@@ -1,0 +1,12 @@
+/target
+/Cargo.lock.bak
+**/*.rs.bk
+.envrc.local
+.DS_Store
+
+# Local data dirs (Dolos's bootstrap output). Bind-mount or point env at
+# an external path on real deployments; ignore by default for local dev.
+/data
+/snapshot
+/.dingo
+/.dolos

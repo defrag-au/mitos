@@ -1,0 +1,29 @@
+[package]
+name = "mitos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mitos"
+path = "src/main.rs"
+
+[dependencies]
+mitos-core = { path = "../../crates/mitos-core" }
+jpg-co-indexer = { path = "../../crates/jpg-co-indexer" }
+
+# Dolos for the embedded data plane.
+dolos = { workspace = true }
+dolos-core = { workspace = true }
+dolos-cardano = { workspace = true }
+
+# Runtime / HTTP / observability.
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# CLI / config.
+clap = { workspace = true }
+config = { workspace = true }

@@ -1,0 +1,69 @@
+# mitos — a framework for composing Cardano indexers as Rust modules
+# that share a single in-process chain data plane (Dolos).
+#
+# Name: from Greek μίτος, "thread" — Theseus's thread through the
+# Labyrinth. Each indexer is one thread of meaning pulled from the chain;
+# a bundle weaves them together for an application.
+#
+# Sits in the txpipe-adjacent Greek-mythology naming neighbourhood
+# (Dolos / Pallas / Balius / Mithril).
+
+[workspace]
+members = [
+    "crates/mitos-core",
+    "crates/jpg-co-indexer",
+    "bundles/default",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = ["Damon Oehlman <damon.oehlman@gmail.com>"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Dolos as embedded data plane. Pinned to a tag for reproducibility;
+# bump deliberately and audit the diff (see docs/design/ROADMAP.md).
+dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+
+# Cardano types + parsing. Same pallas version Dolos uses.
+pallas = "1.0.0-alpha.3"
+pallas-addresses = "1.0.0-alpha.3"
+pallas-codec = "1.0.0-alpha.3"
+pallas-primitives = "1.0.0-alpha.3"
+pallas-traverse = "1.0.0-alpha.3"
+
+# Async runtime + HTTP server.
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+tower = "0.5"
+
+# Serialization + logging + errors.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "1"
+hex = "0.4"
+
+# Storage backend for indexer materialized views (separate from Dolos's
+# state store — each indexer owns its own view).
+redb = "2"
+
+# CLI / config.
+clap = { version = "4", features = ["derive", "env"] }
+config = { version = "0.14", default-features = false, features = ["toml"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
