@@ -44,11 +44,9 @@ pallas-traverse = "1.0.0-alpha.3"
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
-# Sourced from defrag-au/shared-crates; during prototype iteration
-# overridden via the [patch] section below to point at a local
-# checkout. Once shared-crates publishes a release with the typed
-# wrappers, the override comes off.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", features = ["cip14"] }
+# Pinned to a specific shared-crates rev for reproducibility; bump
+# deliberately when shared-crates lands changes mitos needs.
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97", features = ["cip14"] }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -83,15 +81,3 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# --- Patch overrides ---
-#
-# During cardano-assets typed-newtypes development, point at a
-# local shared-crates checkout. Remove once the typed-PolicyId /
-# Fingerprint changes land on shared-crates main and a new
-# revision is pinned in [workspace.dependencies] above.
-#
-# Convention: shared-crates is a sibling repo at
-# `../shared-crates`. Adjust the path locally if your layout
-# differs.
-[patch."https://github.com/defrag-au/shared-crates"]
-cardano-assets = { path = "../shared-crates/cardano-assets" }
