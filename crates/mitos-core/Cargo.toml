@@ -30,4 +30,8 @@ miette = "7"
 # Subscription scope payloads on the CF replication channel are CBOR;
 # the framework decodes once at the IndexerHandle boundary.
 serde = { workspace = true }
+serde_bytes = "0.11"
 ciborium = "0.2"
+
+# WebSocket message receive uses `StreamExt::next` on the split stream.
+futures-util = { version = "0.3", default-features = false }

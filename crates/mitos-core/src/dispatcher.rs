@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use dolos_core::{Domain, TipEvent, TipSubscription};
+use dolos::adapters::DomainAdapter;
+use dolos_core::{TipEvent, TipSubscription};
 use tracing::{error, info};
 
 use crate::handle::IndexerHandle;
@@ -10,12 +11,12 @@ use crate::handle::IndexerHandle;
 /// Loops on `next_tip().await`, dispatches each event to the indexer's
 /// `handle_event`, logs errors, retries on next event. Indexers are
 /// passed as type-erased `IndexerHandle` trait objects (the `Indexer`
-/// trait itself is non-object-safe due to its associated `Scope` type;
-/// see `handle.rs`).
-pub async fn run_dispatcher<D: Domain>(
-    indexer: Arc<dyn IndexerHandle<D>>,
-    domain: D,
-    mut subscription: D::TipSubscription,
+/// trait itself is non-object-safe due to its associated `Scope` and
+/// `Change` types; see `handle.rs`).
+pub async fn run_dispatcher(
+    indexer: Arc<dyn IndexerHandle>,
+    domain: DomainAdapter,
+    mut subscription: <DomainAdapter as dolos_core::Domain>::TipSubscription,
 ) {
     let name = indexer.name();
     info!(indexer = %name, "dispatcher started");

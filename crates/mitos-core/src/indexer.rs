@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use dolos_core::{ChainPoint, TipEvent};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::emitter::Emitter;
 
 /// Reply to a `subscribe` request from a CF replication consumer.
 ///
@@ -18,7 +20,7 @@ use serde::{Serialize, de::DeserializeOwned};
 /// records along the new chain. `common_ancestor` is informational —
 /// the consumer doesn't need to act on it directly, the Apply/Undo
 /// stream handles correctness.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SubscribeReply {
     Resume {
         cursor: ChainPoint,
@@ -54,6 +56,11 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// typed value.
     type Scope: DeserializeOwned + Serialize + Send + Sync + 'static;
 
+    /// Indexer-defined change record. One of these per Apply emission;
+    /// flows over the CF replication channel after CBOR encoding.
+    /// Indexers with no replication output use `type Change = ()`.
+    type Change: DeserializeOwned + Serialize + Clone + Send + Sync + 'static;
+
     /// Stable identifier. Used for log scoping, storage path naming
     /// (under `<bundle-data-dir>/indexers/<name>/`), and HTTP route
     /// prefix by convention. Must be valid as a filesystem directory.
@@ -68,7 +75,16 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// Single chain event. The dispatcher calls this for every
     /// subscribed event in order. Implementations MUST be idempotent
     /// against re-delivery.
-    async fn handle_event(&mut self, domain: &D, event: &TipEvent) -> anyhow::Result<()>;
+    ///
+    /// `emitter` is stamped with the cursor of `event`; calling
+    /// `emitter.apply(change)` produces a CF replication record at
+    /// that cursor. Indexers with `type Change = ()` ignore it.
+    async fn handle_event(
+        &mut self,
+        domain: &D,
+        event: &TipEvent,
+        emitter: &Emitter<Self::Change>,
+    ) -> anyhow::Result<()>;
 
     /// HTTP routes this indexer exposes. The bundle merges all
     /// indexers' routes under a shared `axum::Router`, conventionally
@@ -95,5 +111,16 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// Drop a previously-subscribed scope. Default: no-op.
     async fn unsubscribe(&mut self, _scope: Self::Scope) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Per-consumer filter: does this change belong to a consumer
+    /// watching `scope`? Called for each broadcast record on each
+    /// consumer's WebSocket pump.
+    ///
+    /// Default: every change matches every scope. Correct for
+    /// indexers with `type Scope = ()`. Indexers with structured
+    /// scopes (e.g. `OwnershipScope { policy_id }`) override.
+    fn change_matches_scope(_scope: &Self::Scope, _change: &Self::Change) -> bool {
+        true
     }
 }

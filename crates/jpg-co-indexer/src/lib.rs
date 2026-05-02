@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use axum::Router;
 use dolos_core::{ChainPoint, Domain, TipEvent};
-use mitos_core::Indexer;
+use mitos_core::{Emitter, Indexer};
 use tracing::info;
 
 /// Known CO script addresses (jpg.store V2 + V3). Mirrors
@@ -48,6 +48,10 @@ impl<D: Domain> Indexer<D> for JpgCoIndexer {
     /// `SubscribeReply::Resume`) is correct here.
     type Scope = ();
 
+    /// Phase 2 will define the actual change record (e.g. a CO datum
+    /// upsert/remove). Stub stays `()`.
+    type Change = ();
+
     fn name(&self) -> &'static str {
         "jpg-co"
     }
@@ -63,7 +67,12 @@ impl<D: Domain> Indexer<D> for JpgCoIndexer {
         Ok(ChainPoint::Origin)
     }
 
-    async fn handle_event(&mut self, _domain: &D, event: &TipEvent) -> anyhow::Result<()> {
+    async fn handle_event(
+        &mut self,
+        _domain: &D,
+        event: &TipEvent,
+        _emitter: &Emitter<Self::Change>,
+    ) -> anyhow::Result<()> {
         match event {
             TipEvent::Mark(point) => {
                 info!(indexer = "jpg-co", ?point, "mark");

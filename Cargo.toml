@@ -42,7 +42,7 @@ pallas-traverse = "1.0.0-alpha.3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }
 tower = "0.5"
 
 # Serialization + logging + errors.

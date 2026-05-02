@@ -5,17 +5,18 @@
 //! write:
 //!
 //! ```ignore
-//! let mut bundle = Bundle::new(domain, &config, listen_addr);
+//! let mut bundle = Bundle::new(domain, config, listen_addr);
 //! bundle.add_indexer(JpgCoIndexer::new()?);
 //! bundle.add_indexer(OwnershipIndexer::new()?);
 //! bundle.run(exit).await?;
 //! ```
 //!
-//! The generic `add_indexer<I: Indexer<D>>` keeps each indexer's
-//! associated `Scope` type at the registration boundary; internally,
-//! `IndexerAdapter<I>` wraps it into the object-safe `IndexerHandle`
-//! so the bundle can store a heterogeneous collection. See
-//! `docs/design/CF_REPLICATION.md` for why the trait is non-object-safe.
+//! The generic `add_indexer<I: Indexer<DomainAdapter>>` keeps each
+//! indexer's associated `Scope`/`Change` types at the registration
+//! boundary; internally `IndexerAdapter<I>` wraps it into the
+//! object-safe `IndexerHandle` so the bundle can store a
+//! heterogeneous collection. See `docs/design/CF_REPLICATION.md` for
+//! why the trait is non-object-safe.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,18 +30,14 @@ use tracing::{error, info};
 
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
+use crate::replicate::replicate_router;
 use crate::{run_dispatcher, spawn_sync_pipeline};
 
-/// The framework's runtime composer. Concrete on `DomainAdapter`
-/// because `spawn_sync_pipeline` is — there's only one production
-/// domain. Indexers themselves stay generic over `D: Domain` for
-/// testability; the bundle just happens to instantiate them at the
-/// concrete `DomainAdapter`.
 pub struct Bundle {
     domain: DomainAdapter,
     config: RootConfig,
     listen: SocketAddr,
-    indexers: Vec<Arc<dyn IndexerHandle<DomainAdapter>>>,
+    indexers: Vec<Arc<dyn IndexerHandle>>,
 }
 
 impl Bundle {
@@ -54,19 +51,20 @@ impl Bundle {
     }
 
     /// Register an indexer with the bundle. The indexer's `Scope`
-    /// type is erased into CBOR-bytes-at-the-boundary inside the
-    /// adapter; bundle code never sees the erased form.
+    /// and `Change` types are erased into CBOR-bytes-at-the-boundary
+    /// inside the adapter; bundle code never sees the erased form.
     pub fn add_indexer<I>(&mut self, indexer: I)
     where
         I: Indexer<DomainAdapter> + 'static,
     {
-        let adapter = IndexerAdapter::<I>::new::<DomainAdapter>(indexer);
+        let adapter = IndexerAdapter::<I>::new(indexer);
         self.indexers.push(Arc::new(adapter));
     }
 
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
-    /// indexer, start its dispatcher, mount HTTP routes, and serve
-    /// until `exit` is cancelled.
+    /// indexer, start its dispatcher, mount HTTP routes plus the CF
+    /// replication WebSocket endpoints, and serve until `exit` is
+    /// cancelled.
     pub async fn run(self, exit: CancellationToken) -> anyhow::Result<()> {
         let Bundle {
             domain,
@@ -100,6 +98,9 @@ impl Bundle {
 
             app = app.nest(&format!("/{name}"), ix.routes());
         }
+
+        // Mount CF replication endpoints on the same listener.
+        app = app.merge(replicate_router(&indexers, domain.clone()));
 
         let listener = tokio::net::TcpListener::bind(listen).await?;
         info!(addr = %listen, "HTTP server listening");
