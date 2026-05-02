@@ -1,21 +1,21 @@
-//! CF replication wire protocol + axum mount.
+//! CF replication wire protocol + axum mount (test/admin surface).
 //!
 //! Defines the CBOR envelopes consumers exchange with mitos and
 //! provides `replicate_router` which mounts `/replicate/{indexer}` for
-//! each registered indexer. Per-indexer logic (scope decode, broadcast
-//! subscription, wire encoding of change payloads) lives in
-//! `IndexerHandle::run_subscriber` so the framework's WebSocket
-//! plumbing never needs to know an indexer's `Scope` or `Change` type.
+//! each registered indexer. **This server endpoint is a test surface,
+//! not the production path** — production uses `Replicator` to dial
+//! outbound to CF DOs that accept the WebSocket via the Hibernation
+//! API. See `docs/design/CF_REPLICATION.md` § Connection direction.
 //!
-//! See `docs/design/CF_REPLICATION.md` for the protocol walkthrough.
+//! The shared per-consumer protocol logic lives in
+//! `IndexerHandle::run_subscriber` and is direction-agnostic via the
+//! `WsTransport` trait — both this server endpoint and the outbound
+//! `Replicator` feed it the same protocol.
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{
-    State, WebSocketUpgrade,
-    ws::{Message, WebSocket},
-};
+use axum::extract::{State, WebSocketUpgrade, ws::WebSocket};
 use axum::response::Response;
 use axum::routing::get;
 use dolos::adapters::DomainAdapter;
@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::SubscribeReply;
 use crate::handle::IndexerHandle;
+use crate::transport::AxumWs;
 
 /// Messages the consumer (CF DO) sends to mitos over the WebSocket.
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,9 +75,9 @@ struct ReplicateState {
     domain: DomainAdapter,
 }
 
-/// Mount `/replicate/{indexer}` for each registered indexer. The
-/// router takes a typed `State` per route so each upgrade callback
-/// resolves directly to the indexer it serves — no name lookup at
+/// Mount `/replicate/{indexer}` for each registered indexer (test
+/// surface — see module-level docs). Each route's typed `State`
+/// resolves directly to the indexer it serves; no name lookup at
 /// runtime.
 pub fn replicate_router(
     handles: &[Arc<dyn IndexerHandle>],
@@ -105,8 +106,9 @@ async fn handle_upgrade(
 
 async fn run_socket(socket: WebSocket, state: ReplicateState) {
     let name = state.handle.name();
-    info!(indexer = %name, "consumer connected");
-    match state.handle.run_subscriber(socket, state.domain).await {
+    info!(indexer = %name, "test consumer connected (server-accepted)");
+    let transport = Box::new(AxumWs(socket));
+    match state.handle.run_subscriber(transport, state.domain).await {
         Ok(()) => info!(indexer = %name, "consumer disconnected"),
         Err(e) => warn!(indexer = %name, error = %e, "subscriber loop exited with error"),
     }
@@ -119,16 +121,19 @@ pub fn encode_server(msg: &ServerMessage) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Encode a `ClientMessage` to CBOR for transport.
+pub fn encode_client(msg: &ClientMessage) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(64);
+    ciborium::into_writer(msg, &mut buf).map_err(|e| anyhow::anyhow!("CBOR encode: {e}"))?;
+    Ok(buf)
+}
+
 /// Decode a `ClientMessage` from CBOR.
 pub fn decode_client(bytes: &[u8]) -> anyhow::Result<ClientMessage> {
     ciborium::from_reader(bytes).map_err(|e| anyhow::anyhow!("CBOR decode: {e}"))
 }
 
-/// Convenience: send a `ServerMessage` over a WebSocket.
-pub async fn send_server(socket: &mut WebSocket, msg: &ServerMessage) -> anyhow::Result<()> {
-    let bytes = encode_server(msg)?;
-    socket
-        .send(Message::Binary(bytes.into()))
-        .await
-        .map_err(|e| anyhow::anyhow!("ws send: {e}"))
+/// Decode a `ServerMessage` from CBOR.
+pub fn decode_server(bytes: &[u8]) -> anyhow::Result<ServerMessage> {
+    ciborium::from_reader(bytes).map_err(|e| anyhow::anyhow!("CBOR decode: {e}"))
 }

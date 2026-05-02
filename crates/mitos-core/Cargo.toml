@@ -35,3 +35,9 @@ ciborium = "0.2"
 
 # WebSocket message receive uses `StreamExt::next` on the split stream.
 futures-util = { version = "0.3", default-features = false }
+
+# Outbound WebSocket client for the `Replicator` (mitos dials
+# CF Durable Objects). `rustls-tls-webpki-roots` keeps the build
+# self-contained — no system OpenSSL needed.
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"

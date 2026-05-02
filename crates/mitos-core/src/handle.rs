@@ -8,25 +8,28 @@
 //!
 //! `IndexerHandle` is an object-safe trait that erases the typed
 //! interface by accepting CBOR bytes at the subscribe boundary and
-//! decoding inside the per-indexer impl. This is the same shape axum
-//! uses for handlers (`Handler<T>` is generic; `BoxedHandler` is the
-//! erased form stored in the router). Bundle authors never see the
+//! decoding inside the per-indexer impl. Bundle authors never see the
 //! erased form — they just call `Bundle::add_indexer(MyIndexer::new()?)`
 //! and the framework wraps it.
+//!
+//! `run_subscriber` accepts a `Box<dyn WsTransport>` so the same
+//! protocol logic works regardless of who initiated the WebSocket.
+//! The server-side `/replicate/{indexer}` endpoint wraps an axum
+//! WebSocket; the client-side `Replicator` wraps a tokio-tungstenite
+//! stream. See `docs/design/CF_REPLICATION.md` § Connection direction.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::extract::ws::{Message, WebSocket};
 use dolos::adapters::DomainAdapter;
 use dolos_core::{ChainPoint, TipEvent};
-use futures_util::StreamExt;
 use tokio::sync::{Mutex, broadcast};
 use tracing::warn;
 
 use crate::emitter::{EmittedRecord, Emitter};
 use crate::indexer::Indexer;
-use crate::replicate::{ClientMessage, ServerMessage, decode_client, send_server};
+use crate::replicate::{ClientMessage, ServerMessage, decode_client, encode_server};
+use crate::transport::WsTransport;
 
 /// How many records to buffer per indexer in the broadcast channel.
 /// Slow consumers that fall behind get a `Lagged` error and the pump
@@ -38,9 +41,7 @@ const BROADCAST_CAPACITY: usize = 4096;
 /// Object-safe view of an `Indexer<DomainAdapter>` for storage in
 /// heterogeneous collections. All methods take only `Send + Sync`
 /// types — the indexer's `Scope` and `Change` are erased behind CBOR
-/// bytes. Concrete on `DomainAdapter` because the framework only
-/// runs against the Dolos-backed domain in production; indexers
-/// remain generic over `D: Domain` for testability.
+/// bytes.
 #[async_trait]
 pub trait IndexerHandle: Send + Sync {
     fn name(&self) -> &'static str;
@@ -58,13 +59,16 @@ pub trait IndexerHandle: Send + Sync {
         event: &TipEvent,
     ) -> anyhow::Result<()>;
 
-    /// Run the per-consumer WebSocket pump until the consumer
-    /// disconnects (or the indexer drops). Owns the subscribe
-    /// handshake, broadcast→ws forwarding, scope filtering, and
-    /// (Phase 4.5) ack-driven retransmit-buffer trim.
+    /// Run the per-consumer pump until the consumer disconnects or
+    /// drops. Owns the subscribe handshake, broadcast→ws forwarding,
+    /// scope filtering, and (Phase 4.5) ack-driven retransmit-buffer
+    /// trim.
+    ///
+    /// `transport` is direction-agnostic — server-accepted axum
+    /// WebSocket or client-dialed tungstenite stream both work.
     async fn run_subscriber(
         &self,
-        socket: WebSocket,
+        transport: Box<dyn WsTransport>,
         domain: DomainAdapter,
     ) -> anyhow::Result<()>;
 }
@@ -127,64 +131,69 @@ where
         let emitter = Emitter::new(self.changes.clone(), cursor.clone());
         let mut guard = self.inner.lock().await;
         let result = guard.handle_event(domain, event, &emitter).await;
-        // Mark heartbeats are auto-emitted; indexers don't call
-        // emitter.mark() themselves.
-        if matches!(event, TipEvent::Mark(_)) {
-            let _ = self.changes.send(EmittedRecord::Mark { cursor });
+        // `Undo` and `Mark` are chain-level signals, not
+        // indexer-specific. The framework auto-emits them after the
+        // indexer has had a chance to roll back its own materialized
+        // view (Undo) or update its cursor (Mark). Indexers only
+        // emit explicit `Apply` records.
+        match event {
+            TipEvent::Undo(_, _) => {
+                let _ = self.changes.send(EmittedRecord::Undo { cursor });
+            }
+            TipEvent::Mark(_) => {
+                let _ = self.changes.send(EmittedRecord::Mark { cursor });
+            }
+            TipEvent::Apply(_, _) => {}
         }
         result
     }
 
     async fn run_subscriber(
         &self,
-        socket: WebSocket,
+        mut transport: Box<dyn WsTransport>,
         domain: DomainAdapter,
     ) -> anyhow::Result<()> {
-        let mut socket = socket;
-
         // Phase A: subscribe handshake.
-        let (scope, cursor) = match read_subscribe::<I>(&mut socket).await? {
+        let (scope, cursor) = match read_subscribe::<I>(&mut transport).await? {
             Some(pair) => pair,
             None => return Ok(()), // peer closed before subscribing
         };
 
         let reply = {
             let mut guard = self.inner.lock().await;
-            guard.subscribe(&domain, scope.clone_for_subscribe(), cursor).await?
+            guard
+                .subscribe(&domain, scope.clone_for_subscribe(), cursor)
+                .await?
         };
-        send_server(&mut socket, &ServerMessage::SubscribeReply(reply)).await?;
+        send(&mut transport, &ServerMessage::SubscribeReply(reply)).await?;
 
         // Phase B: forward broadcast records, filtered by scope, until
         // the consumer disconnects or lags.
         let rx = self.changes.subscribe();
-        forward_records::<I>(&mut socket, rx, scope.into_inner()).await
+        forward_records::<I>(&mut transport, rx, scope.into_inner()).await
     }
+}
+
+async fn send(
+    transport: &mut Box<dyn WsTransport>,
+    msg: &ServerMessage,
+) -> anyhow::Result<()> {
+    let bytes = encode_server(msg)?;
+    transport.send_binary(bytes).await
 }
 
 /// Read the first message from a freshly-upgraded socket and decode
 /// it as a Subscribe. Returns `None` if the peer closed before
 /// subscribing.
 async fn read_subscribe<I>(
-    socket: &mut WebSocket,
+    transport: &mut Box<dyn WsTransport>,
 ) -> anyhow::Result<Option<(TypedScope<I>, ChainPoint)>>
 where
     I: Indexer<DomainAdapter>,
 {
-    let bytes = match socket.next().await {
-        Some(Ok(Message::Binary(b))) => b,
-        Some(Ok(Message::Close(_))) | None => return Ok(None),
-        Some(Ok(other)) => {
-            let _ = send_server(
-                socket,
-                &ServerMessage::Error {
-                    code: "expected_binary".into(),
-                    message: format!("expected Binary frame, got {other:?}"),
-                },
-            )
-            .await;
-            return Ok(None);
-        }
-        Some(Err(e)) => return Err(anyhow::anyhow!("ws recv: {e}")),
+    let bytes = match transport.recv_binary().await? {
+        Some(b) => b,
+        None => return Ok(None),
     };
 
     match decode_client(&bytes)? {
@@ -195,8 +204,8 @@ where
             Ok(Some((TypedScope(typed), cursor)))
         }
         ClientMessage::Ack { .. } | ClientMessage::Unsubscribe => {
-            let _ = send_server(
-                socket,
+            let _ = send(
+                transport,
                 &ServerMessage::Error {
                     code: "subscribe_required".into(),
                     message: "first message must be Subscribe".into(),
@@ -222,8 +231,6 @@ where
     I: Indexer<DomainAdapter>,
 {
     fn clone_for_subscribe(&self) -> <I as Indexer<DomainAdapter>>::Scope {
-        // Re-encode → re-decode round-trip. Cheap (scopes are small)
-        // and avoids requiring Clone on every indexer's Scope.
         let mut buf = Vec::with_capacity(32);
         ciborium::into_writer(&self.0, &mut buf).expect("scope re-encode");
         ciborium::from_reader(buf.as_slice()).expect("scope re-decode")
@@ -235,7 +242,7 @@ where
 }
 
 async fn forward_records<I>(
-    socket: &mut WebSocket,
+    transport: &mut Box<dyn WsTransport>,
     mut rx: broadcast::Receiver<EmittedRecord<<I as Indexer<DomainAdapter>>::Change>>,
     scope: <I as Indexer<DomainAdapter>>::Scope,
 ) -> anyhow::Result<()>
@@ -247,8 +254,8 @@ where
             Ok(r) => r,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(skipped = n, "consumer lagged, dropping connection");
-                let _ = send_server(
-                    socket,
+                let _ = send(
+                    transport,
                     &ServerMessage::Error {
                         code: "lagged".into(),
                         message: format!("consumer lagged by {n} records; reconnect"),
@@ -274,7 +281,7 @@ where
             EmittedRecord::Mark { cursor } => ServerMessage::Mark { cursor },
         };
 
-        send_server(socket, &msg).await?;
+        send(transport, &msg).await?;
     }
 }
 

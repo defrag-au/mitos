@@ -309,6 +309,39 @@ the connection* even when idle, because the DO request handler is open
 the entire time. At chain pacing that's 24 hours of billed duration
 per consumer per day for what's actually a few minutes of work.
 
+### Connection direction
+
+Hibernation has a hard constraint: it only works on **inbound
+WebSockets the DO accepts** via `state.acceptWebSocket(&server)`.
+Outbound WebSockets initiated *by* a DO (via `fetch()` with
+`Upgrade: websocket`) are technically possible but **do not
+hibernate** — the DO must stay active for the lifetime of the
+connection. Fully defeats the cost model.
+
+Therefore the connection direction is fixed:
+
+- **Mitos = WebSocket client.** Mitos initiates outbound
+  WSS connections to CF. One per active subscription.
+- **CF DO = WebSocket server.** The DO's `fetch` handler responds
+  to the upgrade request, accepts the socket via
+  `state.accept_web_socket(&server)`, returns the client half in the
+  `Response`, and immediately hibernates. Subsequent messages from
+  mitos wake the DO via the `websocket_message` lifecycle hook.
+
+The application protocol direction is independent of the WebSocket
+direction. After the upgrade:
+
+1. The DO (data sink) sends `ClientMessage::Subscribe { scope, cursor }`
+   first.
+2. Mitos (data source) replies with `ServerMessage::SubscribeReply(...)`.
+3. Mitos streams `Apply` / `Undo` / `Mark` records.
+
+Naming in the codebase reflects this: the `Replicator` on the mitos
+side is the WS client driver, owning the outbound dial loop with
+reconnect/backoff. The `replicate_router` server endpoint stays as a
+test surface (a synthetic CBOR client can speak to it without
+spinning up a CF worker), but is not the production path.
+
 The Hibernation API decouples socket lifetime from DO billing: CF
 holds the WebSocket, the DO hibernates between messages, and active
 duration only accrues while a message is being processed. For our

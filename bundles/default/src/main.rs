@@ -5,6 +5,7 @@
 //! indexer the bundle wants to include, and hands off to `Bundle::run`.
 
 use clap::Parser;
+use collection_ownership_indexer::OwnershipIndexer;
 use jpg_co_indexer::JpgCoIndexer;
 use mitos_core::Bundle;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut bundle = Bundle::new(domain, config, args.listen);
     bundle.add_indexer(JpgCoIndexer::new()?);
+    bundle.add_indexer(OwnershipIndexer::new()?);
 
     bundle.run(exit).await?;
 

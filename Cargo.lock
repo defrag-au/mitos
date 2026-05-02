@@ -634,6 +634,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
+name = "collection-ownership-indexer"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.4",
+ "dolos-core",
+ "hex",
+ "mitos-core",
+ "pallas",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2766,6 +2781,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.4",
  "clap",
+ "collection-ownership-indexer",
  "config 0.14.1",
  "dolos",
  "dolos-cardano",
@@ -2797,8 +2813,10 @@ dependencies = [
  "serde_bytes",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4940,8 +4958,12 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.8",
 ]
 
 [[package]]
@@ -5325,6 +5347,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.1",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.12",
  "utf-8",

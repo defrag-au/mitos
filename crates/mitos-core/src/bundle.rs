@@ -21,9 +21,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{delete, get};
 use dolos::adapters::DomainAdapter;
 use dolos_core::Domain;
 use dolos_core::config::RootConfig;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -31,6 +37,7 @@ use tracing::{error, info};
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
 use crate::replicate::replicate_router;
+use crate::replicator::{Replicator, Subscription, SubscriptionId};
 use crate::{run_dispatcher, spawn_sync_pipeline};
 
 pub struct Bundle {
@@ -62,9 +69,9 @@ impl Bundle {
     }
 
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
-    /// indexer, start its dispatcher, mount HTTP routes plus the CF
-    /// replication WebSocket endpoints, and serve until `exit` is
-    /// cancelled.
+    /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
+    /// `/replicate/{indexer}` test surface + `/_admin/subscriptions`),
+    /// and serve until `exit` is cancelled.
     pub async fn run(self, exit: CancellationToken) -> anyhow::Result<()> {
         let Bundle {
             domain,
@@ -77,7 +84,7 @@ impl Bundle {
         info!("chain-sync pipeline spawned");
 
         let mut dispatcher_handles: Vec<JoinHandle<()>> = Vec::with_capacity(indexers.len());
-        let mut app = axum::Router::new().route("/health", axum::routing::get(handle_health));
+        let mut app = axum::Router::new().route("/health", get(handle_health));
 
         for ix in &indexers {
             let name = ix.name();
@@ -99,8 +106,13 @@ impl Bundle {
             app = app.nest(&format!("/{name}"), ix.routes());
         }
 
-        // Mount CF replication endpoints on the same listener.
+        // Mount CF replication test surface (server-accepted WS) and
+        // admin endpoints for managing outbound `Replicator`
+        // subscriptions (production WS-client direction).
         app = app.merge(replicate_router(&indexers, domain.clone()));
+
+        let replicator = Arc::new(Replicator::new(&indexers, domain.clone()));
+        app = app.merge(admin_router(replicator.clone()));
 
         let listener = tokio::net::TcpListener::bind(listen).await?;
         info!(addr = %listen, "HTTP server listening");
@@ -124,6 +136,87 @@ impl Bundle {
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------
+// Admin endpoints: /_admin/subscriptions
+// ---------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AdminState {
+    replicator: Arc<Replicator>,
+}
+
+fn admin_router(replicator: Arc<Replicator>) -> axum::Router {
+    let state = AdminState { replicator };
+    axum::Router::new()
+        .route(
+            "/_admin/subscriptions",
+            get(list_subscriptions).post(add_subscription),
+        )
+        .route("/_admin/subscriptions/{id}", delete(remove_subscription))
+        .with_state(state)
+}
+
+#[derive(Serialize)]
+struct SubscriptionEntry {
+    id: SubscriptionId,
+    sub: Subscription,
+}
+
+async fn list_subscriptions(State(state): State<AdminState>) -> Json<Vec<SubscriptionEntry>> {
+    let entries = state
+        .replicator
+        .list()
+        .await
+        .into_iter()
+        .map(|(id, sub)| SubscriptionEntry { id, sub })
+        .collect();
+    Json(entries)
+}
+
+#[derive(Deserialize)]
+struct AddSubscription {
+    indexer: String,
+    target_url: String,
+    /// CBOR-encoded scope payload for the indexer's `Scope` type.
+    #[serde(with = "serde_bytes")]
+    scope: Vec<u8>,
+    cursor: dolos_core::ChainPoint,
+}
+
+#[derive(Serialize)]
+struct AddedResponse {
+    id: SubscriptionId,
+}
+
+async fn add_subscription(
+    State(state): State<AdminState>,
+    Json(body): Json<AddSubscription>,
+) -> Result<Json<AddedResponse>, (StatusCode, String)> {
+    let sub = Subscription {
+        indexer: body.indexer,
+        target_url: body.target_url,
+        scope: body.scope,
+        cursor: body.cursor,
+    };
+    state
+        .replicator
+        .add(sub)
+        .await
+        .map(|id| Json(AddedResponse { id }))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+async fn remove_subscription(
+    State(state): State<AdminState>,
+    Path(id): Path<SubscriptionId>,
+) -> impl IntoResponse {
+    if state.replicator.remove(id).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
     }
 }
 

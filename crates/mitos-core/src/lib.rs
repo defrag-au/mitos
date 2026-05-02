@@ -13,6 +13,8 @@ mod emitter;
 mod handle;
 mod indexer;
 mod replicate;
+mod replicator;
+mod transport;
 
 pub use bundle::Bundle;
 pub use dispatcher::run_dispatcher;
@@ -21,8 +23,11 @@ pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};
 pub use indexer::{Indexer, SubscribeReply};
 pub use replicate::{
-    ClientMessage, ServerMessage, decode_client, encode_server, replicate_router, send_server,
+    ClientMessage, ServerMessage, decode_client, decode_server, encode_client, encode_server,
+    replicate_router,
 };
+pub use replicator::{Replicator, Subscription, SubscriptionId};
+pub use transport::{AxumWs, TungsteniteWs, WsTransport};
 
 // Re-export the dolos types indexers need at the trait surface, so
 // downstream crates only need to depend on `mitos-core`.

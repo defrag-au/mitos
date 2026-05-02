@@ -228,7 +228,12 @@ Don't get bogged down before learning anything:
 - [ ] Push channel implementation: WebSocket via DO Hibernation API
       (mandated by CF billing — see `CF_REPLICATION.md`),
       authentication, per-consumer retransmit buffer with
-      cursor-ack-driven trim, per-block message batching
+      cursor-ack-driven trim, per-block message batching. **Mitos is
+      the WS client (outbound dial); CF DO is the WS server.**
+- [ ] `Replicator` outbound dial loop: tokio-tungstenite client per
+      registered subscription, reconnect with backoff, hands the
+      socket to the same `run_subscriber` protocol logic as the
+      `/replicate/{indexer}` test surface uses
 - [ ] `subscribe(last_cursor)` handler that picks between resume,
       snapshot redirect, and fork-recognition reply
 - [ ] `OwnershipIndexer` in mitos that mirrors the cnft.dev-workers DO
