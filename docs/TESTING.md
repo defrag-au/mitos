@@ -105,32 +105,51 @@ nix develop -c wrangler dev
 # (note the local URL, typically http://localhost:8787)
 ```
 
-### 2.2 Start mitos pointing at it
+### 2.2 Verify mitos config offline (optional but recommended)
+
+Before starting the long-running process, dump everything mitos
+*will* load to confirm paths and env are set correctly:
+
+```sh
+cd ~/code/defrag/mitos
+MITOS_AUTH_TOKEN=$MITOS_AUTH_TOKEN \
+nix develop -c cargo run --release -p mitos -- \
+    --config /opt/mitos/mainnet/dolos.toml \
+    --data-dir /opt/mitos/mainnet/mitos-data \
+    --print-config-only
+```
+
+Output is a one-shot summary: listen address, data_dir, dolos
+storage paths, registered indexers, auth status, persisted
+subscriptions. Exits 0 without starting the chain follower or HTTP
+server. If anything looks wrong (e.g. `auth: OPEN` when you set the
+env, or persisted subs missing after a restart), fix it before
+moving on.
+
+### 2.3 Start mitos pointing at it
 
 Same command as Scenario 1, with `MITOS_AUTH_TOKEN` set.
 
-### 2.3 Register an outbound subscription
+### 2.4 Register an outbound subscription
 
-Pick the WSS URL from above and the policy you want tracked:
+Use `mitos-admin` (sibling tool, friendly args, no JSON
+heredocs):
 
 ```sh
 TARGET="wss://collection-ownership-mitos.<account>.workers.dev/_internal/replicate?policy_id=<hex>"
 POLICY="<28-byte-policy-hex>"
 
-curl -X POST http://127.0.0.1:8181/_admin/subscriptions \
-  -H "Authorization: Bearer $MITOS_AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @- <<EOF
-{
-  "indexer": "collection-ownership",
-  "target_url": "$TARGET",
-  "scope": {"policy_id": "$POLICY"},
-  "cursor": "origin"
-}
-EOF
+cd ~/code/defrag/mitos
+nix develop -c cargo run --release -p mitos-admin -- \
+    --mitos http://127.0.0.1:8181 \
+    add \
+    --indexer collection-ownership \
+    --target  "$TARGET" \
+    --scope-json "{\"policy_id\":\"$POLICY\"}" \
+    --cursor   origin
 ```
 
-Expected response: `{"id":1}` (or whatever the assigned id is).
+Expected output: `added subscription id=1`.
 
 Watch mitos's logs for:
 ```
@@ -138,7 +157,31 @@ INFO mitos_core::replicator: outbound ws connected
 INFO collection_ownership_indexer: subscribe policy_id=... new=true backfilled=N
 ```
 
-### 2.4 Probe the DO's read APIs
+Confirm via:
+
+```sh
+nix develop -c cargo run --release -p mitos-admin -- list
+```
+
+```
+ID    INDEXER                   STATUS        BACKOFF   TARGET
+1     collection-ownership      connected     -         wss://...
+```
+
+The `health` subcommand gives a roll-up:
+
+```sh
+nix develop -c cargo run --release -p mitos-admin -- health
+```
+
+```
+status:        ok
+uptime:        12m45s
+indexers:      jpg-co, collection-ownership
+subscriptions: total=1 connected=1 connecting=0 backing_off=0 disconnected=0
+```
+
+### 2.5 Probe the DO's read APIs
 
 ```sh
 BASE="https://collection-ownership-mitos.<account>.workers.dev"
@@ -159,28 +202,25 @@ curl "$BASE/api/check/$POLICY?asset=<asset_name_hex>&stake=stake1u..."
 Compare to the existing `collection-ownership` worker's responses
 for the same policy — they should match.
 
-### 2.5 Verify subscription persistence
+### 2.6 Verify subscription persistence
 
 ```sh
 # Confirm the subscription is registered:
-curl -s http://127.0.0.1:8181/_admin/subscriptions \
-  -H "Authorization: Bearer $MITOS_AUTH_TOKEN" | jq
+nix develop -c cargo run --release -p mitos-admin -- list
 
-# Restart mitos (Ctrl+C, then re-run the command from 2.2).
-# The subscription should re-appear and the dial loop should
-# reconnect automatically:
-curl -s http://127.0.0.1:8181/_admin/subscriptions \
-  -H "Authorization: Bearer $MITOS_AUTH_TOKEN" | jq
-# (should show the same id and target_url)
+# Restart mitos (Ctrl+C, then re-run the start command).
+# The subscription should re-appear automatically:
+nix develop -c cargo run --release -p mitos-admin -- list
+# (same id and target_url)
 ```
 
-### 2.6 Tear down
+You can also confirm offline via `--print-config-only` — it reads
+the persisted redb without spinning up the rest of the process.
+
+### 2.7 Tear down
 
 ```sh
-SUB_ID=1   # whatever was returned in 2.3
-
-curl -X DELETE http://127.0.0.1:8181/_admin/subscriptions/$SUB_ID \
-  -H "Authorization: Bearer $MITOS_AUTH_TOKEN"
+nix develop -c cargo run --release -p mitos-admin -- remove 1
 ```
 
 Mitos disconnects, the DO's hibernating WS gets a close.

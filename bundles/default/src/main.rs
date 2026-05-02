@@ -29,6 +29,14 @@ struct Args {
     /// Independent of Dolos's data dir.
     #[arg(long, env = "BUNDLE_DATA_DIR", default_value = "./mitos-data")]
     data_dir: std::path::PathBuf,
+
+    /// Print the loaded configuration + persisted subscriptions to
+    /// stdout, then exit 0 without starting the chain follower or
+    /// HTTP server. Useful for verifying env vars, paths, and the
+    /// state of the redb registry before committing to a long-
+    /// running process.
+    #[arg(long)]
+    print_config_only: bool,
 }
 
 #[tokio::main]
@@ -46,6 +54,11 @@ async fn main() -> anyhow::Result<()> {
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
     bundle.add_indexer(JpgCoIndexer::new()?);
     bundle.add_indexer(OwnershipIndexer::new()?);
+
+    if args.print_config_only {
+        bundle.print_config_summary()?;
+        return Ok(());
+    }
 
     bundle.run(exit).await?;
 

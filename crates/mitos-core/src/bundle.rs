@@ -21,6 +21,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -39,7 +40,7 @@ use crate::auth::AuthToken;
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
 use crate::replicate::replicate_router;
-use crate::replicator::{Replicator, Subscription, SubscriptionId};
+use crate::replicator::{ConnState, Replicator, Subscription, SubscriptionId};
 use crate::{run_dispatcher, spawn_sync_pipeline};
 
 pub struct Bundle {
@@ -83,6 +84,56 @@ impl Bundle {
         self.indexers.push(Arc::new(adapter));
     }
 
+    /// Print a summary of the loaded configuration to stdout
+    /// without spawning the chain follower or any dispatchers, then
+    /// return. Used by `mitos --print-config-only` to validate
+    /// startup state offline (env vars, paths, persisted
+    /// subscriptions).
+    pub fn print_config_summary(self) -> anyhow::Result<()> {
+        let Bundle {
+            domain: _,
+            config,
+            listen,
+            data_dir,
+            indexers,
+        } = self;
+
+        println!("# mitos config summary");
+        println!();
+        println!("listen:        {listen}");
+        println!("data_dir:      {}", data_dir.display());
+        println!("storage.wal:   {:?}", config.storage.wal.path());
+        println!("storage.state: {:?}", config.storage.state.path());
+        println!();
+        println!("indexers ({}):", indexers.len());
+        for h in &indexers {
+            println!("  - {}", h.name());
+        }
+        println!();
+
+        let auth = AuthToken::from_env();
+        println!("auth:          {}", if auth.is_open() { "OPEN" } else { "set" });
+        println!();
+
+        let replicator_path = data_dir.join("subscriptions.redb");
+        let persisted = Replicator::list_persisted(&replicator_path)?;
+        println!(
+            "persisted subscriptions ({}, from {}):",
+            persisted.len(),
+            replicator_path.display()
+        );
+        for (id, sub) in persisted {
+            println!(
+                "  [{id}] indexer={} target={} cursor={:?} scope_bytes={}",
+                sub.indexer,
+                sub.target_url,
+                sub.cursor,
+                sub.scope.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
     /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
     /// `/replicate/{indexer}` test surface + `/_admin/subscriptions`),
@@ -99,8 +150,11 @@ impl Bundle {
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
         info!("chain-sync pipeline spawned");
 
+        let started_at = SystemTime::now();
+        let indexer_names: Vec<String> = indexers.iter().map(|h| h.name().to_string()).collect();
+
         let mut dispatcher_handles: Vec<JoinHandle<()>> = Vec::with_capacity(indexers.len());
-        let mut app = axum::Router::new().route("/health", get(handle_health));
+        let mut app = axum::Router::new();
 
         for ix in &indexers {
             let name = ix.name();
@@ -139,6 +193,19 @@ impl Bundle {
         )?);
         info!(path = %replicator_path.display(), "replicator registry opened");
         app = app.merge(admin_router(replicator.clone(), auth.clone()));
+
+        // /health surfaces replicator state — open (no auth) so a
+        // status page or LB health check can hit it without
+        // credentials. No sensitive data is exposed.
+        let health_state = HealthState {
+            started_at,
+            indexers: indexer_names,
+            replicator: replicator.clone(),
+        };
+        app = app.route(
+            "/health",
+            get(handle_health).with_state(health_state),
+        );
 
         let listener = tokio::net::TcpListener::bind(listen).await?;
         info!(addr = %listen, "HTTP server listening");
@@ -193,6 +260,7 @@ fn admin_router(replicator: Arc<Replicator>, auth: AuthToken) -> axum::Router {
 struct SubscriptionEntry {
     id: SubscriptionId,
     sub: Subscription,
+    state: ConnState,
 }
 
 async fn list_subscriptions(State(state): State<AdminState>) -> Json<Vec<SubscriptionEntry>> {
@@ -201,7 +269,7 @@ async fn list_subscriptions(State(state): State<AdminState>) -> Json<Vec<Subscri
         .list()
         .await
         .into_iter()
-        .map(|(id, sub)| SubscriptionEntry { id, sub })
+        .map(|(id, sub, state)| SubscriptionEntry { id, sub, state })
         .collect();
     Json(entries)
 }
@@ -309,7 +377,31 @@ async fn remove_subscription(
     }
 }
 
-async fn handle_health() -> &'static str {
-    // Phase 4.5+: aggregate per-indexer cursor lag.
-    "ok"
+#[derive(Clone)]
+struct HealthState {
+    started_at: SystemTime,
+    indexers: Vec<String>,
+    replicator: Arc<Replicator>,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    uptime_secs: u64,
+    indexers: Vec<String>,
+    replicator: crate::replicator::ReplicatorSummary,
+}
+
+async fn handle_health(State(state): State<HealthState>) -> Json<HealthResponse> {
+    let uptime_secs = SystemTime::now()
+        .duration_since(state.started_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let summary = state.replicator.summary().await;
+    Json(HealthResponse {
+        status: "ok",
+        uptime_secs,
+        indexers: state.indexers,
+        replicator: summary,
+    })
 }

@@ -16,6 +16,7 @@ members = [
     "bundles/default",
     "tools/diff-collection-ownership",
     "tools/mitos-tail",
+    "tools/mitos-admin",
 ]
 resolver = "2"
 

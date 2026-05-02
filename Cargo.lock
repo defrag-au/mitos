@@ -2810,6 +2810,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-admin"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mitos-core"
 version = "0.0.1"
 dependencies = [

@@ -22,7 +22,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::RwLock;
+use std::time::{Duration, SystemTime};
 
 use dolos::adapters::DomainAdapter;
 use redb::{Database, ReadableTable, TableDefinition};
@@ -81,7 +82,59 @@ struct ReplicatorInner {
 
 struct ActiveSub {
     sub: Subscription,
+    state: Arc<RwLock<ConnState>>,
     task: JoinHandle<()>,
+}
+
+/// Status reported per-subscription in `Replicator::list` and rolled
+/// up in `Replicator::summary`. Updated by the per-subscription
+/// dial loop on every state transition.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnStatus {
+    /// Task spawned, dial in flight.
+    Connecting,
+    /// `connect_async` succeeded; `run_subscriber` running.
+    Connected,
+    /// Clean disconnect from the peer; will reconnect.
+    Disconnected,
+    /// Dial failed; sleeping `backoff_secs` before next attempt.
+    BackingOff,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnState {
+    pub status: ConnStatus,
+    /// Unix-seconds timestamp of last successful connect, if any.
+    pub last_connected_at: Option<u64>,
+    /// Most recent failure message, if any.
+    pub last_error: Option<String>,
+    /// Current backoff duration (only meaningful while
+    /// `BackingOff`).
+    pub backoff_secs: u64,
+}
+
+impl Default for ConnState {
+    fn default() -> Self {
+        Self {
+            status: ConnStatus::Connecting,
+            last_connected_at: None,
+            last_error: None,
+            backoff_secs: 0,
+        }
+    }
+}
+
+/// One-line snapshot of the registry: total subscriptions and
+/// counts by status. For the bundle's `/health` endpoint and human
+/// observers.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplicatorSummary {
+    pub total: usize,
+    pub connecting: usize,
+    pub connected: usize,
+    pub disconnected: usize,
+    pub backing_off: usize,
 }
 
 impl Replicator {
@@ -156,14 +209,16 @@ impl Replicator {
         // don't want a runaway connection without a registry entry.
         write_subscription(&self.db, id, &sub, inner.next_id)?;
 
+        let state = Arc::new(RwLock::new(ConnState::default()));
         let task = tokio::spawn(run_subscription(
             id,
             sub.clone(),
             handle,
             self.domain.clone(),
             self.auth.clone(),
+            state.clone(),
         ));
-        inner.subs.insert(id, ActiveSub { sub, task });
+        inner.subs.insert(id, ActiveSub { sub, state, task });
         Ok(id)
     }
 
@@ -183,14 +238,66 @@ impl Replicator {
     }
 
     /// Snapshot of the current registry. Returns id + subscription
-    /// for each active entry.
-    pub async fn list(&self) -> Vec<(SubscriptionId, Subscription)> {
+    /// + current connection state for each active entry.
+    pub async fn list(&self) -> Vec<(SubscriptionId, Subscription, ConnState)> {
         let inner = self.inner.lock().await;
         inner
             .subs
             .iter()
-            .map(|(id, active)| (*id, active.sub.clone()))
+            .map(|(id, active)| {
+                let state = active
+                    .state
+                    .read()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                (*id, active.sub.clone(), state)
+            })
             .collect()
+    }
+
+    /// Summary: count of subscriptions by status. Cheap; for use
+    /// in the bundle's `/health` endpoint.
+    pub async fn summary(&self) -> ReplicatorSummary {
+        let inner = self.inner.lock().await;
+        let mut s = ReplicatorSummary {
+            total: inner.subs.len(),
+            connecting: 0,
+            connected: 0,
+            disconnected: 0,
+            backing_off: 0,
+        };
+        for active in inner.subs.values() {
+            let status = active
+                .state
+                .read()
+                .map(|g| g.status.clone())
+                .unwrap_or(ConnStatus::Connecting);
+            match status {
+                ConnStatus::Connecting => s.connecting += 1,
+                ConnStatus::Connected => s.connected += 1,
+                ConnStatus::Disconnected => s.disconnected += 1,
+                ConnStatus::BackingOff => s.backing_off += 1,
+            }
+        }
+        s
+    }
+
+    /// Read the persisted subscription registry without spawning
+    /// dial loops. Used by the bundle's `--print-config-only` flag
+    /// for offline inspection. No `IndexerHandle` lookup is
+    /// performed; entries that reference unknown indexers come
+    /// through unchanged.
+    pub fn list_persisted(
+        db_path: impl AsRef<Path>,
+    ) -> anyhow::Result<Vec<(SubscriptionId, Subscription)>> {
+        let path = db_path.as_ref();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let db = Database::open(path)
+            .map_err(|e| anyhow::anyhow!("open replicator db at {}: {e}", path.display()))?;
+        let (subs, _next_id) = load_persisted(&db)?;
+        Ok(subs)
     }
 
     /// Look up a registered indexer handle by name. Used by the
@@ -215,18 +322,20 @@ impl Replicator {
                 return;
             }
         };
+        let state = Arc::new(RwLock::new(ConnState::default()));
         let task = tokio::spawn(run_subscription(
             id,
             sub.clone(),
             handle,
             self.domain.clone(),
             self.auth.clone(),
+            state.clone(),
         ));
         // We're holding `&self`, not `&mut self`; need to grab the
         // Mutex synchronously. `new` is called from a blocking
         // context (during bundle setup), so block_in_place is fine.
         let mut inner = self.inner.blocking_lock();
-        inner.subs.insert(id, ActiveSub { sub, task });
+        inner.subs.insert(id, ActiveSub { sub, state, task });
     }
 }
 
@@ -315,11 +424,17 @@ async fn run_subscription(
     handle: Arc<dyn IndexerHandle>,
     domain: DomainAdapter,
     auth: AuthToken,
+    state: Arc<RwLock<ConnState>>,
 ) {
     let url = match Url::parse(&sub.target_url) {
         Ok(u) => u,
         Err(e) => {
             error!(id, target = %sub.target_url, error = %e, "invalid subscription URL — task exiting");
+            set_state(&state, |s| {
+                s.status = ConnStatus::BackingOff;
+                s.last_error = Some(format!("invalid URL: {e}"));
+                s.backoff_secs = 0;
+            });
             return;
         }
     };
@@ -328,25 +443,53 @@ async fn run_subscription(
     let max_backoff = Duration::from_secs(60);
 
     loop {
-        match dial_and_run(&url, &sub, &handle, &domain, &auth).await {
+        set_state(&state, |s| {
+            s.status = ConnStatus::Connecting;
+            s.backoff_secs = 0;
+        });
+
+        match dial_and_run(&url, &sub, &handle, &domain, &auth, &state).await {
             Ok(()) => {
                 info!(id, indexer = %sub.indexer, "subscription disconnected cleanly; reconnecting");
+                set_state(&state, |s| {
+                    s.status = ConnStatus::Disconnected;
+                    s.last_error = None;
+                });
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
+                let err_msg = e.to_string();
                 warn!(
                     id,
                     indexer = %sub.indexer,
                     target = %sub.target_url,
-                    error = %e,
+                    error = %err_msg,
                     backoff_secs = backoff.as_secs(),
                     "subscription error; backing off before reconnect"
                 );
+                set_state(&state, |s| {
+                    s.status = ConnStatus::BackingOff;
+                    s.last_error = Some(err_msg);
+                    s.backoff_secs = backoff.as_secs();
+                });
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(max_backoff);
     }
+}
+
+fn set_state<F: FnOnce(&mut ConnState)>(state: &Arc<RwLock<ConnState>>, f: F) {
+    if let Ok(mut g) = state.write() {
+        f(&mut g);
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn dial_and_run(
@@ -355,6 +498,7 @@ async fn dial_and_run(
     handle: &Arc<dyn IndexerHandle>,
     domain: &DomainAdapter,
     auth: &AuthToken,
+    state: &Arc<RwLock<ConnState>>,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -376,6 +520,12 @@ async fn dial_and_run(
         .await
         .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
     info!(target = %url, indexer = %sub.indexer, "outbound ws connected");
+    set_state(state, |s| {
+        s.status = ConnStatus::Connected;
+        s.last_connected_at = Some(unix_now());
+        s.last_error = None;
+        s.backoff_secs = 0;
+    });
 
     // The DO will send the real `Subscribe` on connect (its scope is
     // implicit from the connection it accepted, but it still
