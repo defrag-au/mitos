@@ -509,7 +509,6 @@ checksum = "1c53ba0f290bfc610084c05582d9c5d421662128fc69f4bf236707af6fd321b9"
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=80601b906db5e0201085ccf9fb0639ed3e746b97#80601b906db5e0201085ccf9fb0639ed3e746b97"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
@@ -6243,3 +6242,15 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "address-registry"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "transactions"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "tx-classifier"
+version = "0.1.0"

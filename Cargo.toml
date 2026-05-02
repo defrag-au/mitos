@@ -47,6 +47,19 @@ pallas-traverse = "1.0.0-alpha.3"
 # Pinned to a specific shared-crates rev for reproducibility; bump
 # deliberately when shared-crates lands changes mitos needs.
 cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97", features = ["cip14"] }
+# Pipeline transaction shape (`RawTxData`) + the `pallas-adapter`
+# helpers that convert pallas `MultiEraTx` + resolved inputs into
+# `RawTxData`. The marketplace indexer feeds this into the
+# classifier's `RuleEngine` to decode sales / listings / offers.
+transactions = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97", features = ["pallas-adapter"] }
+# Marketplace classification (`RuleEngine::classify(&RawTxData) -> TxClassification`).
+# Default features only — the `indexers` feature pulls in CF
+# Workers / Maestro deps that mitos doesn't want.
+tx-classifier = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97" }
+# Same git source for shared sub-deps the classifier itself uses;
+# pinning here keeps the lockfile from picking up multiple
+# revisions of shared-crates.
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -80,4 +93,19 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# --- Patch overrides ---
+#
+# During shared-crates `damon-mitos-improvements` development,
+# point at a local checkout. Removed once the typed newtypes /
+# pallas-adapter / classify_raw work lands on shared-crates main
+# and a new revision is pinned in [workspace.dependencies] above.
+#
+# Convention: shared-crates is a sibling repo at `../shared-crates`.
+# Adjust the path locally if your layout differs.
+[patch."https://github.com/defrag-au/shared-crates"]
+cardano-assets = { path = "../shared-crates/cardano-assets" }
+transactions = { path = "../shared-crates/pipeline/transactions" }
+tx-classifier = { path = "../shared-crates/pipeline/tx-classifier" }
+address-registry = { path = "../shared-crates/address-registry" }
 
