@@ -1,0 +1,31 @@
+[package]
+name = "mitos-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Wire-format types and selector machinery for the mitos
+# subscription model. Deliberately framework-free — no dolos,
+# gasket, axum, tokio-tungstenite — so CF Workers and other
+# consumers can pull this in to deserialize protocol events
+# without dragging in the whole indexer runtime.
+#
+# See `../../docs/design/SUBSCRIPTION_MECHANICS.md` for the full
+# design.
+
+[dependencies]
+serde = { workspace = true }
+serde_bytes = "0.11"
+
+# Selector backing — `EnumSet<MarketplaceBrand>` etc.
+enumset = { version = "1.1", features = ["serde"] }
+
+# Shared asset + pipeline types referenced by the protocol-event
+# taxonomy and the asset selector. Same versions cnft.dev-workers
+# uses, so events deserialise identically across consumers.
+cardano-assets = { workspace = true }
+pipeline-types = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+ciborium = "0.2"

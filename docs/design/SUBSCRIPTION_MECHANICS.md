@@ -377,13 +377,41 @@ implements `change_matches_scope` via the matching algorithm above.
   consumer-side post-filter; the subscription model itself stays
   typed.
 
+## Crate location
+
+The wire-format types and selector machinery live in
+`mitos-protocol` — a deliberately framework-free crate. CF Workers
+and other deserialise-only consumers depend only on this crate,
+not on `mitos-core` (which transitively pulls in dolos, gasket,
+axum, tokio-tungstenite, redb). `mitos-core` re-exports
+`mitos-protocol`'s public API for the in-process matching engine,
+so framework-side code keeps using `mitos_core::Interest` /
+`mitos_core::protocol::*` paths unchanged.
+
+```
+mitos-protocol  ── lightweight types + matching algorithm
+    ↑
+mitos-core      ── indexer trait + dispatcher + replicator + …
+    ↑
+marketplace-indexer  /  jpg-co-indexer  /  collection-ownership-indexer
+    ↑
+bundles/default
+```
+
 ## Crate dependencies
 
-- `strum` (0.28+) with `derive` feature — `EnumDiscriminants`
-  derives `MarketplaceEventKind` directly from `Marketplace`'s
-  variants
 - `enumset` (1.1+) with `serde` feature — `BrandSet` / `KindSet`
-- `serde` — wire serialisation
+- `cardano-assets` — typed `AssetId` / `PolicyId` / `Fingerprint`
+- `pipeline-types` — `PricedAsset` shared with the existing
+  classifier
+- `serde` + `serde_bytes` — wire serialisation
+- ~~`strum::EnumDiscriminants`~~ — initially planned for
+  auto-deriving the per-domain kind enums, but its hard-coded
+  `Copy/Clone/PartialEq/Eq` derives on the generated type collide
+  with `enumset::EnumSetType`'s blanket derives, and strum 0.28
+  has no opt-out for the defaults. Each domain hand-mirrors its
+  kind enum + an exhaustive-match `From<&Domain>` impl instead
+  (~15 lines per domain).
 - (Future) `subenum` (1.2+) — kept on the radar for cross-domain
   variant subsets (e.g., a "cancel event from marketplace OR
   lending" projection). Inside one domain it's redundant under the

@@ -1,0 +1,30 @@
+//! Wire-format types + selector machinery for the mitos
+//! subscription model.
+//!
+//! This crate is deliberately **framework-free** — no dolos,
+//! gasket, axum, tokio-tungstenite. CF Workers and other consumers
+//! pull this in solely to deserialise protocol events and express
+//! subscription `Interest`s. The indexer-runtime side
+//! (`mitos-core`) re-exports everything here for the in-process
+//! matching engine.
+//!
+//! See `../../docs/design/SUBSCRIPTION_MECHANICS.md` for the full
+//! design rationale.
+
+mod interest;
+pub mod protocol;
+
+#[cfg(test)]
+mod interest_tests;
+
+pub use interest::{
+    AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
+    ValueFilter,
+};
+pub use protocol::{
+    Address, BorrowPayload, Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand,
+    LendingEventKind, ListingPayload, Lovelace, Marketplace, MarketplaceBrand,
+    MarketplaceEventKind, OfferAcceptPayload, OfferCancelPayload, OfferCreatePayload,
+    OfferUpdatePayload, OutputRef, PlutusBytes, ProtocolEvent, SalePayload, SwapPayload,
+    UnlistingPayload,
+};

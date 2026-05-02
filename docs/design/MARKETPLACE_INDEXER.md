@@ -77,9 +77,13 @@ Out (Phase 5+):
 
 ## Event taxonomy
 
-Variants live in `mitos-protocol::MarketplaceEvent` (per
-`ROADMAP.md` step 8 — the protocol crate is shared between mitos
-and CF workers, eliminating wire-format drift).
+Variants live in `mitos_protocol::Marketplace` — the
+kind-as-outer / brand-as-data layout from
+`SUBSCRIPTION_MECHANICS.md`. The crate is shared between mitos
+and CF workers, eliminating wire-format drift. The event taxonomy
+below is illustrative of the *Phase 0* shape used in the existing
+classifier worker; Phase 2 of the subscription-mechanics rollout
+replaces it with `mitos_protocol::Marketplace`.
 
 ```rust
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -47,18 +47,8 @@ url = "2"
 # Persistent subscription registry for the Replicator.
 redb = { workspace = true }
 
-# Typed protocol taxonomy + selector machinery (see
-# `docs/design/SUBSCRIPTION_MECHANICS.md`):
-# - `strum::EnumDiscriminants` derives the kind enum directly off
-#   each domain's payload-carrying enum (no manual sync between
-#   `Marketplace` variants and `MarketplaceEventKind`).
-# - `enumset::EnumSet<T>` backs `BrandSet` / `KindSet` selectors —
-#   const construction, efficient set ops, auto-widening past 64
-#   variants if a domain ever needs it.
-strum = { version = "0.28", features = ["derive"] }
-enumset = { version = "1.1", features = ["serde"] }
-
-# Shared asset + pipeline types used by the protocol-event taxonomy
-# (Marketplace / Dex / Lending payloads) and the asset selector.
-cardano-assets = { workspace = true }
-pipeline-types = { workspace = true }
+# Wire-format types + selector machinery (see
+# `docs/design/SUBSCRIPTION_MECHANICS.md`). Lives in its own crate
+# so CF Workers and other deserialise-only consumers can pull just
+# the types without the indexer-runtime dep stack.
+mitos-protocol = { path = "../mitos-protocol" }

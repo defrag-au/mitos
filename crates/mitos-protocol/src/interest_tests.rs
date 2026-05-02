@@ -326,7 +326,8 @@ fn dex_and_lending_filters_compile_and_match() {
 #[test]
 fn vec_of_interests_ors_at_subscription_level() {
     // "Sales for any asset, OR offer-cancels on a specific policy"
-    let subscription = [Interest {
+    let subscription = [
+        Interest {
             asset: AssetSelector::Any,
             domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
                 brands: enum_set!(MarketplaceBrand::JpgStore | MarketplaceBrand::Wayup),
@@ -341,7 +342,8 @@ fn vec_of_interests_ors_at_subscription_level() {
                 kinds: enum_set!(MarketplaceEventKind::OfferCancel),
             }),
             value: ValueFilter::Any,
-        }];
+        },
+    ];
 
     let matches_any = |ev: &ProtocolEvent| subscription.iter().any(|i| i.matches(ev));
 

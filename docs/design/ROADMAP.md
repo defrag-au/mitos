@@ -243,6 +243,12 @@ Each step lands cleanly before the next becomes meaningful.
    to decode. Mirroring is structurally drift-prone; a shared crate
    prevents the class.
 
+   **Status:** crate exists (`crates/mitos-protocol`, created
+   alongside the subscription-mechanics work — see
+   `SUBSCRIPTION_MECHANICS.md`). It currently owns the typed event
+   taxonomy + selector machinery. The replication-framing types
+   below still need to migrate.
+
    Shape:
    - New crate `crates/mitos-protocol` in the mitos workspace.
      wasm32-compatible (no dolos/pallas deps in the *protocol*

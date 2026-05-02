@@ -13,14 +13,10 @@ mod domain;
 mod emitter;
 mod handle;
 mod indexer;
-mod interest;
-pub mod protocol;
 mod replicate;
 mod replicator;
 mod transport;
 
-#[cfg(test)]
-mod interest_tests;
 #[cfg(test)]
 mod tests;
 
@@ -31,16 +27,22 @@ pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
 pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};
 pub use indexer::{Indexer, SubscribeReply};
-pub use interest::{
-    AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
-    ValueFilter,
-};
 pub use replicate::{
     ClientMessage, ServerMessage, decode_client, decode_server, encode_client, encode_server,
     replicate_router,
 };
 pub use replicator::{Replicator, Subscription, SubscriptionId};
 pub use transport::{AxumWs, TungsteniteWs, WsTransport};
+
+// Re-export the wire-format / selector types so framework-side
+// consumers (indexers, the matching engine) get them via
+// `mitos_core::*` without needing a direct `mitos-protocol` dep.
+// Deserialise-only consumers (CF Workers) pull `mitos-protocol`
+// directly.
+pub use mitos_protocol::{
+    AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
+    ValueFilter, protocol,
+};
 
 // Re-export the dolos types indexers need at the trait surface, so
 // downstream crates only need to depend on `mitos-core`.

@@ -10,6 +10,7 @@
 
 [workspace]
 members = [
+    "crates/mitos-protocol",
     "crates/mitos-core",
     "crates/jpg-co-indexer",
     "crates/collection-ownership-indexer",
