@@ -1513,6 +1513,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumset"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25b07a8dfbbbfc0064c0a6bdf9edcf966de6b1c33ce344bdeca3b41615452634"
+dependencies = [
+ "enumset_derive",
+ "serde",
+]
+
+[[package]]
+name = "enumset_derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f43e744e4ea338060faee68ed933e46e722fb7f3617e722a5772d7e856d8b3ce"
+dependencies = [
+ "darling 0.21.3",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2780,7 +2802,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slog",
- "strum",
+ "strum 0.27.1",
  "tar",
  "thiserror 2.0.12",
  "tokio",
@@ -2824,7 +2846,7 @@ dependencies = [
  "serde_with 3.16.0",
  "sha2",
  "slog",
- "strum",
+ "strum 0.27.1",
  "thiserror 2.0.12",
  "tokio",
  "typetag",
@@ -2892,19 +2914,23 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.4",
+ "cardano-assets",
  "ciborium",
  "config 0.14.1",
  "dolos",
  "dolos-cardano",
  "dolos-core",
+ "enumset",
  "futures-util",
  "gasket",
  "hex",
  "miette",
+ "pipeline-types",
  "redb 2.6.3",
  "serde",
  "serde_bytes",
  "serde_json",
+ "strum 0.28.0",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
@@ -4817,7 +4843,16 @@ version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f64def088c51c9510a8579e3c5d67c65349dcf755e5479ad3d010aa6454e2c32"
 dependencies = [
- "strum_macros",
+ "strum_macros 0.27.1",
+]
+
+[[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
 ]
 
 [[package]]
@@ -4830,6 +4865,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
+ "syn",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
  "syn",
 ]
 

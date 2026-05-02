@@ -48,6 +48,11 @@ pallas-traverse = "1.0.0-alpha.3"
 # Pinned to a specific shared-crates rev for reproducibility; bump
 # deliberately when shared-crates lands changes mitos needs.
 cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97", features = ["cip14"] }
+# Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
+# by the protocol-event taxonomy in `mitos-core::protocol`. Same
+# shape the existing classifier emits, so mitos events deserialize
+# identically on the CF side.
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "80601b906db5e0201085ccf9fb0639ed3e746b97" }
 # Pipeline transaction shape (`RawTxData`) + the `pallas-adapter`
 # helpers that convert pallas `MultiEraTx` + resolved inputs into
 # `RawTxData`. The marketplace indexer feeds this into the
@@ -106,6 +111,7 @@ strip = "symbols"
 # Adjust the path locally if your layout differs.
 [patch."https://github.com/defrag-au/shared-crates"]
 cardano-assets = { path = "../shared-crates/cardano-assets" }
+pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
 transactions = { path = "../shared-crates/pipeline/transactions" }
 tx-classifier = { path = "../shared-crates/pipeline/tx-classifier" }
 address-registry = { path = "../shared-crates/address-registry" }

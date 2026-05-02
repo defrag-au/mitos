@@ -13,10 +13,14 @@ mod domain;
 mod emitter;
 mod handle;
 mod indexer;
+mod interest;
+pub mod protocol;
 mod replicate;
 mod replicator;
 mod transport;
 
+#[cfg(test)]
+mod interest_tests;
 #[cfg(test)]
 mod tests;
 
@@ -27,6 +31,10 @@ pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
 pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};
 pub use indexer::{Indexer, SubscribeReply};
+pub use interest::{
+    AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
+    ValueFilter,
+};
 pub use replicate::{
     ClientMessage, ServerMessage, decode_client, decode_server, encode_client, encode_server,
     replicate_router,

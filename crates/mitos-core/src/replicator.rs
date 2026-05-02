@@ -165,7 +165,9 @@ impl Replicator {
 
         // Make sure tables exist so list/insert calls don't panic
         // on first run.
-        let txn = db.begin_write().map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
+        let txn = db
+            .begin_write()
+            .map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
         {
             let _ = txn
                 .open_table(SUBS_TABLE)
@@ -174,7 +176,8 @@ impl Replicator {
                 .open_table(META_TABLE)
                 .map_err(|e| anyhow::anyhow!("open meta table: {e}"))?;
         }
-        txn.commit().map_err(|e| anyhow::anyhow!("commit init: {e}"))?;
+        txn.commit()
+            .map_err(|e| anyhow::anyhow!("commit init: {e}"))?;
 
         let (persisted, next_id) = load_persisted(&db)?;
 
@@ -250,11 +253,7 @@ impl Replicator {
             .subs
             .iter()
             .map(|(id, active)| {
-                let state = active
-                    .state
-                    .read()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
+                let state = active.state.read().map(|g| g.clone()).unwrap_or_default();
                 (*id, active.sub.clone(), state)
             })
             .collect()
@@ -542,11 +541,10 @@ async fn dial_and_run(
     };
     let bytes = encode_client(&subscribe)?;
 
-    let transport: Box<dyn crate::transport::WsTransport> =
-        Box::new(InjectFirst {
-            inner: Box::new(TungsteniteWs(stream)),
-            injected: Some(bytes),
-        });
+    let transport: Box<dyn crate::transport::WsTransport> = Box::new(InjectFirst {
+        inner: Box::new(TungsteniteWs(stream)),
+        injected: Some(bytes),
+    });
 
     handle
         .run_subscriber(transport, domain.clone())

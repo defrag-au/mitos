@@ -109,8 +109,8 @@ where
         _parts: &mut Parts,
         state: &S,
     ) -> Result<Option<Self>, Self::Rejection> {
-        Ok(Some(
-            <AuthToken as axum::extract::FromRef<S>>::from_ref(state),
-        ))
+        Ok(Some(<AuthToken as axum::extract::FromRef<S>>::from_ref(
+            state,
+        )))
     }
 }

@@ -66,10 +66,7 @@ mod tungstenite_impl {
     use async_trait::async_trait;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpStream;
-    use tokio_tungstenite::{
-        MaybeTlsStream, WebSocketStream,
-        tungstenite::Message,
-    };
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
     /// A connected outbound stream. The two TLS variants are unified
     /// behind `MaybeTlsStream<TcpStream>`.
