@@ -116,6 +116,15 @@ mitos experiments, **stop Dolos cleanly** first, then `cp -a` the whole
 data dir. Filesystem-level snapshots taken while Dolos is writing will
 produce a state that fails to recover.
 
+## Testing
+
+End-to-end recipes for exercising the CF replication path —
+protocol-only loop with `mitos-tail`, full mitos↔CF DO round-trip,
+and the parallel-run convergence diff against the existing
+`collection-ownership` worker — are in
+[`docs/TESTING.md`](docs/TESTING.md). Start there once the bundle
+builds.
+
 ## Related
 
 - `~/code/defrag/cnft.dev-workers/docs/design/CARDANO-SHIKU.md` —

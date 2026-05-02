@@ -71,6 +71,15 @@ pub trait IndexerHandle: Send + Sync {
         transport: Box<dyn WsTransport>,
         domain: DomainAdapter,
     ) -> anyhow::Result<()>;
+
+    /// Convert a JSON-shaped scope value into the CBOR bytes that
+    /// flow on the wire. Lets admin clients (and the `Replicator`
+    /// registration API) hand in scope as ordinary JSON without
+    /// needing to know the indexer's CBOR encoding details.
+    ///
+    /// JSON → indexer's `Scope` (via serde) → CBOR. Errors if the
+    /// JSON shape doesn't match the indexer's type.
+    fn encode_scope_from_json(&self, value: &serde_json::Value) -> anyhow::Result<Vec<u8>>;
 }
 
 /// Concrete adapter. Captures `name` and `routes` at construction (both
@@ -146,6 +155,16 @@ where
             TipEvent::Apply(_, _) => {}
         }
         result
+    }
+
+    fn encode_scope_from_json(&self, value: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+        let scope: <I as Indexer<DomainAdapter>>::Scope =
+            serde_json::from_value(value.clone())
+                .map_err(|e| anyhow::anyhow!("scope JSON does not match indexer scope type: {e}"))?;
+        let mut buf = Vec::with_capacity(64);
+        ciborium::into_writer(&scope, &mut buf)
+            .map_err(|e| anyhow::anyhow!("encode scope CBOR: {e}"))?;
+        Ok(buf)
     }
 
     async fn run_subscriber(

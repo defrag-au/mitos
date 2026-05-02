@@ -193,6 +193,13 @@ impl Replicator {
             .collect()
     }
 
+    /// Look up a registered indexer handle by name. Used by the
+    /// admin endpoint to encode JSON scope into CBOR for the named
+    /// indexer's `Scope` type before persisting the subscription.
+    pub fn indexer_handle(&self, name: &str) -> Option<Arc<dyn IndexerHandle>> {
+        self.indexers.get(name).cloned()
+    }
+
     /// Restore a persisted subscription on startup — does not
     /// re-write to redb (it's already there) and does not bump the
     /// id counter. Used only by `new`.

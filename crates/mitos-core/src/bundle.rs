@@ -206,14 +206,32 @@ async fn list_subscriptions(State(state): State<AdminState>) -> Json<Vec<Subscri
     Json(entries)
 }
 
+/// Friendly admin-API shape. The framework looks up the indexer by
+/// name to convert `scope` (JSON) → typed `Scope` → CBOR, and
+/// parses `cursor` from a friendly string. Avoids forcing admin
+/// clients to know the indexer's CBOR encoding or the dolos-core
+/// `ChainPoint` JSON shape.
+///
+/// Examples:
+/// ```json
+/// {
+///   "indexer": "collection-ownership",
+///   "target_url": "wss://collection-ownership-mitos.<acct>.workers.dev/_internal/replicate?policy_id=abc...",
+///   "scope": {"policy_id": "abc..."},
+///   "cursor": "origin"
+/// }
+/// ```
+///
+/// `cursor` accepts:
+/// - `"origin"` — start from chain origin
+/// - `"<slot>"` — start from a slot (no hash)
+/// - `"<slot>:<hash_hex>"` — specific block at a slot
 #[derive(Deserialize)]
 struct AddSubscription {
     indexer: String,
     target_url: String,
-    /// CBOR-encoded scope payload for the indexer's `Scope` type.
-    #[serde(with = "serde_bytes")]
-    scope: Vec<u8>,
-    cursor: dolos_core::ChainPoint,
+    scope: serde_json::Value,
+    cursor: String,
 }
 
 #[derive(Serialize)]
@@ -225,11 +243,30 @@ async fn add_subscription(
     State(state): State<AdminState>,
     Json(body): Json<AddSubscription>,
 ) -> Result<Json<AddedResponse>, (StatusCode, String)> {
+    // Look up the indexer so we can encode the scope using its
+    // typed `Scope` shape. Returns 400 if the indexer is unknown.
+    let handle = state
+        .replicator
+        .indexer_handle(&body.indexer)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("unknown indexer: {}", body.indexer),
+            )
+        })?;
+
+    let scope_cbor = handle
+        .encode_scope_from_json(&body.scope)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let cursor = parse_friendly_cursor(&body.cursor)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
     let sub = Subscription {
         indexer: body.indexer,
         target_url: body.target_url,
-        scope: body.scope,
-        cursor: body.cursor,
+        scope: scope_cbor,
+        cursor,
     };
     state
         .replicator
@@ -237,6 +274,28 @@ async fn add_subscription(
         .await
         .map(|id| Json(AddedResponse { id }))
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+fn parse_friendly_cursor(s: &str) -> anyhow::Result<dolos_core::ChainPoint> {
+    if s.eq_ignore_ascii_case("origin") {
+        return Ok(dolos_core::ChainPoint::Origin);
+    }
+    if let Some((slot, hash_hex)) = s.split_once(':') {
+        let slot: u64 = slot.parse().map_err(|e| anyhow::anyhow!("bad slot: {e}"))?;
+        let hash_bytes =
+            hex::decode(hash_hex).map_err(|e| anyhow::anyhow!("bad hash hex: {e}"))?;
+        if hash_bytes.len() != 32 {
+            anyhow::bail!("hash must be 32 bytes; got {}", hash_bytes.len());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash_bytes);
+        return Ok(dolos_core::ChainPoint::Specific(
+            slot,
+            dolos_core::BlockHash::from(arr),
+        ));
+    }
+    let slot: u64 = s.parse().map_err(|e| anyhow::anyhow!("bad slot: {e}"))?;
+    Ok(dolos_core::ChainPoint::Slot(slot))
 }
 
 async fn remove_subscription(

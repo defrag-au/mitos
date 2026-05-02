@@ -190,6 +190,13 @@ Each step lands cleanly before the next becomes meaningful.
    pipelines, confirm mitos side emits `Undo` records and converges
    correctly while existing side does not.
 
+### How to run it
+
+End-to-end recipes (Scenarios 1→3) are in [`../TESTING.md`](../TESTING.md).
+Friendly admin API + a `mitos-tail` synthetic CBOR client + the
+diff harness are all in place; `wrangler dev` or a `*.workers.dev`
+deploy is enough on the CF side.
+
 ### Success criteria for "works in practice"
 
 - [ ] One real registered policy (~5-10k assets) tracked in parallel
