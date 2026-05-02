@@ -43,7 +43,8 @@ fn asset_other() -> AssetId {
 
 fn sale_event(brand: MarketplaceBrand, asset: AssetId) -> ProtocolEvent {
     ProtocolEvent {
-        asset: asset.clone(),
+        policy_id: PolicyId::new(asset.policy_id.clone()).unwrap(),
+        asset_name_hex: Some(asset.asset_name_hex.clone()),
         tx_hash: "deadbeef".repeat(8),
         slot: 100_000_000,
         domain: Domain::Marketplace(Marketplace::Sale(SalePayload {
@@ -58,7 +59,8 @@ fn sale_event(brand: MarketplaceBrand, asset: AssetId) -> ProtocolEvent {
 
 fn offer_cancel_event(asset: AssetId, payload: OfferCancelPayload) -> ProtocolEvent {
     ProtocolEvent {
-        asset,
+        policy_id: PolicyId::new(asset.policy_id.clone()).unwrap(),
+        asset_name_hex: Some(asset.asset_name_hex.clone()),
         tx_hash: "feedface".repeat(8),
         slot: 100_000_001,
         domain: Domain::Marketplace(Marketplace::OfferCancel(payload)),
@@ -91,7 +93,7 @@ fn marketplace_kind_projection_matches_variants() {
                 policy_id: policy_blackflag(),
                 asset_name_hex: None,
                 bidder: "x".into(),
-                redeemer: PlutusBytes::new(vec![1, 2, 3]),
+                redeemer: Some(PlutusBytes::new(vec![1, 2, 3])),
             }),
             MarketplaceEventKind::OfferCancel,
         ),
@@ -118,15 +120,15 @@ fn marketplace_brand_dispatch_handles_field_and_variant_layouts() {
         policy_id: policy_blackflag(),
         asset_name_hex: None,
         bidder: "x".into(),
-        redeemer: PlutusBytes::new(vec![]),
-        script_ref: OutputRef::new("aa".repeat(32), 0),
+        redeemer: Some(PlutusBytes::new(vec![])),
+        script_ref: Some(OutputRef::new("aa".repeat(32), 0)),
     });
     assert_eq!(cancel.brand(), MarketplaceBrand::JpgStore);
 
     let unknown_cancel = Marketplace::OfferCancel(OfferCancelPayload::Unknown {
         brand_script: "addr1unknown".into(),
         policy_id: policy_blackflag(),
-        raw: PlutusBytes::new(vec![]),
+        raw: Some(PlutusBytes::new(vec![])),
     });
     assert_eq!(unknown_cancel.brand(), MarketplaceBrand::Unknown);
 }
@@ -163,7 +165,7 @@ fn asset_selector_specific_asset_matches_only_exact_pair() {
     let exact = sale_event(MarketplaceBrand::JpgStore, asset_blackflag());
     let other = sale_event(MarketplaceBrand::JpgStore, asset_other());
     let same_policy_other_name = ProtocolEvent {
-        asset: AssetId::new(POLICY_BLACKFLAG.into(), "deadbeef".into()).unwrap(),
+        asset_name_hex: Some("deadbeef".into()),
         ..exact.clone()
     };
     assert!(interest.matches(&exact));
@@ -206,8 +208,8 @@ fn marketplace_selector_filters_orthogonal_axes() {
             policy_id: policy_blackflag(),
             asset_name_hex: None,
             bidder: "x".into(),
-            redeemer: PlutusBytes::new(vec![]),
-            script_ref: OutputRef::new("aa".repeat(32), 0),
+            redeemer: Some(PlutusBytes::new(vec![])),
+            script_ref: Some(OutputRef::new("aa".repeat(32), 0)),
         }
     )));
 
@@ -252,7 +254,8 @@ fn cross_domain_mismatch_does_not_match() {
         value: ValueFilter::Any,
     };
     let dex_event = ProtocolEvent {
-        asset: asset_blackflag(),
+        policy_id: policy_blackflag(),
+        asset_name_hex: Some(ASSET_NAME_HEX.into()),
         tx_hash: "ab".repeat(32),
         slot: 1,
         domain: Domain::Dex(Dex::Swap(SwapPayload {
@@ -286,7 +289,8 @@ fn dex_and_lending_filters_compile_and_match() {
         value: ValueFilter::Any,
     };
     let splash_swap = ProtocolEvent {
-        asset: asset_blackflag(),
+        policy_id: policy_blackflag(),
+        asset_name_hex: Some(ASSET_NAME_HEX.into()),
         tx_hash: "ab".repeat(32),
         slot: 1,
         domain: Domain::Dex(Dex::Swap(SwapPayload {
@@ -309,7 +313,8 @@ fn dex_and_lending_filters_compile_and_match() {
         value: ValueFilter::Any,
     };
     let borrow_event = ProtocolEvent {
-        asset: asset_blackflag(),
+        policy_id: policy_blackflag(),
+        asset_name_hex: Some(ASSET_NAME_HEX.into()),
         tx_hash: "ab".repeat(32),
         slot: 1,
         domain: Domain::Lending(Lending::Borrow(BorrowPayload {
@@ -360,7 +365,7 @@ fn vec_of_interests_ors_at_subscription_level() {
         OfferCancelPayload::Unknown {
             brand_script: "addr1unknown".into(),
             policy_id: policy_blackflag(),
-            raw: PlutusBytes::new(vec![]),
+            raw: Some(PlutusBytes::new(vec![])),
         },
     );
     assert!(matches_any(&cancel));
@@ -372,7 +377,7 @@ fn vec_of_interests_ors_at_subscription_level() {
             policy_id: policy_other(),
             asset_name_hex: None,
             bidder: "x".into(),
-            redeemer: PlutusBytes::new(vec![]),
+            redeemer: Some(PlutusBytes::new(vec![])),
         },
     );
     assert!(!matches_any(&off_policy_cancel));
@@ -391,7 +396,8 @@ fn offer_create_create_payload_is_addressable() {
         bidder: "addr1bidder".into(),
     };
     let event = ProtocolEvent {
-        asset: asset_blackflag(),
+        policy_id: policy_blackflag(),
+        asset_name_hex: Some(ASSET_NAME_HEX.into()),
         tx_hash: "ab".repeat(32),
         slot: 1,
         domain: Domain::Marketplace(Marketplace::OfferCreate(payload)),
@@ -436,8 +442,8 @@ fn protocol_event_serde_json_roundtrip() {
             policy_id: policy_blackflag(),
             asset_name_hex: None,
             bidder: "addr1bidder".into(),
-            redeemer: PlutusBytes::new(vec![1, 2, 3, 4]),
-            script_ref: OutputRef::new("aa".repeat(32), 7),
+            redeemer: Some(PlutusBytes::new(vec![1, 2, 3, 4])),
+            script_ref: Some(OutputRef::new("aa".repeat(32), 7)),
         },
     );
     let encoded = serde_json::to_string(&cancel).unwrap();

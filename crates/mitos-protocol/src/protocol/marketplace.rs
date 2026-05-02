@@ -175,27 +175,34 @@ pub struct OfferUpdatePayload {
 /// inline redeemer only, etc. Consumers that build cancel
 /// transactions match on this inner enum to extract the brand-
 /// specific data they need.
+///
+/// `redeemer` / `script_ref` are `Option`-typed because brand
+/// identification is upstream of cancel-payload decoding: the
+/// existing classifier surfaces the brand + policy + bidder for
+/// cancels but doesn't extract the on-chain redeemer/script-ref
+/// bytes. A future enhancement populates them for consumers that
+/// build cancel TXs; until then `None` is the honest answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OfferCancelPayload {
     JpgStore {
         policy_id: PolicyId,
         asset_name_hex: Option<String>,
         bidder: Address,
-        redeemer: PlutusBytes,
-        script_ref: OutputRef,
+        redeemer: Option<PlutusBytes>,
+        script_ref: Option<OutputRef>,
     },
     Wayup {
         policy_id: PolicyId,
         asset_name_hex: Option<String>,
         bidder: Address,
-        redeemer: PlutusBytes,
+        redeemer: Option<PlutusBytes>,
     },
     /// Unrecognised brand. The script string lets a consumer triage
     /// (catalogue the new brand, ignore, or attempt a generic cancel).
     Unknown {
         brand_script: String,
         policy_id: PolicyId,
-        raw: PlutusBytes,
+        raw: Option<PlutusBytes>,
     },
 }
 

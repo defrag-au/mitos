@@ -7,7 +7,7 @@
 //! plutus data is left as opaque bytes until a consumer surfaces a
 //! genuine need to decode at the framework boundary.
 
-use cardano_assets::AssetId;
+use cardano_assets::PolicyId;
 use serde::{Deserialize, Serialize};
 
 use super::Domain;
@@ -61,16 +61,25 @@ impl OutputRef {
 
 /// What mitos emits over the replication channel for protocol
 /// indexers (marketplace, dex, lending). One record per
-/// `(asset, domain_event)` pair — a tx that touches N assets across
-/// N protocols emits N records.
+/// `(policy, domain_event)` pair — a tx that touches N policies
+/// across N protocols emits N records, regardless of how many
+/// assets within each policy the tx referenced.
 ///
-/// The `asset` field is what the asset-axis of `Interest` matches
-/// against. Brand and event-kind are projected out of `domain` via
-/// methods on the `Domain` arm's payload (e.g.
+/// `asset_name_hex` is `Some` for events targeting a specific
+/// asset within the policy (single-asset sales, single-asset
+/// offers) and `None` for events that target the policy as a
+/// whole (collection-wide offers) or span multiple assets in the
+/// same policy (bundle listings — the asset list lives in the
+/// payload, but only one event is emitted per policy).
+///
+/// `policy_id` and `asset_name_hex` are what the asset-axis of
+/// `Interest` matches against. Brand and event-kind are projected
+/// out of `domain` via methods on the `Domain` arm's payload (e.g.
 /// `marketplace.brand()` / `marketplace.kind()`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolEvent {
-    pub asset: AssetId,
+    pub policy_id: PolicyId,
+    pub asset_name_hex: Option<String>,
     pub tx_hash: String,
     pub slot: u64,
     pub domain: Domain,

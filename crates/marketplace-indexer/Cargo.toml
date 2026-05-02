@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 mitos-core = { path = "../mitos-core" }
+# Direct dep on the protocol-types crate too: the translator and
+# brand resolver work at the `mitos_protocol::*` level, so naming
+# the dep explicitly here documents the layering. Available
+# transitively via `mitos-core` as well.
+mitos-protocol = { path = "../mitos-protocol" }
 
 dolos-core = { workspace = true }
 dolos-cardano = { workspace = true }
@@ -18,6 +23,10 @@ pallas = { workspace = true }
 transactions = { workspace = true, features = ["pallas-adapter"] }
 tx-classifier = { workspace = true }
 address-registry = { workspace = true }
+# `PricedAsset` and friends used by the translator at call sites
+# where we lift classifier output into protocol-event payloads.
+pipeline-types = { workspace = true }
+cardano-assets = { workspace = true }
 
 async-trait = { workspace = true }
 axum = { workspace = true }

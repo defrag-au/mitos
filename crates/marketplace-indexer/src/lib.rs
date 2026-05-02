@@ -39,6 +39,15 @@
 //! collection offers, royalty resolution, parallel-run validation
 //! against the existing classifier worker.
 
+mod brand_resolver;
+mod translator;
+
+#[cfg(test)]
+mod translator_tests;
+
+pub use brand_resolver::marketplace_brand_from_address;
+pub use translator::classification_to_events;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

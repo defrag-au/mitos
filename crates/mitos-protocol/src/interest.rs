@@ -40,7 +40,8 @@ impl Interest {
 
     /// Per-event match. AND across the three axes.
     pub fn matches(&self, event: &ProtocolEvent) -> bool {
-        self.asset.matches(&event.asset)
+        self.asset
+            .matches(&event.policy_id, event.asset_name_hex.as_deref())
             && self.domain.matches(&event.domain)
             && self.value.matches(event)
     }
@@ -68,16 +69,27 @@ pub enum AssetSelector {
 }
 
 impl AssetSelector {
-    pub fn matches(&self, asset: &AssetId) -> bool {
+    /// Match against an event's `(policy_id, asset_name_hex)` pair.
+    /// `asset_name_hex == None` means the event is policy-wide
+    /// (e.g. a collection-wide offer or a multi-asset bundle
+    /// listing): `Policy` selectors match it, `Asset` /
+    /// `Fingerprint` selectors do not.
+    pub fn matches(&self, policy_id: &PolicyId, asset_name_hex: Option<&str>) -> bool {
         match self {
             AssetSelector::Any => true,
-            AssetSelector::Policy(p) => asset.policy_id == p.as_str(),
+            AssetSelector::Policy(p) => p == policy_id,
             AssetSelector::Asset { policy, name_hex } => {
-                asset.policy_id == policy.as_str() && &asset.asset_name_hex == name_hex
+                policy == policy_id && asset_name_hex == Some(name_hex.as_str())
             }
-            AssetSelector::Fingerprint(fp) => match asset.fingerprint_typed() {
-                Ok(actual) => &actual == fp,
-                Err(_) => false,
+            AssetSelector::Fingerprint(fp) => match asset_name_hex {
+                Some(name) => match AssetId::new(policy_id.as_str().to_string(), name.to_string())
+                    .ok()
+                    .and_then(|a| a.fingerprint_typed().ok())
+                {
+                    Some(actual) => &actual == fp,
+                    None => false,
+                },
+                None => false,
             },
             AssetSelector::Trait { .. } => false,
         }
