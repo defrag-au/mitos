@@ -43,6 +43,11 @@ impl Default for JpgCoIndexer {
 
 #[async_trait]
 impl<D: Domain> Indexer<D> for JpgCoIndexer {
+    /// Fixed contract address set; no per-consumer scope concept.
+    /// Default `subscribe`/`unsubscribe` from the trait (no-op,
+    /// `SubscribeReply::Resume`) is correct here.
+    type Scope = ();
+
     fn name(&self) -> &'static str {
         "jpg-co"
     }

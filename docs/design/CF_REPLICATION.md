@@ -271,6 +271,17 @@ bundle.run().await?;
 
 …and never sees the type erasure.
 
+### Server placement
+
+The replication WebSocket server lives **in the same axum app the
+bundle already runs for indexer HTTP routes**, not a separate
+listener or process. A dedicated upgrade endpoint
+(`/replicate/{indexer}`) handles the WebSocket handoff and routes
+into the framework's connection-handling code; each indexer's
+existing `routes()` Router continues to nest under
+`/<indexer-name>/...`. One listener, one auth surface, one place to
+operate.
+
 ## Retention windows
 
 Three numbers per indexer, set in the bundle config:

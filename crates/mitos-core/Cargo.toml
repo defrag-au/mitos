@@ -26,3 +26,8 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 miette = "7"
+
+# Subscription scope payloads on the CF replication channel are CBOR;
+# the framework decodes once at the IndexerHandle boundary.
+serde = { workspace = true }
+ciborium = "0.2"

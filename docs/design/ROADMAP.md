@@ -146,6 +146,73 @@ idempotent, and the protocol's `Undo` semantics actually close an
 existing reorg gap rather than just preserving current behaviour. The
 code is at `cnft.dev-workers/workers/collection-ownership/`.
 
+**Fork, don't feature-flag.** New worker at
+`cnft.dev-workers/workers/collection-ownership-mitos/` runs in
+parallel with the existing `collection-ownership` for as long as
+convergence validation requires (target: 30+ days of byte-identical
+read-API output before retiring the original). The fork avoids any
+risk to the production path during prototype work; the cost of the
+extra worker on CF is negligible.
+
+**Server placement.** The replication WebSocket server is hosted by
+the same axum app the bundle already runs for indexer HTTP routes —
+new `/replicate/{indexer}` upgrade endpoint, no separate listener.
+Each indexer's `routes()` Router continues nesting under
+`/<indexer-name>/...` as today.
+
+### Build order
+
+Each step lands cleanly before the next becomes meaningful.
+
+1. **Trait extension + bundle refactor** against the existing
+   `JpgCoIndexer` (`type Scope = ()`). Proves the refactor works
+   without introducing new behaviour; bundle still composes.
+2. **`SubscribeReply` enum + `/replicate/{indexer}` WebSocket upgrade
+   handler** in `mitos-core`. Drive from a Rust integration test with
+   a synthetic CBOR client — validates framing, scope decode, cursor
+   handling, retransmit buffer, ack-driven trim.
+3. **`OwnershipIndexer` skeleton, watch-set-only.** Override
+   `subscribe` to add `policy_id`; cold subscribe returns
+   `cursor = current_tip` (no backfill yet). Proves end-to-end records
+   flow for new mints/transfers.
+4. **`collection-ownership-mitos` worker, minimum viable.** Hibernated
+   WebSocket consumer, same SQLite schema as existing worker, same
+   read APIs. Wire one test policy. **Diff `/api/check` and
+   `/api/bundle` outputs against the existing worker hourly — that's
+   the validation.**
+5. **Backfill in `OwnershipIndexer`.** Synthetic-applies stream for
+   cold subscribes (enumerate UTxOs via Dolos by-policy index,
+   resolve owners, emit Apply per asset). Diff freshly-bootstrapped
+   mitos DO against existing for same policy.
+6. **R2 snapshot path.** Only when a real >50k-asset collection
+   exposes the inline backfill limit.
+7. **Reorg validation.** Pick a known historical reorg, replay both
+   pipelines, confirm mitos side emits `Undo` records and converges
+   correctly while existing side does not.
+
+### Success criteria for "works in practice"
+
+- [ ] One real registered policy (~5-10k assets) tracked in parallel
+      for 7 days
+- [ ] `/api/check` and `/api/bundle` outputs match byte-for-byte
+      hourly
+- [ ] DO active duration on mitos side >90% lower than existing
+      (validates the hibernation cost projection)
+- [ ] Mitos-side recovers cleanly after forced mitos restart; DO
+      takes resume path, no data loss
+- [ ] Simulated reorg produces correct `Undo` flow
+
+### Deferred for the prototype
+
+Don't get bogged down before learning anything:
+
+- Authentication: hardcoded shared secret in upgrade header
+- Per-block message batching: one record per message
+- Multi-consumer testing: one DO, one connection
+- `schema_version` evolution: pin v0
+- Mints flow / holder-map: not until collection-ownership is
+  converging cleanly
+
 - [ ] `Indexer` trait extension: associated `type Scope`, default
       `subscribe`/`unsubscribe` impls, `SubscribeReply` enum with
       resume / snapshot-redirect / fork-recognition variants
