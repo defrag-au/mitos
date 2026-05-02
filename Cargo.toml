@@ -25,11 +25,11 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Dolos as embedded data plane. Pinned to a tag for reproducibility;
 # bump deliberately and audit the diff (see docs/design/ROADMAP.md).
-dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
 
 # Cardano types + parsing. Same pallas version Dolos uses.
 pallas = "1.0.0-alpha.3"

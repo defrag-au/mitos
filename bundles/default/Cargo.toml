@@ -19,6 +19,7 @@ dolos-cardano = { workspace = true }
 
 # Runtime / HTTP / observability.
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

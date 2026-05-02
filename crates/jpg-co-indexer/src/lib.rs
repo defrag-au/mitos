@@ -58,11 +58,7 @@ impl<D: Domain> Indexer<D> for JpgCoIndexer {
         Ok(ChainPoint::Origin)
     }
 
-    async fn handle_event(
-        &mut self,
-        _domain: &D,
-        event: &TipEvent,
-    ) -> anyhow::Result<()> {
+    async fn handle_event(&mut self, _domain: &D, event: &TipEvent) -> anyhow::Result<()> {
         match event {
             TipEvent::Mark(point) => {
                 info!(indexer = "jpg-co", ?point, "mark");

@@ -25,11 +25,7 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// Single chain event. The dispatcher calls this for every
     /// subscribed event in order. Implementations MUST be idempotent
     /// against re-delivery.
-    async fn handle_event(
-        &mut self,
-        domain: &D,
-        event: &TipEvent,
-    ) -> anyhow::Result<()>;
+    async fn handle_event(&mut self, domain: &D, event: &TipEvent) -> anyhow::Result<()>;
 
     /// HTTP routes this indexer exposes. The bundle merges all
     /// indexers' routes under a shared `axum::Router`, conventionally
