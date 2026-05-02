@@ -165,43 +165,109 @@ Notes on shape:
 - `Marketplace` enum is closed (not a string) so consumers can
   match exhaustively.
 
-### Subscription scope
+### Subscription scope: none
 
 ```rust
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MarketplaceScope {
-    pub policy_id: String,
-}
+type Scope = ();
 ```
 
-Consumer scopes by policy. Same shape as `OwnershipScope` — same
-ergonomics for the registration flow. Consumers wanting all
-marketplace activity (e.g. a global feed) can subscribe to a
-sentinel "all" policy, but that's a follow-up; per-policy is the
-primary usage.
+**Marketplace events are emitted as a single global feed**, not
+scoped per-policy. The CF worker subscribes once and receives
+every marketplace tx on chain. Per-policy fan-out happens on the
+CF side (see "Per-DO multi-feed pattern" below).
 
-## Per-DO multi-feed pattern
+This is the meaningful architectural divergence from
+`OwnershipIndexer`. Ownership state is *naturally per-policy*
+(asset X belongs to policy Y, mutating Y's DO is well-defined).
+Marketplace events are *naturally global*: thousands of policies
+trade through the same handful of marketplace contracts every
+day. Pre-registering each one as a separate subscription would be
+absurd — and missing one means missing the corresponding sales,
+which is silent data loss.
 
-A single CF Durable Object per policy holds **all** the chain
-state for that policy:
+The shape that fits: emit everything from mitos, route on receipt
+in CF. Policies the CF worker doesn't care about: drop the event
+(or route to a never-created DO that 404s on read — both fine).
+"What policies are we watching" is a CF-side concern, not a
+mitos-side concern.
 
-- `OwnershipIndexer` feeds the `ownership` table (current owner per
-  asset).
-- `MarketplaceIndexer` feeds `sales`, `listings`, `offers`,
-  `marketplace_events` tables.
+## CF-side topology
 
-Both feeds terminate at the same DO instance because
-`idFromName(policy_id)` returns the same id for the same policy.
-Two outbound WebSockets from mitos, both pointing at the same DO
-URL but tagged differently:
+Two indexers feed the CF worker, but their connection patterns
+differ because their semantics differ:
+
+**`collection-ownership`** is per-policy. One WebSocket per
+watched policy_id; mitos's `Replicator` opens N connections to
+N per-policy DOs, each one scoped via `OwnershipScope { policy_id }`.
+
+**`marketplace`** is global. **One WebSocket total.** A single
+"router DO" (or just the worker's `fetch` handler) receives the
+full feed, extracts `policy_id` from each event, and forwards to
+the relevant per-policy DO via `idFromName(policy_id).get_stub()`.
 
 ```
-wss://collections-mitos.cnft.dev/_internal/replicate/collection-ownership?policy_id=X
-wss://collections-mitos.cnft.dev/_internal/replicate/collection-marketplace?policy_id=X
+                    ┌───────────────────────────┐
+   mitos box ──────►│ ownership-mitos.cnft.dev/ │
+                    │  _internal/replicate/     │
+                    │   collection-ownership    │  one WS per
+                    │   ?policy_id=abc...       │  watched policy
+                    └─────────────┬─────────────┘
+                                  ▼
+                        ┌─────────────────┐
+                        │ DO[policy=abc]  │  ◄── ownership state
+                        └─────────────────┘
+
+                    ┌───────────────────────────┐
+   mitos box ──────►│ marketplace-mitos.cnft.dev│
+                    │  /_internal/replicate/    │  one WS, period
+                    │   marketplace             │
+                    └─────────────┬─────────────┘
+                                  ▼
+                       ┌─────────────────────┐
+                       │  Router (the worker │
+                       │   fetch handler or  │
+                       │   a single DO)      │
+                       └────┬───┬───┬────────┘
+                            │   │   │
+                  policy=abc▼   │   ▼ policy=ghi
+                  (watched)     │   (unwatched, drop)
+                                ▼
+                          policy=def
+                          (watched)
+                       ┌─────────────────────┐
+                       │ DO[policy=abc]      │ ◄── sales/listings/offers
+                       │ DO[policy=def]      │ ◄── sales/listings/offers
+                       └─────────────────────┘
 ```
 
-The DO accepts each via `state.accept_web_socket_with_tags` so it
-can route incoming messages to the right handler:
+A "watched" policy is one some downstream user has expressed
+interest in tracking — represented in CF KV or D1 as a small
+allowlist (`marketplace_watched_policies` keyed by policy_id).
+The router checks membership before forwarding; if absent, the
+event is dropped. Adding/removing watched policies is an admin
+operation that doesn't require touching the mitos side.
+
+Same DO instance still holds both ownership AND marketplace state
+for a watched policy (the DO is keyed only on `policy_id`), so
+queries like "current owner + recent sales for asset X" join
+naturally. The two feeds reach the same DO via different paths
+— one direct (ownership's per-policy WS), one mediated by the
+router (marketplace's global feed).
+
+The DO's writes for marketplace events use the Hibernation API
+the same way ownership does — but only on the *router's*
+WebSocket. Per-policy DOs receive marketplace updates as
+ordinary fetch invocations (RPC-style) from the router, not via
+WebSockets of their own. Cost-wise that's a slightly more active
+DO than pure-hibernation, but negligible.
+
+The previous design — two WSs per policy, tagged via
+`accept_web_socket_with_tags` — applied to both feeds. Marketplace's
+global feed sidesteps that entirely; only ownership uses the
+WebSocket-per-policy pattern. The tag-attachment design is
+recorded below as a fallback if we later decide to scope
+marketplace per-policy after all (e.g. for a high-volume policy
+where the router becomes a bottleneck).
 
 ```rust
 fn handle_replicate_upgrade(&self, indexer: &str, policy_id: &str) -> Result<Response> {

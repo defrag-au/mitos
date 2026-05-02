@@ -13,6 +13,7 @@ members = [
     "crates/mitos-core",
     "crates/jpg-co-indexer",
     "crates/collection-ownership-indexer",
+    "crates/marketplace-indexer",
     "bundles/default",
     "tools/diff-collection-ownership",
     "tools/mitos-tail",
