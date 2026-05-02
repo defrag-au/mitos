@@ -19,10 +19,11 @@ mod interest_tests;
 
 pub use interest::{
     AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
-    ValueFilter, any_interest_matches_asset, any_interest_matches_event, watched_policies,
+    ValueFilter, any_interest_matches_asset, any_interest_matches_asset_role,
+    any_interest_matches_event, watched_policies,
 };
 pub use protocol::{
-    Address, BorrowPayload, Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand,
+    Address, AssetRole, BorrowPayload, Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand,
     LendingEventKind, ListingPayload, Lovelace, Marketplace, MarketplaceBrand,
     MarketplaceEventKind, OfferAcceptPayload, OfferCancelPayload, OfferCreatePayload,
     OfferUpdatePayload, OutputRef, PlutusBytes, ProtocolEvent, SalePayload, SwapPayload,

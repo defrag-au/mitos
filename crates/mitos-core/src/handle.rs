@@ -193,10 +193,21 @@ where
         // record as an Apply at the reply's cursor (so the consumer
         // advances its last-applied cursor atomically once the
         // batch is fully applied). Live tail follows.
+        //
+        // Apply the same `change_matches_scope` filter the live-tail
+        // pump uses — backfill records are equivalent to synthetic
+        // Apply events at startup, so they should respect the
+        // subscriber's scope identically. Without this filter,
+        // axes like `Interest.roles` (which pre-Phase-7 ownership
+        // didn't have) would only apply to live records, leaving
+        // backfill polluted with reference NFTs / sentinels.
         let resume_cursor = reply_cursor(&reply);
         send(&mut transport, &ServerMessage::SubscribeReply(reply)).await?;
 
         for change in backfill {
+            if !I::change_matches_scope(&scope.0, &change) {
+                continue;
+            }
             let mut buf = Vec::with_capacity(64);
             ciborium::into_writer(&change, &mut buf)
                 .map_err(|e| anyhow::anyhow!("encode backfill change: {e}"))?;

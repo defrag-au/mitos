@@ -8,9 +8,69 @@
 //! genuine need to decode at the framework boundary.
 
 use cardano_assets::PolicyId;
+use enumset::EnumSetType;
 use serde::{Deserialize, Serialize};
 
 use super::Domain;
+
+/// NFT-centric classification of an asset by its `asset_name_hex`
+/// shape. Drives server-side filtering at the indexer: a consumer
+/// that only wants user-facing NFTs subscribes with
+/// `roles: enum_set!(NativeUser | Cip68User)` and the indexer
+/// drops reference tokens, sentinel mints, etc. before delivery.
+///
+/// This is orthogonal to `cardano_assets::TokenType` (which is
+/// fungibility-based — Nft / Ft / Rft). `AssetRole` captures
+/// *purpose by name shape*: did this asset come out of a CIP-68
+/// reference label, a CIP-68 user label, or no label at all? Plus
+/// the special "empty asset name" sentinel that minting scripts
+/// commonly mint at policy creation as a thread/control token.
+///
+/// `EnumSetType` lets `EnumSet<AssetRole>` serve as a compact
+/// filter-axis on `Interest`.
+#[derive(Debug, EnumSetType, Hash, Serialize, Deserialize, Default)]
+pub enum AssetRole {
+    /// Plain native asset, no CIP-68 prefix. Holdable by users.
+    /// The default outcome for any non-prefixed asset name.
+    #[default]
+    NativeUser,
+    /// CIP-68 user token (label 222 prefix `000de140`).
+    Cip68User,
+    /// CIP-68 reference NFT (label 100 prefix `000643b0`). Holds
+    /// collection-level metadata at a script address; not
+    /// user-owned.
+    Cip68Reference,
+    /// CIP-68 reference fungible (label 444 prefix `000ad79c`).
+    /// Reference token for a CIP-68 fungible; not user-owned.
+    Cip68RefFungible,
+    /// Empty asset name. Typically a minting-script sentinel /
+    /// thread token minted once at policy creation.
+    Empty,
+}
+
+impl AssetRole {
+    /// Derive the role from a hex-encoded asset name. Cheap
+    /// prefix-check, no allocation. Used by indexers at emission
+    /// time and by `Interest::matches_asset_role` for client
+    /// filtering.
+    pub fn from_asset_name_hex(name: &str) -> AssetRole {
+        if name.is_empty() {
+            return AssetRole::Empty;
+        }
+        if name.len() >= 8 {
+            match &name[..8] {
+                "000de140" => AssetRole::Cip68User,
+                "000643b0" => AssetRole::Cip68Reference,
+                "000ad79c" => AssetRole::Cip68RefFungible,
+                _ => AssetRole::NativeUser,
+            }
+        } else {
+            // Asset name shorter than a CIP-68 label can't carry
+            // one. Treat as plain native.
+            AssetRole::NativeUser
+        }
+    }
+}
 
 /// Bech32 Cardano address. Kept stringly here to match the existing
 /// classifier output and avoid forcing a typed-address dep into

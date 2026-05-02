@@ -7,7 +7,7 @@
 //! says it does.
 
 use cardano_assets::{AssetId, PolicyId};
-use enumset::enum_set;
+use enumset::{EnumSet, enum_set};
 use pipeline_types::PricedAsset;
 
 use crate::interest::{
@@ -143,6 +143,7 @@ fn interest_any_matches_everything() {
 fn asset_selector_policy_isolates_by_policy() {
     let interest = Interest {
         asset: AssetSelector::Policy(policy_blackflag()),
+        roles: EnumSet::all(),
         domain: DomainSelector::Any,
         value: ValueFilter::Any,
     };
@@ -161,6 +162,7 @@ fn asset_selector_specific_asset_matches_only_exact_pair() {
         },
         domain: DomainSelector::Any,
         value: ValueFilter::Any,
+        roles: EnumSet::all(),
     };
     let exact = sale_event(MarketplaceBrand::JpgStore, asset_blackflag());
     let other = sale_event(MarketplaceBrand::JpgStore, asset_other());
@@ -183,6 +185,7 @@ fn asset_selector_trait_is_inert() {
         },
         domain: DomainSelector::Any,
         value: ValueFilter::Any,
+        roles: EnumSet::all(),
     };
     let event = sale_event(MarketplaceBrand::JpgStore, asset_blackflag());
     assert!(!interest.matches(&event));
@@ -192,6 +195,7 @@ fn asset_selector_trait_is_inert() {
 fn marketplace_selector_filters_orthogonal_axes() {
     let interest = Interest {
         asset: AssetSelector::Any,
+        roles: EnumSet::all(),
         domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
             brands: enum_set!(MarketplaceBrand::JpgStore | MarketplaceBrand::Wayup),
             kinds: enum_set!(MarketplaceEventKind::Sale | MarketplaceEventKind::OfferCancel),
@@ -232,6 +236,7 @@ fn marketplace_selector_filters_orthogonal_axes() {
 fn marketplace_selector_any_matches_all_kinds_and_brands() {
     let interest = Interest {
         asset: AssetSelector::Any,
+        roles: EnumSet::all(),
         domain: DomainSelector::Marketplace(MarketplaceSelector::Any),
         value: ValueFilter::Any,
     };
@@ -250,6 +255,7 @@ fn marketplace_selector_any_matches_all_kinds_and_brands() {
 fn cross_domain_mismatch_does_not_match() {
     let marketplace_only = Interest {
         asset: AssetSelector::Any,
+        roles: EnumSet::all(),
         domain: DomainSelector::Marketplace(MarketplaceSelector::Any),
         value: ValueFilter::Any,
     };
@@ -271,6 +277,7 @@ fn cross_domain_mismatch_does_not_match() {
 
     let dex_only = Interest {
         asset: AssetSelector::Any,
+        roles: EnumSet::all(),
         domain: DomainSelector::Dex(DexSelector::Any),
         value: ValueFilter::Any,
     };
@@ -282,6 +289,7 @@ fn cross_domain_mismatch_does_not_match() {
 fn dex_and_lending_filters_compile_and_match() {
     let dex_swap = Interest {
         asset: AssetSelector::Any,
+        roles: EnumSet::all(),
         domain: DomainSelector::Dex(DexSelector::Filter {
             brands: enum_set!(DexBrand::Splash | DexBrand::Cswap),
             kinds: enum_set!(DexEventKind::Swap),
@@ -306,6 +314,7 @@ fn dex_and_lending_filters_compile_and_match() {
 
     let lending_borrow = Interest {
         asset: AssetSelector::Any,
+        roles: EnumSet::all(),
         domain: DomainSelector::Lending(LendingSelector::Filter {
             brands: enum_set!(LendingBrand::Liqwid),
             kinds: enum_set!(LendingEventKind::Borrow),
@@ -334,6 +343,7 @@ fn vec_of_interests_ors_at_subscription_level() {
     let subscription = [
         Interest {
             asset: AssetSelector::Any,
+            roles: EnumSet::all(),
             domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
                 brands: enum_set!(MarketplaceBrand::JpgStore | MarketplaceBrand::Wayup),
                 kinds: enum_set!(MarketplaceEventKind::Sale),
@@ -342,6 +352,7 @@ fn vec_of_interests_ors_at_subscription_level() {
         },
         Interest {
             asset: AssetSelector::Policy(policy_blackflag()),
+            roles: EnumSet::all(),
             domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
                 brands: enumset::EnumSet::all(),
                 kinds: enum_set!(MarketplaceEventKind::OfferCancel),
@@ -418,6 +429,7 @@ fn offer_create_create_payload_is_addressable() {
 fn interest_serde_json_roundtrip() {
     let interest = Interest {
         asset: AssetSelector::Policy(policy_blackflag()),
+        roles: EnumSet::all(),
         domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
             brands: enum_set!(MarketplaceBrand::JpgStore | MarketplaceBrand::Wayup),
             kinds: enum_set!(MarketplaceEventKind::Sale | MarketplaceEventKind::OfferCancel),
@@ -465,6 +477,7 @@ fn interest_serde_cbor_roundtrip() {
             kinds: enum_set!(DexEventKind::Swap),
         }),
         value: ValueFilter::Any,
+        roles: EnumSet::all(),
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&interest, &mut buf).unwrap();
@@ -483,6 +496,7 @@ fn matches_asset_ignores_domain_and_value_axes() {
     // because the indexer doesn't speak the Domain dimension.
     let interest = Interest {
         asset: AssetSelector::Policy(policy_blackflag()),
+        roles: EnumSet::all(),
         domain: DomainSelector::Marketplace(MarketplaceSelector::Any),
         value: ValueFilter::Any,
     };
@@ -503,6 +517,7 @@ fn watched_policies_collapses_to_none_for_any_or_fingerprint() {
         .unwrap();
     let with_fp = vec![Interest {
         asset: AssetSelector::Fingerprint(fp_str),
+        roles: EnumSet::all(),
         domain: DomainSelector::Any,
         value: ValueFilter::Any,
     }];
@@ -515,6 +530,7 @@ fn watched_policies_unions_bounded_selectors() {
     let interests = vec![
         Interest {
             asset: AssetSelector::Policy(policy_blackflag()),
+            roles: EnumSet::all(),
             domain: DomainSelector::Any,
             value: ValueFilter::Any,
         },
@@ -525,6 +541,7 @@ fn watched_policies_unions_bounded_selectors() {
             },
             domain: DomainSelector::Any,
             value: ValueFilter::Any,
+            roles: EnumSet::all(),
         },
         Interest {
             asset: AssetSelector::Trait {
@@ -534,6 +551,7 @@ fn watched_policies_unions_bounded_selectors() {
             },
             domain: DomainSelector::Any,
             value: ValueFilter::Any,
+            roles: EnumSet::all(),
         },
     ];
     let policies = watched_policies(&interests).expect("bounded");
@@ -548,6 +566,7 @@ fn any_interest_matches_event_ors_subscription() {
     let subscription = vec![
         Interest {
             asset: AssetSelector::Policy(policy_blackflag()),
+            roles: EnumSet::all(),
             domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
                 brands: enum_set!(MarketplaceBrand::JpgStore),
                 kinds: enum_set!(MarketplaceEventKind::Sale),
@@ -556,6 +575,7 @@ fn any_interest_matches_event_ors_subscription() {
         },
         Interest {
             asset: AssetSelector::Policy(policy_other()),
+            roles: EnumSet::all(),
             domain: DomainSelector::Any,
             value: ValueFilter::Any,
         },
@@ -580,6 +600,7 @@ fn any_interest_matches_asset_handles_state_only_consumers() {
     // on the policy clause and ignore the domain restriction.
     let subscription = vec![Interest {
         asset: AssetSelector::Policy(policy_blackflag()),
+        roles: EnumSet::all(),
         domain: DomainSelector::Marketplace(MarketplaceSelector::Any),
         value: ValueFilter::Any,
     }];
@@ -593,4 +614,120 @@ fn any_interest_matches_asset_handles_state_only_consumers() {
         &policy_other(),
         Some(ASSET_NAME_HEX),
     ));
+}
+
+// ----- AssetRole axis tests (NFT-centric server-side filtering) -----
+
+#[test]
+fn asset_role_classifies_cip68_labels_and_plain_native() {
+    use crate::protocol::AssetRole;
+    // CIP-68 user (label 222 prefix 000de140)
+    assert_eq!(
+        AssetRole::from_asset_name_hex("000de1404e616d6531"),
+        AssetRole::Cip68User
+    );
+    // CIP-68 reference NFT (label 100 prefix 000643b0)
+    assert_eq!(
+        AssetRole::from_asset_name_hex("000643b04e616d6531"),
+        AssetRole::Cip68Reference
+    );
+    // CIP-68 reference fungible (label 444 prefix 000ad79c)
+    assert_eq!(
+        AssetRole::from_asset_name_hex("000ad79c4e616d6531"),
+        AssetRole::Cip68RefFungible
+    );
+    // Plain native NFT — no recognized prefix
+    assert_eq!(
+        AssetRole::from_asset_name_hex("4e616d6531"),
+        AssetRole::NativeUser
+    );
+    // Empty name (minting-script sentinel)
+    assert_eq!(AssetRole::from_asset_name_hex(""), AssetRole::Empty);
+    // Short name (couldn't carry a CIP-68 label) defaults to NativeUser
+    assert_eq!(AssetRole::from_asset_name_hex("ab"), AssetRole::NativeUser);
+}
+
+#[test]
+fn role_filter_drops_reference_tokens_at_match_time() {
+    use crate::protocol::AssetRole;
+    let interest = Interest {
+        asset: AssetSelector::Policy(policy_blackflag()),
+        roles: enum_set!(AssetRole::NativeUser | AssetRole::Cip68User),
+        domain: DomainSelector::Any,
+        value: ValueFilter::Any,
+    };
+
+    // Plain user-NFT event matches.
+    let user_event = sale_event(MarketplaceBrand::JpgStore, asset_blackflag());
+    assert!(interest.matches(&user_event));
+
+    // CIP-68 reference NFT under the same policy: rejected by the role filter.
+    let ref_asset =
+        AssetId::new(POLICY_BLACKFLAG.into(), "000643b04e616d6531".into()).unwrap();
+    let ref_event = sale_event(MarketplaceBrand::JpgStore, ref_asset);
+    assert!(!interest.matches(&ref_event));
+}
+
+#[test]
+fn role_filter_bypassed_for_collection_wide_events() {
+    use crate::protocol::AssetRole;
+    // Collection-wide offer (asset_name_hex = None) should pass
+    // through even with a strict role filter, because there's no
+    // specific asset to classify.
+    let interest = Interest {
+        asset: AssetSelector::Policy(policy_blackflag()),
+        roles: enum_set!(AssetRole::NativeUser),
+        domain: DomainSelector::Any,
+        value: ValueFilter::Any,
+    };
+    let collection_offer = ProtocolEvent {
+        policy_id: policy_blackflag(),
+        asset_name_hex: None,
+        tx_hash: "ab".repeat(32),
+        slot: 1,
+        domain: Domain::Marketplace(Marketplace::OfferCreate(OfferCreatePayload {
+            brand: MarketplaceBrand::JpgStore,
+            policy_id: policy_blackflag(),
+            asset_name_hex: None,
+            price_lovelace: 100_000_000,
+            bidder: "addr1bidder".into(),
+        })),
+    };
+    assert!(interest.matches(&collection_offer));
+}
+
+#[test]
+fn matches_asset_role_helper_for_state_only_indexers() {
+    use crate::protocol::AssetRole;
+    let interest = Interest {
+        asset: AssetSelector::Policy(policy_blackflag()),
+        roles: enum_set!(AssetRole::NativeUser | AssetRole::Cip68User),
+        domain: DomainSelector::Any,
+        value: ValueFilter::Any,
+    };
+    assert!(interest.matches_asset_role(
+        &policy_blackflag(),
+        Some(ASSET_NAME_HEX),
+        AssetRole::NativeUser,
+    ));
+    assert!(!interest.matches_asset_role(
+        &policy_blackflag(),
+        Some("000643b04e616d6531"),
+        AssetRole::Cip68Reference,
+    ));
+    // Other policy: rejected by asset axis regardless of role.
+    assert!(!interest.matches_asset_role(
+        &policy_other(),
+        Some(ASSET_NAME_HEX),
+        AssetRole::NativeUser,
+    ));
+}
+
+#[test]
+fn interest_serde_roundtrip_includes_roles_default_when_absent() {
+    // Old payloads (pre-roles) should deserialise with the
+    // `EnumSet::all()` default. Forge a JSON without the field.
+    let json = r#"{"asset":"Any","domain":"Any","value":"Any"}"#;
+    let decoded: Interest = serde_json::from_str(json).unwrap();
+    assert_eq!(decoded.roles, EnumSet::all());
 }

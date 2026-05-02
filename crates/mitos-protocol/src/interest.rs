@@ -14,16 +14,38 @@ use enumset::EnumSet;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-    Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand, LendingEventKind, Marketplace,
-    MarketplaceBrand, MarketplaceEventKind, ProtocolEvent,
+    AssetRole, Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand, LendingEventKind,
+    Marketplace, MarketplaceBrand, MarketplaceEventKind, ProtocolEvent,
 };
 
-/// One descent path of consumer interest. Three axes, ANDed at
+/// `EnumSet::all()` as a serde default for the `roles` axis.
+/// Kept as a free function so `#[serde(default = ...)]` can name
+/// it; absent the explicit default, serde would substitute
+/// `EnumSet::default()` which is **empty** — the wrong semantic
+/// (would silently match nothing). Old payloads on the wire that
+/// predate the `roles` field deserialise as "all roles".
+fn all_asset_roles() -> EnumSet<AssetRole> {
+    EnumSet::all()
+}
+
+/// One descent path of consumer interest. Four axes, ANDed at
 /// match time. To express disjoint interests, send a `Vec<Interest>`
 /// — entries are ORed at match time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interest {
     pub asset: AssetSelector,
+    /// NFT-centric role filter. `EnumSet::all()` (the serde
+    /// default) keeps every role through; a narrower set like
+    /// `enum_set!(AssetRole::NativeUser | AssetRole::Cip68User)`
+    /// drops reference NFTs and minting-script sentinels server-
+    /// side at the indexer.
+    ///
+    /// For events with no specific asset (collection-wide offers,
+    /// multi-asset bundle listings — `event.asset_name_hex ==
+    /// None`) the role is undefined and the filter is bypassed:
+    /// such events match regardless of `roles`.
+    #[serde(default = "all_asset_roles")]
+    pub roles: EnumSet<AssetRole>,
     pub domain: DomainSelector,
     pub value: ValueFilter,
 }
@@ -33,25 +55,47 @@ impl Interest {
     pub fn any() -> Self {
         Self {
             asset: AssetSelector::Any,
+            roles: EnumSet::all(),
             domain: DomainSelector::Any,
             value: ValueFilter::Any,
         }
     }
 
-    /// Per-event match. AND across the three axes.
+    /// Per-event match. AND across the four axes.
+    /// `roles` is bypassed for collection-wide events (no
+    /// specific asset → no derivable role).
     pub fn matches(&self, event: &ProtocolEvent) -> bool {
         self.asset
             .matches(&event.policy_id, event.asset_name_hex.as_deref())
+            && self.role_matches(event.asset_name_hex.as_deref())
             && self.domain.matches(&event.domain)
             && self.value.matches(event)
     }
 
-    /// Match the asset axis only. For state-only indexers
-    /// (ownership, future tokenisation indexers) whose Change is
-    /// not a `ProtocolEvent`: only the asset selector applies, the
-    /// `domain` and `value` axes are ignored.
+    /// Match the asset axis only, plus the role axis. For
+    /// state-only indexers (ownership, future tokenisation) whose
+    /// Change is not a `ProtocolEvent`. The indexer derives the
+    /// role from the asset's name once and passes it in.
+    pub fn matches_asset_role(
+        &self,
+        policy_id: &PolicyId,
+        asset_name_hex: Option<&str>,
+        role: AssetRole,
+    ) -> bool {
+        self.asset.matches(policy_id, asset_name_hex) && self.roles.contains(role)
+    }
+
+    /// Match the asset axis only (no role check). Retained for
+    /// callers that don't have a role projected.
     pub fn matches_asset(&self, policy_id: &PolicyId, asset_name_hex: Option<&str>) -> bool {
         self.asset.matches(policy_id, asset_name_hex)
+    }
+
+    fn role_matches(&self, asset_name_hex: Option<&str>) -> bool {
+        match asset_name_hex {
+            Some(name) => self.roles.contains(AssetRole::from_asset_name_hex(name)),
+            None => true,
+        }
     }
 }
 
@@ -62,7 +106,8 @@ pub fn any_interest_matches_event(interests: &[Interest], event: &ProtocolEvent)
     interests.iter().any(|i| i.matches(event))
 }
 
-/// OR-fold for asset-only matching. For state-only indexers.
+/// OR-fold for asset-only matching, no role projected. Retained
+/// for transitional callers.
 pub fn any_interest_matches_asset(
     interests: &[Interest],
     policy_id: &PolicyId,
@@ -71,6 +116,20 @@ pub fn any_interest_matches_asset(
     interests
         .iter()
         .any(|i| i.matches_asset(policy_id, asset_name_hex))
+}
+
+/// OR-fold for state-only indexers that surface the asset's
+/// `AssetRole`. The canonical match check for ownership-style
+/// changes once role-aware emission lands.
+pub fn any_interest_matches_asset_role(
+    interests: &[Interest],
+    policy_id: &PolicyId,
+    asset_name_hex: Option<&str>,
+    role: AssetRole,
+) -> bool {
+    interests
+        .iter()
+        .any(|i| i.matches_asset_role(policy_id, asset_name_hex, role))
 }
 
 /// Project a slice of `Interest`s down to the set of policy_ids

@@ -30,7 +30,7 @@ use cardano_assets::PolicyId;
 use dolos_cardano::indexes::CardanoIndexExt;
 use dolos_core::{ChainPoint, Domain, StateStore, TipEvent};
 use mitos_core::{Emitter, Indexer, SubscribeReply};
-use mitos_protocol::{Interest, any_interest_matches_asset, watched_policies};
+use mitos_protocol::{AssetRole, Interest, any_interest_matches_asset_role, watched_policies};
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -58,10 +58,28 @@ pub enum OwnershipChange {
         /// workers that don't know about it — serde+CBOR ignores
         /// unknown map entries on read.
         asset_fingerprint: String,
+        /// NFT-centric classification of this asset by its name
+        /// shape. Computed once at emit time via
+        /// `mitos_protocol::AssetRole::from_asset_name_hex` so
+        /// consumers don't have to re-derive it; also lets the
+        /// indexer's `change_matches_scope` drop reference NFTs
+        /// and minting-script sentinels server-side when an
+        /// `Interest` narrows the `roles` axis.
+        ///
+        /// `#[serde(default)]` because old payloads on the wire
+        /// (pre-AssetRole) lack the field; serde substitutes
+        /// `AssetRole::NativeUser` (the most permissive default
+        /// — every receiver currently filters explicitly).
+        #[serde(default = "default_native_user")]
+        role: AssetRole,
         new_owner: String,
         tx_hash: String,
         output_index: u32,
     },
+}
+
+fn default_native_user() -> AssetRole {
+    AssetRole::NativeUser
 }
 
 /// Aggregate watch state across all live subscriptions.
@@ -158,10 +176,12 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
                             for asset in policy_assets.assets() {
                                 let asset_name_hex = hex::encode(asset.name());
                                 let fingerprint = compute_fingerprint(&policy_hex, &asset_name_hex);
+                                let role = AssetRole::from_asset_name_hex(&asset_name_hex);
                                 emitter.apply(OwnershipChange::Transfer {
                                     policy_id: policy_hex.clone(),
                                     asset_name: asset_name_hex,
                                     asset_fingerprint: fingerprint,
+                                    role,
                                     new_owner: address.clone(),
                                     tx_hash: tx_hash.clone(),
                                     output_index: idx as u32,
@@ -258,9 +278,10 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
             OwnershipChange::Transfer {
                 policy_id,
                 asset_name,
+                role,
                 ..
             } => match PolicyId::new(policy_id.as_str()) {
-                Ok(p) => any_interest_matches_asset(scope, &p, Some(asset_name)),
+                Ok(p) => any_interest_matches_asset_role(scope, &p, Some(asset_name), *role),
                 Err(_) => false,
             },
         }
@@ -369,10 +390,12 @@ fn backfill_for_policy<D: Domain>(
             for asset in policy_assets.assets() {
                 let asset_name_hex = hex::encode(asset.name());
                 let fingerprint = compute_fingerprint(policy_hex, &asset_name_hex);
+                let role = AssetRole::from_asset_name_hex(&asset_name_hex);
                 out.push(OwnershipChange::Transfer {
                     policy_id: policy_hex.to_string(),
                     asset_name: asset_name_hex,
                     asset_fingerprint: fingerprint,
+                    role,
                     new_owner: address.clone(),
                     tx_hash: hex::encode(txo_ref.0),
                     output_index: txo_ref.1,

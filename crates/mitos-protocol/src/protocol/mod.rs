@@ -35,7 +35,7 @@ mod dex;
 mod lending;
 mod marketplace;
 
-pub use common::{Address, Lovelace, OutputRef, PlutusBytes, ProtocolEvent};
+pub use common::{Address, AssetRole, Lovelace, OutputRef, PlutusBytes, ProtocolEvent};
 pub use dex::{Dex, DexBrand, DexEventKind, SwapPayload};
 pub use lending::{BorrowPayload, Lending, LendingBrand, LendingEventKind};
 pub use marketplace::{
