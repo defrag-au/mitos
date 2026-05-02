@@ -45,7 +45,7 @@ impl Default for JpgCoIndexer {
 impl<D: Domain> Indexer<D> for JpgCoIndexer {
     /// Fixed contract address set; no per-consumer scope concept.
     /// Default `subscribe`/`unsubscribe` from the trait (no-op,
-    /// `SubscribeReply::Resume`) is correct here.
+    /// `SubscribeReply::Resume`, no backfill) is correct here.
     type Scope = ();
 
     /// Phase 2 will define the actual change record (e.g. a CO datum

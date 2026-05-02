@@ -159,18 +159,67 @@ where
             None => return Ok(()), // peer closed before subscribing
         };
 
+        // Subscribe to broadcast *before* acquiring the indexer
+        // Mutex. The dispatcher acquires the same Mutex during
+        // `handle_event`, so any live record it produces while we
+        // hold the lock for `subscribe` arrives in `rx` afterward.
+        // Subscribing first guarantees we don't miss a record that
+        // fires between Mutex release and pump start.
+        let rx = self.changes.subscribe();
+
+        // Run the indexer's subscribe under the Mutex. The indexer
+        // mutates its watch set and populates `backfill` with
+        // synthetic Apply records reflecting current state at the
+        // cursor returned in the reply.
+        let mut backfill: Vec<<I as Indexer<DomainAdapter>>::Change> = Vec::new();
         let reply = {
             let mut guard = self.inner.lock().await;
             guard
-                .subscribe(&domain, scope.clone_for_subscribe(), cursor)
+                .subscribe(
+                    &domain,
+                    scope.clone_for_subscribe(),
+                    cursor,
+                    &mut backfill,
+                )
                 .await?
         };
+
+        // Send the SubscribeReply, then deliver every backfill
+        // record as an Apply at the reply's cursor (so the consumer
+        // advances its last-applied cursor atomically once the
+        // batch is fully applied). Live tail follows.
+        let resume_cursor = reply_cursor(&reply);
         send(&mut transport, &ServerMessage::SubscribeReply(reply)).await?;
 
-        // Phase B: forward broadcast records, filtered by scope, until
-        // the consumer disconnects or lags.
-        let rx = self.changes.subscribe();
+        for change in backfill {
+            let mut buf = Vec::with_capacity(64);
+            ciborium::into_writer(&change, &mut buf)
+                .map_err(|e| anyhow::anyhow!("encode backfill change: {e}"))?;
+            send(
+                &mut transport,
+                &ServerMessage::Apply {
+                    cursor: resume_cursor.clone(),
+                    change: buf,
+                },
+            )
+            .await?;
+        }
+
+        // Phase B: forward broadcast records, filtered by scope.
         forward_records::<I>(&mut transport, rx, scope.into_inner()).await
+    }
+}
+
+/// Resume cursor extracted from a `SubscribeReply` for stamping
+/// backfill records. For `SnapshotRedirect` the consumer fetches
+/// the snapshot from R2 — we still stamp any inline backfill at
+/// the snapshot cursor as a safety net.
+fn reply_cursor(reply: &crate::indexer::SubscribeReply) -> ChainPoint {
+    use crate::indexer::SubscribeReply;
+    match reply {
+        SubscribeReply::Resume { cursor } => cursor.clone(),
+        SubscribeReply::SnapshotRedirect { snapshot_cursor, .. } => snapshot_cursor.clone(),
+        SubscribeReply::Fork { common_ancestor } => common_ancestor.clone(),
     }
 }
 

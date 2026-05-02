@@ -91,19 +91,29 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// nested under `/<name>/`.
     fn routes(&self) -> axum::Router;
 
-    /// Add a CF replication scope to this indexer's watch set.
+    /// Add a CF replication scope to this indexer's watch set, and
+    /// (optionally) populate `backfill` with synthetic Apply change
+    /// records that bring the consumer up to the cursor returned in
+    /// the reply.
+    ///
+    /// `backfill` is delivered to *only this consumer* as Apply
+    /// records before live tail begins. Each record is tagged with
+    /// the cursor in the reply (typically the current chain tip), so
+    /// the consumer's last-applied cursor advances atomically once
+    /// the backfill batch is fully applied.
     ///
     /// Default implementation: no-op subscribe that returns
-    /// `Resume { cursor }`, suitable for indexers whose view is fully
-    /// determined by the indexer config (e.g. fixed contract
-    /// addresses) and don't need per-consumer scope tracking.
-    /// Indexers with dynamic watch sets (e.g. ownership keyed by
-    /// policy) override this.
+    /// `Resume { cursor }` with no backfill, suitable for indexers
+    /// whose view is fully determined by the indexer config (e.g.
+    /// fixed contract addresses) and don't need per-consumer scope
+    /// tracking. Indexers with dynamic watch sets (e.g. ownership
+    /// keyed by policy) override this.
     async fn subscribe(
         &mut self,
         _domain: &D,
         _scope: Self::Scope,
         cursor: ChainPoint,
+        _backfill: &mut Vec<Self::Change>,
     ) -> anyhow::Result<SubscribeReply> {
         Ok(SubscribeReply::Resume { cursor })
     }

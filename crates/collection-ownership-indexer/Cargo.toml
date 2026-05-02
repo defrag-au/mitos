@@ -8,6 +8,7 @@ license.workspace = true
 mitos-core = { path = "../mitos-core" }
 
 dolos-core = { workspace = true }
+dolos-cardano = { workspace = true }
 pallas = { workspace = true }
 
 async-trait = { workspace = true }
