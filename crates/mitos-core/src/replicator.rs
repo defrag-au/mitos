@@ -14,14 +14,18 @@
 //! 3. On disconnect or error, waits with exponential backoff and
 //!    reconnects.
 //!
-//! Subscriptions are kept in an in-memory registry. Phase 4.5+ adds
-//! redb persistence so subscriptions survive mitos restart.
+//! Subscriptions are persisted to a redb file under the bundle's
+//! data directory so they survive mitos restart. The on-disk schema
+//! is one table keyed by `SubscriptionId` → CBOR-encoded
+//! `Subscription`. The id counter is recorded in a meta table.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dolos::adapters::DomainAdapter;
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -29,9 +33,16 @@ use tokio_tungstenite::connect_async;
 use tracing::{error, info, warn};
 use url::Url;
 
+use crate::auth::AuthToken;
 use crate::handle::IndexerHandle;
 use crate::replicate::{ClientMessage, encode_client};
 use crate::transport::TungsteniteWs;
+
+/// redb table holding `SubscriptionId` → CBOR(`Subscription`).
+const SUBS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("subscriptions");
+/// redb table for meta values (next_id counter).
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const META_NEXT_ID: &str = "next_id";
 
 /// Identifier for one registered subscription. The framework
 /// generates these so the registry can list/remove individual
@@ -53,10 +64,13 @@ pub struct Subscription {
 }
 
 /// Maintains the registry of active outbound subscriptions plus the
-/// per-subscription tasks that drive them.
+/// per-subscription tasks that drive them. Backed by redb on disk,
+/// so subscriptions survive mitos restart.
 pub struct Replicator {
     indexers: HashMap<String, Arc<dyn IndexerHandle>>,
     domain: DomainAdapter,
+    db: Arc<Database>,
+    auth: AuthToken,
     inner: Arc<Mutex<ReplicatorInner>>,
 }
 
@@ -71,23 +85,62 @@ struct ActiveSub {
 }
 
 impl Replicator {
-    pub fn new(handles: &[Arc<dyn IndexerHandle>], domain: DomainAdapter) -> Self {
+    /// Open (or create) the persistent registry at `db_path` and
+    /// re-spawn dial loops for every persisted subscription.
+    pub fn new(
+        handles: &[Arc<dyn IndexerHandle>],
+        domain: DomainAdapter,
+        db_path: impl AsRef<Path>,
+        auth: AuthToken,
+    ) -> anyhow::Result<Self> {
         let mut indexers = HashMap::new();
         for h in handles {
             indexers.insert(h.name().to_string(), h.clone());
         }
-        Self {
+
+        let path: PathBuf = db_path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let db = Database::create(&path)
+            .map_err(|e| anyhow::anyhow!("open replicator db at {}: {e}", path.display()))?;
+
+        // Make sure tables exist so list/insert calls don't panic
+        // on first run.
+        let txn = db.begin_write().map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
+        {
+            let _ = txn
+                .open_table(SUBS_TABLE)
+                .map_err(|e| anyhow::anyhow!("open subs table: {e}"))?;
+            let _ = txn
+                .open_table(META_TABLE)
+                .map_err(|e| anyhow::anyhow!("open meta table: {e}"))?;
+        }
+        txn.commit().map_err(|e| anyhow::anyhow!("commit init: {e}"))?;
+
+        let (persisted, next_id) = load_persisted(&db)?;
+
+        let replicator = Self {
             indexers,
             domain,
+            db: Arc::new(db),
+            auth,
             inner: Arc::new(Mutex::new(ReplicatorInner {
-                next_id: 1,
+                next_id,
                 subs: HashMap::new(),
             })),
+        };
+
+        // Re-spawn dial loops for every persisted entry.
+        for (id, sub) in persisted {
+            replicator.spawn_blocking_existing(id, sub);
         }
+
+        Ok(replicator)
     }
 
-    /// Register a new outbound subscription. Spawns the dial loop
-    /// immediately. Returns the assigned `SubscriptionId`.
+    /// Register a new outbound subscription. Persists to redb, then
+    /// spawns the dial loop. Returns the assigned `SubscriptionId`.
     pub async fn add(&self, sub: Subscription) -> anyhow::Result<SubscriptionId> {
         let handle = self
             .indexers
@@ -99,21 +152,29 @@ impl Replicator {
         let id = inner.next_id;
         inner.next_id += 1;
 
+        // Persist before spawning the task — if the write fails we
+        // don't want a runaway connection without a registry entry.
+        write_subscription(&self.db, id, &sub, inner.next_id)?;
+
         let task = tokio::spawn(run_subscription(
             id,
             sub.clone(),
             handle,
             self.domain.clone(),
+            self.auth.clone(),
         ));
         inner.subs.insert(id, ActiveSub { sub, task });
         Ok(id)
     }
 
-    /// Drop a subscription by id. Aborts its task; the connection
-    /// will be torn down on the next message boundary.
+    /// Drop a subscription by id. Removes from redb, aborts its
+    /// task; the connection will be torn down on the next message
+    /// boundary.
     pub async fn remove(&self, id: SubscriptionId) -> bool {
         let mut inner = self.inner.lock().await;
-        if let Some(active) = inner.subs.remove(&id) {
+        let removed = inner.subs.remove(&id);
+        let _ = delete_subscription(&self.db, id);
+        if let Some(active) = removed {
             active.task.abort();
             true
         } else {
@@ -131,6 +192,112 @@ impl Replicator {
             .map(|(id, active)| (*id, active.sub.clone()))
             .collect()
     }
+
+    /// Restore a persisted subscription on startup — does not
+    /// re-write to redb (it's already there) and does not bump the
+    /// id counter. Used only by `new`.
+    fn spawn_blocking_existing(&self, id: SubscriptionId, sub: Subscription) {
+        let handle = match self.indexers.get(&sub.indexer).cloned() {
+            Some(h) => h,
+            None => {
+                warn!(
+                    id,
+                    indexer = %sub.indexer,
+                    "persisted subscription references unknown indexer; leaving in registry but not dialing"
+                );
+                return;
+            }
+        };
+        let task = tokio::spawn(run_subscription(
+            id,
+            sub.clone(),
+            handle,
+            self.domain.clone(),
+            self.auth.clone(),
+        ));
+        // We're holding `&self`, not `&mut self`; need to grab the
+        // Mutex synchronously. `new` is called from a blocking
+        // context (during bundle setup), so block_in_place is fine.
+        let mut inner = self.inner.blocking_lock();
+        inner.subs.insert(id, ActiveSub { sub, task });
+    }
+}
+
+fn load_persisted(db: &Database) -> anyhow::Result<(Vec<(SubscriptionId, Subscription)>, u64)> {
+    let txn = db
+        .begin_read()
+        .map_err(|e| anyhow::anyhow!("begin_read: {e}"))?;
+    let subs_table = txn
+        .open_table(SUBS_TABLE)
+        .map_err(|e| anyhow::anyhow!("open subs table: {e}"))?;
+    let meta_table = txn
+        .open_table(META_TABLE)
+        .map_err(|e| anyhow::anyhow!("open meta table: {e}"))?;
+
+    let mut subs: Vec<(SubscriptionId, Subscription)> = Vec::new();
+    for entry in subs_table
+        .iter()
+        .map_err(|e| anyhow::anyhow!("iter subs: {e}"))?
+    {
+        let (id, value) = entry.map_err(|e| anyhow::anyhow!("iter subs entry: {e}"))?;
+        let bytes = value.value();
+        match ciborium::from_reader::<Subscription, _>(bytes) {
+            Ok(sub) => subs.push((id.value(), sub)),
+            Err(e) => warn!(id = id.value(), error = %e, "skipping corrupt subscription"),
+        }
+    }
+
+    let next_id = meta_table
+        .get(META_NEXT_ID)
+        .map_err(|e| anyhow::anyhow!("read meta: {e}"))?
+        .map(|g| g.value())
+        .unwrap_or(1);
+
+    Ok((subs, next_id))
+}
+
+fn write_subscription(
+    db: &Database,
+    id: SubscriptionId,
+    sub: &Subscription,
+    next_id: u64,
+) -> anyhow::Result<()> {
+    let mut buf = Vec::with_capacity(128);
+    ciborium::into_writer(sub, &mut buf)
+        .map_err(|e| anyhow::anyhow!("encode subscription: {e}"))?;
+
+    let txn = db
+        .begin_write()
+        .map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
+    {
+        let mut subs = txn
+            .open_table(SUBS_TABLE)
+            .map_err(|e| anyhow::anyhow!("open subs table: {e}"))?;
+        subs.insert(id, buf.as_slice())
+            .map_err(|e| anyhow::anyhow!("insert subscription: {e}"))?;
+        let mut meta = txn
+            .open_table(META_TABLE)
+            .map_err(|e| anyhow::anyhow!("open meta table: {e}"))?;
+        meta.insert(META_NEXT_ID, next_id)
+            .map_err(|e| anyhow::anyhow!("insert next_id: {e}"))?;
+    }
+    txn.commit()
+        .map_err(|e| anyhow::anyhow!("commit subscription: {e}"))
+}
+
+fn delete_subscription(db: &Database, id: SubscriptionId) -> anyhow::Result<()> {
+    let txn = db
+        .begin_write()
+        .map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
+    {
+        let mut subs = txn
+            .open_table(SUBS_TABLE)
+            .map_err(|e| anyhow::anyhow!("open subs table: {e}"))?;
+        subs.remove(id)
+            .map_err(|e| anyhow::anyhow!("remove subscription: {e}"))?;
+    }
+    txn.commit()
+        .map_err(|e| anyhow::anyhow!("commit delete: {e}"))
 }
 
 /// Per-subscription task: dial → run protocol → reconnect with
@@ -140,6 +307,7 @@ async fn run_subscription(
     sub: Subscription,
     handle: Arc<dyn IndexerHandle>,
     domain: DomainAdapter,
+    auth: AuthToken,
 ) {
     let url = match Url::parse(&sub.target_url) {
         Ok(u) => u,
@@ -153,7 +321,7 @@ async fn run_subscription(
     let max_backoff = Duration::from_secs(60);
 
     loop {
-        match dial_and_run(&url, &sub, &handle, &domain).await {
+        match dial_and_run(&url, &sub, &handle, &domain, &auth).await {
             Ok(()) => {
                 info!(id, indexer = %sub.indexer, "subscription disconnected cleanly; reconnecting");
                 backoff = Duration::from_secs(1);
@@ -179,8 +347,25 @@ async fn dial_and_run(
     sub: &Subscription,
     handle: &Arc<dyn IndexerHandle>,
     domain: &DomainAdapter,
+    auth: &AuthToken,
 ) -> anyhow::Result<()> {
-    let (stream, _resp) = connect_async(url.as_str())
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+
+    // Build a client request from the URL so we can attach the
+    // Authorization header for the upgrade.
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("build ws request: {e}"))?;
+    if let Some(token) = auth.as_deref() {
+        let value = format!("Bearer {token}").parse().map_err(|e| {
+            anyhow::anyhow!("invalid auth token (must be ASCII for HTTP header): {e}")
+        })?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+
+    let (stream, _resp) = connect_async(request)
         .await
         .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
     info!(target = %url, indexer = %sub.indexer, "outbound ws connected");

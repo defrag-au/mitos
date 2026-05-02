@@ -1113,6 +1113,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "diff-collection-ownership"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1352,7 +1366,7 @@ dependencies = [
  "hex",
  "itertools 0.14.0",
  "pallas",
- "redb",
+ "redb 3.1.0",
  "redb-extras",
  "serde",
  "tempfile",
@@ -2810,6 +2824,7 @@ dependencies = [
  "futures-util",
  "gasket",
  "miette",
+ "redb 2.6.3",
  "serde",
  "serde_bytes",
  "thiserror 1.0.69",
@@ -2817,6 +2832,25 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "mitos-tail"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "clap",
+ "futures-util",
+ "hex",
+ "mitos-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -3823,6 +3857,15 @@ dependencies = [
 
 [[package]]
 name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "redb"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae323eb086579a3769daa2c753bb96deb95993c534711e0dbe881b5192906a06"
@@ -3836,7 +3879,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba3a0913835a509dd3f308cfe2379b9884f7bcc8d1ff856513eeab1ec450923f"
 dependencies = [
- "redb",
+ "redb 3.1.0",
  "roaring",
  "thiserror 1.0.69",
  "xxhash-rust",

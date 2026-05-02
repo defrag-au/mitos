@@ -79,9 +79,14 @@ struct ReplicateState {
 /// surface — see module-level docs). Each route's typed `State`
 /// resolves directly to the indexer it serves; no name lookup at
 /// runtime.
+///
+/// `auth` gates every upgrade request via the standard axum
+/// middleware (Bearer token in `Authorization` header). Open mode
+/// when `auth` is `None`-equivalent.
 pub fn replicate_router(
     handles: &[Arc<dyn IndexerHandle>],
     domain: DomainAdapter,
+    auth: crate::auth::AuthToken,
 ) -> Router {
     let mut router = Router::new();
     for handle in handles {
@@ -94,7 +99,10 @@ pub fn replicate_router(
         router = router.route(&endpoint, get(handle_upgrade).with_state(state));
         debug!(indexer = %name, endpoint = %endpoint, "replicate route mounted");
     }
-    router
+    router.layer(axum::middleware::from_fn_with_state(
+        auth,
+        crate::auth::require_auth,
+    ))
 }
 
 async fn handle_upgrade(

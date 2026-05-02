@@ -14,6 +14,8 @@ members = [
     "crates/jpg-co-indexer",
     "crates/collection-ownership-indexer",
     "bundles/default",
+    "tools/diff-collection-ownership",
+    "tools/mitos-tail",
 ]
 resolver = "2"
 
@@ -62,6 +64,9 @@ redb = "2"
 # CLI / config.
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.14", default-features = false, features = ["toml"] }
+
+# HTTP client for the diff harness (polls both workers' read APIs).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
 [profile.release]
 opt-level = 3

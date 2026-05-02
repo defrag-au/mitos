@@ -19,6 +19,7 @@
 //! why the trait is non-object-safe.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
@@ -34,6 +35,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use crate::auth::AuthToken;
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
 use crate::replicate::replicate_router;
@@ -44,15 +46,28 @@ pub struct Bundle {
     domain: DomainAdapter,
     config: RootConfig,
     listen: SocketAddr,
+    data_dir: PathBuf,
     indexers: Vec<Arc<dyn IndexerHandle>>,
 }
 
 impl Bundle {
-    pub fn new(domain: DomainAdapter, config: RootConfig, listen: SocketAddr) -> Self {
+    /// Construct a bundle.
+    ///
+    /// `data_dir` is where mitos stores its own state (subscription
+    /// registry, future per-indexer materialized views). Independent
+    /// of the Dolos data dir referenced by `config` — Dolos's data
+    /// dir is under its own ownership, mitos doesn't write there.
+    pub fn new(
+        domain: DomainAdapter,
+        config: RootConfig,
+        listen: SocketAddr,
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
             domain,
             config,
             listen,
+            data_dir,
             indexers: Vec::new(),
         }
     }
@@ -77,6 +92,7 @@ impl Bundle {
             domain,
             config,
             listen,
+            data_dir,
             indexers,
         } = self;
 
@@ -106,13 +122,23 @@ impl Bundle {
             app = app.nest(&format!("/{name}"), ix.routes());
         }
 
+        let auth = AuthToken::from_env();
+
         // Mount CF replication test surface (server-accepted WS) and
         // admin endpoints for managing outbound `Replicator`
-        // subscriptions (production WS-client direction).
-        app = app.merge(replicate_router(&indexers, domain.clone()));
+        // subscriptions (production WS-client direction). Both gated
+        // by Bearer-token auth (see auth.rs).
+        app = app.merge(replicate_router(&indexers, domain.clone(), auth.clone()));
 
-        let replicator = Arc::new(Replicator::new(&indexers, domain.clone()));
-        app = app.merge(admin_router(replicator.clone()));
+        let replicator_path = data_dir.join("subscriptions.redb");
+        let replicator = Arc::new(Replicator::new(
+            &indexers,
+            domain.clone(),
+            &replicator_path,
+            auth.clone(),
+        )?);
+        info!(path = %replicator_path.display(), "replicator registry opened");
+        app = app.merge(admin_router(replicator.clone(), auth.clone()));
 
         let listener = tokio::net::TcpListener::bind(listen).await?;
         info!(addr = %listen, "HTTP server listening");
@@ -148,7 +174,7 @@ struct AdminState {
     replicator: Arc<Replicator>,
 }
 
-fn admin_router(replicator: Arc<Replicator>) -> axum::Router {
+fn admin_router(replicator: Arc<Replicator>, auth: AuthToken) -> axum::Router {
     let state = AdminState { replicator };
     axum::Router::new()
         .route(
@@ -157,6 +183,10 @@ fn admin_router(replicator: Arc<Replicator>) -> axum::Router {
         )
         .route("/_admin/subscriptions/{id}", delete(remove_subscription))
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::require_auth,
+        ))
 }
 
 #[derive(Serialize)]

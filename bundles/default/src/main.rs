@@ -23,6 +23,12 @@ struct Args {
     /// HTTP listen address for indexer routes.
     #[arg(long, env = "BUNDLE_LISTEN", default_value = "127.0.0.1:8080")]
     listen: std::net::SocketAddr,
+
+    /// Where mitos stores its own state — the subscription registry
+    /// today, per-indexer materialized views in the future.
+    /// Independent of Dolos's data dir.
+    #[arg(long, env = "BUNDLE_DATA_DIR", default_value = "./mitos-data")]
+    data_dir: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -37,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     let exit = install_exit_handler();
 
-    let mut bundle = Bundle::new(domain, config, args.listen);
+    let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
     bundle.add_indexer(JpgCoIndexer::new()?);
     bundle.add_indexer(OwnershipIndexer::new()?);
 

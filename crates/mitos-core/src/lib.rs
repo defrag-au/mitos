@@ -6,6 +6,7 @@
 //! See `../../docs/design/CF_REPLICATION.md` for the subscription
 //! model behind the trait's associated `Scope` and `Change` types.
 
+mod auth;
 mod bundle;
 mod dispatcher;
 mod domain;
@@ -16,6 +17,10 @@ mod replicate;
 mod replicator;
 mod transport;
 
+#[cfg(test)]
+mod tests;
+
+pub use auth::AuthToken;
 pub use bundle::Bundle;
 pub use dispatcher::run_dispatcher;
 pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
@@ -32,4 +37,4 @@ pub use transport::{AxumWs, TungsteniteWs, WsTransport};
 // Re-export the dolos types indexers need at the trait surface, so
 // downstream crates only need to depend on `mitos-core`.
 pub use dolos::adapters::DomainAdapter;
-pub use dolos_core::{ChainPoint, Domain, TipEvent, TipSubscription};
+pub use dolos_core::{BlockHash, ChainPoint, Domain, TipEvent, TipSubscription};
