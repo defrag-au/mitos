@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mitos-core = { path = "../mitos-core" }
+mitos-protocol = { path = "../mitos-protocol" }
 
 dolos-core = { workspace = true }
 dolos-cardano = { workspace = true }

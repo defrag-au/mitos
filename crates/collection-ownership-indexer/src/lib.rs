@@ -4,39 +4,36 @@
 //! prototype, mirroring `cnft.dev-workers/workers/collection-ownership/`.
 //! See `docs/design/CF_REPLICATION.md` Phase 4.5 for the build order.
 //!
-//! Phase 3 (this crate, current state): watch-set-only skeleton.
-//! - `subscribe(policy_id)` adds the policy to the in-memory watch set
-//! - `handle_event(Apply)` decodes the block, scans tx outputs at
-//!   watched policies, and emits an `OwnershipChange::Transfer` for
-//!   each output
-//! - Cold subscribes return `Resume { cursor }` from the current
-//!   dispatcher position — no historical backfill yet.
-//!
-//! Phase 5 (next): backfill via `domain.indexes().utxos_by_policy()`
-//! at subscribe time, so a fresh consumer gets the full current
-//! ownership state for `policy_id` before live tail begins.
+//! Current state (post Phase 4 trait surgery):
+//! - `Scope = Vec<Interest>` — consumers express interest using the
+//!   shared `mitos_protocol::Interest` vocabulary; the indexer
+//!   projects the asset axis (Domain/Value axes are inert here —
+//!   ownership produces state changes, not protocol events).
+//! - The indexer maintains an in-memory `watch_set: HashSet<PolicyId>`
+//!   derived from the union of `AssetSelector::Policy/Asset/Trait`
+//!   policies across all live subscriptions. An interest with
+//!   `AssetSelector::Any` or `AssetSelector::Fingerprint` (which
+//!   doesn't constrain by policy) collapses the watch set to "scan
+//!   everything" — `watch_set` becomes `None`.
+//! - Backfill: each new subscribe drives `utxos_by_policy` lookups
+//!   for the distinct policies referenced by the subscriber's
+//!   interests, synthesising `OwnershipChange::Transfer` records.
+//!   Subscribers using `Any`/`Fingerprint` selectors get no
+//!   backfill (would require enumerating every policy on chain) —
+//!   they live-tail only.
 
 use std::collections::HashSet;
 
 use async_trait::async_trait;
 use axum::Router;
+use cardano_assets::PolicyId;
 use dolos_cardano::indexes::CardanoIndexExt;
 use dolos_core::{ChainPoint, Domain, StateStore, TipEvent};
 use mitos_core::{Emitter, Indexer, SubscribeReply};
+use mitos_protocol::{Interest, any_interest_matches_asset, watched_policies};
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-
-/// CF subscription scope: a single Cardano policy ID.
-///
-/// Encoded as lowercase hex on the wire; that's what the
-/// cnft.dev-workers ecosystem uses everywhere. Could be a `[u8; 28]`
-/// internally for slight efficiency, but the saving is irrelevant at
-/// our scale and the hex form makes logs and debugging trivial.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct OwnershipScope {
-    pub policy_id: String,
-}
 
 /// Single ownership change record.
 ///
@@ -67,17 +64,35 @@ pub enum OwnershipChange {
     },
 }
 
+/// Aggregate watch state across all live subscriptions.
+///
+/// `Bounded(set)` — every active subscription's interests project to
+/// a finite set of policies; we can skip blocks that touch none of
+/// them.
+///
+/// `Unbounded` — at least one subscription has `AssetSelector::Any`
+/// or `AssetSelector::Fingerprint` (which doesn't constrain by
+/// policy). Indexer must scan every output and post-filter.
+///
+/// `Empty` — no live subscriptions. Skip all blocks.
+///
+/// On unsubscribe we don't shrink the set (only correctness
+/// implication is brief over-scanning until the next subscribe
+/// recomputes). Phase 5+ refinement.
+enum WatchState {
+    Empty,
+    Bounded(HashSet<PolicyId>),
+    Unbounded,
+}
+
 pub struct OwnershipIndexer {
-    /// Set of policy IDs (hex) the indexer is currently emitting
-    /// records for. Mutated by `subscribe`/`unsubscribe`; read on
-    /// every Apply.
-    watch_set: HashSet<String>,
+    watched: WatchState,
 }
 
 impl OwnershipIndexer {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            watch_set: HashSet::new(),
+            watched: WatchState::Empty,
         })
     }
 }
@@ -90,7 +105,7 @@ impl Default for OwnershipIndexer {
 
 #[async_trait]
 impl<D: Domain> Indexer<D> for OwnershipIndexer {
-    type Scope = OwnershipScope;
+    type Scope = Vec<Interest>;
     type Change = OwnershipChange;
 
     fn name(&self) -> &'static str {
@@ -100,7 +115,7 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
     async fn bootstrap(&mut self, _domain: &D) -> anyhow::Result<ChainPoint> {
         info!(
             indexer = "collection-ownership",
-            "bootstrap: watch set empty until first subscribe"
+            "bootstrap: watch state empty until first subscribe"
         );
         Ok(ChainPoint::Origin)
     }
@@ -113,9 +128,11 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
     ) -> anyhow::Result<()> {
         match event {
             TipEvent::Apply(_, block) => {
-                if self.watch_set.is_empty() {
-                    return Ok(());
-                }
+                let watched = match &self.watched {
+                    WatchState::Empty => return Ok(()),
+                    WatchState::Bounded(set) if set.is_empty() => return Ok(()),
+                    state => state,
+                };
                 let parsed = match MultiEraBlock::decode(block.as_ref()) {
                     Ok(b) => b,
                     Err(e) => {
@@ -134,15 +151,15 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
                             }
                         };
                         for policy_assets in output.value().assets() {
-                            let policy = hex::encode(policy_assets.policy());
-                            if !self.watch_set.contains(&policy) {
+                            let policy_hex = hex::encode(policy_assets.policy());
+                            if !watch_state_contains(watched, &policy_hex) {
                                 continue;
                             }
                             for asset in policy_assets.assets() {
                                 let asset_name_hex = hex::encode(asset.name());
-                                let fingerprint = compute_fingerprint(&policy, &asset_name_hex);
+                                let fingerprint = compute_fingerprint(&policy_hex, &asset_name_hex);
                                 emitter.apply(OwnershipChange::Transfer {
-                                    policy_id: policy.clone(),
+                                    policy_id: policy_hex.clone(),
                                     asset_name: asset_name_hex,
                                     asset_fingerprint: fingerprint,
                                     new_owner: address.clone(),
@@ -179,26 +196,41 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
         consumer_cursor: ChainPoint,
         backfill: &mut Vec<Self::Change>,
     ) -> anyhow::Result<SubscribeReply> {
-        let added = self.watch_set.insert(scope.policy_id.clone());
+        // Project this consumer's interests down to a policy set
+        // (None = subscriber wants Any/Fingerprint, can't backfill
+        // without enumerating all policies on chain).
+        let policies_for_backfill = watched_policies(&scope);
 
-        // Cold subscribes (`Origin` cursor) get a full backfill
-        // synthesised from current state. Warm subscribes skip
-        // backfill — live tail from `consumer_cursor` is enough,
-        // assuming the gap is small. (Phase 5+ adds a gap heuristic
-        // and snapshot redirect for large gaps.)
-        let do_backfill = matches!(consumer_cursor, ChainPoint::Origin);
+        // Update the indexer-wide watch state to include this
+        // consumer's policies (or escalate to Unbounded if needed).
+        merge_into_watch_state(&mut self.watched, policies_for_backfill.as_ref());
+
+        // Cold subscribes (`Origin` cursor) with a bounded policy
+        // set get a full backfill synthesised from current state.
+        // Warm subscribes skip backfill (live tail from cursor is
+        // enough). Subscribers using `Any`/`Fingerprint` selectors
+        // also skip backfill — Phase 5+ may add chain-wide
+        // backfill via snapshot redirect for those.
+        let do_backfill =
+            matches!(consumer_cursor, ChainPoint::Origin) && policies_for_backfill.is_some();
 
         let resume_cursor = if do_backfill {
-            backfill_for_policy(domain, &scope.policy_id, backfill)?
+            // Safe: do_backfill implies Some.
+            let policies = policies_for_backfill.as_ref().unwrap();
+            let mut last_cursor = consumer_cursor;
+            for policy in policies {
+                last_cursor = backfill_for_policy(domain, policy.as_str(), backfill)?;
+            }
+            last_cursor
         } else {
             consumer_cursor
         };
 
         info!(
             indexer = "collection-ownership",
-            policy_id = %scope.policy_id,
-            new = added,
-            watch_set_size = self.watch_set.len(),
+            interests = scope.len(),
+            policies_added = policies_for_backfill.as_ref().map(|p| p.len()),
+            watched = ?self.watched,
             backfilled = backfill.len(),
             ?resume_cursor,
             "subscribe"
@@ -209,21 +241,60 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
         })
     }
 
-    async fn unsubscribe(&mut self, scope: Self::Scope) -> anyhow::Result<()> {
-        let removed = self.watch_set.remove(&scope.policy_id);
+    async fn unsubscribe(&mut self, _scope: Self::Scope) -> anyhow::Result<()> {
+        // Best-effort: don't shrink the watch set on unsubscribe.
+        // The only correctness implication is wasted CPU on blocks
+        // matching now-stale policies, which the next subscribe or
+        // restart resolves. Tracked under Phase 5+ refinement.
         info!(
             indexer = "collection-ownership",
-            policy_id = %scope.policy_id,
-            removed,
-            watch_set_size = self.watch_set.len(),
-            "unsubscribe"
+            "unsubscribe (watch state preserved)"
         );
         Ok(())
     }
 
     fn change_matches_scope(scope: &Self::Scope, change: &Self::Change) -> bool {
         match change {
-            OwnershipChange::Transfer { policy_id, .. } => *policy_id == scope.policy_id,
+            OwnershipChange::Transfer {
+                policy_id,
+                asset_name,
+                ..
+            } => match PolicyId::new(policy_id.as_str()) {
+                Ok(p) => any_interest_matches_asset(scope, &p, Some(asset_name)),
+                Err(_) => false,
+            },
+        }
+    }
+}
+
+fn watch_state_contains(state: &WatchState, policy_hex: &str) -> bool {
+    match state {
+        WatchState::Empty => false,
+        WatchState::Unbounded => true,
+        WatchState::Bounded(set) => match PolicyId::new(policy_hex) {
+            Ok(p) => set.contains(&p),
+            Err(_) => false,
+        },
+    }
+}
+
+fn merge_into_watch_state(state: &mut WatchState, additions: Option<&HashSet<PolicyId>>) {
+    match additions {
+        None => *state = WatchState::Unbounded,
+        Some(new_policies) => match state {
+            WatchState::Unbounded => {}
+            WatchState::Empty => *state = WatchState::Bounded(new_policies.clone()),
+            WatchState::Bounded(existing) => existing.extend(new_policies.iter().cloned()),
+        },
+    }
+}
+
+impl std::fmt::Debug for WatchState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WatchState::Empty => write!(f, "Empty"),
+            WatchState::Unbounded => write!(f, "Unbounded"),
+            WatchState::Bounded(s) => write!(f, "Bounded({} policies)", s.len()),
         }
     }
 }

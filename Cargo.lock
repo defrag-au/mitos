@@ -668,6 +668,7 @@ dependencies = [
  "dolos-core",
  "hex",
  "mitos-core",
+ "mitos-protocol",
  "pallas",
  "serde",
  "tracing",

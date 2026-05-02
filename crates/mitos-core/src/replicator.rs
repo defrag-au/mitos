@@ -40,9 +40,17 @@ use crate::replicate::{ClientMessage, encode_client};
 use crate::transport::TungsteniteWs;
 
 /// redb table holding `SubscriptionId` → CBOR(`Subscription`).
-const SUBS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("subscriptions");
+///
+/// Bumped from `subscriptions` to `subscriptions_v2` for the
+/// Phase 4 trait surgery: per-indexer `Scope` types changed
+/// (`OwnershipScope` → `Vec<Interest>`, `()` → `Vec<Interest>`)
+/// and the persisted CBOR is no longer decodable. Old rows in
+/// the v1 table are silently abandoned — the CF consumer
+/// re-subscribes on first reconnect with the new shape. The on-
+/// disk file keeps the old table; nothing to delete.
+const SUBS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("subscriptions_v2");
 /// redb table for meta values (next_id counter).
-const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta_v2");
 const META_NEXT_ID: &str = "next_id";
 
 /// Identifier for one registered subscription. The framework

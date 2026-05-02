@@ -4,40 +4,42 @@
 //! but with a fundamentally different topology. Where ownership is
 //! a per-policy stream (one consumer per policy, scope-filtered at
 //! the indexer), marketplace events are emitted **as a single
-//! global feed** — every marketplace tx on chain produces a record
-//! regardless of policy.
+//! global feed** — every marketplace tx on chain produces one or
+//! more typed `ProtocolEvent` records.
 //!
 //! The CF-side worker subscribes once, receives every event, and
-//! is responsible for per-policy fan-out: extract `policy_id` from
-//! each event, route to a per-policy DO via `idFromName(policy_id)`.
-//! For policies no consumer cares about, the worker drops the
-//! event (or routes to a "missing" DO that 404s on read). The
-//! marketplace indexer doesn't try to know which policies anyone
-//! is watching; that's the consumer worker's concern.
+//! is responsible for per-policy fan-out: read `policy_id` /
+//! `asset_name_hex` off the event, route to a per-policy DO via
+//! `idFromName(policy_id)`. For policies no consumer cares about,
+//! the worker drops the event (or routes to a "missing" DO that
+//! 404s on read). The marketplace indexer doesn't try to know
+//! which policies anyone is watching; that's the consumer worker's
+//! concern.
 //!
-//! This shape avoids the awkwardness of "you have to subscribe to
-//! every policy you might care about ahead of time" — sales
-//! happen across thousands of policies, and pre-registering all of
-//! them is the wrong default. Instead: emit everything, route
-//! cheaply.
+//! Design + rationale: see
+//! `mitos/docs/design/MARKETPLACE_INDEXER.md` and
+//! `mitos/docs/design/SUBSCRIPTION_MECHANICS.md`.
 //!
-//! Design + rationale: see `mitos/docs/design/MARKETPLACE_INDEXER.md`.
-//!
-//! Phase 9 (this crate, current state): skeleton.
+//! Phase 3 (this crate, current state): typed event emission via
+//! the `mitos-protocol` taxonomy.
 //!
 //! - `Scope = ()` — no per-consumer scope. The single subscriber
-//!   gets everything.
+//!   gets everything; the framework `Interest` filtering machinery
+//!   is wired in Phase 4 when the trait surgery lands.
+//! - `Change = mitos_protocol::ProtocolEvent` — kind-as-outer
+//!   `Marketplace` payloads with brand-as-data. One event per
+//!   `(policy, marketplace_event)` pair: a tx that touches N
+//!   policies emits N records.
 //! - `handle_event(Apply)` walks each tx in the block, resolves
 //!   its consumed inputs via `domain.state().get_utxos`, builds a
 //!   `RawTxData` via the shared-crates `pallas-adapter` feature,
-//!   runs `RuleEngine::classify`, and emits one `MarketplaceEvent`
-//!   for each marketplace-relevant `TxType` it finds. No watch
-//!   set, no policy filtering at the indexer.
+//!   runs `RuleEngine::classify`, then hands the result to
+//!   `classification_to_events` to translate into typed events.
 //!
-//! Phase 10+ (deferred): typed per-variant change records (vs.
-//! the current "wrap a TxClassification" approach), trait-filtered
-//! collection offers, royalty resolution, parallel-run validation
-//! against the existing classifier worker.
+//! Phase 4+ (deferred): `Scope = Interest` (server-side filtering
+//! by asset/brand/kind), trait-filtered collection offers, cancel-
+//! payload redeemer/script-ref decoding, royalty resolution,
+//! parallel-run validation against the existing classifier worker.
 
 mod brand_resolver;
 mod translator;
@@ -55,49 +57,13 @@ use async_trait::async_trait;
 use axum::Router;
 use dolos_core::{ChainPoint, Domain, StateStore, TipEvent, TxoRef};
 use mitos_core::{Emitter, Indexer};
+use mitos_protocol::{Interest, ProtocolEvent, any_interest_matches_event};
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput};
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use address_registry::SmartContractRegistry;
 use transactions::pallas_adapter::{OutputRef, raw_tx_data_from_pallas};
-use tx_classifier::{RuleEngine, TxClassification, TxType};
-
-/// Single marketplace event record.
-///
-/// For the skeleton we wrap the classifier's full
-/// `TxClassification` rather than re-defining a typed taxonomy of
-/// variants. Pros: zero risk of drift from the upstream decoder;
-/// changes to `TxType` flow through automatically. Cons: consumers
-/// see a richer type than they need (mints, transfers, dex swaps
-/// all included alongside marketplace events) and have to extract
-/// what they care about.
-///
-/// `policy_id` is surfaced at the top level so the CF-side worker
-/// can route to per-policy DOs without parsing the embedded
-/// classification. A single tx that touches multiple policies
-/// (rare but valid) emits multiple records — one per policy.
-///
-/// Phase 10 work: replace with a narrowed `MarketplaceEventType`
-/// enum covering only sales / listings / offers / collection
-/// offers, with explicit conversion at the emit site.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarketplaceEvent {
-    /// Policy this event references. Used by the CF worker to
-    /// route to a per-policy DO. A tx that touches N policies
-    /// produces N MarketplaceEvent records, one per policy.
-    pub policy_id: String,
-    /// Transaction hash this classification belongs to. Same as
-    /// `classification.tx_hash` but lifted out for cheap access.
-    pub tx_hash: String,
-    /// Slot the block was at when the tx was applied. Useful for
-    /// downstream chronological ordering and reorg correlation.
-    pub slot: u64,
-    /// Full classifier output. Includes all `TxType` variants the
-    /// rule engine identified — consumers filter to whichever they
-    /// care about (e.g. only `Sale` for floor tracking).
-    pub classification: TxClassification,
-}
+use tx_classifier::RuleEngine;
 
 pub struct MarketplaceIndexer {
     /// Address-aware classifier engine. Built once at construction
@@ -122,11 +88,14 @@ impl Default for MarketplaceIndexer {
 
 #[async_trait]
 impl<D: Domain> Indexer<D> for MarketplaceIndexer {
-    /// No per-consumer scope — marketplace events are a global
-    /// feed. The CF worker subscribes once and routes to per-policy
-    /// DOs internally.
-    type Scope = ();
-    type Change = MarketplaceEvent;
+    /// Per-consumer scope is a `Vec<Interest>` — a list of
+    /// disjoint subscription clauses, ORed at match time. Each
+    /// emitted `ProtocolEvent` is delivered only to consumers
+    /// whose interest list contains a clause that matches it.
+    /// Consumers wanting "all marketplace events" send a single
+    /// `Interest::any()`.
+    type Scope = Vec<Interest>;
+    type Change = ProtocolEvent;
 
     fn name(&self) -> &'static str {
         "marketplace"
@@ -182,10 +151,17 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
         Router::new()
     }
 
-    // `subscribe`, `unsubscribe`, and `change_matches_scope` use
-    // the trait defaults: no-op subscribe (returns Resume), no-op
-    // unsubscribe, every change matches every scope (since scope
-    // is `()`, there's nothing to match).
+    /// Per-consumer filter: `change` is delivered only when at
+    /// least one `Interest` in `scope` matches. `Interest::matches`
+    /// ANDs the asset / domain / value axes; the OR across the
+    /// vec is what `any_interest_matches_event` performs.
+    fn change_matches_scope(scope: &Self::Scope, change: &Self::Change) -> bool {
+        any_interest_matches_event(scope, change)
+    }
+
+    // `subscribe`/`unsubscribe` keep the trait defaults: this
+    // indexer doesn't track per-scope state (the rule engine + the
+    // chain are everything; filtering is post-emit).
 }
 
 impl MarketplaceIndexer {
@@ -195,7 +171,7 @@ impl MarketplaceIndexer {
         domain: &D,
         tx: &pallas::ledger::traverse::MultiEraTx<'_>,
         slot: u64,
-        emitter: &Emitter<MarketplaceEvent>,
+        emitter: &Emitter<ProtocolEvent>,
     ) -> anyhow::Result<()> {
         // Resolve consumed inputs via dolos's state store.
         // Reference inputs too — their datums often carry the
@@ -238,70 +214,15 @@ impl MarketplaceIndexer {
         let mut classification = self.rule_engine.classify(&raw);
         classification.tx_hash = raw.tx_hash.clone();
 
-        // Per-policy emission: one `MarketplaceEvent` per policy
-        // referenced by the classification. The CF worker uses the
-        // top-level `policy_id` to route. Non-marketplace `TxType`
-        // variants (Mint, Transfer, DexSwap) contribute nothing to
-        // the policy set — they ride along inside `classification`
-        // for context but don't trigger a fan-out by themselves.
-        let policies = policies_in_classification(&classification);
-        for policy_id in policies {
-            emitter.apply(MarketplaceEvent {
-                policy_id,
-                tx_hash: classification.tx_hash.clone(),
-                slot,
-                classification: classification.clone(),
-            });
+        // Translate the classification into typed protocol events.
+        // One event per `(policy, marketplace_event)` pair —
+        // multi-policy listings emit one event per affected policy;
+        // non-marketplace `TxType` variants (Mint, Transfer,
+        // DexSwap) contribute nothing.
+        for event in classification_to_events(&classification, slot) {
+            emitter.apply(event);
         }
 
         Ok(())
     }
-}
-
-/// Walk a `TxClassification` and collect every distinct policy_id
-/// referenced by any marketplace-relevant `TxType`.
-fn policies_in_classification(c: &TxClassification) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    for ty in &c.tx_types {
-        match ty {
-            // Sale carries a `PricedAsset` (asset + price + delta).
-            // The nested `asset.asset` is the typed `AssetId`.
-            TxType::Sale { asset, .. } => {
-                out.insert(asset.asset.policy_id.clone());
-            }
-            // OfferAccept carries a bare `AssetId`.
-            TxType::OfferAccept { asset, .. } => {
-                out.insert(asset.policy_id.clone());
-            }
-            // Listing create/update carry `Vec<PricedAsset>` for
-            // bundles.
-            TxType::ListingCreate { assets, .. } | TxType::ListingUpdate { assets, .. } => {
-                for a in assets {
-                    out.insert(a.asset.policy_id.clone());
-                }
-            }
-            // Unlisting carries `Vec<AssetId>` (no price on
-            // unlist).
-            TxType::Unlisting { assets, .. } => {
-                for a in assets {
-                    out.insert(a.policy_id.clone());
-                }
-            }
-            // Offer create/update/cancel carry the policy_id at
-            // the top level (works for both per-asset and
-            // collection-wide offers — `encoded_asset_name` on the
-            // variant tells them apart).
-            TxType::CreateOffer { policy_id, .. }
-            | TxType::OfferUpdate { policy_id, .. }
-            | TxType::OfferCancel { policy_id, .. } => {
-                out.insert(policy_id.clone());
-            }
-            // Non-marketplace variants — skipped at the policy
-            // extraction phase. The classification still includes
-            // them in tx_types for downstream context, but this
-            // indexer doesn't fan them out.
-            _ => {}
-        }
-    }
-    out
 }

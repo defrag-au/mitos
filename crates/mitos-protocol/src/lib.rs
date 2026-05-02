@@ -19,7 +19,7 @@ mod interest_tests;
 
 pub use interest::{
     AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
-    ValueFilter,
+    ValueFilter, any_interest_matches_asset, any_interest_matches_event, watched_policies,
 };
 pub use protocol::{
     Address, BorrowPayload, Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand,

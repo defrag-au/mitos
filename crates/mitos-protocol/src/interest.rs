@@ -45,6 +45,63 @@ impl Interest {
             && self.domain.matches(&event.domain)
             && self.value.matches(event)
     }
+
+    /// Match the asset axis only. For state-only indexers
+    /// (ownership, future tokenisation indexers) whose Change is
+    /// not a `ProtocolEvent`: only the asset selector applies, the
+    /// `domain` and `value` axes are ignored.
+    pub fn matches_asset(&self, policy_id: &PolicyId, asset_name_hex: Option<&str>) -> bool {
+        self.asset.matches(policy_id, asset_name_hex)
+    }
+}
+
+/// OR-fold over a `Vec<Interest>` against a fully-typed event.
+/// The canonical "subscription matches" check for indexers whose
+/// `Change = ProtocolEvent`.
+pub fn any_interest_matches_event(interests: &[Interest], event: &ProtocolEvent) -> bool {
+    interests.iter().any(|i| i.matches(event))
+}
+
+/// OR-fold for asset-only matching. For state-only indexers.
+pub fn any_interest_matches_asset(
+    interests: &[Interest],
+    policy_id: &PolicyId,
+    asset_name_hex: Option<&str>,
+) -> bool {
+    interests
+        .iter()
+        .any(|i| i.matches_asset(policy_id, asset_name_hex))
+}
+
+/// Project a slice of `Interest`s down to the set of policy_ids
+/// they reference, for indexers that maintain a watch-set
+/// optimisation (e.g. ownership indexer skipping blocks that touch
+/// no watched policy).
+///
+/// Returns `None` if any interest in the slice is unbounded by
+/// policy (`AssetSelector::Any`) — meaning every block must be
+/// processed, no watch-set optimisation possible. Otherwise
+/// returns `Some(set)` of distinct policies referenced by `Policy`,
+/// `Asset`, or `Trait` selectors.
+///
+/// `Fingerprint` selectors don't constrain by policy
+/// (a fingerprint is policy+name combined and hashed), so they
+/// also force `None` — the indexer must scan everything and
+/// post-filter.
+pub fn watched_policies(interests: &[Interest]) -> Option<std::collections::HashSet<PolicyId>> {
+    let mut out = std::collections::HashSet::new();
+    for i in interests {
+        match &i.asset {
+            AssetSelector::Any | AssetSelector::Fingerprint(_) => return None,
+            AssetSelector::Policy(p) | AssetSelector::Trait { policy: p, .. } => {
+                out.insert(p.clone());
+            }
+            AssetSelector::Asset { policy, .. } => {
+                out.insert(policy.clone());
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Asset-axis selector — equality at the chosen specificity level.

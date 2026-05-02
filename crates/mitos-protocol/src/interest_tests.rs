@@ -471,3 +471,126 @@ fn interest_serde_cbor_roundtrip() {
     let decoded: Interest = ciborium::from_reader(buf.as_slice()).unwrap();
     assert_eq!(interest, decoded);
 }
+
+// ----- Helper-function tests (Phase 4 surface) -----
+
+#[test]
+fn matches_asset_ignores_domain_and_value_axes() {
+    // For state-only indexers (ownership, future tokenisation),
+    // only the asset axis applies. A consumer who said "watch
+    // every marketplace event for policy X" still matches an
+    // ownership Transfer for that policy via matches_asset,
+    // because the indexer doesn't speak the Domain dimension.
+    let interest = Interest {
+        asset: AssetSelector::Policy(policy_blackflag()),
+        domain: DomainSelector::Marketplace(MarketplaceSelector::Any),
+        value: ValueFilter::Any,
+    };
+    assert!(interest.matches_asset(&policy_blackflag(), Some(ASSET_NAME_HEX)));
+    assert!(!interest.matches_asset(&policy_other(), Some(ASSET_NAME_HEX)));
+}
+
+#[test]
+fn watched_policies_collapses_to_none_for_any_or_fingerprint() {
+    use crate::interest::watched_policies;
+    let with_any = vec![Interest::any()];
+    assert!(watched_policies(&with_any).is_none());
+
+    // Fingerprint also doesn't constrain by policy alone.
+    let fp_str = AssetId::new(POLICY_BLACKFLAG.into(), ASSET_NAME_HEX.into())
+        .unwrap()
+        .fingerprint_typed()
+        .unwrap();
+    let with_fp = vec![Interest {
+        asset: AssetSelector::Fingerprint(fp_str),
+        domain: DomainSelector::Any,
+        value: ValueFilter::Any,
+    }];
+    assert!(watched_policies(&with_fp).is_none());
+}
+
+#[test]
+fn watched_policies_unions_bounded_selectors() {
+    use crate::interest::watched_policies;
+    let interests = vec![
+        Interest {
+            asset: AssetSelector::Policy(policy_blackflag()),
+            domain: DomainSelector::Any,
+            value: ValueFilter::Any,
+        },
+        Interest {
+            asset: AssetSelector::Asset {
+                policy: policy_other(),
+                name_hex: ASSET_NAME_HEX.into(),
+            },
+            domain: DomainSelector::Any,
+            value: ValueFilter::Any,
+        },
+        Interest {
+            asset: AssetSelector::Trait {
+                policy: policy_blackflag(),
+                key: "background".into(),
+                value: "blue".into(),
+            },
+            domain: DomainSelector::Any,
+            value: ValueFilter::Any,
+        },
+    ];
+    let policies = watched_policies(&interests).expect("bounded");
+    assert_eq!(policies.len(), 2);
+    assert!(policies.contains(&policy_blackflag()));
+    assert!(policies.contains(&policy_other()));
+}
+
+#[test]
+fn any_interest_matches_event_ors_subscription() {
+    use crate::interest::any_interest_matches_event;
+    let subscription = vec![
+        Interest {
+            asset: AssetSelector::Policy(policy_blackflag()),
+            domain: DomainSelector::Marketplace(MarketplaceSelector::Filter {
+                brands: enum_set!(MarketplaceBrand::JpgStore),
+                kinds: enum_set!(MarketplaceEventKind::Sale),
+            }),
+            value: ValueFilter::Any,
+        },
+        Interest {
+            asset: AssetSelector::Policy(policy_other()),
+            domain: DomainSelector::Any,
+            value: ValueFilter::Any,
+        },
+    ];
+    let bf_sale = sale_event(MarketplaceBrand::JpgStore, asset_blackflag());
+    let other_sale = sale_event(MarketplaceBrand::Wayup, asset_other());
+    let unrelated = sale_event(
+        MarketplaceBrand::JpgStore,
+        AssetId::new("aa".repeat(28), "deadbeef".into()).unwrap(),
+    );
+
+    assert!(any_interest_matches_event(&subscription, &bf_sale));
+    assert!(any_interest_matches_event(&subscription, &other_sale));
+    assert!(!any_interest_matches_event(&subscription, &unrelated));
+}
+
+#[test]
+fn any_interest_matches_asset_handles_state_only_consumers() {
+    use crate::interest::any_interest_matches_asset;
+    // Subscription with a domain-specific clause AND a broad
+    // policy clause: state-only indexer (ownership) should match
+    // on the policy clause and ignore the domain restriction.
+    let subscription = vec![Interest {
+        asset: AssetSelector::Policy(policy_blackflag()),
+        domain: DomainSelector::Marketplace(MarketplaceSelector::Any),
+        value: ValueFilter::Any,
+    }];
+    assert!(any_interest_matches_asset(
+        &subscription,
+        &policy_blackflag(),
+        Some(ASSET_NAME_HEX),
+    ));
+    assert!(!any_interest_matches_asset(
+        &subscription,
+        &policy_other(),
+        Some(ASSET_NAME_HEX),
+    ));
+}
