@@ -189,8 +189,53 @@ Each step lands cleanly before the next becomes meaningful.
 7. **Reorg validation.** Pick a known historical reorg, replay both
    pipelines, confirm mitos side emits `Undo` records and converges
    correctly while existing side does not.
-8. **Extract `mitos-protocol` crate** so the worker side stops
-   hand-mirroring wire types. The first end-to-end test (Black Flag,
+8. **CIP-14 fingerprints + cardano-assets adoption** (small,
+   prerequisite for #9). Coordinated across mitos and shared-crates
+   via patch overrides during development.
+
+   **In shared-crates** (cardano-assets):
+   - Add `flake.nix` (mirror mitos / cnft.dev-workers — same
+     `defrag-nix` `rust-worker-stack` shell).
+   - Add typed newtypes: `PolicyId(String)` (56-char hex,
+     validated), `Fingerprint(String)` (CIP-14 bech32,
+     validated), optionally `AssetNameHex(String)`.
+   - Update `AssetId.policy_id` from `String` to `PolicyId`.
+     Update `AssetId::fingerprint() -> Result<Fingerprint, _>`.
+     Both are breaking API changes on the crate surface; cascade
+     through internal call sites.
+
+   **In mitos**:
+   - Add `cardano-assets = { ..., features = ["cip14"] }` workspace
+     dep.
+   - Add `[patch]` override pointing at the local shared-crates
+     checkout for the duration.
+   - `OwnershipChange::Transfer` gains `asset_fingerprint:
+     Fingerprint` field; `policy_id` becomes `PolicyId`.
+   - DO schema: `ownership.asset_fingerprint TEXT NOT NULL` +
+     `idx_ownership_fingerprint`. Read APIs accept
+     `?fingerprint=asset1...` alongside `?asset=hex`.
+   - Replace standalone `extract_stake_address` and
+     `is_user_token` helpers with cardano-assets equivalents
+     where available.
+
+   **In cnft.dev-workers**: same `[patch]` override; existing
+   shared-crates consumers update their type signatures. Validate
+   build + tests across both downstreams before bumping
+   shared-crates version and removing the patch.
+
+   Public-vs-private dep direction (cardano-assets extraction to
+   its own public location) is deferred to mitos's actual public-
+   release moment; not blocking. See `MARKETPLACE_INDEXER.md` §
+   "Reusing cardano-assets from shared-crates".
+9. **`MarketplaceIndexer` + multi-feed-per-DO**: port the existing
+   classifier's decode logic (sales, listings, offers, collection
+   offers) into a second indexer alongside `OwnershipIndexer`. The
+   per-policy CF DO subscribes to *both* feeds, becoming a
+   per-policy collection-state aggregator. Worker renames from
+   `collection-ownership-mitos` to `collections-mitos`. Full
+   design + phasing in `MARKETPLACE_INDEXER.md`.
+10. **Extract `mitos-protocol` crate** so the worker side stops
+    hand-mirroring wire types. The first end-to-end test (Black Flag,
    2026-05-02) hit a wire-format bug because pallas's `Hash<32>`
    Serialize impl emits a hex *string*, not bytes, and the worker's
    `protocol.rs` declared the cursor's hash field as
