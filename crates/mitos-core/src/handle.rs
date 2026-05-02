@@ -1,0 +1,362 @@
+//! Type-erasure adapter for `Indexer<D>`.
+//!
+//! The `Indexer` trait carries associated `Scope` and `Change` types so
+//! per-consumer subscriptions and change payloads are typed at the
+//! indexer's boundary rather than passed around as `serde_json::Value`.
+//! Those associated types make the trait non-object-safe, so the bundle
+//! can't store `Vec<Arc<dyn Indexer<D>>>` directly.
+//!
+//! `IndexerHandle` is an object-safe trait that erases the typed
+//! interface by accepting CBOR bytes at the subscribe boundary and
+//! decoding inside the per-indexer impl. Bundle authors never see the
+//! erased form — they just call `Bundle::add_indexer(MyIndexer::new()?)`
+//! and the framework wraps it.
+//!
+//! `run_subscriber` accepts a `Box<dyn WsTransport>` so the same
+//! protocol logic works regardless of who initiated the WebSocket.
+//! The server-side `/replicate/{indexer}` endpoint wraps an axum
+//! WebSocket; the client-side `Replicator` wraps a tokio-tungstenite
+//! stream. See `docs/design/CF_REPLICATION.md` § Connection direction.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use dolos::adapters::DomainAdapter;
+use dolos_core::{ChainPoint, TipEvent};
+use tokio::sync::{Mutex, broadcast};
+use tracing::warn;
+
+use crate::emitter::{EmittedRecord, Emitter};
+use crate::indexer::Indexer;
+use crate::replicate::{ClientMessage, ServerMessage, decode_client, encode_server};
+use crate::transport::WsTransport;
+
+/// How many records to buffer per indexer in the broadcast channel.
+/// Slow consumers that fall behind get a `Lagged` error and the pump
+/// drops their connection — they reconnect via the resume / snapshot
+/// path. Sized for one block's worth of busy chain activity (~hundreds
+/// of changes) plus headroom; production tuning is Phase 4.5 work.
+const BROADCAST_CAPACITY: usize = 4096;
+
+/// Object-safe view of an `Indexer<DomainAdapter>` for storage in
+/// heterogeneous collections. All methods take only `Send + Sync`
+/// types — the indexer's `Scope` and `Change` are erased behind CBOR
+/// bytes.
+#[async_trait]
+pub trait IndexerHandle: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    /// HTTP routes for this indexer. Captured at adapter construction
+    /// (a clone of the original `Router`), so this is cheap to call
+    /// from synchronous bundle-setup code.
+    fn routes(&self) -> axum::Router;
+
+    async fn bootstrap(&self, domain: &DomainAdapter) -> anyhow::Result<ChainPoint>;
+
+    async fn handle_event(
+        &self,
+        domain: &DomainAdapter,
+        event: &TipEvent,
+    ) -> anyhow::Result<()>;
+
+    /// Run the per-consumer pump until the consumer disconnects or
+    /// drops. Owns the subscribe handshake, broadcast→ws forwarding,
+    /// scope filtering, and (Phase 4.5) ack-driven retransmit-buffer
+    /// trim.
+    ///
+    /// `transport` is direction-agnostic — server-accepted axum
+    /// WebSocket or client-dialed tungstenite stream both work.
+    async fn run_subscriber(
+        &self,
+        transport: Box<dyn WsTransport>,
+        domain: DomainAdapter,
+    ) -> anyhow::Result<()>;
+
+    /// Convert a JSON-shaped scope value into the CBOR bytes that
+    /// flow on the wire. Lets admin clients (and the `Replicator`
+    /// registration API) hand in scope as ordinary JSON without
+    /// needing to know the indexer's CBOR encoding details.
+    ///
+    /// JSON → indexer's `Scope` (via serde) → CBOR. Errors if the
+    /// JSON shape doesn't match the indexer's type.
+    fn encode_scope_from_json(&self, value: &serde_json::Value) -> anyhow::Result<Vec<u8>>;
+}
+
+/// Concrete adapter. Captures `name` and `routes` at construction (both
+/// are `&self` methods on `Indexer` returning owned values), holds an
+/// `Arc<Mutex<I>>` for the methods that need `&mut self`, and owns the
+/// broadcast channel emissions flow through.
+pub struct IndexerAdapter<I>
+where
+    I: Indexer<DomainAdapter>,
+{
+    name: &'static str,
+    routes: axum::Router,
+    inner: Arc<Mutex<I>>,
+    changes: broadcast::Sender<EmittedRecord<<I as Indexer<DomainAdapter>>::Change>>,
+}
+
+impl<I> IndexerAdapter<I>
+where
+    I: Indexer<DomainAdapter> + 'static,
+{
+    pub fn new(indexer: I) -> Self {
+        let name = indexer.name();
+        let routes = indexer.routes();
+        let (changes, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            name,
+            routes,
+            inner: Arc::new(Mutex::new(indexer)),
+            changes,
+        }
+    }
+}
+
+#[async_trait]
+impl<I> IndexerHandle for IndexerAdapter<I>
+where
+    I: Indexer<DomainAdapter> + 'static,
+{
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn routes(&self) -> axum::Router {
+        self.routes.clone()
+    }
+
+    async fn bootstrap(&self, domain: &DomainAdapter) -> anyhow::Result<ChainPoint> {
+        let mut guard = self.inner.lock().await;
+        guard.bootstrap(domain).await
+    }
+
+    async fn handle_event(
+        &self,
+        domain: &DomainAdapter,
+        event: &TipEvent,
+    ) -> anyhow::Result<()> {
+        let cursor = event_cursor(event);
+        let emitter = Emitter::new(self.changes.clone(), cursor.clone());
+        let mut guard = self.inner.lock().await;
+        let result = guard.handle_event(domain, event, &emitter).await;
+        // `Undo` and `Mark` are chain-level signals, not
+        // indexer-specific. The framework auto-emits them after the
+        // indexer has had a chance to roll back its own materialized
+        // view (Undo) or update its cursor (Mark). Indexers only
+        // emit explicit `Apply` records.
+        match event {
+            TipEvent::Undo(_, _) => {
+                let _ = self.changes.send(EmittedRecord::Undo { cursor });
+            }
+            TipEvent::Mark(_) => {
+                let _ = self.changes.send(EmittedRecord::Mark { cursor });
+            }
+            TipEvent::Apply(_, _) => {}
+        }
+        result
+    }
+
+    fn encode_scope_from_json(&self, value: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+        let scope: <I as Indexer<DomainAdapter>>::Scope =
+            serde_json::from_value(value.clone())
+                .map_err(|e| anyhow::anyhow!("scope JSON does not match indexer scope type: {e}"))?;
+        let mut buf = Vec::with_capacity(64);
+        ciborium::into_writer(&scope, &mut buf)
+            .map_err(|e| anyhow::anyhow!("encode scope CBOR: {e}"))?;
+        Ok(buf)
+    }
+
+    async fn run_subscriber(
+        &self,
+        mut transport: Box<dyn WsTransport>,
+        domain: DomainAdapter,
+    ) -> anyhow::Result<()> {
+        // Phase A: subscribe handshake.
+        let (scope, cursor) = match read_subscribe::<I>(&mut transport).await? {
+            Some(pair) => pair,
+            None => return Ok(()), // peer closed before subscribing
+        };
+
+        // Subscribe to broadcast *before* acquiring the indexer
+        // Mutex. The dispatcher acquires the same Mutex during
+        // `handle_event`, so any live record it produces while we
+        // hold the lock for `subscribe` arrives in `rx` afterward.
+        // Subscribing first guarantees we don't miss a record that
+        // fires between Mutex release and pump start.
+        let rx = self.changes.subscribe();
+
+        // Run the indexer's subscribe under the Mutex. The indexer
+        // mutates its watch set and populates `backfill` with
+        // synthetic Apply records reflecting current state at the
+        // cursor returned in the reply.
+        let mut backfill: Vec<<I as Indexer<DomainAdapter>>::Change> = Vec::new();
+        let reply = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .subscribe(
+                    &domain,
+                    scope.clone_for_subscribe(),
+                    cursor,
+                    &mut backfill,
+                )
+                .await?
+        };
+
+        // Send the SubscribeReply, then deliver every backfill
+        // record as an Apply at the reply's cursor (so the consumer
+        // advances its last-applied cursor atomically once the
+        // batch is fully applied). Live tail follows.
+        let resume_cursor = reply_cursor(&reply);
+        send(&mut transport, &ServerMessage::SubscribeReply(reply)).await?;
+
+        for change in backfill {
+            let mut buf = Vec::with_capacity(64);
+            ciborium::into_writer(&change, &mut buf)
+                .map_err(|e| anyhow::anyhow!("encode backfill change: {e}"))?;
+            send(
+                &mut transport,
+                &ServerMessage::Apply {
+                    cursor: resume_cursor.clone(),
+                    change: buf,
+                },
+            )
+            .await?;
+        }
+
+        // Phase B: forward broadcast records, filtered by scope.
+        forward_records::<I>(&mut transport, rx, scope.into_inner()).await
+    }
+}
+
+/// Resume cursor extracted from a `SubscribeReply` for stamping
+/// backfill records. For `SnapshotRedirect` the consumer fetches
+/// the snapshot from R2 — we still stamp any inline backfill at
+/// the snapshot cursor as a safety net.
+fn reply_cursor(reply: &crate::indexer::SubscribeReply) -> ChainPoint {
+    use crate::indexer::SubscribeReply;
+    match reply {
+        SubscribeReply::Resume { cursor } => cursor.clone(),
+        SubscribeReply::SnapshotRedirect { snapshot_cursor, .. } => snapshot_cursor.clone(),
+        SubscribeReply::Fork { common_ancestor } => common_ancestor.clone(),
+    }
+}
+
+async fn send(
+    transport: &mut Box<dyn WsTransport>,
+    msg: &ServerMessage,
+) -> anyhow::Result<()> {
+    let bytes = encode_server(msg)?;
+    transport.send_binary(bytes).await
+}
+
+/// Read the first message from a freshly-upgraded socket and decode
+/// it as a Subscribe. Returns `None` if the peer closed before
+/// subscribing.
+async fn read_subscribe<I>(
+    transport: &mut Box<dyn WsTransport>,
+) -> anyhow::Result<Option<(TypedScope<I>, ChainPoint)>>
+where
+    I: Indexer<DomainAdapter>,
+{
+    let bytes = match transport.recv_binary().await? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    match decode_client(&bytes)? {
+        ClientMessage::Subscribe { scope, cursor } => {
+            let typed: <I as Indexer<DomainAdapter>>::Scope =
+                ciborium::from_reader(scope.as_slice())
+                    .map_err(|e| anyhow::anyhow!("decoding scope CBOR: {e}"))?;
+            Ok(Some((TypedScope(typed), cursor)))
+        }
+        ClientMessage::Ack { .. } | ClientMessage::Unsubscribe => {
+            let _ = send(
+                transport,
+                &ServerMessage::Error {
+                    code: "subscribe_required".into(),
+                    message: "first message must be Subscribe".into(),
+                },
+            )
+            .await;
+            Ok(None)
+        }
+    }
+}
+
+/// Wrapper letting us hand the same `Scope` value to both
+/// `Indexer::subscribe` (consumes by value) and the broadcast pump
+/// filter (needs to keep its own copy). We require `Scope: Clone`
+/// implicitly by going through CBOR re-encode; this avoids forcing
+/// a `Clone` bound on every indexer's scope type.
+struct TypedScope<I>(<I as Indexer<DomainAdapter>>::Scope)
+where
+    I: Indexer<DomainAdapter>;
+
+impl<I> TypedScope<I>
+where
+    I: Indexer<DomainAdapter>,
+{
+    fn clone_for_subscribe(&self) -> <I as Indexer<DomainAdapter>>::Scope {
+        let mut buf = Vec::with_capacity(32);
+        ciborium::into_writer(&self.0, &mut buf).expect("scope re-encode");
+        ciborium::from_reader(buf.as_slice()).expect("scope re-decode")
+    }
+
+    fn into_inner(self) -> <I as Indexer<DomainAdapter>>::Scope {
+        self.0
+    }
+}
+
+async fn forward_records<I>(
+    transport: &mut Box<dyn WsTransport>,
+    mut rx: broadcast::Receiver<EmittedRecord<<I as Indexer<DomainAdapter>>::Change>>,
+    scope: <I as Indexer<DomainAdapter>>::Scope,
+) -> anyhow::Result<()>
+where
+    I: Indexer<DomainAdapter>,
+{
+    loop {
+        let record = match rx.recv().await {
+            Ok(r) => r,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(skipped = n, "consumer lagged, dropping connection");
+                let _ = send(
+                    transport,
+                    &ServerMessage::Error {
+                        code: "lagged".into(),
+                        message: format!("consumer lagged by {n} records; reconnect"),
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        };
+
+        let msg = match record {
+            EmittedRecord::Apply { cursor, change } => {
+                if !I::change_matches_scope(&scope, &change) {
+                    continue;
+                }
+                let mut buf = Vec::with_capacity(64);
+                ciborium::into_writer(&change, &mut buf)
+                    .map_err(|e| anyhow::anyhow!("encode change: {e}"))?;
+                ServerMessage::Apply { cursor, change: buf }
+            }
+            EmittedRecord::Undo { cursor } => ServerMessage::Undo { cursor },
+            EmittedRecord::Mark { cursor } => ServerMessage::Mark { cursor },
+        };
+
+        send(transport, &msg).await?;
+    }
+}
+
+fn event_cursor(event: &TipEvent) -> ChainPoint {
+    match event {
+        TipEvent::Apply(c, _) => c.clone(),
+        TipEvent::Undo(c, _) => c.clone(),
+        TipEvent::Mark(c) => c.clone(),
+    }
+}

@@ -165,6 +165,78 @@ storage schema changes. The chain data plane (Dolos) is shared in the
 sense of "same upstream chain" but each bundle has its own Dolos data
 directory; no cross-bundle storage sharing.
 
+## Where mitos lives in the stack
+
+Mitos is **not** the runtime substrate for our dApps. Our dApps live on
+Cloudflare Workers — that's the always-on, multi-region, billed-per-
+request layer that user traffic hits. Mitos runs on budget VPSes
+co-located with chain infrastructure; it can be down for maintenance,
+restarted for a Dolos version bump, or migrated between boxes without
+the dApp going dark.
+
+What mitos contributes is a **projection of the chain** — the subset of
+on-chain state an app actually needs, decoded and materialized into a
+shape the app can query cheaply. The goal is for that projection to
+flow into Cloudflare (Durable Objects, D1, KV — whichever fits the
+access pattern) so that the dApp's hot path never has to reach back to
+the VPS.
+
+The natural analogue is a CouchDB-style document store with a
+replication protocol: each indexer's materialized view is a "database",
+and a CF Durable Object subscribes to changes and applies them
+locally. The crucial difference is the **change cursor**: in CouchDB
+it's a per-database monotonic sequence number; for mitos the natural
+cursor is the Cardano `(slot, block_hash)` pair, since that's the unit
+the chain itself rolls forward and back on. A replicating consumer
+that knows its last-applied `(slot, hash)` can:
+
+- ask mitos for everything since that point, and
+- handle reorgs by recognizing when mitos's history diverges from the
+  consumer's last-known hash, and rolling back to the fork point.
+
+The shape of that protocol — long-poll HTTP, SSE, WebSocket, signed
+snapshot bundles, something else — is parked until Phase 2 produces
+a real materialized view we'd want to replicate. The architectural
+commitment now is just that **mitos's HTTP surface is designed to be
+replicated, not just queried**: every indexer's view should be
+expressible as a stream of `(slot, hash, change)` records, with
+`Apply` and `Undo` as the two change kinds, mirroring the `TipEvent`
+contract one level up.
+
+This framing also explains why mitos doesn't try to be highly available
+on its own — it's the upstream of a replication tree, not the serving
+layer. HA at the VPS layer would be solving the wrong problem; HA at
+the CF layer is what the platform already gives us for free.
+
+## The Dolos coupling
+
+Embedding Dolos as a library means mitos inherits two real operational
+constraints. Worth naming explicitly so they don't surprise anyone
+later.
+
+**Version coupling at the WAL schema level.** Dolos versions its WAL
+schema and refuses to recover a data dir written by a different schema
+version. Concretely: a mitos build pinned to `dolos = { tag = "v1.0.3" }`
+will not start against a data dir written by `dolos v1.1.0`, and vice
+versa. Each workspace bump is a deliberate decision involving (a)
+recompiling mitos, and (b) ensuring the data dir mitos points at was
+written by a compatible Dolos. There is no online upgrade. This is
+acceptable because the chain follower is the deployed binary; we
+control the rebuild cadence.
+
+**Data dir is an atomic unit.** WAL + state + index must be a
+consistent snapshot. Filesystem-level snapshotting only works while
+Dolos is fully stopped — concurrent writes during a copy produce a
+state mitos refuses to bootstrap on, with a `state` cursor ahead of the
+`archive`/WAL cursor. The deploy story (Phase 3) inherits this: bundle
+parallel-run for schema migrations means each bundle owns its own
+Dolos data dir and bootstraps from Mithril independently, not by
+copying from a sibling.
+
+`dolos doctor reset-wal` exists as a recovery tool for small WAL/state
+divergences, but treat it as a backstop, not a routine workaround. The
+ROADMAP records the empirical incident this came out of.
+
 ## Where Shiku fits
 
 `Shiku` (the deploy tool from `~/code/defrag/augminted-bots/shiku/`)

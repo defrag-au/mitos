@@ -5,10 +5,44 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Dolos core types + the concrete DomainAdapter we wire up.
+dolos = { workspace = true }
 dolos-core = { workspace = true }
+dolos-cardano = { workspace = true }
+
+# `gasket` is what Dolos's chain-sync pipeline runs on; we need to pull
+# it as a direct dep so we can construct the `Daemon::new(pipeline)`
+# wrapper around it ourselves.
+gasket = "^0.9"
+
+# Config loading mirrors Dolos's pattern (TOML + env overrides).
+config = { workspace = true }
+
 async-trait = { workspace = true }
 axum = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+miette = "7"
+
+# Subscription scope payloads on the CF replication channel are CBOR;
+# the framework decodes once at the IndexerHandle boundary.
+serde = { workspace = true }
+serde_bytes = "0.11"
+ciborium = "0.2"
+
+# WebSocket message receive uses `StreamExt::next` on the split stream.
+futures-util = { version = "0.3", default-features = false }
+
+# Outbound WebSocket client for the `Replicator` (mitos dials
+# CF Durable Objects). `rustls-tls-webpki-roots` keeps the build
+# self-contained — no system OpenSSL needed.
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+
+# Persistent subscription registry for the Replicator.
+redb = { workspace = true }

@@ -12,7 +12,11 @@
 members = [
     "crates/mitos-core",
     "crates/jpg-co-indexer",
+    "crates/collection-ownership-indexer",
     "bundles/default",
+    "tools/diff-collection-ownership",
+    "tools/mitos-tail",
+    "tools/mitos-admin",
 ]
 resolver = "2"
 
@@ -25,11 +29,11 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Dolos as embedded data plane. Pinned to a tag for reproducibility;
 # bump deliberately and audit the diff (see docs/design/ROADMAP.md).
-dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.1.0" }
+dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
 
 # Cardano types + parsing. Same pallas version Dolos uses.
 pallas = "1.0.0-alpha.3"
@@ -42,7 +46,7 @@ pallas-traverse = "1.0.0-alpha.3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }
 tower = "0.5"
 
 # Serialization + logging + errors.
@@ -61,6 +65,9 @@ redb = "2"
 # CLI / config.
 clap = { version = "4", features = ["derive", "env"] }
 config = { version = "0.14", default-features = false, features = ["toml"] }
+
+# HTTP client for the diff harness (polls both workers' read APIs).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
 [profile.release]
 opt-level = 3

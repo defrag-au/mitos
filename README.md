@@ -32,21 +32,27 @@ contract every indexer must implement is in `docs/design/INDEXER_TRAIT.md`.
 
 ## Status
 
-Skeleton. The pieces in place:
+**Phase 1 validated end-to-end against a real Dolos data directory.** The
+default bundle starts, recovers state + index keyspaces from a snapshot of
+the production mainnet data dir, runs the Cardano logic, and dispatches
+`TipEvent::Apply` blocks to the `JpgCoIndexer` stub as the chain advances.
+
+In place:
 
 - Workspace structure
-- Public `Indexer<D: Domain>` trait
-- Tip-event dispatcher signature
-- A stub `JpgCoIndexer` that just logs events
-- A `default` bundle main that wires Dolos + the stub together (Dolos init
-  is currently a TODO — see `bundles/default/src/main.rs`)
+- Public `Indexer<D: Domain>` trait + tip-event dispatcher
+- `mitos-core::{load_config, setup_domain, spawn_sync_pipeline}` —
+  replicates Dolos's `bin/dolos/common.rs` initialization
+- A stub `JpgCoIndexer` that logs Apply/Undo/Mark events
+- A `default` bundle main that composes Dolos + the stub, runs an axum
+  HTTP server, and handles graceful shutdown
 
 Things explicitly NOT done yet (see `docs/design/ROADMAP.md`):
 
-- Actual `setup_domain` wiring (need to replicate `dolos/src/bin/dolos/common.rs`'s logic)
-- Storage layer for indexer materialized views (redb scaffolded as workspace dep)
-- Bootstrap implementations (use `domain.indexes()` + `domain.state()`)
+- Real `JpgCoIndexer::bootstrap` (currently returns `ChainPoint::Origin`)
+- Apply/Undo logic that actually decodes blocks and writes a materialized view
 - HTTP route implementations
+- Storage layer for indexer materialized views (redb scaffolded as workspace dep)
 - ARM64 cross-compile + deploy via Shiku
 
 ## Layout
@@ -72,16 +78,28 @@ Different deployments can be different bundles.
 
 ## Building
 
-Standard cargo. Pinned to Rust toolchain via `rust-toolchain.toml` (TODO).
+A `flake.nix` provides the dev shell — same `defrag-nix` `rust-worker-stack`
+the wider org uses, so the toolchain is in lock-step with cnft.dev-workers
+and similar repos:
 
 ```
-cargo build                       # build everything
-cargo build -p mitos --release    # release binary for deployment
+nix develop -c cargo build                       # build everything
+nix develop -c cargo build -p mitos --release    # release binary for deployment
 ```
 
-Dolos crate dependencies are git deps from `txpipe/dolos@v1.1.0`. First build
-will resolve and compile them — this can take a while. Subsequent rebuilds are
-incremental.
+If you have cargo on PATH already (e.g. via system rustup), plain
+`cargo build` works the same — the flake is convenience, not a hard
+requirement.
+
+Dolos crate dependencies are git deps pinned to a specific tag in
+`Cargo.toml` (currently `v1.0.3`). First build will resolve and compile
+them — this can take a while. Subsequent rebuilds are incremental.
+
+**The pinned tag must match the version of Dolos that wrote the data
+directory you're pointing the bundle at.** Dolos's WAL schema is versioned
+and a mismatch fails fast with `WAL schema not compatible: found=N
+expected=M`. See `docs/design/ROADMAP.md` Phase 1 notes for the full
+incident and recovery commands.
 
 ## Running
 
@@ -93,9 +111,25 @@ local dev:
 DOLOS_CONFIG=/path/to/dolos.toml cargo run -p mitos
 ```
 
-This is currently a stub — actual chain-event flow is gated on the
-`setup_domain` TODO in `bundles/default/src/main.rs`. See ROADMAP for the
-sequence.
+The bundle starts the chain-sync pipeline, brings each indexer through
+`bootstrap()`, and dispatches `TipEvent`s as the WAL advances. The
+`JpgCoIndexer` is currently a stub that just logs events — Phase 2 fills
+in real bootstrap, decode, and HTTP routes (see ROADMAP).
+
+The Dolos data directory is an **atomic unit**: WAL, state, and index
+must be a consistent snapshot. To clone a running Dolos instance for
+mitos experiments, **stop Dolos cleanly** first, then `cp -a` the whole
+data dir. Filesystem-level snapshots taken while Dolos is writing will
+produce a state that fails to recover.
+
+## Testing
+
+End-to-end recipes for exercising the CF replication path —
+protocol-only loop with `mitos-tail`, full mitos↔CF DO round-trip,
+and the parallel-run convergence diff against the existing
+`collection-ownership` worker — are in
+[`docs/TESTING.md`](docs/TESTING.md). Start there once the bundle
+builds.
 
 ## Related
 

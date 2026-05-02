@@ -1,14 +1,40 @@
-//! Core trait + dispatcher for the mitos framework.
+//! Core trait + dispatcher + domain wiring + CF replication for the
+//! mitos framework.
 //!
 //! See `../../docs/design/INDEXER_TRAIT.md` for the contract.
 //! See `../../docs/design/ARCHITECTURE.md` for why this exists.
+//! See `../../docs/design/CF_REPLICATION.md` for the subscription
+//! model behind the trait's associated `Scope` and `Change` types.
 
+mod auth;
+mod bundle;
 mod dispatcher;
+mod domain;
+mod emitter;
+mod handle;
 mod indexer;
+mod replicate;
+mod replicator;
+mod transport;
 
+#[cfg(test)]
+mod tests;
+
+pub use auth::AuthToken;
+pub use bundle::{Bundle, print_config_summary};
 pub use dispatcher::run_dispatcher;
-pub use indexer::Indexer;
+pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
+pub use emitter::{EmittedRecord, Emitter};
+pub use handle::{IndexerAdapter, IndexerHandle};
+pub use indexer::{Indexer, SubscribeReply};
+pub use replicate::{
+    ClientMessage, ServerMessage, decode_client, decode_server, encode_client, encode_server,
+    replicate_router,
+};
+pub use replicator::{Replicator, Subscription, SubscriptionId};
+pub use transport::{AxumWs, TungsteniteWs, WsTransport};
 
 // Re-export the dolos types indexers need at the trait surface, so
 // downstream crates only need to depend on `mitos-core`.
-pub use dolos_core::{ChainPoint, Domain, TipEvent};
+pub use dolos::adapters::DomainAdapter;
+pub use dolos_core::{BlockHash, ChainPoint, Domain, TipEvent, TipSubscription};

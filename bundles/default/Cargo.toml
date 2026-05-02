@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 mitos-core = { path = "../../crates/mitos-core" }
 jpg-co-indexer = { path = "../../crates/jpg-co-indexer" }
+collection-ownership-indexer = { path = "../../crates/collection-ownership-indexer" }
 
 # Dolos for the embedded data plane.
 dolos = { workspace = true }
@@ -19,6 +20,7 @@ dolos-cardano = { workspace = true }
 
 # Runtime / HTTP / observability.
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

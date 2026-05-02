@@ -1,0 +1,19 @@
+[package]
+name = "collection-ownership-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mitos-core = { path = "../mitos-core" }
+
+dolos-core = { workspace = true }
+dolos-cardano = { workspace = true }
+pallas = { workspace = true }
+
+async-trait = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
