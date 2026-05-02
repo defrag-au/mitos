@@ -279,7 +279,7 @@ async fn list_subscriptions(State(state): State<AdminState>) -> Json<Vec<Subscri
 /// ```json
 /// {
 ///   "indexer": "collection-ownership",
-///   "target_url": "wss://collection-ownership-mitos.<acct>.workers.dev/_internal/replicate?policy_id=abc...",
+///   "target_url": "wss://collections-mitos.<acct>.workers.dev/_internal/replicate?policy_id=abc...",
 ///   "scope": {"policy_id": "abc..."},
 ///   "cursor": "origin"
 /// }

@@ -147,7 +147,7 @@ existing reorg gap rather than just preserving current behaviour. The
 code is at `cnft.dev-workers/workers/collection-ownership/`.
 
 **Fork, don't feature-flag.** New worker at
-`cnft.dev-workers/workers/collection-ownership-mitos/` runs in
+`cnft.dev-workers/workers/collections-mitos/` runs in
 parallel with the existing `collection-ownership` for as long as
 convergence validation requires (target: 30+ days of byte-identical
 read-API output before retiring the original). The fork avoids any
@@ -175,7 +175,7 @@ Each step lands cleanly before the next becomes meaningful.
    `subscribe` to add `policy_id`; cold subscribe returns
    `cursor = current_tip` (no backfill yet). Proves end-to-end records
    flow for new mints/transfers.
-4. **`collection-ownership-mitos` worker, minimum viable.** Hibernated
+4. **`collections-mitos` worker, minimum viable.** Hibernated
    WebSocket consumer, same SQLite schema as existing worker, same
    read APIs. Wire one test policy. **Diff `/api/check` and
    `/api/bundle` outputs against the existing worker hourly — that's
@@ -232,7 +232,7 @@ Each step lands cleanly before the next becomes meaningful.
    offers) into a second indexer alongside `OwnershipIndexer`. The
    per-policy CF DO subscribes to *both* feeds, becoming a
    per-policy collection-state aggregator. Worker renames from
-   `collection-ownership-mitos` to `collections-mitos`. Full
+   `collections-mitos` to `collections-mitos`. Full
    design + phasing in `MARKETPLACE_INDEXER.md`.
 10. **Extract `mitos-protocol` crate** so the worker side stops
     hand-mirroring wire types. The first end-to-end test (Black Flag,
@@ -261,7 +261,7 @@ Each step lands cleanly before the next becomes meaningful.
      the dispatcher boundary.
    - Once mitos is a public repo, `cnft.dev-workers` adds it as a
      git or version dep. The hand-mirrored
-     `workers/collection-ownership-mitos/src/protocol.rs` deletes.
+     `workers/collections-mitos/src/protocol.rs` deletes.
    - Estimated ~30 minutes of work; bounded; no API change to
      existing consumers.
 

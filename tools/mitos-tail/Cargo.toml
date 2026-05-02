@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 mitos-core = { path = "../../crates/mitos-core" }
+# Typed protocol-event taxonomy — used by `--decode protocol-event`
+# to surface brand + kind + brand-specific payload arms in
+# human-readable output instead of dumping raw CBOR bytes.
+mitos-protocol = { path = "../../crates/mitos-protocol" }
 
 clap = { workspace = true }
 serde = { workspace = true }
@@ -23,3 +27,9 @@ tracing-subscriber = { workspace = true }
 hex = { workspace = true }
 ciborium = "0.2"
 url = "2"
+
+[dev-dependencies]
+# Used in unit tests to construct sample `ProtocolEvent`s the same
+# way the marketplace indexer does.
+cardano-assets = { workspace = true }
+pipeline-types = { workspace = true }

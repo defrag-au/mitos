@@ -21,7 +21,7 @@ Cross-references:
 
 ## Goals
 
-A consumer worker — `collection-ownership-mitos`, a future DEX
+A consumer worker — `collections-mitos`, a future DEX
 worker, an alert-rule evaluator — needs to say:
 
 - *which assets* it cares about (one policy, one fingerprint,
@@ -356,7 +356,7 @@ implements `change_matches_scope` via the matching algorithm above.
 
 ## What this enables
 
-- **`collection-ownership-mitos`** subscribes to: `Interest { asset:
+- **`collections-mitos`** subscribes to: `Interest { asset:
   Policy(p), domain: Any, value: Any }` per policy it tracks.
   Receives ownership state changes (today's behaviour) plus, on
   opt-in, marketplace events for that policy.

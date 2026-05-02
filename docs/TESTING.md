@@ -89,7 +89,7 @@ full hibernation-API path.
 ### 2.1 Deploy the worker
 
 ```sh
-cd ~/code/defrag/cnft.dev-workers/workers/collection-ownership-mitos
+cd ~/code/defrag/cnft.dev-workers/workers/collections-mitos
 
 # Configure the auth token CF-side (same value as mitos):
 nix develop -c wrangler secret put MITOS_TOKEN
@@ -136,7 +136,7 @@ Use `mitos-admin` (sibling tool, friendly args, no JSON
 heredocs):
 
 ```sh
-TARGET="wss://collection-ownership-mitos.<account>.workers.dev/_internal/replicate?policy_id=<hex>"
+TARGET="wss://collections-mitos.<account>.workers.dev/_internal/replicate?policy_id=<hex>"
 POLICY="<28-byte-policy-hex>"
 
 cd ~/code/defrag/mitos
@@ -184,7 +184,7 @@ subscriptions: total=1 connected=1 connecting=0 backing_off=0 disconnected=0
 ### 2.5 Probe the DO's read APIs
 
 ```sh
-BASE="https://collection-ownership-mitos.<account>.workers.dev"
+BASE="https://collections-mitos.<account>.workers.dev"
 
 # Asset count for the policy:
 curl "$BASE/api/stats/$POLICY"
@@ -235,7 +235,7 @@ Phase 4.5.
 cd ~/code/defrag/mitos
 nix develop -c cargo run --release -p diff-collection-ownership -- \
     --baseline https://ownership.cnft.dev \
-    --mitos    https://collection-ownership-mitos.<account>.workers.dev \
+    --mitos    https://collections-mitos.<account>.workers.dev \
     --policy   <hex> \
     --probe-asset <asset_hex> --probe-stake stake1u...8 \
     --probe-asset <asset_hex2> --probe-stake stake1u...9 \
@@ -268,7 +268,7 @@ roadmap's "byte-identical hourly" success criterion.
 ## Cost validation (hibernation actually working)
 
 After Scenario 2 has been running for an hour or more, check the CF
-dashboard for the `collection-ownership-mitos` worker:
+dashboard for the `collections-mitos` worker:
 
 - DO → Active duration should be **~3 min/day per consumer**, not
   24 hours.

@@ -420,7 +420,7 @@ through other code paths, presented from a single per-policy DO.
 
 ## Worker rename
 
-`collection-ownership-mitos` becomes a misnomer once it consumes
+`collections-mitos` becomes a misnomer once it consumes
 non-ownership feeds. Suggested rename: **`collections-mitos`**.
 Routes move from `ownership-mitos.cnft.dev/api/...` to
 `collections-mitos.cnft.dev/api/...` (or the existing

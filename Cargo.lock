@@ -2958,11 +2958,14 @@ name = "mitos-tail"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "cardano-assets",
  "ciborium",
  "clap",
  "futures-util",
  "hex",
  "mitos-core",
+ "mitos-protocol",
+ "pipeline-types",
  "serde",
  "serde_json",
  "tokio",
