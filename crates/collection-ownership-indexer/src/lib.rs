@@ -49,6 +49,18 @@ pub enum OwnershipChange {
     Transfer {
         policy_id: String,
         asset_name: String,
+        /// CIP-14 fingerprint (`asset1...`). Computed once on the
+        /// indexer side via `cardano_assets::AssetId::fingerprint_typed`
+        /// and emitted as a string on the wire (CBOR doesn't gain
+        /// from typed wrappers in transit). The CF-side mirror
+        /// can leave this as `String` for now or upgrade to typed
+        /// in the planned `mitos-protocol` extraction (ROADMAP
+        /// step 10).
+        ///
+        /// Adding this field is wire-compatible with older CF
+        /// workers that don't know about it — serde+CBOR ignores
+        /// unknown map entries on read.
+        asset_fingerprint: String,
         new_owner: String,
         tx_hash: String,
         output_index: u32,
@@ -127,9 +139,12 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
                                 continue;
                             }
                             for asset in policy_assets.assets() {
+                                let asset_name_hex = hex::encode(asset.name());
+                                let fingerprint = compute_fingerprint(&policy, &asset_name_hex);
                                 emitter.apply(OwnershipChange::Transfer {
                                     policy_id: policy.clone(),
-                                    asset_name: hex::encode(asset.name()),
+                                    asset_name: asset_name_hex,
+                                    asset_fingerprint: fingerprint,
                                     new_owner: address.clone(),
                                     tx_hash: tx_hash.clone(),
                                     output_index: idx as u32,
@@ -281,9 +296,12 @@ fn backfill_for_policy<D: Domain>(
                 continue;
             }
             for asset in policy_assets.assets() {
+                let asset_name_hex = hex::encode(asset.name());
+                let fingerprint = compute_fingerprint(policy_hex, &asset_name_hex);
                 out.push(OwnershipChange::Transfer {
                     policy_id: policy_hex.to_string(),
-                    asset_name: hex::encode(asset.name()),
+                    asset_name: asset_name_hex,
+                    asset_fingerprint: fingerprint,
                     new_owner: address.clone(),
                     tx_hash: hex::encode(txo_ref.0),
                     output_index: txo_ref.1,
@@ -293,4 +311,47 @@ fn backfill_for_policy<D: Domain>(
     }
 
     Ok(resume_cursor)
+}
+
+/// Compute the CIP-14 asset fingerprint for `(policy_hex,
+/// asset_name_hex)`.
+///
+/// Returns the bech32 string (`asset1...`). Falls back to an empty
+/// string with a warn log if the inputs don't validate as a
+/// well-formed `AssetId` — exceedingly rare since both come
+/// straight from on-chain data, but the framework's emit loop
+/// shouldn't crash on a single malformed input.
+fn compute_fingerprint(policy_hex: &str, asset_name_hex: &str) -> String {
+    use cardano_assets::AssetId;
+
+    // CIP-14 is defined for any asset, including empty asset
+    // name. AssetId::new rejects empty names, so use
+    // new_unchecked when we hit that case (the indexer already
+    // accepts these via `output.value().assets()` even though
+    // the consumer DO will filter them out as minting-script
+    // artifacts).
+    let asset_id = if asset_name_hex.is_empty() {
+        AssetId::new_unchecked(policy_hex.to_string(), String::new())
+    } else {
+        match AssetId::new(policy_hex.to_string(), asset_name_hex.to_string()) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    policy = %policy_hex,
+                    asset_name = %asset_name_hex,
+                    error = %e,
+                    "invalid AssetId for fingerprint computation; emitting empty"
+                );
+                return String::new();
+            }
+        }
+    };
+
+    match asset_id.fingerprint_typed() {
+        Ok(f) => f.into_string(),
+        Err(e) => {
+            warn!(error = %e, "fingerprint computation failed; emitting empty");
+            String::new()
+        }
+    }
 }

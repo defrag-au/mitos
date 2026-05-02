@@ -507,6 +507,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c53ba0f290bfc610084c05582d9c5d421662128fc69f4bf236707af6fd321b9"
 
 [[package]]
+name = "cardano-assets"
+version = "0.1.0"
+dependencies = [
+ "bech32 0.11.1",
+ "blake2 0.10.6",
+ "hex",
+ "indexmap 2.9.0",
+ "serde",
+ "serde_json",
+ "serde_plain",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -640,6 +653,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.4",
+ "cardano-assets",
  "dolos-cardano",
  "dolos-core",
  "hex",
@@ -4369,6 +4383,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59fab13f937fa393d08645bf3a84bdfe86e296747b506ada67bb15f10f218b2a"
 dependencies = [
  "itoa",
+ "serde",
+]
+
+[[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
  "serde",
 ]
 
