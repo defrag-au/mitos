@@ -140,7 +140,12 @@ pub struct ReplicatorSummary {
 impl Replicator {
     /// Open (or create) the persistent registry at `db_path` and
     /// re-spawn dial loops for every persisted subscription.
-    pub fn new(
+    ///
+    /// Async because restoring subscriptions requires acquiring
+    /// the inner Mutex from within a tokio runtime context — the
+    /// blocking variant panics with `Cannot block the current
+    /// thread from within a runtime`.
+    pub async fn new(
         handles: &[Arc<dyn IndexerHandle>],
         domain: DomainAdapter,
         db_path: impl AsRef<Path>,
@@ -186,7 +191,7 @@ impl Replicator {
 
         // Re-spawn dial loops for every persisted entry.
         for (id, sub) in persisted {
-            replicator.spawn_blocking_existing(id, sub);
+            replicator.respawn_existing(id, sub).await;
         }
 
         Ok(replicator)
@@ -309,8 +314,9 @@ impl Replicator {
 
     /// Restore a persisted subscription on startup — does not
     /// re-write to redb (it's already there) and does not bump the
-    /// id counter. Used only by `new`.
-    fn spawn_blocking_existing(&self, id: SubscriptionId, sub: Subscription) {
+    /// id counter. Used only by `new`. Async because we're inside
+    /// a tokio runtime when called.
+    async fn respawn_existing(&self, id: SubscriptionId, sub: Subscription) {
         let handle = match self.indexers.get(&sub.indexer).cloned() {
             Some(h) => h,
             None => {
@@ -331,10 +337,7 @@ impl Replicator {
             self.auth.clone(),
             state.clone(),
         ));
-        // We're holding `&self`, not `&mut self`; need to grab the
-        // Mutex synchronously. `new` is called from a blocking
-        // context (during bundle setup), so block_in_place is fine.
-        let mut inner = self.inner.blocking_lock();
+        let mut inner = self.inner.lock().await;
         inner.subs.insert(id, ActiveSub { sub, state, task });
     }
 }

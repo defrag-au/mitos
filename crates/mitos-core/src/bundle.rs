@@ -135,12 +135,15 @@ impl Bundle {
         app = app.merge(replicate_router(&indexers, domain.clone(), auth.clone()));
 
         let replicator_path = data_dir.join("subscriptions.redb");
-        let replicator = Arc::new(Replicator::new(
-            &indexers,
-            domain.clone(),
-            &replicator_path,
-            auth.clone(),
-        )?);
+        let replicator = Arc::new(
+            Replicator::new(
+                &indexers,
+                domain.clone(),
+                &replicator_path,
+                auth.clone(),
+            )
+            .await?,
+        );
         info!(path = %replicator_path.display(), "replicator registry opened");
         app = app.merge(admin_router(replicator.clone(), auth.clone()));
 
