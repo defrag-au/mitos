@@ -46,6 +46,20 @@ async fn main() -> anyhow::Result<()> {
     info!(config = %args.config, listen = %args.listen, "mitos starting");
 
     let config = mitos_core::load_config(&args.config)?;
+
+    // Early exit BEFORE opening data stores (which acquires the
+    // WAL lock). Lets `--print-config-only` run safely against a
+    // dir that's actively being used by another mitos instance.
+    if args.print_config_only {
+        mitos_core::print_config_summary(
+            &config,
+            args.listen,
+            &args.data_dir,
+            &["jpg-co", "collection-ownership"],
+        )?;
+        return Ok(());
+    }
+
     let domain = mitos_core::setup_domain(&config)?;
     info!("domain initialized");
 
@@ -54,11 +68,6 @@ async fn main() -> anyhow::Result<()> {
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
     bundle.add_indexer(JpgCoIndexer::new()?);
     bundle.add_indexer(OwnershipIndexer::new()?);
-
-    if args.print_config_only {
-        bundle.print_config_summary()?;
-        return Ok(());
-    }
 
     bundle.run(exit).await?;
 

@@ -21,7 +21,7 @@ mod transport;
 mod tests;
 
 pub use auth::AuthToken;
-pub use bundle::Bundle;
+pub use bundle::{Bundle, print_config_summary};
 pub use dispatcher::run_dispatcher;
 pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
 pub use emitter::{EmittedRecord, Emitter};

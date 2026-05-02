@@ -78,12 +78,18 @@ Different deployments can be different bundles.
 
 ## Building
 
-Standard cargo. Pinned to Rust toolchain via `rust-toolchain.toml` (TODO).
+A `flake.nix` provides the dev shell — same `defrag-nix` `rust-worker-stack`
+the wider org uses, so the toolchain is in lock-step with cnft.dev-workers
+and similar repos:
 
 ```
-cargo build                       # build everything
-cargo build -p mitos --release    # release binary for deployment
+nix develop -c cargo build                       # build everything
+nix develop -c cargo build -p mitos --release    # release binary for deployment
 ```
+
+If you have cargo on PATH already (e.g. via system rustup), plain
+`cargo build` works the same — the flake is convenience, not a hard
+requirement.
 
 Dolos crate dependencies are git deps pinned to a specific tag in
 `Cargo.toml` (currently `v1.0.3`). First build will resolve and compile

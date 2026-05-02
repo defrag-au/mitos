@@ -84,56 +84,6 @@ impl Bundle {
         self.indexers.push(Arc::new(adapter));
     }
 
-    /// Print a summary of the loaded configuration to stdout
-    /// without spawning the chain follower or any dispatchers, then
-    /// return. Used by `mitos --print-config-only` to validate
-    /// startup state offline (env vars, paths, persisted
-    /// subscriptions).
-    pub fn print_config_summary(self) -> anyhow::Result<()> {
-        let Bundle {
-            domain: _,
-            config,
-            listen,
-            data_dir,
-            indexers,
-        } = self;
-
-        println!("# mitos config summary");
-        println!();
-        println!("listen:        {listen}");
-        println!("data_dir:      {}", data_dir.display());
-        println!("storage.wal:   {:?}", config.storage.wal.path());
-        println!("storage.state: {:?}", config.storage.state.path());
-        println!();
-        println!("indexers ({}):", indexers.len());
-        for h in &indexers {
-            println!("  - {}", h.name());
-        }
-        println!();
-
-        let auth = AuthToken::from_env();
-        println!("auth:          {}", if auth.is_open() { "OPEN" } else { "set" });
-        println!();
-
-        let replicator_path = data_dir.join("subscriptions.redb");
-        let persisted = Replicator::list_persisted(&replicator_path)?;
-        println!(
-            "persisted subscriptions ({}, from {}):",
-            persisted.len(),
-            replicator_path.display()
-        );
-        for (id, sub) in persisted {
-            println!(
-                "  [{id}] indexer={} target={} cursor={:?} scope_bytes={}",
-                sub.indexer,
-                sub.target_url,
-                sub.cursor,
-                sub.scope.len()
-            );
-        }
-        Ok(())
-    }
-
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
     /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
     /// `/replicate/{indexer}` test surface + `/_admin/subscriptions`),
@@ -230,6 +180,57 @@ impl Bundle {
 
         Ok(())
     }
+}
+
+/// Print a summary of the loaded configuration to stdout without
+/// opening the Dolos data stores or spawning anything. Used by
+/// `mitos --print-config-only` to validate startup state offline
+/// (env vars, paths, persisted subscriptions) — crucially, this
+/// does NOT acquire the WAL lock, so it's safe to run while
+/// another mitos instance is live against the same data dir.
+pub fn print_config_summary(
+    config: &RootConfig,
+    listen: SocketAddr,
+    data_dir: &std::path::Path,
+    indexer_names: &[&'static str],
+) -> anyhow::Result<()> {
+    println!("# mitos config summary");
+    println!();
+    println!("listen:        {listen}");
+    println!("data_dir:      {}", data_dir.display());
+    println!("storage.wal:   {:?}", config.storage.wal.path());
+    println!("storage.state: {:?}", config.storage.state.path());
+    println!();
+    println!("indexers ({}):", indexer_names.len());
+    for n in indexer_names {
+        println!("  - {n}");
+    }
+    println!();
+
+    let auth = AuthToken::from_env();
+    println!(
+        "auth:          {}",
+        if auth.is_open() { "OPEN" } else { "set" }
+    );
+    println!();
+
+    let replicator_path = data_dir.join("subscriptions.redb");
+    let persisted = Replicator::list_persisted(&replicator_path)?;
+    println!(
+        "persisted subscriptions ({}, from {}):",
+        persisted.len(),
+        replicator_path.display()
+    );
+    for (id, sub) in persisted {
+        println!(
+            "  [{id}] indexer={} target={} cursor={:?} scope_bytes={}",
+            sub.indexer,
+            sub.target_url,
+            sub.cursor,
+            sub.scope.len()
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

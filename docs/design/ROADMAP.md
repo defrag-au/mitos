@@ -189,6 +189,30 @@ Each step lands cleanly before the next becomes meaningful.
 7. **Reorg validation.** Pick a known historical reorg, replay both
    pipelines, confirm mitos side emits `Undo` records and converges
    correctly while existing side does not.
+8. **Extract `mitos-protocol` crate** so the worker side stops
+   hand-mirroring wire types. The first end-to-end test (Black Flag,
+   2026-05-02) hit a wire-format bug because pallas's `Hash<32>`
+   Serialize impl emits a hex *string*, not bytes, and the worker's
+   `protocol.rs` declared the cursor's hash field as
+   `#[serde(with = "serde_bytes")] Vec<u8>` — every record failed
+   to decode. Mirroring is structurally drift-prone; a shared crate
+   prevents the class.
+
+   Shape:
+   - New crate `crates/mitos-protocol` in the mitos workspace.
+     wasm32-compatible (no dolos/pallas deps in the *protocol*
+     types). Owns: `ChainPoint`, `ClientMessage`, `ServerMessage`,
+     `SubscribeReply`, encode/decode helpers, the indexer-specific
+     change types (`OwnershipScope`, `OwnershipChange`).
+   - `ChainPoint::Specific(u64, String)` is canonical (the hex
+     string matches what pallas emits on the wire). mitos-core
+     defines `From<dolos_core::ChainPoint>` for the conversion at
+     the dispatcher boundary.
+   - Once mitos is a public repo, `cnft.dev-workers` adds it as a
+     git or version dep. The hand-mirrored
+     `workers/collection-ownership-mitos/src/protocol.rs` deletes.
+   - Estimated ~30 minutes of work; bounded; no API change to
+     existing consumers.
 
 ### How to run it
 

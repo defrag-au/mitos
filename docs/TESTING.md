@@ -12,9 +12,9 @@ The Phase 4.5 build order + success criteria are in
 
 - A Dolos data directory you control (mitos can read it; pin must
   match — see ROADMAP Phase 1 lessons banked).
-- `nix develop` shell available in `~/code/defrag/mitos`.
-- For Scenario 2+: a Cloudflare account and `wrangler` on PATH (via
-  the cnft.dev-workers `nix develop -c` shell).
+- `nix develop` shell available in `~/code/defrag/mitos` (via the
+  repo's `flake.nix`). Provides `cargo`, `rustc`, `clippy`, plus
+  `wrangler` for the CF worker side of Scenario 2+.
 
 Pick a shared secret you'll use for `MITOS_AUTH_TOKEN` /
 `MITOS_TOKEN` — both sides need to agree. A 32-char alphanumeric is
