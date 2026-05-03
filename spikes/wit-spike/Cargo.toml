@@ -1,0 +1,18 @@
+# Standalone workspace. Kept out of the main mitos workspace so
+# `wasm32-wasip2` build target settings don't bleed into the main
+# build, and so the spike can churn on tooling without disturbing
+# the real crates.
+[workspace]
+members = ["host", "guest"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

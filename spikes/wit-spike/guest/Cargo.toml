@@ -1,0 +1,11 @@
+[package]
+name = "mitos-platform-spike-guest"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.54"

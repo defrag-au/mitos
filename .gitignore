@@ -4,6 +4,11 @@
 .envrc.local
 .DS_Store
 
+# Nested cargo targets — sub-workspaces under spikes/ have their own
+# target dirs; the top-level /target only ignores the main workspace's.
+spikes/**/target/
+spikes/**/Cargo.lock
+
 # Local data dirs (Dolos's bootstrap output). Bind-mount or point env at
 # an external path on real deployments; ignore by default for local dev.
 /data

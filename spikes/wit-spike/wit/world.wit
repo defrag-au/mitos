@@ -1,0 +1,93 @@
+// Mitos platform v1 WIT spike.
+//
+// Goal: validate three load-bearing claims from
+// `docs/strategy/MITOS_PLATFORM_V1.md` before committing the
+// real platform crate's structure.
+//
+// 1. `resolved-block` as a `borrow` parameter to handle-event —
+//    guest cannot stash it past dispatch (compile-time enforced),
+//    host pushes/borrows via `ResourceTable`.
+// 2. Async host fns via `imports: { default: async | trappable }`
+//    flow through Tokio cleanly, including `spawn_blocking` for
+//    redb-style synchronous I/O.
+// 3. Tuple-returning export `trap-policy: func() -> tuple<trap-strategy,
+//    retry-policy>` works with bindgen (or fall back to a record).
+//
+// Names + types here are spike-quality — they will be refined when
+// promoted to the real `mitos-platform` crate.
+
+package mitos:spike;
+
+interface types {
+    record output-ref {
+        tx-hash: list<u8>,
+        index: u32,
+    }
+
+    record typed-output {
+        address: string,
+        lovelace: u64,
+    }
+
+    /// Trap supervision strategy declared by the module.
+    /// Host's supervisor consults this on every trap.
+    variant trap-strategy {
+        /// Replay the block on restart. Module promises
+        /// idempotent dispatch.
+        replay,
+        /// Skip the failing block, advance the cursor, log.
+        skip-and-mark,
+        /// Stop the module, do not advance the cursor.
+        quarantine,
+    }
+
+    record retry-policy {
+        max-retries: u32,
+        backoff-cap-ms: u32,
+    }
+}
+
+interface state-kv {
+    /// Async host fn. Real impl will hit redb via spawn_blocking;
+    /// in the spike it sleeps briefly to prove the future flows
+    /// through the wasmtime executor cleanly.
+    get-value: func(key: string) -> option<list<u8>>;
+
+    set-value: func(key: string, value: list<u8>);
+}
+
+interface block-context {
+    use types.{output-ref, typed-output};
+
+    /// Host-owned, per-block resource. Passed as `borrow` to
+    /// handle-event so the guest cannot retain it past dispatch.
+    resource resolved-block {
+        slot: func() -> u64;
+        tx-count: func() -> u32;
+
+        /// Lazy: first call resolves via the data plane,
+        /// memoised for the block's lifetime.
+        get-consumed-input: func(tx-idx: u32, input-idx: u32) -> option<typed-output>;
+    }
+}
+
+world mitos-module {
+    use types.{trap-strategy, retry-policy};
+    use block-context.{resolved-block};
+
+    import state-kv;
+    import block-context;
+
+    /// ABI version handshake. Bumped on any breaking change.
+    export module-version: func() -> tuple<u32, u32>;
+
+    /// Trap supervision policy. Read once at load.
+    export trap-policy: func() -> tuple<trap-strategy, retry-policy>;
+
+    /// One-shot init at module load.
+    export init: func(config: list<u8>);
+
+    /// Single dispatch entry point. Resource handle is `borrow`
+    /// — guest cannot stash it past the call.
+    export handle-event: func(channel: u32, block: borrow<resolved-block>);
+}
