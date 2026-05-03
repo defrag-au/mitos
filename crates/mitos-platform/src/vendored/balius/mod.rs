@@ -4,15 +4,22 @@
 //! `../../../../docs/strategy/MITOS_PLATFORM_V1.md`
 //! §"What we vendor from Balius".
 //!
-//! This directory will hold (when the vendoring step lands):
-//! - `router.rs`  — `MatchKey` router (~140 lines)
-//! - `store.rs`   — redb WAL + per-worker cursor (~252 lines)
-//! - `kv.rs`      — worker-prefixed KV (subset of `kv/redb.rs`)
-//! - `metrics.rs` — OpenTelemetry per-worker metrics (~291 lines)
+//! Each file preserves an attribution annotation describing its
+//! upstream source + commit + the substantive local
+//! modifications. See `NOTICE` in this directory for project-
+//! level attribution and `LICENSE-APACHE-2.0` for the upstream
+//! license text.
 //!
-//! Each will preserve the upstream Apache-2.0 license header
-//! verbatim and carry a `// Vendored from txpipe/balius @ <sha>`
-//! annotation listing the local modifications. See `NOTICE` in
-//! this directory for attribution.
+//! Currently vendored:
+//! - `kv` — redb-backed per-module KV store (from
+//!   `balius-runtime/src/kv/redb.rs`)
 //!
-//! Until the vendoring lands, this module is empty.
+//! Planned (will land when mitos-platform needs them):
+//! - `router` — match-key routing engine (from
+//!   `balius-runtime/src/router.rs`)
+//! - `store` — redb WAL + per-worker cursor (from
+//!   `balius-runtime/src/store.rs`)
+//! - `metrics` — OpenTelemetry per-worker metrics (from
+//!   `balius-runtime/src/metrics.rs`)
+
+pub mod kv;

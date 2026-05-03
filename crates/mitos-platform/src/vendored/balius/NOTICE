@@ -21,11 +21,15 @@ crate does not claim authorship of these files; mitos-platform's
 own original sources live alongside the vendored tree under
 `src/` proper.
 
-Vendored files (planned; see MITOS_PLATFORM_V1.md):
+Vendored files:
+- kv.rs       (from balius-runtime/src/kv/redb.rs @ e9c8cd50c7d7074dc6db75633bb26c68d41da187)
+
+Planned (see MITOS_PLATFORM_V1.md):
 - router.rs   (from balius-runtime/src/router.rs)
 - store.rs    (from balius-runtime/src/store.rs)
-- kv.rs       (subset of balius-runtime/src/kv/redb.rs)
 - metrics.rs  (from balius-runtime/src/metrics.rs)
 
-Until the vendoring step lands, this directory holds only
-this NOTICE and a placeholder `mod.rs`.
+These will land when mitos-platform's needs catch up to them
+(router: when modules declare typed Watch sets at init time;
+store: when per-module redb cursor persistence + WAL is needed;
+metrics: when OpenTelemetry surfaces are wired into the host).
