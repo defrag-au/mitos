@@ -173,23 +173,29 @@ impl ModuleStorage {
         Ok(Some(self.module_dir(id).join(target)))
     }
 
-    /// Cursor checkpoint path. Single CBOR file under the
-    /// module's storage dir.
-    fn cursor_path(&self, id: &str) -> PathBuf {
-        self.module_dir(id).join("cursor.cbor")
+    /// Per-module crash-safe cursor file (redb).
+    pub fn cursor_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("cursor.redb")
     }
 
-    /// Persist the driver's last-applied cursor. Best-effort:
-    /// no fsync, no atomic-rename. Crash-safety lands when
-    /// `store.rs` is vendored from Balius (see
-    /// `vendored/balius/NOTICE`); v1.5 just gets us "restart
-    /// resumes from approximately where we were."
+    /// Per-module crash-safe KV file (redb, via the vendored
+    /// `RedbKv`). Bundle's KV factory points at this.
+    pub fn kv_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("kv.redb")
+    }
+
+    /// Persist the driver's last-applied cursor atomically.
+    /// One redb table, one row, value is CBOR-encoded
+    /// `ChainPoint`. Each `write_cursor` opens the database,
+    /// writes, fsyncs, closes — trivial overhead, full
+    /// crash-safety. We don't keep the database open between
+    /// calls because cursor writes are infrequent (one per
+    /// applied block) and the open cost is dominated by
+    /// per-block dispatch.
     pub fn write_cursor(&self, id: &str, cursor: &ChainPoint) -> Result<(), StorageError> {
         std::fs::create_dir_all(self.module_dir(id))?;
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(cursor, &mut buf)
-            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
-        std::fs::write(self.cursor_path(id), buf)?;
+        let store = CursorStore::open(self.cursor_path(id))?;
+        store.write(cursor)?;
         Ok(())
     }
 
@@ -202,10 +208,8 @@ impl ModuleStorage {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = std::fs::read(&path)?;
-        let cursor: ChainPoint = ciborium::de::from_reader(bytes.as_slice())
-            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(Some(cursor))
+        let store = CursorStore::open(&path)?;
+        store.read()
     }
 
     /// List registered module ids by directory enumeration.
@@ -225,6 +229,89 @@ impl ModuleStorage {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+/// Crash-safe per-module cursor store. One redb file per
+/// module containing a single-row `cursor` table. Opened
+/// per-call rather than kept hot — cursor writes are infrequent
+/// (one per applied block) and the open overhead is dominated
+/// by the per-block wasm dispatch cost.
+///
+/// Why not vendor Balius's `store.rs`: their `Store` is a WAL
+/// for replay-safe worker restart (`CURSORS` → `WAL` tables,
+/// workers replay `LogEntry`s forward from their recorded
+/// `LogSeq`). Mitos has a different replay model — dolos's
+/// archive *is* our WAL; on module restart we re-subscribe
+/// from the persisted `ChainPoint` and the chain follower
+/// re-fetches blocks from there. A host-side WAL would be
+/// dead weight; a focused single-row cursor store is what we
+/// actually need.
+struct CursorStore {
+    db: redb::Database,
+}
+
+const CURSOR_TABLE: redb::TableDefinition<'_, &str, &[u8]> =
+    redb::TableDefinition::new("cursor");
+const CURSOR_ROW: &str = "current";
+
+impl CursorStore {
+    fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StorageError> {
+        let db = redb::Database::builder()
+            .create(path)
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        // Initialize the table on first open so reads don't
+        // racy-fail on a not-yet-created table.
+        let wx = db
+            .begin_write()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        wx.open_table(CURSOR_TABLE)
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        wx.commit()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(Self { db })
+    }
+
+    fn write(&self, cursor: &ChainPoint) -> Result<(), StorageError> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(cursor, &mut buf)
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        let wx = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        {
+            let mut table = wx
+                .open_table(CURSOR_TABLE)
+                .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+            table
+                .insert(CURSOR_ROW, buf.as_slice())
+                .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        wx.commit()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(())
+    }
+
+    fn read(&self) -> Result<Option<ChainPoint>, StorageError> {
+        let rx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        let table = rx
+            .open_table(CURSOR_TABLE)
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        let entry = table
+            .get(CURSOR_ROW)
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        match entry {
+            Some(v) => {
+                let cursor: ChainPoint = ciborium::de::from_reader(v.value())
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+                Ok(Some(cursor))
+            }
+            None => Ok(None),
+        }
     }
 }
 

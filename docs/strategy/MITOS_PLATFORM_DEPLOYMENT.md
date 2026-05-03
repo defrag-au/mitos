@@ -534,6 +534,55 @@ managed-mitos service trust model), the path is well-trodden:
 strip` to remove non-deterministic custom sections. Worth
 doing then; not worth the complexity now.
 
+### 7. Vendoring Balius's `store.rs` — RESOLVED: don't, build focused redb cursor instead
+
+Originally listed as planned vendoring (alongside `kv.rs`,
+`router.rs`, `metrics.rs`) per `MITOS_PLATFORM_V1.md`'s "What
+we vendor from Balius" section. On closer inspection, the file
+isn't a fit for our v1 needs.
+
+**What Balius's `store.rs` actually is:** a write-ahead log for
+replay-safe worker restart. Two redb tables:
+- `CURSORS`: `WorkerId → LogSeq` (each worker's position in the WAL)
+- `WAL`: `LogSeq → LogEntry { next_block, undo_blocks }`
+
+On worker restart, Balius replays from the worker's recorded
+`LogSeq` forward through the WAL — that's how a Balius worker
+catches up after a crash without re-fetching from chain.
+
+**Why mitos doesn't need this:** dolos's archive *is* our WAL.
+On module restart we re-subscribe via
+`Domain::watch_tip(Some(persisted_cursor))` and dolos serves
+the missed blocks directly from its archive. A host-side WAL
+would be a duplicate retention layer with no behavioural
+benefit.
+
+**What we built instead:** a focused single-row `CursorStore`
+in `mitos_platform::storage`:
+- One redb file per module: `<storage>/<id>/cursor.redb`
+- One table `cursor` with one row keyed `"current"`,
+  value=CBOR-encoded `ChainPoint`
+- Open/write/commit/close per call (cursor writes are
+  infrequent — one per applied block — so the open cost is
+  negligible compared to the block dispatch cost)
+
+This gives us crash-safety (atomic redb commit, fsync on close)
+without the operational complexity of a host-side WAL. Roughly
+80 lines vs. Balius's 252.
+
+**KV side** (the other half of "module state"): the existing
+`vendored/balius/kv.rs` continues to back per-module KV via
+`ModuleKv::open_redb(<storage>/<id>/kv.redb)`. The bundle's
+KV factory builds these per-module on first use; falls back
+to in-memory with a loud error log if redb open fails (avoids
+host startup failure for a single bad module).
+
+**Updating the vendoring plan in `MITOS_PLATFORM_V1.md`:** the
+list of "planned vendorings" loses `store.rs`. `router.rs` +
+`metrics.rs` remain on the plan for when we actually need them
+(router: when modules declare typed Watch sets at init-time;
+metrics: when OpenTelemetry surfaces are wired into the host).
+
 ## Lessons banked from related work
 
 - **`worker-build` does ONE thing well** (build a wasm-bindgen

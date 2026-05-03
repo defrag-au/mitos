@@ -199,8 +199,32 @@ impl Bundle {
                     .expect("watch_tip subscribe failed")
             });
 
-            let kv_factory: mitos_platform::host::KvFactory = Arc::new(|_id: &str| {
-                mitos_platform::host_fns::state_kv::ModuleKv::new_in_memory()
+            // Per-module redb-backed KV — crash-safe across
+            // restarts. Each module gets its own `kv.redb`
+            // alongside `cursor.redb` + `current.wasm`.
+            let storage_for_kv = storage.clone();
+            let kv_factory: mitos_platform::host::KvFactory = Arc::new(move |id: &str| {
+                let path = storage_for_kv.kv_path(id);
+                match mitos_platform::host_fns::state_kv::ModuleKv::open_redb(&path, None) {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        // Fall back to in-memory rather than refusing
+                        // to start. The error logs loudly; cursor
+                        // resume still works (cursor lives in its own
+                        // file), so the operator can investigate
+                        // without taking the host down. In practice
+                        // open() failure here means a permissions or
+                        // disk-full issue that affects the whole
+                        // modules dir.
+                        error!(
+                            module = %id,
+                            path = %path.display(),
+                            error = %e,
+                            "redb KV open failed; falling back to in-memory"
+                        );
+                        mitos_platform::host_fns::state_kv::ModuleKv::new_in_memory()
+                    }
+                }
             });
             let emitter_factory: mitos_platform::host::EmitterFactory =
                 Arc::new(mitos_platform::host_fns::emit::EventSink::new);

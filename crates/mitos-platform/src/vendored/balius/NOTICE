@@ -24,12 +24,17 @@ own original sources live alongside the vendored tree under
 Vendored files:
 - kv.rs       (from balius-runtime/src/kv/redb.rs @ e9c8cd50c7d7074dc6db75633bb26c68d41da187)
 
-Planned (see MITOS_PLATFORM_V1.md):
-- router.rs   (from balius-runtime/src/router.rs)
-- store.rs    (from balius-runtime/src/store.rs)
-- metrics.rs  (from balius-runtime/src/metrics.rs)
+Planned:
+- router.rs   (from balius-runtime/src/router.rs) — when modules declare typed Watch sets at init-time
+- metrics.rs  (from balius-runtime/src/metrics.rs) — when OpenTelemetry surfaces are wired into the host
 
-These will land when mitos-platform's needs catch up to them
-(router: when modules declare typed Watch sets at init time;
-store: when per-module redb cursor persistence + WAL is needed;
-metrics: when OpenTelemetry surfaces are wired into the host).
+Removed from the original plan:
+- store.rs — Balius's store.rs is a host-side WAL for replay-safe
+  worker restart; mitos has a different replay model (dolos's
+  archive is the WAL — on restart we re-subscribe via
+  `watch_tip(Some(persisted_cursor))` and the chain follower
+  re-fetches from there). A focused `CursorStore` in
+  `mitos_platform::storage` covers our crash-safety needs in
+  ~80 lines instead of vendoring 252 lines of WAL we'd never
+  use. See `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design
+  questions" #7 for the rationale.

@@ -340,12 +340,14 @@ on top.
 - Keep their algorithmic approach; replace their match-key
   variants with our typed predicates from `mitos-data-plane`
 
-**2. `store.rs`** (~252 lines, from `balius-runtime/src/store.rs`)
-- redb-backed WAL for module state
-- Per-worker cursor tracking
-- Atomic update primitives
-- We adapt the per-worker schema to handle our ABI version
-  field; otherwise the structure is what we want
+**2. ~~`store.rs`~~** — REMOVED from the vendoring plan after
+inspection. Balius's `store.rs` is a host-side WAL for
+replay-safe worker restart; mitos has a different replay model
+(dolos's archive is our WAL). We built a focused `CursorStore`
+in `mitos_platform::storage` instead — ~80 lines, single redb
+table, single-row cursor. KV side stays vendored from #3 below.
+See `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design questions"
+#7 for the rationale.
 
 **3. `kv/redb.rs`** (from `balius-runtime/src/kv/redb.rs`)
 - Worker-prefixed KV implementation
