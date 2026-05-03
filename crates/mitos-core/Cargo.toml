@@ -46,3 +46,9 @@ url = "2"
 
 # Persistent subscription registry for the Replicator.
 redb = { workspace = true }
+
+# Wire-format types + selector machinery (see
+# `docs/design/SUBSCRIPTION_MECHANICS.md`). Lives in its own crate
+# so CF Workers and other deserialise-only consumers can pull just
+# the types without the indexer-runtime dep stack.
+mitos-protocol = { path = "../mitos-protocol" }

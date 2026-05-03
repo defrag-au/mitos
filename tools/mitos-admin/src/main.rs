@@ -55,7 +55,7 @@ enum Cmd {
         indexer: String,
 
         /// Target WebSocket URL (e.g.
-        /// `wss://collection-ownership-mitos.<account>.workers.dev/_internal/replicate?policy_id=abc`).
+        /// `wss://collections-mitos.<account>.workers.dev/_internal/replicate?policy_id=abc`).
         #[arg(long)]
         target: String,
 

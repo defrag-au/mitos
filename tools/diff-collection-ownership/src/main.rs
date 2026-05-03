@@ -1,5 +1,5 @@
 //! Convergence diff harness: poll the existing `collection-ownership`
-//! worker and the new `collection-ownership-mitos` worker, compare
+//! worker and the new `collections-mitos` worker, compare
 //! their read-API outputs for one or more policies, and report
 //! divergence.
 //!

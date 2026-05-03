@@ -53,11 +53,7 @@ pub trait IndexerHandle: Send + Sync {
 
     async fn bootstrap(&self, domain: &DomainAdapter) -> anyhow::Result<ChainPoint>;
 
-    async fn handle_event(
-        &self,
-        domain: &DomainAdapter,
-        event: &TipEvent,
-    ) -> anyhow::Result<()>;
+    async fn handle_event(&self, domain: &DomainAdapter, event: &TipEvent) -> anyhow::Result<()>;
 
     /// Run the per-consumer pump until the consumer disconnects or
     /// drops. Owns the subscribe handshake, broadcast→ws forwarding,
@@ -131,11 +127,7 @@ where
         guard.bootstrap(domain).await
     }
 
-    async fn handle_event(
-        &self,
-        domain: &DomainAdapter,
-        event: &TipEvent,
-    ) -> anyhow::Result<()> {
+    async fn handle_event(&self, domain: &DomainAdapter, event: &TipEvent) -> anyhow::Result<()> {
         let cursor = event_cursor(event);
         let emitter = Emitter::new(self.changes.clone(), cursor.clone());
         let mut guard = self.inner.lock().await;
@@ -158,9 +150,8 @@ where
     }
 
     fn encode_scope_from_json(&self, value: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
-        let scope: <I as Indexer<DomainAdapter>>::Scope =
-            serde_json::from_value(value.clone())
-                .map_err(|e| anyhow::anyhow!("scope JSON does not match indexer scope type: {e}"))?;
+        let scope: <I as Indexer<DomainAdapter>>::Scope = serde_json::from_value(value.clone())
+            .map_err(|e| anyhow::anyhow!("scope JSON does not match indexer scope type: {e}"))?;
         let mut buf = Vec::with_capacity(64);
         ciborium::into_writer(&scope, &mut buf)
             .map_err(|e| anyhow::anyhow!("encode scope CBOR: {e}"))?;
@@ -194,12 +185,7 @@ where
         let reply = {
             let mut guard = self.inner.lock().await;
             guard
-                .subscribe(
-                    &domain,
-                    scope.clone_for_subscribe(),
-                    cursor,
-                    &mut backfill,
-                )
+                .subscribe(&domain, scope.clone_for_subscribe(), cursor, &mut backfill)
                 .await?
         };
 
@@ -207,10 +193,21 @@ where
         // record as an Apply at the reply's cursor (so the consumer
         // advances its last-applied cursor atomically once the
         // batch is fully applied). Live tail follows.
+        //
+        // Apply the same `change_matches_scope` filter the live-tail
+        // pump uses — backfill records are equivalent to synthetic
+        // Apply events at startup, so they should respect the
+        // subscriber's scope identically. Without this filter,
+        // axes like `Interest.roles` (which pre-Phase-7 ownership
+        // didn't have) would only apply to live records, leaving
+        // backfill polluted with reference NFTs / sentinels.
         let resume_cursor = reply_cursor(&reply);
         send(&mut transport, &ServerMessage::SubscribeReply(reply)).await?;
 
         for change in backfill {
+            if !I::change_matches_scope(&scope.0, &change) {
+                continue;
+            }
             let mut buf = Vec::with_capacity(64);
             ciborium::into_writer(&change, &mut buf)
                 .map_err(|e| anyhow::anyhow!("encode backfill change: {e}"))?;
@@ -237,15 +234,14 @@ fn reply_cursor(reply: &crate::indexer::SubscribeReply) -> ChainPoint {
     use crate::indexer::SubscribeReply;
     match reply {
         SubscribeReply::Resume { cursor } => cursor.clone(),
-        SubscribeReply::SnapshotRedirect { snapshot_cursor, .. } => snapshot_cursor.clone(),
+        SubscribeReply::SnapshotRedirect {
+            snapshot_cursor, ..
+        } => snapshot_cursor.clone(),
         SubscribeReply::Fork { common_ancestor } => common_ancestor.clone(),
     }
 }
 
-async fn send(
-    transport: &mut Box<dyn WsTransport>,
-    msg: &ServerMessage,
-) -> anyhow::Result<()> {
+async fn send(transport: &mut Box<dyn WsTransport>, msg: &ServerMessage) -> anyhow::Result<()> {
     let bytes = encode_server(msg)?;
     transport.send_binary(bytes).await
 }
@@ -343,7 +339,10 @@ where
                 let mut buf = Vec::with_capacity(64);
                 ciborium::into_writer(&change, &mut buf)
                     .map_err(|e| anyhow::anyhow!("encode change: {e}"))?;
-                ServerMessage::Apply { cursor, change: buf }
+                ServerMessage::Apply {
+                    cursor,
+                    change: buf,
+                }
             }
             EmittedRecord::Undo { cursor } => ServerMessage::Undo { cursor },
             EmittedRecord::Mark { cursor } => ServerMessage::Mark { cursor },

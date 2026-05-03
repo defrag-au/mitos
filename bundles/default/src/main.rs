@@ -7,6 +7,7 @@
 use clap::Parser;
 use collection_ownership_indexer::OwnershipIndexer;
 use jpg_co_indexer::JpgCoIndexer;
+use marketplace_indexer::MarketplaceIndexer;
 use mitos_core::Bundle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -68,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
     bundle.add_indexer(JpgCoIndexer::new()?);
     bundle.add_indexer(OwnershipIndexer::new()?);
+    bundle.add_indexer(MarketplaceIndexer::new()?);
 
     bundle.run(exit).await?;
 

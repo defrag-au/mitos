@@ -147,7 +147,7 @@ existing reorg gap rather than just preserving current behaviour. The
 code is at `cnft.dev-workers/workers/collection-ownership/`.
 
 **Fork, don't feature-flag.** New worker at
-`cnft.dev-workers/workers/collection-ownership-mitos/` runs in
+`cnft.dev-workers/workers/collections-mitos/` runs in
 parallel with the existing `collection-ownership` for as long as
 convergence validation requires (target: 30+ days of byte-identical
 read-API output before retiring the original). The fork avoids any
@@ -175,7 +175,7 @@ Each step lands cleanly before the next becomes meaningful.
    `subscribe` to add `policy_id`; cold subscribe returns
    `cursor = current_tip` (no backfill yet). Proves end-to-end records
    flow for new mints/transfers.
-4. **`collection-ownership-mitos` worker, minimum viable.** Hibernated
+4. **`collections-mitos` worker, minimum viable.** Hibernated
    WebSocket consumer, same SQLite schema as existing worker, same
    read APIs. Wire one test policy. **Diff `/api/check` and
    `/api/bundle` outputs against the existing worker hourly — that's
@@ -189,14 +189,65 @@ Each step lands cleanly before the next becomes meaningful.
 7. **Reorg validation.** Pick a known historical reorg, replay both
    pipelines, confirm mitos side emits `Undo` records and converges
    correctly while existing side does not.
-8. **Extract `mitos-protocol` crate** so the worker side stops
-   hand-mirroring wire types. The first end-to-end test (Black Flag,
+8. **CIP-14 fingerprints + cardano-assets adoption** (small,
+   prerequisite for #9). Coordinated across mitos and shared-crates
+   via patch overrides during development.
+
+   **In shared-crates** (cardano-assets):
+   - Add `flake.nix` (mirror mitos / cnft.dev-workers — same
+     `defrag-nix` `rust-worker-stack` shell).
+   - Add typed newtypes: `PolicyId(String)` (56-char hex,
+     validated), `Fingerprint(String)` (CIP-14 bech32,
+     validated), optionally `AssetNameHex(String)`.
+   - Update `AssetId.policy_id` from `String` to `PolicyId`.
+     Update `AssetId::fingerprint() -> Result<Fingerprint, _>`.
+     Both are breaking API changes on the crate surface; cascade
+     through internal call sites.
+
+   **In mitos**:
+   - Add `cardano-assets = { ..., features = ["cip14"] }` workspace
+     dep.
+   - Add `[patch]` override pointing at the local shared-crates
+     checkout for the duration.
+   - `OwnershipChange::Transfer` gains `asset_fingerprint:
+     Fingerprint` field; `policy_id` becomes `PolicyId`.
+   - DO schema: `ownership.asset_fingerprint TEXT NOT NULL` +
+     `idx_ownership_fingerprint`. Read APIs accept
+     `?fingerprint=asset1...` alongside `?asset=hex`.
+   - Replace standalone `extract_stake_address` and
+     `is_user_token` helpers with cardano-assets equivalents
+     where available.
+
+   **In cnft.dev-workers**: same `[patch]` override; existing
+   shared-crates consumers update their type signatures. Validate
+   build + tests across both downstreams before bumping
+   shared-crates version and removing the patch.
+
+   Public-vs-private dep direction (cardano-assets extraction to
+   its own public location) is deferred to mitos's actual public-
+   release moment; not blocking. See `MARKETPLACE_INDEXER.md` §
+   "Reusing cardano-assets from shared-crates".
+9. **`MarketplaceIndexer` + multi-feed-per-DO**: port the existing
+   classifier's decode logic (sales, listings, offers, collection
+   offers) into a second indexer alongside `OwnershipIndexer`. The
+   per-policy CF DO subscribes to *both* feeds, becoming a
+   per-policy collection-state aggregator. Worker renames from
+   `collections-mitos` to `collections-mitos`. Full
+   design + phasing in `MARKETPLACE_INDEXER.md`.
+10. **Extract `mitos-protocol` crate** so the worker side stops
+    hand-mirroring wire types. The first end-to-end test (Black Flag,
    2026-05-02) hit a wire-format bug because pallas's `Hash<32>`
    Serialize impl emits a hex *string*, not bytes, and the worker's
    `protocol.rs` declared the cursor's hash field as
    `#[serde(with = "serde_bytes")] Vec<u8>` — every record failed
    to decode. Mirroring is structurally drift-prone; a shared crate
    prevents the class.
+
+   **Status:** crate exists (`crates/mitos-protocol`, created
+   alongside the subscription-mechanics work — see
+   `SUBSCRIPTION_MECHANICS.md`). It currently owns the typed event
+   taxonomy + selector machinery. The replication-framing types
+   below still need to migrate.
 
    Shape:
    - New crate `crates/mitos-protocol` in the mitos workspace.
@@ -210,7 +261,7 @@ Each step lands cleanly before the next becomes meaningful.
      the dispatcher boundary.
    - Once mitos is a public repo, `cnft.dev-workers` adds it as a
      git or version dep. The hand-mirrored
-     `workers/collection-ownership-mitos/src/protocol.rs` deletes.
+     `workers/collections-mitos/src/protocol.rs` deletes.
    - Estimated ~30 minutes of work; bounded; no API change to
      existing consumers.
 

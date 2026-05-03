@@ -135,12 +135,9 @@ impl Bundle {
         app = app.merge(replicate_router(&indexers, domain.clone(), auth.clone()));
 
         let replicator_path = data_dir.join("subscriptions.redb");
-        let replicator = Arc::new(Replicator::new(
-            &indexers,
-            domain.clone(),
-            &replicator_path,
-            auth.clone(),
-        )?);
+        let replicator = Arc::new(
+            Replicator::new(&indexers, domain.clone(), &replicator_path, auth.clone()).await?,
+        );
         info!(path = %replicator_path.display(), "replicator registry opened");
         app = app.merge(admin_router(replicator.clone(), auth.clone()));
 
@@ -152,10 +149,7 @@ impl Bundle {
             indexers: indexer_names,
             replicator: replicator.clone(),
         };
-        app = app.route(
-            "/health",
-            get(handle_health).with_state(health_state),
-        );
+        app = app.route("/health", get(handle_health).with_state(health_state));
 
         let listener = tokio::net::TcpListener::bind(listen).await?;
         info!(addr = %listen, "HTTP server listening");
@@ -285,7 +279,7 @@ async fn list_subscriptions(State(state): State<AdminState>) -> Json<Vec<Subscri
 /// ```json
 /// {
 ///   "indexer": "collection-ownership",
-///   "target_url": "wss://collection-ownership-mitos.<acct>.workers.dev/_internal/replicate?policy_id=abc...",
+///   "target_url": "wss://collections-mitos.<acct>.workers.dev/_internal/replicate?policy_id=abc...",
 ///   "scope": {"policy_id": "abc..."},
 ///   "cursor": "origin"
 /// }
@@ -351,8 +345,7 @@ fn parse_friendly_cursor(s: &str) -> anyhow::Result<dolos_core::ChainPoint> {
     }
     if let Some((slot, hash_hex)) = s.split_once(':') {
         let slot: u64 = slot.parse().map_err(|e| anyhow::anyhow!("bad slot: {e}"))?;
-        let hash_bytes =
-            hex::decode(hash_hex).map_err(|e| anyhow::anyhow!("bad hash hex: {e}"))?;
+        let hash_bytes = hex::decode(hash_hex).map_err(|e| anyhow::anyhow!("bad hash hex: {e}"))?;
         if hash_bytes.len() != 32 {
             anyhow::bail!("hash must be 32 bytes; got {}", hash_bytes.len());
         }

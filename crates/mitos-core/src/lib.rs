@@ -34,6 +34,16 @@ pub use replicate::{
 pub use replicator::{Replicator, Subscription, SubscriptionId};
 pub use transport::{AxumWs, TungsteniteWs, WsTransport};
 
+// Re-export the wire-format / selector types so framework-side
+// consumers (indexers, the matching engine) get them via
+// `mitos_core::*` without needing a direct `mitos-protocol` dep.
+// Deserialise-only consumers (CF Workers) pull `mitos-protocol`
+// directly.
+pub use mitos_protocol::{
+    AssetSelector, DexSelector, DomainSelector, Interest, LendingSelector, MarketplaceSelector,
+    ValueFilter, protocol,
+};
+
 // Re-export the dolos types indexers need at the trait surface, so
 // downstream crates only need to depend on `mitos-core`.
 pub use dolos::adapters::DomainAdapter;

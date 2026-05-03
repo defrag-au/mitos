@@ -40,9 +40,17 @@ use crate::replicate::{ClientMessage, encode_client};
 use crate::transport::TungsteniteWs;
 
 /// redb table holding `SubscriptionId` → CBOR(`Subscription`).
-const SUBS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("subscriptions");
+///
+/// Bumped from `subscriptions` to `subscriptions_v2` for the
+/// Phase 4 trait surgery: per-indexer `Scope` types changed
+/// (`OwnershipScope` → `Vec<Interest>`, `()` → `Vec<Interest>`)
+/// and the persisted CBOR is no longer decodable. Old rows in
+/// the v1 table are silently abandoned — the CF consumer
+/// re-subscribes on first reconnect with the new shape. The on-
+/// disk file keeps the old table; nothing to delete.
+const SUBS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("subscriptions_v2");
 /// redb table for meta values (next_id counter).
-const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta_v2");
 const META_NEXT_ID: &str = "next_id";
 
 /// Identifier for one registered subscription. The framework
@@ -140,7 +148,12 @@ pub struct ReplicatorSummary {
 impl Replicator {
     /// Open (or create) the persistent registry at `db_path` and
     /// re-spawn dial loops for every persisted subscription.
-    pub fn new(
+    ///
+    /// Async because restoring subscriptions requires acquiring
+    /// the inner Mutex from within a tokio runtime context — the
+    /// blocking variant panics with `Cannot block the current
+    /// thread from within a runtime`.
+    pub async fn new(
         handles: &[Arc<dyn IndexerHandle>],
         domain: DomainAdapter,
         db_path: impl AsRef<Path>,
@@ -160,7 +173,9 @@ impl Replicator {
 
         // Make sure tables exist so list/insert calls don't panic
         // on first run.
-        let txn = db.begin_write().map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
+        let txn = db
+            .begin_write()
+            .map_err(|e| anyhow::anyhow!("begin_write: {e}"))?;
         {
             let _ = txn
                 .open_table(SUBS_TABLE)
@@ -169,7 +184,8 @@ impl Replicator {
                 .open_table(META_TABLE)
                 .map_err(|e| anyhow::anyhow!("open meta table: {e}"))?;
         }
-        txn.commit().map_err(|e| anyhow::anyhow!("commit init: {e}"))?;
+        txn.commit()
+            .map_err(|e| anyhow::anyhow!("commit init: {e}"))?;
 
         let (persisted, next_id) = load_persisted(&db)?;
 
@@ -186,7 +202,7 @@ impl Replicator {
 
         // Re-spawn dial loops for every persisted entry.
         for (id, sub) in persisted {
-            replicator.spawn_blocking_existing(id, sub);
+            replicator.respawn_existing(id, sub).await;
         }
 
         Ok(replicator)
@@ -245,11 +261,7 @@ impl Replicator {
             .subs
             .iter()
             .map(|(id, active)| {
-                let state = active
-                    .state
-                    .read()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
+                let state = active.state.read().map(|g| g.clone()).unwrap_or_default();
                 (*id, active.sub.clone(), state)
             })
             .collect()
@@ -309,8 +321,9 @@ impl Replicator {
 
     /// Restore a persisted subscription on startup — does not
     /// re-write to redb (it's already there) and does not bump the
-    /// id counter. Used only by `new`.
-    fn spawn_blocking_existing(&self, id: SubscriptionId, sub: Subscription) {
+    /// id counter. Used only by `new`. Async because we're inside
+    /// a tokio runtime when called.
+    async fn respawn_existing(&self, id: SubscriptionId, sub: Subscription) {
         let handle = match self.indexers.get(&sub.indexer).cloned() {
             Some(h) => h,
             None => {
@@ -331,10 +344,7 @@ impl Replicator {
             self.auth.clone(),
             state.clone(),
         ));
-        // We're holding `&self`, not `&mut self`; need to grab the
-        // Mutex synchronously. `new` is called from a blocking
-        // context (during bundle setup), so block_in_place is fine.
-        let mut inner = self.inner.blocking_lock();
+        let mut inner = self.inner.lock().await;
         inner.subs.insert(id, ActiveSub { sub, state, task });
     }
 }
@@ -539,11 +549,10 @@ async fn dial_and_run(
     };
     let bytes = encode_client(&subscribe)?;
 
-    let transport: Box<dyn crate::transport::WsTransport> =
-        Box::new(InjectFirst {
-            inner: Box::new(TungsteniteWs(stream)),
-            injected: Some(bytes),
-        });
+    let transport: Box<dyn crate::transport::WsTransport> = Box::new(InjectFirst {
+        inner: Box::new(TungsteniteWs(stream)),
+        injected: Some(bytes),
+    });
 
     handle
         .run_subscriber(transport, domain.clone())

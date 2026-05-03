@@ -12,6 +12,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "address-registry"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "phf",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -507,6 +518,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c53ba0f290bfc610084c05582d9c5d421662128fc69f4bf236707af6fd321b9"
 
 [[package]]
+name = "cardano-assets"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "bech32 0.11.1",
+ "blake2 0.10.6",
+ "hex",
+ "indexmap 2.9.0",
+ "serde",
+ "serde_json",
+ "serde_plain",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -640,10 +665,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.4",
+ "cardano-assets",
  "dolos-cardano",
  "dolos-core",
  "hex",
  "mitos-core",
+ "mitos-data-plane",
+ "mitos-protocol",
  "pallas",
  "serde",
  "tracing",
@@ -1038,6 +1066,24 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "datum-parsing"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "address-registry",
+ "hex",
+ "once_cell",
+ "pallas-codec 1.0.0-alpha.4",
+ "pallas-primitives 1.0.0-alpha.4",
+ "pipeline-types",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml 0.8.20",
+ "tracing",
+]
 
 [[package]]
 name = "der"
@@ -1466,6 +1512,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
 dependencies = [
  "once_cell",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "enumset"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25b07a8dfbbbfc0064c0a6bdf9edcf966de6b1c33ce344bdeca3b41615452634"
+dependencies = [
+ "enumset_derive",
+ "serde",
+]
+
+[[package]]
+name = "enumset_derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f43e744e4ea338060faee68ed933e46e722fb7f3617e722a5772d7e856d8b3ce"
+dependencies = [
+ "darling 0.21.3",
  "proc-macro2",
  "quote",
  "syn",
@@ -2547,6 +2615,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "marketplace-indexer"
+version = "0.0.1"
+dependencies = [
+ "address-registry",
+ "anyhow",
+ "async-trait",
+ "axum 0.8.4",
+ "cardano-assets",
+ "dolos-cardano",
+ "dolos-core",
+ "hex",
+ "mitos-core",
+ "mitos-protocol",
+ "pallas",
+ "pipeline-types",
+ "serde",
+ "serde_json",
+ "tracing",
+ "transactions",
+ "tx-classifier",
+]
+
+[[package]]
 name = "matchers"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2802,6 +2893,7 @@ dependencies = [
  "dolos-cardano",
  "dolos-core",
  "jpg-co-indexer",
+ "marketplace-indexer",
  "mitos-core",
  "tokio",
  "tokio-util",
@@ -2839,6 +2931,7 @@ dependencies = [
  "gasket",
  "hex",
  "miette",
+ "mitos-protocol",
  "redb 2.6.3",
  "serde",
  "serde_bytes",
@@ -2852,15 +2945,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-data-plane"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cardano-assets",
+ "ciborium",
+ "dolos-cardano",
+ "dolos-core",
+ "hex",
+ "pallas",
+ "pallas-addresses 1.0.0-alpha.4",
+ "pallas-codec 1.0.0-alpha.4",
+ "pallas-primitives 1.0.0-alpha.4",
+ "pallas-traverse 1.0.0-alpha.4",
+ "pipeline-types",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mitos-protocol"
+version = "0.0.1"
+dependencies = [
+ "cardano-assets",
+ "ciborium",
+ "enumset",
+ "pipeline-types",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+]
+
+[[package]]
 name = "mitos-tail"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "cardano-assets",
  "ciborium",
  "clap",
  "futures-util",
  "hex",
  "mitos-core",
+ "mitos-protocol",
+ "pipeline-types",
  "serde",
  "serde_json",
  "tokio",
@@ -3553,6 +3687,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_macros",
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared",
+ "rand 0.8.5",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3583,6 +3759,20 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pipeline-types"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "cardano-assets",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "tx_insights",
+]
 
 [[package]]
 name = "pkcs8"
@@ -4373,6 +4563,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4571,6 +4770,12 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "slab"
@@ -5390,6 +5595,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "transactions"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "hex",
+ "pallas-codec 1.0.0-alpha.4",
+ "pallas-crypto 1.0.0-alpha.4",
+ "pallas-primitives 1.0.0-alpha.4",
+ "pallas-traverse 1.0.0-alpha.4",
+ "pipeline-types",
+ "serde",
+ "serde_json",
+ "wasm_safe_serde",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5419,6 +5640,32 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
+name = "tx-classifier"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "address-registry",
+ "base64 0.22.1",
+ "cardano-assets",
+ "datum-parsing",
+ "hex",
+ "once_cell",
+ "pallas-addresses 1.0.0-alpha.4",
+ "pallas-codec 1.0.0-alpha.4",
+ "pallas-crypto 1.0.0-alpha.4",
+ "pallas-primitives 1.0.0-alpha.4",
+ "phf",
+ "pipeline-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tracing",
+ "transactions",
+ "tx_insights",
+]
 
 [[package]]
 name = "tx3-cardano"
@@ -5462,6 +5709,17 @@ dependencies = [
  "hex",
  "serde",
  "thiserror 2.0.12",
+]
+
+[[package]]
+name = "tx_insights"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "cardano-assets",
+ "serde",
+ "serde_json",
+ "wasm_safe_serde",
 ]
 
 [[package]]
@@ -5816,6 +6074,15 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wasm_safe_serde"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

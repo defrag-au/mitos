@@ -1,0 +1,37 @@
+[package]
+name = "marketplace-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mitos-core = { path = "../mitos-core" }
+# Direct dep on the protocol-types crate too: the translator and
+# brand resolver work at the `mitos_protocol::*` level, so naming
+# the dep explicitly here documents the layering. Available
+# transitively via `mitos-core` as well.
+mitos-protocol = { path = "../mitos-protocol" }
+
+dolos-core = { workspace = true }
+dolos-cardano = { workspace = true }
+pallas = { workspace = true }
+
+# Shared-crates classifier + raw-tx-data shape. The classifier
+# already decodes marketplace contracts (jpg.store v1-v4, wayup,
+# etc.) — we feed it pallas-derived RawTxData and filter the
+# resulting TxClassification to marketplace-relevant variants.
+transactions = { workspace = true, features = ["pallas-adapter"] }
+tx-classifier = { workspace = true }
+address-registry = { workspace = true }
+# `PricedAsset` and friends used by the translator at call sites
+# where we lift classifier output into protocol-event payloads.
+pipeline-types = { workspace = true }
+cardano-assets = { workspace = true }
+
+async-trait = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

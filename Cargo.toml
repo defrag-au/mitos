@@ -10,9 +10,12 @@
 
 [workspace]
 members = [
+    "crates/mitos-protocol",
+    "crates/mitos-data-plane",
     "crates/mitos-core",
     "crates/jpg-co-indexer",
     "crates/collection-ownership-indexer",
+    "crates/marketplace-indexer",
     "bundles/default",
     "tools/diff-collection-ownership",
     "tools/mitos-tail",
@@ -41,6 +44,30 @@ pallas-addresses = "1.0.0-alpha.3"
 pallas-codec = "1.0.0-alpha.3"
 pallas-primitives = "1.0.0-alpha.3"
 pallas-traverse = "1.0.0-alpha.3"
+
+# Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
+# TokenType, asset-name decoders. Shared with cnft.dev-workers.
+# Pinned to a specific shared-crates rev for reproducibility; bump
+# deliberately when shared-crates lands changes mitos needs.
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "24e2052d4a7e22a3bc335e0792166d31238add42", features = ["cip14"] }
+# Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
+# by the protocol-event taxonomy in `mitos-core::protocol`. Same
+# shape the existing classifier emits, so mitos events deserialize
+# identically on the CF side.
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "24e2052d4a7e22a3bc335e0792166d31238add42" }
+# Pipeline transaction shape (`RawTxData`) + the `pallas-adapter`
+# helpers that convert pallas `MultiEraTx` + resolved inputs into
+# `RawTxData`. The marketplace indexer feeds this into the
+# classifier's `RuleEngine` to decode sales / listings / offers.
+transactions = { git = "https://github.com/defrag-au/shared-crates", rev = "24e2052d4a7e22a3bc335e0792166d31238add42", features = ["pallas-adapter"] }
+# Marketplace classification (`RuleEngine::classify(&RawTxData) -> TxClassification`).
+# Default features only — the `indexers` feature pulls in CF
+# Workers / Maestro deps that mitos doesn't want.
+tx-classifier = { git = "https://github.com/defrag-au/shared-crates", rev = "24e2052d4a7e22a3bc335e0792166d31238add42" }
+# Same git source for shared sub-deps the classifier itself uses;
+# pinning here keeps the lockfile from picking up multiple
+# revisions of shared-crates.
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "24e2052d4a7e22a3bc335e0792166d31238add42" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -74,3 +101,19 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# --- Patch overrides ---
+#
+# All disabled now that the typed newtypes / pallas-adapter /
+# classify_raw work landed on shared-crates main (rev
+# 24e2052d4a7e22a3bc335e0792166d31238add42, pinned above).
+# Uncomment a line during local shared-crates dev to point at the
+# sibling repo at `../shared-crates`. Re-comment before commit so
+# CI uses the git rev.
+[patch."https://github.com/defrag-au/shared-crates"]
+# cardano-assets = { path = "../shared-crates/cardano-assets" }
+# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+# transactions = { path = "../shared-crates/pipeline/transactions" }
+# tx-classifier = { path = "../shared-crates/pipeline/tx-classifier" }
+# address-registry = { path = "../shared-crates/address-registry" }
+

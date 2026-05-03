@@ -42,6 +42,33 @@ Mitos additionally emits periodic `Mark` heartbeats that carry just a
 cursor, used by the consumer for "I am up to date" health checks and
 liveness detection. Marks are not stored, only observed.
 
+### Asset identity
+
+Every change record that references a specific asset carries the
+asset by **both** `(policy_id, asset_name)` AND its **CIP-14
+fingerprint** (e.g. `asset1abc...`). Computing the fingerprint is
+deterministic — `bech32(hrp="asset", data=blake2b_160(policy_id ||
+asset_name))` — but it's load-bearing for read paths:
+
+- jpg.store, cardanoscan, NMKR, pool.pm and most third-party
+  Cardano tooling addresses assets primarily by fingerprint. URLs,
+  search bars, alert rule keys — all fingerprint. Including it on
+  the wire means consumers don't recompute, and lookups by
+  fingerprint are O(1) with an index.
+- Computing once on the indexer side is cheaper than N consumers
+  each computing on receipt. The indexer already has policy_id +
+  asset_name decoded; the fingerprint is essentially free.
+- It's the natural alternate key for DO storage:
+  `idx_ownership_fingerprint`, `idx_sales_fingerprint`, etc.
+
+The `cardano-assets` crate's `cip14` feature provides
+`AssetId::fingerprint() -> Result<String, AssetIdError>`. Indexers
+should use it directly rather than rolling their own.
+
+This is universal across indexers — the marketplace indexer's
+event types include it; the ownership indexer's `OwnershipChange`
+variants will gain it as part of the same work.
+
 ### Encoding
 
 **CBOR is the wire encoding**, with zstd compression at the channel
