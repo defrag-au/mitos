@@ -53,11 +53,13 @@ In:
 - Host functions for: chain reads (data plane), KV state,
   event emission, structured logging
 - ABI version handshake (host refuses to load mismatched modules)
-- Pre-resolved consumed inputs (host-side; module never sees raw
-  CBOR)
+- Lazy consumed-input resolution behind the `resolved-block`
+  resource (host resolves on first access, memoises for block
+  lifetime; module never sees raw CBOR)
 - Per-module redb cursor with bounded lag
-- Catch-and-restart supervision (trap → log → restart with
-  bounded retry)
+- Author-declared trap strategy (`replay` / `skip-and-mark` /
+  `quarantine`) with bounded retry policy; host supervisor
+  consults it on every trap
 - Same observable WS replication output as today
 
 Out (defer to v2+):
@@ -148,12 +150,21 @@ interface block-context {
         slot: func() -> u64;
         tx-count: func() -> u32;
         get-tx: func(idx: u32) -> tx;
-        /// Pre-resolved consumed inputs — host did the lookup
-        /// against snapshot state before dispatch, so the
-        /// marketplace input-resolution problem stops being a
-        /// module concern.
+        /// Lazy consumed-input lookup. First call for a given
+        /// (tx-idx, input-idx) triggers a single read against
+        /// snapshot state via the data plane; result is memoised
+        /// for the block's lifetime. Modules that don't ask
+        /// don't pay. Marketplace-style indexers should prefer
+        /// the batch variant below.
         get-consumed-input: func(tx-idx: u32, input-idx: u32)
                             -> option<typed-output>;
+        /// Bulk consumed-input lookup for a single tx. Resolves
+        /// all inputs in one data-plane call (one redb read
+        /// transaction, one batched B-tree walk). Use this when
+        /// the module knows it will need most inputs of a tx —
+        /// classifier-style workloads.
+        get-consumed-inputs: func(tx-idx: u32)
+                             -> list<option<typed-output>>;
     }
     record tx { /* lazy view; module calls back through the resource */ }
 }
@@ -236,17 +247,30 @@ Host side:
 ```toml
 # mitos-platform/Cargo.toml
 [dependencies]
-wasmtime = { version = "44", features = ["component-model-async"] }
+wasmtime = { version = "44", features = ["async", "component-model"] }
 ```
 
 ```rust
 wasmtime::component::bindgen!({
     path: "wit",
     world: "mitos-module",
-    imports: { default: async },
+    imports: { default: async | trappable },
     exports: { default: async },
 });
 ```
+
+Note: we do **not** enable `wasm_component_model_async` on the
+`Config`. That flag turns on the Component Model concurrency ABI
+(`stream`, `future`, `error-context`) which our WIT does not
+use; wasmtime 44 documents it as "_very_ incomplete". The
+`imports: { default: async }` bindgen knob is a separate
+mechanism — stable since wasmtime 12, used by Spin in production
+— that simply makes generated host trait fns return `Future`s.
+That's all we need.
+
+The deprecated `Config::async_support(true)` is also a no-op as
+of wasmtime 42 ([RELEASES.md](https://github.com/bytecodealliance/wasmtime/blob/release-42.0.0/RELEASES.md))
+— don't call it.
 
 That's the entire build pipeline. No `cargo-component`, no
 `spin-componentize`, no `wac` composition tool. Plain cargo +
@@ -353,18 +377,28 @@ which means a slow worker stalls all workers. We track per-worker
 cursors with a bounded lag tolerance; a slow module gets restarted
 or quarantined, it doesn't block the host.
 
-**3. Pre-resolve consumed inputs host-side.** Balius hands raw
-CBOR to modules; our `block-context` resource pre-resolves
-consumed inputs from snapshot state before dispatch. This makes
-the marketplace input-resolution problem invisible to module
-authors (they can't get it wrong because they can't get raw
-inputs).
+**3. Resolve consumed inputs host-side, lazily.** Balius hands
+raw CBOR to modules; our `block-context` resource resolves
+consumed inputs from snapshot state via the data plane, but
+only on demand — first access triggers the lookup, the result
+is memoised for the block's lifetime. Eager pre-resolution was
+the original design but the cost analysis (every input lookup
+is a redb B-tree point read; ownership-style indexers consume
+zero inputs; busy mainnet blocks have hundreds of inputs) made
+lazy the obvious answer. Modules still can't get raw CBOR — the
+resource owns the decode path either way. Marketplace-style
+indexers that want bulk resolution use the
+`get-consumed-inputs(tx_idx)` batch variant, which amortises the
+redb read-transaction open cost.
 
-**4. Catch-and-restart supervision, not trap propagation.**
+**4. Author-declared trap supervision, not trap propagation.**
 Balius's runtime propagates traps up; we catch them, log them,
-restart with exponential backoff, and quarantine after N
-consecutive failures. A trapping module shouldn't break the
-chain follower.
+and consult the module's declared `trap-strategy` (`replay` /
+`skip-and-mark` / `quarantine`) with bounded retry. A trapping
+module shouldn't break the chain follower, *and* the module
+author — not the host — gets to decide whether replaying is
+safe, skipping is acceptable, or human review is required.
+Keeps semantics in the module source where they belong.
 
 **5. Pallas not in modules.** Balius modules can pull pallas in
 as a wasm dependency; we forbid this. The host owns block decode;
@@ -416,9 +450,15 @@ vendored Balius files, which add another ~700):
 - **Subscription lifecycle** (~200 lines) — translate CF WS
   subscribe → module instance + channel registration → event
   dispatch loop → cursor advance
-- **Pre-resolution layer** (~200 lines) — for each block, run
-  the registered Watch unions, pre-resolve consumed inputs,
-  build the `resolved-block` resource, hand to modules
+- **`resolved-block` resource** (~200 lines) — per-block, build
+  the resource backed by the decoded block + a lazy resolution
+  cache; on `get-consumed-input` / `get-consumed-inputs` calls,
+  fetch from the data plane and memoise. Resource lives in a
+  long-lived `ResourceTable` on the `Store`; pushed before
+  `handle-event`, deleted after. Pass as `borrow` so the guest
+  can't stash it past the dispatch boundary (compile-time
+  enforcement). Modelled on `wasmtime-wasi-http`'s pattern for
+  request-body resources.
 
 Tests + integration layer adds another ~500 lines on top. The
 crate is small on purpose; that's the discipline of v1.
@@ -468,42 +508,205 @@ Once v1 is running and stable, the natural next steps:
 These are explicitly out of v1 scope. We learn from running v1
 before committing the shapes for v2.
 
-## Open questions for v1 implementation
+## Resolved design questions (post-spike)
 
-These need answers during implementation; flagging here so they
-don't get rediscovered:
+The spikes below were run before committing v1 implementation.
+Recording the answers here so the rationale is recoverable.
 
-1. **Async over the WIT boundary.** `component-model-async` is
-   the right answer for awaiting host I/O without blocking the
-   instance, but it's relatively young in wasmtime 44. Need a
-   spike to confirm Tokio runtime + wasmtime async work the way
-   the bindings suggest. Fall-back: sync host fns + run instances
-   on a dedicated thread pool.
+### 1. Async over the WIT boundary — RESOLVED: commit to async
 
-2. **`resolved-block` resource lifetime.** Resource handles must
-   not outlive their `Store`; the dispatch loop has to be
-   careful about when the handle is dropped vs. when the next
-   block's data overwrites it. Likely solved by per-event
-   resource scoping; needs verification.
+Use `imports: { default: async | trappable }, exports: { default:
+async }` on the bindgen macro. Spin v4.0.0 (2026-04) ships this
+pattern in production; the `imports: { default: async }` knob has
+been stable in wasmtime since v12. No fallback to sync host fns
++ dedicated thread pool is warranted.
 
-3. **Pre-resolution cost.** Every block's consumed inputs get
-   resolved against snapshot state before dispatch. For a busy
-   block that's hundreds of UTxO lookups against dolos-cardano.
-   Need to confirm the data plane's `read-utxos` bulk shape is
-   fast enough that this isn't a regression vs. today's
-   per-indexer ad-hoc resolution.
+Concrete gotchas baked into v1:
+- **Send bound is mandatory** on host fn futures. Don't hold
+  `!Send` types (`Rc`, `RefCell`) across `.await` in host
+  fns. `Arc<redb::Database>` and our dolos-cardano clients are
+  fine.
+- **Don't `block_on` inside async host fns** — deadlocks Tokio
+  under load. Use `tokio::task::spawn_blocking` for any
+  unavoidable blocking call.
+- **Pair with `epoch_interruption(true)`** for guest preemption.
+  Wasmtime async only yields to Tokio at `.await` boundaries in
+  host fns; pure-compute guest loops need epoch ticks.
+- **Don't enable `wasm_component_model_async`** on `Config` —
+  that's the Component Model concurrency ABI for `stream`,
+  `future`, `error-context`, which our WIT does not use and
+  which wasmtime 44 documents as "_very_ incomplete".
+- **Drop deprecated `Config::async_support(true)`** — no-op as
+  of wasmtime 42.
 
-4. **Cursor coordination during module restart.** When a module
-   traps mid-block, where does the cursor land? Replay the
-   block on restart? Skip and log? Quarantine and require
-   manual recovery? V1 default: replay (idempotent dispatch is
-   already a constraint we honour).
+### 2. `resolved-block` resource lifetime — RESOLVED: persistent ResourceTable, push-and-delete per block
 
-5. **Module config payload format.** `init: func(config: list<u8>)`
-   is intentionally opaque; what does the bytes shape look like
-   in practice? Likely CBOR'd typed config from the shared types
-   crate, but the host needs to know enough to validate before
-   handing over.
+Pattern (modelled on `wasmtime-wasi-http`'s body-resource
+handling):
+
+```rust
+// In StoreData
+struct HostState {
+    table: ResourceTable,  // long-lived; lives in Store
+    // ... other state
+}
+
+// Per-block dispatch
+let resource = state.table.push(resolved_block)?;
+instance.call_handle_event(&mut store, channel, event, &resource).await?;
+state.table.delete::<ResolvedBlock>(resource_id)?;
+```
+
+Key calls:
+- **One `ResourceTable` per `Store`, lives the lifetime of the
+  instance.** Don't recreate per block.
+- **Pass the resource as `borrow`** (not `own`). The guest can
+  read from it during `handle-event` but cannot stash it past
+  the call boundary — compile-time enforcement. Avoids the
+  parent-child tracking complexity of `own`-typed resources.
+- **`Resource<T>` is a non-forgeable `u32` index.** If a buggy
+  guest somehow held a stale handle (only possible with `own`
+  + late drop), the next access traps via `ResourceTableError`
+  — memory-safe.
+- **Don't model `tx` and `typed-output` as resources.** Return
+  them as plain WIT records by value. Resources are for
+  identity/lazy semantics; these don't need either, and modelling
+  them as records sidesteps parent-child cleanup ordering.
+
+### 3. Pre-resolution cost — RESOLVED: lazy-on-demand inside the resource
+
+Originally specced as eager pre-resolution before dispatch; the
+analysis flipped this to lazy:
+
+- Every consumed-input lookup is a redb B-tree point read against
+  the dolos UTxO state (`get_sparse` opens a read transaction,
+  loops refs, does N independent lookups; no in-memory cache
+  layer).
+- Today's `OwnershipIndexer` resolves zero consumed inputs (it
+  only walks `tx.produces()`). Eager pre-resolution would charge
+  it ~hundreds of redb reads per block for data it never
+  touches — a regression vs. today.
+- Cardano blocks are getting fatter (Input Endorsers); eager
+  scales linearly with block fatness whether modules care or not.
+
+Lazy + memoise inside `resolved-block` keeps the
+"module-author-can't-get-it-wrong" property (modules still can't
+see raw CBOR; the resource owns the decode path). Marketplace-
+style indexers that want bulk resolution use
+`get-consumed-inputs(tx_idx)` to amortise the redb read-tx open
+cost across all inputs of one tx. Pure-output indexers pay zero.
+
+## Resolved design questions (continued)
+
+### 4. Cursor coordination on mid-block trap — RESOLVED: author-declared strategy
+
+Module authors know best whether their indexer can safely replay
+a block, must skip, or has to halt for human review. The host
+supports a small enum of strategies declared by the module up
+front; the supervisor consults it on every trap.
+
+Add to the WIT:
+
+```wit
+interface lifecycle {
+    /// How the host should handle a trap during handle-event.
+    variant trap-strategy {
+        /// Replay the block on restart. Module promises
+        /// idempotent dispatch (e.g. ownership-style: typed
+        /// upserts, no side effects per call).
+        replay,
+        /// Skip the failing block, advance the cursor, log a
+        /// structured warning. Module accepts gaps for the sake
+        /// of liveness (e.g. best-effort metadata indexers).
+        skip-and-mark,
+        /// Stop the module, do not advance the cursor, surface
+        /// loudly. Operator must intervene before processing
+        /// resumes. For modules whose state would be corrupted
+        /// by skipping or by replaying a non-idempotent step.
+        quarantine,
+    }
+
+    record retry-policy {
+        /// Bounded retry count before falling through to the
+        /// strategy. Lets transient errors (e.g. snapshot read
+        /// blip) recover without invoking the strategy at all.
+        max-retries: u32,
+        /// Exponential backoff cap, ms.
+        backoff-cap-ms: u32,
+    }
+}
+
+world mitos-module {
+    // ...existing exports...
+
+    /// Called once at module load, before init. Module declares
+    /// its supervision policy; host uses it for the lifetime
+    /// of this instance. Returning different values across
+    /// restarts of the same module version is undefined.
+    export trap-policy: func() -> tuple<trap-strategy, retry-policy>;
+}
+```
+
+V1 default for `OwnershipIndexer`: `replay`, max-retries 3,
+backoff cap 1s. The module *also* gets to record its choice
+explicitly — no implicit "host picks for you" — so the strategy
+shows up in module source, not in operator config.
+
+The strategy is per-module, not per-event. Per-event would let
+modules signal "this specific block is fine to skip but the
+next isn't"; that's expressive but adds plumbing v1 doesn't
+need. If we discover a real use case post-v1, the natural shape
+is `handle-event -> result<_, handle-error>` already returns a
+typed error; we'd extend `handle-error` with strategy hints
+later.
+
+Validation: integration tests for each strategy variant —
+inject a trap, verify (a) replay produces matching state in a
+control run, (b) skip advances cursor and logs the gap, (c)
+quarantine stops the instance and surfaces a clear operator
+diagnostic.
+
+### 5. Module config payload format — RESOLVED: CBOR + per-module TOML alongside wrangler.toml
+
+The TOML file lives in the dApp's repo next to `wrangler.toml`
+— same pattern operators already know, same colocation the
+companion-pattern thesis assumes. The host transcodes to CBOR'd
+typed config and hands to `init`.
+
+```
+my-app/
+├── wrangler.toml
+├── mitos.toml          # ← module config; loaded by mitos host
+├── shared/             # types crate; defines the typed config struct
+├── indexer/            # the wasm module
+└── companion/          # the CF DO
+```
+
+Concretely:
+- The module's `shared/` crate defines a `Config` struct
+  (`#[derive(Serialize, Deserialize)]`).
+- `mitos.toml` is human-edited; deserialises into `Config` via
+  `toml`.
+- The mitos host reads the TOML file, deserialises into the
+  module's typed `Config` shape (known via the host's view of
+  the shared crate, or via a registered config schema — TBD
+  during impl), re-encodes as CBOR, passes to
+  `init(config: list<u8>)`.
+- Module side: `wit_bindgen`-generated `init` impl deserialises
+  the CBOR back into the typed `Config` from the same shared
+  crate. Wire format is CBOR (compact, deterministic, fast); the
+  *human-facing* format is TOML.
+
+Open detail for v1: how the host knows the config schema
+(parse-with-validation) — options are (a) host loads the schema
+from the wasm module's `__mitos_config_schema` custom section,
+(b) host treats the CBOR as opaque and only the module
+validates. Default to (b) for v1; iterate to (a) if operator
+typo diagnostics become a problem.
+
+For the `OwnershipIndexer` initial port, `Config` is small —
+the watched policy set + a backfill-style flag. Hand-validating
+that in the module is fine.
 
 ## Lessons banked from existing implementations
 
