@@ -1,17 +1,55 @@
 # Isolation roadmap
 
-How mitos's indexer-deployment model should evolve once the
-current monolithic-bundle approach hits its limits. **This is a
-forward-looking design — nothing here is built yet.** Captured so
-the architectural direction is recoverable later when we hit the
-trigger conditions.
+How mitos's indexer-deployment model evolves out of the current
+monolithic-bundle approach.
+
+**Status (2026-05): the trigger has fired.** Platform v1 is
+committed; concrete implementation shape lives in
+`../strategy/MITOS_PLATFORM_V1.md`. The decision was driven by
+the user-facing ergonomics constraint: **no more mitos deploys
+until the platform can load indexer modules independently of
+the host binary.** The current single-process statically-composed
+bundle is no longer acceptable for shipping indexer changes.
+
+This doc remains the **context** — why we picked the shape we
+did, what we ruled out and why, lessons we've banked. Read this
+to understand the reasoning; read `MITOS_PLATFORM_V1.md` for
+what we're actually building.
+
+**Decision summary (locked in 2026-05):**
+- **Wasm via wasmtime**, not native plugins. Native plugins
+  cannot meet the isolation bar (no per-thread OOM cap, no
+  watchdog for runaway loops, unsafe blast radius for
+  trap/segfault).
+- **WIT-defined ABI**, not hand-rolled. Spin v4.0.0's mid-2026
+  toolchain shipping demonstrates `wit-bindgen 0.54` +
+  `wasm32-wasip2` + `wasmtime::component::bindgen!` is mature
+  enough to skip the hand-rolled detour. (This reverses an
+  earlier decision in this document's drafting; see
+  `MITOS_PLATFORM_V1.md` §"The reversal".)
+- **Vendor four files from Balius** with explicit Apache-2.0
+  attribution (router, store, kv/redb, metrics) rather than
+  depending on the inactive crate.
+- **Resource limits from day one** (fuel + epoch + ResourceLimiter).
+- **Strict v1 scope**: ownership-indexer-as-wasm-module + a
+  stripped-down platform mitos that loads it from local FS.
+  Multi-tenancy, HTTP control plane, hot-reload, OCI registries,
+  per-team auth all deferred.
 
 Cross-references:
+- `../strategy/MITOS_PLATFORM_V1.md` — **the concrete v1
+  implementation shape (new; read this for what we're building)**
+- `../strategy/MITOS_COMPANION_PATTERN.md` — the paired-
+  deployable contract platform v1 enables
+- `../strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md` — broader
+  framework framing
 - `ARCHITECTURE.md` — current host design (single-process bundle
-  with statically-composed indexers)
+  with statically-composed indexers; what platform v1 replaces)
 - `SUBSCRIPTION_MECHANICS.md` — `Interest` selectors, the
   *consumer-side* declarative-filter precedent that informs the
   *indexer-side* `Watch` grammar proposed here
+- `MITOS_DATA_PLANE_API.md` — the typed chain query API
+  modules consume via host functions in v1
 - `INDEXER_TRAIT.md` — the trait that needs to stabilise before
   any of this can land
 - `ROADMAP.md` step 8+ — `mitos-protocol` extraction (already
@@ -316,72 +354,69 @@ host-shared work.
 
 ## Migration path
 
-Don't try to land this in one PR. Three phases, each useful on
-its own:
+The earlier framing of this doc proposed three phases (trait
+stabilisation → native plugins → wasm). **That phasing is
+superseded.** The deployment-ergonomics trigger fired before the
+isolation trigger, and the user's call ("no more mitos deploys
+until platform v1") collapses the phasing: we're going straight
+to the wasm model, scoped tightly to what one indexer needs.
 
-### Phase A — Stabilise the `Indexer` trait + extract host
-*(Trigger: indexer count grows past 3-4, current trait surface
-churns less than monthly)*
+The historical phasing is preserved below for context — the
+*shape* of the work is still recognisable inside platform v1,
+just compressed into a single delivery.
 
-- Move `mitos-core::Indexer` trait + dispatcher + replicator + bundle
-  composition into a `mitos-host` crate published from the mitos
-  repo. (Most of this is already true post-Phase-1; just
-  formalise the API.)
-- Stabilise the trait: no more breaking changes without a
-  versioned crate bump.
-- Document the trait's contract (already done as
-  `INDEXER_TRAIT.md` — keep current).
+### Platform v1 (committed; see `MITOS_PLATFORM_V1.md`)
 
-This phase enables phase B. By itself it does nothing for
-deployment ergonomics.
+- One wasm module (`ownership-indexer.wasm`), one host slot,
+  filesystem-loaded
+- WIT-defined ABI, `wasm32-wasip2`, `wit-bindgen 0.54`,
+  `wasmtime 44`
+- Resource limits + supervision + ABI versioning from day one
+- Pre-resolved consumed inputs host-side (solves the marketplace
+  input-resolution gap by making it invisible to modules)
+- Same observable replication output as today
+- Vendor four files from Balius with explicit Apache-2.0
+  attribution
 
-### Phase B — Native-plugin model (no wasm yet)
-*(Trigger: cross-repo PR coordination becomes the dominant
-friction; we're tired of touching the mitos repo for every
-consumer-team indexer)*
+### Historical phasing (superseded — kept for context)
 
-- Move indexer crates out of `mitos/crates/` into
-  `cnft.dev-workers/indexers/<name>/` (or similar — colocated
-  with consumers).
-- `bundles/default/main.rs` becomes the manifest: imports each
-  external indexer crate via git rev pin, calls `add_indexer`.
-- Wrap dispatcher's `handle_event` calls in `catch_unwind` for
-  *light* fault isolation (Rust panics caught; not real
-  isolation).
-- CI builds release binaries (no on-box `cargo build`); deploy
-  via SSH copy + symlink swap.
-- Adding a new indexer: create the crate in the worker repo,
-  bump the rev pin in mitos, add one line to `main.rs`,
-  redeploy. Mitos repo touch is trivial; deploy is fast.
+The original plan was Phase A (trait stabilisation), Phase B
+(native plugins for colocation), Phase C (wasm for isolation).
+The reasoning: each phase was useful on its own and incrementally
+de-risked.
 
-This phase delivers colocation + sane deployment. Doesn't deliver
-real isolation. Most of the perceived frustration probably
-evaporates here without ever needing wasm.
+What changed:
+- **Phase B (native plugins) was bypassed.** It would have
+  delivered colocation + sane deploy without isolation, and the
+  isolation gap looked tolerable. In practice, the iteration-
+  speed pain hit before any indexer-takes-host-down event;
+  rebuilding `cargo build --release` for every indexer change
+  is the dominant friction now. Native plugins would have moved
+  the rebuild from mitos to a slightly-smaller subset, but
+  still required a host restart per change. Wasm gets the right
+  property (load-without-restart) directly.
+- **Phase A (trait stabilisation) is still required**, just
+  rolled into v1. The WIT ABI *is* the stabilised trait surface;
+  there's no point stabilising the Rust trait separately when
+  the load-bearing contract is the WIT.
+- **Phase C (wasm) is what platform v1 is**, but scoped much
+  tighter than the original Phase C scope. No control-plane
+  HTTP API, no multi-tenant module registry, no OCI artefact
+  storage. One module, filesystem-loaded, observable equivalence
+  with today.
 
-### Phase C — Wasm modules + intent API
-*(Trigger: an indexer takes the host down in production; OR we
-hit 10+ indexers with diverging deploy needs; OR external
-contributors want to ship indexers without write access to our
-repos)*
-
-- Design + iterate on the `Watch` grammar (highest-risk design
-  call — review every indexer pattern we've encountered).
-- Implement native primitives (block traverse, input resolution,
-  decode kit) as host-side helpers; expose via `Watch` /
-  `DecodeRequest`.
-- Spike: reimplement `OwnershipIndexer` against the wasm API.
-  Validate the abstractions on the simplest case first.
-- Spike: reimplement `MarketplaceIndexer` against the wasm API.
-  This is the real test — input resolution + classifier. If it
-  feels forced, the API needs work.
-- Roll out per indexer; native plugins from phase B can coexist
-  with wasm modules indefinitely.
-- Add the control-plane HTTP API (`/_admin/modules/*`).
-- Worker deploy pipelines: integrate `.wasm` upload into
-  `wrangler deploy` flows.
-
-Phase C is the big-ticket work. Avoid until phase B's
-limitations bite for real reasons.
+What we kept from the phased thinking:
+- **Avoid pure wasm-everywhere.** Pallas decode stays host-side;
+  modules consume typed values via `block-context` resource
+  handles. (See `MITOS_PLATFORM_V1.md` §"Things we explicitly
+  do *not* copy from Balius".)
+- **Avoid pure subprocess plugins.** Wasmtime in-process is the
+  right isolation/throughput trade.
+- **Hot-reload is not the goal.** Restarts on config change are
+  fine; what we wanted was decoupled lifecycles.
+- **`Watch` grammar still informs the design.** It now lives as
+  WIT-defined predicates the module declares during `init`,
+  consumed by the host's pre-resolution layer.
 
 ## Open questions
 
@@ -421,33 +456,48 @@ limitations bite for real reasons.
   e.g. "alert evaluator wants marketplace events filtered to a
   policy set".
 
-## Trigger conditions for picking this work back up
+## Trigger conditions — fired
 
-Don't start any of this until at least one of these is true. The
-current model is fine until it isn't.
+The original list of triggers is preserved below for archaeology.
+**The trigger that fired** in 2026-05 was #5: indexer iteration
+speed became the bottleneck on product-side velocity. The user's
+explicit call — *"no more mitos deploys until we can actually
+deploy indexers into it via whatever mechanism we decide rather
+than rebuilding and deploying mitos with updated indexers"* —
+made the trigger condition concrete and immediate.
 
-1. **Indexer count > 5.** Current model scales fine to a handful;
-   coupling pressure compounds with each.
+Original triggers (none of #1-#4 had to fire for #5 to be
+sufficient):
+
+1. ~~**Indexer count > 5.**~~ Currently 2 (ownership +
+   marketplace) plus one in design (jpg.store CO listings).
+   Didn't need to compound.
 2. **Cross-repo PR coordination becomes the dominant friction.**
-   When the natural answer to "where does this indexer go?" is
-   "in someone else's repo", phase B becomes attractive.
-3. **An indexer takes the host down in production.** No `catch_unwind`
-   workaround is going to be sufficient at that point; phase C
-   becomes a real safety requirement, not just an architectural
-   nicety.
-4. **External contributors want to ship indexers.** Inviting an
-   external team to write code that runs in our process raises
-   the isolation bar dramatically; wasm is the only sane answer.
-5. **Indexer iteration speed becomes the bottleneck on
-   product-side velocity.** When teams measure "ship a new
-   collection-stats query" in days because of mitos coupling,
-   not because the logic is hard, the architecture is wrong for
-   the workload.
+   Approached but didn't fully fire — the in-repo coupling
+   problem fired first.
+3. ~~**An indexer takes the host down in production.**~~ Hasn't
+   happened. Solving it preventively is now cheap because v1
+   gives us the isolation for free.
+4. ~~**External contributors want to ship indexers.**~~ Not yet,
+   but the companion-pattern thesis suggests it'll matter sooner
+   than we'd otherwise plan for. V1's shape is forward-compatible.
+5. **Indexer iteration speed became the bottleneck.** Fired —
+   this is the one that triggered v1.
 
-If none of these are true, the existing single-process
-statically-composed bundle is a perfectly good answer — the
-architecture is *correct enough* until the org's scale changes
-the calculus.
+The architectural lesson: **we underweighted #5**. The original
+phasing assumed isolation was the load-bearing concern (#3 / #4
+firing), and treated iteration speed as a nice-to-have that
+could be solved by Phase B's native plugins without ever needing
+wasm. In practice, the iteration-speed pain hit first and was
+sharp enough that the user wanted the *full* solution
+(load-without-restart) immediately rather than the partial
+Phase B answer (load-with-restart).
+
+Generalising: when a trigger says "the architecture is correct
+enough until the org's scale changes the calculus" — the
+calculus that changes first might not be the one you expected.
+For mitos, the org-scale shift was the pace at which we ship
+indexer changes, not the count of indexers or contributors.
 
 ## Lessons banked from current implementation
 
