@@ -32,12 +32,14 @@
 //!   see `vendored/balius/NOTICE`)
 
 pub mod bindings;
+pub mod driver;
 pub mod host_fns;
 pub mod registry;
 pub mod resolved_block;
 pub mod supervisor;
 pub mod vendored;
 
+pub use driver::{ApplyOutcome, BlockEvent, Driver};
 pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
 pub use resolved_block::{ResolvedBlock, TxView};
 pub use supervisor::{Supervisor, SupervisorOutcome};
@@ -62,6 +64,9 @@ pub enum PlatformError {
 
     #[error("wasmtime: {0}")]
     Wasmtime(#[from] wasmtime::Error),
+
+    #[error("resource table: {0}")]
+    ResourceTable(#[from] wasmtime::component::ResourceTableError),
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

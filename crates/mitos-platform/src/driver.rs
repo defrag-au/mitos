@@ -1,0 +1,185 @@
+//! Per-instance dispatch loop.
+//!
+//! Owns a `ModuleInstance` and pumps a stream of `BlockEvent`s
+//! through it. For each block:
+//!   1. Build a `ResolvedBlock` from the typed event payload.
+//!   2. Push into the wasmtime `ResourceTable`.
+//!   3. Call `handle-event(channel, &handle)`.
+//!   4. On success: drop the resource, advance the cursor,
+//!      record the supervisor success, refuel the store.
+//!   5. On trap: consult the supervisor, handle the outcome
+//!      (retry / restart / skip / quarantine).
+//!
+//! V1 cursor model is "advance only on success or skip-and-mark";
+//! traps that fall through to `RestartAndReplay` keep the cursor
+//! pinned to the failing block's predecessor so the replay
+//! re-runs the block. Cursor is held in-memory only for now;
+//! redb-backed persistence lands with the vendored Balius
+//! `store.rs`.
+//!
+//! Forward-compat note: `BlockEvent` is the shape we'd plug
+//! against the existing `mitos-core` chain-event source. V1
+//! defines it locally (so we don't take a `mitos-core` dep on
+//! `mitos-platform` yet); when we wire the real chain follower,
+//! the natural move is to promote `BlockEvent` into a
+//! `mitos-protocol` enum that both halves share.
+
+use dolos_core::ChainPoint;
+use tokio::time::{Duration, sleep};
+
+use crate::registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
+use crate::resolved_block::{ResolvedBlock, TxView};
+use crate::supervisor::SupervisorOutcome;
+use crate::{PlatformError, PlatformResult};
+use std::sync::Arc;
+
+use crate::host_fns::{DataPlaneFacade, emit, state_kv};
+
+/// One typed chain event the driver consumes. V1 only carries
+/// `Apply { block }` — undo/mark/snapshot will land alongside
+/// the chain-follower wiring.
+#[derive(Debug, Clone)]
+pub enum BlockEvent {
+    /// Apply a block forward. `cursor_after` is the chain point
+    /// that's reached after the block is applied — what gets
+    /// persisted on success.
+    Apply {
+        slot: u64,
+        cursor_after: ChainPoint,
+        txs: Vec<TxView>,
+    },
+}
+
+/// Driver state. One per active subscription. Owns the wasmtime
+/// instance + supervisor; restartable via the registry.
+pub struct Driver {
+    instance: ModuleInstance,
+    cursor: Option<ChainPoint>,
+    budget: ResourceBudget,
+    /// Channel to dispatch on. V1 pins to channel 0; per-channel
+    /// routing arrives with the registry-driven init handshake.
+    dispatch_channel: u32,
+}
+
+/// Outcome of a single block apply.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ApplyOutcome {
+    /// Block applied; cursor advanced.
+    Applied,
+    /// Block skipped (`SkipAndMark` strategy); cursor advanced
+    /// past the failing block.
+    Skipped,
+    /// Module instance was restarted; the failing block will be
+    /// retried on the next call. Caller should re-feed the same
+    /// `BlockEvent` (idempotent dispatch is a v1 contract).
+    RestartedRetry,
+    /// Module is quarantined; cursor NOT advanced. Caller must
+    /// surface the failure to the operator.
+    Quarantined,
+}
+
+impl Driver {
+    pub fn new(instance: ModuleInstance, budget: ResourceBudget) -> Self {
+        Self {
+            instance,
+            cursor: None,
+            budget,
+            dispatch_channel: 0,
+        }
+    }
+
+    pub fn cursor(&self) -> Option<&ChainPoint> {
+        self.cursor.as_ref()
+    }
+
+    /// Apply one block. Handles trap supervision internally;
+    /// caller decides whether to keep feeding blocks (Applied /
+    /// Skipped / RestartedRetry) or stop (Quarantined).
+    pub async fn apply(
+        &mut self,
+        registry: &ModuleRegistry,
+        data_plane: Arc<dyn DataPlaneFacade>,
+        kv_factory: impl Fn() -> state_kv::ModuleKv,
+        emitter_factory: impl Fn() -> emit::EventSink,
+        event: BlockEvent,
+    ) -> PlatformResult<ApplyOutcome> {
+        let BlockEvent::Apply {
+            slot,
+            cursor_after,
+            txs,
+        } = event;
+
+        // Refuel before each call. wasmtime consumes fuel
+        // monotonically; without this, the second block would
+        // run on the leftover budget from the first.
+        self.instance.store.set_fuel(self.budget.fuel_per_call)?;
+        self.instance
+            .store
+            .set_epoch_deadline(self.budget.epoch_deadline_ticks);
+
+        let block = ResolvedBlock::from_views(slot, txs.clone());
+        let resource = self.instance.store.data_mut().table.push(block)?;
+
+        let dispatch_result = self
+            .instance
+            .bindings
+            .call_handle_event(&mut self.instance.store, self.dispatch_channel, resource)
+            .await;
+
+        match dispatch_result {
+            Ok(()) => {
+                self.instance.supervisor.record_success();
+                self.cursor = Some(cursor_after);
+                Ok(ApplyOutcome::Applied)
+            }
+            Err(trap) => {
+                tracing::warn!(
+                    error = %trap,
+                    slot,
+                    "module trapped during handle-event",
+                );
+                self.handle_trap(registry, data_plane, kv_factory, emitter_factory, cursor_after)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_trap(
+        &mut self,
+        registry: &ModuleRegistry,
+        data_plane: Arc<dyn DataPlaneFacade>,
+        kv_factory: impl Fn() -> state_kv::ModuleKv,
+        emitter_factory: impl Fn() -> emit::EventSink,
+        cursor_after: ChainPoint,
+    ) -> PlatformResult<ApplyOutcome> {
+        // record_trap returns one of {Retry, RestartAndReplay,
+        // SkipAndContinue, Quarantine} — each terminal for this
+        // call. Caller decides whether to re-feed the same block
+        // (Retry / RestartedRetry) or move on.
+        match self.instance.supervisor.record_trap() {
+            SupervisorOutcome::Retry { backoff_ms } => {
+                sleep(Duration::from_millis(backoff_ms as u64)).await;
+                Ok(ApplyOutcome::RestartedRetry)
+            }
+            SupervisorOutcome::RestartAndReplay => {
+                tracing::warn!("supervisor: restarting instance for replay");
+                let kv = kv_factory();
+                let emitter = emitter_factory();
+                self.instance = registry
+                    .instantiate(data_plane.clone(), kv, emitter, self.budget)
+                    .await?;
+                Ok(ApplyOutcome::RestartedRetry)
+            }
+            SupervisorOutcome::SkipAndContinue => {
+                tracing::warn!("supervisor: skipping failing block, advancing cursor");
+                self.cursor = Some(cursor_after);
+                Ok(ApplyOutcome::Skipped)
+            }
+            SupervisorOutcome::Quarantine => {
+                tracing::error!("supervisor: quarantining module");
+                Err(PlatformError::Quarantined { failures: 1 })
+            }
+            SupervisorOutcome::Ok => unreachable!("record_trap never returns Ok"),
+        }
+    }
+}
