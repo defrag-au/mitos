@@ -10,7 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
-reqwest = { workspace = true }
+# Reqwest with multipart for module uploads. Same version the
+# rest of the workspace uses; multipart is feature-gated.
+reqwest = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
