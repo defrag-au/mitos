@@ -144,3 +144,39 @@ where
         mitos_data_plane::ChainDataPlane::read_utxos(self, refs, decode).await
     }
 }
+
+/// Owning adapter wrapping a `Domain` for the platform's
+/// `Arc<dyn DataPlaneFacade>` slot. `LocalDataPlane` borrows the
+/// domain for its lifetime; this adapter owns a clone (the
+/// `Domain` trait already requires `Clone`) so the resulting
+/// facade is `'static` and works behind `Arc<dyn …>`.
+///
+/// Constructs a fresh `LocalDataPlane` per call — cheap, since
+/// `LocalDataPlane::new` is just a struct-literal over the
+/// borrowed domain.
+pub struct DomainDataPlane<D: dolos_core::Domain> {
+    domain: D,
+}
+
+impl<D: dolos_core::Domain> DomainDataPlane<D> {
+    pub fn new(domain: D) -> Self {
+        Self { domain }
+    }
+}
+
+#[async_trait::async_trait]
+impl<D> DataPlaneFacade for DomainDataPlane<D>
+where
+    D: dolos_core::Domain + 'static,
+{
+    async fn read_utxos(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+        decode: mitos_data_plane::DecodeLevel,
+    ) -> mitos_data_plane::DataPlaneResult<
+        Vec<(mitos_data_plane::OutputRef, mitos_data_plane::TypedOutput)>,
+    > {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::read_utxos(&plane, refs, decode).await
+    }
+}

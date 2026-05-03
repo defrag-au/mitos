@@ -49,6 +49,12 @@ pub struct Bundle {
     listen: SocketAddr,
     data_dir: PathBuf,
     indexers: Vec<Arc<dyn IndexerHandle>>,
+    /// Filesystem path for wasm-module artifacts. `None` = wasm
+    /// hosting disabled; the bundle runs as a pure
+    /// statically-composed indexer host (today's behaviour).
+    /// `Some(path)` = enable `/_admin/modules/*` + auto-resume
+    /// any modules already activated under that path.
+    modules_dir: Option<PathBuf>,
 }
 
 impl Bundle {
@@ -70,6 +76,7 @@ impl Bundle {
             listen,
             data_dir,
             indexers: Vec::new(),
+            modules_dir: None,
         }
     }
 
@@ -84,6 +91,22 @@ impl Bundle {
         self.indexers.push(Arc::new(adapter));
     }
 
+    /// Enable wasm-module hosting. After this is called:
+    /// - `/_admin/modules/*` routes are mounted
+    /// - any modules already registered under `modules_dir`
+    ///   get their followers auto-started on `run` (resume)
+    /// - successful uploads via `POST /_admin/modules/{id}`
+    ///   start (or replace) a running follower for that module
+    ///
+    /// Per `MITOS_PLATFORM_DEPLOYMENT.md`: the modules dir is
+    /// the canonical artifact storage location, e.g.
+    /// `/var/lib/mitos/modules/`. Layout is one subdir per
+    /// module id: `<id>/current.wasm`, `<id>/manifest.toml`,
+    /// `<id>/cursor.cbor`, `<id>/<sha>.wasm` (rollback target).
+    pub fn enable_modules(&mut self, modules_dir: PathBuf) {
+        self.modules_dir = Some(modules_dir);
+    }
+
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
     /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
     /// `/replicate/{indexer}` test surface + `/_admin/subscriptions`),
@@ -95,6 +118,7 @@ impl Bundle {
             listen,
             data_dir,
             indexers,
+            modules_dir,
         } = self;
 
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
@@ -140,6 +164,83 @@ impl Bundle {
         );
         info!(path = %replicator_path.display(), "replicator registry opened");
         app = app.merge(admin_router(replicator.clone(), auth.clone()));
+
+        // Wasm-module hosting (Bundle::enable_modules). Mounts
+        // /_admin/modules/* and auto-starts followers for any
+        // modules already registered on disk.
+        if let Some(modules_dir) = modules_dir.as_ref() {
+            std::fs::create_dir_all(modules_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "creating modules dir {}: {e}",
+                    modules_dir.display()
+                )
+            })?;
+            let storage = mitos_platform::storage::ModuleStorage::new(modules_dir.clone());
+            let engine = mitos_platform::registry::ModuleRegistry::build_engine()
+                .map_err(|e| anyhow::anyhow!("module engine: {e}"))?;
+            let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = Arc::new(
+                mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
+            );
+
+            // Subscription factory: each follower gets its own
+            // tip-watch. Today's `watch_tip(None)` starts from
+            // the chain's current point — for the v1.5 in-memory
+            // cursor + on-disk checkpoint this is fine; the
+            // driver replays from the checkpoint on the first
+            // applied block. v2's `store.rs` vendoring will
+            // wire `watch_tip(Some(persisted_cursor))` so the
+            // chain follower itself starts at the right point.
+            let domain_for_factory = domain.clone();
+            let sub_factory: mitos_platform::host::SubscriptionFactory<
+                <DomainAdapter as Domain>::TipSubscription,
+            > = Arc::new(move || {
+                domain_for_factory
+                    .watch_tip(None)
+                    .expect("watch_tip subscribe failed")
+            });
+
+            let kv_factory: mitos_platform::host::KvFactory = Arc::new(|_id: &str| {
+                mitos_platform::host_fns::state_kv::ModuleKv::new_in_memory()
+            });
+            let emitter_factory: mitos_platform::host::EmitterFactory =
+                Arc::new(mitos_platform::host_fns::emit::EventSink::new);
+
+            let host = Arc::new(mitos_platform::host::ModuleHost::new(
+                storage.clone(),
+                engine,
+                dp,
+                sub_factory,
+                kv_factory,
+                emitter_factory,
+                mitos_platform::registry::ResourceBudget::default(),
+            ));
+
+            // Auto-resume: scan modules dir, start a follower
+            // for each registered module. Failures here are
+            // logged but don't abort bundle startup — a single
+            // bad module shouldn't take the host down.
+            for module_id in storage.list_modules().unwrap_or_default() {
+                match host.start(&module_id).await {
+                    Ok(()) => info!(module = %module_id, "auto-resumed wasm module"),
+                    Err(e) => {
+                        error!(module = %module_id, error = %e, "auto-resume failed; module not running");
+                    }
+                }
+            }
+
+            // The platform admin router has its own AuthToken
+            // type — same shape, same env var, separate crate.
+            let platform_auth = mitos_platform::admin::AuthToken::from_env();
+            app = app.merge(mitos_platform::admin::admin_router_with_host(
+                storage,
+                host,
+                platform_auth,
+            ));
+            info!(
+                modules_dir = %modules_dir.display(),
+                "wasm-module hosting enabled"
+            );
+        }
 
         // /health surfaces replicator state — open (no auth) so a
         // status page or LB health check can hit it without

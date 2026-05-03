@@ -3416,6 +3416,7 @@ dependencies = [
  "gasket",
  "hex",
  "miette",
+ "mitos-platform",
  "mitos-protocol",
  "redb 2.6.3",
  "serde",
