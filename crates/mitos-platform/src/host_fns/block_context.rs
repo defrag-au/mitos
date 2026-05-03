@@ -30,6 +30,51 @@ impl HostResolvedBlock for HostState {
         Ok(self.table.get(&self_)?.tx_count)
     }
 
+    async fn tx_hash(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+    ) -> wasmtime::Result<Vec<u8>> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        Ok(tx.tx_hash.clone())
+    }
+
+    async fn output_count(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+    ) -> wasmtime::Result<u32> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        Ok(tx.outputs.len() as u32)
+    }
+
+    async fn get_output(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        output_idx: u32,
+    ) -> wasmtime::Result<TypedOutput> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let output = tx.outputs.get(output_idx as usize).ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "output_idx {output_idx} out of range for tx {tx_idx}"
+            ))
+        })?;
+        Ok(output.clone())
+    }
+
     async fn get_consumed_input(
         &mut self,
         self_: Resource<ResolvedBlock>,

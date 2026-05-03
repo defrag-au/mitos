@@ -1,0 +1,17 @@
+# Standalone workspace — kept out of the main mitos workspace
+# so wasm32-wasip2 build settings don't bleed into the main
+# build, same isolation pattern as `spikes/wit-spike/`.
+[workspace]
+members = ["module"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

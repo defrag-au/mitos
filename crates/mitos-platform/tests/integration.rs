@@ -31,7 +31,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dolos_core::ChainPoint;
 use mitos_data_plane::{DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
-use mitos_platform::bindings::OutputRef as WitOutputRef;
+use mitos_platform::bindings::{
+    AssetEntry as WitAssetEntry, AssetId as WitAssetId, OutputRef as WitOutputRef,
+    TypedOutput as WitTypedOutput,
+};
 use mitos_platform::driver::{ApplyOutcome, BlockEvent, Driver};
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
 use mitos_platform::registry::{ModuleRegistry, ResourceBudget};
@@ -111,6 +114,8 @@ async fn end_to_end_load_instantiate_dispatch() {
     let block = ResolvedBlock::from_views(
         12_345_678,
         vec![TxView {
+            tx_hash: vec![0xCD; 32],
+            outputs: vec![],
             consumed_input_refs: vec![synthetic_input],
         }],
     );
@@ -130,6 +135,220 @@ async fn end_to_end_load_instantiate_dispatch() {
     // Drain any emitted events. Spike guest doesn't emit; assert
     // empty so a regression that wires up emission would surface.
     assert!(events.try_recv().is_err(), "spike guest must not emit");
+}
+
+fn ownership_module_wasm() -> Option<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidate = manifest
+        .parent()? // crates/
+        .parent()? // mitos/
+        .join(
+            "modules/ownership-indexer/target/wasm32-wasip2/release/\
+             ownership_indexer_module.wasm",
+        );
+    candidate.exists().then_some(candidate)
+}
+
+/// Drive the ownership module through one block carrying one
+/// asset of a watched policy; assert it emits exactly one
+/// `OwnershipChange::Transfer` event and that the policy_id
+/// matches the configured watch.
+#[tokio::test]
+async fn ownership_module_emits_transfer_for_watched_policy() {
+    let Some(wasm) = ownership_module_wasm() else {
+        eprintln!(
+            "skipping: ownership module .wasm not built. \
+             Run `cd modules/ownership-indexer && \
+             cargo build -p ownership-indexer-module \
+             --target wasm32-wasip2 --release` first."
+        );
+        return;
+    };
+
+    let engine = ModuleRegistry::build_engine().expect("engine build");
+    let registry = ModuleRegistry::load_from_path(engine, "ownership".to_owned(), &wasm)
+        .expect("component load");
+
+    let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
+    let budget = ResourceBudget::default();
+
+    let (sink, mut events) = emit::EventSink::new();
+    let kv = state_kv::ModuleKv::new_in_memory();
+
+    let mut instance = registry
+        .instantiate(dp.clone(), kv, sink, budget)
+        .await
+        .expect("instantiate");
+
+    // Hand the module a CBOR'd Config matching its expected
+    // shape: one watched policy. The hex below is the same
+    // 28-byte (56-hex) policy we'll plant on the synthetic
+    // output so `handle_event` matches and emits.
+    #[derive(serde::Serialize)]
+    struct ModuleConfig {
+        policies: Vec<String>,
+    }
+    let watched_policy_hex =
+        "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6".to_owned();
+    let cfg = ModuleConfig {
+        policies: vec![watched_policy_hex.clone()],
+    };
+    let mut cfg_bytes = Vec::new();
+    ciborium::ser::into_writer(&cfg, &mut cfg_bytes).expect("cbor encode");
+
+    instance
+        .bindings
+        .call_init(&mut instance.store, &cfg_bytes)
+        .await
+        .expect("init");
+
+    // Synthetic block with one tx producing one output that
+    // carries one asset under the watched policy. Asset name
+    // is "BlackFlag001" hex-encoded.
+    let policy_bytes = hex::decode(&watched_policy_hex).unwrap();
+    let asset_name_bytes = b"BlackFlag001".to_vec();
+    let output = WitTypedOutput {
+        address: "addr1qxy...".to_owned(),
+        lovelace: 2_000_000,
+        assets: vec![WitAssetEntry {
+            asset: WitAssetId {
+                policy: policy_bytes,
+                name: asset_name_bytes.clone(),
+            },
+            quantity: 1,
+        }],
+    };
+    let block = ResolvedBlock::from_views(
+        90_000_000,
+        vec![TxView {
+            tx_hash: vec![0xEF; 32],
+            outputs: vec![output],
+            consumed_input_refs: vec![],
+        }],
+    );
+    let block_id = instance
+        .store
+        .data_mut()
+        .table
+        .push(block)
+        .expect("push resource");
+    instance
+        .bindings
+        .call_handle_event(&mut instance.store, 0, block_id)
+        .await
+        .expect("handle-event");
+
+    // One emission, on channel 0.
+    let event = events.try_recv().expect("expected one Transfer event");
+    assert_eq!(event.channel, 0);
+    assert_eq!(event.module_id, "ownership");
+
+    // CBOR-decode the payload + assert the field shapes match
+    // the host-side `OwnershipChange::Transfer` we'd expect.
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(tag = "type")]
+    enum Decoded {
+        Transfer {
+            policy_id: String,
+            asset_name: String,
+            new_owner: String,
+            tx_hash: String,
+            output_index: u32,
+        },
+    }
+    let decoded: Decoded = ciborium::de::from_reader(event.payload.as_slice()).expect("decode");
+    let Decoded::Transfer {
+        policy_id,
+        asset_name,
+        new_owner,
+        tx_hash,
+        output_index,
+    } = decoded;
+    assert_eq!(policy_id, watched_policy_hex);
+    assert_eq!(asset_name, hex::encode(&asset_name_bytes));
+    assert_eq!(new_owner, "addr1qxy...");
+    assert_eq!(tx_hash, hex::encode([0xEF; 32]));
+    assert_eq!(output_index, 0);
+
+    // No further emissions.
+    assert!(events.try_recv().is_err(), "expected exactly one event");
+}
+
+/// Drive the ownership module through one block whose output
+/// carries an asset under a non-watched policy; assert it emits
+/// nothing.
+#[tokio::test]
+async fn ownership_module_ignores_unwatched_policy() {
+    let Some(wasm) = ownership_module_wasm() else {
+        return;
+    };
+
+    let engine = ModuleRegistry::build_engine().expect("engine build");
+    let registry = ModuleRegistry::load_from_path(engine, "ownership".to_owned(), &wasm)
+        .expect("component load");
+
+    let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
+    let budget = ResourceBudget::default();
+
+    let (sink, mut events) = emit::EventSink::new();
+    let kv = state_kv::ModuleKv::new_in_memory();
+
+    let mut instance = registry
+        .instantiate(dp.clone(), kv, sink, budget)
+        .await
+        .expect("instantiate");
+
+    #[derive(serde::Serialize)]
+    struct ModuleConfig {
+        policies: Vec<String>,
+    }
+    let watched = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+    let mut cfg_bytes = Vec::new();
+    ciborium::ser::into_writer(
+        &ModuleConfig {
+            policies: vec![watched.clone()],
+        },
+        &mut cfg_bytes,
+    )
+    .unwrap();
+    instance
+        .bindings
+        .call_init(&mut instance.store, &cfg_bytes)
+        .await
+        .expect("init");
+
+    let unwatched =
+        hex::decode("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let output = WitTypedOutput {
+        address: "addr1abc".to_owned(),
+        lovelace: 2_000_000,
+        assets: vec![WitAssetEntry {
+            asset: WitAssetId {
+                policy: unwatched,
+                name: b"X".to_vec(),
+            },
+            quantity: 1,
+        }],
+    };
+    let block = ResolvedBlock::from_views(
+        90_000_001,
+        vec![TxView {
+            tx_hash: vec![0x11; 32],
+            outputs: vec![output],
+            consumed_input_refs: vec![],
+        }],
+    );
+    let block_id = instance.store.data_mut().table.push(block).unwrap();
+    instance
+        .bindings
+        .call_handle_event(&mut instance.store, 0, block_id)
+        .await
+        .expect("handle-event");
+
+    assert!(
+        events.try_recv().is_err(),
+        "unwatched policy must not emit"
+    );
 }
 
 /// Driver-level test: drive two consecutive blocks through the
@@ -181,6 +400,8 @@ async fn driver_advances_cursor_across_blocks() {
             slot,
             cursor_after: ChainPoint::Slot(slot),
             txs: vec![TxView {
+                tx_hash: vec![0xCD; 32],
+                outputs: vec![],
                 consumed_input_refs: vec![synthetic_input.clone()],
             }],
         };

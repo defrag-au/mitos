@@ -96,6 +96,18 @@ interface block-context {
         slot: func() -> u64;
         tx-count: func() -> u32;
 
+        /// Tx hash bytes (32). Modules emit it as event metadata.
+        tx-hash: func(tx-idx: u32) -> list<u8>;
+
+        /// Number of outputs produced by a tx. Eager — host has
+        /// the decoded block in hand, no I/O needed.
+        output-count: func(tx-idx: u32) -> u32;
+
+        /// Get a produced output by `(tx_idx, output_idx)`.
+        /// Eager (decoded host-side already). The hot path for
+        /// ownership-style indexers walks `output_count` × this.
+        get-output: func(tx-idx: u32, output-idx: u32) -> typed-output;
+
         /// Lazy consumed-input lookup. First call triggers a
         /// data-plane read; result is memoised for the block's
         /// lifetime. Pure-output indexers (e.g. ownership) never

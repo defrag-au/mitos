@@ -66,10 +66,17 @@ impl From<&OutputRef> for OutputRefKey {
 }
 
 /// Per-tx view inside `ResolvedBlock`. Holds enough to answer
-/// `tx-count` / `get-consumed-input` / `get-consumed-inputs`
-/// without re-decoding.
+/// `tx-hash` / `output-count` / `get-output` /
+/// `get-consumed-input` / `get-consumed-inputs` without
+/// re-decoding.
 #[derive(Debug, Clone)]
 pub struct TxView {
+    /// 32-byte tx hash. Modules emit as event metadata.
+    pub tx_hash: Vec<u8>,
+    /// Outputs produced by this tx, in declaration order.
+    /// Already projected to the WIT shape; host pre-decodes
+    /// these once when building the `ResolvedBlock`.
+    pub outputs: Vec<crate::bindings::TypedOutput>,
     /// `OutputRef`s of inputs consumed by this tx, in order.
     /// `get_consumed_input(tx_idx, i)` resolves
     /// `txs[tx_idx].consumed_input_refs[i]`.
