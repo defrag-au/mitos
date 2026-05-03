@@ -54,6 +54,7 @@ redb = { workspace = true }
 
 # Async runtime. Module dispatch + host I/O run on Tokio.
 tokio = { workspace = true }
+tokio-util = "0.7"
 async-trait = { workspace = true }
 
 # Admin HTTP surface — `/_admin/modules/*` lives here. Same axum

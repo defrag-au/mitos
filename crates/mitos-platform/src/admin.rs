@@ -27,7 +27,7 @@ use axum::extract::{Multipart, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Manifest, ManifestError};
@@ -94,18 +94,46 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Clone)]
 struct AdminState {
     storage: ModuleStorage,
+    host: Option<Arc<dyn crate::host::ModuleHostHandle>>,
 }
 
-/// Build the admin router. Mount on the host's axum app via
-/// `app.merge(admin_router(...))`.
+/// Build the admin router with artifact-only behaviour. Uploads
+/// land on disk but no follower is started. Used by:
+/// - read-only / inspector deployments
+/// - tests that only exercise the artifact pipeline
+///
+/// Production wires the lifecycle-aware variant
+/// `admin_router_with_host` which actually starts running
+/// modules after upload.
 pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
-    let state = AdminState { storage };
+    admin_router_inner(storage, None, auth)
+}
+
+/// Build the admin router with the running-instance lifecycle
+/// wired in. Uploads trigger `host.replace(id)` so the new sha
+/// starts running immediately; DELETE + restart routes are
+/// available for admin operators.
+pub fn admin_router_with_host(
+    storage: ModuleStorage,
+    host: Arc<dyn crate::host::ModuleHostHandle>,
+    auth: AuthToken,
+) -> axum::Router {
+    admin_router_inner(storage, Some(host), auth)
+}
+
+fn admin_router_inner(
+    storage: ModuleStorage,
+    host: Option<Arc<dyn crate::host::ModuleHostHandle>>,
+    auth: AuthToken,
+) -> axum::Router {
+    let state = AdminState { storage, host };
     axum::Router::new()
         .route("/_admin/modules", get(list_modules))
         .route(
             "/_admin/modules/{id}",
-            get(get_module).post(upload_module),
+            get(get_module).post(upload_module).delete(delete_module),
         )
+        .route("/_admin/modules/{id}/restart", post(restart_module))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(auth, require_auth))
 }
@@ -295,10 +323,62 @@ async fn upload_module(
         "module uploaded + activated",
     );
 
+    // If a host is wired in, start (or replace) the running
+    // instance so the new sha actually takes effect. In
+    // artifact-only mode (test harness, read-only deployments)
+    // skip this step — the artifact is on disk, that's all.
+    if let Some(host) = &state.host {
+        host.replace(&id)
+            .await
+            .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    }
+
     Ok(Json(UploadResponse {
         ok: true,
         module: ModuleSummary::from(&manifest),
     }))
+}
+
+async fn delete_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    if let Some(host) = &state.host {
+        host.stop(&id)
+            .await
+            .map_err(|e| HandlerError::Wasmtime(format!("host.stop: {e}")))?;
+    }
+    // V1.5 doesn't yet remove the artifact directory — that's a
+    // safer default while we still don't have rollback CLI
+    // surface; operators can `rm -rf` if they really want it
+    // gone. The lifecycle effect (stop + drop slot) is what
+    // matters for "delete."
+    tracing::info!(module = %id, "module stopped via DELETE");
+    Ok((StatusCode::NO_CONTENT, ()).into_response())
+}
+
+async fn restart_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let Some(host) = &state.host else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no host wired in this admin router",
+        )
+            .into_response());
+    };
+    host.replace(&id)
+        .await
+        .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    tracing::info!(module = %id, "module restarted");
+    Ok((StatusCode::OK, "restarted").into_response())
 }
 
 /// Independent wasmtime-side validation. Phase 1: confirm the
@@ -317,10 +397,3 @@ fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
     Ok(())
 }
 
-// Suppress dead-code warning for the `Arc` import — it'll be
-// load-bearing in phase 2 when the running-instance lifecycle
-// wiring lands and the admin state grows an `Arc<ModuleHost>`.
-#[allow(dead_code)]
-fn _phase2_placeholder() -> Arc<()> {
-    Arc::new(())
-}

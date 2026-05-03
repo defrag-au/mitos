@@ -19,6 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
+use dolos_core::ChainPoint;
+
 use crate::manifest::Manifest;
 
 #[derive(Debug, thiserror::Error)]
@@ -169,6 +171,41 @@ impl ModuleStorage {
         // Symlink targets are stored relative to the symlink's
         // dir; resolve to absolute for caller convenience.
         Ok(Some(self.module_dir(id).join(target)))
+    }
+
+    /// Cursor checkpoint path. Single CBOR file under the
+    /// module's storage dir.
+    fn cursor_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("cursor.cbor")
+    }
+
+    /// Persist the driver's last-applied cursor. Best-effort:
+    /// no fsync, no atomic-rename. Crash-safety lands when
+    /// `store.rs` is vendored from Balius (see
+    /// `vendored/balius/NOTICE`); v1.5 just gets us "restart
+    /// resumes from approximately where we were."
+    pub fn write_cursor(&self, id: &str, cursor: &ChainPoint) -> Result<(), StorageError> {
+        std::fs::create_dir_all(self.module_dir(id))?;
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(cursor, &mut buf)
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        std::fs::write(self.cursor_path(id), buf)?;
+        Ok(())
+    }
+
+    /// Read the persisted cursor, if any. `Ok(None)` means the
+    /// module has no checkpoint yet; caller should start from
+    /// `ChainPoint::Origin` (or whatever the configured start
+    /// point is).
+    pub fn read_cursor(&self, id: &str) -> Result<Option<ChainPoint>, StorageError> {
+        let path = self.cursor_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)?;
+        let cursor: ChainPoint = ciborium::de::from_reader(bytes.as_slice())
+            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(Some(cursor))
     }
 
     /// List registered module ids by directory enumeration.
@@ -360,6 +397,29 @@ mod tests {
         }
         // Should be re-acquirable.
         let _again = storage.acquire_upload_lock("released").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cursor_round_trip() {
+        let dir = tempdir("cursor");
+        let storage = ModuleStorage::new(&dir);
+
+        // No cursor yet.
+        assert!(storage.read_cursor("test-module").unwrap().is_none());
+
+        // Write + read.
+        let cursor = ChainPoint::Slot(186_000_000);
+        storage.write_cursor("test-module", &cursor).unwrap();
+        let read = storage.read_cursor("test-module").unwrap().unwrap();
+        assert_eq!(read.slot(), 186_000_000);
+
+        // Overwrite — last write wins.
+        let cursor2 = ChainPoint::Slot(186_001_000);
+        storage.write_cursor("test-module", &cursor2).unwrap();
+        let read2 = storage.read_cursor("test-module").unwrap().unwrap();
+        assert_eq!(read2.slot(), 186_001_000);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

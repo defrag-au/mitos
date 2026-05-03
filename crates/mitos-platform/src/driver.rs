@@ -51,6 +51,13 @@ pub enum BlockEvent {
     },
 }
 
+/// Hook called after every successful cursor advance. Used by
+/// `ModuleHost` to persist the cursor to disk so a restart
+/// resumes from the last-applied block. Best-effort: failure
+/// logs but does not abort the dispatch loop (the in-memory
+/// cursor is still updated; we lose at most one block on crash).
+pub type CheckpointHook = Arc<dyn Fn(&ChainPoint) + Send + Sync>;
+
 /// Driver state. One per active subscription. Owns the wasmtime
 /// instance + supervisor; restartable via the registry.
 pub struct Driver {
@@ -60,6 +67,8 @@ pub struct Driver {
     /// Channel to dispatch on. V1 pins to channel 0; per-channel
     /// routing arrives with the registry-driven init handshake.
     dispatch_channel: u32,
+    /// Optional checkpoint hook fired after every Applied/Skipped.
+    checkpoint_hook: Option<CheckpointHook>,
 }
 
 /// Outcome of a single block apply.
@@ -86,7 +95,23 @@ impl Driver {
             cursor: None,
             budget,
             dispatch_channel: 0,
+            checkpoint_hook: None,
         }
+    }
+
+    /// Builder: prime the driver's cursor from a persisted
+    /// checkpoint. Used by `ModuleHost` on restart to resume
+    /// from the last-applied block rather than chain origin.
+    pub fn with_initial_cursor(mut self, cursor: ChainPoint) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// Builder: install a checkpoint hook fired on every
+    /// successful cursor advance.
+    pub fn with_checkpoint_hook(mut self, hook: CheckpointHook) -> Self {
+        self.checkpoint_hook = Some(hook);
+        self
     }
 
     pub fn cursor(&self) -> Option<&ChainPoint> {
@@ -154,7 +179,8 @@ impl Driver {
         match dispatch_result {
             Ok(()) => {
                 self.instance.supervisor.record_success();
-                self.cursor = Some(cursor_after);
+                self.cursor = Some(cursor_after.clone());
+                self.fire_checkpoint(&cursor_after);
                 Ok(ApplyOutcome::Applied)
             }
             Err(trap) => {
@@ -166,6 +192,15 @@ impl Driver {
                 self.handle_trap(registry, data_plane, kv_factory, emitter_factory, cursor_after)
                     .await
             }
+        }
+    }
+
+    /// Fire the checkpoint hook if one's installed. Failure
+    /// here does not abort the dispatch loop — we log + carry
+    /// on with the in-memory cursor (best-effort persistence).
+    fn fire_checkpoint(&self, cursor: &ChainPoint) {
+        if let Some(hook) = &self.checkpoint_hook {
+            hook(cursor);
         }
     }
 
@@ -197,7 +232,8 @@ impl Driver {
             }
             SupervisorOutcome::SkipAndContinue => {
                 tracing::warn!("supervisor: skipping failing block, advancing cursor");
-                self.cursor = Some(cursor_after);
+                self.cursor = Some(cursor_after.clone());
+                self.fire_checkpoint(&cursor_after);
                 Ok(ApplyOutcome::Skipped)
             }
             SupervisorOutcome::Quarantine => {

@@ -36,6 +36,7 @@ pub mod bindings;
 pub mod block_decode;
 pub mod driver;
 pub mod follower;
+pub mod host;
 pub mod host_fns;
 pub mod inspect;
 pub mod manifest;
@@ -78,6 +79,9 @@ pub enum PlatformError {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("storage: {0}")]
+    Storage(#[from] crate::storage::StorageError),
 
     #[error("block decode: {0}")]
     Decode(String),
