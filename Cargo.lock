@@ -266,6 +266,7 @@ dependencies = [
  "matchit 0.8.4",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
@@ -3443,6 +3444,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.8.4",
  "cardano-assets",
  "ciborium",
  "dolos-core",
@@ -3454,9 +3456,12 @@ dependencies = [
  "redb 2.6.3",
  "serde",
  "serde_bytes",
+ "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.20",
+ "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
  "wasmtime",
@@ -3496,6 +3501,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]

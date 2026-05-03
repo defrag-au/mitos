@@ -31,13 +31,16 @@
 //! - `vendored` — files vendored from upstream (Apache-2.0;
 //!   see `vendored/balius/NOTICE`)
 
+pub mod admin;
 pub mod bindings;
 pub mod block_decode;
 pub mod driver;
 pub mod follower;
 pub mod host_fns;
+pub mod manifest;
 pub mod registry;
 pub mod resolved_block;
+pub mod storage;
 pub mod supervisor;
 pub mod vendored;
 
