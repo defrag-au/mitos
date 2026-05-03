@@ -3385,6 +3385,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-build"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "mitos-platform",
+ "serde",
+ "tokio",
+ "toml 0.8.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mitos-core"
 version = "0.0.1"
 dependencies = [
