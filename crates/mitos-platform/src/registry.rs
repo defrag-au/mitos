@@ -23,8 +23,8 @@
 
 use std::path::Path;
 
-use wasmtime::{Config, Engine};
 use wasmtime::component::Component;
+use wasmtime::{Config, Engine};
 
 use crate::PlatformResult;
 

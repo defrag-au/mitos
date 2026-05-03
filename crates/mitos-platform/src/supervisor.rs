@@ -77,3 +77,62 @@ impl Supervisor {
         exp.min(self.retry.backoff_cap_ms)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retry(max: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: max,
+            backoff_cap_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn first_traps_within_budget_yield_retry() {
+        let mut sup = Supervisor::new(TrapStrategy::Replay, retry(3));
+        assert!(matches!(sup.record_trap(), SupervisorOutcome::Retry { .. }));
+        assert!(matches!(sup.record_trap(), SupervisorOutcome::Retry { .. }));
+    }
+
+    #[test]
+    fn replay_strategy_falls_through_after_budget() {
+        let mut sup = Supervisor::new(TrapStrategy::Replay, retry(2));
+        let _ = sup.record_trap(); // 1
+        assert_eq!(sup.record_trap(), SupervisorOutcome::RestartAndReplay); // 2 → fallthrough
+    }
+
+    #[test]
+    fn skip_strategy_advances_after_budget() {
+        let mut sup = Supervisor::new(TrapStrategy::SkipAndMark, retry(1));
+        assert_eq!(sup.record_trap(), SupervisorOutcome::SkipAndContinue);
+    }
+
+    #[test]
+    fn quarantine_strategy_halts_after_budget() {
+        let mut sup = Supervisor::new(TrapStrategy::Quarantine, retry(1));
+        assert_eq!(sup.record_trap(), SupervisorOutcome::Quarantine);
+    }
+
+    #[test]
+    fn success_resets_failure_counter() {
+        let mut sup = Supervisor::new(TrapStrategy::Replay, retry(3));
+        let _ = sup.record_trap();
+        let _ = sup.record_trap();
+        sup.record_success();
+        // First post-success trap should still be a Retry, not a
+        // fall-through — counter reset confirmed.
+        assert!(matches!(sup.record_trap(), SupervisorOutcome::Retry { .. }));
+    }
+
+    #[test]
+    fn backoff_caps() {
+        let mut sup = Supervisor::new(TrapStrategy::Replay, retry(20));
+        for _ in 0..10 {
+            if let SupervisorOutcome::Retry { backoff_ms } = sup.record_trap() {
+                assert!(backoff_ms <= 1_000);
+            }
+        }
+    }
+}

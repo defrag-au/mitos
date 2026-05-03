@@ -81,12 +81,40 @@ impl BlockContextHost for HostState {}
 
 /// Trait the platform crate uses to talk to the data plane,
 /// kept narrow on purpose. `mitos-data-plane::ChainDataPlane`
-/// is the production impl; tests stub a smaller fake.
+/// is the production impl (via the blanket impl below); tests
+/// stub a smaller fake.
+///
+/// Method shape mirrors the underlying — pairs of
+/// `(OutputRef, TypedOutput)` — so the conversion at the WIT
+/// boundary stays trivial. Missing entries are silently omitted
+/// (per the underlying contract).
 #[async_trait::async_trait]
 pub trait DataPlaneFacade: Send + Sync + 'static {
     async fn read_utxos(
         &self,
         refs: &[mitos_data_plane::OutputRef],
         decode: mitos_data_plane::DecodeLevel,
-    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::TypedOutput>>;
+    ) -> mitos_data_plane::DataPlaneResult<
+        Vec<(mitos_data_plane::OutputRef, mitos_data_plane::TypedOutput)>,
+    >;
+}
+
+/// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
+/// Production wires `LocalDataPlane` here; the facade trait
+/// exists primarily so tests can stub a smaller fake without
+/// implementing the full ChainDataPlane surface.
+#[async_trait::async_trait]
+impl<T> DataPlaneFacade for T
+where
+    T: mitos_data_plane::ChainDataPlane + Send + Sync + 'static,
+{
+    async fn read_utxos(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+        decode: mitos_data_plane::DecodeLevel,
+    ) -> mitos_data_plane::DataPlaneResult<
+        Vec<(mitos_data_plane::OutputRef, mitos_data_plane::TypedOutput)>,
+    > {
+        mitos_data_plane::ChainDataPlane::read_utxos(self, refs, decode).await
+    }
 }

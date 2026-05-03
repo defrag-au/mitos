@@ -48,7 +48,9 @@ pub use supervisor::{Supervisor, SupervisorOutcome};
 /// errors (load, version-mismatch, supervisor) use this enum.
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
-    #[error("module ABI version mismatch: host wants {wanted_major}.x, module is {got_major}.{got_minor}")]
+    #[error(
+        "module ABI version mismatch: host wants {wanted_major}.x, module is {got_major}.{got_minor}"
+    )]
     AbiMismatch {
         wanted_major: u32,
         got_major: u32,

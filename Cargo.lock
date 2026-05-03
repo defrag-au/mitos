@@ -3308,6 +3308,7 @@ dependencies = [
  "cardano-assets",
  "ciborium",
  "dolos-core",
+ "hex",
  "mitos-data-plane",
  "pallas",
  "pallas-primitives 1.0.0-alpha.4",
