@@ -1,0 +1,31 @@
+This directory contains files vendored from the Balius project
+(github.com/txpipe/balius), Copyright TxPipe contributors,
+licensed under the Apache License, Version 2.0.
+
+The Apache-2.0 license text is reproduced in
+LICENSE-APACHE-2.0 alongside this NOTICE.
+
+Each vendored file preserves its original upstream copyright
+header verbatim and carries an annotation comment of the form:
+
+    // Vendored from github.com/txpipe/balius @ <commit-sha>
+    // Original path: balius-runtime/src/<path>
+    // Apache-2.0 — see LICENSE-APACHE-2.0 (vendored alongside)
+    //
+    // Local modifications:
+    // - <list of substantive deltas>
+
+Substantive local modifications, where they exist, are
+described in each file's annotation block. The mitos-platform
+crate does not claim authorship of these files; mitos-platform's
+own original sources live alongside the vendored tree under
+`src/` proper.
+
+Vendored files (planned; see MITOS_PLATFORM_V1.md):
+- router.rs   (from balius-runtime/src/router.rs)
+- store.rs    (from balius-runtime/src/store.rs)
+- kv.rs       (subset of balius-runtime/src/kv/redb.rs)
+- metrics.rs  (from balius-runtime/src/metrics.rs)
+
+Until the vendoring step lands, this directory holds only
+this NOTICE and a placeholder `mod.rs`.
