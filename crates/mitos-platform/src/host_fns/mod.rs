@@ -28,6 +28,7 @@ pub mod state_kv;
 use std::sync::Arc;
 
 use wasmtime::component::ResourceTable;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bindings::{BlockContextHost, TypesHost};
 
@@ -38,7 +39,7 @@ use crate::bindings::{BlockContextHost, TypesHost};
 pub struct HostState {
     /// Long-lived resource table. Resources (today: `ResolvedBlock`;
     /// tomorrow: tx views, datum handles) push/delete through here.
-    pub(crate) table: ResourceTable,
+    pub table: ResourceTable,
 
     /// Data plane handle — proxied through `chain_data` host fns.
     /// `Arc` so cloning into the host fn closures is cheap.
@@ -54,6 +55,15 @@ pub struct HostState {
 
     /// Module identifier — surfaces in logs + metrics.
     pub(crate) module_id: String,
+
+    /// WASI context. Modules built against `wasm32-wasip2` pull
+    /// in `wasi:io`, `wasi:cli`, etc. as imports via the std lib;
+    /// `wasmtime_wasi::add_to_linker_async` populates the linker
+    /// with default impls. We give every module a minimal ctx
+    /// (no real fs/network surface) — the platform's intended
+    /// I/O all flows through our typed host fns.
+    pub(crate) wasi: WasiCtx,
+    pub(crate) wasi_table: ResourceTable,
 }
 
 impl HostState {
@@ -69,6 +79,22 @@ impl HostState {
             kv,
             emitter,
             module_id,
+            wasi: WasiCtxBuilder::new().build(),
+            wasi_table: ResourceTable::new(),
+        }
+    }
+}
+
+// `wasmtime_wasi`'s `add_to_linker_async` requires the store
+// data to expose a `WasiView`. We give it a separate
+// `wasi_table` so WASI-owned resources can't collide with our
+// platform-owned `ResolvedBlock` table.
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.wasi_table,
         }
     }
 }

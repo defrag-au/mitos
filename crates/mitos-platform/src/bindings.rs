@@ -28,9 +28,14 @@ wasmtime::component::bindgen!({
     },
 });
 
-// Re-export the bindgen-generated trait surface at a stable
-// crate-internal path so subsystems (host_fns, supervisor) don't
-// reach into the macro-generated module tree directly.
+// Re-export the bindgen-generated trait surface at stable
+// crate-internal paths so subsystems (registry, host_fns,
+// supervisor) don't reach into the macro-generated module tree
+// directly. `MitosModule` (the world's component handle with
+// `instantiate_async`, `call_*`, `add_to_linker`) is generated
+// at this module's level by the `bindgen!` macro and is already
+// addressable as `crate::bindings::MitosModule` — no re-export
+// needed.
 //
 // Note: `RetryPolicy` and `TrapStrategy` are pulled into the
 // bindgen-generated module's top-level scope by the world's

@@ -1,22 +1,13 @@
-// Mitos platform v1 WIT spike.
+// Mitos platform v1 ABI.
 //
-// Goal: validate three load-bearing claims from
-// `docs/strategy/MITOS_PLATFORM_V1.md` before committing the
-// real platform crate's structure.
+// See ../../../docs/strategy/MITOS_PLATFORM_V1.md for the full
+// rationale and ../../../spikes/wit-spike/wit/world.wit for the
+// proven-out shape this is promoted from.
 //
-// 1. `resolved-block` as a `borrow` parameter to handle-event —
-//    guest cannot stash it past dispatch (compile-time enforced),
-//    host pushes/borrows via `ResourceTable`.
-// 2. Async host fns via `imports: { default: async | trappable }`
-//    flow through Tokio cleanly, including `spawn_blocking` for
-//    redb-style synchronous I/O.
-// 3. Tuple-returning export `trap-policy: func() -> tuple<trap-strategy,
-//    retry-policy>` works with bindgen (or fall back to a record).
-//
-// Names + types here are spike-quality — they will be refined when
-// promoted to the real `mitos-platform` crate.
+// Stability: 0.x. The `module-version` export is the binding
+// stability promise; bumped on any breaking change to this WIT.
 
-package mitos:spike;
+package mitos:platform;
 
 interface types {
     record output-ref {
@@ -24,13 +15,37 @@ interface types {
         index: u32,
     }
 
+    record asset-id {
+        policy: list<u8>,
+        name: list<u8>,
+    }
+
+    /// Output projected through the data plane. Lean variant of
+    /// `mitos_data_plane::TypedOutput` for crossing the WIT
+    /// boundary cheaply; expand on demand if real workloads need
+    /// more fields.
     record typed-output {
         address: string,
         lovelace: u64,
+        assets: list<asset-entry>,
     }
 
-    /// Trap supervision strategy declared by the module.
-    /// Host's supervisor consults this on every trap.
+    record asset-entry {
+        asset: asset-id,
+        quantity: u64,
+    }
+
+    /// How aggressively the host should pre-decode datums and
+    /// scripts before handing the result to the module. Mirrors
+    /// `mitos_data_plane::DecodeLevel`.
+    variant decode-level {
+        lean,
+        with-datum,
+        full,
+    }
+
+    /// Trap supervision strategy declared by the module. Host
+    /// supervisor consults this on every trap.
     variant trap-strategy {
         /// Replay the block on restart. Module promises
         /// idempotent dispatch.
@@ -47,47 +62,99 @@ interface types {
     }
 }
 
-interface state-kv {
-    /// Async host fn. Real impl will hit redb via spawn_blocking;
-    /// in the spike it sleeps briefly to prove the future flows
-    /// through the wasmtime executor cleanly.
-    get-value: func(key: string) -> option<list<u8>>;
+/// Snapshot chain-state queries. Proxies into `mitos-data-plane`
+/// host-side; modules never touch dolos directly.
+interface chain-data {
+    use types.{output-ref, typed-output, decode-level};
 
-    set-value: func(key: string, value: list<u8>);
+    /// Bulk lookup of N output refs in one host call. Amortises
+    /// the boundary cost; modules should batch where possible.
+    read-utxos: func(refs: list<output-ref>, decode: decode-level)
+                -> list<typed-output>;
 }
 
+/// Module-private KV state. Backed by a per-module redb table
+/// host-side. Keys are namespaced under the module's ID; modules
+/// cannot reach each other's state.
+interface state-kv {
+    get-value: func(key: string) -> option<list<u8>>;
+    set-value: func(key: string, value: list<u8>);
+    delete-value: func(key: string);
+}
+
+/// Per-block context handed to the module via `handle-event`.
+/// Resource semantics: host owns the underlying decoded block;
+/// module pulls fields lazily without paying CBOR marshalling
+/// cost on every dispatch. Passed as `borrow<>` so the guest
+/// cannot stash it past the call boundary (compile-time enforced
+/// by Rust's borrow checker on the bindgen-generated guest
+/// stubs).
 interface block-context {
     use types.{output-ref, typed-output};
 
-    /// Host-owned, per-block resource. Passed as `borrow` to
-    /// handle-event so the guest cannot retain it past dispatch.
     resource resolved-block {
         slot: func() -> u64;
         tx-count: func() -> u32;
 
-        /// Lazy: first call resolves via the data plane,
-        /// memoised for the block's lifetime.
-        get-consumed-input: func(tx-idx: u32, input-idx: u32) -> option<typed-output>;
+        /// Lazy consumed-input lookup. First call triggers a
+        /// data-plane read; result is memoised for the block's
+        /// lifetime. Pure-output indexers (e.g. ownership) never
+        /// call this and pay zero resolution cost.
+        get-consumed-input: func(tx-idx: u32, input-idx: u32)
+                            -> option<typed-output>;
+
+        /// Bulk consumed-input lookup for one tx. Resolves all
+        /// inputs in one data-plane call. Marketplace-style
+        /// indexers should prefer this over per-input calls.
+        get-consumed-inputs: func(tx-idx: u32)
+                             -> list<option<typed-output>>;
     }
+}
+
+/// Module-side event emission. Host fans events out to the
+/// existing CF replication WS without re-encoding.
+interface emit {
+    /// CBOR-encoded typed event. Channel discriminates the
+    /// logical stream the module is publishing on (registered
+    /// during `init` via the host-side registry).
+    emit-event: func(channel: u32, event: list<u8>);
+}
+
+/// Structured logging from the module into the host's `tracing`
+/// subscriber. Avoids modules needing to do their own log I/O.
+interface logging {
+    variant log-level { trace, debug, info, warn, error }
+
+    log: func(level: log-level, target: string, message: string);
 }
 
 world mitos-module {
     use types.{trap-strategy, retry-policy};
     use block-context.{resolved-block};
 
+    import chain-data;
     import state-kv;
     import block-context;
+    import emit;
+    import logging;
 
-    /// ABI version handshake. Bumped on any breaking change.
+    /// ABI version handshake. Host enforces compatibility before
+    /// any other call. Bumped on any breaking change. Avoids
+    /// Balius's silent breakage from their PR #98.
     export module-version: func() -> tuple<u32, u32>;
 
-    /// Trap supervision policy. Read once at load.
+    /// Trap supervision policy. Read once at module load; host
+    /// supervisor consults on every trap.
     export trap-policy: func() -> tuple<trap-strategy, retry-policy>;
 
-    /// One-shot init at module load.
+    /// One-shot init at module load. Config is CBOR'd typed config
+    /// from the module's shared crate; host transcodes from a
+    /// human-edited TOML colocated with `wrangler.toml` in the
+    /// dApp's repo.
     export init: func(config: list<u8>);
 
-    /// Single dispatch entry point. Resource handle is `borrow`
-    /// — guest cannot stash it past the call.
+    /// Single dispatch entry. Channel discriminates the logical
+    /// stream; the resource handle borrow does NOT outlive the
+    /// call (Rust borrow lifetime enforces this).
     export handle-event: func(channel: u32, block: borrow<resolved-block>);
 }

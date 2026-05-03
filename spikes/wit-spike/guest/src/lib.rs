@@ -36,8 +36,8 @@ impl Guest for Spike {
         let _tx_count = block.tx_count();
         let _maybe_input = block.get_consumed_input(0, 0);
 
-        let _v = mitos::spike::state_kv::get_value("spike-key");
-        mitos::spike::state_kv::set_value("spike-key", &[1, 2, 3]);
+        let _v = mitos::platform::state_kv::get_value("spike-key");
+        mitos::platform::state_kv::set_value("spike-key", &[1, 2, 3]);
 
         // CLAIM 1 (negative test). Uncommenting MUST fail to
         // compile because `&ResolvedBlock` is borrowed for the

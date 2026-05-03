@@ -25,6 +25,12 @@ license.workspace = true
 # — that's the stream/future ABI which our WIT does not use and
 # wasmtime 44 documents as "_very_ incomplete".
 wasmtime = { version = "44", features = ["async", "component-model"] }
+# WASI Preview 2 host impls. wasm32-wasip2 std lib imports
+# `wasi:io`, `wasi:cli`, `wasi:clocks` etc. by default; we don't
+# rely on any of them in the v1 ABI but the linker still needs
+# matching impls so component instantiation succeeds. We feed
+# every module a default WASI context (no real I/O surface).
+wasmtime-wasi = { version = "44" }
 
 # Data plane — module host fns proxy through this for chain reads.
 mitos-data-plane = { path = "../mitos-data-plane" }
@@ -65,3 +71,4 @@ hex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }

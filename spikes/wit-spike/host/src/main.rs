@@ -21,7 +21,7 @@ wasmtime::component::bindgen!({
     imports: { default: async | trappable },
     exports: { default: async },
     with: {
-        "mitos:spike/block-context.resolved-block": ResolvedBlockHost,
+        "mitos:platform/block-context.resolved-block": ResolvedBlockHost,
     },
 });
 

@@ -38,8 +38,8 @@ pub mod resolved_block;
 pub mod supervisor;
 pub mod vendored;
 
-pub use registry::ModuleRegistry;
-pub use resolved_block::ResolvedBlock;
+pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
+pub use resolved_block::{ResolvedBlock, TxView};
 pub use supervisor::{Supervisor, SupervisorOutcome};
 
 /// Platform-level error surface. Per-host-fn errors flow back
