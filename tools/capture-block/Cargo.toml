@@ -1,0 +1,33 @@
+[package]
+name = "capture-block"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "capture-block"
+path = "src/main.rs"
+
+[dependencies]
+# Block decoder — used to verify the CBOR is round-trippable
+# before we write it to disk (catches "wrong shape" upstream).
+mitos-platform = { path = "../../crates/mitos-platform" }
+
+# Direct redb reader — we open dolos's archive index ourselves
+# in read-only mode (no `Database::create()`, no writer setup).
+# Same redb 3.1 the dolos crate uses; multi-version dep is
+# enforced via the workspace lockfile.
+redb = "3.1"
+
+# Read dolos.toml — re-using the dolos config schema would pull
+# in the whole dolos dep tree. Instead we parse the storage path
+# we care about (`storage.path`) ourselves; everything else in
+# dolos.toml is irrelevant for read-only block fetch.
+toml = "0.8"
+
+clap = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }

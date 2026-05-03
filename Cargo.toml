@@ -18,6 +18,7 @@ members = [
     "crates/collection-ownership-indexer",
     "crates/marketplace-indexer",
     "bundles/default",
+    "tools/capture-block",
     "tools/diff-collection-ownership",
     "tools/mitos-tail",
     "tools/mitos-admin",

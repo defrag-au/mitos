@@ -620,6 +620,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture-block"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "mitos-platform",
+ "redb 3.1.0",
+ "serde",
+ "toml 0.8.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cardano-assets"
 version = "0.1.0"
 source = "git+https://github.com/defrag-au/shared-crates?rev=24e2052d4a7e22a3bc335e0792166d31238add42#24e2052d4a7e22a3bc335e0792166d31238add42"
