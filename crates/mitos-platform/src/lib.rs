@@ -34,6 +34,7 @@
 pub mod bindings;
 pub mod block_decode;
 pub mod driver;
+pub mod follower;
 pub mod host_fns;
 pub mod registry;
 pub mod resolved_block;
@@ -42,6 +43,7 @@ pub mod vendored;
 
 pub use block_decode::{decode_block, DecodedBlock};
 pub use driver::{ApplyOutcome, BlockEvent, Driver};
+pub use follower::run_chain_follower;
 pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
 pub use resolved_block::{ResolvedBlock, TxView};
 pub use supervisor::{Supervisor, SupervisorOutcome};
