@@ -1,0 +1,59 @@
+[package]
+name = "mitos-data-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Typed query API for current Cardano chain state. One trait,
+# multiple transports — `LocalDataPlane` ships in-process atop
+# `dolos_core::Domain` at zero serialisation cost; future
+# `WasmDataPlane` / `IpcDataPlane` / `GrpcDataPlane` impls layer on
+# the same shape.
+#
+# Design doc: ../../docs/design/MITOS_DATA_PLANE_API.md
+# Strategy framing: ../../docs/strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md
+
+[dependencies]
+# Typed asset / address newtypes. The data plane surfaces the
+# typed forms (PolicyId, AssetId, Fingerprint) rather than raw
+# strings — strong-typed I/O is the defining property of this
+# crate.
+cardano-assets = { workspace = true }
+pipeline-types = { workspace = true }
+
+# Pallas types where unavoidable: PlutusData (typed; not heavy),
+# Hash<N>, address structs. We re-expose narrowed forms but keep
+# pallas as the underlying source of truth for fidelity.
+pallas = { workspace = true }
+pallas-addresses = { workspace = true }
+pallas-codec = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-traverse = { workspace = true }
+
+# Dolos: needed for `LocalDataPlane`'s `Domain` access. Other
+# transports won't touch dolos directly.
+dolos-core = { workspace = true }
+# Cardano-specific dolos extensions — `CardanoIndexExt` for
+# `utxos_by_policy` etc. Only the local impl uses these.
+dolos-cardano = { workspace = true }
+
+# Async trait surface. Allows the trait to be both used generically
+# (zero-cost dispatch — the common case) AND boxed as `dyn` if
+# future transports need runtime impl-swap.
+async-trait = { workspace = true }
+
+# Wire-format serialisation for the (eventually) IPC + gRPC
+# transports. Not used by `LocalDataPlane` but the typed forms
+# still derive Serialize/Deserialize for cross-transport fidelity.
+serde = { workspace = true }
+serde_bytes = "0.11"
+ciborium = "0.2"
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

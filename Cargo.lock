@@ -670,6 +670,7 @@ dependencies = [
  "dolos-core",
  "hex",
  "mitos-core",
+ "mitos-data-plane",
  "mitos-protocol",
  "pallas",
  "serde",
@@ -2941,6 +2942,31 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "mitos-data-plane"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cardano-assets",
+ "ciborium",
+ "dolos-cardano",
+ "dolos-core",
+ "hex",
+ "pallas",
+ "pallas-addresses 1.0.0-alpha.4",
+ "pallas-codec 1.0.0-alpha.4",
+ "pallas-primitives 1.0.0-alpha.4",
+ "pallas-traverse 1.0.0-alpha.4",
+ "pipeline-types",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

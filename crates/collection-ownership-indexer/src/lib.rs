@@ -407,6 +407,81 @@ fn backfill_for_policy<D: Domain>(
     Ok(resume_cursor)
 }
 
+/// **Spike**: same backfill, expressed via the
+/// `mitos_data_plane::LocalDataPlane` trait surface.
+///
+/// Currently *not* called from `subscribe` (the original
+/// `backfill_for_policy` is). Lives alongside as a side-by-side
+/// reference implementation so we can A/B the trait shape
+/// against a real consumer pattern. If the trait holds up — i.e.
+/// this function is correct, ergonomic, and not meaningfully
+/// slower — the original `backfill_for_policy` becomes a
+/// candidate for replacement, and other indexers can adopt the
+/// same pattern.
+///
+/// Compared to the original:
+/// - No manual era / output decode (plane handles it).
+/// - No manual asset-multiset walk to re-filter to the policy
+///   (plane's predicate did this server-side via the
+///   utxos_by_policy index — we still walk the multiset because
+///   a single UTxO can carry assets from multiple policies even
+///   though the index found it via one specific policy).
+/// - `resume_cursor` comes from the page's `tip` rather than a
+///   pre-walk read_cursor; same effect, slightly more honest
+///   (the cursor reflects what the data is consistent with).
+#[allow(dead_code)] // spike — kept alongside the live impl for side-by-side comparison
+async fn backfill_for_policy_via_data_plane<D: dolos_core::Domain>(
+    domain: &D,
+    policy_hex: &str,
+    out: &mut Vec<OwnershipChange>,
+) -> anyhow::Result<ChainPoint> {
+    use cardano_assets::PolicyId;
+    use mitos_data_plane::{
+        ChainDataPlane, DecodeLevel, LocalDataPlane, PageRequest, UtxoPattern, UtxoPredicate,
+    };
+
+    let plane = LocalDataPlane::new(domain);
+    let policy =
+        PolicyId::new(policy_hex).map_err(|e| anyhow::anyhow!("invalid policy_id: {e:?}"))?;
+    let predicate = UtxoPredicate::Match(UtxoPattern::under_policy(policy.clone()));
+
+    // Phase A LocalDataPlane returns a single page; pagination
+    // not yet implemented. Loop is structured for the future
+    // pagination story, but ends after one iteration today.
+    let mut req = PageRequest::first(1000);
+    loop {
+        let page = plane
+            .search_utxos(&predicate, DecodeLevel::Lean, req.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("search_utxos: {e}"))?;
+
+        for (oref, output) in &page.items {
+            for asset in &output.assets {
+                if asset.policy_id != policy {
+                    continue;
+                }
+                let fingerprint = compute_fingerprint(policy_hex, &asset.asset_name_hex);
+                let role = AssetRole::from_asset_name_hex(&asset.asset_name_hex);
+                out.push(OwnershipChange::Transfer {
+                    policy_id: policy_hex.to_string(),
+                    asset_name: asset.asset_name_hex.clone(),
+                    asset_fingerprint: fingerprint,
+                    role,
+                    new_owner: output.address.clone(),
+                    tx_hash: hex::encode(oref.tx_hash),
+                    output_index: oref.index,
+                });
+            }
+        }
+
+        match page.next_token {
+            Some(t) => req = PageRequest::next(t, 1000),
+            // Last page — its tip is the resume cursor.
+            None => return Ok(page.tip.point),
+        }
+    }
+}
+
 /// Compute the CIP-14 asset fingerprint for `(policy_hex,
 /// asset_name_hex)`.
 ///

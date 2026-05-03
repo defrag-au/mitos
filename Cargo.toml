@@ -11,6 +11,7 @@
 [workspace]
 members = [
     "crates/mitos-protocol",
+    "crates/mitos-data-plane",
     "crates/mitos-core",
     "crates/jpg-co-indexer",
     "crates/collection-ownership-indexer",
