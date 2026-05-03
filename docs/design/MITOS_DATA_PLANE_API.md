@@ -511,6 +511,73 @@ If none of these are true, the existing `dolos_core::Domain`
 access pattern + indexer-internal state is fine. Don't build
 abstractions ahead of demand.
 
+## Known gaps the trait doesn't yet address
+
+### Marketplace input resolution — needs a separate primitive
+
+The MarketplaceIndexer's `classify_tx` needs to resolve a tx's
+*consumed inputs* into typed `MultiEraOutput` form so the
+classifier can build a `RawTxData` for rule evaluation. This
+case **cannot be served by `ChainDataPlane` as currently
+specified** because:
+
+- The plane is a snapshot-of-current-state API. By the time
+  `Indexer::handle_event(Apply, block)` fires, dolos has
+  already applied the block to state — consumed UTxOs are
+  gone from the snapshot.
+- `state.get_utxos(refs)` returns `None`/empty for spent
+  refs at this point; the plane's `read_utxos()` wrapping
+  the same call has the same failure mode.
+- This is empirically observable: the marketplace indexer
+  is currently silent in production despite chain activity,
+  because every tx's input resolution fails this way.
+
+The right shape for a fix is a **block-context resolution
+primitive**, not a data plane query:
+
+```rust
+/// Resolve the consumed inputs of a single tx within the
+/// current block being applied. Implementation detail varies
+/// by host: dolos's archive may retain spent UTxOs for a
+/// short window; otherwise the host has to capture inputs
+/// pre-apply via a different sync hook.
+trait BlockContext {
+    fn resolve_consumed_inputs(
+        &self,
+        tx: &MultiEraTx<'_>,
+    ) -> Result<HashMap<OutputRef, MultiEraOutput<'_>>, _>;
+}
+```
+
+This is a different contract from `ChainDataPlane`:
+- Tied to a specific block / tx context, not the open chain
+- Returns pallas-shaped values (the classifier consumes those
+  directly), not the data plane's projected `TypedOutput`
+- Available only inside `handle_event` hooks, not from
+  arbitrary callers
+
+Until this primitive exists:
+- MarketplaceIndexer keeps its current `domain.state().get_utxos()`
+  call shape (silently fails for spent inputs — known)
+- Refactoring it to `LocalDataPlane.read_utxos()` is cosmetic,
+  doesn't change behaviour, not a meaningful win
+- The data plane proceeds with snapshot-only queries; the
+  block-context primitive lives in `mitos-core` (closer to
+  dolos's chainsync) once designed
+
+### Datum / script witness-set resolution
+
+Already noted under "Phase A scope explicitly deferred" but
+worth flagging here too. `DecodeLevel::WithDatum` and `Full`
+are honoured at the API surface (caller can request them, the
+`decoded_at` field reflects the request) but the
+`LocalDataPlane` impl always returns `datum: None` /
+`script_ref: None` because the witness-set lookup primitive
+isn't built. Affects any consumer that needs decoded datum
+content on outputs — not used by Phase A's ownership backfill,
+will be needed for tx-template construction in the framework
+context.
+
 ## Phase A implementation notes
 
 Implementation landed 2026-05-03 (see `crates/mitos-data-plane/`).

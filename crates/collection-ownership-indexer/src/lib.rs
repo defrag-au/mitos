@@ -27,11 +27,10 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use axum::Router;
 use cardano_assets::PolicyId;
-use dolos_cardano::indexes::CardanoIndexExt;
-use dolos_core::{ChainPoint, Domain, StateStore, TipEvent};
+use dolos_core::{ChainPoint, Domain, TipEvent};
 use mitos_core::{Emitter, Indexer, SubscribeReply};
 use mitos_protocol::{AssetRole, Interest, any_interest_matches_asset_role, watched_policies};
-use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput};
+use pallas::ledger::traverse::MultiEraBlock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -239,7 +238,8 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
             let policies = policies_for_backfill.as_ref().unwrap();
             let mut last_cursor = consumer_cursor;
             for policy in policies {
-                last_cursor = backfill_for_policy(domain, policy.as_str(), backfill)?;
+                last_cursor =
+                    backfill_for_policy_via_data_plane(domain, policy.as_str(), backfill).await?;
             }
             last_cursor
         } else {
@@ -321,115 +321,19 @@ impl std::fmt::Debug for WatchState {
 }
 
 /// Synthesise backfill records for a policy from current chain
-/// state. Returns the cursor the consumer should resume from
-/// (mitos's view of current tip after enumeration).
+/// state via the `mitos_data_plane::LocalDataPlane` trait surface.
+/// Returns the cursor the consumer should resume from.
 ///
-/// Procedure:
-/// 1. Read the current cursor from `domain.state()`.
-/// 2. Enumerate UTxOs at this policy via the by-policy index.
-/// 3. Hydrate each UTxO via `domain.state().get_utxos`.
-/// 4. Decode each output, extract address + assets, emit one
-///    Transfer record per asset under the watched policy.
-fn backfill_for_policy<D: Domain>(
-    domain: &D,
-    policy_hex: &str,
-    out: &mut Vec<OwnershipChange>,
-) -> anyhow::Result<ChainPoint> {
-    let resume_cursor = domain
-        .state()
-        .read_cursor()
-        .map_err(|e| anyhow::anyhow!("read_cursor: {e:?}"))?
-        .unwrap_or(ChainPoint::Origin);
-
-    let policy_bytes =
-        hex::decode(policy_hex).map_err(|e| anyhow::anyhow!("invalid policy_id hex: {e}"))?;
-
-    let utxo_set = domain
-        .indexes()
-        .utxos_by_policy(&policy_bytes)
-        .map_err(|e| anyhow::anyhow!("utxos_by_policy: {e:?}"))?;
-
-    let txo_refs: Vec<_> = utxo_set.into_iter().collect();
-    if txo_refs.is_empty() {
-        return Ok(resume_cursor);
-    }
-
-    let utxo_map = domain
-        .state()
-        .get_utxos(txo_refs)
-        .map_err(|e| anyhow::anyhow!("get_utxos: {e:?}"))?;
-
-    for (txo_ref, era_cbor) in utxo_map {
-        let era: pallas::ledger::traverse::Era = match era_cbor.0.try_into() {
-            Ok(e) => e,
-            Err(_) => {
-                debug!(?txo_ref, "skipping output with un-convertible era");
-                continue;
-            }
-        };
-        let output = match MultiEraOutput::decode(era, &era_cbor.1) {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(?txo_ref, error = %e, "decode utxo failed; skipping");
-                continue;
-            }
-        };
-
-        let address = match output.address() {
-            Ok(a) => a.to_string(),
-            Err(e) => {
-                debug!(?txo_ref, error = %e, "output address parse failed; skipping");
-                continue;
-            }
-        };
-
-        for policy_assets in output.value().assets() {
-            if hex::encode(policy_assets.policy()) != policy_hex {
-                continue;
-            }
-            for asset in policy_assets.assets() {
-                let asset_name_hex = hex::encode(asset.name());
-                let fingerprint = compute_fingerprint(policy_hex, &asset_name_hex);
-                let role = AssetRole::from_asset_name_hex(&asset_name_hex);
-                out.push(OwnershipChange::Transfer {
-                    policy_id: policy_hex.to_string(),
-                    asset_name: asset_name_hex,
-                    asset_fingerprint: fingerprint,
-                    role,
-                    new_owner: address.clone(),
-                    tx_hash: hex::encode(txo_ref.0),
-                    output_index: txo_ref.1,
-                });
-            }
-        }
-    }
-
-    Ok(resume_cursor)
-}
-
-/// **Spike**: same backfill, expressed via the
-/// `mitos_data_plane::LocalDataPlane` trait surface.
-///
-/// Currently *not* called from `subscribe` (the original
-/// `backfill_for_policy` is). Lives alongside as a side-by-side
-/// reference implementation so we can A/B the trait shape
-/// against a real consumer pattern. If the trait holds up — i.e.
-/// this function is correct, ergonomic, and not meaningfully
-/// slower — the original `backfill_for_policy` becomes a
-/// candidate for replacement, and other indexers can adopt the
-/// same pattern.
-///
-/// Compared to the original:
+/// Compared to a hand-rolled `dolos_core::Domain` walk:
 /// - No manual era / output decode (plane handles it).
 /// - No manual asset-multiset walk to re-filter to the policy
-///   (plane's predicate did this server-side via the
-///   utxos_by_policy index — we still walk the multiset because
+///   (plane's predicate filters server-side via the
+///   `utxos_by_policy` index — we still walk the multiset because
 ///   a single UTxO can carry assets from multiple policies even
 ///   though the index found it via one specific policy).
 /// - `resume_cursor` comes from the page's `tip` rather than a
-///   pre-walk read_cursor; same effect, slightly more honest
+///   pre-walk `read_cursor`; same effect, slightly more honest
 ///   (the cursor reflects what the data is consistent with).
-#[allow(dead_code)] // spike — kept alongside the live impl for side-by-side comparison
 async fn backfill_for_policy_via_data_plane<D: dolos_core::Domain>(
     domain: &D,
     policy_hex: &str,
