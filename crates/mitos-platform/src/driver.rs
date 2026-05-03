@@ -27,6 +27,7 @@
 use dolos_core::ChainPoint;
 use tokio::time::{Duration, sleep};
 
+use crate::block_decode::decode_block;
 use crate::registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
 use crate::resolved_block::{ResolvedBlock, TxView};
 use crate::supervisor::SupervisorOutcome;
@@ -90,6 +91,30 @@ impl Driver {
 
     pub fn cursor(&self) -> Option<&ChainPoint> {
         self.cursor.as_ref()
+    }
+
+    /// Convenience: decode + apply in one step. Caller hands raw
+    /// block CBOR (e.g. straight off the chain follower's
+    /// `TipEvent::Apply(_, block_cbor)` payload) plus the
+    /// `ChainPoint` to advance to on success. Decode errors
+    /// propagate as `PlatformError::Decode`.
+    pub async fn apply_cbor(
+        &mut self,
+        registry: &ModuleRegistry,
+        data_plane: Arc<dyn DataPlaneFacade>,
+        kv_factory: impl Fn() -> state_kv::ModuleKv,
+        emitter_factory: impl Fn() -> emit::EventSink,
+        cbor: &[u8],
+        cursor_after: ChainPoint,
+    ) -> PlatformResult<ApplyOutcome> {
+        let decoded = decode_block(cbor).map_err(|e| PlatformError::Decode(e.to_string()))?;
+        let event = BlockEvent::Apply {
+            slot: decoded.slot,
+            cursor_after,
+            txs: decoded.txs,
+        };
+        self.apply(registry, data_plane, kv_factory, emitter_factory, event)
+            .await
     }
 
     /// Apply one block. Handles trap supervision internally;

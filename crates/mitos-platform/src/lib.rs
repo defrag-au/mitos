@@ -32,6 +32,7 @@
 //!   see `vendored/balius/NOTICE`)
 
 pub mod bindings;
+pub mod block_decode;
 pub mod driver;
 pub mod host_fns;
 pub mod registry;
@@ -39,6 +40,7 @@ pub mod resolved_block;
 pub mod supervisor;
 pub mod vendored;
 
+pub use block_decode::{decode_block, DecodedBlock};
 pub use driver::{ApplyOutcome, BlockEvent, Driver};
 pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
 pub use resolved_block::{ResolvedBlock, TxView};
@@ -70,6 +72,9 @@ pub enum PlatformError {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("block decode: {0}")]
+    Decode(String),
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;
