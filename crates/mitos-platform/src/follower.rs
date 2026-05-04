@@ -63,7 +63,7 @@ where
                 // is "re-feed the same block". Loop until we get
                 // a terminal outcome.
                 loop {
-                    let outcome = driver
+                    let outcome = match driver
                         .apply_cbor(
                             registry,
                             data_plane.clone(),
@@ -72,7 +72,29 @@ where
                             block_bytes,
                             point.clone(),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(o) => o,
+                        // Host-side decode failure — match the
+                        // static indexers' posture: skip + warn,
+                        // keep the follower alive. The
+                        // alternative (exit + cursor-stuck) is
+                        // worse because mitos has at least one
+                        // block format in retention pallas can't
+                        // decode (logged at WARN by marketplace_indexer
+                        // since 2026-05-02). Decode is a host
+                        // concern, not the module's — supervisor
+                        // policy doesn't apply.
+                        Err(crate::PlatformError::Decode(e)) => {
+                            tracing::warn!(
+                                ?point,
+                                error = %e,
+                                "host-side block decode failed; skipping",
+                            );
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     match outcome {
                         ApplyOutcome::Applied => {
                             tracing::trace!(?point, "applied");

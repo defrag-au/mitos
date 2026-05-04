@@ -51,6 +51,7 @@ use crate::{PlatformError, PlatformResult, follower::run_chain_follower};
 pub trait ModuleHostHandle: Send + Sync {
     async fn replace(&self, id: &str) -> PlatformResult<()>;
     async fn stop(&self, id: &str) -> PlatformResult<()>;
+    async fn stop_all(&self);
     async fn list_running(&self) -> Vec<String>;
 }
 
@@ -65,6 +66,9 @@ where
     async fn stop(&self, id: &str) -> PlatformResult<()> {
         ModuleHost::stop(self, id).await
     }
+    async fn stop_all(&self) {
+        ModuleHost::stop_all(self).await
+    }
     async fn list_running(&self) -> Vec<String> {
         ModuleHost::list(self).await
     }
@@ -73,7 +77,15 @@ where
 /// Factory for fresh `TipSubscription`s. Called once per
 /// `start`/`replace` to spin up an isolated subscription for
 /// each follower.
-pub type SubscriptionFactory<S> = Arc<dyn Fn() -> S + Send + Sync>;
+///
+/// Takes the persisted cursor (if any) so the production wiring
+/// can choose: resume from cursor on restart, or fall back to
+/// current chain tip on fresh deploy. Passing `None` to
+/// `dolos::Domain::watch_tip` triggers a full WAL-replay from
+/// the WAL's earliest retained slot — wrong default for
+/// wasm-module followers, which want live-tail semantics with
+/// backfill happening via `read_utxos` data-plane queries.
+pub type SubscriptionFactory<S> = Arc<dyn Fn(Option<ChainPoint>) -> S + Send + Sync>;
 
 /// Factory for fresh in-memory KVs. V1.5 default; v2 will use
 /// the redb-backed `ModuleKv::open_redb` per module.
@@ -193,10 +205,13 @@ where
             .call_init(&mut instance.store, &[])
             .await
             .map_err(PlatformError::Wasmtime)?;
+        let persisted_cursor = self.storage.read_cursor(id)?;
         let mut driver = Driver::new(instance, self.budget);
-        if let Some(cursor) = self.storage.read_cursor(id)? {
+        if let Some(cursor) = persisted_cursor.as_ref() {
             tracing::info!(module = %id, ?cursor, "resuming from persisted cursor");
-            driver = driver.with_initial_cursor(cursor);
+            driver = driver.with_initial_cursor(cursor.clone());
+        } else {
+            tracing::info!(module = %id, "no persisted cursor; factory will pick start point");
         }
         let storage_for_hook = self.storage.clone();
         let id_for_hook = id.to_owned();
@@ -210,7 +225,7 @@ where
         // Spawn the follower.
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
-        let subscription = (self.subscription_factory)();
+        let subscription = (self.subscription_factory)(persisted_cursor);
         let storage = self.storage.clone();
         let engine = self.engine.clone();
         let data_plane = self.data_plane.clone();
@@ -297,6 +312,21 @@ where
         let mut out: Vec<String> = slots.keys().cloned().collect();
         out.sort();
         out
+    }
+
+    /// Stop every running follower. Used during bundle shutdown
+    /// — without this, follower tasks keep tokio's runtime alive
+    /// past the bundle's `serve` future and systemd hits its
+    /// 90s graceful-shutdown timeout, SIGKILL's the process,
+    /// and we lose any in-flight cursor checkpoints.
+    pub async fn stop_all(&self) {
+        let ids = self.list().await;
+        for id in &ids {
+            // stop() is idempotent + best-effort logged on
+            // failure; we drive every slot regardless of any
+            // single one's outcome.
+            let _ = self.stop(id).await;
+        }
     }
 
     /// Take the events receiver off a running slot. Used by

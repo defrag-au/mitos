@@ -145,8 +145,12 @@ async fn main() -> anyhow::Result<()> {
 
     let Args { mitos, token, cmd } = Args::parse();
     let cli = Cli { mitos, token };
+    // 60s timeout — uploads trigger wasmtime component validation
+    // + dry-instantiate on the host, which can take 20s+ in
+    // production. Read-only commands (list/get) finish in
+    // milliseconds; the timeout only matters for upload + restart.
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
     match cmd {

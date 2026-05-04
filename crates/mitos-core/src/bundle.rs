@@ -167,7 +167,13 @@ impl Bundle {
 
         // Wasm-module hosting (Bundle::enable_modules). Mounts
         // /_admin/modules/* and auto-starts followers for any
-        // modules already registered on disk.
+        // modules already registered on disk. The host handle
+        // is captured outside the scope so the shutdown path
+        // can call `stop_all` — without that, follower tasks
+        // keep tokio's runtime alive past the bundle's serve
+        // future and systemd hits its 90s graceful-shutdown
+        // timeout.
+        let mut module_host: Option<Arc<dyn mitos_platform::host::ModuleHostHandle>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!(
@@ -183,19 +189,29 @@ impl Bundle {
             );
 
             // Subscription factory: each follower gets its own
-            // tip-watch. Today's `watch_tip(None)` starts from
-            // the chain's current point — for the v1.5 in-memory
-            // cursor + on-disk checkpoint this is fine; the
-            // driver replays from the checkpoint on the first
-            // applied block. v2's `store.rs` vendoring will
-            // wire `watch_tip(Some(persisted_cursor))` so the
-            // chain follower itself starts at the right point.
+            // tip-watch. Resume from persisted cursor when
+            // available; on fresh deploy fall back to the
+            // domain's current chain tip — NOT to None, because
+            // dolos's `watch_tip(None)` triggers a full
+            // WAL-replay of the entire retention window
+            // (~10k+ historical slots), which is wrong default
+            // for wasm-module followers (backfill should happen
+            // via `read_utxos` data-plane queries, not chain
+            // replay).
             let domain_for_factory = domain.clone();
             let sub_factory: mitos_platform::host::SubscriptionFactory<
                 <DomainAdapter as Domain>::TipSubscription,
-            > = Arc::new(move || {
+            > = Arc::new(move |cursor: Option<dolos_core::ChainPoint>| {
+                use dolos_core::StateStore;
+                let from = cursor.or_else(|| {
+                    domain_for_factory
+                        .state()
+                        .read_cursor()
+                        .ok()
+                        .flatten()
+                });
                 domain_for_factory
-                    .watch_tip(None)
+                    .watch_tip(from)
                     .expect("watch_tip subscribe failed")
             });
 
@@ -255,11 +271,13 @@ impl Bundle {
             // The platform admin router has its own AuthToken
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
+            let host_for_admin = host.clone();
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage,
-                host,
+                host_for_admin,
                 platform_auth,
             ));
+            module_host = Some(host);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -295,6 +313,16 @@ impl Bundle {
 
         for h in dispatcher_handles {
             h.abort();
+        }
+
+        // Stop wasm-module followers cleanly so cursor checkpoints
+        // get their final write before tokio's runtime shuts down.
+        // Each `stop` cancels its slot's CancellationToken and awaits
+        // task termination; loop bounded by however many slots are
+        // running.
+        if let Some(host) = module_host {
+            tracing::info!("stopping wasm-module followers");
+            host.stop_all().await;
         }
 
         Ok(())

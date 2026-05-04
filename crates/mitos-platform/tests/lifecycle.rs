@@ -140,7 +140,7 @@ async fn start_replace_stop_roundtrip() {
     let rx_holder = Arc::new(Mutex::new(rx));
     let sub_factory: mitos_platform::host::SubscriptionFactory<OneShotSub> = Arc::new({
         let rx_holder = rx_holder.clone();
-        move || OneShotSub {
+        move |_resume_cursor: Option<ChainPoint>| OneShotSub {
             rx: rx_holder.clone(),
         }
     });

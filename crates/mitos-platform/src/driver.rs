@@ -132,7 +132,23 @@ impl Driver {
         cbor: &[u8],
         cursor_after: ChainPoint,
     ) -> PlatformResult<ApplyOutcome> {
-        let decoded = decode_block(cbor).map_err(|e| PlatformError::Decode(e.to_string()))?;
+        let decoded = decode_block(cbor).map_err(|e| {
+            // Rich diagnostic context — when this fires we want
+            // to identify the failing block precisely. The
+            // follower's `?`-propagation logs only the bare
+            // `PlatformError::Decode(_)` Display; this `error!`
+            // adds the slot + bytes length + CBOR prefix so we
+            // can reproduce offline.
+            let prefix_len = cbor.len().min(64);
+            tracing::error!(
+                slot = cursor_after.slot(),
+                bytes_len = cbor.len(),
+                cbor_prefix = %hex::encode(&cbor[..prefix_len]),
+                error = %e,
+                "block decode failed; follower will exit",
+            );
+            PlatformError::Decode(format!("slot={}: {e}", cursor_after.slot()))
+        })?;
         let event = BlockEvent::Apply {
             slot: decoded.slot,
             cursor_after,
