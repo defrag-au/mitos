@@ -534,6 +534,43 @@ managed-mitos service trust model), the path is well-trodden:
 strip` to remove non-deterministic custom sections. Worth
 doing then; not worth the complexity now.
 
+### 8. Lag-tolerant TipSubscription — RESOLVED: wrap dolos's tip_broadcast directly
+
+Dolos's `TipSubscription::next_tip` does
+`self.receiver.recv().await.unwrap()` (`dolos
+v1.0.3/src/adapters/mod.rs`). When the wasm follower falls
+more than ~100 slots behind during initial WAL replay,
+`broadcast::Receiver::recv()` returns `Err(Lagged(n))` —
+recoverable in principle ("you missed n events, refetch from
+last-known position"), but `unwrap` converts it to a panic
+that kills the consumer task silently.
+
+**What we built**:
+`mitos_platform::lag_tolerant::LagTolerantSubscription<D>` —
+~100-line wrapper that subscribes to `tip_broadcast` directly
+(skipping dolos's broken adapter), holds an optional replay
+queue, and on `RecvError::Lagged(n)` queries the WAL for the
+missed range starting from last-seen cursor and refills the
+replay. `RecvError::Closed` (sender dropped during shutdown)
+returns `pending().await` so the caller's cancel token
+handles termination.
+
+**Why not upstream PR**:
+The upstream fix is correct and we should land it eventually.
+But this wrapper unblocks production deploys today, lives
+entirely in our crate (`crates/mitos-platform/src/lag_tolerant.rs`),
+and depends only on dolos's public `Domain::wal()` +
+`DomainAdapter::tip_broadcast` field. No fork or vendoring
+required.
+
+**Trade-off**:
+The wrapper is concrete-typed against `D: Domain`, not
+generic over an arbitrary `TipSubscription`. The bundle's
+factory closure constructs it directly rather than calling
+`domain.watch_tip(from)`. Future upstream PR replaces the
+wrapper with `domain.watch_tip(from)` and the factory
+becomes a one-liner again.
+
 ### 7. Vendoring Balius's `store.rs` — RESOLVED: don't, build focused redb cursor instead
 
 Originally listed as planned vendoring (alongside `kv.rs`,

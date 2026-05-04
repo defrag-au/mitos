@@ -39,6 +39,7 @@ pub mod follower;
 pub mod host;
 pub mod host_fns;
 pub mod inspect;
+pub mod lag_tolerant;
 pub mod manifest;
 pub mod registry;
 pub mod resolved_block;

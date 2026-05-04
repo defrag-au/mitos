@@ -189,18 +189,28 @@ impl Bundle {
             );
 
             // Subscription factory: each follower gets its own
-            // tip-watch. Resume from persisted cursor when
-            // available; on fresh deploy fall back to the
-            // domain's current chain tip — NOT to None, because
-            // dolos's `watch_tip(None)` triggers a full
-            // WAL-replay of the entire retention window
-            // (~10k+ historical slots), which is wrong default
-            // for wasm-module followers (backfill should happen
-            // via `read_utxos` data-plane queries, not chain
-            // replay).
-            let domain_for_factory = domain.clone();
+            // tip-watch. Two layers of fix applied:
+            //
+            // 1. Resume from persisted cursor when available;
+            //    on fresh deploy fall back to the domain's
+            //    current chain tip — NOT to None, because
+            //    `watch_tip(None)` triggers a full WAL-replay
+            //    of the entire retention window (~10k+
+            //    historical slots), which is wrong default for
+            //    wasm-module followers (backfill should happen
+            //    via `read_utxos` data-plane queries, not chain
+            //    replay).
+            //
+            // 2. Use `LagTolerantSubscription` instead of
+            //    dolos's `watch_tip` directly. Dolos's
+            //    TipSubscription panics on
+            //    `broadcast::RecvError::Lagged(_)` via
+            //    unwrap; the wrapper handles lag gracefully
+            //    by re-fetching missed blocks from the WAL.
+            //    See `mitos_platform::lag_tolerant`.
+            let domain_for_factory = Arc::new(domain.clone());
             let sub_factory: mitos_platform::host::SubscriptionFactory<
-                <DomainAdapter as Domain>::TipSubscription,
+                mitos_platform::lag_tolerant::LagTolerantSubscription<DomainAdapter>,
             > = Arc::new(move |cursor: Option<dolos_core::ChainPoint>| {
                 use dolos_core::StateStore;
                 let from = cursor.or_else(|| {
@@ -210,9 +220,12 @@ impl Bundle {
                         .ok()
                         .flatten()
                 });
-                domain_for_factory
-                    .watch_tip(from)
-                    .expect("watch_tip subscribe failed")
+                mitos_platform::lag_tolerant::LagTolerantSubscription::new(
+                    domain_for_factory.clone(),
+                    &domain_for_factory.tip_broadcast,
+                    from,
+                )
+                .expect("LagTolerantSubscription::new (WAL iter_blocks failed)")
             });
 
             // Per-module redb-backed KV — crash-safe across
