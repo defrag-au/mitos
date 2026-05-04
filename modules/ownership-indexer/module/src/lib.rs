@@ -148,6 +148,27 @@ impl Guest for Module {
                         );
                         continue;
                     }
+                    // INFO-log every emission so it surfaces in the
+                    // host's journal — visible during early-deploy
+                    // observation. Modules wired to a real CF
+                    // subscription will drop this once the consumer
+                    // pipeline is in place.
+                    if let OwnershipChange::Transfer {
+                        policy_id,
+                        asset_name,
+                        new_owner,
+                        ..
+                    } = &event
+                    {
+                        let _ = mitos::platform::logging::log(
+                            LogLevel::Info,
+                            "ownership-indexer-module",
+                            &format!(
+                                "emit Transfer policy={} asset={} owner={}",
+                                policy_id, asset_name, new_owner,
+                            ),
+                        );
+                    }
                     mitos::platform::emit::emit_event(0, &buf);
                 }
             }

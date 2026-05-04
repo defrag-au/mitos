@@ -178,6 +178,34 @@ impl ModuleStorage {
         self.module_dir(id).join("cursor.redb")
     }
 
+    /// Per-module config bytes (CBOR'd typed config from the
+    /// dApp's `mitos.toml`). Plain file because the host reads
+    /// it once at follower start and passes through to the
+    /// module's `init`.
+    pub fn config_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("config.cbor")
+    }
+
+    /// Write module config bytes atomically (write-then-rename).
+    pub fn write_config(&self, id: &str, bytes: &[u8]) -> Result<(), StorageError> {
+        std::fs::create_dir_all(self.module_dir(id))?;
+        let final_path = self.config_path(id);
+        let tmp = final_path.with_extension("cbor.new");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &final_path)?;
+        Ok(())
+    }
+
+    /// Read module config bytes, if any. `Ok(None)` means no
+    /// config has been uploaded — host calls `init(&[])`.
+    pub fn read_config(&self, id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let path = self.config_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read(path)?))
+    }
+
     /// Per-module crash-safe KV file (redb, via the vendored
     /// `RedbKv`). Bundle's KV factory points at this.
     pub fn kv_path(&self, id: &str) -> PathBuf {

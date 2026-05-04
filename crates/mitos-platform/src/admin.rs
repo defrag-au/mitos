@@ -266,11 +266,13 @@ async fn upload_module(
     // Acquire upload lock first — fail-fast on concurrent uploads.
     let _lock = state.storage.acquire_upload_lock(&id)?;
 
-    // Drain the multipart payload. Two required fields:
-    //   - manifest (text/toml)
-    //   - wasm (application/wasm)
+    // Drain the multipart payload. Required: manifest + wasm.
+    // Optional: config (CBOR-encoded module config — written to
+    // `<storage>/<id>/config.cbor` for the host to pass to
+    // `init` on follower start).
     let mut manifest_bytes: Option<Vec<u8>> = None;
     let mut wasm_bytes: Option<Vec<u8>> = None;
+    let mut config_bytes: Option<Vec<u8>> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -285,6 +287,7 @@ async fn upload_module(
         match name.as_str() {
             "manifest" => manifest_bytes = Some(bytes.to_vec()),
             "wasm" => wasm_bytes = Some(bytes.to_vec()),
+            "config" => config_bytes = Some(bytes.to_vec()),
             other => {
                 tracing::debug!(field = %other, "ignoring unrecognised multipart field");
             }
@@ -315,6 +318,14 @@ async fn upload_module(
 
     // Write artifact + manifest + symlink atomically.
     state.storage.activate(&manifest, &wasm_bytes)?;
+
+    // If config was supplied, write it alongside. Atomic via
+    // write-then-rename. Absence is meaningful — the host
+    // distinguishes "no config" (call `init(&[])`) from "empty
+    // CBOR config" (call `init(b'')`).
+    if let Some(cfg) = config_bytes.as_ref() {
+        state.storage.write_config(&id, cfg)?;
+    }
 
     tracing::info!(
         module = %manifest.module.id,

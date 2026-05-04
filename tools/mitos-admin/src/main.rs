@@ -108,6 +108,24 @@ enum Cmd {
         artifact: std::path::PathBuf,
     },
 
+    /// Re-instantiate a running module without re-uploading.
+    /// Useful for clearing a quarantined-flag or for forcing a
+    /// follower to re-pickup a config change once that wires up.
+    RestartModule {
+        /// Module id (e.g. `ownership`).
+        id: String,
+    },
+
+    /// Stop a running module's follower + drop the slot. Artifact
+    /// stays on disk for rollback per
+    /// `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design questions"
+    /// #1; remove with `rm -rf <storage>/<id>` if you really
+    /// want it gone.
+    DeleteModule {
+        /// Module id.
+        id: String,
+    },
+
     /// Build then upload — wrangler-deploy ergonomics. Shells out
     /// to `mitos-build`, then POSTs the artifact via
     /// `upload-module`. Equivalent to running both steps by hand.
@@ -168,6 +186,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::UploadModule { artifact } => {
             cmd_upload_module(&client, &cli, artifact).await
         }
+        Cmd::RestartModule { id } => cmd_restart_module(&client, &cli, id).await,
+        Cmd::DeleteModule { id } => cmd_delete_module(&client, &cli, id).await,
         Cmd::Deploy {
             crate_name,
             module_id,
@@ -450,14 +470,21 @@ async fn upload_artifact(
         );
     }
     let wasm_bytes = std::fs::read(&wasm_path)?;
+    let config_path = artifact.join("config.cbor");
+    let config_bytes = if config_path.exists() {
+        Some(std::fs::read(&config_path)?)
+    } else {
+        None
+    };
     tracing::info!(
         module = %module_id,
         manifest_bytes = manifest_str.len(),
         wasm_bytes = wasm_bytes.len(),
+        config_bytes = config_bytes.as_ref().map(|c| c.len()),
         "uploading"
     );
 
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .part(
             "manifest",
             reqwest::multipart::Part::text(manifest_str)
@@ -470,6 +497,14 @@ async fn upload_artifact(
                 .file_name(format!("{module_id}.wasm"))
                 .mime_str("application/wasm")?,
         );
+    if let Some(cfg) = config_bytes {
+        form = form.part(
+            "config",
+            reqwest::multipart::Part::bytes(cfg)
+                .file_name("config.cbor")
+                .mime_str("application/cbor")?,
+        );
+    }
 
     let url = format!("{}/_admin/modules/{module_id}", cli.mitos);
     let resp = auth(client.post(&url), cli.token.as_deref())
@@ -507,6 +542,40 @@ async fn upload_artifact(
         short_sha(&body.module.sha256),
         body.ok
     );
+    Ok(())
+}
+
+async fn cmd_restart_module(
+    client: &Client,
+    cli: &Cli,
+    id: String,
+) -> anyhow::Result<()> {
+    let url = format!("{}/_admin/modules/{id}/restart", cli.mitos);
+    let resp = auth(client.post(&url), cli.token.as_deref()).send().await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        anyhow::bail!("module `{id}` not registered");
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("restart failed: {status}: {text}");
+    }
+    println!("restarted module={id}");
+    Ok(())
+}
+
+async fn cmd_delete_module(client: &Client, cli: &Cli, id: String) -> anyhow::Result<()> {
+    let url = format!("{}/_admin/modules/{id}", cli.mitos);
+    let resp = auth(client.delete(&url), cli.token.as_deref()).send().await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        anyhow::bail!("module `{id}` not registered");
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("delete failed: {status}: {text}");
+    }
+    println!("deleted module={id} (artifact preserved on disk)");
     Ok(())
 }
 

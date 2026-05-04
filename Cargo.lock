@@ -3390,6 +3390,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "ciborium",
  "clap",
  "hex",
  "mitos-platform",

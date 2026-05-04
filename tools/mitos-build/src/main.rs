@@ -132,6 +132,35 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(&manifest_out, manifest.to_toml().context("manifest toml")?)
         .with_context(|| format!("writing {}", manifest_out.display()))?;
 
+    // If a `mitos.toml` is colocated with the module workspace,
+    // CBOR-encode its parsed value tree as `config.cbor` next to
+    // the wasm. The module's `init` deserialises this back into
+    // its `Config` shape via ciborium. Wrangler-style: human
+    // edits TOML, machine ships CBOR.
+    let mitos_toml = args.workspace.join("mitos.toml");
+    if mitos_toml.exists() {
+        let toml_str = std::fs::read_to_string(&mitos_toml)
+            .with_context(|| format!("reading {}", mitos_toml.display()))?;
+        let value: toml::Value = toml::from_str(&toml_str)
+            .with_context(|| format!("parsing {}", mitos_toml.display()))?;
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&value, &mut buf)
+            .context("CBOR-encode mitos.toml")?;
+        let config_out = out.join("config.cbor");
+        std::fs::write(&config_out, &buf)
+            .with_context(|| format!("writing {}", config_out.display()))?;
+        tracing::info!(
+            path = %mitos_toml.display(),
+            cbor_bytes = buf.len(),
+            "config.cbor written"
+        );
+    } else {
+        tracing::info!(
+            "no mitos.toml at {} — module will get empty config",
+            mitos_toml.display()
+        );
+    }
+
     println!("Module:        {module_id}");
     println!("SHA-256:       {}", manifest.module.sha256);
     println!("Size:          {} bytes", manifest.module.size_bytes);

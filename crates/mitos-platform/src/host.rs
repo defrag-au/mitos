@@ -200,9 +200,14 @@ where
         let mut instance = registry
             .instantiate(self.data_plane.clone(), kv, sink, self.budget)
             .await?;
+        // Init with persisted config if any; empty bytes
+        // otherwise. The module decides what to do with empty
+        // config — ownership-indexer-module treats it as
+        // "no policies watched, no-op."
+        let config = self.storage.read_config(id)?.unwrap_or_default();
         instance
             .bindings
-            .call_init(&mut instance.store, &[])
+            .call_init(&mut instance.store, &config)
             .await
             .map_err(PlatformError::Wasmtime)?;
         let persisted_cursor = self.storage.read_cursor(id)?;
@@ -232,6 +237,7 @@ where
         let kv_factory = self.kv_factory.clone();
         let emitter_factory_inner = self.emitter_factory.clone();
         let id_for_task = id.to_owned();
+        let id_for_log = id.to_owned();
         let task = tokio::spawn(async move {
             // Build a registry handle that the follower can use
             // to re-instantiate on RestartAndReplay outcomes.
@@ -247,7 +253,7 @@ where
             let kv_factory_for_run =
                 move || kv_factory(&id_for_task);
             let emitter_factory_for_run = move || emitter_factory_inner().0;
-            tokio::select! {
+            let result = tokio::select! {
                 _ = cancel_for_task.cancelled() => {
                     tracing::info!(module = %registry.module_id, "follower cancelled");
                     Ok(())
@@ -260,7 +266,25 @@ where
                     kv_factory_for_run,
                     emitter_factory_for_run,
                 ) => r,
+            };
+            // Task-death detection: log the outcome so a silent
+            // panic from upstream code (e.g. dolos's
+            // `TipSubscription::next_tip` unwrap on lagged
+            // broadcast::Receiver) surfaces as an ERROR line
+            // rather than a stuck follower with no journal trace.
+            if let Err(e) = &result {
+                tracing::error!(
+                    module = %id_for_log,
+                    error = %e,
+                    "follower task exited with error",
+                );
+            } else {
+                tracing::info!(
+                    module = %id_for_log,
+                    "follower task exited cleanly",
+                );
             }
+            result
         });
 
         let mut slots = self.slots.lock().await;
