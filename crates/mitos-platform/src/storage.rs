@@ -17,7 +17,9 @@
 //! current.wasm)`. Readers see either old target or new target,
 //! never a missing or partial symlink.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use dolos_core::ChainPoint;
 
@@ -33,15 +35,50 @@ pub enum StorageError {
     UploadInProgress(String),
 }
 
-/// Owns the storage root path. Cheap to clone; no internal state.
+/// Owns the storage root path + a cache of open per-module
+/// `CursorStore` handles. The cache is load-bearing for write
+/// throughput: cursor commits fire on every applied block;
+/// reopening redb per write costs ~100-500ms (file-format check +
+/// possible repair pass), capping throughput at ~2-10 blocks/sec.
+/// Holding the database open drops per-write overhead to ~5ms,
+/// which moves the bottleneck off cursor I/O and onto wasmtime
+/// dispatch (the irreducible per-block work).
+///
+/// Thread-safe + cheap to clone (Arc-wrapped cache).
 #[derive(Clone)]
 pub struct ModuleStorage {
     root: PathBuf,
+    cursor_stores: Arc<Mutex<HashMap<String, Arc<CursorStore>>>>,
 }
 
 impl ModuleStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            cursor_stores: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Get-or-open the cursor store for a module. First call
+    /// per module pays the redb open cost (~hundreds of ms);
+    /// subsequent calls are O(1) HashMap lookup + Arc clone.
+    fn cursor_store(&self, id: &str) -> Result<Arc<CursorStore>, StorageError> {
+        let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
+        if let Some(s) = cache.get(id) {
+            return Ok(s.clone());
+        }
+        std::fs::create_dir_all(self.module_dir(id))?;
+        let store = Arc::new(CursorStore::open(self.cursor_path(id))?);
+        cache.insert(id.to_owned(), store.clone());
+        Ok(store)
+    }
+
+    /// Drop the cached cursor store for a module. Used by
+    /// `host::stop` so a follower restart re-opens the database
+    /// (ensuring no stale handle outlives a Driver replacement).
+    pub fn close_cursor(&self, id: &str) {
+        let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
+        cache.remove(id);
     }
 
     pub fn root(&self) -> &Path {
@@ -213,18 +250,11 @@ impl ModuleStorage {
     }
 
     /// Persist the driver's last-applied cursor atomically.
-    /// One redb table, one row, value is CBOR-encoded
-    /// `ChainPoint`. Each `write_cursor` opens the database,
-    /// writes, fsyncs, closes — trivial overhead, full
-    /// crash-safety. We don't keep the database open between
-    /// calls because cursor writes are infrequent (one per
-    /// applied block) and the open cost is dominated by
-    /// per-block dispatch.
+    /// Reuses the open `CursorStore` per module — one redb open
+    /// per module lifetime, one redb commit per block. See
+    /// `ModuleStorage` doc comment for why this matters.
     pub fn write_cursor(&self, id: &str, cursor: &ChainPoint) -> Result<(), StorageError> {
-        std::fs::create_dir_all(self.module_dir(id))?;
-        let store = CursorStore::open(self.cursor_path(id))?;
-        store.write(cursor)?;
-        Ok(())
+        self.cursor_store(id)?.write(cursor)
     }
 
     /// Read the persisted cursor, if any. `Ok(None)` means the
@@ -236,8 +266,7 @@ impl ModuleStorage {
         if !path.exists() {
             return Ok(None);
         }
-        let store = CursorStore::open(&path)?;
-        store.read()
+        self.cursor_store(id)?.read()
     }
 
     /// List registered module ids by directory enumeration.

@@ -325,6 +325,12 @@ where
                 Err(join_err) if join_err.is_cancelled() => {}
                 Err(join_err) => tracing::warn!(module = %id, error = %join_err, "follower task panicked"),
             }
+            // Drop the cached cursor-store handle so the next
+            // start re-opens redb cleanly. Without this, a
+            // crash during the just-stopped task could leave a
+            // half-committed transaction visible to the new
+            // task via the cached handle.
+            self.storage.close_cursor(id);
             tracing::info!(module = %id, sha = %slot.sha, "follower stopped");
         }
         Ok(())
