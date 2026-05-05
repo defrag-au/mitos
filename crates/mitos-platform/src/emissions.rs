@@ -114,6 +114,10 @@ impl EmissionsStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Sole open site for emissions.redb. Routed exclusively
+        // through `ModuleStorage::emissions_store` which caches
+        // by path; see clippy.toml for the workspace lint.
+        #[allow(clippy::disallowed_methods)]
         let db = redb::Database::builder()
             .create(path)
             .map_err(|e| EmissionsError::Redb(e.to_string()))?;

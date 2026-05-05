@@ -168,6 +168,11 @@ impl Replicator {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // Sole open site for the global subscriptions registry —
+        // process-lifetime singleton. Other redb files belong
+        // under `mitos_platform::storage`. See clippy.toml for
+        // the workspace lint.
+        #[allow(clippy::disallowed_methods)]
         let db = Database::create(&path)
             .map_err(|e| anyhow::anyhow!("open replicator db at {}: {e}", path.display()))?;
 
@@ -306,6 +311,11 @@ impl Replicator {
         if !path.exists() {
             return Ok(Vec::new());
         }
+        // Offline `--print-config-only` flow — by contract,
+        // mitos isn't running in this mode, so opening the
+        // subscriptions registry read-only here can't conflict
+        // with a live `Replicator::new`. See clippy.toml.
+        #[allow(clippy::disallowed_methods)]
         let db = Database::open(path)
             .map_err(|e| anyhow::anyhow!("open replicator db at {}: {e}", path.display()))?;
         let (subs, _next_id) = load_persisted(&db)?;

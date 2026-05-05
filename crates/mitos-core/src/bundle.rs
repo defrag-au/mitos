@@ -222,12 +222,16 @@ impl Bundle {
 
             // Per-module redb-backed KV — crash-safe across
             // restarts. Each module gets its own `kv.redb`
-            // alongside `cursor.redb` + `current.wasm`.
+            // alongside `cursor.redb` + `current.wasm`. Routed
+            // through `ModuleStorage::kv_store` so all opens
+            // share a single cached `Arc<Database>` handle per
+            // module — redb is single-writer-per-process and
+            // a second `Database::open` of the same file fails
+            // with `Database already open`.
             let storage_for_kv = storage.clone();
             let kv_factory: mitos_platform::host::KvFactory = Arc::new(move |id: &str| {
-                let path = storage_for_kv.kv_path(id);
-                match mitos_platform::host_fns::state_kv::ModuleKv::open_redb(&path, None) {
-                    Ok(kv) => kv,
+                match storage_for_kv.kv_store(id, None) {
+                    Ok(kv) => mitos_platform::host_fns::state_kv::ModuleKv::Redb(kv),
                     Err(e) => {
                         // Fall back to in-memory rather than refusing
                         // to start. The error logs loudly; cursor
@@ -239,7 +243,6 @@ impl Bundle {
                         // modules dir.
                         error!(
                             module = %id,
-                            path = %path.display(),
                             error = %e,
                             "redb KV open failed; falling back to in-memory"
                         );

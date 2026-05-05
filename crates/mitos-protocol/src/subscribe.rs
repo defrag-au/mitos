@@ -16,10 +16,12 @@ use crate::interest::Interest;
 use crate::wire::ChainPoint;
 
 /// Wire MIME type for both `SubscribeRequest` and
-/// `SubscribeResponse`. CBOR for both directions — same encoder
-/// + decoder pair on each side, no encoding ambiguity. Errors
-/// (non-2xx HTTP responses) stay JSON so operators can read the
-/// body straight from `curl` output.
+/// `SubscribeResponse`.
+///
+/// CBOR for both directions — same encoder + decoder pair on
+/// each side, no encoding ambiguity. Errors (non-2xx HTTP
+/// responses) stay JSON so operators can read the body straight
+/// from `curl` output.
 pub const SUBSCRIBE_MIME: &str = "application/cbor";
 
 /// Request body for `POST /api/companions/subscribe`.

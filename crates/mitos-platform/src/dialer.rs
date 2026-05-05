@@ -160,7 +160,11 @@ impl CompanionDialer {
             let mut tasks = self.tasks.lock().await;
             if let Some(prev) = tasks.remove(&id) {
                 prev.cancel.cancel();
-                let _ = prev.task; // task drains itself on cancel
+                // Task self-terminates once it observes the
+                // cancel token; explicitly drop the JoinHandle
+                // so the underlying tokio task isn't accidentally
+                // awaited / blocked on here.
+                drop(prev.task);
             }
         }
         self.spawn(req).await;
@@ -385,11 +389,10 @@ fn resolve_auth_header(
     req: &SubscribeRequest,
     auth: &AuthToken,
 ) -> (Option<String>, Option<String>) {
-    if let Some(d) = &req.dial_back {
-        if let (Some(name), Some(value)) = (d.auth_header.clone(), d.auth_value.clone()) {
+    if let Some(d) = &req.dial_back
+        && let (Some(name), Some(value)) = (d.auth_header.clone(), d.auth_value.clone()) {
             return (Some(name), Some(value));
         }
-    }
     if let Some(token) = auth.as_deref() {
         return (
             Some("Authorization".to_string()),

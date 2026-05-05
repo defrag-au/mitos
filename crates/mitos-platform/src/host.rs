@@ -342,18 +342,19 @@ where
             // follower, so cancelling above also signals it.
             // Await to ensure any in-flight EmissionsStore
             // append commits before stop returns.
-            if let Err(join_err) = slot.drain_task.await {
-                if !join_err.is_cancelled() {
+            if let Err(join_err) = slot.drain_task.await
+                && !join_err.is_cancelled() {
                     tracing::warn!(module = %id, error = %join_err, "emit drain task panicked")
                 }
-            }
-            // Drop the cached cursor-store + emissions-store
-            // handles so the next start re-opens redb cleanly.
-            // Without this, a crash during the just-stopped task
-            // could leave a half-committed transaction visible
-            // to the new task via the cached handle.
+            // Drop the cached redb store handles (cursor,
+            // emissions, KV) so the next start re-opens redb
+            // cleanly. Without this, a crash during the
+            // just-stopped task could leave a half-committed
+            // transaction visible to the new task via the
+            // cached handle.
             self.storage.close_cursor(id);
             self.storage.close_emissions(id);
+            self.storage.close_kv(id);
             tracing::info!(module = %id, sha = %slot.sha, "follower stopped");
         }
         Ok(())

@@ -36,27 +36,38 @@ pub enum StorageError {
 }
 
 /// Owns the storage root path + a cache of open per-module
-/// `CursorStore` handles. The cache is load-bearing for write
-/// throughput: cursor commits fire on every applied block;
-/// reopening redb per write costs ~100-500ms (file-format check +
-/// possible repair pass), capping throughput at ~2-10 blocks/sec.
-/// Holding the database open drops per-write overhead to ~5ms,
-/// which moves the bottleneck off cursor I/O and onto wasmtime
-/// dispatch (the irreducible per-block work).
+/// redb store handles (`CursorStore`, `EmissionsStore`,
+/// `RedbKv`). One file = one cached handle for the lifetime of
+/// the process — the canonical pattern for redb, which is
+/// single-writer-per-process and rejects a second
+/// `Database::open` of the same file with `Database already
+/// open. Cannot acquire lock.`
 ///
-/// Same caching applies to per-module `EmissionsStore` handles:
-/// redb is single-writer-process, so the emit drain task, the
-/// companion dialer's poll loop, and the subscribe handler's
-/// `peek_next_id` call must all share one open instance per
-/// module — otherwise the second opener fails with
-/// `Database already open. Cannot acquire lock.`
+/// **All redb opens for module-scoped files MUST go through
+/// `ModuleStorage`.** Direct calls to `redb::Database::create`
+/// outside this module are a bug — see `clippy.toml`'s
+/// `disallowed_methods` for the lint.
+///
+/// Mirrors the dolos pattern (`StateStore`, `RedbWalStore`):
+/// each typed store wraps a private `Arc<Database>`, derives
+/// `Clone`, and exposes only typed read/write methods. There
+/// is no public way to obtain `&redb::Database` — by design.
+///
+/// Cache is load-bearing for write throughput: cursor commits
+/// fire on every applied block; reopening redb per write costs
+/// ~100-500ms (file-format check + possible repair pass),
+/// capping throughput at ~2-10 blocks/sec. Holding databases
+/// open drops per-write overhead to ~5ms, moving the
+/// bottleneck onto wasmtime dispatch (the irreducible
+/// per-block work).
 ///
 /// Thread-safe + cheap to clone (Arc-wrapped caches).
 #[derive(Clone)]
 pub struct ModuleStorage {
     root: PathBuf,
-    cursor_stores: Arc<Mutex<HashMap<String, Arc<CursorStore>>>>,
+    cursor_stores: Arc<Mutex<HashMap<String, CursorStore>>>,
     emissions_stores: Arc<Mutex<HashMap<String, crate::emissions::EmissionsStore>>>,
+    kv_stores: Arc<Mutex<HashMap<String, crate::vendored::balius::kv::RedbKv>>>,
 }
 
 impl ModuleStorage {
@@ -65,7 +76,45 @@ impl ModuleStorage {
             root: root.into(),
             cursor_stores: Arc::new(Mutex::new(HashMap::new())),
             emissions_stores: Arc::new(Mutex::new(HashMap::new())),
+            kv_stores: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get-or-open the per-module KV store. Idempotent; first
+    /// call per module pays the redb open cost, subsequent
+    /// calls return the cached `RedbKv` (cheap to clone — one
+    /// `Arc<Database>` inside).
+    ///
+    /// Caller surface: the bundle's `KvFactory` invokes this
+    /// once per module follower instantiation. Trap-replay
+    /// outcomes that re-instantiate within the same process
+    /// re-call the factory; without this cache, the second
+    /// open hits the single-writer lock and fails.
+    ///
+    /// `cache_size` is forwarded to balius's redb cache config
+    /// (MiB). Defaults applied internally if `None`.
+    pub fn kv_store(
+        &self,
+        id: &str,
+        cache_size: Option<usize>,
+    ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
+        let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
+        if let Some(s) = cache.get(id) {
+            return Ok(s.clone());
+        }
+        std::fs::create_dir_all(self.module_dir(id))
+            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
+        let store = crate::vendored::balius::kv::RedbKv::try_new(self.kv_path(id), cache_size)?;
+        cache.insert(id.to_owned(), store.clone());
+        Ok(store)
+    }
+
+    /// Drop the cached KV handle for a module. Mirror of
+    /// `close_cursor` / `close_emissions`. Called from
+    /// `host::stop` so a follower restart re-opens redb cleanly.
+    pub fn close_kv(&self, id: &str) {
+        let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
+        cache.remove(id);
     }
 
     /// Get-or-open the emissions store for a module. Idempotent;
@@ -95,14 +144,15 @@ impl ModuleStorage {
 
     /// Get-or-open the cursor store for a module. First call
     /// per module pays the redb open cost (~hundreds of ms);
-    /// subsequent calls are O(1) HashMap lookup + Arc clone.
-    fn cursor_store(&self, id: &str) -> Result<Arc<CursorStore>, StorageError> {
+    /// subsequent calls are O(1) HashMap lookup + cheap clone
+    /// (`CursorStore` holds `Arc<redb::Database>` internally).
+    fn cursor_store(&self, id: &str) -> Result<CursorStore, StorageError> {
         let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
         if let Some(s) = cache.get(id) {
             return Ok(s.clone());
         }
         std::fs::create_dir_all(self.module_dir(id))?;
-        let store = Arc::new(CursorStore::open(self.cursor_path(id))?);
+        let store = CursorStore::open(self.cursor_path(id))?;
         cache.insert(id.to_owned(), store.clone());
         Ok(store)
     }
@@ -133,7 +183,13 @@ impl ModuleStorage {
     /// Per-module emissions log path. Single redb file at
     /// `<storage_root>/<id>/emissions.redb`. PR 3 of the
     /// companion-runtime delivery.
-    pub fn emissions_path(&self, id: &str) -> PathBuf {
+    ///
+    /// Crate-private — callers outside `mitos-platform` MUST go
+    /// through `emissions_store(id)` so the cached
+    /// `Arc<Database>` handle is shared. Direct path access
+    /// would let callers `Database::open` themselves and trip
+    /// the single-writer lock.
+    pub(crate) fn emissions_path(&self, id: &str) -> PathBuf {
         self.module_dir(id).join("emissions.redb")
     }
 
@@ -256,7 +312,10 @@ impl ModuleStorage {
     }
 
     /// Per-module crash-safe cursor file (redb).
-    pub fn cursor_path(&self, id: &str) -> PathBuf {
+    ///
+    /// Crate-private — callers go through `cursor_store(id)`.
+    /// See `emissions_path` for the rationale.
+    pub(crate) fn cursor_path(&self, id: &str) -> PathBuf {
         self.module_dir(id).join("cursor.redb")
     }
 
@@ -290,7 +349,10 @@ impl ModuleStorage {
 
     /// Per-module crash-safe KV file (redb, via the vendored
     /// `RedbKv`). Bundle's KV factory points at this.
-    pub fn kv_path(&self, id: &str) -> PathBuf {
+    ///
+    /// Crate-private — callers go through `kv_store(id)`.
+    /// See `emissions_path` for the rationale.
+    pub(crate) fn kv_path(&self, id: &str) -> PathBuf {
         self.module_dir(id).join("kv.redb")
     }
 
@@ -335,10 +397,10 @@ impl ModuleStorage {
 }
 
 /// Crash-safe per-module cursor store. One redb file per
-/// module containing a single-row `cursor` table. Opened
-/// per-call rather than kept hot — cursor writes are infrequent
-/// (one per applied block) and the open overhead is dominated
-/// by the per-block wasm dispatch cost.
+/// module containing a single-row `cursor` table. Opened once
+/// per process per module, cached in `ModuleStorage::cursor_stores`,
+/// shared via cheap `Clone` (the inner `Arc<redb::Database>`
+/// makes clones share one open handle).
 ///
 /// Why not vendor Balius's `store.rs`: their `Store` is a WAL
 /// for replay-safe worker restart (`CURSORS` → `WAL` tables,
@@ -349,8 +411,9 @@ impl ModuleStorage {
 /// re-fetches blocks from there. A host-side WAL would be
 /// dead weight; a focused single-row cursor store is what we
 /// actually need.
+#[derive(Clone)]
 struct CursorStore {
-    db: redb::Database,
+    db: Arc<redb::Database>,
 }
 
 const CURSOR_TABLE: redb::TableDefinition<'_, &str, &[u8]> = redb::TableDefinition::new("cursor");
@@ -358,6 +421,10 @@ const CURSOR_ROW: &str = "current";
 
 impl CursorStore {
     fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StorageError> {
+        // Sole open site for cursor.redb. Routed exclusively
+        // through `ModuleStorage::cursor_store` which caches by
+        // path; see clippy.toml for the workspace lint.
+        #[allow(clippy::disallowed_methods)]
         let db = redb::Database::builder()
             .create(path)
             .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
@@ -370,7 +437,7 @@ impl CursorStore {
             .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
         wx.commit()
             .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     fn write(&self, cursor: &ChainPoint) -> Result<(), StorageError> {

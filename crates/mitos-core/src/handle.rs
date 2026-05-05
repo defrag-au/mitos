@@ -419,11 +419,10 @@ where
                         }
                     }
                     Ok(ClientMessage::Ack { emission_id }) => {
-                        if let Some(h) = &inbound_handler {
-                            if let Err(e) = h.on_ack(emission_id).await {
+                        if let Some(h) = &inbound_handler
+                            && let Err(e) = h.on_ack(emission_id).await {
                                 warn!(error = %e, "inbound Ack handler failed");
                             }
-                        }
                     }
                     Ok(ClientMessage::Nack { emission_id, error }) => {
                         if let Some(h) = &inbound_handler {

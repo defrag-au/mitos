@@ -46,6 +46,10 @@ impl RedbKv {
     pub const DEF: TableDefinition<'static, String, Vec<u8>> = TableDefinition::new("kv");
 
     pub fn try_new(path: impl AsRef<Path>, cache_size: Option<usize>) -> Result<Self, KvError> {
+        // Sole open site for kv.redb. Routed exclusively through
+        // `ModuleStorage::kv_store` which caches by path; see
+        // clippy.toml for the workspace lint.
+        #[allow(clippy::disallowed_methods)]
         let db = Database::builder()
             .set_repair_callback(|x| warn!(progress = x.progress() * 100f64, "db is repairing"))
             .set_cache_size(1024 * 1024 * cache_size.unwrap_or(10_000))
@@ -69,6 +73,10 @@ impl RedbKv {
     }
 
     pub fn into_ephemeral(&mut self) -> Result<Self, KvError> {
+        // In-memory backend — no file lock; the workspace lint
+        // is about preventing duplicate file opens, not in-memory
+        // databases. Allow locally.
+        #[allow(clippy::disallowed_methods)]
         let new_db = redb::Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(|e| KvError::Internal(e.to_string()))?;
