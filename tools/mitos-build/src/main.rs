@@ -22,31 +22,65 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use mitos_platform::inspect::{InspectResult, dry_inspect};
 use mitos_platform::manifest::{
     AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, sha256_hex,
 };
 
+/// Host WIT contract bundled at compile time. Each `mitos-build`
+/// release pins exactly one WIT version; upgrading the tool
+/// upgrades the WIT every single-file module is built against.
+const HOST_WIT: &str = include_str!("../../../crates/mitos-platform/wit/world.wit");
+
+/// Absolute path to the `mitos-protocol` crate baked at compile
+/// time. Single-file modules need a path-dep into mitos-protocol
+/// (it carries `Interest`, `ChainPoint`, etc.); resolving from
+/// `CARGO_MANIFEST_DIR` lets the materialised crate find it
+/// without the user threading paths around. Tied to the build
+/// tree mitos-build was compiled in — re-run cargo install after
+/// moving the source.
+const MITOS_PROTOCOL_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/mitos-protocol",
+);
+
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Build a mitos wasm-module crate into a deployable artifact"
+    about = "Build a mitos wasm-module crate into a deployable artifact",
+    // Subcommands (e.g. `prepare`) carry their own args and don't
+    // need the top-level `--crate-name` / `--module` requirement.
+    subcommand_negates_reqs = true,
 )]
 struct Args {
-    /// Workspace member to build. Should be the crate that
-    /// contains `wit_bindgen::generate!` + `impl Guest`. Used
-    /// as the `cargo build -p` argument.
-    #[arg(long)]
-    crate_name: String,
+    /// Single-file module shape: build from a `<name>.rs` +
+    /// optional `<name>.toml`. mitos-build materialises a Cargo
+    /// crate around the user's source under `target/mitos-build/<id>/`,
+    /// injects the wit_bindgen header + bundled host WIT, and
+    /// runs cargo. Mutually exclusive with `--crate-name` /
+    /// `--workspace`.
+    ///
+    /// Argument can be either the `.rs` file directly or the
+    /// stem (we'll find `<stem>.rs` next to it).
+    #[arg(long, conflicts_with_all = ["crate_name", "workspace"])]
+    module: Option<PathBuf>,
 
-    /// Module ID written to the manifest. Defaults to the
-    /// crate name with underscores replaced by hyphens. Must
+    /// Workspace member to build. Used as the `cargo build -p`
+    /// argument. Required for the legacy multi-crate shape;
+    /// omit when using `--module`.
+    #[arg(long, required_unless_present = "module")]
+    crate_name: Option<String>,
+
+    /// Module ID written to the manifest. Defaults to the file
+    /// stem (single-file mode) or the crate name with
+    /// underscores replaced by hyphens (legacy mode). Must
     /// match `[a-z0-9-]+` (max 64 chars).
     #[arg(long)]
     module_id: Option<String>,
 
-    /// Workspace root. Defaults to current directory.
+    /// Workspace root for the legacy multi-crate shape. Defaults
+    /// to the current directory. Ignored when `--module` is set.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
 
@@ -70,6 +104,22 @@ struct Args {
     /// artifact directory. Returns non-zero if validation fails.
     #[arg(long)]
     dry_run: bool,
+
+    #[command(subcommand)]
+    cmd: Option<SubCmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum SubCmd {
+    /// Materialise the single-file module's Cargo crate without
+    /// building. Useful for IDE / rust-analyzer pointing — the
+    /// printed path can be opened in your editor for completion
+    /// against the bindgen-generated traits.
+    Prepare {
+        /// `<name>.rs` (or stem) to materialise.
+        #[arg(long)]
+        module: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -83,15 +133,50 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let module_id = args
-        .module_id
-        .clone()
-        .unwrap_or_else(|| args.crate_name.replace('_', "-"));
+    // Subcommand dispatch — `prepare` exits early without
+    // running cargo.
+    if let Some(SubCmd::Prepare { module }) = args.cmd.as_ref() {
+        let single = SingleFileSpec::resolve(module)?;
+        let materialised = materialise_module(&single)?;
+        println!("{}", materialised.crate_dir.display());
+        println!(
+            "Open the path above in your IDE for rust-analyzer \
+             completion against the bindgen-generated traits."
+        );
+        return Ok(());
+    }
+
+    // Single-file mode: materialise a Cargo crate around the
+    // user's `.rs` + bundled WIT, then fall through into the
+    // legacy build path with synthetic crate-name + workspace.
+    let (build_workspace, build_crate_name, build_module_id) = if let Some(module) =
+        args.module.as_ref()
+    {
+        let single = SingleFileSpec::resolve(module)?;
+        let materialised = materialise_module(&single)?;
+        let module_id = args.module_id.clone().unwrap_or(single.module_id.clone());
+        (
+            materialised.workspace_root,
+            materialised.crate_name,
+            module_id,
+        )
+    } else {
+        let crate_name = args
+            .crate_name
+            .clone()
+            .ok_or_else(|| anyhow!("--crate-name is required when --module is not given"))?;
+        let module_id = args
+            .module_id
+            .clone()
+            .unwrap_or_else(|| crate_name.replace('_', "-"));
+        (args.workspace.clone(), crate_name, module_id)
+    };
+    let module_id = build_module_id;
 
     // 1. Build (or accept a pre-built path).
     let wasm_path = match args.wasm_path.as_ref() {
         Some(p) => p.clone(),
-        None => cargo_build(&args)?,
+        None => cargo_build_at(&build_workspace, &build_crate_name, &args.profile)?,
     };
     let wasm_bytes =
         std::fs::read(&wasm_path).with_context(|| format!("reading {}", wasm_path.display()))?;
@@ -108,7 +193,14 @@ async fn main() -> anyhow::Result<()> {
     log_inspect(&inspect);
 
     // 3. Build the manifest from inspected values + build metadata.
-    let manifest = build_manifest(&module_id, &wasm_bytes, &inspect, &args)?;
+    let manifest = build_manifest(
+        &module_id,
+        &wasm_bytes,
+        &inspect,
+        &build_workspace,
+        &build_crate_name,
+        &args.profile,
+    )?;
 
     if args.dry_run {
         println!("--dry-run: not writing artifact");
@@ -117,10 +209,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 4. Emit artifact directory.
-    let out = args
-        .out
-        .clone()
-        .unwrap_or_else(|| args.workspace.join("target").join("mitos").join(&module_id));
+    //
+    // For single-file mode: the artifact lands next to the
+    // user's `.rs` (under `<source-dir>/target/mitos/<id>/`)
+    // rather than buried inside the materialised work dir.
+    // Operators expect to find it next to the source.
+    let out = args.out.clone().unwrap_or_else(|| {
+        let source_dir = args
+            .module
+            .as_ref()
+            .and_then(|m| {
+                let p = if m.is_file() { m.parent().map(|p| p.to_path_buf()) } else { Some(m.clone()) };
+                p
+            })
+            .unwrap_or_else(|| build_workspace.clone());
+        source_dir.join("target").join("mitos").join(&module_id)
+    });
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     let wasm_out = out.join(format!("{module_id}.wasm"));
     std::fs::copy(&wasm_path, &wasm_out)
@@ -129,12 +233,19 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(&manifest_out, manifest.to_toml().context("manifest toml")?)
         .with_context(|| format!("writing {}", manifest_out.display()))?;
 
-    // If a `mitos.toml` is colocated with the module workspace,
-    // CBOR-encode its parsed value tree as `config.cbor` next to
-    // the wasm. The module's `init` deserialises this back into
-    // its `Config` shape via ciborium. Wrangler-style: human
-    // edits TOML, machine ships CBOR.
-    let mitos_toml = args.workspace.join("mitos.toml");
+    // CBOR-encode the colocated mitos config as `config.cbor`
+    // next to the wasm. The module's `init` deserialises this
+    // back into its `Config` shape via ciborium. Wrangler-style:
+    // human edits TOML, machine ships CBOR.
+    //
+    // Single-file mode: `<stem>.toml` next to the `.rs`.
+    // Legacy mode: `<workspace>/mitos.toml`.
+    let mitos_toml = if let Some(module) = args.module.as_ref() {
+        let single = SingleFileSpec::resolve(module)?;
+        single.config_path.unwrap_or_else(|| build_workspace.join("__nonexistent__.toml"))
+    } else {
+        args.workspace.join("mitos.toml")
+    };
     if mitos_toml.exists() {
         let toml_str = std::fs::read_to_string(&mitos_toml)
             .with_context(|| format!("reading {}", mitos_toml.display()))?;
@@ -176,17 +287,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cargo_build(args: &Args) -> anyhow::Result<PathBuf> {
-    tracing::info!(crate_name = %args.crate_name, profile = %args.profile, "cargo build");
+fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::Result<PathBuf> {
+    tracing::info!(crate_name = %crate_name, profile = %profile, "cargo build");
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("--target")
         .arg("wasm32-wasip2")
         .arg("--profile")
-        .arg(&args.profile)
+        .arg(profile)
         .arg("-p")
-        .arg(&args.crate_name)
-        .current_dir(&args.workspace);
+        .arg(crate_name)
+        .current_dir(workspace);
     let status = cmd
         .status()
         .with_context(|| "running cargo (is it on PATH?)")?;
@@ -197,14 +308,9 @@ fn cargo_build(args: &Args) -> anyhow::Result<PathBuf> {
     // Resolve the produced .wasm. Cargo writes to
     // `<workspace>/target/wasm32-wasip2/<profile>/<crate>.wasm`
     // with hyphens in the crate name converted to underscores.
-    let crate_underscore = args.crate_name.replace('-', "_");
-    let profile_dir = if args.profile == "dev" {
-        "debug"
-    } else {
-        &args.profile
-    };
-    let path = args
-        .workspace
+    let crate_underscore = crate_name.replace('-', "_");
+    let profile_dir = if profile == "dev" { "debug" } else { profile };
+    let path = workspace
         .join("target")
         .join("wasm32-wasip2")
         .join(profile_dir)
@@ -219,13 +325,227 @@ fn cargo_build(args: &Args) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+// ============================================================================
+// Single-file module support
+// ============================================================================
+
+/// Resolved single-file module: paths to `<name>.rs` and the
+/// optional `<name>.toml`, plus the inferred module-id (file
+/// stem, hyphenated).
+struct SingleFileSpec {
+    rs_path: PathBuf,
+    config_path: Option<PathBuf>,
+    module_id: String,
+}
+
+impl SingleFileSpec {
+    fn resolve(arg: &Path) -> anyhow::Result<Self> {
+        let rs_path = if arg.extension().and_then(|s| s.to_str()) == Some("rs") {
+            arg.to_path_buf()
+        } else {
+            // Allow the user to pass `modules/ownership` and we'll
+            // append `.rs`. Mirrors how `clippy --fix path/to/file`
+            // accepts either form.
+            let with_rs = arg.with_extension("rs");
+            if !with_rs.exists() {
+                return Err(anyhow!(
+                    "single-file module: neither {} nor {} exists",
+                    arg.display(),
+                    with_rs.display()
+                ));
+            }
+            with_rs
+        };
+        if !rs_path.exists() {
+            return Err(anyhow!(
+                "single-file module: {} does not exist",
+                rs_path.display()
+            ));
+        }
+        let stem = rs_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("invalid file name: {}", rs_path.display()))?;
+        let module_id = stem.replace('_', "-");
+        let config_candidate = rs_path.with_extension("toml");
+        let config_path = config_candidate.exists().then_some(config_candidate);
+        Ok(Self {
+            rs_path: rs_path.canonicalize().unwrap_or(rs_path),
+            config_path,
+            module_id,
+        })
+    }
+}
+
+/// Outcome of `materialise_module`: paths the build flow uses.
+struct Materialised {
+    /// Workspace root (cargo's `current_dir`). Contains the
+    /// `[workspace] members = ["module"]` Cargo.toml.
+    workspace_root: PathBuf,
+    /// `module/` directory (the cdylib crate). Same as
+    /// `workspace_root.join("module")`.
+    crate_dir: PathBuf,
+    /// The crate's `[package].name`. Used as `cargo build -p`.
+    crate_name: String,
+}
+
+/// Materialise a Cargo crate around a single-file module under
+/// `<rs_dir>/target/mitos-build/<id>/`. Idempotent — overwrites
+/// generated files on every invocation; cargo's incremental
+/// compilation cache stays warm because file mtimes only update
+/// when content changes.
+fn materialise_module(spec: &SingleFileSpec) -> anyhow::Result<Materialised> {
+    let crate_name = format!("{}-module", spec.module_id);
+    let rs_dir = spec
+        .rs_path
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent: {}", spec.rs_path.display()))?
+        .to_path_buf();
+    let workspace_root = rs_dir
+        .join("target")
+        .join("mitos-build")
+        .join(&spec.module_id);
+    let crate_dir = workspace_root.join("module");
+    let wit_dir = workspace_root.join("wit");
+    let src_dir = crate_dir.join("src");
+    std::fs::create_dir_all(&src_dir)
+        .with_context(|| format!("creating {}", src_dir.display()))?;
+    std::fs::create_dir_all(&wit_dir)
+        .with_context(|| format!("creating {}", wit_dir.display()))?;
+
+    // Workspace Cargo.toml.
+    let workspace_toml = format!(
+        r#"# AUTO-GENERATED by mitos-build — DO NOT EDIT.
+# Regenerated on every `mitos-build --module ...` run.
+[workspace]
+members = ["module"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+"#
+    );
+    write_if_changed(&workspace_root.join("Cargo.toml"), &workspace_toml)?;
+
+    // Crate Cargo.toml. Fixed dep set — `wit-bindgen`, `serde`,
+    // `ciborium`, `hex`, `mitos-protocol`. mitos-protocol comes
+    // from the absolute path baked at compile time so the user
+    // doesn't have to thread workspace patches around.
+    let crate_toml = format!(
+        r#"# AUTO-GENERATED by mitos-build — DO NOT EDIT.
+[package]
+name = "{crate_name}"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.54"
+serde = {{ version = "1", features = ["derive"] }}
+ciborium = "0.2"
+hex = "0.4"
+mitos-protocol = {{ path = "{mitos_protocol}" }}
+"#,
+        crate_name = crate_name,
+        mitos_protocol = MITOS_PROTOCOL_PATH,
+    );
+    write_if_changed(&crate_dir.join("Cargo.toml"), &crate_toml)?;
+
+    // WIT contract bundled at compile time.
+    write_if_changed(&wit_dir.join("world.wit"), HOST_WIT)?;
+
+    // Generate the crate's `src/lib.rs`. Layout:
+    //
+    //   <leading //! module docs from user source>
+    //   <wit_bindgen::generate! macro — header injected here>
+    //   <rest of user source>
+    //
+    // Inner doc comments (`//!`) must precede all items, so we
+    // hoist them above the macro. The macro's bindgen-generated
+    // items become available to the user code that follows.
+    let user_src = std::fs::read_to_string(&spec.rs_path)
+        .with_context(|| format!("reading {}", spec.rs_path.display()))?;
+    let (user_inner_docs, user_rest) = split_inner_docs(&user_src);
+    let lib_rs = format!(
+        r#"// AUTO-GENERATED by mitos-build — DO NOT EDIT.
+// Regenerated on every `mitos-build --module {rs_path}` run.
+{user_inner_docs}
+// Header injected by mitos-build: wit_bindgen macro pointing at
+// the bundled host WIT under `../wit`. User source below.
+wit_bindgen::generate!({{
+    path: "../wit",
+    world: "mitos-module",
+}});
+
+{user_rest}
+"#,
+        rs_path = spec.rs_path.display(),
+        user_inner_docs = user_inner_docs,
+        user_rest = user_rest,
+    );
+    write_if_changed(&src_dir.join("lib.rs"), &lib_rs)?;
+
+    Ok(Materialised {
+        workspace_root,
+        crate_dir,
+        crate_name,
+    })
+}
+
+/// Split user source into a leading inner-doc block (`//!` lines
+/// + blank lines that come before any non-doc content) and the
+/// rest. Hoisting the doc block above the injected wit_bindgen
+/// macro keeps `//!` comments valid (inner attributes must
+/// precede all items in a module).
+fn split_inner_docs(src: &str) -> (String, String) {
+    let mut docs = String::new();
+    let mut rest_start = 0usize;
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//!") || trimmed.is_empty() {
+            docs.push_str(line);
+            docs.push('\n');
+            rest_start += line.len() + 1;
+        } else {
+            break;
+        }
+    }
+    let rest = src.get(rest_start..).unwrap_or("").to_string();
+    (docs, rest)
+}
+
+/// Write `content` to `path` only if it differs. Avoids
+/// touching mtime on no-op runs so cargo's incremental cache
+/// stays warm.
+fn write_if_changed(path: &Path, content: &str) -> anyhow::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
+        }
+    }
+    std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+}
+
 fn build_manifest(
     module_id: &str,
     wasm_bytes: &[u8],
     inspect: &InspectResult,
-    args: &Args,
+    workspace: &Path,
+    crate_name: &str,
+    profile: &str,
 ) -> anyhow::Result<Manifest> {
-    let crate_version = read_crate_version(&args.workspace, &args.crate_name).unwrap_or_else(|e| {
+    let crate_version = read_crate_version(workspace, crate_name).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "could not read crate version; using 0.0.0");
         "0.0.0".to_owned()
     });
@@ -233,7 +553,7 @@ fn build_manifest(
         tracing::warn!(error = %e, "could not get rustc version");
         "unknown".to_owned()
     });
-    let git_sha = git_sha(&args.workspace).ok();
+    let git_sha = git_sha(workspace).ok();
     let build_id = chrono::Utc::now().to_rfc3339();
 
     Ok(Manifest {
@@ -256,7 +576,7 @@ fn build_manifest(
         build: BuildSection {
             rust_version,
             target: "wasm32-wasip2".to_owned(),
-            profile: args.profile.clone(),
+            profile: profile.to_owned(),
             build_id,
             git_sha,
             crate_version,
