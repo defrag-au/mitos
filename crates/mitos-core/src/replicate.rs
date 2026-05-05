@@ -130,7 +130,11 @@ async fn run_socket(socket: WebSocket, state: ReplicateState) {
     let name = state.handle.name();
     info!(indexer = %name, "test consumer connected (server-accepted)");
     let transport = Box::new(AxumWs(socket));
-    match state.handle.run_subscriber(transport, state.domain).await {
+    match state
+        .handle
+        .run_subscriber(transport, state.domain, None)
+        .await
+    {
         Ok(()) => info!(indexer = %name, "consumer disconnected"),
         Err(e) => warn!(indexer = %name, error = %e, "subscriber loop exited with error"),
     }

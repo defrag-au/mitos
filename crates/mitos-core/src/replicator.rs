@@ -555,7 +555,7 @@ async fn dial_and_run(
     });
 
     handle
-        .run_subscriber(transport, domain.clone())
+        .run_subscriber(transport, domain.clone(), None)
         .await
         .map_err(|e| anyhow::anyhow!("run_subscriber: {e}"))
 }
