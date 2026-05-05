@@ -34,7 +34,7 @@ these terms fix that.
 | **Interest set** | The dApp's expression of "what I want to be told about". Source of truth on companion side; replicated to the module as filter. | Companion DO SQLite (canonical), Module redb (replica). |
 | **Emission** | One matched event the module sends to a companion as `ServerMessage::Apply`. | Recorded in host's `module_emissions` log (see "Emissions log on the host"). |
 | **Companion** | The CF-side counterpart of a module. A `#[durable_object]` DO using the runtime. Receives emissions, calls dApp's `apply_event`, owns the dApp's state slice. | `cnft.dev-workers/workers/<name>-companion/` (or wherever the dApp keeps its CF code) |
-| **Runtime** | The `mitos-companion` crate. Absorbs companion boilerplate. Provides `MitosCompanionRuntime<C>`, `MitosCompanion` trait, `MitosChannel` trait. | `cnft.dev-workers/types/mitos-companion/` |
+| **Runtime** | The `mitos-companion` crate. Absorbs companion boilerplate. Provides `MitosCompanionRuntime<C>`, `MitosCompanion` trait, `MitosChannel` trait. | `mitos/crates/mitos-companion/` |
 | **dApp Worker** | The dApp's CF Worker — HTTP entrypoint, business logic. Mitos-unaware (treats companions as service bindings). | dApp's repo, e.g. `cnft.dev-workers/workers/<dapp>/` |
 | **dApp** | The product. One or more dApp Workers + N companions + frontend + DBs. Owns its own modules in its own repo. | Multi-crate scope. |
 | **ACK / NACK** | Companion's response to an emission after `apply_event`. ACK = success; NACK = the dApp handler errored. | Wire protocol additions (see "Emissions log"). |
@@ -88,7 +88,7 @@ The runtime owns:
 ## Concrete v1 scope (strict)
 
 In:
-- `mitos-companion` crate in `cnft.dev-workers/types/mitos-companion/`
+- `mitos-companion` crate in `mitos/crates/mitos-companion/` (alongside `mitos-protocol`, in the public mitos repo)
 - `MitosCompanion` trait — the dApp builder's entry point
 - `MitosCompanionRuntime<C: MitosCompanion>` — plain struct (no
   `#[durable_object]`, no `DurableObject` impl) that the dApp
@@ -1340,21 +1340,25 @@ only when concerns are tightly coupled at the SQL layer.
 
 ## Crate location
 
-`cnft.dev-workers/types/mitos-companion/`
-- Lives in cnft.dev-workers because the first consumer is
-  there
-- Named `mitos-companion` so it's discoverable
-- Public to all workspace members (other workers can adopt
-  later)
-- Promotable to `shared-crates` repo if/when a non-cnft.dev
-  team needs it
+`mitos/crates/mitos-companion/`
+- Lives in the public mitos repo alongside `mitos-protocol`,
+  so both halves of the wire protocol have a single source of
+  truth and evolve in lockstep
+- Anyone consuming mitos can clone, build, and use the
+  companion runtime — no private-repo gates
+- Discoverable next to the design docs in `docs/strategy/`
+  and `docs/design/` that describe the protocol it implements
 
-Rationale for not putting in `mitos/` repo: the runtime
-depends on `worker-rs`, which is CF-specific and not relevant
-to mitos's host-side runtime. Keeping it in cnft.dev-workers
-mirrors the companion-pattern's "consumer owns their half"
-principle — the SDK is the consumer's tool, even though
-mitos defines the wire protocol it speaks.
+The original PR 1 plan placed this crate in
+`cnft.dev-workers/types/mitos-companion/` on the rationale
+that it depended on `worker-rs` (CF-specific). That rationale
+turned out to be weak: `worker-rs` builds fine on host
+targets for library work, mitos-companion has no `[[bin]]`
+targets, and all 13 tests are pure-Rust round-trip / dispatch
+contract tests. The bigger concern — that hosting the runtime
+in a private workspace defeats the point of mitos being
+public — won out, and the crate was moved here in the move-PR
+that landed before PR 2 of the runtime delivery.
 
 ## Order of operations
 
@@ -1364,7 +1368,7 @@ because the migration loses functionality vs. the existing
 worker without them.
 
 ### PR 1 — `mitos-companion` crate skeleton + addressing + WS lifecycle (~700 lines)
-- New crate at `types/mitos-companion/`
+- New crate at `mitos/crates/mitos-companion/`
 - `MitosCompanion` trait + `MitosChannel` sub-trait +
   `MitosChannelDyn` blanket impl
 - `MitosCompanionRuntime<C>` plain struct (no DO macro, no

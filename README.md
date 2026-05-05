@@ -65,10 +65,14 @@ live in [`docs/strategy/`](docs/strategy/).
 
 Active workstreams (most recent first):
 
-- **Companion runtime v1** — CF-side SDK that absorbs ~70% of boilerplate
-  every CF Worker companion currently hand-rolls. Wire types now live in
-  `mitos-protocol` (no more mirror drift); subscribe endpoint shipping in
-  `mitos-platform`. Design: [`MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md).
+- **Companion runtime v1** — CF Worker Durable Object SDK
+  (`mitos-companion`) that absorbs ~70% of the boilerplate every
+  CF Worker companion currently hand-rolls. Wire types live in
+  `mitos-protocol` (no mirror drift); subscribe endpoint in
+  `mitos-platform`; runtime SDK in `mitos-companion`. PR 1 of a
+  planned 7-PR delivery has landed; PR 2 (dynamic interest) is
+  next. Design:
+  [`MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md).
 - **Platform v1** — wasm-isolated module runtime with hot-loadable
   indexers, author-declared trap policies, and resource limits.
   Validated end-to-end against mainnet; ownership-indexer module emits live.
@@ -97,6 +101,7 @@ mitos/
 │   ├── mitos-protocol/                # framework-free wire types (wire ↔ companions)
 │   ├── mitos-data-plane/              # typed chain-data lookups over Dolos
 │   ├── mitos-platform/                # wasm module runtime (hot-load, sandbox, supervise)
+│   ├── mitos-companion/               # CF Worker DO runtime SDK (companion-side)
 │   ├── jpg-co-indexer/                # jpg.store collection offers indexer
 │   ├── collection-ownership-indexer/  # per-policy ownership-change feed
 │   └── marketplace-indexer/           # multi-marketplace event taxonomy
