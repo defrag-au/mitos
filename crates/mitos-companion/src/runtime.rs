@@ -66,6 +66,15 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         &self.env
     }
 
+    /// Borrow the DO `State`. Used by the dApp's `#[durable_object]`
+    /// wrapper for direct SQL access in read-API handlers (the
+    /// runtime owns its own meta tables, but the dApp's read API
+    /// queries its own application tables and needs the same
+    /// `state.storage().sql()` handle the runtime is using).
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
     /// Borrow the inner companion. Useful for tests + RPC handler
     /// dispatch (PR 6 work).
     pub fn inner(&self) -> &C {
