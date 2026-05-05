@@ -141,8 +141,8 @@ fn segment_path(archive_dir: &std::path::Path, segment_id: u32) -> PathBuf {
 
 fn read_block(archive_dir: &std::path::Path, loc: &BlockLocation) -> anyhow::Result<Vec<u8>> {
     let path = segment_path(archive_dir, loc.segment_id);
-    let mut file = File::open(&path)
-        .with_context(|| format!("opening segment file {}", path.display()))?;
+    let mut file =
+        File::open(&path).with_context(|| format!("opening segment file {}", path.display()))?;
     file.seek(SeekFrom::Start(loc.offset))?;
     let mut buf = vec![0u8; loc.length as usize];
     file.read_exact(&mut buf)
@@ -163,8 +163,8 @@ fn main() -> anyhow::Result<()> {
     // Parse config — just enough to find `storage.path`.
     let cfg_text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("reading config {}", args.config.display()))?;
-    let cfg: DolosConfig = toml::from_str(&cfg_text)
-        .context("parsing dolos.toml [storage] section")?;
+    let cfg: DolosConfig =
+        toml::from_str(&cfg_text).context("parsing dolos.toml [storage] section")?;
     let archive_dir = cfg.storage.path.join("archive");
     let index_path = archive_dir.join("index");
     tracing::info!(archive_dir = %archive_dir.display(), "opening archive read-only");
@@ -267,8 +267,7 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&args.out, &bytes)
-        .with_context(|| format!("writing {}", args.out.display()))?;
+    std::fs::write(&args.out, &bytes).with_context(|| format!("writing {}", args.out.display()))?;
     tracing::info!(out = %args.out.display(), bytes = bytes.len(), "wrote fixture");
     Ok(())
 }

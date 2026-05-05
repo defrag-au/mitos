@@ -662,8 +662,7 @@ fn role_filter_drops_reference_tokens_at_match_time() {
     assert!(interest.matches(&user_event));
 
     // CIP-68 reference NFT under the same policy: rejected by the role filter.
-    let ref_asset =
-        AssetId::new(POLICY_BLACKFLAG.into(), "000643b04e616d6531".into()).unwrap();
+    let ref_asset = AssetId::new(POLICY_BLACKFLAG.into(), "000643b04e616d6531".into()).unwrap();
     let ref_event = sale_event(MarketplaceBrand::JpgStore, ref_asset);
     assert!(!interest.matches(&ref_event));
 }

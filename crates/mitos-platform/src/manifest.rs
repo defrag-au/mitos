@@ -122,8 +122,7 @@ impl Manifest {
         }
 
         // WIT world must match. Format is "mitos:platform/mitos-module".
-        let claimed_world =
-            format!("{}/{}", self.abi.wit_package, self.abi.wit_world);
+        let claimed_world = format!("{}/{}", self.abi.wit_package, self.abi.wit_world);
         if claimed_world != wanted_wit_world {
             return Err(ManifestError::WitMismatch {
                 wanted: wanted_wit_world.to_owned(),
@@ -274,7 +273,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_module_id() {
-        for bad in &["", "Foo", "has space", "../etc/passwd", "x".repeat(65).as_str()] {
+        for bad in &[
+            "",
+            "Foo",
+            "has space",
+            "../etc/passwd",
+            "x".repeat(65).as_str(),
+        ] {
             let bytes = b"hello wasm";
             let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
             m.module.id = (*bad).to_owned();

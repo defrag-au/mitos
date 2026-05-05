@@ -28,7 +28,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "diff convergence between two collection-ownership workers")]
+#[command(
+    version,
+    about = "diff convergence between two collection-ownership workers"
+)]
 struct Args {
     /// Base URL of the existing classifier-fed worker.
     #[arg(long, env = "BASELINE_URL")]
@@ -75,9 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
 
     if args.once {
         run_once(&client, &args).await?;

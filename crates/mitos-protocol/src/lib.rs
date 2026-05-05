@@ -13,6 +13,8 @@
 
 mod interest;
 pub mod protocol;
+pub mod subscribe;
+pub mod wire;
 
 #[cfg(test)]
 mod interest_tests;
@@ -28,4 +30,9 @@ pub use protocol::{
     MarketplaceEventKind, OfferAcceptPayload, OfferCancelPayload, OfferCreatePayload,
     OfferUpdatePayload, OutputRef, PlutusBytes, ProtocolEvent, SalePayload, SwapPayload,
     UnlistingPayload,
+};
+pub use subscribe::{DialBackOverride, SubscribeRequest, SubscribeResponse};
+pub use wire::{
+    ChainPoint, ClientMessage, InterestOp, ServerMessage, SubscribeReply, decode_client,
+    decode_server, encode_client, encode_server,
 };

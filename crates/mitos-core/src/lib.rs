@@ -28,8 +28,8 @@ pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};
 pub use indexer::{Indexer, SubscribeReply};
 pub use replicate::{
-    ClientMessage, ServerMessage, decode_client, decode_server, encode_client, encode_server,
-    replicate_router,
+    ClientMessage, ServerMessage, chain_point_from_wire, chain_point_to_wire, decode_client,
+    decode_server, encode_client, encode_server, replicate_router, subscribe_reply_to_wire,
 };
 pub use replicator::{Replicator, Subscription, SubscriptionId};
 pub use transport::{AxumWs, TungsteniteWs, WsTransport};

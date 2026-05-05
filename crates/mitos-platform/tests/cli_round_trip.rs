@@ -60,11 +60,7 @@ fn tempdir(name: &str) -> PathBuf {
 
 fn write_artifact_dir(out: &std::path::Path, manifest: &Manifest, wasm: &[u8]) {
     std::fs::create_dir_all(out).unwrap();
-    std::fs::write(
-        out.join(format!("{}.wasm", manifest.module.id)),
-        wasm,
-    )
-    .unwrap();
+    std::fs::write(out.join(format!("{}.wasm", manifest.module.id)), wasm).unwrap();
     std::fs::write(out.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
 }
 

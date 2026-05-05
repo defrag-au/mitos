@@ -113,8 +113,8 @@ async fn wasm_emit(
     txs: Vec<TxView>,
 ) -> Vec<OwnershipChangeV1Wire> {
     let engine = ModuleRegistry::build_engine().expect("engine");
-    let registry = ModuleRegistry::load_from_path(engine, "ownership".to_owned(), wasm)
-        .expect("load");
+    let registry =
+        ModuleRegistry::load_from_path(engine, "ownership".to_owned(), wasm).expect("load");
     let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
 
     let (sink, mut events) = emit::EventSink::new();

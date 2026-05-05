@@ -88,8 +88,8 @@ pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError
     config.epoch_interruption(true);
     let engine = Engine::new(&config).map_err(|e| InspectError::Engine(e.to_string()))?;
 
-    let component = Component::from_file(&engine, wasm_path)
-        .map_err(|e| InspectError::Load(e.to_string()))?;
+    let component =
+        Component::from_file(&engine, wasm_path).map_err(|e| InspectError::Load(e.to_string()))?;
 
     // Build the platform's linker (WASI + host fns). If the
     // module's WIT world doesn't match, this is where it'll
@@ -146,4 +146,3 @@ fn trap_strategy_to_string(s: TrapStrategy) -> String {
     }
     .to_owned()
 }
-

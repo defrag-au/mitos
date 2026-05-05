@@ -87,7 +87,10 @@ impl RedbKv {
                     .open_table(Self::DEF)
                     .map_err(|e| KvError::Internal(e.to_string()))?;
 
-                for entry in source.iter().map_err(|e| KvError::Internal(e.to_string()))? {
+                for entry in source
+                    .iter()
+                    .map_err(|e| KvError::Internal(e.to_string()))?
+                {
                     let (k, v) = entry.map_err(|e| KvError::Internal(e.to_string()))?;
                     target
                         .insert(k.value(), v.value())

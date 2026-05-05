@@ -33,8 +33,8 @@ use crate::resolved_block::TxView;
 /// projection failures are logged + dropped (the same
 /// best-effort posture the existing host-side indexer uses).
 pub fn decode_block(cbor: &[u8]) -> Result<DecodedBlock, anyhow::Error> {
-    let block = MultiEraBlock::decode(cbor)
-        .map_err(|e| anyhow::anyhow!("MultiEraBlock decode: {e}"))?;
+    let block =
+        MultiEraBlock::decode(cbor).map_err(|e| anyhow::anyhow!("MultiEraBlock decode: {e}"))?;
     let slot = block.slot();
     let txs = block.txs().iter().map(project_tx).collect();
     Ok(DecodedBlock { slot, txs })

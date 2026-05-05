@@ -31,6 +31,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dolos_core::{ChainPoint, TipEvent, TipSubscription};
 use mitos_data_plane::{DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
+use mitos_platform::ResolvedBlock;
 use mitos_platform::bindings::{
     AssetEntry as WitAssetEntry, AssetId as WitAssetId, OutputRef as WitOutputRef,
     TypedOutput as WitTypedOutput,
@@ -40,7 +41,6 @@ use mitos_platform::follower::run_chain_follower;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
 use mitos_platform::registry::{ModuleRegistry, ResourceBudget};
 use mitos_platform::resolved_block::TxView;
-use mitos_platform::ResolvedBlock;
 
 /// Stub data plane that records calls but returns nothing. The
 /// spike guest's `handle-event` doesn't currently call read-utxos,
@@ -189,8 +189,7 @@ async fn ownership_module_emits_transfer_for_watched_policy() {
     struct ModuleConfig {
         policies: Vec<String>,
     }
-    let watched_policy_hex =
-        "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6".to_owned();
+    let watched_policy_hex = "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6".to_owned();
     let cfg = ModuleConfig {
         policies: vec![watched_policy_hex.clone()],
     };
@@ -346,10 +345,7 @@ async fn ownership_module_ignores_unwatched_policy() {
         .await
         .expect("handle-event");
 
-    assert!(
-        events.try_recv().is_err(),
-        "unwatched policy must not emit"
-    );
+    assert!(events.try_recv().is_err(), "unwatched policy must not emit");
 }
 
 /// Synthetic TipSubscription backed by an mpsc receiver.
@@ -385,8 +381,8 @@ async fn follower_pumps_apply_events_through_module() {
     // Fixture must be present for this test to be meaningful;
     // skip otherwise (same auto-skip pattern as the equivalence
     // test).
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/186000000.block.cbor");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/186000000.block.cbor");
     if !fixture_path.exists() {
         eprintln!(
             "skipping: no fixture at {} — run capture-block first",
@@ -417,8 +413,7 @@ async fn follower_pumps_apply_events_through_module() {
     struct Cfg {
         policies: Vec<String>,
     }
-    let decoded =
-        mitos_platform::block_decode::decode_block(&cbor).expect("decode fixture");
+    let decoded = mitos_platform::block_decode::decode_block(&cbor).expect("decode fixture");
     let mut policies = std::collections::HashSet::new();
     for tx in &decoded.txs {
         for out in &tx.outputs {

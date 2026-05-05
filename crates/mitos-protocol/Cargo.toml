@@ -16,6 +16,9 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_bytes = "0.11"
+# CBOR encode/decode helpers ride alongside the wire types so both
+# host (mitos-core) and CF companion can use them. Framework-free.
+ciborium = "0.2"
 
 # Selector backing — `EnumSet<MarketplaceBrand>` etc.
 enumset = { version = "1.1", features = ["serde"] }
