@@ -61,6 +61,7 @@ use url::Url;
 
 use crate::admin::AuthToken;
 use crate::emissions::{EmissionStatus, EmissionsStore};
+use crate::host::InterestRouter;
 use crate::storage::ModuleStorage;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -98,14 +99,24 @@ struct ActiveCompanion {
 pub struct CompanionDialer {
     storage: ModuleStorage,
     auth: AuthToken,
+    /// Routes inbound `ClientMessage::Interest` frames into the
+    /// matching module's follower task. `None` in tests / dev
+    /// builds where no `ModuleHost` is wired; production
+    /// always passes `Some(host as Arc<dyn InterestRouter>)`.
+    interest_router: Option<Arc<dyn InterestRouter>>,
     tasks: Arc<Mutex<HashMap<CompanionId, ActiveCompanion>>>,
 }
 
 impl CompanionDialer {
-    pub fn new(storage: ModuleStorage, auth: AuthToken) -> Self {
+    pub fn new(
+        storage: ModuleStorage,
+        auth: AuthToken,
+        interest_router: Option<Arc<dyn InterestRouter>>,
+    ) -> Self {
         Self {
             storage,
             auth,
+            interest_router,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -186,8 +197,9 @@ impl CompanionDialer {
         let cancel_for_task = cancel.clone();
         let storage = self.storage.clone();
         let auth = self.auth.clone();
+        let interest_router = self.interest_router.clone();
         let task = tokio::spawn(async move {
-            run_companion(req, storage, auth, cancel_for_task).await;
+            run_companion(req, storage, auth, interest_router, cancel_for_task).await;
         });
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, ActiveCompanion { cancel, task });
@@ -207,6 +219,7 @@ async fn run_companion(
     req: SubscribeRequest,
     storage: ModuleStorage,
     auth: AuthToken,
+    interest_router: Option<Arc<dyn InterestRouter>>,
     cancel: CancellationToken,
 ) {
     let url_str = match resolve_dial_url(&req) {
@@ -252,7 +265,7 @@ async fn run_companion(
         if cancel.is_cancelled() {
             return;
         }
-        match dial_and_pump(&parsed, &req, &auth, &store, &cancel).await {
+        match dial_and_pump(&parsed, &req, &auth, &store, interest_router.as_ref(), &cancel).await {
             Ok(()) => {
                 info!(
                     module = %req.module_name,
@@ -304,6 +317,7 @@ async fn dial_and_pump(
     req: &SubscribeRequest,
     auth: &AuthToken,
     store: &EmissionsStore,
+    interest_router: Option<&Arc<dyn InterestRouter>>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     // Build request with auth header. Per-companion override
@@ -364,7 +378,13 @@ async fn dial_and_pump(
             inbound = source.next() => {
                 match inbound {
                     Some(Ok(Message::Binary(bytes))) => {
-                        handle_inbound_frame(&bytes, store).await;
+                        handle_inbound_frame(
+                            &bytes,
+                            store,
+                            interest_router,
+                            &req.module_name,
+                        )
+                        .await;
                     }
                     Some(Ok(Message::Close(frame))) => {
                         info!(?frame, "peer closed ws");
@@ -450,7 +470,12 @@ async fn drain_queued(
     Ok(())
 }
 
-async fn handle_inbound_frame(bytes: &[u8], store: &EmissionsStore) {
+async fn handle_inbound_frame(
+    bytes: &[u8],
+    store: &EmissionsStore,
+    interest_router: Option<&Arc<dyn InterestRouter>>,
+    module_id: &str,
+) {
     let msg = match decode_client(bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -474,9 +499,31 @@ async fn handle_inbound_frame(bytes: &[u8], store: &EmissionsStore) {
             }
         }
         ClientMessage::Interest { op, items } => {
-            // TODO: forward to follower's update-interest call
-            // via a control channel (separate work item).
-            debug!(?op, count = items.len(), "Interest frame received; not yet wired");
+            let count = items.len();
+            match interest_router {
+                Some(router) => {
+                    if let Err(e) = router.route_interest(module_id, op, items).await {
+                        warn!(
+                            module = %module_id,
+                            error = %e,
+                            "route_interest failed; companion's interest update dropped",
+                        );
+                    } else {
+                        debug!(
+                            module = %module_id,
+                            ?op,
+                            count,
+                            "interest update routed to follower",
+                        );
+                    }
+                }
+                None => {
+                    debug!(
+                        ?op,
+                        count, "Interest frame received but no router wired; dropping"
+                    );
+                }
+            }
         }
         ClientMessage::Unsubscribe => {
             info!("companion sent Unsubscribe; closing pump");

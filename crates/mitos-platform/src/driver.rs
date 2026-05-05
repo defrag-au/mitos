@@ -158,6 +158,52 @@ impl Driver {
             .await
     }
 
+    /// Forward a dynamic-interest update to the wasm module's
+    /// `update-interest` export. Called from the chain follower
+    /// in response to `ClientMessage::Interest` frames received
+    /// over a companion's outbound WS — see `dialer.rs` and the
+    /// `InterestRouter` plumbing in `host.rs`.
+    ///
+    /// Items cross the WIT boundary as one CBOR-encoded
+    /// `Vec<mitos_protocol::Interest>` blob: host encodes once,
+    /// module decodes once. Module-side decode/validation
+    /// failures surface as `Err(reason)` from the export and
+    /// are logged + propagated as `PlatformError::Decode`; they
+    /// do NOT trap the instance or advance the cursor (per the
+    /// WIT contract — interest-shape mismatch is a recoverable
+    /// deploy-version skew).
+    pub async fn update_interest(
+        &mut self,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> PlatformResult<()> {
+        // Refuel before the call. update-interest can do
+        // arbitrary state-kv work module-side; budget it the
+        // same way an apply gets budgeted.
+        self.instance.store.set_fuel(self.budget.fuel_per_call)?;
+        self.instance
+            .store
+            .set_epoch_deadline(self.budget.epoch_deadline_ticks);
+
+        let mut buf = Vec::with_capacity(64);
+        ciborium::ser::into_writer(&items, &mut buf)
+            .map_err(|e| PlatformError::Decode(format!("encode interest items: {e}")))?;
+
+        let bindgen_op = match op {
+            mitos_protocol::InterestOp::Add => crate::bindings::InterestOp::Add,
+            mitos_protocol::InterestOp::Remove => crate::bindings::InterestOp::Remove,
+            mitos_protocol::InterestOp::Replace => crate::bindings::InterestOp::Replace,
+        };
+        let result = self
+            .instance
+            .bindings
+            .call_update_interest(&mut self.instance.store, bindgen_op, &buf)
+            .await?;
+        result.map_err(|reason| {
+            PlatformError::Decode(format!("module update_interest err: {reason}"))
+        })
+    }
+
     /// Apply one block. Handles trap supervision internally;
     /// caller decides whether to keep feeding blocks (Applied /
     /// Skipped / RestartedRetry) or stop (Quarantined).

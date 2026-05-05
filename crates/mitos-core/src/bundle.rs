@@ -287,9 +287,16 @@ impl Bundle {
             // companion persisted from a previous run; the
             // companion subscribe handler hands fresh
             // registrations to it as they arrive.
+            //
+            // Hand the dialer an `Arc<dyn InterestRouter>` cloned
+            // off the host so inbound `ClientMessage::Interest`
+            // frames get routed into the right module's follower
+            // task and call its `update-interest` export.
+            let interest_router: Arc<dyn mitos_platform::host::InterestRouter> = host.clone();
             let dialer = mitos_platform::dialer::CompanionDialer::new(
                 storage.clone(),
                 platform_auth.clone(),
+                Some(interest_router),
             );
             dialer.start_all().await;
             app = app.merge(mitos_platform::companions::companion_router(

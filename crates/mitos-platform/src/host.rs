@@ -55,6 +55,44 @@ pub trait ModuleHostHandle: Send + Sync {
     async fn list_running(&self) -> Vec<String>;
 }
 
+/// One dynamic-interest update queued for delivery to a
+/// running module's `update-interest` export. Pushed by the
+/// dialer when a `ClientMessage::Interest` frame arrives over
+/// the companion's WS; drained by the per-module follower
+/// task and passed through `Driver::update_interest`.
+#[derive(Debug)]
+pub struct InterestUpdate {
+    pub op: mitos_protocol::InterestOp,
+    pub items: Vec<mitos_protocol::Interest>,
+}
+
+/// Routes inbound `Interest` frames to the right running
+/// module's follower task. Only the follower task can call
+/// the wasmtime instance's exports (the wasmtime Store isn't
+/// safely shareable across tasks), so the dialer can't invoke
+/// `update-interest` directly — it pushes through this trait
+/// and the follower drains.
+///
+/// `ModuleHost<S>` implements this trait; `bundle.rs` hands
+/// the dialer an `Arc<dyn InterestRouter>` cloned off the host.
+#[async_trait::async_trait]
+pub trait InterestRouter: Send + Sync {
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InterestRouteError {
+    #[error("module `{0}` is not running; interest update dropped")]
+    NotRunning(String),
+    #[error("module `{0}` follower channel closed; interest update dropped")]
+    ChannelClosed(String),
+}
+
 #[async_trait::async_trait]
 impl<S> ModuleHostHandle for ModuleHost<S>
 where
@@ -71,6 +109,32 @@ where
     }
     async fn list_running(&self) -> Vec<String> {
         ModuleHost::list(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> InterestRouter for ModuleHost<S>
+where
+    S: TipSubscription + 'static,
+{
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError> {
+        let sender = {
+            let senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.get(module_id).cloned()
+        };
+        let sender = sender.ok_or_else(|| InterestRouteError::NotRunning(module_id.to_owned()))?;
+        sender
+            .send(InterestUpdate { op, items })
+            .map_err(|_| InterestRouteError::ChannelClosed(module_id.to_owned()))?;
+        Ok(())
     }
 }
 
@@ -139,6 +203,16 @@ where
     emitter_factory: EmitterFactory,
     budget: ResourceBudget,
     slots: Arc<Mutex<HashMap<String, RunningSlot>>>,
+    /// Per-module senders for the dynamic-interest control
+    /// channel. Populated on `start`; drained + removed on
+    /// `stop`. The matching receiver lives inside the per-
+    /// module follower task.
+    ///
+    /// Held in a `std::sync::Mutex` (not `tokio::sync::Mutex`)
+    /// because every access is a quick map insert/remove/get
+    /// — we never hold the guard across an `.await`.
+    interest_senders:
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>>,
 }
 
 impl<S> ModuleHost<S>
@@ -163,6 +237,7 @@ where
             emitter_factory,
             budget,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -237,6 +312,22 @@ where
         let emitter_factory_inner = self.emitter_factory.clone();
         let id_for_task = id.to_owned();
         let id_for_log = id.to_owned();
+
+        // Dynamic-interest control channel. Sender is owned
+        // by `interest_senders` (cloned for the dialer via
+        // `InterestRouter::route_interest`); receiver moves
+        // into the follower task and is multiplexed with tip
+        // events via `tokio::select!`.
+        let (interest_tx, interest_rx) =
+            tokio::sync::mpsc::unbounded_channel::<InterestUpdate>();
+        {
+            let mut senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.insert(id.to_owned(), interest_tx);
+        }
+
         let task = tokio::spawn(async move {
             // Build a registry handle that the follower can use
             // to re-instantiate on RestartAndReplay outcomes.
@@ -257,6 +348,7 @@ where
                 r = run_chain_follower(
                     driver,
                     subscription,
+                    interest_rx,
                     &registry,
                     data_plane,
                     kv_factory_for_run,
@@ -321,6 +413,16 @@ where
     /// Stop the running follower for `id`, if any. No-op when
     /// `id` isn't running. Awaits the task to confirm cleanup.
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
+        // Drop the interest sender first so the follower's
+        // `tokio::select!` sees a `None` on `interest_rx.recv()`
+        // alongside cancellation (clean exit, no panic).
+        {
+            let mut senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.remove(id);
+        }
         let mut slots = self.slots.lock().await;
         if let Some(slot) = slots.remove(id) {
             slot.cancel.cancel();

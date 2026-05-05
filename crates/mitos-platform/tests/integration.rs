@@ -451,11 +451,16 @@ async fn follower_pumps_apply_events_through_module() {
     // so we cancel after the Apply is processed.
     let kv_factory = state_kv::ModuleKv::new_in_memory;
     let emitter_factory = || emit::EventSink::new().0;
+    // No interest updates in this test — keep the sender
+    // alive in scope so the follower's interest arm parks
+    // (never resolves) rather than seeing `None` and exiting.
+    let (_interest_tx, interest_rx) = tokio::sync::mpsc::unbounded_channel();
     let follower_task = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         run_chain_follower(
             driver,
             FakeTipSubscription { rx },
+            interest_rx,
             &registry,
             dp.clone(),
             kv_factory,
