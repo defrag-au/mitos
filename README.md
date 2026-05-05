@@ -5,10 +5,38 @@
 A composable framework for building Cardano indexers as Rust modules that share
 a single in-process chain data plane.
 
-Each deployment is a **bundle**: a Rust binary that embeds Dolos as a library
-plus one or more indexer modules. The bundle runs as a single OS process,
-sharing chain state, ledger state, and secondary indexes across modules. Each
-module owns its own decoder logic, materialized view, and HTTP endpoints.
+> ## ⚠️ Here be dragons
+>
+> This repository is **early-stage and under heavy development**. APIs change
+> without notice, on-disk formats are not yet stable, the wire protocol is
+> evolving frame-by-frame, and there is no commitment to backwards
+> compatibility yet. Expect rough edges, half-implemented subsystems, and
+> documentation that drifts ahead of the code.
+>
+> It is open-sourced primarily so that consumers (including the author's CF
+> Worker companions) can pin to specific commits and so that the design
+> conversation can happen in public. **It is not ready for production use,
+> external contributions are not solicited yet, and there are no support
+> promises.** If you find this interesting, the design documents in
+> [`docs/strategy/`](docs/strategy/) are probably more useful than the code.
+>
+> ## ⚠️ AI-co-authored
+>
+> Substantial portions of this repository — code, design documents, commit
+> messages, PR descriptions — have been **heavily co-authored with
+> [Claude](https://www.anthropic.com/claude)** (Anthropic's LLM, primarily
+> via Claude Code) under the human author's direction and review. Designs
+> and implementations were iterated through dialogue; Claude both proposed
+> and refined the architecture you'll find documented in `docs/`. Decisions
+> are still owned and reviewed by the human author, but readers evaluating
+> the code or design rationale should know the provenance.
+
+Each deployment is a **bundle**: a Rust binary that embeds Dolos as a library,
+hosts one or more indexer modules, and (since Platform v1) can dynamically
+load + sandbox additional indexers as wasm components. The bundle runs as a
+single OS process, sharing chain state, ledger state, and secondary indexes
+across modules. Each module owns its own decoder logic, materialized view, and
+HTTP endpoints.
 
 The name comes from Greek *μίτος* — the thread Ariadne gave Theseus to find his
 way out of the Labyrinth. Each indexer is one thread of meaning pulled from the
@@ -27,62 +55,76 @@ between them and direct access to Dolos's lookup primitives
 (`utxos_by_policy`, `plutus_data_by_hash`, etc.) without going through gRPC
 or REST.
 
-The architectural rationale is in `docs/design/ARCHITECTURE.md`. The
-contract every indexer must implement is in `docs/design/INDEXER_TRAIT.md`.
+The architectural rationale lives in [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md).
+The contract every indexer must implement is in
+[`docs/design/INDEXER_TRAIT.md`](docs/design/INDEXER_TRAIT.md). The active
+workstreams (platform isolation, companion runtime, dApp framework thesis)
+live in [`docs/strategy/`](docs/strategy/).
 
 ## Status
 
-**Phase 1 validated end-to-end against a real Dolos data directory.** The
-default bundle starts, recovers state + index keyspaces from a snapshot of
-the production mainnet data dir, runs the Cardano logic, and dispatches
-`TipEvent::Apply` blocks to the `JpgCoIndexer` stub as the chain advances.
+Active workstreams (most recent first):
 
-In place:
+- **Companion runtime v1** — CF-side SDK that absorbs ~70% of boilerplate
+  every CF Worker companion currently hand-rolls. Wire types now live in
+  `mitos-protocol` (no more mirror drift); subscribe endpoint shipping in
+  `mitos-platform`. Design: [`MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md).
+- **Platform v1** — wasm-isolated module runtime with hot-loadable
+  indexers, author-declared trap policies, and resource limits.
+  Validated end-to-end against mainnet; ownership-indexer module emits live.
+  Design: [`MITOS_PLATFORM_V1.md`](docs/strategy/MITOS_PLATFORM_V1.md),
+  deployment story: [`MITOS_PLATFORM_DEPLOYMENT.md`](docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md).
+- **CF replication** — Apply/Undo/Mark protocol over WebSocket between mitos
+  and Cloudflare Durable Objects. Live in production.
+  Design: [`docs/design/CF_REPLICATION.md`](docs/design/CF_REPLICATION.md).
 
-- Workspace structure
-- Public `Indexer<D: Domain>` trait + tip-event dispatcher
-- `mitos-core::{load_config, setup_domain, spawn_sync_pipeline}` —
-  replicates Dolos's `bin/dolos/common.rs` initialization
-- A stub `JpgCoIndexer` that logs Apply/Undo/Mark events
-- A `default` bundle main that composes Dolos + the stub, runs an axum
-  HTTP server, and handles graceful shutdown
+Concrete indexers in the tree:
 
-Things explicitly NOT done yet (see `docs/design/ROADMAP.md`):
+- `jpg-co-indexer` — collection offers from jpg.store
+- `collection-ownership-indexer` — per-policy ownership-change feed (the
+  canonical reference indexer)
+- `marketplace-indexer` — multi-marketplace event taxonomy
 
-- Real `JpgCoIndexer::bootstrap` (currently returns `ChainPoint::Origin`)
-- Apply/Undo logic that actually decodes blocks and writes a materialized view
-- HTTP route implementations
-- Storage layer for indexer materialized views (redb scaffolded as workspace dep)
-- ARM64 cross-compile + deploy via Shiku
+For the longer arc see [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) and
+[`docs/design/MITOS_ISOLATION_ROADMAP.md`](docs/design/MITOS_ISOLATION_ROADMAP.md).
 
 ## Layout
 
 ```
 mitos/
 ├── crates/
-│   ├── mitos-core/          # the Indexer trait, dispatcher, common types
-│   └── jpg-co-indexer/      # first concrete indexer (jpg.store collection offers)
+│   ├── mitos-core/                    # Indexer trait, dispatcher, CF replication
+│   ├── mitos-protocol/                # framework-free wire types (wire ↔ companions)
+│   ├── mitos-data-plane/              # typed chain-data lookups over Dolos
+│   ├── mitos-platform/                # wasm module runtime (hot-load, sandbox, supervise)
+│   ├── jpg-co-indexer/                # jpg.store collection offers indexer
+│   ├── collection-ownership-indexer/  # per-policy ownership-change feed
+│   └── marketplace-indexer/           # multi-marketplace event taxonomy
 ├── bundles/
-│   └── default/             # composite binary: Dolos + chosen indexers
-├── docs/
-│   └── design/
-│       ├── ARCHITECTURE.md  # why this exists, how it composes
-│       ├── INDEXER_TRAIT.md # the contract for indexer authors
-│       └── ROADMAP.md       # what's done, what's next, in what order
-└── README.md (you are here)
+│   └── default/                       # composite binary: Dolos + chosen indexers
+├── modules/
+│   └── ownership-indexer/             # wasm module testing scaffolding
+├── tools/
+│   ├── mitos-admin/                   # admin HTTP client (deploy modules etc.)
+│   ├── mitos-build/                   # builds wasm module artifacts + manifests
+│   ├── mitos-tail/                    # observability CLI for the CF replication path
+│   ├── capture-block/                 # capture chain blocks for tests
+│   └── diff-collection-ownership/     # parallel-run convergence diff harness
+└── docs/
+    ├── design/                        # contract docs (ARCHITECTURE, ROADMAP, etc.)
+    └── strategy/                      # active-workstream design docs
 ```
 
-A bundle's `Cargo.toml` declares which indexer crates it includes. To add an
-indexer to a deployment, add a workspace dep + register it in `main.rs`.
-Different deployments can be different bundles.
+A bundle's `Cargo.toml` declares which indexer crates it includes. Different
+deployments can be different bundles. As of Platform v1, indexers can also be
+loaded as wasm modules at runtime via `mitos-admin` rather than baked into the
+bundle binary.
 
 ## Building
 
-A `flake.nix` provides the dev shell — same `defrag-nix` `rust-worker-stack`
-the wider org uses, so the toolchain is in lock-step with cnft.dev-workers
-and similar repos:
+A `flake.nix` provides the dev shell. Same toolchain as the rest of the org:
 
-```
+```sh
 nix develop -c cargo build                       # build everything
 nix develop -c cargo build -p mitos --release    # release binary for deployment
 ```
@@ -91,30 +133,27 @@ If you have cargo on PATH already (e.g. via system rustup), plain
 `cargo build` works the same — the flake is convenience, not a hard
 requirement.
 
-Dolos crate dependencies are git deps pinned to a specific tag in
-`Cargo.toml` (currently `v1.0.3`). First build will resolve and compile
-them — this can take a while. Subsequent rebuilds are incremental.
+Dolos crate dependencies are git-pinned to a specific tag in `Cargo.toml`
+(currently `v1.0.3`). First build will resolve and compile them — this
+takes a while. Subsequent rebuilds are incremental.
 
-**The pinned tag must match the version of Dolos that wrote the data
+**The pinned Dolos tag must match the version that wrote the data
 directory you're pointing the bundle at.** Dolos's WAL schema is versioned
 and a mismatch fails fast with `WAL schema not compatible: found=N
-expected=M`. See `docs/design/ROADMAP.md` Phase 1 notes for the full
-incident and recovery commands.
+expected=M`. See [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) Phase 1
+notes for the full incident and recovery commands.
 
 ## Running
 
 The default bundle expects a Dolos-managed data directory (initialized by
-`dolos bootstrap mithril ...` against the same `dolos.toml` config schema). For
-local dev:
+`dolos bootstrap mithril ...` against the same `dolos.toml` config schema):
 
-```
+```sh
 DOLOS_CONFIG=/path/to/dolos.toml cargo run -p mitos
 ```
 
 The bundle starts the chain-sync pipeline, brings each indexer through
-`bootstrap()`, and dispatches `TipEvent`s as the WAL advances. The
-`JpgCoIndexer` is currently a stub that just logs events — Phase 2 fills
-in real bootstrap, decode, and HTTP routes (see ROADMAP).
+`bootstrap()`, and dispatches `TipEvent`s as the WAL advances.
 
 The Dolos data directory is an **atomic unit**: WAL, state, and index
 must be a consistent snapshot. To clone a running Dolos instance for
@@ -126,15 +165,22 @@ produce a state that fails to recover.
 
 End-to-end recipes for exercising the CF replication path —
 protocol-only loop with `mitos-tail`, full mitos↔CF DO round-trip,
-and the parallel-run convergence diff against the existing
-`collection-ownership` worker — are in
-[`docs/TESTING.md`](docs/TESTING.md). Start there once the bundle
-builds.
+and the parallel-run convergence diff against an existing CF
+Worker indexer — are in [`docs/TESTING.md`](docs/TESTING.md).
 
-## Related
+## License
 
-- `~/code/defrag/cnft.dev-workers/docs/design/CARDANO-SHIKU.md` —
-  the broader architecture mitos implements
-- `~/code/defrag/cnft.dev-workers/workers/dolos-spike/` —
-  validated the chain-data primitives mitos depends on
-- `~/code/github/dolos/` — the embedded data plane
+Apache-2.0 — same license Dolos ships under, picked deliberately to keep
+things aligned with the embedded data plane. See [`LICENSE`](LICENSE).
+
+## Design documents
+
+If you want to understand mitos rather than run it, read in this order:
+
+1. [`docs/strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md`](docs/strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md) — the why.
+2. [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md) — the how, at the bundle level.
+3. [`docs/strategy/MITOS_PLATFORM_V1.md`](docs/strategy/MITOS_PLATFORM_V1.md) — the wasm-module runtime.
+4. [`docs/strategy/MITOS_COMPANION_PATTERN.md`](docs/strategy/MITOS_COMPANION_PATTERN.md) — the paired-deployable thesis.
+5. [`docs/strategy/MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md) — the CF-side SDK.
+6. [`docs/design/INDEXER_TRAIT.md`](docs/design/INDEXER_TRAIT.md) — the contract for indexer authors.
+7. [`docs/design/CF_REPLICATION.md`](docs/design/CF_REPLICATION.md) — the WS protocol.
