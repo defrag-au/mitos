@@ -11,5 +11,9 @@
 # Black Flag (per memory bank) is the canonical first watched
 # policy. Add more as needed.
 policies = [
+    # Black Flag (per memory bank — canonical first watched policy)
     "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6",
+    # ADAGods — recent activity, useful for validating live emission
+    # in a tight observation window
+    "793aca910dc6a400ced6c94698c6f01d6479d701227fc9a7287ae2a5",
 ]
