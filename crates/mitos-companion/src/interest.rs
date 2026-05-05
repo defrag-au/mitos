@@ -114,7 +114,10 @@ pub fn list_interests(sql: &SqlStorage) -> Result<Vec<InterestRow>> {
 /// only — other kinds are skipped with a warn log.
 ///
 /// The host's `update-interest` WIT call accepts a CBOR-encoded
-/// `Vec<Interest>`; this helper produces that Vec.
+/// `Vec<Interest>`; this helper produces that Vec across all
+/// channels. For multi-channel companions, prefer
+/// [`rows_to_interests_for_channel`] which filters rows whose
+/// `channel` matches the WS connection's Hibernation tag.
 pub fn rows_to_interests(rows: &[InterestRow]) -> Vec<Interest> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -144,6 +147,29 @@ pub fn rows_to_interests(rows: &[InterestRow]) -> Vec<Interest> {
         }
     }
     out
+}
+
+/// Channel-scoped variant of [`rows_to_interests`]. Filters rows
+/// whose `channel` field is either:
+///
+/// - **equal to `target_channel`** — exact match for the WS this
+///   frame is being sent over, or
+/// - **empty (`NO_CHANNEL`)** — the row applies to every channel
+///   the companion holds (single-channel default + cross-channel
+///   interests).
+///
+/// Rows with a non-matching, non-empty channel are skipped.
+/// Multi-channel companions (PR 4 of the runtime delivery) use
+/// this when broadcasting `ClientMessage::Interest` frames so
+/// the ownership channel's interests don't bleed into the
+/// marketplace channel's filter set, etc.
+pub fn rows_to_interests_for_channel(rows: &[InterestRow], target_channel: &str) -> Vec<Interest> {
+    let filtered: Vec<&InterestRow> = rows
+        .iter()
+        .filter(|r| r.channel == target_channel || r.channel == NO_CHANNEL)
+        .collect();
+    let owned: Vec<InterestRow> = filtered.into_iter().cloned().collect();
+    rows_to_interests(&owned)
 }
 
 // ============================================================================
@@ -227,5 +253,85 @@ mod tests {
         }];
         let interests = rows_to_interests(&rows);
         assert!(interests.is_empty());
+    }
+
+    // ====================================================================
+    // Multi-channel scoping (PR 4)
+    // ====================================================================
+
+    fn make_policy_row(value: &str, channel: &str) -> InterestRow {
+        InterestRow {
+            kind: kinds::POLICY.into(),
+            value: value.into(),
+            channel: channel.into(),
+            added_at: "2026-05-05T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn for_channel_includes_exact_match_and_global() {
+        // Three rows: one ownership-scoped, one marketplace-
+        // scoped, one global (NO_CHANNEL). When sending the
+        // ownership channel's WS frame, we want ownership +
+        // global rows; the marketplace row stays out.
+        let rows = vec![
+            make_policy_row(
+                "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6",
+                "ownership",
+            ),
+            make_policy_row(
+                "793aca910dc6a400ced6c94698c6f01d6479d701227fc9a7287ae2a5",
+                "marketplace",
+            ),
+            make_policy_row(
+                "aaaa11111111111111111111111111111111111111111111111111aa",
+                NO_CHANNEL,
+            ),
+        ];
+        let owned_for_ownership = rows_to_interests_for_channel(&rows, "ownership");
+        // 1 ownership-scoped + 1 global = 2.
+        assert_eq!(owned_for_ownership.len(), 2);
+
+        let owned_for_marketplace = rows_to_interests_for_channel(&rows, "marketplace");
+        // 1 marketplace-scoped + 1 global = 2.
+        assert_eq!(owned_for_marketplace.len(), 2);
+    }
+
+    #[test]
+    fn for_channel_excludes_other_channels() {
+        let rows = vec![
+            make_policy_row(
+                "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6",
+                "ownership",
+            ),
+            make_policy_row(
+                "793aca910dc6a400ced6c94698c6f01d6479d701227fc9a7287ae2a5",
+                "marketplace",
+            ),
+        ];
+        // No global rows — each channel sees only its own.
+        let owned_for_ownership = rows_to_interests_for_channel(&rows, "ownership");
+        assert_eq!(owned_for_ownership.len(), 1);
+        let owned_for_marketplace = rows_to_interests_for_channel(&rows, "marketplace");
+        assert_eq!(owned_for_marketplace.len(), 1);
+    }
+
+    #[test]
+    fn for_channel_with_empty_target_matches_only_global_rows() {
+        // Calling for_channel("") with mixed rows: only NO_CHANNEL
+        // rows return. Channel-scoped rows are skipped because
+        // their channel doesn't match the empty target.
+        let rows = vec![
+            make_policy_row(
+                "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6",
+                "ownership",
+            ),
+            make_policy_row(
+                "aaaa11111111111111111111111111111111111111111111111111aa",
+                NO_CHANNEL,
+            ),
+        ];
+        let global_only = rows_to_interests_for_channel(&rows, "");
+        assert_eq!(global_only.len(), 1);
     }
 }

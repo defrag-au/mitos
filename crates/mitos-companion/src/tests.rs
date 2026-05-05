@@ -7,7 +7,7 @@
 //! PR 1; that arrives with PR 7's second-consumer-port work.
 
 use crate::ctx::{Ctx, SqlStorageValue};
-use crate::traits::{MitosChannel, MitosChannelDyn};
+use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
 use crate::wire::{ChainPoint, ClientMessage, InterestOp, ServerMessage};
 use serde::{Deserialize, Serialize};
 
@@ -206,6 +206,74 @@ fn client_interest_frame_round_trips_add_op() {
         }
         other => panic!("expected Interest, got {other:?}"),
     }
+}
+
+// ============================================================================
+// Multi-channel companion compile-test (PR 4)
+// ============================================================================
+
+/// Second mock channel — paired with `MockChannel` to validate
+/// that a single companion impl can return multiple
+/// `MitosChannelDyn` from `channels()` without trait-shape
+/// breakage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MarketplaceMockEvent {
+    Sale { policy: String, price: u64 },
+    Offer { policy: String, amount: u64 },
+}
+
+pub struct MarketplaceMockChannel;
+
+#[async_trait::async_trait(?Send)]
+impl MitosChannel for MarketplaceMockChannel {
+    const NAME: &'static str = "marketplace";
+    type Event = MarketplaceMockEvent;
+    async fn apply_event(&self, _ctx: &Ctx, _event: MarketplaceMockEvent) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+/// Companion that holds two channels — exercises the
+/// `MitosChannel + MitosChannelDyn` blanket impl across multiple
+/// concrete channel types in a single `channels()` call.
+struct MultiChannelCompanion;
+
+impl crate::MitosCompanion for MultiChannelCompanion {
+    const NAME: &'static str = "multi-channel";
+    type Config = ();
+    fn channels(&self) -> Vec<Box<dyn MitosChannelDyn>> {
+        vec![
+            Box::new(MockChannel::default()),
+            Box::new(MarketplaceMockChannel),
+        ]
+    }
+}
+
+#[test]
+fn multi_channel_companion_returns_two_channels() {
+    let companion = MultiChannelCompanion;
+    let channels = companion.channels();
+    assert_eq!(channels.len(), 2);
+    let names: Vec<&str> = channels.iter().map(|c| c.name()).collect();
+    assert!(names.contains(&"mock"));
+    assert!(names.contains(&"marketplace"));
+}
+
+#[test]
+fn multi_channel_dyn_dispatch_routes_by_name() {
+    // Walking the channels Vec to find a channel by name is
+    // exactly what `MitosCompanionRuntime::lookup_channel` does
+    // internally on each `Apply` frame. Tests the lookup
+    // contract without spinning up a runtime DO.
+    let companion = MultiChannelCompanion;
+    let channels = companion.channels();
+    let ownership_idx = channels.iter().position(|c| c.name() == "mock").unwrap();
+    assert_eq!(channels[ownership_idx].name(), "mock");
+    let marketplace_idx = channels
+        .iter()
+        .position(|c| c.name() == "marketplace")
+        .unwrap();
+    assert_eq!(channels[marketplace_idx].name(), "marketplace");
 }
 
 #[test]

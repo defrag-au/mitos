@@ -408,8 +408,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             channel: channel.clone(),
             added_at: added_at.clone(),
         };
-        let interests = crate::interest::rows_to_interests(std::slice::from_ref(&row));
-        self.broadcast_interest_frame(InterestOp::Add, interests);
+        self.broadcast_interest_frame(InterestOp::Add, &row);
 
         Response::from_json(&crate::interest::InterestMutateResponse {
             op_result: "added".into(),
@@ -436,8 +435,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             channel: channel.clone(),
             added_at: String::new(), // unused by rows_to_interests
         };
-        let interests = crate::interest::rows_to_interests(std::slice::from_ref(&row));
-        self.broadcast_interest_frame(InterestOp::Remove, interests);
+        self.broadcast_interest_frame(InterestOp::Remove, &row);
 
         Response::from_json(&crate::interest::InterestMutateResponse {
             op_result: "removed".into(),
@@ -447,14 +445,50 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         })
     }
 
-    /// Send a `ClientMessage::Interest { op, items }` frame to
-    /// every WS held by this DO via the Hibernation API. v1
-    /// expectation: zero or one WS held (one mitos connection
-    /// per Companion DO); the broadcast loop just covers the
-    /// multi-channel case where a future companion holds several.
-    /// On encode/send failure, logs and continues — the SQL
-    /// row is the source of truth.
-    fn broadcast_interest_frame(&self, op: InterestOp, items: Vec<crate::wire::Interest>) {
+    /// Send `ClientMessage::Interest { op, items }` frames to the
+    /// companion's held WS connections, filtering items per
+    /// channel so multi-channel companions (PR 4) don't bleed
+    /// ownership interests into a marketplace WS, etc.
+    ///
+    /// Routing rules:
+    ///
+    /// - **Channel-scoped row** (`row.channel == "ownership"`,
+    ///   say): sent only to WSs tagged `ownership`.
+    /// - **Empty channel** (`row.channel == NO_CHANNEL`): sent
+    ///   to every held WS regardless of tag.
+    ///
+    /// On encode/send failure, logs and continues — the SQL row
+    /// is the source of truth and the next reconnect-time
+    /// `Replace` rehydrates the host.
+    fn broadcast_interest_frame(&self, op: InterestOp, row: &crate::interest::InterestRow) {
+        let rows = std::slice::from_ref(row);
+        if row.channel.is_empty() {
+            // Broadcast to every WS we hold. Single-channel
+            // companions land here; so do explicit
+            // cross-channel interests (NO_CHANNEL marker).
+            self.send_interest_to(op, rows, &self.state.get_websockets());
+            return;
+        }
+        // Channel-scoped: send only to WSs whose Hibernation tag
+        // matches.
+        let targeted = self.state.get_websockets_with_tag(&row.channel);
+        if targeted.is_empty() {
+            tracing::debug!(
+                channel = %row.channel,
+                "no WS held with this channel tag; companion will rehydrate on reconnect"
+            );
+            return;
+        }
+        self.send_interest_to(op, rows, &targeted);
+    }
+
+    fn send_interest_to(
+        &self,
+        op: InterestOp,
+        rows: &[crate::interest::InterestRow],
+        sockets: &[WebSocket],
+    ) {
+        let items = crate::interest::rows_to_interests(rows);
         if items.is_empty() {
             return;
         }
@@ -466,7 +500,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 return;
             }
         };
-        for ws in self.state.get_websockets() {
+        for ws in sockets {
             if let Err(e) = ws.send_with_bytes(&bytes) {
                 tracing::warn!(error = %e, "send Interest frame failed");
             }

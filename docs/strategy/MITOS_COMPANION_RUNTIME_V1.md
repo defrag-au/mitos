@@ -1482,11 +1482,35 @@ before PR 2 will fail instantiation with `no export
 `mitos-build` before re-running host tests after pulling
 this branch.
 
-### PR 4 — Multi-channel support
-- `Channel` type + per-channel dispatch
-- WS Hibernation tag → channel name routing
-- Per-channel interest scoping (interest rows have `channel` column)
-- Tests with two channels (ownership + marketplace)
+### PR 4 — Multi-channel support (landed)
+
+Most of multi-channel was already wired in PR 1 — the trait
+shape (`MitosChannel + MitosChannelDyn` blanket impl), per-WS
+Hibernation tag accept (`accept_websocket_with_tags(ws, &[tag])`),
+the `/_internal/replicate-{channel}` upgrade endpoint, and the
+`channel` column on `mitos_companion_interest`. PR 4 adds the
+remaining piece — **per-channel scoping when broadcasting
+`ClientMessage::Interest` frames**:
+
+- `interest::rows_to_interests_for_channel(rows, target_channel)`
+  — filters rows to `channel == target_channel || channel ==
+  NO_CHANNEL`. NO_CHANNEL rows broadcast across every channel
+  the companion holds; channel-scoped rows go only to the
+  matching WS.
+- Runtime `broadcast_interest_frame` now consults the row's
+  channel field — channel-scoped rows route via
+  `state.get_websockets_with_tag(channel)`; empty-channel
+  rows broadcast to every held WS via `state.get_websockets()`.
+- Tests with two channels (mock + marketplace): trait-shape
+  compile-test, `channels()` returns 2, lookup-by-name
+  routing works.
+
+### PR 4 deferred (lands with PR 5 collections-mitos migration)
+
+- Multi-channel example dApp wiring — collections-mitos has
+  ownership + marketplace today as siblings in one DO; PR 5's
+  migration is the natural place to validate the runtime's
+  multi-channel surface against real production traffic.
 
 ### PR 5 — Migrate `collections-mitos` to the runtime
 - Concrete `OwnershipImpl: MitosCompanion` + `OwnershipChannel: MitosChannel`
