@@ -100,10 +100,13 @@ impl WasiView for HostState {
 }
 
 // Empty interface marker traits. Bindgen requires these even
-// though `types` and `block-context` (the interface itself)
-// have no free functions.
+// though `types`, `block-context`, and `interest` (each interface
+// itself) have no free functions — `interest` defines only the
+// `interest-op` variant; the `update-interest` function is a
+// world-level export, not an interface-level free function.
 impl TypesHost for HostState {}
 impl BlockContextHost for HostState {}
+impl crate::bindings::InterestHost for HostState {}
 
 /// Trait the platform crate uses to talk to the data plane,
 /// kept narrow on purpose. `mitos-data-plane::ChainDataPlane`

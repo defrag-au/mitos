@@ -25,6 +25,13 @@ js-sys = "0.3"
 # protocol share a single source of truth.
 mitos-protocol = { path = "../mitos-protocol" }
 
+# Typed PolicyId. The companion's interest helpers translate
+# `(kind, value)` SQL rows into `mitos_protocol::Interest`
+# values via `AssetSelector::Policy(PolicyId)`. Same rev mitos-
+# protocol uses, since both are pulled through the same workspace
+# dep.
+cardano-assets = { workspace = true }
+
 # Workspace-inherited basics.
 serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }

@@ -17,7 +17,9 @@ use crate::error::{CompanionError, Result};
 use crate::meta::{self, ensure_schema, migrate_split_row_cursor, write_cursor};
 use crate::subscribe::SubscribeRequest;
 use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
-use crate::wire::{ChainPoint, ClientMessage, ServerMessage, decode_server, encode_client};
+use crate::wire::{
+    ChainPoint, ClientMessage, InterestOp, ServerMessage, decode_server, encode_client,
+};
 
 /// Default WS Hibernation tag when an upgrade lands on
 /// `/_internal/replicate` without a channel suffix. Single-channel
@@ -90,6 +92,11 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             (Method::Post, "/_internal/wake") => self.handle_wake().await,
             (Method::Get, "/api/_health") => self.handle_health(),
             (Method::Get, "/api/_meta") => self.handle_meta(),
+            (Method::Get, "/api/_interest") => self.handle_interest_list(),
+            (Method::Post, "/api/_interest/subscribe") => self.handle_interest_subscribe(req).await,
+            (Method::Post, "/api/_interest/unsubscribe") => {
+                self.handle_interest_unsubscribe(req).await
+            }
             _ => Response::error("not found", 404),
         }
     }
@@ -330,11 +337,20 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let sql = self.state.storage().sql();
         let resume_from = meta::read_cursor(&sql)?;
 
+        // Pull the canonical interest set from DO SQLite. Sent to
+        // the host as `Vec<mitos_protocol::Interest>` in the
+        // subscribe payload — host persists this as the
+        // companion's registration. (PR 3 wires the host's
+        // dial-back to deliver matching emissions; until then,
+        // this is the canonical-source-of-record handshake.)
+        let interest_rows = crate::interest::list_interests(&sql)?;
+        let interests = crate::interest::rows_to_interests(&interest_rows);
+
         let request = SubscribeRequest {
             module_name: C::NAME.to_string(),
             companion_key,
             resume_from,
-            interests: Vec::new(), // PR 2 reads the dynamic interest table
+            interests,
             dial_back: None,
         };
 
@@ -352,6 +368,107 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             Err(e) => {
                 tracing::error!(error = %e, "subscribe call failed");
                 Response::error(format!("subscribe failed: {e}"), 502)
+            }
+        }
+    }
+
+    /// `GET /api/_interest` — list the companion's canonical
+    /// interest set as JSON.
+    fn handle_interest_list(&self) -> worker::Result<Response> {
+        let sql = self.state.storage().sql();
+        let rows = crate::interest::list_interests(&sql)?;
+        Response::from_json(&crate::interest::InterestListResponse { interests: rows })
+    }
+
+    /// `POST /api/_interest/subscribe` — add a single interest
+    /// row. Body: `InterestMutateRequest`. On success, emits a
+    /// `ClientMessage::Interest { op: Add, items: [Interest] }`
+    /// frame over the held WS so the host's running module picks
+    /// up the new filter immediately. (Host-side WS-receive-loop
+    /// wiring lands in PR 3 alongside the dial-back path; PR 2
+    /// validates the companion-side surface end-to-end via
+    /// the SQL row + WS-frame send.)
+    async fn handle_interest_subscribe(&self, mut req: Request) -> worker::Result<Response> {
+        let payload: crate::interest::InterestMutateRequest = req.json().await?;
+        let channel = payload.channel.clone().unwrap_or_default();
+        let added_at = current_rfc3339();
+
+        let sql = self.state.storage().sql();
+        crate::interest::add_interest(&sql, &payload.kind, &payload.value, &channel, &added_at)?;
+
+        // Translate just-added row to wire `Interest` and emit
+        // `ClientMessage::Interest { op: Add, items: [..] }` over
+        // the held WS. Best-effort — if no WS is currently held
+        // (DO not yet wakened with a live mitos connection), the
+        // canonical SQL row stays committed and the next
+        // reconnect-time `Replace` rehydrates the host.
+        let row = crate::interest::InterestRow {
+            kind: payload.kind.clone(),
+            value: payload.value.clone(),
+            channel: channel.clone(),
+            added_at: added_at.clone(),
+        };
+        let interests = crate::interest::rows_to_interests(std::slice::from_ref(&row));
+        self.broadcast_interest_frame(InterestOp::Add, interests);
+
+        Response::from_json(&crate::interest::InterestMutateResponse {
+            op_result: "added".into(),
+            kind: payload.kind,
+            value: payload.value,
+            channel,
+        })
+    }
+
+    /// `POST /api/_interest/unsubscribe` — symmetric to subscribe.
+    /// Body: `InterestMutateRequest`. Emits a
+    /// `ClientMessage::Interest { op: Remove, items: [..] }`
+    /// frame on success.
+    async fn handle_interest_unsubscribe(&self, mut req: Request) -> worker::Result<Response> {
+        let payload: crate::interest::InterestMutateRequest = req.json().await?;
+        let channel = payload.channel.clone().unwrap_or_default();
+
+        let sql = self.state.storage().sql();
+        crate::interest::remove_interest(&sql, &payload.kind, &payload.value, &channel)?;
+
+        let row = crate::interest::InterestRow {
+            kind: payload.kind.clone(),
+            value: payload.value.clone(),
+            channel: channel.clone(),
+            added_at: String::new(), // unused by rows_to_interests
+        };
+        let interests = crate::interest::rows_to_interests(std::slice::from_ref(&row));
+        self.broadcast_interest_frame(InterestOp::Remove, interests);
+
+        Response::from_json(&crate::interest::InterestMutateResponse {
+            op_result: "removed".into(),
+            kind: payload.kind,
+            value: payload.value,
+            channel,
+        })
+    }
+
+    /// Send a `ClientMessage::Interest { op, items }` frame to
+    /// every WS held by this DO via the Hibernation API. v1
+    /// expectation: zero or one WS held (one mitos connection
+    /// per Companion DO); the broadcast loop just covers the
+    /// multi-channel case where a future companion holds several.
+    /// On encode/send failure, logs and continues — the SQL
+    /// row is the source of truth.
+    fn broadcast_interest_frame(&self, op: InterestOp, items: Vec<crate::wire::Interest>) {
+        if items.is_empty() {
+            return;
+        }
+        let frame = ClientMessage::Interest { op, items };
+        let bytes = match encode_client(&frame) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "encode Interest frame failed");
+                return;
+            }
+        };
+        for ws in self.state.get_websockets() {
+            if let Err(e) = ws.send_with_bytes(&bytes) {
+                tracing::warn!(error = %e, "send Interest frame failed");
             }
         }
     }
@@ -404,6 +521,89 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 /// from this module. (Pulls the trait import in the hot path.)
 #[allow(dead_code)]
 fn _channel_trait_witness<T: MitosChannel>() {}
+
+/// Current time as an RFC 3339 / ISO 8601 string. JavaScript's
+/// `Date.toISOString()` returns the canonical RFC 3339 shape
+/// (`2026-05-05T12:34:56.789Z`); we use that directly rather
+/// than pulling chrono into a wasm32 build.
+#[cfg(target_arch = "wasm32")]
+fn current_rfc3339() -> String {
+    let date = js_sys::Date::new_0();
+    date.to_iso_string().as_string().unwrap_or_default()
+}
+
+/// Native fallback for non-wasm builds (tests run host-side).
+/// Uses `SystemTime::now()` and a tiny formatter.
+#[cfg(not(target_arch = "wasm32"))]
+fn current_rfc3339() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let secs = (nanos / 1_000_000_000) as i64;
+    let nsec = (nanos % 1_000_000_000) as u32;
+    format_rfc3339_secs(secs, nsec)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_rfc3339_secs(secs: i64, nsec: u32) -> String {
+    // Minimal RFC 3339 formatter — sufficient for diagnostic
+    // timestamps. Only used in native test builds; production
+    // wasm path goes through the JS Date.toISOString() above.
+    let days_per_400y: i64 = 365 * 400 + 97;
+    let days_per_100y: i64 = 365 * 100 + 24;
+    let days_per_4y: i64 = 365 * 4 + 1;
+    let mut secs = secs;
+    let mut days = secs / 86_400;
+    secs -= days * 86_400;
+    if secs < 0 {
+        secs += 86_400;
+        days -= 1;
+    }
+    let h = secs / 3600;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+
+    days += 11_017; // shift epoch to 2000-03-01
+    let qc_cycles = days / days_per_400y;
+    days %= days_per_400y;
+    let mut c_cycles = days / days_per_100y;
+    if c_cycles == 4 {
+        c_cycles = 3;
+    }
+    days -= c_cycles * days_per_100y;
+    let mut q_cycles = days / days_per_4y;
+    if q_cycles == 25 {
+        q_cycles = 24;
+    }
+    days -= q_cycles * days_per_4y;
+    let mut remyears = days / 365;
+    if remyears == 4 {
+        remyears = 3;
+    }
+    days -= remyears * 365;
+
+    let year = 2000 + remyears + 4 * q_cycles + 100 * c_cycles + 400 * qc_cycles;
+    let months = [31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 31, 29];
+    let mut mon = 0;
+    let mut d = days;
+    while mon < 12 && d >= months[mon] {
+        d -= months[mon];
+        mon += 1;
+    }
+    let (year, mon) = if mon >= 10 {
+        (year + 1, mon - 9)
+    } else {
+        (year, mon + 3)
+    };
+    let day = (d + 1) as u32;
+
+    format!(
+        "{year:04}-{mon:02}-{day:02}T{h:02}:{m:02}:{s:02}.{nsec_ms:03}Z",
+        nsec_ms = nsec / 1_000_000
+    )
+}
 
 /// Wrap the wasm-only `subscribe::post_subscribe` so the runtime can
 /// call it without `cfg` decoration at every call site. On non-wasm

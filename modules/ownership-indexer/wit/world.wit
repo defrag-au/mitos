@@ -140,9 +140,32 @@ interface logging {
     log: func(level: log-level, target: string, message: string);
 }
 
+/// Dynamic interest mechanics — host pushes the companion's filter
+/// set into the running module without redeploy. See the design
+/// doc's "Dynamic interest mechanics" section in
+/// `MITOS_COMPANION_RUNTIME_V1.md`.
+///
+/// Items cross the boundary as CBOR-encoded `mitos_protocol::Interest`
+/// blobs — same wire shape mitos-protocol already defines, so module
+/// authors never duplicate the type. Modules persist the resulting
+/// filter set via `state-kv` so a host restart without an attached
+/// companion still filters correctly until the companion reconnects
+/// and replays.
+interface interest {
+    /// Op semantics matching `mitos_protocol::wire::InterestOp`:
+    /// `add` / `remove` are incremental; `replace` swaps the entire
+    /// filter set in one shot (used on companion reconnect).
+    variant interest-op {
+        add,
+        remove,
+        replace,
+    }
+}
+
 world mitos-module {
     use types.{trap-strategy, retry-policy};
     use block-context.{resolved-block};
+    use interest.{interest-op};
 
     import chain-data;
     import state-kv;
@@ -169,4 +192,18 @@ world mitos-module {
     /// stream; the resource handle borrow does NOT outlive the
     /// call (Rust borrow lifetime enforces this).
     export handle-event: func(channel: u32, block: borrow<resolved-block>);
+
+    /// Dynamic interest mutation. Host calls this when a
+    /// `ClientMessage::Interest { op, items }` frame arrives over
+    /// the CF replication WS. `items-cbor` is a single CBOR-encoded
+    /// `Vec<mitos_protocol::Interest>` blob — host encodes once,
+    /// module decodes once, no per-item boundary cost.
+    ///
+    /// Returning `Err(reason)` surfaces module-side decode /
+    /// validation failure to the host without trapping; the host
+    /// logs but does not advance the cursor or quarantine.
+    /// (Mismatched interest shapes are typically a deploy-version
+    /// mismatch — recoverable once the module is bumped.)
+    export update-interest: func(op: interest-op, items-cbor: list<u8>)
+                            -> result<_, string>;
 }

@@ -176,3 +176,74 @@ fn sql_value_export_is_usable() {
     let _v = SqlStorageValue::from(42_i64);
     let _w = SqlStorageValue::from("hello");
 }
+
+// ============================================================================
+// Dynamic-interest wire shape round-trips (PR 2)
+// ============================================================================
+
+#[test]
+fn client_interest_frame_round_trips_add_op() {
+    use crate::interest::{InterestRow, NO_CHANNEL, kinds, rows_to_interests};
+    use crate::wire::{decode_client, encode_client};
+
+    let row = InterestRow {
+        kind: kinds::POLICY.into(),
+        value: "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6".into(),
+        channel: NO_CHANNEL.into(),
+        added_at: "2026-05-05T12:00:00Z".into(),
+    };
+    let items = rows_to_interests(std::slice::from_ref(&row));
+    let frame = ClientMessage::Interest {
+        op: InterestOp::Add,
+        items,
+    };
+    let bytes = encode_client(&frame).unwrap();
+    let decoded = decode_client(&bytes).unwrap();
+    match decoded {
+        ClientMessage::Interest { op, items } => {
+            assert!(matches!(op, InterestOp::Add));
+            assert_eq!(items.len(), 1);
+        }
+        other => panic!("expected Interest, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_request_carries_full_interest_set() {
+    use crate::interest::{InterestRow, NO_CHANNEL, kinds, rows_to_interests};
+    use crate::subscribe::{SubscribeRequest, decode_subscribe, encode_subscribe};
+
+    let rows = vec![
+        InterestRow {
+            kind: kinds::POLICY.into(),
+            value: "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6".into(),
+            channel: NO_CHANNEL.into(),
+            added_at: "2026-05-05T12:00:00Z".into(),
+        },
+        InterestRow {
+            kind: kinds::POLICY.into(),
+            value: "793aca910dc6a400ced6c94698c6f01d6479d701227fc9a7287ae2a5".into(),
+            channel: NO_CHANNEL.into(),
+            added_at: "2026-05-05T12:00:01Z".into(),
+        },
+    ];
+    let interests = rows_to_interests(&rows);
+
+    let req = SubscribeRequest {
+        module_name: "ownership-indexer".into(),
+        companion_key: "customer_42".into(),
+        resume_from: None,
+        interests,
+        dial_back: None,
+    };
+    let bytes = encode_subscribe(&req).unwrap();
+    let decoded = decode_subscribe(&bytes).unwrap();
+    assert_eq!(decoded.interests.len(), 2);
+    // Each Interest decodes back into something the host can act on
+    // (CBOR-encode → host calls update-interest with Replace semantics
+    // → module decodes Vec<Interest>).
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&decoded.interests, &mut buf).unwrap();
+    let recovered: Vec<crate::wire::Interest> = ciborium::de::from_reader(&buf[..]).unwrap();
+    assert_eq!(recovered.len(), 2);
+}

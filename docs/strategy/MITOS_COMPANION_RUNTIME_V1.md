@@ -1396,6 +1396,7 @@ worker without them.
 
 ### PR 2 — Dynamic interest wire protocol (~500 lines split host + companion)
 - `ClientMessage::Interest { op, items }` in mitos-protocol
+  *(already landed in PR 1's wire-types consolidation)*
 - Companion runtime: `mitos_companion_interest` SQLite table,
   `subscribe`/`unsubscribe`/`list` RPC handlers under
   `/api/_interest/*`
@@ -1403,21 +1404,42 @@ worker without them.
   in-session mutations emit `ClientMessage::Interest` frames
   over held WS (immediate, no batching)
 - Host platform: WIT export `update-interest`, module-side
-  redb interest table, host applies `Add`/`Remove`/`Replace`
-  to module via host call
+  state-kv-persisted interest set, module's `init` rehydrates
+  from state-kv before consulting `policies = [...]` bootstrap
 - Host: `mitos.toml` `policies` becomes bootstrap-only default
-- Tests: round-trip subscribe → host receives matching events;
-  unsubscribe stops them; reconnect (mitos re-dials) rehydrates
+- Tests: companion-side wire round-trips + interest-row → wire
+  Interest translation
+
+**Scope note**: the host-side WS-receive-loop branch that
+parses inbound `ClientMessage::Interest` frames and calls
+`update-interest` on a running module via a control channel
+is **deferred to PR 3**. PR 3 substantially refactors the
+WS receive path anyway (to add the `Ack`/`Nack` parsing +
+the dial-back path's read loop) so adding the Interest
+branch + follower control-channel plumbing there avoids
+double-touching the same code. PR 2 ships the wire surface,
+RPC handlers, module-side handler, and the wake-time
+HTTPS subscribe call (which already includes the full
+interest set in `SubscribeRequest.interests` so the host
+has the canonical set persisted from first connection,
+even before in-session mutation flows are wired).
 
 ### PR 3 — Emissions log + Ack/Nack wire protocol (~600 lines split host + companion)
 - `ServerMessage::Apply` gains `emission_id: u64`
+  *(already landed in PR 1's wire-types consolidation)*
 - New `ClientMessage::Ack` and `ClientMessage::Nack` frames
+  *(already landed in PR 1's wire-types consolidation)*
 - Host: `module_emissions` redb table per module, append on
   match (status `pending` if WS connected, `queued` if not),
   status update on Ack/Nack
 - Host: `mitos-admin emissions list/replay/purge` subcommands
 - Host: on companion reconnect, drain `queued` rows in
   chain-point order before resuming live stream
+- Host: WS-receive-loop refactor — parse inbound
+  `ClientMessage::{Interest, Ack, Nack, Unsubscribe}` frames;
+  add follower control-channel + `update-interest` host call
+  on Interest frames *(work deferred from PR 2 — see PR 2
+  scope note)*
 - Companion runtime: send Ack after successful apply + cursor
   advance; send Nack on apply error (cursor still advances)
 - Compaction: Acked rows drop after 7d, Nacked retained,

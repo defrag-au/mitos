@@ -44,6 +44,7 @@
 
 pub mod ctx;
 pub mod error;
+pub mod interest;
 pub mod meta;
 pub mod runtime;
 pub mod subscribe;
@@ -55,6 +56,7 @@ mod tests;
 
 pub use ctx::{Ctx, SqlStorageValue};
 pub use error::{CompanionError, Result};
+pub use interest::{InterestRow, NO_CHANNEL};
 pub use meta::{RUNTIME_SCHEMA_VERSION, RegistrationCache};
 pub use runtime::MitosCompanionRuntime;
 pub use subscribe::{
