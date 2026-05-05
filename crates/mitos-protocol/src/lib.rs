@@ -32,4 +32,7 @@ pub use protocol::{
     UnlistingPayload,
 };
 pub use subscribe::{DialBackOverride, SubscribeRequest, SubscribeResponse};
-pub use wire::ChainPoint;
+pub use wire::{
+    ChainPoint, ClientMessage, InterestOp, ServerMessage, SubscribeReply, decode_client,
+    decode_server, encode_client, encode_server,
+};

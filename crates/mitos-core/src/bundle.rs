@@ -176,10 +176,7 @@ impl Bundle {
         let mut module_host: Option<Arc<dyn mitos_platform::host::ModuleHostHandle>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
-                anyhow::anyhow!(
-                    "creating modules dir {}: {e}",
-                    modules_dir.display()
-                )
+                anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
             })?;
             let storage = mitos_platform::storage::ModuleStorage::new(modules_dir.clone());
             let engine = mitos_platform::registry::ModuleRegistry::build_engine()
@@ -213,13 +210,8 @@ impl Bundle {
                 mitos_platform::lag_tolerant::LagTolerantSubscription<DomainAdapter>,
             > = Arc::new(move |cursor: Option<dolos_core::ChainPoint>| {
                 use dolos_core::StateStore;
-                let from = cursor.or_else(|| {
-                    domain_for_factory
-                        .state()
-                        .read_cursor()
-                        .ok()
-                        .flatten()
-                });
+                let from =
+                    cursor.or_else(|| domain_for_factory.state().read_cursor().ok().flatten());
                 mitos_platform::lag_tolerant::LagTolerantSubscription::new(
                     domain_for_factory.clone(),
                     &domain_for_factory.tip_broadcast,

@@ -117,14 +117,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 4. Emit artifact directory.
-    let out = args.out.clone().unwrap_or_else(|| {
-        args.workspace
-            .join("target")
-            .join("mitos")
-            .join(&module_id)
-    });
-    std::fs::create_dir_all(&out)
-        .with_context(|| format!("creating {}", out.display()))?;
+    let out = args
+        .out
+        .clone()
+        .unwrap_or_else(|| args.workspace.join("target").join("mitos").join(&module_id));
+    std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     let wasm_out = out.join(format!("{module_id}.wasm"));
     std::fs::copy(&wasm_path, &wasm_out)
         .with_context(|| format!("copying wasm to {}", wasm_out.display()))?;
@@ -144,8 +141,7 @@ async fn main() -> anyhow::Result<()> {
         let value: toml::Value = toml::from_str(&toml_str)
             .with_context(|| format!("parsing {}", mitos_toml.display()))?;
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&value, &mut buf)
-            .context("CBOR-encode mitos.toml")?;
+        ciborium::ser::into_writer(&value, &mut buf).context("CBOR-encode mitos.toml")?;
         let config_out = out.join("config.cbor");
         std::fs::write(&config_out, &buf)
             .with_context(|| format!("writing {}", config_out.display()))?;
@@ -335,9 +331,11 @@ fn read_crate_version(workspace: &Path, crate_name: &str) -> anyhow::Result<Stri
 
 fn read_workspace_version(workspace: &Path) -> anyhow::Result<String> {
     let root = workspace.join("Cargo.toml");
-    let text = std::fs::read_to_string(&root)
-        .with_context(|| format!("reading {}", root.display()))?;
-    let parsed = text.parse::<toml::Value>().context("parsing workspace toml")?;
+    let text =
+        std::fs::read_to_string(&root).with_context(|| format!("reading {}", root.display()))?;
+    let parsed = text
+        .parse::<toml::Value>()
+        .context("parsing workspace toml")?;
     parsed
         .get("workspace")
         .and_then(|w| w.get("package"))

@@ -183,9 +183,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Remove { id } => cmd_remove(&client, &cli, id).await,
         Cmd::ListModules { json } => cmd_list_modules(&client, &cli, json).await,
         Cmd::GetModule { id } => cmd_get_module(&client, &cli, id).await,
-        Cmd::UploadModule { artifact } => {
-            cmd_upload_module(&client, &cli, artifact).await
-        }
+        Cmd::UploadModule { artifact } => cmd_upload_module(&client, &cli, artifact).await,
         Cmd::RestartModule { id } => cmd_restart_module(&client, &cli, id).await,
         Cmd::DeleteModule { id } => cmd_delete_module(&client, &cli, id).await,
         Cmd::Deploy {
@@ -193,17 +191,7 @@ async fn main() -> anyhow::Result<()> {
             module_id,
             workspace,
             mitos_build,
-        } => {
-            cmd_deploy(
-                &client,
-                &cli,
-                crate_name,
-                module_id,
-                workspace,
-                mitos_build,
-            )
-            .await
-        }
+        } => cmd_deploy(&client, &cli, crate_name, module_id, workspace, mitos_build).await,
     }
 }
 
@@ -231,7 +219,13 @@ struct ReplicatorSummary {
 
 async fn cmd_health(client: &Client, cli: &Cli) -> anyhow::Result<()> {
     let url = format!("{}/health", cli.mitos);
-    let resp: HealthResp = client.get(&url).send().await?.error_for_status()?.json().await?;
+    let resp: HealthResp = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     println!("status:        {}", resp.status);
     println!("uptime:        {}", format_duration(resp.uptime_secs));
     println!("indexers:      {}", resp.indexers.join(", "));
@@ -349,7 +343,9 @@ async fn cmd_add(
 
 async fn cmd_remove(client: &Client, cli: &Cli, id: u64) -> anyhow::Result<()> {
     let url = format!("{}/_admin/subscriptions/{id}", cli.mitos);
-    let resp = auth(client.delete(&url), cli.token.as_deref()).send().await?;
+    let resp = auth(client.delete(&url), cli.token.as_deref())
+        .send()
+        .await?;
     let status = resp.status();
     if status.as_u16() == 204 {
         println!("removed subscription id={id}");
@@ -545,11 +541,7 @@ async fn upload_artifact(
     Ok(())
 }
 
-async fn cmd_restart_module(
-    client: &Client,
-    cli: &Cli,
-    id: String,
-) -> anyhow::Result<()> {
+async fn cmd_restart_module(client: &Client, cli: &Cli, id: String) -> anyhow::Result<()> {
     let url = format!("{}/_admin/modules/{id}/restart", cli.mitos);
     let resp = auth(client.post(&url), cli.token.as_deref()).send().await?;
     let status = resp.status();
@@ -566,7 +558,9 @@ async fn cmd_restart_module(
 
 async fn cmd_delete_module(client: &Client, cli: &Cli, id: String) -> anyhow::Result<()> {
     let url = format!("{}/_admin/modules/{id}", cli.mitos);
-    let resp = auth(client.delete(&url), cli.token.as_deref()).send().await?;
+    let resp = auth(client.delete(&url), cli.token.as_deref())
+        .send()
+        .await?;
     let status = resp.status();
     if status.as_u16() == 404 {
         anyhow::bail!("module `{id}` not registered");

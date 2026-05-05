@@ -28,7 +28,10 @@ use tracing::warn;
 
 use crate::emitter::{EmittedRecord, Emitter};
 use crate::indexer::Indexer;
-use crate::replicate::{ClientMessage, ServerMessage, decode_client, encode_server};
+use crate::replicate::{
+    ClientMessage, ServerMessage, chain_point_from_wire, chain_point_to_wire, decode_client,
+    encode_server, subscribe_reply_to_wire,
+};
 use crate::transport::WsTransport;
 
 /// How many records to buffer per indexer in the broadcast channel.
@@ -197,12 +200,10 @@ where
         // Apply the same `change_matches_scope` filter the live-tail
         // pump uses — backfill records are equivalent to synthetic
         // Apply events at startup, so they should respect the
-        // subscriber's scope identically. Without this filter,
-        // axes like `Interest.roles` (which pre-Phase-7 ownership
-        // didn't have) would only apply to live records, leaving
-        // backfill polluted with reference NFTs / sentinels.
+        // subscriber's scope identically.
         let resume_cursor = reply_cursor(&reply);
-        send(&mut transport, &ServerMessage::SubscribeReply(reply)).await?;
+        let wire_reply = subscribe_reply_to_wire(&reply);
+        send(&mut transport, &ServerMessage::SubscribeReply(wire_reply)).await?;
 
         for change in backfill {
             if !I::change_matches_scope(&scope.0, &change) {
@@ -214,7 +215,11 @@ where
             send(
                 &mut transport,
                 &ServerMessage::Apply {
-                    cursor: resume_cursor.clone(),
+                    // emission_id stays 0 until PR 3 wires the
+                    // emissions log; companions tolerate the
+                    // default via `#[serde(default)]`.
+                    emission_id: 0,
+                    cursor: chain_point_to_wire(&resume_cursor),
                     change: buf,
                 },
             )
@@ -242,7 +247,7 @@ fn reply_cursor(reply: &crate::indexer::SubscribeReply) -> ChainPoint {
 }
 
 async fn send(transport: &mut Box<dyn WsTransport>, msg: &ServerMessage) -> anyhow::Result<()> {
-    let bytes = encode_server(msg)?;
+    let bytes = encode_server(msg).map_err(|e| anyhow::anyhow!("{e}"))?;
     transport.send_binary(bytes).await
 }
 
@@ -260,14 +265,19 @@ where
         None => return Ok(None),
     };
 
-    match decode_client(&bytes)? {
+    let msg = decode_client(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    match msg {
         ClientMessage::Subscribe { scope, cursor } => {
             let typed: <I as Indexer<DomainAdapter>>::Scope =
                 ciborium::from_reader(scope.as_slice())
                     .map_err(|e| anyhow::anyhow!("decoding scope CBOR: {e}"))?;
-            Ok(Some((TypedScope(typed), cursor)))
+            let dolos_cursor = chain_point_from_wire(&cursor)?;
+            Ok(Some((TypedScope(typed), dolos_cursor)))
         }
-        ClientMessage::Ack { .. } | ClientMessage::Unsubscribe => {
+        ClientMessage::Ack { .. }
+        | ClientMessage::Nack { .. }
+        | ClientMessage::Interest { .. }
+        | ClientMessage::Unsubscribe => {
             let _ = send(
                 transport,
                 &ServerMessage::Error {
@@ -340,12 +350,17 @@ where
                 ciborium::into_writer(&change, &mut buf)
                     .map_err(|e| anyhow::anyhow!("encode change: {e}"))?;
                 ServerMessage::Apply {
-                    cursor,
+                    emission_id: 0, // PR 3 wires the emissions log
+                    cursor: chain_point_to_wire(&cursor),
                     change: buf,
                 }
             }
-            EmittedRecord::Undo { cursor } => ServerMessage::Undo { cursor },
-            EmittedRecord::Mark { cursor } => ServerMessage::Mark { cursor },
+            EmittedRecord::Undo { cursor } => ServerMessage::Undo {
+                cursor: chain_point_to_wire(&cursor),
+            },
+            EmittedRecord::Mark { cursor } => ServerMessage::Mark {
+                cursor: chain_point_to_wire(&cursor),
+            },
         };
 
         send(transport, &msg).await?;

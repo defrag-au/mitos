@@ -1,41 +1,41 @@
 //! Unit tests for the protocol layer.
 //!
-//! Full end-to-end integration (mitos↔CF DO with a live WebSocket
-//! and a real `DomainAdapter`) is deferred until parallel-run
-//! validation against the cardano-infra Dolos snapshot — that path
-//! tests the same protocol surface against a real chain feed. These
-//! unit tests cover the parts that don't depend on `Domain`:
-//!
-//! - Wire envelope CBOR round-trip (`ClientMessage`, `ServerMessage`,
-//!   `SubscribeReply`, `ChainPoint` re-encode through serde_bytes).
-//! - The `InjectFirst` transport wrapper used by the `Replicator` to
-//!   replay a synthetic Subscribe as the first frame.
-//! - The constant-time auth comparison.
+//! Wire types live in `mitos-protocol`; these tests round-trip them
+//! using the same encode/decode helpers re-exported through
+//! `crate::replicate::*`. The host-internal `crate::indexer::SubscribeReply`
+//! (which uses `dolos_core::ChainPoint`) is converted at the wire
+//! boundary via `subscribe_reply_to_wire`, also tested below.
 
-use crate::indexer::SubscribeReply;
+use crate::indexer::SubscribeReply as InternalSubscribeReply;
 use crate::replicate::{
-    ClientMessage, ServerMessage, decode_client, decode_server, encode_client, encode_server,
+    ClientMessage, ServerMessage, chain_point_from_wire, chain_point_to_wire, decode_client,
+    decode_server, encode_client, encode_server, subscribe_reply_to_wire,
 };
 use dolos_core::{BlockHash, ChainPoint};
+use mitos_protocol::{ChainPoint as WireChainPoint, SubscribeReply as WireSubscribeReply};
 
 fn fixed_hash() -> BlockHash {
     BlockHash::from([0xa1u8; 32])
+}
+
+fn fixed_hash_hex() -> String {
+    hex::encode([0xa1u8; 32])
 }
 
 #[test]
 fn client_subscribe_roundtrip() {
     let original = ClientMessage::Subscribe {
         scope: vec![0xde, 0xad, 0xbe, 0xef],
-        cursor: ChainPoint::Specific(186_076_148, fixed_hash()),
+        cursor: WireChainPoint::Specific(186_076_148, fixed_hash_hex()),
     };
     let bytes = encode_client(&original).unwrap();
     match decode_client(&bytes).unwrap() {
         ClientMessage::Subscribe { scope, cursor } => {
             assert_eq!(scope, vec![0xde, 0xad, 0xbe, 0xef]);
             match cursor {
-                ChainPoint::Specific(slot, hash) => {
+                WireChainPoint::Specific(slot, hash) => {
                     assert_eq!(slot, 186_076_148);
-                    assert_eq!(hash, fixed_hash());
+                    assert_eq!(hash, fixed_hash_hex());
                 }
                 other => panic!("expected Specific, got {other:?}"),
             }
@@ -46,28 +46,40 @@ fn client_subscribe_roundtrip() {
 
 #[test]
 fn client_ack_roundtrip() {
-    let original = ClientMessage::Ack {
-        cursor: ChainPoint::Slot(42),
-    };
+    // Q5 emission-id Ack — replaces the legacy cursor-Ack.
+    let original = ClientMessage::Ack { emission_id: 42 };
     let bytes = encode_client(&original).unwrap();
     match decode_client(&bytes).unwrap() {
-        ClientMessage::Ack { cursor } => match cursor {
-            ChainPoint::Slot(s) => assert_eq!(s, 42),
-            other => panic!("expected Slot, got {other:?}"),
-        },
+        ClientMessage::Ack { emission_id } => assert_eq!(emission_id, 42),
         other => panic!("expected Ack, got {other:?}"),
     }
 }
 
 #[test]
+fn client_nack_roundtrip() {
+    let original = ClientMessage::Nack {
+        emission_id: 99,
+        error: "apply failed: example".into(),
+    };
+    let bytes = encode_client(&original).unwrap();
+    match decode_client(&bytes).unwrap() {
+        ClientMessage::Nack { emission_id, error } => {
+            assert_eq!(emission_id, 99);
+            assert!(error.contains("apply failed"));
+        }
+        other => panic!("expected Nack, got {other:?}"),
+    }
+}
+
+#[test]
 fn server_subscribe_reply_resume_roundtrip() {
-    let original = ServerMessage::SubscribeReply(SubscribeReply::Resume {
-        cursor: ChainPoint::Origin,
+    let original = ServerMessage::SubscribeReply(WireSubscribeReply::Resume {
+        cursor: WireChainPoint::Origin,
     });
     let bytes = encode_server(&original).unwrap();
     match decode_server(&bytes).unwrap() {
-        ServerMessage::SubscribeReply(SubscribeReply::Resume { cursor }) => {
-            assert!(matches!(cursor, ChainPoint::Origin));
+        ServerMessage::SubscribeReply(WireSubscribeReply::Resume { cursor }) => {
+            assert!(matches!(cursor, WireChainPoint::Origin));
         }
         other => panic!("expected SubscribeReply::Resume, got {other:?}"),
     }
@@ -75,19 +87,19 @@ fn server_subscribe_reply_resume_roundtrip() {
 
 #[test]
 fn server_subscribe_reply_snapshot_redirect_roundtrip() {
-    let original = ServerMessage::SubscribeReply(SubscribeReply::SnapshotRedirect {
+    let original = ServerMessage::SubscribeReply(WireSubscribeReply::SnapshotRedirect {
         snapshot_url: "r2://mitos-snapshots/collection-ownership/snapshot-186076148-a1.cbor.zst"
             .into(),
-        snapshot_cursor: ChainPoint::Specific(186_076_148, fixed_hash()),
+        snapshot_cursor: WireChainPoint::Specific(186_076_148, fixed_hash_hex()),
     });
     let bytes = encode_server(&original).unwrap();
     match decode_server(&bytes).unwrap() {
-        ServerMessage::SubscribeReply(SubscribeReply::SnapshotRedirect {
+        ServerMessage::SubscribeReply(WireSubscribeReply::SnapshotRedirect {
             snapshot_url,
             snapshot_cursor,
         }) => {
             assert!(snapshot_url.starts_with("r2://"));
-            assert!(matches!(snapshot_cursor, ChainPoint::Specific(_, _)));
+            assert!(matches!(snapshot_cursor, WireChainPoint::Specific(_, _)));
         }
         other => panic!("expected SnapshotRedirect, got {other:?}"),
     }
@@ -95,17 +107,21 @@ fn server_subscribe_reply_snapshot_redirect_roundtrip() {
 
 #[test]
 fn server_apply_roundtrip_preserves_change_bytes_verbatim() {
-    // The framework treats `change` as opaque CBOR — it must not
-    // reinterpret the bytes between encode and decode.
     let raw_change = vec![0x01, 0x02, 0x03, 0x04, 0x05];
     let original = ServerMessage::Apply {
-        cursor: ChainPoint::Slot(100),
+        emission_id: 7,
+        cursor: WireChainPoint::Slot(100),
         change: raw_change.clone(),
     };
     let bytes = encode_server(&original).unwrap();
     match decode_server(&bytes).unwrap() {
-        ServerMessage::Apply { cursor, change } => {
-            assert!(matches!(cursor, ChainPoint::Slot(100)));
+        ServerMessage::Apply {
+            emission_id,
+            cursor,
+            change,
+        } => {
+            assert_eq!(emission_id, 7);
+            assert!(matches!(cursor, WireChainPoint::Slot(100)));
             assert_eq!(change, raw_change);
         }
         other => panic!("expected Apply, got {other:?}"),
@@ -116,10 +132,10 @@ fn server_apply_roundtrip_preserves_change_bytes_verbatim() {
 fn server_undo_and_mark_roundtrip() {
     for original in [
         ServerMessage::Undo {
-            cursor: ChainPoint::Slot(7),
+            cursor: WireChainPoint::Slot(7),
         },
         ServerMessage::Mark {
-            cursor: ChainPoint::Slot(8),
+            cursor: WireChainPoint::Slot(8),
         },
     ] {
         let bytes = encode_server(&original).unwrap();
@@ -148,6 +164,47 @@ fn server_error_roundtrip() {
     }
 }
 
+#[test]
+fn chain_point_conversion_round_trips() {
+    let dolos = ChainPoint::Specific(186_076_148, fixed_hash());
+    let wire = chain_point_to_wire(&dolos);
+    match &wire {
+        WireChainPoint::Specific(slot, hash) => {
+            assert_eq!(*slot, 186_076_148);
+            assert_eq!(hash, &fixed_hash_hex());
+        }
+        other => panic!("expected Specific, got {other:?}"),
+    }
+    let back = chain_point_from_wire(&wire).unwrap();
+    assert_eq!(back, dolos);
+
+    assert_eq!(
+        chain_point_from_wire(&chain_point_to_wire(&ChainPoint::Origin)).unwrap(),
+        ChainPoint::Origin
+    );
+    assert_eq!(
+        chain_point_from_wire(&chain_point_to_wire(&ChainPoint::Slot(42))).unwrap(),
+        ChainPoint::Slot(42)
+    );
+}
+
+#[test]
+fn subscribe_reply_to_wire_round_trip() {
+    let internal = InternalSubscribeReply::Resume {
+        cursor: ChainPoint::Specific(123, fixed_hash()),
+    };
+    let wire = subscribe_reply_to_wire(&internal);
+    match wire {
+        WireSubscribeReply::Resume {
+            cursor: WireChainPoint::Specific(slot, hash),
+        } => {
+            assert_eq!(slot, 123);
+            assert_eq!(hash, fixed_hash_hex());
+        }
+        other => panic!("expected Resume, got {other:?}"),
+    }
+}
+
 // ---- InjectFirst transport ----
 
 mod inject_first {
@@ -155,8 +212,6 @@ mod inject_first {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
-    /// Test fixture: a WsTransport whose recv returns a scripted
-    /// sequence of frames, and whose send appends to a captured Vec.
     struct ScriptedTransport {
         recv_queue: Mutex<Vec<Vec<u8>>>,
         sent: Mutex<Vec<Vec<u8>>>,
@@ -192,17 +247,8 @@ mod inject_first {
         }
     }
 
-    /// Reach into the private InjectFirst by going through the
-    /// public `Replicator` module's `connect_async` … no — easier
-    /// path: the test imports the type from the parent module. The
-    /// `pub(crate)` visibility makes that valid.
     #[tokio::test]
     async fn inject_first_returns_injected_frame_then_underlying() {
-        // We can't directly construct InjectFirst from outside its
-        // module, so we test the same shape inline. This is a
-        // lightweight regression test for the wrapper's contract:
-        // first recv returns the injected bytes, subsequent recvs
-        // pass through to the inner transport.
         struct Wrap {
             inner: Box<dyn WsTransport>,
             injected: Option<Vec<u8>>,

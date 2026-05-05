@@ -36,7 +36,7 @@ use url::Url;
 
 use crate::auth::AuthToken;
 use crate::handle::IndexerHandle;
-use crate::replicate::{ClientMessage, encode_client};
+use crate::replicate::{ClientMessage, chain_point_to_wire, encode_client};
 use crate::transport::TungsteniteWs;
 
 /// redb table holding `SubscriptionId` → CBOR(`Subscription`).
@@ -545,9 +545,9 @@ async fn dial_and_run(
     // so `run_subscriber` can run end-to-end without a live DO.
     let subscribe = ClientMessage::Subscribe {
         scope: sub.scope.clone(),
-        cursor: sub.cursor.clone(),
+        cursor: chain_point_to_wire(&sub.cursor),
     };
-    let bytes = encode_client(&subscribe)?;
+    let bytes = encode_client(&subscribe).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let transport: Box<dyn crate::transport::WsTransport> = Box::new(InjectFirst {
         inner: Box::new(TungsteniteWs(stream)),

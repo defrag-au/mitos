@@ -44,10 +44,10 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
-use mitos_core::{
-    ChainPoint, ClientMessage, ServerMessage, SubscribeReply, decode_server, encode_client,
+use mitos_core::{ClientMessage, ServerMessage, decode_server, encode_client};
+use mitos_protocol::{
+    ChainPoint, Domain, Marketplace, OfferCancelPayload, ProtocolEvent, SubscribeReply,
 };
-use mitos_protocol::{Domain, Marketplace, OfferCancelPayload, ProtocolEvent};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -225,10 +225,7 @@ fn parse_cursor(s: &str) -> anyhow::Result<ChainPoint> {
         if hash_bytes.len() != 32 {
             anyhow::bail!("hash must be 32 bytes; got {}", hash_bytes.len());
         }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hash_bytes);
-        let hash = mitos_core::BlockHash::from(arr);
-        return Ok(ChainPoint::Specific(slot, hash));
+        return Ok(ChainPoint::Specific(slot, hash_hex.to_string()));
     }
     let slot: u64 = s.parse().map_err(|e| anyhow::anyhow!("bad slot: {e}"))?;
     Ok(ChainPoint::Slot(slot))
@@ -283,7 +280,14 @@ impl TailState {
                     info!(t = format_args!("{t:.3}"), ?reply, "subscribe reply");
                 }
             }
-            ServerMessage::Apply { cursor, change } => {
+            ServerMessage::Connected { last_emission_id } => {
+                info!(t = format_args!("{t:.3}"), last_emission_id, "connected");
+            }
+            ServerMessage::Apply {
+                emission_id: _,
+                cursor,
+                change,
+            } => {
                 self.counts.apply += 1;
                 let key = cursor_key(&cursor);
                 if self.validate {
@@ -425,7 +429,7 @@ fn cursor_key(c: &ChainPoint) -> String {
     match c {
         ChainPoint::Origin => "origin".into(),
         ChainPoint::Slot(s) => format!("{s}"),
-        ChainPoint::Specific(s, h) => format!("{s}:{}", hex::encode(h)),
+        ChainPoint::Specific(s, h) => format!("{s}:{h}"),
     }
 }
 
@@ -436,7 +440,7 @@ fn cursor_summary(c: &ChainPoint) -> serde_json::Value {
         ChainPoint::Specific(s, h) => serde_json::json!({
             "kind": "specific",
             "slot": s,
-            "hash_hex": hex::encode(h),
+            "hash_hex": h,
         }),
     }
 }
