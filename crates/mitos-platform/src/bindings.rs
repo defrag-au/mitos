@@ -46,6 +46,7 @@ wasmtime::component::bindgen!({
 pub use mitos::platform::block_context::{Host as BlockContextHost, HostResolvedBlock};
 pub use mitos::platform::chain_data::Host as ChainDataHost;
 pub use mitos::platform::emit::Host as EmitHost;
+pub use mitos::platform::interest::Host as InterestHost;
 pub use mitos::platform::logging::{Host as LoggingHost, LogLevel};
 pub use mitos::platform::state_kv::Host as StateKvHost;
 pub use mitos::platform::types::{

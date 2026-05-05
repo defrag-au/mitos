@@ -1,0 +1,47 @@
+[package]
+name = "mitos-companion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CF Worker Durable Object runtime SDK for mitos companions"
+
+# Runtime SDK that absorbs WS lifecycle, cursor coordination, schema migration,
+# auth, dynamic interest, Ack/Nack delivery, and HTTPS subscribe registration
+# for any CF Worker companion that consumes mitos emissions. dApps implement
+# `MitosCompanion` + one or more `MitosChannel`s and embed a
+# `MitosCompanionRuntime<C>` inside their own `#[durable_object]` wrapper.
+#
+# Design doc: ../../docs/strategy/MITOS_COMPANION_RUNTIME_V1.md
+
+[dependencies]
+# CF Worker SDK. Pinned per-crate (not via workspace) because no other mitos
+# crate depends on it — CF-specific, only material for the runtime SDK and
+# the dApp wrappers that build wasm32 worker binaries against it.
+worker = { version = "=0.7.4", features = ["queue", "d1"] }
+js-sys = "0.3"
+
+# Wire-format types live alongside in mitos-protocol — both halves of the
+# protocol share a single source of truth.
+mitos-protocol = { path = "../mitos-protocol" }
+
+# Typed PolicyId. The companion's interest helpers translate
+# `(kind, value)` SQL rows into `mitos_protocol::Interest`
+# values via `AssetSelector::Policy(PolicyId)`. Same rev mitos-
+# protocol uses, since both are pulled through the same workspace
+# dep.
+cardano-assets = { workspace = true }
+
+# Workspace-inherited basics.
+serde = { workspace = true, features = ["derive"] }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+# CBOR + bytes encoding helpers — pinned per-crate matching mitos-protocol's
+# direct pins (so the same versions stay coherent across both halves of the
+# protocol).
+serde_bytes = "0.11"
+ciborium = "0.2"

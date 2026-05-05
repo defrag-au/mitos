@@ -34,7 +34,7 @@ these terms fix that.
 | **Interest set** | The dApp's expression of "what I want to be told about". Source of truth on companion side; replicated to the module as filter. | Companion DO SQLite (canonical), Module redb (replica). |
 | **Emission** | One matched event the module sends to a companion as `ServerMessage::Apply`. | Recorded in host's `module_emissions` log (see "Emissions log on the host"). |
 | **Companion** | The CF-side counterpart of a module. A `#[durable_object]` DO using the runtime. Receives emissions, calls dApp's `apply_event`, owns the dApp's state slice. | `cnft.dev-workers/workers/<name>-companion/` (or wherever the dApp keeps its CF code) |
-| **Runtime** | The `mitos-companion` crate. Absorbs companion boilerplate. Provides `MitosCompanionRuntime<C>`, `MitosCompanion` trait, `MitosChannel` trait. | `cnft.dev-workers/types/mitos-companion/` |
+| **Runtime** | The `mitos-companion` crate. Absorbs companion boilerplate. Provides `MitosCompanionRuntime<C>`, `MitosCompanion` trait, `MitosChannel` trait. | `mitos/crates/mitos-companion/` |
 | **dApp Worker** | The dApp's CF Worker — HTTP entrypoint, business logic. Mitos-unaware (treats companions as service bindings). | dApp's repo, e.g. `cnft.dev-workers/workers/<dapp>/` |
 | **dApp** | The product. One or more dApp Workers + N companions + frontend + DBs. Owns its own modules in its own repo. | Multi-crate scope. |
 | **ACK / NACK** | Companion's response to an emission after `apply_event`. ACK = success; NACK = the dApp handler errored. | Wire protocol additions (see "Emissions log"). |
@@ -88,7 +88,7 @@ The runtime owns:
 ## Concrete v1 scope (strict)
 
 In:
-- `mitos-companion` crate in `cnft.dev-workers/types/mitos-companion/`
+- `mitos-companion` crate in `mitos/crates/mitos-companion/` (alongside `mitos-protocol`, in the public mitos repo)
 - `MitosCompanion` trait — the dApp builder's entry point
 - `MitosCompanionRuntime<C: MitosCompanion>` — plain struct (no
   `#[durable_object]`, no `DurableObject` impl) that the dApp
@@ -1340,21 +1340,25 @@ only when concerns are tightly coupled at the SQL layer.
 
 ## Crate location
 
-`cnft.dev-workers/types/mitos-companion/`
-- Lives in cnft.dev-workers because the first consumer is
-  there
-- Named `mitos-companion` so it's discoverable
-- Public to all workspace members (other workers can adopt
-  later)
-- Promotable to `shared-crates` repo if/when a non-cnft.dev
-  team needs it
+`mitos/crates/mitos-companion/`
+- Lives in the public mitos repo alongside `mitos-protocol`,
+  so both halves of the wire protocol have a single source of
+  truth and evolve in lockstep
+- Anyone consuming mitos can clone, build, and use the
+  companion runtime — no private-repo gates
+- Discoverable next to the design docs in `docs/strategy/`
+  and `docs/design/` that describe the protocol it implements
 
-Rationale for not putting in `mitos/` repo: the runtime
-depends on `worker-rs`, which is CF-specific and not relevant
-to mitos's host-side runtime. Keeping it in cnft.dev-workers
-mirrors the companion-pattern's "consumer owns their half"
-principle — the SDK is the consumer's tool, even though
-mitos defines the wire protocol it speaks.
+The original PR 1 plan placed this crate in
+`cnft.dev-workers/types/mitos-companion/` on the rationale
+that it depended on `worker-rs` (CF-specific). That rationale
+turned out to be weak: `worker-rs` builds fine on host
+targets for library work, mitos-companion has no `[[bin]]`
+targets, and all 13 tests are pure-Rust round-trip / dispatch
+contract tests. The bigger concern — that hosting the runtime
+in a private workspace defeats the point of mitos being
+public — won out, and the crate was moved here in the move-PR
+that landed before PR 2 of the runtime delivery.
 
 ## Order of operations
 
@@ -1364,7 +1368,7 @@ because the migration loses functionality vs. the existing
 worker without them.
 
 ### PR 1 — `mitos-companion` crate skeleton + addressing + WS lifecycle (~700 lines)
-- New crate at `types/mitos-companion/`
+- New crate at `mitos/crates/mitos-companion/`
 - `MitosCompanion` trait + `MitosChannel` sub-trait +
   `MitosChannelDyn` blanket impl
 - `MitosCompanionRuntime<C>` plain struct (no DO macro, no
@@ -1392,6 +1396,7 @@ worker without them.
 
 ### PR 2 — Dynamic interest wire protocol (~500 lines split host + companion)
 - `ClientMessage::Interest { op, items }` in mitos-protocol
+  *(already landed in PR 1's wire-types consolidation)*
 - Companion runtime: `mitos_companion_interest` SQLite table,
   `subscribe`/`unsubscribe`/`list` RPC handlers under
   `/api/_interest/*`
@@ -1399,34 +1404,113 @@ worker without them.
   in-session mutations emit `ClientMessage::Interest` frames
   over held WS (immediate, no batching)
 - Host platform: WIT export `update-interest`, module-side
-  redb interest table, host applies `Add`/`Remove`/`Replace`
-  to module via host call
+  state-kv-persisted interest set, module's `init` rehydrates
+  from state-kv before consulting `policies = [...]` bootstrap
 - Host: `mitos.toml` `policies` becomes bootstrap-only default
-- Tests: round-trip subscribe → host receives matching events;
-  unsubscribe stops them; reconnect (mitos re-dials) rehydrates
+- Tests: companion-side wire round-trips + interest-row → wire
+  Interest translation
 
-### PR 3 — Emissions log + Ack/Nack wire protocol (~600 lines split host + companion)
+**Scope note**: the host-side WS-receive-loop branch that
+parses inbound `ClientMessage::Interest` frames and calls
+`update-interest` on a running module via a control channel
+is **deferred to PR 3**. PR 3 substantially refactors the
+WS receive path anyway (to add the `Ack`/`Nack` parsing +
+the dial-back path's read loop) so adding the Interest
+branch + follower control-channel plumbing there avoids
+double-touching the same code. PR 2 ships the wire surface,
+RPC handlers, module-side handler, and the wake-time
+HTTPS subscribe call (which already includes the full
+interest set in `SubscribeRequest.interests` so the host
+has the canonical set persisted from first connection,
+even before in-session mutation flows are wired).
+
+### PR 3 — Emissions log + Ack/Nack wire protocol (split into 3a foundation + 3b delivery)
+
+**PR 3a — Foundation (landed)**:
 - `ServerMessage::Apply` gains `emission_id: u64`
+  *(already landed in PR 1's wire-types consolidation)*
 - New `ClientMessage::Ack` and `ClientMessage::Nack` frames
-- Host: `module_emissions` redb table per module, append on
-  match (status `pending` if WS connected, `queued` if not),
-  status update on Ack/Nack
-- Host: `mitos-admin emissions list/replay/purge` subcommands
-- Host: on companion reconnect, drain `queued` rows in
-  chain-point order before resuming live stream
-- Companion runtime: send Ack after successful apply + cursor
-  advance; send Nack on apply error (cursor still advances)
-- Compaction: Acked rows drop after 7d, Nacked retained,
-  Pending → timeout after 24h, Queued never auto-expires
-- Tests: full round-trip apply → ack; apply error → nack;
-  offline companion → queued → drain on reconnect;
-  operator-driven replay; ack-timeout aging
+  *(already landed in PR 1's wire-types consolidation)*
+- Companion runtime: sends Ack after successful apply + cursor
+  advance; sends Nack on apply error (cursor still advances)
+  *(already landed in PR 1's runtime DO shape)*
+- Host: `EmissionsStore` per-module redb log
+  (`<storage>/<id>/emissions.redb`) with the full status
+  lifecycle (`Queued` → `Pending` → `Acked`/`Nacked`/`Timeout`),
+  monotonic ID assignment, queued-for-companion lookup,
+  filter-and-purge ops. 7 unit tests pass.
+- Host: `companions/subscribe` endpoint returns the real
+  `next_emission_id` from the module's emissions log
+  (`peek_next_id`), so companions get a sync point on first
+  connect.
+- Storage helpers: `module_dir_for_companions(id)`,
+  `emissions_path(id)`.
 
-### PR 4 — Multi-channel support
-- `Channel` type + per-channel dispatch
-- WS Hibernation tag → channel name routing
-- Per-channel interest scoping (interest rows have `channel` column)
-- Tests with two channels (ownership + marketplace)
+**PR 3b — Delivery engine (deferred)**:
+- Host: emit-interception path — when a module emits, append
+  to `EmissionsStore` (status `Pending` if WS connected,
+  `Queued` if not) and dispatch over the held WS.
+- Host: dial-back implementation — mitos opens WS to
+  companion's Worker URL using the registered `replicate_url`
+  template, sends `ServerMessage::Connected { last_emission_id }`
+  as the first frame, drains `queued` rows in chain-point
+  order before live stream resumes.
+- Host: WS-receive-loop refactor — parse inbound
+  `ClientMessage::{Interest, Ack, Nack, Unsubscribe}` frames;
+  add follower control-channel + `update-interest` host call
+  on Interest frames *(work also deferred from PR 2 — see
+  PR 2 scope note)*.
+- Host: `mitos-admin emissions list/replay/purge` subcommands.
+- Compaction: Acked rows drop after 7d, Nacked retained,
+  Pending → timeout after 24h, Queued never auto-expires.
+- Integration tests: full round-trip apply → ack; apply
+  error → nack; offline companion → queued → drain on
+  reconnect; operator-driven replay; ack-timeout aging.
+
+**Why split**: PR 3b naturally lands alongside PR 5
+(collections-mitos migration), where a real consumer
+exercises the dial-back + queued-drain flow end-to-end. PR 3a
+ships the data-layer foundation (emissions log, sync-point
+wiring) so the rest of the work has somewhere to land. Until
+PR 3b lands, the emissions log writes nothing — the value is
+infrastructural, not behavioural.
+
+**Operational note (transitional)**: PR 2 added
+`update-interest` to the WIT. Module wasm artifacts built
+before PR 2 will fail instantiation with `no export
+`update-interest` found`. Rebuild module wasm via
+`mitos-build` before re-running host tests after pulling
+this branch.
+
+### PR 4 — Multi-channel support (landed)
+
+Most of multi-channel was already wired in PR 1 — the trait
+shape (`MitosChannel + MitosChannelDyn` blanket impl), per-WS
+Hibernation tag accept (`accept_websocket_with_tags(ws, &[tag])`),
+the `/_internal/replicate-{channel}` upgrade endpoint, and the
+`channel` column on `mitos_companion_interest`. PR 4 adds the
+remaining piece — **per-channel scoping when broadcasting
+`ClientMessage::Interest` frames**:
+
+- `interest::rows_to_interests_for_channel(rows, target_channel)`
+  — filters rows to `channel == target_channel || channel ==
+  NO_CHANNEL`. NO_CHANNEL rows broadcast across every channel
+  the companion holds; channel-scoped rows go only to the
+  matching WS.
+- Runtime `broadcast_interest_frame` now consults the row's
+  channel field — channel-scoped rows route via
+  `state.get_websockets_with_tag(channel)`; empty-channel
+  rows broadcast to every held WS via `state.get_websockets()`.
+- Tests with two channels (mock + marketplace): trait-shape
+  compile-test, `channels()` returns 2, lookup-by-name
+  routing works.
+
+### PR 4 deferred (lands with PR 5 collections-mitos migration)
+
+- Multi-channel example dApp wiring — collections-mitos has
+  ownership + marketplace today as siblings in one DO; PR 5's
+  migration is the natural place to validate the runtime's
+  multi-channel surface against real production traffic.
 
 ### PR 5 — Migrate `collections-mitos` to the runtime
 - Concrete `OwnershipImpl: MitosCompanion` + `OwnershipChannel: MitosChannel`

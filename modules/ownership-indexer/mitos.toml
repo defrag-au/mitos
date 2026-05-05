@@ -8,8 +8,23 @@
 # carries an asset under one of these policies will trigger an
 # `OwnershipChange::Transfer` emission.
 #
-# Black Flag (per memory bank) is the canonical first watched
-# policy. Add more as needed.
+# **Bootstrap-only default.** With companion-runtime v1 (PR 2:
+# dynamic interest), the canonical interest set is asserted by
+# the companion's `/api/_interest/subscribe` RPC and replicated
+# into the module via the `update-interest` WIT export. This
+# `policies = [...]` list is consulted only on first init when
+# the module's persisted interest state is empty — i.e., fresh
+# deploy with no companion attached yet. Once a companion has
+# driven an interest set into the module at least once, the
+# persisted state-kv entry wins and this list is ignored on
+# subsequent restarts.
+#
+# Production dApps typically empty this list and drive interest
+# exclusively via the companion RPC, so deploys don't ship
+# stale policy hardcodes. Keeping a couple of entries here is
+# fine for local-dev / observability bootstraps where you just
+# want the module to emit something on first run before wiring
+# a companion.
 policies = [
     # Black Flag (per memory bank — canonical first watched policy)
     "b3dab69f7e6100849434fb1781e34bd12a916557f6231b8d2629b6f6",

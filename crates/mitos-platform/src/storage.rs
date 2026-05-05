@@ -96,6 +96,13 @@ impl ModuleStorage {
         self.module_dir(id).join("companions")
     }
 
+    /// Per-module emissions log path. Single redb file at
+    /// `<storage_root>/<id>/emissions.redb`. PR 3 of the
+    /// companion-runtime delivery.
+    pub fn emissions_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("emissions.redb")
+    }
+
     fn artifact_path(&self, id: &str, sha: &str) -> PathBuf {
         self.module_dir(id).join(format!("{sha}.wasm"))
     }

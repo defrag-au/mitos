@@ -6,17 +6,23 @@
 //! wake. Mitos persists the registration so it can later dial back
 //! to deliver emissions.
 //!
-//! ## v1 scope (PR 1)
+//! ## What's wired (as of PR 3 foundation work)
 //!
 //! - `POST /api/companions/subscribe` — accepts CBOR, persists to
 //!   `<storage>/<module_id>/companions/<companion_key>.cbor`,
-//!   responds `200 OK { status: "subscribed", next_emission_id: 0 }`.
-//! - Auth via the existing `MITOS_AUTH_TOKEN` shared-secret middleware.
+//!   responds with `next_emission_id` from the module's
+//!   `EmissionsStore` (`peek_next_id`). Companions use the
+//!   returned value as a sync point.
+//! - Auth via the existing `MITOS_AUTH_TOKEN` shared-secret
+//!   middleware.
 //!
-//! ## Out of v1 scope (lands in PR 3)
+//! ## Still deferred
 //!
 //! - Actual dial-back over WS to the registered companion's URL.
-//! - `module_emissions` log + `next_emission_id` increment.
+//!   The address book is persisted; the dial loop is not yet
+//!   wired (lands alongside the WS-receive-loop refactor when
+//!   PR 5's collections-mitos migration drives a real consumer
+//!   workload).
 //! - Idempotency-aware overwrite semantics with last-modified
 //!   timestamps.
 //! - Auto-cleanup of registrations for evicted companions.
@@ -177,11 +183,29 @@ async fn subscribe_handler(
         "companion registered"
     );
 
-    // PR 3 will return the host's actual emission_id counter from
-    // the module_emissions table; PR 1 stub returns 0.
+    // PR 3: return the host's actual next emission_id from the
+    // module_emissions log. Companions use this as a sync point
+    // — any emission_id at or below `peek_next_id - 1` is
+    // already in the log; anything above is fresh on this
+    // session. Open-then-peek so we don't need a long-lived
+    // EmissionsStore in the router state (the actual append
+    // path goes through the host's emit-interception loop).
+    let next_emission_id = match crate::emissions::EmissionsStore::open(
+        state.storage.emissions_path(&request.module_name),
+    ) {
+        Ok(store) => store.peek_next_id().unwrap_or(1),
+        Err(e) => {
+            tracing::warn!(
+                module = %request.module_name,
+                error = %e,
+                "open emissions log to peek next_id failed; returning 1"
+            );
+            1
+        }
+    };
     Ok(Json(SubscribeResponse {
         status: "subscribed".to_string(),
-        next_emission_id: 0,
+        next_emission_id,
     }))
 }
 
