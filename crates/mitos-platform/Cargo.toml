@@ -1,0 +1,87 @@
+[package]
+name = "mitos-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Wasm-isolated module runtime for mitos. Loads `.wasm` indexer
+# modules from the local filesystem, instantiates them in
+# wasmtime sandboxes, dispatches chain events through a typed
+# WIT ABI, and supervises traps with author-declared strategies.
+#
+# v1 scope (strict): one module slot, filesystem-loaded,
+# observable equivalence with today's monolithic-bundle host.
+# Multi-tenant module hosting, HTTP control plane, OCI registry,
+# hot-reload of running modules — all deferred to v2+.
+#
+# Strategy doc:  ../../docs/strategy/MITOS_PLATFORM_V1.md
+# Roadmap doc:   ../../docs/design/MITOS_ISOLATION_ROADMAP.md
+# Companion doc: ../../docs/strategy/MITOS_COMPANION_PATTERN.md
+
+[dependencies]
+# Wasmtime runtime. The `async` feature makes generated host fn
+# bindings return futures; `component-model` enables WIT-defined
+# components. We deliberately do NOT enable `component-model-async`
+# — that's the stream/future ABI which our WIT does not use and
+# wasmtime 44 documents as "_very_ incomplete".
+wasmtime = { version = "44", features = ["async", "component-model"] }
+# WASI Preview 2 host impls. wasm32-wasip2 std lib imports
+# `wasi:io`, `wasi:cli`, `wasi:clocks` etc. by default; we don't
+# rely on any of them in the v1 ABI but the linker still needs
+# matching impls so component instantiation succeeds. We feed
+# every module a default WASI context (no real I/O surface).
+wasmtime-wasi = { version = "44" }
+
+# Data plane — module host fns proxy through this for chain reads.
+mitos-data-plane = { path = "../mitos-data-plane" }
+
+# Typed asset / address newtypes — surfaced through WIT records
+# in the chain-data interface.
+cardano-assets = { workspace = true }
+
+# Block decode happens host-side; modules consume typed values
+# only. Pallas stays in the host crate, never in modules.
+pallas = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-traverse = { workspace = true }
+
+# Dolos for the chain-event source feeding the dispatch loop.
+dolos-core = { workspace = true }
+
+# Storage for module state (KV) + per-module cursor + WAL. Same
+# version the rest of the workspace uses.
+redb = { workspace = true }
+
+# Async runtime. Module dispatch + host I/O run on Tokio.
+tokio = { workspace = true }
+tokio-util = "0.7"
+async-trait = { workspace = true }
+
+# Admin HTTP surface — `/_admin/modules/*` lives here. Same axum
+# version the rest of the workspace uses (see workspace deps in
+# the root Cargo.toml).
+axum = { workspace = true, features = ["multipart"] }
+tower = { workspace = true }
+
+# Serialisation for module config (CBOR'd typed config from
+# shared crate) + persisted state.
+serde = { workspace = true }
+serde_bytes = "0.11"
+ciborium = "0.2"
+toml = "0.8"
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+ciborium = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Drives the admin router via its tower::Service surface.
+tower = { workspace = true, features = ["util"] }

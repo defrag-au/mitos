@@ -1,0 +1,27 @@
+[package]
+name = "mitos-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mitos-build"
+path = "src/main.rs"
+
+[dependencies]
+# Drives wasmtime + manifest validation through the platform's
+# library API — same engine + linker the production runtime
+# uses, so anything that passes mitos-build also passes the
+# host's upload validator.
+mitos-platform = { path = "../../crates/mitos-platform" }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+toml = "0.8"
+serde = { workspace = true }
+ciborium = "0.2"

@@ -31,6 +31,14 @@ struct Args {
     #[arg(long, env = "BUNDLE_DATA_DIR", default_value = "./mitos-data")]
     data_dir: std::path::PathBuf,
 
+    /// Wasm-module artifact storage. Setting this enables the
+    /// `/_admin/modules/*` admin surface + auto-resume of any
+    /// modules already registered under the path. Unset =
+    /// classic statically-composed bundle (today's behaviour).
+    /// See `docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md`.
+    #[arg(long, env = "BUNDLE_MODULES_DIR")]
+    modules_dir: Option<std::path::PathBuf>,
+
     /// Print the loaded configuration + persisted subscriptions to
     /// stdout, then exit 0 without starting the chain follower or
     /// HTTP server. Useful for verifying env vars, paths, and the
@@ -70,6 +78,13 @@ async fn main() -> anyhow::Result<()> {
     bundle.add_indexer(JpgCoIndexer::new()?);
     bundle.add_indexer(OwnershipIndexer::new()?);
     bundle.add_indexer(MarketplaceIndexer::new()?);
+
+    if let Some(modules_dir) = args.modules_dir {
+        info!(modules_dir = %modules_dir.display(), "wasm-module hosting enabled");
+        bundle.enable_modules(modules_dir);
+    } else {
+        info!("wasm-module hosting disabled (set --modules-dir to enable)");
+    }
 
     bundle.run(exit).await?;
 

@@ -1,0 +1,40 @@
+This directory contains files vendored from the Balius project
+(github.com/txpipe/balius), Copyright TxPipe contributors,
+licensed under the Apache License, Version 2.0.
+
+The Apache-2.0 license text is reproduced in
+LICENSE-APACHE-2.0 alongside this NOTICE.
+
+Each vendored file preserves its original upstream copyright
+header verbatim and carries an annotation comment of the form:
+
+    // Vendored from github.com/txpipe/balius @ <commit-sha>
+    // Original path: balius-runtime/src/<path>
+    // Apache-2.0 — see LICENSE-APACHE-2.0 (vendored alongside)
+    //
+    // Local modifications:
+    // - <list of substantive deltas>
+
+Substantive local modifications, where they exist, are
+described in each file's annotation block. The mitos-platform
+crate does not claim authorship of these files; mitos-platform's
+own original sources live alongside the vendored tree under
+`src/` proper.
+
+Vendored files:
+- kv.rs       (from balius-runtime/src/kv/redb.rs @ e9c8cd50c7d7074dc6db75633bb26c68d41da187)
+
+Planned:
+- router.rs   (from balius-runtime/src/router.rs) — when modules declare typed Watch sets at init-time
+- metrics.rs  (from balius-runtime/src/metrics.rs) — when OpenTelemetry surfaces are wired into the host
+
+Removed from the original plan:
+- store.rs — Balius's store.rs is a host-side WAL for replay-safe
+  worker restart; mitos has a different replay model (dolos's
+  archive is the WAL — on restart we re-subscribe via
+  `watch_tip(Some(persisted_cursor))` and the chain follower
+  re-fetches from there). A focused `CursorStore` in
+  `mitos_platform::storage` covers our crash-safety needs in
+  ~80 lines instead of vendoring 252 lines of WAL we'd never
+  use. See `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design
+  questions" #7 for the rationale.

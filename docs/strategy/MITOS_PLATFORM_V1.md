@@ -221,6 +221,19 @@ approach; the universal `handle-event(channel, event)` keeps the
 ABI surface tiny while letting modules express many logical
 event streams.
 
+WIT syntax note from the spike: when the world's exports take a
+`borrow<resolved-block>`, the resource must be `use`d into the
+world's scope first. The dotted form `borrow<block-context.resolved-block>`
+fails to parse; the correct shape is:
+
+```wit
+world mitos-module {
+    use block-context.{resolved-block};
+    import block-context;
+    export handle-event: func(channel: u32, block: borrow<resolved-block>);
+}
+```
+
 ## Build pipeline
 
 Module side:
@@ -256,8 +269,27 @@ wasmtime::component::bindgen!({
     world: "mitos-module",
     imports: { default: async | trappable },
     exports: { default: async },
+    with: {
+        // Path format: <package>:<name>/<interface>.<resource>
+        // — dot before the resource, NOT slash.
+        "mitos:platform/block-context.resolved-block": ResolvedBlock,
+    },
 });
 ```
+
+`add_to_linker` takes a `HasData` parameter; for the common
+"Store data implements every host trait" case the canonical
+idiom is:
+
+```rust
+MitosModule::add_to_linker::<_, HasSelf<HostState>>(
+    &mut linker, |s| s,
+)?;
+```
+
+Empty interface-level `Host` marker traits must be implemented
+on the store data even when the interface contains only records
+or free functions — bindgen requires `impl mitos::platform::types::Host for HostState {}`.
 
 Note: we do **not** enable `wasm_component_model_async` on the
 `Config`. That flag turns on the Component Model concurrency ABI
@@ -270,7 +302,16 @@ That's all we need.
 
 The deprecated `Config::async_support(true)` is also a no-op as
 of wasmtime 42 ([RELEASES.md](https://github.com/bytecodealliance/wasmtime/blob/release-42.0.0/RELEASES.md))
-— don't call it.
+— don't call it. Async support is implicit once the wasmtime
+crate's `async` feature is enabled.
+
+`Config::consume_fuel(true)` and `Config::epoch_interruption(true)`
+must both be set before any per-store fuel/epoch call. Epoch
+interruption additionally requires `store.set_epoch_deadline(N)`
+before the first guest call — otherwise the first instruction
+traps as `wasm trap: interrupt`. A background thread bumps the
+epoch periodically; the deadline is the number of ticks the
+guest may execute before being interrupted.
 
 That's the entire build pipeline. No `cargo-component`, no
 `spin-componentize`, no `wac` composition tool. Plain cargo +
@@ -299,12 +340,14 @@ on top.
 - Keep their algorithmic approach; replace their match-key
   variants with our typed predicates from `mitos-data-plane`
 
-**2. `store.rs`** (~252 lines, from `balius-runtime/src/store.rs`)
-- redb-backed WAL for module state
-- Per-worker cursor tracking
-- Atomic update primitives
-- We adapt the per-worker schema to handle our ABI version
-  field; otherwise the structure is what we want
+**2. ~~`store.rs`~~** — REMOVED from the vendoring plan after
+inspection. Balius's `store.rs` is a host-side WAL for
+replay-safe worker restart; mitos has a different replay model
+(dolos's archive is our WAL). We built a focused `CursorStore`
+in `mitos_platform::storage` instead — ~80 lines, single redb
+table, single-row cursor. KV side stays vendored from #3 below.
+See `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design questions"
+#7 for the rationale.
 
 **3. `kv/redb.rs`** (from `balius-runtime/src/kv/redb.rs`)
 - Worker-prefixed KV implementation
@@ -724,3 +767,12 @@ that in the module is fine.
 - **The `mitos-data-plane` Phase A spike** — confirmed the typed
   query API is the right shape for module consumption; v1
   exposes it via WIT without further redesign
+- **The WIT spike at `spikes/wit-spike/`** — end-to-end validated
+  the three load-bearing claims before committing platform
+  structure: (a) `borrow<resolved-block>` resource passed to
+  `handle-event` enforces non-stash via Rust borrow lifetime,
+  (b) `imports: { default: async | trappable }` flows through
+  Tokio cleanly with `tokio::time::sleep` inside an async host
+  fn, (c) tuple-returning export `trap-policy: func() -> tuple<trap-strategy, retry-policy>`
+  works with bindgen first-try. Spike artifact compiles + runs
+  on wasmtime 44 / wit-bindgen 0.54 / wasm32-wasip2.

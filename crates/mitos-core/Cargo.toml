@@ -52,3 +52,7 @@ redb = { workspace = true }
 # so CF Workers and other deserialise-only consumers can pull just
 # the types without the indexer-runtime dep stack.
 mitos-protocol = { path = "../mitos-protocol" }
+
+# Wasm-module hosting (Bundle::enable_modules path). Pulls in
+# wasmtime + the platform's storage/host/admin surface.
+mitos-platform = { path = "../mitos-platform" }
