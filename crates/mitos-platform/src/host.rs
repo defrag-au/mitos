@@ -185,11 +185,8 @@ where
             .ok_or_else(|| PlatformError::Decode(format!("no current.wasm for {id}")))?;
 
         // Build a fresh registry pointed at this module's wasm.
-        let registry = ModuleRegistry::load_from_path(
-            self.engine.clone(),
-            id.to_owned(),
-            &wasm_path,
-        )?;
+        let registry =
+            ModuleRegistry::load_from_path(self.engine.clone(), id.to_owned(), &wasm_path)?;
 
         // Per-slot state: kv + emitter pair.
         let kv = (self.kv_factory)(id);
@@ -244,14 +241,11 @@ where
             let registry = ModuleRegistry::load_from_path(
                 engine,
                 id_for_task.clone(),
-                &storage
-                    .current_wasm_path(&id_for_task)?
-                    .ok_or_else(|| {
-                        PlatformError::Decode(format!("no current.wasm for {id_for_task}"))
-                    })?,
+                &storage.current_wasm_path(&id_for_task)?.ok_or_else(|| {
+                    PlatformError::Decode(format!("no current.wasm for {id_for_task}"))
+                })?,
             )?;
-            let kv_factory_for_run =
-                move || kv_factory(&id_for_task);
+            let kv_factory_for_run = move || kv_factory(&id_for_task);
             let emitter_factory_for_run = move || emitter_factory_inner().0;
             let result = tokio::select! {
                 _ = cancel_for_task.cancelled() => {
@@ -321,9 +315,13 @@ where
             // is "stopped no matter what."
             match slot.task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(module = %id, error = %e, "follower exited with error"),
+                Ok(Err(e)) => {
+                    tracing::warn!(module = %id, error = %e, "follower exited with error")
+                }
                 Err(join_err) if join_err.is_cancelled() => {}
-                Err(join_err) => tracing::warn!(module = %id, error = %join_err, "follower task panicked"),
+                Err(join_err) => {
+                    tracing::warn!(module = %id, error = %join_err, "follower task panicked")
+                }
             }
             // Drop the cached cursor-store handle so the next
             // start re-opens redb cleanly. Without this, a

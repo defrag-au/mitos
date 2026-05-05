@@ -205,8 +205,14 @@ impl Driver {
                     slot,
                     "module trapped during handle-event",
                 );
-                self.handle_trap(registry, data_plane, kv_factory, emitter_factory, cursor_after)
-                    .await
+                self.handle_trap(
+                    registry,
+                    data_plane,
+                    kv_factory,
+                    emitter_factory,
+                    cursor_after,
+                )
+                .await
             }
         }
     }

@@ -116,10 +116,7 @@ impl HostResolvedBlock for HostState {
             .read_utxos(&[dp_ref], DecodeLevel::Lean)
             .await
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-        let resolved = pairs
-            .into_iter()
-            .next()
-            .map(|(_, out)| from_dp_output(out));
+        let resolved = pairs.into_iter().next().map(|(_, out)| from_dp_output(out));
 
         // Phase 4: memoise + return. Even `None` is cached so
         // repeated lookups for missing inputs don't re-hit redb.

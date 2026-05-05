@@ -105,10 +105,8 @@ async fn upload_module_happy_path() {
     let auth = AuthToken(None); // open mode for the test
     let app = admin_router(storage.clone(), auth);
 
-    let (content_type, body) = multipart_body(&[
-        ("manifest", manifest_toml.as_bytes()),
-        ("wasm", &wasm),
-    ]);
+    let (content_type, body) =
+        multipart_body(&[("manifest", manifest_toml.as_bytes()), ("wasm", &wasm)]);
 
     let req = Request::builder()
         .method("POST")
@@ -152,10 +150,8 @@ async fn upload_id_mismatch_rejected() {
     let auth = AuthToken(None);
     let app = admin_router(storage.clone(), auth);
 
-    let (content_type, body) = multipart_body(&[
-        ("manifest", manifest_toml.as_bytes()),
-        ("wasm", &wasm),
-    ]);
+    let (content_type, body) =
+        multipart_body(&[("manifest", manifest_toml.as_bytes()), ("wasm", &wasm)]);
     let req = Request::builder()
         .method("POST")
         .uri("/_admin/modules/ownership")
@@ -187,10 +183,8 @@ async fn upload_sha_mismatch_rejected() {
     let auth = AuthToken(None);
     let app = admin_router(storage.clone(), auth);
 
-    let (content_type, body) = multipart_body(&[
-        ("manifest", manifest_toml.as_bytes()),
-        ("wasm", &wasm),
-    ]);
+    let (content_type, body) =
+        multipart_body(&[("manifest", manifest_toml.as_bytes()), ("wasm", &wasm)]);
     let req = Request::builder()
         .method("POST")
         .uri("/_admin/modules/ownership")
@@ -219,10 +213,8 @@ async fn upload_then_list_then_get() {
     // Upload.
     {
         let app = admin_router(storage.clone(), auth.clone());
-        let (content_type, body) = multipart_body(&[
-            ("manifest", manifest_toml.as_bytes()),
-            ("wasm", &wasm),
-        ]);
+        let (content_type, body) =
+            multipart_body(&[("manifest", manifest_toml.as_bytes()), ("wasm", &wasm)]);
         let req = Request::builder()
             .method("POST")
             .uri("/_admin/modules/ownership")

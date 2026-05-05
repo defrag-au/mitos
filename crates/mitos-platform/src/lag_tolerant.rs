@@ -73,10 +73,8 @@ impl<D: Domain> LagTolerantSubscription<D> {
         // dolos's adapter (and same race-window caveat documented
         // there).
         let receiver = tip_broadcast.subscribe();
-        let replay: VecDeque<(ChainPoint, ArcBlock)> = domain
-            .wal()
-            .iter_blocks(from.clone(), None)?
-            .collect();
+        let replay: VecDeque<(ChainPoint, ArcBlock)> =
+            domain.wal().iter_blocks(from.clone(), None)?.collect();
         Ok(Self {
             domain,
             replay,
@@ -90,11 +88,7 @@ impl<D: Domain> LagTolerantSubscription<D> {
     /// `RecvError::Lagged(n)` — we know we missed `n` events,
     /// the WAL has them, fetch from `last_seen` forward.
     fn refill_after_lag(&mut self, missed: u64) {
-        match self
-            .domain
-            .wal()
-            .iter_blocks(self.last_seen.clone(), None)
-        {
+        match self.domain.wal().iter_blocks(self.last_seen.clone(), None) {
             Ok(iter) => {
                 let collected: VecDeque<_> = iter.collect();
                 tracing::warn!(

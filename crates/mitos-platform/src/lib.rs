@@ -34,6 +34,7 @@
 pub mod admin;
 pub mod bindings;
 pub mod block_decode;
+pub mod companions;
 pub mod driver;
 pub mod follower;
 pub mod host;
@@ -47,7 +48,7 @@ pub mod storage;
 pub mod supervisor;
 pub mod vendored;
 
-pub use block_decode::{decode_block, DecodedBlock};
+pub use block_decode::{DecodedBlock, decode_block};
 pub use driver::{ApplyOutcome, BlockEvent, Driver};
 pub use follower::run_chain_follower;
 pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};

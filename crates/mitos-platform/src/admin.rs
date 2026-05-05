@@ -407,4 +407,3 @@ fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
         .map_err(|e| HandlerError::Wasmtime(format!("component: {e}")))?;
     Ok(())
 }
-

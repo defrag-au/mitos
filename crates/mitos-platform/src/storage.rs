@@ -89,6 +89,13 @@ impl ModuleStorage {
         self.root.join(id)
     }
 
+    /// Per-module companions registration directory.
+    /// `<storage_root>/<id>/companions/<companion_key>.cbor` is
+    /// where each registered companion's `SubscribeRequest` lives.
+    pub fn module_dir_for_companions(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("companions")
+    }
+
     fn artifact_path(&self, id: &str, sha: &str) -> PathBuf {
         self.module_dir(id).join(format!("{sha}.wasm"))
     }
@@ -125,10 +132,7 @@ impl ModuleStorage {
             tracing::warn!(?lock, "reaping stale upload lock");
             let _ = std::fs::remove_file(&lock);
         }
-        std::fs::write(
-            &lock,
-            format!("{}", std::process::id()).as_bytes(),
-        )?;
+        std::fs::write(&lock, format!("{}", std::process::id()).as_bytes())?;
         Ok(UploadLockGuard { path: lock })
     }
 
@@ -308,8 +312,7 @@ struct CursorStore {
     db: redb::Database,
 }
 
-const CURSOR_TABLE: redb::TableDefinition<'_, &str, &[u8]> =
-    redb::TableDefinition::new("cursor");
+const CURSOR_TABLE: redb::TableDefinition<'_, &str, &[u8]> = redb::TableDefinition::new("cursor");
 const CURSOR_ROW: &str = "current";
 
 impl CursorStore {
@@ -387,9 +390,7 @@ impl Drop for UploadLockGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{
-        sha256_hex, AbiSection, BuildSection, ModuleSection, TrapPolicySection,
-    };
+    use crate::manifest::{AbiSection, BuildSection, ModuleSection, TrapPolicySection, sha256_hex};
 
     fn tempdir(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -444,16 +445,10 @@ mod tests {
         let read = storage.read_current_wasm("test-module").unwrap().unwrap();
         assert_eq!(read, wasm);
 
-        let read_manifest = storage
-            .read_manifest("test-module")
-            .unwrap()
-            .unwrap();
+        let read_manifest = storage.read_manifest("test-module").unwrap().unwrap();
         assert_eq!(read_manifest, manifest);
 
-        let path = storage
-            .current_wasm_path("test-module")
-            .unwrap()
-            .unwrap();
+        let path = storage.current_wasm_path("test-module").unwrap().unwrap();
         assert!(path.exists());
         assert!(path.to_string_lossy().ends_with(".wasm"));
 
@@ -486,12 +481,16 @@ mod tests {
         );
 
         // Both shas should still exist on disk (rollback target).
-        assert!(storage
-            .artifact_path("test-module", &sha256_hex(wasm_a))
-            .exists());
-        assert!(storage
-            .artifact_path("test-module", &sha256_hex(wasm_b))
-            .exists());
+        assert!(
+            storage
+                .artifact_path("test-module", &sha256_hex(wasm_a))
+                .exists()
+        );
+        assert!(
+            storage
+                .artifact_path("test-module", &sha256_hex(wasm_b))
+                .exists()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
