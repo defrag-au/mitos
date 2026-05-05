@@ -31,7 +31,9 @@ pub use protocol::{
     OfferUpdatePayload, OutputRef, PlutusBytes, ProtocolEvent, SalePayload, SwapPayload,
     UnlistingPayload,
 };
-pub use subscribe::{DialBackOverride, SubscribeRequest, SubscribeResponse};
+pub use subscribe::{
+    DialBackOverride, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeWireError,
+};
 pub use wire::{
     ChainPoint, ClientMessage, InterestOp, ServerMessage, SubscribeReply, decode_client,
     decode_server, encode_client, encode_server,

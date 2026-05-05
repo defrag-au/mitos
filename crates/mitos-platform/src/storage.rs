@@ -44,11 +44,19 @@ pub enum StorageError {
 /// which moves the bottleneck off cursor I/O and onto wasmtime
 /// dispatch (the irreducible per-block work).
 ///
-/// Thread-safe + cheap to clone (Arc-wrapped cache).
+/// Same caching applies to per-module `EmissionsStore` handles:
+/// redb is single-writer-process, so the emit drain task, the
+/// companion dialer's poll loop, and the subscribe handler's
+/// `peek_next_id` call must all share one open instance per
+/// module — otherwise the second opener fails with
+/// `Database already open. Cannot acquire lock.`
+///
+/// Thread-safe + cheap to clone (Arc-wrapped caches).
 #[derive(Clone)]
 pub struct ModuleStorage {
     root: PathBuf,
     cursor_stores: Arc<Mutex<HashMap<String, Arc<CursorStore>>>>,
+    emissions_stores: Arc<Mutex<HashMap<String, crate::emissions::EmissionsStore>>>,
 }
 
 impl ModuleStorage {
@@ -56,7 +64,33 @@ impl ModuleStorage {
         Self {
             root: root.into(),
             cursor_stores: Arc::new(Mutex::new(HashMap::new())),
+            emissions_stores: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get-or-open the emissions store for a module. Idempotent;
+    /// first call per module pays the redb open cost, subsequent
+    /// calls return the cached handle. Cloning the returned
+    /// `EmissionsStore` is cheap (Arc-wrapped redb handle inside).
+    pub fn emissions_store(
+        &self,
+        id: &str,
+    ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
+        let mut cache = self.emissions_stores.lock().expect("emissions_stores mutex");
+        if let Some(s) = cache.get(id) {
+            return Ok(s.clone());
+        }
+        let store = crate::emissions::EmissionsStore::open(self.emissions_path(id))?;
+        cache.insert(id.to_owned(), store.clone());
+        Ok(store)
+    }
+
+    /// Drop the cached emissions store handle for a module.
+    /// Mirror of `close_cursor` — used during follower stop so
+    /// the next start re-opens redb cleanly.
+    pub fn close_emissions(&self, id: &str) {
+        let mut cache = self.emissions_stores.lock().expect("emissions_stores mutex");
+        cache.remove(id);
     }
 
     /// Get-or-open the cursor store for a module. First call

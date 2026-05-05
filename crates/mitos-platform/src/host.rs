@@ -347,12 +347,13 @@ where
                     tracing::warn!(module = %id, error = %join_err, "emit drain task panicked")
                 }
             }
-            // Drop the cached cursor-store handle so the next
-            // start re-opens redb cleanly. Without this, a
-            // crash during the just-stopped task could leave a
-            // half-committed transaction visible to the new
-            // task via the cached handle.
+            // Drop the cached cursor-store + emissions-store
+            // handles so the next start re-opens redb cleanly.
+            // Without this, a crash during the just-stopped task
+            // could leave a half-committed transaction visible
+            // to the new task via the cached handle.
             self.storage.close_cursor(id);
+            self.storage.close_emissions(id);
             tracing::info!(module = %id, sha = %slot.sha, "follower stopped");
         }
         Ok(())
@@ -399,7 +400,7 @@ async fn run_emit_drain(
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
     cancel: CancellationToken,
 ) {
-    let store = match crate::emissions::EmissionsStore::open(storage.emissions_path(&module_id)) {
+    let store = match storage.emissions_store(&module_id) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(

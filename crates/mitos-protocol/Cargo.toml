@@ -29,6 +29,10 @@ enumset = { version = "1.1", features = ["serde"] }
 cardano-assets = { workspace = true }
 pipeline-types = { workspace = true }
 
+# Error type for the wire codec helpers (`SubscribeRequest::encode`,
+# etc.). Workspace pin — same major as the rest of the workspace.
+thiserror = { workspace = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 ciborium = "0.2"

@@ -231,13 +231,11 @@ async fn run_companion(
         }
     };
 
-    let store_path = storage.emissions_path(&req.module_name);
-    let store = match EmissionsStore::open(&store_path) {
+    let store = match storage.emissions_store(&req.module_name) {
         Ok(s) => s,
         Err(e) => {
             error!(
                 module = %req.module_name,
-                path = %store_path.display(),
                 error = %e,
                 "open EmissionsStore failed; companion task exiting"
             );

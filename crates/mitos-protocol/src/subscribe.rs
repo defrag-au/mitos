@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 use crate::interest::Interest;
 use crate::wire::ChainPoint;
 
+/// Wire MIME type for both `SubscribeRequest` and
+/// `SubscribeResponse`. CBOR for both directions — same encoder
+/// + decoder pair on each side, no encoding ambiguity. Errors
+/// (non-2xx HTTP responses) stay JSON so operators can read the
+/// body straight from `curl` output.
+pub const SUBSCRIBE_MIME: &str = "application/cbor";
+
 /// Request body for `POST /api/companions/subscribe`.
 ///
 /// CBOR-encoded — host expects `application/cbor`.
@@ -66,4 +73,54 @@ pub struct SubscribeResponse {
     /// stub returns 0.
     #[serde(default)]
     pub next_emission_id: u64,
+}
+
+// ============================================================================
+// Wire codec — co-located with the types so both sides agree on the
+// encoding without each independently picking ciborium / serde_json /
+// axum::Json. CBOR for both directions; the host's `subscribe_handler`
+// and the companion's `post_subscribe` call into these.
+// ============================================================================
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubscribeWireError {
+    #[error("encode: {0}")]
+    Encode(String),
+    #[error("decode: {0}")]
+    Decode(String),
+}
+
+impl SubscribeRequest {
+    /// CBOR-encode for the wire. Used by the companion's
+    /// `post_subscribe` HTTPS call.
+    pub fn encode(&self) -> Result<Vec<u8>, SubscribeWireError> {
+        let mut buf = Vec::with_capacity(256);
+        ciborium::ser::into_writer(self, &mut buf)
+            .map_err(|e| SubscribeWireError::Encode(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// CBOR-decode from the wire. Used by the host's
+    /// `subscribe_handler`.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SubscribeWireError> {
+        ciborium::de::from_reader(bytes).map_err(|e| SubscribeWireError::Decode(e.to_string()))
+    }
+}
+
+impl SubscribeResponse {
+    /// CBOR-encode for the wire. Used by the host's
+    /// `subscribe_handler`. Errors (non-2xx) bypass this and
+    /// return JSON for operator readability.
+    pub fn encode(&self) -> Result<Vec<u8>, SubscribeWireError> {
+        let mut buf = Vec::with_capacity(64);
+        ciborium::ser::into_writer(self, &mut buf)
+            .map_err(|e| SubscribeWireError::Encode(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// CBOR-decode from the wire. Used by the companion's
+    /// `post_subscribe` HTTPS call.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SubscribeWireError> {
+        ciborium::de::from_reader(bytes).map_err(|e| SubscribeWireError::Decode(e.to_string()))
+    }
 }
