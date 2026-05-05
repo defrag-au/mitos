@@ -355,12 +355,27 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let interest_rows = crate::interest::list_interests(&sql)?;
         let interests = crate::interest::rows_to_interests(&interest_rows);
 
+        // Pull the dial-back URL from wrangler env so mitos
+        // knows where to open its outbound WS. Required for
+        // emission delivery — without it the host persists
+        // the registration but the dial loop logs and exits.
+        let dial_back = self
+            .env
+            .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
+            .ok()
+            .map(|v| v.to_string())
+            .map(|url| crate::subscribe::DialBackOverride {
+                url: Some(url),
+                auth_header: None,
+                auth_value: None,
+            });
+
         let request = SubscribeRequest {
             module_name: C::NAME.to_string(),
             companion_key,
             resume_from,
             interests,
-            dial_back: None,
+            dial_back,
         };
 
         match subscribe_via_env(&self.env, &request).await {

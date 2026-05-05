@@ -277,6 +277,24 @@ impl Bundle {
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
             let host_for_admin = host.clone();
+
+            // Companion dial supervisor: maintains an outbound
+            // WS to each registered companion so the host can
+            // deliver emissions. `start_all()` redials any
+            // companion persisted from a previous run; the
+            // companion subscribe handler hands fresh
+            // registrations to it as they arrive.
+            let dialer = mitos_platform::dialer::CompanionDialer::new(
+                storage.clone(),
+                platform_auth.clone(),
+            );
+            dialer.start_all().await;
+            app = app.merge(mitos_platform::companions::companion_router(
+                storage.clone(),
+                platform_auth.clone(),
+                Some(dialer.clone()),
+            ));
+
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage,
                 host_for_admin,

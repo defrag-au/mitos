@@ -184,6 +184,10 @@ impl Driver {
             .set_epoch_deadline(self.budget.epoch_deadline_ticks);
 
         let block = ResolvedBlock::from_views(slot, txs.clone());
+        // Stash the cursor on HostState so emit_event can tag
+        // every EmittedEvent with the chain point of the
+        // currently-dispatching block.
+        self.instance.store.data_mut().current_cursor = Some(cursor_after.clone());
         let resource = self.instance.store.data_mut().table.push(block)?;
 
         let dispatch_result = self
@@ -191,6 +195,7 @@ impl Driver {
             .bindings
             .call_handle_event(&mut self.instance.store, self.dispatch_channel, resource)
             .await;
+        self.instance.store.data_mut().current_cursor = None;
 
         match dispatch_result {
             Ok(()) => {

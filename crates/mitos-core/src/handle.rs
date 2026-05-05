@@ -445,7 +445,20 @@ where
                         tracing::warn!("unexpected Subscribe after initial handshake; ignoring");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "client frame decode failed; ignoring");
+                        // Legacy pre-PR-3 consumers send Ack/Nack frames
+                        // without `emission_id`; that surfaces here as
+                        // a `missing field` decode error. Demote those
+                        // to debug to avoid log-flood — once those
+                        // consumers migrate to companion runtime, the
+                        // case disappears. Other decode failures stay
+                        // at warn so genuinely-malformed frames remain
+                        // visible.
+                        let msg = e.to_string();
+                        if msg.contains("missing field `emission_id`") {
+                            tracing::debug!(error = %msg, "legacy client frame (no emission_id); ignoring");
+                        } else {
+                            tracing::warn!(error = %msg, "client frame decode failed; ignoring");
+                        }
                     }
                 }
             }

@@ -1446,34 +1446,58 @@ even before in-session mutation flows are wired).
 - Storage helpers: `module_dir_for_companions(id)`,
   `emissions_path(id)`.
 
-**PR 3b — Delivery engine (deferred)**:
-- Host: emit-interception path — when a module emits, append
-  to `EmissionsStore` (status `Pending` if WS connected,
-  `Queued` if not) and dispatch over the held WS.
-- Host: dial-back implementation — mitos opens WS to
-  companion's Worker URL using the registered `replicate_url`
-  template, sends `ServerMessage::Connected { last_emission_id }`
-  as the first frame, drains `queued` rows in chain-point
-  order before live stream resumes.
-- Host: WS-receive-loop refactor — parse inbound
-  `ClientMessage::{Interest, Ack, Nack, Unsubscribe}` frames;
-  add follower control-channel + `update-interest` host call
-  on Interest frames *(work also deferred from PR 2 — see
-  PR 2 scope note)*.
-- Host: `mitos-admin emissions list/replay/purge` subcommands.
+**PR 3b — Delivery engine** *(landed 2026-05-05 — partial; see
+deferred items below)*:
+- Host: WS-receive-loop refactor — `forward_records` rewritten
+  with `tokio::select!` to multiplex outbound broadcast with
+  inbound frame parsing. New `InboundFrameHandler` trait
+  carries the dispatch path for `ClientMessage::{Interest,
+  Ack, Nack, Unsubscribe}`. `IndexerHandle::run_subscriber`
+  threads the optional handler through. *(landed)*
+- Host: emit-interception path — per-module drain task on
+  `events_rx` mpsc appends one `Queued` row per registered
+  companion to `EmissionsStore`, tagged with the chain point
+  the driver stashed on `HostState::current_cursor` before
+  dispatch. *(landed)*
+- Host: companion dialer (`mitos-platform/src/dialer.rs`) —
+  scans `<storage>/<module>/companions/*.cbor` on startup +
+  on every `register()` call, spawns one supervisor task per
+  `(module, companion_key)` pair. Each task dials the
+  registered URL with `tokio_tungstenite::connect_async`,
+  sends `ServerMessage::Connected { last_emission_id }` as
+  the readiness signal, drains `EmissionStatus::Queued` rows
+  in id order to `ServerMessage::Apply` frames (flipping each
+  to `Pending`), then tails on a 1s poll interval. Inbound
+  `Ack`/`Nack` frames update emission status; `Interest`
+  frames are logged (follower control-channel deferred).
+  Reconnect with exponential backoff to 60s. *(landed)*
+- Worker side: companion runtime reads `MITOS_REPLICATE_URL`
+  from `wrangler.toml [vars]` and threads it into
+  `SubscribeRequest.dial_back.url` so mitos can compute the
+  outbound dial target. `{key}` is substituted with the
+  companion key at dial time.
+
+**Deferred from PR 3b** (follow-up work):
+- Follower control-channel + `update-interest` host call on
+  inbound Interest frames *(currently logged-only)*.
+- `mitos-admin emissions list/replay/purge` subcommands.
 - Compaction: Acked rows drop after 7d, Nacked retained,
   Pending → timeout after 24h, Queued never auto-expires.
 - Integration tests: full round-trip apply → ack; apply
   error → nack; offline companion → queued → drain on
   reconnect; operator-driven replay; ack-timeout aging.
+- Module-level `[companion] replicate_url` defaults from
+  `mitos.toml` (currently every subscribe must carry
+  `dial_back.url` explicitly via env var).
 
-**Why split**: PR 3b naturally lands alongside PR 5
-(collections-mitos migration), where a real consumer
-exercises the dial-back + queued-drain flow end-to-end. PR 3a
-ships the data-layer foundation (emissions log, sync-point
-wiring) so the rest of the work has somewhere to land. Until
-PR 3b lands, the emissions log writes nothing — the value is
-infrastructural, not behavioural.
+**Architectural notes**:
+- v1 model is poll-based: emit drain writes `Queued` rows,
+  dial loop polls every 1s. Avoids broadcast/queue-split
+  complexity. Cardano blocks land every 20s on mainnet so
+  poll latency is well below chain cadence.
+- Channel u32 is stringified into emission rows for v1.
+  Companion-side WS upgrade tags channels by string; v2 will
+  plumb name-mapping through manifest metadata.
 
 **Operational note (transitional)**: PR 2 added
 `update-interest` to the WIT. Module wasm artifacts built

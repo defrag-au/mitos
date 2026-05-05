@@ -45,6 +45,14 @@ pub const MITOS_HOST_URL_ENV: &str = "MITOS_HOST_URL";
 /// admin endpoints use; same value rotates them in lockstep.
 pub const MITOS_AUTH_TOKEN_ENV: &str = "MITOS_AUTH_TOKEN";
 
+/// Environment variable name for the dial-back URL template the
+/// host should use when opening its outbound WS to this companion.
+/// Carries `{key}` as a placeholder that mitos substitutes with
+/// the companion key at dial time.
+///
+/// Example: `wss://collections-mitos.cnft.dev/_internal/replicate?policy_id={key}`
+pub const MITOS_REPLICATE_URL_ENV: &str = "MITOS_REPLICATE_URL";
+
 /// CBOR-encode a `SubscribeRequest` for transport.
 pub fn encode_subscribe(req: &SubscribeRequest) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(256);

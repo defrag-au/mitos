@@ -111,10 +111,12 @@ struct RunningSlot {
     sha: String,
     task: JoinHandle<PlatformResult<()>>,
     cancel: CancellationToken,
-    /// Receiver end of the emitter pair. Stashed here so a
-    /// caller (or a test) can drain emissions; future bundle
-    /// integration will move this into the replication path.
-    pub events: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+    /// Drain task that pulls from the module's `events_rx`
+    /// mpsc and appends one `Queued` row per registered
+    /// companion to the per-module `EmissionsStore`. Owned
+    /// alongside the follower task so `stop()` can cancel
+    /// both in lockstep.
+    drain_task: JoinHandle<()>,
 }
 
 /// Running-module lifecycle manager.
@@ -281,6 +283,19 @@ where
             result
         });
 
+        // Drain task: pull EmittedEvents off events_rx, look
+        // up registered companions for this module, and append
+        // one `Queued` row per companion to the EmissionsStore.
+        // The dial loop polls EmissionsStore for queued rows
+        // and converts each to a `ServerMessage::Apply` over the
+        // outbound WS — see `dialer::run_companion`.
+        let drain_storage = self.storage.clone();
+        let drain_module_id = id.to_owned();
+        let drain_cancel = cancel.clone();
+        let drain_task = tokio::spawn(async move {
+            run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel).await;
+        });
+
         let mut slots = self.slots.lock().await;
         slots.insert(
             id.to_owned(),
@@ -288,7 +303,7 @@ where
                 sha: manifest.module.sha256,
                 task,
                 cancel,
-                events: events_rx,
+                drain_task,
             },
         );
         tracing::info!(module = %id, "follower started");
@@ -321,6 +336,15 @@ where
                 Err(join_err) if join_err.is_cancelled() => {}
                 Err(join_err) => {
                     tracing::warn!(module = %id, error = %join_err, "follower task panicked")
+                }
+            }
+            // Drain task shares the cancel token with the
+            // follower, so cancelling above also signals it.
+            // Await to ensure any in-flight EmissionsStore
+            // append commits before stop returns.
+            if let Err(join_err) = slot.drain_task.await {
+                if !join_err.is_cancelled() {
+                    tracing::warn!(module = %id, error = %join_err, "emit drain task panicked")
                 }
             }
             // Drop the cached cursor-store handle so the next
@@ -357,25 +381,103 @@ where
         }
     }
 
-    /// Take the events receiver off a running slot. Used by
-    /// tests or callers that want to drain emissions out-of-band;
-    /// production wiring would pass the receiver into the
-    /// replication WS at start time instead.
-    pub async fn take_events(
-        &self,
-        id: &str,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>> {
-        let mut slots = self.slots.lock().await;
-        slots.get_mut(id).map(|slot| {
-            // Replace with a closed channel so subsequent emits
-            // don't panic (the host fn returns an error if the
-            // sender is closed; the dispatch loop catches that
-            // as a trap, which is loud — not ideal for v1.5 but
-            // tests should call `take_events` AFTER they've
-            // drained what they need, then `stop`).
-            let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
-            drop(closed_tx);
-            std::mem::replace(&mut slot.events, closed_rx)
-        })
+}
+
+/// Per-module drain task: pulls EmittedEvents off `events_rx`
+/// and writes one `Queued` row per registered companion to the
+/// per-module `EmissionsStore`. Each companion gets its own row
+/// so the dial loop can drain per-companion in id order.
+///
+/// Companions are discovered by listing
+/// `<storage>/<module_id>/companions/*.cbor` on every event —
+/// inefficient but trivially correct in the face of
+/// register/unregister churn. v2 caches the companion list
+/// behind a registered-companions broadcast.
+async fn run_emit_drain(
+    storage: ModuleStorage,
+    module_id: String,
+    mut events_rx: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+    cancel: CancellationToken,
+) {
+    let store = match crate::emissions::EmissionsStore::open(storage.emissions_path(&module_id)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                module = %module_id,
+                error = %e,
+                "open EmissionsStore for drain failed; emit interception disabled for this module"
+            );
+            return;
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            event = events_rx.recv() => {
+                let Some(event) = event else { return };
+                drain_one(&storage, &store, &module_id, event);
+            }
+        }
+    }
+}
+
+fn drain_one(
+    storage: &ModuleStorage,
+    store: &crate::emissions::EmissionsStore,
+    module_id: &str,
+    event: emit::EmittedEvent,
+) {
+    use crate::emissions::EmissionStatus;
+    let companions_dir = storage.module_dir_for_companions(module_id);
+    if !companions_dir.exists() {
+        return; // no registered companions
+    }
+    let read = match std::fs::read_dir(&companions_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                module = %module_id,
+                dir = %companions_dir.display(),
+                error = %e,
+                "read companions dir failed; emission dropped"
+            );
+            return;
+        }
+    };
+    let now = format!(
+        "unix:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    // Channel as a string — the WIT ABI uses u32; companion-side
+    // dispatch is by string tag. v1 stringifies; v2 will plumb
+    // the name through manifest metadata.
+    let channel = event.channel.to_string();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+            continue;
+        }
+        let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Err(e) = store.append(
+            &companion_key,
+            &channel,
+            event.chain_point.clone(),
+            event.payload.clone(),
+            EmissionStatus::Queued,
+            &now,
+        ) {
+            tracing::warn!(
+                module = %module_id,
+                companion_key = %companion_key,
+                error = %e,
+                "append emission row failed"
+            );
+        }
     }
 }

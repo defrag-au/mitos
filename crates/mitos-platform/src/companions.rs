@@ -50,14 +50,24 @@ use axum::routing::post;
 use mitos_protocol::{SubscribeRequest, SubscribeResponse};
 
 use crate::admin::AuthToken;
+use crate::dialer::CompanionDialer;
 use crate::storage::ModuleStorage;
 
 /// Build the companion-registration router with the same auth shape
 /// as the admin router. Returns the axum `Router`; the host wires it
 /// into the top-level service alongside `admin_router`.
-pub fn companion_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
+///
+/// `dialer` is optional so unit tests can exercise the persistence
+/// surface without spinning up the dial supervisor. Production
+/// callers always pass `Some(...)`.
+pub fn companion_router(
+    storage: ModuleStorage,
+    auth: AuthToken,
+    dialer: Option<CompanionDialer>,
+) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
+        dialer,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -68,6 +78,7 @@ pub fn companion_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router
 #[derive(Clone)]
 struct CompanionState {
     storage: Arc<ModuleStorage>,
+    dialer: Option<CompanionDialer>,
 }
 
 // Local re-implementation of the admin auth middleware so the
@@ -183,6 +194,13 @@ async fn subscribe_handler(
         "companion registered"
     );
 
+    // Hand the registration to the dial supervisor so it can
+    // start (or restart, for re-subscribes) the outbound WS
+    // dial loop. Dialer absent only in unit tests.
+    if let Some(dialer) = &state.dialer {
+        dialer.register(request.clone()).await;
+    }
+
     // PR 3: return the host's actual next emission_id from the
     // module_emissions log. Companions use this as a sync point
     // — any emission_id at or below `peek_next_id - 1` is
@@ -263,7 +281,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
-        companion_router(storage, AuthToken(None))
+        companion_router(storage, AuthToken(None), None)
     }
 
     fn cbor(req: &SubscribeRequest) -> Vec<u8> {
