@@ -1424,29 +1424,63 @@ interest set in `SubscribeRequest.interests` so the host
 has the canonical set persisted from first connection,
 even before in-session mutation flows are wired).
 
-### PR 3 — Emissions log + Ack/Nack wire protocol (~600 lines split host + companion)
+### PR 3 — Emissions log + Ack/Nack wire protocol (split into 3a foundation + 3b delivery)
+
+**PR 3a — Foundation (landed)**:
 - `ServerMessage::Apply` gains `emission_id: u64`
   *(already landed in PR 1's wire-types consolidation)*
 - New `ClientMessage::Ack` and `ClientMessage::Nack` frames
   *(already landed in PR 1's wire-types consolidation)*
-- Host: `module_emissions` redb table per module, append on
-  match (status `pending` if WS connected, `queued` if not),
-  status update on Ack/Nack
-- Host: `mitos-admin emissions list/replay/purge` subcommands
-- Host: on companion reconnect, drain `queued` rows in
-  chain-point order before resuming live stream
+- Companion runtime: sends Ack after successful apply + cursor
+  advance; sends Nack on apply error (cursor still advances)
+  *(already landed in PR 1's runtime DO shape)*
+- Host: `EmissionsStore` per-module redb log
+  (`<storage>/<id>/emissions.redb`) with the full status
+  lifecycle (`Queued` → `Pending` → `Acked`/`Nacked`/`Timeout`),
+  monotonic ID assignment, queued-for-companion lookup,
+  filter-and-purge ops. 7 unit tests pass.
+- Host: `companions/subscribe` endpoint returns the real
+  `next_emission_id` from the module's emissions log
+  (`peek_next_id`), so companions get a sync point on first
+  connect.
+- Storage helpers: `module_dir_for_companions(id)`,
+  `emissions_path(id)`.
+
+**PR 3b — Delivery engine (deferred)**:
+- Host: emit-interception path — when a module emits, append
+  to `EmissionsStore` (status `Pending` if WS connected,
+  `Queued` if not) and dispatch over the held WS.
+- Host: dial-back implementation — mitos opens WS to
+  companion's Worker URL using the registered `replicate_url`
+  template, sends `ServerMessage::Connected { last_emission_id }`
+  as the first frame, drains `queued` rows in chain-point
+  order before live stream resumes.
 - Host: WS-receive-loop refactor — parse inbound
   `ClientMessage::{Interest, Ack, Nack, Unsubscribe}` frames;
   add follower control-channel + `update-interest` host call
-  on Interest frames *(work deferred from PR 2 — see PR 2
-  scope note)*
-- Companion runtime: send Ack after successful apply + cursor
-  advance; send Nack on apply error (cursor still advances)
+  on Interest frames *(work also deferred from PR 2 — see
+  PR 2 scope note)*.
+- Host: `mitos-admin emissions list/replay/purge` subcommands.
 - Compaction: Acked rows drop after 7d, Nacked retained,
-  Pending → timeout after 24h, Queued never auto-expires
-- Tests: full round-trip apply → ack; apply error → nack;
-  offline companion → queued → drain on reconnect;
-  operator-driven replay; ack-timeout aging
+  Pending → timeout after 24h, Queued never auto-expires.
+- Integration tests: full round-trip apply → ack; apply
+  error → nack; offline companion → queued → drain on
+  reconnect; operator-driven replay; ack-timeout aging.
+
+**Why split**: PR 3b naturally lands alongside PR 5
+(collections-mitos migration), where a real consumer
+exercises the dial-back + queued-drain flow end-to-end. PR 3a
+ships the data-layer foundation (emissions log, sync-point
+wiring) so the rest of the work has somewhere to land. Until
+PR 3b lands, the emissions log writes nothing — the value is
+infrastructural, not behavioural.
+
+**Operational note (transitional)**: PR 2 added
+`update-interest` to the WIT. Module wasm artifacts built
+before PR 2 will fail instantiation with `no export
+`update-interest` found`. Rebuild module wasm via
+`mitos-build` before re-running host tests after pulling
+this branch.
 
 ### PR 4 — Multi-channel support
 - `Channel` type + per-channel dispatch

@@ -36,6 +36,7 @@ pub mod bindings;
 pub mod block_decode;
 pub mod companions;
 pub mod driver;
+pub mod emissions;
 pub mod follower;
 pub mod host;
 pub mod host_fns;
