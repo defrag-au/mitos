@@ -219,8 +219,8 @@ async fn main() -> anyhow::Result<()> {
             .module
             .as_ref()
             .and_then(|m| {
-                let p = if m.is_file() { m.parent().map(|p| p.to_path_buf()) } else { Some(m.clone()) };
-                p
+                
+                if m.is_file() { m.parent().map(|p| p.to_path_buf()) } else { Some(m.clone()) }
             })
             .unwrap_or_else(|| build_workspace.clone());
         source_dir.join("target").join("mitos").join(&module_id)
@@ -582,11 +582,11 @@ fn render_user_deps(spec: &SingleFileSpec) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// Split user source into a leading inner-doc block (`//!` lines
-/// + blank lines that come before any non-doc content) and the
-/// rest. Hoisting the doc block above the injected wit_bindgen
-/// macro keeps `//!` comments valid (inner attributes must
-/// precede all items in a module).
+/// Split user source into a leading inner-doc block (`//!`
+/// lines and blank lines that come before any non-doc content)
+/// and the rest. Hoisting the doc block above the injected
+/// wit_bindgen macro keeps `//!` comments valid (inner
+/// attributes must precede all items in a module).
 fn split_inner_docs(src: &str) -> (String, String) {
     let mut docs = String::new();
     let mut rest_start = 0usize;
@@ -608,11 +608,10 @@ fn split_inner_docs(src: &str) -> (String, String) {
 /// touching mtime on no-op runs so cargo's incremental cache
 /// stays warm.
 fn write_if_changed(path: &Path, content: &str) -> anyhow::Result<()> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == content {
             return Ok(());
         }
-    }
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
