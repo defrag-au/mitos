@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::bindings::{OutputRef, TypedOutput};
+use crate::bindings::{OutputRef, TypedDatum, TypedOutput};
 
 /// Host-side per-block state. Stored in the `ResourceTable`
 /// behind a `Resource<ResolvedBlock>` handle that the guest
@@ -45,6 +45,15 @@ pub struct ResolvedBlock {
     /// hits the cache.
     #[allow(dead_code)] // wired up when host_fns::block_context lazy-resolution lands
     pub(crate) consumed_input_cache: HashMap<OutputRefKey, Option<TypedOutput>>,
+
+    /// Memoised datum resolutions for consumed inputs.
+    /// `get-consumed-input-datum(tx_idx, input_idx)` populates
+    /// this on first call by fetching the prior output at
+    /// `with-datum` decode level via the data plane. Same
+    /// `OutputRefKey` shape as `consumed_input_cache` — different
+    /// payload type so we don't change the existing
+    /// `read_utxos(Lean)` shape of that cache.
+    pub(crate) consumed_input_datum_cache: HashMap<OutputRefKey, Option<TypedDatum>>,
 }
 
 /// Hashable key for the consumed-input cache. `OutputRef` from
@@ -67,8 +76,8 @@ impl From<&OutputRef> for OutputRefKey {
 
 /// Per-tx view inside `ResolvedBlock`. Holds enough to answer
 /// `tx-hash` / `output-count` / `get-output` /
-/// `get-consumed-input` / `get-consumed-inputs` without
-/// re-decoding.
+/// `get-consumed-input` / `get-consumed-inputs` /
+/// `get-output-datum` without re-decoding.
 #[derive(Debug, Clone)]
 pub struct TxView {
     /// 32-byte tx hash. Modules emit as event metadata.
@@ -77,10 +86,33 @@ pub struct TxView {
     /// Already projected to the WIT shape; host pre-decodes
     /// these once when building the `ResolvedBlock`.
     pub outputs: Vec<crate::bindings::TypedOutput>,
+    /// Per-output datum info, parallel to `outputs`. `None` =
+    /// output has no datum on chain. `Some(info)` carries the
+    /// hash, plus inline bytes if the on-chain datum was
+    /// inline (`DatumOption::Data`). Hash-only entries are
+    /// resolved on demand via the data plane's witness-datum
+    /// state index.
+    pub output_datums: Vec<Option<OutputDatumInfo>>,
     /// `OutputRef`s of inputs consumed by this tx, in order.
     /// `get_consumed_input(tx_idx, i)` resolves
     /// `txs[tx_idx].consumed_input_refs[i]`.
     pub consumed_input_refs: Vec<OutputRef>,
+}
+
+/// Per-output datum extraction outcome. Inline datums carry
+/// their CBOR directly (the on-chain bytes are already in hand
+/// during block decode); hash-attached datums record only the
+/// hash. The guest sees only the resolved bytes — see
+/// `host_fns::block_context::get_output_datum`.
+#[derive(Debug, Clone)]
+pub struct OutputDatumInfo {
+    pub hash: pallas::crypto::hash::Hash<32>,
+    /// `Some` when the on-chain datum was inline
+    /// (`DatumOption::Data`); the bytes are the original CBOR
+    /// of the inner `PlutusData`. `None` for hash-attached
+    /// datums — the host resolves these via Dolos's
+    /// `DATUM_NS` state index when the guest asks.
+    pub inline_bytes: Option<Vec<u8>>,
 }
 
 impl ResolvedBlock {
@@ -93,6 +125,7 @@ impl ResolvedBlock {
             tx_count: txs.len() as u32,
             txs,
             consumed_input_cache: HashMap::new(),
+            consumed_input_datum_cache: HashMap::new(),
         }
     }
 }

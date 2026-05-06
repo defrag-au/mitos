@@ -71,6 +71,13 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         Ok(Vec::new())
     }
+
+    async fn datum_by_hash(
+        &self,
+        _hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// Load a wasm component, instantiate against the platform's

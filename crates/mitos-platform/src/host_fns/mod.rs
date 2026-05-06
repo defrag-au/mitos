@@ -140,6 +140,17 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         &self,
         address: &str,
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
+
+    /// Resolve a datum hash to its raw CBOR bytes via the
+    /// underlying state's witness-datum index. Returns `None`
+    /// when the hash isn't present (datum was inline-only and
+    /// never landed in the witness-datum index, or the UTxO
+    /// referencing it has been spent and its refcount dropped
+    /// to zero).
+    async fn datum_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>>;
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -166,6 +177,17 @@ where
         address: &str,
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         mitos_data_plane::ChainDataPlane::utxos_by_address(self, address).await
+    }
+
+    async fn datum_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        let phash = pallas_primitives::Hash::<32>::from(*hash);
+        match mitos_data_plane::ChainDataPlane::read_datum(self, &phash).await? {
+            Some(td) => Ok(td.original_cbor),
+            None => Ok(None),
+        }
     }
 }
 
@@ -210,5 +232,17 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         mitos_data_plane::ChainDataPlane::utxos_by_address(&plane, address).await
+    }
+
+    async fn datum_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        let phash = pallas_primitives::Hash::<32>::from(*hash);
+        match mitos_data_plane::ChainDataPlane::read_datum(&plane, &phash).await? {
+            Some(td) => Ok(td.original_cbor),
+            None => Ok(None),
+        }
     }
 }

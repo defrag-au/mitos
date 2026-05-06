@@ -102,6 +102,13 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Vec<OutputRef>> {
         Ok(Vec::new())
     }
+
+    async fn datum_by_hash(
+        &self,
+        _hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// One-shot mpsc-backed subscription. Each call to the factory

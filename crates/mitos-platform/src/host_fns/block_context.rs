@@ -195,40 +195,64 @@ impl HostResolvedBlock for HostState {
         tx_idx: u32,
         output_idx: u32,
     ) -> wasmtime::Result<Option<TypedDatum>> {
-        // STUB — full data-plane datum-resolution wiring is the
-        // outstanding piece of WIT extension work tracked in
-        // `docs/design/WIT_DATUM_EXTENSION.md` ("What needs
-        // implementing host-side"). Today's `LocalDataPlane`
-        // hardcodes `datum: None` in `project_output()`; the full
-        // path needs (a) inline-datum extraction from the decoded
-        // output, (b) same-block witness-set resolution during
-        // block decode, (c) cross-block hash → bytes via Dolos's
-        // archive (`domain.query().plutus_data(&hash)`).
-        //
-        // Until that lands, the method is reachable but always
-        // returns `None`. Modules that call it (e.g. the planned
-        // `jpg-co` indexer in cnft.dev-workers) degrade gracefully
-        // — they emit zero events for blocks whose CO outputs
-        // need datum resolution. This is fine for an initial
-        // deployment because Phase 0 of the JPG CO design path
-        // doesn't depend on the module at all (cancel-by-May-23
-        // uses Maestro polling).
-        //
-        // Range-validate to surface bad indices loudly even
-        // though we'd return `None` either way; matches the
-        // existing `get_output` shape so guests get consistent
-        // error messages once the real wiring lands.
-        let block = self.table.get(&self_)?;
-        let tx = block
-            .txs
-            .get(tx_idx as usize)
-            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
-        let _ = tx.outputs.get(output_idx as usize).ok_or_else(|| {
-            wasmtime::Error::msg(format!(
-                "output_idx {output_idx} out of range for tx {tx_idx}"
-            ))
-        })?;
-        Ok(None)
+        // Phase 1: pre-extracted per-output datum info on
+        // `TxView::output_datums` (built during block decode in
+        // `block_decode::extract_datum_info`). For inline datums
+        // the bytes are already in hand; for hash-attached datums
+        // we resolve via the data plane's `datum_by_hash` (which
+        // hits Dolos's witness-datum state index). The guest sees
+        // only resolved bytes — caller-blind, per the WIT
+        // contract.
+        let info = {
+            let block = self.table.get(&self_)?;
+            let tx = block
+                .txs
+                .get(tx_idx as usize)
+                .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+            // Validate output_idx against produced outputs even
+            // when the matching `output_datums` slot is None, so
+            // out-of-range indices error consistently with
+            // `get_output`.
+            let _ = tx.outputs.get(output_idx as usize).ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "output_idx {output_idx} out of range for tx {tx_idx}"
+                ))
+            })?;
+            tx.output_datums.get(output_idx as usize).cloned().flatten()
+        };
+        let Some(info) = info else {
+            return Ok(None);
+        };
+
+        let hash_bytes: [u8; 32] = *info.hash;
+        let payload = if let Some(bytes) = info.inline_bytes {
+            bytes
+        } else {
+            // Hash-attached datum — resolve via state index.
+            match self.data_plane.datum_by_hash(&hash_bytes).await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    tracing::debug!(
+                        hash = %hex::encode(hash_bytes),
+                        "datum hash not present in state index"
+                    );
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %hex::encode(hash_bytes),
+                        error = %e,
+                        "datum_by_hash lookup failed"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+
+        Ok(Some(TypedDatum {
+            hash: hash_bytes.to_vec(),
+            payload,
+        }))
     }
 
     async fn get_consumed_input_datum(
@@ -237,29 +261,69 @@ impl HostResolvedBlock for HostState {
         tx_idx: u32,
         input_idx: u32,
     ) -> wasmtime::Result<Option<TypedDatum>> {
-        // STUB — see `get_output_datum`. Same outstanding work,
-        // applied to consumed-input-side datum resolution. The
-        // existing `get_consumed_input` lookup path with its
-        // `consumed_input_cache` is the natural extension point
-        // (parallel `datum_cache: HashMap<OutputRefKey, Option<TypedDatum>>`
-        // on `ResolvedBlock`); the data-plane bump is the
-        // remaining lift.
-        //
-        // Index-validates for consistency with `get_consumed_input`.
-        let block = self.table.get(&self_)?;
-        let tx = block
-            .txs
-            .get(tx_idx as usize)
-            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
-        let _ = tx
-            .consumed_input_refs
-            .get(input_idx as usize)
-            .ok_or_else(|| {
-                wasmtime::Error::msg(format!(
-                    "input_idx {input_idx} out of range for tx {tx_idx}"
-                ))
-            })?;
-        Ok(None)
+        // Pull the consumed input's `OutputRef` and check the
+        // per-block datum cache (we cache hash→bytes resolutions
+        // separately from the consumed-input typed-output cache;
+        // the latter stays at `Lean` decode level so existing
+        // callers don't pay datum-resolution cost they don't
+        // want).
+        let (oref, key) = {
+            let block = self.table.get(&self_)?;
+            let tx = block
+                .txs
+                .get(tx_idx as usize)
+                .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+            let oref = tx
+                .consumed_input_refs
+                .get(input_idx as usize)
+                .ok_or_else(|| {
+                    wasmtime::Error::msg(format!(
+                        "input_idx {input_idx} out of range for tx {tx_idx}"
+                    ))
+                })?
+                .clone();
+            let key = OutputRefKey::from(&oref);
+            (oref, key)
+        };
+
+        // Cache hit?
+        if let Some(cached) = self
+            .table
+            .get(&self_)?
+            .consumed_input_datum_cache
+            .get(&key)
+        {
+            return Ok(cached.clone());
+        }
+
+        // Miss: fetch the prior output at WithDatum decode level
+        // so the data plane resolves its datum (inline or hash)
+        // transparently in one round trip. We extract the resolved
+        // datum bytes and project to the WIT shape.
+        let dp_ref = into_dp_ref_owned(&oref)?;
+        let pairs = self
+            .data_plane
+            .read_utxos(&[dp_ref], DecodeLevel::WithDatum)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+
+        let resolved: Option<TypedDatum> = pairs
+            .into_iter()
+            .next()
+            .and_then(|(_, out)| out.datum)
+            .and_then(|td| {
+                td.original_cbor.map(|payload| TypedDatum {
+                    hash: td.hash.as_ref().to_vec(),
+                    payload,
+                })
+            });
+
+        // Memoise (even `None`) so repeated lookups are cheap.
+        let block = self.table.get_mut(&self_)?;
+        block
+            .consumed_input_datum_cache
+            .insert(key, resolved.clone());
+        Ok(resolved)
     }
 
     async fn drop(&mut self, rep: Resource<ResolvedBlock>) -> wasmtime::Result<()> {

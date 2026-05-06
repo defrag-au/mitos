@@ -63,6 +63,13 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Vec<OutputRef>> {
         Ok(Vec::new())
     }
+
+    async fn datum_by_hash(
+        &self,
+        _hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 fn spike_guest_wasm() -> Option<PathBuf> {
@@ -124,6 +131,7 @@ async fn end_to_end_load_instantiate_dispatch() {
         vec![TxView {
             tx_hash: vec![0xCD; 32],
             outputs: vec![],
+            output_datums: Vec::new(),
             consumed_input_refs: vec![synthetic_input],
         }],
     );
@@ -230,6 +238,7 @@ async fn ownership_module_emits_transfer_for_watched_policy() {
         vec![TxView {
             tx_hash: vec![0xEF; 32],
             outputs: vec![output],
+            output_datums: Vec::new(),
             consumed_input_refs: vec![],
         }],
     );
@@ -342,6 +351,7 @@ async fn ownership_module_ignores_unwatched_policy() {
         vec![TxView {
             tx_hash: vec![0x11; 32],
             outputs: vec![output],
+            output_datums: Vec::new(),
             consumed_input_refs: vec![],
         }],
     );
@@ -543,6 +553,7 @@ async fn driver_advances_cursor_across_blocks() {
             txs: vec![TxView {
                 tx_hash: vec![0xCD; 32],
                 outputs: vec![],
+                output_datums: Vec::new(),
                 consumed_input_refs: vec![synthetic_input.clone()],
             }],
         };

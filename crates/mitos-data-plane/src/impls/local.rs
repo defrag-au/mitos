@@ -15,7 +15,11 @@
 
 use async_trait::async_trait;
 use cardano_assets::PolicyId;
-use dolos_core::{ChainPoint, Domain, EraCbor, StateStore, TxoRef};
+use dolos_cardano::model::{DATUM_NS, DatumState};
+use dolos_core::{ChainPoint, Domain, EntityKey, EraCbor, StateStore, TxoRef};
+use pallas::ledger::primitives::PlutusData;
+use pallas::ledger::primitives::conway::DatumOption;
+use pallas::ledger::traverse::OriginalHash;
 use pallas_traverse::MultiEraOutput;
 
 use crate::ChainDataPlane;
@@ -42,9 +46,17 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
     }
 
     /// Project a hydrated UTxO (TxoRef + EraCbor) into a
-    /// `TypedOutput` at the requested `DecodeLevel`. Pure
-    /// translation function; no side effects, no Domain access.
+    /// `TypedOutput` at the requested `DecodeLevel`.
+    ///
+    /// Datum handling per `DecodeLevel`:
+    /// - `Lean` — `datum: None` regardless of on-chain shape.
+    /// - `WithDatum` / `Full` — extract inline datums directly,
+    ///   resolve hash-attached datums via the host's state store
+    ///   (`DATUM_NS`) which Dolos populates from witness sets
+    ///   during block apply. Caller-blind: the guest sees only
+    ///   the resolved bytes, never the inline-vs-hash source.
     fn project_output(
+        &self,
         cbor: &EraCbor,
         level: DecodeLevel,
         include_raw_cbor: bool,
@@ -84,19 +96,12 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             }
         }
 
-        // TODO Phase A+: datum + script extraction.
-        // The current `output.datum()` / `output.script_ref()`
-        // accessors give us inline forms; hash-referenced
-        // datums need a witness-set lookup which the current
-        // `MultiEraOutput` API doesn't expose at this layer.
-        // For Phase A both fields are always `None` — the
-        // contract is honest, just incomplete. `decoded_at`
-        // surfaces what level the plane actually performed so
-        // callers can detect that `Lean` is the only level
-        // currently fully supported.
-        let _ = level.includes_datum();
+        let datum = if level.includes_datum() {
+            self.resolve_output_datum(&output)
+        } else {
+            None
+        };
         let _ = level.includes_script();
-        let datum = None;
         let script_ref = None;
 
         let original_cbor = if include_raw_cbor {
@@ -113,6 +118,53 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             script_ref,
             original_cbor,
             decoded_at: level,
+        })
+    }
+
+    /// Caller-blind datum resolution for one output.
+    ///
+    /// - `None` if the output has no datum on chain.
+    /// - `Some(TypedDatum { hash, payload, original_cbor })`
+    ///   when a datum exists. `payload` and `original_cbor` are
+    ///   populated when the plane could resolve the bytes (always
+    ///   for inline; for hash-attached when present in
+    ///   `DATUM_NS`). `payload` falls back to `None` if the bytes
+    ///   exist but minicbor decode fails (rare; logged debug).
+    fn resolve_output_datum(&self, output: &MultiEraOutput<'_>) -> Option<TypedDatum> {
+        let datum_opt = output.datum()?;
+        let (hash, bytes): (pallas_primitives::Hash<32>, Option<Vec<u8>>) = match datum_opt {
+            DatumOption::Data(cbor_wrap) => {
+                let raw = cbor_wrap.0.raw_cbor().to_vec();
+                let h = cbor_wrap.0.original_hash();
+                (h, Some(raw))
+            }
+            DatumOption::Hash(h) => {
+                let key = EntityKey::from(h);
+                let bytes = self
+                    .domain
+                    .state()
+                    .read_entity_typed::<DatumState>(DATUM_NS, &key)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.bytes);
+                (h, bytes)
+            }
+        };
+
+        let payload = bytes.as_ref().and_then(|b| {
+            match pallas::codec::minicbor::decode::<PlutusData>(b) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::debug!(?hash, error = %e, "datum payload minicbor decode failed");
+                    None
+                }
+            }
+        });
+
+        Some(TypedDatum {
+            hash,
+            payload,
+            original_cbor: bytes,
         })
     }
 
@@ -143,7 +195,7 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             .map_err(|e| DataPlaneError::Storage(format!("get_utxos: {e:?}")))?;
 
         match utxos.into_iter().next() {
-            Some((_, era_cbor)) => Self::project_output(&era_cbor, decode, false).map(Some),
+            Some((_, era_cbor)) => self.project_output(&era_cbor, decode, false).map(Some),
             None => Ok(None),
         }
     }
@@ -162,7 +214,7 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
 
         let mut out = Vec::with_capacity(utxos.len());
         for (txo_ref, era_cbor) in utxos {
-            match Self::project_output(&era_cbor, decode, false) {
+            match self.project_output(&era_cbor, decode, false) {
                 Ok(typed) => out.push((OutputRef::from(txo_ref), typed)),
                 Err(e) => {
                     tracing::debug!(?txo_ref, error = ?e, "skipping output that failed to project");
@@ -239,7 +291,7 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
 
         let mut items = Vec::with_capacity(utxo_map.len());
         for (txo_ref, era_cbor) in utxo_map {
-            match Self::project_output(&era_cbor, decode, false) {
+            match self.project_output(&era_cbor, decode, false) {
                 Ok(typed) => items.push((OutputRef::from(txo_ref), typed)),
                 Err(e) => {
                     tracing::debug!(?txo_ref, error = ?e, "skipping output that failed to project");
@@ -297,14 +349,41 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
 
     async fn read_datum(
         &self,
-        _hash: &pallas_primitives::Hash<32>,
+        hash: &pallas_primitives::Hash<32>,
     ) -> DataPlaneResult<Option<TypedDatum>> {
-        // Phase A: not implemented. Witness-set resolution
-        // requires a hash-keyed datum index that mitos doesn't
-        // currently maintain. Revisit when a consumer needs it.
-        Err(DataPlaneError::NotYetImplemented(
-            "read_datum requires a hash-keyed datum index (Phase B follow-up)",
-        ))
+        // Dolos maintains a refcounted hash-keyed datum index in
+        // its state store under the `DATUM_NS` namespace,
+        // populated from witness sets during block apply (see
+        // `dolos-cardano/src/roll/datums.rs`). Inline datums are
+        // *not* in this index — they're carried on the output
+        // itself and surfaced by `project_output` directly.
+        //
+        // This side-door is for callers that have a hash but no
+        // containing UTxO context (rare). Most consumers should
+        // call `read_utxo*` with `DecodeLevel::WithDatum` and let
+        // the plane do caller-blind resolution transparently.
+        let key = EntityKey::from(*hash);
+        let bytes = self
+            .domain
+            .state()
+            .read_entity_typed::<DatumState>(DATUM_NS, &key)
+            .map_err(|e| DataPlaneError::Storage(format!("read_entity_typed(datum): {e:?}")))?
+            .map(|s| s.bytes);
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let payload = match pallas::codec::minicbor::decode::<PlutusData>(&bytes) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::debug!(?hash, error = %e, "datum payload minicbor decode failed");
+                None
+            }
+        };
+        Ok(Some(TypedDatum {
+            hash: *hash,
+            payload,
+            original_cbor: Some(bytes),
+        }))
     }
 
     async fn read_script(
