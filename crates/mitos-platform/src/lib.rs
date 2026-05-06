@@ -34,6 +34,7 @@
 pub mod admin;
 pub mod bindings;
 pub mod block_decode;
+pub mod compaction;
 pub mod companions;
 pub mod dialer;
 pub mod driver;

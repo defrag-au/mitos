@@ -1,5 +1,18 @@
 //! Marketplace events indexer (sales, listings, offers).
 //!
+//! ## Status: legacy. Slated for retirement.
+//!
+//! Same retirement path as `collection-ownership-indexer` — once
+//! the production consumer migrates onto `mitos-platform`'s
+//! wasm-module path (a `marketplace.rs` colocated next to
+//! `cnft.dev-workers/workers/collections-mitos/modules/ownership.rs`),
+//! this static crate becomes deletable. Currently has no
+//! `replicator.connected` subscribers, but the classification
+//! logic in `classify_tx` is non-trivial and worth porting
+//! when the wasm-module side gains a marketplace channel.
+//!
+//! ## Original docs:
+//!
 //! This is the second mitos indexer, alongside `OwnershipIndexer`,
 //! but with a fundamentally different topology. Where ownership is
 //! a per-policy stream (one consumer per policy, scope-filtered at

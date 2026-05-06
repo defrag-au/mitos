@@ -15,7 +15,6 @@ members = [
     "crates/mitos-platform",
     "crates/mitos-core",
     "crates/mitos-companion",
-    "crates/jpg-co-indexer",
     "crates/collection-ownership-indexer",
     "crates/marketplace-indexer",
     "bundles/default",

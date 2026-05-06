@@ -20,8 +20,8 @@
 //! away and this file + the static `IndexerHandle` machinery
 //! (`crate::handle::IndexerHandle`, `run_subscriber`,
 //! `replicate_router`, `crates/collection-ownership-indexer/`,
-//! `crates/jpg-co-indexer/`, `crates/marketplace-indexer/`)
-//! become deletable as a single cleanup PR.
+//! `crates/marketplace-indexer/`) become deletable as a single
+//! cleanup PR.
 //!
 //! Until then, leaving in place — production ownership data
 //! flows through this `Replicator`.

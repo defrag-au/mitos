@@ -1,4 +1,5 @@
-//! Default bundle: Dolos data plane + JpgCoIndexer.
+//! Default bundle: Dolos data plane + legacy static indexers
+//! (collection-ownership, marketplace).
 //!
 //! Phase 1+: composition logic now lives in `mitos_core::Bundle`. This
 //! file just loads config, constructs the domain, instantiates each
@@ -6,7 +7,6 @@
 
 use clap::Parser;
 use collection_ownership_indexer::OwnershipIndexer;
-use jpg_co_indexer::JpgCoIndexer;
 use marketplace_indexer::MarketplaceIndexer;
 use mitos_core::Bundle;
 use tokio_util::sync::CancellationToken;
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
             &config,
             args.listen,
             &args.data_dir,
-            &["jpg-co", "collection-ownership"],
+            &["collection-ownership", "marketplace"],
         )?;
         return Ok(());
     }
@@ -75,7 +75,6 @@ async fn main() -> anyhow::Result<()> {
     let exit = install_exit_handler();
 
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
-    bundle.add_indexer(JpgCoIndexer::new()?);
     bundle.add_indexer(OwnershipIndexer::new()?);
     bundle.add_indexer(MarketplaceIndexer::new()?);
 
@@ -129,7 +128,7 @@ fn init_tracing() {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,mitos=debug,jpg_co_indexer=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,mitos=debug")),
         )
         .with(fmt::layer().compact())
         .init();

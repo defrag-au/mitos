@@ -84,10 +84,11 @@ Active workstreams (most recent first):
 
 Concrete indexers in the tree:
 
-- `jpg-co-indexer` — collection offers from jpg.store
 - `collection-ownership-indexer` — per-policy ownership-change feed (the
-  canonical reference indexer)
-- `marketplace-indexer` — multi-marketplace event taxonomy
+  canonical reference indexer; legacy, slated for retirement once the
+  production consumer migrates onto `mitos-platform`'s wasm-module path)
+- `marketplace-indexer` — multi-marketplace event taxonomy (legacy,
+  same retirement path)
 
 For the longer arc see [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) and
 [`docs/design/MITOS_ISOLATION_ROADMAP.md`](docs/design/MITOS_ISOLATION_ROADMAP.md).
@@ -102,9 +103,8 @@ mitos/
 │   ├── mitos-data-plane/              # typed chain-data lookups over Dolos
 │   ├── mitos-platform/                # wasm module runtime (hot-load, sandbox, supervise)
 │   ├── mitos-companion/               # CF Worker DO runtime SDK (companion-side)
-│   ├── jpg-co-indexer/                # jpg.store collection offers indexer
-│   ├── collection-ownership-indexer/  # per-policy ownership-change feed
-│   └── marketplace-indexer/           # multi-marketplace event taxonomy
+│   ├── collection-ownership-indexer/  # per-policy ownership-change feed (legacy)
+│   └── marketplace-indexer/           # multi-marketplace event taxonomy (legacy)
 ├── bundles/
 │   └── default/                       # composite binary: Dolos + chosen indexers
 ├── modules/

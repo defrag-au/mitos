@@ -6,8 +6,8 @@
 //!
 //! ```ignore
 //! let mut bundle = Bundle::new(domain, config, listen_addr);
-//! bundle.add_indexer(JpgCoIndexer::new()?);
 //! bundle.add_indexer(OwnershipIndexer::new()?);
+//! bundle.add_indexer(MarketplaceIndexer::new()?);
 //! bundle.run(exit).await?;
 //! ```
 //!
@@ -174,6 +174,7 @@ impl Bundle {
         // future and systemd hits its 90s graceful-shutdown
         // timeout.
         let mut module_host: Option<Arc<dyn mitos_platform::host::ModuleHostHandle>> = None;
+        let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
@@ -306,11 +307,22 @@ impl Bundle {
             ));
 
             app = app.merge(mitos_platform::admin::admin_router_with_host(
-                storage,
+                storage.clone(),
                 host_for_admin,
                 platform_auth,
             ));
+
+            // Periodic emissions-log compaction. Hourly sweep
+            // ages out Acked rows (7d) + flips stuck Pending
+            // rows to Timeout (24h). See `mitos_platform::compaction`.
+            let compaction_handle = mitos_platform::compaction::spawn(
+                storage,
+                host.clone() as Arc<dyn mitos_platform::host::ModuleHostHandle>,
+                exit.clone(),
+            );
+
             module_host = Some(host);
+            module_compaction_handle = Some(compaction_handle);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -346,6 +358,15 @@ impl Bundle {
 
         for h in dispatcher_handles {
             h.abort();
+        }
+
+        // Compaction task observes the same `exit` token used
+        // for graceful shutdown — already cancelled by now —
+        // so it'll have stopped on its own. Await the join
+        // handle to confirm cleanup before module followers
+        // tear down redb handles.
+        if let Some(handle) = module_compaction_handle {
+            let _ = handle.await;
         }
 
         // Stop wasm-module followers cleanly so cursor checkpoints
