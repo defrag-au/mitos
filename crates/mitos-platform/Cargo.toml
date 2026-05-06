@@ -69,7 +69,7 @@ futures-util = "0.3"
 # Admin HTTP surface — `/_admin/modules/*` lives here. Same axum
 # version the rest of the workspace uses (see workspace deps in
 # the root Cargo.toml).
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "query"] }
 tower = { workspace = true }
 
 # Serialisation for module config (CBOR'd typed config from

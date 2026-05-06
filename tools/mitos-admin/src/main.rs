@@ -149,6 +149,65 @@ enum Cmd {
         #[arg(long, default_value = "mitos-build")]
         mitos_build: std::path::PathBuf,
     },
+
+    /// List rows from a module's emissions log. Default filter
+    /// is `queued,pending` — the actionable backlog. Pass
+    /// `--status all` to include `acked,nacked,timeout`.
+    Emissions {
+        /// Module id (e.g. `ownership`).
+        #[arg(long)]
+        module: String,
+
+        /// Comma-separated status filter:
+        /// `queued,pending,acked,nacked,timeout`. `all` skips
+        /// the filter.
+        #[arg(long, default_value = "queued,pending")]
+        status: String,
+
+        /// Filter to a specific companion (DO name).
+        #[arg(long)]
+        companion: Option<String>,
+
+        /// Cap response size. Default 50.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Cursor pagination — skip rows with id ≤ this.
+        #[arg(long)]
+        after_id: Option<u64>,
+
+        /// Emit raw JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replay a single emission row by id. Flips its status
+    /// back to `Queued` so the dialer redelivers on the next
+    /// poll cycle. Useful for retrying a `Nacked` or
+    /// `Timeout` row after fixing the cause.
+    EmissionsReplay {
+        #[arg(long)]
+        module: String,
+        /// Row id (from `emissions list`).
+        emission_id: u64,
+    },
+
+    /// Purge emissions matching a status filter. Refuses to
+    /// run without an explicit `--status` (no blast-radius
+    /// purges). Common usage: `--status acked` for compaction.
+    EmissionsPurge {
+        #[arg(long)]
+        module: String,
+
+        /// REQUIRED. Comma-separated status filter. `all` is
+        /// rejected — use specific statuses.
+        #[arg(long)]
+        status: String,
+
+        /// Optional companion filter.
+        #[arg(long)]
+        companion: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -192,6 +251,23 @@ async fn main() -> anyhow::Result<()> {
             workspace,
             mitos_build,
         } => cmd_deploy(&client, &cli, crate_name, module_id, workspace, mitos_build).await,
+        Cmd::Emissions {
+            module,
+            status,
+            companion,
+            limit,
+            after_id,
+            json,
+        } => cmd_emissions_list(&client, &cli, module, status, companion, limit, after_id, json).await,
+        Cmd::EmissionsReplay {
+            module,
+            emission_id,
+        } => cmd_emissions_replay(&client, &cli, module, emission_id).await,
+        Cmd::EmissionsPurge {
+            module,
+            status,
+            companion,
+        } => cmd_emissions_purge(&client, &cli, module, status, companion).await,
     }
 }
 
@@ -608,6 +684,157 @@ async fn cmd_deploy(
     let artifact = workspace.join("target").join("mitos").join(&resolved_id);
     println!(">>> upload-module --artifact {}", artifact.display());
     upload_artifact(client, cli, &artifact).await
+}
+
+// ---------------------------------------------------------------------
+// Emissions subcommands
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct EmissionsListResp {
+    rows: Vec<EmissionView>,
+    total: usize,
+    counts: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // chain_point only surfaces in --json output
+struct EmissionView {
+    id: u64,
+    matched_at: String,
+    sent_at: Option<String>,
+    chain_point: Value,
+    channel: String,
+    companion_id: String,
+    status: String,
+    status_at: String,
+    error: Option<String>,
+    payload_bytes: usize,
+}
+
+#[allow(clippy::too_many_arguments)] // CLI dispatch — fine for one shot
+async fn cmd_emissions_list(
+    client: &Client,
+    cli: &Cli,
+    module: String,
+    status: String,
+    companion: Option<String>,
+    limit: usize,
+    after_id: Option<u64>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let mut url = reqwest::Url::parse(&format!("{}/_admin/modules/{module}/emissions", cli.mitos))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("status", &status);
+        q.append_pair("limit", &limit.to_string());
+        if let Some(c) = &companion {
+            q.append_pair("companion_key", c);
+        }
+        if let Some(a) = after_id {
+            q.append_pair("after_id", &a.to_string());
+        }
+    }
+    let resp = auth(client.get(url), cli.token.as_deref())
+        .send()
+        .await?
+        .error_for_status()?;
+    if json_out {
+        let v: Value = resp.json().await?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let body: EmissionsListResp = resp.json().await?;
+    if body.rows.is_empty() {
+        println!("(no emissions match filter; total={})", body.total);
+    } else {
+        println!(
+            "{:<8}  {:<10}  {:<32}  {:<12}  {:<8}  MATCHED_AT",
+            "ID", "STATUS", "COMPANION", "CHANNEL", "BYTES"
+        );
+        for r in &body.rows {
+            let companion = if r.companion_id.len() > 32 {
+                format!("{}…", &r.companion_id[..30])
+            } else {
+                r.companion_id.clone()
+            };
+            println!(
+                "{:<8}  {:<10}  {:<32}  {:<12}  {:<8}  {}",
+                r.id, r.status, companion, r.channel, r.payload_bytes, r.matched_at
+            );
+            if let Some(err) = &r.error {
+                println!("           error: {err}");
+            }
+            if let Some(sent) = &r.sent_at {
+                println!("           sent_at: {sent} → status_at: {}", r.status_at);
+            }
+        }
+        println!();
+        println!(
+            "total: {} (showing {} via limit) — counts: {}",
+            body.total,
+            body.rows.len(),
+            body.counts
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_emissions_replay(
+    client: &Client,
+    cli: &Cli,
+    module: String,
+    emission_id: u64,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "{}/_admin/modules/{module}/emissions/{emission_id}/replay",
+        cli.mitos
+    );
+    let resp = auth(client.post(&url), cli.token.as_deref()).send().await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("not found: {text}");
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("replay failed: {status}: {text}");
+    }
+    let v: Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn cmd_emissions_purge(
+    client: &Client,
+    cli: &Cli,
+    module: String,
+    status: String,
+    companion: Option<String>,
+) -> anyhow::Result<()> {
+    let mut url = reqwest::Url::parse(&format!("{}/_admin/modules/{module}/emissions", cli.mitos))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("status", &status);
+        if let Some(c) = &companion {
+            q.append_pair("companion_key", c);
+        }
+    }
+    let resp = auth(client.delete(url), cli.token.as_deref())
+        .send()
+        .await?;
+    let s = resp.status();
+    if !s.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("purge failed: {s}: {text}");
+    }
+    let v: Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

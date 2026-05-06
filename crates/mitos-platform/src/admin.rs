@@ -134,6 +134,14 @@ fn admin_router_inner(
             get(get_module).post(upload_module).delete(delete_module),
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
+        .route(
+            "/_admin/modules/{id}/emissions",
+            get(list_emissions).delete(purge_emissions),
+        )
+        .route(
+            "/_admin/modules/{id}/emissions/{emission_id}/replay",
+            post(replay_emission),
+        )
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(auth, require_auth))
 }
@@ -390,6 +398,276 @@ async fn restart_module(
         .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
     tracing::info!(module = %id, "module restarted");
     Ok((StatusCode::OK, "restarted").into_response())
+}
+
+// -----------------------------------------------------------------------------
+// Emissions: list / replay / purge
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct EmissionsListQuery {
+    /// Filter by lifecycle status. Comma-separated; case-insensitive.
+    /// Default = "queued,pending" (the actionable rows). Use
+    /// "all" to skip the status filter.
+    #[serde(default)]
+    status: Option<String>,
+    /// Filter to a specific companion. Empty / missing = all.
+    #[serde(default)]
+    companion_key: Option<String>,
+    /// Cap the response size. Default 50.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip rows with id <= this (cursor pagination).
+    #[serde(default)]
+    after_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmissionView {
+    id: u64,
+    matched_at: String,
+    sent_at: Option<String>,
+    chain_point: mitos_protocol::ChainPoint,
+    channel: String,
+    companion_id: String,
+    status: &'static str,
+    status_at: String,
+    error: Option<String>,
+    payload_bytes: usize,
+}
+
+impl From<&crate::emissions::EmissionRecord> for EmissionView {
+    fn from(r: &crate::emissions::EmissionRecord) -> Self {
+        Self {
+            id: r.id,
+            matched_at: r.matched_at.clone(),
+            sent_at: r.sent_at.clone(),
+            chain_point: r.chain_point.clone(),
+            channel: r.channel.clone(),
+            companion_id: r.companion_id.clone(),
+            status: r.status.as_str(),
+            status_at: r.status_at.clone(),
+            error: r.error.clone(),
+            payload_bytes: r.payload.len(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EmissionsListResponse {
+    rows: Vec<EmissionView>,
+    /// Total rows matching the filter (before `limit`). Useful
+    /// for paginators that want to know how many remain.
+    total: usize,
+    /// Aggregate counts by status across the filter — handy for
+    /// operator triage. Lower-case keys: queued, pending, acked,
+    /// nacked, timeout.
+    counts: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmissionsPurgeResponse {
+    purged: usize,
+    matched_status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EmissionsReplayResponse {
+    replayed_id: u64,
+    previous_status: String,
+    new_status: &'static str,
+}
+
+/// Parse a comma-separated status filter into a set of
+/// `EmissionStatus`. `None`/empty defaults to actionable rows
+/// (queued + pending). `"all"` matches everything.
+fn parse_status_filter(s: Option<&str>) -> Option<Vec<crate::emissions::EmissionStatus>> {
+    use crate::emissions::EmissionStatus::*;
+    let s = s.unwrap_or("queued,pending").trim().to_ascii_lowercase();
+    if s.is_empty() || s == "all" {
+        return None;
+    }
+    let mut out = Vec::new();
+    for tok in s.split(',') {
+        match tok.trim() {
+            "queued" => out.push(Queued),
+            "pending" => out.push(Pending),
+            "acked" => out.push(Acked),
+            "nacked" => out.push(Nacked),
+            "timeout" => out.push(Timeout),
+            _ => {} // silently skip unknown tokens
+        }
+    }
+    Some(out)
+}
+
+async fn list_emissions(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<EmissionsListQuery>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let store = state
+        .storage
+        .emissions_store(&id)
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+
+    let status_filter = parse_status_filter(q.status.as_deref());
+    let companion_filter: Option<String> = q
+        .companion_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let limit = q.limit.unwrap_or(50);
+    let after_id = q.after_id.unwrap_or(0);
+
+    let all_matching = store
+        .list_filtered(|r| {
+            if r.id <= after_id {
+                return false;
+            }
+            if let Some(key) = &companion_filter
+                && &r.companion_id != key {
+                    return false;
+                }
+            if let Some(statuses) = &status_filter
+                && !statuses.contains(&r.status) {
+                    return false;
+                }
+            true
+        })
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+
+    // Aggregate-by-status across the FULL match set (before
+    // limit-truncation) so operators can see "10 acked, 3
+    // pending" even when only the first page is returned.
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for r in &all_matching {
+        *counts.entry(r.status.as_str().to_owned()).or_insert(0) += 1;
+    }
+
+    let total = all_matching.len();
+    let rows: Vec<EmissionView> = all_matching.iter().take(limit).map(EmissionView::from).collect();
+    Ok(Json(EmissionsListResponse {
+        rows,
+        total,
+        counts,
+    })
+    .into_response())
+}
+
+async fn purge_emissions(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<EmissionsListQuery>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let store = state
+        .storage
+        .emissions_store(&id)
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+
+    // Refuse to operate without an explicit status filter.
+    // Default ("queued,pending") is the actionable backlog —
+    // accidentally purging Pending rows would orphan in-flight
+    // deliveries. Operators must opt in to which statuses they
+    // mean to purge.
+    let raw = q
+        .status
+        .as_deref()
+        .ok_or_else(|| {
+            HandlerError::Storage(StorageError::Io(std::io::Error::other(
+                "purge requires explicit ?status=<list> (e.g. status=acked or status=nacked,timeout)",
+            )))
+        })?
+        .to_owned();
+    let status_filter = parse_status_filter(Some(&raw))
+        .ok_or_else(|| {
+            HandlerError::Storage(StorageError::Io(std::io::Error::other(
+                "purge requires a non-`all` status filter; reject blast-radius purges",
+            )))
+        })?;
+    let companion_filter: Option<String> = q
+        .companion_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+
+    let purged = store
+        .purge(|r| {
+            if let Some(key) = &companion_filter
+                && &r.companion_id != key {
+                    return false;
+                }
+            status_filter.contains(&r.status)
+        })
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+
+    tracing::info!(
+        module = %id,
+        purged,
+        status_filter = %raw,
+        companion = ?companion_filter,
+        "emissions purged"
+    );
+    Ok(Json(EmissionsPurgeResponse {
+        purged,
+        matched_status: raw,
+    })
+    .into_response())
+}
+
+async fn replay_emission(
+    State(state): State<AdminState>,
+    Path((id, emission_id)): Path<(String, u64)>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let store = state
+        .storage
+        .emissions_store(&id)
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+
+    let Some(record) = store
+        .get(emission_id)
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            format!("emission_id {emission_id} not found"),
+        )
+            .into_response());
+    };
+
+    let previous = record.status.as_str().to_owned();
+    let now = format!(
+        "unix:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    store
+        .update_status(emission_id, crate::emissions::EmissionStatus::Queued, &now, None)
+        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+
+    tracing::info!(
+        module = %id,
+        emission_id,
+        previous_status = %previous,
+        "emission replayed (status flipped to Queued)"
+    );
+    Ok(Json(EmissionsReplayResponse {
+        replayed_id: emission_id,
+        previous_status: previous,
+        new_status: "queued",
+    })
+    .into_response())
 }
 
 /// Independent wasmtime-side validation. Phase 1: confirm the

@@ -286,12 +286,43 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         Ok(())
     }
 
+    /// Look up a channel handler by tag.
+    ///
+    /// Tags come from `state.get_tags(ws)` set during WS upgrade
+    /// — see `handle_replicate_upgrade`. Naming layers below the
+    /// runtime don't always agree:
+    ///
+    /// - The legacy `IndexerHandle` path tags the WS with the
+    ///   indexer name (e.g. `"collection-ownership"`).
+    /// - The new emit-interception path stringifies the WIT u32
+    ///   channel id (e.g. `"0"`) — the host doesn't know the
+    ///   dApp's channel names, only their indices.
+    /// - The default upgrade route uses `DEFAULT_CHANNEL_TAG`
+    ///   (`"default"`).
+    ///
+    /// None of those match the dApp's `MitosChannel::NAME`
+    /// values directly. v1 fallback: when the tag isn't a
+    /// match, dispatch to the **first registered channel**.
+    /// That's correct for single-channel dApps + matches the
+    /// v1 emit-interception model where every event from
+    /// channel 0 goes through the primary channel handler.
+    /// Multi-channel routing where each channel gets only its
+    /// own events is a v2 problem (will require the wasm module
+    /// to declare its channel-name → u32 mapping at init time
+    /// so the host can tag the dial-back URL appropriately).
     fn lookup_channel(&self, name: &str) -> Result<&dyn MitosChannelDyn> {
-        self.channels
-            .iter()
-            .find(|c| c.name() == name)
-            .map(|c| c.as_ref())
-            .ok_or_else(|| CompanionError::UnknownChannel(name.to_string()))
+        if let Some(c) = self.channels.iter().find(|c| c.name() == name) {
+            return Ok(c.as_ref());
+        }
+        if let Some(first) = self.channels.first() {
+            tracing::debug!(
+                requested = %name,
+                fallback = %first.name(),
+                "channel tag did not match any registered channel; falling back to first",
+            );
+            return Ok(first.as_ref());
+        }
+        Err(CompanionError::UnknownChannel(name.to_string()))
     }
 
     // ========================================================================

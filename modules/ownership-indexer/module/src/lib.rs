@@ -1,20 +1,27 @@
-//! Ownership indexer — wasm-module port.
+//! Ownership indexer — host-side integration test fixture.
 //!
-//! Watches a configured set of policies; for each block,
-//! enumerates produced outputs and emits an `OwnershipChange::Transfer`
-//! event for every asset under a watched policy.
+//! **NOT the deployable ownership module.** That lives in
+//! `cnft.dev-workers/workers/collections-mitos/modules/ownership.{rs,toml}`
+//! and is built via the single-file flow (`mitos-build --module …`)
+//! + uploaded via `mitos-admin upload-module`. See this directory's
+//! `README.md` for context.
 //!
-//! Intentionally *behaviour-equivalent* with the host-side
-//! `crates/collection-ownership-indexer/` so platform v1 can
-//! be tested for observable equivalence: same emission for the
-//! same blocks. CIP-14 fingerprint computation is deferred
-//! host-side in v1 (the WIT exposes only address + lovelace +
-//! assets; fingerprints could be added with an ABI bump).
+//! This fixture exists so `mitos-platform`'s integration tests
+//! (`tests/{integration,admin,lifecycle,equivalence}.rs`) can
+//! drive the host through a real wasm component. Tests skip
+//! cleanly when the artifact isn't built; CI is opt-in.
 //!
-//! Watch-state model is simpler than the host-side version:
-//! v1 modules don't have a subscription system, so the watch
-//! set is *the* config — pinned at init from CBOR'd typed
-//! config.
+//! Behaviour: watches a configured set of policies; for each
+//! block, enumerates produced outputs and emits an
+//! `OwnershipChange::Transfer` event for every asset under a
+//! watched policy. Intentionally behaviour-equivalent with the
+//! deployable module + the legacy host-side
+//! `crates/collection-ownership-indexer/` so the test suite can
+//! pin observable equivalence across all three shapes.
+//!
+//! When the deployable module's behaviour changes meaningfully,
+//! mirror the change here so the host's integration tests stay
+//! representative.
 
 wit_bindgen::generate!({
     path: "../wit",
