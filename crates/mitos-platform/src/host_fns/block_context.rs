@@ -16,7 +16,7 @@
 use mitos_data_plane::DecodeLevel;
 use wasmtime::component::Resource;
 
-use crate::bindings::{HostResolvedBlock, TypedOutput};
+use crate::bindings::{HostResolvedBlock, TypedDatum, TypedOutput};
 use crate::host_fns::HostState;
 use crate::host_fns::chain_data::{from_dp_output, into_dp_ref_owned};
 use crate::resolved_block::{OutputRefKey, ResolvedBlock};
@@ -187,6 +187,79 @@ impl HostResolvedBlock for HostState {
             out.push(resolved);
         }
         Ok(out)
+    }
+
+    async fn get_output_datum(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        output_idx: u32,
+    ) -> wasmtime::Result<Option<TypedDatum>> {
+        // STUB — full data-plane datum-resolution wiring is the
+        // outstanding piece of WIT extension work tracked in
+        // `docs/design/WIT_DATUM_EXTENSION.md` ("What needs
+        // implementing host-side"). Today's `LocalDataPlane`
+        // hardcodes `datum: None` in `project_output()`; the full
+        // path needs (a) inline-datum extraction from the decoded
+        // output, (b) same-block witness-set resolution during
+        // block decode, (c) cross-block hash → bytes via Dolos's
+        // archive (`domain.query().plutus_data(&hash)`).
+        //
+        // Until that lands, the method is reachable but always
+        // returns `None`. Modules that call it (e.g. the planned
+        // `jpg-co` indexer in cnft.dev-workers) degrade gracefully
+        // — they emit zero events for blocks whose CO outputs
+        // need datum resolution. This is fine for an initial
+        // deployment because Phase 0 of the JPG CO design path
+        // doesn't depend on the module at all (cancel-by-May-23
+        // uses Maestro polling).
+        //
+        // Range-validate to surface bad indices loudly even
+        // though we'd return `None` either way; matches the
+        // existing `get_output` shape so guests get consistent
+        // error messages once the real wiring lands.
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let _ = tx.outputs.get(output_idx as usize).ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "output_idx {output_idx} out of range for tx {tx_idx}"
+            ))
+        })?;
+        Ok(None)
+    }
+
+    async fn get_consumed_input_datum(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        input_idx: u32,
+    ) -> wasmtime::Result<Option<TypedDatum>> {
+        // STUB — see `get_output_datum`. Same outstanding work,
+        // applied to consumed-input-side datum resolution. The
+        // existing `get_consumed_input` lookup path with its
+        // `consumed_input_cache` is the natural extension point
+        // (parallel `datum_cache: HashMap<OutputRefKey, Option<TypedDatum>>`
+        // on `ResolvedBlock`); the data-plane bump is the
+        // remaining lift.
+        //
+        // Index-validates for consistency with `get_consumed_input`.
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let _ = tx
+            .consumed_input_refs
+            .get(input_idx as usize)
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "input_idx {input_idx} out of range for tx {tx_idx}"
+                ))
+            })?;
+        Ok(None)
     }
 
     async fn drop(&mut self, rep: Resource<ResolvedBlock>) -> wasmtime::Result<()> {

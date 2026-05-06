@@ -20,10 +20,36 @@ interface types {
         name: list<u8>,
     }
 
+    /// Resolved datum. The host populates `payload` regardless of
+    /// whether the on-chain output carried the datum inline or as
+    /// a hash reference into the witness set / archive — modules
+    /// see only the bytes. This is the **caller-blind datum
+    /// resolution** principle from `MITOS_DATA_PLANE_API.md`:
+    /// inline-vs-hash is the plane's concern and never surfaces
+    /// in the guest API. Modules should never branch on a
+    /// "kind: inline | hash" discriminator — there isn't one,
+    /// deliberately.
+    ///
+    /// `hash` is always present (when a datum exists at all).
+    /// `payload` is the literal on-chain CBOR; modules decode
+    /// locally via `ciborium` / `pallas-codec`.
+    record typed-datum {
+        hash: list<u8>,
+        payload: list<u8>,
+    }
+
     /// Output projected through the data plane. Lean variant of
     /// `mitos_data_plane::TypedOutput` for crossing the WIT
     /// boundary cheaply; expand on demand if real workloads need
     /// more fields.
+    ///
+    /// **Datum bytes are accessed via separate methods on
+    /// `resolved-block`** (`get-output-datum`,
+    /// `get-consumed-input-datum`) rather than carried on this
+    /// record. Records are positionally-encoded in Canonical ABI
+    /// so adding a field is a major-bump-breaking change; resource
+    /// methods are additive. Indexers that need datum bytes call
+    /// the dedicated method; indexers that don't pay nothing.
     record typed-output {
         address: string,
         lovelace: u64,
@@ -38,6 +64,16 @@ interface types {
     /// How aggressively the host should pre-decode datums and
     /// scripts before handing the result to the module. Mirrors
     /// `mitos_data_plane::DecodeLevel`.
+    ///
+    /// This is the **single knob** for datum hydration: setting
+    /// `with-datum` triggers caller-blind resolution (host
+    /// fetches inline datums from the output, hash-attached
+    /// datums from the same-block witness set, cross-block
+    /// hashes from Dolos's archive). Modules never call a
+    /// separate `plutus-data-by-hash` host fn — that path is
+    /// deliberately not in this WIT, because it would re-leak
+    /// the inline-vs-hash distinction the data plane is
+    /// designed to seal.
     variant decode-level {
         lean,
         with-datum,
@@ -90,7 +126,7 @@ interface state-kv {
 /// by Rust's borrow checker on the bindgen-generated guest
 /// stubs).
 interface block-context {
-    use types.{output-ref, typed-output};
+    use types.{output-ref, typed-output, typed-datum};
 
     resource resolved-block {
         slot: func() -> u64;
@@ -120,6 +156,34 @@ interface block-context {
         /// indexers should prefer this over per-input calls.
         get-consumed-inputs: func(tx-idx: u32)
                              -> list<option<typed-output>>;
+
+        /// Resolve the datum on a produced output, regardless of
+        /// inline-vs-hash on-chain. Returns `none` if the output
+        /// has no datum at all. Per the caller-blind principle,
+        /// modules see bytes only — the host fetches inline data
+        /// from the output, hash-attached data from the same-
+        /// block witness set, or cross-block hashes from Dolos's
+        /// archive, all transparently.
+        ///
+        /// Costs:
+        /// - inline / same-block-witness: ~free (already decoded)
+        /// - cross-block archive hash: one redb read (~µs warm,
+        ///   ~ms cold). Negligible at typical block rates.
+        ///
+        /// Indexers that don't need datums (e.g. policy-scoped
+        /// ownership) never call this and pay zero resolution
+        /// cost — same shape as the consumed-input split above.
+        get-output-datum: func(tx-idx: u32, output-idx: u32)
+                          -> option<typed-datum>;
+
+        /// Same shape for consumed inputs. Resolves the prior
+        /// output's datum, regardless of whether the original
+        /// was inline or hash-attached. Useful for marketplace
+        /// indexers that need to decode the datum of a CO being
+        /// spent in order to emit a typed `Spent` event with
+        /// offerer pkh / collection target / etc.
+        get-consumed-input-datum: func(tx-idx: u32, input-idx: u32)
+                                  -> option<typed-datum>;
     }
 }
 

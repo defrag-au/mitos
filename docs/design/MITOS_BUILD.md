@@ -236,6 +236,25 @@ Module authors call these as if they were ordinary Rust functions;
 wit-bindgen handles the boundary marshalling. See
 `crates/mitos-platform/wit/world.wit` for the full surface.
 
+### Datum access — `decode-level` is the single knob
+
+Modules that need datum bytes ask for them by setting the dispatch
+decode-level to `with-datum` (or `full`) and calling
+`block_context::resolved_block::get_output_datum(tx_idx, output_idx)`
+or `get_consumed_input_datum(...)`. The host returns `option<typed_datum>`
+with the resolved CBOR bytes — **regardless of whether the on-chain
+output carried the datum inline or as a hash reference**. Modules
+must never branch on inline-vs-hash; that's the caller-blind
+resolution principle from `MITOS_DATA_PLANE_API.md`, and there's
+deliberately no `plutus_data_by_hash` host fn that would re-leak
+the distinction.
+
+Cost-wise: indexers that don't need datums (e.g. ownership-by-policy)
+should stay at `decode-level::lean` and never call the `*_datum`
+methods, paying zero datum-resolution cost. Indexers that do need
+them pay one archive lookup per cross-block hash datum (most blocks
+touch <50 datums of interest; lookup is sub-millisecond redb read).
+
 ### What the module must export
 
 The bundled WIT world `mitos:platform/mitos-module` requires five
