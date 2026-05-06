@@ -1,5 +1,27 @@
 //! Collection ownership indexer: per-policy NFT ownership tracking.
 //!
+//! ## Status: legacy. Slated for retirement.
+//!
+//! Behaviour-equivalent with the wasm-module port at
+//! `cnft.dev-workers/workers/collections-mitos/modules/ownership.rs`.
+//! Both produce `OwnershipChange::Transfer` events for the same
+//! blocks; the wasm module ships through `mitos-platform`'s
+//! companion-runtime path (single-file build via `mitos-build`,
+//! upload via `mitos-admin upload-module`); this static crate
+//! ships compiled into the host binary and feeds the legacy
+//! `mitos-core::Replicator` outbound subscription model.
+//!
+//! Production cutover plan: once the legacy
+//! `cnft.dev-workers/workers/collection-ownership/` consumer
+//! migrates onto `collections-mitos`'s companion-runtime path,
+//! the two `replicator.connected` legacy subscriptions go away
+//! and this crate (along with `mitos-core::Replicator`,
+//! `IndexerHandle`, `run_subscriber`) becomes deletable.
+//! Until then, leaving in place — production ownership data
+//! flows through here.
+//!
+//! ## Original docs:
+//!
 //! This is the first migration target for the CF replication
 //! prototype, mirroring `cnft.dev-workers/workers/collection-ownership/`.
 //! See `docs/design/CF_REPLICATION.md` Phase 4.5 for the build order.

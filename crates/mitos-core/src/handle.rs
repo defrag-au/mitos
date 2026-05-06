@@ -413,8 +413,13 @@ where
                                 warn!(error = %e, "inbound Interest handler failed");
                             }
                         } else {
-                            tracing::debug!(
-                                "Interest frame received but no inbound_handler wired; ignoring"
+                            // Legacy Replicator lane never wires
+                            // an inbound_handler; the new
+                            // companion-runtime path goes through
+                            // `mitos_platform::dialer` which has
+                            // its own handler. Trace, not debug.
+                            tracing::trace!(
+                                "legacy lane: Interest frame received with no handler; ignoring"
                             );
                         }
                     }
@@ -430,7 +435,13 @@ where
                                 warn!(error = %e, "inbound Nack handler failed");
                             }
                         } else {
-                            tracing::warn!(
+                            // Same legacy-lane case as Interest;
+                            // demote to trace so the deploy log
+                            // stays clean. Genuine unrouted Nacks
+                            // still surface at trace + the row
+                            // staying Pending in the EmissionsStore
+                            // is the durable signal.
+                            tracing::trace!(
                                 emission_id, error = %error,
                                 "Nack received but no inbound_handler wired",
                             );

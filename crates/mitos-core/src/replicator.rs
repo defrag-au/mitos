@@ -1,5 +1,33 @@
 //! `Replicator`: outbound WebSocket client driver.
 //!
+//! ## Status: legacy. Slated for retirement.
+//!
+//! This is the pre-companion-runtime outbound model: each
+//! `Subscription` ties a static `IndexerHandle` (compiled into
+//! the host binary, e.g. `collection-ownership-indexer`) to a
+//! single dialed Worker URL. The companion-runtime model
+//! (`mitos-platform::dialer::CompanionDialer`) replaces this
+//! with a wasm-module-driven path where each registered
+//! companion gets its own dial loop, emissions go through the
+//! per-module `EmissionsStore`, and the operator surface
+//! (`mitos-admin emissions list/replay/purge`) makes the
+//! delivery state inspectable.
+//!
+//! Production cutover: when the legacy
+//! `cnft.dev-workers/workers/collection-ownership/` consumer
+//! migrates onto `collections-mitos`'s companion-runtime path,
+//! the two `replicator.connected` legacy subscriptions go
+//! away and this file + the static `IndexerHandle` machinery
+//! (`crate::handle::IndexerHandle`, `run_subscriber`,
+//! `replicate_router`, `crates/collection-ownership-indexer/`,
+//! `crates/jpg-co-indexer/`, `crates/marketplace-indexer/`)
+//! become deletable as a single cleanup PR.
+//!
+//! Until then, leaving in place — production ownership data
+//! flows through this `Replicator`.
+//!
+//! ## Original docs:
+//!
 //! Production replication is mitos-as-WS-client → CF-DO-as-WS-server,
 //! because only inbound-accepted sockets get DO Hibernation. See
 //! `docs/design/CF_REPLICATION.md` § Connection direction.
