@@ -98,8 +98,79 @@ The framework version of this is **the same architecture, packaged**:
 
 ## What "packaged" means concretely
 
-A dApp builder runs `cargo cardano init my-app` and gets a
-workspace:
+> **Note on this section.** Two layouts coexist in this doc:
+> the **steady-state vision** below the next subheading
+> (a future `cargo cardano init`-generated workspace), and
+> the **current convention** that ships in production today
+> (single-file modules under a CF Worker's `modules/`
+> directory, materialised by `mitos-build`). New modules
+> should follow the current convention; the steady-state
+> vision is forward-looking.
+>
+> For the today-shape: see `docs/HOWTO_FIRST_MODULE.md`
+> (walkthrough), `docs/design/MITOS_BUILD.md` (build tool
+> contract), and `cnft.dev-workers/workers/collections-mitos/`
+> (reference implementation).
+
+### Current convention (today's tooling)
+
+A dApp builder adds two things to an existing CF Worker
+monorepo: a `modules/<feature>.rs` next to their worker, and a
+shared types crate under `types/<feature>-events/`. There is
+**no module Cargo.toml** — `mitos-build` synthesises one from
+the bundled host WIT and a paired `<feature>.toml` whose
+`[deps]` table lists the user-declared dependencies.
+
+```
+your-worker-monorepo/
+├── workers/
+│   └── <my-worker>/
+│       ├── Cargo.toml            # CF Worker DO — depends on
+│       │                         #   mitos-companion, mitos-protocol,
+│       │                         #   <feature>-events
+│       ├── wrangler.toml
+│       ├── src/                  # DurableObject impl, RPC handlers
+│       └── modules/
+│           ├── <feature>.rs      # the wasm indexer module — single file
+│           └── <feature>.toml    # runtime config + build-time [deps]
+└── types/
+    └── <feature>-events/         # shared event-shape crate
+        └── src/lib.rs            # types both halves deserialise
+```
+
+Build + deploy is a two-step manual flow today:
+
+```bash
+# Build the module artifact (wasm + manifest + config.cbor):
+mitos-build --module workers/<my-worker>/modules/<feature>.rs
+
+# Upload to a running mitos host:
+mitos-admin upload-module \
+    --artifact workers/<my-worker>/modules/target/mitos/<feature>
+
+# Deploy the CF DO half (standard wrangler):
+cd workers/<my-worker> && wrangler deploy
+
+# Tell mitos to dial the companion's replication endpoint:
+mitos-admin add --indexer <feature> \
+    --target wss://<my-worker>.workers.dev/<feature>/replicate
+```
+
+Module updates replace the running instance on the mitos host;
+the chain-point cursor and module-private `state-kv` persist
+across replacement. Companion updates roll out via standard
+`wrangler deploy`.
+
+The companion-runtime SDK (`mitos-companion` crate) absorbs the
+WS lifecycle, cursor persistence, `/api/_interest/*` endpoints,
+and Apply/Undo/Mark dispatch. The dApp builder implements
+`MitosCompanion` (top-level companion declaration) and one or
+more `MitosChannel` traits (per-channel `apply_event` handlers).
+
+### Steady-state vision (future `cargo cardano` shape)
+
+Once `cargo cardano init` ships, the dApp builder runs that
+once and gets a self-contained workspace:
 
 ```
 my-app/
@@ -139,12 +210,22 @@ my-app/
 3. WS connection between them
 4. Optional Rust-wasm frontend hot-reloading on top
 
-Critically: **changing the indexer doesn't redeploy mitos.**
-The wasm module gets uploaded to the running mitos host, hot-
-loaded, and starts emitting. Same lifecycle as `wrangler
-deploy` already gives us for the companion side. Both halves
-deploy independently of the mitos *host*, but together as a
-unit relative to each other.
+Differences from the current convention:
+- Self-contained workspace (vs. modules co-resident with an
+  existing worker monorepo).
+- A separate `indexer/` crate with its own Cargo.toml (vs.
+  single-file modules with `mitos-build` synthesising the crate).
+- A single `cargo cardano deploy` orchestrating both halves +
+  subscription registration (vs. the manual `mitos-build` →
+  `mitos-admin upload-module` → `wrangler deploy` →
+  `mitos-admin add` sequence).
+
+Critically — and true under both shapes: **changing the indexer
+doesn't redeploy mitos.** The wasm module gets uploaded to the
+running mitos host, the running instance is replaced (cursor +
+state-kv persist), and dispatch resumes. Both halves deploy
+independently of the mitos *host*, but together as a unit
+relative to each other.
 
 ## What's distinct about the companion pattern
 

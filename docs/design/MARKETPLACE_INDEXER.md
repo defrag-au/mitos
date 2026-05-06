@@ -1,5 +1,25 @@
 # Marketplace indexer
 
+> **Scope: this doc describes the legacy in-tree static-crate
+> shape** at `crates/marketplace-indexer/`, including the
+> per-policy CF fan-out topology, the SQL schema, and the HTTP
+> routes the consumer worker would expose. The crate has the
+> decode logic but is currently flagged "legacy, slated for
+> retirement, no live subscribers" (`crates/marketplace-indexer/src/lib.rs`).
+>
+> **For new marketplace-event consumers**, the canonical shape
+> is a companion-module pair in the consumer's repo — see
+> `../strategy/MITOS_COMPANION_PATTERN.md`, `../HOWTO_FIRST_MODULE.md`,
+> and `MITOS_BUILD.md`. The decode logic in this doc is portable
+> (event taxonomy, datum shapes, brand resolution); the
+> deployment topology (per-policy router DO, mounted HTTP routes
+> on the bundle) is the legacy shape.
+>
+> The schema, routes, and fan-out diagrams below are recorded as
+> a transitional spec — useful when porting the decode logic
+> into a wasm module + companion DO pair, less useful as a
+> blueprint for "where does this code live."
+
 A second indexer for mitos that ports the existing classifier's
 decode logic (sales, listings, offers, collection offers) into the
 chain-projection model.

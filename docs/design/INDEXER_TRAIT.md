@@ -1,5 +1,29 @@
 # Indexer trait contract
 
+> **Scope: this doc covers the in-process Rust trait used by
+> indexers compiled directly into a mitos bundle binary** (the
+> "static-crate-in-mitos-tree" shape — `crates/collection-ownership-indexer`
+> and `crates/marketplace-indexer` are the live examples). It
+> **does not** describe the wasm-module shape that's now the
+> canonical home for new indexers; that surface is the WIT
+> contract at `crates/mitos-platform/wit/world.wit` consumed via
+> `wit_bindgen::generate!` and built with `mitos-build`.
+>
+> **For new indexers**, follow the wasm-module shape — see
+> `../strategy/MITOS_COMPANION_PATTERN.md`, `../HOWTO_FIRST_MODULE.md`,
+> and `MITOS_BUILD.md`. The two shapes share concepts
+> (idempotent dispatch, bootstrap, Apply/Undo/Mark, scope-as-Interest)
+> but differ in surface — wasm modules export `init` /
+> `handle-event` / `update-interest` over WIT instead of
+> implementing this Rust trait, and they emit events to the host
+> via `emit::emit-event(channel, cbor)` rather than mounting
+> their own HTTP routes (the companion DO owns the RPC surface).
+>
+> The worked examples below (`JpgCoIndexer`, mounted-routes,
+> `Indexer::new(config)` constructors) are illustrative of the
+> static-crate shape; reach for the wasm-module / companion shape
+> first.
+
 The `Indexer` trait is the entire framework-side surface an indexer module
 must implement. This doc is the contract: what's expected, what's
 guaranteed, what's optional.
