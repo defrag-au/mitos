@@ -135,6 +135,11 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
     ) -> mitos_data_plane::DataPlaneResult<
         Vec<(mitos_data_plane::OutputRef, mitos_data_plane::TypedOutput)>,
     >;
+
+    async fn utxos_by_address(
+        &self,
+        address: &str,
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -154,6 +159,13 @@ where
         Vec<(mitos_data_plane::OutputRef, mitos_data_plane::TypedOutput)>,
     > {
         mitos_data_plane::ChainDataPlane::read_utxos(self, refs, decode).await
+    }
+
+    async fn utxos_by_address(
+        &self,
+        address: &str,
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        mitos_data_plane::ChainDataPlane::utxos_by_address(self, address).await
     }
 }
 
@@ -190,5 +202,13 @@ where
     > {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         mitos_data_plane::ChainDataPlane::read_utxos(&plane, refs, decode).await
+    }
+
+    async fn utxos_by_address(
+        &self,
+        address: &str,
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::utxos_by_address(&plane, address).await
     }
 }

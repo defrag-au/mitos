@@ -64,6 +64,13 @@ impl DataPlaneFacade for NullDataPlane {
     > {
         Ok(Vec::new())
     }
+
+    async fn utxos_by_address(
+        &self,
+        _address: &str,
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Load a wasm component, instantiate against the platform's

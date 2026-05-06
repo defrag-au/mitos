@@ -35,6 +35,27 @@ impl ChainDataHost for HostState {
             .map(|(_, out)| from_dp_output(out))
             .collect())
     }
+
+    async fn utxos_by_address(
+        &mut self,
+        address: String,
+    ) -> wasmtime::Result<Vec<WitOutputRef>> {
+        let refs = self
+            .data_plane
+            .utxos_by_address(&address)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+}
+
+/// data-plane `OutputRef` → WIT `output-ref`. Inverse of
+/// `into_dp_ref_owned`.
+fn from_dp_ref(r: mitos_data_plane::OutputRef) -> WitOutputRef {
+    WitOutputRef {
+        tx_hash: r.tx_hash.as_ref().to_vec(),
+        index: r.index,
+    }
 }
 
 /// WIT `output-ref` → data-plane `OutputRef`. Fails if `tx_hash`

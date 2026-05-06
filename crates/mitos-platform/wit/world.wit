@@ -107,6 +107,23 @@ interface chain-data {
     /// the boundary cost; modules should batch where possible.
     read-utxos: func(refs: list<output-ref>, decode: decode-level)
                 -> list<typed-output>;
+
+    /// Enumerate the current unspent set at one Cardano address.
+    /// Returns the output refs only — modules pair this with
+    /// `read-utxos` when they want full outputs + datums.
+    ///
+    /// Bootstrap primitive for indexers that watch a script
+    /// address (marketplaces, DEXes, oracles). Backed by Dolos's
+    /// per-address secondary index — fast, no chain replay.
+    /// `address` is bech32 (`addr1...` / `addr_test1...`); the
+    /// host bech32-decodes once per call.
+    ///
+    /// Order is unspecified. Result is hard-capped at 100K refs
+    /// to bound host-side memory; addresses with more UTxOs are
+    /// expected to use the predicate-based `search-utxos` flow
+    /// (Phase B+) once it lands. Today's marketplace contracts
+    /// hold thousands, not hundreds of thousands.
+    utxos-by-address: func(address: string) -> list<output-ref>;
 }
 
 /// Module-private KV state. Backed by a per-module redb table

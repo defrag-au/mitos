@@ -259,6 +259,42 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         })
     }
 
+    async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>> {
+        use dolos_cardano::indexes::CardanoIndexExt;
+
+        // Bech32 → raw address bytes. Dolos's per-address index
+        // is keyed on the binary address, not the bech32 string.
+        // `pallas_addresses::Address::from_bech32` handles both
+        // mainnet (`addr1...`) and testnet (`addr_test1...`)
+        // forms, plus Byron (`Ae2.../DdzFF...`) which round-trip
+        // through `to_vec()` to their canonical encoding too.
+        let addr = pallas_addresses::Address::from_bech32(address).map_err(|e| {
+            DataPlaneError::InvalidRequest(format!("address not bech32: {e:?}"))
+        })?;
+        let addr_bytes = addr.to_vec();
+
+        let utxo_set = self
+            .domain
+            .indexes()
+            .utxos_by_address(&addr_bytes)
+            .map_err(|e| DataPlaneError::Storage(format!("utxos_by_address: {e:?}")))?;
+
+        // Cap at 100K refs to bound host-side memory; addresses
+        // with more UTxOs warrant the predicate-based
+        // `search_utxos` flow with proper pagination (Phase B+).
+        const HARD_CAP: usize = 100_000;
+        let total: Vec<TxoRef> = utxo_set.into_iter().collect();
+        if total.len() > HARD_CAP {
+            tracing::warn!(
+                address = %address,
+                returned = HARD_CAP,
+                total = total.len(),
+                "utxos_by_address result truncated at hard cap"
+            );
+        }
+        Ok(total.into_iter().take(HARD_CAP).map(OutputRef::from).collect())
+    }
+
     async fn read_datum(
         &self,
         _hash: &pallas_primitives::Hash<32>,

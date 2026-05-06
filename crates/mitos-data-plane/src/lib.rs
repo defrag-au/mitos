@@ -89,6 +89,22 @@ pub trait ChainDataPlane: Send + Sync {
         page: PageRequest,
     ) -> DataPlaneResult<Page<(OutputRef, TypedOutput)>>;
 
+    /// Bootstrap helper: enumerate output refs at one address.
+    /// Refs only — callers pair with `read_utxos` when they want
+    /// full outputs.
+    ///
+    /// Convenience wrapper over `search_utxos` for the common
+    /// indexer-bootstrap pattern ("give me everything currently
+    /// unspent at this script address"). Calling
+    /// `search_utxos(Match(at_address(...)))` would work
+    /// equivalently but pays construction overhead and pagination
+    /// machinery for a use case that wants the full list in one
+    /// shot.
+    ///
+    /// `address` is bech32 (`addr1...` / `addr_test1...`).
+    /// Result is hard-capped at 100K refs.
+    async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>>;
+
     /// Resolve a datum hash to its Plutus payload. Side-door for
     /// callers that have a hash but not the containing UTxO
     /// context (rare — most callers should use `read_utxo` with

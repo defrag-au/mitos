@@ -56,6 +56,13 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Vec<(OutputRef, TypedOutput)>> {
         Ok(Vec::new())
     }
+
+    async fn utxos_by_address(
+        &self,
+        _address: &str,
+    ) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(Vec::new())
+    }
 }
 
 fn spike_guest_wasm() -> Option<PathBuf> {
