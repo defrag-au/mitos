@@ -55,6 +55,44 @@ pub trait ModuleHostHandle: Send + Sync {
     async fn list_running(&self) -> Vec<String>;
 }
 
+/// One dynamic-interest update queued for delivery to a
+/// running module's `update-interest` export. Pushed by the
+/// dialer when a `ClientMessage::Interest` frame arrives over
+/// the companion's WS; drained by the per-module follower
+/// task and passed through `Driver::update_interest`.
+#[derive(Debug)]
+pub struct InterestUpdate {
+    pub op: mitos_protocol::InterestOp,
+    pub items: Vec<mitos_protocol::Interest>,
+}
+
+/// Routes inbound `Interest` frames to the right running
+/// module's follower task. Only the follower task can call
+/// the wasmtime instance's exports (the wasmtime Store isn't
+/// safely shareable across tasks), so the dialer can't invoke
+/// `update-interest` directly — it pushes through this trait
+/// and the follower drains.
+///
+/// `ModuleHost<S>` implements this trait; `bundle.rs` hands
+/// the dialer an `Arc<dyn InterestRouter>` cloned off the host.
+#[async_trait::async_trait]
+pub trait InterestRouter: Send + Sync {
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InterestRouteError {
+    #[error("module `{0}` is not running; interest update dropped")]
+    NotRunning(String),
+    #[error("module `{0}` follower channel closed; interest update dropped")]
+    ChannelClosed(String),
+}
+
 #[async_trait::async_trait]
 impl<S> ModuleHostHandle for ModuleHost<S>
 where
@@ -71,6 +109,32 @@ where
     }
     async fn list_running(&self) -> Vec<String> {
         ModuleHost::list(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> InterestRouter for ModuleHost<S>
+where
+    S: TipSubscription + 'static,
+{
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError> {
+        let sender = {
+            let senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.get(module_id).cloned()
+        };
+        let sender = sender.ok_or_else(|| InterestRouteError::NotRunning(module_id.to_owned()))?;
+        sender
+            .send(InterestUpdate { op, items })
+            .map_err(|_| InterestRouteError::ChannelClosed(module_id.to_owned()))?;
+        Ok(())
     }
 }
 
@@ -111,10 +175,12 @@ struct RunningSlot {
     sha: String,
     task: JoinHandle<PlatformResult<()>>,
     cancel: CancellationToken,
-    /// Receiver end of the emitter pair. Stashed here so a
-    /// caller (or a test) can drain emissions; future bundle
-    /// integration will move this into the replication path.
-    pub events: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+    /// Drain task that pulls from the module's `events_rx`
+    /// mpsc and appends one `Queued` row per registered
+    /// companion to the per-module `EmissionsStore`. Owned
+    /// alongside the follower task so `stop()` can cancel
+    /// both in lockstep.
+    drain_task: JoinHandle<()>,
 }
 
 /// Running-module lifecycle manager.
@@ -137,6 +203,16 @@ where
     emitter_factory: EmitterFactory,
     budget: ResourceBudget,
     slots: Arc<Mutex<HashMap<String, RunningSlot>>>,
+    /// Per-module senders for the dynamic-interest control
+    /// channel. Populated on `start`; drained + removed on
+    /// `stop`. The matching receiver lives inside the per-
+    /// module follower task.
+    ///
+    /// Held in a `std::sync::Mutex` (not `tokio::sync::Mutex`)
+    /// because every access is a quick map insert/remove/get
+    /// — we never hold the guard across an `.await`.
+    interest_senders:
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>>,
 }
 
 impl<S> ModuleHost<S>
@@ -161,6 +237,7 @@ where
             emitter_factory,
             budget,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -235,6 +312,22 @@ where
         let emitter_factory_inner = self.emitter_factory.clone();
         let id_for_task = id.to_owned();
         let id_for_log = id.to_owned();
+
+        // Dynamic-interest control channel. Sender is owned
+        // by `interest_senders` (cloned for the dialer via
+        // `InterestRouter::route_interest`); receiver moves
+        // into the follower task and is multiplexed with tip
+        // events via `tokio::select!`.
+        let (interest_tx, interest_rx) =
+            tokio::sync::mpsc::unbounded_channel::<InterestUpdate>();
+        {
+            let mut senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.insert(id.to_owned(), interest_tx);
+        }
+
         let task = tokio::spawn(async move {
             // Build a registry handle that the follower can use
             // to re-instantiate on RestartAndReplay outcomes.
@@ -255,6 +348,7 @@ where
                 r = run_chain_follower(
                     driver,
                     subscription,
+                    interest_rx,
                     &registry,
                     data_plane,
                     kv_factory_for_run,
@@ -281,6 +375,19 @@ where
             result
         });
 
+        // Drain task: pull EmittedEvents off events_rx, look
+        // up registered companions for this module, and append
+        // one `Queued` row per companion to the EmissionsStore.
+        // The dial loop polls EmissionsStore for queued rows
+        // and converts each to a `ServerMessage::Apply` over the
+        // outbound WS — see `dialer::run_companion`.
+        let drain_storage = self.storage.clone();
+        let drain_module_id = id.to_owned();
+        let drain_cancel = cancel.clone();
+        let drain_task = tokio::spawn(async move {
+            run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel).await;
+        });
+
         let mut slots = self.slots.lock().await;
         slots.insert(
             id.to_owned(),
@@ -288,7 +395,7 @@ where
                 sha: manifest.module.sha256,
                 task,
                 cancel,
-                events: events_rx,
+                drain_task,
             },
         );
         tracing::info!(module = %id, "follower started");
@@ -306,6 +413,16 @@ where
     /// Stop the running follower for `id`, if any. No-op when
     /// `id` isn't running. Awaits the task to confirm cleanup.
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
+        // Drop the interest sender first so the follower's
+        // `tokio::select!` sees a `None` on `interest_rx.recv()`
+        // alongside cancellation (clean exit, no panic).
+        {
+            let mut senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.remove(id);
+        }
         let mut slots = self.slots.lock().await;
         if let Some(slot) = slots.remove(id) {
             slot.cancel.cancel();
@@ -323,12 +440,23 @@ where
                     tracing::warn!(module = %id, error = %join_err, "follower task panicked")
                 }
             }
-            // Drop the cached cursor-store handle so the next
-            // start re-opens redb cleanly. Without this, a
-            // crash during the just-stopped task could leave a
-            // half-committed transaction visible to the new
-            // task via the cached handle.
+            // Drain task shares the cancel token with the
+            // follower, so cancelling above also signals it.
+            // Await to ensure any in-flight EmissionsStore
+            // append commits before stop returns.
+            if let Err(join_err) = slot.drain_task.await
+                && !join_err.is_cancelled() {
+                    tracing::warn!(module = %id, error = %join_err, "emit drain task panicked")
+                }
+            // Drop the cached redb store handles (cursor,
+            // emissions, KV) so the next start re-opens redb
+            // cleanly. Without this, a crash during the
+            // just-stopped task could leave a half-committed
+            // transaction visible to the new task via the
+            // cached handle.
             self.storage.close_cursor(id);
+            self.storage.close_emissions(id);
+            self.storage.close_kv(id);
             tracing::info!(module = %id, sha = %slot.sha, "follower stopped");
         }
         Ok(())
@@ -357,25 +485,103 @@ where
         }
     }
 
-    /// Take the events receiver off a running slot. Used by
-    /// tests or callers that want to drain emissions out-of-band;
-    /// production wiring would pass the receiver into the
-    /// replication WS at start time instead.
-    pub async fn take_events(
-        &self,
-        id: &str,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>> {
-        let mut slots = self.slots.lock().await;
-        slots.get_mut(id).map(|slot| {
-            // Replace with a closed channel so subsequent emits
-            // don't panic (the host fn returns an error if the
-            // sender is closed; the dispatch loop catches that
-            // as a trap, which is loud — not ideal for v1.5 but
-            // tests should call `take_events` AFTER they've
-            // drained what they need, then `stop`).
-            let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
-            drop(closed_tx);
-            std::mem::replace(&mut slot.events, closed_rx)
-        })
+}
+
+/// Per-module drain task: pulls EmittedEvents off `events_rx`
+/// and writes one `Queued` row per registered companion to the
+/// per-module `EmissionsStore`. Each companion gets its own row
+/// so the dial loop can drain per-companion in id order.
+///
+/// Companions are discovered by listing
+/// `<storage>/<module_id>/companions/*.cbor` on every event —
+/// inefficient but trivially correct in the face of
+/// register/unregister churn. v2 caches the companion list
+/// behind a registered-companions broadcast.
+async fn run_emit_drain(
+    storage: ModuleStorage,
+    module_id: String,
+    mut events_rx: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+    cancel: CancellationToken,
+) {
+    let store = match storage.emissions_store(&module_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                module = %module_id,
+                error = %e,
+                "open EmissionsStore for drain failed; emit interception disabled for this module"
+            );
+            return;
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            event = events_rx.recv() => {
+                let Some(event) = event else { return };
+                drain_one(&storage, &store, &module_id, event);
+            }
+        }
+    }
+}
+
+fn drain_one(
+    storage: &ModuleStorage,
+    store: &crate::emissions::EmissionsStore,
+    module_id: &str,
+    event: emit::EmittedEvent,
+) {
+    use crate::emissions::EmissionStatus;
+    let companions_dir = storage.module_dir_for_companions(module_id);
+    if !companions_dir.exists() {
+        return; // no registered companions
+    }
+    let read = match std::fs::read_dir(&companions_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                module = %module_id,
+                dir = %companions_dir.display(),
+                error = %e,
+                "read companions dir failed; emission dropped"
+            );
+            return;
+        }
+    };
+    let now = format!(
+        "unix:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    // Channel as a string — the WIT ABI uses u32; companion-side
+    // dispatch is by string tag. v1 stringifies; v2 will plumb
+    // the name through manifest metadata.
+    let channel = event.channel.to_string();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+            continue;
+        }
+        let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Err(e) = store.append(
+            &companion_key,
+            &channel,
+            event.chain_point.clone(),
+            event.payload.clone(),
+            EmissionStatus::Queued,
+            &now,
+        ) {
+            tracing::warn!(
+                module = %module_id,
+                companion_key = %companion_key,
+                error = %e,
+                "append emission row failed"
+            );
+        }
     }
 }

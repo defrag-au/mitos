@@ -42,22 +42,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 
-use mitos_protocol::{SubscribeRequest, SubscribeResponse};
+use mitos_protocol::{SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse};
 
 use crate::admin::AuthToken;
+use crate::dialer::CompanionDialer;
 use crate::storage::ModuleStorage;
 
 /// Build the companion-registration router with the same auth shape
 /// as the admin router. Returns the axum `Router`; the host wires it
 /// into the top-level service alongside `admin_router`.
-pub fn companion_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
+///
+/// `dialer` is optional so unit tests can exercise the persistence
+/// surface without spinning up the dial supervisor. Production
+/// callers always pass `Some(...)`.
+pub fn companion_router(
+    storage: ModuleStorage,
+    auth: AuthToken,
+    dialer: Option<CompanionDialer>,
+) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
+        dialer,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -68,6 +79,7 @@ pub fn companion_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router
 #[derive(Clone)]
 struct CompanionState {
     storage: Arc<ModuleStorage>,
+    dialer: Option<CompanionDialer>,
 }
 
 // Local re-implementation of the admin auth middleware so the
@@ -149,9 +161,9 @@ impl IntoResponse for SubscribeError {
 async fn subscribe_handler(
     State(state): State<CompanionState>,
     body: axum::body::Bytes,
-) -> std::result::Result<Json<SubscribeResponse>, SubscribeError> {
-    let request: SubscribeRequest =
-        ciborium::de::from_reader(&body[..]).map_err(|e| SubscribeError::Decode(e.to_string()))?;
+) -> std::result::Result<Response, SubscribeError> {
+    let request = SubscribeRequest::decode(&body[..])
+        .map_err(|e| SubscribeError::Decode(e.to_string()))?;
 
     validate_module_id(&request.module_name)?;
     validate_companion_key(&request.companion_key)?;
@@ -171,9 +183,9 @@ async fn subscribe_handler(
     std::fs::create_dir_all(&companions_dir).map_err(|e| SubscribeError::Io(e.to_string()))?;
 
     let path = companions_dir.join(format!("{}.cbor", request.companion_key));
-    let mut buf = Vec::with_capacity(256);
-    ciborium::ser::into_writer(&request, &mut buf)
-        .map_err(|e| SubscribeError::Io(format!("encode: {e}")))?;
+    let buf = request
+        .encode()
+        .map_err(|e| SubscribeError::Io(format!("encode persisted registration: {e}")))?;
     write_atomic(&path, &buf).map_err(|e| SubscribeError::Io(e.to_string()))?;
 
     tracing::info!(
@@ -183,6 +195,13 @@ async fn subscribe_handler(
         "companion registered"
     );
 
+    // Hand the registration to the dial supervisor so it can
+    // start (or restart, for re-subscribes) the outbound WS
+    // dial loop. Dialer absent only in unit tests.
+    if let Some(dialer) = &state.dialer {
+        dialer.register(request.clone()).await;
+    }
+
     // PR 3: return the host's actual next emission_id from the
     // module_emissions log. Companions use this as a sync point
     // — any emission_id at or below `peek_next_id - 1` is
@@ -190,9 +209,7 @@ async fn subscribe_handler(
     // session. Open-then-peek so we don't need a long-lived
     // EmissionsStore in the router state (the actual append
     // path goes through the host's emit-interception loop).
-    let next_emission_id = match crate::emissions::EmissionsStore::open(
-        state.storage.emissions_path(&request.module_name),
-    ) {
+    let next_emission_id = match state.storage.emissions_store(&request.module_name) {
         Ok(store) => store.peek_next_id().unwrap_or(1),
         Err(e) => {
             tracing::warn!(
@@ -203,10 +220,18 @@ async fn subscribe_handler(
             1
         }
     };
-    Ok(Json(SubscribeResponse {
+    let response = SubscribeResponse {
         status: "subscribed".to_string(),
         next_emission_id,
-    }))
+    };
+    let body = response
+        .encode()
+        .map_err(|e| SubscribeError::Io(format!("encode subscribe response: {e}")))?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, SUBSCRIBE_MIME)
+        .body(Body::from(body))
+        .expect("response builder"))
 }
 
 fn companions_dir_for(storage: &ModuleStorage, module_id: &str) -> PathBuf {
@@ -263,7 +288,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
-        companion_router(storage, AuthToken(None))
+        companion_router(storage, AuthToken(None), None)
     }
 
     fn cbor(req: &SubscribeRequest) -> Vec<u8> {

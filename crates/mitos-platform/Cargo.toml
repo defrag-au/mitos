@@ -61,12 +61,15 @@ redb = { workspace = true }
 # Async runtime. Module dispatch + host I/O run on Tokio.
 tokio = { workspace = true }
 tokio-util = "0.7"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
 async-trait = { workspace = true }
+futures-util = "0.3"
 
 # Admin HTTP surface — `/_admin/modules/*` lives here. Same axum
 # version the rest of the workspace uses (see workspace deps in
 # the root Cargo.toml).
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "query"] }
 tower = { workspace = true }
 
 # Serialisation for module config (CBOR'd typed config from

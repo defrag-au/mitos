@@ -2825,24 +2825,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpg-co-indexer"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.4",
- "dolos-core",
- "hex",
- "mitos-core",
- "pallas-codec 1.0.0-alpha.6",
- "pallas-primitives 1.0.0-alpha.6",
- "pallas-traverse 1.0.0-alpha.6",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3356,7 +3338,6 @@ dependencies = [
  "dolos",
  "dolos-cardano",
  "dolos-core",
- "jpg-co-indexer",
  "marketplace-indexer",
  "mitos-core",
  "tokio",
@@ -3479,6 +3460,7 @@ dependencies = [
  "cardano-assets",
  "ciborium",
  "dolos-core",
+ "futures-util",
  "hex",
  "mitos-data-plane",
  "mitos-protocol",
@@ -3493,11 +3475,13 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.8.20",
  "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wasmtime",
  "wasmtime-wasi",
 ]
@@ -3513,6 +3497,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

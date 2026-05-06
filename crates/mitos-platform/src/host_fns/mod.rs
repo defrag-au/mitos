@@ -27,6 +27,7 @@ pub mod state_kv;
 
 use std::sync::Arc;
 
+use dolos_core::ChainPoint;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -56,6 +57,13 @@ pub struct HostState {
     /// Module identifier — surfaces in logs + metrics.
     pub(crate) module_id: String,
 
+    /// Cursor of the block currently being dispatched. Set by
+    /// the driver immediately before each `call_handle_event`;
+    /// read by `emit_event` so emissions can be tagged with
+    /// the chain point at which they were produced. `None`
+    /// outside an active dispatch (init, idle).
+    pub(crate) current_cursor: Option<ChainPoint>,
+
     /// WASI context. Modules built against `wasm32-wasip2` pull
     /// in `wasi:io`, `wasi:cli`, etc. as imports via the std lib;
     /// `wasmtime_wasi::add_to_linker_async` populates the linker
@@ -79,6 +87,7 @@ impl HostState {
             kv,
             emitter,
             module_id,
+            current_cursor: None,
             wasi: WasiCtxBuilder::new().build(),
             wasi_table: ResourceTable::new(),
         }

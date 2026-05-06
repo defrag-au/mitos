@@ -66,6 +66,15 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         &self.env
     }
 
+    /// Borrow the DO `State`. Used by the dApp's `#[durable_object]`
+    /// wrapper for direct SQL access in read-API handlers (the
+    /// runtime owns its own meta tables, but the dApp's read API
+    /// queries its own application tables and needs the same
+    /// `state.storage().sql()` handle the runtime is using).
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
     /// Borrow the inner companion. Useful for tests + RPC handler
     /// dispatch (PR 6 work).
     pub fn inner(&self) -> &C {
@@ -277,12 +286,43 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         Ok(())
     }
 
+    /// Look up a channel handler by tag.
+    ///
+    /// Tags come from `state.get_tags(ws)` set during WS upgrade
+    /// — see `handle_replicate_upgrade`. Naming layers below the
+    /// runtime don't always agree:
+    ///
+    /// - The legacy `IndexerHandle` path tags the WS with the
+    ///   indexer name (e.g. `"collection-ownership"`).
+    /// - The new emit-interception path stringifies the WIT u32
+    ///   channel id (e.g. `"0"`) — the host doesn't know the
+    ///   dApp's channel names, only their indices.
+    /// - The default upgrade route uses `DEFAULT_CHANNEL_TAG`
+    ///   (`"default"`).
+    ///
+    /// None of those match the dApp's `MitosChannel::NAME`
+    /// values directly. v1 fallback: when the tag isn't a
+    /// match, dispatch to the **first registered channel**.
+    /// That's correct for single-channel dApps + matches the
+    /// v1 emit-interception model where every event from
+    /// channel 0 goes through the primary channel handler.
+    /// Multi-channel routing where each channel gets only its
+    /// own events is a v2 problem (will require the wasm module
+    /// to declare its channel-name → u32 mapping at init time
+    /// so the host can tag the dial-back URL appropriately).
     fn lookup_channel(&self, name: &str) -> Result<&dyn MitosChannelDyn> {
-        self.channels
-            .iter()
-            .find(|c| c.name() == name)
-            .map(|c| c.as_ref())
-            .ok_or_else(|| CompanionError::UnknownChannel(name.to_string()))
+        if let Some(c) = self.channels.iter().find(|c| c.name() == name) {
+            return Ok(c.as_ref());
+        }
+        if let Some(first) = self.channels.first() {
+            tracing::debug!(
+                requested = %name,
+                fallback = %first.name(),
+                "channel tag did not match any registered channel; falling back to first",
+            );
+            return Ok(first.as_ref());
+        }
+        Err(CompanionError::UnknownChannel(name.to_string()))
     }
 
     // ========================================================================
@@ -346,12 +386,27 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let interest_rows = crate::interest::list_interests(&sql)?;
         let interests = crate::interest::rows_to_interests(&interest_rows);
 
+        // Pull the dial-back URL from wrangler env so mitos
+        // knows where to open its outbound WS. Required for
+        // emission delivery — without it the host persists
+        // the registration but the dial loop logs and exits.
+        let dial_back = self
+            .env
+            .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
+            .ok()
+            .map(|v| v.to_string())
+            .map(|url| crate::subscribe::DialBackOverride {
+                url: Some(url),
+                auth_header: None,
+                auth_value: None,
+            });
+
         let request = SubscribeRequest {
             module_name: C::NAME.to_string(),
             companion_key,
             resume_from,
             interests,
-            dial_back: None,
+            dial_back,
         };
 
         match subscribe_via_env(&self.env, &request).await {

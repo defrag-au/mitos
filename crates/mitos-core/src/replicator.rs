@@ -1,5 +1,33 @@
 //! `Replicator`: outbound WebSocket client driver.
 //!
+//! ## Status: legacy. Slated for retirement.
+//!
+//! This is the pre-companion-runtime outbound model: each
+//! `Subscription` ties a static `IndexerHandle` (compiled into
+//! the host binary, e.g. `collection-ownership-indexer`) to a
+//! single dialed Worker URL. The companion-runtime model
+//! (`mitos-platform::dialer::CompanionDialer`) replaces this
+//! with a wasm-module-driven path where each registered
+//! companion gets its own dial loop, emissions go through the
+//! per-module `EmissionsStore`, and the operator surface
+//! (`mitos-admin emissions list/replay/purge`) makes the
+//! delivery state inspectable.
+//!
+//! Production cutover: when the legacy
+//! `cnft.dev-workers/workers/collection-ownership/` consumer
+//! migrates onto `collections-mitos`'s companion-runtime path,
+//! the two `replicator.connected` legacy subscriptions go
+//! away and this file + the static `IndexerHandle` machinery
+//! (`crate::handle::IndexerHandle`, `run_subscriber`,
+//! `replicate_router`, `crates/collection-ownership-indexer/`,
+//! `crates/marketplace-indexer/`) become deletable as a single
+//! cleanup PR.
+//!
+//! Until then, leaving in place — production ownership data
+//! flows through this `Replicator`.
+//!
+//! ## Original docs:
+//!
 //! Production replication is mitos-as-WS-client → CF-DO-as-WS-server,
 //! because only inbound-accepted sockets get DO Hibernation. See
 //! `docs/design/CF_REPLICATION.md` § Connection direction.
@@ -168,6 +196,11 @@ impl Replicator {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // Sole open site for the global subscriptions registry —
+        // process-lifetime singleton. Other redb files belong
+        // under `mitos_platform::storage`. See clippy.toml for
+        // the workspace lint.
+        #[allow(clippy::disallowed_methods)]
         let db = Database::create(&path)
             .map_err(|e| anyhow::anyhow!("open replicator db at {}: {e}", path.display()))?;
 
@@ -306,6 +339,11 @@ impl Replicator {
         if !path.exists() {
             return Ok(Vec::new());
         }
+        // Offline `--print-config-only` flow — by contract,
+        // mitos isn't running in this mode, so opening the
+        // subscriptions registry read-only here can't conflict
+        // with a live `Replicator::new`. See clippy.toml.
+        #[allow(clippy::disallowed_methods)]
         let db = Database::open(path)
             .map_err(|e| anyhow::anyhow!("open replicator db at {}: {e}", path.display()))?;
         let (subs, _next_id) = load_persisted(&db)?;
@@ -555,7 +593,7 @@ async fn dial_and_run(
     });
 
     handle
-        .run_subscriber(transport, domain.clone())
+        .run_subscriber(transport, domain.clone(), None)
         .await
         .map_err(|e| anyhow::anyhow!("run_subscriber: {e}"))
 }

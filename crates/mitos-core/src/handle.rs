@@ -69,6 +69,7 @@ pub trait IndexerHandle: Send + Sync {
         &self,
         transport: Box<dyn WsTransport>,
         domain: DomainAdapter,
+        inbound_handler: Option<Arc<dyn InboundFrameHandler>>,
     ) -> anyhow::Result<()>;
 
     /// Convert a JSON-shaped scope value into the CBOR bytes that
@@ -165,6 +166,7 @@ where
         &self,
         mut transport: Box<dyn WsTransport>,
         domain: DomainAdapter,
+        inbound_handler: Option<Arc<dyn InboundFrameHandler>>,
     ) -> anyhow::Result<()> {
         // Phase A: subscribe handshake.
         let (scope, cursor) = match read_subscribe::<I>(&mut transport).await? {
@@ -227,7 +229,7 @@ where
         }
 
         // Phase B: forward broadcast records, filtered by scope.
-        forward_records::<I>(&mut transport, rx, scope.into_inner()).await
+        forward_records::<I>(&mut transport, rx, scope.into_inner(), inbound_handler).await
     }
 }
 
@@ -315,56 +317,191 @@ where
     }
 }
 
+/// Bidirectional pump after the subscribe handshake. Multiplexes
+/// outbound broadcast→WS sends with inbound WS→handler reads via
+/// `tokio::select!`. The two arms share `&mut transport` but
+/// `select!` runs them sequentially — only one branch holds the
+/// borrow at a time, so this is safe without a transport split.
+///
+/// Inbound frames (Phase B handling, PR 3b):
+/// - `ClientMessage::Interest { op, items }` — forwarded to the
+///   `inbound_handler` if one is wired. Bundle wires this to the
+///   running module's `update-interest` host call.
+/// - `ClientMessage::Ack { emission_id }` /
+///   `Nack { emission_id, error }` — forwarded to the
+///   `inbound_handler`. Bundle wires this to the
+///   `EmissionsStore::update_status` path.
+/// - `ClientMessage::Unsubscribe` — graceful close; pump returns
+///   `Ok(())` to drop the WS.
+/// - `ClientMessage::Subscribe { .. }` after the initial handshake
+///   is unexpected — log + ignore (single-subscribe per session).
+///
+/// `inbound_handler` is optional so the legacy test surface
+/// (`replicate_router`) without a wired bundle keeps working —
+/// it just logs frames it can't act on.
 async fn forward_records<I>(
     transport: &mut Box<dyn WsTransport>,
     mut rx: broadcast::Receiver<EmittedRecord<<I as Indexer<DomainAdapter>>::Change>>,
     scope: <I as Indexer<DomainAdapter>>::Scope,
+    inbound_handler: Option<Arc<dyn InboundFrameHandler>>,
 ) -> anyhow::Result<()>
 where
     I: Indexer<DomainAdapter>,
 {
     loop {
-        let record = match rx.recv().await {
-            Ok(r) => r,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(skipped = n, "consumer lagged, dropping connection");
-                let _ = send(
-                    transport,
-                    &ServerMessage::Error {
-                        code: "lagged".into(),
-                        message: format!("consumer lagged by {n} records; reconnect"),
+        tokio::select! {
+            biased; // outbound first — keeps the live stream moving
+
+            record = rx.recv() => {
+                let record = match record {
+                    Ok(r) => r,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "consumer lagged, dropping connection");
+                        let _ = send(
+                            transport,
+                            &ServerMessage::Error {
+                                code: "lagged".into(),
+                                message: format!("consumer lagged by {n} records; reconnect"),
+                            },
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+
+                let msg = match record {
+                    EmittedRecord::Apply { cursor, change } => {
+                        if !I::change_matches_scope(&scope, &change) {
+                            continue;
+                        }
+                        let mut buf = Vec::with_capacity(64);
+                        ciborium::into_writer(&change, &mut buf)
+                            .map_err(|e| anyhow::anyhow!("encode change: {e}"))?;
+                        // emission_id is assigned by the inbound_handler's
+                        // emit-interception path when it appends to the
+                        // EmissionsStore. The pump itself doesn't write
+                        // the log; we send `0` here as a placeholder. Bundle
+                        // wires the real id assignment via a future
+                        // intercept-then-forward pump if it cares.
+                        ServerMessage::Apply {
+                            emission_id: 0,
+                            cursor: chain_point_to_wire(&cursor),
+                            change: buf,
+                        }
+                    }
+                    EmittedRecord::Undo { cursor } => ServerMessage::Undo {
+                        cursor: chain_point_to_wire(&cursor),
                     },
-                )
-                .await;
-                return Ok(());
-            }
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
-        };
+                    EmittedRecord::Mark { cursor } => ServerMessage::Mark {
+                        cursor: chain_point_to_wire(&cursor),
+                    },
+                };
 
-        let msg = match record {
-            EmittedRecord::Apply { cursor, change } => {
-                if !I::change_matches_scope(&scope, &change) {
-                    continue;
-                }
-                let mut buf = Vec::with_capacity(64);
-                ciborium::into_writer(&change, &mut buf)
-                    .map_err(|e| anyhow::anyhow!("encode change: {e}"))?;
-                ServerMessage::Apply {
-                    emission_id: 0, // PR 3 wires the emissions log
-                    cursor: chain_point_to_wire(&cursor),
-                    change: buf,
+                send(transport, &msg).await?;
+            }
+
+            inbound = transport.recv_binary() => {
+                let bytes = match inbound? {
+                    Some(b) => b,
+                    None => return Ok(()), // peer closed cleanly
+                };
+                match decode_client(&bytes) {
+                    Ok(ClientMessage::Interest { op, items }) => {
+                        if let Some(h) = &inbound_handler {
+                            if let Err(e) = h.on_interest(op, items).await {
+                                warn!(error = %e, "inbound Interest handler failed");
+                            }
+                        } else {
+                            // Legacy Replicator lane never wires
+                            // an inbound_handler; the new
+                            // companion-runtime path goes through
+                            // `mitos_platform::dialer` which has
+                            // its own handler. Trace, not debug.
+                            tracing::trace!(
+                                "legacy lane: Interest frame received with no handler; ignoring"
+                            );
+                        }
+                    }
+                    Ok(ClientMessage::Ack { emission_id }) => {
+                        if let Some(h) = &inbound_handler
+                            && let Err(e) = h.on_ack(emission_id).await {
+                                warn!(error = %e, "inbound Ack handler failed");
+                            }
+                    }
+                    Ok(ClientMessage::Nack { emission_id, error }) => {
+                        if let Some(h) = &inbound_handler {
+                            if let Err(e) = h.on_nack(emission_id, &error).await {
+                                warn!(error = %e, "inbound Nack handler failed");
+                            }
+                        } else {
+                            // Same legacy-lane case as Interest;
+                            // demote to trace so the deploy log
+                            // stays clean. Genuine unrouted Nacks
+                            // still surface at trace + the row
+                            // staying Pending in the EmissionsStore
+                            // is the durable signal.
+                            tracing::trace!(
+                                emission_id, error = %error,
+                                "Nack received but no inbound_handler wired",
+                            );
+                        }
+                    }
+                    Ok(ClientMessage::Unsubscribe) => {
+                        tracing::info!("client unsubscribed; closing pump");
+                        return Ok(());
+                    }
+                    Ok(ClientMessage::Subscribe { .. }) => {
+                        tracing::warn!("unexpected Subscribe after initial handshake; ignoring");
+                    }
+                    Err(e) => {
+                        // Legacy pre-PR-3 consumers send Ack/Nack frames
+                        // without `emission_id`; that surfaces here as
+                        // a `missing field` decode error. Demote those
+                        // to debug to avoid log-flood — once those
+                        // consumers migrate to companion runtime, the
+                        // case disappears. Other decode failures stay
+                        // at warn so genuinely-malformed frames remain
+                        // visible.
+                        let msg = e.to_string();
+                        if msg.contains("missing field `emission_id`") {
+                            tracing::debug!(error = %msg, "legacy client frame (no emission_id); ignoring");
+                        } else {
+                            tracing::warn!(error = %msg, "client frame decode failed; ignoring");
+                        }
+                    }
                 }
             }
-            EmittedRecord::Undo { cursor } => ServerMessage::Undo {
-                cursor: chain_point_to_wire(&cursor),
-            },
-            EmittedRecord::Mark { cursor } => ServerMessage::Mark {
-                cursor: chain_point_to_wire(&cursor),
-            },
-        };
-
-        send(transport, &msg).await?;
+        }
     }
+}
+
+/// Inbound-frame handler trait — bundle implements this to wire
+/// Interest frames into the running module's `update-interest`
+/// call and Ack/Nack into the emissions log status update path.
+/// Object-safe so `Box<dyn InboundFrameHandler>` flows through
+/// the indexer-handle / run_subscriber surface.
+#[async_trait]
+pub trait InboundFrameHandler: Send + Sync {
+    /// Called on `ClientMessage::Interest`. `items` is the typed
+    /// `Vec<mitos_protocol::Interest>` decoded from the frame.
+    /// Bundle implementations re-encode as CBOR and call the
+    /// module's `update-interest` export via the follower
+    /// control channel.
+    async fn on_interest(
+        &self,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> anyhow::Result<()>;
+
+    /// Called on `ClientMessage::Ack`. Bundle implementations
+    /// move the emission row's status to `Acked`.
+    async fn on_ack(&self, emission_id: u64) -> anyhow::Result<()>;
+
+    /// Called on `ClientMessage::Nack`. Bundle implementations
+    /// move the emission row's status to `Nacked` and record the
+    /// error.
+    async fn on_nack(&self, emission_id: u64, error: &str) -> anyhow::Result<()>;
 }
 
 fn event_cursor(event: &TipEvent) -> ChainPoint {

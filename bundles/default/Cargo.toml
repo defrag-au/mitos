@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 mitos-core = { path = "../../crates/mitos-core" }
-jpg-co-indexer = { path = "../../crates/jpg-co-indexer" }
 collection-ownership-indexer = { path = "../../crates/collection-ownership-indexer" }
 marketplace-indexer = { path = "../../crates/marketplace-indexer" }
 

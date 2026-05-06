@@ -45,25 +45,58 @@ pub const MITOS_HOST_URL_ENV: &str = "MITOS_HOST_URL";
 /// admin endpoints use; same value rotates them in lockstep.
 pub const MITOS_AUTH_TOKEN_ENV: &str = "MITOS_AUTH_TOKEN";
 
-/// CBOR-encode a `SubscribeRequest` for transport.
-pub fn encode_subscribe(req: &SubscribeRequest) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    ciborium::ser::into_writer(req, &mut buf)
-        .map_err(|e| CompanionError::Wire(format!("encode_subscribe: {e}")))?;
-    Ok(buf)
+/// Environment variable name for the dial-back URL template the
+/// host should use when opening its outbound WS to this companion.
+/// Carries `{key}` as a placeholder that mitos substitutes with
+/// the companion key at dial time.
+///
+/// Example: `wss://collections-mitos.cnft.dev/_internal/replicate?policy_id={key}`
+pub const MITOS_REPLICATE_URL_ENV: &str = "MITOS_REPLICATE_URL";
+
+/// Read the auth token. dApps configure this in `wrangler.toml`
+/// as a CF Secrets Store binding (`secrets_store_secrets`,
+/// preferred) or as a legacy worker secret. `env.var()` is
+/// intentionally not consulted — auth tokens belong in secret
+/// storage, not plaintext wrangler vars.
+#[cfg(target_arch = "wasm32")]
+async fn read_auth_token(env: &worker::Env) -> Result<String> {
+    if let Ok(store) = env.secret_store(MITOS_AUTH_TOKEN_ENV) {
+        return match store.get().await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(CompanionError::Wire(format!(
+                "{MITOS_AUTH_TOKEN_ENV} secret store binding is empty"
+            ))),
+            Err(e) => Err(CompanionError::Wire(format!(
+                "{MITOS_AUTH_TOKEN_ENV} secret store get(): {e}"
+            ))),
+        };
+    }
+    env.secret(MITOS_AUTH_TOKEN_ENV)
+        .map(|s| s.to_string())
+        .map_err(|e| CompanionError::Wire(format!("read {MITOS_AUTH_TOKEN_ENV}: {e}")))
 }
 
-/// CBOR-decode a `SubscribeRequest`. Used by the host endpoint;
-/// also useful in tests.
+/// CBOR-encode a `SubscribeRequest` for transport. Thin wrapper
+/// over `SubscribeRequest::encode` that surfaces the codec error
+/// as a `CompanionError`.
+pub fn encode_subscribe(req: &SubscribeRequest) -> Result<Vec<u8>> {
+    req.encode()
+        .map_err(|e| CompanionError::Wire(format!("encode_subscribe: {e}")))
+}
+
+/// CBOR-decode a `SubscribeRequest`. Mirror of `encode_subscribe`
+/// for completeness — host calls `SubscribeRequest::decode` directly.
 pub fn decode_subscribe(bytes: &[u8]) -> Result<SubscribeRequest> {
-    ciborium::de::from_reader(bytes)
+    SubscribeRequest::decode(bytes)
         .map_err(|e| CompanionError::Wire(format!("decode_subscribe: {e}")))
 }
 
-/// CBOR-decode a `SubscribeResponse`. Used by the companion runtime
-/// to interpret the host's reply.
+/// CBOR-decode a `SubscribeResponse`. Both directions ride CBOR
+/// — the encoding is fixed by `SubscribeResponse::decode` /
+/// `encode` co-located with the type in `mitos-protocol`, so
+/// host and consumer can never disagree on encoding.
 pub fn decode_subscribe_response(bytes: &[u8]) -> Result<SubscribeResponse> {
-    ciborium::de::from_reader(bytes)
+    SubscribeResponse::decode(bytes)
         .map_err(|e| CompanionError::Wire(format!("decode_subscribe_response: {e}")))
 }
 
@@ -87,11 +120,7 @@ pub async fn post_subscribe(
         .var(MITOS_HOST_URL_ENV)
         .map_err(|e| CompanionError::Wire(format!("read {MITOS_HOST_URL_ENV}: {e}")))?
         .to_string();
-    let token = env
-        .secret(MITOS_AUTH_TOKEN_ENV)
-        .or_else(|_| env.var(MITOS_AUTH_TOKEN_ENV))
-        .map_err(|e| CompanionError::Wire(format!("read {MITOS_AUTH_TOKEN_ENV}: {e}")))?
-        .to_string();
+    let token = read_auth_token(env).await?;
 
     let body_bytes = encode_subscribe(request)?;
     let body_array = Uint8Array::from(body_bytes.as_slice());

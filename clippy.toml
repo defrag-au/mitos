@@ -1,0 +1,25 @@
+# Workspace-wide clippy configuration.
+#
+# Most of the rules live in code via `#![deny(...)]`. This file is
+# reserved for `clippy::disallowed_methods` — the redb single-writer
+# guard that surfaces "Database already open" as a *compile-time*
+# rather than runtime error.
+
+# redb (https://github.com/cberner/redb) is single-writer-per-process:
+# opening the same file twice in one process fails with
+# `Database already open. Cannot acquire lock.`
+#
+# Every redb-backed file in mitos must be opened in exactly one place
+# and shared via the typed Store wrappers in
+# `mitos_platform::storage` (or `mitos_core::replicator` for the
+# global subscriptions registry). Bare `Database::create` /
+# `Database::open` / `Database::builder()` outside those modules is
+# a bug.
+#
+# To exempt a specific call site, opt in locally with
+# `#[allow(clippy::disallowed_methods)]` and a comment explaining why.
+disallowed-methods = [
+    { path = "redb::Database::create", reason = "open redb only via mitos_platform::storage::ModuleStorage::{cursor_store, emissions_store, kv_store} or mitos_core::replicator (single registry); see docs/design/REDB_ACCESS.md" },
+    { path = "redb::Database::open", reason = "open redb only via mitos_platform::storage::ModuleStorage::{cursor_store, emissions_store, kv_store} or mitos_core::replicator (single registry); see docs/design/REDB_ACCESS.md" },
+    { path = "redb::Builder::create", reason = "open redb only via mitos_platform::storage::ModuleStorage::{cursor_store, emissions_store, kv_store} or mitos_core::replicator (single registry); see docs/design/REDB_ACCESS.md" },
+]

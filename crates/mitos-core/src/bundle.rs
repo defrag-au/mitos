@@ -6,8 +6,8 @@
 //!
 //! ```ignore
 //! let mut bundle = Bundle::new(domain, config, listen_addr);
-//! bundle.add_indexer(JpgCoIndexer::new()?);
 //! bundle.add_indexer(OwnershipIndexer::new()?);
+//! bundle.add_indexer(MarketplaceIndexer::new()?);
 //! bundle.run(exit).await?;
 //! ```
 //!
@@ -174,6 +174,7 @@ impl Bundle {
         // future and systemd hits its 90s graceful-shutdown
         // timeout.
         let mut module_host: Option<Arc<dyn mitos_platform::host::ModuleHostHandle>> = None;
+        let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
@@ -222,12 +223,16 @@ impl Bundle {
 
             // Per-module redb-backed KV — crash-safe across
             // restarts. Each module gets its own `kv.redb`
-            // alongside `cursor.redb` + `current.wasm`.
+            // alongside `cursor.redb` + `current.wasm`. Routed
+            // through `ModuleStorage::kv_store` so all opens
+            // share a single cached `Arc<Database>` handle per
+            // module — redb is single-writer-per-process and
+            // a second `Database::open` of the same file fails
+            // with `Database already open`.
             let storage_for_kv = storage.clone();
             let kv_factory: mitos_platform::host::KvFactory = Arc::new(move |id: &str| {
-                let path = storage_for_kv.kv_path(id);
-                match mitos_platform::host_fns::state_kv::ModuleKv::open_redb(&path, None) {
-                    Ok(kv) => kv,
+                match storage_for_kv.kv_store(id, None) {
+                    Ok(kv) => mitos_platform::host_fns::state_kv::ModuleKv::Redb(kv),
                     Err(e) => {
                         // Fall back to in-memory rather than refusing
                         // to start. The error logs loudly; cursor
@@ -239,7 +244,6 @@ impl Bundle {
                         // modules dir.
                         error!(
                             module = %id,
-                            path = %path.display(),
                             error = %e,
                             "redb KV open failed; falling back to in-memory"
                         );
@@ -277,12 +281,48 @@ impl Bundle {
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
             let host_for_admin = host.clone();
+
+            // Companion dial supervisor: maintains an outbound
+            // WS to each registered companion so the host can
+            // deliver emissions. `start_all()` redials any
+            // companion persisted from a previous run; the
+            // companion subscribe handler hands fresh
+            // registrations to it as they arrive.
+            //
+            // Hand the dialer an `Arc<dyn InterestRouter>` cloned
+            // off the host so inbound `ClientMessage::Interest`
+            // frames get routed into the right module's follower
+            // task and call its `update-interest` export.
+            let interest_router: Arc<dyn mitos_platform::host::InterestRouter> = host.clone();
+            let dialer = mitos_platform::dialer::CompanionDialer::new(
+                storage.clone(),
+                platform_auth.clone(),
+                Some(interest_router),
+            );
+            dialer.start_all().await;
+            app = app.merge(mitos_platform::companions::companion_router(
+                storage.clone(),
+                platform_auth.clone(),
+                Some(dialer.clone()),
+            ));
+
             app = app.merge(mitos_platform::admin::admin_router_with_host(
-                storage,
+                storage.clone(),
                 host_for_admin,
                 platform_auth,
             ));
+
+            // Periodic emissions-log compaction. Hourly sweep
+            // ages out Acked rows (7d) + flips stuck Pending
+            // rows to Timeout (24h). See `mitos_platform::compaction`.
+            let compaction_handle = mitos_platform::compaction::spawn(
+                storage,
+                host.clone() as Arc<dyn mitos_platform::host::ModuleHostHandle>,
+                exit.clone(),
+            );
+
             module_host = Some(host);
+            module_compaction_handle = Some(compaction_handle);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -318,6 +358,15 @@ impl Bundle {
 
         for h in dispatcher_handles {
             h.abort();
+        }
+
+        // Compaction task observes the same `exit` token used
+        // for graceful shutdown — already cancelled by now —
+        // so it'll have stopped on its own. Await the join
+        // handle to confirm cleanup before module followers
+        // tear down redb handles.
+        if let Some(handle) = module_compaction_handle {
+            let _ = handle.await;
         }
 
         // Stop wasm-module followers cleanly so cursor checkpoints

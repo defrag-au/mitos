@@ -114,6 +114,10 @@ impl EmissionsStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Sole open site for emissions.redb. Routed exclusively
+        // through `ModuleStorage::emissions_store` which caches
+        // by path; see clippy.toml for the workspace lint.
+        #[allow(clippy::disallowed_methods)]
         let db = redb::Database::builder()
             .create(path)
             .map_err(|e| EmissionsError::Redb(e.to_string()))?;
@@ -355,6 +359,64 @@ impl EmissionsStore {
         Ok(to_drop.len())
     }
 
+    /// Periodic compaction. Walks every row once and applies
+    /// two policies in one pass:
+    ///
+    /// - **Acked rows** older than `acked_max_age_secs` are
+    ///   purged outright (the consumer confirmed delivery; we
+    ///   keep them around briefly for diagnostics, then drop).
+    /// - **Pending rows** older than `pending_max_age_secs`
+    ///   flip to `Timeout` (delivery uncertain — likely the WS
+    ///   dropped before the Ack arrived). The operator decides
+    ///   whether to `mitos-admin emissions-replay`. Timeout
+    ///   rows are otherwise terminal and stay around as a
+    ///   diagnostic signal.
+    ///
+    /// `now_secs` is the current Unix seconds; tests pass a
+    /// fixed value for determinism. Rows with timestamps that
+    /// can't be parsed as `unix:N` are skipped (keeps the
+    /// sweep safe across legacy / future timestamp formats).
+    ///
+    /// Returns `(timed_out_pending, purged_acked)` for logging.
+    pub fn compact(
+        &self,
+        now_secs: u64,
+        acked_max_age_secs: u64,
+        pending_max_age_secs: u64,
+    ) -> Result<(usize, usize), EmissionsError> {
+        // First pass: classify.
+        let acked_threshold = now_secs.saturating_sub(acked_max_age_secs);
+        let pending_threshold = now_secs.saturating_sub(pending_max_age_secs);
+        let mut to_purge: Vec<u64> = Vec::new();
+        let mut to_timeout: Vec<u64> = Vec::new();
+        for record in self.list_filtered(|_| true)? {
+            let Some(ts) = parse_unix_secs(&record.status_at) else {
+                continue;
+            };
+            match record.status {
+                EmissionStatus::Acked if ts < acked_threshold => {
+                    to_purge.push(record.id);
+                }
+                EmissionStatus::Pending if ts < pending_threshold => {
+                    to_timeout.push(record.id);
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: apply. update_status touches one redb
+        // tx per call — fine for the volumes we expect (single
+        // digits to low hundreds per sweep). Batch into one
+        // transaction if this becomes hot.
+        let timed_out_count = to_timeout.len();
+        let now_str = format!("unix:{now_secs}");
+        for id in to_timeout {
+            self.update_status(id, EmissionStatus::Timeout, &now_str, None)?;
+        }
+        let purged_count = self.purge(|r| to_purge.contains(&r.id))?;
+        Ok((timed_out_count, purged_count))
+    }
+
     /// Return the next emission_id that would be assigned. Used
     /// in `SubscribeResponse.next_emission_id` so companions can
     /// sync against the host's view.
@@ -372,6 +434,14 @@ impl EmissionsStore {
             .map(|v| v.value())
             .unwrap_or(1))
     }
+}
+
+/// Parse the `unix:N` timestamp shape produced by the bundle's
+/// `now_rfc3339` helpers. Returns `None` for legacy / future
+/// formats so the compaction sweep treats those rows as
+/// "leave alone."
+fn parse_unix_secs(s: &str) -> Option<u64> {
+    s.strip_prefix("unix:").and_then(|n| n.parse::<u64>().ok())
 }
 
 #[cfg(test)]
