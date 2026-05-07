@@ -10,6 +10,7 @@
 mod chain_point;
 mod decode;
 mod error;
+mod event;
 mod interest;
 mod output;
 mod output_ref;
@@ -21,6 +22,10 @@ mod tip;
 pub use chain_point::ChainPoint;
 pub use decode::DecodeLevel;
 pub use error::{DataPlaneError, DataPlaneResult};
+pub use event::{
+    ConsumedEvent, DispatchEvent, MintedEvent, ProducedEvent, ReferencedEvent, RollbackEvent,
+    TickEvent, TxContextEvent, TxEventBatch, UtxoEvent, ValidityInterval,
+};
 pub use interest::{InterestPredicate, InterestSet, StakeCred};
 pub use output::{AssetEntry, ScriptLanguage, TypedDatum, TypedOutput, TypedScript};
 pub use output_ref::OutputRef;

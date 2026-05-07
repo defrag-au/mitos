@@ -30,7 +30,9 @@ fn to_wire(point: &ChainPoint) -> WireChainPoint {
 /// Sink for emitted events. One per module instance; drained by
 /// the replication side.
 pub struct EventSink {
-    sender: tokio::sync::mpsc::UnboundedSender<EmittedEvent>,
+    // Crate-visible so v2 host fns can also push events through
+    // it without duplicating the emit channel plumbing.
+    pub(crate) sender: tokio::sync::mpsc::UnboundedSender<EmittedEvent>,
 }
 
 #[derive(Debug)]

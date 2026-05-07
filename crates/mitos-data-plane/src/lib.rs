@@ -27,6 +27,8 @@
 //!   then mean "genuinely absent on chain", not "caller didn't
 //!   ask" — that distinction is in `DecodeLevel`.
 
+pub mod block_events;
+pub mod dispatch;
 pub mod impls;
 pub mod types;
 
@@ -34,10 +36,11 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, DataPlaneError,
-    DataPlaneResult, DecodeLevel, InterestPredicate, InterestSet, OutputRef, OutputRefPattern,
-    Page, PageRequest, ScriptLanguage, StakeCred, TypedDatum, TypedOutput, TypedScript,
-    UtxoPattern, UtxoPredicate,
+    AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, ConsumedEvent, DataPlaneError,
+    DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate, InterestSet, MintedEvent,
+    OutputRef, OutputRefPattern, Page, PageRequest, ProducedEvent, ReferencedEvent, RollbackEvent,
+    ScriptLanguage, StakeCred, TickEvent, TxContextEvent, TxEventBatch, TypedDatum, TypedOutput,
+    TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
 };
 
 pub use impls::LocalDataPlane;

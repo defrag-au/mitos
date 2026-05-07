@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dolos_core::{ChainPoint, TipEvent, TipSubscription};
-use mitos_data_plane::{DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
+use dolos_core::{TipEvent, TipSubscription};
+use mitos_data_plane::{ChainPoint, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 use mitos_platform::host::ModuleHost;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
 use mitos_platform::manifest::{
@@ -206,7 +206,7 @@ async fn start_replace_stop_roundtrip() {
     //    is the empty-watchset case — module dispatches but
     //    doesn't emit.
     tx.send(TipEvent::Apply(
-        ChainPoint::Slot(186_000_000),
+        ChainPoint::Slot(186_000_000).into(),
         Arc::new(cbor.clone()),
     ))
     .unwrap();

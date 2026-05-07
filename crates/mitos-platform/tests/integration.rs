@@ -29,7 +29,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dolos_core::{ChainPoint, TipEvent, TipSubscription};
+use dolos_core::{TipEvent, TipSubscription};
+use mitos_data_plane::ChainPoint;
 use mitos_data_plane::{DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 use mitos_platform::ResolvedBlock;
 use mitos_platform::bindings::{
@@ -481,8 +482,10 @@ async fn follower_pumps_apply_events_through_module() {
 
     // Wire the synthetic subscription; send one Apply, then drop.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // TipEvent uses dolos's ChainPoint at the boundary; convert
+    // mitos's owned type at the send site.
     tx.send(TipEvent::Apply(
-        ChainPoint::Slot(186_000_000),
+        ChainPoint::Slot(186_000_000).into(),
         std::sync::Arc::new(cbor.clone()),
     ))
     .unwrap();
