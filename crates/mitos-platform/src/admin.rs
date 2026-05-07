@@ -318,7 +318,20 @@ async fn upload_module(
         });
     }
 
-    manifest.validate_against_host(&wasm_bytes, HOST_ABI_MAJOR, PLATFORM_WIT_WORLD)?;
+    // Accept both v1 and v2 modules — the unified host routes
+    // by manifest.abi.version_major at start time. Each (major,
+    // wit_world) pair must align internally; a manifest claiming
+    // v2 major with the v1 world is malformed and rejected.
+    manifest.validate_against_host(
+        &wasm_bytes,
+        &[
+            (HOST_ABI_MAJOR, PLATFORM_WIT_WORLD),
+            (
+                crate::registry_v2::HOST_ABI_MAJOR_V2,
+                "mitos:platform-v2/mitos-module-v2",
+            ),
+        ],
+    )?;
 
     // Independent wasmtime validation: even if the manifest claims
     // valid shape, we re-load the bytes to confirm wasmtime

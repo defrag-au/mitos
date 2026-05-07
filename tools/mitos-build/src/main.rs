@@ -713,8 +713,22 @@ fn build_manifest(
         abi: AbiSection {
             version_major: inspect.abi_version_major,
             version_minor: inspect.abi_version_minor,
-            wit_package: "mitos:platform".to_owned(),
-            wit_world: "mitos-module".to_owned(),
+            // WIT package + world differ between v1 and v2.
+            // v1: `mitos:platform/mitos-module`
+            // v2: `mitos:platform-v2/mitos-module-v2`
+            // Pick by inspected ABI major.
+            wit_package: if inspect.abi_version_major >= 2 {
+                "mitos:platform-v2"
+            } else {
+                "mitos:platform"
+            }
+            .to_owned(),
+            wit_world: if inspect.abi_version_major >= 2 {
+                "mitos-module-v2"
+            } else {
+                "mitos-module"
+            }
+            .to_owned(),
         },
         trap_policy: TrapPolicySection {
             strategy: inspect.trap_strategy.clone(),

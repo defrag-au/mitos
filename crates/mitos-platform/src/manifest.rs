@@ -120,33 +120,50 @@ impl Manifest {
 
     /// Validate the manifest against the host's expectations and
     /// against the actual wasm bytes the manifest claims to describe.
+    ///
+    /// `accepted_abis` is a list of `(major, wit_world)` pairs the
+    /// host is willing to load. The unified host accepts both v1
+    /// (`(1, "mitos:platform/mitos-module")`) and v2
+    /// (`(2, "mitos:platform-v2/mitos-module-v2")`); routing
+    /// happens at start time per `manifest.abi.version_major`.
     pub fn validate_against_host(
         &self,
         wasm_bytes: &[u8],
-        wanted_major: u32,
-        wanted_wit_world: &str,
+        accepted_abis: &[(u32, &str)],
     ) -> Result<(), ManifestError> {
-        // Module id sanity — kept loose for v1 but rules out
-        // path-traversal characters and overlong values.
         validate_module_id(&self.module.id)?;
-
-        // Trap strategy must parse.
         validate_trap_strategy(&self.trap_policy.strategy)?;
 
-        // ABI major must match the host's expectations.
-        if self.abi.version_major != wanted_major {
-            return Err(ManifestError::AbiMismatch {
-                wanted_major,
-                got_major: self.abi.version_major,
-                got_minor: self.abi.version_minor,
-            });
-        }
-
-        // WIT world must match. Format is "mitos:platform/mitos-module".
+        // Match (major, wit_world) against the accepted set.
+        // Both must align — a manifest claiming v2 major with the
+        // v1 world (or vice-versa) is malformed.
         let claimed_world = format!("{}/{}", self.abi.wit_package, self.abi.wit_world);
-        if claimed_world != wanted_wit_world {
+        let mut matched = false;
+        for (major, world) in accepted_abis {
+            if self.abi.version_major == *major && claimed_world == *world {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            // Pick the first accepted ABI as the "wanted" hint —
+            // the operator gets a clear next-step rather than the
+            // full set in the error.
+            let (wanted_major, wanted_world) = accepted_abis
+                .first()
+                .copied()
+                .unwrap_or((1, "mitos:platform/mitos-module"));
+            // Major mismatch wins as the more informative error
+            // when both axes diverge.
+            if self.abi.version_major != wanted_major {
+                return Err(ManifestError::AbiMismatch {
+                    wanted_major,
+                    got_major: self.abi.version_major,
+                    got_minor: self.abi.version_minor,
+                });
+            }
             return Err(ManifestError::WitMismatch {
-                wanted: wanted_wit_world.to_owned(),
+                wanted: wanted_world.to_owned(),
                 got: claimed_world,
             });
         }
