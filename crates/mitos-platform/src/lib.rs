@@ -33,6 +33,7 @@
 
 pub mod admin;
 pub mod bindings;
+pub mod bindings_v2;
 pub mod block_decode;
 pub mod compaction;
 pub mod companions;

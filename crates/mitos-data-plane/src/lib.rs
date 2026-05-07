@@ -35,8 +35,9 @@ mod tests;
 
 pub use types::{
     AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, DataPlaneError,
-    DataPlaneResult, DecodeLevel, OutputRef, OutputRefPattern, Page, PageRequest, ScriptLanguage,
-    TypedDatum, TypedOutput, TypedScript, UtxoPattern, UtxoPredicate,
+    DataPlaneResult, DecodeLevel, InterestPredicate, InterestSet, OutputRef, OutputRefPattern,
+    Page, PageRequest, ScriptLanguage, StakeCred, TypedDatum, TypedOutput, TypedScript,
+    UtxoPattern, UtxoPredicate,
 };
 
 pub use impls::LocalDataPlane;

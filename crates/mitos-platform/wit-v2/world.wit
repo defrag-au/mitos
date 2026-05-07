@@ -1,0 +1,384 @@
+// Mitos platform v2 ABI.
+//
+// Full design rationale: ../../../docs/strategy/MITOS_PLATFORM_V2.md
+//
+// V2 in one sentence: same wasmtime runtime, same companion-pattern
+// deployment, but the dispatch unit is the eUTXO event filtered by
+// declared interest, not the raw Cardano block. Modules receive a
+// stream of typed events (`produced`, `consumed`, `referenced`,
+// `minted`, `tx-context`, plus periodic `tick` events) batched per
+// Cardano TX, in deterministic order.
+//
+// Stability: 0.x. The `module-version` export is the binding
+// stability promise; v2 modules return `(2, 0)`. v1 modules
+// continue running against `wit/world.wit`; ABI handshake routes
+// to the right dispatch path host-side.
+
+package mitos:platform-v2;
+
+interface types {
+    record output-ref {
+        tx-hash: list<u8>,
+        index: u32,
+    }
+
+    record asset-id {
+        policy: list<u8>,
+        name: list<u8>,
+    }
+
+    record asset-entry {
+        asset: asset-id,
+        quantity: u64,
+    }
+
+    /// Resolved datum. `hash` always present when the output had
+    /// a datum; `payload` is the on-chain CBOR when the host
+    /// could resolve (caller-blind inline-or-witness-set
+    /// resolution per the data-plane contract). Modules that
+    /// need metadata-encoded datums (jpg.store labels-50+)
+    /// use `chain-data::tx-metadata` to recover bytes when
+    /// `payload` is empty.
+    record typed-datum {
+        hash: list<u8>,
+        payload: list<u8>,
+    }
+
+    record typed-output {
+        address: string,
+        lovelace: u64,
+        assets: list<asset-entry>,
+    }
+
+    /// Where on chain we are. Variant so we can represent
+    /// genesis pre-state (`origin`), slot-only points
+    /// (`slot-only`, used by some indexers' captured cursors)
+    /// alongside fully-specified `specific` points. Mitos
+    /// owns this type; dolos conversions live in
+    /// `mitos-data-plane::types::chain_point`.
+    variant chain-point {
+        origin,
+        slot-only(u64),
+        specific(specific-point),
+    }
+
+    record specific-point {
+        slot: u64,
+        block-hash: list<u8>,
+    }
+
+    record validity-interval {
+        valid-from: option<u64>,    // slot, inclusive
+        valid-to: option<u64>,      // slot, exclusive
+    }
+
+    /// Stake credential — payment-credential-independent identity
+    /// of an address's "owner". Used by `at-stake-cred` interest.
+    variant stake-cred {
+        key-hash(list<u8>),     // 28-byte stake key hash
+        script-hash(list<u8>),  // 28-byte stake script hash
+    }
+
+    /// Trap supervision strategy declared by the module. Host
+    /// supervisor consults this on every trap. Unchanged from v1.
+    variant trap-strategy {
+        replay,
+        skip-and-mark,
+        quarantine,
+    }
+
+    record retry-policy {
+        max-retries: u32,
+        backoff-cap-ms: u32,
+    }
+
+    // ============================================================
+    // Event variants
+    // ============================================================
+
+    /// One UTxO-shaped event the platform delivers to a module.
+    /// Filtered against the module's Interest set before dispatch
+    /// — modules only see events from TXs that match their
+    /// interest. Within a matching TX they receive every variant
+    /// the platform produces (see ordering in the v2 design doc)
+    /// so they have full TX-level context.
+    variant utxo-event {
+        produced(produced-event),
+        consumed(consumed-event),
+        referenced(referenced-event),
+        minted(minted-event),
+        tx-context(tx-context-event),
+    }
+
+    record produced-event {
+        cursor: chain-point,
+        tx-hash: list<u8>,
+        tx-idx: u32,
+        oref: output-ref,
+        output: typed-output,
+        datum: option<typed-datum>,
+    }
+
+    record consumed-event {
+        cursor: chain-point,
+        consuming-tx-hash: list<u8>,
+        consuming-tx-idx: u32,
+        oref: output-ref,
+        prior-output: typed-output,
+        prior-datum: option<typed-datum>,
+        /// Plutus redeemer used to spend this input. `None`
+        /// when the prior output was key-locked.
+        redeemer: option<list<u8>>,
+    }
+
+    record referenced-event {
+        cursor: chain-point,
+        referencing-tx-hash: list<u8>,
+        referencing-tx-idx: u32,
+        oref: output-ref,
+        prior-output: typed-output,
+        prior-datum: option<typed-datum>,
+    }
+
+    /// Mint or burn. One per `(policy, asset-name)` pair in the
+    /// TX's mint field. Filtered by `holds-policy` /
+    /// `holds-asset` predicates.
+    record minted-event {
+        cursor: chain-point,
+        tx-hash: list<u8>,
+        tx-idx: u32,
+        policy: list<u8>,
+        asset-name: list<u8>,
+        /// Signed: positive = mint, negative = burn.
+        quantity-delta: s64,
+    }
+
+    /// TX-level facts that don't fit per-output. Always the
+    /// FIRST event in a TX's dispatch batch — subsequent
+    /// per-output events can be processed with TX-level state
+    /// already in scope.
+    record tx-context-event {
+        cursor: chain-point,
+        tx-hash: list<u8>,
+        tx-idx: u32,
+        validity-interval: validity-interval,
+        /// Required additional signers (28-byte key hashes
+        /// declared in the TX's `required_signers` field).
+        required-signers: list<list<u8>>,
+    }
+
+    /// Periodic wake-up. Fires when any of the module's
+    /// `tick-every(seconds)` interest predicates is due.
+    record tick-event {
+        cursor: chain-point,
+        /// Wall-clock timestamp (seconds since UNIX epoch).
+        timestamp: u64,
+        /// Which `tick-every` registration triggered this tick.
+        interval-seconds: u32,
+    }
+
+    /// Rollback marker. Inserted between event batches when the
+    /// chain forks past `to-cursor`. Modules treat all events
+    /// with `cursor > to-cursor` as invalid and roll their
+    /// derived state back.
+    record rollback-event {
+        to-cursor: chain-point,
+    }
+
+    /// What the platform actually dispatches via `handle-events`.
+    variant dispatch-event {
+        utxo(utxo-event),
+        tick(tick-event),
+        rollback(rollback-event),
+    }
+
+    // ============================================================
+    // Chain-data record shapes used by `read-tx`
+    // ============================================================
+
+    record consumed-input {
+        oref: output-ref,
+        prior-output: typed-output,
+        prior-datum: option<typed-datum>,
+        redeemer: option<list<u8>>,
+    }
+
+    record referenced-input {
+        oref: output-ref,
+        prior-output: typed-output,
+        prior-datum: option<typed-datum>,
+    }
+
+    record mint-entry {
+        policy: list<u8>,
+        asset-name: list<u8>,
+        quantity-delta: s64,
+    }
+
+    record tx-record {
+        tx-hash: list<u8>,
+        tx-idx: u32,
+        cursor: chain-point,
+        inputs: list<consumed-input>,
+        reference-inputs: list<referenced-input>,
+        outputs: list<typed-output>,
+        mint: list<mint-entry>,
+        required-signers: list<list<u8>>,
+        validity-interval: validity-interval,
+        /// Aux-data CBOR (TX metadata + native scripts +
+        /// plutus scripts wrapper). Same shape as
+        /// `tx-metadata` returns. `None` when no aux-data.
+        aux-data: option<list<u8>>,
+    }
+}
+
+/// Snapshot chain-state queries. Proxies into `mitos-data-plane`
+/// host-side. v2 takes a permissive stance on utility host-fns:
+/// anything that helps a module do its job cleanly belongs here.
+/// Wasm-side reimplementations of indexer lookups are pure
+/// deadweight — the host has dolos in process and the lookup is
+/// one redb call.
+interface chain-data {
+    use types.{output-ref, typed-output, typed-datum, tx-record};
+
+    /// Bulk lookup of N output refs in one host call.
+    read-utxos: func(refs: list<output-ref>) -> list<typed-output>;
+
+    /// Enumerate the current unspent set at one Cardano address.
+    /// Bootstrap primitive for indexers that want one-shot
+    /// hydration outside the platform-managed bootstrap path —
+    /// most modules will never call this directly because the
+    /// platform's interest-driven bootstrap handles it
+    /// transparently. Cap: 100K refs.
+    utxos-by-address: func(address: string) -> list<output-ref>;
+
+    /// Bulk caller-blind datum lookup for a list of output refs.
+    /// Returns parallel `option<typed-datum>` — `Some` when the
+    /// output has a datum (resolved transparently regardless of
+    /// inline-vs-hash), `None` for outputs with no datum or
+    /// refs that don't exist.
+    read-output-datums: func(refs: list<output-ref>)
+                       -> list<option<typed-datum>>;
+
+    /// Auxiliary-data CBOR for a transaction by hash. Used to
+    /// decode app-specific metadata schemes (jpg.store
+    /// labels-50+). `None` when the tx has no aux data or isn't
+    /// known to the archive.
+    tx-metadata: func(tx-hash: list<u8>) -> option<list<u8>>;
+
+    /// Resolve a datum hash to its raw CBOR bytes. Side-door
+    /// for callers that have a hash but not the containing
+    /// UTxO context (rare).
+    datum-by-hash: func(hash: list<u8>) -> option<list<u8>>;
+
+    /// Full TX rollup — single call returns every component a
+    /// module might need: inputs (with prior outputs and
+    /// redeemers), reference inputs, outputs, mint field,
+    /// required signers, validity interval, aux-data.
+    ///
+    /// Used by modules that need to inspect the full TX
+    /// context (atomic swap counterparties, marketplace-fee
+    /// inspection, loan settlement details). One redb-backed
+    /// archive lookup; lazy.
+    ///
+    /// `None` when the tx isn't known to the archive.
+    read-tx: func(tx-hash: list<u8>) -> option<tx-record>;
+}
+
+/// Module-private KV state. Backed by a per-module redb table
+/// host-side. Unchanged from v1.
+interface state-kv {
+    get-value: func(key: string) -> option<list<u8>>;
+    set-value: func(key: string, value: list<u8>);
+    delete-value: func(key: string);
+}
+
+/// Module-side event emission. Unchanged from v1.
+interface emit {
+    emit-event: func(channel: u32, event: list<u8>);
+}
+
+/// Structured logging. Unchanged from v1.
+interface logging {
+    variant log-level { trace, debug, info, warn, error }
+
+    log: func(level: log-level, target: string, message: string);
+}
+
+/// Dynamic interest mechanics — runtime-mutable.
+///
+/// v2 extends the predicate vocabulary:
+/// - `at-address(bech32)` — output's address matches exactly
+/// - `at-stake-cred(stake-cred)` — output's address shares this
+///   stake credential, regardless of payment credential
+/// - `holds-policy(policy_id)` — output's asset multiset
+///   contains any asset under this policy
+/// - `holds-asset(asset-id)` — output holds this exact asset
+/// - `tick-every(seconds)` — periodic wake-up
+///
+/// Modules persist their resolved interest set via `state-kv`
+/// so a host restart without an attached companion still filters
+/// correctly until the companion reconnects.
+interface interest {
+    use types.{stake-cred, asset-id};
+
+    variant interest-op {
+        add,
+        remove,
+        replace,
+    }
+
+    variant interest-predicate {
+        at-address(string),
+        at-stake-cred(stake-cred),
+        holds-policy(list<u8>),
+        holds-asset(asset-id),
+        tick-every(u32),
+    }
+}
+
+world mitos-module-v2 {
+    use types.{trap-strategy, retry-policy, dispatch-event};
+    use interest.{interest-op};
+
+    import chain-data;
+    import state-kv;
+    import emit;
+    import logging;
+
+    /// ABI version handshake. v2 modules return `(2, 0)`.
+    /// Mismatch is enforced at module load — v1 modules
+    /// can't run on v2 hosts and vice-versa.
+    export module-version: func() -> tuple<u32, u32>;
+
+    /// Trap supervision policy. Read once at module load; host
+    /// supervisor consults on every trap. Unchanged from v1.
+    export trap-policy: func() -> tuple<trap-strategy, retry-policy>;
+
+    /// One-shot init at module load. CBOR-encoded typed config
+    /// from the module's shared crate.
+    ///
+    /// v2 init is **light**: no bootstrap work, no current-state
+    /// hydration. Modules that need to scan a script address
+    /// declare it via interest; the platform dispatches the
+    /// bootstrap stream as synthesised events through
+    /// `handle-events` before live tip dispatch.
+    export init: func(config: list<u8>);
+
+    /// Single dispatch entry. The platform calls this with a
+    /// list of events from one Cardano TX (or, in the bootstrap
+    /// case, a chunk of synthesised per-output events from one
+    /// historical producing TX), in deterministic order:
+    /// `tx-context` → `referenced` → `consumed` → `produced` →
+    /// `minted`. Tick events and rollback markers are
+    /// dispatched in their own handle-events call (never
+    /// share a batch with utxo events).
+    export handle-events: func(events: list<dispatch-event>);
+
+    /// Dynamic interest mutation. Host calls this when a
+    /// `ClientMessage::Interest { op, items }` frame arrives
+    /// over the CF replication WS. `items-cbor` is a CBOR
+    /// `list<interest-predicate>`.
+    export update-interest: func(op: interest-op, items-cbor: list<u8>)
+                            -> result<_, string>;
+}
