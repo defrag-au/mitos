@@ -150,7 +150,7 @@ async fn scan_one_address<P: ChainDataPlane + Sync>(
         (Hash<32>, u32),
         mitos_data_plane::TypedDatum,
     > = std::collections::HashMap::new();
-    for (oref, datum_opt) in refs.iter().zip(datums.into_iter()) {
+    for (oref, datum_opt) in refs.iter().zip(datums) {
         if let Some(td) = datum_opt {
             datum_by_ref.insert((oref.tx_hash, oref.index), td);
         }

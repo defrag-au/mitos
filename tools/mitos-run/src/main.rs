@@ -274,8 +274,6 @@ struct FixtureDataPlane {
 #[derive(Clone)]
 struct ResolvedUtxo {
     output: TypedOutput,
-    datum_hash: Option<[u8; 32]>,
-    datum_payload: Option<Vec<u8>>,
 }
 
 impl FixtureDataPlane {
@@ -289,7 +287,12 @@ impl FixtureDataPlane {
                 .with_context(|| format!("utxo tx_hash {}", u.tx_hash))?;
             let oref = OutputRef::from_bytes(tx_hash, u.index);
 
-            let datum_hash = u
+            // Project fixture datum fields onto the TypedOutput
+            // so the data plane's `read_utxos` (and through it
+            // the v2 dispatch composer) can see them. Hash bytes
+            // come back as `pallas::Hash<32>`; payload becomes
+            // `original_cbor` per the data-plane convention.
+            let datum_hash_bytes = u
                 .datum_hash
                 .as_deref()
                 .map(decode_32)
@@ -303,6 +306,11 @@ impl FixtureDataPlane {
                 .with_context(|| {
                     format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index)
                 })?;
+            let datum = datum_hash_bytes.map(|h| mitos_data_plane::TypedDatum {
+                hash: pallas_primitives::Hash::new(h),
+                payload: None,
+                original_cbor: datum_payload,
+            });
 
             by_address
                 .entry(u.address.clone())
@@ -315,13 +323,11 @@ impl FixtureDataPlane {
                         address: u.address,
                         lovelace: u.lovelace,
                         assets: Vec::new(),
-                        datum: None,
+                        datum,
                         script_ref: None,
                         original_cbor: None,
                         decoded_at: DecodeLevel::Lean,
                     },
-                    datum_hash,
-                    datum_payload,
                 },
             );
         }

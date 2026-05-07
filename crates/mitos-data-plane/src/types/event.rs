@@ -133,9 +133,13 @@ impl UtxoEvent {
     }
 }
 
+/// `Utxo` is boxed because `UtxoEvent` is dramatically larger
+/// than `TickEvent` / `RollbackEvent` — without the box, every
+/// `DispatchEvent` value would carry the full UtxoEvent footprint
+/// even for non-utxo dispatches (clippy::large_enum_variant).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DispatchEvent {
-    Utxo(UtxoEvent),
+    Utxo(Box<UtxoEvent>),
     Tick(TickEvent),
     Rollback(RollbackEvent),
 }

@@ -31,7 +31,7 @@ use crate::bindings_v2::{
 /// the WIT-bindgen shape.
 pub fn dispatch_to_wit(event: DispatchEvent) -> bindings_v2::DispatchEvent {
     match event {
-        DispatchEvent::Utxo(u) => bindings_v2::DispatchEvent::Utxo(utxo_to_wit(u)),
+        DispatchEvent::Utxo(u) => bindings_v2::DispatchEvent::Utxo(utxo_to_wit(*u)),
         DispatchEvent::Tick(t) => bindings_v2::DispatchEvent::Tick(tick_to_wit(t)),
         DispatchEvent::Rollback(r) => bindings_v2::DispatchEvent::Rollback(rollback_to_wit(r)),
     }

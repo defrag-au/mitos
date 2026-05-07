@@ -31,7 +31,7 @@ use crate::bootstrap_v2::{interest_from_addresses, run_bootstrap};
 use crate::driver_v2::DriverV2;
 use crate::follower_v2::run_chain_follower_v2;
 use crate::host::{EmitterFactory, KvFactory, SubscriptionFactory};
-use crate::host_fns::{DataPlaneFacade, emit, state_kv};
+use crate::host_fns::DataPlaneFacade;
 use crate::registry::ResourceBudget;
 use crate::registry_v2::ModuleRegistryV2;
 use crate::storage::ModuleStorage;
@@ -81,6 +81,13 @@ where
     S: TipSubscription + 'static,
     P: ChainDataPlane + Send + Sync + 'static,
 {
+    // Lifecycle constructor takes one parameter per platform
+    // capability the host needs to spin up a v2 module slot
+    // (storage, engine, data planes, factories, budget). They
+    // don't naturally collapse into a config struct without
+    // adding a new struct that's just a parameter bag, so
+    // we accept the count over clippy's heuristic.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: ModuleStorage,
         engine: wasmtime::Engine,

@@ -145,7 +145,7 @@ impl DriverV2 {
         let wit_events: Vec<WitDispatchEvent> = batch
             .events
             .into_iter()
-            .map(|u| event_bindings::dispatch_to_wit(DispatchEvent::Utxo(u)))
+            .map(|u| event_bindings::dispatch_to_wit(DispatchEvent::Utxo(Box::new(u))))
             .collect();
 
         self.instance.store.set_fuel(self.fuel_per_call)?;

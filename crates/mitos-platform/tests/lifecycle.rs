@@ -81,6 +81,7 @@ fn manifest_for(wasm: &[u8]) -> Manifest {
             git_sha: None,
             crate_version: "0.0.0".to_owned(),
         },
+        interest: Default::default(),
     }
 }
 

@@ -60,7 +60,7 @@ pub async fn build_event_batches<P: ChainDataPlane + Sync>(
         }
     }
     // Cheap dedup via HashSet of (tx_hash bytes, index).
-    refs_to_resolve.sort_by(|a, b| (a.tx_hash, a.index).cmp(&(b.tx_hash, b.index)));
+    refs_to_resolve.sort_by_key(|a| (a.tx_hash, a.index));
     refs_to_resolve.dedup();
 
     // Step 2: bulk-resolve outputs + datums.
