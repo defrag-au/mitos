@@ -101,7 +101,7 @@ interface types {
 /// Snapshot chain-state queries. Proxies into `mitos-data-plane`
 /// host-side; modules never touch dolos directly.
 interface chain-data {
-    use types.{output-ref, typed-output, decode-level};
+    use types.{output-ref, typed-output, typed-datum, decode-level};
 
     /// Bulk lookup of N output refs in one host call. Amortises
     /// the boundary cost; modules should batch where possible.
@@ -124,6 +124,27 @@ interface chain-data {
     /// (Phase B+) once it lands. Today's marketplace contracts
     /// hold thousands, not hundreds of thousands.
     utxos-by-address: func(address: string) -> list<output-ref>;
+
+    /// Bulk caller-blind datum lookup for a list of output refs.
+    /// Returns a parallel list of `option<typed-datum>` — `Some`
+    /// when the output has a datum (resolved transparently
+    /// regardless of inline-vs-hash), `None` for outputs with no
+    /// datum on chain or refs that don't exist in the current
+    /// UTxO set.
+    ///
+    /// Bootstrap pair: indexers walking
+    /// `utxos-by-address(addr)` typically need both the output
+    /// content (`read-utxos(refs, Lean)`) and the datum bytes
+    /// (`read-output-datums(refs)`) for each ref. Two bulk
+    /// calls amortise the boundary cost across N refs.
+    ///
+    /// Datum *on-output* (i.e. carried with `read-utxos` results)
+    /// would be the cleaner shape but is a record-shape ABI
+    /// break; this method keeps the existing `typed-output`
+    /// stable while exposing the same data via the same
+    /// caller-blind resolution path.
+    read-output-datums: func(refs: list<output-ref>)
+                       -> list<option<typed-datum>>;
 }
 
 /// Module-private KV state. Backed by a per-module redb table
@@ -201,6 +222,18 @@ interface block-context {
         /// offerer pkh / collection target / etc.
         get-consumed-input-datum: func(tx-idx: u32, input-idx: u32)
                                   -> option<typed-datum>;
+
+        /// The `output-ref` of a consumed input — the
+        /// `(tx-hash, index)` of the prior output being spent.
+        /// `get-consumed-input` returns the prior output's
+        /// content (address, lovelace, assets); this returns its
+        /// identity. Modules emitting `Spent` events typically
+        /// need both: the address (to filter by watched script),
+        /// the datum (to decode offerer/etc.), and the ref (to
+        /// key the event so the companion can DELETE by primary
+        /// key). Always present — every consumed input has a ref
+        /// by construction; out-of-range `input_idx` traps.
+        get-consumed-input-ref: func(tx-idx: u32, input-idx: u32) -> output-ref;
     }
 }
 

@@ -6,7 +6,8 @@
 
 use crate::bindings::{
     AssetEntry as WitAssetEntry, AssetId as WitAssetId, ChainDataHost,
-    DecodeLevel as WitDecodeLevel, OutputRef as WitOutputRef, TypedOutput as WitTypedOutput,
+    DecodeLevel as WitDecodeLevel, OutputRef as WitOutputRef, TypedDatum as WitTypedDatum,
+    TypedOutput as WitTypedOutput,
 };
 use crate::host_fns::HostState;
 
@@ -46,6 +47,25 @@ impl ChainDataHost for HostState {
             .await
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+
+    async fn read_output_datums(
+        &mut self,
+        refs: Vec<WitOutputRef>,
+    ) -> wasmtime::Result<Vec<Option<WitTypedDatum>>> {
+        let dp_refs: Vec<mitos_data_plane::OutputRef> = refs
+            .iter()
+            .map(into_dp_ref_owned)
+            .collect::<wasmtime::Result<Vec<_>>>()?;
+        let resolved = self
+            .data_plane
+            .read_output_datums(&dp_refs)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(resolved
+            .into_iter()
+            .map(|opt| opt.map(|(hash, payload)| WitTypedDatum { hash, payload }))
+            .collect())
     }
 }
 

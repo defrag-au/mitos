@@ -151,6 +151,15 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         &self,
         hash: &[u8; 32],
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>>;
+
+    /// Bulk datum lookup paired with `read_utxos` for the
+    /// bootstrap pattern. Returns parallel `Option<(hash,
+    /// payload)>` per ref — caller-blind inline / hash
+    /// resolution.
+    async fn read_output_datums(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>>;
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -188,6 +197,20 @@ where
             Some(td) => Ok(td.original_cbor),
             None => Ok(None),
         }
+    }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        let datums =
+            mitos_data_plane::ChainDataPlane::read_output_datums(self, refs).await?;
+        Ok(datums
+            .into_iter()
+            .map(|opt| {
+                opt.and_then(|td| td.original_cbor.map(|payload| (td.hash.to_vec(), payload)))
+            })
+            .collect())
     }
 }
 
@@ -244,5 +267,20 @@ where
             Some(td) => Ok(td.original_cbor),
             None => Ok(None),
         }
+    }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        let datums =
+            mitos_data_plane::ChainDataPlane::read_output_datums(&plane, refs).await?;
+        Ok(datums
+            .into_iter()
+            .map(|opt| {
+                opt.and_then(|td| td.original_cbor.map(|payload| (td.hash.to_vec(), payload)))
+            })
+            .collect())
     }
 }

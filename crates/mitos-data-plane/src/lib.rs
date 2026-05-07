@@ -105,6 +105,26 @@ pub trait ChainDataPlane: Send + Sync {
     /// Result is hard-capped at 100K refs.
     async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>>;
 
+    /// Bulk datum lookup for a list of output refs. Returns a
+    /// parallel `Vec<Option<TypedDatum>>` where the i'th element
+    /// is the datum on `refs[i]`, resolved caller-blind (inline
+    /// or hash-via-state). `None` for outputs with no datum on
+    /// chain or refs that don't exist in the current UTxO set.
+    ///
+    /// Default impl walks `read_utxo` per ref; impls with bulk
+    /// shortcuts (e.g. batched state reads) can override.
+    async fn read_output_datums(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<TypedDatum>>> {
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let resolved = self.read_utxo(r, DecodeLevel::WithDatum).await?;
+            out.push(resolved.and_then(|t| t.datum));
+        }
+        Ok(out)
+    }
+
     /// Resolve a datum hash to its Plutus payload. Side-door for
     /// callers that have a hash but not the containing UTxO
     /// context (rare — most callers should use `read_utxo` with

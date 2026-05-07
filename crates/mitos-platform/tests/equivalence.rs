@@ -105,6 +105,13 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        Ok(vec![None; refs.len()])
+    }
 }
 
 fn ownership_module_wasm() -> Option<PathBuf> {

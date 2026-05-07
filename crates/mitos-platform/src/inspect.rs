@@ -78,6 +78,13 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        Ok(vec![None; refs.len()])
+    }
 }
 
 /// Load a wasm component, instantiate against the platform's

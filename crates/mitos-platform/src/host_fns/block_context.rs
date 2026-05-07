@@ -16,7 +16,7 @@
 use mitos_data_plane::DecodeLevel;
 use wasmtime::component::Resource;
 
-use crate::bindings::{HostResolvedBlock, TypedDatum, TypedOutput};
+use crate::bindings::{HostResolvedBlock, OutputRef, TypedDatum, TypedOutput};
 use crate::host_fns::HostState;
 use crate::host_fns::chain_data::{from_dp_output, into_dp_ref_owned};
 use crate::resolved_block::{OutputRefKey, ResolvedBlock};
@@ -324,6 +324,29 @@ impl HostResolvedBlock for HostState {
             .consumed_input_datum_cache
             .insert(key, resolved.clone());
         Ok(resolved)
+    }
+
+    async fn get_consumed_input_ref(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        input_idx: u32,
+    ) -> wasmtime::Result<OutputRef> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let oref = tx
+            .consumed_input_refs
+            .get(input_idx as usize)
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "input_idx {input_idx} out of range for tx {tx_idx}"
+                ))
+            })?
+            .clone();
+        Ok(oref)
     }
 
     async fn drop(&mut self, rep: Resource<ResolvedBlock>) -> wasmtime::Result<()> {
