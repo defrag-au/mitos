@@ -182,9 +182,15 @@ impl Bundle {
             let storage = mitos_platform::storage::ModuleStorage::new(modules_dir.clone());
             let engine = mitos_platform::registry::ModuleRegistry::build_engine()
                 .map_err(|e| anyhow::anyhow!("module engine: {e}"))?;
-            let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = Arc::new(
+            // Single DomainDataPlane instance serves both v1
+            // and v2 hosts: v1 wires it as `Arc<dyn DataPlaneFacade>`
+            // (via the blanket impl), v2 wires it as the concrete
+            // `Arc<DomainDataPlane<_>>` so the dispatch composer's
+            // generic bound resolves without a vtable hop.
+            let chain_plane = Arc::new(
                 mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
             );
+            let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = chain_plane.clone();
 
             // Subscription factory: each follower gets its own
             // tip-watch. Two layers of fix applied:
@@ -260,33 +266,46 @@ impl Bundle {
             let emitter_factory: mitos_platform::host::EmitterFactory =
                 Arc::new(mitos_platform::host_fns::emit::EventSink::new);
 
-            let host = Arc::new(mitos_platform::host::ModuleHost::new(
+            // Build v1 + v2 hosts pointed at the same storage,
+            // engine, factories, and budget. The unified host
+            // wraps both and routes per-module by manifest ABI.
+            let budget = mitos_platform::registry::ResourceBudget::default();
+            let v1_host = Arc::new(mitos_platform::host::ModuleHost::new(
+                storage.clone(),
+                engine.clone(),
+                dp.clone(),
+                sub_factory.clone(),
+                kv_factory.clone(),
+                emitter_factory.clone(),
+                budget,
+            ));
+            let v2_host = Arc::new(mitos_platform::host_v2::ModuleHostV2::new(
                 storage.clone(),
                 engine,
-                dp,
+                dp.clone(),
+                chain_plane,
                 sub_factory,
                 kv_factory,
                 emitter_factory,
-                mitos_platform::registry::ResourceBudget::default(),
+                budget,
+            ));
+            let host = Arc::new(mitos_platform::host_unified::UnifiedModuleHost::new(
+                storage.clone(),
+                v1_host,
+                v2_host,
             ));
 
-            // Auto-resume: scan modules dir, start a follower
-            // for each registered module. Failures here are
-            // logged but don't abort bundle startup — a single
-            // bad module shouldn't take the host down.
-            for module_id in storage.list_modules().unwrap_or_default() {
-                match host.start(&module_id).await {
-                    Ok(()) => info!(module = %module_id, "auto-resumed wasm module"),
-                    Err(e) => {
-                        error!(module = %module_id, error = %e, "auto-resume failed; module not running");
-                    }
-                }
-            }
+            // Auto-resume: per-module ABI routing. The unified
+            // host reads each manifest, picks v1/v2 dispatch,
+            // logs + skips on failure (single bad module
+            // doesn't abort bundle startup).
+            host.auto_resume().await;
 
             // The platform admin router has its own AuthToken
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
-            let host_for_admin = host.clone();
+            let host_for_admin =
+                host.clone() as Arc<dyn mitos_platform::host::ModuleHostHandle>;
 
             // Companion dial supervisor: maintains an outbound
             // WS to each registered companion so the host can

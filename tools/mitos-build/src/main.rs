@@ -159,28 +159,28 @@ async fn main() -> anyhow::Result<()> {
     // Single-file mode: materialise a Cargo crate around the
     // user's `.rs` + bundled WIT, then fall through into the
     // legacy build path with synthetic crate-name + workspace.
-    let (build_workspace, build_crate_name, build_module_id) = if let Some(module) =
-        args.module.as_ref()
-    {
-        let single = SingleFileSpec::resolve(module)?;
-        let materialised = materialise_module(&single)?;
-        let module_id = args.module_id.clone().unwrap_or(single.module_id.clone());
-        (
-            materialised.workspace_root,
-            materialised.crate_name,
-            module_id,
-        )
-    } else {
-        let crate_name = args
-            .crate_name
-            .clone()
-            .ok_or_else(|| anyhow!("--crate-name is required when --module is not given"))?;
-        let module_id = args
-            .module_id
-            .clone()
-            .unwrap_or_else(|| crate_name.replace('_', "-"));
-        (args.workspace.clone(), crate_name, module_id)
-    };
+    let (build_workspace, build_crate_name, build_module_id, build_config_path) =
+        if let Some(module) = args.module.as_ref() {
+            let single = SingleFileSpec::resolve(module)?;
+            let materialised = materialise_module(&single)?;
+            let module_id = args.module_id.clone().unwrap_or(single.module_id.clone());
+            (
+                materialised.workspace_root,
+                materialised.crate_name,
+                module_id,
+                single.config_path.clone(),
+            )
+        } else {
+            let crate_name = args
+                .crate_name
+                .clone()
+                .ok_or_else(|| anyhow!("--crate-name is required when --module is not given"))?;
+            let module_id = args
+                .module_id
+                .clone()
+                .unwrap_or_else(|| crate_name.replace('_', "-"));
+            (args.workspace.clone(), crate_name, module_id, None)
+        };
     let module_id = build_module_id;
 
     // 1. Build (or accept a pre-built path).
@@ -210,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         &build_workspace,
         &build_crate_name,
         &args.profile,
+        build_config_path.as_deref(),
     )?;
 
     if args.dry_run {
@@ -687,6 +688,10 @@ fn build_manifest(
     workspace: &Path,
     crate_name: &str,
     profile: &str,
+    // Path to the module's `<name>.toml` (single-file mode);
+    // `None` for the legacy multi-crate mode where `[interest]`
+    // has nowhere to live anyway.
+    config_path: Option<&Path>,
 ) -> anyhow::Result<Manifest> {
     let crate_version = read_crate_version(workspace, crate_name).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "could not read crate version; using 0.0.0");
@@ -724,7 +729,40 @@ fn build_manifest(
             git_sha,
             crate_version,
         },
+        // Interest section: read from `<name>.toml`'s
+        // `[interest]` table when present. v2 modules declare
+        // watched addresses here so the platform's bootstrap
+        // orchestrator can hydrate state on first deploy. v1
+        // modules omit this and the section round-trips empty.
+        interest: read_interest_section(config_path)?,
     })
+}
+
+/// Read `[interest]` from the module's `<name>.toml` if
+/// present. Today supports only `addresses = [...]`; richer
+/// predicate vocabulary lands when the manifest schema does
+/// (likely v2.1).
+fn read_interest_section(
+    config_path: Option<&Path>,
+) -> anyhow::Result<mitos_platform::manifest::InterestSection> {
+    let Some(path) = config_path else {
+        return Ok(Default::default());
+    };
+    let toml_str = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let value: toml::Value = toml::from_str(&toml_str)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let Some(interest) = value.get("interest").and_then(|v| v.as_table()) else {
+        return Ok(Default::default());
+    };
+    let addresses: Vec<String> = match interest.get("addresses") {
+        Some(toml::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(mitos_platform::manifest::InterestSection { addresses })
 }
 
 fn log_inspect(inspect: &InspectResult) {

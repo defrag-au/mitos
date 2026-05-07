@@ -569,7 +569,7 @@ where
 /// inefficient but trivially correct in the face of
 /// register/unregister churn. v2 caches the companion list
 /// behind a registered-companions broadcast.
-async fn run_emit_drain(
+pub(crate) async fn run_emit_drain(
     storage: ModuleStorage,
     module_id: String,
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,

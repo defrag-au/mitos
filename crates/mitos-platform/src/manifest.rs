@@ -21,6 +21,27 @@ pub struct Manifest {
     pub abi: AbiSection,
     pub trap_policy: TrapPolicySection,
     pub build: BuildSection,
+    /// v2-only: declarative interest set the platform applies
+    /// before block dispatch starts. Bootstrapping (current-
+    /// state hydration at watched addresses) runs against this
+    /// set; runtime mutation via `update-interest` evolves it
+    /// from there. Empty / absent for v1 modules — they
+    /// declare interest in their config or by other means.
+    #[serde(default, skip_serializing_if = "InterestSection::is_empty")]
+    pub interest: InterestSection,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterestSection {
+    /// bech32 addresses to watch + bootstrap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+}
+
+impl InterestSection {
+    pub fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +230,7 @@ mod tests {
                 git_sha: Some("abc123".to_owned()),
                 crate_version: "0.1.0".to_owned(),
             },
+            interest: InterestSection::default(),
         }
     }
 
