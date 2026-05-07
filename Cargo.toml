@@ -23,6 +23,7 @@ members = [
     "tools/mitos-tail",
     "tools/mitos-admin",
     "tools/mitos-build",
+    "tools/mitos-run",
 ]
 resolver = "2"
 

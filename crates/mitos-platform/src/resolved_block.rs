@@ -77,7 +77,7 @@ impl From<&OutputRef> for OutputRefKey {
 /// Per-tx view inside `ResolvedBlock`. Holds enough to answer
 /// `tx-hash` / `output-count` / `get-output` /
 /// `get-consumed-input` / `get-consumed-inputs` /
-/// `get-output-datum` without re-decoding.
+/// `get-output-datum` / `tx-metadata` without re-decoding.
 #[derive(Debug, Clone)]
 pub struct TxView {
     /// 32-byte tx hash. Modules emit as event metadata.
@@ -97,6 +97,11 @@ pub struct TxView {
     /// `get_consumed_input(tx_idx, i)` resolves
     /// `txs[tx_idx].consumed_input_refs[i]`.
     pub consumed_input_refs: Vec<OutputRef>,
+    /// Raw CBOR bytes of the tx's auxiliary_data section, if
+    /// present on chain. Modules consume this for app-aware
+    /// metadata decoding (jpg.store's labels-50+ datum
+    /// reconstruction etc.). `None` for txs with no metadata.
+    pub aux_data_cbor: Option<Vec<u8>>,
 }
 
 /// Per-output datum extraction outcome. Inline datums carry

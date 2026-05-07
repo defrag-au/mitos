@@ -125,6 +125,37 @@ pub trait ChainDataPlane: Send + Sync {
         Ok(out)
     }
 
+    /// Return just the datum *hashes* per ref — `None` when the
+    /// output has no datum on chain. Decoupled from byte
+    /// resolution so consumers can still get the hash even when
+    /// the plane couldn't resolve the payload (typical: hash-
+    /// attached datums whose bytes only live in TX metadata,
+    /// outside the witness-set index).
+    async fn output_datum_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<pallas_primitives::Hash<32>>>> {
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let resolved = self.read_utxo(r, DecodeLevel::WithDatum).await?;
+            out.push(resolved.and_then(|t| t.datum.map(|d| d.hash)));
+        }
+        Ok(out)
+    }
+
+    /// Auxiliary-data CBOR for a transaction by hash, looked up
+    /// via the archive's tx index. Used by app-aware modules
+    /// that decode datums (or other data) from TX metadata
+    /// rather than witness sets — e.g. jpg.store's collection-
+    /// offer labels-50+ convention.
+    ///
+    /// `None` when the tx isn't known to the archive or has no
+    /// auxiliary data attached.
+    async fn tx_metadata(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<Vec<u8>>>;
+
     /// Resolve a datum hash to its Plutus payload. Side-door for
     /// callers that have a hash but not the containing UTxO
     /// context (rare — most callers should use `read_utxo` with

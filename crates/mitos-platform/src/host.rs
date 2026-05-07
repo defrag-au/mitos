@@ -448,14 +448,35 @@ where
                 && !join_err.is_cancelled() {
                     tracing::warn!(module = %id, error = %join_err, "emit drain task panicked")
                 }
-            // Drop the cached redb store handles (cursor,
-            // emissions, KV) so the next start re-opens redb
-            // cleanly. Without this, a crash during the
-            // just-stopped task could leave a half-committed
-            // transaction visible to the new task via the
-            // cached handle.
+            // Eviction policy is per-store, calibrated to which
+            // tasks hold the redb handle:
+            //
+            // - `close_cursor` — cursor handle is held briefly
+            //   inside the dispatch loop (read on start, write
+            //   on each Apply). Evicting on stop is fine; the
+            //   next start re-opens cleanly with no race.
+            // - `close_kv` — KV handle is held by the wasm
+            //   instance (long-lived). When stop() drops the
+            //   instance, the Arc releases synchronously. Cache
+            //   eviction is required for the recapture flow:
+            //   external `rm kv.redb` won't take effect unless
+            //   we drop the cached handle too, otherwise the
+            //   in-memory state-kv survives.
+            // - `close_emissions` — DELIBERATELY NOT EVICTED.
+            //   The emissions handle is held by the long-running
+            //   drain task. Tokio JoinHandle resolution doesn't
+            //   guarantee immediate Drop of the future's
+            //   environment, so when stop()'s drain_task.await
+            //   returns, the previous Arc<Database> may still be
+            //   alive briefly. Evicting the cache + opening
+            //   fresh in the next start() races with that drop
+            //   and trips redb's "Database already open" guard,
+            //   silently disabling emission interception. The
+            //   cache stays populated so the new drain task
+            //   picks up the same handle — single open, no race.
+            //   redb transactions are atomic so there's no
+            //   "half-committed" concern.
             self.storage.close_cursor(id);
-            self.storage.close_emissions(id);
             self.storage.close_kv(id);
             tracing::info!(module = %id, sha = %slot.sha, "follower stopped");
         }

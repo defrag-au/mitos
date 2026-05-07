@@ -112,6 +112,20 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
         Ok(vec![None; refs.len()])
     }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn tx_metadata(
+        &self,
+        _tx_hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 fn ownership_module_wasm() -> Option<PathBuf> {
@@ -212,6 +226,7 @@ async fn equivalence_empty_watch_emits_nothing() {
             vec![(vec![0xAA; 28], b"X".to_vec(), 1)],
         )],
         output_datums: Vec::new(),
+        aux_data_cbor: None,
         consumed_input_refs: vec![],
     }];
     let actual = wasm_emit(&wasm, &watched, txs.clone()).await;
@@ -234,6 +249,7 @@ async fn equivalence_single_watched_asset() {
             vec![(policy.clone(), b"BlackFlag001".to_vec(), 1)],
         )],
         output_datums: Vec::new(),
+        aux_data_cbor: None,
         consumed_input_refs: vec![],
     }];
     let actual = wasm_emit(&wasm, &watched, txs.clone()).await;
@@ -274,12 +290,14 @@ async fn equivalence_multi_output_multi_asset() {
                 ),
             ],
             output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![],
         },
         TxView {
             tx_hash: vec![0xBB; 32],
             outputs: vec![make_output("addr1qpp", vec![])],
             output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![],
         },
     ];
@@ -303,6 +321,7 @@ async fn equivalence_unwatched_policy_emits_nothing() {
             vec![(vec![0xBB; 28], b"X".to_vec(), 1)],
         )],
         output_datums: Vec::new(),
+        aux_data_cbor: None,
         consumed_input_refs: vec![],
     }];
     let actual = wasm_emit(&wasm, &watched, txs.clone()).await;

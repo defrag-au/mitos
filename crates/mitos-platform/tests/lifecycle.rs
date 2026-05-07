@@ -116,6 +116,20 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
         Ok(vec![None; refs.len()])
     }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn tx_metadata(
+        &self,
+        _tx_hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// One-shot mpsc-backed subscription. Each call to the factory

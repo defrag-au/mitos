@@ -77,6 +77,20 @@ impl DataPlaneFacade for NullDataPlane {
     ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
         Ok(vec![None; refs.len()])
     }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn tx_metadata(
+        &self,
+        _tx_hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 fn spike_guest_wasm() -> Option<PathBuf> {
@@ -139,6 +153,7 @@ async fn end_to_end_load_instantiate_dispatch() {
             tx_hash: vec![0xCD; 32],
             outputs: vec![],
             output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![synthetic_input],
         }],
     );
@@ -246,6 +261,7 @@ async fn ownership_module_emits_transfer_for_watched_policy() {
             tx_hash: vec![0xEF; 32],
             outputs: vec![output],
             output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![],
         }],
     );
@@ -359,6 +375,7 @@ async fn ownership_module_ignores_unwatched_policy() {
             tx_hash: vec![0x11; 32],
             outputs: vec![output],
             output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![],
         }],
     );
@@ -561,6 +578,7 @@ async fn driver_advances_cursor_across_blocks() {
                 tx_hash: vec![0xCD; 32],
                 outputs: vec![],
                 output_datums: Vec::new(),
+                aux_data_cbor: None,
                 consumed_input_refs: vec![synthetic_input.clone()],
             }],
         };

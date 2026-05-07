@@ -145,6 +145,39 @@ interface chain-data {
     /// caller-blind resolution path.
     read-output-datums: func(refs: list<output-ref>)
                        -> list<option<typed-datum>>;
+
+    /// Datum *hashes* per output, decoupled from byte resolution.
+    /// Returns `Some(hash)` when the output carries a datum
+    /// (inline or hash-attached — the hash is what the on-chain
+    /// output references either way), `None` when the output has
+    /// no datum at all.
+    ///
+    /// Companion shape to `read-output-datums`: when the latter
+    /// returns `None` for a ref because the host couldn't resolve
+    /// the bytes (e.g. a hash-attached datum whose bytes only
+    /// live in TX metadata, not in any witness set), a module
+    /// can still get the *expected* hash here and try its own
+    /// app-aware reconstruction (see `tx-metadata` below).
+    read-output-hashes: func(refs: list<output-ref>)
+                       -> list<option<list<u8>>>;
+
+    /// Auxiliary-data CBOR for a transaction by hash. `None`
+    /// when the tx has no metadata or isn't known to the
+    /// archive.
+    ///
+    /// Modules use this to decode app-specific datum-encoding
+    /// conventions that live in TX metadata rather than
+    /// witness sets — jpg.store's collection-offer convention
+    /// (chunked hex under labels 50+) is the motivating
+    /// example. The host returns the raw aux-data CBOR; the
+    /// module parses it however the application encodes things.
+    /// No platform-level knowledge of any specific scheme.
+    ///
+    /// Hash-matching: pair this with `read-output-hashes` so
+    /// the module can blake2b-hash each metadata-decoded
+    /// candidate and match against the output's expected
+    /// datum hash.
+    tx-metadata: func(tx-hash: list<u8>) -> option<list<u8>>;
 }
 
 /// Module-private KV state. Backed by a per-module redb table
@@ -222,6 +255,28 @@ interface block-context {
         /// offerer pkh / collection target / etc.
         get-consumed-input-datum: func(tx-idx: u32, input-idx: u32)
                                   -> option<typed-datum>;
+
+        /// Datum hash on a produced output, decoupled from byte
+        /// resolution. `Some(hash)` when the output carries a
+        /// datum (inline or hash-attached); `None` for outputs
+        /// with no datum at all. Companion to `get-output-datum`
+        /// for cases where the host couldn't resolve the bytes
+        /// and the module wants to do its own reconstruction
+        /// (e.g. parse `tx-metadata` for app-specific
+        /// encodings) and match candidates against the expected
+        /// hash.
+        get-output-datum-hash: func(tx-idx: u32, output-idx: u32)
+                              -> option<list<u8>>;
+
+        /// Auxiliary-data CBOR for a transaction in the current
+        /// block. Same shape as the cross-block
+        /// `chain-data::tx-metadata` but reads from the
+        /// already-decoded block in hand — zero archive
+        /// round-trip cost.
+        ///
+        /// `None` when the tx at `tx-idx` has no auxiliary
+        /// data attached. Out-of-range `tx-idx` traps.
+        tx-metadata: func(tx-idx: u32) -> option<list<u8>>;
 
         /// The `output-ref` of a consumed input — the
         /// `(tx-hash, index)` of the prior output being spent.

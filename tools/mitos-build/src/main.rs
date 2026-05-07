@@ -443,7 +443,13 @@ publish = false
 opt-level = "z"
 lto = true
 codegen-units = 1
-strip = "symbols"
+# Keep symbols + line tables in release wasm so trap backtraces
+# resolve to source locations. Platform v1 prioritises debuggability
+# over wire size — modules run server-side on the operator's mitos
+# host, so the ~30-50% size bump has no cost. Revisit if module
+# count grows or cold-start matters.
+strip = false
+debug = "line-tables-only"
 
 [patch."https://github.com/defrag-au/mitos"]
 mitos-protocol = {{ path = "{mitos_protocol}" }}

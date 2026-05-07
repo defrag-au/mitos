@@ -24,6 +24,7 @@
 //! existing host-side ownership indexer does the same — a
 //! single bad output shouldn't poison the block.
 
+use pallas::codec::utils::Nullable;
 use pallas::ledger::primitives::conway::DatumOption;
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput, MultiEraTx, OriginalHash};
 
@@ -63,11 +64,37 @@ fn project_tx(tx: &MultiEraTx<'_>) -> TxView {
             index: input.index() as u32,
         })
         .collect();
+    let aux_data_cbor = extract_aux_data(tx);
     TxView {
         tx_hash,
         outputs,
         output_datums,
         consumed_input_refs,
+        aux_data_cbor,
+    }
+}
+
+/// Pull the raw auxiliary-data CBOR out of a `MultiEraTx`.
+/// `MultiEraTx::aux_data()` is `pub(crate)` upstream, so we
+/// pattern-match on the variant ourselves and access the
+/// public `auxiliary_data` field. `KeepRaw::raw_cbor()`
+/// preserves the original CBOR bytes.
+fn extract_aux_data(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
+    match tx {
+        MultiEraTx::AlonzoCompatible(t, _) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Babbage(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Conway(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Byron(_) => None,
+        _ => None,
     }
 }
 

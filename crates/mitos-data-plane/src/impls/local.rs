@@ -16,10 +16,12 @@
 use async_trait::async_trait;
 use cardano_assets::PolicyId;
 use dolos_cardano::model::{DATUM_NS, DatumState};
-use dolos_core::{ChainPoint, Domain, EntityKey, EraCbor, StateStore, TxoRef};
+use dolos_core::{
+    ArchiveStore, ChainPoint, Domain, EntityKey, EraCbor, IndexStore, StateStore, TxoRef,
+};
 use pallas::ledger::primitives::PlutusData;
 use pallas::ledger::primitives::conway::DatumOption;
-use pallas::ledger::traverse::OriginalHash;
+use pallas::ledger::traverse::{MultiEraBlock, MultiEraTx, OriginalHash};
 use pallas_traverse::MultiEraOutput;
 
 use crate::ChainDataPlane;
@@ -395,6 +397,44 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         ))
     }
 
+    async fn tx_metadata(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        // Dolos's tx index gives us the slot; the archive
+        // holds the block CBOR. Decode the block via pallas,
+        // find the matching tx by hash, return its
+        // auxiliary_data CBOR. Sync I/O — both lookups are
+        // in-process redb reads.
+        let slot = self
+            .domain
+            .indexes()
+            .slot_by_tx_hash(tx_hash.as_slice())
+            .map_err(|e| DataPlaneError::Storage(format!("slot_by_tx_hash: {e:?}")))?;
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        let block_body = self
+            .domain
+            .archive()
+            .get_block_by_slot(&slot)
+            .map_err(|e| DataPlaneError::Storage(format!("get_block_by_slot: {e:?}")))?;
+        let Some(block_body) = block_body else {
+            return Ok(None);
+        };
+        let block = MultiEraBlock::decode(block_body.as_slice()).map_err(|e| {
+            DataPlaneError::Decode(format!("MultiEraBlock decode: {e}"))
+        })?;
+        let tx = block
+            .txs()
+            .into_iter()
+            .find(|t| t.hash().as_slice() == tx_hash.as_slice());
+        let Some(tx) = tx else {
+            return Ok(None);
+        };
+        Ok(extract_aux_cbor(&tx))
+    }
+
     async fn total_supply(
         &self,
         _policy: &PolicyId,
@@ -468,3 +508,31 @@ const _: () = {
     let _ = ScriptLanguage::PlutusV2;
     let _ = ScriptLanguage::PlutusV3;
 };
+
+/// Pull the raw auxiliary-data CBOR out of a `MultiEraTx`.
+/// `MultiEraTx::aux_data()` is `pub(crate)` upstream, so we
+/// pattern-match on the variant ourselves and access the
+/// public `auxiliary_data` field. Each era's `KeepRaw` wrapper
+/// preserves the original CBOR bytes via `raw_cbor()`.
+fn extract_aux_cbor(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
+    use pallas_codec::utils::Nullable;
+    match tx {
+        MultiEraTx::AlonzoCompatible(t, _) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Babbage(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Conway(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Byron(_) => None,
+        // `MultiEraTx` is `#[non_exhaustive]`. Future eras land
+        // here until we add matching arms — return None defensively
+        // so an unknown era doesn't break aux-data lookups.
+        _ => None,
+    }
+}

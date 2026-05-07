@@ -349,6 +349,43 @@ impl HostResolvedBlock for HostState {
         Ok(oref)
     }
 
+    async fn get_output_datum_hash(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        output_idx: u32,
+    ) -> wasmtime::Result<Option<Vec<u8>>> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let _ = tx.outputs.get(output_idx as usize).ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "output_idx {output_idx} out of range for tx {tx_idx}"
+            ))
+        })?;
+        Ok(tx
+            .output_datums
+            .get(output_idx as usize)
+            .cloned()
+            .flatten()
+            .map(|info| info.hash.as_ref().to_vec()))
+    }
+
+    async fn tx_metadata(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+    ) -> wasmtime::Result<Option<Vec<u8>>> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        Ok(tx.aux_data_cbor.clone())
+    }
+
     async fn drop(&mut self, rep: Resource<ResolvedBlock>) -> wasmtime::Result<()> {
         // Resource passed as `borrow<>` — host retains ownership.
         // We still implement drop so wasmtime can wire up the

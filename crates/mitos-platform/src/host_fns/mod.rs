@@ -160,6 +160,24 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         &self,
         refs: &[mitos_data_plane::OutputRef],
     ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>>;
+
+    /// Datum hashes per ref, decoupled from byte resolution —
+    /// `Some(hash)` even when the host couldn't resolve the
+    /// payload (e.g. metadata-only datums). Caller pairs with
+    /// `tx_metadata` + their own decoder when bytes weren't
+    /// resolved.
+    async fn read_output_hashes(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<Vec<u8>>>>;
+
+    /// Auxiliary-data CBOR for a transaction by hash. `None`
+    /// when the tx has no aux data or the archive doesn't
+    /// know it.
+    async fn tx_metadata(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>>;
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -211,6 +229,23 @@ where
                 opt.and_then(|td| td.original_cbor.map(|payload| (td.hash.to_vec(), payload)))
             })
             .collect())
+    }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        let hashes =
+            mitos_data_plane::ChainDataPlane::output_datum_hashes(self, refs).await?;
+        Ok(hashes.into_iter().map(|o| o.map(|h| h.to_vec())).collect())
+    }
+
+    async fn tx_metadata(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        let phash = pallas_primitives::Hash::<32>::from(*tx_hash);
+        mitos_data_plane::ChainDataPlane::tx_metadata(self, &phash).await
     }
 }
 
@@ -282,5 +317,24 @@ where
                 opt.and_then(|td| td.original_cbor.map(|payload| (td.hash.to_vec(), payload)))
             })
             .collect())
+    }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        let hashes =
+            mitos_data_plane::ChainDataPlane::output_datum_hashes(&plane, refs).await?;
+        Ok(hashes.into_iter().map(|o| o.map(|h| h.to_vec())).collect())
+    }
+
+    async fn tx_metadata(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        let phash = pallas_primitives::Hash::<32>::from(*tx_hash);
+        mitos_data_plane::ChainDataPlane::tx_metadata(&plane, &phash).await
     }
 }
