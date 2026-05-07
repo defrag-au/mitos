@@ -134,6 +134,7 @@ fn admin_router_inner(
             get(get_module).post(upload_module).delete(delete_module),
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
+        .route("/_admin/modules/{id}/last-trap", get(last_trap))
         .route(
             "/_admin/modules/{id}/emissions",
             get(list_emissions).delete(purge_emissions),
@@ -398,6 +399,38 @@ async fn restart_module(
         .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
     tracing::info!(module = %id, "module restarted");
     Ok((StatusCode::OK, "restarted").into_response())
+}
+
+/// Return the most recently captured trap fixture for a module.
+/// Written by the host's `TrapContextLogger` on every wasm trap
+/// during `init` (and, in a follow-up, `handle_event`); the
+/// fixture is `mitos-run --fixture` compatible TOML so the
+/// operator can reproduce the trap locally with full debug
+/// symbols, no SSH or Dolos snapshot needed.
+///
+/// 404 when the module has never trapped (or `last-trap.toml`
+/// has been manually cleared). Plain-text body so curl can
+/// `>` it straight to disk.
+async fn last_trap(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let path = state.storage.last_trap_path(&id);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/x-toml")],
+            body,
+        )
+            .into_response()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((StatusCode::NOT_FOUND, "no trap fixture captured for this module").into_response())
+        }
+        Err(e) => Err(HandlerError::Storage(StorageError::Io(e))),
+    }
 }
 
 // -----------------------------------------------------------------------------

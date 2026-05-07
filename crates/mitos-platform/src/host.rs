@@ -40,6 +40,7 @@ use crate::driver::Driver;
 use crate::host_fns::{DataPlaneFacade, emit, state_kv};
 use crate::registry::{ModuleRegistry, ResourceBudget};
 use crate::storage::ModuleStorage;
+use crate::trap_context::{TrapContextLogger, write_fixture};
 use crate::{PlatformError, PlatformResult, follower::run_chain_follower};
 
 /// Object-safe lifecycle surface for the admin router.
@@ -269,21 +270,56 @@ where
         let kv = (self.kv_factory)(id);
         let (sink, events_rx) = (self.emitter_factory)();
 
+        // Wrap the data plane in a trap-context logger. Every
+        // host-fn call goes through it; on a wasm trap the
+        // captured log gets serialised to `last-trap.toml` so
+        // the operator can replay it locally with mitos-run.
+        // Logger is shared between init + the follower task —
+        // `Arc<TrapContextLogger>` works as a `DataPlaneFacade`
+        // and as a snapshot source.
+        let trap_logger = Arc::new(TrapContextLogger::new(self.data_plane.clone()));
+
         // Build the driver with the resumed cursor + checkpoint
         // hook so future advances persist back through storage.
         let mut instance = registry
-            .instantiate(self.data_plane.clone(), kv, sink, self.budget)
+            .instantiate(trap_logger.clone(), kv, sink, self.budget)
             .await?;
         // Init with persisted config if any; empty bytes
         // otherwise. The module decides what to do with empty
         // config — ownership-indexer-module treats it as
         // "no policies watched, no-op."
         let config = self.storage.read_config(id)?.unwrap_or_default();
-        instance
+        if let Err(e) = instance
             .bindings
             .call_init(&mut instance.store, &config)
             .await
-            .map_err(PlatformError::Wasmtime)?;
+        {
+            // Dump the captured data-plane log so the operator
+            // can replay locally. Best-effort — a fixture-write
+            // failure shouldn't mask the underlying wasm error,
+            // we just log and propagate the original.
+            let snap = trap_logger.snapshot();
+            let path = self.storage.last_trap_path(id);
+            match write_fixture(&snap, id, &path) {
+                Ok(()) => {
+                    tracing::error!(
+                        module = %id,
+                        fixture = %path.display(),
+                        utxos = snap.read_utxos.iter().map(|c| c.returned.len()).sum::<usize>(),
+                        tx_metadata_calls = snap.tx_metadata.len(),
+                        "init trapped; fixture written for local replay (mitos-run --fixture)"
+                    );
+                }
+                Err(write_err) => {
+                    tracing::warn!(
+                        module = %id,
+                        error = %write_err,
+                        "init trapped; failed to write trap fixture",
+                    );
+                }
+            }
+            return Err(PlatformError::Wasmtime(e));
+        }
         let persisted_cursor = self.storage.read_cursor(id)?;
         let mut driver = Driver::new(instance, self.budget);
         if let Some(cursor) = persisted_cursor.as_ref() {
@@ -307,7 +343,14 @@ where
         let subscription = (self.subscription_factory)(persisted_cursor);
         let storage = self.storage.clone();
         let engine = self.engine.clone();
-        let data_plane = self.data_plane.clone();
+        // Reuse the same trap_logger as the follower's data
+        // plane so dispatch traps capture context the same way
+        // init traps do (and so re-instantiation on
+        // RestartAndReplay keeps going through the logger).
+        // Dispatch-time fixture dump is wired into the follower
+        // path in a follow-up (today: init traps captured;
+        // dispatch traps still surface as wasmtime errors).
+        let data_plane: Arc<dyn DataPlaneFacade> = trap_logger.clone();
         let kv_factory = self.kv_factory.clone();
         let emitter_factory_inner = self.emitter_factory.clone();
         let id_for_task = id.to_owned();

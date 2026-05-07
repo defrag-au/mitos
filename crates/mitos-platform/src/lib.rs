@@ -49,6 +49,7 @@ pub mod registry;
 pub mod resolved_block;
 pub mod storage;
 pub mod supervisor;
+pub mod trap_context;
 pub mod vendored;
 
 pub use block_decode::{DecodedBlock, decode_block};

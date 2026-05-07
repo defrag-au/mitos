@@ -173,6 +173,17 @@ impl ModuleStorage {
         self.root.join(id)
     }
 
+    /// Per-module last-trap fixture path. The host's
+    /// `TrapContextLogger` writes here on every `init` /
+    /// `handle_event` failure; the admin endpoint
+    /// `GET /_admin/modules/<id>/last-trap` reads it back. Always
+    /// the most recent trap — older ones are overwritten,
+    /// matching the "pull → debug → push fix" iteration loop
+    /// the operator runs.
+    pub fn last_trap_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("last-trap.toml")
+    }
+
     /// Per-module companions registration directory.
     /// `<storage_root>/<id>/companions/<companion_key>.cbor` is
     /// where each registered companion's `SubscribeRequest` lives.
