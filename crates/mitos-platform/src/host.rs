@@ -289,6 +289,13 @@ where
         // config — ownership-indexer-module treats it as
         // "no policies watched, no-op."
         let config = self.storage.read_config(id)?.unwrap_or_default();
+        // Refuel before init with the init-class budget. Modules
+        // that bootstrap by scanning a script address can burn
+        // 10×+ what `fuel_per_call` allows; without this they
+        // exhaust mid-bootstrap on first deploy. The Driver
+        // re-applies `fuel_per_call` before each subsequent
+        // dispatch, so this larger budget is one-shot.
+        instance.store.set_fuel(self.budget.init_fuel)?;
         if let Err(e) = instance
             .bindings
             .call_init(&mut instance.store, &config)

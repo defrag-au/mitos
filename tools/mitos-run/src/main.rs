@@ -112,14 +112,24 @@ async fn main() -> Result<()> {
     let registry = ModuleRegistry::load_from_path(engine, module_id.clone(), &wasm_path)
         .map_err(|e| anyhow::anyhow!("load module: {e}"))?;
 
+    let budget = ResourceBudget::default();
     let mut instance = registry
-        .instantiate(dp, kv, sink, ResourceBudget::default())
+        .instantiate(dp, kv, sink, budget)
         .await
         .map_err(|e| anyhow::anyhow!("instantiate: {e}"))?;
 
+    // Mirror `ModuleHost::start`: refuel with the init-class
+    // budget before `call_init`. Bootstrap-style modules can
+    // burn an order of magnitude more than `fuel_per_call`
+    // would allow.
+    instance
+        .store
+        .set_fuel(budget.init_fuel)
+        .map_err(|e| anyhow::anyhow!("set init fuel: {e}"))?;
     println!(
-        "▸ init(): calling with config_bytes.len()={}",
-        config_bytes.len()
+        "▸ init(): calling with config_bytes.len()={}, fuel={}",
+        config_bytes.len(),
+        budget.init_fuel
     );
     let init_result = instance
         .bindings
