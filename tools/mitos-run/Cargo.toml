@@ -1,0 +1,32 @@
+[package]
+name = "mitos-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mitos-run"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the platform's wasmtime engine + linker + WIT bindings.
+# Same code path the production host uses — anything that runs
+# clean here will run clean there.
+mitos-platform = { path = "../../crates/mitos-platform" }
+mitos-data-plane = { path = "../../crates/mitos-data-plane" }
+
+# Typed asset/policy newtypes — for v2 fixture interest predicates.
+cardano-assets = { workspace = true }
+# Pallas hash newtype — the data-plane trait method signatures
+# carry `Hash<32>` / `Hash<28>` directly.
+pallas-primitives = { workspace = true }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
+toml = "0.8"
+serde = { workspace = true }
+async-trait = { workspace = true }

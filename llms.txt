@@ -1,0 +1,162 @@
+# mitos
+
+> A framework for building Cardano indexers as **wasm modules paired
+> with Cloudflare Worker companions**. The host (mitos) embeds Dolos
+> as a chain follower, runs your wasm module against each block, and
+> dials your CF Worker over a WebSocket to deliver typed events. Your
+> Worker's Durable Objects consume those events, persist application
+> state, and serve your read API.
+>
+> One dApp = one repo with two halves: the wasm module (`.rs` source
+> emitting events) and the CF Worker (companion DO that consumes
+> them). Both halves reference one shared event-types crate so the
+> wire shape can't drift.
+
+## When to use mitos
+
+Use mitos when you need to project on-chain data into a queryable
+service:
+
+- **A queryable view over chain state** — "who currently owns each
+  asset under policy P," "all marketplace listings for collection C,"
+  "all jpg.store collection offers on contract address A," etc.
+- **A pipeline that runs on every block** with low latency and no
+  re-derivation cost — your indexer code touches Dolos's lookup
+  primitives directly (no gRPC / REST hops) and emits typed events
+  to your consumer immediately.
+- **A consumer service that lives at the edge** — your CF Worker
+  Durable Objects hold the materialised view, serve your dApp's
+  HTTP / WS surface, and stay warm via Hibernation.
+
+Don't use mitos for ad-hoc one-shot queries — Dolos's HTTP APIs are
+fine for that.
+
+## How to build an indexer (the canonical path)
+
+### 1. Lay out the dApp repo
+
+A dApp owns both halves. Layout (matching `cnft.dev-workers/workers/collections-mitos/`):
+
+```
+my-dapp/
+├── workers/my-dapp/
+│   ├── src/                          # CF Worker code (worker entry, DO)
+│   ├── modules/
+│   │   ├── <name>.rs                 # wasm module — emits events on each block
+│   │   └── <name>.toml               # module config (watched policies, [deps])
+│   ├── Cargo.toml
+│   └── wrangler.toml
+└── types/<my-dapp>-events/           # shared event-type crate (Serialize/Deserialize)
+    ├── Cargo.toml
+    └── src/lib.rs                    # `pub enum MyEvent { ... }` with #[serde(tag = "type")]
+```
+
+Both the wasm module and the worker DO depend on the shared
+event-types crate. **Never inline duplicate event definitions** —
+encoder/decoder drift turns into silent `Nacked: invalid type: map,
+expected enum` rows in the host's emissions log.
+
+### 2. Write the wasm module
+
+Single-file: `modules/<name>.rs` is the source of truth. mitos-build
+materialises a Cargo crate around it at build time, injects the
+WIT bindgen header, and ships the bundled host WIT in-tree.
+
+The module implements `Guest` from `mitos:platform/mitos-module`.
+Hot path is `handle-event(channel, block)` — walks the resolved
+block, decides what to emit. Dynamic interest comes through
+`update-interest(op, items-cbor)` — host pushes the consumer's
+filter set in.
+
+State is held in `state-kv` (per-module redb-backed). The
+ownership module at `cnft.dev-workers/workers/collections-mitos/modules/ownership.rs`
+is the canonical reference.
+
+### 3. Write the CF Worker companion
+
+Worker embeds a `MitosCompanionRuntime<C>` inside a non-generic
+`#[durable_object]` wrapper. The runtime owns:
+
+- WebSocket lifecycle (Hibernation API)
+- HTTPS subscribe call to the host
+- Cursor coordination
+- Schema migration
+- Auth (CF Secrets Store)
+- Dynamic interest mutation
+- Ack/Nack delivery
+
+You implement `MitosCompanion` (`NAME`, `Config`, `channels()`) and
+`MitosChannel` per channel — each channel typed over its `Event`
+shape. The channel's `apply_event` does the SQL writes; the runtime
+handles cursor advance + Ack atomicity.
+
+Reference: `cnft.dev-workers/workers/collections-mitos/src/do_state.rs`.
+
+### 4. Deploy
+
+```bash
+# Build + upload the wasm module
+./scripts/build-module.sh workers/my-dapp <name>
+mitos-admin --mitos https://mitos.defrag.cc --token "$TOKEN" \
+    upload-module --artifact workers/my-dapp/modules/target/mitos/<name>
+
+# Deploy the worker
+cd workers/my-dapp && wrangler deploy
+```
+
+The worker's first DO wake POSTs `SubscribeRequest` to the host;
+the host persists, dials back, and starts streaming.
+
+## Docs to read in order
+
+### To understand the model
+- [Companion pattern](docs/strategy/MITOS_COMPANION_PATTERN.md) — why dApps pair a wasm module with a CF Worker companion. **Start here** for any new project.
+- [Architecture](docs/design/ARCHITECTURE.md) — the host's role: Dolos + bundle + chain dispatch.
+- [Cardano dApp framework thesis](docs/strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md) — why this shape exists.
+
+### To build the wasm module side
+- [Platform v1](docs/strategy/MITOS_PLATFORM_V1.md) — wasm-module runtime, WIT ABI, resource limits, trap policies.
+- [Module deployment](docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md) — mitos-build + mitos-admin upload-module flow.
+- [WIT contract](crates/mitos-platform/wit/world.wit) — exact ABI: `init`, `handle-event`, `update-interest`, host fns (`chain-data`, `state-kv`, `emit`, `logging`).
+
+### To build the CF Worker companion side
+- [Companion runtime](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md) — `MitosCompanionRuntime`, channels, subscribe call, dynamic interest, Ack/Nack semantics.
+- [CF replication protocol](docs/design/CF_REPLICATION.md) — wire shapes for Apply / Undo / Mark / Ack / Nack / Interest / Subscribe / Connected.
+- [Subscription mechanics](docs/design/SUBSCRIPTION_MECHANICS.md) — `Interest` vocabulary, asset / domain / value selectors.
+
+### To operate a deployment
+- [Deploy procedure](docs/PR3B_DEPLOYMENT.md) — rsync + cargo build on the host, wrangler deploy on the CF side.
+- [redb access pattern](docs/design/REDB_ACCESS.md) — host's storage discipline; relevant if you touch host code.
+
+## Reference dApp
+
+`cnft.dev-workers/workers/collections-mitos/` is the canonical dApp
+implementation. When designing a new dApp, mirror its layout:
+
+- `modules/ownership.rs` + `modules/ownership.toml` — single-file wasm module
+- `src/do_state.rs` — `MitosCompanion` + `MitosChannel` impls
+- `src/lib.rs` — Worker entry + `route_to_do` for read-API forwarding
+- `wrangler.toml` — `[vars]` for `MITOS_HOST_URL` + `MITOS_REPLICATE_URL`, secrets store binding for `MITOS_AUTH_TOKEN`
+- `cnft.dev-workers/types/collections-mitos-events/` — shared event-type crate
+
+## Static indexers (legacy — do not start new work here)
+
+The crates `crates/collection-ownership-indexer/` and
+`crates/marketplace-indexer/` are legacy static indexers compiled
+into the bundle binary, paired with the legacy `mitos-core::Replicator`
+outbound subscription model. **They are slated for retirement once
+the production consumer migrates onto the wasm-module + companion path.**
+
+Don't build new indexers as static crates. The wasm-module path is
+the steady state — single-file source, hot-load via `mitos-admin
+upload-module`, paired with a CF Worker companion in the dApp's
+own repo.
+
+## Active host
+
+- Host: `https://mitos.defrag.cc` (Cloudflare-tunnelled to a netcup
+  box running the bundle binary)
+- Auth: shared bearer token via `MITOS_AUTH_TOKEN`
+- Operator surface: `mitos-admin {health, list-modules, get-module,
+  upload-module, restart-module, delete-module, deploy, emissions,
+  emissions-replay, emissions-purge}`

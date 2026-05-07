@@ -27,6 +27,8 @@
 //!   then mean "genuinely absent on chain", not "caller didn't
 //!   ask" — that distinction is in `DecodeLevel`.
 
+pub mod block_events;
+pub mod dispatch;
 pub mod impls;
 pub mod types;
 
@@ -34,9 +36,11 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    AddressPattern, AssetEntry, AssetPattern, ChainTip, DataPlaneError, DataPlaneResult,
-    DecodeLevel, OutputRef, OutputRefPattern, Page, PageRequest, ScriptLanguage, TypedDatum,
-    TypedOutput, TypedScript, UtxoPattern, UtxoPredicate,
+    AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, ConsumedEvent, DataPlaneError,
+    DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate, InterestSet, MintedEvent,
+    OutputRef, OutputRefPattern, Page, PageRequest, ProducedEvent, ReferencedEvent, RollbackEvent,
+    ScriptLanguage, StakeCred, TickEvent, TxContextEvent, TxEventBatch, TypedDatum, TypedOutput,
+    TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
 };
 
 pub use impls::LocalDataPlane;
@@ -88,6 +92,73 @@ pub trait ChainDataPlane: Send + Sync {
         decode: DecodeLevel,
         page: PageRequest,
     ) -> DataPlaneResult<Page<(OutputRef, TypedOutput)>>;
+
+    /// Bootstrap helper: enumerate output refs at one address.
+    /// Refs only — callers pair with `read_utxos` when they want
+    /// full outputs.
+    ///
+    /// Convenience wrapper over `search_utxos` for the common
+    /// indexer-bootstrap pattern ("give me everything currently
+    /// unspent at this script address"). Calling
+    /// `search_utxos(Match(at_address(...)))` would work
+    /// equivalently but pays construction overhead and pagination
+    /// machinery for a use case that wants the full list in one
+    /// shot.
+    ///
+    /// `address` is bech32 (`addr1...` / `addr_test1...`).
+    /// Result is hard-capped at 100K refs.
+    async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>>;
+
+    /// Bulk datum lookup for a list of output refs. Returns a
+    /// parallel `Vec<Option<TypedDatum>>` where the i'th element
+    /// is the datum on `refs[i]`, resolved caller-blind (inline
+    /// or hash-via-state). `None` for outputs with no datum on
+    /// chain or refs that don't exist in the current UTxO set.
+    ///
+    /// Default impl walks `read_utxo` per ref; impls with bulk
+    /// shortcuts (e.g. batched state reads) can override.
+    async fn read_output_datums(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<TypedDatum>>> {
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let resolved = self.read_utxo(r, DecodeLevel::WithDatum).await?;
+            out.push(resolved.and_then(|t| t.datum));
+        }
+        Ok(out)
+    }
+
+    /// Return just the datum *hashes* per ref — `None` when the
+    /// output has no datum on chain. Decoupled from byte
+    /// resolution so consumers can still get the hash even when
+    /// the plane couldn't resolve the payload (typical: hash-
+    /// attached datums whose bytes only live in TX metadata,
+    /// outside the witness-set index).
+    async fn output_datum_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<pallas_primitives::Hash<32>>>> {
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let resolved = self.read_utxo(r, DecodeLevel::WithDatum).await?;
+            out.push(resolved.and_then(|t| t.datum.map(|d| d.hash)));
+        }
+        Ok(out)
+    }
+
+    /// Auxiliary-data CBOR for a transaction by hash, looked up
+    /// via the archive's tx index. Used by app-aware modules
+    /// that decode datums (or other data) from TX metadata
+    /// rather than witness sets — e.g. jpg.store's collection-
+    /// offer labels-50+ convention.
+    ///
+    /// `None` when the tx isn't known to the archive or has no
+    /// auxiliary data attached.
+    async fn tx_metadata(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<Vec<u8>>>;
 
     /// Resolve a datum hash to its Plutus payload. Side-door for
     /// callers that have a hash but not the containing UTxO

@@ -6,7 +6,8 @@
 
 use crate::bindings::{
     AssetEntry as WitAssetEntry, AssetId as WitAssetId, ChainDataHost,
-    DecodeLevel as WitDecodeLevel, OutputRef as WitOutputRef, TypedOutput as WitTypedOutput,
+    DecodeLevel as WitDecodeLevel, OutputRef as WitOutputRef, TypedDatum as WitTypedDatum,
+    TypedOutput as WitTypedOutput,
 };
 use crate::host_fns::HostState;
 
@@ -34,6 +35,74 @@ impl ChainDataHost for HostState {
             .into_iter()
             .map(|(_, out)| from_dp_output(out))
             .collect())
+    }
+
+    async fn utxos_by_address(
+        &mut self,
+        address: String,
+    ) -> wasmtime::Result<Vec<WitOutputRef>> {
+        let refs = self
+            .data_plane
+            .utxos_by_address(&address)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+
+    async fn read_output_datums(
+        &mut self,
+        refs: Vec<WitOutputRef>,
+    ) -> wasmtime::Result<Vec<Option<WitTypedDatum>>> {
+        let dp_refs: Vec<mitos_data_plane::OutputRef> = refs
+            .iter()
+            .map(into_dp_ref_owned)
+            .collect::<wasmtime::Result<Vec<_>>>()?;
+        let resolved = self
+            .data_plane
+            .read_output_datums(&dp_refs)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(resolved
+            .into_iter()
+            .map(|opt| opt.map(|(hash, payload)| WitTypedDatum { hash, payload }))
+            .collect())
+    }
+
+    async fn read_output_hashes(
+        &mut self,
+        refs: Vec<WitOutputRef>,
+    ) -> wasmtime::Result<Vec<Option<Vec<u8>>>> {
+        let dp_refs: Vec<mitos_data_plane::OutputRef> = refs
+            .iter()
+            .map(into_dp_ref_owned)
+            .collect::<wasmtime::Result<Vec<_>>>()?;
+        self.data_plane
+            .read_output_hashes(&dp_refs)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))
+    }
+
+    async fn tx_metadata(
+        &mut self,
+        tx_hash: Vec<u8>,
+    ) -> wasmtime::Result<Option<Vec<u8>>> {
+        let bytes: [u8; 32] = tx_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| wasmtime::Error::msg("tx_hash must be 32 bytes"))?;
+        self.data_plane
+            .tx_metadata(&bytes)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))
+    }
+}
+
+/// data-plane `OutputRef` → WIT `output-ref`. Inverse of
+/// `into_dp_ref_owned`.
+fn from_dp_ref(r: mitos_data_plane::OutputRef) -> WitOutputRef {
+    WitOutputRef {
+        tx_hash: r.tx_hash.as_ref().to_vec(),
+        index: r.index,
     }
 }
 

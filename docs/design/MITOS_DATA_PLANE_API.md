@@ -232,6 +232,23 @@ pub enum DatumDecode {
 /// Server-resolved datum struct. Hash always present (when any
 /// datum exists); payload populated whenever decoded; original
 /// CBOR available for callers that want to skip the codec hop.
+///
+/// `payload` (typed `PlutusData`) and `original_cbor` (raw bytes)
+/// are distinct **at the in-process Rust trait level** — the
+/// payload is the parsed AST (saves the consumer a CBOR-decode
+/// hop), original_cbor is the on-chain bytes (saves the consumer
+/// a re-encode hop, useful for hash verification or witness-set
+/// inclusion). The distinction earns its keep here because Rust
+/// callers can cheaply consume both representations.
+///
+/// **At the WIT boundary the distinction collapses.** Marshalling
+/// a recursive `PlutusData` tree across the host/guest boundary
+/// is more expensive than passing CBOR bytes and decoding
+/// guest-side. The WIT projection of this struct therefore has
+/// only `hash` and `payload: list<u8>` (the resolved on-chain
+/// CBOR bytes); guests use `ciborium` / `pallas-codec` to decode
+/// locally. See `crates/mitos-platform/wit/world.wit`'s
+/// `typed-datum`.
 pub struct TypedDatum {
     pub hash: DatumHash,
     pub payload: Option<PlutusData>,

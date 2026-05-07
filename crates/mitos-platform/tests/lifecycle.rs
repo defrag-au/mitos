@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dolos_core::{ChainPoint, TipEvent, TipSubscription};
-use mitos_data_plane::{DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
+use dolos_core::{TipEvent, TipSubscription};
+use mitos_data_plane::{ChainPoint, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 use mitos_platform::host::ModuleHost;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
 use mitos_platform::manifest::{
@@ -81,6 +81,7 @@ fn manifest_for(wasm: &[u8]) -> Manifest {
             git_sha: None,
             crate_version: "0.0.0".to_owned(),
         },
+        interest: Default::default(),
     }
 }
 
@@ -94,6 +95,41 @@ impl DataPlaneFacade for NullDataPlane {
         _decode: DecodeLevel,
     ) -> DataPlaneResult<Vec<(OutputRef, TypedOutput)>> {
         Ok(Vec::new())
+    }
+
+    async fn utxos_by_address(
+        &self,
+        _address: &str,
+    ) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(Vec::new())
+    }
+
+    async fn datum_by_hash(
+        &self,
+        _hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn tx_metadata(
+        &self,
+        _tx_hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
     }
 }
 
@@ -171,7 +207,7 @@ async fn start_replace_stop_roundtrip() {
     //    is the empty-watchset case — module dispatches but
     //    doesn't emit.
     tx.send(TipEvent::Apply(
-        ChainPoint::Slot(186_000_000),
+        ChainPoint::Slot(186_000_000).into(),
         Arc::new(cbor.clone()),
     ))
     .unwrap();

@@ -9,10 +9,11 @@
 //! - produced outputs as `bindings::TypedOutput` (address +
 //!   lovelace + assets)
 //! - `consumed_input_refs` for lazy on-demand resolution
+//! - per-output datum info (hash + inline-bytes-when-present)
+//!   stashed on `TxView` for the `get-output-datum` host fn
 //!
 //! v1 deliberately drops:
-//! - datum + script_ref (not on the WIT yet — bump ABI when
-//!   they land)
+//! - script_ref (not on the WIT yet — bump ABI when it lands)
 //! - `original_cbor` passthrough (modules requiring raw CBOR
 //!   are out of v1 scope)
 //!
@@ -23,10 +24,12 @@
 //! existing host-side ownership indexer does the same — a
 //! single bad output shouldn't poison the block.
 
-use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput, MultiEraTx};
+use pallas::codec::utils::Nullable;
+use pallas::ledger::primitives::conway::DatumOption;
+use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput, MultiEraTx, OriginalHash};
 
 use crate::bindings::{AssetEntry, AssetId, TypedOutput};
-use crate::resolved_block::TxView;
+use crate::resolved_block::{OutputDatumInfo, TxView};
 
 /// Decode a CBOR-encoded block into the platform's typed view.
 /// Returns `Err` on undecoded CBOR; per-tx and per-output
@@ -49,7 +52,10 @@ pub struct DecodedBlock {
 
 fn project_tx(tx: &MultiEraTx<'_>) -> TxView {
     let tx_hash = tx.hash().as_slice().to_vec();
-    let outputs: Vec<TypedOutput> = tx.outputs().iter().map(project_output).collect();
+    let raw_outputs = tx.outputs();
+    let outputs: Vec<TypedOutput> = raw_outputs.iter().map(project_output).collect();
+    let output_datums: Vec<Option<OutputDatumInfo>> =
+        raw_outputs.iter().map(extract_datum_info).collect();
     let consumed_input_refs = tx
         .consumes()
         .iter()
@@ -58,10 +64,37 @@ fn project_tx(tx: &MultiEraTx<'_>) -> TxView {
             index: input.index() as u32,
         })
         .collect();
+    let aux_data_cbor = extract_aux_data(tx);
     TxView {
         tx_hash,
         outputs,
+        output_datums,
         consumed_input_refs,
+        aux_data_cbor,
+    }
+}
+
+/// Pull the raw auxiliary-data CBOR out of a `MultiEraTx`.
+/// `MultiEraTx::aux_data()` is `pub(crate)` upstream, so we
+/// pattern-match on the variant ourselves and access the
+/// public `auxiliary_data` field. `KeepRaw::raw_cbor()`
+/// preserves the original CBOR bytes.
+fn extract_aux_data(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
+    match tx {
+        MultiEraTx::AlonzoCompatible(t, _) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Babbage(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Conway(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor().to_vec()),
+            _ => None,
+        },
+        MultiEraTx::Byron(_) => None,
+        _ => None,
     }
 }
 
@@ -97,5 +130,38 @@ fn project_output(output: &MultiEraOutput<'_>) -> TypedOutput {
         address,
         lovelace,
         assets,
+    }
+}
+
+/// Extract per-output datum info during block decode. Inline
+/// datums carry their bytes directly here; hash-attached datums
+/// record only the hash (the host resolves via Dolos's datum
+/// state index later, when the guest asks via
+/// `block-context::get-output-datum`).
+///
+/// This is the hook for the caller-blind datum resolution
+/// principle: when the guest asks for the datum on `(tx_idx,
+/// output_idx)`, the host has the inline payload pre-extracted
+/// here OR resolves the hash transparently via the data plane.
+/// The guest never sees the source distinction.
+fn extract_datum_info(output: &MultiEraOutput<'_>) -> Option<OutputDatumInfo> {
+    let datum_opt = output.datum()?;
+    match datum_opt {
+        DatumOption::Hash(h) => Some(OutputDatumInfo {
+            hash: h,
+            inline_bytes: None,
+        }),
+        DatumOption::Data(cbor_wrap) => {
+            // `cbor_wrap` is `CborWrap<KeepRaw<'_, PlutusData<'_>>>`.
+            // The original CBOR of the inner PlutusData is what we
+            // want to ship as `payload` to the guest. `KeepRaw`
+            // stashes the original bytes during decode.
+            let raw = cbor_wrap.0.raw_cbor().to_vec();
+            let hash = cbor_wrap.0.original_hash();
+            Some(OutputDatumInfo {
+                hash,
+                inline_bytes: Some(raw),
+            })
+        }
     }
 }

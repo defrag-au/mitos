@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use dolos_core::ChainPoint;
+use mitos_data_plane::ChainPoint;
 
 use crate::manifest::Manifest;
 
@@ -171,6 +171,17 @@ impl ModuleStorage {
 
     fn module_dir(&self, id: &str) -> PathBuf {
         self.root.join(id)
+    }
+
+    /// Per-module last-trap fixture path. The host's
+    /// `TrapContextLogger` writes here on every `init` /
+    /// `handle_event` failure; the admin endpoint
+    /// `GET /_admin/modules/<id>/last-trap` reads it back. Always
+    /// the most recent trap — older ones are overwritten,
+    /// matching the "pull → debug → push fix" iteration loop
+    /// the operator runs.
+    pub fn last_trap_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("last-trap.toml")
     }
 
     /// Per-module companions registration directory.
@@ -538,6 +549,7 @@ mod tests {
                 git_sha: None,
                 crate_version: "0.1.0".to_owned(),
             },
+            interest: crate::manifest::InterestSection::default(),
         }
     }
 

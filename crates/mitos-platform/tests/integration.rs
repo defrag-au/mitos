@@ -29,7 +29,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dolos_core::{ChainPoint, TipEvent, TipSubscription};
+use dolos_core::{TipEvent, TipSubscription};
+use mitos_data_plane::ChainPoint;
 use mitos_data_plane::{DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 use mitos_platform::ResolvedBlock;
 use mitos_platform::bindings::{
@@ -55,6 +56,41 @@ impl DataPlaneFacade for NullDataPlane {
         _decode: DecodeLevel,
     ) -> DataPlaneResult<Vec<(OutputRef, TypedOutput)>> {
         Ok(Vec::new())
+    }
+
+    async fn utxos_by_address(
+        &self,
+        _address: &str,
+    ) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(Vec::new())
+    }
+
+    async fn datum_by_hash(
+        &self,
+        _hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        Ok(vec![None; refs.len()])
+    }
+
+    async fn tx_metadata(
+        &self,
+        _tx_hash: &[u8; 32],
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
     }
 }
 
@@ -117,6 +153,8 @@ async fn end_to_end_load_instantiate_dispatch() {
         vec![TxView {
             tx_hash: vec![0xCD; 32],
             outputs: vec![],
+            output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![synthetic_input],
         }],
     );
@@ -223,6 +261,8 @@ async fn ownership_module_emits_transfer_for_watched_policy() {
         vec![TxView {
             tx_hash: vec![0xEF; 32],
             outputs: vec![output],
+            output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![],
         }],
     );
@@ -335,6 +375,8 @@ async fn ownership_module_ignores_unwatched_policy() {
         vec![TxView {
             tx_hash: vec![0x11; 32],
             outputs: vec![output],
+            output_datums: Vec::new(),
+            aux_data_cbor: None,
             consumed_input_refs: vec![],
         }],
     );
@@ -440,8 +482,10 @@ async fn follower_pumps_apply_events_through_module() {
 
     // Wire the synthetic subscription; send one Apply, then drop.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // TipEvent uses dolos's ChainPoint at the boundary; convert
+    // mitos's owned type at the send site.
     tx.send(TipEvent::Apply(
-        ChainPoint::Slot(186_000_000),
+        ChainPoint::Slot(186_000_000).into(),
         std::sync::Arc::new(cbor.clone()),
     ))
     .unwrap();
@@ -536,6 +580,8 @@ async fn driver_advances_cursor_across_blocks() {
             txs: vec![TxView {
                 tx_hash: vec![0xCD; 32],
                 outputs: vec![],
+                output_datums: Vec::new(),
+                aux_data_cbor: None,
                 consumed_input_refs: vec![synthetic_input.clone()],
             }],
         };

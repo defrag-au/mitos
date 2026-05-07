@@ -113,7 +113,12 @@ where
                             kv_factory.clone(),
                             emitter_factory.clone(),
                             block_bytes,
-                            point.clone(),
+                            // Convert at the dolos boundary —
+                            // `point` is `dolos_core::ChainPoint`
+                            // from the broadcast; the driver
+                            // and downstream platform code take
+                            // `mitos_data_plane::ChainPoint`.
+                            point.clone().into(),
                         )
                         .await
                     {

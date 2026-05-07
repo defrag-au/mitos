@@ -50,5 +50,5 @@ pub use mitos::platform::interest::Host as InterestHost;
 pub use mitos::platform::logging::{Host as LoggingHost, LogLevel};
 pub use mitos::platform::state_kv::Host as StateKvHost;
 pub use mitos::platform::types::{
-    AssetEntry, AssetId, DecodeLevel, Host as TypesHost, OutputRef, TypedOutput,
+    AssetEntry, AssetId, DecodeLevel, Host as TypesHost, OutputRef, TypedDatum, TypedOutput,
 };

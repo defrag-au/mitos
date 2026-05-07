@@ -28,10 +28,20 @@ use mitos_platform::manifest::{
     AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, sha256_hex,
 };
 
-/// Host WIT contract bundled at compile time. Each `mitos-build`
-/// release pins exactly one WIT version; upgrading the tool
+/// Host WIT contracts bundled at compile time. Each `mitos-build`
+/// release pins specific WIT versions; upgrading the tool
 /// upgrades the WIT every single-file module is built against.
-const HOST_WIT: &str = include_str!("../../../crates/mitos-platform/wit/world.wit");
+///
+/// v1: legacy `mitos-module` world — block-centric `handle-event`
+/// dispatch. Existing modules (`collection-ownership-indexer`,
+/// `marketplace-indexer`, jpg-co's pre-migration shape) build
+/// against this.
+///
+/// v2: `mitos-module-v2` world — eUTXO event-stream dispatch
+/// per `MITOS_PLATFORM_V2.md`. Modules opt in by setting
+/// `abi_version = 2` at the top of their `<name>.toml`.
+const HOST_WIT_V1: &str = include_str!("../../../crates/mitos-platform/wit/world.wit");
+const HOST_WIT_V2: &str = include_str!("../../../crates/mitos-platform/wit-v2/world.wit");
 
 /// Absolute path to the `mitos-protocol` crate baked at compile
 /// time. Single-file modules need a path-dep into mitos-protocol
@@ -149,28 +159,28 @@ async fn main() -> anyhow::Result<()> {
     // Single-file mode: materialise a Cargo crate around the
     // user's `.rs` + bundled WIT, then fall through into the
     // legacy build path with synthetic crate-name + workspace.
-    let (build_workspace, build_crate_name, build_module_id) = if let Some(module) =
-        args.module.as_ref()
-    {
-        let single = SingleFileSpec::resolve(module)?;
-        let materialised = materialise_module(&single)?;
-        let module_id = args.module_id.clone().unwrap_or(single.module_id.clone());
-        (
-            materialised.workspace_root,
-            materialised.crate_name,
-            module_id,
-        )
-    } else {
-        let crate_name = args
-            .crate_name
-            .clone()
-            .ok_or_else(|| anyhow!("--crate-name is required when --module is not given"))?;
-        let module_id = args
-            .module_id
-            .clone()
-            .unwrap_or_else(|| crate_name.replace('_', "-"));
-        (args.workspace.clone(), crate_name, module_id)
-    };
+    let (build_workspace, build_crate_name, build_module_id, build_config_path) =
+        if let Some(module) = args.module.as_ref() {
+            let single = SingleFileSpec::resolve(module)?;
+            let materialised = materialise_module(&single)?;
+            let module_id = args.module_id.clone().unwrap_or(single.module_id.clone());
+            (
+                materialised.workspace_root,
+                materialised.crate_name,
+                module_id,
+                single.config_path.clone(),
+            )
+        } else {
+            let crate_name = args
+                .crate_name
+                .clone()
+                .ok_or_else(|| anyhow!("--crate-name is required when --module is not given"))?;
+            let module_id = args
+                .module_id
+                .clone()
+                .unwrap_or_else(|| crate_name.replace('_', "-"));
+            (args.workspace.clone(), crate_name, module_id, None)
+        };
     let module_id = build_module_id;
 
     // 1. Build (or accept a pre-built path).
@@ -200,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         &build_workspace,
         &build_crate_name,
         &args.profile,
+        build_config_path.as_deref(),
     )?;
 
     if args.dry_run {
@@ -337,6 +348,22 @@ fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::
 // Single-file module support
 // ============================================================================
 
+/// Which platform ABI a module targets. Determines which WIT
+/// gets bundled into the materialised crate and which world
+/// the wit_bindgen macro generates against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbiVersion {
+    /// `mitos-module` world — block-centric `handle-event`
+    /// dispatch. Default when `<name>.toml` doesn't declare
+    /// `abi_version`.
+    V1,
+    /// `mitos-module-v2` world — eUTXO event-stream dispatch
+    /// per `MITOS_PLATFORM_V2.md`. Opt in by setting
+    /// `abi_version = 2` at the top of the module's
+    /// `<name>.toml`.
+    V2,
+}
+
 /// Resolved single-file module: paths to `<name>.rs` and the
 /// optional `<name>.toml`, plus the inferred module-id (file
 /// stem, hyphenated).
@@ -344,6 +371,7 @@ struct SingleFileSpec {
     rs_path: PathBuf,
     config_path: Option<PathBuf>,
     module_id: String,
+    abi_version: AbiVersion,
 }
 
 impl SingleFileSpec {
@@ -377,10 +405,36 @@ impl SingleFileSpec {
         let module_id = stem.replace('_', "-");
         let config_candidate = rs_path.with_extension("toml");
         let config_path = config_candidate.exists().then_some(config_candidate);
+
+        // Read `abi_version` from the top of `<name>.toml` if
+        // present. Default v1 — existing modules keep working
+        // without changes; v2 modules opt in by adding
+        // `abi_version = 2`.
+        let abi_version = match &config_path {
+            None => AbiVersion::V1,
+            Some(path) => {
+                let toml_str = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let value: toml::Value = toml::from_str(&toml_str)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                match value.get("abi_version").and_then(|v| v.as_integer()) {
+                    Some(1) | None => AbiVersion::V1,
+                    Some(2) => AbiVersion::V2,
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "{}: unsupported abi_version = {other} (only 1 or 2)",
+                            path.display(),
+                        ));
+                    }
+                }
+            }
+        };
+
         Ok(Self {
             rs_path: rs_path.canonicalize().unwrap_or(rs_path),
             config_path,
             module_id,
+            abi_version,
         })
     }
 }
@@ -443,7 +497,13 @@ publish = false
 opt-level = "z"
 lto = true
 codegen-units = 1
-strip = "symbols"
+# Keep symbols + line tables in release wasm so trap backtraces
+# resolve to source locations. Platform v1 prioritises debuggability
+# over wire size — modules run server-side on the operator's mitos
+# host, so the ~30-50% size bump has no cost. Revisit if module
+# count grows or cold-start matters.
+strip = false
+debug = "line-tables-only"
 
 [patch."https://github.com/defrag-au/mitos"]
 mitos-protocol = {{ path = "{mitos_protocol}" }}
@@ -483,8 +543,14 @@ mitos-protocol = {{ path = "{mitos_protocol}" }}
     );
     write_if_changed(&crate_dir.join("Cargo.toml"), &crate_toml)?;
 
-    // WIT contract bundled at compile time.
-    write_if_changed(&wit_dir.join("world.wit"), HOST_WIT)?;
+    // WIT contract bundled at compile time. v1 vs v2 is picked
+    // off the spec — `<name>.toml`'s `abi_version` field, with
+    // v1 as the default for existing modules.
+    let (host_wit, world_name) = match spec.abi_version {
+        AbiVersion::V1 => (HOST_WIT_V1, "mitos-module"),
+        AbiVersion::V2 => (HOST_WIT_V2, "mitos-module-v2"),
+    };
+    write_if_changed(&wit_dir.join("world.wit"), host_wit)?;
 
     // Generate the crate's `src/lib.rs`. Layout:
     //
@@ -506,7 +572,7 @@ mitos-protocol = {{ path = "{mitos_protocol}" }}
 // the bundled host WIT under `../wit`. User source below.
 wit_bindgen::generate!({{
     path: "../wit",
-    world: "mitos-module",
+    world: "{world_name}",
 }});
 
 {user_rest}
@@ -622,6 +688,10 @@ fn build_manifest(
     workspace: &Path,
     crate_name: &str,
     profile: &str,
+    // Path to the module's `<name>.toml` (single-file mode);
+    // `None` for the legacy multi-crate mode where `[interest]`
+    // has nowhere to live anyway.
+    config_path: Option<&Path>,
 ) -> anyhow::Result<Manifest> {
     let crate_version = read_crate_version(workspace, crate_name).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "could not read crate version; using 0.0.0");
@@ -643,8 +713,22 @@ fn build_manifest(
         abi: AbiSection {
             version_major: inspect.abi_version_major,
             version_minor: inspect.abi_version_minor,
-            wit_package: "mitos:platform".to_owned(),
-            wit_world: "mitos-module".to_owned(),
+            // WIT package + world differ between v1 and v2.
+            // v1: `mitos:platform/mitos-module`
+            // v2: `mitos:platform-v2/mitos-module-v2`
+            // Pick by inspected ABI major.
+            wit_package: if inspect.abi_version_major >= 2 {
+                "mitos:platform-v2"
+            } else {
+                "mitos:platform"
+            }
+            .to_owned(),
+            wit_world: if inspect.abi_version_major >= 2 {
+                "mitos-module-v2"
+            } else {
+                "mitos-module"
+            }
+            .to_owned(),
         },
         trap_policy: TrapPolicySection {
             strategy: inspect.trap_strategy.clone(),
@@ -659,7 +743,40 @@ fn build_manifest(
             git_sha,
             crate_version,
         },
+        // Interest section: read from `<name>.toml`'s
+        // `[interest]` table when present. v2 modules declare
+        // watched addresses here so the platform's bootstrap
+        // orchestrator can hydrate state on first deploy. v1
+        // modules omit this and the section round-trips empty.
+        interest: read_interest_section(config_path)?,
     })
+}
+
+/// Read `[interest]` from the module's `<name>.toml` if
+/// present. Today supports only `addresses = [...]`; richer
+/// predicate vocabulary lands when the manifest schema does
+/// (likely v2.1).
+fn read_interest_section(
+    config_path: Option<&Path>,
+) -> anyhow::Result<mitos_platform::manifest::InterestSection> {
+    let Some(path) = config_path else {
+        return Ok(Default::default());
+    };
+    let toml_str = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let value: toml::Value = toml::from_str(&toml_str)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let Some(interest) = value.get("interest").and_then(|v| v.as_table()) else {
+        return Ok(Default::default());
+    };
+    let addresses: Vec<String> = match interest.get("addresses") {
+        Some(toml::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(mitos_platform::manifest::InterestSection { addresses })
 }
 
 fn log_inspect(inspect: &InspectResult) {

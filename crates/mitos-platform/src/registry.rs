@@ -58,9 +58,19 @@ pub struct ModuleInstance {
 
 /// Per-instance resource budget. V1: generous defaults that
 /// won't trip ownership-style indexers. v2 will tune per-module.
+///
+/// `init_fuel` is separate from `fuel_per_call` because
+/// bootstrap-style modules (jpg.store CO indexer, marketplace
+/// indexers that scan a script address on first deploy) walk
+/// thousands of UTxOs in `init()`, decoding metadata + hashing
+/// per output. That's a one-shot heavyweight cost that doesn't
+/// recur on subsequent dispatches; budgeting `init` separately
+/// keeps the per-block ceiling tight without starving the
+/// bootstrap path.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceBudget {
     pub fuel_per_call: u64,
+    pub init_fuel: u64,
     pub fuel_yield_interval: u64,
     pub epoch_deadline_ticks: u64,
 }
@@ -69,6 +79,13 @@ impl Default for ResourceBudget {
     fn default() -> Self {
         Self {
             fuel_per_call: 100_000_000,
+            // Empirically calibrated: jpg-co's metadata-fallback
+            // bootstrap costs ~630K fuel per output (CBOR parse
+            // + hex decode + blake2b match + datum decode +
+            // event emit). 10B keeps headroom for ~15K outputs;
+            // jpg.store V2 currently sits at ~4.5K. Per-block
+            // dispatch keeps the tighter `fuel_per_call` cap.
+            init_fuel: 10_000_000_000,
             fuel_yield_interval: 10_000,
             epoch_deadline_ticks: 1_000_000,
         }

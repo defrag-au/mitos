@@ -3501,6 +3501,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-run"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cardano-assets",
+ "clap",
+ "hex",
+ "mitos-data-plane",
+ "mitos-platform",
+ "pallas-primitives 1.0.0-alpha.6",
+ "serde",
+ "tokio",
+ "toml 0.8.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mitos-tail"
 version = "0.0.1"
 dependencies = [

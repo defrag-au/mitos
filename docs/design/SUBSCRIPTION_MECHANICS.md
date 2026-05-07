@@ -328,6 +328,75 @@ on old `Filter`s simply don't match the new variants).
 Removing variants is breaking — versioned via the indexer's
 `schema_version` field on subscribe (returned in the ack).
 
+## Bootstrap vs. dynamic Interest
+
+Wasm-module indexers receive Interest from two sources, and the
+distinction is operationally load-bearing.
+
+**Bootstrap config** (the `<feature>.toml`'s top-level keys —
+`policies = [...]`, etc.) is consulted **once**, on first init,
+**only when the module's persisted interest state is empty**.
+This is the "module loaded, no companion attached yet" case —
+typically fresh deploys for local dev or observability bootstraps
+where you want the module to emit something on first run before
+any consumer wires up.
+
+**Dynamic interest** is the canonical, production-mode source.
+The companion DO asserts its current Interest set by calling its
+own `/api/_interest/subscribe` endpoint (provided by the
+`mitos-companion` runtime SDK), which writes to the companion's
+`mitos_companion_interest` SQL table and forwards a
+`ClientMessage::Interest { op, items }` frame over the held WS
+to the mitos host. The host calls the module's
+`update-interest(op, items_cbor)` WIT export. The module
+deserialises, applies the new filter, and persists the result to
+its private `state-kv` (per the `crates/mitos-platform/wit/world.wit`
+`interest` interface contract — "modules persist the resulting
+filter set via `state-kv` so a host restart without an attached
+companion still filters correctly until the companion reconnects
+and replays").
+
+The precedence rule:
+
+1. **Module restart with empty `state-kv`** — bootstrap config
+   wins. The module emits per the TOML's hardcoded list until a
+   companion connects and asserts something canonical.
+2. **Module restart with populated `state-kv`** — persisted state
+   wins. The TOML's bootstrap list is ignored. This is the steady
+   state for any module that's been live for more than one
+   companion-driven Interest mutation.
+3. **Companion-driven `update-interest` frame** — always wins
+   for the calling companion's scope. Replaces (or
+   adds-to / removes-from, per `InterestOp`) the persisted set,
+   which gets re-persisted to `state-kv` for the next restart.
+
+**Operational consequences:**
+
+- **Don't ship policy hardcodes in `<feature>.toml` for production
+  deploys.** Once a companion has driven Interest into the module
+  at least once, the TOML's list is a deploy-time hazard — it
+  can't take effect (state-kv has the canonical set), but it can
+  mislead operators reading the deploy.
+- **Empty `policies = []` in production toml is the right default.**
+  It signals "no bootstrap fallback; companions own this." Modules
+  under empty interest emit nothing, which is the correct behaviour
+  for a freshly-deployed module that hasn't yet been wired to a
+  companion.
+- **Local-dev / observability deploys** are the exception — keep
+  a couple of entries in the TOML so the module emits something
+  visible without needing a companion attached.
+- **State-schema-breaking module updates** that need a fresh
+  Interest replay should explicitly clear `state-kv`'s interest
+  key before restart (the module-side equivalent of dropping the
+  cursor row to force re-bootstrap). v1 has no first-class
+  primitive for this; operator runs an admin op.
+
+The legacy in-tree static-crate shape (`Indexer<D>` with
+`type Scope = ...`) doesn't have this distinction — scope is
+asserted once on subscribe and held as a runtime value. The
+bootstrap-vs-dynamic split is specific to wasm modules where
+state must survive restart without a host-resident scope value.
+
 ## Indexer trait change
 
 Today's `Indexer<D>` has:

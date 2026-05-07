@@ -16,7 +16,7 @@
 use mitos_data_plane::DecodeLevel;
 use wasmtime::component::Resource;
 
-use crate::bindings::{HostResolvedBlock, TypedOutput};
+use crate::bindings::{HostResolvedBlock, OutputRef, TypedDatum, TypedOutput};
 use crate::host_fns::HostState;
 use crate::host_fns::chain_data::{from_dp_output, into_dp_ref_owned};
 use crate::resolved_block::{OutputRefKey, ResolvedBlock};
@@ -187,6 +187,203 @@ impl HostResolvedBlock for HostState {
             out.push(resolved);
         }
         Ok(out)
+    }
+
+    async fn get_output_datum(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        output_idx: u32,
+    ) -> wasmtime::Result<Option<TypedDatum>> {
+        // Phase 1: pre-extracted per-output datum info on
+        // `TxView::output_datums` (built during block decode in
+        // `block_decode::extract_datum_info`). For inline datums
+        // the bytes are already in hand; for hash-attached datums
+        // we resolve via the data plane's `datum_by_hash` (which
+        // hits Dolos's witness-datum state index). The guest sees
+        // only resolved bytes — caller-blind, per the WIT
+        // contract.
+        let info = {
+            let block = self.table.get(&self_)?;
+            let tx = block
+                .txs
+                .get(tx_idx as usize)
+                .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+            // Validate output_idx against produced outputs even
+            // when the matching `output_datums` slot is None, so
+            // out-of-range indices error consistently with
+            // `get_output`.
+            let _ = tx.outputs.get(output_idx as usize).ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "output_idx {output_idx} out of range for tx {tx_idx}"
+                ))
+            })?;
+            tx.output_datums.get(output_idx as usize).cloned().flatten()
+        };
+        let Some(info) = info else {
+            return Ok(None);
+        };
+
+        let hash_bytes: [u8; 32] = *info.hash;
+        let payload = if let Some(bytes) = info.inline_bytes {
+            bytes
+        } else {
+            // Hash-attached datum — resolve via state index.
+            match self.data_plane.datum_by_hash(&hash_bytes).await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    tracing::debug!(
+                        hash = %hex::encode(hash_bytes),
+                        "datum hash not present in state index"
+                    );
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %hex::encode(hash_bytes),
+                        error = %e,
+                        "datum_by_hash lookup failed"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+
+        Ok(Some(TypedDatum {
+            hash: hash_bytes.to_vec(),
+            payload,
+        }))
+    }
+
+    async fn get_consumed_input_datum(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        input_idx: u32,
+    ) -> wasmtime::Result<Option<TypedDatum>> {
+        // Pull the consumed input's `OutputRef` and check the
+        // per-block datum cache (we cache hash→bytes resolutions
+        // separately from the consumed-input typed-output cache;
+        // the latter stays at `Lean` decode level so existing
+        // callers don't pay datum-resolution cost they don't
+        // want).
+        let (oref, key) = {
+            let block = self.table.get(&self_)?;
+            let tx = block
+                .txs
+                .get(tx_idx as usize)
+                .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+            let oref = tx
+                .consumed_input_refs
+                .get(input_idx as usize)
+                .ok_or_else(|| {
+                    wasmtime::Error::msg(format!(
+                        "input_idx {input_idx} out of range for tx {tx_idx}"
+                    ))
+                })?
+                .clone();
+            let key = OutputRefKey::from(&oref);
+            (oref, key)
+        };
+
+        // Cache hit?
+        if let Some(cached) = self
+            .table
+            .get(&self_)?
+            .consumed_input_datum_cache
+            .get(&key)
+        {
+            return Ok(cached.clone());
+        }
+
+        // Miss: fetch the prior output at WithDatum decode level
+        // so the data plane resolves its datum (inline or hash)
+        // transparently in one round trip. We extract the resolved
+        // datum bytes and project to the WIT shape.
+        let dp_ref = into_dp_ref_owned(&oref)?;
+        let pairs = self
+            .data_plane
+            .read_utxos(&[dp_ref], DecodeLevel::WithDatum)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+
+        let resolved: Option<TypedDatum> = pairs
+            .into_iter()
+            .next()
+            .and_then(|(_, out)| out.datum)
+            .and_then(|td| {
+                td.original_cbor.map(|payload| TypedDatum {
+                    hash: td.hash.as_ref().to_vec(),
+                    payload,
+                })
+            });
+
+        // Memoise (even `None`) so repeated lookups are cheap.
+        let block = self.table.get_mut(&self_)?;
+        block
+            .consumed_input_datum_cache
+            .insert(key, resolved.clone());
+        Ok(resolved)
+    }
+
+    async fn get_consumed_input_ref(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        input_idx: u32,
+    ) -> wasmtime::Result<OutputRef> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let oref = tx
+            .consumed_input_refs
+            .get(input_idx as usize)
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "input_idx {input_idx} out of range for tx {tx_idx}"
+                ))
+            })?
+            .clone();
+        Ok(oref)
+    }
+
+    async fn get_output_datum_hash(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+        output_idx: u32,
+    ) -> wasmtime::Result<Option<Vec<u8>>> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        let _ = tx.outputs.get(output_idx as usize).ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "output_idx {output_idx} out of range for tx {tx_idx}"
+            ))
+        })?;
+        Ok(tx
+            .output_datums
+            .get(output_idx as usize)
+            .cloned()
+            .flatten()
+            .map(|info| info.hash.as_ref().to_vec()))
+    }
+
+    async fn tx_metadata(
+        &mut self,
+        self_: Resource<ResolvedBlock>,
+        tx_idx: u32,
+    ) -> wasmtime::Result<Option<Vec<u8>>> {
+        let block = self.table.get(&self_)?;
+        let tx = block
+            .txs
+            .get(tx_idx as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("tx_idx {tx_idx} out of range")))?;
+        Ok(tx.aux_data_cbor.clone())
     }
 
     async fn drop(&mut self, rep: Resource<ResolvedBlock>) -> wasmtime::Result<()> {

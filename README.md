@@ -180,12 +180,21 @@ things aligned with the embedded data plane. See [`LICENSE`](LICENSE).
 
 ## Design documents
 
-If you want to understand mitos rather than run it, read in this order:
+If you want to **build a companion module** on this stack today,
+start here:
+
+- [`docs/HOWTO_FIRST_MODULE.md`](docs/HOWTO_FIRST_MODULE.md) — end-to-end
+  walkthrough using current tooling (`mitos-build`, `mitos-admin`,
+  `mitos-companion`); reference impl is `cnft.dev-workers/workers/collections-mitos/`.
+- [`docs/design/MITOS_BUILD.md`](docs/design/MITOS_BUILD.md) — TOML schema,
+  materialisation rules, manifest format for the single-file-module build tool.
+
+If you want to **understand mitos** rather than run it, read in this order:
 
 1. [`docs/strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md`](docs/strategy/CARDANO_DAPP_FRAMEWORK_THESIS.md) — the why.
 2. [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md) — the how, at the bundle level.
 3. [`docs/strategy/MITOS_PLATFORM_V1.md`](docs/strategy/MITOS_PLATFORM_V1.md) — the wasm-module runtime.
 4. [`docs/strategy/MITOS_COMPANION_PATTERN.md`](docs/strategy/MITOS_COMPANION_PATTERN.md) — the paired-deployable thesis.
 5. [`docs/strategy/MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md) — the CF-side SDK.
-6. [`docs/design/INDEXER_TRAIT.md`](docs/design/INDEXER_TRAIT.md) — the contract for indexer authors.
+6. [`docs/design/INDEXER_TRAIT.md`](docs/design/INDEXER_TRAIT.md) — the contract for indexer authors (legacy in-tree shape; new modules use the wasm-module shape per the HOWTO).
 7. [`docs/design/CF_REPLICATION.md`](docs/design/CF_REPLICATION.md) — the WS protocol.

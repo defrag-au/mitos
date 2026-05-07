@@ -33,27 +33,41 @@
 
 pub mod admin;
 pub mod bindings;
+pub mod bindings_v2;
 pub mod block_decode;
+pub mod bootstrap_v2;
+pub mod event_bindings;
 pub mod compaction;
 pub mod companions;
 pub mod dialer;
 pub mod driver;
+pub mod driver_v2;
 pub mod emissions;
 pub mod follower;
+pub mod follower_v2;
 pub mod host;
 pub mod host_fns;
+pub mod host_fns_v2;
+pub mod host_unified;
+pub mod host_v2;
 pub mod inspect;
 pub mod lag_tolerant;
 pub mod manifest;
 pub mod registry;
+pub mod registry_v2;
 pub mod resolved_block;
 pub mod storage;
 pub mod supervisor;
+pub mod trap_context;
 pub mod vendored;
 
 pub use block_decode::{DecodedBlock, decode_block};
 pub use driver::{ApplyOutcome, BlockEvent, Driver};
 pub use follower::run_chain_follower;
+/// Re-export the platform-internal `ChainPoint` from
+/// `mitos-data-plane` so consumers (like the bundle binary) can
+/// take/return it without a separate dep on `mitos-data-plane`.
+pub use mitos_data_plane::ChainPoint;
 pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
 pub use resolved_block::{ResolvedBlock, TxView};
 pub use supervisor::{Supervisor, SupervisorOutcome};

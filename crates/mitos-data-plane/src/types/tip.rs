@@ -2,13 +2,12 @@
 //! every query response.
 //!
 //! Surfacing tip in responses lets paginated queries detect
-//! drift. Different from `dolos_core::ChainPoint` only in that
-//! the data-plane wire form may eventually want richer metadata
-//! (era, epoch, slot-time) and we'd rather not be forced into
-//! `dolos_core` at that surface.
+//! drift. Uses mitos's owned `ChainPoint` (in `chain_point.rs`)
+//! so dolos version drift doesn't reach this surface.
 
-use dolos_core::ChainPoint;
 use serde::{Deserialize, Serialize};
+
+use super::ChainPoint;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainTip {
@@ -27,11 +26,7 @@ impl ChainTip {
     }
 
     pub fn slot(&self) -> u64 {
-        match &self.point {
-            ChainPoint::Origin => 0,
-            ChainPoint::Slot(s) => *s,
-            ChainPoint::Specific(s, _) => *s,
-        }
+        self.point.slot()
     }
 }
 

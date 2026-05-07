@@ -8,26 +8,31 @@
 //! subscription lifecycle code drains. The real impl will wire
 //! into `mitos-core`'s replication path.
 
+use mitos_data_plane::ChainPoint;
 use mitos_protocol::ChainPoint as WireChainPoint;
 
 use crate::bindings::EmitHost;
 use crate::host_fns::HostState;
 
-/// Convert dolos's `ChainPoint` to the wire shape used in
-/// emissions storage + delivered to companions. Inlined here
-/// to keep mitos-platform free of the mitos-core dep.
-fn to_wire(point: &dolos_core::ChainPoint) -> WireChainPoint {
+/// Convert mitos's `ChainPoint` to the wire shape used in
+/// emissions storage + delivered to companions. Wire form has
+/// hex-string hash; mitos's internal type has bytes
+/// (`pallas::Hash<32>`). One conversion site keeps the
+/// hex-vs-bytes distinction at this boundary.
+fn to_wire(point: &ChainPoint) -> WireChainPoint {
     match point {
-        dolos_core::ChainPoint::Origin => WireChainPoint::Origin,
-        dolos_core::ChainPoint::Slot(s) => WireChainPoint::Slot(*s),
-        dolos_core::ChainPoint::Specific(s, h) => WireChainPoint::Specific(*s, h.to_string()),
+        ChainPoint::Origin => WireChainPoint::Origin,
+        ChainPoint::Slot(s) => WireChainPoint::Slot(*s),
+        ChainPoint::Specific(s, h) => WireChainPoint::Specific(*s, h.to_string()),
     }
 }
 
 /// Sink for emitted events. One per module instance; drained by
 /// the replication side.
 pub struct EventSink {
-    sender: tokio::sync::mpsc::UnboundedSender<EmittedEvent>,
+    // Crate-visible so v2 host fns can also push events through
+    // it without duplicating the emit channel plumbing.
+    pub(crate) sender: tokio::sync::mpsc::UnboundedSender<EmittedEvent>,
 }
 
 #[derive(Debug)]
