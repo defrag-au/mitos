@@ -28,10 +28,20 @@ use mitos_platform::manifest::{
     AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, sha256_hex,
 };
 
-/// Host WIT contract bundled at compile time. Each `mitos-build`
-/// release pins exactly one WIT version; upgrading the tool
+/// Host WIT contracts bundled at compile time. Each `mitos-build`
+/// release pins specific WIT versions; upgrading the tool
 /// upgrades the WIT every single-file module is built against.
-const HOST_WIT: &str = include_str!("../../../crates/mitos-platform/wit/world.wit");
+///
+/// v1: legacy `mitos-module` world — block-centric `handle-event`
+/// dispatch. Existing modules (`collection-ownership-indexer`,
+/// `marketplace-indexer`, jpg-co's pre-migration shape) build
+/// against this.
+///
+/// v2: `mitos-module-v2` world — eUTXO event-stream dispatch
+/// per `MITOS_PLATFORM_V2.md`. Modules opt in by setting
+/// `abi_version = 2` at the top of their `<name>.toml`.
+const HOST_WIT_V1: &str = include_str!("../../../crates/mitos-platform/wit/world.wit");
+const HOST_WIT_V2: &str = include_str!("../../../crates/mitos-platform/wit-v2/world.wit");
 
 /// Absolute path to the `mitos-protocol` crate baked at compile
 /// time. Single-file modules need a path-dep into mitos-protocol
