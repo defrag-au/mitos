@@ -347,6 +347,22 @@ fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::
 // Single-file module support
 // ============================================================================
 
+/// Which platform ABI a module targets. Determines which WIT
+/// gets bundled into the materialised crate and which world
+/// the wit_bindgen macro generates against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbiVersion {
+    /// `mitos-module` world — block-centric `handle-event`
+    /// dispatch. Default when `<name>.toml` doesn't declare
+    /// `abi_version`.
+    V1,
+    /// `mitos-module-v2` world — eUTXO event-stream dispatch
+    /// per `MITOS_PLATFORM_V2.md`. Opt in by setting
+    /// `abi_version = 2` at the top of the module's
+    /// `<name>.toml`.
+    V2,
+}
+
 /// Resolved single-file module: paths to `<name>.rs` and the
 /// optional `<name>.toml`, plus the inferred module-id (file
 /// stem, hyphenated).
@@ -354,6 +370,7 @@ struct SingleFileSpec {
     rs_path: PathBuf,
     config_path: Option<PathBuf>,
     module_id: String,
+    abi_version: AbiVersion,
 }
 
 impl SingleFileSpec {
@@ -387,10 +404,36 @@ impl SingleFileSpec {
         let module_id = stem.replace('_', "-");
         let config_candidate = rs_path.with_extension("toml");
         let config_path = config_candidate.exists().then_some(config_candidate);
+
+        // Read `abi_version` from the top of `<name>.toml` if
+        // present. Default v1 — existing modules keep working
+        // without changes; v2 modules opt in by adding
+        // `abi_version = 2`.
+        let abi_version = match &config_path {
+            None => AbiVersion::V1,
+            Some(path) => {
+                let toml_str = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let value: toml::Value = toml::from_str(&toml_str)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                match value.get("abi_version").and_then(|v| v.as_integer()) {
+                    Some(1) | None => AbiVersion::V1,
+                    Some(2) => AbiVersion::V2,
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "{}: unsupported abi_version = {other} (only 1 or 2)",
+                            path.display(),
+                        ));
+                    }
+                }
+            }
+        };
+
         Ok(Self {
             rs_path: rs_path.canonicalize().unwrap_or(rs_path),
             config_path,
             module_id,
+            abi_version,
         })
     }
 }
@@ -499,8 +542,14 @@ mitos-protocol = {{ path = "{mitos_protocol}" }}
     );
     write_if_changed(&crate_dir.join("Cargo.toml"), &crate_toml)?;
 
-    // WIT contract bundled at compile time.
-    write_if_changed(&wit_dir.join("world.wit"), HOST_WIT)?;
+    // WIT contract bundled at compile time. v1 vs v2 is picked
+    // off the spec — `<name>.toml`'s `abi_version` field, with
+    // v1 as the default for existing modules.
+    let (host_wit, world_name) = match spec.abi_version {
+        AbiVersion::V1 => (HOST_WIT_V1, "mitos-module"),
+        AbiVersion::V2 => (HOST_WIT_V2, "mitos-module-v2"),
+    };
+    write_if_changed(&wit_dir.join("world.wit"), host_wit)?;
 
     // Generate the crate's `src/lib.rs`. Layout:
     //
@@ -522,7 +571,7 @@ mitos-protocol = {{ path = "{mitos_protocol}" }}
 // the bundled host WIT under `../wit`. User source below.
 wit_bindgen::generate!({{
     path: "../wit",
-    world: "mitos-module",
+    world: "{world_name}",
 }});
 
 {user_rest}

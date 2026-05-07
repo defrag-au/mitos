@@ -126,31 +126,57 @@ pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError
     let component =
         Component::from_file(&engine, wasm_path).map_err(|e| InspectError::Load(e.to_string()))?;
 
-    // Build the platform's linker (WASI + host fns). If the
-    // module's WIT world doesn't match, this is where it'll
-    // fail at instantiate time.
-    let mut linker = Linker::<HostState>::new(&engine);
+    // Try v1 first. If the module's imports don't match v1's
+    // world, fall through to v2. mitos-platform is the single
+    // source of truth for both worlds; the bindgen output here
+    // is what the production runtime would link against.
+    match dry_inspect_v1(&engine, &component).await {
+        Ok(result) => Ok(result),
+        Err(v1_err) => {
+            // v2 fallback. Some failure modes are common across
+            // both worlds (e.g. trap during the metadata exports);
+            // surface the v2 error directly so the operator
+            // doesn't have to read both.
+            match dry_inspect_v2(&engine, &component).await {
+                Ok(result) => Ok(result),
+                Err(v2_err) => {
+                    // Both failed — surface the most actionable
+                    // message. If v1 failed at instantiate
+                    // (mismatched imports) and v2 also did, the
+                    // module isn't a mitos module at all; report
+                    // both branches.
+                    Err(InspectError::Instantiate(format!(
+                        "v1: {v1_err}; v2: {v2_err}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+async fn dry_inspect_v1(
+    engine: &Engine,
+    component: &Component,
+) -> Result<InspectResult, InspectError> {
+    let mut linker = Linker::<HostState>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|e| InspectError::Load(format!("wasi linker: {e}")))?;
     MitosModule::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
         .map_err(|e| InspectError::Load(format!("platform linker: {e}")))?;
 
-    // Minimal host state — the dry call doesn't exercise any of
-    // the I/O surface, but the bindings need everything wired.
     let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
     let kv = state_kv::ModuleKv::new_in_memory();
     let (sink, _events) = emit::EventSink::new();
     let host_state = HostState::new("__inspect__".to_owned(), dp, kv, sink);
 
-    let mut store = Store::new(&engine, host_state);
-    // Generous budgets; the dry exports are tiny pure functions.
+    let mut store = Store::new(engine, host_state);
     let budget = ResourceBudget::default();
     store
         .set_fuel(budget.fuel_per_call)
         .map_err(|e| InspectError::Instantiate(e.to_string()))?;
     store.set_epoch_deadline(budget.epoch_deadline_ticks);
 
-    let bindings = MitosModule::instantiate_async(&mut store, &component, &linker)
+    let bindings = MitosModule::instantiate_async(&mut store, component, &linker)
         .await
         .map_err(|e| InspectError::Instantiate(e.to_string()))?;
 
@@ -167,17 +193,75 @@ pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError
     Ok(InspectResult {
         abi_version_major: major,
         abi_version_minor: minor,
-        trap_strategy: trap_strategy_to_string(strategy),
+        trap_strategy: trap_strategy_to_string_v1(strategy),
         trap_max_retries: retry.max_retries,
         trap_backoff_cap_ms: retry.backoff_cap_ms,
     })
 }
 
-fn trap_strategy_to_string(s: TrapStrategy) -> String {
+async fn dry_inspect_v2(
+    engine: &Engine,
+    component: &Component,
+) -> Result<InspectResult, InspectError> {
+    use crate::bindings_v2::MitosModuleV2;
+    use crate::host_fns_v2::HostStateV2;
+
+    let mut linker = Linker::<HostStateV2>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|e| InspectError::Load(format!("v2 wasi linker: {e}")))?;
+    MitosModuleV2::add_to_linker::<_, HasSelf<HostStateV2>>(&mut linker, |s| s)
+        .map_err(|e| InspectError::Load(format!("v2 platform linker: {e}")))?;
+
+    let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
+    let kv = state_kv::ModuleKv::new_in_memory();
+    let (sink, _events) = emit::EventSink::new();
+    let host_state = HostStateV2::new("__inspect__".to_owned(), dp, kv, sink);
+
+    let mut store = Store::new(engine, host_state);
+    let budget = ResourceBudget::default();
+    store
+        .set_fuel(budget.fuel_per_call)
+        .map_err(|e| InspectError::Instantiate(e.to_string()))?;
+    store.set_epoch_deadline(budget.epoch_deadline_ticks);
+
+    let bindings = MitosModuleV2::instantiate_async(&mut store, component, &linker)
+        .await
+        .map_err(|e| InspectError::Instantiate(e.to_string()))?;
+
+    let (major, minor) = bindings
+        .call_module_version(&mut store)
+        .await
+        .map_err(|e| InspectError::ExportCall(format!("module-version: {e}")))?;
+
+    let (strategy, retry) = bindings
+        .call_trap_policy(&mut store)
+        .await
+        .map_err(|e| InspectError::ExportCall(format!("trap-policy: {e}")))?;
+
+    Ok(InspectResult {
+        abi_version_major: major,
+        abi_version_minor: minor,
+        trap_strategy: trap_strategy_to_string_v2(strategy),
+        trap_max_retries: retry.max_retries,
+        trap_backoff_cap_ms: retry.backoff_cap_ms,
+    })
+}
+
+fn trap_strategy_to_string_v1(s: TrapStrategy) -> String {
     match s {
         TrapStrategy::Replay => "replay",
         TrapStrategy::SkipAndMark => "skip-and-mark",
         TrapStrategy::Quarantine => "quarantine",
+    }
+    .to_owned()
+}
+
+fn trap_strategy_to_string_v2(s: crate::bindings_v2::TrapStrategy) -> String {
+    use crate::bindings_v2::TrapStrategy as T;
+    match s {
+        T::Replay => "replay",
+        T::SkipAndMark => "skip-and-mark",
+        T::Quarantine => "quarantine",
     }
     .to_owned()
 }

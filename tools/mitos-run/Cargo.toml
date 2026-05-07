@@ -15,6 +15,12 @@ path = "src/main.rs"
 mitos-platform = { path = "../../crates/mitos-platform" }
 mitos-data-plane = { path = "../../crates/mitos-data-plane" }
 
+# Typed asset/policy newtypes — for v2 fixture interest predicates.
+cardano-assets = { workspace = true }
+# Pallas hash newtype — the data-plane trait method signatures
+# carry `Hash<32>` / `Hash<28>` directly.
+pallas-primitives = { workspace = true }
+
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

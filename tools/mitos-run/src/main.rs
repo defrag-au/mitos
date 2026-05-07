@@ -46,6 +46,15 @@ struct Args {
     /// Override module id (defaults to `manifest.module.id`).
     #[arg(long)]
     module_id: Option<String>,
+
+    /// Path to a Cardano block CBOR file. v2 modules only — the
+    /// platform decodes the block, builds per-TX event batches
+    /// against the module's interest set (loaded from the
+    /// fixture's `[interest]` section), and dispatches each
+    /// batch through `handle-events`. Repeatable for multi-block
+    /// fixtures; specify in chain order.
+    #[arg(long)]
+    block: Vec<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -94,15 +103,29 @@ async fn main() -> Result<()> {
         None => Fixture::default(),
     };
 
+    let abi_major = manifest.abi.version_major;
     println!("▸ artifact:    {}", args.artifact.display());
     println!("  module id:   {module_id}");
+    println!("  abi:         v{abi_major}");
     println!("  wasm:        {} bytes", fs::metadata(&wasm_path)?.len());
     println!("  config:      {} bytes", config_bytes.len());
     println!(
-        "  fixture:     {} utxo(s), {} tx_metadata entry(ies)",
+        "  fixture:     {} utxo(s), {} tx_metadata entry(ies), {} interest pred(s)",
         fixture.utxo.len(),
-        fixture.tx_metadata.len()
+        fixture.tx_metadata.len(),
+        fixture.interest.len(),
     );
+    if !args.block.is_empty() {
+        println!("  blocks:      {}", args.block.len());
+    }
+
+    // Branch on ABI version. v2 modules go through
+    // ModuleRegistryV2 + DriverV2 with optional block dispatch
+    // after init; v1 modules keep the existing init-only test
+    // shape.
+    if abi_major == 2 {
+        return run_v2(&args.block, &fixture, &module_id, &wasm_path, &config_bytes).await;
+    }
 
     let dp: Arc<dyn DataPlaneFacade> = Arc::new(FixtureDataPlane::from_fixture(fixture)?);
     let kv = state_kv::ModuleKv::new_in_memory();
@@ -171,7 +194,7 @@ async fn main() -> Result<()> {
 // Fixture schema (TOML)
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct Fixture {
     /// Schema version. Bump on breaking changes; we don't read
     /// it today but parsing it forward-proofs the file.
@@ -188,13 +211,30 @@ struct Fixture {
     /// Auxiliary-data CBOR keyed by tx_hash. Hex-encoded.
     #[serde(default)]
     tx_metadata: Vec<FixtureTxMetadata>,
+
+    /// v2-only: the module's interest set. Applied before any
+    /// `handle-events` dispatch so the platform can filter
+    /// matching events. Ignored for v1 modules.
+    #[serde(default)]
+    interest: Vec<FixtureInterestPredicate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FixtureInterestPredicate {
+    AtAddress { address: String },
+    AtStakeKeyHash { hash: String },
+    AtStakeScriptHash { hash: String },
+    HoldsPolicy { policy: String },
+    HoldsAsset { policy: String, asset_name: String },
+    TickEvery { seconds: u32 },
 }
 
 fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct FixtureUtxo {
     /// 64-hex tx_hash.
     tx_hash: String,
@@ -213,7 +253,7 @@ struct FixtureUtxo {
     datum_payload_hex: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct FixtureTxMetadata {
     /// 64-hex tx_hash.
     tx_hash: String,
@@ -302,8 +342,22 @@ impl FixtureDataPlane {
     }
 }
 
+// `FixtureDataPlane` impls `ChainDataPlane` directly; the
+// `DataPlaneFacade` impl comes for free via the blanket impl
+// in `mitos-platform`. This lets the same fixture serve both
+// v1 (DataPlaneFacade-shaped) and v2 (ChainDataPlane-shaped)
+// dispatch paths.
 #[async_trait]
-impl DataPlaneFacade for FixtureDataPlane {
+impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
+    async fn read_utxo(
+        &self,
+        oref: &OutputRef,
+        _decode: DecodeLevel,
+    ) -> DataPlaneResult<Option<TypedOutput>> {
+        let key = (oref.tx_hash.as_ref().to_vec(), oref.index);
+        Ok(self.by_ref.get(&key).map(|u| u.output.clone()))
+    }
+
     async fn read_utxos(
         &self,
         refs: &[OutputRef],
@@ -319,51 +373,69 @@ impl DataPlaneFacade for FixtureDataPlane {
         Ok(out)
     }
 
+    async fn search_utxos(
+        &self,
+        _predicate: &mitos_data_plane::UtxoPredicate,
+        _decode: DecodeLevel,
+        _page: mitos_data_plane::PageRequest,
+    ) -> DataPlaneResult<mitos_data_plane::Page<(OutputRef, TypedOutput)>> {
+        Ok(mitos_data_plane::Page {
+            items: Vec::new(),
+            next_token: None,
+            tip: mitos_data_plane::ChainTip::origin(),
+        })
+    }
+
     async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>> {
         Ok(self.by_address.get(address).cloned().unwrap_or_default())
     }
 
-    async fn datum_by_hash(&self, _hash: &[u8; 32]) -> DataPlaneResult<Option<Vec<u8>>> {
+    async fn tx_metadata(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(self.aux_by_tx.get(tx_hash.as_ref() as &[u8]).cloned())
+    }
+
+    async fn read_datum(
+        &self,
+        _hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<mitos_data_plane::TypedDatum>> {
+        Ok(None)
+    }
+
+    async fn read_script(
+        &self,
+        _hash: &pallas_primitives::Hash<28>,
+    ) -> DataPlaneResult<Option<mitos_data_plane::TypedScript>> {
+        Ok(None)
+    }
+
+    async fn total_supply(
+        &self,
+        _policy: &cardano_assets::PolicyId,
+        _asset_name_hex: Option<&str>,
+    ) -> DataPlaneResult<u64> {
+        Ok(0)
+    }
+
+    async fn holder_count(
+        &self,
+        _policy: &cardano_assets::PolicyId,
+    ) -> DataPlaneResult<u64> {
+        Ok(0)
+    }
+
+    async fn tip(&self) -> DataPlaneResult<mitos_data_plane::ChainTip> {
+        Ok(mitos_data_plane::ChainTip::origin())
+    }
+
+    async fn protocol_params(
+        &self,
+    ) -> DataPlaneResult<mitos_data_plane::types::ProtocolParameters> {
         Err(DataPlaneError::NotYetImplemented(
-            "datum_by_hash not surfaced via fixtures",
+            "fixture has no protocol params",
         ))
-    }
-
-    async fn read_output_datums(
-        &self,
-        refs: &[OutputRef],
-    ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
-        let mut out = Vec::with_capacity(refs.len());
-        for r in refs {
-            let key = (r.tx_hash.as_ref().to_vec(), r.index);
-            let entry = self.by_ref.get(&key).and_then(|u| {
-                let payload = u.datum_payload.as_ref()?.clone();
-                let hash = u.datum_hash?;
-                Some((hash.to_vec(), payload))
-            });
-            out.push(entry);
-        }
-        Ok(out)
-    }
-
-    async fn read_output_hashes(
-        &self,
-        refs: &[OutputRef],
-    ) -> DataPlaneResult<Vec<Option<Vec<u8>>>> {
-        let mut out = Vec::with_capacity(refs.len());
-        for r in refs {
-            let key = (r.tx_hash.as_ref().to_vec(), r.index);
-            let entry = self
-                .by_ref
-                .get(&key)
-                .and_then(|u| u.datum_hash.map(|h| h.to_vec()));
-            out.push(entry);
-        }
-        Ok(out)
-    }
-
-    async fn tx_metadata(&self, tx_hash: &[u8; 32]) -> DataPlaneResult<Option<Vec<u8>>> {
-        Ok(self.aux_by_tx.get(tx_hash.as_slice()).cloned())
     }
 }
 
@@ -375,11 +447,198 @@ impl DataPlaneFacade for FixtureDataPlane {
 #[derive(Deserialize)]
 struct ManifestSummary {
     module: ManifestModule,
+    #[serde(default)]
+    abi: ManifestAbi,
 }
 
 #[derive(Deserialize)]
 struct ManifestModule {
     id: String,
+}
+
+#[derive(Default, Deserialize)]
+struct ManifestAbi {
+    #[serde(default = "default_abi_major")]
+    version_major: u32,
+}
+
+fn default_abi_major() -> u32 {
+    1
+}
+
+// ============================================================
+// v2 dispatch path
+// ============================================================
+//
+// Boots a v2 module against the same fixture shape v1 uses, plus
+// optional block CBORs via `--block`. After init, the fixture's
+// `[interest]` predicates are pushed into the host state, then
+// each block is decoded + filtered + dispatched per `handle-events`
+// in chain order.
+
+async fn run_v2(
+    blocks: &[PathBuf],
+    fixture: &Fixture,
+    module_id: &str,
+    wasm_path: &std::path::Path,
+    config_bytes: &[u8],
+) -> Result<()> {
+    use mitos_platform::driver_v2::{ApplyOutcomeV2, DriverV2};
+    use mitos_platform::registry_v2::ModuleRegistryV2;
+
+    let interest = build_interest_set(&fixture.interest)?;
+    println!("▸ interest:    {} predicate(s)", interest.predicates.len());
+
+    let dp: Arc<FixtureDataPlane> = Arc::new(FixtureDataPlane::from_fixture(fixture.clone())?);
+    let dp_facade: Arc<dyn DataPlaneFacade> = dp.clone();
+    let kv = state_kv::ModuleKv::new_in_memory();
+    let (sink, mut events_rx) = emit::EventSink::new();
+
+    let engine =
+        ModuleRegistryV2::build_engine().map_err(|e| anyhow::anyhow!("v2 engine: {e}"))?;
+    let registry = ModuleRegistryV2::load_from_path(engine, module_id.to_owned(), wasm_path)
+        .map_err(|e| anyhow::anyhow!("v2 load: {e}"))?;
+
+    let budget = ResourceBudget::default();
+    let mut instance = registry
+        .instantiate(dp_facade, kv, sink, budget)
+        .await
+        .map_err(|e| anyhow::anyhow!("v2 instantiate: {e}"))?;
+
+    // Refuel before init with the larger init budget, mirroring
+    // ModuleHostV2's eventual behaviour. v2 init should be light
+    // (no bootstrap work) but the budget gives headroom for any
+    // one-shot setup the module wants to do.
+    instance
+        .store
+        .set_fuel(budget.init_fuel)
+        .map_err(|e| anyhow::anyhow!("set init fuel: {e}"))?;
+    println!(
+        "▸ init(): calling with config_bytes.len()={}, fuel={}",
+        config_bytes.len(),
+        budget.init_fuel
+    );
+    if let Err(e) = instance
+        .bindings
+        .call_init(&mut instance.store, config_bytes)
+        .await
+    {
+        eprintln!("✗ init() failed:\n{e:?}");
+        std::process::exit(1);
+    }
+
+    // Drain any emissions produced during init.
+    let mut emitted = 0;
+    while let Ok(event) = events_rx.try_recv() {
+        emitted += 1;
+        println!(
+            "  emit channel={} payload={} bytes",
+            event.channel,
+            event.payload.len()
+        );
+    }
+    if emitted > 0 {
+        println!("▸ {emitted} event(s) emitted during init");
+    }
+    println!("✓ init() returned cleanly");
+
+    // Push the fixture's interest set into the host state so the
+    // block-dispatch path can filter against it.
+    let mut driver = DriverV2::new(instance, budget);
+    driver.set_interest(interest);
+
+    if blocks.is_empty() {
+        println!("▸ no --block flags; skipping handle-events dispatch");
+        return Ok(());
+    }
+
+    for path in blocks {
+        let cbor = fs::read(path)
+            .with_context(|| format!("read block {}", path.display()))?;
+        println!(
+            "▸ apply_block: {} ({} bytes)",
+            path.display(),
+            cbor.len()
+        );
+        match driver.apply_block(&cbor, dp.as_ref()).await {
+            Ok(ApplyOutcomeV2::Applied) => {
+                println!("  ✓ Applied (events dispatched)");
+            }
+            Ok(ApplyOutcomeV2::AppliedEmpty) => {
+                println!("  ✓ AppliedEmpty (no matching events; cursor advanced)");
+            }
+            Err(e) => {
+                eprintln!("  ✗ apply_block failed:\n{e:?}");
+                std::process::exit(1);
+            }
+        }
+        // Drain emissions per block so they're attributed clearly.
+        let mut block_emitted = 0;
+        while let Ok(event) = events_rx.try_recv() {
+            block_emitted += 1;
+            println!(
+                "  emit channel={} payload={} bytes",
+                event.channel,
+                event.payload.len()
+            );
+        }
+        if block_emitted > 0 {
+            println!("  ▸ {block_emitted} event(s) emitted");
+        }
+    }
+
+    Ok(())
+}
+
+fn build_interest_set(
+    preds: &[FixtureInterestPredicate],
+) -> Result<mitos_data_plane::InterestSet> {
+    use cardano_assets::PolicyId;
+    use mitos_data_plane::{InterestPredicate, InterestSet, StakeCred};
+
+    let mut set = InterestSet::default();
+    for p in preds {
+        let pred = match p {
+            FixtureInterestPredicate::AtAddress { address } => {
+                InterestPredicate::AtAddress(address.clone())
+            }
+            FixtureInterestPredicate::AtStakeKeyHash { hash } => {
+                let bytes = hex::decode(hash).context("at_stake_key_hash hex")?;
+                if bytes.len() != 28 {
+                    bail!("stake key hash must be 28 bytes");
+                }
+                let mut arr = [0u8; 28];
+                arr.copy_from_slice(&bytes);
+                InterestPredicate::AtStakeCred(StakeCred::KeyHash(arr))
+            }
+            FixtureInterestPredicate::AtStakeScriptHash { hash } => {
+                let bytes = hex::decode(hash).context("at_stake_script_hash hex")?;
+                if bytes.len() != 28 {
+                    bail!("stake script hash must be 28 bytes");
+                }
+                let mut arr = [0u8; 28];
+                arr.copy_from_slice(&bytes);
+                InterestPredicate::AtStakeCred(StakeCred::ScriptHash(arr))
+            }
+            FixtureInterestPredicate::HoldsPolicy { policy } => {
+                let p = PolicyId::new(policy.clone()).context("holds_policy hex")?;
+                InterestPredicate::HoldsPolicy(p)
+            }
+            FixtureInterestPredicate::HoldsAsset { policy, asset_name } => {
+                let p = PolicyId::new(policy.clone()).context("holds_asset.policy hex")?;
+                let name = hex::decode(asset_name).context("holds_asset.asset_name hex")?;
+                InterestPredicate::HoldsAsset {
+                    policy: p,
+                    asset_name: name,
+                }
+            }
+            FixtureInterestPredicate::TickEvery { seconds } => {
+                InterestPredicate::TickEvery(*seconds)
+            }
+        };
+        set.add(pred);
+    }
+    Ok(set)
 }
 
 fn decode_32(s: &str) -> Result<[u8; 32]> {
