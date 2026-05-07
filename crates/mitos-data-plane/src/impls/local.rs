@@ -171,6 +171,9 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
     }
 
     /// Read current chain tip from the domain's state cursor.
+    /// `read_cursor` surfaces a `dolos_core::ChainPoint`; we
+    /// convert at this boundary into mitos's owned type before
+    /// handing back to the data-plane caller.
     fn current_tip(&self) -> DataPlaneResult<ChainTip> {
         let point = self
             .domain
@@ -178,7 +181,7 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             .read_cursor()
             .map_err(|e| DataPlaneError::Storage(format!("read_cursor: {e:?}")))?
             .unwrap_or(ChainPoint::Origin);
-        Ok(ChainTip::at(point))
+        Ok(ChainTip::at(point.into()))
     }
 }
 

@@ -31,7 +31,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dolos_core::{ChainPoint, TipSubscription};
+use dolos_core::TipSubscription;
+use mitos_data_plane::ChainPoint;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

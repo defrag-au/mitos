@@ -209,10 +209,16 @@ impl Bundle {
             let domain_for_factory = Arc::new(domain.clone());
             let sub_factory: mitos_platform::host::SubscriptionFactory<
                 mitos_platform::lag_tolerant::LagTolerantSubscription<DomainAdapter>,
-            > = Arc::new(move |cursor: Option<dolos_core::ChainPoint>| {
+            > = Arc::new(move |cursor: Option<mitos_platform::ChainPoint>| {
                 use dolos_core::StateStore;
-                let from =
-                    cursor.or_else(|| domain_for_factory.state().read_cursor().ok().flatten());
+                // Convert mitos's ChainPoint back to dolos's at
+                // this boundary — `LagTolerantSubscription` works
+                // directly against `dolos_core::TipEvent` and its
+                // chain-point. mitos's owned type insulates the
+                // platform consumers from dolos drift.
+                let from = cursor
+                    .map(dolos_core::ChainPoint::from)
+                    .or_else(|| domain_for_factory.state().read_cursor().ok().flatten());
                 mitos_platform::lag_tolerant::LagTolerantSubscription::new(
                     domain_for_factory.clone(),
                     &domain_for_factory.tip_broadcast,

@@ -403,7 +403,10 @@ async fn backfill_for_policy_via_data_plane<D: dolos_core::Domain>(
         match page.next_token {
             Some(t) => req = PageRequest::next(t, 1000),
             // Last page — its tip is the resume cursor.
-            None => return Ok(page.tip.point),
+            // `page.tip.point` is mitos's owned ChainPoint;
+            // convert to the dolos type the indexer's
+            // `ChainPoint` import refers to.
+            None => return Ok(page.tip.point.into()),
         }
     }
 }

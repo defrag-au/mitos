@@ -55,6 +55,10 @@ pub mod vendored;
 pub use block_decode::{DecodedBlock, decode_block};
 pub use driver::{ApplyOutcome, BlockEvent, Driver};
 pub use follower::run_chain_follower;
+/// Re-export the platform-internal `ChainPoint` from
+/// `mitos-data-plane` so consumers (like the bundle binary) can
+/// take/return it without a separate dep on `mitos-data-plane`.
+pub use mitos_data_plane::ChainPoint;
 pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
 pub use resolved_block::{ResolvedBlock, TxView};
 pub use supervisor::{Supervisor, SupervisorOutcome};

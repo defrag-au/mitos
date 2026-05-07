@@ -24,7 +24,7 @@
 //! the natural move is to promote `BlockEvent` into a
 //! `mitos-protocol` enum that both halves share.
 
-use dolos_core::ChainPoint;
+use mitos_data_plane::ChainPoint;
 use tokio::time::{Duration, sleep};
 
 use crate::block_decode::decode_block;

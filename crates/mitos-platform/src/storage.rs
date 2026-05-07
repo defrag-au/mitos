@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use dolos_core::ChainPoint;
+use mitos_data_plane::ChainPoint;
 
 use crate::manifest::Manifest;
 

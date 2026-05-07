@@ -27,7 +27,7 @@ pub mod state_kv;
 
 use std::sync::Arc;
 
-use dolos_core::ChainPoint;
+use mitos_data_plane::ChainPoint;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
