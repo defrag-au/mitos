@@ -305,11 +305,20 @@ where
         let persisted_cursor = self.storage.read_cursor(id)?;
         let subscription = (self.subscription_factory)(persisted_cursor);
         let chain_plane = self.chain_plane.clone();
+        let follower_storage = self.storage.clone();
+        let follower_module_id = id.to_owned();
         let id_for_log = id.to_owned();
 
         let task = tokio::spawn(async move {
-            let result =
-                run_chain_follower_v2(driver, subscription, cancel_for_task, chain_plane).await;
+            let result = run_chain_follower_v2(
+                driver,
+                subscription,
+                cancel_for_task,
+                chain_plane,
+                follower_storage,
+                follower_module_id,
+            )
+            .await;
             match &result {
                 Err(e) => tracing::error!(
                     module = %id_for_log,
