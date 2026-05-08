@@ -87,6 +87,39 @@ impl DriverV2 {
         self.instance.store.data_mut().set_interest(interest);
     }
 
+    /// Snapshot the current interest set. Used by the follower's
+    /// dynamic-interest path to compute Add/Remove deltas
+    /// against the existing predicates without holding a borrow
+    /// across the `update_interest` WIT call.
+    pub fn interest(&self) -> InterestSet {
+        self.instance.store.data().interest().clone()
+    }
+
+    /// Forward the CBOR-encoded predicates to the module's
+    /// `update-interest` WIT export. The host has already applied
+    /// the op to its own `InterestSet` for filtering; this call
+    /// gives the module a chance to persist the change via
+    /// `state-kv` so a future host restart without an attached
+    /// companion still filters correctly.
+    ///
+    /// Returns the export's own result — `Err(String)` is the
+    /// module's typed failure shape, surfaced for logging.
+    pub async fn call_update_interest(
+        &mut self,
+        op: crate::bindings_v2::InterestOp,
+        items_cbor: &[u8],
+    ) -> wasmtime::Result<Result<(), String>> {
+        // Refuel before calling — `update-interest` is a small
+        // call but the module may persist via state-kv which
+        // burns a few thousand fuel units. Using `fuel_per_call`
+        // keeps it bounded.
+        self.instance.store.set_fuel(self.fuel_per_call)?;
+        self.instance
+            .bindings
+            .call_update_interest(&mut self.instance.store, op, items_cbor)
+            .await
+    }
+
     /// Apply one block. The driver pulls the InterestSet off the
     /// host state (already populated via `set_interest`) and
     /// resolves prior outputs through the data plane to filter

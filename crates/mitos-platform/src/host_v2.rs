@@ -57,10 +57,57 @@ pub trait ModuleHostHandle: Send + Sync {
 /// One dynamic-interest update queued for delivery to a running
 /// module's `update-interest` export. Pushed by the dialer when a
 /// `ClientMessage::Interest` frame arrives over the companion's WS.
+///
+/// Carries *both* shapes:
+/// - `op` + `predicates` are what the host applies to its own
+///   driver-level `InterestSet` for runtime filtering.
+/// - `items_cbor` is the raw bytes the WIT `update-interest` export
+///   takes — encoded `Vec<InterestPredicate>` so modules can decode
+///   for their own state-kv persistence if they want.
+///
+/// The host owns the dispatch filter; module-side persistence is
+/// optional. Encoding once and shipping bytes through avoids
+/// double-encoding at the follower hop.
 #[derive(Debug)]
 pub struct InterestUpdate {
     pub op: mitos_protocol::InterestOp,
-    pub items: Vec<mitos_protocol::Interest>,
+    pub predicates: Vec<mitos_data_plane::InterestPredicate>,
+    pub items_cbor: Vec<u8>,
+}
+
+/// Translate a v1-shaped wire `Interest` (multi-axis, designed for
+/// protocol-event filtering) into a v2 `InterestPredicate`
+/// (single-purpose, designed for utxo-event filtering).
+///
+/// Today the companion-runtime SDK only emits `policy` rows
+/// (`mitos_companion::interest::rows_to_interests`), which map to
+/// `Interest::any().asset = AssetSelector::Policy(p)`. So the
+/// projection collapses to extracting the policy id from the asset
+/// axis. Roles / domain / value axes are v1 protocol-event concerns
+/// the v2 utxo-dispatch path doesn't apply.
+///
+/// Returns `None` for items the v2 vocabulary can't represent
+/// (asset selector `Any`, address-only selectors that v1 didn't
+/// distinguish, etc.) — caller logs + drops those.
+fn v1_interest_to_predicate(
+    item: &mitos_protocol::Interest,
+) -> Option<mitos_data_plane::InterestPredicate> {
+    use mitos_data_plane::InterestPredicate;
+    use mitos_protocol::AssetSelector;
+    match &item.asset {
+        AssetSelector::Policy(p) => Some(InterestPredicate::HoldsPolicy(p.clone())),
+        AssetSelector::Asset { policy, name_hex } => Some(InterestPredicate::HoldsAsset {
+            policy: policy.clone(),
+            asset_name: hex::decode(name_hex).ok()?,
+        }),
+        // v2 doesn't have a wildcard predicate; "match everything"
+        // means an empty `InterestSet`. v1 `Any` rows on the wire
+        // should never reach the host (the SDK doesn't emit them),
+        // but if they did we drop rather than synthesize a no-op.
+        // `Fingerprint` and `Trait` are v1 protocol-event filters
+        // with no v2 utxo-dispatch analogue — also drop.
+        _ => None,
+    }
 }
 
 /// Routes inbound `Interest` frames to the right running module's
@@ -144,6 +191,15 @@ where
     emitter_factory: EmitterFactory,
     budget: ResourceBudget,
     slots: Arc<Mutex<HashMap<String, RunningSlotV2>>>,
+    /// Per-running-module dynamic-interest channel senders. The
+    /// matching receiver lives inside each module's follower task
+    /// where it's multiplexed with tip events. Held in a
+    /// `std::sync::Mutex` (not `tokio::sync`) because every
+    /// access is a quick map insert/remove/get — no `.await` ever
+    /// held across the guard.
+    interest_senders: Arc<
+        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>,
+    >,
 }
 
 impl<S, P> ModuleHostV2<S, P>
@@ -178,6 +234,7 @@ where
             emitter_factory,
             budget,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -309,10 +366,26 @@ where
         let follower_module_id = id.to_owned();
         let id_for_log = id.to_owned();
 
+        // Dynamic-interest channel — sender owned by
+        // `interest_senders` (cloned for the dialer via
+        // `InterestRouter::route_interest`); receiver moves into
+        // the follower task and is multiplexed with tip events
+        // via `tokio::select!`.
+        let (interest_tx, interest_rx) =
+            tokio::sync::mpsc::unbounded_channel::<InterestUpdate>();
+        {
+            let mut senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.insert(id.to_owned(), interest_tx);
+        }
+
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
                 subscription,
+                interest_rx,
                 cancel_for_task,
                 chain_plane,
                 follower_storage,
@@ -363,6 +436,18 @@ where
     }
 
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
+        // Drop the interest sender first so the follower's
+        // `tokio::select!` sees a `None` on `interest_rx.recv()`
+        // alongside cancellation. Mirrors v1's stop semantics —
+        // sender drop is the clean-exit signal for the multiplexed
+        // loop.
+        {
+            let mut senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.remove(id);
+        }
         let slot = {
             let mut slots = self.slots.lock().await;
             slots.remove(id)
@@ -543,12 +628,14 @@ fn drain_one(
 
 /// Interest-update router for v2 modules.
 ///
-/// The companion-WS dialer in `dialer.rs` doesn't know which ABI
-/// version a module runs under, so it routes every inbound
-/// `ClientMessage::Interest` frame through a `dyn InterestRouter`.
-/// v2's wire-interest path is not wired through to the follower
-/// yet (manifest-declared interest is the source of truth at
-/// runtime); accept + log so the dialer doesn't error.
+/// The companion-WS dialer in `dialer.rs` forwards every inbound
+/// `ClientMessage::Interest` frame here. We translate v1-shaped
+/// `Interest` items into v2 `InterestPredicate`s, encode them as
+/// CBOR (the WIT `update-interest` export takes opaque bytes) and
+/// push an `InterestUpdate` through the per-module follower
+/// channel. The follower applies the op to the driver's
+/// `InterestSet` between blocks and calls the module's
+/// `update-interest` export so it can persist if it wants.
 #[async_trait::async_trait]
 impl<S, P> InterestRouter for ModuleHostV2<S, P>
 where
@@ -558,13 +645,65 @@ where
     async fn route_interest(
         &self,
         module_id: &str,
-        _op: mitos_protocol::InterestOp,
-        _items: Vec<mitos_protocol::Interest>,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
     ) -> Result<(), InterestRouteError> {
-        tracing::debug!(
-            module = %module_id,
-            "v2 interest update dropped (wire path TBD; manifest [interest] is source of truth)",
-        );
+        // Project v1 wire items into v2 predicates. Items the v2
+        // vocabulary can't represent (Any, Fingerprint, Trait)
+        // get logged + dropped — caller continues with the
+        // remainder.
+        let mut predicates = Vec::with_capacity(items.len());
+        for item in &items {
+            match v1_interest_to_predicate(item) {
+                Some(p) => predicates.push(p),
+                None => tracing::debug!(
+                    module = %module_id,
+                    "v1 interest item with no v2 analogue — dropped",
+                ),
+            }
+        }
+        if predicates.is_empty() && !items.is_empty() {
+            // Every item dropped — operator wanted to update
+            // interest but nothing landed. Surface as a log; not
+            // an error since the SDK only emits policy rows
+            // today and those translate cleanly.
+            tracing::warn!(
+                module = %module_id,
+                "v1 interest update with {} item(s) projected to 0 v2 predicates; nothing applied",
+                items.len(),
+            );
+            return Ok(());
+        }
+
+        // CBOR-encode the v2 predicates so the follower can hand
+        // the same bytes to the module's `update-interest` export
+        // — module decodes once on its side if it cares.
+        let mut items_cbor = Vec::with_capacity(64);
+        if let Err(e) = ciborium::ser::into_writer(&predicates, &mut items_cbor) {
+            tracing::error!(
+                module = %module_id,
+                error = %e,
+                "encode v2 interest predicates as CBOR failed; update dropped",
+            );
+            return Ok(());
+        }
+
+        let sender = {
+            let senders = self
+                .interest_senders
+                .lock()
+                .expect("interest_senders mutex");
+            senders.get(module_id).cloned()
+        };
+        let sender =
+            sender.ok_or_else(|| InterestRouteError::NotRunning(module_id.to_owned()))?;
+        sender
+            .send(InterestUpdate {
+                op,
+                predicates,
+                items_cbor,
+            })
+            .map_err(|_| InterestRouteError::ChannelClosed(module_id.to_owned()))?;
         Ok(())
     }
 }
