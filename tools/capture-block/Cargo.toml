@@ -12,6 +12,7 @@ path = "src/main.rs"
 # Block decoder — used to verify the CBOR is round-trippable
 # before we write it to disk (catches "wrong shape" upstream).
 mitos-platform = { path = "../../crates/mitos-platform" }
+mitos-data-plane = { path = "../../crates/mitos-data-plane" }
 
 # Direct redb reader — we open dolos's archive index ourselves
 # in read-only mode (no `Database::create()`, no writer setup).

@@ -66,7 +66,7 @@ pub struct DriverV2 {
 impl DriverV2 {
     pub fn new(
         instance: ModuleInstanceV2,
-        budget: crate::registry::ResourceBudget,
+        budget: crate::registry_v2::ResourceBudget,
     ) -> Self {
         Self {
             instance,

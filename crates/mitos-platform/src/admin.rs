@@ -31,12 +31,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Manifest, ManifestError};
-use crate::registry::HOST_ABI_MAJOR;
 use crate::storage::{ModuleStorage, StorageError};
-
-/// World string that all modules conforming to platform v1 must
-/// declare. Mirror of the world: clause in `wit/world.wit`.
-pub const PLATFORM_WIT_WORLD: &str = "mitos:platform/mitos-module";
 
 /// Auth posture for the admin endpoints.
 #[derive(Clone, Debug)]
@@ -94,7 +89,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Clone)]
 struct AdminState {
     storage: ModuleStorage,
-    host: Option<Arc<dyn crate::host::ModuleHostHandle>>,
+    host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -115,7 +110,7 @@ pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
 /// available for admin operators.
 pub fn admin_router_with_host(
     storage: ModuleStorage,
-    host: Arc<dyn crate::host::ModuleHostHandle>,
+    host: Arc<dyn crate::host_v2::ModuleHostHandle>,
     auth: AuthToken,
 ) -> axum::Router {
     admin_router_inner(storage, Some(host), auth)
@@ -123,7 +118,7 @@ pub fn admin_router_with_host(
 
 fn admin_router_inner(
     storage: ModuleStorage,
-    host: Option<Arc<dyn crate::host::ModuleHostHandle>>,
+    host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
     auth: AuthToken,
 ) -> axum::Router {
     let state = AdminState { storage, host };
@@ -318,19 +313,15 @@ async fn upload_module(
         });
     }
 
-    // Accept both v1 and v2 modules — the unified host routes
-    // by manifest.abi.version_major at start time. Each (major,
-    // wit_world) pair must align internally; a manifest claiming
-    // v2 major with the v1 world is malformed and rejected.
+    // v2 is the only supported ABI; v1 was retired (see
+    // MITOS_PLATFORM_V2.md). A manifest claiming any other major
+    // is rejected.
     manifest.validate_against_host(
         &wasm_bytes,
-        &[
-            (HOST_ABI_MAJOR, PLATFORM_WIT_WORLD),
-            (
-                crate::registry_v2::HOST_ABI_MAJOR_V2,
-                "mitos:platform-v2/mitos-module-v2",
-            ),
-        ],
+        &[(
+            crate::registry_v2::HOST_ABI_MAJOR_V2,
+            "mitos:platform-v2/mitos-module-v2",
+        )],
     )?;
 
     // Independent wasmtime validation: even if the manifest claims

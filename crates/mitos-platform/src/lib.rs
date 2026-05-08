@@ -1,10 +1,11 @@
-//! Mitos platform v1 — wasm-isolated module runtime.
+//! Mitos platform — wasm-isolated module runtime (v2).
 //!
-//! See `../../../docs/strategy/MITOS_PLATFORM_V1.md` for the
-//! full design rationale and v1 scope. Headlines:
+//! See `../../../docs/strategy/MITOS_PLATFORM_V2.md` for the
+//! full design rationale. Headlines:
 //!
-//! - **One module slot, filesystem-loaded.** Multi-tenant
-//!   hosting, HTTP control plane, OCI registry — all deferred.
+//! - **eUTXO event-stream dispatch.** Modules see typed events
+//!   (`Produced`, `Consumed`, `TxContext`, `Tick`, `Rollback`)
+//!   filtered host-side against their declared interest set.
 //! - **WIT-defined ABI.** `wit/world.wit` is the contract;
 //!   `wasmtime::component::bindgen!` generates host bindings,
 //!   `wit-bindgen` generates guest stubs.
@@ -12,64 +13,62 @@
 //!   + `ResourceLimiter` configured before any guest call.
 //! - **Author-declared trap strategy.** Module exports
 //!   `trap-policy()`; supervisor consults it on every trap.
-//! - **Lazy consumed-input resolution.** `resolved-block`
-//!   resource resolves on first access, memoises for block
-//!   lifetime. Pure-output indexers pay zero.
+//! - **Manifest-driven bootstrap.** Per-address interest
+//!   predicates trigger a synthetic event scan at module start,
+//!   so historical state hydrates through the same dispatch
+//!   path as live chain activity.
 //!
-//! Crate layout mirrors the doc's "Platform layer breakdown":
+//! Crate layout:
 //!
-//! - `bindings` — wasmtime `bindgen!` invocation + re-exports
-//! - `host_fns` — host-side impls of the WIT-imported
-//!   interfaces (chain-data, state-kv, emit, logging,
-//!   block-context)
-//! - `resolved_block` — per-block resource backed by lazy
-//!   data-plane resolution
-//! - `registry` — load module artifact, version-check,
-//!   instantiate
+//! - `bindings_v2` — wasmtime `bindgen!` invocation for the
+//!   `mitos:platform-v2` world
+//! - `host_fns` — shared `DataPlaneFacade` trait + `state_kv` +
+//!   `emit` channel types
+//! - `host_fns_v2` — host-side impls of the v2 WIT-imported
+//!   interfaces (chain-data, state-kv, emit, logging, interest)
+//! - `registry_v2` — load module artifact, version-check,
+//!   instantiate, `ResourceBudget`
+//! - `driver_v2`, `follower_v2`, `host_v2` — per-block dispatch,
+//!   chain follower, lifecycle manager
+//! - `bootstrap_v2` — synthetic event scan for manifest interest
 //! - `supervisor` — trap policy enforcement + bounded retry +
 //!   quarantine
 //! - `vendored` — files vendored from upstream (Apache-2.0;
 //!   see `vendored/balius/NOTICE`)
+//!
+//! The v1 dispatch path (block-CBOR-resource model with
+//! `ResolvedBlock`, `Driver`, `ModuleHost`, `host_unified`)
+//! was retired in May 2026 — both production modules
+//! (`ownership`, `jpg-co`) had migrated to v2 and no remaining
+//! consumer needed v1 dispatch.
 
 pub mod admin;
-pub mod bindings;
 pub mod bindings_v2;
-pub mod block_decode;
 pub mod bootstrap_v2;
 pub mod event_bindings;
 pub mod compaction;
 pub mod companions;
 pub mod dialer;
-pub mod driver;
 pub mod driver_v2;
 pub mod emissions;
-pub mod follower;
 pub mod follower_v2;
-pub mod host;
 pub mod host_fns;
 pub mod host_fns_v2;
-pub mod host_unified;
 pub mod host_v2;
 pub mod inspect;
 pub mod lag_tolerant;
 pub mod manifest;
-pub mod registry;
 pub mod registry_v2;
-pub mod resolved_block;
 pub mod storage;
 pub mod supervisor;
 pub mod trap_context;
 pub mod vendored;
 
-pub use block_decode::{DecodedBlock, decode_block};
-pub use driver::{ApplyOutcome, BlockEvent, Driver};
-pub use follower::run_chain_follower;
 /// Re-export the platform-internal `ChainPoint` from
 /// `mitos-data-plane` so consumers (like the bundle binary) can
 /// take/return it without a separate dep on `mitos-data-plane`.
 pub use mitos_data_plane::ChainPoint;
-pub use registry::{ModuleInstance, ModuleRegistry, ResourceBudget};
-pub use resolved_block::{ResolvedBlock, TxView};
+pub use registry_v2::{ModuleInstanceV2, ModuleRegistryV2, ResourceBudget};
 pub use supervisor::{Supervisor, SupervisorOutcome};
 
 /// Platform-level error surface. Per-host-fn errors flow back
