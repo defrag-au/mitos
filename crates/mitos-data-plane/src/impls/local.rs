@@ -622,6 +622,17 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
         .map(|i| OutputRef::new(*i.hash(), i.index() as u32))
         .collect();
 
+    // Snapshot this TX's witness-set datums so we can backfill
+    // `prior_datum.original_cbor` for hash-datum prior outputs
+    // the data plane couldn't resolve directly (e.g. jpg.store's
+    // metadata-encoded CO datums revealed only on cancel/accept).
+    // Mirrors `block_events::project_tx`.
+    let witness_datums: Vec<(pallas_primitives::Hash<32>, Vec<u8>)> = tx
+        .plutus_data()
+        .iter()
+        .map(|d| (d.original_hash(), d.raw_cbor().to_vec()))
+        .collect();
+
     // Best-effort prior-output resolution. Loop per-input
     // rather than `read_utxos` because the bulk method
     // silently omits unresolved entries; we want explicit
@@ -632,7 +643,10 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
             .await
             .unwrap_or(None);
         let (prior_output, prior_datum) = match prior {
-            Some(o) => {
+            Some(mut o) => {
+                if let Some(d) = o.datum.as_mut() {
+                    d.fill_from_witness(&witness_datums);
+                }
                 let datum = o.datum.clone();
                 (Some(o), datum)
             }
@@ -652,7 +666,10 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
             .await
             .unwrap_or(None);
         let (prior_output, prior_datum) = match prior {
-            Some(o) => {
+            Some(mut o) => {
+                if let Some(d) = o.datum.as_mut() {
+                    d.fill_from_witness(&witness_datums);
+                }
                 let datum = o.datum.clone();
                 (Some(o), datum)
             }

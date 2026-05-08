@@ -68,6 +68,15 @@ pub struct TxDraft {
     /// derived metadata if needed (currently unused — modules
     /// fetch on demand).
     pub aux_data_cbor: Option<Vec<u8>>,
+    /// Datums in this TX's witness set, paired with their
+    /// `original_hash`. Lets the dispatcher fill in
+    /// `prior_datum.original_cbor` for hash-datum prior outputs
+    /// the data plane couldn't resolve directly — jpg.store's
+    /// metadata-encoded CO datums, for instance, are only
+    /// revealed in the cancel/accept TX's witness set, so a
+    /// `read_utxo` lookup of the prior CO yields hash-only
+    /// `TypedDatum` until this fallback runs.
+    pub witness_datums: Vec<(Hash<32>, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +204,12 @@ fn project_tx(tx_idx: u32, tx: &MultiEraTx<'_>) -> TxDraft {
 
     let aux_data_cbor = extract_aux_data(tx);
 
+    let witness_datums: Vec<(Hash<32>, Vec<u8>)> = tx
+        .plutus_data()
+        .iter()
+        .map(|d| (d.original_hash(), d.raw_cbor().to_vec()))
+        .collect();
+
     TxDraft {
         tx_hash,
         tx_idx,
@@ -205,6 +220,7 @@ fn project_tx(tx_idx: u32, tx: &MultiEraTx<'_>) -> TxDraft {
         outputs,
         mints,
         aux_data_cbor,
+        witness_datums,
     }
 }
 

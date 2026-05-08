@@ -107,9 +107,10 @@ fn build_tx_batch(
         .reference_inputs
         .iter()
         .filter_map(|oref| {
-            let (prior_output, prior_datum) = resolved
+            let (mut prior_output, mut prior_datum) = resolved
                 .get(&(oref.tx_hash, oref.index))
                 .cloned()?;
+            backfill_prior_datum(&mut prior_output, &mut prior_datum, &tx.witness_datums);
             Some(UtxoEvent::Referenced(ReferencedEvent {
                 cursor: cursor.clone(),
                 referencing_tx_hash: tx.tx_hash,
@@ -125,9 +126,10 @@ fn build_tx_batch(
         .inputs
         .iter()
         .filter_map(|input: &InputDraft| {
-            let (prior_output, prior_datum) = resolved
+            let (mut prior_output, mut prior_datum) = resolved
                 .get(&(input.oref.tx_hash, input.oref.index))
                 .cloned()?;
+            backfill_prior_datum(&mut prior_output, &mut prior_datum, &tx.witness_datums);
             Some(UtxoEvent::Consumed(ConsumedEvent {
                 cursor: cursor.clone(),
                 consuming_tx_hash: tx.tx_hash,
@@ -212,6 +214,26 @@ fn build_tx_batch(
         batch.push(e);
     }
     Some(batch)
+}
+
+/// Apply the witness-set fallback to both copies of the prior
+/// datum. `prior_output.datum` and the standalone `prior_datum`
+/// field carry the same `TypedDatum` clone — fill both so a
+/// module observing either path sees consistent bytes.
+fn backfill_prior_datum(
+    prior_output: &mut TypedOutput,
+    prior_datum: &mut Option<TypedDatum>,
+    witness_datums: &[(pallas_primitives::Hash<32>, Vec<u8>)],
+) {
+    if witness_datums.is_empty() {
+        return;
+    }
+    if let Some(d) = prior_output.datum.as_mut() {
+        d.fill_from_witness(witness_datums);
+    }
+    if let Some(d) = prior_datum.as_mut() {
+        d.fill_from_witness(witness_datums);
+    }
 }
 
 fn event_matches(event: &UtxoEvent, interest: &InterestSet) -> bool {
@@ -377,6 +399,7 @@ mod tests {
                 }],
                 mints: Vec::new(),
                 aux_data_cbor: None,
+                witness_datums: Vec::new(),
             }],
         };
         let interest = InterestSet::default()
@@ -430,11 +453,105 @@ mod tests {
                 }],
                 mints: Vec::new(),
                 aux_data_cbor: None,
+                witness_datums: Vec::new(),
             }],
         };
         let interest = InterestSet::default()
             .with_predicate(InterestPredicate::AtAddress("addr1watched".to_owned()));
         let batches = build_event_batches(block, &interest, &plane).await.unwrap();
         assert!(batches.is_empty());
+    }
+
+    /// Hash-datum prior output whose bytes the data plane couldn't
+    /// resolve directly (no inline datum, no `DATUM_NS` entry yet)
+    /// — the consuming TX's witness set carries the matching
+    /// datum, so the dispatcher must backfill `original_cbor` on
+    /// both `prior_output.datum` and the standalone `prior_datum`
+    /// before dispatch reaches the module. This is the path
+    /// jpg.store CO cancellations rely on.
+    #[tokio::test]
+    async fn consumed_event_backfills_prior_datum_from_witness_set() {
+        // Prior CO output: hash-datum, bytes unresolved.
+        // Datum hash and bytes are arbitrary — the dispatch logic
+        // only checks key equality between the prior datum's hash
+        // and a `witness_datums` entry, so we don't need a real
+        // hash-of-bytes relationship for the lookup test.
+        let prior_tx_hash = pallas_primitives::Hash::new([0x11; 32]);
+        let datum_hash = pallas_primitives::Hash::<32>::new([0x77; 32]);
+        let datum_bytes: Vec<u8> = vec![0xd8, 0x79, 0x9f, 0xff];
+        let watched_addr = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd";
+        let prior_output = TypedOutput {
+            address: watched_addr.to_owned(),
+            lovelace: 100_000_000,
+            assets: Vec::new(),
+            datum: Some(TypedDatum {
+                hash: datum_hash,
+                payload: None,
+                original_cbor: None,
+            }),
+            script_ref: None,
+            original_cbor: None,
+            decoded_at: DecodeLevel::WithDatum,
+        };
+        let mut utxos = HashMap::new();
+        utxos.insert((prior_tx_hash, 0), prior_output);
+        let plane = StubPlane { utxos };
+
+        // Consuming TX: spends the prior CO; witness set carries
+        // the matching datum bytes.
+        let consuming_tx_hash = pallas_primitives::Hash::new([0x22; 32]);
+        let block = DecodedBlockV2 {
+            cursor: ChainPoint::Slot(200),
+            txs: vec![TxDraft {
+                tx_hash: consuming_tx_hash,
+                tx_idx: 0,
+                validity_interval: Default::default(),
+                required_signers: Vec::new(),
+                inputs: vec![InputDraft {
+                    oref: OutputRef::new(prior_tx_hash, 0),
+                    redeemer: Some(vec![0xd8, 0x7a, 0x80]), // cancel redeemer
+                }],
+                reference_inputs: Vec::new(),
+                outputs: Vec::new(),
+                mints: Vec::new(),
+                aux_data_cbor: None,
+                witness_datums: vec![(datum_hash, datum_bytes.clone())],
+            }],
+        };
+        let interest = InterestSet::default()
+            .with_predicate(InterestPredicate::AtAddress(watched_addr.to_owned()));
+        let batches = build_event_batches(block, &interest, &plane)
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1, "consumed at watched addr matches");
+        let consumed = batches[0]
+            .events
+            .iter()
+            .find_map(|e| match e {
+                UtxoEvent::Consumed(c) => Some(c),
+                _ => None,
+            })
+            .expect("Consumed event present");
+
+        let prior_datum = consumed
+            .prior_datum
+            .as_ref()
+            .expect("prior_datum populated");
+        assert_eq!(
+            prior_datum.original_cbor.as_deref(),
+            Some(datum_bytes.as_slice()),
+            "standalone prior_datum.original_cbor backfilled from witness set",
+        );
+        let inline_datum = consumed
+            .prior_output
+            .datum
+            .as_ref()
+            .expect("prior_output carries the datum");
+        assert_eq!(
+            inline_datum.original_cbor.as_deref(),
+            Some(datum_bytes.as_slice()),
+            "prior_output.datum.original_cbor backfilled symmetrically",
+        );
     }
 }
