@@ -16,10 +16,11 @@
 
 use std::collections::BTreeMap;
 
+use cardano_assets::PolicyId;
 use mitos_data_plane::{
-    block_events::datum_from_draft, ChainDataPlane, ChainPoint, InterestPredicate, InterestSet,
-    OutputRef, ProducedEvent, TxContextEvent, TxEventBatch, TypedOutput, UtxoEvent,
-    ValidityInterval,
+    AssetPattern, ChainDataPlane, ChainPoint, DecodeLevel, InterestPredicate, InterestSet,
+    OutputRef, PageRequest, ProducedEvent, TxContextEvent, TxEventBatch, TypedOutput, UtxoEvent,
+    UtxoPattern, UtxoPredicate, ValidityInterval, block_events::datum_from_draft,
 };
 use pallas_primitives::Hash;
 
@@ -35,25 +36,44 @@ pub struct BootstrapStats {
     /// Number of addresses we actually scanned (ones missing
     /// the completion flag).
     pub addresses_scanned: usize,
+    /// Number of `holds_policy` predicates seen.
+    pub policies_seen: usize,
+    /// Number of policies we actually scanned (ones missing
+    /// the completion flag).
+    pub policies_scanned: usize,
     /// Total UTxOs synthesised into events across all scanned
-    /// addresses.
+    /// addresses + policies.
     pub utxos_dispatched: usize,
     /// Number of synthetic `handle-events` calls made.
     pub batches_dispatched: usize,
 }
 
-/// Reserved state-kv key prefix the platform uses for per-
-/// address bootstrap completion flags. Modules MUST NOT touch
-/// keys under this prefix — `__platform/...` is platform-
-/// reserved namespace.
-fn bootstrap_flag_key(address: &str) -> String {
+/// Reserved state-kv key prefix for per-address bootstrap
+/// completion flags. Modules MUST NOT touch keys under
+/// `__platform/...` — that's platform-reserved namespace.
+/// Existing deploys' flag keys live at this exact path, so
+/// the format stays stable across the bootstrap-by-policy
+/// addition (otherwise a redeploy would re-bootstrap every
+/// already-hydrated address).
+fn bootstrap_flag_key_for_address(address: &str) -> String {
     format!("__platform/bootstrap/{address}")
 }
 
+/// Reserved state-kv key prefix for per-policy bootstrap
+/// completion flags. Separate namespace from the address flags
+/// — addresses are bech32 (`addr1...`), policies are bare hex,
+/// so the values wouldn't collide in practice, but the explicit
+/// `policy/` segment keeps the two paths visually distinct in
+/// state-kv dumps.
+fn bootstrap_flag_key_for_policy(policy: &PolicyId) -> String {
+    format!("__platform/bootstrap/policy/{policy}")
+}
+
 /// Run bootstrap for one module. Walks the interest set,
-/// scans each not-yet-bootstrapped `at_address` predicate,
-/// synthesises events, dispatches batches through the driver.
-/// Returns when all addresses have been hydrated.
+/// scans each not-yet-bootstrapped `at_address` and
+/// `holds_policy` predicate, synthesises events, dispatches
+/// batches through the driver. Returns when every watched
+/// scope has been hydrated.
 ///
 /// `module_id` is needed to namespace state-kv accesses (the
 /// underlying `ModuleKv` keys by `(module_id, key)`).
@@ -65,42 +85,139 @@ pub async fn run_bootstrap<P: ChainDataPlane + Sync>(
     plane: &P,
 ) -> anyhow::Result<BootstrapStats> {
     let mut stats = BootstrapStats::default();
-    let addresses: Vec<&str> = interest.watched_addresses().collect();
-    stats.addresses_seen = addresses.len();
 
+    // ----- address scans (current-state hydration via
+    // `utxos_by_address`).
+    let addresses: Vec<String> = interest
+        .watched_addresses()
+        .map(|s| s.to_owned())
+        .collect();
+    stats.addresses_seen = addresses.len();
     for address in addresses {
-        let key = bootstrap_flag_key(address);
+        let key = bootstrap_flag_key_for_address(&address);
         if has_flag(kv, module_id, &key)? {
             tracing::debug!(
                 module = %module_id,
-                address,
-                "bootstrap: skipping; already complete",
+                address = %address,
+                "bootstrap: skipping address; already complete",
             );
             continue;
         }
         tracing::info!(
             module = %module_id,
-            address,
-            "bootstrap: scanning current unspent set",
+            address = %address,
+            "bootstrap: scanning current unspent set at address",
         );
-        let scanned = scan_one_address(driver, address, plane).await?;
+        let scanned = scan_one_address(driver, &address, plane).await?;
         stats.addresses_scanned += 1;
         stats.utxos_dispatched += scanned.utxos;
         stats.batches_dispatched += scanned.batches;
-
-        // Persist completion. Failure here surfaces — we can't
-        // safely advance without recording or we'd re-emit on
-        // restart and slow the next deploy.
         set_flag(kv, module_id, &key)?;
         tracing::info!(
             module = %module_id,
-            address,
+            address = %address,
             utxos = scanned.utxos,
             batches = scanned.batches,
             "bootstrap: address complete",
         );
     }
 
+    // ----- policy scans (current-state hydration via
+    // `search_utxos(holds_policy)`). Same idempotence pattern
+    // as the address path: a per-policy state-kv flag records
+    // completion. An operator who wants to re-hydrate clears
+    // the flag and the orchestrator re-runs.
+    let policies: Vec<PolicyId> = interest.watched_policies().cloned().collect();
+    stats.policies_seen = policies.len();
+    for policy in policies {
+        let key = bootstrap_flag_key_for_policy(&policy);
+        if has_flag(kv, module_id, &key)? {
+            tracing::debug!(
+                module = %module_id,
+                policy = %policy,
+                "bootstrap: skipping policy; already complete",
+            );
+            continue;
+        }
+        tracing::info!(
+            module = %module_id,
+            policy = %policy,
+            "bootstrap: scanning current unspent set under policy",
+        );
+        let scanned = scan_one_policy(driver, &policy, plane).await?;
+        stats.policies_scanned += 1;
+        stats.utxos_dispatched += scanned.utxos;
+        stats.batches_dispatched += scanned.batches;
+        set_flag(kv, module_id, &key)?;
+        tracing::info!(
+            module = %module_id,
+            policy = %policy,
+            utxos = scanned.utxos,
+            batches = scanned.batches,
+            "bootstrap: policy complete",
+        );
+    }
+
+    Ok(stats)
+}
+
+/// Run bootstrap for a single newly-added predicate (address or
+/// policy). Used by the dynamic-interest path: when a companion
+/// adds a new policy at runtime via `update-interest(Add, ...)`,
+/// the follower calls this to hydrate current state for just
+/// that scope rather than re-scanning everything in the set.
+///
+/// Idempotent — the per-scope state-kv flag prevents repeated
+/// scans on subsequent dynamic adds of the same predicate.
+pub async fn bootstrap_one_predicate<P: ChainDataPlane + Sync>(
+    driver: &mut DriverV2,
+    module_id: &str,
+    kv: &mut ModuleKv,
+    predicate: &InterestPredicate,
+    plane: &P,
+) -> anyhow::Result<BootstrapStats> {
+    let mut stats = BootstrapStats::default();
+    match predicate {
+        InterestPredicate::AtAddress(address) => {
+            stats.addresses_seen = 1;
+            let key = bootstrap_flag_key_for_address(address);
+            if has_flag(kv, module_id, &key)? {
+                return Ok(stats);
+            }
+            let scanned = scan_one_address(driver, address, plane).await?;
+            stats.addresses_scanned = 1;
+            stats.utxos_dispatched = scanned.utxos;
+            stats.batches_dispatched = scanned.batches;
+            set_flag(kv, module_id, &key)?;
+        }
+        InterestPredicate::HoldsPolicy(policy) => {
+            stats.policies_seen = 1;
+            let key = bootstrap_flag_key_for_policy(policy);
+            if has_flag(kv, module_id, &key)? {
+                return Ok(stats);
+            }
+            let scanned = scan_one_policy(driver, policy, plane).await?;
+            stats.policies_scanned = 1;
+            stats.utxos_dispatched = scanned.utxos;
+            stats.batches_dispatched = scanned.batches;
+            set_flag(kv, module_id, &key)?;
+        }
+        // `AtStakeCred` would need a stake-cred → addresses
+        // resolution at the data plane (not implemented Phase A).
+        // `HoldsAsset` is single-asset specific; bootstrap-by-
+        // asset is uncommon in practice (most callers either
+        // care about a whole policy or already know the UTxO).
+        // `TickEvery` has no current-state to hydrate.
+        InterestPredicate::AtStakeCred(_)
+        | InterestPredicate::HoldsAsset { .. }
+        | InterestPredicate::TickEvery(_) => {
+            tracing::debug!(
+                module = %module_id,
+                predicate = ?predicate,
+                "bootstrap: predicate has no current-state hydration path; skipped",
+            );
+        }
+    }
     Ok(stats)
 }
 
@@ -225,6 +342,124 @@ async fn scan_one_address<P: ChainDataPlane + Sync>(
     Ok(result)
 }
 
+/// Scan one policy: page through `search_utxos(holds_policy)`,
+/// group by producing-tx, dispatch one synthetic batch per tx
+/// through the driver. Mirrors `scan_one_address` but works
+/// against the data plane's policy index instead of the
+/// address index.
+async fn scan_one_policy<P: ChainDataPlane + Sync>(
+    driver: &mut DriverV2,
+    policy: &PolicyId,
+    plane: &P,
+) -> anyhow::Result<AddressScanResult> {
+    let predicate = UtxoPredicate::matching(UtxoPattern {
+        asset: Some(AssetPattern::Policy(policy.clone())),
+        ..Default::default()
+    });
+
+    // Page through the entire matching set. The data plane's
+    // current cap is per-page (Phase A: 1000); keep walking
+    // until `next_token` is `None`.
+    let mut all_outputs: Vec<(OutputRef, TypedOutput)> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let page = plane
+            .search_utxos(
+                &predicate,
+                DecodeLevel::Lean,
+                PageRequest {
+                    start_token: page_token.clone(),
+                    max_items: 1000,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("search_utxos(holds_policy({policy})): {e}"))?;
+        all_outputs.extend(page.items);
+        match page.next_token {
+            Some(t) => page_token = Some(t),
+            None => break,
+        }
+    }
+
+    if all_outputs.is_empty() {
+        return Ok(AddressScanResult::default());
+    }
+
+    // Bulk-resolve datums for everything we got back. Mirrors
+    // the address-side flow.
+    let refs: Vec<OutputRef> = all_outputs.iter().map(|(r, _)| r.clone()).collect();
+    let datums = plane
+        .read_output_datums(&refs)
+        .await
+        .map_err(|e| anyhow::anyhow!("read_output_datums: {e}"))?;
+
+    let mut output_by_ref: std::collections::HashMap<(Hash<32>, u32), TypedOutput> =
+        std::collections::HashMap::new();
+    for (oref, out) in all_outputs {
+        output_by_ref.insert((oref.tx_hash, oref.index), out);
+    }
+    let mut datum_by_ref: std::collections::HashMap<
+        (Hash<32>, u32),
+        mitos_data_plane::TypedDatum,
+    > = std::collections::HashMap::new();
+    for (oref, datum_opt) in refs.iter().zip(datums) {
+        if let Some(td) = datum_opt {
+            datum_by_ref.insert((oref.tx_hash, oref.index), td);
+        }
+    }
+
+    // Group refs by producing tx_hash. BTreeMap → deterministic
+    // dispatch order across runs.
+    let mut by_tx: BTreeMap<Hash<32>, Vec<OutputRef>> = BTreeMap::new();
+    for r in refs {
+        by_tx.entry(r.tx_hash).or_default().push(r);
+    }
+
+    let mut result = AddressScanResult::default();
+    for (tx_hash, group_refs) in by_tx {
+        let cursor = ChainPoint::Origin;
+        let mut batch = TxEventBatch::new(0);
+        batch.push(UtxoEvent::TxContext(TxContextEvent {
+            cursor: cursor.clone(),
+            tx_hash,
+            tx_idx: 0,
+            validity_interval: ValidityInterval::default(),
+            required_signers: Vec::new(),
+        }));
+
+        let mut group_utxos = 0;
+        for r in group_refs {
+            let key = (r.tx_hash, r.index);
+            let Some(output) = output_by_ref.remove(&key) else {
+                continue;
+            };
+            let datum = datum_by_ref.remove(&key);
+            let _ = datum_from_draft;
+
+            batch.push(UtxoEvent::Produced(ProducedEvent {
+                cursor: cursor.clone(),
+                tx_hash,
+                tx_idx: 0,
+                oref: r,
+                output,
+                datum,
+            }));
+            group_utxos += 1;
+        }
+        if group_utxos == 0 {
+            continue;
+        }
+        driver
+            .dispatch_synthetic_batch(batch, cursor)
+            .await
+            .map_err(|e| anyhow::anyhow!("dispatch_synthetic_batch: {e}"))?;
+        result.utxos += group_utxos;
+        result.batches += 1;
+    }
+
+    Ok(result)
+}
+
 // ----- state-kv flag helpers --------------------------------
 
 fn has_flag(kv: &ModuleKv, module_id: &str, key: &str) -> anyhow::Result<bool> {
@@ -262,12 +497,11 @@ pub fn interest_from_addresses(addresses: &[String]) -> InterestSet {
 }
 
 /// Build an `InterestSet` from manifest-declared addresses +
-/// policies. Address predicates participate in the bootstrap
-/// scan (current-state hydration via `utxos_by_address`);
-/// policy predicates apply to the runtime event filter only —
-/// bootstrap-by-policy is not implemented today (modules pick
-/// up new activity going forward and rely on a separate
-/// backfill if they need historical hydration).
+/// policies. Both predicate kinds participate in the bootstrap
+/// scan: addresses hydrate via `utxos_by_address` and policies
+/// hydrate via `search_utxos(holds_policy)`. Idempotent — the
+/// per-scope state-kv flag prevents repeated scans across
+/// restarts.
 pub fn interest_from_manifest(
     addresses: &[String],
     policy_hexes: &[String],

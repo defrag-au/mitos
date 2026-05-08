@@ -381,6 +381,7 @@ where
             senders.insert(id.to_owned(), interest_tx);
         }
 
+        let follower_kv_factory = self.kv_factory.clone();
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -390,6 +391,7 @@ where
                 chain_plane,
                 follower_storage,
                 follower_module_id,
+                follower_kv_factory,
             )
             .await;
             match &result {

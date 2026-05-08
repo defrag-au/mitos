@@ -143,6 +143,18 @@ impl InterestSet {
             _ => None,
         })
     }
+
+    /// Iterate all `HoldsPolicy(policy)` predicates. The
+    /// bootstrap orchestrator reads these to scan the current
+    /// UTxO set under each policy via `search_utxos` and
+    /// synthesise events for every existing holder — the
+    /// policy-side analogue of `watched_addresses`.
+    pub fn watched_policies(&self) -> impl Iterator<Item = &PolicyId> + '_ {
+        self.predicates.iter().filter_map(|p| match p {
+            InterestPredicate::HoldsPolicy(p) => Some(p),
+            _ => None,
+        })
+    }
 }
 
 fn predicate_matches_output(p: &InterestPredicate, output: &TypedOutput) -> bool {
