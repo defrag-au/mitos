@@ -20,6 +20,7 @@ use mitos_data_plane::ChainDataPlane;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver_v2::DriverV2;
+use crate::storage::ModuleStorage;
 use crate::PlatformResult;
 
 /// Run the v2 chain follower until cancelled or the tip
@@ -28,11 +29,18 @@ use crate::PlatformResult;
 /// `data_plane` is the `ChainDataPlane` impl the dispatch path
 /// uses to resolve prior outputs during event-batch building.
 /// Same plane the host was instantiated with.
+///
+/// `storage` + `module_id` are used to flush the driver's
+/// post-apply cursor to disk after every successful Apply /
+/// Mark / Undo. Without this, restart loses progress and
+/// `auto_resume` resumes from `None` (= origin / WAL replay).
 pub async fn run_chain_follower_v2<S, P>(
     mut driver: DriverV2,
     mut subscription: S,
     cancel: CancellationToken,
     data_plane: Arc<P>,
+    storage: ModuleStorage,
+    module_id: String,
 ) -> PlatformResult<()>
 where
     S: TipSubscription,
@@ -58,6 +66,7 @@ where
                             ?outcome,
                             "v2 follower: applied",
                         );
+                        flush_cursor(&storage, &module_id, &driver);
                     }
                     Err(crate::PlatformError::Decode(e)) => {
                         // Match v1's posture: host-side decode
@@ -88,10 +97,32 @@ where
                     return Err(crate::PlatformError::Wasmtime(e));
                 }
                 tracing::info!(?to_cursor, "v2 follower: rollback dispatched");
+                flush_cursor(&storage, &module_id, &driver);
             }
             TipEvent::Mark(point) => {
                 tracing::trace!(?point, "v2 follower: mark");
+                // No dispatch on Mark, but still flush — Mark is
+                // the cursor-only checkpoint that lets a restart
+                // resume from a known point even when no module-
+                // visible blocks have arrived.
+                flush_cursor(&storage, &module_id, &driver);
             }
         }
+    }
+}
+
+/// Persist the driver's post-apply cursor to module storage.
+/// Best-effort: a transient redb error is logged but doesn't
+/// kill the follower (next successful flush will overwrite).
+fn flush_cursor(storage: &ModuleStorage, module_id: &str, driver: &DriverV2) {
+    let Some(cursor) = driver.cursor() else {
+        return;
+    };
+    if let Err(e) = storage.write_cursor(module_id, cursor) {
+        tracing::warn!(
+            module = %module_id,
+            error = %e,
+            "v2 follower: cursor flush failed; will retry on next event",
+        );
     }
 }

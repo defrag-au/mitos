@@ -17,15 +17,49 @@ use wasmtime::{Engine, Store};
 use crate::bindings_v2::MitosModuleV2;
 use crate::host_fns::{DataPlaneFacade, emit, state_kv};
 use crate::host_fns_v2::HostStateV2;
-use crate::registry::ResourceBudget;
 use crate::supervisor::Supervisor;
 use crate::{PlatformError, PlatformResult};
 
-/// Major ABI version v2 modules must declare. v1 modules
-/// (`HOST_ABI_MAJOR = 1`) and v2 modules can both sit under
-/// `<modules-dir>/<id>/`; the host routes per-module by reading
-/// the manifest's declared major version.
+/// Major ABI version v2 modules must declare. v2 is the only
+/// supported ABI; v1 was retired (see MITOS_PLATFORM_V2.md).
 pub const HOST_ABI_MAJOR_V2: u32 = 2;
+
+/// Per-instance resource caps the host applies before any guest
+/// call. Moved here from `registry.rs` when the v1 dispatch path
+/// was retired.
+///
+/// `init_fuel` is separate from `fuel_per_call` because
+/// bootstrap-style modules (jpg.store CO indexer, marketplace
+/// indexers that scan a script address on first deploy) walk
+/// thousands of UTxOs in `init()`, decoding metadata + hashing
+/// per output. That's a one-shot heavyweight cost that doesn't
+/// recur on subsequent dispatches; budgeting `init` separately
+/// keeps the per-block ceiling tight without starving the
+/// bootstrap path.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceBudget {
+    pub fuel_per_call: u64,
+    pub init_fuel: u64,
+    pub fuel_yield_interval: u64,
+    pub epoch_deadline_ticks: u64,
+}
+
+impl Default for ResourceBudget {
+    fn default() -> Self {
+        Self {
+            fuel_per_call: 100_000_000,
+            // Empirically calibrated: jpg-co's metadata-fallback
+            // bootstrap costs ~630K fuel per output (CBOR parse
+            // + hex decode + blake2b match + datum decode +
+            // event emit). 10B keeps headroom for ~15K outputs;
+            // jpg.store V2 currently sits at ~4.5K. Per-block
+            // dispatch keeps the tighter `fuel_per_call` cap.
+            init_fuel: 10_000_000_000,
+            fuel_yield_interval: 10_000,
+            epoch_deadline_ticks: 1_000_000,
+        }
+    }
+}
 
 /// Wasmtime engine + a single loaded v2 component.
 pub struct ModuleRegistryV2 {
@@ -108,24 +142,9 @@ impl ModuleRegistryV2 {
         }
 
         // Trap policy: the v2 WIT defines the same `trap-strategy`
-        // / `retry-policy` shapes as v1, but as distinct types
-        // under the v2 bindgen tree. Convert variant-by-variant
-        // here — Supervisor itself is shape-agnostic and works on
-        // the v1 enums (single source of truth for now).
-        let (v2_strategy, v2_retry) = bindings.call_trap_policy(&mut store).await?;
-        let strategy = match v2_strategy {
-            crate::bindings_v2::TrapStrategy::Replay => crate::bindings::TrapStrategy::Replay,
-            crate::bindings_v2::TrapStrategy::SkipAndMark => {
-                crate::bindings::TrapStrategy::SkipAndMark
-            }
-            crate::bindings_v2::TrapStrategy::Quarantine => {
-                crate::bindings::TrapStrategy::Quarantine
-            }
-        };
-        let retry = crate::bindings::RetryPolicy {
-            max_retries: v2_retry.max_retries,
-            backoff_cap_ms: v2_retry.backoff_cap_ms,
-        };
+        // Supervisor speaks the v2 bindgen types directly now
+        // that v1 is gone — no conversion shim.
+        let (strategy, retry) = bindings.call_trap_policy(&mut store).await?;
         let supervisor = Supervisor::new(strategy, retry);
 
         Ok(ModuleInstanceV2 {

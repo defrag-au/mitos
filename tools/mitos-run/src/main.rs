@@ -24,8 +24,7 @@ use clap::Parser;
 use mitos_data_plane::{
     DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput,
 };
-use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
-use mitos_platform::registry::{ModuleRegistry, ResourceBudget};
+use mitos_platform::host_fns::DataPlaneFacade;
 use serde::Deserialize;
 
 #[derive(Parser, Debug)]
@@ -119,75 +118,16 @@ async fn main() -> Result<()> {
         println!("  blocks:      {}", args.block.len());
     }
 
-    // Branch on ABI version. v2 modules go through
-    // ModuleRegistryV2 + DriverV2 with optional block dispatch
-    // after init; v1 modules keep the existing init-only test
-    // shape.
-    if abi_major == 2 {
-        return run_v2(&args.block, &fixture, &module_id, &wasm_path, &config_bytes).await;
-    }
-
-    let dp: Arc<dyn DataPlaneFacade> = Arc::new(FixtureDataPlane::from_fixture(fixture)?);
-    let kv = state_kv::ModuleKv::new_in_memory();
-    let (sink, mut events_rx) = emit::EventSink::new();
-
-    let engine = ModuleRegistry::build_engine().map_err(|e| anyhow::anyhow!("build engine: {e}"))?;
-    let registry = ModuleRegistry::load_from_path(engine, module_id.clone(), &wasm_path)
-        .map_err(|e| anyhow::anyhow!("load module: {e}"))?;
-
-    let budget = ResourceBudget::default();
-    let mut instance = registry
-        .instantiate(dp, kv, sink, budget)
-        .await
-        .map_err(|e| anyhow::anyhow!("instantiate: {e}"))?;
-
-    // Mirror `ModuleHost::start`: refuel with the init-class
-    // budget before `call_init`. Bootstrap-style modules can
-    // burn an order of magnitude more than `fuel_per_call`
-    // would allow.
-    instance
-        .store
-        .set_fuel(budget.init_fuel)
-        .map_err(|e| anyhow::anyhow!("set init fuel: {e}"))?;
-    println!(
-        "▸ init(): calling with config_bytes.len()={}, fuel={}",
-        config_bytes.len(),
-        budget.init_fuel
-    );
-    let init_result = instance
-        .bindings
-        .call_init(&mut instance.store, &config_bytes)
-        .await;
-
-    // Drain any emissions produced during init (the module may
-    // emit during bootstrap).
-    let mut emitted = 0;
-    while let Ok(event) = events_rx.try_recv() {
-        emitted += 1;
-        println!(
-            "  emit channel={} payload={} bytes",
-            event.channel,
-            event.payload.len()
+    // v2 is the only supported ABI; v1 was retired
+    // (see MITOS_PLATFORM_V2.md). Mismatched manifests are a
+    // build error rather than a silent fallback.
+    if abi_major != 2 {
+        bail!(
+            "unsupported ABI v{abi_major} — mitos-run only handles v2 modules; \
+             rebuild with `mitos-build` (v2 is the default)"
         );
     }
-    if emitted > 0 {
-        println!("▸ {emitted} event(s) emitted during init");
-    }
-
-    match init_result {
-        Ok(()) => {
-            println!("✓ init() returned cleanly");
-            Ok(())
-        }
-        Err(e) => {
-            // wasmtime::Error's Debug formatter includes the
-            // trap backtrace; with the line-tables-only debug
-            // info baked in by mitos-build's release profile,
-            // each frame names its source function.
-            eprintln!("✗ init() failed:\n{e:?}");
-            std::process::exit(1);
-        }
-    }
+    run_v2(&args.block, &fixture, &module_id, &wasm_path, &config_bytes).await
 }
 
 // -----------------------------------------------------------------------------
@@ -490,7 +430,8 @@ async fn run_v2(
     config_bytes: &[u8],
 ) -> Result<()> {
     use mitos_platform::driver_v2::{ApplyOutcomeV2, DriverV2};
-    use mitos_platform::registry_v2::ModuleRegistryV2;
+    use mitos_platform::host_fns::{emit, state_kv};
+    use mitos_platform::registry_v2::{ModuleRegistryV2, ResourceBudget};
 
     let interest = build_interest_set(&fixture.interest)?;
     println!("▸ interest:    {} predicate(s)", interest.predicates.len());

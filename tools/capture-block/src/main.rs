@@ -225,12 +225,12 @@ fn main() -> anyhow::Result<()> {
     let bytes = read_block(&archive_dir, &loc)?;
     tracing::info!(slot, bytes = bytes.len(), "fetched block CBOR");
 
-    // Round-trip through the platform's decoder so we know the
-    // bytes are exactly what the equivalence test will accept.
-    let decoded = mitos_platform::decode_block(&bytes)
-        .context("decode_block round-trip — fetched CBOR is not pallas-decodable")?;
+    // Round-trip through the v2 block decoder so we know the
+    // bytes the test runner will see decode cleanly.
+    let decoded = mitos_data_plane::block_events::decode_block_v2(&bytes)
+        .context("decode_block_v2 round-trip — fetched CBOR is not pallas-decodable")?;
     tracing::info!(
-        decoded_slot = decoded.slot,
+        slot = ?decoded.cursor,
         tx_count = decoded.txs.len(),
         "decoded ok",
     );
@@ -242,9 +242,9 @@ fn main() -> anyhow::Result<()> {
     for tx in &decoded.txs {
         total_outputs += tx.outputs.len();
         for out in &tx.outputs {
-            total_assets += out.assets.len();
-            for asset in &out.assets {
-                policies.insert(hex::encode(&asset.asset.policy));
+            total_assets += out.output.assets.len();
+            for asset in &out.output.assets {
+                policies.insert(asset.policy_id.clone());
             }
         }
     }

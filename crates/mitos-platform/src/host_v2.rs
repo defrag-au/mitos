@@ -22,21 +22,91 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dolos_core::TipSubscription;
-use mitos_data_plane::ChainDataPlane;
+use mitos_data_plane::{ChainDataPlane, ChainPoint};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::bootstrap_v2::{interest_from_addresses, run_bootstrap};
+use crate::bootstrap_v2::{interest_from_manifest, run_bootstrap};
 use crate::driver_v2::DriverV2;
 use crate::follower_v2::run_chain_follower_v2;
-use crate::host::{EmitterFactory, KvFactory, SubscriptionFactory};
-use crate::host_fns::DataPlaneFacade;
-use crate::registry::ResourceBudget;
-use crate::registry_v2::ModuleRegistryV2;
+use crate::host_fns::{DataPlaneFacade, emit, state_kv};
+use crate::registry_v2::{ModuleRegistryV2, ResourceBudget};
 use crate::storage::ModuleStorage;
 use crate::trap_context::{TrapContextLogger, write_fixture};
 use crate::{PlatformError, PlatformResult};
+
+// ============================================================================
+// Public lifecycle traits + factory types (moved from `host.rs` when the v1
+// dispatch path was retired — see MITOS_PLATFORM_V2.md).
+// ============================================================================
+
+/// Object-safe lifecycle surface for the admin router. The concrete
+/// `ModuleHostV2<S, P>` is generic over the `TipSubscription` and
+/// `ChainDataPlane` types; the admin router doesn't care about that
+/// — it just needs "start a module" / "stop a module" / "what's
+/// running." The trait keeps the generics out of route signatures.
+#[async_trait::async_trait]
+pub trait ModuleHostHandle: Send + Sync {
+    async fn replace(&self, id: &str) -> PlatformResult<()>;
+    async fn stop(&self, id: &str) -> PlatformResult<()>;
+    async fn stop_all(&self);
+    async fn list_running(&self) -> Vec<String>;
+}
+
+/// One dynamic-interest update queued for delivery to a running
+/// module's `update-interest` export. Pushed by the dialer when a
+/// `ClientMessage::Interest` frame arrives over the companion's WS.
+#[derive(Debug)]
+pub struct InterestUpdate {
+    pub op: mitos_protocol::InterestOp,
+    pub items: Vec<mitos_protocol::Interest>,
+}
+
+/// Routes inbound `Interest` frames to the right running module's
+/// follower task. Only the follower task can call the wasmtime
+/// instance's exports (the wasmtime Store isn't safely shareable
+/// across tasks), so the dialer can't invoke `update-interest`
+/// directly — it pushes through this trait and the follower drains.
+#[async_trait::async_trait]
+pub trait InterestRouter: Send + Sync {
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InterestRouteError {
+    #[error("module `{0}` is not running; interest update dropped")]
+    NotRunning(String),
+    #[error("module `{0}` follower channel closed; interest update dropped")]
+    ChannelClosed(String),
+}
+
+/// Factory for fresh `TipSubscription`s. Called once per
+/// `start`/`replace` to spin up an isolated subscription for each
+/// follower. Takes the persisted cursor (if any) so the production
+/// wiring can choose: resume from cursor on restart, or fall back
+/// to the current chain tip on fresh deploy.
+pub type SubscriptionFactory<S> = Arc<dyn Fn(Option<ChainPoint>) -> S + Send + Sync>;
+
+/// Factory for fresh in-memory or redb-backed KVs. Called per
+/// module on start/replace.
+pub type KvFactory = Arc<dyn Fn(&str) -> state_kv::ModuleKv + Send + Sync>;
+
+/// Factory for fresh `EventSink` pairs. Each follower gets one;
+/// the host wires the receiving end into the emissions store /
+/// replication WS.
+pub type EmitterFactory = Arc<
+    dyn Fn() -> (
+            emit::EventSink,
+            tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+        ) + Send
+        + Sync,
+>;
 
 /// Per-running-module state held inside the host.
 struct RunningSlotV2 {
@@ -172,14 +242,19 @@ where
         // declared in the manifest's `[interest]` section.
         // Per-address state-kv flags make this a no-op for
         // already-bootstrapped addresses (idempotent), so the
-        // path runs cheap on every restart.
-        if !manifest.interest.addresses.is_empty() {
+        // path runs cheap on every restart. Policy-scoped
+        // interest predicates participate in runtime
+        // filtering but don't trigger a bootstrap pass today.
+        if !manifest.interest.is_empty() {
             // Build the InterestSet from the manifest's
-            // declarative addresses. Push it onto the driver
-            // so subsequent block dispatch filters correctly
-            // even if no companion-driven update-interest
-            // arrives.
-            let interest = interest_from_addresses(&manifest.interest.addresses);
+            // declarative addresses + policies. Push it onto
+            // the driver so subsequent block dispatch filters
+            // correctly even if no companion-driven
+            // update-interest arrives.
+            let interest = interest_from_manifest(
+                &manifest.interest.addresses,
+                &manifest.interest.policies,
+            );
             driver.set_interest(interest.clone());
 
             // Hand the bootstrap orchestrator a mutable
@@ -230,11 +305,20 @@ where
         let persisted_cursor = self.storage.read_cursor(id)?;
         let subscription = (self.subscription_factory)(persisted_cursor);
         let chain_plane = self.chain_plane.clone();
+        let follower_storage = self.storage.clone();
+        let follower_module_id = id.to_owned();
         let id_for_log = id.to_owned();
 
         let task = tokio::spawn(async move {
-            let result =
-                run_chain_follower_v2(driver, subscription, cancel_for_task, chain_plane).await;
+            let result = run_chain_follower_v2(
+                driver,
+                subscription,
+                cancel_for_task,
+                chain_plane,
+                follower_storage,
+                follower_module_id,
+            )
+            .await;
             match &result {
                 Err(e) => tracing::error!(
                     module = %id_for_log,
@@ -256,7 +340,7 @@ where
         let drain_module_id = id.to_owned();
         let drain_cancel = cancel.clone();
         let drain_task = tokio::spawn(async move {
-            crate::host::run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel)
+            run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel)
                 .await;
         });
 
@@ -316,5 +400,171 @@ where
         for id in ids {
             let _ = self.stop(&id).await;
         }
+    }
+
+    /// Resume any modules whose manifests already sit on disk.
+    /// Called once at host start; logs + skips on per-module
+    /// failure so a single bad module can't abort bundle startup.
+    /// Replaces the v1 unified host's auto-resume that previously
+    /// routed by ABI version.
+    pub async fn auto_resume(&self) {
+        let module_ids = match self.storage.list_modules() {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(error = %e, "auto-resume: list_modules failed");
+                return;
+            }
+        };
+        for id in module_ids {
+            match self.start(&id).await {
+                Ok(()) => tracing::info!(module = %id, "auto-resumed"),
+                Err(e) => tracing::error!(
+                    module = %id,
+                    error = %e,
+                    "auto-resume failed; module not running",
+                ),
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S, P> ModuleHostHandle for ModuleHostV2<S, P>
+where
+    S: TipSubscription + 'static,
+    P: ChainDataPlane + Send + Sync + 'static,
+{
+    async fn replace(&self, id: &str) -> PlatformResult<()> {
+        ModuleHostV2::replace(self, id).await
+    }
+    async fn stop(&self, id: &str) -> PlatformResult<()> {
+        ModuleHostV2::stop(self, id).await
+    }
+    async fn stop_all(&self) {
+        ModuleHostV2::stop_all(self).await
+    }
+    async fn list_running(&self) -> Vec<String> {
+        ModuleHostV2::list(self).await
+    }
+}
+
+/// Drain task — pull events off the per-module emit channel and
+/// fan them out into the per-companion emissions store. Spawned
+/// alongside the follower task in `start()` and cancelled in
+/// `stop()`. (Moved here from the retired v1 `host.rs`.)
+pub(crate) async fn run_emit_drain(
+    storage: ModuleStorage,
+    module_id: String,
+    mut events_rx: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+    cancel: CancellationToken,
+) {
+    let store = match storage.emissions_store(&module_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                module = %module_id,
+                error = %e,
+                "open EmissionsStore for drain failed; emit interception disabled for this module"
+            );
+            return;
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            event = events_rx.recv() => {
+                let Some(event) = event else { return };
+                drain_one(&storage, &store, &module_id, event);
+            }
+        }
+    }
+}
+
+fn drain_one(
+    storage: &ModuleStorage,
+    store: &crate::emissions::EmissionsStore,
+    module_id: &str,
+    event: emit::EmittedEvent,
+) {
+    use crate::emissions::EmissionStatus;
+    let companions_dir = storage.module_dir_for_companions(module_id);
+    if !companions_dir.exists() {
+        return; // no registered companions
+    }
+    let read = match std::fs::read_dir(&companions_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                module = %module_id,
+                dir = %companions_dir.display(),
+                error = %e,
+                "read companions dir failed; emission dropped"
+            );
+            return;
+        }
+    };
+    let now = format!(
+        "unix:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    // Channel as a string — the WIT ABI uses u32; companion-side
+    // dispatch is by string tag. We stringify here; future work
+    // could plumb the name through manifest metadata.
+    let channel = event.channel.to_string();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+            continue;
+        }
+        let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Err(e) = store.append(
+            &companion_key,
+            &channel,
+            event.chain_point.clone(),
+            event.payload.clone(),
+            EmissionStatus::Queued,
+            &now,
+        ) {
+            tracing::warn!(
+                module = %module_id,
+                companion_key = %companion_key,
+                error = %e,
+                "append emission row failed"
+            );
+        }
+    }
+}
+
+/// Interest-update router for v2 modules.
+///
+/// The companion-WS dialer in `dialer.rs` doesn't know which ABI
+/// version a module runs under, so it routes every inbound
+/// `ClientMessage::Interest` frame through a `dyn InterestRouter`.
+/// v2's wire-interest path is not wired through to the follower
+/// yet (manifest-declared interest is the source of truth at
+/// runtime); accept + log so the dialer doesn't error.
+#[async_trait::async_trait]
+impl<S, P> InterestRouter for ModuleHostV2<S, P>
+where
+    S: TipSubscription + 'static,
+    P: ChainDataPlane + Send + Sync + 'static,
+{
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        _op: mitos_protocol::InterestOp,
+        _items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError> {
+        tracing::debug!(
+            module = %module_id,
+            "v2 interest update dropped (wire path TBD; manifest [interest] is source of truth)",
+        );
+        Ok(())
     }
 }

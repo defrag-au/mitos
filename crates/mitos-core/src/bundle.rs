@@ -173,20 +173,20 @@ impl Bundle {
         // keep tokio's runtime alive past the bundle's serve
         // future and systemd hits its 90s graceful-shutdown
         // timeout.
-        let mut module_host: Option<Arc<dyn mitos_platform::host::ModuleHostHandle>> = None;
+        let mut module_host: Option<Arc<dyn mitos_platform::host_v2::ModuleHostHandle>> = None;
         let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
             })?;
             let storage = mitos_platform::storage::ModuleStorage::new(modules_dir.clone());
-            let engine = mitos_platform::registry::ModuleRegistry::build_engine()
+            let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine()
                 .map_err(|e| anyhow::anyhow!("module engine: {e}"))?;
-            // Single DomainDataPlane instance serves both v1
-            // and v2 hosts: v1 wires it as `Arc<dyn DataPlaneFacade>`
-            // (via the blanket impl), v2 wires it as the concrete
-            // `Arc<DomainDataPlane<_>>` so the dispatch composer's
-            // generic bound resolves without a vtable hop.
+            // Single DomainDataPlane instance: v2 wires it as the
+            // concrete `Arc<DomainDataPlane<_>>` so the dispatch
+            // composer's generic bound resolves without a vtable
+            // hop. The `dp` view (`Arc<dyn DataPlaneFacade>`) is
+            // what the per-instance host fns see.
             let chain_plane = Arc::new(
                 mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
             );
@@ -213,7 +213,7 @@ impl Bundle {
             //    by re-fetching missed blocks from the WAL.
             //    See `mitos_platform::lag_tolerant`.
             let domain_for_factory = Arc::new(domain.clone());
-            let sub_factory: mitos_platform::host::SubscriptionFactory<
+            let sub_factory: mitos_platform::host_v2::SubscriptionFactory<
                 mitos_platform::lag_tolerant::LagTolerantSubscription<DomainAdapter>,
             > = Arc::new(move |cursor: Option<mitos_platform::ChainPoint>| {
                 use dolos_core::StateStore;
@@ -242,7 +242,7 @@ impl Bundle {
             // a second `Database::open` of the same file fails
             // with `Database already open`.
             let storage_for_kv = storage.clone();
-            let kv_factory: mitos_platform::host::KvFactory = Arc::new(move |id: &str| {
+            let kv_factory: mitos_platform::host_v2::KvFactory = Arc::new(move |id: &str| {
                 match storage_for_kv.kv_store(id, None) {
                     Ok(kv) => mitos_platform::host_fns::state_kv::ModuleKv::Redb(kv),
                     Err(e) => {
@@ -263,23 +263,14 @@ impl Bundle {
                     }
                 }
             });
-            let emitter_factory: mitos_platform::host::EmitterFactory =
+            let emitter_factory: mitos_platform::host_v2::EmitterFactory =
                 Arc::new(mitos_platform::host_fns::emit::EventSink::new);
 
-            // Build v1 + v2 hosts pointed at the same storage,
-            // engine, factories, and budget. The unified host
-            // wraps both and routes per-module by manifest ABI.
-            let budget = mitos_platform::registry::ResourceBudget::default();
-            let v1_host = Arc::new(mitos_platform::host::ModuleHost::new(
-                storage.clone(),
-                engine.clone(),
-                dp.clone(),
-                sub_factory.clone(),
-                kv_factory.clone(),
-                emitter_factory.clone(),
-                budget,
-            ));
-            let v2_host = Arc::new(mitos_platform::host_v2::ModuleHostV2::new(
+            // Single v2 host (the v1 dispatch path was retired —
+            // see `mitos/docs/strategy/MITOS_PLATFORM_V2.md`). All
+            // production modules now build against ABI 2.
+            let budget = mitos_platform::registry_v2::ResourceBudget::default();
+            let host = Arc::new(mitos_platform::host_v2::ModuleHostV2::new(
                 storage.clone(),
                 engine,
                 dp.clone(),
@@ -289,23 +280,17 @@ impl Bundle {
                 emitter_factory,
                 budget,
             ));
-            let host = Arc::new(mitos_platform::host_unified::UnifiedModuleHost::new(
-                storage.clone(),
-                v1_host,
-                v2_host,
-            ));
 
-            // Auto-resume: per-module ABI routing. The unified
-            // host reads each manifest, picks v1/v2 dispatch,
-            // logs + skips on failure (single bad module
-            // doesn't abort bundle startup).
+            // Auto-resume: walk every manifest on disk and start
+            // it. Single bad module is logged and skipped so it
+            // can't abort bundle startup.
             host.auto_resume().await;
 
             // The platform admin router has its own AuthToken
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
             let host_for_admin =
-                host.clone() as Arc<dyn mitos_platform::host::ModuleHostHandle>;
+                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
 
             // Companion dial supervisor: maintains an outbound
             // WS to each registered companion so the host can
@@ -318,7 +303,7 @@ impl Bundle {
             // off the host so inbound `ClientMessage::Interest`
             // frames get routed into the right module's follower
             // task and call its `update-interest` export.
-            let interest_router: Arc<dyn mitos_platform::host::InterestRouter> = host.clone();
+            let interest_router: Arc<dyn mitos_platform::host_v2::InterestRouter> = host.clone();
             let dialer = mitos_platform::dialer::CompanionDialer::new(
                 storage.clone(),
                 platform_auth.clone(),
@@ -342,7 +327,7 @@ impl Bundle {
             // rows to Timeout (24h). See `mitos_platform::compaction`.
             let compaction_handle = mitos_platform::compaction::spawn(
                 storage,
-                host.clone() as Arc<dyn mitos_platform::host::ModuleHostHandle>,
+                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>,
                 exit.clone(),
             );
 

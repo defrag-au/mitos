@@ -61,7 +61,7 @@ use url::Url;
 
 use crate::admin::AuthToken;
 use crate::emissions::{EmissionStatus, EmissionsStore};
-use crate::host::InterestRouter;
+use crate::host_v2::InterestRouter;
 use crate::storage::ModuleStorage;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_000);

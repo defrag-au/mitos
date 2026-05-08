@@ -9,7 +9,7 @@
 
 // `RetryPolicy` and `TrapStrategy` come from the world-level
 // `use types.{...}` and live at the bindgen module's top-level.
-use crate::bindings::{RetryPolicy, TrapStrategy};
+use crate::bindings_v2::{RetryPolicy, TrapStrategy};
 
 /// Outcome of one dispatch attempt.
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::host::ModuleHostHandle;
+use crate::host_v2::ModuleHostHandle;
 use crate::storage::ModuleStorage;
 
 /// Default sweep interval. Hourly is plenty — the policies

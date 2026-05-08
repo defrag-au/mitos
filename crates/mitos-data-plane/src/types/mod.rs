@@ -18,6 +18,7 @@ mod page;
 mod params;
 mod predicate;
 mod tip;
+mod tx_record;
 
 pub use chain_point::ChainPoint;
 pub use decode::DecodeLevel;
@@ -33,3 +34,4 @@ pub use page::{Page, PageRequest};
 pub use params::ProtocolParameters;
 pub use predicate::{AddressPattern, AssetPattern, OutputRefPattern, UtxoPattern, UtxoPredicate};
 pub use tip::ChainTip;
+pub use tx_record::{ConsumedInput, MintEntry, ReferencedInput, TxRecord};

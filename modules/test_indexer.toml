@@ -1,0 +1,28 @@
+# mitos.toml — test fixture indexer for `mitos-platform`'s
+# integration suite. Built locally via:
+#
+#   scripts/build-module.sh . test_indexer
+#
+# Output lands at `modules/target/mitos/test-indexer/` and is
+# consumed by `crates/mitos-platform/tests/{lifecycle_v2,
+# dispatch_v2}.rs`. Tests skip cleanly when the artifact is
+# absent so this build is opt-in (the `scripts/test-platform.sh`
+# helper does the build-then-test sequence in one step).
+
+# v2 ABI — the only ABI the platform supports after Step 12.
+abi_version = 2
+
+# `[interest]` is set per-test at runtime via `Driver::set_interest`,
+# not from this manifest. Tests scan their own block fixture, pick
+# the first policy they find, and configure interest dynamically
+# so the fixture stays self-tuning across block-fixture changes.
+[interest]
+policies = []
+
+# Self-contained — no path-deps to cnft.dev-workers' wire-format
+# crates. mitos-build implicitly pulls in `wit-bindgen`, `hex`,
+# `serde`, `ciborium`, `mitos-protocol`; this module needs nothing
+# beyond those, so `[deps]` is intentionally empty. Module emits
+# a CBOR map shape (`policy_id`, `tx_hash`, `out`) that tests
+# decode inline.
+[deps]

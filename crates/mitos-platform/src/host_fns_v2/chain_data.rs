@@ -100,14 +100,137 @@ impl ChainDataHost for HostStateV2 {
 
     async fn read_tx(
         &mut self,
-        _tx_hash: Vec<u8>,
+        tx_hash: Vec<u8>,
     ) -> wasmtime::Result<Option<bindings_v2::TxRecord>> {
-        // `read-tx` requires composing several data-plane
-        // calls (block-by-tx-hash, decode, project to typed
-        // shape). Wired in a follow-up step alongside the
-        // bootstrap orchestrator. For now: surface as `None`
-        // so modules calling it gracefully degrade.
-        Ok(None)
+        let bytes: [u8; 32] = tx_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| wasmtime::Error::msg("tx_hash must be 32 bytes"))?;
+        let phash = pallas_primitives::Hash::<32>::from(bytes);
+        let record = self
+            .data_plane
+            .read_tx(&phash)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(record.map(tx_record_to_wit))
+    }
+}
+
+fn tx_record_to_wit(r: mitos_data_plane::TxRecord) -> bindings_v2::TxRecord {
+    bindings_v2::TxRecord {
+        tx_hash: r.tx_hash.as_ref().to_vec(),
+        tx_idx: r.tx_idx,
+        cursor: chain_point_to_wit(r.cursor),
+        inputs: r
+            .inputs
+            .into_iter()
+            .map(consumed_input_to_wit)
+            .collect(),
+        reference_inputs: r
+            .reference_inputs
+            .into_iter()
+            .map(referenced_input_to_wit)
+            .collect(),
+        outputs: r.outputs.into_iter().map(typed_output_to_wit).collect(),
+        mint: r.mint.into_iter().map(mint_entry_to_wit).collect(),
+        required_signers: r
+            .required_signers
+            .into_iter()
+            .map(|h| h.as_ref().to_vec())
+            .collect(),
+        validity_interval: bindings_v2::ValidityInterval {
+            valid_from: r.validity_interval.valid_from,
+            valid_to: r.validity_interval.valid_to,
+        },
+        aux_data: r.aux_data,
+    }
+}
+
+/// Sentinel empty `TypedOutput` returned when the host couldn't
+/// resolve a prior output (already-spent input). Modules detect
+/// via `prior_output.address.is_empty()`.
+fn empty_typed_output() -> bindings_v2::TypedOutput {
+    bindings_v2::TypedOutput {
+        address: String::new(),
+        lovelace: 0,
+        assets: Vec::new(),
+    }
+}
+
+fn consumed_input_to_wit(c: mitos_data_plane::ConsumedInput) -> bindings_v2::ConsumedInput {
+    bindings_v2::ConsumedInput {
+        oref: WitOutputRef {
+            tx_hash: c.oref.tx_hash.as_ref().to_vec(),
+            index: c.oref.index,
+        },
+        prior_output: c
+            .prior_output
+            .map(typed_output_to_wit)
+            .unwrap_or_else(empty_typed_output),
+        prior_datum: c.prior_datum.map(typed_datum_to_wit),
+        redeemer: c.redeemer,
+    }
+}
+
+fn referenced_input_to_wit(
+    r: mitos_data_plane::ReferencedInput,
+) -> bindings_v2::ReferencedInput {
+    bindings_v2::ReferencedInput {
+        oref: WitOutputRef {
+            tx_hash: r.oref.tx_hash.as_ref().to_vec(),
+            index: r.oref.index,
+        },
+        prior_output: r
+            .prior_output
+            .map(typed_output_to_wit)
+            .unwrap_or_else(empty_typed_output),
+        prior_datum: r.prior_datum.map(typed_datum_to_wit),
+    }
+}
+
+fn mint_entry_to_wit(m: mitos_data_plane::MintEntry) -> bindings_v2::MintEntry {
+    bindings_v2::MintEntry {
+        policy: m.policy.as_bytes().unwrap_or([0u8; 28]).to_vec(),
+        asset_name: m.asset_name,
+        quantity_delta: m.quantity_delta,
+    }
+}
+
+fn typed_output_to_wit(o: mitos_data_plane::TypedOutput) -> bindings_v2::TypedOutput {
+    bindings_v2::TypedOutput {
+        address: o.address,
+        lovelace: o.lovelace,
+        assets: o
+            .assets
+            .into_iter()
+            .map(|a| WitAssetEntry {
+                asset: WitAssetId {
+                    policy: a.policy_id.as_bytes().unwrap_or([0u8; 28]).to_vec(),
+                    name: hex::decode(&a.asset_name_hex).unwrap_or_default(),
+                },
+                quantity: a.quantity,
+            })
+            .collect(),
+    }
+}
+
+fn typed_datum_to_wit(d: mitos_data_plane::TypedDatum) -> WitTypedDatum {
+    WitTypedDatum {
+        hash: d.hash.as_ref().to_vec(),
+        payload: d.original_cbor.unwrap_or_default(),
+    }
+}
+
+fn chain_point_to_wit(cp: mitos_data_plane::ChainPoint) -> bindings_v2::ChainPoint {
+    match cp {
+        mitos_data_plane::ChainPoint::Origin => bindings_v2::ChainPoint::Origin,
+        mitos_data_plane::ChainPoint::Slot(s) => bindings_v2::ChainPoint::SlotOnly(s),
+        mitos_data_plane::ChainPoint::Specific(s, h) => {
+            bindings_v2::ChainPoint::Specific(bindings_v2::SpecificPoint {
+                slot: s,
+                block_hash: h.as_ref().to_vec(),
+            })
+        }
     }
 }
 

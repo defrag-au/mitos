@@ -1,121 +1,13 @@
-//! Host-side impls of the WIT-imported interfaces.
-//!
-//! Each WIT interface has a sibling submodule:
-//! - `chain_data` — proxies into `mitos-data-plane`
-//! - `state_kv` — backs the per-module redb table
-//! - `emit` — fans events out to the CF replication WS
-//! - `logging` — funnels module logs into `tracing`
-//! - `block_context` — exposes the per-block `ResolvedBlock`
-//!   resource via lazy data-plane resolution
-//!
-//! The umbrella `HostState` here is the wasmtime `Store` data
-//! type. It implements every WIT-imported `Host` trait, so the
-//! `add_to_linker` call uses the canonical `HasSelf<HostState>`
-//! idiom proven out in the spike:
-//!
-//! ```ignore
-//! MitosModule::add_to_linker::<_, HasSelf<HostState>>(
-//!     &mut linker, |s| s,
-//! )?;
-//! ```
+//! Shared host-fn types: `DataPlaneFacade` trait + the v2 host
+//! fns' supporting `state_kv` / `emit` modules. Originally the
+//! v1 host-fn impls lived here too; v1 was retired (see
+//! `mitos/docs/strategy/MITOS_PLATFORM_V2.md`) and the v2 impls
+//! live under `host_fns_v2/`. This module is what's left of the
+//! shared surface — both halves of the v2 platform see it for
+//! the trait, the kv enum, and the emit channel types.
 
-pub mod block_context;
-pub mod chain_data;
 pub mod emit;
-pub mod logging;
 pub mod state_kv;
-
-use std::sync::Arc;
-
-use mitos_data_plane::ChainPoint;
-use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-
-use crate::bindings::{BlockContextHost, TypesHost};
-
-/// Per-instance host state. One per wasmtime `Store`.
-///
-/// V1: a single instance hosts a single module slot. V2 would
-/// fan this out per-tenant; the shape is forward-compatible.
-pub struct HostState {
-    /// Long-lived resource table. Resources (today: `ResolvedBlock`;
-    /// tomorrow: tx views, datum handles) push/delete through here.
-    pub table: ResourceTable,
-
-    /// Data plane handle — proxied through `chain_data` host fns.
-    /// `Arc` so cloning into the host fn closures is cheap.
-    pub(crate) data_plane: Arc<dyn DataPlaneFacade>,
-
-    /// Per-module redb-backed KV. V1: one module → one table;
-    /// keys are namespaced under the module ID.
-    pub(crate) kv: state_kv::ModuleKv,
-
-    /// Event sink — host fans out via the existing CF replication
-    /// machinery.
-    pub(crate) emitter: emit::EventSink,
-
-    /// Module identifier — surfaces in logs + metrics.
-    pub(crate) module_id: String,
-
-    /// Cursor of the block currently being dispatched. Set by
-    /// the driver immediately before each `call_handle_event`;
-    /// read by `emit_event` so emissions can be tagged with
-    /// the chain point at which they were produced. `None`
-    /// outside an active dispatch (init, idle).
-    pub(crate) current_cursor: Option<ChainPoint>,
-
-    /// WASI context. Modules built against `wasm32-wasip2` pull
-    /// in `wasi:io`, `wasi:cli`, etc. as imports via the std lib;
-    /// `wasmtime_wasi::add_to_linker_async` populates the linker
-    /// with default impls. We give every module a minimal ctx
-    /// (no real fs/network surface) — the platform's intended
-    /// I/O all flows through our typed host fns.
-    pub(crate) wasi: WasiCtx,
-    pub(crate) wasi_table: ResourceTable,
-}
-
-impl HostState {
-    pub fn new(
-        module_id: String,
-        data_plane: Arc<dyn DataPlaneFacade>,
-        kv: state_kv::ModuleKv,
-        emitter: emit::EventSink,
-    ) -> Self {
-        Self {
-            table: ResourceTable::new(),
-            data_plane,
-            kv,
-            emitter,
-            module_id,
-            current_cursor: None,
-            wasi: WasiCtxBuilder::new().build(),
-            wasi_table: ResourceTable::new(),
-        }
-    }
-}
-
-// `wasmtime_wasi`'s `add_to_linker_async` requires the store
-// data to expose a `WasiView`. We give it a separate
-// `wasi_table` so WASI-owned resources can't collide with our
-// platform-owned `ResolvedBlock` table.
-
-impl WasiView for HostState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.wasi_table,
-        }
-    }
-}
-
-// Empty interface marker traits. Bindgen requires these even
-// though `types`, `block-context`, and `interest` (each interface
-// itself) have no free functions — `interest` defines only the
-// `interest-op` variant; the `update-interest` function is a
-// world-level export, not an interface-level free function.
-impl TypesHost for HostState {}
-impl BlockContextHost for HostState {}
-impl crate::bindings::InterestHost for HostState {}
 
 /// Trait the platform crate uses to talk to the data plane,
 /// kept narrow on purpose. `mitos-data-plane::ChainDataPlane`
@@ -178,6 +70,16 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         &self,
         tx_hash: &[u8; 32],
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>>;
+
+    /// Full TX rollup. Default impl returns `None` so test
+    /// fakes don't have to implement it; the blanket
+    /// `impl<T: ChainDataPlane>` overrides for production.
+    async fn read_tx(
+        &self,
+        _tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        Ok(None)
+    }
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -246,6 +148,13 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         let phash = pallas_primitives::Hash::<32>::from(*tx_hash);
         mitos_data_plane::ChainDataPlane::tx_metadata(self, &phash).await
+    }
+
+    async fn read_tx(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        mitos_data_plane::ChainDataPlane::read_tx(self, tx_hash).await
     }
 }
 
@@ -329,6 +238,14 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         mitos_data_plane::ChainDataPlane::tx_metadata(&plane, tx_hash).await
+    }
+
+    async fn read_tx(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::read_tx(&plane, tx_hash).await
     }
 
     async fn read_datum(
