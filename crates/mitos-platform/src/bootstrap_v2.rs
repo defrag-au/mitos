@@ -260,3 +260,30 @@ pub fn interest_from_addresses(addresses: &[String]) -> InterestSet {
     }
     set
 }
+
+/// Build an `InterestSet` from manifest-declared addresses +
+/// policies. Address predicates participate in the bootstrap
+/// scan (current-state hydration via `utxos_by_address`);
+/// policy predicates apply to the runtime event filter only —
+/// bootstrap-by-policy is not implemented today (modules pick
+/// up new activity going forward and rely on a separate
+/// backfill if they need historical hydration).
+pub fn interest_from_manifest(
+    addresses: &[String],
+    policy_hexes: &[String],
+) -> InterestSet {
+    let mut set = interest_from_addresses(addresses);
+    for hex in policy_hexes {
+        match cardano_assets::PolicyId::new(hex.clone()) {
+            Ok(p) => set.add(InterestPredicate::HoldsPolicy(p)),
+            Err(e) => {
+                tracing::warn!(
+                    policy = %hex,
+                    error = %e,
+                    "interest_from_manifest: skipping invalid policy id",
+                );
+            }
+        }
+    }
+    set
+}

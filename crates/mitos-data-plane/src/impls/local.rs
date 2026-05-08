@@ -438,6 +438,55 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         Ok(extract_aux_cbor(&tx))
     }
 
+    async fn read_tx(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<crate::types::TxRecord>> {
+        // Same archive lookup as `tx_metadata` — slot index +
+        // block-by-slot + decode + find by hash.
+        let slot = self
+            .domain
+            .indexes()
+            .slot_by_tx_hash(tx_hash.as_slice())
+            .map_err(|e| DataPlaneError::Storage(format!("slot_by_tx_hash: {e:?}")))?;
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        let block_body = self
+            .domain
+            .archive()
+            .get_block_by_slot(&slot)
+            .map_err(|e| DataPlaneError::Storage(format!("get_block_by_slot: {e:?}")))?;
+        let Some(block_body) = block_body else {
+            return Ok(None);
+        };
+        let block = MultiEraBlock::decode(block_body.as_slice()).map_err(|e| {
+            DataPlaneError::Decode(format!("MultiEraBlock decode: {e}"))
+        })?;
+        let block_hash = block.hash();
+        let cursor = crate::types::ChainPoint::Specific(block.slot(), block_hash);
+
+        // Find tx + capture its index in the block.
+        let mut tx_idx_found: Option<u32> = None;
+        let mut tx_found: Option<MultiEraTx<'_>> = None;
+        for (idx, tx) in block.txs().into_iter().enumerate() {
+            if tx.hash().as_slice() == tx_hash.as_slice() {
+                tx_idx_found = Some(idx as u32);
+                tx_found = Some(tx);
+                break;
+            }
+        }
+        let (Some(tx_idx), Some(tx)) = (tx_idx_found, tx_found) else {
+            return Ok(None);
+        };
+
+        // Project the tx into the typed rollup. Prior outputs
+        // for inputs are looked up via current-state UTxOs;
+        // already-spent inputs return `None` (per the
+        // `TxRecord` doc comment's resolution caveat).
+        Ok(Some(project_tx_record(&tx, tx_idx, cursor, self).await?))
+    }
+
     async fn total_supply(
         &self,
         _policy: &PolicyId,
@@ -537,5 +586,192 @@ fn extract_aux_cbor(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
         // here until we add matching arms — return None defensively
         // so an unknown era doesn't break aux-data lookups.
         _ => None,
+    }
+}
+
+/// Project a `MultiEraTx` into the typed `TxRecord`. Inputs +
+/// reference inputs get a best-effort prior-output lookup
+/// against current state via `read_utxo`; already-spent inputs
+/// surface as `prior_output: None`.
+async fn project_tx_record<'a, D: dolos_core::Domain>(
+    tx: &MultiEraTx<'a>,
+    tx_idx: u32,
+    cursor: crate::types::ChainPoint,
+    plane: &LocalDataPlane<'_, D>,
+) -> DataPlaneResult<crate::types::TxRecord> {
+    let tx_hash = tx.hash();
+
+    // Collect input refs first so we can do bulk lookups.
+    let input_refs: Vec<(OutputRef, Option<Vec<u8>>)> = tx
+        .consumes()
+        .iter()
+        .enumerate()
+        .map(|(input_order, input)| {
+            let redeemer = tx
+                .find_spend_redeemer(input_order as u32)
+                .map(|r| r.encode());
+            (
+                OutputRef::new(*input.hash(), input.index() as u32),
+                redeemer,
+            )
+        })
+        .collect();
+    let ref_input_refs: Vec<OutputRef> = tx
+        .reference_inputs()
+        .iter()
+        .map(|i| OutputRef::new(*i.hash(), i.index() as u32))
+        .collect();
+
+    // Best-effort prior-output resolution. Loop per-input
+    // rather than `read_utxos` because the bulk method
+    // silently omits unresolved entries; we want explicit
+    // None for absent inputs.
+    let mut inputs = Vec::with_capacity(input_refs.len());
+    for (oref, redeemer) in input_refs {
+        let prior = ChainDataPlane::read_utxo(plane, &oref, DecodeLevel::WithDatum)
+            .await
+            .unwrap_or(None);
+        let (prior_output, prior_datum) = match prior {
+            Some(o) => {
+                let datum = o.datum.clone();
+                (Some(o), datum)
+            }
+            None => (None, None),
+        };
+        inputs.push(crate::types::ConsumedInput {
+            oref,
+            prior_output,
+            prior_datum,
+            redeemer,
+        });
+    }
+
+    let mut reference_inputs = Vec::with_capacity(ref_input_refs.len());
+    for oref in ref_input_refs {
+        let prior = ChainDataPlane::read_utxo(plane, &oref, DecodeLevel::WithDatum)
+            .await
+            .unwrap_or(None);
+        let (prior_output, prior_datum) = match prior {
+            Some(o) => {
+                let datum = o.datum.clone();
+                (Some(o), datum)
+            }
+            None => (None, None),
+        };
+        reference_inputs.push(crate::types::ReferencedInput {
+            oref,
+            prior_output,
+            prior_datum,
+        });
+    }
+
+    // Outputs go through the existing per-output projection.
+    // Eras differ on output CBOR shape; we re-encode the era-
+    // specific output to bytes via the multi-era variant's
+    // `encode()` (via project_output's existing path).
+    let outputs: Vec<TypedOutput> = tx
+        .outputs()
+        .iter()
+        .map(|o| project_typed_output(o))
+        .collect();
+
+    // Mints from the multi-asset field.
+    let mint: Vec<crate::types::MintEntry> = tx
+        .mints()
+        .iter()
+        .flat_map(|policy_assets| {
+            let policy = match cardano_assets::PolicyId::new(hex::encode(
+                policy_assets.policy().as_slice(),
+            )) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "skip mint with invalid policy id");
+                    return Vec::new();
+                }
+            };
+            policy_assets
+                .assets()
+                .iter()
+                .map(|asset| crate::types::MintEntry {
+                    policy: policy.clone(),
+                    asset_name: asset.name().to_vec(),
+                    quantity_delta: asset
+                        .any_coin()
+                        .clamp(i64::MIN as i128, i64::MAX as i128)
+                        as i64,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let required_signers: Vec<pallas_primitives::Hash<28>> = tx
+        .required_signers()
+        .collect::<Vec<&pallas_primitives::Hash<28>>>()
+        .into_iter()
+        .copied()
+        .collect();
+
+    let validity_interval = crate::types::ValidityInterval {
+        valid_from: tx.validity_start(),
+        valid_to: tx.ttl(),
+    };
+
+    let aux_data = extract_aux_cbor(tx);
+
+    Ok(crate::types::TxRecord {
+        tx_hash,
+        tx_idx,
+        cursor,
+        inputs,
+        reference_inputs,
+        outputs,
+        mint,
+        required_signers,
+        validity_interval,
+        aux_data,
+    })
+}
+
+/// Lean projection of a `MultiEraOutput` into mitos's owned
+/// `TypedOutput`. Used by `project_tx_record`'s output walk.
+/// Same shape `read_utxos(_, Lean)` already produces, hand-
+/// rolled here to avoid an extra data-plane round-trip when
+/// we already have the raw `MultiEraOutput` in scope.
+fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> TypedOutput {
+    let address = match output.address() {
+        Ok(addr) => addr.to_string(),
+        Err(_) => String::new(),
+    };
+    let value = output.value();
+    let lovelace = value.coin();
+    let assets: Vec<AssetEntry> = value
+        .assets()
+        .iter()
+        .flat_map(|policy_assets| {
+            let policy = match cardano_assets::PolicyId::new(hex::encode(
+                policy_assets.policy().as_slice(),
+            )) {
+                Ok(p) => p,
+                Err(_) => return Vec::new(),
+            };
+            policy_assets
+                .assets()
+                .iter()
+                .map(|asset| AssetEntry {
+                    policy_id: policy.clone(),
+                    asset_name_hex: hex::encode(asset.name()),
+                    quantity: asset.any_coin().max(0) as u64,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    TypedOutput {
+        address,
+        lovelace,
+        assets,
+        datum: None,
+        script_ref: None,
+        original_cbor: None,
+        decoded_at: DecodeLevel::Lean,
     }
 }

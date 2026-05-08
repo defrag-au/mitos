@@ -178,6 +178,16 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         &self,
         tx_hash: &[u8; 32],
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>>;
+
+    /// Full TX rollup. Default impl returns `None` so test
+    /// fakes don't have to implement it; the blanket
+    /// `impl<T: ChainDataPlane>` overrides for production.
+    async fn read_tx(
+        &self,
+        _tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        Ok(None)
+    }
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -246,6 +256,13 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         let phash = pallas_primitives::Hash::<32>::from(*tx_hash);
         mitos_data_plane::ChainDataPlane::tx_metadata(self, &phash).await
+    }
+
+    async fn read_tx(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        mitos_data_plane::ChainDataPlane::read_tx(self, tx_hash).await
     }
 }
 
@@ -329,6 +346,14 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         mitos_data_plane::ChainDataPlane::tx_metadata(&plane, tx_hash).await
+    }
+
+    async fn read_tx(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::read_tx(&plane, tx_hash).await
     }
 
     async fn read_datum(

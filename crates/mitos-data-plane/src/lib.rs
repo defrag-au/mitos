@@ -36,11 +36,12 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, ConsumedEvent, DataPlaneError,
-    DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate, InterestSet, MintedEvent,
-    OutputRef, OutputRefPattern, Page, PageRequest, ProducedEvent, ReferencedEvent, RollbackEvent,
-    ScriptLanguage, StakeCred, TickEvent, TxContextEvent, TxEventBatch, TypedDatum, TypedOutput,
-    TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
+    AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, ConsumedEvent, ConsumedInput,
+    DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate, InterestSet,
+    MintEntry, MintedEvent, OutputRef, OutputRefPattern, Page, PageRequest, ProducedEvent,
+    ReferencedEvent, ReferencedInput, RollbackEvent, ScriptLanguage, StakeCred, TickEvent,
+    TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput, TypedScript, UtxoEvent,
+    UtxoPattern, UtxoPredicate, ValidityInterval,
 };
 
 pub use impls::LocalDataPlane;
@@ -159,6 +160,34 @@ pub trait ChainDataPlane: Send + Sync {
         &self,
         tx_hash: &pallas_primitives::Hash<32>,
     ) -> DataPlaneResult<Option<Vec<u8>>>;
+
+    /// Full TX rollup: inputs (with redeemers), reference
+    /// inputs, outputs, mint, required signers, validity
+    /// interval, aux-data CBOR. Backed by the archive's
+    /// `slot_by_tx_hash` + `get_block_by_slot` lookups; the
+    /// implementation projects the matching tx out of the
+    /// decoded block.
+    ///
+    /// Prior outputs for consumed/reference inputs are
+    /// best-effort via current-state lookups — `None` for
+    /// already-spent inputs (the typical case for any TX
+    /// older than the one being processed). Modules that
+    /// need prior outputs for spent inputs should process
+    /// the relevant TX in real-time via
+    /// `consumed-event.prior-output` rather than retrospectively
+    /// via `read-tx`.
+    ///
+    /// `None` when the tx isn't known to the archive.
+    ///
+    /// Default impl returns `None` so `LocalDataPlane` (and
+    /// any future archive-bearing plane) can override; non-
+    /// archive transports return `None`.
+    async fn read_tx(
+        &self,
+        _tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<TxRecord>> {
+        Ok(None)
+    }
 
     /// Resolve a datum hash to its Plutus payload. Side-door for
     /// callers that have a hash but not the containing UTxO

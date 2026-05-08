@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::bootstrap_v2::{interest_from_addresses, run_bootstrap};
+use crate::bootstrap_v2::{interest_from_manifest, run_bootstrap};
 use crate::driver_v2::DriverV2;
 use crate::follower_v2::run_chain_follower_v2;
 use crate::host::{EmitterFactory, KvFactory, SubscriptionFactory};
@@ -172,14 +172,19 @@ where
         // declared in the manifest's `[interest]` section.
         // Per-address state-kv flags make this a no-op for
         // already-bootstrapped addresses (idempotent), so the
-        // path runs cheap on every restart.
-        if !manifest.interest.addresses.is_empty() {
+        // path runs cheap on every restart. Policy-scoped
+        // interest predicates participate in runtime
+        // filtering but don't trigger a bootstrap pass today.
+        if !manifest.interest.is_empty() {
             // Build the InterestSet from the manifest's
-            // declarative addresses. Push it onto the driver
-            // so subsequent block dispatch filters correctly
-            // even if no companion-driven update-interest
-            // arrives.
-            let interest = interest_from_addresses(&manifest.interest.addresses);
+            // declarative addresses + policies. Push it onto
+            // the driver so subsequent block dispatch filters
+            // correctly even if no companion-driven
+            // update-interest arrives.
+            let interest = interest_from_manifest(
+                &manifest.interest.addresses,
+                &manifest.interest.policies,
+            );
             driver.set_interest(interest.clone());
 
             // Hand the bootstrap orchestrator a mutable

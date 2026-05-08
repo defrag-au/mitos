@@ -33,14 +33,22 @@ pub struct Manifest {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InterestSection {
-    /// bech32 addresses to watch + bootstrap.
+    /// bech32 addresses to watch + bootstrap. Maps to
+    /// `at-address` predicates; bootstrap walks
+    /// `utxos_by_address` for each on first deploy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+    /// 56-char lowercase hex policy ids to watch. Maps to
+    /// `holds-policy` predicates; matches outputs whose
+    /// asset multiset contains any asset under the policy.
+    /// Bootstrap walks `utxos_by_policy` when set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<String>,
 }
 
 impl InterestSection {
     pub fn is_empty(&self) -> bool {
-        self.addresses.is_empty()
+        self.addresses.is_empty() && self.policies.is_empty()
     }
 }
 

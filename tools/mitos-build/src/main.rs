@@ -776,7 +776,17 @@ fn read_interest_section(
             .collect(),
         _ => Vec::new(),
     };
-    Ok(mitos_platform::manifest::InterestSection { addresses })
+    let policies: Vec<String> = match interest.get("policies") {
+        Some(toml::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(mitos_platform::manifest::InterestSection {
+        addresses,
+        policies,
+    })
 }
 
 fn log_inspect(inspect: &InspectResult) {
