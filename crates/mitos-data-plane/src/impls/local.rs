@@ -67,7 +67,24 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             .map_err(|_| DataPlaneError::Decode("invalid era tag".into()))?;
         let output = MultiEraOutput::decode(era, &cbor.1)
             .map_err(|e| DataPlaneError::Decode(format!("output decode: {e}")))?;
+        let original_cbor = if include_raw_cbor {
+            Some(cbor.1.clone())
+        } else {
+            None
+        };
+        self.project_multi_era_output(&output, level, original_cbor)
+    }
 
+    /// Build a `TypedOutput` from an already-decoded `MultiEraOutput`.
+    /// Used both by the era-cbor entry (`project_output`) and the
+    /// archive-fallback path (`read_utxo_from_archive`), which has a
+    /// `MultiEraOutput` in hand from decoding the historical block.
+    fn project_multi_era_output(
+        &self,
+        output: &MultiEraOutput<'_>,
+        level: DecodeLevel,
+        original_cbor: Option<Vec<u8>>,
+    ) -> DataPlaneResult<TypedOutput> {
         let address = output
             .address()
             .map_err(|e| DataPlaneError::Decode(format!("address parse: {e}")))?
@@ -99,18 +116,12 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
         }
 
         let datum = if level.includes_datum() {
-            self.resolve_output_datum(&output)
+            self.resolve_output_datum(output)
         } else {
             None
         };
         let _ = level.includes_script();
         let script_ref = None;
-
-        let original_cbor = if include_raw_cbor {
-            Some(cbor.1.clone())
-        } else {
-            None
-        };
 
         Ok(TypedOutput {
             address,
@@ -121,6 +132,60 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             original_cbor,
             decoded_at: level,
         })
+    }
+
+    /// Fallback path for `read_utxo` / `read_utxos` when the current-
+    /// state lookup misses. Walks Dolos's archive: tx-hash → slot →
+    /// block CBOR → decode → find tx → pick output by index.
+    ///
+    /// This is the path that lets the dispatcher resolve prior
+    /// outputs for inputs being consumed in the very block that's
+    /// being applied — by the time per-module dispatch runs, those
+    /// UTxOs have already been removed from current state, but they
+    /// still live in the archive's block body. Without this fallback
+    /// the dispatcher's `consumed` event filter silently drops every
+    /// same-block consumption, which is the entire point of running
+    /// a follower-mode indexer in the first place.
+    ///
+    /// Heavier than `state.get_utxos` (decodes a whole block per
+    /// miss), so only worth invoking when the cheap state lookup
+    /// already came back empty.
+    async fn read_utxo_from_archive(
+        &self,
+        oref: &OutputRef,
+        level: DecodeLevel,
+    ) -> DataPlaneResult<Option<TypedOutput>> {
+        let slot = self
+            .domain
+            .indexes()
+            .slot_by_tx_hash(oref.tx_hash.as_slice())
+            .map_err(|e| DataPlaneError::Storage(format!("slot_by_tx_hash: {e:?}")))?;
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
+        let block_body = self
+            .domain
+            .archive()
+            .get_block_by_slot(&slot)
+            .map_err(|e| DataPlaneError::Storage(format!("get_block_by_slot: {e:?}")))?;
+        let Some(block_body) = block_body else {
+            return Ok(None);
+        };
+        let block = MultiEraBlock::decode(block_body.as_slice())
+            .map_err(|e| DataPlaneError::Decode(format!("MultiEraBlock decode: {e}")))?;
+        let tx = block
+            .txs()
+            .into_iter()
+            .find(|t| t.hash().as_slice() == oref.tx_hash.as_slice());
+        let Some(tx) = tx else {
+            return Ok(None);
+        };
+        let outputs = tx.outputs();
+        let Some(output) = outputs.get(oref.index as usize) else {
+            return Ok(None);
+        };
+        let typed = self.project_multi_era_output(output, level, None)?;
+        Ok(Some(typed))
     }
 
     /// Caller-blind datum resolution for one output.
@@ -199,10 +264,11 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             .get_utxos(vec![txo_ref])
             .map_err(|e| DataPlaneError::Storage(format!("get_utxos: {e:?}")))?;
 
-        match utxos.into_iter().next() {
-            Some((_, era_cbor)) => self.project_output(&era_cbor, decode, false).map(Some),
-            None => Ok(None),
+        if let Some((_, era_cbor)) = utxos.into_iter().next() {
+            return self.project_output(&era_cbor, decode, false).map(Some);
         }
+        // Archive fallback — see `read_utxo_from_archive` doc.
+        self.read_utxo_from_archive(oref, decode).await
     }
 
     async fn read_utxos(
@@ -217,12 +283,36 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             .get_utxos(txo_refs)
             .map_err(|e| DataPlaneError::Storage(format!("get_utxos: {e:?}")))?;
 
-        let mut out = Vec::with_capacity(utxos.len());
+        let mut out = Vec::with_capacity(orefs.len());
+        let mut found: std::collections::HashSet<(pallas_primitives::Hash<32>, u32)> =
+            std::collections::HashSet::new();
         for (txo_ref, era_cbor) in utxos {
             match self.project_output(&era_cbor, decode, false) {
-                Ok(typed) => out.push((OutputRef::from(txo_ref), typed)),
+                Ok(typed) => {
+                    let oref = OutputRef::from(txo_ref);
+                    found.insert((oref.tx_hash, oref.index));
+                    out.push((oref, typed));
+                }
                 Err(e) => {
                     tracing::debug!(?txo_ref, error = ?e, "skipping output that failed to project");
+                }
+            }
+        }
+        // Archive fallback for refs the current-state lookup didn't
+        // find — typically outputs consumed in the same block whose
+        // events we're building. Per-miss block decode, so the cost
+        // only applies when the cheap path missed.
+        for oref in orefs {
+            if found.contains(&(oref.tx_hash, oref.index)) {
+                continue;
+            }
+            match self.read_utxo_from_archive(oref, decode).await {
+                Ok(Some(typed)) => out.push((*oref, typed)),
+                Ok(None) => {
+                    tracing::debug!(?oref, "archive fallback: utxo not found");
+                }
+                Err(e) => {
+                    tracing::debug!(?oref, error = %e, "archive fallback: lookup failed");
                 }
             }
         }
