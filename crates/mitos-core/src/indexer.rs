@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use dolos_core::{ChainPoint, TipEvent};
+use mitos_protocol::MovementClaim;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::emitter::Emitter;
@@ -79,12 +80,24 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// `emitter` is stamped with the cursor of `event`; calling
     /// `emitter.apply(change)` produces a CF replication record at
     /// that cursor. Indexers with `type Change = ()` ignore it.
+    ///
+    /// Returns the `MovementClaim`s the indexer made for this event
+    /// — one per `(asset, from, to)` triplet the indexer
+    /// classified into a domain-specific event. The dispatcher's
+    /// residual pass (see `docs/design/DOMAIN_REFACTOR.md`)
+    /// reads the accumulated claim set and skips emitting
+    /// `Domain::AssetMovement` for any movement already covered.
+    /// Indexers that don't classify movements (most state-only
+    /// indexers, or indexers whose events don't represent asset
+    /// transfers) return `Ok(Vec::new())`. Claims are ephemeral
+    /// per `Apply` event — they are not persisted across events
+    /// and don't need rollback handling on `Undo`.
     async fn handle_event(
         &mut self,
         domain: &D,
         event: &TipEvent,
         emitter: &Emitter<Self::Change>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Vec<MovementClaim>>;
 
     /// HTTP routes this indexer exposes. The bundle merges all
     /// indexers' routes under a shared `axum::Router`, conventionally

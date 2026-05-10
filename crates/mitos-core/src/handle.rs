@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dolos::adapters::DomainAdapter;
 use dolos_core::{ChainPoint, TipEvent};
+use mitos_protocol::MovementClaim;
 use tokio::sync::{Mutex, broadcast};
 use tracing::warn;
 
@@ -56,7 +57,11 @@ pub trait IndexerHandle: Send + Sync {
 
     async fn bootstrap(&self, domain: &DomainAdapter) -> anyhow::Result<ChainPoint>;
 
-    async fn handle_event(&self, domain: &DomainAdapter, event: &TipEvent) -> anyhow::Result<()>;
+    async fn handle_event(
+        &self,
+        domain: &DomainAdapter,
+        event: &TipEvent,
+    ) -> anyhow::Result<Vec<MovementClaim>>;
 
     /// Run the per-consumer pump until the consumer disconnects or
     /// drops. Owns the subscribe handshake, broadcast→ws forwarding,
@@ -131,7 +136,11 @@ where
         guard.bootstrap(domain).await
     }
 
-    async fn handle_event(&self, domain: &DomainAdapter, event: &TipEvent) -> anyhow::Result<()> {
+    async fn handle_event(
+        &self,
+        domain: &DomainAdapter,
+        event: &TipEvent,
+    ) -> anyhow::Result<Vec<MovementClaim>> {
         let cursor = event_cursor(event);
         let emitter = Emitter::new(self.changes.clone(), cursor.clone());
         let mut guard = self.inner.lock().await;

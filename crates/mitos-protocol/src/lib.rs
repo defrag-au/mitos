@@ -27,9 +27,9 @@ pub use interest::{
 pub use protocol::{
     Address, AssetMovementPayload, AssetRole, BorrowPayload, BurnPayload, Dex, DexBrand,
     DexEventKind, Domain, Lending, LendingBrand, LendingEventKind, ListingPayload, Lovelace,
-    Marketplace, MarketplaceBrand, MarketplaceEventKind, MintPayload, OfferAcceptPayload,
-    OfferCancelPayload, OfferCreatePayload, OfferUpdatePayload, OutputRef, PlutusBytes,
-    ProtocolEvent, SalePayload, SwapPayload, UnlistingPayload,
+    Marketplace, MarketplaceBrand, MarketplaceEventKind, MintPayload, MovementClaim,
+    OfferAcceptPayload, OfferCancelPayload, OfferCreatePayload, OfferUpdatePayload, OutputRef,
+    PlutusBytes, ProtocolEvent, SalePayload, SwapPayload, UnlistingPayload,
 };
 pub use subscribe::{
     DialBackOverride, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeWireError,

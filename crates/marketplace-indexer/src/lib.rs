@@ -70,7 +70,7 @@ use async_trait::async_trait;
 use axum::Router;
 use dolos_core::{ChainPoint, Domain, StateStore, TipEvent, TxoRef};
 use mitos_core::{Emitter, Indexer};
-use mitos_protocol::{Interest, ProtocolEvent, any_interest_matches_event};
+use mitos_protocol::{Interest, MovementClaim, ProtocolEvent, any_interest_matches_event};
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput};
 use tracing::{debug, info, warn};
 
@@ -127,14 +127,19 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
         domain: &D,
         event: &TipEvent,
         emitter: &Emitter<Self::Change>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<MovementClaim>> {
+        // Phase-2 transitional: returns `Vec::new()` for now. Phase
+        // 3 (per DOMAIN_REFACTOR.md migration step 2) extends
+        // `classify_tx` to accumulate movement claims for
+        // Sale/Listing/Unlisting events so the residual pass
+        // doesn't double-emit them as `AssetMovement`.
         match event {
             TipEvent::Apply(point, block) => {
                 let parsed = match MultiEraBlock::decode(block.as_ref()) {
                     Ok(b) => b,
                     Err(e) => {
                         warn!(error = %e, "block decode failed; skipping");
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 };
 
@@ -157,7 +162,7 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
             // track its own state to revert.
             TipEvent::Undo(_, _) | TipEvent::Mark(_) => {}
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn routes(&self) -> Router {
