@@ -37,11 +37,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::auth::AuthToken;
+use crate::coordinator::TxClaimCoordinator;
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
 use crate::replicate::replicate_router;
 use crate::replicator::{ConnState, Replicator, Subscription, SubscriptionId};
-use crate::{run_dispatcher, spawn_sync_pipeline};
+use crate::{run_dispatcher, run_synchronized_dispatcher, spawn_sync_pipeline};
+
+/// Reserved name for the residual-pass indexer. The synchronised
+/// dispatcher detects an indexer with this name and routes it to
+/// the residual tail-step.
+const NONE_MATCH_NAME: &str = "none-match";
 
 pub struct Bundle {
     domain: DomainAdapter,
@@ -55,6 +61,13 @@ pub struct Bundle {
     /// `Some(path)` = enable `/_admin/modules/*` + auto-resume
     /// any modules already activated under that path.
     modules_dir: Option<PathBuf>,
+    /// When `Some`, residual-pass mode is enabled. `run()` uses
+    /// the synchronised dispatcher (single task across all
+    /// indexers) instead of one task per indexer, so the residual
+    /// `none-match` indexer can read claims accumulated by
+    /// specific-domain indexers within the same Apply event. See
+    /// `docs/design/DOMAIN_REFACTOR.md`.
+    residual_coordinator: Option<TxClaimCoordinator>,
 }
 
 impl Bundle {
@@ -77,7 +90,33 @@ impl Bundle {
             data_dir,
             indexers: Vec::new(),
             modules_dir: None,
+            residual_coordinator: None,
         }
+    }
+
+    /// Enable residual-pass mode for `Domain::AssetMovement`
+    /// emission.
+    ///
+    /// Returns the `TxClaimCoordinator` the caller must hand to
+    /// `NoneMatchIndexer::new(...)` (registered via the regular
+    /// `add_indexer` path). The bundle's `run()` then switches
+    /// from per-indexer dispatchers to a single synchronised
+    /// dispatcher so the residual indexer can see claims
+    /// accumulated by specific-domain indexers for the same
+    /// Apply event.
+    ///
+    /// Calling this method commits the bundle to synchronised
+    /// dispatch — every registered indexer goes through the
+    /// single-task loop, not just the residual one. This is
+    /// load-bearing for correctness: claims and the events that
+    /// match them must all be visible against the same per-Apply
+    /// coordinator state.
+    ///
+    /// See `docs/design/DOMAIN_REFACTOR.md`.
+    pub fn enable_residual_pass(&mut self) -> TxClaimCoordinator {
+        let coord = TxClaimCoordinator::new();
+        self.residual_coordinator = Some(coord.clone());
+        coord
     }
 
     /// Register an indexer with the bundle. The indexer's `Scope`
@@ -119,6 +158,7 @@ impl Bundle {
             data_dir,
             indexers,
             modules_dir,
+            residual_coordinator,
         } = self;
 
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
@@ -130,24 +170,76 @@ impl Bundle {
         let mut dispatcher_handles: Vec<JoinHandle<()>> = Vec::with_capacity(indexers.len());
         let mut app = axum::Router::new();
 
+        // Bootstrap each indexer (lets them initialise their state
+        // and report a starting cursor) and mount their HTTP routes.
+        // The dispatcher path that consumes these results then
+        // diverges based on whether residual-pass mode is enabled.
+        let mut bootstrap_results: Vec<(Arc<dyn IndexerHandle>, dolos_core::ChainPoint)> =
+            Vec::with_capacity(indexers.len());
         for ix in &indexers {
             let name = ix.name();
-
             let from = ix.bootstrap(&domain).await?;
             info!(indexer = %name, ?from, "indexer bootstrapped");
+            bootstrap_results.push((ix.clone(), from));
+            app = app.nest(&format!("/{name}"), ix.routes());
+        }
 
-            let subscription = domain
-                .watch_tip(Some(from.clone()))
-                .map_err(|e| anyhow::anyhow!("watch_tip for {name}: {e:?}"))?;
+        if let Some(coordinator) = residual_coordinator {
+            // Synchronised dispatch — one task across all indexers,
+            // with the residual `none-match` indexer running last
+            // per Apply event so it sees the accumulated claim set.
+            let mut none_match_opt: Option<Arc<dyn IndexerHandle>> = None;
+            let mut specific_indexers: Vec<Arc<dyn IndexerHandle>> = Vec::new();
+            let mut starting_cursor: Option<dolos_core::ChainPoint> = None;
+            for (ix, from) in bootstrap_results {
+                if ix.name() == NONE_MATCH_NAME {
+                    none_match_opt = Some(ix);
+                } else {
+                    if starting_cursor.is_none() {
+                        starting_cursor = Some(from);
+                    }
+                    specific_indexers.push(ix);
+                }
+            }
+            let none_match = none_match_opt.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "residual pass enabled (Bundle::enable_residual_pass) but no `{NONE_MATCH_NAME}` \
+                     indexer was registered — call `bundle.add_indexer(NoneMatchIndexer::new(coord))`"
+                )
+            })?;
 
-            let ix_clone = ix.clone();
+            let from = starting_cursor.unwrap_or(dolos_core::ChainPoint::Origin);
+            let subscription = domain.watch_tip(Some(from)).map_err(|e| {
+                anyhow::anyhow!("watch_tip for synchronised dispatch: {e:?}")
+            })?;
+
             let domain_clone = domain.clone();
             let handle = tokio::spawn(async move {
-                run_dispatcher(ix_clone, domain_clone, subscription).await;
+                run_synchronized_dispatcher(
+                    specific_indexers,
+                    none_match,
+                    coordinator,
+                    domain_clone,
+                    subscription,
+                )
+                .await;
             });
             dispatcher_handles.push(handle);
-
-            app = app.nest(&format!("/{name}"), ix.routes());
+        } else {
+            // Per-indexer dispatch — today's default. Each indexer
+            // has its own subscription + task; they run in parallel
+            // with no cross-indexer coordination.
+            for (ix, from) in bootstrap_results {
+                let name = ix.name();
+                let subscription = domain
+                    .watch_tip(Some(from.clone()))
+                    .map_err(|e| anyhow::anyhow!("watch_tip for {name}: {e:?}"))?;
+                let domain_clone = domain.clone();
+                let handle = tokio::spawn(async move {
+                    run_dispatcher(ix, domain_clone, subscription).await;
+                });
+                dispatcher_handles.push(handle);
+            }
         }
 
         let auth = AuthToken::from_env();

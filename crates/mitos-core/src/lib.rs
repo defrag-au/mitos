@@ -8,10 +8,12 @@
 
 mod auth;
 mod bundle;
+mod coordinator;
 mod dispatcher;
 mod domain;
 mod emitter;
 mod handle;
+pub mod helpers;
 mod indexer;
 mod replicate;
 mod replicator;
@@ -22,7 +24,8 @@ mod tests;
 
 pub use auth::AuthToken;
 pub use bundle::{Bundle, print_config_summary};
-pub use dispatcher::run_dispatcher;
+pub use coordinator::TxClaimCoordinator;
+pub use dispatcher::{run_dispatcher, run_synchronized_dispatcher};
 pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
 pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};

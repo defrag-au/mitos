@@ -10,6 +10,7 @@ use collection_ownership_indexer::OwnershipIndexer;
 use marketplace_indexer::MarketplaceIndexer;
 use mint_burn_indexer::MintBurnIndexer;
 use mitos_core::Bundle;
+use none_match_indexer::NoneMatchIndexer;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -65,7 +66,12 @@ async fn main() -> anyhow::Result<()> {
             &config,
             args.listen,
             &args.data_dir,
-            &["collection-ownership", "marketplace", "mint-burn"],
+            &[
+                "collection-ownership",
+                "marketplace",
+                "mint-burn",
+                "none-match",
+            ],
         )?;
         return Ok(());
     }
@@ -79,6 +85,14 @@ async fn main() -> anyhow::Result<()> {
     bundle.add_indexer(OwnershipIndexer::new()?);
     bundle.add_indexer(MarketplaceIndexer::new()?);
     bundle.add_indexer(MintBurnIndexer::new()?);
+
+    // Residual pass: emits `Domain::AssetMovement` for asset
+    // transfers no specific-domain indexer claimed (P2P transfers,
+    // unrecognised marketplace scripts, etc.). Switches the
+    // dispatcher to synchronised mode — see
+    // `docs/design/DOMAIN_REFACTOR.md`.
+    let claim_coordinator = bundle.enable_residual_pass();
+    bundle.add_indexer(NoneMatchIndexer::new(claim_coordinator));
 
     if let Some(modules_dir) = args.modules_dir {
         info!(modules_dir = %modules_dir.display(), "wasm-module hosting enabled");

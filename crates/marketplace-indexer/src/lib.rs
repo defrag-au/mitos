@@ -61,7 +61,7 @@ mod translator;
 mod translator_tests;
 
 pub use brand_resolver::marketplace_brand_from_address;
-pub use translator::classification_to_events;
+pub use translator::{classification_to_claims, classification_to_events};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -128,11 +128,7 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
         event: &TipEvent,
         emitter: &Emitter<Self::Change>,
     ) -> anyhow::Result<Vec<MovementClaim>> {
-        // Phase-2 transitional: returns `Vec::new()` for now. Phase
-        // 3 (per DOMAIN_REFACTOR.md migration step 2) extends
-        // `classify_tx` to accumulate movement claims for
-        // Sale/Listing/Unlisting events so the residual pass
-        // doesn't double-emit them as `AssetMovement`.
+        let mut claims = Vec::new();
         match event {
             TipEvent::Apply(point, block) => {
                 let parsed = match MultiEraBlock::decode(block.as_ref()) {
@@ -150,8 +146,11 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
                 };
 
                 for tx in parsed.txs() {
-                    if let Err(e) = self.classify_tx(domain, &tx, slot, emitter) {
-                        debug!(tx_hash = %hex::encode(tx.hash()), error = %e, "tx classification failed; skipping");
+                    match self.classify_tx(domain, &tx, slot, emitter) {
+                        Ok(tx_claims) => claims.extend(tx_claims),
+                        Err(e) => {
+                            debug!(tx_hash = %hex::encode(tx.hash()), error = %e, "tx classification failed; skipping");
+                        }
                     }
                 }
             }
@@ -162,7 +161,7 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
             // track its own state to revert.
             TipEvent::Undo(_, _) | TipEvent::Mark(_) => {}
         }
-        Ok(Vec::new())
+        Ok(claims)
     }
 
     fn routes(&self) -> Router {
@@ -184,13 +183,17 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
 
 impl MarketplaceIndexer {
     /// Classify one tx and emit any marketplace-relevant events.
+    /// Returns the `MovementClaim`s produced for this tx — one per
+    /// asset-movement-bearing event (Sale, ListingCreate,
+    /// Unlisting, OfferAccept). The residual pass uses these to
+    /// suppress redundant `AssetMovement` emissions.
     fn classify_tx<D: Domain>(
         &self,
         domain: &D,
         tx: &pallas::ledger::traverse::MultiEraTx<'_>,
         slot: u64,
         emitter: &Emitter<ProtocolEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<MovementClaim>> {
         // Resolve consumed inputs via dolos's state store.
         // Reference inputs too — their datums often carry the
         // marketplace pricing context.
@@ -207,7 +210,7 @@ impl MarketplaceIndexer {
             Ok(m) => m,
             Err(e) => {
                 debug!(error = ?e, "state lookup failed; skipping");
-                return Ok(());
+                return Ok(Vec::new());
             }
         };
 
@@ -241,6 +244,11 @@ impl MarketplaceIndexer {
             emitter.apply(event);
         }
 
-        Ok(())
+        // Extract the chain-level movement claims for the residual
+        // pass. One claim per asset-movement-bearing event (Sale,
+        // ListingCreate, Unlisting, OfferAccept). ListingUpdate and
+        // the offer-lifecycle variants emit no claims (see translator
+        // comments).
+        Ok(classification_to_claims(&classification))
     }
 }

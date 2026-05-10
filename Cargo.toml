@@ -18,6 +18,7 @@ members = [
     "crates/collection-ownership-indexer",
     "crates/marketplace-indexer",
     "crates/mint-burn-indexer",
+    "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",
@@ -95,6 +96,12 @@ hex = "0.4"
 # Storage backend for indexer materialized views (separate from Dolos's
 # state store — each indexer owns its own view).
 redb = "2"
+
+# Concurrent map for the dispatcher's per-Apply claim coordinator
+# (residual pass — see `docs/design/DOMAIN_REFACTOR.md`). Lock-free
+# insertion avoids contention when specific-domain indexers run in
+# parallel and add claims for the same tx.
+dashmap = "6"
 
 # CLI / config.
 clap = { version = "4", features = ["derive", "env"] }
