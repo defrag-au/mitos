@@ -30,11 +30,16 @@
 //! and the trait surgery (`Scope = Interest`) come in Phase 2 / 4
 //! respectively.
 
+mod asset_movement;
+mod burn;
 mod common;
 mod dex;
 mod lending;
 mod marketplace;
+mod mint;
 
+pub use asset_movement::AssetMovementPayload;
+pub use burn::BurnPayload;
 pub use common::{Address, AssetRole, Lovelace, OutputRef, PlutusBytes, ProtocolEvent};
 pub use dex::{Dex, DexBrand, DexEventKind, SwapPayload};
 pub use lending::{BorrowPayload, Lending, LendingBrand, LendingEventKind};
@@ -42,18 +47,32 @@ pub use marketplace::{
     ListingPayload, Marketplace, MarketplaceBrand, MarketplaceEventKind, OfferAcceptPayload,
     OfferCancelPayload, OfferCreatePayload, OfferUpdatePayload, SalePayload, UnlistingPayload,
 };
+pub use mint::MintPayload;
 
 use serde::{Deserialize, Serialize};
 
 /// Top-level domain tag. One arm per "bounded problem domain on
-/// chain" — NFT marketplaces, DEXes, lending protocols, ...
+/// chain" — asset lifecycle (mint/burn/movement), NFT
+/// marketplaces, DEXes, lending protocols, ...
 ///
 /// A `ProtocolEvent` carries exactly one `Domain` value. Cross-
 /// domain queries on the consumer side ("any cancel from
 /// marketplace OR lending") match by walking the variants; they
 /// don't require a flat global event-kind enum.
+///
+/// **Asset-lifecycle arms (`Mint`, `Burn`, `AssetMovement`)** are
+/// top-tier rather than nested under marketplace because they
+/// represent chain-level state transitions independent of any
+/// protocol. `AssetMovement` is the residual classification —
+/// emitted by the dispatcher's `none_match-indexer` for transfers
+/// no specific-domain indexer claimed (P2P trades, transfers
+/// through unrecognised scripts, etc.). See
+/// `docs/design/DOMAIN_REFACTOR.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Domain {
+    Mint(MintPayload),
+    Burn(BurnPayload),
+    AssetMovement(AssetMovementPayload),
     Marketplace(Marketplace),
     Dex(Dex),
     Lending(Lending),

@@ -14,8 +14,9 @@ use enumset::EnumSet;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-    AssetRole, Dex, DexBrand, DexEventKind, Domain, Lending, LendingBrand, LendingEventKind,
-    Marketplace, MarketplaceBrand, MarketplaceEventKind, ProtocolEvent,
+    AssetMovementPayload, AssetRole, BurnPayload, Dex, DexBrand, DexEventKind, Domain, Lending,
+    LendingBrand, LendingEventKind, Marketplace, MarketplaceBrand, MarketplaceEventKind,
+    MintPayload, ProtocolEvent,
 };
 
 /// `EnumSet::all()` as a serde default for the `roles` axis.
@@ -217,6 +218,9 @@ impl AssetSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DomainSelector {
     Any,
+    Mint(MintSelector),
+    Burn(BurnSelector),
+    AssetMovement(AssetMovementSelector),
     Marketplace(MarketplaceSelector),
     Dex(DexSelector),
     Lending(LendingSelector),
@@ -226,10 +230,63 @@ impl DomainSelector {
     pub fn matches(&self, domain: &Domain) -> bool {
         match (self, domain) {
             (DomainSelector::Any, _) => true,
+            (DomainSelector::Mint(s), Domain::Mint(p)) => s.matches(p),
+            (DomainSelector::Burn(s), Domain::Burn(p)) => s.matches(p),
+            (DomainSelector::AssetMovement(s), Domain::AssetMovement(p)) => s.matches(p),
             (DomainSelector::Marketplace(s), Domain::Marketplace(m)) => s.matches(m),
             (DomainSelector::Dex(s), Domain::Dex(d)) => s.matches(d),
             (DomainSelector::Lending(s), Domain::Lending(l)) => s.matches(l),
             _ => false,
+        }
+    }
+}
+
+/// Mint-domain selector. v1 ships `Any` only — per-policy and
+/// per-asset targeting is handled by the asset axis on `Interest`.
+/// Future `Filter { ... }` variants can add sub-axes
+/// (`min_amount`, recipient address filters, ...) without
+/// breaking the wire format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MintSelector {
+    Any,
+}
+
+impl MintSelector {
+    pub fn matches(&self, _payload: &MintPayload) -> bool {
+        match self {
+            MintSelector::Any => true,
+        }
+    }
+}
+
+/// Burn-domain selector. Same shape as `MintSelector`; v1 is
+/// `Any` only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BurnSelector {
+    Any,
+}
+
+impl BurnSelector {
+    pub fn matches(&self, _payload: &BurnPayload) -> bool {
+        match self {
+            BurnSelector::Any => true,
+        }
+    }
+}
+
+/// AssetMovement-domain selector. Same shape; v1 is `Any` only.
+/// Future `Filter { ... }` variants could expose `via_script`
+/// targeting (when that payload field lands) or address-pair
+/// filtering for specific P2P-monitoring use cases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssetMovementSelector {
+    Any,
+}
+
+impl AssetMovementSelector {
+    pub fn matches(&self, _payload: &AssetMovementPayload) -> bool {
+        match self {
+            AssetMovementSelector::Any => true,
         }
     }
 }

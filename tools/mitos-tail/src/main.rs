@@ -516,6 +516,9 @@ fn protocol_event_summary(event: &ProtocolEvent) -> String {
         }
         Domain::Dex(d) => format!("Dex::{:?}/{:?}", d.kind(), d.brand()),
         Domain::Lending(l) => format!("Lending::{:?}/{:?}", l.kind(), l.brand()),
+        Domain::Mint(p) => format!("Mint/amount={}", p.amount),
+        Domain::Burn(p) => format!("Burn/amount={}", p.amount),
+        Domain::AssetMovement(p) => format!("AssetMovement/amount={}", p.amount),
     }
 }
 
