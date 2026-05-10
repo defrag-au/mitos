@@ -164,7 +164,7 @@ impl CompanionDialer {
     /// loop for the same `(module_id, companion_key)` and
     /// spawns a fresh one with the updated registration.
     pub async fn register(&self, req: SubscribeRequest) {
-        let id = CompanionId::new(&req.module_name, &req.companion_key);
+        let id = CompanionId::new(req.primary_target_name(), &req.companion_key);
         // Cancel any existing task for this id before spawning
         // a fresh one — register() is idempotent re-registration.
         {
@@ -192,7 +192,7 @@ impl CompanionDialer {
     }
 
     async fn spawn(&self, req: SubscribeRequest) {
-        let id = CompanionId::new(&req.module_name, &req.companion_key);
+        let id = CompanionId::new(req.primary_target_name(), &req.companion_key);
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let storage = self.storage.clone();
@@ -226,7 +226,7 @@ async fn run_companion(
         Ok(u) => u,
         Err(e) => {
             error!(
-                module = %req.module_name,
+                module = %req.primary_target_name(),
                 companion_key = %req.companion_key,
                 error = %e,
                 "no dial-back URL configured; companion will not receive emissions"
@@ -238,7 +238,7 @@ async fn run_companion(
         Ok(u) => u,
         Err(e) => {
             error!(
-                module = %req.module_name,
+                module = %req.primary_target_name(),
                 companion_key = %req.companion_key,
                 url = %url_str,
                 error = %e,
@@ -248,11 +248,11 @@ async fn run_companion(
         }
     };
 
-    let store = match storage.emissions_store(&req.module_name) {
+    let store = match storage.emissions_store(req.primary_target_name()) {
         Ok(s) => s,
         Err(e) => {
             error!(
-                module = %req.module_name,
+                module = %req.primary_target_name(),
                 error = %e,
                 "open EmissionsStore failed; companion task exiting"
             );
@@ -268,7 +268,7 @@ async fn run_companion(
         match dial_and_pump(&parsed, &req, &auth, &store, interest_router.as_ref(), &cancel).await {
             Ok(()) => {
                 info!(
-                    module = %req.module_name,
+                    module = %req.primary_target_name(),
                     companion_key = %req.companion_key,
                     "companion dial loop exited cleanly; redialing"
                 );
@@ -276,7 +276,7 @@ async fn run_companion(
             }
             Err(e) => {
                 warn!(
-                    module = %req.module_name,
+                    module = %req.primary_target_name(),
                     companion_key = %req.companion_key,
                     target = %url_str,
                     error = %e,
@@ -305,7 +305,7 @@ fn resolve_dial_url(req: &SubscribeRequest) -> anyhow::Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "subscribe request from {}/{} has no dial_back.url",
-                req.module_name,
+                req.primary_target_name(),
                 req.companion_key
             )
         })?;
@@ -340,7 +340,7 @@ async fn dial_and_pump(
         .await
         .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
     info!(
-        module = %req.module_name,
+        module = %req.primary_target_name(),
         companion_key = %req.companion_key,
         target = %url,
         "companion ws connected"
@@ -382,7 +382,7 @@ async fn dial_and_pump(
                             &bytes,
                             store,
                             interest_router,
-                            &req.module_name,
+                            req.primary_target_name(),
                         )
                         .await;
                     }

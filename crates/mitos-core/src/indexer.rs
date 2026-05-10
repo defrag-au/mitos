@@ -67,6 +67,20 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// prefix by convention. Must be valid as a filesystem directory.
     fn name(&self) -> &'static str;
 
+    /// Whether this indexer is framework-internal — i.e. not
+    /// subscribable from companion modules via the unified subscribe
+    /// path (`docs/design/UNIFIED_SUBSCRIBE.md`).
+    ///
+    /// Defaults to `false` (most indexers are public protocol
+    /// surfaces). Override to `true` for indexers that exist only
+    /// to serve the dispatcher (e.g. `none-match-indexer`, the
+    /// residual emitter). The host rejects
+    /// `SubscribeTarget::Indexer { name }` requests where the
+    /// resolved indexer's `is_internal()` returns `true`.
+    fn is_internal(&self) -> bool {
+        false
+    }
+
     /// One-time pull of current chain state into the indexer's
     /// materialized view. Called before any chain events are dispatched.
     /// Returns the chain point we caught up to — the dispatcher will

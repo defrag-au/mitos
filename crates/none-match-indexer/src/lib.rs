@@ -87,6 +87,17 @@ impl<D: dolos_core::Domain> Indexer<D> for NoneMatchIndexer {
         NONE_MATCH_INDEXER_NAME
     }
 
+    /// The residual emitter is framework-internal — it exists to
+    /// serve the dispatcher's `none_match` tail-step, not to be
+    /// consumed directly by companion modules. The unified-
+    /// subscribe handler (see `docs/design/UNIFIED_SUBSCRIBE.md`)
+    /// rejects `SubscribeTarget::Indexer { name: "none-match" }`
+    /// because of this. Legacy `Replicator` consumers can still
+    /// reach the emissions until that path retires.
+    fn is_internal(&self) -> bool {
+        true
+    }
+
     async fn bootstrap(&mut self, _domain: &D) -> anyhow::Result<ChainPoint> {
         info!("none-match-indexer bootstrap (residual emitter; forward-only)");
         Ok(ChainPoint::Origin)

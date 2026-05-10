@@ -401,8 +401,17 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 auth_value: None,
             });
 
+        // v1 of unified subscribe always targets a single wasm
+        // module — the SDK only constructs `Module` targets. The
+        // host-side bridge that resolves `Indexer` targets lands
+        // in a separate step (see `docs/design/UNIFIED_SUBSCRIBE.md`).
+        // The future `MitosCompanionRuntime::indexer(...)`
+        // constructor will populate this with the `Indexer` arm
+        // instead.
         let request = SubscribeRequest {
-            module_name: C::NAME.to_string(),
+            targets: vec![mitos_protocol::SubscribeTarget::Module {
+                name: C::NAME.to_string(),
+            }],
             companion_key,
             resume_from,
             interests,

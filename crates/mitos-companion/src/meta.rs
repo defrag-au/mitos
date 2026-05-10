@@ -14,6 +14,7 @@
 //! See the design doc's "Cursor coordination" + "Addressing & wake-up"
 //! + "Dynamic interest mechanics" sections.
 
+use mitos_protocol::SubscribeTarget;
 use serde::{Deserialize, Serialize};
 use worker::SqlStorage;
 
@@ -214,9 +215,16 @@ pub fn migrate_split_row_cursor(sql: &SqlStorage) -> Result<bool> {
 /// Cached subscribe-call config. Stored as CBOR in the meta table
 /// under `META_KEY_REGISTRATION`. Compared on subsequent wakes; if
 /// unchanged, the runtime skips the HTTPS subscribe round-trip.
+///
+/// Changed by the unified-subscribe wire refactor (see
+/// `docs/design/UNIFIED_SUBSCRIBE.md`): `module_name: String` →
+/// `targets: Vec<SubscribeTarget>`. Old CBOR-encoded caches that
+/// predate this shape will fail to decode in `read_registration`,
+/// which downgrades the failure to `Ok(None)` so the next wake
+/// just re-registers cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistrationCache {
-    pub module_name: String,
+    pub targets: Vec<SubscribeTarget>,
     pub companion_key: String,
     pub mitos_host_url: String,
     pub interests_hash: u64,
@@ -233,9 +241,21 @@ pub fn read_registration(sql: &SqlStorage) -> Result<Option<RegistrationCache>> 
     match iter.next() {
         Some(Ok(row)) => match row.into_iter().next() {
             Some(SqlStorageValue::Blob(bytes)) => {
-                let cache: RegistrationCache = ciborium::de::from_reader(&bytes[..])
-                    .map_err(|e| CompanionError::Storage(format!("decode registration: {e}")))?;
-                Ok(Some(cache))
+                match ciborium::de::from_reader::<RegistrationCache, _>(&bytes[..]) {
+                    Ok(cache) => Ok(Some(cache)),
+                    Err(e) => {
+                        // Cache schema mismatch (e.g. pre-unified-
+                        // subscribe rows still on disk). Treat as
+                        // no-cache so the runtime re-registers
+                        // cleanly on this wake. Log so an operator
+                        // can see the migration happen.
+                        tracing::warn!(
+                            error = %e,
+                            "registration cache failed to decode; treating as absent (will re-subscribe)"
+                        );
+                        Ok(None)
+                    }
+                }
             }
             _ => Ok(None),
         },

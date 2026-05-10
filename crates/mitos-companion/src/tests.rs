@@ -280,6 +280,7 @@ fn multi_channel_dyn_dispatch_routes_by_name() {
 fn subscribe_request_carries_full_interest_set() {
     use crate::interest::{InterestRow, NO_CHANNEL, kinds, rows_to_interests};
     use crate::subscribe::{SubscribeRequest, decode_subscribe, encode_subscribe};
+    use mitos_protocol::SubscribeTarget;
 
     let rows = vec![
         InterestRow {
@@ -298,7 +299,9 @@ fn subscribe_request_carries_full_interest_set() {
     let interests = rows_to_interests(&rows);
 
     let req = SubscribeRequest {
-        module_name: "ownership-indexer".into(),
+        targets: vec![SubscribeTarget::Module {
+            name: "ownership-indexer".into(),
+        }],
         companion_key: "customer_42".into(),
         resume_from: None,
         interests,

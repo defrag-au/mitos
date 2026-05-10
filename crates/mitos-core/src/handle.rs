@@ -50,6 +50,12 @@ const BROADCAST_CAPACITY: usize = 4096;
 pub trait IndexerHandle: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Mirrors `Indexer::is_internal()`. Captured at adapter
+    /// construction so the host's unified-subscribe handler can
+    /// reject `SubscribeTarget::Indexer { name }` requests for
+    /// internal indexers without locking the inner mutex.
+    fn is_internal(&self) -> bool;
+
     /// HTTP routes for this indexer. Captured at adapter construction
     /// (a clone of the original `Router`), so this is cheap to call
     /// from synchronous bundle-setup code.
@@ -96,6 +102,7 @@ where
     I: Indexer<DomainAdapter>,
 {
     name: &'static str,
+    is_internal: bool,
     routes: axum::Router,
     inner: Arc<Mutex<I>>,
     changes: broadcast::Sender<EmittedRecord<<I as Indexer<DomainAdapter>>::Change>>,
@@ -107,10 +114,12 @@ where
 {
     pub fn new(indexer: I) -> Self {
         let name = indexer.name();
+        let is_internal = indexer.is_internal();
         let routes = indexer.routes();
         let (changes, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             name,
+            is_internal,
             routes,
             inner: Arc::new(Mutex::new(indexer)),
             changes,
@@ -125,6 +134,10 @@ where
 {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn is_internal(&self) -> bool {
+        self.is_internal
     }
 
     fn routes(&self) -> axum::Router {

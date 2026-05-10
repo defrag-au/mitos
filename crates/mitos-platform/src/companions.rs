@@ -165,21 +165,23 @@ async fn subscribe_handler(
     let request = SubscribeRequest::decode(&body[..])
         .map_err(|e| SubscribeError::Decode(e.to_string()))?;
 
-    validate_module_id(&request.module_name)?;
+    validate_module_id(request.primary_target_name())?;
     validate_companion_key(&request.companion_key)?;
 
     // Module must be registered (i.e. have an artifact uploaded) so
     // we don't accept registrations for unknown modules.
     if state
         .storage
-        .read_manifest(&request.module_name)
+        .read_manifest(request.primary_target_name())
         .map_err(|e| SubscribeError::Io(e.to_string()))?
         .is_none()
     {
-        return Err(SubscribeError::UnknownModule(request.module_name.clone()));
+        return Err(SubscribeError::UnknownModule(
+            request.primary_target_name().to_string(),
+        ));
     }
 
-    let companions_dir = companions_dir_for(&state.storage, &request.module_name);
+    let companions_dir = companions_dir_for(&state.storage, request.primary_target_name());
     std::fs::create_dir_all(&companions_dir).map_err(|e| SubscribeError::Io(e.to_string()))?;
 
     let path = companions_dir.join(format!("{}.cbor", request.companion_key));
@@ -189,7 +191,7 @@ async fn subscribe_handler(
     write_atomic(&path, &buf).map_err(|e| SubscribeError::Io(e.to_string()))?;
 
     tracing::info!(
-        module = %request.module_name,
+        module = %request.primary_target_name(),
         companion_key = %request.companion_key,
         interests = request.interests.len(),
         "companion registered"
@@ -209,11 +211,11 @@ async fn subscribe_handler(
     // session. Open-then-peek so we don't need a long-lived
     // EmissionsStore in the router state (the actual append
     // path goes through the host's emit-interception loop).
-    let next_emission_id = match state.storage.emissions_store(&request.module_name) {
+    let next_emission_id = match state.storage.emissions_store(request.primary_target_name()) {
         Ok(store) => store.peek_next_id().unwrap_or(1),
         Err(e) => {
             tracing::warn!(
-                module = %request.module_name,
+                module = %request.primary_target_name(),
                 error = %e,
                 "open emissions log to peek next_id failed; returning 1"
             );
@@ -284,7 +286,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
-    use mitos_protocol::ChainPoint;
+    use mitos_protocol::{ChainPoint, SubscribeTarget};
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
@@ -304,7 +306,9 @@ mod tests {
         let router = build_router_with(storage);
 
         let req = SubscribeRequest {
-            module_name: "nonexistent".into(),
+            targets: vec![SubscribeTarget::Module {
+                name: "nonexistent".into(),
+            }],
             companion_key: "customer_42".into(),
             resume_from: None,
             interests: vec![],
@@ -332,7 +336,9 @@ mod tests {
         let router = build_router_with(storage);
 
         let req = SubscribeRequest {
-            module_name: "ownership-indexer".into(),
+            targets: vec![SubscribeTarget::Module {
+                name: "ownership-indexer".into(),
+            }],
             companion_key: "../escape".into(),
             resume_from: None,
             interests: vec![],
@@ -377,7 +383,9 @@ mod tests {
     #[test]
     fn cbor_round_trip() {
         let req = SubscribeRequest {
-            module_name: "ownership".into(),
+            targets: vec![SubscribeTarget::Module {
+                name: "ownership".into(),
+            }],
             companion_key: "customer_7".into(),
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![],
@@ -385,7 +393,7 @@ mod tests {
         };
         let bytes = cbor(&req);
         let decoded: SubscribeRequest = ciborium::de::from_reader(&bytes[..]).unwrap();
-        assert_eq!(decoded.module_name, "ownership");
+        assert_eq!(decoded.single_module_target(), Some("ownership"));
         assert_eq!(decoded.companion_key, "customer_7");
     }
 
