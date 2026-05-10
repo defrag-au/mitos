@@ -55,6 +55,7 @@ pub mod follower_v2;
 pub mod host_fns;
 pub mod host_fns_v2;
 pub mod host_v2;
+pub mod indexer_bridge;
 pub mod inspect;
 pub mod lag_tolerant;
 pub mod manifest;

@@ -48,7 +48,9 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 
-use mitos_protocol::{SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse};
+use mitos_protocol::{SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeTarget};
+
+use crate::indexer_bridge::IndexerBridgeHandle;
 
 use crate::admin::AuthToken;
 use crate::dialer::CompanionDialer;
@@ -65,10 +67,12 @@ pub fn companion_router(
     storage: ModuleStorage,
     auth: AuthToken,
     dialer: Option<CompanionDialer>,
+    indexer_bridge: Option<IndexerBridgeHandle>,
 ) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
         dialer,
+        indexer_bridge,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -80,6 +84,12 @@ pub fn companion_router(
 struct CompanionState {
     storage: Arc<ModuleStorage>,
     dialer: Option<CompanionDialer>,
+    /// Indexer bridge — populated by the bundle when the host
+    /// has in-tree indexers to expose via the unified subscribe
+    /// path. `None` means the host only supports
+    /// `SubscribeTarget::Module { ... }` requests (no in-tree
+    /// indexers wired into the unified path).
+    indexer_bridge: Option<IndexerBridgeHandle>,
 }
 
 // Local re-implementation of the admin auth middleware so the
@@ -127,6 +137,24 @@ enum SubscribeError {
     Io(String),
     #[error("module not registered: {0}")]
     UnknownModule(String),
+    /// `SubscribeTarget::Indexer { name }` requested but the
+    /// named indexer is not registered with the bundle (or the
+    /// host has no indexer registry wired at all — see
+    /// `Bundle::enable_modules` / future
+    /// `enable_companion_subscribe`).
+    #[error("indexer not registered: {0}")]
+    UnknownIndexer(String),
+    /// `SubscribeTarget::Indexer { name }` requested but the
+    /// indexer is marked internal (`Indexer::is_internal() == true`,
+    /// e.g. `none-match`). See `docs/design/UNIFIED_SUBSCRIBE.md`
+    /// "Indexer visibility".
+    #[error("indexer is internal (not subscribable from companions): {0}")]
+    InternalIndexer(String),
+    /// `targets` length not equal to 1. v1 only supports
+    /// single-target subscribe; multi-target is a future
+    /// extension.
+    #[error("v1 supports single-target subscribe only ({0} targets supplied)")]
+    UnsupportedMultiTarget(usize),
 }
 
 #[derive(serde::Serialize)]
@@ -140,7 +168,9 @@ impl IntoResponse for SubscribeError {
         let status = match &self {
             Self::Decode(_) => StatusCode::BAD_REQUEST,
             Self::InvalidModuleName(_) | Self::InvalidCompanionKey(_) => StatusCode::BAD_REQUEST,
-            Self::UnknownModule(_) => StatusCode::NOT_FOUND,
+            Self::UnknownModule(_) | Self::UnknownIndexer(_) => StatusCode::NOT_FOUND,
+            Self::InternalIndexer(_) => StatusCode::BAD_REQUEST,
+            Self::UnsupportedMultiTarget(_) => StatusCode::BAD_REQUEST,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let code = match &self {
@@ -149,6 +179,9 @@ impl IntoResponse for SubscribeError {
             Self::InvalidCompanionKey(_) => "invalid_companion_key",
             Self::Io(_) => "storage_io",
             Self::UnknownModule(_) => "unknown_module",
+            Self::UnknownIndexer(_) => "unknown_indexer",
+            Self::InternalIndexer(_) => "internal_indexer",
+            Self::UnsupportedMultiTarget(_) => "unsupported_multi_target",
         };
         let body = ErrorBody {
             error: self.to_string(),
@@ -165,61 +198,23 @@ async fn subscribe_handler(
     let request = SubscribeRequest::decode(&body[..])
         .map_err(|e| SubscribeError::Decode(e.to_string()))?;
 
-    validate_module_id(request.primary_target_name())?;
     validate_companion_key(&request.companion_key)?;
 
-    // Module must be registered (i.e. have an artifact uploaded) so
-    // we don't accept registrations for unknown modules.
-    if state
-        .storage
-        .read_manifest(request.primary_target_name())
-        .map_err(|e| SubscribeError::Io(e.to_string()))?
-        .is_none()
-    {
-        return Err(SubscribeError::UnknownModule(
-            request.primary_target_name().to_string(),
+    // v1 supports exactly one target per subscribe call. Multi-
+    // target subscriptions are a future extension (see
+    // `docs/design/UNIFIED_SUBSCRIBE.md`).
+    if request.targets.len() != 1 {
+        return Err(SubscribeError::UnsupportedMultiTarget(
+            request.targets.len(),
         ));
     }
 
-    let companions_dir = companions_dir_for(&state.storage, request.primary_target_name());
-    std::fs::create_dir_all(&companions_dir).map_err(|e| SubscribeError::Io(e.to_string()))?;
-
-    let path = companions_dir.join(format!("{}.cbor", request.companion_key));
-    let buf = request
-        .encode()
-        .map_err(|e| SubscribeError::Io(format!("encode persisted registration: {e}")))?;
-    write_atomic(&path, &buf).map_err(|e| SubscribeError::Io(e.to_string()))?;
-
-    tracing::info!(
-        module = %request.primary_target_name(),
-        companion_key = %request.companion_key,
-        interests = request.interests.len(),
-        "companion registered"
-    );
-
-    // Hand the registration to the dial supervisor so it can
-    // start (or restart, for re-subscribes) the outbound WS
-    // dial loop. Dialer absent only in unit tests.
-    if let Some(dialer) = &state.dialer {
-        dialer.register(request.clone()).await;
-    }
-
-    // PR 3: return the host's actual next emission_id from the
-    // module_emissions log. Companions use this as a sync point
-    // — any emission_id at or below `peek_next_id - 1` is
-    // already in the log; anything above is fresh on this
-    // session. Open-then-peek so we don't need a long-lived
-    // EmissionsStore in the router state (the actual append
-    // path goes through the host's emit-interception loop).
-    let next_emission_id = match state.storage.emissions_store(request.primary_target_name()) {
-        Ok(store) => store.peek_next_id().unwrap_or(1),
-        Err(e) => {
-            tracing::warn!(
-                module = %request.primary_target_name(),
-                error = %e,
-                "open emissions log to peek next_id failed; returning 1"
-            );
-            1
+    let next_emission_id = match &request.targets[0] {
+        SubscribeTarget::Module { name } => {
+            handle_module_subscribe(&state, &request, name).await?
+        }
+        SubscribeTarget::Indexer { name } => {
+            handle_indexer_subscribe(&state, &request, name).await?
         }
     };
     let response = SubscribeResponse {
@@ -234,6 +229,104 @@ async fn subscribe_handler(
         .header(header::CONTENT_TYPE, SUBSCRIBE_MIME)
         .body(Body::from(body))
         .expect("response builder"))
+}
+
+/// Existing wasm-module subscribe flow: validate module id +
+/// artifact, persist CBOR registration, hand to dialer, peek the
+/// emissions store for `next_emission_id`. Returns the value to
+/// echo back in `SubscribeResponse`.
+async fn handle_module_subscribe(
+    state: &CompanionState,
+    request: &SubscribeRequest,
+    module_name: &str,
+) -> std::result::Result<u64, SubscribeError> {
+    validate_module_id(module_name)?;
+
+    // Module must be registered (i.e. have an artifact uploaded) so
+    // we don't accept registrations for unknown modules.
+    if state
+        .storage
+        .read_manifest(module_name)
+        .map_err(|e| SubscribeError::Io(e.to_string()))?
+        .is_none()
+    {
+        return Err(SubscribeError::UnknownModule(module_name.to_string()));
+    }
+
+    let companions_dir = companions_dir_for(&state.storage, module_name);
+    std::fs::create_dir_all(&companions_dir).map_err(|e| SubscribeError::Io(e.to_string()))?;
+
+    let path = companions_dir.join(format!("{}.cbor", request.companion_key));
+    let buf = request
+        .encode()
+        .map_err(|e| SubscribeError::Io(format!("encode persisted registration: {e}")))?;
+    write_atomic(&path, &buf).map_err(|e| SubscribeError::Io(e.to_string()))?;
+
+    tracing::info!(
+        module = %module_name,
+        companion_key = %request.companion_key,
+        interests = request.interests.len(),
+        "companion registered (module target)"
+    );
+
+    if let Some(dialer) = &state.dialer {
+        dialer.register(request.clone()).await;
+    }
+
+    // Companions use this as a sync point — any emission_id at or
+    // below `peek_next_id - 1` is already in the log; anything
+    // above is fresh on this session.
+    let next_emission_id = match state.storage.emissions_store(module_name) {
+        Ok(store) => store.peek_next_id().unwrap_or(1),
+        Err(e) => {
+            tracing::warn!(
+                module = %module_name,
+                error = %e,
+                "open emissions log to peek next_id failed; returning 1"
+            );
+            1
+        }
+    };
+    Ok(next_emission_id)
+}
+
+/// New in-tree indexer subscribe flow: validate the indexer
+/// exists and isn't internal, then hand to the dialer (which
+/// dispatches on target kind and runs the broadcast-channel
+/// bridge for indexer targets). Indexer subscriptions are NOT
+/// persisted in v1 — companions re-register on each DO wake.
+/// Returns 0 as `next_emission_id` because in-tree indexers
+/// don't have a per-module emissions log.
+async fn handle_indexer_subscribe(
+    state: &CompanionState,
+    request: &SubscribeRequest,
+    indexer_name: &str,
+) -> std::result::Result<u64, SubscribeError> {
+    let Some(bridge) = &state.indexer_bridge else {
+        return Err(SubscribeError::UnknownIndexer(format!(
+            "{indexer_name} (host has no indexer bridge wired)"
+        )));
+    };
+
+    if !bridge.contains(indexer_name) {
+        return Err(SubscribeError::UnknownIndexer(indexer_name.to_string()));
+    }
+    if bridge.is_internal(indexer_name) {
+        return Err(SubscribeError::InternalIndexer(indexer_name.to_string()));
+    }
+
+    tracing::info!(
+        indexer = %indexer_name,
+        companion_key = %request.companion_key,
+        interests = request.interests.len(),
+        "companion registered (indexer target)"
+    );
+
+    if let Some(dialer) = &state.dialer {
+        dialer.register(request.clone()).await;
+    }
+
+    Ok(0)
 }
 
 fn companions_dir_for(storage: &ModuleStorage, module_id: &str) -> PathBuf {
@@ -290,7 +383,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
-        companion_router(storage, AuthToken(None), None)
+        companion_router(storage, AuthToken(None), None, None)
     }
 
     fn cbor(req: &SubscribeRequest) -> Vec<u8> {

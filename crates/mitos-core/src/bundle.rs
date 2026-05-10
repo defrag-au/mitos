@@ -396,16 +396,33 @@ impl Bundle {
             // frames get routed into the right module's follower
             // task and call its `update-interest` export.
             let interest_router: Arc<dyn mitos_platform::host_v2::InterestRouter> = host.clone();
+
+            // In-tree indexer bridge — what the unified subscribe
+            // handler uses to route `SubscribeTarget::Indexer`
+            // requests. Shared between the dialer (for
+            // `spawn_dial` of indexer-target dial loops) and the
+            // subscribe handler (for `contains` / `is_internal`
+            // validation). See `docs/design/UNIFIED_SUBSCRIBE.md`.
+            let core_bridge = std::sync::Arc::new(crate::indexer_bridge::CoreIndexerBridge::new(
+                indexers.to_vec(),
+                domain.clone(),
+                auth.clone(),
+            ));
+            let indexer_bridge: mitos_platform::indexer_bridge::IndexerBridgeHandle =
+                core_bridge.clone();
+
             let dialer = mitos_platform::dialer::CompanionDialer::new(
                 storage.clone(),
                 platform_auth.clone(),
                 Some(interest_router),
-            );
+            )
+            .with_indexer_bridge(indexer_bridge.clone());
             dialer.start_all().await;
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),
                 platform_auth.clone(),
                 Some(dialer.clone()),
+                Some(indexer_bridge),
             ));
 
             app = app.merge(mitos_platform::admin::admin_router_with_host(

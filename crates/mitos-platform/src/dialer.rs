@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 
 use futures_util::{SinkExt, StreamExt};
 use mitos_protocol::{
-    ClientMessage, ServerMessage, SubscribeRequest, decode_client, encode_server,
+    ClientMessage, ServerMessage, SubscribeRequest, SubscribeTarget, decode_client, encode_server,
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -62,6 +62,7 @@ use url::Url;
 use crate::admin::AuthToken;
 use crate::emissions::{EmissionStatus, EmissionsStore};
 use crate::host_v2::InterestRouter;
+use crate::indexer_bridge::IndexerBridgeHandle;
 use crate::storage::ModuleStorage;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -104,6 +105,11 @@ pub struct CompanionDialer {
     /// builds where no `ModuleHost` is wired; production
     /// always passes `Some(host as Arc<dyn InterestRouter>)`.
     interest_router: Option<Arc<dyn InterestRouter>>,
+    /// In-tree indexer bridge — handles `SubscribeTarget::Indexer`
+    /// dispatch. Provided by `mitos-core::Bundle` at runtime when
+    /// the host has in-tree indexers. `None` means the dialer
+    /// only handles `Module` targets.
+    indexer_bridge: Option<IndexerBridgeHandle>,
     tasks: Arc<Mutex<HashMap<CompanionId, ActiveCompanion>>>,
 }
 
@@ -117,8 +123,17 @@ impl CompanionDialer {
             storage,
             auth,
             interest_router,
+            indexer_bridge: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach an in-tree indexer bridge. The dialer will dispatch
+    /// `SubscribeTarget::Indexer` requests through the bridge's
+    /// `spawn_dial` method.
+    pub fn with_indexer_bridge(mut self, bridge: IndexerBridgeHandle) -> Self {
+        self.indexer_bridge = Some(bridge);
+        self
     }
 
     /// Scan `<storage_root>/*/companions/*.cbor` and start a
@@ -195,12 +210,50 @@ impl CompanionDialer {
         let id = CompanionId::new(req.primary_target_name(), &req.companion_key);
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
-        let storage = self.storage.clone();
-        let auth = self.auth.clone();
-        let interest_router = self.interest_router.clone();
-        let task = tokio::spawn(async move {
-            run_companion(req, storage, auth, interest_router, cancel_for_task).await;
-        });
+
+        // Dispatch on the request's target kind. v1 supports
+        // exactly one target per subscribe call (validated in
+        // `companions::subscribe_handler`), so we only inspect
+        // `targets[0]`.
+        let target = match req.targets.first() {
+            Some(t) => t,
+            None => {
+                warn!(
+                    companion_key = %req.companion_key,
+                    "subscribe request has no target; skipping dial"
+                );
+                return;
+            }
+        };
+
+        let task = match target {
+            SubscribeTarget::Module { .. } => {
+                let storage = self.storage.clone();
+                let auth = self.auth.clone();
+                let interest_router = self.interest_router.clone();
+                tokio::spawn(async move {
+                    run_companion(req, storage, auth, interest_router, cancel_for_task).await;
+                })
+            }
+            SubscribeTarget::Indexer { name } => {
+                let Some(bridge) = self.indexer_bridge.clone() else {
+                    warn!(
+                        indexer = %name,
+                        companion_key = %req.companion_key,
+                        "indexer-target subscribe but no bridge wired on dialer; skipping dial"
+                    );
+                    return;
+                };
+                // The bridge owns the dial loop for indexer
+                // targets — it has access to the
+                // `IndexerHandle::run_subscriber` machinery in
+                // `mitos-core`. We just track the JoinHandle in
+                // the supervisor map so re-registration can
+                // cancel it.
+                bridge.spawn_dial(req, cancel_for_task)
+            }
+        };
+
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, ActiveCompanion { cancel, task });
     }
