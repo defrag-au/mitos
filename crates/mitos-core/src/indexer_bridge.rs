@@ -72,6 +72,13 @@ impl CoreIndexerBridge {
             auth,
         }
     }
+
+    /// Owned snapshot of registered indexer names. Used by the
+    /// bundle to pass into `admin_router_with_host` for reserved-
+    /// name enforcement at wasm-module upload time.
+    pub fn reserved_names_owned(&self) -> Vec<String> {
+        self.indexers.keys().cloned().collect()
+    }
 }
 
 impl IndexerBridge for CoreIndexerBridge {

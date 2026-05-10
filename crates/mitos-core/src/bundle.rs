@@ -373,6 +373,32 @@ impl Bundle {
                 budget,
             ));
 
+            // Reserved-name check: any on-disk module whose id
+            // collides with an in-tree indexer's name must abort
+            // startup. Loud failure beats silent shadowing —
+            // operator deleted-then-re-added the indexer crate
+            // and the module needs renaming or removing. See
+            // `docs/design/UNIFIED_SUBSCRIBE.md` step 4.
+            let reserved: std::collections::HashSet<String> =
+                indexers.iter().map(|h| h.name().to_string()).collect();
+            match storage.list_modules() {
+                Ok(ids) => {
+                    let collisions: Vec<String> =
+                        ids.into_iter().filter(|id| reserved.contains(id)).collect();
+                    if !collisions.is_empty() {
+                        anyhow::bail!(
+                            "wasm modules on disk shadow reserved in-tree indexer names: {:?}. \
+                             Rename or delete these modules before restart (see \
+                             docs/design/UNIFIED_SUBSCRIBE.md).",
+                            collisions
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "reserved-name check: list_modules failed; continuing");
+                }
+            }
+
             // Auto-resume: walk every manifest on disk and start
             // it. Single bad module is logged and skipped so it
             // can't abort bundle startup.
@@ -425,9 +451,15 @@ impl Bundle {
                 Some(indexer_bridge),
             ));
 
+            // Pass the reserved-names set so the upload handler
+            // rejects modules whose id collides with an in-tree
+            // indexer (see `docs/design/UNIFIED_SUBSCRIBE.md`
+            // step 4).
+            let reserved_names = core_bridge.reserved_names_owned();
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage.clone(),
                 host_for_admin,
+                reserved_names,
                 platform_auth,
             ));
 

@@ -90,6 +90,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 struct AdminState {
     storage: ModuleStorage,
     host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
+    /// Names of in-tree indexers registered with the bundle.
+    /// `upload_module` rejects (400 reserved_name) any module ID
+    /// that collides with one of these — see
+    /// `docs/design/UNIFIED_SUBSCRIBE.md` step 4.
+    reserved_names: Vec<String>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -101,27 +106,39 @@ struct AdminState {
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
 pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
-    admin_router_inner(storage, None, auth)
+    admin_router_inner(storage, None, Vec::new(), auth)
 }
 
 /// Build the admin router with the running-instance lifecycle
 /// wired in. Uploads trigger `host.replace(id)` so the new sha
 /// starts running immediately; DELETE + restart routes are
 /// available for admin operators.
+///
+/// `reserved_names` is the set of in-tree indexer names the host
+/// has registered — `upload_module` rejects collisions to prevent
+/// a wasm module from shadowing an indexer subscribable via the
+/// unified-subscribe path. Pass an empty `Vec` when the bundle
+/// has no in-tree indexers (artifact-only deployments).
 pub fn admin_router_with_host(
     storage: ModuleStorage,
     host: Arc<dyn crate::host_v2::ModuleHostHandle>,
+    reserved_names: Vec<String>,
     auth: AuthToken,
 ) -> axum::Router {
-    admin_router_inner(storage, Some(host), auth)
+    admin_router_inner(storage, Some(host), reserved_names, auth)
 }
 
 fn admin_router_inner(
     storage: ModuleStorage,
     host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
+    reserved_names: Vec<String>,
     auth: AuthToken,
 ) -> axum::Router {
-    let state = AdminState { storage, host };
+    let state = AdminState {
+        storage,
+        host,
+        reserved_names,
+    };
     axum::Router::new()
         .route("/_admin/modules", get(list_modules))
         .route(
@@ -195,6 +212,13 @@ enum HandlerError {
     Storage(#[from] StorageError),
     #[error("wasmtime: {0}")]
     Wasmtime(String),
+    /// Module ID shadows an in-tree indexer's name (e.g. uploading
+    /// a module called `mint-burn` while the host has the
+    /// `mint-burn` indexer registered). Rejected to keep the
+    /// unified-subscribe routing unambiguous — see
+    /// `docs/design/UNIFIED_SUBSCRIBE.md`.
+    #[error("module id `{0}` shadows reserved in-tree indexer name")]
+    ReservedName(String),
 }
 
 impl HandlerError {
@@ -213,6 +237,7 @@ impl HandlerError {
             Self::Storage(StorageError::UploadInProgress(_)) => "upload_in_progress",
             Self::Storage(_) => "storage_io",
             Self::Wasmtime(_) => "wasm_invalid",
+            Self::ReservedName(_) => "reserved_name",
         }
     }
 
@@ -220,6 +245,7 @@ impl HandlerError {
         match self {
             Self::Storage(StorageError::UploadInProgress(_)) => StatusCode::CONFLICT,
             Self::Storage(StorageError::Io(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ReservedName(_) => StatusCode::CONFLICT,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -267,6 +293,16 @@ async fn upload_module(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, HandlerError> {
+    // Reserved-name guard: reject uploads whose ID collides with
+    // an in-tree indexer's name (e.g. uploading a module called
+    // `mint-burn` while the host has the `mint-burn` indexer
+    // registered). Done before acquiring the upload lock — cheap
+    // check, no point holding the lock for a request that's about
+    // to fail.
+    if state.reserved_names.iter().any(|n| n == &id) {
+        return Err(HandlerError::ReservedName(id));
+    }
+
     // Acquire upload lock first — fail-fast on concurrent uploads.
     let _lock = state.storage.acquire_upload_lock(&id)?;
 
