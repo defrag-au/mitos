@@ -36,20 +36,60 @@ pub struct MitosCompanionRuntime<C: MitosCompanion> {
     env: Env,
     inner: C,
     /// Channel set, materialised eagerly from `inner.channels()` in
-    /// `new()`. Owned `Vec<Box<dyn MitosChannelDyn>>`; never mutated
-    /// after construction so dispatch can borrow it without lifetime
-    /// gymnastics.
+    /// the constructor. Owned `Vec<Box<dyn MitosChannelDyn>>`;
+    /// never mutated after construction so dispatch can borrow it
+    /// without lifetime gymnastics.
     channels: Vec<Box<dyn MitosChannelDyn>>,
     /// Whether the runtime has run its one-time schema setup. Cheap
     /// flag to avoid re-running `ensure_schema` on every request.
     schema_ready: Cell<bool>,
+    /// What kind of source this companion subscribes to. Determines
+    /// which `SubscribeTarget` variant the runtime constructs on
+    /// the HTTPS subscribe handshake. Picked once at construction
+    /// via `MitosCompanionRuntime::module(...)` /
+    /// `MitosCompanionRuntime::indexer(...)`. See
+    /// `docs/design/UNIFIED_SUBSCRIBE.md`.
+    target_kind: TargetKind,
+}
+
+/// Internal flag captured at runtime construction; controls which
+/// `SubscribeTarget` variant flows on the subscribe call. Not
+/// exposed in the public API — dApps pick at construction time
+/// via the matching constructor.
+#[derive(Debug, Clone, Copy)]
+enum TargetKind {
+    Module,
+    Indexer,
 }
 
 impl<C: MitosCompanion> MitosCompanionRuntime<C> {
-    /// Construct a new runtime. Called by the dApp's
-    /// `#[durable_object]` wrapper inside its `new(state, env)`
-    /// constructor.
-    pub fn new(state: State, env: Env, inner: C) -> Self {
+    /// Construct a runtime that subscribes to a **wasm module**
+    /// hosted by the mitos platform. `C::NAME` is treated as the
+    /// module identity (matches the `[module].id` in the module's
+    /// manifest).
+    ///
+    /// This is the path most dApps want — wasm modules are the
+    /// canonical extension point for adding custom indexing
+    /// behaviour to mitos.
+    pub fn module(state: State, env: Env, inner: C) -> Self {
+        Self::with_target(state, env, inner, TargetKind::Module)
+    }
+
+    /// Construct a runtime that subscribes to an **in-tree
+    /// indexer** built into the mitos host (e.g. `marketplace`,
+    /// `mint-burn`). `C::NAME` is treated as the indexer's stable
+    /// identifier.
+    ///
+    /// The host's unified-subscribe handler rejects internal
+    /// indexers (those with `Indexer::is_internal() == true`,
+    /// e.g. `none-match`); see `docs/design/UNIFIED_SUBSCRIBE.md`.
+    /// Companions subscribing to internal indexers get a 400
+    /// response.
+    pub fn indexer(state: State, env: Env, inner: C) -> Self {
+        Self::with_target(state, env, inner, TargetKind::Indexer)
+    }
+
+    fn with_target(state: State, env: Env, inner: C, target_kind: TargetKind) -> Self {
         let channels = inner.channels();
         Self {
             state,
@@ -57,6 +97,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             inner,
             channels,
             schema_ready: Cell::new(false),
+            target_kind,
         }
     }
 
@@ -401,17 +442,21 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 auth_value: None,
             });
 
-        // v1 of unified subscribe always targets a single wasm
-        // module — the SDK only constructs `Module` targets. The
-        // host-side bridge that resolves `Indexer` targets lands
-        // in a separate step (see `docs/design/UNIFIED_SUBSCRIBE.md`).
-        // The future `MitosCompanionRuntime::indexer(...)`
-        // constructor will populate this with the `Indexer` arm
-        // instead.
-        let request = SubscribeRequest {
-            targets: vec![mitos_protocol::SubscribeTarget::Module {
+        // Pick the `SubscribeTarget` variant from the runtime's
+        // construction-time choice (`module(...)` vs
+        // `indexer(...)`). v1 of unified subscribe always sends
+        // a single target; multi-target subscriptions are a
+        // future extension (see `docs/design/UNIFIED_SUBSCRIBE.md`).
+        let target = match self.target_kind {
+            TargetKind::Module => mitos_protocol::SubscribeTarget::Module {
                 name: C::NAME.to_string(),
-            }],
+            },
+            TargetKind::Indexer => mitos_protocol::SubscribeTarget::Indexer {
+                name: C::NAME.to_string(),
+            },
+        };
+        let request = SubscribeRequest {
+            targets: vec![target],
             companion_key,
             resume_from,
             interests,

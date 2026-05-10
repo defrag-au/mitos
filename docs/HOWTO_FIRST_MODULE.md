@@ -285,7 +285,11 @@ pub struct MyDO {
 
 impl DurableObject for MyDO {
     fn new(state: State, env: Env) -> Self {
-        Self { runtime: MitosCompanionRuntime::new(state, env, MyCompanion) }
+        // Wasm-module companion — `::module()` constructor. Use
+        // `::indexer()` instead when subscribing to an in-tree
+        // indexer like `marketplace` or `mint-burn`. See
+        // `docs/design/UNIFIED_SUBSCRIBE.md`.
+        Self { runtime: MitosCompanionRuntime::module(state, env, MyCompanion) }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
