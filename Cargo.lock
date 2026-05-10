@@ -3215,6 +3215,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mint-burn-indexer"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.4",
+ "cardano-assets",
+ "dolos-core",
+ "hex",
+ "mitos-core",
+ "mitos-protocol",
+ "pallas",
+ "tracing",
+]
+
+[[package]]
 name = "mio"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3340,6 +3356,7 @@ dependencies = [
  "dolos-cardano",
  "dolos-core",
  "marketplace-indexer",
+ "mint-burn-indexer",
  "mitos-core",
  "tokio",
  "tokio-util",

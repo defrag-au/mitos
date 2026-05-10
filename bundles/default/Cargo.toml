@@ -12,6 +12,7 @@ path = "src/main.rs"
 mitos-core = { path = "../../crates/mitos-core" }
 collection-ownership-indexer = { path = "../../crates/collection-ownership-indexer" }
 marketplace-indexer = { path = "../../crates/marketplace-indexer" }
+mint-burn-indexer = { path = "../../crates/mint-burn-indexer" }
 
 # Dolos for the embedded data plane.
 dolos = { workspace = true }

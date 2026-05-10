@@ -17,6 +17,7 @@ members = [
     "crates/mitos-companion",
     "crates/collection-ownership-indexer",
     "crates/marketplace-indexer",
+    "crates/mint-burn-indexer",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",

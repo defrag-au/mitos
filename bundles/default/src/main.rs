@@ -8,6 +8,7 @@
 use clap::Parser;
 use collection_ownership_indexer::OwnershipIndexer;
 use marketplace_indexer::MarketplaceIndexer;
+use mint_burn_indexer::MintBurnIndexer;
 use mitos_core::Bundle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -64,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             &config,
             args.listen,
             &args.data_dir,
-            &["collection-ownership", "marketplace"],
+            &["collection-ownership", "marketplace", "mint-burn"],
         )?;
         return Ok(());
     }
@@ -77,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
     bundle.add_indexer(OwnershipIndexer::new()?);
     bundle.add_indexer(MarketplaceIndexer::new()?);
+    bundle.add_indexer(MintBurnIndexer::new()?);
 
     if let Some(modules_dir) = args.modules_dir {
         info!(modules_dir = %modules_dir.display(), "wasm-module hosting enabled");
