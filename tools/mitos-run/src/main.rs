@@ -54,6 +54,20 @@ struct Args {
     /// fixtures; specify in chain order.
     #[arg(long)]
     block: Vec<PathBuf>,
+
+    /// Golden-test mode. After all `--block`s are dispatched,
+    /// the JSON-decoded emissions (in emission order, one array
+    /// element per `emit_event` call) are compared against the
+    /// JSON array in this file. Mismatch → exit 1 with a diff
+    /// report. Match → exit 0 (and we run quietly).
+    ///
+    /// Set `UPDATE_GOLDEN=1` in the env to overwrite the expected
+    /// file with the actual emissions instead of asserting —
+    /// useful when intentionally evolving a module's wire shape.
+    /// Always re-review the diff before committing the new
+    /// expected file.
+    #[arg(long)]
+    expected: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -127,7 +141,15 @@ async fn main() -> Result<()> {
              rebuild with `mitos-build` (v2 is the default)"
         );
     }
-    run_v2(&args.block, &fixture, &module_id, &wasm_path, &config_bytes).await
+    run_v2(
+        &args.block,
+        &fixture,
+        &module_id,
+        &wasm_path,
+        &config_bytes,
+        args.expected.as_deref(),
+    )
+    .await
 }
 
 // -----------------------------------------------------------------------------
@@ -538,6 +560,7 @@ async fn run_v2(
     module_id: &str,
     wasm_path: &std::path::Path,
     config_bytes: &[u8],
+    expected_path: Option<&std::path::Path>,
 ) -> Result<()> {
     use mitos_platform::driver_v2::{ApplyOutcomeV2, DriverV2};
     use mitos_platform::host_fns::{emit, state_kv};
@@ -658,6 +681,10 @@ async fn run_v2(
         return Ok(());
     }
 
+    // Collected decoded emissions across all blocks — used for the
+    // optional `--expected` golden-file comparison at end of run.
+    let mut collected_emits: Vec<serde_json::Value> = Vec::new();
+
     for path in blocks {
         let cbor = fs::read(path)
             .with_context(|| format!("read block {}", path.display()))?;
@@ -693,7 +720,7 @@ async fn run_v2(
                 event.channel,
                 &event.payload,
             );
-            match decoded {
+            match &decoded {
                 Some(json) => {
                     println!(
                         "  emit channel={} payload={} bytes",
@@ -710,9 +737,66 @@ async fn run_v2(
                     event.payload.len()
                 ),
             }
+            if expected_path.is_some() {
+                let value = decoded
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "channel": event.channel,
+                            "payload_bytes": event.payload.len(),
+                            "undecoded": true,
+                        })
+                    });
+                collected_emits.push(value);
+            }
         }
         if block_emitted > 0 {
             println!("  ▸ {block_emitted} event(s) emitted");
+        }
+    }
+
+    if let Some(path) = expected_path {
+        let actual = serde_json::Value::Array(collected_emits);
+        let update = std::env::var("UPDATE_GOLDEN").is_ok();
+        if update {
+            let pretty = serde_json::to_string_pretty(&actual)
+                .map_err(|e| anyhow::anyhow!("encode actual emits as JSON: {e}"))?;
+            fs::write(path, format!("{pretty}\n"))
+                .with_context(|| format!("write golden file {}", path.display()))?;
+            println!(
+                "▸ UPDATE_GOLDEN=1 — overwrote {} with {} emission(s)",
+                path.display(),
+                actual.as_array().map(Vec::len).unwrap_or(0)
+            );
+            return Ok(());
+        }
+        if !path.exists() {
+            bail!(
+                "golden file {} doesn't exist; set UPDATE_GOLDEN=1 to create it",
+                path.display()
+            );
+        }
+        let expected_str = fs::read_to_string(path)
+            .with_context(|| format!("read golden file {}", path.display()))?;
+        let expected: serde_json::Value = serde_json::from_str(&expected_str)
+            .with_context(|| format!("parse golden file {} as JSON", path.display()))?;
+        if expected == actual {
+            println!(
+                "✓ golden match ({} emission(s)) against {}",
+                actual.as_array().map(Vec::len).unwrap_or(0),
+                path.display()
+            );
+        } else {
+            eprintln!("✗ golden mismatch against {}", path.display());
+            eprintln!(
+                "  re-run with UPDATE_GOLDEN=1 to accept the new shape (review the diff first)"
+            );
+            eprintln!("---- expected ----");
+            eprintln!("{}", serde_json::to_string_pretty(&expected).unwrap_or_default());
+            eprintln!("---- actual ----");
+            eprintln!("{}", serde_json::to_string_pretty(&actual).unwrap_or_default());
+            std::process::exit(1);
         }
     }
 

@@ -48,7 +48,7 @@
 //! See `mitos/docs/design/MINT_BURN_MODULES.md`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use mitos_community_events::asset_metadata_update::AssetMetadataUpdate;
 use minicbor::data::Type;
@@ -106,13 +106,17 @@ impl From<&TypedDatum> for DatumPayload {
 #[derive(Default)]
 struct TxBuffer {
     /// `_100`-asset datums captured from `Consumed.prior-datum`.
-    consumed_refs: HashMap<(Vec<u8>, Vec<u8>), DatumPayload>,
-    /// `_100`-asset datums captured from `Produced.datum`.
-    produced_refs: HashMap<(Vec<u8>, Vec<u8>), DatumPayload>,
+    /// `BTreeMap` (not `HashMap`) so flush iteration order is
+    /// deterministic — important for golden testing + replay
+    /// equivalence across operators.
+    consumed_refs: BTreeMap<(Vec<u8>, Vec<u8>), DatumPayload>,
+    /// `_100`-asset datums captured from `Produced.datum`. See
+    /// `consumed_refs` for the BTreeMap rationale.
+    produced_refs: BTreeMap<(Vec<u8>, Vec<u8>), DatumPayload>,
     /// Assets with positive `quantity_delta` mint entries in
     /// this TX — used to exclude fresh CIP-68 mints from the
-    /// refresh path.
-    minted_positive: HashSet<(Vec<u8>, Vec<u8>)>,
+    /// refresh path. `BTreeSet` for the same determinism reason.
+    minted_positive: BTreeSet<(Vec<u8>, Vec<u8>)>,
     /// tx_hash from the first event seen in this batch.
     tx_hash: Option<Vec<u8>>,
 }

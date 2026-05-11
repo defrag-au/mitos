@@ -34,7 +34,7 @@
 //!
 //! See `mitos/docs/design/MINT_BURN_MODULES.md`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use mitos_community_events::cip68_mint::{Cip68Mint, Cip68RefInfo, Cip68UserInfo};
 use pallas_primitives::PlutusData;
@@ -100,16 +100,21 @@ struct UserCandidate {
 #[derive(Default)]
 struct TxBuffer {
     /// Reference-token mints, keyed by (policy, suffix).
-    ref_mints: HashMap<(Vec<u8>, Vec<u8>), RefCandidate>,
-    /// User-token mints, keyed by (policy, suffix).
-    user_mints: HashMap<(Vec<u8>, Vec<u8>), UserCandidate>,
+    /// `BTreeMap` (not `HashMap`) so the flush iteration order is
+    /// deterministic — important for golden testing, replay
+    /// equivalence across operators, and downstream consumers
+    /// that index by emission order.
+    ref_mints: BTreeMap<(Vec<u8>, Vec<u8>), RefCandidate>,
+    /// User-token mints, keyed by (policy, suffix). See
+    /// `ref_mints` for the BTreeMap rationale.
+    user_mints: BTreeMap<(Vec<u8>, Vec<u8>), UserCandidate>,
     /// Datum bytes captured from `Produced` events that contain
     /// a `_100`-prefixed asset, keyed by (policy, full
     /// asset_name of the reference). The full asset_name (not
     /// suffix) is the key because `Produced` events don't
     /// re-derive the suffix — we look up the matching ref
     /// asset_name when emitting.
-    ref_datums: HashMap<(Vec<u8>, Vec<u8>), DatumPayload>,
+    ref_datums: BTreeMap<(Vec<u8>, Vec<u8>), DatumPayload>,
     /// tx_hash from the first event seen in this batch (all
     /// events in one `handle-events` call belong to the same
     /// TX).

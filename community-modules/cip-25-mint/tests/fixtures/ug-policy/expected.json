@@ -1,0 +1,30 @@
+[
+  {
+    "asset_name_hex": "554733333334",
+    "metadata_json": "{\"collection\":\"UGs by Squashua 2024\",\"files\":[{\"mediaType\":\"image/webp\",\"name\":\"Ugton Blorpwham\",\"src\":\"ipfs://Qmck3nC1LgBpbo2dpbFu2aD1TguM8CNTdiiwEYGsPbKqBA\"}],\"image\":\"ipfs://Qmck3nC1LgBpbo2dpbFu2aD1TguM8CNTdiiwEYGsPbKqBA\",\"mediaType\":\"image/webp\",\"name\":\"Ugton Blorpwham\",\"traits\":[{\"Background\":\"Hadouken\"},{\"Skin\":\"Orange\"},{\"Outfit\":\"Whisky\"},{\"Hats\":\"Baseball Cap\"},{\"Mouth\":\"Tight-lipped\"},{\"Eyenose\":\"Four-eyed\"}]}",
+    "policy": "8972aab912aed2cf44b65916e206324c6bdcb6fbd3dc4eb634fdbd28",
+    "quantity": 1,
+    "tx_hash": "1420f1dd8b532c9314a06760211a41769e41a7439f298ec69098e74dc967f0ca"
+  },
+  {
+    "asset_name_hex": "554733333335",
+    "metadata_json": "{\"collection\":\"UGs by Squashua 2024\",\"files\":[{\"mediaType\":\"image/webp\",\"name\":\"Ugford Muddlezigzag\",\"src\":\"ipfs://QmPPN3CMNhnsMcBAj5xLpAsQJxShJ8jphf66hGVdgpk6kJ\"}],\"image\":\"ipfs://QmPPN3CMNhnsMcBAj5xLpAsQJxShJ8jphf66hGVdgpk6kJ\",\"mediaType\":\"image/webp\",\"name\":\"Ugford Muddlezigzag\",\"traits\":[{\"Background\":\"Faded Purple makes my Heart sing\"},{\"Skin\":\"Peach Stripes\"},{\"Outfit\":\"Pajamas\"},{\"Hats\":\"Policemans Hat\"},{\"Mouth\":\"You Dont Say\"},{\"Eyenose\":\"Top-tier\"}]}",
+    "policy": "8972aab912aed2cf44b65916e206324c6bdcb6fbd3dc4eb634fdbd28",
+    "quantity": 1,
+    "tx_hash": "1420f1dd8b532c9314a06760211a41769e41a7439f298ec69098e74dc967f0ca"
+  },
+  {
+    "asset_name_hex": "554733333336",
+    "metadata_json": "{\"collection\":\"UGs by Squashua 2024\",\"files\":[{\"mediaType\":\"image/webp\",\"name\":\"Uggler Twizzleflick\",\"src\":\"ipfs://QmTMTHqqrVhp2U9qxbMTgbV29XhkzZ9xB9Bt61f5wktw1V\"}],\"image\":\"ipfs://QmTMTHqqrVhp2U9qxbMTgbV29XhkzZ9xB9Bt61f5wktw1V\",\"mediaType\":\"image/webp\",\"name\":\"Uggler Twizzleflick\",\"traits\":[{\"Background\":\"Vaguely Aqua\"},{\"Skin\":\"Pink\"},{\"Outfit\":\"Shelf\"},{\"Hats\":\"Cowboy Hat\"},{\"Mouth\":\"Tense\"},{\"Eyenose\":\"Teacher\"}]}",
+    "policy": "8972aab912aed2cf44b65916e206324c6bdcb6fbd3dc4eb634fdbd28",
+    "quantity": 1,
+    "tx_hash": "1420f1dd8b532c9314a06760211a41769e41a7439f298ec69098e74dc967f0ca"
+  },
+  {
+    "asset_name_hex": "554733333337",
+    "metadata_json": "{\"collection\":\"UGs by Squashua 2024\",\"files\":[{\"mediaType\":\"image/webp\",\"name\":\"Ugley Snurflethump\",\"src\":\"ipfs://QmZw64VKtvvj3NJzGc8x63cf7dnwJ23ZEL5Mph58vtYuBD\"}],\"image\":\"ipfs://QmZw64VKtvvj3NJzGc8x63cf7dnwJ23ZEL5Mph58vtYuBD\",\"mediaType\":\"image/webp\",\"name\":\"Ugley Snurflethump\",\"traits\":[{\"Background\":\"Hazy Vignette\"},{\"Skin\":\"Purple Glow\"},{\"Outfit\":\"Scientist\"},{\"Hats\":\"Dark Blue and Curly Hair\"},{\"Mouth\":\"Cocky\"},{\"Eyenose\":\"Rising Panic\"}]}",
+    "policy": "8972aab912aed2cf44b65916e206324c6bdcb6fbd3dc4eb634fdbd28",
+    "quantity": 1,
+    "tx_hash": "1420f1dd8b532c9314a06760211a41769e41a7439f298ec69098e74dc967f0ca"
+  }
+]

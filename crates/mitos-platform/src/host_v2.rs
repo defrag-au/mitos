@@ -441,6 +441,7 @@ where
         }
 
         let follower_kv_factory = self.kv_factory.clone();
+        let follower_trap_logger = trap_logger.clone();
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -451,6 +452,7 @@ where
                 follower_storage,
                 follower_module_id,
                 follower_kv_factory,
+                follower_trap_logger,
             )
             .await;
             match &result {

@@ -24,11 +24,18 @@ use serde::Deserialize;
 
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
+use crate::mitos::platform_v2::state_kv;
 // `DispatchEvent`, `TrapStrategy`, `RetryPolicy`, `InterestOp`,
 // and the `Guest` trait come from world-level `use ...` clauses.
 use crate::mitos::platform_v2::types::{ProducedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "burn-address-module";
+/// state-kv key under which we persist the resolved
+/// watched-address set. Keyed by a single string so the whole
+/// set round-trips as one CBOR-encoded list of strings —
+/// cheaper than per-address keys for the small sets typical
+/// of burn-sink consumers.
+const KV_WATCHED_ADDRS: &str = "watched-addresses";
 
 // Watched-address set. The platform's v2 dispatch model
 // filters TXs (any matching event qualifies → all events
@@ -111,7 +118,10 @@ fn handle_produced(p: &ProducedEvent) {
 
 /// Decode the CBOR-encoded interest predicates and update the
 /// watched-address set per the op. Silent best-effort: unknown
-/// variants and decode errors leave the set unchanged.
+/// variants and decode errors leave the set unchanged. Always
+/// flushes the updated set to state-kv so a host process
+/// restart (without an attached companion to re-send Interest
+/// messages) keeps filtering correctly.
 fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
     let predicates: Vec<InterestPredicateWire> =
         match ciborium::de::from_reader(items_cbor) {
@@ -132,7 +142,7 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
             _ => None,
         })
         .collect();
-    WATCHED_ADDRS.with(|set| {
+    let final_size = WATCHED_ADDRS.with(|set| {
         let mut set = set.borrow_mut();
         match op {
             InterestOp::Replace => {
@@ -148,12 +158,64 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
                 }
             }
         }
-        logging::log(
-            LogLevel::Info,
-            LOG_TARGET,
-            &format!("interest update applied; now watching {} address(es)", set.len()),
-        );
+        set.len()
     });
+    persist_watched_addrs();
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!("interest update applied; now watching {final_size} address(es)"),
+    );
+}
+
+/// Serialise the current watched-address set as CBOR and write
+/// it to state-kv. Cheap (small payload, single key); skipped
+/// silently on encode failure since the in-memory set is still
+/// the source of truth for this process.
+fn persist_watched_addrs() {
+    let addrs: Vec<String> =
+        WATCHED_ADDRS.with(|set| set.borrow().iter().cloned().collect());
+    let mut buf = Vec::with_capacity(64 + addrs.len() * 64);
+    if let Err(e) = ciborium::ser::into_writer(&addrs, &mut buf) {
+        logging::log(
+            LogLevel::Error,
+            LOG_TARGET,
+            &format!("encode watched addresses for state-kv: {e}"),
+        );
+        return;
+    }
+    state_kv::set_value(KV_WATCHED_ADDRS, &buf);
+}
+
+/// Restore the watched-address set from state-kv at init time.
+/// No-op when the key is absent (first-ever start, or the
+/// companion will send Interest before the first dispatch).
+fn restore_watched_addrs_from_kv() {
+    let Some(bytes) = state_kv::get_value(KV_WATCHED_ADDRS) else {
+        return;
+    };
+    let addrs: Vec<String> = match ciborium::de::from_reader(bytes.as_slice()) {
+        Ok(v) => v,
+        Err(e) => {
+            logging::log(
+                LogLevel::Error,
+                LOG_TARGET,
+                &format!("decode persisted watched addresses: {e}"),
+            );
+            return;
+        }
+    };
+    let n = addrs.len();
+    WATCHED_ADDRS.with(|set| {
+        let mut set = set.borrow_mut();
+        set.clear();
+        set.extend(addrs);
+    });
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!("restored {n} watched address(es) from state-kv"),
+    );
 }
 
 // ============================================================
@@ -184,6 +246,10 @@ impl Guest for Module {
             &format!("init: enter (config_bytes={})", config.len()),
         );
         // No persistent config — interest set entirely dynamic.
+        // Rehydrate the watched-address set in case the host
+        // restarted without an attached companion to re-send
+        // Interest messages.
+        restore_watched_addrs_from_kv();
     }
 
     fn handle_events(events: Vec<DispatchEvent>) {

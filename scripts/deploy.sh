@@ -136,13 +136,21 @@ step_build_community_modules() {
     # community-modules/<name>/target/mitos/<name>/, exactly where
     # the host's community-module auto-load reads from.
     #
+    # Per-module resilience:
+    #   - source missing → skip silently
+    #   - existing wasm newer than every .rs + .toml file in the
+    #     module dir → skip (idempotent cache)
+    #   - mitos-build failure → log, increment FAILED, keep going.
+    #     auto-load gets whatever artifacts succeeded.
+    #
     # Single-quoted heredoc on purpose — the loop body runs on the
     # remote box, so $name etc. must NOT expand locally.
     run "ssh '$MITOS_HOST' '
-        set -e
         cd $MITOS_SRC_REMOTE
         BUILT=0
+        FRESH=0
         SKIPPED=0
+        FAILED=0
         for d in community-modules/*/; do
             name=\$(basename \"\$d\")
             stem=\$(echo \"\$name\" | tr - _)
@@ -151,11 +159,21 @@ step_build_community_modules() {
                 SKIPPED=\$((SKIPPED+1))
                 continue
             fi
+            wasm=\"\${d}target/mitos/\${name}/\${name}.wasm\"
+            if [ -f \"\$wasm\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.rs\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.toml\" -newer \"\$wasm\" -print -quit)\" ]; then
+                FRESH=\$((FRESH+1))
+                continue
+            fi
             echo \"  building \$name\"
-            ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/dev/null
-            BUILT=\$((BUILT+1))
+            if ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
+                BUILT=\$((BUILT+1))
+            else
+                FAILED=\$((FAILED+1))
+                echo \"    \$name: BUILD FAILED — see /tmp/mitos-build-\$name.log on the host\"
+                echo \"    auto-load will skip this module; other modules will continue\"
+            fi
         done
-        echo \"  community modules: built=\$BUILT skipped=\$SKIPPED\"
+        echo \"  community modules: built=\$BUILT  fresh=\$FRESH  skipped=\$SKIPPED  failed=\$FAILED\"
     '"
 }
 
