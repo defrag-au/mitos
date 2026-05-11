@@ -1,0 +1,20 @@
+# mitos.toml — module config for the asset-metadata-update indexer.
+#
+# Empty default interest set — consumer declares policies via
+# `/api/_interest/asset-metadata-update/subscribe` (kind = "policy").
+
+abi_version = 2
+
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+# Datum decode via PlutusData walking — same path as cip-68-mint.
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"
+# CBOR walking for label-721 metadata extraction (CIP-25 refresh).
+minicbor = { version = "0.20", features = ["std"] }
+# JSON serialisation for both metadata containers.
+serde_json = "1"

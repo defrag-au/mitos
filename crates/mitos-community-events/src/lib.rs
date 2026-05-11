@@ -7,4 +7,9 @@
 //!
 //! See `docs/strategy/COMMUNITY_MODULES.md` for the design.
 
+pub mod asset_metadata_update;
+pub mod burn_address;
+pub mod cip25_mint;
+pub mod cip68_mint;
 pub mod jpg_co;
+pub mod standard_burn;

@@ -1,0 +1,15 @@
+# mitos.toml — module config for the burn-address indexer.
+#
+# Empty default interest set — consumer declares burn addresses
+# via the companion's `/api/_interest/burn-address/subscribe`
+# endpoint (`kind = "address"`). See
+# `mitos/docs/design/MINT_BURN_MODULES.md` "Dynamic addresses".
+
+abi_version = 2
+
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
