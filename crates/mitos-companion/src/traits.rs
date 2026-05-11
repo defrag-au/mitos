@@ -79,6 +79,24 @@ pub trait MitosCompanion: Send + Sync + 'static {
             name: Self::NAME.to_string(),
         }]
     }
+
+    /// Programmatic initial-interest declaration — appended to the
+    /// SQL-table-backed dynamic interest set when constructing the
+    /// subscribe request.
+    ///
+    /// The SQL-table interest mechanism (populated via
+    /// `/api/_interest/subscribe`) supports `kind = "policy"` only
+    /// in v1. Companions that need richer Interest shapes —
+    /// `DomainSelector::Marketplace(Filter { ... })` for an in-tree
+    /// marketplace-indexer target, for example — declare them here
+    /// programmatically.
+    ///
+    /// Default: empty. Most single-target wasm-module companions
+    /// don't need this — their wasm module filters by address /
+    /// asset internally.
+    fn initial_interests(&self) -> Vec<mitos_protocol::Interest> {
+        Vec::new()
+    }
 }
 
 /// Per-channel handler. Implemented once per channel a companion

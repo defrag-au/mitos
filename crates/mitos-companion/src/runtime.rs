@@ -416,7 +416,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // dial-back to deliver matching emissions; until then,
         // this is the canonical-source-of-record handshake.)
         let interest_rows = crate::interest::list_interests(&sql)?;
-        let interests = crate::interest::rows_to_interests(&interest_rows);
+        let mut interests = crate::interest::rows_to_interests(&interest_rows);
+        // Append the companion's programmatic initial-interest
+        // declarations — used for filter shapes the SQL table
+        // doesn't support (e.g. `DomainSelector::Marketplace`
+        // filters for an in-tree marketplace-indexer target).
+        // See `MitosCompanion::initial_interests`.
+        interests.extend(self.inner.initial_interests());
 
         // Pull the dial-back URL from wrangler env so mitos
         // knows where to open its outbound WS. Required for
