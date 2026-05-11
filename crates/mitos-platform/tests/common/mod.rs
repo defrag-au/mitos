@@ -74,24 +74,15 @@ impl ChainDataPlane for NullChainDataPlane {
         Ok(Vec::new())
     }
 
-    async fn tx_metadata(
-        &self,
-        _tx_hash: &Hash<32>,
-    ) -> DataPlaneResult<Option<Vec<u8>>> {
+    async fn tx_metadata(&self, _tx_hash: &Hash<32>) -> DataPlaneResult<Option<Vec<u8>>> {
         Ok(None)
     }
 
-    async fn read_datum(
-        &self,
-        _hash: &Hash<32>,
-    ) -> DataPlaneResult<Option<TypedDatum>> {
+    async fn read_datum(&self, _hash: &Hash<32>) -> DataPlaneResult<Option<TypedDatum>> {
         Ok(None)
     }
 
-    async fn read_script(
-        &self,
-        _hash: &Hash<28>,
-    ) -> DataPlaneResult<Option<TypedScript>> {
+    async fn read_script(&self, _hash: &Hash<28>) -> DataPlaneResult<Option<TypedScript>> {
         Ok(None)
     }
 
@@ -103,10 +94,7 @@ impl ChainDataPlane for NullChainDataPlane {
         Ok(0)
     }
 
-    async fn holder_count(
-        &self,
-        _policy: &cardano_assets::PolicyId,
-    ) -> DataPlaneResult<u64> {
+    async fn holder_count(&self, _policy: &cardano_assets::PolicyId) -> DataPlaneResult<u64> {
         Ok(0)
     }
 

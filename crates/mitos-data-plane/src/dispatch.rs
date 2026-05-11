@@ -24,15 +24,15 @@
 
 use std::collections::HashMap;
 
+use crate::ChainDataPlane;
 use crate::block_events::{
-    datum_from_draft, DecodedBlockV2, InputDraft, MintDraft, OutputDraft, TxDraft,
+    DecodedBlockV2, InputDraft, MintDraft, OutputDraft, TxDraft, datum_from_draft,
 };
 use crate::types::{
     ChainPoint, ConsumedEvent, DataPlaneResult, DecodeLevel, InterestSet, MintedEvent, OutputRef,
     ProducedEvent, ReferencedEvent, TxContextEvent, TxEventBatch, TypedDatum, TypedOutput,
     UtxoEvent,
 };
-use crate::ChainDataPlane;
 
 /// Build per-TX event batches from a decoded block, filtering
 /// against the module's interest set. Async because prior-output
@@ -76,8 +76,10 @@ pub async fn build_event_batches<P: ChainDataPlane + Sync>(
     // emits the corresponding events with empty-but-typed
     // placeholder shapes (modules treat the absence as
     // "data plane couldn't resolve" same as today).
-    let mut resolved: HashMap<(pallas_primitives::Hash<32>, u32), (TypedOutput, Option<TypedDatum>)> =
-        HashMap::new();
+    let mut resolved: HashMap<
+        (pallas_primitives::Hash<32>, u32),
+        (TypedOutput, Option<TypedDatum>),
+    > = HashMap::new();
     for (oref, output) in resolved_outputs {
         let key = (oref.tx_hash, oref.index);
         let datum = output.datum.clone();
@@ -107,9 +109,8 @@ fn build_tx_batch(
         .reference_inputs
         .iter()
         .filter_map(|oref| {
-            let (mut prior_output, mut prior_datum) = resolved
-                .get(&(oref.tx_hash, oref.index))
-                .cloned()?;
+            let (mut prior_output, mut prior_datum) =
+                resolved.get(&(oref.tx_hash, oref.index)).cloned()?;
             backfill_prior_datum(&mut prior_output, &mut prior_datum, &tx.witness_datums);
             Some(UtxoEvent::Referenced(ReferencedEvent {
                 cursor: cursor.clone(),
@@ -287,9 +288,7 @@ mod tests {
             Ok(crate::types::ChainTip::origin())
         }
 
-        async fn protocol_params(
-            &self,
-        ) -> DataPlaneResult<crate::types::ProtocolParameters> {
+        async fn protocol_params(&self) -> DataPlaneResult<crate::types::ProtocolParameters> {
             Err(crate::types::DataPlaneError::NotYetImplemented(
                 "stub plane has no protocol params",
             ))
@@ -308,10 +307,7 @@ mod tests {
             })
         }
 
-        async fn utxos_by_address(
-            &self,
-            _address: &str,
-        ) -> DataPlaneResult<Vec<OutputRef>> {
+        async fn utxos_by_address(&self, _address: &str) -> DataPlaneResult<Vec<OutputRef>> {
             Ok(Vec::new())
         }
 
@@ -344,10 +340,7 @@ mod tests {
             Ok(0)
         }
 
-        async fn holder_count(
-            &self,
-            _policy: &cardano_assets::PolicyId,
-        ) -> DataPlaneResult<u64> {
+        async fn holder_count(&self, _policy: &cardano_assets::PolicyId) -> DataPlaneResult<u64> {
             Ok(0)
         }
     }
@@ -361,8 +354,8 @@ mod tests {
             cursor: ChainPoint::Slot(100),
             txs: Vec::new(),
         };
-        let interest = InterestSet::default()
-            .with_predicate(InterestPredicate::AtAddress("addr1".to_owned()));
+        let interest =
+            InterestSet::default().with_predicate(InterestPredicate::AtAddress("addr1".to_owned()));
         let batches = build_event_batches(block, &interest, &plane).await.unwrap();
         assert!(batches.is_empty());
     }
@@ -520,9 +513,7 @@ mod tests {
         };
         let interest = InterestSet::default()
             .with_predicate(InterestPredicate::AtAddress(watched_addr.to_owned()));
-        let batches = build_event_batches(block, &interest, &plane)
-            .await
-            .unwrap();
+        let batches = build_event_batches(block, &interest, &plane).await.unwrap();
 
         assert_eq!(batches.len(), 1, "consumed at watched addr matches");
         let consumed = batches[0]

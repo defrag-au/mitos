@@ -218,15 +218,16 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             }
         };
 
-        let payload = bytes.as_ref().and_then(|b| {
-            match pallas::codec::minicbor::decode::<PlutusData>(b) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::debug!(?hash, error = %e, "datum payload minicbor decode failed");
-                    None
-                }
-            }
-        });
+        let payload =
+            bytes
+                .as_ref()
+                .and_then(|b| match pallas::codec::minicbor::decode::<PlutusData>(b) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::debug!(?hash, error = %e, "datum payload minicbor decode failed");
+                        None
+                    }
+                });
 
         Some(TypedDatum {
             hash,
@@ -415,9 +416,8 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         // mainnet (`addr1...`) and testnet (`addr_test1...`)
         // forms, plus Byron (`Ae2.../DdzFF...`) which round-trip
         // through `to_vec()` to their canonical encoding too.
-        let addr = pallas_addresses::Address::from_bech32(address).map_err(|e| {
-            DataPlaneError::InvalidRequest(format!("address not bech32: {e:?}"))
-        })?;
+        let addr = pallas_addresses::Address::from_bech32(address)
+            .map_err(|e| DataPlaneError::InvalidRequest(format!("address not bech32: {e:?}")))?;
         let addr_bytes = addr.to_vec();
 
         let utxo_set = self
@@ -439,7 +439,11 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
                 "utxos_by_address result truncated at hard cap"
             );
         }
-        Ok(total.into_iter().take(HARD_CAP).map(OutputRef::from).collect())
+        Ok(total
+            .into_iter()
+            .take(HARD_CAP)
+            .map(OutputRef::from)
+            .collect())
     }
 
     async fn read_datum(
@@ -535,9 +539,8 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         let Some(block_body) = block_body else {
             return Ok(None);
         };
-        let block = MultiEraBlock::decode(block_body.as_slice()).map_err(|e| {
-            DataPlaneError::Decode(format!("MultiEraBlock decode: {e}"))
-        })?;
+        let block = MultiEraBlock::decode(block_body.as_slice())
+            .map_err(|e| DataPlaneError::Decode(format!("MultiEraBlock decode: {e}")))?;
         let tx = block
             .txs()
             .into_iter()
@@ -570,9 +573,8 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         let Some(block_body) = block_body else {
             return Ok(None);
         };
-        let block = MultiEraBlock::decode(block_body.as_slice()).map_err(|e| {
-            DataPlaneError::Decode(format!("MultiEraBlock decode: {e}"))
-        })?;
+        let block = MultiEraBlock::decode(block_body.as_slice())
+            .map_err(|e| DataPlaneError::Decode(format!("MultiEraBlock decode: {e}")))?;
         let block_hash = block.hash();
         let cursor = crate::types::ChainPoint::Specific(block.slot(), block_hash);
 
@@ -812,24 +814,22 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
         .mints()
         .iter()
         .flat_map(|policy_assets| {
-            let policy = match cardano_assets::PolicyId::new(hex::encode(
-                policy_assets.policy().as_slice(),
-            )) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "skip mint with invalid policy id");
-                    return Vec::new();
-                }
-            };
+            let policy =
+                match cardano_assets::PolicyId::new(hex::encode(policy_assets.policy().as_slice()))
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skip mint with invalid policy id");
+                        return Vec::new();
+                    }
+                };
             policy_assets
                 .assets()
                 .iter()
                 .map(|asset| crate::types::MintEntry {
                     policy: policy.clone(),
                     asset_name: asset.name().to_vec(),
-                    quantity_delta: asset
-                        .any_coin()
-                        .clamp(i64::MIN as i128, i64::MAX as i128)
+                    quantity_delta: asset.any_coin().clamp(i64::MIN as i128, i64::MAX as i128)
                         as i64,
                 })
                 .collect::<Vec<_>>()
@@ -885,12 +885,12 @@ pub fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> Typ
         .assets()
         .iter()
         .flat_map(|policy_assets| {
-            let policy = match cardano_assets::PolicyId::new(hex::encode(
-                policy_assets.policy().as_slice(),
-            )) {
-                Ok(p) => p,
-                Err(_) => return Vec::new(),
-            };
+            let policy =
+                match cardano_assets::PolicyId::new(hex::encode(policy_assets.policy().as_slice()))
+                {
+                    Ok(p) => p,
+                    Err(_) => return Vec::new(),
+                };
             policy_assets
                 .assets()
                 .iter()

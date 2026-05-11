@@ -31,9 +31,7 @@ use mitos_platform::host_v2::{
 };
 use mitos_platform::registry_v2::ResourceBudget;
 use mitos_platform::storage::ModuleStorage;
-use mitos_protocol::{
-    AssetSelector, Interest as WireInterest, InterestOp as WireInterestOp,
-};
+use mitos_protocol::{AssetSelector, Interest as WireInterest, InterestOp as WireInterestOp};
 use pallas_primitives::Hash;
 use tokio::sync::Mutex;
 
@@ -161,8 +159,8 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
     // The fixture data plane returns these pairs from
     // `search_utxos(holds_policy(P))` so the bootstrap path has
     // real synthesised events to dispatch.
-    let decoded = mitos_data_plane::block_events::decode_block_v2(&cbor)
-        .expect("decode block fixture");
+    let decoded =
+        mitos_data_plane::block_events::decode_block_v2(&cbor).expect("decode block fixture");
     let mut counts: HashMap<String, usize> = HashMap::new();
     for tx in &decoded.txs {
         for out in &tx.outputs {
@@ -175,8 +173,7 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
         .into_iter()
         .max_by_key(|(_, n)| *n)
         .expect("block fixture has at least one asset");
-    let watched_policy =
-        PolicyId::new(watched_policy_hex.clone()).expect("valid policy id");
+    let watched_policy = PolicyId::new(watched_policy_hex.clone()).expect("valid policy id");
 
     let mut fixture_outputs: Vec<(OutputRef, TypedOutput)> = Vec::new();
     for tx in &decoded.txs {
@@ -187,10 +184,7 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
                 .iter()
                 .any(|a| a.policy_id == watched_policy);
             if holds_target {
-                fixture_outputs.push((
-                    OutputRef::new(tx.tx_hash, idx as u32),
-                    out.output.clone(),
-                ));
+                fixture_outputs.push((OutputRef::new(tx.tx_hash, idx as u32), out.output.clone()));
             }
         }
     }
@@ -216,11 +210,9 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
     // assertion. Same pattern dispatch_v2 / dynamic_interest_v2 use.
     let companions_dir = storage.module_dir_for_companions("test-indexer");
     std::fs::create_dir_all(&companions_dir).expect("companions dir");
-    std::fs::write(companions_dir.join("test-companion.cbor"), b"")
-        .expect("companion stub");
+    std::fs::write(companions_dir.join("test-companion.cbor"), b"").expect("companion stub");
 
-    let engine =
-        mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
+    let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(FixturePolicyDataPlane {
         target_policy: watched_policy.clone(),
         fixture_outputs,
@@ -262,13 +254,9 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
     // `update-interest` export.
     let mut wire_interest = WireInterest::any();
     wire_interest.asset = AssetSelector::Policy(watched_policy);
-    host.route_interest(
-        "test-indexer",
-        WireInterestOp::Add,
-        vec![wire_interest],
-    )
-    .await
-    .expect("route_interest");
+    host.route_interest("test-indexer", WireInterestOp::Add, vec![wire_interest])
+        .await
+        .expect("route_interest");
 
     // Bootstrap is a fire-and-forget hop on the follower's
     // interest channel. Wait long enough for the page walk +

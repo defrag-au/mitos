@@ -88,10 +88,7 @@ pub async fn run_bootstrap<P: ChainDataPlane + Sync>(
 
     // ----- address scans (current-state hydration via
     // `utxos_by_address`).
-    let addresses: Vec<String> = interest
-        .watched_addresses()
-        .map(|s| s.to_owned())
-        .collect();
+    let addresses: Vec<String> = interest.watched_addresses().map(|s| s.to_owned()).collect();
     stats.addresses_seen = addresses.len();
     for address in addresses {
         let key = bootstrap_flag_key_for_address(&address);
@@ -263,10 +260,8 @@ async fn scan_one_address<P: ChainDataPlane + Sync>(
     }
     // `read_output_datums` is parallel-to-input; pair against
     // the requested refs in order.
-    let mut datum_by_ref: std::collections::HashMap<
-        (Hash<32>, u32),
-        mitos_data_plane::TypedDatum,
-    > = std::collections::HashMap::new();
+    let mut datum_by_ref: std::collections::HashMap<(Hash<32>, u32), mitos_data_plane::TypedDatum> =
+        std::collections::HashMap::new();
     for (oref, datum_opt) in refs.iter().zip(datums) {
         if let Some(td) = datum_opt {
             datum_by_ref.insert((oref.tx_hash, oref.index), td);
@@ -398,10 +393,8 @@ async fn scan_one_policy<P: ChainDataPlane + Sync>(
     for (oref, out) in all_outputs {
         output_by_ref.insert((oref.tx_hash, oref.index), out);
     }
-    let mut datum_by_ref: std::collections::HashMap<
-        (Hash<32>, u32),
-        mitos_data_plane::TypedDatum,
-    > = std::collections::HashMap::new();
+    let mut datum_by_ref: std::collections::HashMap<(Hash<32>, u32), mitos_data_plane::TypedDatum> =
+        std::collections::HashMap::new();
     for (oref, datum_opt) in refs.iter().zip(datums) {
         if let Some(td) = datum_opt {
             datum_by_ref.insert((oref.tx_hash, oref.index), td);
@@ -554,10 +547,7 @@ pub fn interest_from_addresses(addresses: &[String]) -> InterestSet {
 /// hydrate via `search_utxos(holds_policy)`. Idempotent — the
 /// per-scope state-kv flag prevents repeated scans across
 /// restarts.
-pub fn interest_from_manifest(
-    addresses: &[String],
-    policy_hexes: &[String],
-) -> InterestSet {
+pub fn interest_from_manifest(addresses: &[String], policy_hexes: &[String]) -> InterestSet {
     let mut set = interest_from_addresses(addresses);
     for hex in policy_hexes {
         match cardano_assets::PolicyId::new(hex.clone()) {

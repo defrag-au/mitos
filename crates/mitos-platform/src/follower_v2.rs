@@ -19,11 +19,11 @@ use dolos_core::{TipEvent, TipSubscription};
 use mitos_data_plane::ChainDataPlane;
 use tokio_util::sync::CancellationToken;
 
+use crate::PlatformResult;
 use crate::driver_v2::DriverV2;
 use crate::host_v2::{InterestUpdate, KvFactory};
 use crate::storage::ModuleStorage;
-use crate::trap_context::{write_fixture, TrapContextLogger};
-use crate::PlatformResult;
+use crate::trap_context::{TrapContextLogger, write_fixture};
 
 /// Run the v2 chain follower until cancelled or the tip
 /// channel closes.
@@ -117,11 +117,7 @@ where
                 trap_logger.set_block(cp.slot(), block_bytes.to_vec());
                 match driver.apply_block(block_bytes, data_plane.as_ref()).await {
                     Ok(outcome) => {
-                        tracing::trace!(
-                            ?point,
-                            ?outcome,
-                            "v2 follower: applied",
-                        );
+                        tracing::trace!(?point, ?outcome, "v2 follower: applied",);
                         flush_cursor(&storage, &module_id, &driver);
                     }
                     Err(crate::PlatformError::Decode(e)) => {
@@ -283,7 +279,10 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
         WireOp::Remove => crate::bindings_v2::InterestOp::Remove,
         WireOp::Replace => crate::bindings_v2::InterestOp::Replace,
     };
-    match driver.call_update_interest(bindgen_op, &update.items_cbor).await {
+    match driver
+        .call_update_interest(bindgen_op, &update.items_cbor)
+        .await
+    {
         Ok(Ok(())) => {
             tracing::debug!(
                 module = %module_id,

@@ -389,9 +389,8 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             Ok(()) => {
                 let frame = ClientMessage::RecaptureReady;
                 let bytes = encode_client(&frame)?;
-                ws.send_with_bytes(&bytes).map_err(|e| {
-                    CompanionError::Wire(format!("send RecaptureReady: {e}"))
-                })?;
+                ws.send_with_bytes(&bytes)
+                    .map_err(|e| CompanionError::Wire(format!("send RecaptureReady: {e}")))?;
                 tracing::info!(
                     module = %module,
                     "on_recapture complete; sent RecaptureReady"

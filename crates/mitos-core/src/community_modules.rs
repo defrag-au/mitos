@@ -1,13 +1,13 @@
 //! Community-module auto-load.
 //!
 //! Walks a `community-modules/<name>/` directory tree and activates
-//! any module whose pre-built artifact (`target/mitos/<name>/<name>.wasm`
-//! + `target/mitos/<name>/manifest.toml`) is present and differs from
+//! any module whose pre-built artifact is present and differs from
 //! the currently-activated artifact under `<modules_dir>/<name>/`.
-//! That path matches the default `--out` of `mitos-build`, so a
-//! deploy that runs `mitos-build --module <path>` for each community
-//! module on the box drops the artifacts straight where auto-load
-//! reads them.
+//! The artifact lives at `target/mitos/<name>/<name>.wasm` paired
+//! with `target/mitos/<name>/manifest.toml` — that path matches
+//! the default `--out` of `mitos-build`, so a deploy that runs
+//! `mitos-build --module <path>` for each community module on the
+//! box drops the artifacts straight where auto-load reads them.
 //!
 //! Idempotent: re-running with the same artifacts is a no-op. Skips
 //! modules without a pre-built artifact (operator hasn't run

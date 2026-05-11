@@ -188,8 +188,8 @@ async fn subscribe_handler(
     State(state): State<CompanionState>,
     body: axum::body::Bytes,
 ) -> std::result::Result<Response, SubscribeError> {
-    let request = SubscribeRequest::decode(&body[..])
-        .map_err(|e| SubscribeError::Decode(e.to_string()))?;
+    let request =
+        SubscribeRequest::decode(&body[..]).map_err(|e| SubscribeError::Decode(e.to_string()))?;
 
     validate_companion_key(&request.companion_key)?;
 

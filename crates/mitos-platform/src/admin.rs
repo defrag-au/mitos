@@ -667,9 +667,11 @@ async fn last_trap(
             body,
         )
             .into_response()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok((StatusCode::NOT_FOUND, "no trap fixture captured for this module").into_response())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((
+            StatusCode::NOT_FOUND,
+            "no trap fixture captured for this module",
+        )
+            .into_response()),
         Err(e) => Err(HandlerError::Storage(StorageError::Io(e))),
     }
 }
@@ -705,9 +707,11 @@ async fn get_block_by_slot(
             bytes,
         )
             .into_response()),
-        Ok(None) => {
-            Ok((StatusCode::NOT_FOUND, "no block at this slot in the archive").into_response())
-        }
+        Ok(None) => Ok((
+            StatusCode::NOT_FOUND,
+            "no block at this slot in the archive",
+        )
+            .into_response()),
         Err(e) => Err(HandlerError::ChainData(format!("read_block: {e}"))),
     }
 }
@@ -729,12 +733,12 @@ async fn get_block_by_tx(
             .into_response());
     };
 
-    let bytes = hex::decode(&tx_hash_hex)
-        .map_err(|_| HandlerError::BadTxHash(tx_hash_hex.clone()))?;
-    let tx_hash: pallas_primitives::Hash<32> = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| HandlerError::BadTxHash(tx_hash_hex.clone()))?;
+    let bytes =
+        hex::decode(&tx_hash_hex).map_err(|_| HandlerError::BadTxHash(tx_hash_hex.clone()))?;
+    if bytes.len() != 32 {
+        return Err(HandlerError::BadTxHash(tx_hash_hex));
+    }
+    let tx_hash: pallas_primitives::Hash<32> = bytes.as_slice().into();
 
     let slot = match chain_data.slot_by_tx_hash(&tx_hash).await {
         Ok(Some(s)) => s,
@@ -748,7 +752,10 @@ async fn get_block_by_tx(
         Ok(Some(bytes)) => Ok((
             StatusCode::OK,
             [
-                (axum::http::header::CONTENT_TYPE, "application/cbor".to_owned()),
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/cbor".to_owned(),
+                ),
                 (
                     axum::http::HeaderName::from_static("x-mitos-block-slot"),
                     slot.to_string(),
@@ -875,10 +882,9 @@ async fn list_emissions(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let store = state
-        .storage
-        .emissions_store(&id)
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+    let store = state.storage.emissions_store(&id).map_err(|e| {
+        HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+    })?;
 
     let status_filter = parse_status_filter(q.status.as_deref());
     let companion_filter: Option<String> = q
@@ -895,16 +901,20 @@ async fn list_emissions(
                 return false;
             }
             if let Some(key) = &companion_filter
-                && &r.companion_id != key {
-                    return false;
-                }
+                && &r.companion_id != key
+            {
+                return false;
+            }
             if let Some(statuses) = &status_filter
-                && !statuses.contains(&r.status) {
-                    return false;
-                }
+                && !statuses.contains(&r.status)
+            {
+                return false;
+            }
             true
         })
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+        .map_err(|e| {
+            HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+        })?;
 
     // Aggregate-by-status across the FULL match set (before
     // limit-truncation) so operators can see "10 acked, 3
@@ -915,7 +925,11 @@ async fn list_emissions(
     }
 
     let total = all_matching.len();
-    let rows: Vec<EmissionView> = all_matching.iter().take(limit).map(EmissionView::from).collect();
+    let rows: Vec<EmissionView> = all_matching
+        .iter()
+        .take(limit)
+        .map(EmissionView::from)
+        .collect();
     Ok(Json(EmissionsListResponse {
         rows,
         total,
@@ -932,10 +946,9 @@ async fn purge_emissions(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let store = state
-        .storage
-        .emissions_store(&id)
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+    let store = state.storage.emissions_store(&id).map_err(|e| {
+        HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+    })?;
 
     // Refuse to operate without an explicit status filter.
     // Default ("queued,pending") is the actionable backlog —
@@ -951,12 +964,11 @@ async fn purge_emissions(
             )))
         })?
         .to_owned();
-    let status_filter = parse_status_filter(Some(&raw))
-        .ok_or_else(|| {
-            HandlerError::Storage(StorageError::Io(std::io::Error::other(
-                "purge requires a non-`all` status filter; reject blast-radius purges",
-            )))
-        })?;
+    let status_filter = parse_status_filter(Some(&raw)).ok_or_else(|| {
+        HandlerError::Storage(StorageError::Io(std::io::Error::other(
+            "purge requires a non-`all` status filter; reject blast-radius purges",
+        )))
+    })?;
     let companion_filter: Option<String> = q
         .companion_key
         .as_deref()
@@ -966,12 +978,15 @@ async fn purge_emissions(
     let purged = store
         .purge(|r| {
             if let Some(key) = &companion_filter
-                && &r.companion_id != key {
-                    return false;
-                }
+                && &r.companion_id != key
+            {
+                return false;
+            }
             status_filter.contains(&r.status)
         })
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+        .map_err(|e| {
+            HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+        })?;
 
     tracing::info!(
         module = %id,
@@ -994,14 +1009,13 @@ async fn replay_emission(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let store = state
-        .storage
-        .emissions_store(&id)
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+    let store = state.storage.emissions_store(&id).map_err(|e| {
+        HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+    })?;
 
-    let Some(record) = store
-        .get(emission_id)
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?
+    let Some(record) = store.get(emission_id).map_err(|e| {
+        HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+    })?
     else {
         return Ok((
             StatusCode::NOT_FOUND,
@@ -1019,8 +1033,15 @@ async fn replay_emission(
             .unwrap_or(0)
     );
     store
-        .update_status(emission_id, crate::emissions::EmissionStatus::Queued, &now, None)
-        .map_err(|e| HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string()))))?;
+        .update_status(
+            emission_id,
+            crate::emissions::EmissionStatus::Queued,
+            &now,
+            None,
+        )
+        .map_err(|e| {
+            HandlerError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+        })?;
 
     tracing::info!(
         module = %id,

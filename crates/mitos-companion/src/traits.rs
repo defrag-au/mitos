@@ -140,12 +140,7 @@ pub trait MitosCompanion: Send + Sync + 'static {
     ///
     /// `reason` is the free-form operator-supplied label from the
     /// admin endpoint, useful for logs.
-    async fn on_recapture(
-        &self,
-        _ctx: &Ctx,
-        module: &str,
-        reason: Option<&str>,
-    ) -> Result<()> {
+    async fn on_recapture(&self, _ctx: &Ctx, module: &str, reason: Option<&str>) -> Result<()> {
         tracing::warn!(
             module = %module,
             reason = ?reason,

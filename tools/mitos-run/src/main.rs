@@ -21,9 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::Parser;
-use mitos_data_plane::{
-    DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput,
-};
+use mitos_data_plane::{DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 use mitos_platform::host_fns::DataPlaneFacade;
 use serde::Deserialize;
 
@@ -77,9 +75,11 @@ async fn main() -> Result<()> {
     // come through the `tracing` subscriber at whatever level
     // the module passed; platform-internal traces at info+.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| tracing_subscriber::EnvFilter::new("info,jpg_co_module=debug,mitos_platform=info"),
-        ))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,jpg_co_module=debug,mitos_platform=info")
+            }),
+        )
         .with_target(true)
         .init();
 
@@ -251,8 +251,8 @@ impl FixtureDataPlane {
         let mut aux_by_tx = HashMap::new();
 
         for u in fixture.utxo {
-            let tx_hash = decode_32(&u.tx_hash)
-                .with_context(|| format!("utxo tx_hash {}", u.tx_hash))?;
+            let tx_hash =
+                decode_32(&u.tx_hash).with_context(|| format!("utxo tx_hash {}", u.tx_hash))?;
             let oref = OutputRef::from_bytes(tx_hash, u.index);
 
             // Project fixture datum fields onto the TypedOutput
@@ -271,19 +271,14 @@ impl FixtureDataPlane {
                 .as_deref()
                 .map(hex::decode)
                 .transpose()
-                .with_context(|| {
-                    format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index)
-                })?;
+                .with_context(|| format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index))?;
             let datum = datum_hash_bytes.map(|h| mitos_data_plane::TypedDatum {
                 hash: pallas_primitives::Hash::new(h),
                 payload: None,
                 original_cbor: datum_payload,
             });
 
-            by_address
-                .entry(u.address.clone())
-                .or_default()
-                .push(oref);
+            by_address.entry(u.address.clone()).or_default().push(oref);
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
                 ResolvedUtxo {
@@ -357,9 +352,10 @@ impl FixtureDataPlane {
             for plutus_data in tx.plutus_data() {
                 use pallas::ledger::traverse::OriginalHash;
                 let hash_bytes = plutus_data.original_hash().to_vec();
-                if !self.datums_by_hash.contains_key(&hash_bytes) {
-                    self.datums_by_hash
-                        .insert(hash_bytes, plutus_data.raw_cbor().to_vec());
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.datums_by_hash.entry(hash_bytes)
+                {
+                    e.insert(plutus_data.raw_cbor().to_vec());
                     harvested += 1;
                 }
             }
@@ -389,16 +385,17 @@ impl FixtureDataPlane {
                         original_cbor: inline_bytes,
                     });
                 }
-                let oref = mitos_data_plane::OutputRef::from_bytes(
-                    tx_hash_bytes_owned,
-                    idx as u32,
-                );
+                let oref = mitos_data_plane::OutputRef::from_bytes(tx_hash_bytes_owned, idx as u32);
                 self.by_address
                     .entry(typed_output.address.clone())
                     .or_default()
                     .push(oref);
-                self.by_ref
-                    .insert(key, ResolvedUtxo { output: typed_output });
+                self.by_ref.insert(
+                    key,
+                    ResolvedUtxo {
+                        output: typed_output,
+                    },
+                );
                 harvested += 1;
             }
         }
@@ -497,10 +494,7 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
         Ok(0)
     }
 
-    async fn holder_count(
-        &self,
-        _policy: &cardano_assets::PolicyId,
-    ) -> DataPlaneResult<u64> {
+    async fn holder_count(&self, _policy: &cardano_assets::PolicyId) -> DataPlaneResult<u64> {
         Ok(0)
     }
 
@@ -580,9 +574,9 @@ async fn run_v2(
     for path in blocks {
         let cbor = fs::read(path)
             .with_context(|| format!("read block for aux harvest {}", path.display()))?;
-        total_harvested += dp_inner.harvest_block_aux(&cbor).with_context(|| {
-            format!("harvest aux-data from {}", path.display())
-        })?;
+        total_harvested += dp_inner
+            .harvest_block_aux(&cbor)
+            .with_context(|| format!("harvest aux-data from {}", path.display()))?;
     }
     if total_harvested > 0 {
         println!(
@@ -596,8 +590,7 @@ async fn run_v2(
     let kv = state_kv::ModuleKv::new_in_memory();
     let (sink, mut events_rx) = emit::EventSink::new();
 
-    let engine =
-        ModuleRegistryV2::build_engine().map_err(|e| anyhow::anyhow!("v2 engine: {e}"))?;
+    let engine = ModuleRegistryV2::build_engine().map_err(|e| anyhow::anyhow!("v2 engine: {e}"))?;
     let registry = ModuleRegistryV2::load_from_path(engine, module_id.to_owned(), wasm_path)
         .map_err(|e| anyhow::anyhow!("v2 load: {e}"))?;
 
@@ -666,7 +659,10 @@ async fn run_v2(
         .await
     {
         Ok(Ok(())) => {
-            println!("✓ update_interest(Replace, {} bytes) returned cleanly", items_cbor.len());
+            println!(
+                "✓ update_interest(Replace, {} bytes) returned cleanly",
+                items_cbor.len()
+            );
         }
         Ok(Err(e)) => {
             eprintln!("✗ update_interest returned Err: {e}");
@@ -686,13 +682,8 @@ async fn run_v2(
     let mut collected_emits: Vec<serde_json::Value> = Vec::new();
 
     for path in blocks {
-        let cbor = fs::read(path)
-            .with_context(|| format!("read block {}", path.display()))?;
-        println!(
-            "▸ apply_block: {} ({} bytes)",
-            path.display(),
-            cbor.len()
-        );
+        let cbor = fs::read(path).with_context(|| format!("read block {}", path.display()))?;
+        println!("▸ apply_block: {} ({} bytes)", path.display(), cbor.len());
         match driver.apply_block(&cbor, dp.as_ref()).await {
             Ok(ApplyOutcomeV2::Applied) => {
                 println!("  ✓ Applied (events dispatched)");
@@ -715,11 +706,8 @@ async fn run_v2(
         let mut block_emitted = 0;
         while let Ok(event) = events_rx.try_recv() {
             block_emitted += 1;
-            let decoded = mitos_community_events::decode_emit(
-                &module_id,
-                event.channel,
-                &event.payload,
-            );
+            let decoded =
+                mitos_community_events::decode_emit(module_id, event.channel, &event.payload);
             match &decoded {
                 Some(json) => {
                     println!(
@@ -793,9 +781,15 @@ async fn run_v2(
                 "  re-run with UPDATE_GOLDEN=1 to accept the new shape (review the diff first)"
             );
             eprintln!("---- expected ----");
-            eprintln!("{}", serde_json::to_string_pretty(&expected).unwrap_or_default());
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&expected).unwrap_or_default()
+            );
             eprintln!("---- actual ----");
-            eprintln!("{}", serde_json::to_string_pretty(&actual).unwrap_or_default());
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&actual).unwrap_or_default()
+            );
             std::process::exit(1);
         }
     }
@@ -803,9 +797,7 @@ async fn run_v2(
     Ok(())
 }
 
-fn build_interest_set(
-    preds: &[FixtureInterestPredicate],
-) -> Result<mitos_data_plane::InterestSet> {
+fn build_interest_set(preds: &[FixtureInterestPredicate]) -> Result<mitos_data_plane::InterestSet> {
     use cardano_assets::PolicyId;
     use mitos_data_plane::{InterestPredicate, InterestSet, StakeCred};
 
