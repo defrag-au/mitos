@@ -107,8 +107,9 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         &self.state
     }
 
-    /// Borrow the inner companion. Useful for tests + RPC handler
-    /// dispatch (PR 6 work).
+    /// Borrow the inner companion. Useful for tests + dApp-level
+    /// dispatch where the runtime needs to reach into the trait
+    /// impl directly (e.g. RPC handlers the dApp owns).
     pub fn inner(&self) -> &C {
         &self.inner
     }
@@ -319,10 +320,12 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 
     async fn dispatch_undo(&self, cursor: ChainPoint) -> Result<()> {
         // Default semantics: log + advance cursor. Channels' undo
-        // hooks fire when reorg-aware dApps opt in. v1 fans the undo
-        // call to all channels (broadcast) since the wire frame
-        // doesn't carry a channel name; channels' default impl just
-        // logs. Refine in PR 4 (multi-channel) if needed.
+        // hooks fire when reorg-aware dApps opt in. Today we fan
+        // the undo call to all channels (broadcast) since the wire
+        // frame doesn't carry a channel name; channels' default
+        // impl just logs. Multi-channel companions that need
+        // channel-targeted undo will require the wire to grow a
+        // channel-name field; not currently a blocker.
         let sql = self.state.storage().sql();
         for ch in &self.channels {
             let ctx = Ctx::new(cursor.clone(), ch.name().to_string(), sql.clone());
@@ -475,9 +478,9 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// onboarding to materialise the DO and run the HTTPS subscribe
     /// call against mitos. Reads the persisted cursor from DO SQLite
     /// (Q4) and the cached interest set from `mitos_companion_interest`
-    /// (PR 2 wires the dynamic-interest helpers; for PR 1 the interest
-    /// set is empty), POSTs `SubscribeRequest` to the mitos host, and
-    /// caches the result so subsequent wakes can short-circuit.
+    /// (populated via `/api/_interest/subscribe`), POSTs
+    /// `SubscribeRequest` to the mitos host, and caches the result so
+    /// subsequent wakes can short-circuit.
     ///
     /// dApp Worker pattern (per design doc "Bootstrapping" subsection):
     ///
@@ -486,12 +489,11 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// stub.fetch_with_str("/_internal/wake").await?;
     /// ```
     async fn handle_wake(&self) -> worker::Result<Response> {
-        // Determine the companion key. PR 1 uses the DO's own name as
-        // the Companion key — the dApp Worker creates the DO with
-        // `id_from_name(companion_key)`, so `state.id().name()` is the
-        // round-trip. (PR 5 will introduce a more flexible mechanism
-        // when collections-mitos consolidates from per-policy to
-        // per-customer keys.)
+        // The companion key is the DO's own name — the dApp Worker
+        // creates the DO with `id_from_name(companion_key)`, so
+        // `state.id().name()` round-trips. Multi-tenant dApps that
+        // want richer key derivation (e.g. per-customer) override
+        // by passing the name explicitly through their wrapper.
         let companion_key = self
             .state
             .id()
@@ -505,9 +507,8 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // Pull the canonical interest set from DO SQLite. Sent to
         // the host as `Vec<mitos_protocol::Interest>` in the
         // subscribe payload — host persists this as the
-        // companion's registration. (PR 3 wires the host's
-        // dial-back to deliver matching emissions; until then,
-        // this is the canonical-source-of-record handshake.)
+        // companion's registration; the dialer uses it for the
+        // filter applied to outbound Apply frames.
         let interest_rows = crate::interest::list_interests(&sql)?;
         let mut interests = crate::interest::rows_to_interests(&interest_rows);
         // Append the companion's programmatic initial-interest
@@ -577,10 +578,9 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// row. Body: `InterestMutateRequest`. On success, emits a
     /// `ClientMessage::Interest { op: Add, items: [Interest] }`
     /// frame over the held WS so the host's running module picks
-    /// up the new filter immediately. (Host-side WS-receive-loop
-    /// wiring lands in PR 3 alongside the dial-back path; PR 2
-    /// validates the companion-side surface end-to-end via
-    /// the SQL row + WS-frame send.)
+    /// up the new filter immediately. Host-side receive-loop
+    /// routes the frame into the module's `update-interest`
+    /// export via the `InterestRouter` trait.
     async fn handle_interest_subscribe(&self, mut req: Request) -> worker::Result<Response> {
         let payload: crate::interest::InterestMutateRequest = req.json().await?;
         let channel = payload.channel.clone().unwrap_or_default();
@@ -640,8 +640,8 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 
     /// Send `ClientMessage::Interest { op, items }` frames to the
     /// companion's held WS connections, filtering items per
-    /// channel so multi-channel companions (PR 4) don't bleed
-    /// ownership interests into a marketplace WS, etc.
+    /// channel so multi-channel companions don't bleed ownership
+    /// interests into a marketplace WS, etc.
     ///
     /// Routing rules:
     ///

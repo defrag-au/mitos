@@ -1,8 +1,6 @@
 //! Bundle: owns the domain, registers indexers, runs the framework.
 //!
-//! Replaces the hand-rolled composition that lived inline in
-//! `bundles/default/src/main.rs` during Phase 1. Bundle authors now
-//! write:
+//! Bundle authors compose the framework as:
 //!
 //! ```ignore
 //! let mut bundle = Bundle::new(domain, config, listen_addr);

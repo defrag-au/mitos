@@ -1,10 +1,29 @@
 # Mitos companion runtime v1
 
+> **Status: shipped (PRs 1–5 landed; PR 6+ post-shipping
+> refinement merged into the codebase organically).** The crate
+> exists at `crates/mitos-companion/`. Production consumers:
+> `cnft.dev-workers/workers/jpg-store-mirror/` (single-module
+> companion, recapture-enabled) and
+> `cnft.dev-workers/workers/collections-mitos/`. The "PR
+> ordering" further down was the delivery plan; current state of
+> each piece is in the code.
+>
+> **For dApp-author use:** read
+> `../HOWTO_CONSUMING_A_COMMUNITY_MODULE.md` first — it covers
+> the current MitosCompanion trait surface, the on_recapture
+> hook, multi-target subscribe, and the runtime's WS Hibernation
+> + emission-id semantics.
+>
+> Body retained as the design rationale + the decision log for
+> the trait shape, output gate, and Q1–Q8 questions resolved
+> during delivery.
+
 The CF Worker / Durable Object half of the paired-deployable
 shape laid out in `MITOS_COMPANION_PATTERN.md`. This doc
-captures the **concrete v1 implementation shape** for the
-companion-side runtime SDK: what's in it, what stays dApp-side,
-crate location, trait surface, and order of operations.
+captures the v1 implementation shape for the companion-side
+runtime SDK: what's in it, what stays dApp-side, crate location,
+trait surface, and order of operations.
 
 Sister to:
 - `MITOS_COMPANION_PATTERN.md` — the paired-deployable thesis

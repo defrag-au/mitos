@@ -39,7 +39,8 @@ use crate::transport::WsTransport;
 /// Slow consumers that fall behind get a `Lagged` error and the pump
 /// drops their connection — they reconnect via the resume / snapshot
 /// path. Sized for one block's worth of busy chain activity (~hundreds
-/// of changes) plus headroom; production tuning is Phase 4.5 work.
+/// of changes) plus headroom; revisit if production traffic patterns
+/// regularly hit this ceiling.
 const BROADCAST_CAPACITY: usize = 4096;
 
 /// Object-safe view of an `Indexer<DomainAdapter>` for storage in
@@ -71,8 +72,9 @@ pub trait IndexerHandle: Send + Sync {
 
     /// Run the per-consumer pump until the consumer disconnects or
     /// drops. Owns the subscribe handshake, broadcast→ws forwarding,
-    /// scope filtering, and (Phase 4.5) ack-driven retransmit-buffer
-    /// trim.
+    /// and scope filtering. Ack-driven retransmit-buffer trim is
+    /// future work — today the broadcast channel's bounded capacity
+    /// applies backpressure without per-consumer trim.
     ///
     /// `transport` is direction-agnostic — server-accepted axum
     /// WebSocket or client-dialed tungstenite stream both work.
@@ -239,9 +241,11 @@ where
             send(
                 &mut transport,
                 &ServerMessage::Apply {
-                    // emission_id stays 0 until PR 3 wires the
-                    // emissions log; companions tolerate the
-                    // default via `#[serde(default)]`.
+                    // emission_id = 0 on the legacy replicator lane
+                    // — the emissions log is per-companion and
+                    // doesn't apply to direct in-tree-indexer
+                    // subscribers. Companions tolerate the default
+                    // via `#[serde(default)]`.
                     emission_id: 0,
                     cursor: chain_point_to_wire(&resume_cursor),
                     change: buf,
@@ -351,7 +355,7 @@ where
 /// `select!` runs them sequentially — only one branch holds the
 /// borrow at a time, so this is safe without a transport split.
 ///
-/// Inbound frames (Phase B handling, PR 3b):
+/// Inbound frames handled:
 /// - `ClientMessage::Interest { op, items }` — forwarded to the
 ///   `inbound_handler` if one is wired. Bundle wires this to the
 ///   running module's `update-interest` host call.

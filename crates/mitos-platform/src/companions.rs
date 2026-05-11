@@ -6,23 +6,23 @@
 //! wake. Mitos persists the registration so it can later dial back
 //! to deliver emissions.
 //!
-//! ## What's wired (as of PR 3 foundation work)
+//! ## What this module owns
 //!
 //! - `POST /api/companions/subscribe` — accepts CBOR, persists to
 //!   `<storage>/<module_id>/companions/<companion_key>.cbor`,
-//!   responds with `next_emission_id` from the module's
-//!   `EmissionsStore` (`peek_next_id`). Companions use the
-//!   returned value as a sync point.
+//!   hands the registration to the `CompanionDialer` to start an
+//!   outbound dial loop, responds with `next_emission_id` from
+//!   the module's `EmissionsStore` (`peek_next_id`). Companions
+//!   use the returned value as a sync point.
 //! - Auth via the existing `MITOS_AUTH_TOKEN` shared-secret
 //!   middleware.
 //!
+//! The actual outbound dial + Apply-frame delivery lives in
+//! `dialer.rs` (`CompanionDialer::run_companion`); this module
+//! only handles registration intake.
+//!
 //! ## Still deferred
 //!
-//! - Actual dial-back over WS to the registered companion's URL.
-//!   The address book is persisted; the dial loop is not yet
-//!   wired (lands alongside the WS-receive-loop refactor when
-//!   PR 5's collections-mitos migration drives a real consumer
-//!   workload).
 //! - Idempotency-aware overwrite semantics with last-modified
 //!   timestamps.
 //! - Auto-cleanup of registrations for evicted companions.

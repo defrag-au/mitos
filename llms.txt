@@ -117,7 +117,7 @@ the host persists, dials back, and starts streaming.
 ### To build the wasm module side
 - [Platform v1](docs/strategy/MITOS_PLATFORM_V1.md) — wasm-module runtime, WIT ABI, resource limits, trap policies.
 - [Module deployment](docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md) — mitos-build + mitos-admin upload-module flow.
-- [WIT contract](crates/mitos-platform/wit/world.wit) — exact ABI: `init`, `handle-event`, `update-interest`, host fns (`chain-data`, `state-kv`, `emit`, `logging`).
+- [WIT contract](crates/mitos-platform/wit-v2/world.wit) — exact ABI (v2): eUTXO event-stream dispatch, `init`, `handle-events`, `update-interest`, host fns (`chain-data`, `state-kv`, `emit`, `logging`).
 
 ### To build the CF Worker companion side
 - [Companion runtime](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md) — `MitosCompanionRuntime`, channels, subscribe call, dynamic interest, Ack/Nack semantics.
@@ -125,7 +125,8 @@ the host persists, dials back, and starts streaming.
 - [Subscription mechanics](docs/design/SUBSCRIPTION_MECHANICS.md) — `Interest` vocabulary, asset / domain / value selectors.
 
 ### To operate a deployment
-- [Deploy procedure](docs/PR3B_DEPLOYMENT.md) — rsync + cargo build on the host, wrangler deploy on the CF side.
+- `scripts/deploy.sh` — rsync + cargo build on the host + systemctl restart; full operator procedure in `~/code/defrag/infra/docs/mitos-operations.md`.
+- [Recapture procedure](docs/design/RECAPTURE.md) — operator-driven coordinated state rebuild via `mitos-admin recapture <module>`.
 - [redb access pattern](docs/design/REDB_ACCESS.md) — host's storage discipline; relevant if you touch host code.
 
 ## Reference dApp

@@ -25,10 +25,12 @@
 //!   `script` string inside the divergent-shape variant's `Unknown`
 //!   payload arm — never as a string in the brand enum itself.
 //!
-//! Phase 1 lands the type definitions only. The marketplace
-//! indexer's translator from `TxClassification` -> `Marketplace`
-//! and the trait surgery (`Scope = Interest`) come in Phase 2 / 4
-//! respectively.
+//! The marketplace indexer's translator from `TxClassification`
+//! -> `Marketplace` lives in
+//! `crates/marketplace-indexer/src/translator.rs`; the
+//! `Scope = Vec<Interest>` trait surgery is wired across the
+//! in-tree indexers (`marketplace-indexer`,
+//! `collection-ownership-indexer`).
 
 mod asset_movement;
 mod burn;

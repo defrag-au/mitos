@@ -13,9 +13,9 @@
 //! ```
 //!
 //! Mitos persists the registration in its module redb so it can dial
-//! back over WS to deliver emissions (the dial-back path lands in
-//! PR 3 alongside the emissions log; for PR 1, the host endpoint
-//! just persists).
+//! back over WS to deliver emissions. The dial-back is driven by
+//! `mitos-platform::dialer::CompanionDialer::start_all` at host
+//! startup, and on every fresh subscribe via `register`.
 //!
 //! ## Type sourcing
 //!

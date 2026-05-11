@@ -1,18 +1,37 @@
 # Indexer trait contract
 
-> **Scope: this doc covers the in-process Rust trait used by
-> indexers compiled directly into a mitos bundle binary** (the
-> "static-crate-in-mitos-tree" shape — `crates/collection-ownership-indexer`
-> and `crates/marketplace-indexer` are the live examples). It
-> **does not** describe the wasm-module shape that's now the
-> canonical home for new indexers; that surface is the WIT
-> contract at `crates/mitos-platform/wit/world.wit` consumed via
-> `wit_bindgen::generate!` and built with `mitos-build`.
+> **Status: stale trait sketch.** The trait signature documented
+> in this file is from an earlier iteration. The actual
+> `Indexer<D: Domain>` trait lives in
+> `crates/mitos-core/src/indexer.rs` and is generic over
+> `Domain`, with associated `Scope` / `Change` types,
+> `subscribe` / `unsubscribe` / `change_matches_scope` /
+> `is_internal` methods, and `handle_event → Vec<MovementClaim>`
+> (returns claims for the residual-pass coordinator —
+> `docs/design/DOMAIN_REFACTOR.md`). The 3-method trait sketched
+> below doesn't match what any in-tree indexer implements.
 >
-> **For new indexers**, follow the wasm-module shape — see
-> `../strategy/MITOS_COMPANION_PATTERN.md`, `../HOWTO_FIRST_MODULE.md`,
-> and `MITOS_BUILD.md`. The two shapes share concepts
-> (idempotent dispatch, bootstrap, Apply/Undo/Mark, scope-as-Interest)
+> **Authoritative source:** `crates/mitos-core/src/indexer.rs`.
+>
+> **For new indexers**, follow the community-modules pattern —
+> see `../strategy/COMMUNITY_MODULES.md` and
+> `../HOWTO_CONSUMING_A_COMMUNITY_MODULE.md`. The in-tree trait
+> documented (poorly) here is grandfathered: existing in-tree
+> indexers (`collection-ownership-indexer`, `marketplace-indexer`,
+> `mint-burn-indexer`, `none-match-indexer`) stay until concrete
+> pressure mandates retirement; new chain-recognition work goes
+> to community wasm modules. See
+> `../strategy/LAYERED_RESPONSIBILITIES.md` for the layering
+> rationale.
+
+> **Original framing (preserved):** this doc covers the
+> in-process Rust trait used by indexers compiled directly into a
+> mitos bundle binary. The wasm-module shape — now canonical for
+> new work — uses the WIT contract at
+> `crates/mitos-platform/wit-v2/world.wit` (v2 ABI) consumed via
+> `wit_bindgen::generate!` and built with `mitos-build`. The two
+> shapes share concepts (idempotent dispatch, bootstrap,
+> Apply/Undo/Mark, scope-as-Interest)
 > but differ in surface — wasm modules export `init` /
 > `handle-event` / `update-interest` over WIT instead of
 > implementing this Rust trait, and they emit events to the host

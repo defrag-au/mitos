@@ -198,8 +198,9 @@ repo's `modules/fixtures/` once you've fixed the issue, so a
 future bug in the same shape doesn't ship past CI.
 
 When the local run reports `✓ init() returned cleanly`,
-push the module artifact upstream the normal way (the consumer
-repo's `scripts/upload-module.sh` or `mitos-admin upload-module`).
+push the module artifact upstream the normal way (`mitos-admin
+upload-module --artifact <dir>` from your laptop, or the
+consumer repo's deploy script if it wraps that).
 
 ## What this doesn't cover yet
 

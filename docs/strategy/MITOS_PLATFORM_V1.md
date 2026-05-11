@@ -1,15 +1,33 @@
 # Mitos platform v1 — concrete shape
 
-**Status: committed.** This doc captures the implementation
-shape we're building, not options we're weighing. Sister to
-`MITOS_COMPANION_PATTERN.md` (the paired-deployable thesis) and
-`../design/MITOS_ISOLATION_ROADMAP.md` (the historical context
-for *why* this shape).
+> **Status: shipped + superseded by v2 (May 2026).** The v1 ABI
+> (block-CBOR-resource model with `ResolvedBlock`, `Driver`,
+> `ModuleHost`, `host_unified`) was retired May 2026 — all
+> production modules migrated to v2's eUTXO event-stream
+> dispatch. The "Out of scope" list below ("Marketplace
+> indexer wasm port", "Companion-side `MitosCompanion` runtime
+> SDK", multi-module support, HTTP control plane) is all
+> shipped.
+>
+> **For current platform shape:** see
+> `MITOS_PLATFORM_V2.md` (event-stream dispatch model),
+> `COMMUNITY_MODULES.md` (the auto-loaded module pattern),
+> and `MITOS_COMPANION_RUNTIME_V1.md` (companion-side SDK).
+>
+> Body retained as the v1 commitment + lessons-banked record —
+> useful for the ABI vendoring + Balius decisions and the
+> single-module / single-tenant tradeoffs that shaped v2.
 
-The trigger condition has fired: **no more mitos deploys until
-platform v1 lands**. The current monolithic-bundle model is
-blocking iteration; rebuilding mitos to ship indexer changes is
-no longer acceptable.
+This doc captures the implementation shape we built (v1) in
+March–May 2026. Sister to `MITOS_COMPANION_PATTERN.md` (the
+paired-deployable thesis) and `../design/MITOS_ISOLATION_ROADMAP.md`
+(the historical context for *why* this shape).
+
+The trigger condition that motivated v1: **the monolithic-bundle
+model was blocking iteration**; rebuilding mitos to ship indexer
+changes was no longer acceptable. v1 unblocked operator-driven
+module uploads via `mitos-admin upload-module`; v2 generalised
+this further and is now the canonical shape.
 
 Cross-references:
 - `MITOS_COMPANION_PATTERN.md` — the paired-deployable contract

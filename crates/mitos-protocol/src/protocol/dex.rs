@@ -1,10 +1,14 @@
-//! DEX domain — minimal stub for Phase 1.
+//! DEX domain — minimal stub.
 //!
 //! Validates the kind-as-outer / brand-as-data pattern across a
 //! second domain so the cross-domain selector machinery is
-//! exercised in tests. The classifier already emits `TxType::DexSwap`
-//! for splash / cswap / minswap; lifting it into this enum is a
-//! Phase 2 translator concern.
+//! exercised in tests. The classifier emits `TxType::DexSwap` for
+//! splash / cswap / minswap; lifting that into typed events here
+//! is future work, deferred until a consumer surfaces a real
+//! query that needs them — and per the community-modules-first
+//! preference, brand-specific decode (e.g. a future
+//! `splash-dex` community module) is the likely home rather than
+//! extending this enum.
 //!
 //! Only `Swap` is modelled today. `AddLiquidity` /
 //! `RemoveLiquidity` / `PoolCreate` etc. land when a consumer

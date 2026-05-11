@@ -1,13 +1,20 @@
 # Recapture — coordinated state rebuild for companion DOs
 
+**Status: v1 implemented + validated in production** (2026-05-11
+end-to-end smoke test against `jpg-co`: 1 companion targeted,
+5.3s round-trip, bootstrap walked 4444 UTxOs, 109 ghost rows
+detected + corrected). Doc preserved as the canonical reference
+for the protocol shape, failure modes, and deferred follow-up
+work.
+
 A protocol + admin endpoint that lets an operator trigger a
 clean state rebuild for a community module's subscribed
 companions: the host signals each companion to drop its
 projected state, waits for the companion to confirm, then
 re-runs the module's bootstrap pass so the synthetic events
-flow back into a clean target. Replaces today's manual two-step
-(operator runs the worker's `/reset` *and* SSHes to the box
-to wipe `kv.redb`) with one coordinated operation.
+flow back into a clean target. Replaces the previous manual
+two-step (operator runs the worker's `/reset` *and* SSHes to
+the box to wipe `kv.redb`) with one coordinated operation.
 
 v1 ships **`companion=*` (all-subscribers) only**. Targeting a
 specific companion is forward-compatible in the API but
@@ -17,9 +24,9 @@ becomes load-bearing and we'll build the targeted-emit path
 then.
 
 Cross-references:
-- `mitos/docs/HOWTO_CONSUMING_A_COMMUNITY_MODULE.md` — current
-  operator procedure (manual). Updated to point at this
-  endpoint once it ships.
+- `mitos/docs/HOWTO_CONSUMING_A_COMMUNITY_MODULE.md` — operator
+  + dApp-author HOWTO; references this doc for the protocol
+  details.
 - `mitos/docs/strategy/COMMUNITY_MODULES.md` — community
   modules layering this is built for.
 - `mitos/docs/design/UNIFIED_SUBSCRIBE.md` — the WS protocol +
@@ -404,6 +411,12 @@ host hasn't fired any refill yet.
 
 ## Implementation plan
 
+**All six commits landed and validated.** Section preserved
+as the post-hoc breakdown of what landed where + the
+reversibility notes that guided rollout. Source-of-truth for
+each commit's behaviour is now the code; this is the map back
+to the rationale.
+
 Six commits, none destructive in isolation.
 
 ### 1. Protocol additions (`mitos-protocol`)
@@ -471,17 +484,19 @@ mitos-admin recapture <module_id> [--reason "rebuild after schema migration"]
 
 ### 6. Worker integration (`cnft.dev-workers/workers/jpg-store-mirror`)
 
-- Implement `on_recapture` on `JpgCoImpl`. Single-module shape
-  for now (only `jpg-co` subscribed), so the body is effectively
-  the existing `handle_reset` minus the cursor reset:
-  - `DROP TABLE collection_offers`
-  - Reinstall schema via `ensure_dapp_schema`
-  - No cursor manipulation — the runtime no longer auto-resets,
-    and the bootstrap refill's Apply frames naturally advance
-    the cursor.
-- Phase 4 (wayup-co) lands the `source_module` schema column
-  and migrates `on_recapture` to per-module `DELETE` — covered
-  in the relayering plan's Phase 4 work, not here.
+- `on_recapture` on `JpgCoImpl` landed as a single
+  `DELETE FROM collection_offers` (chosen over the originally-
+  sketched DROP+recreate — DELETE keeps the schema intact, no
+  race against incoming refill Apply frames, and the body
+  upgrades to `DELETE … WHERE source_module = ?` with one word
+  edit when Phase 4 wayup-co lands and the schema gains the
+  column).
+- No cursor manipulation — the runtime no longer auto-resets
+  on recapture, and the bootstrap refill's Apply frames
+  naturally advance the cursor.
+- Phase 4 (wayup-co) will land the `source_module` schema
+  column and the scoped DELETE — covered in the relayering
+  plan's Phase 4 work, not here.
 
 Existing `POST /_admin/jpg-co/reset` endpoint stays — useful
 as a fallback if the WS connection is broken and the operator
@@ -573,18 +588,21 @@ once individual `recapture` works.
    handles the duplicate — noisy but correct. Accept the
    noise.
 
-3. **What's the right timeout for `RecaptureReady`?** 30s is
-   a guess. Need to measure how long jpg-store-mirror's
-   `on_recapture` actually takes against a populated table.
-   If it's <1s, we can tighten to 5s; if it's >10s for any
-   pathological case, 30s might be too short.
+3. **What's the right timeout for `RecaptureReady`?** **30s is
+   over-budget for the v1 jpg-store-mirror shape.** First
+   production run measured ~1.6s for the worker's
+   `DELETE FROM collection_offers` + `RecaptureReady` send
+   against a 3582-row table. 30s remains the v1 default to
+   give headroom for slower companions / larger tables; can
+   tighten to 5s once a second consumer's numbers are in.
 
 4. **Should `RecaptureDone` carry a precise events_emitted
-   count, or just the cursor?** Counting requires the host
-   to track per-companion delivery during the bootstrap
-   walk. Cursor alone is fine for protocol correctness;
-   the count is observability sugar. v1 ship the count if
-   easy, drop it if not.
+   count, or just the cursor?** **v1 ships with the field at 0
+   — counter wiring deferred.** Counting requires the host to
+   track per-companion delivery during the bootstrap walk;
+   load-bearing observability comes from the journal's
+   `bootstrap: address complete utxos=N batches=M` lines
+   today. Wire the counter when a consumer asks for it.
 
 5. **How do we enforce the `source_module` schema contract?**
    v1 documents it (this doc + the HOWTO + trait docstring).

@@ -131,7 +131,7 @@ impl Manifest {
     ///
     /// `accepted_abis` is a list of `(major, wit_world)` pairs the
     /// host is willing to load. The unified host accepts both v1
-    /// (`(1, "mitos:platform/mitos-module")`) and v2
+    /// (`(2, "mitos:platform-v2/mitos-module-v2")`) and v2
     /// (`(2, "mitos:platform-v2/mitos-module-v2")`); routing
     /// happens at start time per `manifest.abi.version_major`.
     pub fn validate_against_host(
@@ -160,7 +160,7 @@ impl Manifest {
             let (wanted_major, wanted_world) = accepted_abis
                 .first()
                 .copied()
-                .unwrap_or((1, "mitos:platform/mitos-module"));
+                .unwrap_or((2, "mitos:platform-v2/mitos-module-v2"));
             // Major mismatch wins as the more informative error
             // when both axes diverge.
             if self.abi.version_major != wanted_major {
@@ -237,10 +237,10 @@ mod tests {
                 size_bytes: size,
             },
             abi: AbiSection {
-                version_major: 1,
+                version_major: 2,
                 version_minor: 0,
-                wit_package: "mitos:platform".to_owned(),
-                wit_world: "mitos-module".to_owned(),
+                wit_package: "mitos:platform-v2".to_owned(),
+                wit_world: "mitos-module-v2".to_owned(),
             },
             trap_policy: TrapPolicySection {
                 strategy: "replay".to_owned(),
@@ -272,17 +272,22 @@ mod tests {
     fn validate_happy_path() {
         let bytes = b"hello wasm";
         let m = sample(&sha256_hex(bytes), bytes.len() as u64);
-        m.validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+        m.validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap();
     }
 
     #[test]
     fn validate_abi_mismatch() {
+        // Submit a v1 manifest to a v2-only host. Expect rejection
+        // — v1 ABI was retired May 2026 and the host's accepted-ABI
+        // list no longer carries `(1, "mitos:platform/mitos-module")`.
         let bytes = b"hello wasm";
         let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
-        m.abi.version_major = 2;
+        m.abi.version_major = 1;
+        m.abi.wit_package = "mitos:platform".to_owned();
+        m.abi.wit_world = "mitos-module".to_owned();
         let err = m
-            .validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::AbiMismatch { .. }));
     }
@@ -293,7 +298,7 @@ mod tests {
         let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
         m.abi.wit_package = "wrong:package".to_owned();
         let err = m
-            .validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::WitMismatch { .. }));
     }
@@ -303,7 +308,7 @@ mod tests {
         let bytes = b"hello wasm";
         let m = sample("00".repeat(32).as_str(), bytes.len() as u64);
         let err = m
-            .validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::ShaMismatch { .. }));
     }
@@ -313,7 +318,7 @@ mod tests {
         let bytes = b"hello wasm";
         let m = sample(&sha256_hex(bytes), 9999);
         let err = m
-            .validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::SizeMismatch { .. }));
     }
@@ -331,7 +336,7 @@ mod tests {
             let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
             m.module.id = (*bad).to_owned();
             let err = m
-                .validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+                .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
                 .unwrap_err();
             assert!(
                 matches!(err, ManifestError::InvalidModuleId(_)),
@@ -346,7 +351,7 @@ mod tests {
         let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
         m.trap_policy.strategy = "ignore-and-cry".to_owned();
         let err = m
-            .validate_against_host(bytes, &[(1, "mitos:platform/mitos-module")])
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::InvalidTrapStrategy(_)));
     }

@@ -1,16 +1,30 @@
 # Data plane query API
 
+> **Status: largely shipped (2026).** The `ChainDataPlane` trait
+> lives at `crates/mitos-data-plane/src/lib.rs` with the v2
+> dispatch path (`bindings_v2`, `driver_v2`, `event_bindings`)
+> as the host-side consumer. wasm modules call into it via the
+> v2 WIT (`chain-data` interface in
+> `crates/mitos-platform/wit-v2/world.wit`). The "Phase C / wasm
+> host-fn surface" goal from `MITOS_ISOLATION_ROADMAP.md` landed.
+>
+> Body retained as design rationale + the case for keeping the
+> trait portable to future IPC / gRPC consumers. References to
+> `wit/world.wit` below should be read as `wit-v2/world.wit`;
+> "marketplace input resolution needs a separate primitive" was
+> resolved by v2's `block-context` event-payload shape (datum
+> bytes inline on `Produced`/`Consumed`).
+
 A typed query API for *current* UTxO chain state, implemented
 in-process at zero serialisation cost, but designed schema-first
 so the same surface can ship later as wasm host functions, IPC,
 or utxorpc-compatible gRPC for cross-machine consumers.
 
-**Nothing here is built yet.** This is a thought experiment to
-capture design direction so it's recoverable when the work is
-actually picked up. Sister doc to
-`MITOS_ISOLATION_ROADMAP.md` — the two threads converge: this
-trait is the foundation that the wasm host-function surface in
-the isolation roadmap's Phase C sits on.
+The design originally captured here informed the shipped
+`ChainDataPlane` trait. Sister doc to
+`MITOS_ISOLATION_ROADMAP.md` — the two threads converged: this
+trait is the foundation that the wasm host-function surface
+(historically called "Phase C") sits on.
 
 Cross-references:
 - `MITOS_ISOLATION_ROADMAP.md` — host fn surface for wasm modules

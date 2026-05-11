@@ -22,11 +22,8 @@
 //!
 //! ## Original docs:
 //!
-//! This is the first migration target for the CF replication
-//! prototype, mirroring `cnft.dev-workers/workers/collection-ownership/`.
-//! See `docs/design/CF_REPLICATION.md` Phase 4.5 for the build order.
-//!
-//! Current state (post Phase 4 trait surgery):
+//! Mirrors `cnft.dev-workers/workers/collection-ownership/`.
+//! Current shape:
 //! - `Scope = Vec<Interest>` — consumers express interest using the
 //!   shared `mitos_protocol::Interest` vocabulary; the indexer
 //!   projects the asset axis (Domain/Value axes are inert here —

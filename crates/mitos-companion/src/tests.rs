@@ -3,8 +3,9 @@
 //! These exercise pure-Rust pieces that don't need a `worker::Env`
 //! / `State` — wire-protocol round-trips, the channel dispatch
 //! contract, and the dyn-trait blanket impl. The full DO-driven WS
-//! path needs miniflare-style integration which is out of scope for
-//! PR 1; that arrives with PR 7's second-consumer-port work.
+//! path needs miniflare-style integration; not currently wired —
+//! validation of that lane happens via the deployed
+//! jpg-store-mirror + collections-mitos companions in production.
 
 use crate::ctx::{Ctx, SqlStorageValue};
 use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
@@ -63,12 +64,15 @@ impl MitosChannel for MockChannel {
 ///
 /// Skipped in non-wasm builds where `Ctx` would need a real
 /// `worker::SqlStorage` (we can't construct one outside the wasm
-/// runtime). PR 1 documents this gap; full integration tests come
-/// with miniflare in PR 7.
+/// runtime). End-to-end coverage of this lane happens via the
+/// deployed jpg-store-mirror / collections-mitos companions; a
+/// miniflare-based harness would let it run in CI, but isn't
+/// currently wired.
 #[cfg(target_arch = "wasm32")]
 #[tokio::test]
 async fn dispatch_decodes_and_calls_apply_event() {
-    // ...lands when we have a miniflare harness in PR 7...
+    // Body intentionally empty — placeholder for a future
+    // miniflare harness.
 }
 
 #[test]
@@ -118,9 +122,9 @@ fn server_apply_decode_then_dispatch_payload() {
 
 #[test]
 fn ack_nack_pair_round_trips() {
-    // Tests the Ack/Nack frame shapes in the same PR 5 atomic
-    // invariant context — runtime sends one or the other after
-    // synchronous cursor advance.
+    // Tests the Ack/Nack frame shapes — runtime sends one or the
+    // other after the synchronous cursor advance that follows
+    // every `apply_event` call.
     let ack = ClientMessage::Ack { emission_id: 99 };
     let bytes = crate::wire::encode_client(&ack).unwrap();
     let decoded = crate::wire::decode_client(&bytes).unwrap();
@@ -178,7 +182,7 @@ fn sql_value_export_is_usable() {
 }
 
 // ============================================================================
-// Dynamic-interest wire shape round-trips (PR 2)
+// Dynamic-interest wire shape round-trips
 // ============================================================================
 
 #[test]
@@ -209,7 +213,7 @@ fn client_interest_frame_round_trips_add_op() {
 }
 
 // ============================================================================
-// Multi-channel companion compile-test (PR 4)
+// Multi-channel companion compile-test
 // ============================================================================
 
 /// Second mock channel — paired with `MockChannel` to validate

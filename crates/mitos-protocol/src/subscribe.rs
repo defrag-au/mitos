@@ -33,11 +33,13 @@ pub struct SubscribeRequest {
     /// target is either a wasm module or an in-tree indexer.
     /// See `docs/design/UNIFIED_SUBSCRIBE.md`.
     ///
-    /// v1 implementation opens one dial-back WS per target. Multi-
-    /// target subscriptions in a single subscribe call ARE
-    /// supported on the wire from day one (forward-compat), but
-    /// the v1 host limits this to a single target until the
-    /// per-target WS-multiplexing work lands.
+    /// The dialer opens one outbound WS per target. Multi-target
+    /// subscribes are supported end-to-end — each target's WS
+    /// lands at `/_internal/replicate-<target>` on the companion
+    /// (per the `{target}` substitution in
+    /// `MITOS_REPLICATE_URL`) and tags the inbound socket so the
+    /// runtime can route frames to the `MitosChannel` whose
+    /// `NAME` matches.
     pub targets: Vec<SubscribeTarget>,
 
     /// Companion key. dApp's choice — see the design doc's Q8
@@ -143,9 +145,12 @@ pub struct SubscribeResponse {
     /// Status string. `"subscribed"` on success.
     pub status: String,
 
-    /// Host's current emission_id counter for this module. PR 3
-    /// populates this from the actual `module_emissions` log; PR 1
-    /// stub returns 0.
+    /// Host's current emission_id counter for this module, read
+    /// from the per-module `EmissionsStore`. Companions treat
+    /// this as a sync point: anything below it is already in the
+    /// emissions log (delivered or pending), anything from this
+    /// id forward is "live" — covered by the dial-back stream
+    /// rather than the resume scan.
     #[serde(default)]
     pub next_emission_id: u64,
 }

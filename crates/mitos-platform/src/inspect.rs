@@ -1,10 +1,11 @@
 //! Wasmtime-side dry-load of a module artifact.
 //!
-//! Used by `mitos-build` (and by the host's upload validation in
-//! phase 2) to extract the manifest-required values directly
-//! from a built `.wasm` file. The contract is "if this returns
-//! Ok, the platform can load the module" — the same engine,
-//! linker, and host trait wiring the production runtime uses.
+//! Used by `mitos-build` (and by the host's upload-validation
+//! path in `admin.rs`) to extract the manifest-required values
+//! directly from a built `.wasm` file. The contract is "if this
+//! returns Ok, the platform can load the module" — the same
+//! engine, linker, and host trait wiring the production runtime
+//! uses.
 //!
 //! Inspecting via `instantiate_async` + calling the exported
 //! `module-version()` / `trap-policy()` is the strongest possible

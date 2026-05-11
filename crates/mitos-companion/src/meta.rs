@@ -145,9 +145,8 @@ pub fn write_cursor(sql: &SqlStorage, point: &ChainPoint) -> Result<()> {
 ///
 /// Idempotent — if the new row exists, returns immediately. If only
 /// the legacy rows exist, reconstructs `ChainPoint::Specific(slot,
-/// hash)`, writes the new row, deletes the old. Lands in PR 5 (the
-/// collections-mitos migration); included here so the runtime can
-/// eat its own dog food.
+/// hash)`, writes the new row, deletes the old. Runs on every
+/// migration pass so legacy DOs auto-upgrade on first contact.
 pub fn migrate_split_row_cursor(sql: &SqlStorage) -> Result<bool> {
     if read_cursor(sql)?.is_some() {
         return Ok(false);

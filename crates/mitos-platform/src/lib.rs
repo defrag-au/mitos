@@ -6,7 +6,7 @@
 //! - **eUTXO event-stream dispatch.** Modules see typed events
 //!   (`Produced`, `Consumed`, `TxContext`, `Tick`, `Rollback`)
 //!   filtered host-side against their declared interest set.
-//! - **WIT-defined ABI.** `wit/world.wit` is the contract;
+//! - **WIT-defined ABI.** `wit-v2/world.wit` is the contract;
 //!   `wasmtime::component::bindgen!` generates host bindings,
 //!   `wit-bindgen` generates guest stubs.
 //! - **Resource limits from day one.** Fuel + epoch interruption

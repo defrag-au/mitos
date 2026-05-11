@@ -1,12 +1,31 @@
 # HOWTO: build your first companion module
 
-A walkthrough for building a paired indexer-module + CF-Worker-DO
-companion using **today's tooling**, not the future
-`cargo cardano init` shape described in the strategy docs.
+> **For most new work, start with
+> [HOWTO_CONSUMING_A_COMMUNITY_MODULE.md](HOWTO_CONSUMING_A_COMMUNITY_MODULE.md).**
+> The community-modules-first preference
+> (`docs/strategy/LAYERED_RESPONSIBILITIES.md`) means chain-
+> recognition logic shipped via mitos auto-loads from
+> `mitos/community-modules/<name>/` rather than being built
+> from scratch per-dApp. This HOWTO covers the older
+> "private wasm module + companion" pattern — still valid for
+> one-off dApp-specific logic, but no longer the default.
+>
+> Specific updates needed in this doc (some applied; others
+> pending a content rewrite): the v1 ABI references throughout
+> the WIT surface section (`mitos::platform::*` imports,
+> `ResolvedBlock`, block-centric `handle_event`) describe the
+> retired v1 dispatch model — current modules build against v2
+> (eUTXO event-stream dispatch). For the v2 ABI surface, see
+> `crates/mitos-platform/wit-v2/world.wit` directly + the
+> jpg-co community module's source at
+> `mitos/community-modules/jpg-co/jpg_co.rs` as a working
+> reference.
 
-If you're trying to add chain-derived state to a CF Worker dApp and
-you've read `MITOS_COMPANION_PATTERN.md` for the *why*, this doc is
-the *how*. The reference implementation is
+A walkthrough for building a paired indexer-module + CF-Worker-DO
+companion. If you're trying to add chain-derived state to a CF
+Worker dApp and you've read `MITOS_COMPANION_PATTERN.md` for the
+*why*, this doc is the *how* for the private-module variant. The
+reference implementation is
 `cnft.dev-workers/workers/collections-mitos/` —
 copy from it liberally.
 
@@ -24,10 +43,15 @@ Cross-references:
   `cnft.dev-workers/`)
 - A running mitos host (or one you're prepared to spin up locally
   against testnet)
-- `mitos-build` and `mitos-admin` installed:
-  `cargo install --path tools/mitos-build` and
-  `cargo install --path tools/mitos-admin` from the mitos repo
-- Rust target: `rustup target add wasm32-wasip2`
+- `mitos-build` and `mitos-admin` available in the dev shell.
+  From the mitos repo: `nix develop -c cargo build -p mitos-build`
+  and `nix develop -c cargo build -p mitos-admin`. Resulting
+  binaries live at `target/debug/{mitos-build,mitos-admin}`.
+  (Use `cargo build --release -p ...` for production deploys.)
+- Rust target: `wasm32-wasip2` (already in the dev-shell
+  toolchain on cnft.dev-workers; mitos's own shell currently
+  lacks it — run `mitos-build` from the cnft.dev-workers shell
+  for now, see `flake.nix` notes).
 
 ## Repo layout
 
@@ -197,8 +221,8 @@ path. The five interfaces:
   host's tracing subscriber
 - `interest::InterestOp` — enum used by `update_interest`
 
-See `crates/mitos-platform/wit/world.wit` for the precise function
-signatures.
+See `crates/mitos-platform/wit-v2/world.wit` for the precise
+function signatures (v2 ABI — v1 was retired May 2026).
 
 ## Step 3 — write the CF DO companion
 
@@ -333,10 +357,14 @@ realistic blocks). See `design/MITOS_BUILD.md` for the full CLI.
 ## Step 5 — deploy the module to mitos
 
 ```bash
-$ mitos-admin upload-module \
-    --artifact workers/<my-worker>/modules/target/mitos/<feature> \
-    --mitos http://mitos-host:8080
+$ mitos-admin \
+    --mitos http://mitos-host:8080 \
+    upload-module --artifact workers/<my-worker>/modules/target/mitos/<feature>
 ```
+
+`--mitos` and `--token` are **top-level** flags on `mitos-admin`
+(positioned before the subcommand), not subcommand args. Same
+shape applies to every command in this HOWTO.
 
 This POSTs the wasm + manifest + config.cbor multipart to
 `/_admin/modules/<id>`. The host validates the manifest, verifies
@@ -346,7 +374,7 @@ bytes from `config.cbor`.
 
 Subsequent uploads under the same module ID **replace** the running
 instance. State-kv and the chain-point cursor **persist across
-replacement** (`crates/mitos-platform/src/host.rs:101-103`).
+replacement** (`crates/mitos-platform/src/host_v2.rs`).
 
 ## Step 6 — deploy the companion to CF
 
@@ -362,12 +390,13 @@ Standard CF Workers flow. The DO runs on first request.
 mitos dials the companion's WS endpoint. Tell mitos where to dial:
 
 ```bash
-$ mitos-admin add \
+$ mitos-admin \
+    --mitos http://mitos-host:8080 \
+    add \
     --indexer <feature> \
-    --target  wss://<my-worker>.workers.dev/<feature>/replicate \
+    --target wss://<my-worker>.workers.dev/<feature>/replicate \
     --scope-json '{}' \
-    --cursor  origin \
-    --mitos   http://mitos-host:8080
+    --cursor origin
 ```
 
 The companion's `/replicate` endpoint accepts the inbound WS via

@@ -33,12 +33,13 @@
 //! `mitos/docs/design/MARKETPLACE_INDEXER.md` and
 //! `mitos/docs/design/SUBSCRIPTION_MECHANICS.md`.
 //!
-//! Phase 3 (this crate, current state): typed event emission via
-//! the `mitos-protocol` taxonomy.
+//! Current shape: typed event emission via the `mitos-protocol`
+//! taxonomy.
 //!
-//! - `Scope = ()` — no per-consumer scope. The single subscriber
-//!   gets everything; the framework `Interest` filtering machinery
-//!   is wired in Phase 4 when the trait surgery lands.
+//! - `Scope = Vec<Interest>` — server-side filter set declared
+//!   per subscriber. The dispatch pump applies the filter before
+//!   forwarding `ProtocolEvent`s, so consumers only see records
+//!   matching their declared `(asset, role, domain, value)` axes.
 //! - `Change = mitos_protocol::ProtocolEvent` — kind-as-outer
 //!   `Marketplace` payloads with brand-as-data. One event per
 //!   `(policy, marketplace_event)` pair: a tx that touches N
@@ -49,10 +50,11 @@
 //!   runs `RuleEngine::classify`, then hands the result to
 //!   `classification_to_events` to translate into typed events.
 //!
-//! Phase 4+ (deferred): `Scope = Interest` (server-side filtering
-//! by asset/brand/kind), trait-filtered collection offers, cancel-
-//! payload redeemer/script-ref decoding, royalty resolution,
-//! parallel-run validation against the existing classifier worker.
+//! Deferred: cancel-payload redeemer/script-ref decoding, royalty
+//! resolution. Per the community-modules-first preference
+//! (`docs/strategy/LAYERED_RESPONSIBILITIES.md`), brand-specific
+//! deep-decode work lands in `mitos/community-modules/<brand>-co/`
+//! community modules rather than as payload extensions here.
 
 mod brand_resolver;
 mod translator;

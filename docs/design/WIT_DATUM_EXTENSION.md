@@ -1,16 +1,29 @@
 # WIT datum extension
 
+> **Status: v1-scoped historical (May 2026).** The
+> `block-context::resolved-block` resource described here was part
+> of the v1 ABI, retired alongside the rest of v1 dispatch. v2's
+> eUTXO event-stream model exposes datum bytes directly on the
+> `Produced` / `Consumed` event payloads (no resource-handle
+> indirection); the design rationale below for *why* modules need
+> resolved datum access is still valid context, but the API
+> shape moved.
+>
+> **Current v2 datum surface:** see `mitos:platform-v2` WIT at
+> `crates/mitos-platform/wit-v2/world.wit` — `Produced` and
+> `Consumed` events carry inline datum bytes when the host
+> resolved them.
+
 Adds module-side access to resolved datum bytes via two new
 methods on the `block-context::resolved-block` resource. Required
 for any indexer module that needs to decode datums (marketplace,
 DEX, oracle, lending — basically anything beyond pure UTxO
 ownership tracking).
 
-This doc captures the platform-side rationale before the data-plane
-wiring lands. Cross-references:
+This doc captured the v1 rationale before the v2 redesign:
 
-- `crates/mitos-platform/wit/world.wit` — the WIT change itself
-  (in-tree as of the same commit that adds this doc)
+- `crates/mitos-platform/wit-v2/world.wit` — current WIT surface
+  (v2 ABI; replaces the v1 `wit/world.wit` referenced below)
 - `MITOS_DATA_PLANE_API.md` — the in-process trait this WIT
   surface projects from
 - `MITOS_BUILD.md` — the build-tool's "Datum access" note that

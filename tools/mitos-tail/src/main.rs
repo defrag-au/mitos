@@ -12,7 +12,7 @@
 //!   Applied, subsequent Apply records re-establish state).
 //! - Cost validation: count records per minute as a baseline for
 //!   the CF DO billing math in `CF_REPLICATION.md`.
-//! - Brand-typed payload validation (Phase 6): connect with
+//! - Brand-typed payload validation: connect with
 //!   `--decode protocol-event` against the `marketplace` indexer
 //!   and confirm `Marketplace::OfferCancel(OfferCancelPayload::*)`
 //!   variants decode cleanly with the right brand identity.
@@ -20,7 +20,7 @@
 //! Output is human-readable by default; pass `--json` for one
 //! JSON object per record (suitable for piping to `jq`).
 //!
-//! ## Scope JSON shape per indexer (post Phase 4)
+//! ## Scope JSON shape per indexer
 //!
 //! - `marketplace` and `collection-ownership` use
 //!   `Scope = Vec<Interest>`. Example:
@@ -329,6 +329,46 @@ impl TailState {
                     self.print_json(
                         "error",
                         &serde_json::json!({ "code": code, "message": message }),
+                    );
+                }
+            }
+            ServerMessage::Recapture { module, reason } => {
+                // Recapture frames are part of the host→companion
+                // state-rebuild protocol (`docs/design/RECAPTURE.md`).
+                // mitos-tail isn't a companion — it's a diagnostic
+                // pump — so log + ignore. Operator-triggered
+                // recapture is driven via `mitos-admin recapture`.
+                info!(
+                    module = %module,
+                    reason = ?reason,
+                    "received Recapture frame on diagnostic tail; ignoring"
+                );
+                if self.json {
+                    self.print_json(
+                        "recapture",
+                        &serde_json::json!({ "module": module, "reason": reason }),
+                    );
+                }
+            }
+            ServerMessage::RecaptureDone {
+                cursor,
+                module,
+                events_emitted,
+            } => {
+                info!(
+                    module = %module,
+                    events_emitted,
+                    cursor = ?cursor,
+                    "RecaptureDone (informational); ignoring on diagnostic tail"
+                );
+                if self.json {
+                    self.print_json(
+                        "recapture_done",
+                        &serde_json::json!({
+                            "module": module,
+                            "events_emitted": events_emitted,
+                            "cursor": cursor_summary(&cursor),
+                        }),
                     );
                 }
             }

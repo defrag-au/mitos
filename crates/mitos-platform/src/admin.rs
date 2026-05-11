@@ -1,24 +1,29 @@
 //! `/_admin/modules/*` HTTP surface.
 //!
-//! Phase 1 of the deployment story (`MITOS_PLATFORM_DEPLOYMENT.md`):
+//! Mounted by `admin_router_with_host` (production wiring) or
+//! `admin_router` (artifact-only / inspector deployments). See
+//! `docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md` for the operator
+//! workflow.
 //!
+//! Routes:
 //! - `POST /_admin/modules/{id}` — multipart upload + activate
 //! - `GET  /_admin/modules` — list registered modules
 //! - `GET  /_admin/modules/{id}` — single module status
-//!
-//! What's NOT in phase 1 (deferred to phase 2):
-//! - DELETE / restart endpoints
-//! - The running-instance lifecycle (this phase only manages
-//!   on-disk artifacts; `mitos-core` will wire the host
-//!   instance management on top in a follow-up)
-//! - The quarantine→prove-by-replay state machine
-//! - Multipart `config` field (mitos.toml CBOR)
+//! - `DELETE /_admin/modules/{id}` — stop module + drop slot
+//! - `POST /_admin/modules/{id}/restart` — re-instantiate
+//! - `POST /_admin/modules/{id}/recapture` — coordinated state
+//!   rebuild for subscribed companions (see `docs/design/RECAPTURE.md`)
+//! - `GET  /_admin/modules/{id}/last-trap` — trap-context fixture
+//! - `GET  /_admin/modules/{id}/emissions` — emissions log
+//! - `DELETE /_admin/modules/{id}/emissions` — purge
+//! - `POST /_admin/modules/{id}/emissions/{emission_id}/replay` —
+//!   re-queue a single row
 //!
 //! Auth is a self-contained shared-secret bearer-token
 //! middleware mirroring `mitos-core::auth` rather than depending
 //! on mitos-core (which pulls in the dolos crate transitively).
-//! Same env var, same shape; v2 multi-user auth will swap this
-//! out without route changes.
+//! Multi-user auth is future work; today every endpoint is gated
+//! on a single `MITOS_AUTH_TOKEN`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -904,10 +909,12 @@ async fn replay_emission(
     .into_response())
 }
 
-/// Independent wasmtime-side validation. Phase 1: confirm the
-/// component parses and the world declared by the manifest is
-/// what wasmtime sees in the binary's metadata. Phase 2 will add
-/// dry-instantiation + version-export round-trip.
+/// Independent wasmtime-side validation. Confirms the component
+/// parses and the world declared by the manifest is what wasmtime
+/// sees in the binary's metadata. Dry-instantiation + version-export
+/// round-trip is future work — the actual host's `start()` path
+/// catches those on first activation; the cost of doing it here too
+/// hasn't earned its keep.
 fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
     // Build a minimal engine just for parse-validation. Cheap to
     // construct; doesn't need the platform's full Config.

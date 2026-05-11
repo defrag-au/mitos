@@ -2,10 +2,12 @@
 //! references the same `Address`/`Lovelace`/`OutputRef`/`PlutusBytes`
 //! shapes and stays free of domain-crossing imports.
 //!
-//! These are the *minimum-viable* types for Phase 1 — string
-//! addresses match the existing classifier's representation; raw
-//! plutus data is left as opaque bytes until a consumer surfaces a
-//! genuine need to decode at the framework boundary.
+//! Deliberately minimal — string addresses match the classifier's
+//! representation; raw plutus data is left as opaque bytes until a
+//! consumer surfaces a genuine need to decode at the framework
+//! boundary. Per the community-modules-first preference, deep
+//! decode work belongs in brand-specific community modules rather
+//! than as extensions here.
 
 use cardano_assets::{AssetId, PolicyId};
 use enumset::EnumSetType;
@@ -82,8 +84,8 @@ pub type Address = String;
 /// `royalty_lovelace`) so misuse at call sites is rare.
 pub type Lovelace = u64;
 
-/// Hex-encoded raw Plutus datum / redeemer. Phase 1 keeps these
-/// opaque; consumers that need the decoded form re-decode locally
+/// Hex-encoded raw Plutus datum / redeemer. Kept opaque at this
+/// layer; consumers that need the decoded form re-decode locally
 /// using their preferred Plutus library. Storing as bytes (rather
 /// than a typed `PlutusData`) avoids a pallas dep at the type-defs
 /// crate boundary.
