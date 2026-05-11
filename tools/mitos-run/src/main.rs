@@ -286,6 +286,34 @@ impl FixtureDataPlane {
             aux_by_tx,
         })
     }
+
+    /// Walk every TX in the given block CBOR and record its
+    /// auxiliary-data CBOR under the tx hash. Lets fixture-driven
+    /// runs serve `chain_data::tx_metadata` lookups for TXs in
+    /// the dispatched block without operator hand-authoring
+    /// `[[tx_metadata]]` entries.
+    ///
+    /// Explicit fixture entries take precedence: if a tx hash is
+    /// already in `aux_by_tx`, the harvest skips it. That preserves
+    /// the "use the fixture's aux-data verbatim" semantics for
+    /// adversarial / malformed-aux scenarios.
+    fn harvest_block_aux(&mut self, block_cbor: &[u8]) -> Result<usize> {
+        use pallas::ledger::traverse::MultiEraBlock;
+        let block = MultiEraBlock::decode(block_cbor)
+            .map_err(|e| anyhow::anyhow!("MultiEraBlock decode: {e}"))?;
+        let mut harvested = 0;
+        for tx in block.txs() {
+            let tx_hash_bytes = tx.hash().as_slice().to_vec();
+            if self.aux_by_tx.contains_key(&tx_hash_bytes) {
+                continue;
+            }
+            if let Some(aux) = mitos_data_plane::extract_aux_cbor(&tx) {
+                self.aux_by_tx.insert(tx_hash_bytes, aux);
+                harvested += 1;
+            }
+        }
+        Ok(harvested)
+    }
 }
 
 // `FixtureDataPlane` impls `ChainDataPlane` directly; the
@@ -436,7 +464,29 @@ async fn run_v2(
     let interest = build_interest_set(&fixture.interest)?;
     println!("▸ interest:    {} predicate(s)", interest.predicates.len());
 
-    let dp: Arc<FixtureDataPlane> = Arc::new(FixtureDataPlane::from_fixture(fixture.clone())?);
+    // Build the fixture-backed data plane and pre-harvest aux-data
+    // from every `--block` arg so the module's `tx_metadata`
+    // lookups against TXs in the dispatched block resolve
+    // automatically. Operators only need to hand-author
+    // `[[tx_metadata]]` entries for TXs OUTSIDE the dispatched
+    // blocks (rare).
+    let mut dp_inner = FixtureDataPlane::from_fixture(fixture.clone())?;
+    let mut total_harvested = 0usize;
+    for path in blocks {
+        let cbor = fs::read(path)
+            .with_context(|| format!("read block for aux harvest {}", path.display()))?;
+        total_harvested += dp_inner.harvest_block_aux(&cbor).with_context(|| {
+            format!("harvest aux-data from {}", path.display())
+        })?;
+    }
+    if total_harvested > 0 {
+        println!(
+            "▸ harvested aux-data from {} TX(es) across {} block(s)",
+            total_harvested,
+            blocks.len()
+        );
+    }
+    let dp: Arc<FixtureDataPlane> = Arc::new(dp_inner);
     let dp_facade: Arc<dyn DataPlaneFacade> = dp.clone();
     let kv = state_kv::ModuleKv::new_in_memory();
     let (sink, mut events_rx) = emit::EventSink::new();

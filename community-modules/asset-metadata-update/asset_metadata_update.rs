@@ -148,12 +148,48 @@ fn resolve_datum_bytes(d: &DatumPayload) -> Option<Vec<u8>> {
 // ============================================================
 
 fn extract_cip25_metadata(aux: &[u8], policy: &[u8], asset_name: &[u8]) -> Option<String> {
+    // Aux-data wrapper shapes — see cip_25_mint.rs docstring for
+    // detail. Shelley/Allegra/Mary use the array form; Alonzo+
+    // wraps in CBOR tag 259 + an int-keyed map (metadata is at
+    // key 0); pre-Shelley test fixtures may be bare.
     let mut d = minicbor::Decoder::new(aux);
+
+    let was_tagged = if d.datatype().ok()? == Type::Tag {
+        d.tag().ok()?;
+        true
+    } else {
+        false
+    };
 
     let dt = d.datatype().ok()?;
     if dt == Type::Array || dt == Type::ArrayIndef {
         let _arr = d.array().ok()?;
         if d.datatype().ok()? == Type::Null {
+            return None;
+        }
+    } else if was_tagged {
+        let len = d.map().ok()?;
+        let mut i = 0u64;
+        let mut found_0 = false;
+        loop {
+            if let Some(n) = len
+                && i >= n
+            {
+                break;
+            }
+            if len.is_none() && d.datatype().ok()? == Type::Break {
+                d.skip().ok()?;
+                break;
+            }
+            let key: u64 = d.u64().ok()?;
+            if key == 0 {
+                found_0 = true;
+                break;
+            }
+            d.skip().ok()?;
+            i += 1;
+        }
+        if !found_0 {
             return None;
         }
     }

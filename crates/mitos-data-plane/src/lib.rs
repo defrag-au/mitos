@@ -44,7 +44,7 @@ pub use types::{
     UtxoPattern, UtxoPredicate, ValidityInterval,
 };
 
-pub use impls::LocalDataPlane;
+pub use impls::{LocalDataPlane, extract_aux_cbor};
 
 use async_trait::async_trait;
 use cardano_assets::PolicyId;

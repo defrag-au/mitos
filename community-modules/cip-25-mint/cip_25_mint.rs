@@ -86,8 +86,19 @@ fn emit_cip25_mint(event: &Cip25Mint) {
 
 /// Extract the label-721 entry's metadata for a specific asset.
 /// Returns `Some(json)` on success, `None` if the entry isn't
-/// present or decoding fails. The aux-data CBOR follows the
-/// CIP-10 convention: top-level map keyed by `u64` labels.
+/// present or decoding fails.
+///
+/// Aux-data wraps the CIP-10-labelled metadata map in one of
+/// three era-specific shapes:
+///   - Shelley/Allegra/Mary: `[metadata_map, native_scripts]`
+///     (array form, element 0 is the metadata map).
+///   - Alonzo+/Babbage/Conway: `#6.259({ 0 => metadata_map,
+///     1 => native_scripts, 2..4 => plutus scripts })`
+///     (CBOR tag 259 + map keyed by ints).
+///   - Bare (test fixtures, never seen on chain): metadata map
+///     directly.
+/// In all cases the inner `metadata_map` is `{ label_u64 => any }`
+/// and we want the value at `label = 721`.
 fn extract_cip25_metadata(
     aux: &[u8],
     policy: &[u8],
@@ -95,19 +106,58 @@ fn extract_cip25_metadata(
 ) -> Option<String> {
     let mut d = minicbor::Decoder::new(aux);
 
-    // The aux-data wrapper can be either:
-    //   - Pre-Alonzo:  map { label_u64 -> any }
-    //   - Post-Alonzo: array [ metadata_map, native_scripts, plutus_v1, ... ]
-    //                  where metadata_map is the same map shape.
-    // Walk past the array wrapper if present.
+    // Peel a leading CBOR tag — when present, it's the Alonzo+
+    // `#6.259` discriminator. Tag value isn't validated; any tag
+    // is treated as a transparent wrapper, then the inside is
+    // expected to be the `{ 0 => metadata, 1 => scripts, ... }`
+    // map and we navigate to key 0.
+    let was_tagged = if d.datatype().ok()? == Type::Tag {
+        d.tag().ok()?;
+        true
+    } else {
+        false
+    };
+
     let dt = d.datatype().ok()?;
     if dt == Type::Array || dt == Type::ArrayIndef {
+        // Shelley/Allegra/Mary array form. Element 0 is the
+        // metadata map (or null).
         let _arr = d.array().ok()?;
-        // First element is the metadata map (or null).
         if d.datatype().ok()? == Type::Null {
             return None;
         }
+        // Cursor is now on the inner metadata map.
+    } else if was_tagged {
+        // Alonzo+ inner map: { 0 => metadata, 1 => scripts, ... }.
+        // Walk to find key 0.
+        let len = d.map().ok()?;
+        let mut i = 0u64;
+        let mut found_0 = false;
+        loop {
+            if let Some(n) = len
+                && i >= n
+            {
+                break;
+            }
+            if len.is_none() && d.datatype().ok()? == Type::Break {
+                d.skip().ok()?;
+                break;
+            }
+            let key: u64 = d.u64().ok()?;
+            if key == 0 {
+                found_0 = true;
+                break;
+            }
+            d.skip().ok()?;
+            i += 1;
+        }
+        if !found_0 {
+            return None;
+        }
+        // Cursor is now on the metadata sub-map at key 0.
     }
+    // Else: bare CIP-10 metadata map at this level — cursor is
+    // already on it.
 
     // Top-level metadata map. Walk to find key = 721.
     let len = d.map().ok()?;

@@ -676,7 +676,12 @@ const _: () = {
 /// pattern-match on the variant ourselves and access the
 /// public `auxiliary_data` field. Each era's `KeepRaw` wrapper
 /// preserves the original CBOR bytes via `raw_cbor()`.
-fn extract_aux_cbor(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
+///
+/// Re-exported via `mitos_data_plane::extract_aux_cbor` so
+/// fixture-driven test harnesses (mitos-run) can pre-harvest
+/// aux-data from `--block` arguments without re-implementing
+/// the era pattern match.
+pub fn extract_aux_cbor(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
     use pallas_codec::utils::Nullable;
     match tx {
         MultiEraTx::AlonzoCompatible(t, _) => match &t.auxiliary_data {

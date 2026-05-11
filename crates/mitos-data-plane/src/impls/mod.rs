@@ -7,4 +7,4 @@
 
 mod local;
 
-pub use local::LocalDataPlane;
+pub use local::{LocalDataPlane, extract_aux_cbor};

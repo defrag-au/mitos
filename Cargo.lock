@@ -3546,6 +3546,7 @@ dependencies = [
  "mitos-community-events",
  "mitos-data-plane",
  "mitos-platform",
+ "pallas",
  "pallas-primitives 1.0.0-alpha.6",
  "serde",
  "tokio",
