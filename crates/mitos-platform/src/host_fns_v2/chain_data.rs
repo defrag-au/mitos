@@ -85,17 +85,19 @@ impl ChainDataHost for HostStateV2 {
         &mut self,
         hash: Vec<u8>,
     ) -> wasmtime::Result<Option<Vec<u8>>> {
-        let _: [u8; 32] = hash
+        let bytes: [u8; 32] = hash
             .as_slice()
             .try_into()
             .map_err(|_| wasmtime::Error::msg("datum hash must be 32 bytes"))?;
-        // The v1 DataPlaneFacade only exposes the bulk
-        // `read_output_datums` shape — there's no per-hash
-        // accessor today. Wire a `datum_by_hash` method onto
-        // the facade in a follow-up; for now return `None`
-        // (matches the contract: hash not in witness-set
-        // index → caller falls back to `tx-metadata`).
-        Ok(None)
+        // CIP-68 hash-only outputs and any reference-datum
+        // resolution path lands here. The facade's
+        // `datum_by_hash` delegates to `ChainDataPlane::
+        // read_datum` and extracts `original_cbor` — what
+        // modules actually want.
+        self.data_plane
+            .datum_by_hash(&bytes)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))
     }
 
     async fn read_tx(

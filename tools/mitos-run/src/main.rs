@@ -209,6 +209,12 @@ struct FixtureDataPlane {
     by_ref: HashMap<(Vec<u8>, u32), ResolvedUtxo>,
     by_address: HashMap<String, Vec<OutputRef>>,
     aux_by_tx: HashMap<Vec<u8>, Vec<u8>>,
+    /// Hash → datum-CBOR map. Populated from block witness-data
+    /// during harvest so modules calling
+    /// `chain_data::datum_by_hash` (CIP-68 reference-output
+    /// resolution being the canonical case) resolve correctly
+    /// from the fixture.
+    datums_by_hash: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -284,19 +290,24 @@ impl FixtureDataPlane {
             by_ref,
             by_address,
             aux_by_tx,
+            datums_by_hash: HashMap::new(),
         })
     }
 
-    /// Walk every TX in the given block CBOR and record its
-    /// auxiliary-data CBOR under the tx hash. Lets fixture-driven
-    /// runs serve `chain_data::tx_metadata` lookups for TXs in
-    /// the dispatched block without operator hand-authoring
-    /// `[[tx_metadata]]` entries.
+    /// Walk every TX in the given block CBOR and harvest two
+    /// kinds of resolution data from it into the fixture:
+    /// - **aux-data CBOR** keyed by tx hash — so
+    ///   `chain_data::tx_metadata` lookups against TXs in the
+    ///   dispatched block resolve without operator hand-authoring
+    ///   `[[tx_metadata]]` entries.
+    /// - **witness datums** keyed by Plutus-data hash — so
+    ///   `chain_data::datum_by_hash` resolves hash-only output
+    ///   datums (the typical CIP-68 reference-output shape,
+    ///   where the datum lives in the witness set rather than
+    ///   inline on the output).
     ///
-    /// Explicit fixture entries take precedence: if a tx hash is
-    /// already in `aux_by_tx`, the harvest skips it. That preserves
-    /// the "use the fixture's aux-data verbatim" semantics for
-    /// adversarial / malformed-aux scenarios.
+    /// Explicit fixture entries take precedence: if a key is
+    /// already populated, harvest skips it.
     fn harvest_block_aux(&mut self, block_cbor: &[u8]) -> Result<usize> {
         use pallas::ledger::traverse::MultiEraBlock;
         let block = MultiEraBlock::decode(block_cbor)
@@ -304,12 +315,25 @@ impl FixtureDataPlane {
         let mut harvested = 0;
         for tx in block.txs() {
             let tx_hash_bytes = tx.hash().as_slice().to_vec();
-            if self.aux_by_tx.contains_key(&tx_hash_bytes) {
-                continue;
-            }
-            if let Some(aux) = mitos_data_plane::extract_aux_cbor(&tx) {
+            if !self.aux_by_tx.contains_key(&tx_hash_bytes)
+                && let Some(aux) = mitos_data_plane::extract_aux_cbor(&tx)
+            {
                 self.aux_by_tx.insert(tx_hash_bytes, aux);
                 harvested += 1;
+            }
+            // Each plutus_data witness on the TX carries
+            // `(hash, raw_cbor_bytes)`. Index by hash. The
+            // KeepRaw wrapper preserves the original CBOR
+            // bytes; we use those (not pallas's re-encoded form)
+            // so the hash matches what's referenced in outputs.
+            for plutus_data in tx.plutus_data() {
+                use pallas::ledger::traverse::OriginalHash;
+                let hash_bytes = plutus_data.original_hash().to_vec();
+                if !self.datums_by_hash.contains_key(&hash_bytes) {
+                    self.datums_by_hash
+                        .insert(hash_bytes, plutus_data.raw_cbor().to_vec());
+                    harvested += 1;
+                }
             }
         }
         Ok(harvested)
@@ -373,9 +397,23 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
 
     async fn read_datum(
         &self,
-        _hash: &pallas_primitives::Hash<32>,
+        hash: &pallas_primitives::Hash<32>,
     ) -> DataPlaneResult<Option<mitos_data_plane::TypedDatum>> {
-        Ok(None)
+        // Resolve from witness datums harvested off `--block`
+        // arguments. The TypedDatum we return mirrors what
+        // `LocalDataPlane` produces from the dolos archive: the
+        // raw CBOR sits in `original_cbor`, and the WIT→bindgen
+        // conversion in `mitos-platform::event_bindings` plucks
+        // it into `payload` for the wasm side.
+        Ok(self
+            .datums_by_hash
+            .get(hash.as_slice())
+            .cloned()
+            .map(|bytes| mitos_data_plane::TypedDatum {
+                hash: *hash,
+                payload: None,
+                original_cbor: Some(bytes),
+            }))
     }
 
     async fn read_script(

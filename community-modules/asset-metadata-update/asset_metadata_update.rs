@@ -66,13 +66,25 @@ const LOG_TARGET: &str = "asset-metadata-update-module";
 // CIP-67 label tag for CIP-68 reference tokens.
 const CIP67_LABEL_REFERENCE: u32 = 100;
 
-/// Parse the CIP-67 label prefix on an asset-name. Returns
-/// `Some((label, suffix))` for correctly-prefixed names.
+/// Parse the CIP-67 label prefix on an asset-name.
+///
+/// CIP-67's 4-byte prefix is bit-packed across nibble boundaries:
+/// 4 leading zero bits, then a 16-bit label, then 8-bit CRC-8,
+/// then 4 trailing zero bits. See the matching helper in
+/// `cip-68-mint/cip_68_mint.rs` for the bit layout.
 fn parse_cip67(name: &[u8]) -> Option<(u32, &[u8])> {
-    if name.len() < 4 || name[0] != 0 {
+    if name.len() < 4 {
         return None;
     }
-    let label = u32::from(name[1]) << 8 | u32::from(name[2]);
+    if name[0] & 0xf0 != 0 {
+        return None;
+    }
+    if name[3] & 0x0f != 0 {
+        return None;
+    }
+    let label = (u32::from(name[0] & 0x0f) << 12)
+        | (u32::from(name[1]) << 4)
+        | (u32::from(name[2]) >> 4);
     Some((label, &name[4..]))
 }
 

@@ -1,0 +1,25 @@
+# mitos-run fixture for the cip-25-mint module against the
+# UG3334-UG3337 4-asset mint in block 186629202.
+#
+# Distinguishes from `perp-policy.toml` (single-asset mint) by
+# exercising:
+#   - the thread_local AUX_CACHE (4 minted events → 1 host-fn
+#     call, not 4)
+#   - per-asset-name lookup within one policy's metadata sub-map
+#   - 4-emission batch from one `handle-events` call
+#
+# Usage:
+#   mitos-run \
+#     --artifact target/mitos/cip-25-mint \
+#     --fixture community-modules/cip-25-mint/tests/fixtures/ug-policy.toml \
+#     --block community-modules/cip-25-mint/tests/fixtures/186629202.block.cbor
+#
+# Expected: four `Cip25Mint` events, one per UG3334..UG3337,
+# each with `metadata_json` populated from the asset's entry in
+# the label-721 sub-map.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "8972aab912aed2cf44b65916e206324c6bdcb6fbd3dc4eb634fdbd28"

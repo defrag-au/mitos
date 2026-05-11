@@ -53,20 +53,36 @@ const CIP67_LABEL_FT: u32 = 333;
 const CIP67_LABEL_RFT: u32 = 444;
 
 /// Parse the CIP-67 label prefix on an asset-name. CIP-67's
-/// header is 4 bytes: `[0x00, label_msb, label_lsb,
-/// checksum]` followed by the human-readable suffix. Returns
-/// `(label_u16, suffix_bytes)` on success, `None` otherwise.
+/// 4-byte prefix is bit-packed:
+///
+/// ```text
+///   bits  0..4   leading zero nibble
+///   bits  4..20  16-bit label
+///   bits 20..28  8-bit CRC-8 checksum
+///   bits 28..32  trailing zero nibble
+/// ```
+///
+/// So for label 100 the bytes are `00 06 43 b0` — the label
+/// straddles a nibble boundary across bytes 0..3, not bytes 1
+/// and 2 directly. Returns `(label, suffix_bytes)` on success,
+/// `None` otherwise. Checksum isn't verified — the chain only
+/// produces correctly-formed prefixes; we honour whatever label
+/// is encoded.
 fn parse_cip67(name: &[u8]) -> Option<(u32, &[u8])> {
     if name.len() < 4 {
         return None;
     }
-    if name[0] != 0 {
+    // Top nibble of byte 0 must be zero (CIP-67 framing).
+    if name[0] & 0xf0 != 0 {
         return None;
     }
-    let label = u32::from(name[1]) << 8 | u32::from(name[2]);
-    // We don't verify the checksum byte — the chain only
-    // produces correctly-formed prefixes; in adversarial mints
-    // we still try to honour the declared label.
+    // Bottom nibble of byte 3 must be zero (CIP-67 framing).
+    if name[3] & 0x0f != 0 {
+        return None;
+    }
+    let label = (u32::from(name[0] & 0x0f) << 12)
+        | (u32::from(name[1]) << 4)
+        | (u32::from(name[2]) >> 4);
     Some((label, &name[4..]))
 }
 
