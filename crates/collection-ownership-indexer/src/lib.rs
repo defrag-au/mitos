@@ -22,11 +22,8 @@
 //!
 //! ## Original docs:
 //!
-//! This is the first migration target for the CF replication
-//! prototype, mirroring `cnft.dev-workers/workers/collection-ownership/`.
-//! See `docs/design/CF_REPLICATION.md` Phase 4.5 for the build order.
-//!
-//! Current state (post Phase 4 trait surgery):
+//! Mirrors `cnft.dev-workers/workers/collection-ownership/`.
+//! Current shape:
 //! - `Scope = Vec<Interest>` — consumers express interest using the
 //!   shared `mitos_protocol::Interest` vocabulary; the indexer
 //!   projects the asset axis (Domain/Value axes are inert here —
@@ -51,7 +48,9 @@ use axum::Router;
 use cardano_assets::PolicyId;
 use dolos_core::{ChainPoint, Domain, TipEvent};
 use mitos_core::{Emitter, Indexer, SubscribeReply};
-use mitos_protocol::{AssetRole, Interest, any_interest_matches_asset_role, watched_policies};
+use mitos_protocol::{
+    AssetRole, Interest, MovementClaim, any_interest_matches_asset_role, watched_policies,
+};
 use pallas::ledger::traverse::MultiEraBlock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -164,19 +163,25 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
         _domain: &D,
         event: &TipEvent,
         emitter: &Emitter<Self::Change>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<MovementClaim>> {
+        // This indexer doesn't classify movements (its events are
+        // pre-`AssetMovement` ownership-state derivations slated
+        // for retirement once the consumer-side projection lands;
+        // see DOMAIN_REFACTOR.md migration step 4). Returns
+        // `Vec::new()` from every success path so the residual
+        // pass treats every chain transfer as unclaimed.
         match event {
             TipEvent::Apply(_, block) => {
                 let watched = match &self.watched {
-                    WatchState::Empty => return Ok(()),
-                    WatchState::Bounded(set) if set.is_empty() => return Ok(()),
+                    WatchState::Empty => return Ok(Vec::new()),
+                    WatchState::Bounded(set) if set.is_empty() => return Ok(Vec::new()),
                     state => state,
                 };
                 let parsed = match MultiEraBlock::decode(block.as_ref()) {
                     Ok(b) => b,
                     Err(e) => {
                         warn!(error = %e, "block decode failed; skipping");
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 };
                 for tx in parsed.txs() {
@@ -219,7 +224,7 @@ impl<D: Domain> Indexer<D> for OwnershipIndexer {
             // handles that.
             TipEvent::Undo(_, _) | TipEvent::Mark(_) => {}
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn routes(&self) -> Router {

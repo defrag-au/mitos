@@ -8,7 +8,9 @@
 use clap::Parser;
 use collection_ownership_indexer::OwnershipIndexer;
 use marketplace_indexer::MarketplaceIndexer;
+use mint_burn_indexer::MintBurnIndexer;
 use mitos_core::Bundle;
+use none_match_indexer::NoneMatchIndexer;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -39,6 +41,15 @@ struct Args {
     #[arg(long, env = "BUNDLE_MODULES_DIR")]
     modules_dir: Option<std::path::PathBuf>,
 
+    /// Community-modules source tree. When set + `--modules-dir`
+    /// is enabled, the bundle activates any pre-built community
+    /// module under `<dir>/<name>/build/` whose sha differs from
+    /// the currently-active artifact in `--modules-dir`. Typical
+    /// value: `<mitos-checkout>/community-modules`. See
+    /// `docs/strategy/COMMUNITY_MODULES.md`.
+    #[arg(long, env = "BUNDLE_COMMUNITY_MODULES_DIR")]
+    community_modules_dir: Option<std::path::PathBuf>,
+
     /// Print the loaded configuration + persisted subscriptions to
     /// stdout, then exit 0 without starting the chain follower or
     /// HTTP server. Useful for verifying env vars, paths, and the
@@ -64,7 +75,12 @@ async fn main() -> anyhow::Result<()> {
             &config,
             args.listen,
             &args.data_dir,
-            &["collection-ownership", "marketplace"],
+            &[
+                "collection-ownership",
+                "marketplace",
+                "mint-burn",
+                "none-match",
+            ],
         )?;
         return Ok(());
     }
@@ -77,12 +93,34 @@ async fn main() -> anyhow::Result<()> {
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
     bundle.add_indexer(OwnershipIndexer::new()?);
     bundle.add_indexer(MarketplaceIndexer::new()?);
+    bundle.add_indexer(MintBurnIndexer::new()?);
+
+    // Residual pass: emits `Domain::AssetMovement` for asset
+    // transfers no specific-domain indexer claimed (P2P transfers,
+    // unrecognised marketplace scripts, etc.). Switches the
+    // dispatcher to synchronised mode — see
+    // `docs/design/DOMAIN_REFACTOR.md`.
+    let claim_coordinator = bundle.enable_residual_pass();
+    bundle.add_indexer(NoneMatchIndexer::new(claim_coordinator));
 
     if let Some(modules_dir) = args.modules_dir {
         info!(modules_dir = %modules_dir.display(), "wasm-module hosting enabled");
         bundle.enable_modules(modules_dir);
+        if let Some(cm_dir) = args.community_modules_dir {
+            info!(
+                community_modules_dir = %cm_dir.display(),
+                "community-modules auto-load enabled"
+            );
+            bundle.enable_community_modules(cm_dir);
+        }
     } else {
         info!("wasm-module hosting disabled (set --modules-dir to enable)");
+        if args.community_modules_dir.is_some() {
+            tracing::warn!(
+                "--community-modules-dir set but --modules-dir is not; \
+                 community-modules auto-load requires wasm-module hosting"
+            );
+        }
     }
 
     bundle.run(exit).await?;

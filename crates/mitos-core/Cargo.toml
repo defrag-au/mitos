@@ -29,6 +29,19 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 miette = "7"
 
+# Stake-credential parsing for the residual pass's same-wallet
+# suppression rule (`docs/design/DOMAIN_REFACTOR.md`). Compares
+# stake credentials when both addresses have one; falls back to
+# bech32 string equality for non-Shelley addresses.
+pallas-addresses = { workspace = true }
+
+# Concurrent claim accumulation in `TxClaimCoordinator` — avoids
+# Mutex contention when multiple specific-domain indexers add
+# claims for the same tx in parallel.
+dashmap = { workspace = true }
+pallas = { workspace = true }
+cardano-assets = { workspace = true }
+
 # Subscription scope payloads on the CF replication channel are CBOR;
 # the framework decodes once at the IndexerHandle boundary.
 serde = { workspace = true }
@@ -56,3 +69,7 @@ mitos-protocol = { path = "../mitos-protocol" }
 # Wasm-module hosting (Bundle::enable_modules path). Pulls in
 # wasmtime + the platform's storage/host/admin surface.
 mitos-platform = { path = "../mitos-platform" }
+
+[dev-dependencies]
+# Sandbox dirs for community-modules auto-load tests.
+tempfile = "3"

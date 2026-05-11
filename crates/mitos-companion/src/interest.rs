@@ -43,7 +43,8 @@ pub struct InterestRow {
     pub value: String,
     /// Channel this interest is scoped to. Empty string means
     /// "all channels"; non-empty matches the channel name on the
-    /// host's WS Hibernation tag (multi-channel companions, PR 4).
+    /// host's WS Hibernation tag (used by multi-channel companions
+    /// to keep per-channel interest sets isolated).
     #[serde(default)]
     pub channel: String,
     /// RFC3339 timestamp the row was first added. Diagnostic only.
@@ -159,10 +160,10 @@ pub fn rows_to_interests(rows: &[InterestRow]) -> Vec<Interest> {
 ///   interests).
 ///
 /// Rows with a non-matching, non-empty channel are skipped.
-/// Multi-channel companions (PR 4 of the runtime delivery) use
-/// this when broadcasting `ClientMessage::Interest` frames so
-/// the ownership channel's interests don't bleed into the
-/// marketplace channel's filter set, etc.
+/// Multi-channel companions use this when broadcasting
+/// `ClientMessage::Interest` frames so the ownership channel's
+/// interests don't bleed into the marketplace channel's filter
+/// set, etc.
 pub fn rows_to_interests_for_channel(rows: &[InterestRow], target_channel: &str) -> Vec<Interest> {
     let filtered: Vec<&InterestRow> = rows
         .iter()
@@ -256,7 +257,7 @@ mod tests {
     }
 
     // ====================================================================
-    // Multi-channel scoping (PR 4)
+    // Multi-channel scoping
     // ====================================================================
 
     fn make_policy_row(value: &str, channel: &str) -> InterestRow {

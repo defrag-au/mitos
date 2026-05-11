@@ -36,9 +36,9 @@ pub struct MitosCompanionRuntime<C: MitosCompanion> {
     env: Env,
     inner: C,
     /// Channel set, materialised eagerly from `inner.channels()` in
-    /// `new()`. Owned `Vec<Box<dyn MitosChannelDyn>>`; never mutated
-    /// after construction so dispatch can borrow it without lifetime
-    /// gymnastics.
+    /// the constructor. Owned `Vec<Box<dyn MitosChannelDyn>>`;
+    /// never mutated after construction so dispatch can borrow it
+    /// without lifetime gymnastics.
     channels: Vec<Box<dyn MitosChannelDyn>>,
     /// Whether the runtime has run its one-time schema setup. Cheap
     /// flag to avoid re-running `ensure_schema` on every request.
@@ -46,9 +46,15 @@ pub struct MitosCompanionRuntime<C: MitosCompanion> {
 }
 
 impl<C: MitosCompanion> MitosCompanionRuntime<C> {
-    /// Construct a new runtime. Called by the dApp's
-    /// `#[durable_object]` wrapper inside its `new(state, env)`
-    /// constructor.
+    /// Construct a runtime. The companion declares its subscribe
+    /// targets via `MitosCompanion::subscribe_targets()` — default
+    /// is one `SubscribeTarget::Module` with name = `C::NAME`, so
+    /// classic single-wasm-module companions Just Work without
+    /// overriding.
+    ///
+    /// Override `subscribe_targets()` on the companion to declare
+    /// indexer-target or multi-target subscriptions. See
+    /// `docs/design/UNIFIED_SUBSCRIBE.md`.
     pub fn new(state: State, env: Env, inner: C) -> Self {
         let channels = inner.channels();
         Self {
@@ -58,6 +64,32 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             channels,
             schema_ready: Cell::new(false),
         }
+    }
+
+    /// Deprecated alias for `new`. Kept for backward compat with
+    /// dApps that adopted the original step-2 API; remove on next
+    /// breaking-change wave. New code should use `new(...)` and
+    /// — if the default `SubscribeTarget::Module` isn't what they
+    /// want — override `MitosCompanion::subscribe_targets()`.
+    #[deprecated(
+        since = "0.0.2",
+        note = "use `MitosCompanionRuntime::new` and override `MitosCompanion::subscribe_targets()` if needed"
+    )]
+    pub fn module(state: State, env: Env, inner: C) -> Self {
+        Self::new(state, env, inner)
+    }
+
+    /// Deprecated. Companions targeting in-tree indexers should
+    /// `new(...)` and override `MitosCompanion::subscribe_targets()`
+    /// to return `vec![SubscribeTarget::Indexer { name: ... }]`.
+    /// This constructor doesn't actually enforce indexer-target
+    /// behaviour — that's the companion's declaration.
+    #[deprecated(
+        since = "0.0.2",
+        note = "use `MitosCompanionRuntime::new` and override `MitosCompanion::subscribe_targets()` to declare `Indexer` target"
+    )]
+    pub fn indexer(state: State, env: Env, inner: C) -> Self {
+        Self::new(state, env, inner)
     }
 
     /// Borrow the dApp's environment. Useful for the wrapper if it
@@ -75,8 +107,9 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         &self.state
     }
 
-    /// Borrow the inner companion. Useful for tests + RPC handler
-    /// dispatch (PR 6 work).
+    /// Borrow the inner companion. Useful for tests + dApp-level
+    /// dispatch where the runtime needs to reach into the trait
+    /// impl directly (e.g. RPC handlers the dApp owns).
     pub fn inner(&self) -> &C {
         &self.inner
     }
@@ -216,6 +249,22 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 tracing::warn!(code = %code, message = %message, "host-side error frame");
                 Ok(())
             }
+            ServerMessage::Recapture { module, reason } => {
+                self.dispatch_recapture(ws, module, reason).await
+            }
+            ServerMessage::RecaptureDone {
+                cursor,
+                module,
+                events_emitted,
+            } => {
+                tracing::info!(
+                    module = %module,
+                    events_emitted,
+                    ?cursor,
+                    "RecaptureDone frame received; informational"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -271,10 +320,12 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 
     async fn dispatch_undo(&self, cursor: ChainPoint) -> Result<()> {
         // Default semantics: log + advance cursor. Channels' undo
-        // hooks fire when reorg-aware dApps opt in. v1 fans the undo
-        // call to all channels (broadcast) since the wire frame
-        // doesn't carry a channel name; channels' default impl just
-        // logs. Refine in PR 4 (multi-channel) if needed.
+        // hooks fire when reorg-aware dApps opt in. Today we fan
+        // the undo call to all channels (broadcast) since the wire
+        // frame doesn't carry a channel name; channels' default
+        // impl just logs. Multi-channel companions that need
+        // channel-targeted undo will require the wire to grow a
+        // channel-name field; not currently a blocker.
         let sql = self.state.storage().sql();
         for ch in &self.channels {
             let ctx = Ctx::new(cursor.clone(), ch.name().to_string(), sql.clone());
@@ -284,6 +335,83 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         }
         write_cursor(&sql, &cursor)?;
         Ok(())
+    }
+
+    /// Recapture frame handler. Calls the dApp's `on_recapture`
+    /// hook with the module name carried on the frame, then sends
+    /// `RecaptureReady` to signal the host it can begin the refill
+    /// stream. See `docs/design/RECAPTURE.md`.
+    ///
+    /// Error semantics: if `on_recapture` returns `Err`, we DO NOT
+    /// send `RecaptureReady`. The host's per-companion timeout
+    /// (~30s) fires and the admin endpoint returns 504 — the
+    /// operator inspects the companion's logs and retries when
+    /// they've fixed the cleanup. Sending `RecaptureReady` on a
+    /// partial cleanup would tell the host "refill me" while the
+    /// dApp's table is mid-purge, leading to ghost rows for COs
+    /// whose `on_recapture` DELETE didn't fire before the error.
+    /// Timeout-and-investigate is the safer failure mode.
+    ///
+    /// Cursor handling: the runtime does NOT reset the persisted
+    /// cursor here. Per-module recapture must leave other module
+    /// subscriptions undisturbed, and rewinding the cursor would
+    /// affect all of them. The refill Apply frames advance the
+    /// cursor naturally as they arrive. The `Ctx` we pass to
+    /// `on_recapture` carries the current persisted cursor as
+    /// informational context for the dApp's cleanup body.
+    async fn dispatch_recapture(
+        &self,
+        ws: &WebSocket,
+        module: String,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let sql = self.state.storage().sql();
+        let current_cursor = meta::read_cursor(&sql)
+            .ok()
+            .flatten()
+            .unwrap_or(ChainPoint::Origin);
+        // `channel` field on Ctx is set to the recapturing module
+        // for diagnostic purposes — dApps that share a body across
+        // channels can pattern-match on `ctx.channel` if needed.
+        let ctx = Ctx::new(current_cursor, module.clone(), sql.clone());
+
+        tracing::info!(
+            module = %module,
+            reason = ?reason,
+            "Recapture received; invoking on_recapture"
+        );
+        let result = self
+            .inner
+            .on_recapture(&ctx, &module, reason.as_deref())
+            .await;
+
+        match result {
+            Ok(()) => {
+                let frame = ClientMessage::RecaptureReady;
+                let bytes = encode_client(&frame)?;
+                ws.send_with_bytes(&bytes).map_err(|e| {
+                    CompanionError::Wire(format!("send RecaptureReady: {e}"))
+                })?;
+                tracing::info!(
+                    module = %module,
+                    "on_recapture complete; sent RecaptureReady"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Loud log only. Don't send RecaptureReady — host
+                // times out, admin endpoint returns 504. Operator
+                // sees both the 504 and this log line and can act.
+                tracing::error!(
+                    module = %module,
+                    reason = ?reason,
+                    error = %e,
+                    "on_recapture failed; withholding RecaptureReady — \
+                     host will time out and operator can investigate"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Look up a channel handler by tag.
@@ -350,9 +478,9 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// onboarding to materialise the DO and run the HTTPS subscribe
     /// call against mitos. Reads the persisted cursor from DO SQLite
     /// (Q4) and the cached interest set from `mitos_companion_interest`
-    /// (PR 2 wires the dynamic-interest helpers; for PR 1 the interest
-    /// set is empty), POSTs `SubscribeRequest` to the mitos host, and
-    /// caches the result so subsequent wakes can short-circuit.
+    /// (populated via `/api/_interest/subscribe`), POSTs
+    /// `SubscribeRequest` to the mitos host, and caches the result so
+    /// subsequent wakes can short-circuit.
     ///
     /// dApp Worker pattern (per design doc "Bootstrapping" subsection):
     ///
@@ -361,12 +489,11 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// stub.fetch_with_str("/_internal/wake").await?;
     /// ```
     async fn handle_wake(&self) -> worker::Result<Response> {
-        // Determine the companion key. PR 1 uses the DO's own name as
-        // the Companion key — the dApp Worker creates the DO with
-        // `id_from_name(companion_key)`, so `state.id().name()` is the
-        // round-trip. (PR 5 will introduce a more flexible mechanism
-        // when collections-mitos consolidates from per-policy to
-        // per-customer keys.)
+        // The companion key is the DO's own name — the dApp Worker
+        // creates the DO with `id_from_name(companion_key)`, so
+        // `state.id().name()` round-trips. Multi-tenant dApps that
+        // want richer key derivation (e.g. per-customer) override
+        // by passing the name explicitly through their wrapper.
         let companion_key = self
             .state
             .id()
@@ -380,11 +507,16 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // Pull the canonical interest set from DO SQLite. Sent to
         // the host as `Vec<mitos_protocol::Interest>` in the
         // subscribe payload — host persists this as the
-        // companion's registration. (PR 3 wires the host's
-        // dial-back to deliver matching emissions; until then,
-        // this is the canonical-source-of-record handshake.)
+        // companion's registration; the dialer uses it for the
+        // filter applied to outbound Apply frames.
         let interest_rows = crate::interest::list_interests(&sql)?;
-        let interests = crate::interest::rows_to_interests(&interest_rows);
+        let mut interests = crate::interest::rows_to_interests(&interest_rows);
+        // Append the companion's programmatic initial-interest
+        // declarations — used for filter shapes the SQL table
+        // doesn't support (e.g. `DomainSelector::Marketplace`
+        // filters for an in-tree marketplace-indexer target).
+        // See `MitosCompanion::initial_interests`.
+        interests.extend(self.inner.initial_interests());
 
         // Pull the dial-back URL from wrangler env so mitos
         // knows where to open its outbound WS. Required for
@@ -401,8 +533,15 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 auth_value: None,
             });
 
+        // Targets are declared by the companion via
+        // `MitosCompanion::subscribe_targets()`. Default is one
+        // `Module { name: C::NAME }` for backward compat with
+        // single-wasm-module companions. Multi-target (e.g. one
+        // wasm module + one in-tree indexer for the same DO) is
+        // expressed by overriding the trait method.
+        let targets = self.inner.subscribe_targets();
         let request = SubscribeRequest {
-            module_name: C::NAME.to_string(),
+            targets,
             companion_key,
             resume_from,
             interests,
@@ -439,10 +578,9 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// row. Body: `InterestMutateRequest`. On success, emits a
     /// `ClientMessage::Interest { op: Add, items: [Interest] }`
     /// frame over the held WS so the host's running module picks
-    /// up the new filter immediately. (Host-side WS-receive-loop
-    /// wiring lands in PR 3 alongside the dial-back path; PR 2
-    /// validates the companion-side surface end-to-end via
-    /// the SQL row + WS-frame send.)
+    /// up the new filter immediately. Host-side receive-loop
+    /// routes the frame into the module's `update-interest`
+    /// export via the `InterestRouter` trait.
     async fn handle_interest_subscribe(&self, mut req: Request) -> worker::Result<Response> {
         let payload: crate::interest::InterestMutateRequest = req.json().await?;
         let channel = payload.channel.clone().unwrap_or_default();
@@ -502,8 +640,8 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 
     /// Send `ClientMessage::Interest { op, items }` frames to the
     /// companion's held WS connections, filtering items per
-    /// channel so multi-channel companions (PR 4) don't bleed
-    /// ownership interests into a marketplace WS, etc.
+    /// channel so multi-channel companions don't bleed ownership
+    /// interests into a marketplace WS, etc.
     ///
     /// Routing rules:
     ///

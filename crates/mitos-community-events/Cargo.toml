@@ -1,0 +1,16 @@
+[package]
+name = "mitos-community-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Typed event payloads for mitos community modules (auto-loaded wasm modules under mitos/community-modules/<name>/)."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+# Compact CBOR encoding of raw byte fields (e.g. `jpg_co::CoChange::Created::datum_cbor`).
+# Without this, `Vec<u8>` serialises as a CBOR array of ints with ~10x bloat.
+serde_bytes = "0.11"

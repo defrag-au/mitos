@@ -6,7 +6,7 @@
 //! - **eUTXO event-stream dispatch.** Modules see typed events
 //!   (`Produced`, `Consumed`, `TxContext`, `Tick`, `Rollback`)
 //!   filtered host-side against their declared interest set.
-//! - **WIT-defined ABI.** `wit/world.wit` is the contract;
+//! - **WIT-defined ABI.** `wit-v2/world.wit` is the contract;
 //!   `wasmtime::component::bindgen!` generates host bindings,
 //!   `wit-bindgen` generates guest stubs.
 //! - **Resource limits from day one.** Fuel + epoch interruption
@@ -55,6 +55,7 @@ pub mod follower_v2;
 pub mod host_fns;
 pub mod host_fns_v2;
 pub mod host_v2;
+pub mod indexer_bridge;
 pub mod inspect;
 pub mod lag_tolerant;
 pub mod manifest;
@@ -103,6 +104,20 @@ pub enum PlatformError {
 
     #[error("block decode: {0}")]
     Decode(String),
+
+    /// A `recapture_module` call arrived for a module that already
+    /// has an in-flight recapture. The endpoint maps this to
+    /// HTTP 409. See `docs/design/RECAPTURE.md`.
+    #[error("recapture already in flight for module `{0}`")]
+    RecaptureInProgress(String),
+
+    /// Per-companion `RecaptureReady` ACK didn't arrive within
+    /// timeout, or a companion's outbound channel was closed
+    /// mid-protocol. Bootstrap-refill is NOT fired in this case
+    /// — the partial dApp-state cleanup would seed ghost rows.
+    /// Maps to HTTP 504 from the admin endpoint.
+    #[error("recapture coordination failed: {0}")]
+    RecaptureCoordination(String),
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;

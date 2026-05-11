@@ -22,8 +22,9 @@ use std::collections::HashMap;
 
 use cardano_assets::{AssetId, PolicyId};
 use mitos_protocol::{
-    Domain, ListingPayload, Marketplace, MarketplaceBrand, OfferAcceptPayload, OfferCancelPayload,
-    OfferCreatePayload, OfferUpdatePayload, ProtocolEvent, SalePayload, UnlistingPayload,
+    Domain, ListingPayload, Marketplace, MarketplaceBrand, MovementClaim, OfferAcceptPayload,
+    OfferCancelPayload, OfferCreatePayload, OfferUpdatePayload, ProtocolEvent, SalePayload,
+    UnlistingPayload,
 };
 use pipeline_types::PricedAsset;
 use tx_classifier::{TxClassification, TxType};
@@ -317,6 +318,109 @@ fn emit_listing(
 
 fn parse_policy_id(s: &str) -> Option<PolicyId> {
     PolicyId::new(s).ok()
+}
+
+/// Translate a `TxClassification` into the `MovementClaim`s the
+/// marketplace indexer makes. Per the dispatcher's residual pass
+/// (see `docs/design/DOMAIN_REFACTOR.md`), each claim's `(from,
+/// to)` must match the chain-level UTxO movement so the residual
+/// can subtract claimed transfers from the in/out diff. The
+/// conceptual "seller" in marketplace events is the wallet
+/// receiving lovelace; for asset-flow purposes the relevant
+/// addresses are different per kind.
+pub fn classification_to_claims(classification: &TxClassification) -> Vec<MovementClaim> {
+    let mut out = Vec::new();
+    for ty in &classification.tx_types {
+        extract_claims(ty, &mut out);
+    }
+    out
+}
+
+fn extract_claims(ty: &TxType, out: &mut Vec<MovementClaim>) {
+    match ty {
+        TxType::Sale {
+            asset,
+            buyer,
+            marketplace: Some(market_addr),
+            ..
+        } => {
+            // Sale: asset moves from the marketplace script (where
+            // it was previously listed) to the buyer. The
+            // conceptual `seller` field in the event is the wallet
+            // receiving lovelace; they listed the asset earlier and
+            // don't hold it on-chain at sale time.
+            //
+            // If the marketplace address is unavailable (the
+            // `marketplace: None` case caught by the wildcard arm
+            // below), we skip the claim — the residual pass will
+            // then emit `AssetMovement` for the actual chain
+            // transfer, which is a safe fallback (under-claiming
+            // is correct; over-claiming would suppress legitimate
+            // movements).
+            out.push(MovementClaim {
+                asset: asset.asset.clone(),
+                from: market_addr.clone(),
+                to: buyer.clone(),
+            });
+        }
+        TxType::OfferAccept {
+            asset,
+            seller,
+            buyer,
+            ..
+        } => {
+            // OfferAccept: asset moves directly from seller to
+            // buyer — the asset wasn't at a script (only the
+            // bidder's offered lovelace was). Seller's UTxO is
+            // consumed; new UTxO produced at buyer.
+            out.push(MovementClaim {
+                asset: asset.clone(),
+                from: seller.clone(),
+                to: buyer.clone(),
+            });
+        }
+        TxType::ListingCreate {
+            assets,
+            seller,
+            marketplace,
+            ..
+        } => {
+            // Asset moves from seller to the marketplace script.
+            for a in assets {
+                out.push(MovementClaim {
+                    asset: a.asset.clone(),
+                    from: seller.clone(),
+                    to: marketplace.clone(),
+                });
+            }
+        }
+        TxType::Unlisting {
+            assets,
+            seller,
+            marketplace,
+            ..
+        } => {
+            // Asset returns from the marketplace script to seller.
+            for a in assets {
+                out.push(MovementClaim {
+                    asset: a.clone(),
+                    from: marketplace.clone(),
+                    to: seller.clone(),
+                });
+            }
+        }
+        // ListingUpdate: asset stays at the marketplace script (a
+        // UTxO is consumed and a new one is created at the same
+        // address with an updated price). The chain-level movement
+        // is `(script, script)` which the residual pass's same-
+        // wallet suppression rule catches without needing an
+        // explicit claim.
+        //
+        // OfferCreate / OfferUpdate / OfferCancel: tx-level lovelace
+        // movements only (offer locked at script, modified, or
+        // returned). No asset moves, nothing to claim.
+        _ => {}
+    }
 }
 
 /// For a list of assets within a single policy, surface the asset

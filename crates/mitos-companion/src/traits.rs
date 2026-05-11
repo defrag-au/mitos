@@ -16,12 +16,20 @@
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::wire::ChainPoint;
+use mitos_protocol::SubscribeTarget;
 
 /// Top-level companion trait. Implemented once per dApp companion.
 /// Owns the channel set, config, schema, and dApp RPC routes.
 ///
 /// The runtime fans inbound mitos events out to the right channel
 /// by tag.
+///
+/// `#[async_trait(?Send)]` is required because `on_recapture`
+/// (state-rebuild hook) is async — it runs SQL cleanup inside a
+/// CF DO, which is single-threaded but uses async APIs. All sync
+/// methods on the trait stay as plain `fn`; the macro only
+/// rewrites methods declared `async fn`.
+#[async_trait::async_trait(?Send)]
 pub trait MitosCompanion: Send + Sync + 'static {
     /// Stable name (matches the indexer's `name()` on the mitos
     /// side). Used for routing, logging, schema isolation.
@@ -40,6 +48,111 @@ pub trait MitosCompanion: Send + Sync + 'static {
     /// creates `mitos_companion_meta`, `mitos_companion_interest`,
     /// and the registration cache row itself).
     fn migrate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// What this companion subscribes to. Default: one
+    /// `SubscribeTarget::Module` with name = `Self::NAME` — i.e.
+    /// classic single-wasm-module companions Just Work without
+    /// overriding.
+    ///
+    /// Override to declare:
+    ///
+    /// - **Indexer target** instead of module (subscribe to an
+    ///   in-tree indexer via the unified-subscribe bridge — see
+    ///   `docs/design/UNIFIED_SUBSCRIBE.md`):
+    ///   ```ignore
+    ///   fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
+    ///       vec![SubscribeTarget::Indexer { name: "marketplace".into() }]
+    ///   }
+    ///   ```
+    /// - **Multi-target** (a single companion subscribing to
+    ///   several sources — e.g. one wasm module + one in-tree
+    ///   indexer):
+    ///   ```ignore
+    ///   fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
+    ///       vec![
+    ///           SubscribeTarget::Module { name: "jpg-co".into() },
+    ///           SubscribeTarget::Indexer { name: "marketplace".into() },
+    ///       ]
+    ///   }
+    ///   ```
+    ///   The host opens one dial-back WS per target (per
+    ///   UNIFIED_SUBSCRIBE.md's v1 multi-target shape), each
+    ///   landing at `/_internal/replicate-<target_name>` on the
+    ///   companion. Channel routing matches by target name.
+    fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
+        vec![SubscribeTarget::Module {
+            name: Self::NAME.to_string(),
+        }]
+    }
+
+    /// Programmatic initial-interest declaration — appended to the
+    /// SQL-table-backed dynamic interest set when constructing the
+    /// subscribe request.
+    ///
+    /// The SQL-table interest mechanism (populated via
+    /// `/api/_interest/subscribe`) supports `kind = "policy"` only
+    /// in v1. Companions that need richer Interest shapes —
+    /// `DomainSelector::Marketplace(Filter { ... })` for an in-tree
+    /// marketplace-indexer target, for example — declare them here
+    /// programmatically.
+    ///
+    /// Default: empty. Most single-target wasm-module companions
+    /// don't need this — their wasm module filters by address /
+    /// asset internally.
+    fn initial_interests(&self) -> Vec<mitos_protocol::Interest> {
+        Vec::new()
+    }
+
+    /// Drop the portion of the dApp's projected state that
+    /// originated from `module`, in preparation for a refill from
+    /// the host's bootstrap pass against that one module. Called
+    /// by the runtime when the host sends a `Recapture` frame;
+    /// the runtime sends `RecaptureReady` after this returns.
+    ///
+    /// **MUST scope cleanup by `module`** for any companion
+    /// subscribed to more than one community module — blindly
+    /// dropping shared tables would take out rows from other
+    /// subscriptions that aren't being recaptured. The convention
+    /// is a `source_module` column on every table populated from
+    /// community-module events; cleanup is then
+    /// `DELETE FROM <table> WHERE source_module = ?`. See
+    /// `mitos/docs/design/RECAPTURE.md` for the full schema
+    /// contract.
+    ///
+    /// Single-module companions can take the simpler route of
+    /// `DROP TABLE` + reinstall — same outcome, less ceremony.
+    /// They MUST grow the column + scoped DELETE if a second
+    /// community module subscription joins later.
+    ///
+    /// The runtime does NOT reset the companion's cursor around
+    /// this call. Per-module recapture must leave subscriptions
+    /// to other modules untouched, and rewinding the cursor would
+    /// be visible to all of them. The Apply frames the host emits
+    /// during the refill naturally advance the cursor as they
+    /// arrive.
+    ///
+    /// Default impl is a no-op + warning log — that's intentional:
+    /// companions that don't keep meaningful state (e.g. log-only
+    /// consumers) don't need to do anything. Companions that own
+    /// SQL tables MUST override.
+    ///
+    /// `reason` is the free-form operator-supplied label from the
+    /// admin endpoint, useful for logs.
+    async fn on_recapture(
+        &self,
+        _ctx: &Ctx,
+        module: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        tracing::warn!(
+            module = %module,
+            reason = ?reason,
+            companion = Self::NAME,
+            "Recapture received but on_recapture not implemented; \
+             dApp state will be inconsistent after refill"
+        );
         Ok(())
     }
 }

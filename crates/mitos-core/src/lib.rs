@@ -8,11 +8,15 @@
 
 mod auth;
 mod bundle;
+mod community_modules;
+mod coordinator;
 mod dispatcher;
 mod domain;
 mod emitter;
 mod handle;
+pub mod helpers;
 mod indexer;
+mod indexer_bridge;
 mod replicate;
 mod replicator;
 mod transport;
@@ -22,11 +26,13 @@ mod tests;
 
 pub use auth::AuthToken;
 pub use bundle::{Bundle, print_config_summary};
-pub use dispatcher::run_dispatcher;
+pub use coordinator::TxClaimCoordinator;
+pub use dispatcher::{run_dispatcher, run_synchronized_dispatcher};
 pub use domain::{load_config, setup_domain, spawn_sync_pipeline};
 pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};
 pub use indexer::{Indexer, SubscribeReply};
+pub use indexer_bridge::CoreIndexerBridge;
 pub use replicate::{
     ClientMessage, ServerMessage, chain_point_from_wire, chain_point_to_wire, decode_client,
     decode_server, encode_client, encode_server, replicate_router, subscribe_reply_to_wire,

@@ -18,10 +18,12 @@
 //!
 //! - `ClientMessage` — companion → mitos. `Subscribe` (in-session
 //!   re-assertion), `Interest` (Q6), `Ack`/`Nack` (Q5),
-//!   `Unsubscribe`.
+//!   `Unsubscribe`, `RecaptureReady` (recapture ack — see
+//!   `docs/design/RECAPTURE.md`).
 //! - `ServerMessage` — mitos → companion. `Connected` (Q8 readiness),
 //!   `SubscribeReply`, `Apply` (with `emission_id`), `Undo`, `Mark`,
-//!   `Error`.
+//!   `Error`, `Recapture` / `RecaptureDone` (per-module state-rebuild
+//!   protocol — see `docs/design/RECAPTURE.md`).
 //!
 //! See `mitos/docs/strategy/MITOS_COMPANION_RUNTIME_V1.md` for the
 //! design rationale.
@@ -150,6 +152,16 @@ pub enum ClientMessage {
     /// dApp's `apply_event` returned `Err`. Cursor still advances on
     /// the companion side; host records the error in `module_emissions`.
     Nack { emission_id: u64, error: String },
+
+    /// Acknowledgement that the companion has finished its
+    /// `on_recapture` hook (dApp-state cleanup scoped to the
+    /// module name carried in the preceding `Recapture` frame)
+    /// and is ready to receive the refill stream. Mitos waits
+    /// for this before clearing the module's bootstrap-done
+    /// flags and re-running bootstrap. No payload — the WS
+    /// conversation is per-companion so mitos knows the source.
+    /// See `docs/design/RECAPTURE.md`.
+    RecaptureReady,
 }
 
 // ============================================================================
@@ -184,6 +196,58 @@ pub enum ServerMessage {
     /// emission_id for this companion as a sync point.
     Connected {
         last_emission_id: u64,
+    },
+
+    /// Per-module state-rebuild request from the host. Companions
+    /// subscribed to multiple community modules MUST scope their
+    /// `on_recapture` cleanup by `module` — blindly dropping
+    /// shared dApp tables takes out rows from other subscriptions
+    /// whose state isn't being refilled. See
+    /// `docs/design/RECAPTURE.md` for the schema contract.
+    ///
+    /// After the companion's `on_recapture` completes, the runtime
+    /// sends `ClientMessage::RecaptureReady` and the host begins
+    /// re-emitting Apply frames for the module's current
+    /// bootstrap-walk state.
+    Recapture {
+        /// The source module being recaptured (matches a
+        /// `SubscribeTarget::Module { name }` the companion is
+        /// subscribed to). Companions use this to scope their
+        /// cleanup.
+        module: String,
+        /// Operator-supplied free-form label. Surfaced in the
+        /// companion's `on_recapture` callback for logging; not
+        /// load-bearing for the protocol.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// End-of-refill marker emitted after the host's bootstrap
+    /// walk completes for a `Recapture`. Apply frames preceding
+    /// this carry the refill payload; live chain events resume
+    /// from `cursor`.
+    ///
+    /// Informational — the protocol is correct without this frame
+    /// (the Apply stream does all the load-bearing work), but
+    /// the marker gives companions a clean boundary for any
+    /// post-refill housekeeping and the admin endpoint a precise
+    /// finish point for its response.
+    RecaptureDone {
+        /// The chain cursor at the moment the bootstrap walk
+        /// finished. Live events resume from here.
+        cursor: ChainPoint,
+        /// The source module whose recapture is now complete.
+        /// Matches the `module` carried in the preceding
+        /// `Recapture` frame.
+        module: String,
+        /// Number of refill events emitted for this companion's
+        /// view during the recapture. Useful for logs +
+        /// admin-endpoint response. Best-effort counter; if
+        /// counting proves expensive, future revisions may set
+        /// this to 0 — companions MUST NOT depend on the value
+        /// for correctness.
+        #[serde(default)]
+        events_emitted: u64,
     },
 }
 

@@ -20,6 +20,7 @@ use mitos_data_plane::ChainDataPlane;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver_v2::DriverV2;
+use crate::host_v2::{InterestUpdate, KvFactory};
 use crate::storage::ModuleStorage;
 use crate::PlatformResult;
 
@@ -34,13 +35,28 @@ use crate::PlatformResult;
 /// post-apply cursor to disk after every successful Apply /
 /// Mark / Undo. Without this, restart loses progress and
 /// `auto_resume` resumes from `None` (= origin / WAL replay).
+///
+/// `interest_rx` carries dynamic-interest updates from the
+/// companion-WS dialer (one frame per `ClientMessage::Interest`
+/// arrival). The follower multiplexes these with tip events so
+/// new predicates take effect on the next block boundary.
+///
+/// `kv_factory` is used by the dynamic-interest path to open a
+/// short-lived `ModuleKv` handle for bootstrap completion flags
+/// when an Add op brings a new address/policy into the interest
+/// set. The factory's underlying redb handle is cached
+/// (`ModuleStorage::kv_store`) so the multiple opens across
+/// follower lifetime don't fault on redb's single-writer rule.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chain_follower_v2<S, P>(
     mut driver: DriverV2,
     mut subscription: S,
+    mut interest_rx: tokio::sync::mpsc::UnboundedReceiver<InterestUpdate>,
     cancel: CancellationToken,
     data_plane: Arc<P>,
     storage: ModuleStorage,
     module_id: String,
+    kv_factory: KvFactory,
 ) -> PlatformResult<()>
 where
     S: TipSubscription,
@@ -48,11 +64,40 @@ where
 {
     tracing::info!("v2 chain-follower started");
     loop {
+        // Multiplex tip events with interest updates. `biased`
+        // gives tip events priority — dynamic interest is rare
+        // (companion subscribe / unsubscribe), chain blocks
+        // are the steady-state load.
         let event = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 tracing::info!("v2 follower: cancelled");
                 return Ok(());
+            }
+            update = interest_rx.recv() => {
+                match update {
+                    Some(update) => {
+                        apply_interest_update(
+                            &mut driver,
+                            &module_id,
+                            update,
+                            data_plane.as_ref(),
+                            &kv_factory,
+                        )
+                        .await;
+                        continue;
+                    }
+                    None => {
+                        // Sender dropped — `ModuleHostV2::stop`
+                        // signals shutdown by closing the
+                        // channel. Clean exit.
+                        tracing::info!(
+                            module = %module_id,
+                            "v2 interest channel closed; follower exiting",
+                        );
+                        return Ok(());
+                    }
+                }
             }
             event = subscription.next_tip() => event,
         };
@@ -107,6 +152,128 @@ where
                 // visible blocks have arrived.
                 flush_cursor(&storage, &module_id, &driver);
             }
+        }
+    }
+}
+
+/// Apply one dynamic-interest update: mutate the driver's
+/// `InterestSet` per the op, fire bootstrap for any newly-added
+/// predicates that have a current-state hydration path, then
+/// forward the same predicates (already CBOR-encoded by the
+/// router) to the module's `update-interest` export so it can
+/// persist via state-kv.
+///
+/// Errors from the module's export are logged but don't kill
+/// the follower — the host's filter is the source of truth for
+/// dispatch, the module's persisted copy is a best-effort
+/// resilience aid.
+async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
+    driver: &mut DriverV2,
+    module_id: &str,
+    update: InterestUpdate,
+    plane: &P,
+    kv_factory: &KvFactory,
+) {
+    use mitos_protocol::InterestOp as WireOp;
+
+    // 1. Apply the op to the driver's InterestSet so subsequent
+    //    block-dispatch filtering reflects the new predicates.
+    let mut current = driver.interest();
+    match update.op {
+        WireOp::Add => {
+            for p in &update.predicates {
+                // Dedupe: a re-subscribe of an already-watched
+                // predicate is a no-op rather than a duplicate
+                // entry. Keeps `predicates.iter().any(...)`
+                // matching cheap.
+                if !current.predicates.iter().any(|existing| existing == p) {
+                    current.add(p.clone());
+                }
+            }
+        }
+        WireOp::Remove => {
+            for p in &update.predicates {
+                current.remove(p);
+            }
+        }
+        WireOp::Replace => {
+            current.replace(update.predicates.clone());
+        }
+    }
+    driver.set_interest(current);
+
+    // 2. Bootstrap any newly-added predicates that have a
+    //    current-state hydration path (addresses + policies).
+    //    Idempotent via the per-scope state-kv flag — no-op
+    //    when the predicate's already been bootstrapped on a
+    //    previous Add or via the manifest-driven pass at start.
+    //    Only runs on Add (Remove never hydrates; Replace is
+    //    typically used at companion reconnect for re-asserting
+    //    state, not for fresh onboarding).
+    if matches!(update.op, WireOp::Add) {
+        let mut bootstrap_kv = kv_factory(module_id);
+        for predicate in &update.predicates {
+            match crate::bootstrap_v2::bootstrap_one_predicate(
+                driver,
+                module_id,
+                &mut bootstrap_kv,
+                predicate,
+                plane,
+            )
+            .await
+            {
+                Ok(stats) => {
+                    if stats.utxos_dispatched > 0 {
+                        tracing::info!(
+                            module = %module_id,
+                            predicate = ?predicate,
+                            utxos = stats.utxos_dispatched,
+                            batches = stats.batches_dispatched,
+                            "v2 dynamic-interest bootstrap complete",
+                        );
+                    }
+                }
+                Err(e) => tracing::error!(
+                    module = %module_id,
+                    predicate = ?predicate,
+                    error = %e,
+                    "v2 dynamic-interest bootstrap failed; live dispatch still applies",
+                ),
+            }
+        }
+    }
+
+    // 3. Forward to the module's update-interest export. Map
+    //    the wire op enum to the bindgen op enum (same variants,
+    //    different generated types).
+    let bindgen_op = match update.op {
+        WireOp::Add => crate::bindings_v2::InterestOp::Add,
+        WireOp::Remove => crate::bindings_v2::InterestOp::Remove,
+        WireOp::Replace => crate::bindings_v2::InterestOp::Replace,
+    };
+    match driver.call_update_interest(bindgen_op, &update.items_cbor).await {
+        Ok(Ok(())) => {
+            tracing::debug!(
+                module = %module_id,
+                op = ?update.op,
+                "v2 interest update applied",
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                module = %module_id,
+                op = ?update.op,
+                error = %e,
+                "module returned Err from update-interest; host filter still updated",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                module = %module_id,
+                op = ?update.op,
+                error = %e,
+                "update-interest trapped or fuel-exhausted; host filter still updated",
+            );
         }
     }
 }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dolos::adapters::DomainAdapter;
 use dolos_core::{ChainPoint, TipEvent};
+use mitos_protocol::MovementClaim;
 use tokio::sync::{Mutex, broadcast};
 use tracing::warn;
 
@@ -38,7 +39,8 @@ use crate::transport::WsTransport;
 /// Slow consumers that fall behind get a `Lagged` error and the pump
 /// drops their connection — they reconnect via the resume / snapshot
 /// path. Sized for one block's worth of busy chain activity (~hundreds
-/// of changes) plus headroom; production tuning is Phase 4.5 work.
+/// of changes) plus headroom; revisit if production traffic patterns
+/// regularly hit this ceiling.
 const BROADCAST_CAPACITY: usize = 4096;
 
 /// Object-safe view of an `Indexer<DomainAdapter>` for storage in
@@ -49,6 +51,12 @@ const BROADCAST_CAPACITY: usize = 4096;
 pub trait IndexerHandle: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Mirrors `Indexer::is_internal()`. Captured at adapter
+    /// construction so the host's unified-subscribe handler can
+    /// reject `SubscribeTarget::Indexer { name }` requests for
+    /// internal indexers without locking the inner mutex.
+    fn is_internal(&self) -> bool;
+
     /// HTTP routes for this indexer. Captured at adapter construction
     /// (a clone of the original `Router`), so this is cheap to call
     /// from synchronous bundle-setup code.
@@ -56,12 +64,17 @@ pub trait IndexerHandle: Send + Sync {
 
     async fn bootstrap(&self, domain: &DomainAdapter) -> anyhow::Result<ChainPoint>;
 
-    async fn handle_event(&self, domain: &DomainAdapter, event: &TipEvent) -> anyhow::Result<()>;
+    async fn handle_event(
+        &self,
+        domain: &DomainAdapter,
+        event: &TipEvent,
+    ) -> anyhow::Result<Vec<MovementClaim>>;
 
     /// Run the per-consumer pump until the consumer disconnects or
     /// drops. Owns the subscribe handshake, broadcast→ws forwarding,
-    /// scope filtering, and (Phase 4.5) ack-driven retransmit-buffer
-    /// trim.
+    /// and scope filtering. Ack-driven retransmit-buffer trim is
+    /// future work — today the broadcast channel's bounded capacity
+    /// applies backpressure without per-consumer trim.
     ///
     /// `transport` is direction-agnostic — server-accepted axum
     /// WebSocket or client-dialed tungstenite stream both work.
@@ -91,6 +104,7 @@ where
     I: Indexer<DomainAdapter>,
 {
     name: &'static str,
+    is_internal: bool,
     routes: axum::Router,
     inner: Arc<Mutex<I>>,
     changes: broadcast::Sender<EmittedRecord<<I as Indexer<DomainAdapter>>::Change>>,
@@ -102,10 +116,12 @@ where
 {
     pub fn new(indexer: I) -> Self {
         let name = indexer.name();
+        let is_internal = indexer.is_internal();
         let routes = indexer.routes();
         let (changes, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             name,
+            is_internal,
             routes,
             inner: Arc::new(Mutex::new(indexer)),
             changes,
@@ -122,6 +138,10 @@ where
         self.name
     }
 
+    fn is_internal(&self) -> bool {
+        self.is_internal
+    }
+
     fn routes(&self) -> axum::Router {
         self.routes.clone()
     }
@@ -131,7 +151,11 @@ where
         guard.bootstrap(domain).await
     }
 
-    async fn handle_event(&self, domain: &DomainAdapter, event: &TipEvent) -> anyhow::Result<()> {
+    async fn handle_event(
+        &self,
+        domain: &DomainAdapter,
+        event: &TipEvent,
+    ) -> anyhow::Result<Vec<MovementClaim>> {
         let cursor = event_cursor(event);
         let emitter = Emitter::new(self.changes.clone(), cursor.clone());
         let mut guard = self.inner.lock().await;
@@ -217,9 +241,11 @@ where
             send(
                 &mut transport,
                 &ServerMessage::Apply {
-                    // emission_id stays 0 until PR 3 wires the
-                    // emissions log; companions tolerate the
-                    // default via `#[serde(default)]`.
+                    // emission_id = 0 on the legacy replicator lane
+                    // — the emissions log is per-companion and
+                    // doesn't apply to direct in-tree-indexer
+                    // subscribers. Companions tolerate the default
+                    // via `#[serde(default)]`.
                     emission_id: 0,
                     cursor: chain_point_to_wire(&resume_cursor),
                     change: buf,
@@ -279,7 +305,13 @@ where
         ClientMessage::Ack { .. }
         | ClientMessage::Nack { .. }
         | ClientMessage::Interest { .. }
-        | ClientMessage::Unsubscribe => {
+        | ClientMessage::Unsubscribe
+        | ClientMessage::RecaptureReady => {
+            // RecaptureReady is part of the recapture protocol (see
+            // `docs/design/RECAPTURE.md`); it's only meaningful
+            // mid-subscription after the host has sent a `Recapture`
+            // frame. Receiving it before Subscribe is the same shape
+            // of error as Ack/Nack/etc — handle uniformly.
             let _ = send(
                 transport,
                 &ServerMessage::Error {
@@ -323,7 +355,7 @@ where
 /// `select!` runs them sequentially — only one branch holds the
 /// borrow at a time, so this is safe without a transport split.
 ///
-/// Inbound frames (Phase B handling, PR 3b):
+/// Inbound frames handled:
 /// - `ClientMessage::Interest { op, items }` — forwarded to the
 ///   `inbound_handler` if one is wired. Bundle wires this to the
 ///   running module's `update-interest` host call.
@@ -453,6 +485,18 @@ where
                     }
                     Ok(ClientMessage::Subscribe { .. }) => {
                         tracing::warn!("unexpected Subscribe after initial handshake; ignoring");
+                    }
+                    Ok(ClientMessage::RecaptureReady) => {
+                        // Recapture protocol's host-side driver
+                        // lands in a later commit (see
+                        // `docs/design/RECAPTURE.md`). The legacy
+                        // replicate pump never sends `Recapture`,
+                        // so a companion should never reply with
+                        // `RecaptureReady` here. Log and drop.
+                        tracing::warn!(
+                            "RecaptureReady received on legacy pump; ignoring \
+                             (recapture not yet wired)"
+                        );
                     }
                     Err(e) => {
                         // Legacy pre-PR-3 consumers send Ack/Nack frames

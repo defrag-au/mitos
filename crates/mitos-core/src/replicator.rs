@@ -1,6 +1,6 @@
 //! `Replicator`: outbound WebSocket client driver.
 //!
-//! ## Status: legacy. Slated for retirement.
+//! ## Status: legacy. Retirement-blocked on one orphan policy.
 //!
 //! This is the pre-companion-runtime outbound model: each
 //! `Subscription` ties a static `IndexerHandle` (compiled into
@@ -13,18 +13,34 @@
 //! (`mitos-admin emissions list/replay/purge`) makes the
 //! delivery state inspectable.
 //!
-//! Production cutover: when the legacy
-//! `cnft.dev-workers/workers/collection-ownership/` consumer
-//! migrates onto `collections-mitos`'s companion-runtime path,
-//! the two `replicator.connected` legacy subscriptions go
-//! away and this file + the static `IndexerHandle` machinery
-//! (`crate::handle::IndexerHandle`, `run_subscriber`,
-//! `replicate_router`, `crates/collection-ownership-indexer/`,
-//! `crates/marketplace-indexer/`) become deletable as a single
-//! cleanup PR.
+//! ## Current production state (2026-05-11 snapshot)
 //!
-//! Until then, leaving in place — production ownership data
-//! flows through this `Replicator`.
+//! 2 active subscriptions, both for the `collection-ownership`
+//! in-tree indexer, both targeting `ownership-mitos.cnft.dev`
+//! (the `collections-mitos` worker):
+//! - policy `b3dab69f…` — sole path; **blocker for retirement**.
+//! - policy `4523c5e2…` — also has a companion-runtime
+//!   registration against the `ownership` wasm module
+//!   (`/var/lib/mitos/modules/ownership/companions/`); events
+//!   are currently double-routed.
+//!
+//! ## Retirement prerequisites
+//!
+//! 1. Trigger a `/_internal/wake` on the `collections-mitos`
+//!    worker for policy `b3dab69f…` so it registers via
+//!    companion-runtime.
+//! 2. `mitos-admin remove 6` (the duplicate for `4523c5e2…`).
+//! 3. `mitos-admin remove 5` (after step 1 confirms the new
+//!    path is delivering for `b3dab69f…`).
+//! 4. Verify `replicator.connected: 0` from `/health`.
+//!
+//! Once step 4 holds for ~hours: this file + the static
+//! `IndexerHandle` machinery (`crate::handle::IndexerHandle`,
+//! `run_subscriber`, `replicate_router`,
+//! `crates/collection-ownership-indexer/`,
+//! `crates/marketplace-indexer/`) and the
+//! `mitos-admin {add,remove,list}` subcommands become
+//! deletable as a single cleanup PR. Rough size: ~600 lines.
 //!
 //! ## Original docs:
 //!

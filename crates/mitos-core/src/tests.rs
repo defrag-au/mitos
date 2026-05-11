@@ -165,6 +165,79 @@ fn server_error_roundtrip() {
 }
 
 #[test]
+fn server_recapture_roundtrip() {
+    // With reason.
+    let original = ServerMessage::Recapture {
+        module: "jpg-co".into(),
+        reason: Some("manual rebuild after schema migration".into()),
+    };
+    let bytes = encode_server(&original).unwrap();
+    match decode_server(&bytes).unwrap() {
+        ServerMessage::Recapture { module, reason } => {
+            assert_eq!(module, "jpg-co");
+            assert_eq!(
+                reason.as_deref(),
+                Some("manual rebuild after schema migration")
+            );
+        }
+        other => panic!("expected Recapture, got {other:?}"),
+    }
+
+    // Without reason — should round-trip via `skip_serializing_if`
+    // + `serde(default)`.
+    let original = ServerMessage::Recapture {
+        module: "wayup-co".into(),
+        reason: None,
+    };
+    let bytes = encode_server(&original).unwrap();
+    match decode_server(&bytes).unwrap() {
+        ServerMessage::Recapture { module, reason } => {
+            assert_eq!(module, "wayup-co");
+            assert!(reason.is_none());
+        }
+        other => panic!("expected Recapture, got {other:?}"),
+    }
+}
+
+#[test]
+fn client_recapture_ready_roundtrip() {
+    let original = ClientMessage::RecaptureReady;
+    let bytes = encode_client(&original).unwrap();
+    match decode_client(&bytes).unwrap() {
+        ClientMessage::RecaptureReady => {}
+        other => panic!("expected RecaptureReady, got {other:?}"),
+    }
+}
+
+#[test]
+fn server_recapture_done_roundtrip() {
+    let original = ServerMessage::RecaptureDone {
+        cursor: WireChainPoint::Specific(186_076_148, fixed_hash_hex()),
+        module: "jpg-co".into(),
+        events_emitted: 124,
+    };
+    let bytes = encode_server(&original).unwrap();
+    match decode_server(&bytes).unwrap() {
+        ServerMessage::RecaptureDone {
+            cursor,
+            module,
+            events_emitted,
+        } => {
+            match cursor {
+                WireChainPoint::Specific(slot, hash) => {
+                    assert_eq!(slot, 186_076_148);
+                    assert_eq!(hash, fixed_hash_hex());
+                }
+                other => panic!("expected Specific, got {other:?}"),
+            }
+            assert_eq!(module, "jpg-co");
+            assert_eq!(events_emitted, 124);
+        }
+        other => panic!("expected RecaptureDone, got {other:?}"),
+    }
+}
+
+#[test]
 fn chain_point_conversion_round_trips() {
     let dolos = ChainPoint::Specific(186_076_148, fixed_hash());
     let wire = chain_point_to_wire(&dolos);

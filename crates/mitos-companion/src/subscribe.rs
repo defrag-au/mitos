@@ -13,9 +13,9 @@
 //! ```
 //!
 //! Mitos persists the registration in its module redb so it can dial
-//! back over WS to deliver emissions (the dial-back path lands in
-//! PR 3 alongside the emissions log; for PR 1, the host endpoint
-//! just persists).
+//! back over WS to deliver emissions. The dial-back is driven by
+//! `mitos-platform::dialer::CompanionDialer::start_all` at host
+//! startup, and on every fresh subscribe via `register`.
 //!
 //! ## Type sourcing
 //!
@@ -168,12 +168,14 @@ pub async fn post_subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mitos_protocol::{ChainPoint, Interest};
+    use mitos_protocol::{ChainPoint, Interest, SubscribeTarget};
 
     #[test]
     fn round_trip_subscribe_request() {
         let req = SubscribeRequest {
-            module_name: "ownership-indexer".into(),
+            targets: vec![SubscribeTarget::Module {
+                name: "ownership-indexer".into(),
+            }],
             companion_key: "customer_42".into(),
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![Interest::any()],
@@ -181,7 +183,8 @@ mod tests {
         };
         let bytes = encode_subscribe(&req).unwrap();
         let decoded = decode_subscribe(&bytes).unwrap();
-        assert_eq!(decoded.module_name, "ownership-indexer");
+        assert_eq!(decoded.targets.len(), 1);
+        assert_eq!(decoded.single_module_target(), Some("ownership-indexer"));
         assert_eq!(decoded.companion_key, "customer_42");
         assert_eq!(decoded.interests.len(), 1);
         assert!(decoded.dial_back.is_none());
@@ -203,7 +206,9 @@ mod tests {
     #[test]
     fn round_trip_with_dial_back_override() {
         let req = SubscribeRequest {
-            module_name: "tenant-saas".into(),
+            targets: vec![SubscribeTarget::Module {
+                name: "tenant-saas".into(),
+            }],
             companion_key: "tenant_001".into(),
             resume_from: None,
             interests: vec![],

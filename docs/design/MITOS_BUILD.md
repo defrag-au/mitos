@@ -1,5 +1,18 @@
 # mitos-build
 
+> **Status: partially current.** The single-file build flow,
+> materialisation pattern, manifest schema, and artifact-dir
+> shape described below are accurate. The v1 ABI references
+> throughout (`mitos:platform/mitos-module`, `wit/world.wit`)
+> are stale — v1 was retired May 2026; the build tool now
+> emits v2 artifacts only (`mitos:platform-v2/mitos-module-v2`,
+> `wit-v2/world.wit`) and rejects `abi_version = 1` with a
+> clear migration error.
+>
+> Treat WIT-shape examples in this doc as historical; pull
+> current shape from `crates/mitos-platform/wit-v2/world.wit`
+> and `tools/mitos-build/src/main.rs` directly.
+
 The single-file-module build tool. Materialises a Cargo crate around
 a `<name>.rs` + optional `<name>.toml`, runs `cargo build` against
 the bundled WIT, and emits a deployable artifact directory consumable

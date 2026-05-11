@@ -47,9 +47,10 @@ use std::time::{Duration, SystemTime};
 
 use futures_util::{SinkExt, StreamExt};
 use mitos_protocol::{
-    ClientMessage, ServerMessage, SubscribeRequest, decode_client, encode_server,
+    ChainPoint, ClientMessage, ServerMessage, SubscribeRequest, SubscribeTarget, decode_client,
+    encode_server,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     connect_async,
@@ -62,6 +63,7 @@ use url::Url;
 use crate::admin::AuthToken;
 use crate::emissions::{EmissionStatus, EmissionsStore};
 use crate::host_v2::InterestRouter;
+use crate::indexer_bridge::IndexerBridgeHandle;
 use crate::storage::ModuleStorage;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -85,11 +87,64 @@ impl CompanionId {
     }
 }
 
-/// Per-companion dial supervisor entry. Owns the task handle
-/// + cancellation token.
+/// Successful outcome of `CompanionDialer::recapture_module` —
+/// every targeted companion ACKed `RecaptureReady` within timeout.
+/// See `docs/design/RECAPTURE.md`.
+#[derive(Debug, Clone)]
+pub struct RecaptureSummary {
+    pub module: String,
+    /// Companion keys that ACKed, in iteration order. Same as the
+    /// set of subscribers at recapture start (no partial success
+    /// returns this variant).
+    pub ready_companions: Vec<String>,
+}
+
+/// Failure modes for `CompanionDialer::recapture_module`.
+#[derive(Debug, thiserror::Error)]
+pub enum RecaptureError {
+    /// No companions subscribed to this module — the recapture
+    /// has nothing to coordinate. The admin endpoint returns 404
+    /// for this case (distinguishable from "module exists but no
+    /// subscribers" which the host's outer wrapper handles).
+    #[error("no companions subscribed to module `{0}`")]
+    NoSubscribers(String),
+
+    /// One or more companions failed to ACK `RecaptureReady`
+    /// within the per-companion timeout. The bootstrap-refill MUST
+    /// NOT proceed — running it with some companions still
+    /// mid-cleanup would seed ghost rows.
+    #[error(
+        "recapture for `{module}` timed out: {} ready, {} timed out",
+        ready_companions.len(),
+        timed_out_companions.len(),
+    )]
+    Timeout {
+        module: String,
+        ready_companions: Vec<String>,
+        timed_out_companions: Vec<String>,
+    },
+
+    /// Pushing the `Recapture` frame into the companion's
+    /// outbound channel failed — the dial task is gone. The
+    /// recapture is aborted; operator should retry once the
+    /// companion has reconnected.
+    #[error("send Recapture to {companion:?}: {detail}")]
+    FrameSend {
+        companion: CompanionId,
+        detail: String,
+    },
+}
+
+/// Per-companion dial supervisor entry. Owns the task handle,
+/// cancellation token, and an unbounded mpsc sender the recapture
+/// driver uses to push outbound control frames (`Recapture`,
+/// `RecaptureDone`) into the running task. Unbounded so the
+/// driver never has to await capacity; the volume of control
+/// frames per recapture is O(1) per companion.
 struct ActiveCompanion {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    outbound_tx: mpsc::UnboundedSender<ServerMessage>,
 }
 
 /// Dial supervisor — one instance per running mitos host.
@@ -104,7 +159,18 @@ pub struct CompanionDialer {
     /// builds where no `ModuleHost` is wired; production
     /// always passes `Some(host as Arc<dyn InterestRouter>)`.
     interest_router: Option<Arc<dyn InterestRouter>>,
+    /// In-tree indexer bridge — handles `SubscribeTarget::Indexer`
+    /// dispatch. Provided by `mitos-core::Bundle` at runtime when
+    /// the host has in-tree indexers. `None` means the dialer
+    /// only handles `Module` targets.
+    indexer_bridge: Option<IndexerBridgeHandle>,
     tasks: Arc<Mutex<HashMap<CompanionId, ActiveCompanion>>>,
+    /// One-shot senders the recapture driver uses to await
+    /// `ClientMessage::RecaptureReady` from each targeted
+    /// companion. Registered before `Recapture` is sent; fired
+    /// when the matching `RecaptureReady` arrives on that
+    /// companion's WS. See `docs/design/RECAPTURE.md`.
+    pending_recaptures: Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
 }
 
 impl CompanionDialer {
@@ -117,8 +183,18 @@ impl CompanionDialer {
             storage,
             auth,
             interest_router,
+            indexer_bridge: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            pending_recaptures: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach an in-tree indexer bridge. The dialer will dispatch
+    /// `SubscribeTarget::Indexer` requests through the bridge's
+    /// `spawn_dial` method.
+    pub fn with_indexer_bridge(mut self, bridge: IndexerBridgeHandle) -> Self {
+        self.indexer_bridge = Some(bridge);
+        self
     }
 
     /// Scan `<storage_root>/*/companions/*.cbor` and start a
@@ -159,23 +235,27 @@ impl CompanionDialer {
     }
 
     /// Register (or re-register) a companion. Called from the
-    /// `/api/companions/subscribe` handler after the CBOR file
-    /// has been written to disk. Cancels any existing dial
-    /// loop for the same `(module_id, companion_key)` and
-    /// spawns a fresh one with the updated registration.
+    /// `/api/companions/subscribe` handler after persistence +
+    /// validation. Spawns one dial loop per target in the
+    /// request; multi-target subscribe results in N independent
+    /// outbound WSes (one per target). Cancels any existing dial
+    /// loop for each `(target_name, companion_key)` pair before
+    /// spawning fresh ones — register() is idempotent
+    /// re-registration.
     pub async fn register(&self, req: SubscribeRequest) {
-        let id = CompanionId::new(&req.module_name, &req.companion_key);
-        // Cancel any existing task for this id before spawning
-        // a fresh one — register() is idempotent re-registration.
+        // Cancel existing tasks for any of the request's targets.
         {
             let mut tasks = self.tasks.lock().await;
-            if let Some(prev) = tasks.remove(&id) {
-                prev.cancel.cancel();
-                // Task self-terminates once it observes the
-                // cancel token; explicitly drop the JoinHandle
-                // so the underlying tokio task isn't accidentally
-                // awaited / blocked on here.
-                drop(prev.task);
+            for target in &req.targets {
+                let id = CompanionId::new(target.name(), &req.companion_key);
+                if let Some(prev) = tasks.remove(&id) {
+                    prev.cancel.cancel();
+                    // Task self-terminates once it observes the
+                    // cancel token; drop the JoinHandle so the
+                    // underlying tokio task isn't accidentally
+                    // awaited / blocked on here.
+                    drop(prev.task);
+                }
             }
         }
         self.spawn(req).await;
@@ -191,18 +271,245 @@ impl CompanionDialer {
         }
     }
 
+    /// Send `ServerMessage::Recapture { module, reason }` to every
+    /// active companion subscribed to `module_id` and await
+    /// `ClientMessage::RecaptureReady` from each. Returns
+    /// `Ok(RecaptureSummary)` when every targeted companion has
+    /// ACKed within `per_companion_timeout`; `Err(RecaptureError)`
+    /// on timeout, frame-send failure, or no subscribers.
+    ///
+    /// On timeout, the per-companion oneshot is dropped — a late
+    /// `RecaptureReady` arriving after the timeout is logged as a
+    /// "driver gave up" debug line, no protocol state corruption.
+    ///
+    /// See `mitos/docs/design/RECAPTURE.md`.
+    pub async fn recapture_module(
+        &self,
+        module_id: &str,
+        reason: Option<String>,
+        per_companion_timeout: Duration,
+    ) -> Result<RecaptureSummary, RecaptureError> {
+        // Snapshot the targeted companions + their outbound senders.
+        // Holding the tasks lock for the whole recapture would block
+        // re-registration; copy senders out under a short lock then
+        // drop it.
+        let targets: Vec<(CompanionId, mpsc::UnboundedSender<ServerMessage>)> = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .iter()
+                .filter(|(id, _)| id.module_id == module_id)
+                .map(|(id, slot)| (id.clone(), slot.outbound_tx.clone()))
+                .collect()
+        };
+        if targets.is_empty() {
+            return Err(RecaptureError::NoSubscribers(module_id.to_owned()));
+        }
+        let companion_count = targets.len();
+        info!(
+            module = %module_id,
+            companion_count,
+            timeout_secs = per_companion_timeout.as_secs(),
+            "recapture: dispatching Recapture frames to subscribed companions"
+        );
+
+        // Register oneshots + send Recapture frames. Done in two
+        // passes so the receivers are all in place before any
+        // frame goes out — race-free if a companion replies before
+        // we get to its register step.
+        let mut waiters: Vec<(CompanionId, oneshot::Receiver<()>)> = Vec::with_capacity(companion_count);
+        {
+            let mut pending = self.pending_recaptures.lock().await;
+            for (id, _) in &targets {
+                let (tx, rx) = oneshot::channel();
+                pending.insert(id.clone(), tx);
+                waiters.push((id.clone(), rx));
+            }
+        }
+        for (id, tx) in &targets {
+            let frame = ServerMessage::Recapture {
+                module: module_id.to_owned(),
+                reason: reason.clone(),
+            };
+            if let Err(e) = tx.send(frame) {
+                // Send failure means the task is gone. Remove
+                // the oneshot we just registered to avoid leaking
+                // it; surface as a typed error so the host can
+                // report which companion failed.
+                let mut pending = self.pending_recaptures.lock().await;
+                pending.remove(id);
+                return Err(RecaptureError::FrameSend {
+                    companion: id.clone(),
+                    detail: e.to_string(),
+                });
+            }
+        }
+
+        // Await each oneshot with per-companion timeout. We use a
+        // single shared deadline so the *whole* recapture has a
+        // bounded latency; per-companion timeouts run in parallel
+        // via `tokio::time::timeout` per waiter rather than
+        // sequentially.
+        let mut ready: Vec<String> = Vec::with_capacity(companion_count);
+        let mut timed_out: Vec<String> = Vec::new();
+        for (id, rx) in waiters {
+            match tokio::time::timeout(per_companion_timeout, rx).await {
+                Ok(Ok(())) => ready.push(id.companion_key.clone()),
+                Ok(Err(_recv_err)) => {
+                    // oneshot dropped without sending — task
+                    // disconnected mid-wait. Treat as timeout for
+                    // operator-facing purposes.
+                    timed_out.push(id.companion_key.clone());
+                }
+                Err(_elapsed) => {
+                    timed_out.push(id.companion_key.clone());
+                    // Drop our remaining pending entry so a late
+                    // arrival doesn't leak.
+                    let mut pending = self.pending_recaptures.lock().await;
+                    pending.remove(&id);
+                }
+            }
+        }
+
+        if timed_out.is_empty() {
+            info!(
+                module = %module_id,
+                companion_count,
+                "recapture: all companions acked RecaptureReady"
+            );
+            Ok(RecaptureSummary {
+                module: module_id.to_owned(),
+                ready_companions: ready,
+            })
+        } else {
+            warn!(
+                module = %module_id,
+                timed_out_count = timed_out.len(),
+                ready_count = ready.len(),
+                "recapture: some companions failed to ack RecaptureReady within timeout"
+            );
+            Err(RecaptureError::Timeout {
+                module: module_id.to_owned(),
+                ready_companions: ready,
+                timed_out_companions: timed_out,
+            })
+        }
+    }
+
+    /// Push `ServerMessage::RecaptureDone { cursor, module,
+    /// events_emitted }` to every active companion subscribed to
+    /// `module_id`. Fire-and-forget — the frame is informational;
+    /// the operator-facing admin endpoint reports success on
+    /// dispatch, not on companion receipt.
+    ///
+    /// See `mitos/docs/design/RECAPTURE.md`.
+    pub async fn send_recapture_done(
+        &self,
+        module_id: &str,
+        cursor: ChainPoint,
+        events_emitted: u64,
+    ) {
+        let senders: Vec<(CompanionId, mpsc::UnboundedSender<ServerMessage>)> = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .iter()
+                .filter(|(id, _)| id.module_id == module_id)
+                .map(|(id, slot)| (id.clone(), slot.outbound_tx.clone()))
+                .collect()
+        };
+        for (id, tx) in senders {
+            let frame = ServerMessage::RecaptureDone {
+                cursor: cursor.clone(),
+                module: module_id.to_owned(),
+                events_emitted,
+            };
+            if let Err(e) = tx.send(frame) {
+                warn!(
+                    module = %module_id,
+                    companion_key = %id.companion_key,
+                    error = %e,
+                    "send RecaptureDone failed; companion task likely gone"
+                );
+            }
+        }
+    }
+
     async fn spawn(&self, req: SubscribeRequest) {
-        let id = CompanionId::new(&req.module_name, &req.companion_key);
-        let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
-        let storage = self.storage.clone();
-        let auth = self.auth.clone();
-        let interest_router = self.interest_router.clone();
-        let task = tokio::spawn(async move {
-            run_companion(req, storage, auth, interest_router, cancel_for_task).await;
-        });
-        let mut tasks = self.tasks.lock().await;
-        tasks.insert(id, ActiveCompanion { cancel, task });
+        // Spawn one dial loop per target. Each target's dial
+        // gets its own cancellation token + its own entry in
+        // the supervisor map keyed by `(target_name,
+        // companion_key)`. The companion-side runtime accepts
+        // each WS at `/_internal/replicate-<target_name>`
+        // (via the `{target}` substitution in the dial-back URL
+        // template).
+        for target in req.targets.clone() {
+            let id = CompanionId::new(target.name(), &req.companion_key);
+            let cancel = CancellationToken::new();
+            let cancel_for_task = cancel.clone();
+            // Per-task outbound control channel — the recapture
+            // driver pushes `Recapture` / `RecaptureDone` frames
+            // through here and the task forwards to the WS sink.
+            // Unbounded so the driver never awaits capacity;
+            // recaptures send O(1) frames per companion.
+            let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+            let task = match &target {
+                SubscribeTarget::Module { .. } => {
+                    let storage = self.storage.clone();
+                    let auth = self.auth.clone();
+                    let interest_router = self.interest_router.clone();
+                    let target_clone = target.clone();
+                    let req_clone = req.clone();
+                    let pending_recaptures = self.pending_recaptures.clone();
+                    let id_for_task = id.clone();
+                    tokio::spawn(async move {
+                        run_companion(
+                            req_clone,
+                            target_clone,
+                            storage,
+                            auth,
+                            interest_router,
+                            cancel_for_task,
+                            outbound_rx,
+                            pending_recaptures,
+                            id_for_task,
+                        )
+                        .await;
+                    })
+                }
+                SubscribeTarget::Indexer { name } => {
+                    let Some(bridge) = self.indexer_bridge.clone() else {
+                        warn!(
+                            indexer = %name,
+                            companion_key = %req.companion_key,
+                            "indexer-target subscribe but no bridge wired on dialer; skipping dial"
+                        );
+                        continue;
+                    };
+                    // The bridge owns the dial loop for indexer
+                    // targets — it has access to the
+                    // `IndexerHandle::run_subscriber` machinery
+                    // in `mitos-core`. We just track the
+                    // JoinHandle in the supervisor map so
+                    // re-registration can cancel it.
+                    // outbound_rx is dropped on this branch —
+                    // indexer-target dial loops don't currently
+                    // participate in the recapture protocol
+                    // (recapture is a community-module concern).
+                    drop(outbound_rx);
+                    bridge.spawn_dial(req.clone(), target.clone(), cancel_for_task)
+                }
+            };
+
+            let mut tasks = self.tasks.lock().await;
+            tasks.insert(
+                id,
+                ActiveCompanion {
+                    cancel,
+                    task,
+                    outbound_tx,
+                },
+            );
+        }
     }
 }
 
@@ -215,18 +522,30 @@ fn load_companion(path: &std::path::Path) -> anyhow::Result<SubscribeRequest> {
 
 /// Per-companion supervisor: dial → loop with reconnect/backoff
 /// until cancelled.
+///
+/// Parameter count is intentional — each represents an independent
+/// capability the task needs (req shape, target identity, storage,
+/// auth, interest routing, lifecycle cancellation, outbound control
+/// channel, pending-recapture map, companion identity). Bundling
+/// would just move the count into a parameter-bag struct.
+#[allow(clippy::too_many_arguments)]
 async fn run_companion(
     req: SubscribeRequest,
+    target: SubscribeTarget,
     storage: ModuleStorage,
     auth: AuthToken,
     interest_router: Option<Arc<dyn InterestRouter>>,
     cancel: CancellationToken,
+    mut outbound_rx: mpsc::UnboundedReceiver<ServerMessage>,
+    pending_recaptures: Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
+    companion_id: CompanionId,
 ) {
-    let url_str = match resolve_dial_url(&req) {
+    let module_name = target.name().to_string();
+    let url_str = match resolve_dial_url(&req, &target) {
         Ok(u) => u,
         Err(e) => {
             error!(
-                module = %req.module_name,
+                module = %module_name,
                 companion_key = %req.companion_key,
                 error = %e,
                 "no dial-back URL configured; companion will not receive emissions"
@@ -238,7 +557,7 @@ async fn run_companion(
         Ok(u) => u,
         Err(e) => {
             error!(
-                module = %req.module_name,
+                module = %module_name,
                 companion_key = %req.companion_key,
                 url = %url_str,
                 error = %e,
@@ -248,11 +567,11 @@ async fn run_companion(
         }
     };
 
-    let store = match storage.emissions_store(&req.module_name) {
+    let store = match storage.emissions_store(&module_name) {
         Ok(s) => s,
         Err(e) => {
             error!(
-                module = %req.module_name,
+                module = %module_name,
                 error = %e,
                 "open EmissionsStore failed; companion task exiting"
             );
@@ -265,10 +584,22 @@ async fn run_companion(
         if cancel.is_cancelled() {
             return;
         }
-        match dial_and_pump(&parsed, &req, &auth, &store, interest_router.as_ref(), &cancel).await {
+        match dial_and_pump(
+            &parsed,
+            &req,
+            &auth,
+            &store,
+            interest_router.as_ref(),
+            &cancel,
+            &mut outbound_rx,
+            &pending_recaptures,
+            &companion_id,
+        )
+        .await
+        {
             Ok(()) => {
                 info!(
-                    module = %req.module_name,
+                    module = %module_name,
                     companion_key = %req.companion_key,
                     "companion dial loop exited cleanly; redialing"
                 );
@@ -276,7 +607,7 @@ async fn run_companion(
             }
             Err(e) => {
                 warn!(
-                    module = %req.module_name,
+                    module = %module_name,
                     companion_key = %req.companion_key,
                     target = %url_str,
                     error = %e,
@@ -293,11 +624,20 @@ async fn run_companion(
     }
 }
 
-/// Resolve the dial-back URL. v1 requires `dial_back.url` to
-/// be set on the subscribe request. Module-level
-/// `[companion] replicate_url` defaults are wired in a
-/// follow-up.
-fn resolve_dial_url(req: &SubscribeRequest) -> anyhow::Result<String> {
+/// Resolve the dial-back URL for one target. The URL template
+/// from `dial_back.url` is substituted with both `{key}` (the
+/// companion_key) and `{target}` (the target's name). v1
+/// supports either substitution token; companions with a single
+/// target can omit `{target}` from their template and the
+/// substitution becomes a no-op.
+///
+/// Multi-target companions MUST include `{target}` so each
+/// target's dial-back resolves to a distinct URL — typically
+/// `wss://.../_internal/replicate-{target}?key={key}`.
+fn resolve_dial_url(
+    req: &SubscribeRequest,
+    target: &SubscribeTarget,
+) -> anyhow::Result<String> {
     let url = req
         .dial_back
         .as_ref()
@@ -305,13 +645,16 @@ fn resolve_dial_url(req: &SubscribeRequest) -> anyhow::Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "subscribe request from {}/{} has no dial_back.url",
-                req.module_name,
+                target.name(),
                 req.companion_key
             )
         })?;
-    Ok(url.replace("{key}", &req.companion_key))
+    Ok(url
+        .replace("{key}", &req.companion_key)
+        .replace("{target}", target.name()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dial_and_pump(
     url: &Url,
     req: &SubscribeRequest,
@@ -319,6 +662,9 @@ async fn dial_and_pump(
     store: &EmissionsStore,
     interest_router: Option<&Arc<dyn InterestRouter>>,
     cancel: &CancellationToken,
+    outbound_rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    pending_recaptures: &Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
+    companion_id: &CompanionId,
 ) -> anyhow::Result<()> {
     // Build request with auth header. Per-companion override
     // takes precedence over the module-level token.
@@ -340,7 +686,7 @@ async fn dial_and_pump(
         .await
         .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
     info!(
-        module = %req.module_name,
+        module = %req.primary_target_name(),
         companion_key = %req.companion_key,
         target = %url,
         "companion ws connected"
@@ -382,7 +728,8 @@ async fn dial_and_pump(
                             &bytes,
                             store,
                             interest_router,
-                            &req.module_name,
+                            companion_id,
+                            pending_recaptures,
                         )
                         .await;
                     }
@@ -395,6 +742,21 @@ async fn dial_and_pump(
                         return Err(anyhow::anyhow!("ws recv: {e}"));
                     }
                     None => return Ok(()), // stream exhausted
+                }
+            }
+
+            outbound = outbound_rx.recv() => {
+                let Some(frame) = outbound else {
+                    // Channel closed — dialer dropped the sender,
+                    // meaning the task has been deregistered. Exit
+                    // the pump cleanly; the outer `run_companion`
+                    // loop will observe `cancel` and stop too.
+                    return Ok(());
+                };
+                if let Err(e) = send_msg(&mut sink, &frame).await {
+                    return Err(anyhow::anyhow!(
+                        "send outbound control frame: {e}"
+                    ));
                 }
             }
 
@@ -474,7 +836,8 @@ async fn handle_inbound_frame(
     bytes: &[u8],
     store: &EmissionsStore,
     interest_router: Option<&Arc<dyn InterestRouter>>,
-    module_id: &str,
+    companion_id: &CompanionId,
+    pending_recaptures: &Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
 ) {
     let msg = match decode_client(bytes) {
         Ok(m) => m,
@@ -483,6 +846,7 @@ async fn handle_inbound_frame(
             return;
         }
     };
+    let module_id = companion_id.module_id.as_str();
     match msg {
         ClientMessage::Ack { emission_id } => {
             let now = now_rfc3339();
@@ -530,6 +894,46 @@ async fn handle_inbound_frame(
         }
         ClientMessage::Subscribe { .. } => {
             warn!("companion sent unexpected Subscribe frame; ignoring");
+        }
+        ClientMessage::RecaptureReady => {
+            // Recapture protocol — companion has finished its
+            // on_recapture cleanup and is ready for the refill.
+            // Look up the registered oneshot for this companion;
+            // fire it so the host's `recapture_module` driver
+            // can proceed. If there's no pending recapture for
+            // this companion (e.g. spurious frame, or the
+            // driver already timed out + cleaned up), warn-log.
+            let sender = {
+                let mut map = pending_recaptures.lock().await;
+                map.remove(companion_id)
+            };
+            match sender {
+                Some(tx) => {
+                    if tx.send(()).is_err() {
+                        // Receiver dropped — driver already
+                        // moved on (timeout, cancel). Harmless,
+                        // log at debug.
+                        debug!(
+                            module = %module_id,
+                            companion_key = %companion_id.companion_key,
+                            "RecaptureReady arrived after driver gave up; dropping"
+                        );
+                    } else {
+                        info!(
+                            module = %module_id,
+                            companion_key = %companion_id.companion_key,
+                            "RecaptureReady received; unblocking recapture driver"
+                        );
+                    }
+                }
+                None => {
+                    warn!(
+                        module = %module_id,
+                        companion_key = %companion_id.companion_key,
+                        "RecaptureReady received but no pending recapture registered; ignoring"
+                    );
+                }
+            }
         }
     }
 }

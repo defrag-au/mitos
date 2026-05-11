@@ -2,12 +2,14 @@
 //! references the same `Address`/`Lovelace`/`OutputRef`/`PlutusBytes`
 //! shapes and stays free of domain-crossing imports.
 //!
-//! These are the *minimum-viable* types for Phase 1 — string
-//! addresses match the existing classifier's representation; raw
-//! plutus data is left as opaque bytes until a consumer surfaces a
-//! genuine need to decode at the framework boundary.
+//! Deliberately minimal — string addresses match the classifier's
+//! representation; raw plutus data is left as opaque bytes until a
+//! consumer surfaces a genuine need to decode at the framework
+//! boundary. Per the community-modules-first preference, deep
+//! decode work belongs in brand-specific community modules rather
+//! than as extensions here.
 
-use cardano_assets::PolicyId;
+use cardano_assets::{AssetId, PolicyId};
 use enumset::EnumSetType;
 use serde::{Deserialize, Serialize};
 
@@ -82,8 +84,8 @@ pub type Address = String;
 /// `royalty_lovelace`) so misuse at call sites is rare.
 pub type Lovelace = u64;
 
-/// Hex-encoded raw Plutus datum / redeemer. Phase 1 keeps these
-/// opaque; consumers that need the decoded form re-decode locally
+/// Hex-encoded raw Plutus datum / redeemer. Kept opaque at this
+/// layer; consumers that need the decoded form re-decode locally
 /// using their preferred Plutus library. Storing as bytes (rather
 /// than a typed `PlutusData`) avoids a pallas dep at the type-defs
 /// crate boundary.
@@ -143,4 +145,33 @@ pub struct ProtocolEvent {
     pub tx_hash: String,
     pub slot: u64,
     pub domain: Domain,
+}
+
+/// Movement claim returned from `Indexer::handle_event` to the
+/// dispatcher's residual pass.
+///
+/// Indexers that classify an asset transfer (e.g.
+/// `Marketplace::Sale`, `Marketplace::ListingCreate`) emit their
+/// domain-specific event AND return a `MovementClaim` for the
+/// same `(asset, from, to)` triplet. The dispatcher's residual
+/// tail-step (`none_match-indexer`) reads the accumulated claim
+/// set and skips emitting a redundant `Domain::AssetMovement`
+/// for any movement already covered.
+///
+/// Claims are dispatcher-internal — they don't appear on the
+/// consumer-facing wire. They live in `mitos-protocol` (rather
+/// than `mitos-core`) because they're stable typed primitives
+/// that benefit from serde derives + wire-shape stability, even
+/// though current consumers don't read them.
+///
+/// See `docs/design/DOMAIN_REFACTOR.md` "Dispatch mechanism" for
+/// how claims feed the residual pass.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MovementClaim {
+    /// The asset that moved (policy_id + asset_name_hex).
+    pub asset: AssetId,
+    /// Bech32 source address.
+    pub from: Address,
+    /// Bech32 destination address.
+    pub to: Address,
 }

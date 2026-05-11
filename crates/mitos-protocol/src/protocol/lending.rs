@@ -1,9 +1,11 @@
-//! Lending domain — placeholder stub for Phase 1.
+//! Lending domain — placeholder stub.
 //!
 //! Carries one variant (`Borrow`) just to validate the kind-as-outer
-//! pattern across a third domain. No existing classifier produces
-//! these events yet; the classifier work to recognise lending
-//! protocols (Liqwid etc.) is a future deliverable.
+//! pattern across a third domain. No classifier produces these
+//! events yet; recognising lending protocols (Liqwid etc.) is
+//! future work — likely as a brand-specific community module
+//! per `LAYERED_RESPONSIBILITIES.md`, not an extension of this
+//! type set.
 
 use cardano_assets::{AssetId, PolicyId};
 use enumset::EnumSetType;

@@ -1,5 +1,25 @@
 # Mitos companion pattern — paired deployables
 
+> **Status: thesis shipped end-to-end (2026).** The paired-
+> deployable pattern, wasm-isolated indexer modules, CF
+> companion DO runtime SDK, and HTTPS-subscribe-then-WS-dial-back
+> flow are all in production. The "What's already built (today,
+> ad-hoc)" section below predates platform-v1; trigger
+> conditions in "When this pattern is interesting" (isolation
+> roadmap Phase C, data-plane API stability, second team
+> wanting to ship) have all been met. Open questions 1, 4–8 are
+> mostly settled by RECAPTURE.md + the shipped emissions log +
+> dialer.
+>
+> **Current pattern reference (preferred starting point):**
+> `COMMUNITY_MODULES.md` (the canonical home for chain-recognition
+> logic), `MITOS_COMPANION_RUNTIME_V1.md` (the companion SDK
+> shape), `HOWTO_CONSUMING_A_COMMUNITY_MODULE.md` (operator +
+> author walkthrough).
+>
+> Body retained as the architectural rationale — useful for
+> understanding *why* the framework is shaped this way.
+
 A dApp built on this framework consists of **two paired
 deployables** that ship together: a **mitos-side indexer
 module** (lives in mitos's execution environment, reads chain
@@ -8,9 +28,7 @@ state, emits typed events) and a **CF-side mitos companion**
 and the user-facing RPC surface). They're designed in tandem,
 deployed in tandem, and version together.
 
-**This is a thesis document, not an implementation roadmap** —
-captures the architectural shape so the design is recoverable
-when the work is picked up. Sister doc to
+Captures the architectural shape so the design is recoverable. Sister doc to
 `CARDANO_DAPP_FRAMEWORK_THESIS.md` (the broader Rust-everywhere
 framework framing) and `MITOS_ISOLATION_ROADMAP.md` (the
 mitos-side WASM module mechanics). This doc is specifically

@@ -33,12 +33,13 @@
 //! `mitos/docs/design/MARKETPLACE_INDEXER.md` and
 //! `mitos/docs/design/SUBSCRIPTION_MECHANICS.md`.
 //!
-//! Phase 3 (this crate, current state): typed event emission via
-//! the `mitos-protocol` taxonomy.
+//! Current shape: typed event emission via the `mitos-protocol`
+//! taxonomy.
 //!
-//! - `Scope = ()` — no per-consumer scope. The single subscriber
-//!   gets everything; the framework `Interest` filtering machinery
-//!   is wired in Phase 4 when the trait surgery lands.
+//! - `Scope = Vec<Interest>` — server-side filter set declared
+//!   per subscriber. The dispatch pump applies the filter before
+//!   forwarding `ProtocolEvent`s, so consumers only see records
+//!   matching their declared `(asset, role, domain, value)` axes.
 //! - `Change = mitos_protocol::ProtocolEvent` — kind-as-outer
 //!   `Marketplace` payloads with brand-as-data. One event per
 //!   `(policy, marketplace_event)` pair: a tx that touches N
@@ -49,10 +50,11 @@
 //!   runs `RuleEngine::classify`, then hands the result to
 //!   `classification_to_events` to translate into typed events.
 //!
-//! Phase 4+ (deferred): `Scope = Interest` (server-side filtering
-//! by asset/brand/kind), trait-filtered collection offers, cancel-
-//! payload redeemer/script-ref decoding, royalty resolution,
-//! parallel-run validation against the existing classifier worker.
+//! Deferred: cancel-payload redeemer/script-ref decoding, royalty
+//! resolution. Per the community-modules-first preference
+//! (`docs/strategy/LAYERED_RESPONSIBILITIES.md`), brand-specific
+//! deep-decode work lands in `mitos/community-modules/<brand>-co/`
+//! community modules rather than as payload extensions here.
 
 mod brand_resolver;
 mod translator;
@@ -61,7 +63,7 @@ mod translator;
 mod translator_tests;
 
 pub use brand_resolver::marketplace_brand_from_address;
-pub use translator::classification_to_events;
+pub use translator::{classification_to_claims, classification_to_events};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,7 +72,7 @@ use async_trait::async_trait;
 use axum::Router;
 use dolos_core::{ChainPoint, Domain, StateStore, TipEvent, TxoRef};
 use mitos_core::{Emitter, Indexer};
-use mitos_protocol::{Interest, ProtocolEvent, any_interest_matches_event};
+use mitos_protocol::{Interest, MovementClaim, ProtocolEvent, any_interest_matches_event};
 use pallas::ledger::traverse::{MultiEraBlock, MultiEraOutput};
 use tracing::{debug, info, warn};
 
@@ -127,14 +129,15 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
         domain: &D,
         event: &TipEvent,
         emitter: &Emitter<Self::Change>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<MovementClaim>> {
+        let mut claims = Vec::new();
         match event {
             TipEvent::Apply(point, block) => {
                 let parsed = match MultiEraBlock::decode(block.as_ref()) {
                     Ok(b) => b,
                     Err(e) => {
                         warn!(error = %e, "block decode failed; skipping");
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 };
 
@@ -145,8 +148,11 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
                 };
 
                 for tx in parsed.txs() {
-                    if let Err(e) = self.classify_tx(domain, &tx, slot, emitter) {
-                        debug!(tx_hash = %hex::encode(tx.hash()), error = %e, "tx classification failed; skipping");
+                    match self.classify_tx(domain, &tx, slot, emitter) {
+                        Ok(tx_claims) => claims.extend(tx_claims),
+                        Err(e) => {
+                            debug!(tx_hash = %hex::encode(tx.hash()), error = %e, "tx classification failed; skipping");
+                        }
                     }
                 }
             }
@@ -157,7 +163,7 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
             // track its own state to revert.
             TipEvent::Undo(_, _) | TipEvent::Mark(_) => {}
         }
-        Ok(())
+        Ok(claims)
     }
 
     fn routes(&self) -> Router {
@@ -179,13 +185,17 @@ impl<D: Domain> Indexer<D> for MarketplaceIndexer {
 
 impl MarketplaceIndexer {
     /// Classify one tx and emit any marketplace-relevant events.
+    /// Returns the `MovementClaim`s produced for this tx — one per
+    /// asset-movement-bearing event (Sale, ListingCreate,
+    /// Unlisting, OfferAccept). The residual pass uses these to
+    /// suppress redundant `AssetMovement` emissions.
     fn classify_tx<D: Domain>(
         &self,
         domain: &D,
         tx: &pallas::ledger::traverse::MultiEraTx<'_>,
         slot: u64,
         emitter: &Emitter<ProtocolEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<MovementClaim>> {
         // Resolve consumed inputs via dolos's state store.
         // Reference inputs too — their datums often carry the
         // marketplace pricing context.
@@ -202,7 +212,7 @@ impl MarketplaceIndexer {
             Ok(m) => m,
             Err(e) => {
                 debug!(error = ?e, "state lookup failed; skipping");
-                return Ok(());
+                return Ok(Vec::new());
             }
         };
 
@@ -236,6 +246,11 @@ impl MarketplaceIndexer {
             emitter.apply(event);
         }
 
-        Ok(())
+        // Extract the chain-level movement claims for the residual
+        // pass. One claim per asset-movement-bearing event (Sale,
+        // ListingCreate, Unlisting, OfferAccept). ListingUpdate and
+        // the offer-lifecycle variants emit no claims (see translator
+        // comments).
+        Ok(classification_to_claims(&classification))
     }
 }

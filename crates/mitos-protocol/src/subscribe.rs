@@ -29,8 +29,18 @@ pub const SUBSCRIBE_MIME: &str = "application/cbor";
 /// CBOR-encoded — host expects `application/cbor`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscribeRequest {
-    /// Module name (matches the host-side indexer's `name()`).
-    pub module_name: String,
+    /// Sources the companion wants to receive events from. Each
+    /// target is either a wasm module or an in-tree indexer.
+    /// See `docs/design/UNIFIED_SUBSCRIBE.md`.
+    ///
+    /// The dialer opens one outbound WS per target. Multi-target
+    /// subscribes are supported end-to-end — each target's WS
+    /// lands at `/_internal/replicate-<target>` on the companion
+    /// (per the `{target}` substitution in
+    /// `MITOS_REPLICATE_URL`) and tags the inbound socket so the
+    /// runtime can route frames to the `MitosChannel` whose
+    /// `NAME` matches.
+    pub targets: Vec<SubscribeTarget>,
 
     /// Companion key. dApp's choice — see the design doc's Q8
     /// resolution. Load-bearing in four places (DO addressing, host
@@ -54,6 +64,71 @@ pub struct SubscribeRequest {
     pub dial_back: Option<DialBackOverride>,
 }
 
+/// What a companion subscribes to: a wasm module or an in-tree
+/// indexer. The host's `/api/companions/subscribe` handler
+/// routes the dial-back differently per variant — module
+/// targets go through `host_v2`'s emit stream; indexer targets
+/// connect to the indexer's broadcast channel via the bridge
+/// described in `docs/design/UNIFIED_SUBSCRIBE.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubscribeTarget {
+    /// Wasm module identity (matches the module's
+    /// `[module].id` in its manifest).
+    Module { name: String },
+    /// In-tree indexer name (e.g. `"mint-burn"`, `"marketplace"`).
+    /// Indexers marked internal (`Indexer::is_internal() == true`)
+    /// are not subscribable through this path — the host returns
+    /// 400.
+    Indexer { name: String },
+}
+
+impl SubscribeTarget {
+    /// Convenience: the name field, regardless of variant.
+    pub fn name(&self) -> &str {
+        match self {
+            SubscribeTarget::Module { name } | SubscribeTarget::Indexer { name } => name,
+        }
+    }
+}
+
+impl SubscribeRequest {
+    /// Extract the single module target's name, for v1 callers
+    /// that only support `[SubscribeTarget::Module { name }]`.
+    /// Returns `None` if the request has zero or multiple targets
+    /// or if the single target is an `Indexer` variant.
+    ///
+    /// Removed once multi-target + indexer-target support lands
+    /// in the host (steps 3+ of the unified-subscribe migration).
+    pub fn single_module_target(&self) -> Option<&str> {
+        match self.targets.as_slice() {
+            [SubscribeTarget::Module { name }] => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Transitional accessor: returns the first target's name,
+    /// for code paths that haven't been refactored to handle
+    /// multi-target subscriptions yet. v1 always populates exactly
+    /// one target, so this is equivalent to the old
+    /// `request.module_name` field access at every existing call
+    /// site.
+    ///
+    /// Returns `"<no-target>"` if `targets` is empty — that should
+    /// never happen for v1 requests; the placeholder is safer than
+    /// panicking inside log fields.
+    ///
+    /// Removed once host-side code is refactored to handle each
+    /// target explicitly (per-target dial loops, per-target
+    /// storage paths) — see steps 3+ of the unified-subscribe
+    /// migration.
+    pub fn primary_target_name(&self) -> &str {
+        self.targets
+            .first()
+            .map(|t| t.name())
+            .unwrap_or("<no-target>")
+    }
+}
+
 /// Per-companion override for the dial-back URL. Rare — intended
 /// for multi-tenant SaaS with per-customer subdomains. Most
 /// companions inherit the module-level defaults.
@@ -70,9 +145,12 @@ pub struct SubscribeResponse {
     /// Status string. `"subscribed"` on success.
     pub status: String,
 
-    /// Host's current emission_id counter for this module. PR 3
-    /// populates this from the actual `module_emissions` log; PR 1
-    /// stub returns 0.
+    /// Host's current emission_id counter for this module, read
+    /// from the per-module `EmissionsStore`. Companions treat
+    /// this as a sync point: anything below it is already in the
+    /// emissions log (delivered or pending), anything from this
+    /// id forward is "live" — covered by the dial-back stream
+    /// rather than the resume scan.
     #[serde(default)]
     pub next_emission_id: u64,
 }

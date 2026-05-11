@@ -225,46 +225,6 @@ nix develop -c cargo run --release -p mitos-admin -- remove 1
 
 Mitos disconnects, the DO's hibernating WS gets a close.
 
-## Scenario 3: convergence diff against the existing worker
-
-Run both workers in parallel for the same policy and watch
-divergence over time. This is the actual validation harness for
-Phase 4.5.
-
-```sh
-cd ~/code/defrag/mitos
-nix develop -c cargo run --release -p diff-collection-ownership -- \
-    --baseline https://ownership.cnft.dev \
-    --mitos    https://collections-mitos.<account>.workers.dev \
-    --policy   <hex> \
-    --probe-asset <asset_hex> --probe-stake stake1u...8 \
-    --probe-asset <asset_hex2> --probe-stake stake1u...9 \
-    --interval 3600
-```
-
-Successful convergence looks like:
-```
-INFO diff_collection_ownership: stats within tolerance policy=... baseline_assets=10000 mitos_assets=10000 drift_pct=0.00
-INFO diff_collection_ownership: check matches policy=... asset=... stake=... owns=true
-INFO diff_collection_ownership: bundle matches policy=... stake=... count=42
-INFO diff_collection_ownership: all policies converged
-```
-
-A divergence looks like:
-```
-WARN diff_collection_ownership: stats diverged > 5% policy=... baseline_assets=10000 mitos_assets=8500 drift_pct=15.00
-WARN diff_collection_ownership: bundle DIVERGED policy=... stake=... only_baseline=3 only_mitos=0
-```
-
-For one-shot mode (e.g. cron):
-
-```sh
-diff-collection-ownership --once --baseline ... --mitos ... --policy ...
-```
-
-Run this in a `tmux` / `nohup` for at least 24h to satisfy the
-roadmap's "byte-identical hourly" success criterion.
-
 ## Cost validation (hibernation actually working)
 
 After Scenario 2 has been running for an hour or more, check the CF
@@ -299,9 +259,14 @@ fixture-setup task. Track that as part of the Phase 4.5
 between `MITOS_AUTH_TOKEN` (mitos env) and `MITOS_TOKEN` (CF
 secret). Reset both to the same value.
 
-**"unknown indexer" on POST.** The bundle hasn't registered an
-indexer with that name. Check `bundles/default/src/main.rs` lists
-both `JpgCoIndexer` and `OwnershipIndexer`.
+**"unknown indexer" on POST.** Either a typo in the name (the
+in-tree indexers are `collection-ownership`, `marketplace`,
+`mint-burn`, `none-match`) or the bundle hasn't registered it.
+For wasm modules (community or operator-uploaded), `unknown
+module` is the analogous error — check `mitos-admin list-modules`.
+The in-tree indexer set lives in `bundles/default/src/main.rs`;
+community modules auto-load from `BUNDLE_COMMUNITY_MODULES_DIR`
+at host startup.
 
 **"WAL schema not compatible".** Your mitos build's Dolos pin
 doesn't match the data dir's writer version. Bump the pin in

@@ -64,6 +64,28 @@ pub struct TypedDatum {
     pub original_cbor: Option<Vec<u8>>,
 }
 
+impl TypedDatum {
+    /// Backfill `original_cbor` from a witness-set table when the
+    /// plane couldn't resolve bytes directly. The witness slice is
+    /// the consuming TX's plutus-data witnesses keyed by hash —
+    /// jpg.store's metadata-encoded CO datums, for example, are
+    /// only revealed in the cancel/accept TX's witness set, so
+    /// hash-only `prior_datum` values from a `read_utxo` lookup
+    /// need this fallback before dispatch reaches the module.
+    ///
+    /// No-op when `original_cbor` is already populated, or when no
+    /// witness entry matches by hash. `payload` is left untouched —
+    /// minicbor decode stays out of the dispatch hot path.
+    pub fn fill_from_witness(&mut self, witnesses: &[(Hash<32>, Vec<u8>)]) {
+        if self.original_cbor.is_some() {
+            return;
+        }
+        if let Some((_, cbor)) = witnesses.iter().find(|(h, _)| *h == self.hash) {
+            self.original_cbor = Some(cbor.clone());
+        }
+    }
+}
+
 /// On-chain script (reference scripts only — outputs that carry
 /// a `script_ref`). Native script + Plutus V1/V2/V3 are
 /// distinguished via `language`.

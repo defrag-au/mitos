@@ -1,5 +1,26 @@
 # Subscription mechanics
 
+> **Status: partially current** (2025–2026). The `Interest`
+> vocabulary + multi-axis matching algorithm (`asset`, `roles`,
+> `domain`, `value`) are shipped and live in
+> `crates/mitos-protocol/src/interest.rs`. The wire-format
+> example showing externally-tagged JSON
+> (`{"type":"subscribe", ...}`) and `?format=json` negotiation
+> is **fictional** — the real wire is CBOR via
+> `mitos-protocol::wire` and registration is out-of-band HTTPS
+> via `POST /api/companions/subscribe`. Body retained for the
+> matching-algorithm rationale + the kind/brand orthogonality
+> design discussion; treat the wire-format sections as
+> historical sketches.
+>
+> Authoritative current sources:
+> - `crates/mitos-protocol/src/interest.rs` — `Interest`,
+>   `AssetSelector`, `DomainSelector`, `ValueFilter` types +
+>   `match_event` implementation.
+> - `crates/mitos-protocol/src/subscribe.rs` — `SubscribeRequest`
+>   / `SubscribeResponse` shapes.
+> - `docs/design/UNIFIED_SUBSCRIBE.md` — the subscribe handshake.
+
 How a CF-side consumer expresses *what events it wants* and how
 mitos matches that expression against the events it produces.
 

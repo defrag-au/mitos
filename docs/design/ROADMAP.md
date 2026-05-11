@@ -1,5 +1,18 @@
 # Roadmap
 
+> **Status: historical (Phase 0–4 predates v2 + community-modules
+> + recapture).** The phasing below was the original delivery
+> plan; most has shipped, and the framing of "Phase 4.5 = build
+> the replicator" / "Phase 5 = scale-out" no longer maps to
+> current work. Items still relevant are tracked inline in
+> `docs/design/RECAPTURE.md`'s open questions,
+> `docs/strategy/MITOS_PLATFORM_V2.md`, and
+> `docs/strategy/COMMUNITY_MODULES.md`'s open questions.
+>
+> Body retained as the historical sequence — useful for
+> understanding why decisions landed where they did, less useful
+> as a forward-looking plan.
+
 What's done, what's next, in what order. Items further down the list have
 more open questions.
 

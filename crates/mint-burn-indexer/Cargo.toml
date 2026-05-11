@@ -1,0 +1,20 @@
+[package]
+name = "mint-burn-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mitos-core = { path = "../mitos-core" }
+mitos-protocol = { path = "../mitos-protocol" }
+
+dolos-core = { workspace = true }
+pallas = { workspace = true }
+
+cardano-assets = { workspace = true }
+
+async-trait = { workspace = true }
+axum = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

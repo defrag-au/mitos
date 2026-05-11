@@ -28,19 +28,15 @@ use mitos_platform::manifest::{
     AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, sha256_hex,
 };
 
-/// Host WIT contracts bundled at compile time. Each `mitos-build`
-/// release pins specific WIT versions; upgrading the tool
+/// Host WIT contract bundled at compile time. Each `mitos-build`
+/// release pins a specific WIT version; upgrading the tool
 /// upgrades the WIT every single-file module is built against.
 ///
-/// v1: legacy `mitos-module` world — block-centric `handle-event`
-/// dispatch. Existing modules (`collection-ownership-indexer`,
-/// `marketplace-indexer`, jpg-co's pre-migration shape) build
-/// against this.
-///
-/// v2: `mitos-module-v2` world — eUTXO event-stream dispatch
-/// per `MITOS_PLATFORM_V2.md`. Modules opt in by setting
-/// `abi_version = 2` at the top of their `<name>.toml`.
-const HOST_WIT_V1: &str = include_str!("../../../crates/mitos-platform/wit/world.wit");
+/// `mitos-module-v2` world — eUTXO event-stream dispatch per
+/// `MITOS_PLATFORM_V2.md`. The v1 `mitos-module` world (block-
+/// centric `handle-event` dispatch) was retired May 2026 along
+/// with the v1 dispatch path on the host — `mitos-build` no
+/// longer emits artifacts the current host can load.
 const HOST_WIT_V2: &str = include_str!("../../../crates/mitos-platform/wit-v2/world.wit");
 
 /// Absolute path to the `mitos-protocol` crate baked at compile
@@ -94,7 +90,7 @@ struct Args {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
 
-    /// Cargo profile. v1 supports release only — debug-built
+    /// Cargo profile. Release only in practice — debug-built
     /// modules trigger fuel exhaustion under realistic block
     /// sizes.
     #[arg(long, default_value = "release")]
@@ -300,7 +296,10 @@ async fn main() -> anyhow::Result<()> {
         manifest.trap_policy.max_retries,
         manifest.trap_policy.backoff_cap_ms
     );
-    println!("WIT world:     mitos:platform/mitos-module");
+    println!(
+        "WIT world:     {}/{}",
+        manifest.abi.wit_package, manifest.abi.wit_world
+    );
     println!("Artifact:      {}", out.display());
 
     Ok(())
@@ -348,30 +347,20 @@ fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::
 // Single-file module support
 // ============================================================================
 
-/// Which platform ABI a module targets. Determines which WIT
-/// gets bundled into the materialised crate and which world
-/// the wit_bindgen macro generates against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AbiVersion {
-    /// `mitos-module` world — block-centric `handle-event`
-    /// dispatch. Default when `<name>.toml` doesn't declare
-    /// `abi_version`.
-    V1,
-    /// `mitos-module-v2` world — eUTXO event-stream dispatch
-    /// per `MITOS_PLATFORM_V2.md`. Opt in by setting
-    /// `abi_version = 2` at the top of the module's
-    /// `<name>.toml`.
-    V2,
-}
-
 /// Resolved single-file module: paths to `<name>.rs` and the
 /// optional `<name>.toml`, plus the inferred module-id (file
 /// stem, hyphenated).
+///
+/// As of the May 2026 v1 retirement there's only one ABI version
+/// — every module is built against `mitos:platform-v2`. The
+/// `abi_version` key on `<name>.toml` is accepted only if set to
+/// `2` (or absent — `2` is the implicit value). Modules carrying
+/// `abi_version = 1` are rejected at resolve time with a clear
+/// error pointing at the v2 migration.
 struct SingleFileSpec {
     rs_path: PathBuf,
     config_path: Option<PathBuf>,
     module_id: String,
-    abi_version: AbiVersion,
 }
 
 impl SingleFileSpec {
@@ -407,34 +396,42 @@ impl SingleFileSpec {
         let config_path = config_candidate.exists().then_some(config_candidate);
 
         // Read `abi_version` from the top of `<name>.toml` if
-        // present. Default v1 — existing modules keep working
-        // without changes; v2 modules opt in by adding
-        // `abi_version = 2`.
-        let abi_version = match &config_path {
-            None => AbiVersion::V1,
-            Some(path) => {
-                let toml_str = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                let value: toml::Value = toml::from_str(&toml_str)
-                    .with_context(|| format!("parsing {}", path.display()))?;
-                match value.get("abi_version").and_then(|v| v.as_integer()) {
-                    Some(1) | None => AbiVersion::V1,
-                    Some(2) => AbiVersion::V2,
-                    Some(other) => {
-                        return Err(anyhow!(
-                            "{}: unsupported abi_version = {other} (only 1 or 2)",
-                            path.display(),
-                        ));
-                    }
+        // present. v1 is retired (May 2026 — see
+        // `docs/strategy/MITOS_PLATFORM_V2.md`); we accept absent
+        // or `2` and fail-fast on anything else with a clear
+        // pointer to the migration. Modules carrying
+        // `abi_version = 1` produce artifacts no current host
+        // can load — better to refuse the build than emit
+        // unloadable wasm.
+        if let Some(path) = &config_path {
+            let toml_str = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let value: toml::Value = toml::from_str(&toml_str)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            match value.get("abi_version").and_then(|v| v.as_integer()) {
+                None | Some(2) => {}
+                Some(1) => {
+                    return Err(anyhow!(
+                        "{}: abi_version = 1 is retired (May 2026). \
+                         Upgrade to abi_version = 2 and migrate to the \
+                         eUTXO event-stream dispatch shape — see \
+                         mitos/docs/strategy/MITOS_PLATFORM_V2.md",
+                        path.display(),
+                    ));
+                }
+                Some(other) => {
+                    return Err(anyhow!(
+                        "{}: unsupported abi_version = {other} (only 2 is supported)",
+                        path.display(),
+                    ));
                 }
             }
-        };
+        }
 
         Ok(Self {
             rs_path: rs_path.canonicalize().unwrap_or(rs_path),
             config_path,
             module_id,
-            abi_version,
         })
     }
 }
@@ -498,10 +495,10 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 # Keep symbols + line tables in release wasm so trap backtraces
-# resolve to source locations. Platform v1 prioritises debuggability
-# over wire size — modules run server-side on the operator's mitos
-# host, so the ~30-50% size bump has no cost. Revisit if module
-# count grows or cold-start matters.
+# resolve to source locations. Mitos prioritises debuggability
+# over wire size — modules run server-side on the operator's
+# mitos host, so the ~30-50% size bump has no cost. Revisit if
+# module count grows or cold-start matters.
 strip = false
 debug = "line-tables-only"
 
@@ -543,13 +540,11 @@ mitos-protocol = {{ path = "{mitos_protocol}" }}
     );
     write_if_changed(&crate_dir.join("Cargo.toml"), &crate_toml)?;
 
-    // WIT contract bundled at compile time. v1 vs v2 is picked
-    // off the spec — `<name>.toml`'s `abi_version` field, with
-    // v1 as the default for existing modules.
-    let (host_wit, world_name) = match spec.abi_version {
-        AbiVersion::V1 => (HOST_WIT_V1, "mitos-module"),
-        AbiVersion::V2 => (HOST_WIT_V2, "mitos-module-v2"),
-    };
+    // WIT contract bundled at compile time. Only v2 is supported
+    // since the May 2026 retirement of the v1 dispatch path;
+    // `SingleFileSpec::resolve` rejects `abi_version = 1` upstream.
+    let host_wit = HOST_WIT_V2;
+    let world_name = "mitos-module-v2";
     write_if_changed(&wit_dir.join("world.wit"), host_wit)?;
 
     // Generate the crate's `src/lib.rs`. Layout:
@@ -713,22 +708,14 @@ fn build_manifest(
         abi: AbiSection {
             version_major: inspect.abi_version_major,
             version_minor: inspect.abi_version_minor,
-            // WIT package + world differ between v1 and v2.
-            // v1: `mitos:platform/mitos-module`
-            // v2: `mitos:platform-v2/mitos-module-v2`
-            // Pick by inspected ABI major.
-            wit_package: if inspect.abi_version_major >= 2 {
-                "mitos:platform-v2"
-            } else {
-                "mitos:platform"
-            }
-            .to_owned(),
-            wit_world: if inspect.abi_version_major >= 2 {
-                "mitos-module-v2"
-            } else {
-                "mitos-module"
-            }
-            .to_owned(),
+            // Only v2 since the May 2026 retirement of v1
+            // dispatch. `dry_inspect` reads the exported
+            // `module-version`; if a module somehow ships
+            // with major < 2 the host's `validate_against_host`
+            // will 400 on upload (`crates/mitos-platform/src/admin.rs`'s
+            // ABI check), so emit the v2 strings unconditionally.
+            wit_package: "mitos:platform-v2".to_owned(),
+            wit_world: "mitos-module-v2".to_owned(),
         },
         trap_policy: TrapPolicySection {
             strategy: inspect.trap_strategy.clone(),
@@ -805,8 +792,10 @@ fn log_inspect(inspect: &InspectResult) {
 fn read_crate_version(workspace: &Path, crate_name: &str) -> anyhow::Result<String> {
     // Best-effort scan: iterate workspace members for a Cargo.toml
     // whose [package].name matches. Avoids depending on cargo
-    // metadata (heavier dep). For the v1 layout (`modules/<id>/<crate>/`)
-    // the crate's Cargo.toml is one level below the workspace.
+    // metadata (heavier dep). For the legacy multi-crate layout
+    // (`modules/<id>/<crate>/`) the crate's Cargo.toml is one
+    // level below the workspace; single-file mode materialises
+    // its own minimal workspace at `target/mitos-build/<id>/`.
     //
     // Two version shapes to handle:
     //   - literal string: `version = "0.1.0"`

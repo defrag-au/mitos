@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use dolos_core::{ChainPoint, TipEvent};
+use mitos_protocol::MovementClaim;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::emitter::Emitter;
@@ -66,6 +67,20 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// prefix by convention. Must be valid as a filesystem directory.
     fn name(&self) -> &'static str;
 
+    /// Whether this indexer is framework-internal — i.e. not
+    /// subscribable from companion modules via the unified subscribe
+    /// path (`docs/design/UNIFIED_SUBSCRIBE.md`).
+    ///
+    /// Defaults to `false` (most indexers are public protocol
+    /// surfaces). Override to `true` for indexers that exist only
+    /// to serve the dispatcher (e.g. `none-match-indexer`, the
+    /// residual emitter). The host rejects
+    /// `SubscribeTarget::Indexer { name }` requests where the
+    /// resolved indexer's `is_internal()` returns `true`.
+    fn is_internal(&self) -> bool {
+        false
+    }
+
     /// One-time pull of current chain state into the indexer's
     /// materialized view. Called before any chain events are dispatched.
     /// Returns the chain point we caught up to — the dispatcher will
@@ -79,12 +94,24 @@ pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// `emitter` is stamped with the cursor of `event`; calling
     /// `emitter.apply(change)` produces a CF replication record at
     /// that cursor. Indexers with `type Change = ()` ignore it.
+    ///
+    /// Returns the `MovementClaim`s the indexer made for this event
+    /// — one per `(asset, from, to)` triplet the indexer
+    /// classified into a domain-specific event. The dispatcher's
+    /// residual pass (see `docs/design/DOMAIN_REFACTOR.md`)
+    /// reads the accumulated claim set and skips emitting
+    /// `Domain::AssetMovement` for any movement already covered.
+    /// Indexers that don't classify movements (most state-only
+    /// indexers, or indexers whose events don't represent asset
+    /// transfers) return `Ok(Vec::new())`. Claims are ephemeral
+    /// per `Apply` event — they are not persisted across events
+    /// and don't need rollback handling on `Undo`.
     async fn handle_event(
         &mut self,
         domain: &D,
         event: &TipEvent,
         emitter: &Emitter<Self::Change>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Vec<MovementClaim>>;
 
     /// HTTP routes this indexer exposes. The bundle merges all
     /// indexers' routes under a shared `axum::Router`, conventionally

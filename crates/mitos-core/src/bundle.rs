@@ -1,8 +1,6 @@
 //! Bundle: owns the domain, registers indexers, runs the framework.
 //!
-//! Replaces the hand-rolled composition that lived inline in
-//! `bundles/default/src/main.rs` during Phase 1. Bundle authors now
-//! write:
+//! Bundle authors compose the framework as:
 //!
 //! ```ignore
 //! let mut bundle = Bundle::new(domain, config, listen_addr);
@@ -37,11 +35,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::auth::AuthToken;
+use crate::coordinator::TxClaimCoordinator;
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
 use crate::replicate::replicate_router;
 use crate::replicator::{ConnState, Replicator, Subscription, SubscriptionId};
-use crate::{run_dispatcher, spawn_sync_pipeline};
+use crate::{run_dispatcher, run_synchronized_dispatcher, spawn_sync_pipeline};
+
+/// Reserved name for the residual-pass indexer. The synchronised
+/// dispatcher detects an indexer with this name and routes it to
+/// the residual tail-step.
+const NONE_MATCH_NAME: &str = "none-match";
 
 pub struct Bundle {
     domain: DomainAdapter,
@@ -55,6 +59,20 @@ pub struct Bundle {
     /// `Some(path)` = enable `/_admin/modules/*` + auto-resume
     /// any modules already activated under that path.
     modules_dir: Option<PathBuf>,
+    /// Filesystem path to the community-modules source tree
+    /// (`mitos/community-modules/`). When set + wasm hosting is
+    /// enabled, the bundle walks each `<name>/build/` directory
+    /// at startup and activates any pre-built artifact whose
+    /// sha differs from the currently-active one. See
+    /// `docs/strategy/COMMUNITY_MODULES.md`.
+    community_modules_dir: Option<PathBuf>,
+    /// When `Some`, residual-pass mode is enabled. `run()` uses
+    /// the synchronised dispatcher (single task across all
+    /// indexers) instead of one task per indexer, so the residual
+    /// `none-match` indexer can read claims accumulated by
+    /// specific-domain indexers within the same Apply event. See
+    /// `docs/design/DOMAIN_REFACTOR.md`.
+    residual_coordinator: Option<TxClaimCoordinator>,
 }
 
 impl Bundle {
@@ -77,7 +95,34 @@ impl Bundle {
             data_dir,
             indexers: Vec::new(),
             modules_dir: None,
+            community_modules_dir: None,
+            residual_coordinator: None,
         }
+    }
+
+    /// Enable residual-pass mode for `Domain::AssetMovement`
+    /// emission.
+    ///
+    /// Returns the `TxClaimCoordinator` the caller must hand to
+    /// `NoneMatchIndexer::new(...)` (registered via the regular
+    /// `add_indexer` path). The bundle's `run()` then switches
+    /// from per-indexer dispatchers to a single synchronised
+    /// dispatcher so the residual indexer can see claims
+    /// accumulated by specific-domain indexers for the same
+    /// Apply event.
+    ///
+    /// Calling this method commits the bundle to synchronised
+    /// dispatch — every registered indexer goes through the
+    /// single-task loop, not just the residual one. This is
+    /// load-bearing for correctness: claims and the events that
+    /// match them must all be visible against the same per-Apply
+    /// coordinator state.
+    ///
+    /// See `docs/design/DOMAIN_REFACTOR.md`.
+    pub fn enable_residual_pass(&mut self) -> TxClaimCoordinator {
+        let coord = TxClaimCoordinator::new();
+        self.residual_coordinator = Some(coord.clone());
+        coord
     }
 
     /// Register an indexer with the bundle. The indexer's `Scope`
@@ -107,6 +152,23 @@ impl Bundle {
         self.modules_dir = Some(modules_dir);
     }
 
+    /// Enable community-module auto-load from a source tree path.
+    /// Requires `enable_modules` to also be set (community modules
+    /// activate into the same modules_dir). At startup, the bundle
+    /// walks `<community_modules_dir>/<name>/build/` for each
+    /// subdirectory and calls `ModuleStorage::activate` for any
+    /// artifact whose sha differs from the currently-active one.
+    ///
+    /// Typical value: the `community-modules/` directory at the
+    /// root of the mitos source tree. Pre-built artifacts under
+    /// each module's `build/` subdir are produced by `mitos-build`
+    /// either at release time or as a deploy step.
+    ///
+    /// See `docs/strategy/COMMUNITY_MODULES.md`.
+    pub fn enable_community_modules(&mut self, community_modules_dir: PathBuf) {
+        self.community_modules_dir = Some(community_modules_dir);
+    }
+
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
     /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
     /// `/replicate/{indexer}` test surface + `/_admin/subscriptions`),
@@ -119,6 +181,8 @@ impl Bundle {
             data_dir,
             indexers,
             modules_dir,
+            community_modules_dir,
+            residual_coordinator,
         } = self;
 
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
@@ -130,24 +194,76 @@ impl Bundle {
         let mut dispatcher_handles: Vec<JoinHandle<()>> = Vec::with_capacity(indexers.len());
         let mut app = axum::Router::new();
 
+        // Bootstrap each indexer (lets them initialise their state
+        // and report a starting cursor) and mount their HTTP routes.
+        // The dispatcher path that consumes these results then
+        // diverges based on whether residual-pass mode is enabled.
+        let mut bootstrap_results: Vec<(Arc<dyn IndexerHandle>, dolos_core::ChainPoint)> =
+            Vec::with_capacity(indexers.len());
         for ix in &indexers {
             let name = ix.name();
-
             let from = ix.bootstrap(&domain).await?;
             info!(indexer = %name, ?from, "indexer bootstrapped");
+            bootstrap_results.push((ix.clone(), from));
+            app = app.nest(&format!("/{name}"), ix.routes());
+        }
 
+        if let Some(coordinator) = residual_coordinator {
+            // Synchronised dispatch — one task across all indexers,
+            // with the residual `none-match` indexer running last
+            // per Apply event so it sees the accumulated claim set.
+            let mut none_match_opt: Option<Arc<dyn IndexerHandle>> = None;
+            let mut specific_indexers: Vec<Arc<dyn IndexerHandle>> = Vec::new();
+            let mut starting_cursor: Option<dolos_core::ChainPoint> = None;
+            for (ix, from) in bootstrap_results {
+                if ix.name() == NONE_MATCH_NAME {
+                    none_match_opt = Some(ix);
+                } else {
+                    if starting_cursor.is_none() {
+                        starting_cursor = Some(from);
+                    }
+                    specific_indexers.push(ix);
+                }
+            }
+            let none_match = none_match_opt.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "residual pass enabled (Bundle::enable_residual_pass) but no `{NONE_MATCH_NAME}` \
+                     indexer was registered — call `bundle.add_indexer(NoneMatchIndexer::new(coord))`"
+                )
+            })?;
+
+            let from = starting_cursor.unwrap_or(dolos_core::ChainPoint::Origin);
             let subscription = domain
-                .watch_tip(Some(from.clone()))
-                .map_err(|e| anyhow::anyhow!("watch_tip for {name}: {e:?}"))?;
+                .watch_tip(Some(from))
+                .map_err(|e| anyhow::anyhow!("watch_tip for synchronised dispatch: {e:?}"))?;
 
-            let ix_clone = ix.clone();
             let domain_clone = domain.clone();
             let handle = tokio::spawn(async move {
-                run_dispatcher(ix_clone, domain_clone, subscription).await;
+                run_synchronized_dispatcher(
+                    specific_indexers,
+                    none_match,
+                    coordinator,
+                    domain_clone,
+                    subscription,
+                )
+                .await;
             });
             dispatcher_handles.push(handle);
-
-            app = app.nest(&format!("/{name}"), ix.routes());
+        } else {
+            // Per-indexer dispatch — today's default. Each indexer
+            // has its own subscription + task; they run in parallel
+            // with no cross-indexer coordination.
+            for (ix, from) in bootstrap_results {
+                let name = ix.name();
+                let subscription = domain
+                    .watch_tip(Some(from.clone()))
+                    .map_err(|e| anyhow::anyhow!("watch_tip for {name}: {e:?}"))?;
+                let domain_clone = domain.clone();
+                let handle = tokio::spawn(async move {
+                    run_dispatcher(ix, domain_clone, subscription).await;
+                });
+                dispatcher_handles.push(handle);
+            }
         }
 
         let auth = AuthToken::from_env();
@@ -187,9 +303,9 @@ impl Bundle {
             // composer's generic bound resolves without a vtable
             // hop. The `dp` view (`Arc<dyn DataPlaneFacade>`) is
             // what the per-instance host fns see.
-            let chain_plane = Arc::new(
-                mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
-            );
+            let chain_plane = Arc::new(mitos_platform::host_fns::DomainDataPlane::new(
+                domain.clone(),
+            ));
             let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = chain_plane.clone();
 
             // Subscription factory: each follower gets its own
@@ -281,6 +397,52 @@ impl Bundle {
                 budget,
             ));
 
+            // Reserved-name check: any on-disk module whose id
+            // collides with an in-tree indexer's name must abort
+            // startup. Loud failure beats silent shadowing —
+            // operator deleted-then-re-added the indexer crate
+            // and the module needs renaming or removing. See
+            // `docs/design/UNIFIED_SUBSCRIBE.md` step 4.
+            let reserved: std::collections::HashSet<String> =
+                indexers.iter().map(|h| h.name().to_string()).collect();
+            match storage.list_modules() {
+                Ok(ids) => {
+                    let collisions: Vec<String> =
+                        ids.into_iter().filter(|id| reserved.contains(id)).collect();
+                    if !collisions.is_empty() {
+                        anyhow::bail!(
+                            "wasm modules on disk shadow reserved in-tree indexer names: {:?}. \
+                             Rename or delete these modules before restart (see \
+                             docs/design/UNIFIED_SUBSCRIBE.md).",
+                            collisions
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "reserved-name check: list_modules failed; continuing");
+                }
+            }
+
+            // Community-module auto-load (if enabled). Walks the
+            // configured source tree and activates any pre-built
+            // artifact whose sha differs from what's already on
+            // disk. Runs BEFORE `auto_resume` so the follower
+            // pass picks up newly-activated community modules in
+            // the same startup cycle. Reserved-name guard above
+            // already protects against community modules
+            // colliding with in-tree indexer names.
+            //
+            // See `docs/strategy/COMMUNITY_MODULES.md`.
+            if let Some(cm_dir) = community_modules_dir.as_ref() {
+                let activated = crate::community_modules::auto_load(cm_dir, &storage);
+                info!(
+                    community_modules_dir = %cm_dir.display(),
+                    activated_count = activated.len(),
+                    activated = ?activated,
+                    "community-modules auto-load complete"
+                );
+            }
+
             // Auto-resume: walk every manifest on disk and start
             // it. Single bad module is logged and skipped so it
             // can't abort bundle startup.
@@ -289,8 +451,7 @@ impl Bundle {
             // The platform admin router has its own AuthToken
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
-            let host_for_admin =
-                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
+            let host_for_admin = host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
 
             // Companion dial supervisor: maintains an outbound
             // WS to each registered companion so the host can
@@ -304,21 +465,51 @@ impl Bundle {
             // frames get routed into the right module's follower
             // task and call its `update-interest` export.
             let interest_router: Arc<dyn mitos_platform::host_v2::InterestRouter> = host.clone();
+
+            // In-tree indexer bridge — what the unified subscribe
+            // handler uses to route `SubscribeTarget::Indexer`
+            // requests. Shared between the dialer (for
+            // `spawn_dial` of indexer-target dial loops) and the
+            // subscribe handler (for `contains` / `is_internal`
+            // validation). See `docs/design/UNIFIED_SUBSCRIBE.md`.
+            let core_bridge = std::sync::Arc::new(crate::indexer_bridge::CoreIndexerBridge::new(
+                indexers.to_vec(),
+                domain.clone(),
+                auth.clone(),
+            ));
+            let indexer_bridge: mitos_platform::indexer_bridge::IndexerBridgeHandle =
+                core_bridge.clone();
+
             let dialer = mitos_platform::dialer::CompanionDialer::new(
                 storage.clone(),
                 platform_auth.clone(),
                 Some(interest_router),
-            );
+            )
+            .with_indexer_bridge(indexer_bridge.clone());
+            // Wire the dialer into the host so the recapture
+            // orchestrator (admin `/_admin/modules/{id}/recapture`)
+            // can drive companion-side cleanup before re-running
+            // bootstrap. `set_dialer` is `&self` via OnceLock so
+            // we can call it after Arc-wrapping the host. See
+            // `docs/design/RECAPTURE.md`.
+            host.set_dialer(dialer.clone());
             dialer.start_all().await;
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),
                 platform_auth.clone(),
                 Some(dialer.clone()),
+                Some(indexer_bridge),
             ));
 
+            // Pass the reserved-names set so the upload handler
+            // rejects modules whose id collides with an in-tree
+            // indexer (see `docs/design/UNIFIED_SUBSCRIBE.md`
+            // step 4).
+            let reserved_names = core_bridge.reserved_names_owned();
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage.clone(),
                 host_for_admin,
+                reserved_names,
                 platform_auth,
             ));
 

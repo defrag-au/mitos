@@ -1,15 +1,29 @@
 # Isolation roadmap
 
-How mitos's indexer-deployment model evolves out of the current
+> **Status: shipped (platform v1 May 2026, superseded by v2
+> later in May 2026).** This doc captured the rationale that
+> drove platform-v1 delivery. The implementation outcome is
+> documented in `../strategy/MITOS_PLATFORM_V1.md` and superseded
+> by `../strategy/MITOS_PLATFORM_V2.md`. API-route sketches in
+> "What the upload surface looks like" below (e.g.
+> `POST /_admin/modules/{name}/reload`) are the *proposal*; the
+> actual shipped routes are in `crates/mitos-platform/src/admin.rs`
+> (`/restart` rather than `/reload`, plus
+> `/recapture`, `/last-trap`, `/emissions` etc).
+>
+> Body retained as the rationale + the "Lessons banked from v1
+> attempt" section that's still load-bearing for future
+> isolation work.
+
+How mitos's indexer-deployment model evolves out of the original
 monolithic-bundle approach.
 
-**Status (2026-05): the trigger has fired.** Platform v1 is
-committed; concrete implementation shape lives in
-`../strategy/MITOS_PLATFORM_V1.md`. The decision was driven by
-the user-facing ergonomics constraint: **no more mitos deploys
+Platform v1 was committed to in 2026-05 because of the
+user-facing ergonomics constraint: **no more mitos deploys
 until the platform can load indexer modules independently of
-the host binary.** The current single-process statically-composed
-bundle is no longer acceptable for shipping indexer changes.
+the host binary.** The original single-process statically-composed
+bundle wasn't acceptable for shipping indexer changes; the
+solution is the v1 → v2 platform stack now in production.
 
 This doc remains the **context** — why we picked the shape we
 did, what we ruled out and why, lessons we've banked. Read this

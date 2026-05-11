@@ -1,5 +1,28 @@
 # Cloudflare replication protocol
 
+> **Status: historical reference (2025–early 2026).** The push
+> model, broadcast/lag handling, and `Apply`/`Undo`/`Mark`/`Error`
+> frame shapes documented here landed and remain canonical. The
+> *registration* side has been superseded — companions now
+> register out-of-band via the unified-subscribe HTTPS handshake
+> (`POST /api/companions/subscribe`), and mitos dials back over
+> WS. The legacy `Replicator` (operator-driven
+> `mitos-admin add --target-url ...`) is on the retirement path.
+>
+> **For the current wire shape:** see
+> `crates/mitos-protocol/src/wire.rs` (CBOR-tagged
+> `ClientMessage` / `ServerMessage` enums).
+>
+> **For the current subscribe path:** see
+> `docs/design/UNIFIED_SUBSCRIBE.md` and
+> `docs/HOWTO_CONSUMING_A_COMMUNITY_MODULE.md`.
+>
+> The JSON envelope shapes, externally-tagged `{"type":"subscribe", ...}`
+> examples, and `/replicate/{indexer}?policy_id=X` URL scheme
+> below describe an earlier iteration that doesn't match the
+> shipped wire. Body retained as design rationale for the
+> push-not-pull / sealed-snapshot decisions.
+
 How an indexer's materialized view in mitos becomes queryable state in
 Cloudflare. The architectural framing is in `ARCHITECTURE.md` under
 "Where mitos lives in the stack" — this doc covers the wire-level

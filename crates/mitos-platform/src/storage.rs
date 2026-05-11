@@ -192,8 +192,8 @@ impl ModuleStorage {
     }
 
     /// Per-module emissions log path. Single redb file at
-    /// `<storage_root>/<id>/emissions.redb`. PR 3 of the
-    /// companion-runtime delivery.
+    /// `<storage_root>/<id>/emissions.redb` — feeds the companion
+    /// dialer's outbound Apply stream with per-row delivery state.
     ///
     /// Crate-private — callers outside `mitos-platform` MUST go
     /// through `emissions_store(id)` so the cached
