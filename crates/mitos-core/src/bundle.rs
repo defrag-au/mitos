@@ -488,6 +488,13 @@ impl Bundle {
                 Some(interest_router),
             )
             .with_indexer_bridge(indexer_bridge.clone());
+            // Wire the dialer into the host so the recapture
+            // orchestrator (admin `/_admin/modules/{id}/recapture`)
+            // can drive companion-side cleanup before re-running
+            // bootstrap. `set_dialer` is `&self` via OnceLock so
+            // we can call it after Arc-wrapping the host. See
+            // `docs/design/RECAPTURE.md`.
+            host.set_dialer(dialer.clone());
             dialer.start_all().await;
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),

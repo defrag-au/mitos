@@ -21,6 +21,7 @@
 //! out without route changes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Multipart, Path, Request, State};
@@ -146,6 +147,7 @@ fn admin_router_inner(
             get(get_module).post(upload_module).delete(delete_module),
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
+        .route("/_admin/modules/{id}/recapture", post(recapture_module))
         .route("/_admin/modules/{id}/last-trap", get(last_trap))
         .route(
             "/_admin/modules/{id}/emissions",
@@ -219,6 +221,36 @@ enum HandlerError {
     /// `docs/design/UNIFIED_SUBSCRIBE.md`.
     #[error("module id `{0}` shadows reserved in-tree indexer name")]
     ReservedName(String),
+
+    /// Recapture: `companion` filter not `"*"` (v1 only supports
+    /// targeting all subscribers — per-companion is deferred per
+    /// `docs/design/RECAPTURE.md`).
+    #[error("per-companion recapture not yet supported; use companion=*")]
+    RecaptureBadCompanion,
+
+    /// Recapture: per-module mutex held by another in-flight call.
+    /// Operator can retry once the first completes.
+    #[error("recapture already in progress for module `{0}`")]
+    RecaptureInProgress(String),
+
+    /// Recapture: companion failed to ACK `RecaptureReady` within
+    /// the per-companion timeout. Bootstrap-refill was NOT fired;
+    /// dApp state is whatever the companion partially produced.
+    /// Operator inspects companion logs and retries.
+    #[error("recapture timed out / coordination failed: {0}")]
+    RecaptureTimeout(String),
+
+    /// Recapture: the host's dialer isn't wired in this bundle
+    /// (e.g. an artifact-only deployment). Recapture is
+    /// unavailable until the bundle calls `host.set_dialer`.
+    #[error("recapture unavailable: {0}")]
+    RecaptureUnavailable(String),
+
+    /// Recapture: module not registered. Distinct from
+    /// "module exists but no subscribers" — that surfaces as
+    /// `RecaptureTimeout` from the platform layer.
+    #[error("module `{0}` not registered")]
+    ModuleNotFound(String),
 }
 
 impl HandlerError {
@@ -238,6 +270,11 @@ impl HandlerError {
             Self::Storage(_) => "storage_io",
             Self::Wasmtime(_) => "wasm_invalid",
             Self::ReservedName(_) => "reserved_name",
+            Self::RecaptureBadCompanion => "recapture_bad_companion",
+            Self::RecaptureInProgress(_) => "recapture_in_progress",
+            Self::RecaptureTimeout(_) => "recapture_timeout",
+            Self::RecaptureUnavailable(_) => "recapture_unavailable",
+            Self::ModuleNotFound(_) => "not_found",
         }
     }
 
@@ -246,6 +283,10 @@ impl HandlerError {
             Self::Storage(StorageError::UploadInProgress(_)) => StatusCode::CONFLICT,
             Self::Storage(StorageError::Io(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ReservedName(_) => StatusCode::CONFLICT,
+            Self::RecaptureInProgress(_) => StatusCode::CONFLICT,
+            Self::RecaptureTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            Self::RecaptureUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ModuleNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -439,6 +480,126 @@ async fn restart_module(
         .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
     tracing::info!(module = %id, "module restarted");
     Ok((StatusCode::OK, "restarted").into_response())
+}
+
+/// Request body for `POST /_admin/modules/{id}/recapture`. Both
+/// fields optional — empty body means `{ "companion": "*",
+/// "reason": null }`. v1 only accepts `companion = "*"`;
+/// per-companion targeting is a deferred follow-up tracked in
+/// `docs/design/RECAPTURE.md`.
+#[derive(Debug, Default, Deserialize)]
+struct RecaptureRequest {
+    /// Subscriber filter. v1 only accepts `"*"` (= all
+    /// subscribed companions). Optional with default `"*"`.
+    #[serde(default = "default_companion_filter")]
+    companion: String,
+    /// Free-form operator label, surfaced in the companion's
+    /// `on_recapture` callback for logging.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn default_companion_filter() -> String {
+    "*".to_owned()
+}
+
+/// Response body for a successful recapture.
+#[derive(Debug, Serialize)]
+struct RecaptureResponse {
+    module: String,
+    companions_targeted: usize,
+    /// Best-effort counter; v1 always reports `0` (see
+    /// `RECAPTURE.md` open question 4). Companions MUST NOT
+    /// depend on the value for correctness.
+    events_emitted: u64,
+    /// Wall-clock time the admin endpoint spent driving the
+    /// recapture, in milliseconds. Includes the per-companion
+    /// `RecaptureReady` wait + the bootstrap re-walk.
+    duration_ms: u64,
+}
+
+/// Per-companion `RecaptureReady` ACK budget. Matches the design
+/// doc's open question 3 starting guess; revisit once we've
+/// measured `on_recapture` against a populated companion table.
+const RECAPTURE_COMPANION_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn recapture_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<RecaptureRequest>>,
+) -> Result<Response, HandlerError> {
+    // Empty body is treated as the default request.
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+
+    // v1 only supports `companion=*`. Reject anything else with
+    // a 400 + a clear "deferred" message so operators don't
+    // bother retrying with a specific key.
+    if req.companion != "*" {
+        return Err(HandlerError::RecaptureBadCompanion);
+    }
+
+    // 404 when the module's never been activated.
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+
+    let Some(host) = &state.host else {
+        return Err(HandlerError::RecaptureUnavailable(
+            "no host wired in this admin router".to_owned(),
+        ));
+    };
+
+    let started = std::time::Instant::now();
+    tracing::info!(
+        module = %id,
+        reason = ?req.reason,
+        "recapture: admin endpoint dispatching"
+    );
+
+    match host
+        .recapture_module(&id, req.reason, RECAPTURE_COMPANION_TIMEOUT)
+        .await
+    {
+        Ok(outcome) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            tracing::info!(
+                module = %id,
+                companions_targeted = outcome.companion_count,
+                duration_ms,
+                "recapture: complete"
+            );
+            Ok(Json(RecaptureResponse {
+                module: outcome.module,
+                companions_targeted: outcome.companion_count,
+                events_emitted: outcome.events_emitted,
+                duration_ms,
+            })
+            .into_response())
+        }
+        Err(crate::PlatformError::RecaptureInProgress(m)) => {
+            Err(HandlerError::RecaptureInProgress(m))
+        }
+        Err(crate::PlatformError::RecaptureCoordination(detail)) => {
+            // Distinguish "dialer not wired" (operator
+            // misconfiguration; 503) from in-flight timeout /
+            // companion failure (504). The dialer-unwired path
+            // produces a detail string starting with "dialer
+            // not wired" — see host_v2.rs.
+            if detail.starts_with("dialer not wired") {
+                Err(HandlerError::RecaptureUnavailable(detail))
+            } else {
+                Err(HandlerError::RecaptureTimeout(detail))
+            }
+        }
+        Err(other) => {
+            tracing::error!(
+                module = %id,
+                error = %other,
+                "recapture: unexpected platform error"
+            );
+            Err(HandlerError::Wasmtime(format!("recapture: {other}")))
+        }
+    }
 }
 
 /// Return the most recently captured trap fixture for a module.

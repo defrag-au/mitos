@@ -53,6 +53,25 @@ pub trait ModuleHostHandle: Send + Sync {
     async fn stop(&self, id: &str) -> PlatformResult<()>;
     async fn stop_all(&self);
     async fn list_running(&self) -> Vec<String>;
+
+    /// Drive a coordinated state-rebuild for `id`. The protocol
+    /// is in `docs/design/RECAPTURE.md`. v1 always targets every
+    /// subscribed companion (`companion=*`); the `RecaptureRequest`
+    /// type lives at the admin-router boundary.
+    ///
+    /// `companion_timeout` is the per-companion `RecaptureReady`
+    /// ACK budget; reasonable default is `Duration::from_secs(30)`.
+    ///
+    /// Returns errors mappable to admin HTTP statuses:
+    /// - `RecaptureInProgress` → 409
+    /// - `RecaptureCoordination` → 504 (timeout) / 500 (other)
+    /// - `Decode` (unknown module) → 404
+    async fn recapture_module(
+        &self,
+        id: &str,
+        reason: Option<String>,
+        companion_timeout: Duration,
+    ) -> PlatformResult<RecaptureOutcome>;
 }
 
 /// One dynamic-interest update queued for delivery to a running
@@ -209,6 +228,16 @@ where
     /// operations are check-insert-or-reject and remove — no
     /// awaiting needed.
     recapture_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Companion dialer the recapture orchestrator drives.
+    /// Wired post-construction via `set_dialer` because the
+    /// dialer borrows the host as its `InterestRouter` — host
+    /// must exist (and be `Arc`-wrapped) before the dialer can
+    /// be built. `OnceLock` lets us inject behind a `&self`
+    /// without giving up Arc-sharing of the host. `None` (i.e.
+    /// the lock unset) means recapture is unavailable; the
+    /// admin endpoint returns a clear error rather than
+    /// panicking.
+    dialer: std::sync::OnceLock<crate::dialer::CompanionDialer>,
 }
 
 impl<S, P> ModuleHostV2<S, P>
@@ -245,6 +274,26 @@ where
             slots: Arc::new(Mutex::new(HashMap::new())),
             interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recapture_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            dialer: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Wire the companion dialer into the host. Must be called
+    /// before the `recapture_module` flow can run; subsequent
+    /// calls are silent no-ops (the `OnceLock` semantics).
+    ///
+    /// Construction order in `mitos-core::Bundle`:
+    /// 1. `let host = Arc::new(ModuleHostV2::new(...))`
+    /// 2. `let dialer = CompanionDialer::new(storage, auth, host.clone() as Arc<dyn InterestRouter>)`
+    /// 3. `host.set_dialer(dialer.clone())`
+    ///
+    /// The dialer needs the host (as `InterestRouter`), and the
+    /// host needs the dialer (for `recapture_module`); `set_dialer`
+    /// breaks the circular construction without needing interior
+    /// mutability beyond `OnceLock`.
+    pub fn set_dialer(&self, dialer: crate::dialer::CompanionDialer) {
+        if self.dialer.set(dialer).is_err() {
+            tracing::warn!("set_dialer called twice; second call ignored");
         }
     }
 
@@ -566,9 +615,15 @@ where
         &self,
         id: &str,
         reason: Option<String>,
-        dialer: &crate::dialer::CompanionDialer,
         companion_timeout: Duration,
     ) -> PlatformResult<RecaptureOutcome> {
+        let dialer = self.dialer.get().ok_or_else(|| {
+            PlatformError::RecaptureCoordination(
+                "dialer not wired (host.set_dialer never called); recapture unavailable"
+                    .to_owned(),
+            )
+        })?;
+
         // 1. Acquire mutex.
         {
             let mut in_flight = self
@@ -737,6 +792,14 @@ where
     }
     async fn list_running(&self) -> Vec<String> {
         ModuleHostV2::list(self).await
+    }
+    async fn recapture_module(
+        &self,
+        id: &str,
+        reason: Option<String>,
+        companion_timeout: Duration,
+    ) -> PlatformResult<RecaptureOutcome> {
+        ModuleHostV2::recapture_module(self, id, reason, companion_timeout).await
     }
 }
 
