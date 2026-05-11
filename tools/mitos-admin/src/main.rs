@@ -116,6 +116,27 @@ enum Cmd {
         id: String,
     },
 
+    /// Coordinate a state-rebuild for every subscribed companion
+    /// of a module. The protocol is in
+    /// `docs/design/RECAPTURE.md`: mitos sends `Recapture` over
+    /// each companion's dial-back WS, awaits `RecaptureReady`,
+    /// wipes the module's bootstrap-done flags, restarts the
+    /// follower (re-walks unspent UTxOs at the watched
+    /// addresses), and sends `RecaptureDone`. Use after a
+    /// schema migration, or when the dApp side has drifted.
+    ///
+    /// v1 always targets all subscribers (companion=*). Per-
+    /// companion targeting is a planned follow-up.
+    Recapture {
+        /// Module id (e.g. `jpg-co`).
+        id: String,
+        /// Free-form operator label surfaced in the companion's
+        /// `on_recapture` log line and the admin response. Useful
+        /// for tying ops events back to the trigger.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
     /// Stop a running module's follower + drop the slot. Artifact
     /// stays on disk for rollback per
     /// `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design questions"
@@ -244,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::GetModule { id } => cmd_get_module(&client, &cli, id).await,
         Cmd::UploadModule { artifact } => cmd_upload_module(&client, &cli, artifact).await,
         Cmd::RestartModule { id } => cmd_restart_module(&client, &cli, id).await,
+        Cmd::Recapture { id, reason } => cmd_recapture(&client, &cli, id, reason).await,
         Cmd::DeleteModule { id } => cmd_delete_module(&client, &cli, id).await,
         Cmd::Deploy {
             crate_name,
@@ -630,6 +652,77 @@ async fn cmd_restart_module(client: &Client, cli: &Cli, id: String) -> anyhow::R
     }
     println!("restarted module={id}");
     Ok(())
+}
+
+/// Request body for `POST /_admin/modules/{id}/recapture`.
+/// Mirrors the `RecaptureRequest` shape in
+/// `mitos-platform::admin`; we declare it locally rather than
+/// pulling the platform crate into the CLI dep graph just to
+/// reuse two field names.
+#[derive(Debug, Serialize)]
+struct RecaptureBody {
+    /// v1 always sends `"*"`. The server 400s anything else.
+    companion: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// Response shape from a successful recapture. Surfaced in
+/// the typed CLI output for pretty-printing.
+#[derive(Debug, Deserialize)]
+struct RecaptureResp {
+    module: String,
+    companions_targeted: usize,
+    events_emitted: u64,
+    duration_ms: u64,
+}
+
+/// Error body the admin endpoint returns on non-2xx. Shape
+/// matches `AdminError` on the server side.
+#[derive(Debug, Deserialize)]
+struct AdminError {
+    error: String,
+    code: String,
+}
+
+async fn cmd_recapture(
+    client: &Client,
+    cli: &Cli,
+    id: String,
+    reason: Option<String>,
+) -> anyhow::Result<()> {
+    let url = format!("{}/_admin/modules/{id}/recapture", cli.mitos);
+    let body = RecaptureBody {
+        companion: "*",
+        reason: reason.clone(),
+    };
+    let resp = auth(client.post(&url).json(&body), cli.token.as_deref())
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        let parsed: RecaptureResp = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("decode response: {e}; body={text}"))?;
+        println!("recapture complete");
+        println!("  module:              {}", parsed.module);
+        println!("  companions targeted: {}", parsed.companions_targeted);
+        println!("  events emitted:      {}", parsed.events_emitted);
+        println!("  duration (ms):       {}", parsed.duration_ms);
+        if let Some(r) = reason {
+            println!("  reason:              {r}");
+        }
+        return Ok(());
+    }
+
+    // Try to decode the structured AdminError body so the
+    // operator gets the platform's code + message. Fall back to
+    // raw status + text if decoding fails.
+    let detail = serde_json::from_str::<AdminError>(&text)
+        .map(|e| format!("{}: {}", e.code, e.error))
+        .unwrap_or_else(|_| text.clone());
+    anyhow::bail!("recapture failed ({status}): {detail}");
 }
 
 async fn cmd_delete_module(client: &Client, cli: &Cli, id: String) -> anyhow::Result<()> {
