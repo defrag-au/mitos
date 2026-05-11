@@ -168,7 +168,7 @@ fn project_tx(tx_idx: u32, tx: &MultiEraTx<'_>) -> TxDraft {
             .enumerate()
             .map(|(i, inp)| (i, (*inp.hash(), inp.index() as u32)))
             .collect();
-        sortable.sort_by(|a, b| a.1.cmp(&b.1));
+        sortable.sort_by_key(|a| a.1);
         let mut canonical = vec![0u32; consumed_inputs.len()];
         for (canonical_idx, (body_idx, _)) in sortable.into_iter().enumerate() {
             canonical[body_idx] = canonical_idx as u32;

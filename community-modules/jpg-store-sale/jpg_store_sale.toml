@@ -1,0 +1,20 @@
+# mitos.toml — module config for the jpg-store-sale indexer.
+#
+# Sales on jpg.store sale contracts (V1/V2/V3/V4). Listing
+# lifecycle events live in the sibling jpg-store-listing module.
+
+abi_version = 2
+
+[interest]
+addresses = [
+    "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm",
+    "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
+    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
+    "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp",
+]
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"

@@ -1,0 +1,49 @@
+# jpg-store-sale golden scenario: V2 sale of Snekkie #6011.
+#
+# TX:    93b23ce4695dadfb739cfd7386d47f395fb51878b8f5c3228de8861d30e90778
+# Slot:  185685015
+# Prior: 01c700a156a55ef0d03a7af9f146c3bf466a1db89a8f3b1b137e7257ec6528bb#0
+#        @ slot 156956549 — outside the dolos archive horizon, so the
+#        prior listing is supplied as a synthesized `[[utxo]]` entry
+#        with `datum_payload_hex` resolved via Maestro's TXO endpoint.
+#
+# The buy TX also produces an output at the V3 CO script address.
+# The jpg-store-sale module ignores produced CO outputs (those are
+# the jpg-store-offer module's surface) and emits one `Sale` event
+# for the consumed V2 listing.
+#
+# Verification value: exercises the synthesized-utxo prior-resolve
+# path against a real V2 listing whose block is past horizon.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"
+
+# Synthesized prior listing UTxO (block at slot 156956549 is past
+# the local archive horizon). Datum payload + assets from
+# Maestro. Listed asset: Snekkie #6011.
+[[utxo]]
+tx_hash = "01c700a156a55ef0d03a7af9f146c3bf466a1db89a8f3b1b137e7257ec6528bb"
+index = 0
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+lovelace = 1314550
+datum_hash = "8c70b0b8d5b1c80f1fbb8157ecddaab6dde9ff06a3e1df78e0ae511053f51a3d"
+datum_payload_hex = "d8799f9fd8799fd8799fd87a9f581c7aedc614c23e7727d929f0bcc7b63dbbab21960d72d4d3f7b99f86adffd8799fd8799fd87a9f581c7aedc614c23e7727d929f0bcc7b63dbbab21960d72d4d3f7b99f86adffffffff1a017d7840ffd8799fd8799fd8799f581c4609217910b13951c777b54080f1e3fa31343c7001e15279c4b711b6ffd8799fd8799fd8799f581c0d86029e8197c0fc3b497ba87cc5c177bb648a6e022b3d20b37e22c6ffffffff1a0d1cef00ffff581c4609217910b13951c777b54080f1e3fa31343c7001e15279c4b711b6ff"
+
+[[utxo.assets]]
+policy = "b558ea5ecfa2a6e9701dab150248e94104402f789c090426eb60eb60"
+asset_name_hex = "536e656b6b696536303131"

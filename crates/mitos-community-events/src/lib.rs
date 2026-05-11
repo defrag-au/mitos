@@ -13,6 +13,8 @@ pub mod cip25_mint;
 pub mod cip68_mint;
 pub mod jpg_co;
 pub mod jpg_store_listing;
+pub mod jpg_store_offer;
+pub mod jpg_store_sale;
 pub mod standard_burn;
 
 /// Decode + pretty-print an emit-channel payload for a known
@@ -36,6 +38,8 @@ pub fn decode_emit(module_id: &str, channel: u32, payload: &[u8]) -> Option<Stri
         "cip-68-mint" => cip68_mint::decode_emit(channel, payload),
         "jpg-co" => jpg_co::decode_emit(channel, payload),
         "jpg-store-listing" => jpg_store_listing::decode_emit(channel, payload),
+        "jpg-store-offer" => jpg_store_offer::decode_emit(channel, payload),
+        "jpg-store-sale" => jpg_store_sale::decode_emit(channel, payload),
         "standard-burn" => standard_burn::decode_emit(channel, payload),
         _ => None,
     }

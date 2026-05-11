@@ -1,0 +1,46 @@
+[
+  {
+    "asset_name_hex": "536e656b6b696530353233",
+    "buyer_address": "addr1q999ds5lu5wwmdk4930mzlh75dz3wkdpfd5nrmpp9th2qu950tqt0t0pswly8x86hr8q5gwfgcstrf76y7mpgfw8jmkqp3uwrn",
+    "contract_version": "V2",
+    "kind": "sale",
+    "payouts": [
+      {
+        "lovelace": 20000000,
+        "payment_pkh": "972cc7d1c0329b02b4c02b7d13018a31ecbe9f2216c3b472b1a94d65",
+        "stake_pkh": "f781e75452d145b99f83fe979115c3c588064f5c3354c0524c59d09a"
+      },
+      {
+        "lovelace": 175000000,
+        "payment_pkh": "bfe0128542098476f5fbccfe1f3c9a233e845bf0d9df6c64c6cca435",
+        "stake_pkh": "89eeb66e7617d51a209316181e0cf0b8ef79eb985a13a6a9be8ede19"
+      }
+    ],
+    "policy": "b558ea5ecfa2a6e9701dab150248e94104402f789c090426eb60eb60",
+    "price_lovelace": 195000000,
+    "seller_pkh": "bfe0128542098476f5fbccfe1f3c9a233e845bf0d9df6c64c6cca435",
+    "tx_hash": "7ffb11af23122d2467f0ddc3dab52d6e1792079ad741596b3f60fda60afc2daa"
+  },
+  {
+    "asset_name_hex": "536e656b6b696531373930",
+    "buyer_address": "addr1q999ds5lu5wwmdk4930mzlh75dz3wkdpfd5nrmpp9th2qu950tqt0t0pswly8x86hr8q5gwfgcstrf76y7mpgfw8jmkqp3uwrn",
+    "contract_version": "V2",
+    "kind": "sale",
+    "payouts": [
+      {
+        "lovelace": 20000000,
+        "payment_pkh": "972cc7d1c0329b02b4c02b7d13018a31ecbe9f2216c3b472b1a94d65",
+        "stake_pkh": "f781e75452d145b99f83fe979115c3c588064f5c3354c0524c59d09a"
+      },
+      {
+        "lovelace": 175000000,
+        "payment_pkh": "bfe0128542098476f5fbccfe1f3c9a233e845bf0d9df6c64c6cca435",
+        "stake_pkh": "89eeb66e7617d51a209316181e0cf0b8ef79eb985a13a6a9be8ede19"
+      }
+    ],
+    "policy": "b558ea5ecfa2a6e9701dab150248e94104402f789c090426eb60eb60",
+    "price_lovelace": 195000000,
+    "seller_pkh": "bfe0128542098476f5fbccfe1f3c9a233e845bf0d9df6c64c6cca435",
+    "tx_hash": "7ffb11af23122d2467f0ddc3dab52d6e1792079ad741596b3f60fda60afc2daa"
+  }
+]

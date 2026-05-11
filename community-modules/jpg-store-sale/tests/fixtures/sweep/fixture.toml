@@ -1,0 +1,41 @@
+# jpg-store-sale golden scenario: multi-asset sweep (single
+# buyer takes two listings in one TX).
+#
+# Three-block fixture:
+#
+# 1) `185112203.block.cbor` — first listing TX (slot 185112203,
+#    tx 413acbf1...). Lists asset A on jpg.store V2.
+# 2) `185112287.block.cbor` — second listing TX (slot 185112287,
+#    tx 8dd0d20b...). Lists asset B on jpg.store V2.
+# 3) `185128094.block.cbor` — sweep TX (slot 185128094,
+#    tx 7ffb11af..., redeemer constructor 0 = Buy/Accept on
+#    both inputs). One buyer atomically takes both listings;
+#    payouts to seller(s) + jpg.store fee + royalties flow in
+#    one TX.
+#
+# Expected emission: two `Sale` events, one per consumed
+# listing UTxO. Each carries the asset moved, payouts from
+# the original listing datum, and the same buyer address (the
+# wallet that received both assets).
+#
+# Module's static interest in production is read from
+# `jpg_store_sale.toml`. `mitos-run` reads interest from this
+# fixture file so we mirror the addresses here.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"

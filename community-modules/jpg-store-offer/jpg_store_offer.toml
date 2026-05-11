@@ -1,0 +1,40 @@
+# mitos.toml — module config for the jpg-store-offer indexer.
+#
+# Offer lifecycle on jpg.store CO contracts (V2 + V3). Richer
+# event surface than the predecessor `jpg-co` module:
+#   - Create  (was: Created)
+#   - Cancel  ┐
+#   - Accept  ├ replaces a single `Spent` variant
+#   - Update  ┘
+#
+# Cutover plan: ships alongside the existing `jpg-co` until the
+# `cnft.dev-workers/workers/jpg-store-mirror` consumer migrates
+# to the new wire format. Both modules can coexist; the address
+# overlap means each TX is processed by both, emitting both
+# event surfaces in parallel.
+
+abi_version = 2
+
+# Runtime config — passed to the module's `init(config)` as
+# CBOR-encoded by mitos-build. Mirror of `jpg-co`'s shape.
+v2_address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
+v3_address = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p"
+
+[interest]
+# jpg.store CO V2 + V3 script addresses. Same set the existing
+# jpg-co module watches.
+addresses = [
+    # V2 — payment script + V2 staking credential.
+    "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd",
+    # V3 — same payment script, V3 staking credential.
+    "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p",
+]
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"
+# blake2b for hash-matching candidate datum bytes recovered from
+# jpg.store's labels-50+ aux-data convention.
+pallas-crypto = "1.0.0-alpha.6"
