@@ -248,6 +248,37 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 tracing::warn!(code = %code, message = %message, "host-side error frame");
                 Ok(())
             }
+            ServerMessage::Recapture { module, reason } => {
+                // Recapture protocol arrives via the wire in this
+                // commit; the dApp-side `on_recapture` hook + the
+                // RecaptureReady response land in commit 2 of the
+                // implementation plan (see
+                // `mitos/docs/design/RECAPTURE.md`). Until then,
+                // log loudly so any test recapture from a future
+                // host is visible — a deployed host won't send the
+                // frame until commits 3+ of the plan put the
+                // driver in place.
+                tracing::warn!(
+                    module = %module,
+                    reason = ?reason,
+                    "Recapture frame received but on_recapture hook not yet wired; \
+                     dApp state will be inconsistent if this isn't a test"
+                );
+                Ok(())
+            }
+            ServerMessage::RecaptureDone {
+                cursor,
+                module,
+                events_emitted,
+            } => {
+                tracing::info!(
+                    module = %module,
+                    events_emitted,
+                    ?cursor,
+                    "RecaptureDone frame received; informational"
+                );
+                Ok(())
+            }
         }
     }
 

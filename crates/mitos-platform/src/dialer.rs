@@ -605,6 +605,20 @@ async fn handle_inbound_frame(
         ClientMessage::Subscribe { .. } => {
             warn!("companion sent unexpected Subscribe frame; ignoring");
         }
+        ClientMessage::RecaptureReady => {
+            // The recapture protocol's host-side driver lands in a
+            // later commit (see `docs/design/RECAPTURE.md` §
+            // "Implementation plan" — step 3). Until then,
+            // companions built against the new wire-format will
+            // never receive a `Recapture` frame from this host, so
+            // they should never reply with `RecaptureReady`. If we
+            // see one regardless (e.g. a confused companion), log
+            // and drop — no protocol invariant is at stake.
+            warn!(
+                module = %module_id,
+                "received RecaptureReady but recapture driver not yet wired; ignoring"
+            );
+        }
     }
 }
 

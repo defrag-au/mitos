@@ -301,7 +301,13 @@ where
         ClientMessage::Ack { .. }
         | ClientMessage::Nack { .. }
         | ClientMessage::Interest { .. }
-        | ClientMessage::Unsubscribe => {
+        | ClientMessage::Unsubscribe
+        | ClientMessage::RecaptureReady => {
+            // RecaptureReady is part of the recapture protocol (see
+            // `docs/design/RECAPTURE.md`); it's only meaningful
+            // mid-subscription after the host has sent a `Recapture`
+            // frame. Receiving it before Subscribe is the same shape
+            // of error as Ack/Nack/etc — handle uniformly.
             let _ = send(
                 transport,
                 &ServerMessage::Error {
@@ -475,6 +481,18 @@ where
                     }
                     Ok(ClientMessage::Subscribe { .. }) => {
                         tracing::warn!("unexpected Subscribe after initial handshake; ignoring");
+                    }
+                    Ok(ClientMessage::RecaptureReady) => {
+                        // Recapture protocol's host-side driver
+                        // lands in a later commit (see
+                        // `docs/design/RECAPTURE.md`). The legacy
+                        // replicate pump never sends `Recapture`,
+                        // so a companion should never reply with
+                        // `RecaptureReady` here. Log and drop.
+                        tracing::warn!(
+                            "RecaptureReady received on legacy pump; ignoring \
+                             (recapture not yet wired)"
+                        );
                     }
                     Err(e) => {
                         // Legacy pre-PR-3 consumers send Ack/Nack frames
