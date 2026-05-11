@@ -3401,6 +3401,7 @@ name = "mitos-community-events"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "serde_bytes",
 ]
 
 [[package]]
@@ -3447,6 +3448,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",

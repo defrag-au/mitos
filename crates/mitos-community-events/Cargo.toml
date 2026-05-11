@@ -11,3 +11,6 @@ disallowed_methods = "deny"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
+# Compact CBOR encoding of raw byte fields (e.g. `jpg_co::CoChange::Created::datum_cbor`).
+# Without this, `Vec<u8>` serialises as a CBOR array of ints with ~10x bloat.
+serde_bytes = "0.11"

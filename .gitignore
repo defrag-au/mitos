@@ -4,13 +4,23 @@
 .envrc.local
 .DS_Store
 
-# Nested cargo targets — sub-workspaces under spikes/ and modules/
-# have their own target dirs; the top-level /target only ignores
-# the main workspace's.
+# Nested cargo targets — sub-workspaces under spikes/, modules/, and
+# community-modules/ have their own target dirs (mitos-build
+# materialises a synthetic one-member workspace per module); the
+# top-level /target only ignores the main workspace's.
 spikes/**/target/
 spikes/**/Cargo.lock
 modules/**/target/
 modules/**/Cargo.lock
+community-modules/**/target/
+community-modules/**/Cargo.lock
+
+# Community-module pre-built artifacts (wasm + manifest + config.cbor).
+# Produced by `mitos-build --module community-modules/<name>/<name>.rs`
+# and consumed by the host's auto-load on startup. Treated as build
+# output — keep source-only in git; deploy pipeline rebuilds before
+# rsync, or operators run mitos-build locally for dev iteration.
+community-modules/**/build/
 
 # Local data dirs (Dolos's bootstrap output). Bind-mount or point env at
 # an external path on real deployments; ignore by default for local dev.

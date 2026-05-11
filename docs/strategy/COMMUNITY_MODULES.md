@@ -1,26 +1,26 @@
 # Community modules
 
-A first-class layer between in-tree indexers and per-dApp wasm
-modules: **wasm modules that ship with mitos**, auto-load on host
-startup, and are addressable by name from any companion. The
-canonical example is `jpg-co` — contract-specific datum decode
-for jpg.store collection offers that *any* dApp tracking COs
-benefits from.
+**The default home for chain-recognition logic.** Wasm modules
+that ship with mitos, auto-load on host startup, and are
+addressable by name from any companion. The canonical example is
+`jpg-co` — contract-specific datum decode for jpg.store
+collection offers that *any* dApp tracking COs benefits from.
 
-Per `LAYERED_RESPONSIBILITIES.md`'s tier model:
+Per `LAYERED_RESPONSIBILITIES.md`'s layering:
 
-| Tier | Where | This doc covers |
+| Where it lives | When | This doc covers |
 |---|---|---|
-| 0 — Private wasm | Per-dApp repo (`workers/<dapp>/modules/`) | Not here. Default for one-off dApp logic. |
-| **1 — Community wasm** | **`mitos/community-modules/<name>/`** | **Yes** |
-| 2 — Operator preload | Same as tier 1 with auto-load | Yes (v1 collapses 1+2 into one mechanism) |
-| 3 — In-tree native | `mitos/crates/<name>-indexer/` | Not here. The principled answer when ubiquity outgrows the wasm sandbox. |
+| `workers/<dapp>/modules/` (private wasm) | One-off dApp logic with no other consumer | Not here |
+| **`mitos/community-modules/<name>/` (community wasm)** | **Anything two or more dApps would reasonably want** | **Yes — the default** |
+| `mitos/crates/<name>-indexer/` (in-tree) | Framework plumbing the wasm sandbox can't do (chain follower, dispatch, residual pass, …) | Not here. Existing brand-decode indexers shipped pre-community-modules and stay; new chain-recognition work doesn't go here. |
 
 ## Goals
 
-- **Composition, not reinvention.** A worker subscribes to
-  community modules + in-tree indexers; it doesn't ship its own
-  copy of chain-decoding logic that other workers need too.
+- **Composition, not reinvention.** Workers subscribe to
+  community modules by name; they don't ship copies of
+  chain-decoding logic other workers also need. Existing
+  in-tree indexers stay as peers in the same subscribe
+  handshake, but they're not where new decode work lands.
 - **Shared event types.** One typed wire format per community
   module, owned by the module's source-of-truth. Consumers
   decode against the same definition.
@@ -142,7 +142,7 @@ Or via the local-dev patch override at the bottom of the file:
 mitos-community-events = { path = "../mitos/crates/mitos-community-events" }
 ```
 
-## Migration playbook — promoting a tier-0 module to tier 1
+## Migration playbook — promoting a private module to community
 
 Concrete steps using jpg-co as the worked example. Generalises
 to any per-dApp wasm module that earns wider relevance.
@@ -198,29 +198,37 @@ to any per-dApp wasm module that earns wider relevance.
 - `co-stats` total stable; no regression in observed CO
   population.
 
-## What this means for the marketplace-indexer
+## What this means for the existing in-tree indexers
 
-A real open question raised by this migration: **if community
-modules can handle deep per-contract decode (jpg-co, wayup-co,
-etc.), what's left for the host-side `marketplace-indexer` to do?**
+`marketplace-indexer`, `mint-burn-indexer`,
+`collection-ownership-indexer`, `none-match-indexer` all
+shipped pre-community-modules. They work, they have consumers,
+they stay. The community-modules-first preference shapes **new**
+chain-recognition work — it doesn't mandate retroactive
+demolition.
 
-Possible answers:
+Concretely:
 
-1. **Marketplace-indexer stays for cross-brand classification
-   it's good at.** It already handles the classify-shape-then-
-   resolve-brand pattern across multiple marketplace scripts;
-   community modules supplement with brand-specific deep data
-   the indexer can't surface cheaply.
-2. **Marketplace-indexer retires.** Per-brand community modules
-   subsume its responsibilities. The "what brand is this script?"
-   work moves into a community module per brand
-   (`jpg-store-marketplace`, `wayup-marketplace`, etc.).
+- **No rip-and-replace.** Workers that subscribe to in-tree
+  indexers today (jpg-store-mirror's marketplace channel,
+  collections-mitos's ownership channel) keep doing so. The
+  unified-subscribe path treats community modules and in-tree
+  indexers as peers — companions don't notice the distinction.
+- **New brand decode work goes to a community module.** When
+  wayup's CO support lands, it's `wayup-co` next to `jpg-co` —
+  not a payload extension to `marketplace-indexer`. Likewise
+  any new marketplace, DEX, or lending brand.
+- **Retirement is a per-indexer call, not a strategy
+  decision.** If `marketplace-indexer` becomes maintenance
+  dead-weight once `jpg-co` + `wayup-co` + future brand
+  modules cover the same ground, it gets retired then — driven
+  by concrete pressure (a contract change nobody wants to port
+  twice, an indexer payload that's been unused for months),
+  not by principle.
 
-Decision deferred. Worth revisiting once a second brand's
-community module exists and we can compare the patterns
-concretely. Same forcing function as picking between (1) and
-(2): a real second consumer makes the architecture decision
-itself.
+The forcing function for any future retirement is the same as
+the one that produced this doc: real second consumers reveal
+where the duplication actually lives.
 
 ## Operational concern: shared community module efficiency
 
@@ -274,12 +282,14 @@ task; not blocking initial adoption.**
 
 ## Cross-references
 
-- `LAYERED_RESPONSIBILITIES.md` — the three-layer model this
-  doc operationalises tier 1+2 within
+- `LAYERED_RESPONSIBILITIES.md` — the layering this doc
+  operationalises; sets the community-modules-first preference
+  for chain-recognition work
 - `MODULE_COMPOSITION.md` — future module-to-module dependency
   declarations (orthogonal but composes well: community
   modules upstream, dApp-specific modules downstream)
 - `MITOS_PLATFORM_V2.md` — wasm hosting architecture
 - `cnft.dev-workers/docs/JPG_STORE_MIRROR_RELAYERING.md` —
   in-progress migration that this doc reframes (the wasm module
-  doesn't get retired; it gets *promoted* to tier 1)
+  doesn't get retired; it gets *promoted* into
+  `community-modules/`)

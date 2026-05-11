@@ -69,3 +69,7 @@ mitos-protocol = { path = "../mitos-protocol" }
 # Wasm-module hosting (Bundle::enable_modules path). Pulls in
 # wasmtime + the platform's storage/host/admin surface.
 mitos-platform = { path = "../mitos-platform" }
+
+[dev-dependencies]
+# Sandbox dirs for community-modules auto-load tests.
+tempfile = "3"
