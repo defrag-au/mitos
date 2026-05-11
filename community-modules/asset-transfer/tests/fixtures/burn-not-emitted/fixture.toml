@@ -1,0 +1,34 @@
+# asset-transfer negative scenario: a clean Derp Birds burn TX
+# should produce **zero** Transfer events.
+#
+# Reuses the block from `standard-burn/derp-policy` — slot
+# 173579456, TX 7ac8414f...4b47485 burns DP04279 (qty -1 on
+# the mint field). The asset is consumed at the holder's
+# wallet and never produced. With the prior UTxO supplied
+# below, the platform delivers a Consumed event carrying the
+# asset; asset-transfer sees a negative delta with no
+# receivers → burn → skip.
+#
+# This locks in the algorithm's burn-skip behavior alongside
+# the mint-skip case. The same block fires a `Burn` event in
+# the `standard-burn` module via the parallel `Minted` event
+# path; both modules coexist.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0"
+
+# Prior UTxO holding the asset that gets burned. Without this
+# the platform's dispatch composer can't resolve the Consumed
+# event's prior_output and asset-transfer sees nothing — which
+# is also 0 emissions but not the meaningful burn-skip path.
+[[utxo]]
+tx_hash = "94876f9f638b1634672e8523268489fa9e1c383fcde181cfa47e29c43771b202"
+index = 1
+address = "addr1q8pay93een8vr9gwjcud6f093fqjq0gyz6ylg8088r69jnsttadnk66gcdwcaykj7v243uxecjeu5wed6ljf0lrpflhs96f7f2"
+lovelace = 1150770
+[[utxo.assets]]
+policy = "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0"
+asset_name_hex = "44503034323739"
