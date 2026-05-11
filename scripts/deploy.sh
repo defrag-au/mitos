@@ -115,7 +115,7 @@ dirty_tree_warning() {
 }
 
 step_rsync() {
-    log "1/4 rsync $MITOS_SRC_LOCAL/ → $MITOS_HOST:$MITOS_SRC_REMOTE/"
+    log "1/5 rsync $MITOS_SRC_LOCAL/ → $MITOS_HOST:$MITOS_SRC_REMOTE/"
     run "rsync -avz --delete \
         --exclude='target/' \
         --exclude='.git/' \
@@ -125,17 +125,47 @@ step_rsync() {
 }
 
 step_build() {
-    log "2/4 cargo build --profile $MITOS_BUILD_PROFILE -p mitos (on box; ~5min cold, ~30s incremental)"
-    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && cargo build --profile $MITOS_BUILD_PROFILE -p mitos'"
+    log "2/5 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build (on box; ~5min cold, ~30s incremental)"
+    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
+}
+
+step_build_community_modules() {
+    log "3/5 build community-module wasm artifacts (on box)"
+    # Walk every community-modules/<name>/ that has a <name>.rs and
+    # run `mitos-build --module <name>.rs`. Artifacts land at
+    # community-modules/<name>/target/mitos/<name>/, exactly where
+    # the host's community-module auto-load reads from.
+    #
+    # Single-quoted heredoc on purpose — the loop body runs on the
+    # remote box, so $name etc. must NOT expand locally.
+    run "ssh '$MITOS_HOST' '
+        set -e
+        cd $MITOS_SRC_REMOTE
+        BUILT=0
+        SKIPPED=0
+        for d in community-modules/*/; do
+            name=\$(basename \"\$d\")
+            stem=\$(echo \"\$name\" | tr - _)
+            src=\"\${d}\${stem}.rs\"
+            if [ ! -f \"\$src\" ]; then
+                SKIPPED=\$((SKIPPED+1))
+                continue
+            fi
+            echo \"  building \$name\"
+            ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/dev/null
+            BUILT=\$((BUILT+1))
+        done
+        echo \"  community modules: built=\$BUILT skipped=\$SKIPPED\"
+    '"
 }
 
 step_restart() {
-    log "3/4 systemctl restart $MITOS_SERVICE (SIGTERM, 90s graceful timeout, dolos WAL checkpointed)"
+    log "4/5 systemctl restart $MITOS_SERVICE (SIGTERM, 90s graceful timeout, dolos WAL checkpointed)"
     run "ssh '$MITOS_HOST' 'systemctl restart $MITOS_SERVICE'"
 }
 
 step_verify() {
-    log "4/4 health check"
+    log "5/5 health check"
     if [[ $DRY_RUN -eq 1 ]]; then
         printf "  [dry-run] ssh %s 'systemctl is-active %s && curl http://127.0.0.1:%s/health'\n" \
             "$MITOS_HOST" "$MITOS_SERVICE" "$MITOS_HEALTH_PORT" >&2
@@ -191,6 +221,7 @@ case "$CMD" in
         dirty_tree_warning
         step_rsync
         step_build
+        step_build_community_modules
         step_restart
         step_verify
         ;;

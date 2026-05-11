@@ -1,9 +1,13 @@
 //! Community-module auto-load.
 //!
 //! Walks a `community-modules/<name>/` directory tree and activates
-//! any module whose pre-built artifact (`build/<name>.wasm` +
-//! `build/manifest.toml`) is present and differs from the currently-
-//! activated artifact under `<modules_dir>/<name>/`.
+//! any module whose pre-built artifact (`target/mitos/<name>/<name>.wasm`
+//! + `target/mitos/<name>/manifest.toml`) is present and differs from
+//! the currently-activated artifact under `<modules_dir>/<name>/`.
+//! That path matches the default `--out` of `mitos-build`, so a
+//! deploy that runs `mitos-build --module <path>` for each community
+//! module on the box drops the artifacts straight where auto-load
+//! reads them.
 //!
 //! Idempotent: re-running with the same artifacts is a no-op. Skips
 //! modules without a pre-built artifact (operator hasn't run
@@ -84,7 +88,11 @@ pub fn auto_load(community_modules_dir: &Path, storage: &ModuleStorage) -> Vec<S
 }
 
 fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::Result<bool> {
-    let build_dir = module_dir.join("build");
+    // `mitos-build --module <name>.rs` writes its artifact to
+    // `<workspace>/target/mitos/<module-id>/` by default. When the
+    // workspace is the per-module dir (single-file shape), that's
+    // `community-modules/<name>/target/mitos/<name>/`.
+    let build_dir = module_dir.join("target").join("mitos").join(name);
     let manifest_path = build_dir.join("manifest.toml");
     let wasm_path = build_dir.join(format!("{name}.wasm"));
 
@@ -191,22 +199,15 @@ mod tests {
         wasm: &[u8],
     ) -> std::path::PathBuf {
         let module_dir = community_dir.join(dir_name);
-        std::fs::create_dir_all(module_dir.join("build")).unwrap();
+        let build_dir = module_dir.join("target").join("mitos").join(dir_name);
+        std::fs::create_dir_all(&build_dir).unwrap();
         // Source file presence is what auto-load uses to skip
         // non-module dirs.
         std::fs::write(module_dir.join(format!("{source_stem}.rs")), "").unwrap();
         let manifest = sample_manifest(dir_name, wasm);
         std::fs::write(module_dir.join(format!("{source_stem}.toml")), "").unwrap();
-        std::fs::write(
-            module_dir.join("build").join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            module_dir.join("build").join(format!("{dir_name}.wasm")),
-            wasm,
-        )
-        .unwrap();
+        std::fs::write(build_dir.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        std::fs::write(build_dir.join(format!("{dir_name}.wasm")), wasm).unwrap();
         module_dir
     }
 
@@ -260,15 +261,12 @@ mod tests {
         // rather than activate under the wrong id.
         let wasm = b"fake wasm";
         let module_dir = community_dir.join("foo-bar");
-        std::fs::create_dir_all(module_dir.join("build")).unwrap();
+        let build_dir = module_dir.join("target").join("mitos").join("foo-bar");
+        std::fs::create_dir_all(&build_dir).unwrap();
         std::fs::write(module_dir.join("foo_bar.rs"), "").unwrap();
         let manifest = sample_manifest("wrong-id", wasm);
-        std::fs::write(
-            module_dir.join("build").join("manifest.toml"),
-            manifest.to_toml().unwrap(),
-        )
-        .unwrap();
-        std::fs::write(module_dir.join("build").join("foo-bar.wasm"), wasm).unwrap();
+        std::fs::write(build_dir.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        std::fs::write(build_dir.join("foo-bar.wasm"), wasm).unwrap();
 
         let storage = ModuleStorage::new(tmp.path().join("modules"));
         let activated = auto_load(&community_dir, &storage);
