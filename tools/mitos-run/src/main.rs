@@ -624,7 +624,34 @@ async fn run_v2(
     // Push the fixture's interest set into the host state so the
     // block-dispatch path can filter against it.
     let mut driver = DriverV2::new(instance, budget);
-    driver.set_interest(interest);
+    driver.set_interest(interest.clone());
+
+    // Also call the module's `update_interest` export with a
+    // Replace op carrying the CBOR-encoded predicate list — same
+    // shape the production follower uses. Modules whose filter
+    // logic needs to know its own interest set (e.g.
+    // burn-address tracking watched bech32s for per-output
+    // filtering) only work end-to-end if this call is wired.
+    let mut items_cbor = Vec::with_capacity(64);
+    ciborium::ser::into_writer(&interest.predicates, &mut items_cbor)
+        .map_err(|e| anyhow::anyhow!("encode interest predicates as CBOR: {e}"))?;
+    match driver
+        .call_update_interest(
+            mitos_platform::bindings_v2::InterestOp::Replace,
+            &items_cbor,
+        )
+        .await
+    {
+        Ok(Ok(())) => {
+            println!("✓ update_interest(Replace, {} bytes) returned cleanly", items_cbor.len());
+        }
+        Ok(Err(e)) => {
+            eprintln!("✗ update_interest returned Err: {e}");
+        }
+        Err(e) => {
+            eprintln!("✗ update_interest failed: {e:?}");
+        }
+    }
 
     if blocks.is_empty() {
         println!("▸ no --block flags; skipping handle-events dispatch");

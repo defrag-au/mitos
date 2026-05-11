@@ -16,7 +16,11 @@
 //!
 //! See `mitos/docs/design/MINT_BURN_MODULES.md`.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use mitos_community_events::burn_address::AddressBurn;
+use serde::Deserialize;
 
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
@@ -25,6 +29,42 @@ use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::types::{ProducedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "burn-address-module";
+
+// Watched-address set. The platform's v2 dispatch model
+// filters TXs (any matching event qualifies → all events
+// dispatched), NOT per-output. So a TX that touches *any*
+// watched address also delivers Produced events for the
+// other (change, fee) outputs in the same TX. We have to
+// filter per-output ourselves to avoid emitting AddressBurn
+// for the user's own wallet change.
+//
+// Wire format from `update-interest` mirrors what the platform
+// host encodes: `ciborium`-serialised
+// `Vec<mitos_data_plane::InterestPredicate>` with serde's
+// default external tagging. We define a local minimal copy
+// of the discriminator so we can decode without pulling in
+// the full data-plane crate dep.
+thread_local! {
+    static WATCHED_ADDRS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// Minimal mirror of the on-wire `InterestPredicate` enum.
+/// We only care about `AtAddress`; the other variants get
+/// captured for shape-completeness so the deserialiser can
+/// step over them without erroring on unrecognised tags.
+#[derive(Debug, Deserialize)]
+enum InterestPredicateWire {
+    AtAddress(String),
+    AtStakeCred(serde::de::IgnoredAny),
+    HoldsPolicy(serde::de::IgnoredAny),
+    HoldsAsset {
+        #[allow(dead_code)]
+        policy: serde::de::IgnoredAny,
+        #[allow(dead_code)]
+        asset_name: serde::de::IgnoredAny,
+    },
+    TickEvery(u32),
+}
 
 fn emit_address_burn(event: &AddressBurn) {
     let mut buf = Vec::with_capacity(256);
@@ -40,14 +80,19 @@ fn emit_address_burn(event: &AddressBurn) {
 }
 
 fn handle_produced(p: &ProducedEvent) {
-    // Platform pre-filters by `at-address` so we trust the
-    // delivered event matches one of the watched addresses.
-    // Emit one AddressBurn per asset entry in the output's
-    // value (no lovelace event — lovelace is the native asset
-    // and isn't "burned" by being sent to an address).
+    // Per-output filter: platform dispatches every Produced
+    // event in any TX that touched a watched address, NOT just
+    // outputs at the watched address. We bounce non-matching
+    // outputs here so change/fee outputs don't leak into the
+    // emit channel as false-positive burns.
+    let is_watched = WATCHED_ADDRS.with(|set| set.borrow().contains(&p.output.address));
+    if !is_watched {
+        return;
+    }
     if p.output.assets.is_empty() {
         // Pure-ADA output landed at a watched address. Nothing
-        // to emit; log at debug for diagnosis.
+        // to emit (lovelace isn't "burned" by being sent to an
+        // address).
         return;
     }
     let burn_address = p.output.address.clone();
@@ -62,6 +107,53 @@ fn handle_produced(p: &ProducedEvent) {
             burn_address: burn_address.clone(),
         });
     }
+}
+
+/// Decode the CBOR-encoded interest predicates and update the
+/// watched-address set per the op. Silent best-effort: unknown
+/// variants and decode errors leave the set unchanged.
+fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
+    let predicates: Vec<InterestPredicateWire> =
+        match ciborium::de::from_reader(items_cbor) {
+            Ok(v) => v,
+            Err(e) => {
+                logging::log(
+                    LogLevel::Error,
+                    LOG_TARGET,
+                    &format!("decode interest predicates failed: {e}"),
+                );
+                return;
+            }
+        };
+    let addresses: Vec<String> = predicates
+        .into_iter()
+        .filter_map(|p| match p {
+            InterestPredicateWire::AtAddress(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    WATCHED_ADDRS.with(|set| {
+        let mut set = set.borrow_mut();
+        match op {
+            InterestOp::Replace => {
+                set.clear();
+                set.extend(addresses);
+            }
+            InterestOp::Add => {
+                set.extend(addresses);
+            }
+            InterestOp::Remove => {
+                for a in &addresses {
+                    set.remove(a);
+                }
+            }
+        }
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!("interest update applied; now watching {} address(es)", set.len()),
+        );
+    });
 }
 
 // ============================================================
@@ -108,9 +200,8 @@ impl Guest for Module {
         }
     }
 
-    fn update_interest(_op: InterestOp, _items_cbor: Vec<u8>) -> Result<(), String> {
-        // Filter application happens host-side; module is a pure
-        // shape-transform from Produced → AddressBurn.
+    fn update_interest(op: InterestOp, items_cbor: Vec<u8>) -> Result<(), String> {
+        apply_interest_update(op, &items_cbor);
         Ok(())
     }
 }

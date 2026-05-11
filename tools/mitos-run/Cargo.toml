@@ -19,6 +19,9 @@ mitos-data-plane = { path = "../../crates/mitos-data-plane" }
 # off the module's `manifest.module.id`. `decode` feature pulls in
 # ciborium + serde_json; same wire format used in production.
 mitos-community-events = { path = "../../crates/mitos-community-events", features = ["decode"] }
+# Used to encode interest predicates so we can drive the module's
+# `update_interest` export the same way the production follower does.
+ciborium = "0.2"
 
 # Typed asset/policy newtypes — for v2 fixture interest predicates.
 cardano-assets = { workspace = true }

@@ -1,0 +1,21 @@
+# burn-address fixture: 169,000 "The Elite Cats" tokens sent
+# to a script burn sink. Not strictly the canonical $burnsnek
+# address — the module is address-agnostic, so any consumer-
+# declared burn sink fits.
+#
+# TX: d695425b745a3416d999ba2a8072786c917a138913ceb33e2f9e62067ff0ad1e
+# Sink address: addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4
+#   (addr1w prefix → script payment credential, no staking part —
+#   typical burn-sink shape)
+# Asset: 8e40ce04191c1d584614d537d3adab4c082889bb8319c9aba8ffceb4
+#        / 54686520456c6974652043617473 ("The Elite Cats")
+# Quantity to sink: 169,000
+#
+# Expected emission: one `AddressBurn` event for output index 0
+# carrying the policy/asset/qty/sink-address echo.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4"
