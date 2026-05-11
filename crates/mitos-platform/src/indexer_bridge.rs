@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use mitos_protocol::SubscribeRequest;
+use mitos_protocol::{SubscribeRequest, SubscribeTarget};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -50,7 +50,10 @@ pub trait IndexerBridge: Send + Sync {
     /// Spawn the per-companion dial supervisor task for an
     /// `Indexer`-target subscribe request. The implementation:
     ///
-    /// - dials the companion's `/_internal/replicate` URL,
+    /// - dials the companion's
+    ///   `/_internal/replicate-<target_name>` URL (via the
+    ///   `{key}` + `{target}` substitution on the dial-back
+    ///   template),
     /// - injects a synthetic `ClientMessage::Subscribe` carrying
     ///   the request's `interests` (CBOR-encoded as
     ///   `Vec<Interest>` — the in-tree indexer's `Scope` type),
@@ -59,9 +62,21 @@ pub trait IndexerBridge: Send + Sync {
     /// - reconnects on disconnect with exponential backoff until
     ///   `cancel` is triggered.
     ///
+    /// `target` is the specific target this task is running for
+    /// — in multi-target subscribe requests, the dialer calls
+    /// `spawn_dial` once per target, each with the same `req`
+    /// but a different `target`. The implementation reads
+    /// `target.name()` to resolve which indexer to dispatch
+    /// against.
+    ///
     /// The returned `JoinHandle` is what the dialer's supervisor
     /// stores so re-registration can cancel the prior task.
-    fn spawn_dial(&self, req: SubscribeRequest, cancel: CancellationToken) -> JoinHandle<()>;
+    fn spawn_dial(
+        &self,
+        req: SubscribeRequest,
+        target: SubscribeTarget,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()>;
 }
 
 /// Shared handle type — what callers pass around at the trait

@@ -174,23 +174,27 @@ impl CompanionDialer {
     }
 
     /// Register (or re-register) a companion. Called from the
-    /// `/api/companions/subscribe` handler after the CBOR file
-    /// has been written to disk. Cancels any existing dial
-    /// loop for the same `(module_id, companion_key)` and
-    /// spawns a fresh one with the updated registration.
+    /// `/api/companions/subscribe` handler after persistence +
+    /// validation. Spawns one dial loop per target in the
+    /// request; multi-target subscribe results in N independent
+    /// outbound WSes (one per target). Cancels any existing dial
+    /// loop for each `(target_name, companion_key)` pair before
+    /// spawning fresh ones — register() is idempotent
+    /// re-registration.
     pub async fn register(&self, req: SubscribeRequest) {
-        let id = CompanionId::new(req.primary_target_name(), &req.companion_key);
-        // Cancel any existing task for this id before spawning
-        // a fresh one — register() is idempotent re-registration.
+        // Cancel existing tasks for any of the request's targets.
         {
             let mut tasks = self.tasks.lock().await;
-            if let Some(prev) = tasks.remove(&id) {
-                prev.cancel.cancel();
-                // Task self-terminates once it observes the
-                // cancel token; explicitly drop the JoinHandle
-                // so the underlying tokio task isn't accidentally
-                // awaited / blocked on here.
-                drop(prev.task);
+            for target in &req.targets {
+                let id = CompanionId::new(target.name(), &req.companion_key);
+                if let Some(prev) = tasks.remove(&id) {
+                    prev.cancel.cancel();
+                    // Task self-terminates once it observes the
+                    // cancel token; drop the JoinHandle so the
+                    // underlying tokio task isn't accidentally
+                    // awaited / blocked on here.
+                    drop(prev.task);
+                }
             }
         }
         self.spawn(req).await;
@@ -207,55 +211,59 @@ impl CompanionDialer {
     }
 
     async fn spawn(&self, req: SubscribeRequest) {
-        let id = CompanionId::new(req.primary_target_name(), &req.companion_key);
-        let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
+        // Spawn one dial loop per target. Each target's dial
+        // gets its own cancellation token + its own entry in
+        // the supervisor map keyed by `(target_name,
+        // companion_key)`. The companion-side runtime accepts
+        // each WS at `/_internal/replicate-<target_name>`
+        // (via the `{target}` substitution in the dial-back URL
+        // template).
+        for target in req.targets.clone() {
+            let id = CompanionId::new(target.name(), &req.companion_key);
+            let cancel = CancellationToken::new();
+            let cancel_for_task = cancel.clone();
 
-        // Dispatch on the request's target kind. v1 supports
-        // exactly one target per subscribe call (validated in
-        // `companions::subscribe_handler`), so we only inspect
-        // `targets[0]`.
-        let target = match req.targets.first() {
-            Some(t) => t,
-            None => {
-                warn!(
-                    companion_key = %req.companion_key,
-                    "subscribe request has no target; skipping dial"
-                );
-                return;
-            }
-        };
+            let task = match &target {
+                SubscribeTarget::Module { .. } => {
+                    let storage = self.storage.clone();
+                    let auth = self.auth.clone();
+                    let interest_router = self.interest_router.clone();
+                    let target_clone = target.clone();
+                    let req_clone = req.clone();
+                    tokio::spawn(async move {
+                        run_companion(
+                            req_clone,
+                            target_clone,
+                            storage,
+                            auth,
+                            interest_router,
+                            cancel_for_task,
+                        )
+                        .await;
+                    })
+                }
+                SubscribeTarget::Indexer { name } => {
+                    let Some(bridge) = self.indexer_bridge.clone() else {
+                        warn!(
+                            indexer = %name,
+                            companion_key = %req.companion_key,
+                            "indexer-target subscribe but no bridge wired on dialer; skipping dial"
+                        );
+                        continue;
+                    };
+                    // The bridge owns the dial loop for indexer
+                    // targets — it has access to the
+                    // `IndexerHandle::run_subscriber` machinery
+                    // in `mitos-core`. We just track the
+                    // JoinHandle in the supervisor map so
+                    // re-registration can cancel it.
+                    bridge.spawn_dial(req.clone(), target.clone(), cancel_for_task)
+                }
+            };
 
-        let task = match target {
-            SubscribeTarget::Module { .. } => {
-                let storage = self.storage.clone();
-                let auth = self.auth.clone();
-                let interest_router = self.interest_router.clone();
-                tokio::spawn(async move {
-                    run_companion(req, storage, auth, interest_router, cancel_for_task).await;
-                })
-            }
-            SubscribeTarget::Indexer { name } => {
-                let Some(bridge) = self.indexer_bridge.clone() else {
-                    warn!(
-                        indexer = %name,
-                        companion_key = %req.companion_key,
-                        "indexer-target subscribe but no bridge wired on dialer; skipping dial"
-                    );
-                    return;
-                };
-                // The bridge owns the dial loop for indexer
-                // targets — it has access to the
-                // `IndexerHandle::run_subscriber` machinery in
-                // `mitos-core`. We just track the JoinHandle in
-                // the supervisor map so re-registration can
-                // cancel it.
-                bridge.spawn_dial(req, cancel_for_task)
-            }
-        };
-
-        let mut tasks = self.tasks.lock().await;
-        tasks.insert(id, ActiveCompanion { cancel, task });
+            let mut tasks = self.tasks.lock().await;
+            tasks.insert(id, ActiveCompanion { cancel, task });
+        }
     }
 }
 
@@ -270,16 +278,18 @@ fn load_companion(path: &std::path::Path) -> anyhow::Result<SubscribeRequest> {
 /// until cancelled.
 async fn run_companion(
     req: SubscribeRequest,
+    target: SubscribeTarget,
     storage: ModuleStorage,
     auth: AuthToken,
     interest_router: Option<Arc<dyn InterestRouter>>,
     cancel: CancellationToken,
 ) {
-    let url_str = match resolve_dial_url(&req) {
+    let module_name = target.name().to_string();
+    let url_str = match resolve_dial_url(&req, &target) {
         Ok(u) => u,
         Err(e) => {
             error!(
-                module = %req.primary_target_name(),
+                module = %module_name,
                 companion_key = %req.companion_key,
                 error = %e,
                 "no dial-back URL configured; companion will not receive emissions"
@@ -291,7 +301,7 @@ async fn run_companion(
         Ok(u) => u,
         Err(e) => {
             error!(
-                module = %req.primary_target_name(),
+                module = %module_name,
                 companion_key = %req.companion_key,
                 url = %url_str,
                 error = %e,
@@ -301,11 +311,11 @@ async fn run_companion(
         }
     };
 
-    let store = match storage.emissions_store(req.primary_target_name()) {
+    let store = match storage.emissions_store(&module_name) {
         Ok(s) => s,
         Err(e) => {
             error!(
-                module = %req.primary_target_name(),
+                module = %module_name,
                 error = %e,
                 "open EmissionsStore failed; companion task exiting"
             );
@@ -321,7 +331,7 @@ async fn run_companion(
         match dial_and_pump(&parsed, &req, &auth, &store, interest_router.as_ref(), &cancel).await {
             Ok(()) => {
                 info!(
-                    module = %req.primary_target_name(),
+                    module = %module_name,
                     companion_key = %req.companion_key,
                     "companion dial loop exited cleanly; redialing"
                 );
@@ -329,7 +339,7 @@ async fn run_companion(
             }
             Err(e) => {
                 warn!(
-                    module = %req.primary_target_name(),
+                    module = %module_name,
                     companion_key = %req.companion_key,
                     target = %url_str,
                     error = %e,
@@ -346,11 +356,20 @@ async fn run_companion(
     }
 }
 
-/// Resolve the dial-back URL. v1 requires `dial_back.url` to
-/// be set on the subscribe request. Module-level
-/// `[companion] replicate_url` defaults are wired in a
-/// follow-up.
-fn resolve_dial_url(req: &SubscribeRequest) -> anyhow::Result<String> {
+/// Resolve the dial-back URL for one target. The URL template
+/// from `dial_back.url` is substituted with both `{key}` (the
+/// companion_key) and `{target}` (the target's name). v1
+/// supports either substitution token; companions with a single
+/// target can omit `{target}` from their template and the
+/// substitution becomes a no-op.
+///
+/// Multi-target companions MUST include `{target}` so each
+/// target's dial-back resolves to a distinct URL — typically
+/// `wss://.../_internal/replicate-{target}?key={key}`.
+fn resolve_dial_url(
+    req: &SubscribeRequest,
+    target: &SubscribeTarget,
+) -> anyhow::Result<String> {
     let url = req
         .dial_back
         .as_ref()
@@ -358,11 +377,13 @@ fn resolve_dial_url(req: &SubscribeRequest) -> anyhow::Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "subscribe request from {}/{} has no dial_back.url",
-                req.primary_target_name(),
+                target.name(),
                 req.companion_key
             )
         })?;
-    Ok(url.replace("{key}", &req.companion_key))
+    Ok(url
+        .replace("{key}", &req.companion_key)
+        .replace("{target}", target.name()))
 }
 
 async fn dial_and_pump(

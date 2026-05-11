@@ -16,6 +16,7 @@
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::wire::ChainPoint;
+use mitos_protocol::SubscribeTarget;
 
 /// Top-level companion trait. Implemented once per dApp companion.
 /// Owns the channel set, config, schema, and dApp RPC routes.
@@ -41,6 +42,42 @@ pub trait MitosCompanion: Send + Sync + 'static {
     /// and the registration cache row itself).
     fn migrate(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// What this companion subscribes to. Default: one
+    /// `SubscribeTarget::Module` with name = `Self::NAME` — i.e.
+    /// classic single-wasm-module companions Just Work without
+    /// overriding.
+    ///
+    /// Override to declare:
+    ///
+    /// - **Indexer target** instead of module (subscribe to an
+    ///   in-tree indexer via the unified-subscribe bridge — see
+    ///   `docs/design/UNIFIED_SUBSCRIBE.md`):
+    ///   ```ignore
+    ///   fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
+    ///       vec![SubscribeTarget::Indexer { name: "marketplace".into() }]
+    ///   }
+    ///   ```
+    /// - **Multi-target** (a single companion subscribing to
+    ///   several sources — e.g. one wasm module + one in-tree
+    ///   indexer):
+    ///   ```ignore
+    ///   fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
+    ///       vec![
+    ///           SubscribeTarget::Module { name: "jpg-co".into() },
+    ///           SubscribeTarget::Indexer { name: "marketplace".into() },
+    ///       ]
+    ///   }
+    ///   ```
+    ///   The host opens one dial-back WS per target (per
+    ///   UNIFIED_SUBSCRIBE.md's v1 multi-target shape), each
+    ///   landing at `/_internal/replicate-<target_name>` on the
+    ///   companion. Channel routing matches by target name.
+    fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
+        vec![SubscribeTarget::Module {
+            name: Self::NAME.to_string(),
+        }]
     }
 }
 

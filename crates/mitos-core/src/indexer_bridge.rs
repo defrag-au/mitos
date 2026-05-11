@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use dolos::adapters::DomainAdapter;
 use mitos_platform::indexer_bridge::IndexerBridge;
-use mitos_protocol::{ClientMessage, SubscribeRequest};
+use mitos_protocol::{ClientMessage, SubscribeRequest, SubscribeTarget};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     connect_async,
@@ -97,12 +97,17 @@ impl IndexerBridge for CoreIndexerBridge {
         self.indexers.keys().cloned().collect()
     }
 
-    fn spawn_dial(&self, req: SubscribeRequest, cancel: CancellationToken) -> JoinHandle<()> {
+    fn spawn_dial(
+        &self,
+        req: SubscribeRequest,
+        target: SubscribeTarget,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
         // Validation upstream guarantees the target is
         // `Indexer { name }` and the name exists + is public.
         // Defensive: if we're somehow asked to dial a missing or
         // internal indexer here, log and return a no-op task.
-        let indexer_name = req.primary_target_name().to_string();
+        let indexer_name = target.name().to_string();
         let companion_key = req.companion_key.clone();
 
         let Some(handle) = self.indexers.get(&indexer_name).cloned() else {
@@ -126,7 +131,7 @@ impl IndexerBridge for CoreIndexerBridge {
         let auth = self.auth.clone();
 
         tokio::spawn(async move {
-            run_indexer_dial(handle, req, domain, auth, cancel).await;
+            run_indexer_dial(handle, req, target, domain, auth, cancel).await;
         })
     }
 }
@@ -137,18 +142,22 @@ impl IndexerBridge for CoreIndexerBridge {
 async fn run_indexer_dial(
     handle: Arc<dyn IndexerHandle>,
     req: SubscribeRequest,
+    target: SubscribeTarget,
     domain: DomainAdapter,
     auth: AuthToken,
     cancel: CancellationToken,
 ) {
-    let indexer_name = req.primary_target_name().to_string();
+    let indexer_name = target.name().to_string();
     let companion_key = req.companion_key.clone();
 
+    // URL template supports both `{key}` and `{target}`
+    // substitution — multi-target companions land each
+    // target's WS at `/_internal/replicate-<target_name>`.
     let url_str = match req
         .dial_back
         .as_ref()
         .and_then(|d| d.url.clone())
-        .map(|u| u.replace("{key}", &companion_key))
+        .map(|u| u.replace("{key}", &companion_key).replace("{target}", &indexer_name))
     {
         Some(u) => u,
         None => {

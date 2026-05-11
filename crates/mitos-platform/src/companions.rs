@@ -150,11 +150,6 @@ enum SubscribeError {
     /// "Indexer visibility".
     #[error("indexer is internal (not subscribable from companions): {0}")]
     InternalIndexer(String),
-    /// `targets` length not equal to 1. v1 only supports
-    /// single-target subscribe; multi-target is a future
-    /// extension.
-    #[error("v1 supports single-target subscribe only ({0} targets supplied)")]
-    UnsupportedMultiTarget(usize),
 }
 
 #[derive(serde::Serialize)]
@@ -170,7 +165,6 @@ impl IntoResponse for SubscribeError {
             Self::InvalidModuleName(_) | Self::InvalidCompanionKey(_) => StatusCode::BAD_REQUEST,
             Self::UnknownModule(_) | Self::UnknownIndexer(_) => StatusCode::NOT_FOUND,
             Self::InternalIndexer(_) => StatusCode::BAD_REQUEST,
-            Self::UnsupportedMultiTarget(_) => StatusCode::BAD_REQUEST,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let code = match &self {
@@ -181,7 +175,6 @@ impl IntoResponse for SubscribeError {
             Self::UnknownModule(_) => "unknown_module",
             Self::UnknownIndexer(_) => "unknown_indexer",
             Self::InternalIndexer(_) => "internal_indexer",
-            Self::UnsupportedMultiTarget(_) => "unsupported_multi_target",
         };
         let body = ErrorBody {
             error: self.to_string(),
@@ -200,23 +193,40 @@ async fn subscribe_handler(
 
     validate_companion_key(&request.companion_key)?;
 
-    // v1 supports exactly one target per subscribe call. Multi-
-    // target subscriptions are a future extension (see
-    // `docs/design/UNIFIED_SUBSCRIBE.md`).
-    if request.targets.len() != 1 {
-        return Err(SubscribeError::UnsupportedMultiTarget(
-            request.targets.len(),
+    if request.targets.is_empty() {
+        return Err(SubscribeError::Decode(
+            "subscribe request has no targets".into(),
         ));
     }
 
-    let next_emission_id = match &request.targets[0] {
-        SubscribeTarget::Module { name } => {
-            handle_module_subscribe(&state, &request, name).await?
+    // Validate + persist each target (modules write CBOR to disk;
+    // indexers validate against the bridge). No dial-spawning yet —
+    // that's handled by ONE `dialer.register(request)` call below
+    // which fans out across all targets.
+    //
+    // `next_emission_id` is module-target-specific (peek of the
+    // module's emissions log); when multiple targets are present
+    // we surface the first module target's id, or 0 if none.
+    let mut next_emission_id: u64 = 0;
+    for target in &request.targets {
+        match target {
+            SubscribeTarget::Module { name } => {
+                let id = validate_and_persist_module(&state, &request, name).await?;
+                if next_emission_id == 0 {
+                    next_emission_id = id;
+                }
+            }
+            SubscribeTarget::Indexer { name } => {
+                validate_indexer_target(&state, name)?;
+            }
         }
-        SubscribeTarget::Indexer { name } => {
-            handle_indexer_subscribe(&state, &request, name).await?
-        }
-    };
+    }
+
+    // All targets validated. One register-call drives the dialer
+    // to spawn per-target dial loops.
+    if let Some(dialer) = &state.dialer {
+        dialer.register(request.clone()).await;
+    }
     let response = SubscribeResponse {
         status: "subscribed".to_string(),
         next_emission_id,
@@ -231,11 +241,12 @@ async fn subscribe_handler(
         .expect("response builder"))
 }
 
-/// Existing wasm-module subscribe flow: validate module id +
-/// artifact, persist CBOR registration, hand to dialer, peek the
-/// emissions store for `next_emission_id`. Returns the value to
-/// echo back in `SubscribeResponse`.
-async fn handle_module_subscribe(
+/// Validate + persist a wasm-module target. Does NOT hand to the
+/// dialer — the caller spawns dial loops once after all targets
+/// validate, via a single `dialer.register(request)` call. Returns
+/// the module's `next_emission_id` for echoing back in
+/// `SubscribeResponse`.
+async fn validate_and_persist_module(
     state: &CompanionState,
     request: &SubscribeRequest,
     module_name: &str,
@@ -266,12 +277,8 @@ async fn handle_module_subscribe(
         module = %module_name,
         companion_key = %request.companion_key,
         interests = request.interests.len(),
-        "companion registered (module target)"
+        "companion target validated + persisted (module)"
     );
-
-    if let Some(dialer) = &state.dialer {
-        dialer.register(request.clone()).await;
-    }
 
     // Companions use this as a sync point — any emission_id at or
     // below `peek_next_id - 1` is already in the log; anything
@@ -290,18 +297,13 @@ async fn handle_module_subscribe(
     Ok(next_emission_id)
 }
 
-/// New in-tree indexer subscribe flow: validate the indexer
-/// exists and isn't internal, then hand to the dialer (which
-/// dispatches on target kind and runs the broadcast-channel
-/// bridge for indexer targets). Indexer subscriptions are NOT
-/// persisted in v1 — companions re-register on each DO wake.
-/// Returns 0 as `next_emission_id` because in-tree indexers
-/// don't have a per-module emissions log.
-async fn handle_indexer_subscribe(
+/// Validate an in-tree indexer target. Indexer subscriptions
+/// aren't persisted in v1 — companions re-register on each DO
+/// wake. Returns `Ok(())` if the indexer exists + isn't internal.
+fn validate_indexer_target(
     state: &CompanionState,
-    request: &SubscribeRequest,
     indexer_name: &str,
-) -> std::result::Result<u64, SubscribeError> {
+) -> std::result::Result<(), SubscribeError> {
     let Some(bridge) = &state.indexer_bridge else {
         return Err(SubscribeError::UnknownIndexer(format!(
             "{indexer_name} (host has no indexer bridge wired)"
@@ -317,16 +319,10 @@ async fn handle_indexer_subscribe(
 
     tracing::info!(
         indexer = %indexer_name,
-        companion_key = %request.companion_key,
-        interests = request.interests.len(),
-        "companion registered (indexer target)"
+        "companion target validated (indexer)"
     );
 
-    if let Some(dialer) = &state.dialer {
-        dialer.register(request.clone()).await;
-    }
-
-    Ok(0)
+    Ok(())
 }
 
 fn companions_dir_for(storage: &ModuleStorage, module_id: &str) -> PathBuf {
