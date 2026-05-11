@@ -1,0 +1,34 @@
+# jpg-store-listing golden scenario: a single listing-create at jpg.store V2.
+#
+# TX: b648b04a5041c2f0ff38331cc334fc0cc1e28b7f6d5dc76f1ce3d252ef9ec663
+# Slot: 183754751
+# Asset: 477cec772adb1466b301fb8161f505aa66ed1ee8d69d3e7984256a43 / 477574656e62657267204269626c65202335363639
+#        ("Gutenberg Bible #5669")
+# Datum (V2 payouts shape):
+#   - payout 0: jpg.store fee credential → 9,000,000 lovelace (2.5% fee)
+#   - payout 1: seller (pkh 68687582...) → 342,000,000 lovelace
+#   - owner_pkh: 68687582762f144c980faec01e99319e2d051cc4512549d7a5d935d2
+# Total list price: 351,000,000 lovelace (351 ADA).
+#
+# Module's static interest in production is read from
+# `jpg_store_listing.toml`. `mitos-run` reads interest from
+# this fixture file, so we mirror the addresses here. Keep
+# in sync if the module's manifest changes.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"

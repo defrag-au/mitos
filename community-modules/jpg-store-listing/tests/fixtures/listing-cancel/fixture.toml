@@ -1,0 +1,43 @@
+# jpg-store-listing golden scenario: clean V2 cancel.
+#
+# Two-block fixture:
+#
+# 1) `172868651.block.cbor` — listing TX (slot 172868651,
+#    tx 34545914...). Lists Perp #3559 on jpg.store V2.
+#    Total list price 11 + 429 = 440 ADA per the datum
+#    payouts. The listing UTxO datum is hash-only on-chain;
+#    bytes are not visible until the cancel TX reveals them
+#    in its witness set.
+#
+# 2) `186544965.block.cbor` — cancel TX (slot 186544965,
+#    tx 4e74119a..., redeemer constructor 1 = Cancel).
+#    Seller delists Perp #3559 — NFT returns to seller's
+#    wallet, no marketplace payouts flow.
+#
+# Both blocks loaded together so mitos-run's witness-datum
+# harvest from block 2 exposes the listing datum bytes when
+# block 1's Produced event is dispatched, giving us the
+# full payouts decode rather than the "datum unresolvable at
+# create time" partial form.
+#
+# Module's static interest in production is read from
+# `jpg_store_listing.toml`. `mitos-run` reads interest from
+# this fixture file so we mirror the addresses here.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"

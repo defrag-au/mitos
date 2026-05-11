@@ -1,0 +1,13 @@
+[
+  {
+    "asset_name_hex": "477574656e62657267204269626c65202335363639",
+    "contract_version": "V2",
+    "kind": "create",
+    "output_index": 0,
+    "payouts": [],
+    "policy": "477cec772adb1466b301fb8161f505aa66ed1ee8d69d3e7984256a43",
+    "price_lovelace": 0,
+    "seller_pkh": "",
+    "tx_hash": "b648b04a5041c2f0ff38331cc334fc0cc1e28b7f6d5dc76f1ce3d252ef9ec663"
+  }
+]
