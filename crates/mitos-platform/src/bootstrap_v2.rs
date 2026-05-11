@@ -387,7 +387,7 @@ async fn scan_one_policy<P: ChainDataPlane + Sync>(
 
     // Bulk-resolve datums for everything we got back. Mirrors
     // the address-side flow.
-    let refs: Vec<OutputRef> = all_outputs.iter().map(|(r, _)| r.clone()).collect();
+    let refs: Vec<OutputRef> = all_outputs.iter().map(|(r, _)| *r).collect();
     let datums = plane
         .read_output_datums(&refs)
         .await
