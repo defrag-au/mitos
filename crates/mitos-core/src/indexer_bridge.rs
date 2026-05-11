@@ -153,12 +153,10 @@ async fn run_indexer_dial(
     // URL template supports both `{key}` and `{target}`
     // substitution — multi-target companions land each
     // target's WS at `/_internal/replicate-<target_name>`.
-    let url_str = match req
-        .dial_back
-        .as_ref()
-        .and_then(|d| d.url.clone())
-        .map(|u| u.replace("{key}", &companion_key).replace("{target}", &indexer_name))
-    {
+    let url_str = match req.dial_back.as_ref().and_then(|d| d.url.clone()).map(|u| {
+        u.replace("{key}", &companion_key)
+            .replace("{target}", &indexer_name)
+    }) {
         Some(u) => u,
         None => {
             error!(
@@ -240,11 +238,11 @@ async fn dial_once(
         .map_err(|e| anyhow::anyhow!("build ws request: {e}"))?;
     // Per-companion dial-back auth override takes precedence;
     // otherwise the bundle's `MITOS_AUTH_TOKEN` is the bearer.
-    if let Some((header_name, header_value)) = req.dial_back.as_ref().and_then(|dial| {
-        dial.auth_header
-            .as_deref()
-            .zip(dial.auth_value.as_deref())
-    }) {
+    if let Some((header_name, header_value)) = req
+        .dial_back
+        .as_ref()
+        .and_then(|dial| dial.auth_header.as_deref().zip(dial.auth_value.as_deref()))
+    {
         let name = header_name
             .parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
             .map_err(|e| anyhow::anyhow!("auth header name: {e}"))?;

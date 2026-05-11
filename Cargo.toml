@@ -15,6 +15,7 @@ members = [
     "crates/mitos-platform",
     "crates/mitos-core",
     "crates/mitos-companion",
+    "crates/mitos-community-events",
     "crates/collection-ownership-indexer",
     "crates/marketplace-indexer",
     "crates/mint-burn-indexer",

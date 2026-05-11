@@ -1,0 +1,13 @@
+[package]
+name = "mitos-community-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Typed event payloads for mitos community modules (auto-loaded wasm modules under mitos/community-modules/<name>/)."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }

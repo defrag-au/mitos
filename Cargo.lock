@@ -3397,6 +3397,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-community-events"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "mitos-companion"
 version = "0.0.1"
 dependencies = [

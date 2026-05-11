@@ -61,6 +61,13 @@ pub struct Bundle {
     /// `Some(path)` = enable `/_admin/modules/*` + auto-resume
     /// any modules already activated under that path.
     modules_dir: Option<PathBuf>,
+    /// Filesystem path to the community-modules source tree
+    /// (`mitos/community-modules/`). When set + wasm hosting is
+    /// enabled, the bundle walks each `<name>/build/` directory
+    /// at startup and activates any pre-built artifact whose
+    /// sha differs from the currently-active one. See
+    /// `docs/strategy/COMMUNITY_MODULES.md`.
+    community_modules_dir: Option<PathBuf>,
     /// When `Some`, residual-pass mode is enabled. `run()` uses
     /// the synchronised dispatcher (single task across all
     /// indexers) instead of one task per indexer, so the residual
@@ -90,6 +97,7 @@ impl Bundle {
             data_dir,
             indexers: Vec::new(),
             modules_dir: None,
+            community_modules_dir: None,
             residual_coordinator: None,
         }
     }
@@ -146,6 +154,23 @@ impl Bundle {
         self.modules_dir = Some(modules_dir);
     }
 
+    /// Enable community-module auto-load from a source tree path.
+    /// Requires `enable_modules` to also be set (community modules
+    /// activate into the same modules_dir). At startup, the bundle
+    /// walks `<community_modules_dir>/<name>/build/` for each
+    /// subdirectory and calls `ModuleStorage::activate` for any
+    /// artifact whose sha differs from the currently-active one.
+    ///
+    /// Typical value: the `community-modules/` directory at the
+    /// root of the mitos source tree. Pre-built artifacts under
+    /// each module's `build/` subdir are produced by `mitos-build`
+    /// either at release time or as a deploy step.
+    ///
+    /// See `docs/strategy/COMMUNITY_MODULES.md`.
+    pub fn enable_community_modules(&mut self, community_modules_dir: PathBuf) {
+        self.community_modules_dir = Some(community_modules_dir);
+    }
+
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
     /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
     /// `/replicate/{indexer}` test surface + `/_admin/subscriptions`),
@@ -158,6 +183,7 @@ impl Bundle {
             data_dir,
             indexers,
             modules_dir,
+            community_modules_dir,
             residual_coordinator,
         } = self;
 
@@ -209,9 +235,9 @@ impl Bundle {
             })?;
 
             let from = starting_cursor.unwrap_or(dolos_core::ChainPoint::Origin);
-            let subscription = domain.watch_tip(Some(from)).map_err(|e| {
-                anyhow::anyhow!("watch_tip for synchronised dispatch: {e:?}")
-            })?;
+            let subscription = domain
+                .watch_tip(Some(from))
+                .map_err(|e| anyhow::anyhow!("watch_tip for synchronised dispatch: {e:?}"))?;
 
             let domain_clone = domain.clone();
             let handle = tokio::spawn(async move {
@@ -279,9 +305,9 @@ impl Bundle {
             // composer's generic bound resolves without a vtable
             // hop. The `dp` view (`Arc<dyn DataPlaneFacade>`) is
             // what the per-instance host fns see.
-            let chain_plane = Arc::new(
-                mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
-            );
+            let chain_plane = Arc::new(mitos_platform::host_fns::DomainDataPlane::new(
+                domain.clone(),
+            ));
             let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = chain_plane.clone();
 
             // Subscription factory: each follower gets its own
@@ -399,6 +425,26 @@ impl Bundle {
                 }
             }
 
+            // Community-module auto-load (if enabled). Walks the
+            // configured source tree and activates any pre-built
+            // artifact whose sha differs from what's already on
+            // disk. Runs BEFORE `auto_resume` so the follower
+            // pass picks up newly-activated community modules in
+            // the same startup cycle. Reserved-name guard above
+            // already protects against community modules
+            // colliding with in-tree indexer names.
+            //
+            // See `docs/strategy/COMMUNITY_MODULES.md`.
+            if let Some(cm_dir) = community_modules_dir.as_ref() {
+                let activated = crate::community_modules::auto_load(cm_dir, &storage);
+                info!(
+                    community_modules_dir = %cm_dir.display(),
+                    activated_count = activated.len(),
+                    activated = ?activated,
+                    "community-modules auto-load complete"
+                );
+            }
+
             // Auto-resume: walk every manifest on disk and start
             // it. Single bad module is logged and skipped so it
             // can't abort bundle startup.
@@ -407,8 +453,7 @@ impl Bundle {
             // The platform admin router has its own AuthToken
             // type — same shape, same env var, separate crate.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
-            let host_for_admin =
-                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
+            let host_for_admin = host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
 
             // Companion dial supervisor: maintains an outbound
             // WS to each registered companion so the host can
