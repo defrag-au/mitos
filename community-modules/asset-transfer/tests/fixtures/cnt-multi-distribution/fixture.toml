@@ -1,0 +1,118 @@
+# asset-transfer golden scenario: multi-recipient FT
+# distribution with substantial change residual.
+#
+# TX:    231790f0ad8a6d61425ef4fc9b4a97b9ee9177fc9db4d1acd6f6bbfba1f490d1
+# Slot:  186975555
+#
+# Shape:
+#   - Inputs: 2 UTxOs from wallet C
+#       [0] pure ADA (45M lovelace, inline datum)
+#       [1] 18 NFTs (Ryze policy 9ed7b842…)
+#           + 161,901 TEC      (policy a1e239e4…)
+#           +  47,150 MOONFURY (policy a2cdc9c7…)
+#   - Outputs:
+#       [0] wallet A receives 50,000 TEC
+#       [1] wallet D receives 50,000 TEC
+#       [2..4] wallet C — pure ADA splits
+#       [5] wallet C change UTxO holding the remaining
+#           61,901 TEC + 47,150 MOONFURY + all 18 NFTs
+#
+# Expected emission: **2 Transfer events**, both for the TEC
+# policy:
+#   - C → A, 50,000 TEC
+#   - C → D, 50,000 TEC
+#
+# Exercises:
+#   - Multi-recipient FT split (one sender, two receivers)
+#   - Change netting on FT (61,901 TEC at sender → drop)
+#   - Pure round-trip skip (MOONFURY +47,150 / -47,150 = 0
+#     across same address → drop)
+#   - NFT batch round-trip skip (18 NFTs back to sender → drop)
+#   - Primary-sender selection is unambiguous: only wallet C
+#     has a negative delta for TEC
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "a1e239e4ad332ca3c41056eb85aa21a6c5c563d497a74dcfb4fdbaf0"
+
+[[interest]]
+kind = "holds_policy"
+policy = "a2cdc9c73c59d668d5ae2c4dcd51447767362e8a325eaedc320c58f4"
+
+[[interest]]
+kind = "holds_policy"
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+
+# Prior input UTxO carrying all the assets — synthesised from
+# Maestro's TXO endpoint. Input [0] (pure ADA) holds no policy
+# this fixture watches so its Consumed event is dropped by the
+# platform's interest filter anyway; we omit it.
+[[utxo]]
+tx_hash = "c9cb70524e1893c4e959537497f46bbed5bfe438c7e3d4e594cbde4ebfd511b5"
+index = 3
+address = "addr1q8udur5wcxc7ylcvs8yw5v2c3mqsg9xw4q4vfa59e5uj03x4g6w00vrmxl57wxpr54u7crharns8nfn6gv04tfsnhpjse6qms5"
+lovelace = 4913560
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "466c617265417a7572655279616e"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "47726974536c65656b56656e7573"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "53707279426c756666466c616d65"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "536572656e654865726f662e417274"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "576964654c7573685761626572746f"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "4372656564566f727465784d69676779"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "45646479556e6374756f7573466f6d7a"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "466c61726554616c656e745377697373"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "47616c654761696e7361794d6f736965"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "5275627956657373656c45726f636b73"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "4661626c6547617272756c6f7573536562"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "496369636c6554686f726e426f6a61636b"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "476c616369657243726573744a6f73684a44"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "537061726b53656d70697465726e616c454c"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "53746f6e65506c756d654576657267726f77"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "4469676e696669656450726f7564546f746573"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "4272696d556269717569746f7573477261706879"
+[[utxo.assets]]
+policy = "9ed7b8428643e6abfd1162c622bc8ca12b15851d5ff27c47f7b3a160"
+asset_name_hex = "53746174656c794c756d696e6f75734475746368"
+[[utxo.assets]]
+policy = "a1e239e4ad332ca3c41056eb85aa21a6c5c563d497a74dcfb4fdbaf0"
+asset_name_hex = "544543"
+quantity = 161901
+[[utxo.assets]]
+policy = "a2cdc9c73c59d668d5ae2c4dcd51447767362e8a325eaedc320c58f4"
+asset_name_hex = "4d4f4f4e46555259"
+quantity = 47150
