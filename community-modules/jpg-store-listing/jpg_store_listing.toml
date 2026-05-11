@@ -1,0 +1,34 @@
+# mitos.toml — module config for the jpg-store-listing indexer.
+#
+# Listing lifecycle on jpg.store sale contracts (V1/V2/V3/V4).
+# Sale events live in a sibling jpg-store-sale module; this one
+# stays narrowly scoped to listing-book lifecycle (Create /
+# Update / Unlisting).
+
+abi_version = 2
+
+[interest]
+# Hard-wired jpg.store sale contract addresses — bech32 strings
+# from the shared `address-registry`. We don't pull the registry
+# crate into the wasm module since the list is small and stable;
+# updating means a literal string change + a rebuild.
+addresses = [
+    # V1 — addr1z prefix (script payment, key stake) + addr1x
+    # prefix (script payment, stake hash) cover the two bech32
+    # variants pointing at the same script hash.
+    "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm",
+    # V2
+    "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
+    # V3 — addr1w prefix (script payment only, no stake).
+    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
+    # V4
+    "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp",
+]
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+# PlutusData walking for listing datum decode (payouts list +
+# owner pkh extraction). Same path the cip-68-mint module uses.
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"

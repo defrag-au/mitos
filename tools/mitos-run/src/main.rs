@@ -213,6 +213,26 @@ struct FixtureUtxo {
     /// simulate "host couldn't resolve, fall back to metadata".
     #[serde(default)]
     datum_payload_hex: Option<String>,
+    /// Native assets at the output. Set when the synthesized
+    /// UTxO needs to carry NFTs (e.g. listed assets at a
+    /// marketplace script address) for module emit-paths that
+    /// iterate `prior_output.assets`.
+    #[serde(default)]
+    assets: Vec<FixtureAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureAsset {
+    /// 56-hex policy id.
+    policy: String,
+    /// Lowercase hex asset name.
+    asset_name_hex: String,
+    #[serde(default = "default_asset_quantity")]
+    quantity: u64,
+}
+
+fn default_asset_quantity() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,6 +298,20 @@ impl FixtureDataPlane {
                 original_cbor: datum_payload,
             });
 
+            let assets = u
+                .assets
+                .into_iter()
+                .map(|a| {
+                    let policy = cardano_assets::PolicyId::new(a.policy.clone())
+                        .with_context(|| format!("utxo asset policy {}", a.policy))?;
+                    Ok::<_, anyhow::Error>(mitos_data_plane::AssetEntry {
+                        policy_id: policy,
+                        asset_name_hex: a.asset_name_hex,
+                        quantity: a.quantity,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
             by_address.entry(u.address.clone()).or_default().push(oref);
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
@@ -285,7 +319,7 @@ impl FixtureDataPlane {
                     output: TypedOutput {
                         address: u.address,
                         lovelace: u.lovelace,
-                        assets: Vec::new(),
+                        assets,
                         datum,
                         script_ref: None,
                         original_cbor: None,

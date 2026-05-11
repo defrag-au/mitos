@@ -1,0 +1,24 @@
+# jpg-store-offer golden scenario: collection offer creation at jpg.store V2.
+#
+# TX: 8116b5d2b29d5b925d8c42111b4de375ad60e175affd931f3fef35d3fb324c70
+# Slot: 185209731
+# Bidder: 84cc25ea4c29951d40b443b95bbc5676bc425470f96376d1984af9ab
+# Target policy: 4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922
+# Offer amount: 45 ADA (including min-utxo overhead)
+#
+# Datum is hash-only on the V2 output; bytes are reconstructed
+# from labels-50+ aux-data in the same TX (jpg.store's
+# off-chain-datum convention). Our `chain_data::tx_metadata`
+# fallback path inside the module hash-verifies the
+# reconstruction against the output's datum hash before
+# decoding.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p"

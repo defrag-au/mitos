@@ -1,0 +1,24 @@
+[
+  {
+    "asset_name_hex": "536e656b6b696536303131",
+    "buyer_address": "addr1q8c6tr7zea729xj0fgqxxgkqhqt0az6gzg59cnyp5knwmp2mdz3a55rezmt6gfje85r86k082x9sgt0s6rw7p6ykvwdslkte5r",
+    "contract_version": "V2",
+    "kind": "sale",
+    "payouts": [
+      {
+        "lovelace": 25000000,
+        "payment_pkh": "7aedc614c23e7727d929f0bcc7b63dbbab21960d72d4d3f7b99f86ad",
+        "stake_pkh": "7aedc614c23e7727d929f0bcc7b63dbbab21960d72d4d3f7b99f86ad"
+      },
+      {
+        "lovelace": 220000000,
+        "payment_pkh": "4609217910b13951c777b54080f1e3fa31343c7001e15279c4b711b6",
+        "stake_pkh": "0d86029e8197c0fc3b497ba87cc5c177bb648a6e022b3d20b37e22c6"
+      }
+    ],
+    "policy": "b558ea5ecfa2a6e9701dab150248e94104402f789c090426eb60eb60",
+    "price_lovelace": 245000000,
+    "seller_pkh": "4609217910b13951c777b54080f1e3fa31343c7001e15279c4b711b6",
+    "tx_hash": "93b23ce4695dadfb739cfd7386d47f395fb51878b8f5c3228de8861d30e90778"
+  }
+]

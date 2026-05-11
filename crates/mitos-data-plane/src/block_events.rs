@@ -144,18 +144,56 @@ fn project_tx(tx_idx: u32, tx: &MultiEraTx<'_>) -> TxDraft {
     let raw_outputs = tx.outputs();
     let outputs: Vec<OutputDraft> = raw_outputs.iter().map(project_output_draft).collect();
 
-    let inputs: Vec<InputDraft> = tx
-        .consumes()
+    // Spend-redeemers reference inputs by their **canonical**
+    // index — the position the input occupies in the
+    // ledger-sorted set (by (tx_hash, index) ascending). Pallas's
+    // `consumes()` returns inputs in TX-body order, which is NOT
+    // necessarily the same sort order. So we compute the
+    // canonical index per body-position by sorting refs, then
+    // ask `find_spend_redeemer(canonical_idx)` for each input.
+    //
+    // Previous version called `find_spend_redeemer(body_idx)`,
+    // which silently mis-routed redeemers (or dropped them) for
+    // any TX whose body-order didn't match canonical order — a
+    // common shape for sale/cancel TXs where the wallet input
+    // and script input sort the opposite way they appear in the
+    // body.
+    let consumed_inputs = tx.consumes();
+    let canonical_index_for_body: Vec<u32> = {
+        // Build (body_idx, ref) pairs, sort by ref to get canonical
+        // order, then invert so we can look up canonical_idx by
+        // body_idx.
+        let mut sortable: Vec<(usize, (Hash<32>, u32))> = consumed_inputs
+            .iter()
+            .enumerate()
+            .map(|(i, inp)| (i, (*inp.hash(), inp.index() as u32)))
+            .collect();
+        sortable.sort_by_key(|a| a.1);
+        let mut canonical = vec![0u32; consumed_inputs.len()];
+        for (canonical_idx, (body_idx, _)) in sortable.into_iter().enumerate() {
+            canonical[body_idx] = canonical_idx as u32;
+        }
+        canonical
+    };
+    let inputs: Vec<InputDraft> = consumed_inputs
         .iter()
         .enumerate()
-        .map(|(input_order, input)| {
-            // `find_spend_redeemer` is on `MultiEraTx` directly,
-            // not the Vec returned by `redeemers()`. Indices are
-            // canonical input order (sorted by tx_hash, idx),
-            // which `consumes()` already returns.
-            let redeemer = tx
-                .find_spend_redeemer(input_order as u32)
-                .map(|r| r.encode());
+        .map(|(body_idx, input)| {
+            let canonical_idx = canonical_index_for_body[body_idx];
+            // Modules want the redeemer's `data` field (the
+            // PlutusData payload), not the full
+            // `(tag, index, data, ex_units)` record that
+            // `r.encode()` produces. The other three are either
+            // implicit (tag = Spend for ConsumedEvent), already
+            // surfaced (canonical_idx is the input's identity), or
+            // not module-relevant (ex_units). Encode the data
+            // alone so a simple datum-shape check (e.g. constructor
+            // 1 = Cancel = `d87a80`) works directly.
+            let redeemer = tx.find_spend_redeemer(canonical_idx).map(|r| {
+                let mut buf = Vec::with_capacity(8);
+                let _ = pallas_codec::minicbor::encode(r.data(), &mut buf);
+                buf
+            });
             InputDraft {
                 oref: OutputRef::new(*input.hash(), input.index() as u32),
                 redeemer,

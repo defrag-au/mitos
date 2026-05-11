@@ -1,0 +1,39 @@
+# jpg-store-listing golden scenario: batch listing update
+# (10 listings price-updated atomically by the same seller).
+#
+# Two-block fixture:
+#
+# 1) `178807375.block.cbor` — batch listing TX (slot 178807375,
+#    tx 042dcd1d...). Lists 10 assets at V2 in a single TX,
+#    producing outputs #0..#9 at the V2 sale address.
+# 2) `185347071.block.cbor` — batch update TX (slot 185347071,
+#    tx 642ddfba...). Consumes all 10 prior listings and
+#    re-produces 10 new listings at the same V2 sale address.
+#    Redeemer constructor != 1 (not Cancel) — these are
+#    in-place price updates, so the listing module should emit
+#    10 `Update` events rather than 10 `Unlisting`.
+#
+# Stresses the consumed+produced pairing logic: 10 of each at
+# the same address in one TX, all from the same owner. The
+# module pairs them by ordering (the consume order matches the
+# produce order on jpg.store's batch-update flow). Expected
+# emission: 10 `ListingUpdate` events with consistent owner pkh
+# and prior/new UTxO refs.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"

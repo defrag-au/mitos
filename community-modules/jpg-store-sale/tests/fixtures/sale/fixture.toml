@@ -1,0 +1,38 @@
+# jpg-store-sale golden scenario: completed sale of Perp #3134.
+#
+# Two-block fixture:
+#
+# 1) `185242961.block.cbor` — listing TX (slot 185242961,
+#    tx 7af47647...). Lists Perp #3134 on jpg.store V2.
+#    Datum is hash-only on the output; bytes get revealed
+#    when the sale TX (block 2) consumes the UTxO.
+#
+# 2) `185420186.block.cbor` — sale TX (slot 185420186,
+#    tx 06ed6c29..., redeemer constructor 0 = Buy/Accept).
+#    Buyer's wallet pays 47.16 ADA split as:
+#      - 1.16 ADA → jpg.store fee sink
+#      - 4.80 ADA → royalty recipient
+#      - 41.20 ADA → seller
+#    Asset Perp #3134 moves to buyer's wallet.
+#
+# Expected emission: one `Sale` event with full payouts
+# decoded from the listing datum + buyer address resolved
+# from the produced output that received the asset.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"

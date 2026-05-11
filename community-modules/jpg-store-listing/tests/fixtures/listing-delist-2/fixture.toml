@@ -1,0 +1,44 @@
+# jpg-store-listing golden scenario: second V2 unlisting.
+#
+# TX:    7ba9bde47269009f90587e2144552d52cf4be87650d1a2628a9d108a3237eecc
+# Slot:  184451387
+# Prior: ff84f5021b0a7a2b66131923293938e844b43e5f66fa9e6230f8fbd799c343a3#0
+#        @ slot 148262749 — outside the dolos archive horizon, so the
+#        prior listing is supplied as a synthesized `[[utxo]]` entry
+#        with `datum_payload_hex` resolved via Maestro's TXO endpoint.
+#
+# Independent verification of the V2 unlisting path against the
+# existing `listing-cancel` scenario. Listed asset is Snekkie #4390.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm"
+
+[[interest]]
+kind = "at_address"
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+
+[[interest]]
+kind = "at_address"
+address = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp"
+
+# Synthesized prior listing UTxO (block at slot 148262749 is past
+# the local archive horizon). Datum payload + assets from
+# Maestro. Listed asset: Snekkie #4390.
+[[utxo]]
+tx_hash = "ff84f5021b0a7a2b66131923293938e844b43e5f66fa9e6230f8fbd799c343a3"
+index = 0
+address = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx"
+lovelace = 1314550
+datum_hash = "feb24c3f7e8b8f1469223e55d17b3e9bf2e8db39fe9a5298614e9ff9ea7c76d4"
+datum_payload_hex = "d8799f9fd8799fd8799fd87a9f581c7aedc614c23e7727d929f0bcc7b63dbbab21960d72d4d3f7b99f86adffd8799fd8799fd87a9f581c7aedc614c23e7727d929f0bcc7b63dbbab21960d72d4d3f7b99f86adffffffff1a03473bc0ffd8799fd8799fd8799f581c8f679620200b5af226d318fea96ad6276680a2bb6dc45c35a0619bd9ffd8799fd8799fd8799f581c014871cba3cc922ea25ea6a981bfe32182e382b0073007c78faf34c7ffffffff1a1cd94100ffff581c8f679620200b5af226d318fea96ad6276680a2bb6dc45c35a0619bd9ff"
+
+[[utxo.assets]]
+policy = "b558ea5ecfa2a6e9701dab150248e94104402f789c090426eb60eb60"
+asset_name_hex = "536e656b6b696534333930"

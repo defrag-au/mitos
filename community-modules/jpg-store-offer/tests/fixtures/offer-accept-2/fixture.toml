@@ -1,0 +1,23 @@
+# jpg-store-offer golden scenario: second offer-accept on V2 CO.
+#
+# TX:    1d8424eaf74f91ecf6f93e5a813865cbcfea5cc1c925d3108af0abcbfa543414
+# Slot:  183409827
+# Prior: 9b359e5b02b1708bf31c54afffb6695d4a7ad9e208586017e7b91b8fbd8a2543 @ slot 175150826
+#
+# Bidder consumes their offer at the V2 CO address (constructor 1
+# = Accept under the offer contract's inverted-redeemer semantics).
+# Asset moves to bidder; seller receives lovelace; a residual UTxO
+# at the V3 CO address appears alongside.
+#
+# Independent verification of the V2 accept path against the
+# existing `offer-accept` scenario.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p"
