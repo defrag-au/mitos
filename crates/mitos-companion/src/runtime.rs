@@ -249,22 +249,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 Ok(())
             }
             ServerMessage::Recapture { module, reason } => {
-                // Recapture protocol arrives via the wire in this
-                // commit; the dApp-side `on_recapture` hook + the
-                // RecaptureReady response land in commit 2 of the
-                // implementation plan (see
-                // `mitos/docs/design/RECAPTURE.md`). Until then,
-                // log loudly so any test recapture from a future
-                // host is visible — a deployed host won't send the
-                // frame until commits 3+ of the plan put the
-                // driver in place.
-                tracing::warn!(
-                    module = %module,
-                    reason = ?reason,
-                    "Recapture frame received but on_recapture hook not yet wired; \
-                     dApp state will be inconsistent if this isn't a test"
-                );
-                Ok(())
+                self.dispatch_recapture(ws, module, reason).await
             }
             ServerMessage::RecaptureDone {
                 cursor,
@@ -347,6 +332,83 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         }
         write_cursor(&sql, &cursor)?;
         Ok(())
+    }
+
+    /// Recapture frame handler. Calls the dApp's `on_recapture`
+    /// hook with the module name carried on the frame, then sends
+    /// `RecaptureReady` to signal the host it can begin the refill
+    /// stream. See `docs/design/RECAPTURE.md`.
+    ///
+    /// Error semantics: if `on_recapture` returns `Err`, we DO NOT
+    /// send `RecaptureReady`. The host's per-companion timeout
+    /// (~30s) fires and the admin endpoint returns 504 — the
+    /// operator inspects the companion's logs and retries when
+    /// they've fixed the cleanup. Sending `RecaptureReady` on a
+    /// partial cleanup would tell the host "refill me" while the
+    /// dApp's table is mid-purge, leading to ghost rows for COs
+    /// whose `on_recapture` DELETE didn't fire before the error.
+    /// Timeout-and-investigate is the safer failure mode.
+    ///
+    /// Cursor handling: the runtime does NOT reset the persisted
+    /// cursor here. Per-module recapture must leave other module
+    /// subscriptions undisturbed, and rewinding the cursor would
+    /// affect all of them. The refill Apply frames advance the
+    /// cursor naturally as they arrive. The `Ctx` we pass to
+    /// `on_recapture` carries the current persisted cursor as
+    /// informational context for the dApp's cleanup body.
+    async fn dispatch_recapture(
+        &self,
+        ws: &WebSocket,
+        module: String,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let sql = self.state.storage().sql();
+        let current_cursor = meta::read_cursor(&sql)
+            .ok()
+            .flatten()
+            .unwrap_or(ChainPoint::Origin);
+        // `channel` field on Ctx is set to the recapturing module
+        // for diagnostic purposes — dApps that share a body across
+        // channels can pattern-match on `ctx.channel` if needed.
+        let ctx = Ctx::new(current_cursor, module.clone(), sql.clone());
+
+        tracing::info!(
+            module = %module,
+            reason = ?reason,
+            "Recapture received; invoking on_recapture"
+        );
+        let result = self
+            .inner
+            .on_recapture(&ctx, &module, reason.as_deref())
+            .await;
+
+        match result {
+            Ok(()) => {
+                let frame = ClientMessage::RecaptureReady;
+                let bytes = encode_client(&frame)?;
+                ws.send_with_bytes(&bytes).map_err(|e| {
+                    CompanionError::Wire(format!("send RecaptureReady: {e}"))
+                })?;
+                tracing::info!(
+                    module = %module,
+                    "on_recapture complete; sent RecaptureReady"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Loud log only. Don't send RecaptureReady — host
+                // times out, admin endpoint returns 504. Operator
+                // sees both the 504 and this log line and can act.
+                tracing::error!(
+                    module = %module,
+                    reason = ?reason,
+                    error = %e,
+                    "on_recapture failed; withholding RecaptureReady — \
+                     host will time out and operator can investigate"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Look up a channel handler by tag.

@@ -23,6 +23,13 @@ use mitos_protocol::SubscribeTarget;
 ///
 /// The runtime fans inbound mitos events out to the right channel
 /// by tag.
+///
+/// `#[async_trait(?Send)]` is required because `on_recapture`
+/// (state-rebuild hook) is async — it runs SQL cleanup inside a
+/// CF DO, which is single-threaded but uses async APIs. All sync
+/// methods on the trait stay as plain `fn`; the macro only
+/// rewrites methods declared `async fn`.
+#[async_trait::async_trait(?Send)]
 pub trait MitosCompanion: Send + Sync + 'static {
     /// Stable name (matches the indexer's `name()` on the mitos
     /// side). Used for routing, logging, schema isolation.
@@ -96,6 +103,57 @@ pub trait MitosCompanion: Send + Sync + 'static {
     /// asset internally.
     fn initial_interests(&self) -> Vec<mitos_protocol::Interest> {
         Vec::new()
+    }
+
+    /// Drop the portion of the dApp's projected state that
+    /// originated from `module`, in preparation for a refill from
+    /// the host's bootstrap pass against that one module. Called
+    /// by the runtime when the host sends a `Recapture` frame;
+    /// the runtime sends `RecaptureReady` after this returns.
+    ///
+    /// **MUST scope cleanup by `module`** for any companion
+    /// subscribed to more than one community module — blindly
+    /// dropping shared tables would take out rows from other
+    /// subscriptions that aren't being recaptured. The convention
+    /// is a `source_module` column on every table populated from
+    /// community-module events; cleanup is then
+    /// `DELETE FROM <table> WHERE source_module = ?`. See
+    /// `mitos/docs/design/RECAPTURE.md` for the full schema
+    /// contract.
+    ///
+    /// Single-module companions can take the simpler route of
+    /// `DROP TABLE` + reinstall — same outcome, less ceremony.
+    /// They MUST grow the column + scoped DELETE if a second
+    /// community module subscription joins later.
+    ///
+    /// The runtime does NOT reset the companion's cursor around
+    /// this call. Per-module recapture must leave subscriptions
+    /// to other modules untouched, and rewinding the cursor would
+    /// be visible to all of them. The Apply frames the host emits
+    /// during the refill naturally advance the cursor as they
+    /// arrive.
+    ///
+    /// Default impl is a no-op + warning log — that's intentional:
+    /// companions that don't keep meaningful state (e.g. log-only
+    /// consumers) don't need to do anything. Companions that own
+    /// SQL tables MUST override.
+    ///
+    /// `reason` is the free-form operator-supplied label from the
+    /// admin endpoint, useful for logs.
+    async fn on_recapture(
+        &self,
+        _ctx: &Ctx,
+        module: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        tracing::warn!(
+            module = %module,
+            reason = ?reason,
+            companion = Self::NAME,
+            "Recapture received but on_recapture not implemented; \
+             dApp state will be inconsistent after refill"
+        );
+        Ok(())
     }
 }
 
