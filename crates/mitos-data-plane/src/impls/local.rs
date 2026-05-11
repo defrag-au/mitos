@@ -869,7 +869,12 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
 /// Same shape `read_utxos(_, Lean)` already produces, hand-
 /// rolled here to avoid an extra data-plane round-trip when
 /// we already have the raw `MultiEraOutput` in scope.
-fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> TypedOutput {
+///
+/// Re-exported as `mitos_data_plane::project_typed_output` so
+/// fixture-driven test harnesses (mitos-run) can populate
+/// `read_utxos` responses from block bytes without
+/// re-implementing the address/asset/datum walk.
+pub fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> TypedOutput {
     let address = match output.address() {
         Ok(addr) => addr.to_string(),
         Err(_) => String::new(),

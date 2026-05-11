@@ -294,7 +294,7 @@ impl FixtureDataPlane {
         })
     }
 
-    /// Walk every TX in the given block CBOR and harvest two
+    /// Walk every TX in the given block CBOR and harvest three
     /// kinds of resolution data from it into the fixture:
     /// - **aux-data CBOR** keyed by tx hash — so
     ///   `chain_data::tx_metadata` lookups against TXs in the
@@ -305,6 +305,12 @@ impl FixtureDataPlane {
     ///   datums (the typical CIP-68 reference-output shape,
     ///   where the datum lives in the witness set rather than
     ///   inline on the output).
+    /// - **UTxOs produced by each TX** keyed by output ref — so
+    ///   the v2 dispatcher's `read_utxos` lookup resolves prior
+    ///   outputs for Consumed/Referenced events in later blocks
+    ///   (CIP-68 metadata updates spend a reference UTxO
+    ///   produced by a prior block; without harvest the
+    ///   Consumed event silently drops).
     ///
     /// Explicit fixture entries take precedence: if a key is
     /// already populated, harvest skips it.
@@ -334,6 +340,44 @@ impl FixtureDataPlane {
                         .insert(hash_bytes, plutus_data.raw_cbor().to_vec());
                     harvested += 1;
                 }
+            }
+            // Outputs: project each into a TypedOutput so the
+            // dispatcher's prior-output resolution for
+            // Consumed/Referenced events in subsequent blocks
+            // finds them. Datum bytes (if hash-only on the
+            // output) come via the witness-datum index above.
+            let tx_hash_bytes_owned: [u8; 32] = *tx.hash();
+            for (idx, output) in tx.outputs().iter().enumerate() {
+                let key = (tx_hash_bytes_owned.to_vec(), idx as u32);
+                if self.by_ref.contains_key(&key) {
+                    continue;
+                }
+                let mut typed_output = mitos_data_plane::project_typed_output(output);
+                // Populate the datum field — `project_typed_output`
+                // leaves it `None` by convention; we want
+                // hash-only or inline bytes so the dispatcher's
+                // `backfill_prior_datum` step on Consumed events
+                // can fill the witness payload.
+                let (datum_hash, inline_bytes) =
+                    mitos_data_plane::block_events::extract_datum_info(output);
+                if let Some(hash) = datum_hash {
+                    typed_output.datum = Some(mitos_data_plane::TypedDatum {
+                        hash,
+                        payload: None,
+                        original_cbor: inline_bytes,
+                    });
+                }
+                let oref = mitos_data_plane::OutputRef::from_bytes(
+                    tx_hash_bytes_owned,
+                    idx as u32,
+                );
+                self.by_address
+                    .entry(typed_output.address.clone())
+                    .or_default()
+                    .push(oref);
+                self.by_ref
+                    .insert(key, ResolvedUtxo { output: typed_output });
+                harvested += 1;
             }
         }
         Ok(harvested)

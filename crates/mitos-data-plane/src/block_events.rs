@@ -276,7 +276,11 @@ fn project_output_draft(output: &MultiEraOutput<'_>) -> OutputDraft {
     }
 }
 
-fn extract_datum_info(output: &MultiEraOutput<'_>) -> (Option<Hash<32>>, Option<Vec<u8>>) {
+/// Pull the datum hash + (optional) inline bytes off an output.
+/// Re-exported as `mitos_data_plane::extract_datum_info` so
+/// fixture-driven harnesses (mitos-run) can build TypedDatum
+/// from harvested outputs without re-implementing the era walk.
+pub fn extract_datum_info(output: &MultiEraOutput<'_>) -> (Option<Hash<32>>, Option<Vec<u8>>) {
     use pallas::ledger::primitives::conway::DatumOption;
     match output.datum() {
         Some(DatumOption::Hash(h)) => (Some(h), None),

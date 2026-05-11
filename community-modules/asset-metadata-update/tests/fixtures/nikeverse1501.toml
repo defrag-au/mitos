@@ -1,0 +1,23 @@
+# asset-metadata-update fixture: CIP-68 metadata refresh on a
+# Nikeverse reference UTxO.
+#
+# TX: 14402c8ce49c68d7c14c01129fce175ac274c2d5a26e20fa10ff2860210a252a
+# Policy: de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32
+# Reference asset: 000643b04e696b65766572736531353031  (= "Nikeverse1501")
+#
+# Shape:
+#   - 0 mints
+#   - Input spends the prior `_100 Nikeverse1501` UTxO (with hash-only
+#     datum, original metadata)
+#   - Output re-produces the `_100 Nikeverse1501` (with hash-only
+#     datum, new metadata)
+#
+# Expected emission: one `AssetMetadataUpdate::Cip68` event with both
+# `previous_datum_cbor` + `new_datum_cbor` populated and both
+# metadata JSONs decoded.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32"
