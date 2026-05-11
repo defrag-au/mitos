@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    types: [opened, synchronize]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # ----------------------------------------------------------------
+  # Workspace lint / format / test on the native target. Covers
+  # `mitos-platform`, `mitos-core`, `mitos-data-plane`, the in-tree
+  # indexers, and tooling (`mitos-build`, `mitos-run`, `mitos-admin`,
+  # `capture-block`, `mitos-tail`). Community-module wasm builds
+  # land in the separate `community-modules` job further down.
+  # ----------------------------------------------------------------
+  fmt:
+    name: Fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "clippy"
+          cache-on-failure: true
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "test"
+          cache-on-failure: true
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features
+
+  # ----------------------------------------------------------------
+  # Community-module wasm artifacts + golden test suite.
+  #
+  # Same flow as `scripts/deploy.sh` does on the box (build
+  # mitos-build, run it for each `community-modules/<name>/<name>.rs`,
+  # then assert via `scripts/run-golden-tests.sh`). Catches:
+  #   - wasm-target build failures
+  #   - module ABI / manifest drift
+  #   - emission-shape changes that would fail golden assertions
+  #   - non-deterministic emission order
+  #
+  # `wasm32-wasip2` is the canonical target for mitos platform-v2
+  # modules. `wasm32-unknown-unknown` (the typical CF-worker target)
+  # is NOT used here — that's a different ABI surface.
+  # ----------------------------------------------------------------
+  community-modules:
+    name: Community Modules + Golden Tests
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "community-modules"
+          cache-on-failure: true
+
+      - name: Build host tools (mitos-build + mitos-run)
+        run: cargo build --release -p mitos-build -p mitos-run
+
+      - name: Build community-module wasm artifacts
+        run: |
+          # Walk every community-modules/<name>/ with a <name>.rs
+          # source and produce its mitos-build artifact under
+          # target/mitos/<name>/. Aborts on first failure so a wasm
+          # build break shows up loud — same model as `cargo test`
+          # surfaces test failures.
+          set -e
+          for d in community-modules/*/; do
+            name=$(basename "$d")
+            stem=$(echo "$name" | tr - _)
+            src="${d}${stem}.rs"
+            if [ ! -f "$src" ]; then
+              echo "skip $name: no $stem.rs"
+              continue
+            fi
+            echo "::group::build $name"
+            ./target/release/mitos-build --module "$src"
+            echo "::endgroup::"
+          done
+
+      - name: Run golden tests
+        run: ./scripts/run-golden-tests.sh

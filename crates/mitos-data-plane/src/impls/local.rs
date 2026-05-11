@@ -218,15 +218,16 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             }
         };
 
-        let payload = bytes.as_ref().and_then(|b| {
-            match pallas::codec::minicbor::decode::<PlutusData>(b) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::debug!(?hash, error = %e, "datum payload minicbor decode failed");
-                    None
-                }
-            }
-        });
+        let payload =
+            bytes
+                .as_ref()
+                .and_then(|b| match pallas::codec::minicbor::decode::<PlutusData>(b) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::debug!(?hash, error = %e, "datum payload minicbor decode failed");
+                        None
+                    }
+                });
 
         Some(TypedDatum {
             hash,
@@ -415,9 +416,8 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         // mainnet (`addr1...`) and testnet (`addr_test1...`)
         // forms, plus Byron (`Ae2.../DdzFF...`) which round-trip
         // through `to_vec()` to their canonical encoding too.
-        let addr = pallas_addresses::Address::from_bech32(address).map_err(|e| {
-            DataPlaneError::InvalidRequest(format!("address not bech32: {e:?}"))
-        })?;
+        let addr = pallas_addresses::Address::from_bech32(address)
+            .map_err(|e| DataPlaneError::InvalidRequest(format!("address not bech32: {e:?}")))?;
         let addr_bytes = addr.to_vec();
 
         let utxo_set = self
@@ -439,7 +439,11 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
                 "utxos_by_address result truncated at hard cap"
             );
         }
-        Ok(total.into_iter().take(HARD_CAP).map(OutputRef::from).collect())
+        Ok(total
+            .into_iter()
+            .take(HARD_CAP)
+            .map(OutputRef::from)
+            .collect())
     }
 
     async fn read_datum(
@@ -490,6 +494,26 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         ))
     }
 
+    async fn read_block(&self, slot: u64) -> DataPlaneResult<Option<Vec<u8>>> {
+        // Direct archive lookup — same call the `read_tx` /
+        // `tx_metadata` paths use, just exposed at the block
+        // granularity for admin fixture export.
+        self.domain
+            .archive()
+            .get_block_by_slot(&slot)
+            .map_err(|e| DataPlaneError::Storage(format!("get_block_by_slot: {e:?}")))
+    }
+
+    async fn slot_by_tx_hash(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<u64>> {
+        self.domain
+            .indexes()
+            .slot_by_tx_hash(tx_hash.as_slice())
+            .map_err(|e| DataPlaneError::Storage(format!("slot_by_tx_hash: {e:?}")))
+    }
+
     async fn tx_metadata(
         &self,
         tx_hash: &pallas_primitives::Hash<32>,
@@ -515,9 +539,8 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         let Some(block_body) = block_body else {
             return Ok(None);
         };
-        let block = MultiEraBlock::decode(block_body.as_slice()).map_err(|e| {
-            DataPlaneError::Decode(format!("MultiEraBlock decode: {e}"))
-        })?;
+        let block = MultiEraBlock::decode(block_body.as_slice())
+            .map_err(|e| DataPlaneError::Decode(format!("MultiEraBlock decode: {e}")))?;
         let tx = block
             .txs()
             .into_iter()
@@ -550,9 +573,8 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         let Some(block_body) = block_body else {
             return Ok(None);
         };
-        let block = MultiEraBlock::decode(block_body.as_slice()).map_err(|e| {
-            DataPlaneError::Decode(format!("MultiEraBlock decode: {e}"))
-        })?;
+        let block = MultiEraBlock::decode(block_body.as_slice())
+            .map_err(|e| DataPlaneError::Decode(format!("MultiEraBlock decode: {e}")))?;
         let block_hash = block.hash();
         let cursor = crate::types::ChainPoint::Specific(block.slot(), block_hash);
 
@@ -656,7 +678,12 @@ const _: () = {
 /// pattern-match on the variant ourselves and access the
 /// public `auxiliary_data` field. Each era's `KeepRaw` wrapper
 /// preserves the original CBOR bytes via `raw_cbor()`.
-fn extract_aux_cbor(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
+///
+/// Re-exported via `mitos_data_plane::extract_aux_cbor` so
+/// fixture-driven test harnesses (mitos-run) can pre-harvest
+/// aux-data from `--block` arguments without re-implementing
+/// the era pattern match.
+pub fn extract_aux_cbor(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
     use pallas_codec::utils::Nullable;
     match tx {
         MultiEraTx::AlonzoCompatible(t, _) => match &t.auxiliary_data {
@@ -787,24 +814,22 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
         .mints()
         .iter()
         .flat_map(|policy_assets| {
-            let policy = match cardano_assets::PolicyId::new(hex::encode(
-                policy_assets.policy().as_slice(),
-            )) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "skip mint with invalid policy id");
-                    return Vec::new();
-                }
-            };
+            let policy =
+                match cardano_assets::PolicyId::new(hex::encode(policy_assets.policy().as_slice()))
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skip mint with invalid policy id");
+                        return Vec::new();
+                    }
+                };
             policy_assets
                 .assets()
                 .iter()
                 .map(|asset| crate::types::MintEntry {
                     policy: policy.clone(),
                     asset_name: asset.name().to_vec(),
-                    quantity_delta: asset
-                        .any_coin()
-                        .clamp(i64::MIN as i128, i64::MAX as i128)
+                    quantity_delta: asset.any_coin().clamp(i64::MIN as i128, i64::MAX as i128)
                         as i64,
                 })
                 .collect::<Vec<_>>()
@@ -844,7 +869,12 @@ async fn project_tx_record<'a, D: dolos_core::Domain>(
 /// Same shape `read_utxos(_, Lean)` already produces, hand-
 /// rolled here to avoid an extra data-plane round-trip when
 /// we already have the raw `MultiEraOutput` in scope.
-fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> TypedOutput {
+///
+/// Re-exported as `mitos_data_plane::project_typed_output` so
+/// fixture-driven test harnesses (mitos-run) can populate
+/// `read_utxos` responses from block bytes without
+/// re-implementing the address/asset/datum walk.
+pub fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> TypedOutput {
     let address = match output.address() {
         Ok(addr) => addr.to_string(),
         Err(_) => String::new(),
@@ -855,12 +885,12 @@ fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> TypedOu
         .assets()
         .iter()
         .flat_map(|policy_assets| {
-            let policy = match cardano_assets::PolicyId::new(hex::encode(
-                policy_assets.policy().as_slice(),
-            )) {
-                Ok(p) => p,
-                Err(_) => return Vec::new(),
-            };
+            let policy =
+                match cardano_assets::PolicyId::new(hex::encode(policy_assets.policy().as_slice()))
+                {
+                    Ok(p) => p,
+                    Err(_) => return Vec::new(),
+                };
             policy_assets
                 .assets()
                 .iter()

@@ -1,0 +1,24 @@
+# mitos-run fixture for cip-68-mint against the 12-pair CIP-68
+# mint in block 165639806.
+#
+# TX: 3c60bfff18b8a7f385a64c744cb44837ceff64f9966f07b5c81cb9a0edad54f9
+# Policy: 29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56
+# Pairs minted: 12 (`_100` reference + `_222` user-token each)
+#
+# Exercises the full pairing path:
+#   - CIP-67 label parsing (100 → reference, 222 → user)
+#   - in-batch buffering of Minted + Produced events
+#   - pairing by human-name suffix between the `_100` and
+#     `_222` mints
+#   - datum extraction from the Produced output's inline datum
+#   - PlutusData Constructor-0 walk → metadata map → JSON
+#
+# Expected: 12 `Cip68Mint` events, each with
+#   `reference = Some(Cip68RefInfo { metadata_json: Some(...) })`
+#   `user = Cip68UserInfo { quantity: 1, cip67_label: 222 }`.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56"

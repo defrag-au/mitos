@@ -52,13 +52,14 @@ async fn start_replace_stop_roundtrip_v2() {
 
     let storage_dir = tempdir("lifecycle-v2");
     let storage = ModuleStorage::new(&storage_dir);
-    storage.activate(&manifest, &wasm).expect("activate manifest");
+    storage
+        .activate(&manifest, &wasm)
+        .expect("activate manifest");
 
     // Shared engine + null data plane wires once; the subscription
     // factory hands fresh `OneShotSub` receivers off the same
     // sender so we can push events from the test thread.
-    let engine =
-        mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
+    let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(NullChainDataPlane);
     let dp: Arc<dyn DataPlaneFacade> = chain_plane.clone();
 
@@ -161,7 +162,10 @@ async fn start_replace_stop_roundtrip_v2() {
         186_000_000,
         "cold restart should resume the persisted cursor",
     );
-    host_2.stop("test-indexer").await.expect("stop after restart");
+    host_2
+        .stop("test-indexer")
+        .await
+        .expect("stop after restart");
 
     drop(tx);
     std::fs::remove_dir_all(&storage_dir).ok();

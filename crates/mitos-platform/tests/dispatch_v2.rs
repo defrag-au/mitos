@@ -75,8 +75,8 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
     // delivered output, so the expected count is the sum of
     // *all* assets on outputs that have at least one asset
     // under the watched policy.
-    let decoded = mitos_data_plane::block_events::decode_block_v2(&cbor)
-        .expect("decode block fixture");
+    let decoded =
+        mitos_data_plane::block_events::decode_block_v2(&cbor).expect("decode block fixture");
     let mut policy_outputs: HashMap<String, usize> = HashMap::new();
     for tx in &decoded.txs {
         for out in &tx.outputs {
@@ -122,8 +122,7 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
     std::fs::create_dir_all(&companions_dir).expect("companions dir");
     std::fs::write(companions_dir.join("test-companion.cbor"), b"").expect("companion stub");
 
-    let engine =
-        mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
+    let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(NullChainDataPlane);
     let dp: Arc<dyn DataPlaneFacade> = chain_plane.clone();
 
@@ -186,8 +185,8 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
     // `expected_count` for why.)
     let mut watched_seen = 0usize;
     for record in &rows {
-        let shape: EmittedShape = ciborium::de::from_reader(record.payload.as_slice())
-            .expect("decode emitted CBOR");
+        let shape: EmittedShape =
+            ciborium::de::from_reader(record.payload.as_slice()).expect("decode emitted CBOR");
         if shape.policy_id == watched_policy {
             watched_seen += 1;
         }

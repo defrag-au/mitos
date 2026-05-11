@@ -217,9 +217,8 @@ where
     /// `std::sync::Mutex` (not `tokio::sync`) because every
     /// access is a quick map insert/remove/get — no `.await` ever
     /// held across the guard.
-    interest_senders: Arc<
-        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>,
-    >,
+    interest_senders:
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>>,
     /// Set of module ids with an in-flight recapture. Mutual
     /// exclusion is per-module: a second `recapture_module(id)`
     /// while the first is mid-flight returns
@@ -367,10 +366,8 @@ where
             // the driver so subsequent block dispatch filters
             // correctly even if no companion-driven
             // update-interest arrives.
-            let interest = interest_from_manifest(
-                &manifest.interest.addresses,
-                &manifest.interest.policies,
-            );
+            let interest =
+                interest_from_manifest(&manifest.interest.addresses, &manifest.interest.policies);
             driver.set_interest(interest.clone());
 
             // Hand the bootstrap orchestrator a mutable
@@ -430,8 +427,7 @@ where
         // `InterestRouter::route_interest`); receiver moves into
         // the follower task and is multiplexed with tip events
         // via `tokio::select!`.
-        let (interest_tx, interest_rx) =
-            tokio::sync::mpsc::unbounded_channel::<InterestUpdate>();
+        let (interest_tx, interest_rx) = tokio::sync::mpsc::unbounded_channel::<InterestUpdate>();
         {
             let mut senders = self
                 .interest_senders
@@ -441,6 +437,7 @@ where
         }
 
         let follower_kv_factory = self.kv_factory.clone();
+        let follower_trap_logger = trap_logger.clone();
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -451,6 +448,7 @@ where
                 follower_storage,
                 follower_module_id,
                 follower_kv_factory,
+                follower_trap_logger,
             )
             .await;
             match &result {
@@ -474,8 +472,7 @@ where
         let drain_module_id = id.to_owned();
         let drain_cancel = cancel.clone();
         let drain_task = tokio::spawn(async move {
-            run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel)
-                .await;
+            run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel).await;
         });
 
         let mut slots = self.slots.lock().await;
@@ -619,8 +616,7 @@ where
     ) -> PlatformResult<RecaptureOutcome> {
         let dialer = self.dialer.get().ok_or_else(|| {
             PlatformError::RecaptureCoordination(
-                "dialer not wired (host.set_dialer never called); recapture unavailable"
-                    .to_owned(),
+                "dialer not wired (host.set_dialer never called); recapture unavailable".to_owned(),
             )
         })?;
 
@@ -728,9 +724,7 @@ where
             }
         };
         // events_emitted is 0 in v1 — see method docstring.
-        dialer
-            .send_recapture_done(id, tip_cursor.clone(), 0)
-            .await;
+        dialer.send_recapture_done(id, tip_cursor.clone(), 0).await;
 
         tracing::info!(
             module = %id,
@@ -965,8 +959,7 @@ where
                 .expect("interest_senders mutex");
             senders.get(module_id).cloned()
         };
-        let sender =
-            sender.ok_or_else(|| InterestRouteError::NotRunning(module_id.to_owned()))?;
+        let sender = sender.ok_or_else(|| InterestRouteError::NotRunning(module_id.to_owned()))?;
         sender
             .send(InterestUpdate {
                 op,

@@ -24,9 +24,7 @@ use mitos_platform::host_v2::{
 };
 use mitos_platform::registry_v2::ResourceBudget;
 use mitos_platform::storage::ModuleStorage;
-use mitos_protocol::{
-    AssetSelector, Interest as WireInterest, InterestOp as WireInterestOp,
-};
+use mitos_protocol::{AssetSelector, Interest as WireInterest, InterestOp as WireInterestOp};
 use tokio::sync::Mutex;
 
 use common::{
@@ -47,8 +45,8 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     // Pre-scan the block for the highest-frequency policy to
     // assert against. Same self-tuning approach `dispatch_v2`
     // uses — the test stays robust across fixture changes.
-    let decoded = mitos_data_plane::block_events::decode_block_v2(&cbor)
-        .expect("decode block fixture");
+    let decoded =
+        mitos_data_plane::block_events::decode_block_v2(&cbor).expect("decode block fixture");
     let mut counts: HashMap<String, usize> = HashMap::new();
     for tx in &decoded.txs {
         for out in &tx.outputs {
@@ -80,11 +78,9 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     // rows for our assertion. Same pattern dispatch_v2 uses.
     let companions_dir = storage.module_dir_for_companions("test-indexer");
     std::fs::create_dir_all(&companions_dir).expect("companions dir");
-    std::fs::write(companions_dir.join("test-companion.cbor"), b"")
-        .expect("companion stub");
+    std::fs::write(companions_dir.join("test-companion.cbor"), b"").expect("companion stub");
 
-    let engine =
-        mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
+    let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(NullChainDataPlane);
     let dp: Arc<dyn DataPlaneFacade> = chain_plane.clone();
 
@@ -143,13 +139,9 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     let policy_id = PolicyId::new(watched_policy.clone()).expect("valid policy id");
     let mut wire_interest = WireInterest::any();
     wire_interest.asset = AssetSelector::Policy(policy_id);
-    host.route_interest(
-        "test-indexer",
-        WireInterestOp::Add,
-        vec![wire_interest],
-    )
-    .await
-    .expect("route_interest");
+    host.route_interest("test-indexer", WireInterestOp::Add, vec![wire_interest])
+        .await
+        .expect("route_interest");
 
     // Give the follower a tick to drain the interest channel
     // and apply the update before we send the next block.

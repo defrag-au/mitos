@@ -504,12 +504,19 @@ impl Bundle {
             // Pass the reserved-names set so the upload handler
             // rejects modules whose id collides with an in-tree
             // indexer (see `docs/design/UNIFIED_SUBSCRIBE.md`
-            // step 4).
+            // step 4). Chain-data handle enables the
+            // `GET /_admin/blocks/{slot}` route so operators can
+            // pull real-chain block CBOR straight out of the live
+            // archive for `mitos-run` fixtures.
             let reserved_names = core_bridge.reserved_names_owned();
+            let chain_data: Arc<dyn mitos_platform::ChainDataPlane> = Arc::new(
+                mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
+            );
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage.clone(),
                 host_for_admin,
                 reserved_names,
+                Some(chain_data),
                 platform_auth,
             ));
 

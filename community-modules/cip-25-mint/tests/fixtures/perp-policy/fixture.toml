@@ -1,0 +1,23 @@
+# mitos-run fixture for the cip-25-mint module against the
+# Perp5158 mint in block 186913993.
+#
+# Usage:
+#   mitos-run \
+#     --artifact target/mitos/cip-25-mint \
+#     --fixture community-modules/cip-25-mint/tests/fixtures/perp-policy.toml \
+#     --block community-modules/cip-25-mint/tests/fixtures/186913993.block.cbor
+#
+# Expected emission: one `Cip25Mint` event for asset
+# `5065727035313538` (UTF-8 "Perp5158"), quantity = 1,
+# `metadata_json` carrying the label-721 CIP-25 metadata
+# attached to the mint TX.
+
+version = 1
+
+# No bootstrap UTxOs needed — cip-25-mint is `Minted`-event
+# driven; it derives everything from the mint entry + the
+# TX's aux-data fetched via `chain-data::tx-metadata`.
+
+[[interest]]
+kind = "holds_policy"
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"

@@ -19,10 +19,11 @@ use dolos_core::{TipEvent, TipSubscription};
 use mitos_data_plane::ChainDataPlane;
 use tokio_util::sync::CancellationToken;
 
+use crate::PlatformResult;
 use crate::driver_v2::DriverV2;
 use crate::host_v2::{InterestUpdate, KvFactory};
 use crate::storage::ModuleStorage;
-use crate::PlatformResult;
+use crate::trap_context::{TrapContextLogger, write_fixture};
 
 /// Run the v2 chain follower until cancelled or the tip
 /// channel closes.
@@ -57,6 +58,7 @@ pub async fn run_chain_follower_v2<S, P>(
     storage: ModuleStorage,
     module_id: String,
     kv_factory: KvFactory,
+    trap_logger: Arc<TrapContextLogger>,
 ) -> PlatformResult<()>
 where
     S: TipSubscription,
@@ -104,13 +106,18 @@ where
         match event {
             TipEvent::Apply(point, block_cbor) => {
                 let block_bytes: &[u8] = block_cbor.as_ref();
+                // Pin the in-flight block CBOR + slot to the trap
+                // log so a wasm trap during this dispatch can be
+                // replayed locally via
+                // `mitos-run --fixture last-trap.toml`. Clear
+                // first so successful prior blocks don't pollute
+                // this batch's trap context.
+                trap_logger.clear();
+                let cp: mitos_data_plane::ChainPoint = point.clone().into();
+                trap_logger.set_block(cp.slot(), block_bytes.to_vec());
                 match driver.apply_block(block_bytes, data_plane.as_ref()).await {
                     Ok(outcome) => {
-                        tracing::trace!(
-                            ?point,
-                            ?outcome,
-                            "v2 follower: applied",
-                        );
+                        tracing::trace!(?point, ?outcome, "v2 follower: applied",);
                         flush_cursor(&storage, &module_id, &driver);
                     }
                     Err(crate::PlatformError::Decode(e)) => {
@@ -124,9 +131,30 @@ where
                         );
                     }
                     Err(e) => {
-                        // Wasm trap from the module — supervisor
-                        // wiring is a v2.x follow-up; for now
-                        // surface to the spawning task.
+                        // Wasm trap from the module during
+                        // steady-state dispatch. Same fixture-
+                        // write path init uses: snapshot the
+                        // logger (block CBOR + data-plane call
+                        // log) and write to `last-trap.toml` so
+                        // the operator can replay locally.
+                        let snap = trap_logger.snapshot();
+                        let path = storage.last_trap_path(&module_id);
+                        match write_fixture(&snap, &module_id, &path) {
+                            Ok(()) => tracing::error!(
+                                module = %module_id,
+                                fixture = %path.display(),
+                                ?point,
+                                "v2 dispatch trapped; fixture written for local replay (mitos-run --fixture)",
+                            ),
+                            Err(write_err) => tracing::warn!(
+                                module = %module_id,
+                                error = %write_err,
+                                ?point,
+                                "v2 dispatch trapped; failed to write trap fixture",
+                            ),
+                        }
+                        // Supervisor wiring is a v2.x follow-up;
+                        // for now surface to the spawning task.
                         return Err(e);
                     }
                 }
@@ -251,7 +279,10 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
         WireOp::Remove => crate::bindings_v2::InterestOp::Remove,
         WireOp::Replace => crate::bindings_v2::InterestOp::Replace,
     };
-    match driver.call_update_interest(bindgen_op, &update.items_cbor).await {
+    match driver
+        .call_update_interest(bindgen_op, &update.items_cbor)
+        .await
+    {
         Ok(Ok(())) => {
             tracing::debug!(
                 module = %module_id,

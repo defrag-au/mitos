@@ -1,0 +1,37 @@
+# mitos.toml — module config for the standard-burn indexer.
+#
+# Read by `mitos-build`, CBOR-encoded into the artifact's
+# `config.cbor`, uploaded alongside the wasm by the host's
+# auto-load path, and passed to the module's `init(config)` on
+# host follower start.
+#
+# This module has no config — it ships with an empty interest
+# set and is configured entirely at runtime via the companion's
+# `/api/_interest/standard-burn/subscribe` endpoint (kind =
+# "policy"). See `mitos/docs/design/MINT_BURN_MODULES.md`
+# "Dynamic policies" for the interest model.
+
+# Opt into the v2 platform ABI — `mitos-module-v2` world,
+# eUTXO event-stream dispatch.
+abi_version = 2
+
+# Empty interest set by default. Companion populates via
+# `update-interest` at runtime; on the dispatch side the
+# platform's `holds-policy` filter delivers only matching
+# `Minted` events.
+[interest]
+addresses = []
+policies = []
+
+# Module-side build dependencies. mitos-build appends these to
+# the materialised crate's `[dependencies]` block; path entries
+# are resolved relative to this `<name>.toml` file. Stripped
+# from the CBOR'd runtime config so the module's `init` doesn't
+# see them.
+[deps]
+# Shared wire-format event types — `mitos_community_events::standard_burn::Burn`.
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+# Used for the `i64 -> u64` quantity conversion's
+# `unsigned_abs()` (stable in core; no extra dep needed beyond
+# the existing toolchain). Listed here for completeness — none
+# beyond mitos-community-events + the build-tool-bundled deps.

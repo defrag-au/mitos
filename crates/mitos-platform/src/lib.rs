@@ -45,12 +45,12 @@
 pub mod admin;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
-pub mod event_bindings;
 pub mod compaction;
 pub mod companions;
 pub mod dialer;
 pub mod driver_v2;
 pub mod emissions;
+pub mod event_bindings;
 pub mod follower_v2;
 pub mod host_fns;
 pub mod host_fns_v2;
@@ -65,6 +65,11 @@ pub mod supervisor;
 pub mod trap_context;
 pub mod vendored;
 
+/// Re-exported so bundle consumers can construct
+/// `Arc<dyn ChainDataPlane>` to pass into
+/// `admin::admin_router_with_host` without a separate dep on
+/// `mitos-data-plane`.
+pub use mitos_data_plane::ChainDataPlane;
 /// Re-export the platform-internal `ChainPoint` from
 /// `mitos-data-plane` so consumers (like the bundle binary) can
 /// take/return it without a separate dep on `mitos-data-plane`.

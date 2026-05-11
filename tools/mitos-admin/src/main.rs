@@ -280,7 +280,12 @@ async fn main() -> anyhow::Result<()> {
             limit,
             after_id,
             json,
-        } => cmd_emissions_list(&client, &cli, module, status, companion, limit, after_id, json).await,
+        } => {
+            cmd_emissions_list(
+                &client, &cli, module, status, companion, limit, after_id, json,
+            )
+            .await
+        }
         Cmd::EmissionsReplay {
             module,
             emission_id,

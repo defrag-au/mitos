@@ -3400,8 +3400,10 @@ dependencies = [
 name = "mitos-community-events"
 version = "0.0.1"
 dependencies = [
+ "ciborium",
  "serde",
  "serde_bytes",
+ "serde_json",
 ]
 
 [[package]]
@@ -3539,12 +3541,16 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cardano-assets",
+ "ciborium",
  "clap",
  "hex",
+ "mitos-community-events",
  "mitos-data-plane",
  "mitos-platform",
+ "pallas",
  "pallas-primitives 1.0.0-alpha.6",
  "serde",
+ "serde_json",
  "tokio",
  "toml 0.8.20",
  "tracing",

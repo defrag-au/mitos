@@ -14,13 +14,11 @@
 //! call, then denormalises into the per-output / per-tx records
 //! `mitos-run`'s `FixtureDataPlane` looks up.
 
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::host_fns::DataPlaneFacade;
-use mitos_data_plane::{
-    DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput,
-};
+use mitos_data_plane::{DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 
 /// Snapshot of one module's data-plane traffic during the most
 /// recent dispatch attempt. Reset by `clear()` between calls so

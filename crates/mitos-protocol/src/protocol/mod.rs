@@ -42,7 +42,9 @@ mod mint;
 
 pub use asset_movement::AssetMovementPayload;
 pub use burn::BurnPayload;
-pub use common::{Address, AssetRole, Lovelace, MovementClaim, OutputRef, PlutusBytes, ProtocolEvent};
+pub use common::{
+    Address, AssetRole, Lovelace, MovementClaim, OutputRef, PlutusBytes, ProtocolEvent,
+};
 pub use dex::{Dex, DexBrand, DexEventKind, SwapPayload};
 pub use lending::{BorrowPayload, Lending, LendingBrand, LendingEventKind};
 pub use marketplace::{

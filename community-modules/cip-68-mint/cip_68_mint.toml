@@ -1,0 +1,20 @@
+# mitos.toml — module config for the cip-68-mint indexer.
+
+abi_version = 2
+
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+# Datum decode via PlutusData walking — CIP-68 reference outputs
+# carry the metadata as inline datum (Constructor 0 with the
+# `[metadata_map, version, extra]` field tuple).
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"
+# minicbor for the local CBOR walking helper used during datum
+# fallback paths and for any out-of-scope encode rounds.
+minicbor = { version = "0.20", features = ["std"] }
+# JSON serialisation of the decoded CIP-68 metadata map.
+serde_json = "1"

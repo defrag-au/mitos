@@ -18,8 +18,8 @@
 use cardano_assets::PolicyId;
 use serde::{Deserialize, Serialize};
 
-use crate::types::output::AssetEntry;
 use crate::types::TypedOutput;
+use crate::types::output::AssetEntry;
 
 /// Stake credential — the payment-credential-independent
 /// identity of an address's "owner". Used by `at-stake-cred`.
@@ -167,9 +167,10 @@ fn predicate_matches_output(p: &InterestPredicate, output: &TypedOutput) -> bool
             .any(|e: &AssetEntry| e.policy_id == *policy),
         InterestPredicate::HoldsAsset { policy, asset_name } => {
             let needle_hex = hex::encode(asset_name);
-            output.assets.iter().any(|e: &AssetEntry| {
-                e.policy_id == *policy && e.asset_name_hex == needle_hex
-            })
+            output
+                .assets
+                .iter()
+                .any(|e: &AssetEntry| e.policy_id == *policy && e.asset_name_hex == needle_hex)
         }
         // Tick predicates don't apply to outputs.
         InterestPredicate::TickEvery(_) => false,

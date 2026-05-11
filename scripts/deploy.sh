@@ -115,7 +115,7 @@ dirty_tree_warning() {
 }
 
 step_rsync() {
-    log "1/4 rsync $MITOS_SRC_LOCAL/ → $MITOS_HOST:$MITOS_SRC_REMOTE/"
+    log "1/5 rsync $MITOS_SRC_LOCAL/ → $MITOS_HOST:$MITOS_SRC_REMOTE/"
     run "rsync -avz --delete \
         --exclude='target/' \
         --exclude='.git/' \
@@ -125,17 +125,65 @@ step_rsync() {
 }
 
 step_build() {
-    log "2/4 cargo build --profile $MITOS_BUILD_PROFILE -p mitos (on box; ~5min cold, ~30s incremental)"
-    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && cargo build --profile $MITOS_BUILD_PROFILE -p mitos'"
+    log "2/5 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build (on box; ~5min cold, ~30s incremental)"
+    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
+}
+
+step_build_community_modules() {
+    log "3/5 build community-module wasm artifacts (on box)"
+    # Walk every community-modules/<name>/ that has a <name>.rs and
+    # run `mitos-build --module <name>.rs`. Artifacts land at
+    # community-modules/<name>/target/mitos/<name>/, exactly where
+    # the host's community-module auto-load reads from.
+    #
+    # Per-module resilience:
+    #   - source missing → skip silently
+    #   - existing wasm newer than every .rs + .toml file in the
+    #     module dir → skip (idempotent cache)
+    #   - mitos-build failure → log, increment FAILED, keep going.
+    #     auto-load gets whatever artifacts succeeded.
+    #
+    # Single-quoted heredoc on purpose — the loop body runs on the
+    # remote box, so $name etc. must NOT expand locally.
+    run "ssh '$MITOS_HOST' '
+        cd $MITOS_SRC_REMOTE
+        BUILT=0
+        FRESH=0
+        SKIPPED=0
+        FAILED=0
+        for d in community-modules/*/; do
+            name=\$(basename \"\$d\")
+            stem=\$(echo \"\$name\" | tr - _)
+            src=\"\${d}\${stem}.rs\"
+            if [ ! -f \"\$src\" ]; then
+                SKIPPED=\$((SKIPPED+1))
+                continue
+            fi
+            wasm=\"\${d}target/mitos/\${name}/\${name}.wasm\"
+            if [ -f \"\$wasm\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.rs\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.toml\" -newer \"\$wasm\" -print -quit)\" ]; then
+                FRESH=\$((FRESH+1))
+                continue
+            fi
+            echo \"  building \$name\"
+            if ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
+                BUILT=\$((BUILT+1))
+            else
+                FAILED=\$((FAILED+1))
+                echo \"    \$name: BUILD FAILED — see /tmp/mitos-build-\$name.log on the host\"
+                echo \"    auto-load will skip this module; other modules will continue\"
+            fi
+        done
+        echo \"  community modules: built=\$BUILT  fresh=\$FRESH  skipped=\$SKIPPED  failed=\$FAILED\"
+    '"
 }
 
 step_restart() {
-    log "3/4 systemctl restart $MITOS_SERVICE (SIGTERM, 90s graceful timeout, dolos WAL checkpointed)"
+    log "4/5 systemctl restart $MITOS_SERVICE (SIGTERM, 90s graceful timeout, dolos WAL checkpointed)"
     run "ssh '$MITOS_HOST' 'systemctl restart $MITOS_SERVICE'"
 }
 
 step_verify() {
-    log "4/4 health check"
+    log "5/5 health check"
     if [[ $DRY_RUN -eq 1 ]]; then
         printf "  [dry-run] ssh %s 'systemctl is-active %s && curl http://127.0.0.1:%s/health'\n" \
             "$MITOS_HOST" "$MITOS_SERVICE" "$MITOS_HEALTH_PORT" >&2
@@ -191,6 +239,7 @@ case "$CMD" in
         dirty_tree_warning
         step_rsync
         step_build
+        step_build_community_modules
         step_restart
         step_verify
         ;;

@@ -46,10 +46,8 @@ const HOST_WIT_V2: &str = include_str!("../../../crates/mitos-platform/wit-v2/wo
 /// without the user threading paths around. Tied to the build
 /// tree mitos-build was compiled in — re-run cargo install after
 /// moving the source.
-const MITOS_PROTOCOL_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../crates/mitos-protocol",
-);
+const MITOS_PROTOCOL_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/mitos-protocol",);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -226,8 +224,11 @@ async fn main() -> anyhow::Result<()> {
             .module
             .as_ref()
             .and_then(|m| {
-                
-                if m.is_file() { m.parent().map(|p| p.to_path_buf()) } else { Some(m.clone()) }
+                if m.is_file() {
+                    m.parent().map(|p| p.to_path_buf())
+                } else {
+                    Some(m.clone())
+                }
             })
             .unwrap_or_else(|| build_workspace.clone());
         source_dir.join("target").join("mitos").join(&module_id)
@@ -249,7 +250,9 @@ async fn main() -> anyhow::Result<()> {
     // Legacy mode: `<workspace>/mitos.toml`.
     let mitos_toml = if let Some(module) = args.module.as_ref() {
         let single = SingleFileSpec::resolve(module)?;
-        single.config_path.unwrap_or_else(|| build_workspace.join("__nonexistent__.toml"))
+        single
+            .config_path
+            .unwrap_or_else(|| build_workspace.join("__nonexistent__.toml"))
     } else {
         args.workspace.join("mitos.toml")
     };
@@ -406,8 +409,8 @@ impl SingleFileSpec {
         if let Some(path) = &config_path {
             let toml_str = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let value: toml::Value = toml::from_str(&toml_str)
-                .with_context(|| format!("parsing {}", path.display()))?;
+            let value: toml::Value =
+                toml::from_str(&toml_str).with_context(|| format!("parsing {}", path.display()))?;
             match value.get("abi_version").and_then(|v| v.as_integer()) {
                 None | Some(2) => {}
                 Some(1) => {
@@ -467,10 +470,8 @@ fn materialise_module(spec: &SingleFileSpec) -> anyhow::Result<Materialised> {
     let crate_dir = workspace_root.join("module");
     let wit_dir = workspace_root.join("wit");
     let src_dir = crate_dir.join("src");
-    std::fs::create_dir_all(&src_dir)
-        .with_context(|| format!("creating {}", src_dir.display()))?;
-    std::fs::create_dir_all(&wit_dir)
-        .with_context(|| format!("creating {}", wit_dir.display()))?;
+    std::fs::create_dir_all(&src_dir).with_context(|| format!("creating {}", src_dir.display()))?;
+    std::fs::create_dir_all(&wit_dir).with_context(|| format!("creating {}", wit_dir.display()))?;
 
     // Workspace Cargo.toml. Includes a `[patch]` block redirecting
     // the public mitos-protocol git URL to the local path, so that
@@ -597,12 +598,14 @@ fn render_user_deps(spec: &SingleFileSpec) -> anyhow::Result<String> {
     };
     let toml_str = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading {}", config_path.display()))?;
-    let value: toml::Value = toml::from_str(&toml_str)
-        .with_context(|| format!("parsing {}", config_path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&toml_str).with_context(|| format!("parsing {}", config_path.display()))?;
     let Some(deps) = value.get("deps").and_then(|v| v.as_table()) else {
         return Ok(String::new());
     };
-    let toml_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let toml_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let mut out = String::new();
     for (name, dep) in deps {
         let rendered = match dep {
@@ -670,9 +673,10 @@ fn split_inner_docs(src: &str) -> (String, String) {
 /// stays warm.
 fn write_if_changed(path: &Path, content: &str) -> anyhow::Result<()> {
     if let Ok(existing) = std::fs::read_to_string(path)
-        && existing == content {
-            return Ok(());
-        }
+        && existing == content
+    {
+        return Ok(());
+    }
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -749,10 +753,10 @@ fn read_interest_section(
     let Some(path) = config_path else {
         return Ok(Default::default());
     };
-    let toml_str = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let value: toml::Value = toml::from_str(&toml_str)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let toml_str =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&toml_str).with_context(|| format!("parsing {}", path.display()))?;
     let Some(interest) = value.get("interest").and_then(|v| v.as_table()) else {
         return Ok(Default::default());
     };

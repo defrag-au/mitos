@@ -31,10 +31,7 @@ impl ChainDataHost for HostStateV2 {
             .collect())
     }
 
-    async fn utxos_by_address(
-        &mut self,
-        address: String,
-    ) -> wasmtime::Result<Vec<WitOutputRef>> {
+    async fn utxos_by_address(&mut self, address: String) -> wasmtime::Result<Vec<WitOutputRef>> {
         let refs = self
             .data_plane
             .utxos_by_address(&address)
@@ -58,19 +55,11 @@ impl ChainDataHost for HostStateV2 {
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         Ok(resolved
             .into_iter()
-            .map(|opt| {
-                opt.map(|(hash, payload)| WitTypedDatum {
-                    hash,
-                    payload,
-                })
-            })
+            .map(|opt| opt.map(|(hash, payload)| WitTypedDatum { hash, payload }))
             .collect())
     }
 
-    async fn tx_metadata(
-        &mut self,
-        tx_hash: Vec<u8>,
-    ) -> wasmtime::Result<Option<Vec<u8>>> {
+    async fn tx_metadata(&mut self, tx_hash: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
         let bytes: [u8; 32] = tx_hash
             .as_slice()
             .try_into()
@@ -81,21 +70,20 @@ impl ChainDataHost for HostStateV2 {
             .map_err(|e| wasmtime::Error::msg(e.to_string()))
     }
 
-    async fn datum_by_hash(
-        &mut self,
-        hash: Vec<u8>,
-    ) -> wasmtime::Result<Option<Vec<u8>>> {
-        let _: [u8; 32] = hash
+    async fn datum_by_hash(&mut self, hash: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
+        let bytes: [u8; 32] = hash
             .as_slice()
             .try_into()
             .map_err(|_| wasmtime::Error::msg("datum hash must be 32 bytes"))?;
-        // The v1 DataPlaneFacade only exposes the bulk
-        // `read_output_datums` shape — there's no per-hash
-        // accessor today. Wire a `datum_by_hash` method onto
-        // the facade in a follow-up; for now return `None`
-        // (matches the contract: hash not in witness-set
-        // index → caller falls back to `tx-metadata`).
-        Ok(None)
+        // CIP-68 hash-only outputs and any reference-datum
+        // resolution path lands here. The facade's
+        // `datum_by_hash` delegates to `ChainDataPlane::
+        // read_datum` and extracts `original_cbor` — what
+        // modules actually want.
+        self.data_plane
+            .datum_by_hash(&bytes)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))
     }
 
     async fn read_tx(
@@ -121,11 +109,7 @@ fn tx_record_to_wit(r: mitos_data_plane::TxRecord) -> bindings_v2::TxRecord {
         tx_hash: r.tx_hash.as_ref().to_vec(),
         tx_idx: r.tx_idx,
         cursor: chain_point_to_wit(r.cursor),
-        inputs: r
-            .inputs
-            .into_iter()
-            .map(consumed_input_to_wit)
-            .collect(),
+        inputs: r.inputs.into_iter().map(consumed_input_to_wit).collect(),
         reference_inputs: r
             .reference_inputs
             .into_iter()
@@ -172,9 +156,7 @@ fn consumed_input_to_wit(c: mitos_data_plane::ConsumedInput) -> bindings_v2::Con
     }
 }
 
-fn referenced_input_to_wit(
-    r: mitos_data_plane::ReferencedInput,
-) -> bindings_v2::ReferencedInput {
+fn referenced_input_to_wit(r: mitos_data_plane::ReferencedInput) -> bindings_v2::ReferencedInput {
     bindings_v2::ReferencedInput {
         oref: WitOutputRef {
             tx_hash: r.oref.tx_hash.as_ref().to_vec(),

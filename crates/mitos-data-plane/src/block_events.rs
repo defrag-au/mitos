@@ -28,9 +28,7 @@ use cardano_assets::PolicyId;
 use pallas_primitives::Hash;
 use pallas_traverse::{MultiEraBlock, MultiEraOutput, MultiEraTx, OriginalHash};
 
-use crate::types::{
-    AssetEntry, ChainPoint, OutputRef, TypedDatum, TypedOutput, ValidityInterval,
-};
+use crate::types::{AssetEntry, ChainPoint, OutputRef, TypedDatum, TypedOutput, ValidityInterval};
 
 /// Decoded block in dispatch-friendly form. Per-TX drafts that
 /// the platform's dispatcher walks to build full events after
@@ -109,8 +107,8 @@ pub struct MintDraft {
 /// projection failures are logged + dropped (best-effort
 /// posture — a single bad TX shouldn't poison the block).
 pub fn decode_block_v2(cbor: &[u8]) -> anyhow::Result<DecodedBlockV2> {
-    let block = MultiEraBlock::decode(cbor)
-        .map_err(|e| anyhow::anyhow!("MultiEraBlock decode: {e}"))?;
+    let block =
+        MultiEraBlock::decode(cbor).map_err(|e| anyhow::anyhow!("MultiEraBlock decode: {e}"))?;
     let cursor = ChainPoint::Specific(block.slot(), block.hash());
 
     let txs = block
@@ -144,10 +142,7 @@ fn project_tx(tx_idx: u32, tx: &MultiEraTx<'_>) -> TxDraft {
         .collect();
 
     let raw_outputs = tx.outputs();
-    let outputs: Vec<OutputDraft> = raw_outputs
-        .iter()
-        .map(project_output_draft)
-        .collect();
+    let outputs: Vec<OutputDraft> = raw_outputs.iter().map(project_output_draft).collect();
 
     let inputs: Vec<InputDraft> = tx
         .consumes()
@@ -196,7 +191,8 @@ fn project_tx(tx_idx: u32, tx: &MultiEraTx<'_>) -> TxDraft {
                     // since real mint deltas comfortably fit
                     // (max practical Cardano supply ~45B ADA-
                     // equivalents, far below i64 range).
-                    quantity_delta: asset.any_coin().clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                    quantity_delta: asset.any_coin().clamp(i64::MIN as i128, i64::MAX as i128)
+                        as i64,
                 })
                 .collect::<Vec<_>>()
         })
@@ -276,7 +272,11 @@ fn project_output_draft(output: &MultiEraOutput<'_>) -> OutputDraft {
     }
 }
 
-fn extract_datum_info(output: &MultiEraOutput<'_>) -> (Option<Hash<32>>, Option<Vec<u8>>) {
+/// Pull the datum hash + (optional) inline bytes off an output.
+/// Re-exported as `mitos_data_plane::extract_datum_info` so
+/// fixture-driven harnesses (mitos-run) can build TypedDatum
+/// from harvested outputs without re-implementing the era walk.
+pub fn extract_datum_info(output: &MultiEraOutput<'_>) -> (Option<Hash<32>>, Option<Vec<u8>>) {
     use pallas::ledger::primitives::conway::DatumOption;
     match output.datum() {
         Some(DatumOption::Hash(h)) => (Some(h), None),
@@ -341,7 +341,10 @@ mod tests {
     fn decodes_mainnet_block_fixture() {
         let fixture_path = PathBuf::from("../mitos-platform/tests/fixtures/186000000.block.cbor");
         if !fixture_path.exists() {
-            eprintln!("skipping: fixture not present at {}", fixture_path.display());
+            eprintln!(
+                "skipping: fixture not present at {}",
+                fixture_path.display()
+            );
             return;
         }
         let cbor = std::fs::read(&fixture_path).expect("read fixture");

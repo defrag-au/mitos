@@ -125,7 +125,10 @@ impl ModuleStorage {
         &self,
         id: &str,
     ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
-        let mut cache = self.emissions_stores.lock().expect("emissions_stores mutex");
+        let mut cache = self
+            .emissions_stores
+            .lock()
+            .expect("emissions_stores mutex");
         if let Some(s) = cache.get(id) {
             return Ok(s.clone());
         }
@@ -138,7 +141,10 @@ impl ModuleStorage {
     /// Mirror of `close_cursor` — used during follower stop so
     /// the next start re-opens redb cleanly.
     pub fn close_emissions(&self, id: &str) {
-        let mut cache = self.emissions_stores.lock().expect("emissions_stores mutex");
+        let mut cache = self
+            .emissions_stores
+            .lock()
+            .expect("emissions_stores mutex");
         cache.remove(id);
     }
 

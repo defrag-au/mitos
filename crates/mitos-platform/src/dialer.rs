@@ -316,7 +316,8 @@ impl CompanionDialer {
         // passes so the receivers are all in place before any
         // frame goes out — race-free if a companion replies before
         // we get to its register step.
-        let mut waiters: Vec<(CompanionId, oneshot::Receiver<()>)> = Vec::with_capacity(companion_count);
+        let mut waiters: Vec<(CompanionId, oneshot::Receiver<()>)> =
+            Vec::with_capacity(companion_count);
         {
             let mut pending = self.pending_recaptures.lock().await;
             for (id, _) in &targets {
@@ -634,10 +635,7 @@ async fn run_companion(
 /// Multi-target companions MUST include `{target}` so each
 /// target's dial-back resolves to a distinct URL — typically
 /// `wss://.../_internal/replicate-{target}?key={key}`.
-fn resolve_dial_url(
-    req: &SubscribeRequest,
-    target: &SubscribeTarget,
-) -> anyhow::Result<String> {
+fn resolve_dial_url(req: &SubscribeRequest, target: &SubscribeTarget) -> anyhow::Result<String> {
     let url = req
         .dial_back
         .as_ref()
@@ -674,8 +672,9 @@ async fn dial_and_pump(
         .map_err(|e| anyhow::anyhow!("build ws request: {e}"))?;
     let (header_name, header_value) = resolve_auth_header(req, auth);
     if let (Some(name), Some(value)) = (header_name, header_value) {
-        let header_name: tokio_tungstenite::tungstenite::http::HeaderName =
-            name.parse().map_err(|e| anyhow::anyhow!("auth header name: {e}"))?;
+        let header_name: tokio_tungstenite::tungstenite::http::HeaderName = name
+            .parse()
+            .map_err(|e| anyhow::anyhow!("auth header name: {e}"))?;
         let header_value = value
             .parse()
             .map_err(|e| anyhow::anyhow!("auth header value (must be ASCII): {e}"))?;
@@ -698,11 +697,7 @@ async fn dial_and_pump(
     // peek_next_id - 1 (the highest assigned id so far).
     let next_id = store.peek_next_id().unwrap_or(1);
     let last_emission_id = next_id.saturating_sub(1);
-    send_msg(
-        &mut sink,
-        &ServerMessage::Connected { last_emission_id },
-    )
-    .await?;
+    send_msg(&mut sink, &ServerMessage::Connected { last_emission_id }).await?;
 
     // Drain queued rows in id order, send Apply, flip to
     // Pending. New rows arriving while we drain will show up
@@ -772,9 +767,10 @@ fn resolve_auth_header(
     auth: &AuthToken,
 ) -> (Option<String>, Option<String>) {
     if let Some(d) = &req.dial_back
-        && let (Some(name), Some(value)) = (d.auth_header.clone(), d.auth_value.clone()) {
-            return (Some(name), Some(value));
-        }
+        && let (Some(name), Some(value)) = (d.auth_header.clone(), d.auth_value.clone())
+    {
+        return (Some(name), Some(value));
+    }
     if let Some(token) = auth.as_deref() {
         return (
             Some("Authorization".to_string()),
@@ -785,9 +781,7 @@ fn resolve_auth_header(
 }
 
 type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 

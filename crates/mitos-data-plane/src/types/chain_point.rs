@@ -112,10 +112,7 @@ mod tests {
         assert!(ChainPoint::Origin.hash().is_none());
         assert!(ChainPoint::Slot(42).hash().is_none());
         let h = sample_hash();
-        assert_eq!(
-            ChainPoint::Specific(100, h).hash(),
-            Some(&sample_hash())
-        );
+        assert_eq!(ChainPoint::Specific(100, h).hash(), Some(&sample_hash()));
     }
 
     #[test]

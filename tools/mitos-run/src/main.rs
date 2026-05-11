@@ -21,9 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::Parser;
-use mitos_data_plane::{
-    DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput,
-};
+use mitos_data_plane::{DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
 use mitos_platform::host_fns::DataPlaneFacade;
 use serde::Deserialize;
 
@@ -54,6 +52,20 @@ struct Args {
     /// fixtures; specify in chain order.
     #[arg(long)]
     block: Vec<PathBuf>,
+
+    /// Golden-test mode. After all `--block`s are dispatched,
+    /// the JSON-decoded emissions (in emission order, one array
+    /// element per `emit_event` call) are compared against the
+    /// JSON array in this file. Mismatch → exit 1 with a diff
+    /// report. Match → exit 0 (and we run quietly).
+    ///
+    /// Set `UPDATE_GOLDEN=1` in the env to overwrite the expected
+    /// file with the actual emissions instead of asserting —
+    /// useful when intentionally evolving a module's wire shape.
+    /// Always re-review the diff before committing the new
+    /// expected file.
+    #[arg(long)]
+    expected: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -63,9 +75,11 @@ async fn main() -> Result<()> {
     // come through the `tracing` subscriber at whatever level
     // the module passed; platform-internal traces at info+.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| tracing_subscriber::EnvFilter::new("info,jpg_co_module=debug,mitos_platform=info"),
-        ))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,jpg_co_module=debug,mitos_platform=info")
+            }),
+        )
         .with_target(true)
         .init();
 
@@ -127,7 +141,15 @@ async fn main() -> Result<()> {
              rebuild with `mitos-build` (v2 is the default)"
         );
     }
-    run_v2(&args.block, &fixture, &module_id, &wasm_path, &config_bytes).await
+    run_v2(
+        &args.block,
+        &fixture,
+        &module_id,
+        &wasm_path,
+        &config_bytes,
+        args.expected.as_deref(),
+    )
+    .await
 }
 
 // -----------------------------------------------------------------------------
@@ -209,6 +231,12 @@ struct FixtureDataPlane {
     by_ref: HashMap<(Vec<u8>, u32), ResolvedUtxo>,
     by_address: HashMap<String, Vec<OutputRef>>,
     aux_by_tx: HashMap<Vec<u8>, Vec<u8>>,
+    /// Hash → datum-CBOR map. Populated from block witness-data
+    /// during harvest so modules calling
+    /// `chain_data::datum_by_hash` (CIP-68 reference-output
+    /// resolution being the canonical case) resolve correctly
+    /// from the fixture.
+    datums_by_hash: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -223,8 +251,8 @@ impl FixtureDataPlane {
         let mut aux_by_tx = HashMap::new();
 
         for u in fixture.utxo {
-            let tx_hash = decode_32(&u.tx_hash)
-                .with_context(|| format!("utxo tx_hash {}", u.tx_hash))?;
+            let tx_hash =
+                decode_32(&u.tx_hash).with_context(|| format!("utxo tx_hash {}", u.tx_hash))?;
             let oref = OutputRef::from_bytes(tx_hash, u.index);
 
             // Project fixture datum fields onto the TypedOutput
@@ -243,19 +271,14 @@ impl FixtureDataPlane {
                 .as_deref()
                 .map(hex::decode)
                 .transpose()
-                .with_context(|| {
-                    format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index)
-                })?;
+                .with_context(|| format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index))?;
             let datum = datum_hash_bytes.map(|h| mitos_data_plane::TypedDatum {
                 hash: pallas_primitives::Hash::new(h),
                 payload: None,
                 original_cbor: datum_payload,
             });
 
-            by_address
-                .entry(u.address.clone())
-                .or_default()
-                .push(oref);
+            by_address.entry(u.address.clone()).or_default().push(oref);
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
                 ResolvedUtxo {
@@ -284,7 +307,99 @@ impl FixtureDataPlane {
             by_ref,
             by_address,
             aux_by_tx,
+            datums_by_hash: HashMap::new(),
         })
+    }
+
+    /// Walk every TX in the given block CBOR and harvest three
+    /// kinds of resolution data from it into the fixture:
+    /// - **aux-data CBOR** keyed by tx hash — so
+    ///   `chain_data::tx_metadata` lookups against TXs in the
+    ///   dispatched block resolve without operator hand-authoring
+    ///   `[[tx_metadata]]` entries.
+    /// - **witness datums** keyed by Plutus-data hash — so
+    ///   `chain_data::datum_by_hash` resolves hash-only output
+    ///   datums (the typical CIP-68 reference-output shape,
+    ///   where the datum lives in the witness set rather than
+    ///   inline on the output).
+    /// - **UTxOs produced by each TX** keyed by output ref — so
+    ///   the v2 dispatcher's `read_utxos` lookup resolves prior
+    ///   outputs for Consumed/Referenced events in later blocks
+    ///   (CIP-68 metadata updates spend a reference UTxO
+    ///   produced by a prior block; without harvest the
+    ///   Consumed event silently drops).
+    ///
+    /// Explicit fixture entries take precedence: if a key is
+    /// already populated, harvest skips it.
+    fn harvest_block_aux(&mut self, block_cbor: &[u8]) -> Result<usize> {
+        use pallas::ledger::traverse::MultiEraBlock;
+        let block = MultiEraBlock::decode(block_cbor)
+            .map_err(|e| anyhow::anyhow!("MultiEraBlock decode: {e}"))?;
+        let mut harvested = 0;
+        for tx in block.txs() {
+            let tx_hash_bytes = tx.hash().as_slice().to_vec();
+            if !self.aux_by_tx.contains_key(&tx_hash_bytes)
+                && let Some(aux) = mitos_data_plane::extract_aux_cbor(&tx)
+            {
+                self.aux_by_tx.insert(tx_hash_bytes, aux);
+                harvested += 1;
+            }
+            // Each plutus_data witness on the TX carries
+            // `(hash, raw_cbor_bytes)`. Index by hash. The
+            // KeepRaw wrapper preserves the original CBOR
+            // bytes; we use those (not pallas's re-encoded form)
+            // so the hash matches what's referenced in outputs.
+            for plutus_data in tx.plutus_data() {
+                use pallas::ledger::traverse::OriginalHash;
+                let hash_bytes = plutus_data.original_hash().to_vec();
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.datums_by_hash.entry(hash_bytes)
+                {
+                    e.insert(plutus_data.raw_cbor().to_vec());
+                    harvested += 1;
+                }
+            }
+            // Outputs: project each into a TypedOutput so the
+            // dispatcher's prior-output resolution for
+            // Consumed/Referenced events in subsequent blocks
+            // finds them. Datum bytes (if hash-only on the
+            // output) come via the witness-datum index above.
+            let tx_hash_bytes_owned: [u8; 32] = *tx.hash();
+            for (idx, output) in tx.outputs().iter().enumerate() {
+                let key = (tx_hash_bytes_owned.to_vec(), idx as u32);
+                if self.by_ref.contains_key(&key) {
+                    continue;
+                }
+                let mut typed_output = mitos_data_plane::project_typed_output(output);
+                // Populate the datum field — `project_typed_output`
+                // leaves it `None` by convention; we want
+                // hash-only or inline bytes so the dispatcher's
+                // `backfill_prior_datum` step on Consumed events
+                // can fill the witness payload.
+                let (datum_hash, inline_bytes) =
+                    mitos_data_plane::block_events::extract_datum_info(output);
+                if let Some(hash) = datum_hash {
+                    typed_output.datum = Some(mitos_data_plane::TypedDatum {
+                        hash,
+                        payload: None,
+                        original_cbor: inline_bytes,
+                    });
+                }
+                let oref = mitos_data_plane::OutputRef::from_bytes(tx_hash_bytes_owned, idx as u32);
+                self.by_address
+                    .entry(typed_output.address.clone())
+                    .or_default()
+                    .push(oref);
+                self.by_ref.insert(
+                    key,
+                    ResolvedUtxo {
+                        output: typed_output,
+                    },
+                );
+                harvested += 1;
+            }
+        }
+        Ok(harvested)
     }
 }
 
@@ -345,9 +460,23 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
 
     async fn read_datum(
         &self,
-        _hash: &pallas_primitives::Hash<32>,
+        hash: &pallas_primitives::Hash<32>,
     ) -> DataPlaneResult<Option<mitos_data_plane::TypedDatum>> {
-        Ok(None)
+        // Resolve from witness datums harvested off `--block`
+        // arguments. The TypedDatum we return mirrors what
+        // `LocalDataPlane` produces from the dolos archive: the
+        // raw CBOR sits in `original_cbor`, and the WIT→bindgen
+        // conversion in `mitos-platform::event_bindings` plucks
+        // it into `payload` for the wasm side.
+        Ok(self
+            .datums_by_hash
+            .get(hash.as_slice())
+            .cloned()
+            .map(|bytes| mitos_data_plane::TypedDatum {
+                hash: *hash,
+                payload: None,
+                original_cbor: Some(bytes),
+            }))
     }
 
     async fn read_script(
@@ -365,10 +494,7 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
         Ok(0)
     }
 
-    async fn holder_count(
-        &self,
-        _policy: &cardano_assets::PolicyId,
-    ) -> DataPlaneResult<u64> {
+    async fn holder_count(&self, _policy: &cardano_assets::PolicyId) -> DataPlaneResult<u64> {
         Ok(0)
     }
 
@@ -428,6 +554,7 @@ async fn run_v2(
     module_id: &str,
     wasm_path: &std::path::Path,
     config_bytes: &[u8],
+    expected_path: Option<&std::path::Path>,
 ) -> Result<()> {
     use mitos_platform::driver_v2::{ApplyOutcomeV2, DriverV2};
     use mitos_platform::host_fns::{emit, state_kv};
@@ -436,13 +563,34 @@ async fn run_v2(
     let interest = build_interest_set(&fixture.interest)?;
     println!("▸ interest:    {} predicate(s)", interest.predicates.len());
 
-    let dp: Arc<FixtureDataPlane> = Arc::new(FixtureDataPlane::from_fixture(fixture.clone())?);
+    // Build the fixture-backed data plane and pre-harvest aux-data
+    // from every `--block` arg so the module's `tx_metadata`
+    // lookups against TXs in the dispatched block resolve
+    // automatically. Operators only need to hand-author
+    // `[[tx_metadata]]` entries for TXs OUTSIDE the dispatched
+    // blocks (rare).
+    let mut dp_inner = FixtureDataPlane::from_fixture(fixture.clone())?;
+    let mut total_harvested = 0usize;
+    for path in blocks {
+        let cbor = fs::read(path)
+            .with_context(|| format!("read block for aux harvest {}", path.display()))?;
+        total_harvested += dp_inner
+            .harvest_block_aux(&cbor)
+            .with_context(|| format!("harvest aux-data from {}", path.display()))?;
+    }
+    if total_harvested > 0 {
+        println!(
+            "▸ harvested aux-data from {} TX(es) across {} block(s)",
+            total_harvested,
+            blocks.len()
+        );
+    }
+    let dp: Arc<FixtureDataPlane> = Arc::new(dp_inner);
     let dp_facade: Arc<dyn DataPlaneFacade> = dp.clone();
     let kv = state_kv::ModuleKv::new_in_memory();
     let (sink, mut events_rx) = emit::EventSink::new();
 
-    let engine =
-        ModuleRegistryV2::build_engine().map_err(|e| anyhow::anyhow!("v2 engine: {e}"))?;
+    let engine = ModuleRegistryV2::build_engine().map_err(|e| anyhow::anyhow!("v2 engine: {e}"))?;
     let registry = ModuleRegistryV2::load_from_path(engine, module_id.to_owned(), wasm_path)
         .map_err(|e| anyhow::anyhow!("v2 load: {e}"))?;
 
@@ -492,21 +640,50 @@ async fn run_v2(
     // Push the fixture's interest set into the host state so the
     // block-dispatch path can filter against it.
     let mut driver = DriverV2::new(instance, budget);
-    driver.set_interest(interest);
+    driver.set_interest(interest.clone());
+
+    // Also call the module's `update_interest` export with a
+    // Replace op carrying the CBOR-encoded predicate list — same
+    // shape the production follower uses. Modules whose filter
+    // logic needs to know its own interest set (e.g.
+    // burn-address tracking watched bech32s for per-output
+    // filtering) only work end-to-end if this call is wired.
+    let mut items_cbor = Vec::with_capacity(64);
+    ciborium::ser::into_writer(&interest.predicates, &mut items_cbor)
+        .map_err(|e| anyhow::anyhow!("encode interest predicates as CBOR: {e}"))?;
+    match driver
+        .call_update_interest(
+            mitos_platform::bindings_v2::InterestOp::Replace,
+            &items_cbor,
+        )
+        .await
+    {
+        Ok(Ok(())) => {
+            println!(
+                "✓ update_interest(Replace, {} bytes) returned cleanly",
+                items_cbor.len()
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!("✗ update_interest returned Err: {e}");
+        }
+        Err(e) => {
+            eprintln!("✗ update_interest failed: {e:?}");
+        }
+    }
 
     if blocks.is_empty() {
         println!("▸ no --block flags; skipping handle-events dispatch");
         return Ok(());
     }
 
+    // Collected decoded emissions across all blocks — used for the
+    // optional `--expected` golden-file comparison at end of run.
+    let mut collected_emits: Vec<serde_json::Value> = Vec::new();
+
     for path in blocks {
-        let cbor = fs::read(path)
-            .with_context(|| format!("read block {}", path.display()))?;
-        println!(
-            "▸ apply_block: {} ({} bytes)",
-            path.display(),
-            cbor.len()
-        );
+        let cbor = fs::read(path).with_context(|| format!("read block {}", path.display()))?;
+        println!("▸ apply_block: {} ({} bytes)", path.display(), cbor.len());
         match driver.apply_block(&cbor, dp.as_ref()).await {
             Ok(ApplyOutcomeV2::Applied) => {
                 println!("  ✓ Applied (events dispatched)");
@@ -520,26 +697,107 @@ async fn run_v2(
             }
         }
         // Drain emissions per block so they're attributed clearly.
+        // Decode each payload against the module's typed event shape
+        // (registered in `mitos-community-events`) for ergonomic
+        // golden-test style comparisons. Fall back to raw byte
+        // counts when no decoder is registered or the payload fails
+        // to deserialise — the latter is itself a useful signal
+        // (wire-shape drift between module emitter and types crate).
         let mut block_emitted = 0;
         while let Ok(event) = events_rx.try_recv() {
             block_emitted += 1;
-            println!(
-                "  emit channel={} payload={} bytes",
-                event.channel,
-                event.payload.len()
-            );
+            let decoded =
+                mitos_community_events::decode_emit(module_id, event.channel, &event.payload);
+            match &decoded {
+                Some(json) => {
+                    println!(
+                        "  emit channel={} payload={} bytes",
+                        event.channel,
+                        event.payload.len()
+                    );
+                    for line in json.lines() {
+                        println!("    {line}");
+                    }
+                }
+                None => println!(
+                    "  emit channel={} payload={} bytes (no typed decoder for module-id={module_id:?})",
+                    event.channel,
+                    event.payload.len()
+                ),
+            }
+            if expected_path.is_some() {
+                let value = decoded
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "channel": event.channel,
+                            "payload_bytes": event.payload.len(),
+                            "undecoded": true,
+                        })
+                    });
+                collected_emits.push(value);
+            }
         }
         if block_emitted > 0 {
             println!("  ▸ {block_emitted} event(s) emitted");
         }
     }
 
+    if let Some(path) = expected_path {
+        let actual = serde_json::Value::Array(collected_emits);
+        let update = std::env::var("UPDATE_GOLDEN").is_ok();
+        if update {
+            let pretty = serde_json::to_string_pretty(&actual)
+                .map_err(|e| anyhow::anyhow!("encode actual emits as JSON: {e}"))?;
+            fs::write(path, format!("{pretty}\n"))
+                .with_context(|| format!("write golden file {}", path.display()))?;
+            println!(
+                "▸ UPDATE_GOLDEN=1 — overwrote {} with {} emission(s)",
+                path.display(),
+                actual.as_array().map(Vec::len).unwrap_or(0)
+            );
+            return Ok(());
+        }
+        if !path.exists() {
+            bail!(
+                "golden file {} doesn't exist; set UPDATE_GOLDEN=1 to create it",
+                path.display()
+            );
+        }
+        let expected_str = fs::read_to_string(path)
+            .with_context(|| format!("read golden file {}", path.display()))?;
+        let expected: serde_json::Value = serde_json::from_str(&expected_str)
+            .with_context(|| format!("parse golden file {} as JSON", path.display()))?;
+        if expected == actual {
+            println!(
+                "✓ golden match ({} emission(s)) against {}",
+                actual.as_array().map(Vec::len).unwrap_or(0),
+                path.display()
+            );
+        } else {
+            eprintln!("✗ golden mismatch against {}", path.display());
+            eprintln!(
+                "  re-run with UPDATE_GOLDEN=1 to accept the new shape (review the diff first)"
+            );
+            eprintln!("---- expected ----");
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&expected).unwrap_or_default()
+            );
+            eprintln!("---- actual ----");
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&actual).unwrap_or_default()
+            );
+            std::process::exit(1);
+        }
+    }
+
     Ok(())
 }
 
-fn build_interest_set(
-    preds: &[FixtureInterestPredicate],
-) -> Result<mitos_data_plane::InterestSet> {
+fn build_interest_set(preds: &[FixtureInterestPredicate]) -> Result<mitos_data_plane::InterestSet> {
     use cardano_assets::PolicyId;
     use mitos_data_plane::{InterestPredicate, InterestSet, StakeCred};
 
