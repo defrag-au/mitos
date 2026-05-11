@@ -18,8 +18,9 @@
 //!   so the existing `/_admin/modules/<id>/last-trap` endpoint
 //!   serves both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dolos_core::TipSubscription;
 use mitos_data_plane::{ChainDataPlane, ChainPoint};
@@ -200,6 +201,14 @@ where
     interest_senders: Arc<
         std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>,
     >,
+    /// Set of module ids with an in-flight recapture. Mutual
+    /// exclusion is per-module: a second `recapture_module(id)`
+    /// while the first is mid-flight returns
+    /// `PlatformError::RecaptureInProgress`. Uses a `HashSet` +
+    /// std `Mutex` rather than per-key mutex because the only
+    /// operations are check-insert-or-reject and remove — no
+    /// awaiting needed.
+    recapture_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl<S, P> ModuleHostV2<S, P>
@@ -235,6 +244,7 @@ where
             budget,
             slots: Arc::new(Mutex::new(HashMap::new())),
             interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            recapture_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -513,6 +523,201 @@ where
             }
         }
     }
+
+    /// Recapture: coordinate every subscribed companion through a
+    /// clean state-rebuild for `id`. The protocol exchange is in
+    /// `docs/design/RECAPTURE.md`.
+    ///
+    /// Sequence:
+    ///
+    /// 1. Acquire per-module recapture mutex (409 on conflict).
+    /// 2. Through `dialer.recapture_module`: send
+    ///    `ServerMessage::Recapture { module, reason }` to every
+    ///    subscribed companion, await `RecaptureReady` from each
+    ///    with `companion_timeout`. Any timeout aborts the rest of
+    ///    this flow — no bootstrap-refill fires, dApp-state is
+    ///    whatever the companions partially produced, operator
+    ///    investigates.
+    /// 3. Clear the module's bootstrap-done flags via
+    ///    `bootstrap_v2::clear_bootstrap_flags`. Without this the
+    ///    follower's bootstrap pass would short-circuit and no
+    ///    refill events would flow.
+    /// 4. Restart the follower via `self.start(id)`. The fresh
+    ///    follower's `init` runs, then `run_bootstrap` walks every
+    ///    `[interest].address` + `[interest].policy` (now flagless)
+    ///    and synthesises events that flow through the broadcast
+    ///    channel + outbound WSes to each companion's
+    ///    `apply_event` for re-INSERT.
+    /// 5. Through `dialer.send_recapture_done`: push
+    ///    `ServerMessage::RecaptureDone { cursor, module,
+    ///    events_emitted }` to each companion. Informational — the
+    ///    Apply stream already did the load-bearing work; this is
+    ///    a clean boundary marker.
+    ///
+    /// `events_emitted` is currently `0` — counting per-companion
+    /// requires bootstrap_v2 to thread a counter back, which is a
+    /// follow-up refinement noted in `RECAPTURE.md` open
+    /// question 4.
+    ///
+    /// `companion_timeout` is the per-companion budget for the
+    /// `RecaptureReady` ACK. Reasonable default at the call site
+    /// is 30s (matches the design doc's open question 3).
+    pub async fn recapture_module(
+        &self,
+        id: &str,
+        reason: Option<String>,
+        dialer: &crate::dialer::CompanionDialer,
+        companion_timeout: Duration,
+    ) -> PlatformResult<RecaptureOutcome> {
+        // 1. Acquire mutex.
+        {
+            let mut in_flight = self
+                .recapture_in_flight
+                .lock()
+                .expect("recapture_in_flight mutex poisoned");
+            if !in_flight.insert(id.to_owned()) {
+                return Err(PlatformError::RecaptureInProgress(id.to_owned()));
+            }
+        }
+        // Drop-guard ensures the mutex set is cleaned up even on
+        // early-return / panic. Using an explicit struct rather
+        // than `defer!` to keep deps minimal.
+        let _release = RecaptureGuard {
+            set: self.recapture_in_flight.clone(),
+            id: id.to_owned(),
+        };
+
+        tracing::info!(
+            module = %id,
+            reason = ?reason,
+            "recapture: starting"
+        );
+
+        // 2. Send Recapture + await RecaptureReady from each.
+        let ready = match dialer
+            .recapture_module(id, reason.clone(), companion_timeout)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    module = %id,
+                    error = %e,
+                    "recapture: companion coordination failed; aborting before bootstrap-refill"
+                );
+                return Err(PlatformError::RecaptureCoordination(e.to_string()));
+            }
+        };
+        let companion_count = ready.ready_companions.len();
+        tracing::info!(
+            module = %id,
+            companion_count,
+            "recapture: all companions ready; wiping bootstrap-done flags"
+        );
+
+        // 3. Clear bootstrap-done flags.
+        {
+            let mut kv = (self.kv_factory)(id);
+            match crate::bootstrap_v2::clear_bootstrap_flags(&mut kv, id) {
+                Ok(n) => tracing::info!(
+                    module = %id,
+                    flags_cleared = n,
+                    "recapture: bootstrap-done flags cleared"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        module = %id,
+                        error = %e,
+                        "recapture: clear_bootstrap_flags failed; aborting before follower restart"
+                    );
+                    return Err(PlatformError::RecaptureCoordination(format!(
+                        "clear_bootstrap_flags: {e}"
+                    )));
+                }
+            }
+        }
+
+        // 4. Restart follower. `start(id)` stops the existing
+        //    follower (if running), re-instantiates wasmtime, calls
+        //    init, runs bootstrap (which now finds no flags and
+        //    walks the interest set), then spawns the follower
+        //    task. Bootstrap-synthesised events flow through the
+        //    broadcast → outbound WSes → companions while this
+        //    call is returning.
+        if let Err(e) = self.start(id).await {
+            tracing::error!(
+                module = %id,
+                error = %e,
+                "recapture: follower restart failed; refill is partial"
+            );
+            return Err(e);
+        }
+
+        // 5. Send RecaptureDone to each companion. `cursor` here
+        //    is the host's chain tip slot (no hash — the wire
+        //    type is `Slot(u64)`, sufficient for the
+        //    informational marker the design specifies).
+        //    Hash-full cursors would require crossing the
+        //    `mitos-data-plane` → `mitos-protocol` chain-point
+        //    conversion boundary; deferred to a follow-up since
+        //    consumers don't depend on the value for correctness.
+        let tip_cursor = match self.chain_plane.tip().await {
+            Ok(tip) => mitos_protocol::ChainPoint::Slot(tip.point.slot()),
+            Err(e) => {
+                tracing::warn!(
+                    module = %id,
+                    error = %e,
+                    "recapture: failed to read chain tip for RecaptureDone cursor; using Origin"
+                );
+                mitos_protocol::ChainPoint::Origin
+            }
+        };
+        // events_emitted is 0 in v1 — see method docstring.
+        dialer
+            .send_recapture_done(id, tip_cursor.clone(), 0)
+            .await;
+
+        tracing::info!(
+            module = %id,
+            companion_count,
+            "recapture: complete"
+        );
+        Ok(RecaptureOutcome {
+            module: id.to_owned(),
+            companion_count,
+            // Best-effort counter; populated by future bootstrap
+            // instrumentation. See `RECAPTURE.md` open question 4.
+            events_emitted: 0,
+        })
+    }
+}
+
+/// Drop-guard for the per-module recapture mutex set. Ensures
+/// the module is removed from `recapture_in_flight` even if the
+/// `recapture_module` body panics or early-returns.
+struct RecaptureGuard {
+    set: Arc<std::sync::Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for RecaptureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.id);
+        }
+    }
+}
+
+/// Outcome of a successful `recapture_module` call. Surfaced
+/// through the admin endpoint's response body.
+#[derive(Debug, Clone)]
+pub struct RecaptureOutcome {
+    pub module: String,
+    /// Number of companions whose state was refilled.
+    pub companion_count: usize,
+    /// Per `RECAPTURE.md` open question 4: best-effort counter.
+    /// v1 reports `0` — implementation pending.
+    pub events_emitted: u64,
 }
 
 #[async_trait::async_trait]

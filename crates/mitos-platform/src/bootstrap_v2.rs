@@ -485,6 +485,58 @@ fn set_flag(kv: &mut ModuleKv, module_id: &str, key: &str) -> anyhow::Result<()>
     }
 }
 
+/// Reserved prefix every bootstrap flag (address-scoped + policy-scoped)
+/// is filed under. Centralised here so the recapture path can clear
+/// the full set with one call rather than enumerating from the
+/// interest set. See `docs/design/RECAPTURE.md`.
+const BOOTSTRAP_FLAG_PREFIX: &str = "__platform/bootstrap/";
+
+/// Clear every bootstrap-done flag for this module. Used by the
+/// recapture flow to force a re-walk of the manifest's
+/// `[interest]` addresses + policies on the next bootstrap pass.
+///
+/// Returns the number of flags removed.
+///
+/// Implementation note: rather than enumerate the current interest
+/// set and delete each key individually, we range-scan under
+/// `__platform/bootstrap/` and delete everything we find. That makes
+/// the call robust against interest-set drift between runs (e.g. an
+/// address that was once watched, isn't anymore, but still has a
+/// stale flag).
+pub fn clear_bootstrap_flags(kv: &mut ModuleKv, module_id: &str) -> anyhow::Result<usize> {
+    match kv {
+        ModuleKv::InMemory(map) => {
+            let to_remove: Vec<String> = map
+                .keys()
+                .filter(|k| k.starts_with(BOOTSTRAP_FLAG_PREFIX))
+                .cloned()
+                .collect();
+            let n = to_remove.len();
+            for key in to_remove {
+                map.remove(&key);
+            }
+            Ok(n)
+        }
+        ModuleKv::Redb(redb) => {
+            // `list_values` returns full module-scoped keys
+            // (`<module_id>-<key>`); strip the prefix for the
+            // `delete_value` round-trip which re-applies it.
+            let full_keys = redb
+                .list_values(module_id, BOOTSTRAP_FLAG_PREFIX)
+                .map_err(|e| anyhow::anyhow!("kv.list: {e}"))?;
+            let mod_prefix = format!("{module_id}-");
+            let mut n = 0usize;
+            for full in full_keys {
+                let key = full.strip_prefix(&mod_prefix).unwrap_or(&full);
+                redb.delete_value(module_id, key)
+                    .map_err(|e| anyhow::anyhow!("kv.delete {key}: {e}"))?;
+                n += 1;
+            }
+            Ok(n)
+        }
+    }
+}
+
 /// Convenience: build an InterestSet from a list of bech32
 /// addresses. Used by `mitos-run` and (eventually) the
 /// manifest-driven auto-bootstrap path.

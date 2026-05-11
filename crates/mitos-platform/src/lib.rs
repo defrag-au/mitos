@@ -104,6 +104,20 @@ pub enum PlatformError {
 
     #[error("block decode: {0}")]
     Decode(String),
+
+    /// A `recapture_module` call arrived for a module that already
+    /// has an in-flight recapture. The endpoint maps this to
+    /// HTTP 409. See `docs/design/RECAPTURE.md`.
+    #[error("recapture already in flight for module `{0}`")]
+    RecaptureInProgress(String),
+
+    /// Per-companion `RecaptureReady` ACK didn't arrive within
+    /// timeout, or a companion's outbound channel was closed
+    /// mid-protocol. Bootstrap-refill is NOT fired in this case
+    /// — the partial dApp-state cleanup would seed ghost rows.
+    /// Maps to HTTP 504 from the admin endpoint.
+    #[error("recapture coordination failed: {0}")]
+    RecaptureCoordination(String),
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;
