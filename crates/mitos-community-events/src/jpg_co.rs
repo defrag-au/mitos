@@ -131,3 +131,12 @@ impl JpgCoVersion {
         }
     }
 }
+
+#[cfg(feature = "decode")]
+pub fn decode_emit(channel: u32, payload: &[u8]) -> Option<String> {
+    if channel != 0 {
+        return None;
+    }
+    let event: JpgCoChange = ciborium::de::from_reader(payload).ok()?;
+    serde_json::to_string_pretty(&event).ok()
+}

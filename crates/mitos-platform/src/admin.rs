@@ -18,6 +18,13 @@
 //! - `DELETE /_admin/modules/{id}/emissions` — purge
 //! - `POST /_admin/modules/{id}/emissions/{emission_id}/replay` —
 //!   re-queue a single row
+//! - `GET  /_admin/blocks/{slot}` — raw block CBOR from the
+//!   dolos archive; produces `mitos-run --block` fixtures
+//!   without the `capture-block` writer-lock dance.
+//! - `GET  /_admin/blocks/by-tx/{tx_hash}` — same, resolved by
+//!   tx hash via the archive's tx-index. Response carries the
+//!   slot in `X-Mitos-Block-Slot` so the operator can label the
+//!   fixture without a second round trip.
 //!
 //! Auth is a self-contained shared-secret bearer-token
 //! middleware mirroring `mitos-core::auth` rather than depending
@@ -101,6 +108,11 @@ struct AdminState {
     /// that collides with one of these — see
     /// `docs/design/UNIFIED_SUBSCRIBE.md` step 4.
     reserved_names: Vec<String>,
+    /// Optional chain-data handle for the read-only block-fetch
+    /// route (`GET /_admin/blocks/{slot}`). `None` when the admin
+    /// router is mounted without a dolos archive in scope
+    /// (artifact-only deployments, tests).
+    chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -112,7 +124,7 @@ struct AdminState {
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
 pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
-    admin_router_inner(storage, None, Vec::new(), auth)
+    admin_router_inner(storage, None, Vec::new(), None, auth)
 }
 
 /// Build the admin router with the running-instance lifecycle
@@ -125,25 +137,32 @@ pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
 /// a wasm module from shadowing an indexer subscribable via the
 /// unified-subscribe path. Pass an empty `Vec` when the bundle
 /// has no in-tree indexers (artifact-only deployments).
+///
+/// `chain_data` enables the `GET /_admin/blocks/{slot}` block-
+/// fetch route. Pass `None` to disable that route (the handler
+/// returns 503 in that case).
 pub fn admin_router_with_host(
     storage: ModuleStorage,
     host: Arc<dyn crate::host_v2::ModuleHostHandle>,
     reserved_names: Vec<String>,
+    chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     auth: AuthToken,
 ) -> axum::Router {
-    admin_router_inner(storage, Some(host), reserved_names, auth)
+    admin_router_inner(storage, Some(host), reserved_names, chain_data, auth)
 }
 
 fn admin_router_inner(
     storage: ModuleStorage,
     host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
     reserved_names: Vec<String>,
+    chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     auth: AuthToken,
 ) -> axum::Router {
     let state = AdminState {
         storage,
         host,
         reserved_names,
+        chain_data,
     };
     axum::Router::new()
         .route("/_admin/modules", get(list_modules))
@@ -162,6 +181,8 @@ fn admin_router_inner(
             "/_admin/modules/{id}/emissions/{emission_id}/replay",
             post(replay_emission),
         )
+        .route("/_admin/blocks/{slot}", get(get_block_by_slot))
+        .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(auth, require_auth))
 }
@@ -219,6 +240,17 @@ enum HandlerError {
     Storage(#[from] StorageError),
     #[error("wasmtime: {0}")]
     Wasmtime(String),
+
+    /// Chain-data plane returned an error servicing an admin
+    /// query (today: only the block-by-slot route). Operator
+    /// retries; persistent failures point to the dolos archive.
+    #[error("chain-data: {0}")]
+    ChainData(String),
+
+    /// Block-by-tx route: the `{tx_hash}` path segment couldn't
+    /// be parsed as 32 bytes of lowercase hex (64 chars).
+    #[error("invalid tx hash `{0}`: must be 64 lowercase hex chars")]
+    BadTxHash(String),
     /// Module ID shadows an in-tree indexer's name (e.g. uploading
     /// a module called `mint-burn` while the host has the
     /// `mint-burn` indexer registered). Rejected to keep the
@@ -274,6 +306,8 @@ impl HandlerError {
             Self::Storage(StorageError::UploadInProgress(_)) => "upload_in_progress",
             Self::Storage(_) => "storage_io",
             Self::Wasmtime(_) => "wasm_invalid",
+            Self::ChainData(_) => "chain_data",
+            Self::BadTxHash(_) => "bad_tx_hash",
             Self::ReservedName(_) => "reserved_name",
             Self::RecaptureBadCompanion => "recapture_bad_companion",
             Self::RecaptureInProgress(_) => "recapture_in_progress",
@@ -287,6 +321,7 @@ impl HandlerError {
         match self {
             Self::Storage(StorageError::UploadInProgress(_)) => StatusCode::CONFLICT,
             Self::Storage(StorageError::Io(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ChainData(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ReservedName(_) => StatusCode::CONFLICT,
             Self::RecaptureInProgress(_) => StatusCode::CONFLICT,
             Self::RecaptureTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -636,6 +671,98 @@ async fn last_trap(
             Ok((StatusCode::NOT_FOUND, "no trap fixture captured for this module").into_response())
         }
         Err(e) => Err(HandlerError::Storage(StorageError::Io(e))),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Blocks: read-only fetch-by-slot
+// -----------------------------------------------------------------------------
+
+/// Return the raw block CBOR for `slot`. Used to materialise
+/// real-chain fixtures for `mitos-run` without the writer-lock
+/// dance the offline `capture-block` tool requires. Body is
+/// `application/cbor`; the bytes are exactly what the consensus
+/// follower received.
+///
+/// `503 Service Unavailable` when the admin router was mounted
+/// without a chain-data handle (artifact-only deployments).
+/// `404 Not Found` when the slot isn't in the archive.
+async fn get_block_by_slot(
+    State(state): State<AdminState>,
+    Path(slot): Path<u64>,
+) -> Result<Response, HandlerError> {
+    let Some(chain_data) = state.chain_data.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin router mounted without chain-data handle; block fetch unavailable",
+        )
+            .into_response());
+    };
+    match chain_data.read_block(slot).await {
+        Ok(Some(bytes)) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/cbor")],
+            bytes,
+        )
+            .into_response()),
+        Ok(None) => {
+            Ok((StatusCode::NOT_FOUND, "no block at this slot in the archive").into_response())
+        }
+        Err(e) => Err(HandlerError::ChainData(format!("read_block: {e}"))),
+    }
+}
+
+/// Same as `get_block_by_slot` but resolves by tx hash first
+/// via the archive's tx-index. The slot the tx landed in goes
+/// back in the `X-Mitos-Block-Slot` response header so the
+/// operator can label the saved fixture without a follow-up
+/// round trip.
+async fn get_block_by_tx(
+    State(state): State<AdminState>,
+    Path(tx_hash_hex): Path<String>,
+) -> Result<Response, HandlerError> {
+    let Some(chain_data) = state.chain_data.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin router mounted without chain-data handle; block fetch unavailable",
+        )
+            .into_response());
+    };
+
+    let bytes = hex::decode(&tx_hash_hex)
+        .map_err(|_| HandlerError::BadTxHash(tx_hash_hex.clone()))?;
+    let tx_hash: pallas_primitives::Hash<32> = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| HandlerError::BadTxHash(tx_hash_hex.clone()))?;
+
+    let slot = match chain_data.slot_by_tx_hash(&tx_hash).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Ok((StatusCode::NOT_FOUND, "tx hash not found in archive").into_response());
+        }
+        Err(e) => return Err(HandlerError::ChainData(format!("slot_by_tx_hash: {e}"))),
+    };
+
+    match chain_data.read_block(slot).await {
+        Ok(Some(bytes)) => Ok((
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/cbor".to_owned()),
+                (
+                    axum::http::HeaderName::from_static("x-mitos-block-slot"),
+                    slot.to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response()),
+        Ok(None) => Ok((
+            StatusCode::NOT_FOUND,
+            format!("tx hash resolved to slot {slot} but archive has no block at that slot"),
+        )
+            .into_response()),
+        Err(e) => Err(HandlerError::ChainData(format!("read_block: {e}"))),
     }
 }
 

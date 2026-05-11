@@ -71,3 +71,12 @@ pub struct Cip68UserInfo {
     /// CIP-67 label prefix: 222 (NFT) / 333 (FT) / 444 (RFT).
     pub cip67_label: u32,
 }
+
+#[cfg(feature = "decode")]
+pub fn decode_emit(channel: u32, payload: &[u8]) -> Option<String> {
+    if channel != 0 {
+        return None;
+    }
+    let event: Cip68Mint = ciborium::de::from_reader(payload).ok()?;
+    serde_json::to_string_pretty(&event).ok()
+}

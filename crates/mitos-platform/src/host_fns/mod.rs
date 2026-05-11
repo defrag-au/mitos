@@ -248,6 +248,22 @@ where
         mitos_data_plane::ChainDataPlane::read_tx(&plane, tx_hash).await
     }
 
+    async fn read_block(
+        &self,
+        slot: u64,
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::read_block(&plane, slot).await
+    }
+
+    async fn slot_by_tx_hash(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<u64>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::slot_by_tx_hash(&plane, tx_hash).await
+    }
+
     async fn read_datum(
         &self,
         hash: &pallas_primitives::Hash<32>,

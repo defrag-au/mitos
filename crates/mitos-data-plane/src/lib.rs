@@ -189,6 +189,34 @@ pub trait ChainDataPlane: Send + Sync {
         Ok(None)
     }
 
+    /// Raw block CBOR for a given slot. Used by admin tooling
+    /// to produce fixtures from real chain state without going
+    /// through the offline `capture-block` path (which needs
+    /// the writer stopped). The block bytes are the exact CBOR
+    /// the consensus follower produced — `mitos-run --block`
+    /// consumes them unchanged.
+    ///
+    /// Default impl returns `None` so only archive-bearing
+    /// planes (LocalDataPlane today) need to override; transport
+    /// proxies and test stubs return `None`.
+    async fn read_block(&self, _slot: u64) -> DataPlaneResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Resolve a tx hash to its containing slot via the archive's
+    /// tx index. Companion to `read_block` for admin / fixture
+    /// tooling that has a tx hash (from cardanoscan, Maestro,
+    /// etc.) and wants the block CBOR.
+    ///
+    /// Default impl returns `None`; archive-bearing planes
+    /// override.
+    async fn slot_by_tx_hash(
+        &self,
+        _tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<u64>> {
+        Ok(None)
+    }
+
     /// Resolve a datum hash to its Plutus payload. Side-door for
     /// callers that have a hash but not the containing UTxO
     /// context (rare — most callers should use `read_utxo` with

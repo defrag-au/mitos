@@ -69,6 +69,11 @@ pub mod vendored;
 /// `mitos-data-plane` so consumers (like the bundle binary) can
 /// take/return it without a separate dep on `mitos-data-plane`.
 pub use mitos_data_plane::ChainPoint;
+/// Re-exported so bundle consumers can construct
+/// `Arc<dyn ChainDataPlane>` to pass into
+/// `admin::admin_router_with_host` without a separate dep on
+/// `mitos-data-plane`.
+pub use mitos_data_plane::ChainDataPlane;
 pub use registry_v2::{ModuleInstanceV2, ModuleRegistryV2, ResourceBudget};
 pub use supervisor::{Supervisor, SupervisorOutcome};
 

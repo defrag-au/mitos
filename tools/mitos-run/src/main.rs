@@ -520,14 +520,37 @@ async fn run_v2(
             }
         }
         // Drain emissions per block so they're attributed clearly.
+        // Decode each payload against the module's typed event shape
+        // (registered in `mitos-community-events`) for ergonomic
+        // golden-test style comparisons. Fall back to raw byte
+        // counts when no decoder is registered or the payload fails
+        // to deserialise — the latter is itself a useful signal
+        // (wire-shape drift between module emitter and types crate).
         let mut block_emitted = 0;
         while let Ok(event) = events_rx.try_recv() {
             block_emitted += 1;
-            println!(
-                "  emit channel={} payload={} bytes",
+            let decoded = mitos_community_events::decode_emit(
+                &module_id,
                 event.channel,
-                event.payload.len()
+                &event.payload,
             );
+            match decoded {
+                Some(json) => {
+                    println!(
+                        "  emit channel={} payload={} bytes",
+                        event.channel,
+                        event.payload.len()
+                    );
+                    for line in json.lines() {
+                        println!("    {line}");
+                    }
+                }
+                None => println!(
+                    "  emit channel={} payload={} bytes (no typed decoder for module-id={module_id:?})",
+                    event.channel,
+                    event.payload.len()
+                ),
+            }
         }
         if block_emitted > 0 {
             println!("  ▸ {block_emitted} event(s) emitted");

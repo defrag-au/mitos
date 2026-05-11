@@ -9,8 +9,19 @@ description = "Typed event payloads for mitos community modules (auto-loaded was
 [lints.clippy]
 disallowed_methods = "deny"
 
+[features]
+default = []
+# Enable host-side decode + pretty-print of emit-channel payloads. Off
+# by default so wasm-module consumers (encoder side) don't pull in
+# ciborium + serde_json. `mitos-run` and any future test harness
+# enable this feature to deserialise emissions for golden tests.
+decode = ["dep:ciborium", "dep:serde_json"]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 # Compact CBOR encoding of raw byte fields (e.g. `jpg_co::CoChange::Created::datum_cbor`).
 # Without this, `Vec<u8>` serialises as a CBOR array of ints with ~10x bloat.
 serde_bytes = "0.11"
+# Host-side decode path — see `decode` feature flag.
+ciborium = { version = "0.2", optional = true }
+serde_json = { version = "1", optional = true }

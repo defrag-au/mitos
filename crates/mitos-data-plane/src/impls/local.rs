@@ -490,6 +490,26 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         ))
     }
 
+    async fn read_block(&self, slot: u64) -> DataPlaneResult<Option<Vec<u8>>> {
+        // Direct archive lookup — same call the `read_tx` /
+        // `tx_metadata` paths use, just exposed at the block
+        // granularity for admin fixture export.
+        self.domain
+            .archive()
+            .get_block_by_slot(&slot)
+            .map_err(|e| DataPlaneError::Storage(format!("get_block_by_slot: {e:?}")))
+    }
+
+    async fn slot_by_tx_hash(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> DataPlaneResult<Option<u64>> {
+        self.domain
+            .indexes()
+            .slot_by_tx_hash(tx_hash.as_slice())
+            .map_err(|e| DataPlaneError::Storage(format!("slot_by_tx_hash: {e:?}")))
+    }
+
     async fn tx_metadata(
         &self,
         tx_hash: &pallas_primitives::Hash<32>,
