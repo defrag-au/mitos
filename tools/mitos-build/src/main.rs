@@ -100,11 +100,24 @@ struct Args {
     /// `opt-level = "z"` + LTO + `codegen-units = 1` for
     /// production-grade size + perf at the cost of multi-minute
     /// per-module build times. `--fast` (also enabled via env
-    /// `MITOS_BUILD_FAST=1`) is intended for CI / iteration
-    /// where emission *content* matters but size / runtime perf
-    /// don't. Goldens assert on event payload shape so fast
-    /// artifacts produce identical output to release artifacts.
-    #[arg(long, env = "MITOS_BUILD_FAST")]
+    /// `MITOS_BUILD_FAST=1` / `=true` / `=yes`) is intended for
+    /// CI / iteration where emission *content* matters but size
+    /// / runtime perf don't. Goldens assert on event payload
+    /// shape so fast artifacts produce identical output to
+    /// release artifacts.
+    ///
+    /// `num_args(0..=1)` + `default_missing_value("true")` makes
+    /// bare `--fast` work; `BoolishValueParser` lets the env-var
+    /// path accept `1`/`yes`/`on` as well as `true` (clap's
+    /// default bool parser only accepts the latter).
+    #[arg(
+        long,
+        env = "MITOS_BUILD_FAST",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     fast: bool,
 
     /// Where to emit the artifact. Defaults to
