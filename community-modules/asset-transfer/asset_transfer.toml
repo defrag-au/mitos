@@ -1,0 +1,29 @@
+# mitos.toml — module config for the asset-transfer indexer.
+#
+# Read by `mitos-build`, CBOR-encoded into the artifact's
+# `config.cbor`, uploaded alongside the wasm by the host's
+# auto-load path, and passed to the module's `init(config)` on
+# host follower start.
+#
+# This module has no static config — it ships with an empty
+# interest set. Consumers configure scope at runtime via their
+# companion's `/api/_interest/asset-transfer/subscribe`
+# endpoint with `kind = "policy"`. See module file header for
+# the per-tx netting algorithm.
+
+# Opt into the v2 platform ABI — `mitos-module-v2` world,
+# eUTXO event-stream dispatch.
+abi_version = 2
+
+# Empty interest set by default. Companion populates via
+# `update-interest` at runtime; the platform's `holds-policy`
+# filter delivers only matching Produced/Consumed events to
+# the module's `handle-events`.
+[interest]
+addresses = []
+policies = []
+
+[deps]
+# Shared wire-format event types —
+# `mitos_community_events::asset_transfer::{AssetTransfer, Transfer}`.
+mitos-community-events = { path = "../../crates/mitos-community-events" }

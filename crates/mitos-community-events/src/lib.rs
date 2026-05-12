@@ -8,6 +8,7 @@
 //! See `docs/strategy/COMMUNITY_MODULES.md` for the design.
 
 pub mod asset_metadata_update;
+pub mod asset_transfer;
 pub mod burn_address;
 pub mod cip25_mint;
 pub mod cip68_mint;
@@ -33,6 +34,7 @@ pub mod standard_burn;
 pub fn decode_emit(module_id: &str, channel: u32, payload: &[u8]) -> Option<String> {
     match module_id {
         "asset-metadata-update" => asset_metadata_update::decode_emit(channel, payload),
+        "asset-transfer" => asset_transfer::decode_emit(channel, payload),
         "burn-address" => burn_address::decode_emit(channel, payload),
         "cip-25-mint" => cip25_mint::decode_emit(channel, payload),
         "cip-68-mint" => cip68_mint::decode_emit(channel, payload),

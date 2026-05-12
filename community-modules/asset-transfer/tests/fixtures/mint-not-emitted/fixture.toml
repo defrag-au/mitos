@@ -1,0 +1,19 @@
+# asset-transfer negative scenario: a clean CIP-25 mint TX
+# should produce **zero** Transfer events.
+#
+# Reuses the block from `cip-25-mint/perp-policy` — slot
+# 186913993 contains the Perp5158 mint. Asset is produced at
+# the minter's output with no corresponding Consumed entry
+# (mints create from nothing). The delta map shows a positive
+# delta with no senders → mint → skip.
+#
+# This locks in the algorithm's mint-skip behavior. The Perp
+# policy is also covered by the `cip-25-mint` module, which
+# consumes the same block; both modules coexist and emit on
+# their respective channels.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"

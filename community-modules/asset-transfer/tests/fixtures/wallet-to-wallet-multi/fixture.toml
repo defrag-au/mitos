@@ -1,0 +1,102 @@
+# asset-transfer golden scenario: wallet-to-wallet bulk NFT
+# transfer between two of the same operator's wallets, with
+# one NFT retained as change.
+#
+# TX:    fa51e39fd7dc797cc45e761313b1e966346589ecbfa24c4dc383f66c230a8f35
+# Slot:  186904385
+#
+# Shape:
+#   - 3 inputs, all from wallet A
+#       [0] 1 Perp NFT  (policy e6ba9c0f… name Perp0712)
+#       [1] 10 Perp NFTs (Perp0698, Perp1363, Perp2453, Perp2525,
+#                         Perp2542, Perp3336, Perp3811, Perp3973,
+#                         Perp5232, Perp5976)
+#       [2] 1 CIP-68 user token (policy 4523c5e2… name BudC4162)
+#   - 2 outputs
+#       [0] wallet B receives 1 CIP-68 + 10 Perps (everything
+#           except Perp3973)
+#       [1] wallet A retains Perp3973 as change
+#
+# Per-(address, policy, asset) netting drops the Perp3973 entry
+# at wallet A (delta -1 + 1 = 0). Expected emission: **11
+# Transfer events** — 10 Perps + 1 CIP-68 — all attributed to
+# wallet A → wallet B.
+#
+# Exercises:
+#   - Multi-asset, multi-policy single-TX move
+#   - Change-output netting (Perp3973 not emitted)
+#   - Single-sender topology (no FT ambiguity)
+#
+# Module's runtime interest is empty by default; for tests we
+# scope to both policies the TX touches so the platform's
+# dispatch composer delivers Produced + Consumed events for
+# the relevant outputs.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+
+[[interest]]
+kind = "holds_policy"
+policy = "4523c5e21d409b81c95b45b0aea275b8ea1406e6cafea5583b9f8a5f"
+
+# Prior input UTxOs — synthesised from Maestro's TXO endpoint
+# because the create blocks are outside this fixture's loaded
+# block scope. The platform's dispatch composer resolves
+# Consumed events through `read_utxos` against these entries.
+
+[[utxo]]
+tx_hash = "2afc79d4fd01c156b9b9cb1af6a51649bb680991f917038e81f7921fdfae4c54"
+index = 1
+address = "addr1q99qpegypskhugq6nss8gjkwvjlj35wd54venfynreqxjgkt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksl0yc60"
+lovelace = 1155080
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727030373132"
+
+[[utxo]]
+tx_hash = "2c8f08e12edc38ff06c3543a107cc7e76edf112af0ef4b4ed0f16f56c4d4a47e"
+index = 0
+address = "addr1q99qpegypskhugq6nss8gjkwvjlj35wd54venfynreqxjgkt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksl0yc60"
+lovelace = 1542980
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727030363938"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727031333633"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727032343533"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727032353235"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727032353432"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727033333336"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727033383131"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727033393733"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727035323332"
+[[utxo.assets]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727035393736"
+
+[[utxo]]
+tx_hash = "a1e0254fd47130609ca5dc9d3af5ef2cb7a83feba42ab2d9cff77c1d1c6f3597"
+index = 0
+address = "addr1q99qpegypskhugq6nss8gjkwvjlj35wd54venfynreqxjgkt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksl0yc60"
+lovelace = 1168010
+[[utxo.assets]]
+policy = "4523c5e21d409b81c95b45b0aea275b8ea1406e6cafea5583b9f8a5f"
+asset_name_hex = "000de14042756434313632"
