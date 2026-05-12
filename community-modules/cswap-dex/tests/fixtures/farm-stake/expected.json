@@ -1,0 +1,16 @@
+[
+  {
+    "contract_version": null,
+    "dex_brand": "CSWAP",
+    "kind": "farm_stake",
+    "lp_token": {
+      "asset_name_hex": "432d4c503a20414441207820416c69656e73",
+      "kind": "native",
+      "policy": "090da86f84b83c4612a73012fb186ea26d8b607e610a3bb29cd8cc3a",
+      "quantity": 92066110
+    },
+    "slot": 183609728,
+    "staker_address": "addr1qxfeach4jwdaah8cxax43vj3wsmrvk8x3yca2xsg793zahx3hf49jd2yw4ces8x6qm0drae2ukuqc4etvazj08tyeq5q5qs9hm",
+    "tx_hash": "0987f7fe39b3ed9bdbaab766f8ca8349c5b141a37f2e592d7b00f28d3a19a1d5"
+  }
+]

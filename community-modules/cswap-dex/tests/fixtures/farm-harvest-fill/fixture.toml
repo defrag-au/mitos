@@ -1,0 +1,27 @@
+# cswap-dex golden scenario: CSWAP farm harvest distribution
+# — the rewards-payout TX that follows a harvest initiation.
+#
+# TX: 94aec807c49dfd0ae35053af0c237a8f54de54576e3a97a2bd009f0ca0a6242e
+# Slot: 187001739
+# Companion harvest-request TX (separate fixture): fd816bd0...72
+#
+# No pool / order touches. Module ignores it.
+#
+# Pairs with `farm-harvest-request` to cover both halves of the
+# farm-harvest flow. Future `cswap-farm` module (Phase 4) would
+# emit `DexAction::StakeRewardClaim` for this TX; until then,
+# we just assert the swap-recognition module stays quiet.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
+
+[[interest]]
+kind = "at_address"
+address = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf"
+
+[[interest]]
+kind = "at_address"
+address = "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"

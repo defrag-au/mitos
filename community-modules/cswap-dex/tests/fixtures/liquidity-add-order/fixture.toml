@@ -1,0 +1,28 @@
+# cswap-dex golden scenario: user submits an add-liquidity order
+# for the ADA/Aliens pair to the CSWAP order/batcher script.
+#
+# TX: da0fc61c73c14b1b188feeae136945ff793dfea5f3f954ee43e422b8ed7c803f
+# Slot: 183609637
+# Pair: ADA / Aliens
+# Companion fill TX (separate fixture): 5aa63ae6...57 (liquidity-add-fill)
+#
+# This TX produces an output at the order/batcher script — no
+# pool touch. Module's `at_address(POOL_SCRIPT_ADDR)` interest
+# filter skips it. Expected: zero emissions.
+#
+# Proves the module doesn't fire spurious swap events on
+# liquidity-add-order submission.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
+
+[[interest]]
+kind = "at_address"
+address = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf"
+
+[[interest]]
+kind = "at_address"
+address = "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"

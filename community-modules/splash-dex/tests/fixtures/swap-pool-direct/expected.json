@@ -1,0 +1,51 @@
+[
+  {
+    "asset_in": {
+      "kind": "lovelace",
+      "quantity": 51000000
+    },
+    "asset_out": {
+      "asset_name_hex": "416c69656e73",
+      "kind": "native",
+      "policy": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7",
+      "quantity": 1176434
+    },
+    "batcher_fee_lovelace": null,
+    "contract_version": "V3",
+    "dex_brand": "Splash",
+    "effective_price": [
+      1176434,
+      51000000
+    ],
+    "kind": "swap",
+    "pool_fee_bps": 50,
+    "pool_id": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7:416c69656e73|lovelace",
+    "pool_reserves_after": {
+      "base_asset": {
+        "asset_name_hex": "416c69656e73",
+        "kind": "native",
+        "policy": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7",
+        "quantity": 361135101
+      },
+      "quote_asset": {
+        "kind": "lovelace",
+        "quantity": 15586567074
+      }
+    },
+    "pool_reserves_before": {
+      "base_asset": {
+        "asset_name_hex": "416c69656e73",
+        "kind": "native",
+        "policy": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7",
+        "quantity": 362311535
+      },
+      "quote_asset": {
+        "kind": "lovelace",
+        "quantity": 15535567074
+      }
+    },
+    "slot": 186802764,
+    "swapper_address": "addr1qymnnxq5rmes2p6awtw983t3drlyjhflkfat972ws4qscklm56q7dx503mv52y00wp6ynz90ck7qms5z0js73dfl0mgsm4cgx5",
+    "tx_hash": "5b356d48a2c83f5b81b0e84cbc3ec97ef951fde3e41f192b14caee89c4d2d98b"
+  }
+]

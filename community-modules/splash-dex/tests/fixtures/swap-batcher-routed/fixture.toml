@@ -1,0 +1,24 @@
+# splash-dex golden scenario: batcher-routed ADA→Aliens swap.
+#
+# Order TX: 822deaf2dc710392f526f1b2d4349c88082d06fe8c8631ee585a68079bc8b7a8
+# Fill TX:  a79a95524a081655c437ab05490551be256820ea3e8647063e150a3d378b1621
+# Slot of both: 187006494  (order + fill in the same block —
+#   Splash's batcher submitted the fill in the same Cardano
+#   block as the user's order submission)
+# Prior pool block: 187001739 (TX 9470f9d5…67)
+#
+# User paid 50.49 ADA → received 1,232,206 Aliens.
+# Pool reserves before/after: 15,111.91 ADA / 372.80M Aliens →
+# 15,162.40 ADA / 371.57M Aliens (net swap math matches LP
+# token unchanged in pool = Swap dispatch).
+#
+# Note: the platform delivers both the order-script consume
+# event AND the pool-script consume+produce events for this TX
+# (interest matches via the pool). Our module emits one Swap
+# from the pool-pair dispatch path.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z"

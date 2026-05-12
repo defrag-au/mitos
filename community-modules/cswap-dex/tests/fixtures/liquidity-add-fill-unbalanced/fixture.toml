@@ -1,0 +1,37 @@
+# cswap-dex golden scenario: CSWAP batcher fills an unbalanced
+# (zap-in) LP-add order — user deposits more ADA than the
+# pool's natural ratio calls for, CSWAP internally rebalances
+# behind the scenes before minting LP. Distinct from
+# `liquidity-add-fill` (50/50 balanced add).
+#
+# TX: 1600e7113d2185deca27654335904e6dfb8cbb692f0afe6e7db957f3d0ce5f81
+# Slot: 187005775
+# Pair: ADA / Aliens
+# Prior pool block: 186922792 (shared with `fill-ada-to-aliens`
+#   — the pool state was last touched by that swap fill before
+#   this LP-add fill)
+# Order block: 187005763 (TX 7b0639f8…90)
+#
+# User submitted 352.69 ADA + 3,123,103 Aliens, mismatched
+# against the pool's ~39 lovelace-per-Aliens ratio (user
+# provided 112 lovelace-per-Aliens — heavier on ADA). Pool
+# gained 350 ADA + 3.12M Aliens (both legs positive); user
+# received 36,831,782 LP tokens.
+#
+# Both reserve deltas positive → `LiquidityAdd` fires via the
+# same code path as a balanced add (the LP-supply-delta
+# dispatcher doesn't care whether the ratio matches).
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
+
+[[interest]]
+kind = "at_address"
+address = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf"
+
+[[interest]]
+kind = "at_address"
+address = "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"

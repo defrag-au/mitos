@@ -1,0 +1,18 @@
+[
+  {
+    "claimer_address": "addr1qxfeach4jwdaah8cxax43vj3wsmrvk8x3yca2xsg793zahx3hf49jd2yw4ces8x6qm0drae2ukuqc4etvazj08tyeq5q5qs9hm",
+    "contract_version": null,
+    "dex_brand": "CSWAP",
+    "kind": "reward_claim",
+    "rewards": [
+      {
+        "asset_name_hex": "4353574150",
+        "kind": "native",
+        "policy": "c863ceaa796d5429b526c336ab45016abd636859f331758e67204e5c",
+        "quantity": 2439492780
+      }
+    ],
+    "slot": 187001739,
+    "tx_hash": "94aec807c49dfd0ae35053af0c237a8f54de54576e3a97a2bd009f0ca0a6242e"
+  }
+]

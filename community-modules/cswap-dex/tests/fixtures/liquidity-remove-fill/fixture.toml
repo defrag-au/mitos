@@ -1,0 +1,32 @@
+# cswap-dex golden scenario: CSWAP batcher fills an
+# asymmetric LP-remove ("zap-out") order — user burns LP
+# tokens and takes the proceeds entirely on the ADA side.
+#
+# TX: e799ce7561db3c90bd9d82eb949600abcd7d78a828e2d2c09d6c108babbcefd5
+# Slot: 186884698
+# Pair: ADA / PERP COIN
+# Prior pool block: 186876864 (TX 65e76e55…58)
+# Order block: 186884676 (TX 339f61cd…2b — order type
+#   constructor 2 = LP remove, with min_receive ADA=33.5M
+#   and min_receive PERP=0 ⇒ zap-out to all-ADA)
+#
+# Pool transition is asymmetric: ADA reserves shrink by
+# ~32 ADA, PERP COIN reserves unchanged. The directional
+# signal that fires `LiquidityRemove` is the **`total_lp_tokens`
+# delta** in the pool datum (LP burnt = supply shrinks),
+# not the reserve-sign pattern. Validates the LP-supply-delta
+# detection path against a real zap-out.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
+
+[[interest]]
+kind = "at_address"
+address = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf"
+
+[[interest]]
+kind = "at_address"
+address = "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"

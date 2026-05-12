@@ -37,7 +37,7 @@
 //! reclassified as `Update` (cancel + recreate atomic).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use mitos_community_events::jpg_store_offer::{
     JpgStoreOffer, JpgStoreOfferVersion, OfferAccept, OfferCancel, OfferCreate, OfferUpdate,
@@ -339,11 +339,22 @@ struct ProducedNonScript {
 
 #[derive(Default)]
 struct TxBuffer {
-    /// Consumed offers keyed by `bidder_pkh` — pair with
-    /// `produced_offers` for Update detection.
-    consumed_offers: BTreeMap<String, ConsumedOffer>,
-    /// Produced offers keyed by `bidder_pkh`.
-    produced_offers: BTreeMap<String, ProducedOffer>,
+    /// Every Consumed event at a watched address in this TX.
+    /// Stored as a flat list — a single TX can spend multiple
+    /// offers from the same bidder (cancel batches) or different
+    /// bidders, and the per-bidder pairing for Update detection
+    /// is done in `flush_buffer`.
+    ///
+    /// Previously a `BTreeMap<bidder_pkh, …>`, which silently
+    /// dropped all but the last consume per bidder on TXs that
+    /// spent multiple offers from the same wallet — see the
+    /// 2026-05-12 jpg-store-mirror investigation.
+    consumed_offers: Vec<ConsumedOffer>,
+    /// Every Produced event at a watched address in this TX. Same
+    /// flat-list rationale as `consumed_offers` — a TX commonly
+    /// creates N offers in one go and the previous map shape
+    /// collapsed them to one.
+    produced_offers: Vec<ProducedOffer>,
     /// Produced outputs at non-script addresses (potential
     /// accept buyers).
     produced_other: Vec<ProducedNonScript>,
@@ -369,17 +380,14 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
         let Some(decoded) = decode_offer_datum(&datum_bytes) else {
             return;
         };
-        buf.produced_offers.insert(
-            decoded.bidder_pkh.clone(),
-            ProducedOffer {
-                tx_hash: p.tx_hash.clone(),
-                output_index: p.oref.index,
-                lovelace: p.output.lovelace,
-                datum_bytes,
-                co_version: version,
-                decoded,
-            },
-        );
+        buf.produced_offers.push(ProducedOffer {
+            tx_hash: p.tx_hash.clone(),
+            output_index: p.oref.index,
+            lovelace: p.output.lovelace,
+            datum_bytes,
+            co_version: version,
+            decoded,
+        });
         return;
     }
     // Non-script address → record as a potential
@@ -419,18 +427,15 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     let Some(decoded) = decode_offer_datum(&datum_bytes) else {
         return;
     };
-    buf.consumed_offers.insert(
-        decoded.bidder_pkh.clone(),
-        ConsumedOffer {
-            prior_tx_hash: c.oref.tx_hash.clone(),
-            prior_output_index: c.oref.index,
-            prior_datum_bytes: datum_bytes,
-            prior_lovelace: c.prior_output.lovelace,
-            redeemer: c.redeemer.clone(),
-            co_version: version,
-            decoded,
-        },
-    );
+    buf.consumed_offers.push(ConsumedOffer {
+        prior_tx_hash: c.oref.tx_hash.clone(),
+        prior_output_index: c.oref.index,
+        prior_datum_bytes: datum_bytes,
+        prior_lovelace: c.prior_output.lovelace,
+        redeemer: c.redeemer.clone(),
+        co_version: version,
+        decoded,
+    });
 }
 
 fn flush_buffer(mut buf: TxBuffer) {
@@ -439,30 +444,81 @@ fn flush_buffer(mut buf: TxBuffer) {
     };
     let tx_hash_hex = hex::encode(&tx_hash);
 
+    let consumed = std::mem::take(&mut buf.consumed_offers);
+    // Slots so we can `take()` the matched produced offer when
+    // pairing for an Update, and emit the remaining Some entries
+    // as Creates afterwards. Vec index isn't load-bearing; first-
+    // matching slot is fine because pairing only fires when there
+    // is exactly one consume + one produce for the bidder.
+    let mut produced_slots: Vec<Option<ProducedOffer>> =
+        std::mem::take(&mut buf.produced_offers)
+            .into_iter()
+            .map(Some)
+            .collect();
+
+    // Pre-count consumes + produces per bidder. Update detection
+    // only fires for a bidder with exactly 1 of each in this TX
+    // — multi-offer batches (cancel-batch, create-batch, mixed)
+    // emit independent Cancel/Accept + Create events because
+    // pairing N consumes with N produces has no reliable
+    // bidder_pkh-keyed correspondence.
+    //
+    // Previously the buffer used `BTreeMap<bidder_pkh, …>` which
+    // silently collapsed batches to one event per bidder — see
+    // the 2026-05-12 jpg-store-mirror investigation for the
+    // failure mode this guard prevents from regressing.
+    let mut consume_count: HashMap<String, usize> = HashMap::new();
+    for c in &consumed {
+        *consume_count
+            .entry(c.decoded.bidder_pkh.clone())
+            .or_default() += 1;
+    }
+    let mut produce_count: HashMap<String, usize> = HashMap::new();
+    for slot in &produced_slots {
+        if let Some(p) = slot {
+            *produce_count
+                .entry(p.decoded.bidder_pkh.clone())
+                .or_default() += 1;
+        }
+    }
+    let is_update_pair = |pkh: &str| {
+        consume_count.get(pkh).copied().unwrap_or(0) == 1
+            && produce_count.get(pkh).copied().unwrap_or(0) == 1
+    };
+
     // Step 1: walk consumed offers. Each one is either an
-    // Update (paired with a produced offer for the same
+    // Update (paired 1:1 with a produced offer for the same
     // bidder), an Accept (target asset appears at a non-script
     // output), or a Cancel.
-    let consumed = std::mem::take(&mut buf.consumed_offers);
-    for (bidder_pkh, consume) in consumed {
-        // Update path: same bidder has a Produced offer in
-        // this TX → consume the produced entry too so we
-        // don't also emit OfferCreate for it.
-        if let Some(produced) = buf.produced_offers.remove(&bidder_pkh) {
-            emit_offer(&JpgStoreOffer::Update(OfferUpdate {
-                bidder_pkh: bidder_pkh.clone(),
-                tx_hash: tx_hash_hex.clone(),
-                prior_tx_hash: hex::encode(&consume.prior_tx_hash),
-                prior_output_index: consume.prior_output_index,
-                new_output_index: produced.output_index,
-                previous_lovelace: consume.prior_lovelace,
-                new_lovelace: produced.lovelace,
-                datum_cbor: produced.datum_bytes,
-                target_policy: produced.decoded.target_policy,
-                target_asset_names: produced.decoded.target_asset_names,
-                co_version: produced.co_version,
-            }));
-            continue;
+    for consume in consumed {
+        let bidder_pkh = consume.decoded.bidder_pkh.clone();
+
+        if is_update_pair(&bidder_pkh) {
+            // Take the matching produced slot. Pairing is by
+            // bidder_pkh alone since the count guard already
+            // confirmed exactly one of each.
+            let slot = produced_slots.iter_mut().find(|s| {
+                s.as_ref()
+                    .is_some_and(|p| p.decoded.bidder_pkh == bidder_pkh)
+            });
+            if let Some(slot) = slot
+                && let Some(produced) = slot.take()
+            {
+                emit_offer(&JpgStoreOffer::Update(OfferUpdate {
+                    bidder_pkh,
+                    tx_hash: tx_hash_hex.clone(),
+                    prior_tx_hash: hex::encode(&consume.prior_tx_hash),
+                    prior_output_index: consume.prior_output_index,
+                    new_output_index: produced.output_index,
+                    previous_lovelace: consume.prior_lovelace,
+                    new_lovelace: produced.lovelace,
+                    datum_cbor: produced.datum_bytes,
+                    target_policy: produced.decoded.target_policy,
+                    target_asset_names: produced.decoded.target_asset_names,
+                    co_version: produced.co_version,
+                }));
+                continue;
+            }
         }
 
         // Accept vs Cancel discrimination. jpg.store offer
@@ -499,11 +555,7 @@ fn flush_buffer(mut buf: TxBuffer) {
                 // policy-less Accept emission so consumers
                 // see the lifecycle event even without the
                 // delivered asset details.
-                emit_accept_partial(
-                    &bidder_pkh,
-                    &tx_hash_hex,
-                    &consume,
-                );
+                emit_accept_partial(&bidder_pkh, &tx_hash_hex, &consume);
                 continue;
             }
         };
@@ -563,12 +615,15 @@ fn flush_buffer(mut buf: TxBuffer) {
         }
     }
 
-    // Step 2: walk remaining produced offers (no paired
-    // consume → fresh OfferCreate).
-    let produced = std::mem::take(&mut buf.produced_offers);
-    for (bidder_pkh, p) in produced {
+    // Step 2: every produced slot that wasn't consumed for an
+    // Update pairing → fresh OfferCreate. Order preserved from
+    // dispatch (which is on-chain output order within the TX).
+    for slot in produced_slots {
+        let Some(p) = slot else {
+            continue;
+        };
         emit_offer(&JpgStoreOffer::Create(OfferCreate {
-            bidder_pkh,
+            bidder_pkh: p.decoded.bidder_pkh,
             tx_hash: hex::encode(&p.tx_hash),
             output_index: p.output_index,
             lovelace: p.lovelace,
