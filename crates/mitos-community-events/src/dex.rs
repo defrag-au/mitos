@@ -199,6 +199,54 @@ pub struct RewardClaim {
     pub rewards: Vec<SwapAsset>,
 }
 
+/// What kind of order was cancelled. Useful so consumers can
+/// route the cancel to the right "outstanding orders" list
+/// without re-resolving the original order TX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderKind {
+    Swap,
+    LiquidityAdd,
+    LiquidityRemove,
+    /// Order datum shape didn't match any known variant —
+    /// emit anyway so consumers see the cancel happened, but
+    /// can't classify it precisely. Useful signal for "we
+    /// found a new order shape we should add a decoder for".
+    Unknown,
+}
+
+/// Open order at a batcher / order script consumed via cancel
+/// redeemer. Cancellation is the outcome (not just intent) —
+/// unlike order *submission* which we don't emit because the
+/// matching fill carries the actual outcome, a cancel has no
+/// fill counterpart.
+///
+/// **NOT YET WIRED for `cswap-dex`** — CSWAP's contract appears
+/// to lack a user-callable cancel path (every recent
+/// order-script consume on mainnet has used a fill redeemer,
+/// never `d87980`). The struct is defined here so consumers can
+/// match the wire shape now; `splash-dex` (where cancels are
+/// real and well-documented) will be the first module to
+/// actually emit this variant. See
+/// `docs/design/DEX_COMMUNITY_MODULES.md` for the investigation
+/// notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderCancel {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub order_kind: OrderKind,
+    pub canceller_address: String,
+    /// The order UTxO that was consumed by the cancel. Lets
+    /// consumers reconcile a cancel against the prior submit.
+    pub prior_order_tx_hash: String,
+    pub prior_order_output_index: u32,
+    /// Lovelace returned to the canceller — order's locked
+    /// lovelace minus the network fee.
+    pub refund_lovelace: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DexAction {
@@ -217,8 +265,13 @@ pub enum DexAction {
     /// is brand-specific — for CSWAP it's an operator key wallet
     /// rather than a Plutus script.
     RewardClaim(RewardClaim),
-    // Variants pending implementation (additive, no wire break):
-    //   OrderCancel(OrderCancel)
+    /// Open order at a batcher / order script consumed via the
+    /// cancel redeemer. **Wire-defined only — no module emits
+    /// this yet.** Reserved for `splash-dex` (where on-chain
+    /// cancels are common and well-documented). CSWAP appears
+    /// to lack a user-callable cancel path on-chain; see the
+    /// `OrderCancel` struct comment for the investigation.
+    OrderCancel(OrderCancel),
 }
 
 #[cfg(feature = "decode")]

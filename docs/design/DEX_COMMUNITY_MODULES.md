@@ -359,7 +359,7 @@ contract. This affects how we detect those actions:
 | Action | Detection key | Stability |
 |---|---|---|
 | `Swap` / `LiquidityAdd` / `LiquidityRemove` | pool script consume+produce | script-based — rock solid |
-| `OrderCancel` | order/batcher script consume + cancel redeemer | script-based |
+| `OrderCancel` | order/batcher script consume + cancel redeemer | script-based — but **no CSWAP cancels observed on-chain**, see below |
 | `FarmStake` / `FarmUnstake` | farm script consume+produce + LP-token delta sign | script-based |
 | `RewardClaim` | TX consumes from CSWAP's request-collection **key wallet** + user output carries reward asset | **operator-address-based — fragile** |
 
@@ -372,6 +372,31 @@ sudden drop in `RewardClaim` emissions) prompts a module
 rebuild. We accept this fragility because the alternative
 (skipping `RewardClaim` entirely) leaves a real user-facing
 hole in the consumer UX.
+
+### TODO: `OrderCancel` deferred for CSWAP
+
+The `DexAction::OrderCancel` variant is wire-defined in
+`mitos_community_events::dex` but no module currently emits it.
+Investigation against mainnet history (2026-05):
+
+- The CSWAP TX-builder code in cnft.dev-workers
+  (`workers/wallet-operations/src/dex.rs`) marks CSWAP order
+  cancellation as `"CSWAP order cancellation not yet
+  implemented"`.
+- Every one of the ~30 most-recent CSWAP order-script consumes
+  on-chain uses a fill redeemer (Constr 2 — `d87b9f…`), never
+  the expected cancel redeemer (Constr 0 — `d87980`).
+- The CSWAP UI surfaces a "cancel" affordance, but the TXs it
+  produces are aggregator-mediated re-submissions, not on-chain
+  script unlocks.
+
+Best current theory: CSWAP's contract may not expose a
+user-callable cancel path at all — orders sit at the batcher
+until filled. `splash-dex` (where on-chain cancels are common
+and well-documented, and shared-crates has a working cancel
+builder) will be the first module to actually emit
+`OrderCancel`. If a real CSWAP cancel TX surfaces, the
+detection path is a single-fixture addition to `cswap-dex`.
 
 ## Per-module structure
 
