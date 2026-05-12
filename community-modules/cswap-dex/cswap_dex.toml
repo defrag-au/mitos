@@ -1,13 +1,29 @@
 abi_version = 2
 
-# CSWAP runs all 82 pools at one script address. Single
-# `at-address` predicate covers the brand's pool surface
-# completely. Order/batcher addresses aren't in interest because
-# the platform delivers every event from a matching TX — once a
-# pool input or output triggers dispatch we see the full TX.
+# CSWAP DEX surface:
+#   - pool script: all 82 swap pools (`Swap` / `LiquidityAdd` /
+#     `LiquidityRemove`)
+#   - farm script: LP-token staking for yield (`FarmStake` /
+#     `FarmUnstake`)
+#
+# Order/batcher addresses aren't in interest because the platform
+# delivers every event from a matching TX — once a pool consume
+# triggers dispatch we see the order consume on the same TX, which
+# is enough for `batcher_fee_lovelace` and (later) `OrderCancel`.
+#
+# Future additions:
+#   - operator key wallet `addr1vyw4d7m…` for `RewardClaim` —
+#     pending the harvest-fill implementation
 [interest]
 addresses = [
+    # Pool script — Swap / LiquidityAdd / LiquidityRemove
     "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e",
+    # Farm script — FarmStake / FarmUnstake
+    "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf",
+    # Reward-request collection wallet (operator key wallet) —
+    # RewardClaim. Fragile to operator rotation; see the
+    # "Detection-signal stability" section of the design doc.
+    "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g",
 ]
 policies = []
 

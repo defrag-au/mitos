@@ -116,16 +116,109 @@ pub struct Swap {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityAdd {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    /// Bech32 of the wallet that supplied the liquidity and
+    /// received the LP tokens.
+    pub provider_address: String,
+    /// What the provider added on each side of the pair.
+    /// Asymmetric ratios (zap-style) appear as an uneven split
+    /// — no separate `ZapIn` variant; consumers detect zap
+    /// shape from the ratio against `pool_reserves_before`.
+    pub quote_added: SwapAsset,
+    pub base_added: SwapAsset,
+    /// LP tokens minted to the provider. Raw asset (policy +
+    /// name + quantity); LP→pool mapping stays off-module so
+    /// the module doesn't need to maintain a runtime
+    /// LP-policy registry.
+    pub lp_received: SwapAsset,
+    pub pool_id: Option<String>,
+    pub pool_reserves_before: Option<PoolReserves>,
+    pub pool_reserves_after: Option<PoolReserves>,
+    /// Informational — the pool's swap fee. Doesn't apply to
+    /// the LP-add itself but useful so consumers can render
+    /// "you joined a pool charging X bps".
+    pub pool_fee_bps: Option<u32>,
+    pub batcher_fee_lovelace: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityRemove {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub provider_address: String,
+    /// LP tokens burnt or returned by the provider.
+    pub lp_burnt: SwapAsset,
+    pub quote_withdrawn: SwapAsset,
+    pub base_withdrawn: SwapAsset,
+    pub pool_id: Option<String>,
+    pub pool_reserves_before: Option<PoolReserves>,
+    pub pool_reserves_after: Option<PoolReserves>,
+    pub pool_fee_bps: Option<u32>,
+    pub batcher_fee_lovelace: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FarmStake {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub staker_address: String,
+    /// LP token added to the farm. Raw asset; LP→pool mapping
+    /// stays off-module (consumers join against their own
+    /// pool catalogue if they need the pool ID).
+    pub lp_token: SwapAsset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FarmUnstake {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub staker_address: String,
+    pub lp_token: SwapAsset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewardClaim {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub claimer_address: String,
+    /// Reward asset(s) received by the claimer. Vector so
+    /// multi-asset rewards (some farms pay multiple tokens
+    /// per claim) and single-asset rewards share one shape.
+    pub rewards: Vec<SwapAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DexAction {
+    /// Pool swap — opposing reserve deltas.
     Swap(Swap),
-    // Future variants (additive, no wire break):
-    //   LiquidityAdd(LiquidityEvent)
-    //   LiquidityRemove(LiquidityEvent)
-    //   ZapIn(ZapEvent)
-    //   OrderCreate(Order)
-    //   OrderCancel(OrderRef)
-    //   StakeRewardClaim(ClaimEvent)
+    /// Two-sided (50/50) or zap-style (asymmetric) liquidity
+    /// provision. Both reserves grow in the same TX.
+    LiquidityAdd(LiquidityAdd),
+    /// LP burnt to withdraw liquidity. Both reserves shrink.
+    LiquidityRemove(LiquidityRemove),
+    /// LP tokens locked into a farm script.
+    FarmStake(FarmStake),
+    /// LP tokens released from a farm script.
+    FarmUnstake(FarmUnstake),
+    /// Farm rewards distributed to a staker. Detection signal
+    /// is brand-specific — for CSWAP it's an operator key wallet
+    /// rather than a Plutus script.
+    RewardClaim(RewardClaim),
+    // Variants pending implementation (additive, no wire break):
+    //   OrderCancel(OrderCancel)
 }
 
 #[cfg(feature = "decode")]

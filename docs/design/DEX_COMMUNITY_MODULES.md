@@ -8,11 +8,14 @@ mitos. Push past where the classifier could go by combining
 the wasm-module ABI's structural-detection affordances with
 brand-specific datum decoding for known contract families.
 Enable a TapTools-alternative consumer worker that subscribes
-per policy to a fan-out of rich DEX events — swaps in Phase 1;
-liquidity provision, single-sided zap-ins, claim/stake events
-in later phases. The module shape (`<brand>-dex`) accommodates
-the broader DEX surface from day one even though Phase 1
-limits emissions to swap-shaped flows.
+per policy to a fan-out of rich DEX events covering the
+**full common-action surface of a DEX in one module per
+brand**: swaps, liquidity add/remove (including zap-style
+asymmetric ratios), order cancellation, farm staking, and
+reward distribution. Each `<brand>-dex` module owns its brand's
+entire DEX-domain surface so a consumer subscribing to one
+`<brand>-dex` sees everything that brand's users do, not just
+trades.
 
 Same posture as the marketplace + asset-transfer migrations:
 chain recognition belongs in the platform layer, projections
@@ -173,89 +176,275 @@ pub struct PoolReserves {
     pub quote_asset: SwapAsset,
 }
 
+/// Struct-shaped variants (rather than `Lovelace(u64)`) so the
+/// `tag = "kind"` discriminator round-trips through ciborium —
+/// newtype variants wrapping primitives trip the serialiser.
 pub enum SwapAsset {
-    Lovelace(u64),
+    Lovelace { quantity: u64 },
     Native { policy: String, asset_name_hex: String, quantity: u64 },
+}
+
+pub struct LiquidityAdd {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    /// Wallet that supplied the liquidity and received LP
+    /// tokens.
+    pub provider_address: String,
+    /// What the provider added on each side of the pair.
+    /// Asymmetric ratios (zap-style) are encoded by one side's
+    /// quantity being noticeably smaller; CSWAP and equivalent
+    /// brands expose this directly via the same pool-reserves
+    /// delta as a 50/50 add — no separate `ZapIn` variant.
+    pub quote_added: SwapAsset,
+    pub base_added: SwapAsset,
+    /// LP tokens minted to the provider. Raw asset (policy +
+    /// name + quantity) so consumers can map LP→pool off-line
+    /// without us building a runtime LP-policy registry inside
+    /// the module.
+    pub lp_received: SwapAsset,
+    pub pool_id: Option<String>,
+    pub pool_reserves_before: Option<PoolReserves>,
+    pub pool_reserves_after: Option<PoolReserves>,
+    /// Informational — pool's swap fee. Doesn't apply to the
+    /// LP-add path itself but useful so consumers can render
+    /// "you joined a pool charging X bps".
+    pub pool_fee_bps: Option<u32>,
+    pub batcher_fee_lovelace: Option<u64>,
+}
+
+pub struct LiquidityRemove {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub provider_address: String,
+    /// LP tokens burnt or returned by the provider.
+    pub lp_burnt: SwapAsset,
+    pub quote_withdrawn: SwapAsset,
+    pub base_withdrawn: SwapAsset,
+    pub pool_id: Option<String>,
+    pub pool_reserves_before: Option<PoolReserves>,
+    pub pool_reserves_after: Option<PoolReserves>,
+    pub pool_fee_bps: Option<u32>,
+    pub batcher_fee_lovelace: Option<u64>,
+}
+
+pub enum OrderKind {
+    Swap,
+    LiquidityAdd,
+    LiquidityRemove,
+    /// Order datum shape didn't match any known variant —
+    /// emit anyway so consumers see the cancel happened, but
+    /// can't classify it precisely. Useful signal for "we
+    /// found a new order shape we should add a decoder for".
+    Unknown,
+}
+
+pub struct OrderCancel {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    /// What kind of order this was. Cancel-only — for the
+    /// matching fills we already emit `Swap` / `LiquidityAdd`
+    /// / `LiquidityRemove`.
+    pub order_kind: OrderKind,
+    pub canceller_address: String,
+    /// The order UTxO that was consumed by the cancel. Lets
+    /// consumers reconcile a cancel against the prior submit.
+    pub prior_order_tx_hash: String,
+    pub prior_order_output_index: u32,
+    /// Lovelace returned to the canceller — order's locked
+    /// lovelace minus the network fee.
+    pub refund_lovelace: u64,
+}
+
+pub struct FarmStake {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub staker_address: String,
+    /// LP token quantity added to the farm. Raw asset; LP→pool
+    /// mapping stays off-module (same rationale as
+    /// `LiquidityAdd::lp_received`).
+    pub lp_token: SwapAsset,
+}
+
+pub struct FarmUnstake {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub staker_address: String,
+    pub lp_token: SwapAsset,
+}
+
+pub struct RewardClaim {
+    pub tx_hash: String,
+    pub slot: u64,
+    pub dex_brand: String,
+    pub contract_version: Option<String>,
+    pub claimer_address: String,
+    /// Reward asset(s) received by the claimer. Vector so
+    /// multi-asset rewards (some farms pay out two tokens
+    /// simultaneously) fit the same shape as single-asset.
+    pub rewards: Vec<SwapAsset>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DexAction {
+    /// Pool swap — opposing reserve deltas.
     Swap(Swap),
-    // Future variants (Phase 3/4 — additive, no wire break):
-    //   LiquidityAdd(LiquidityEvent)
-    //   LiquidityRemove(LiquidityEvent)
-    //   ZapIn(ZapEvent)              // single-sided liquidity provision
-    //   OrderCreate(Order)           // batcher order placement
-    //   OrderCancel(OrderRef)
-    //   StakeRewardClaim(ClaimEvent) // for DEXes with reward tokens
-    // The `<brand>-dex` module naming accommodates this surface
-    // from day one; Phase 1 ships only `Swap` to bound scope.
+    /// Two-sided (50/50) or zap-style (asymmetric) liquidity
+    /// provision. Both reserves grow in the same TX.
+    LiquidityAdd(LiquidityAdd),
+    /// LP burnt to withdraw liquidity. Both reserves shrink.
+    LiquidityRemove(LiquidityRemove),
+    /// Open order at a batcher / order script consumed via
+    /// cancel redeemer.
+    OrderCancel(OrderCancel),
+    /// LP tokens locked into a farm script.
+    FarmStake(FarmStake),
+    /// LP tokens released from a farm script.
+    FarmUnstake(FarmUnstake),
+    /// Farm rewards distributed. Detection signal is
+    /// brand-specific — for CSWAP it's an operator key wallet
+    /// rather than a Plutus script (see "Detection-signal
+    /// stability" below).
+    RewardClaim(RewardClaim),
 }
 ```
 
-**Single shared event-type crate**, three modules emit it.
-Consumers subscribing to all three see a uniform wire shape —
-they can union events into one `Vec<DexAction>` and key on
-`(tx_hash, dex_brand)` for stable per-trade identity.
+**What we deliberately don't emit:**
 
-The `tag = "kind"` shape means future variants land additively;
-existing consumers reading `Swap` events continue to work
-unchanged when `LiquidityAdd` etc. start appearing.
+- **Order submission** (swap / LP-add / LP-remove orders) —
+  the matching fill TX carries the actual outcome (`Swap`,
+  `LiquidityAdd`, `LiquidityRemove`) with real prices,
+  reserves, and batcher fees. Emitting a parallel "intent"
+  event on submission duplicates with strictly less info.
+  Cancellation is different because the cancel *is* the
+  outcome — hence `OrderCancel` exists, `OrderCreate` doesn't.
+- **Harvest request** (the 2A "claim ticket" TX users send
+  on CSWAP / similar protocols) — same rationale; the
+  distribution TX is the outcome event. The 2A overpay is a
+  CSWAP-side curiosity (operator retains the spread between
+  the flat fee and actual TX cost) — surface it as a
+  consumer-side computation against `batcher_fee_lovelace`
+  conventions if needed, not as its own variant.
+- **Pool creation / liquidity pool init** — one-time admin
+  events; consumers care about user-facing actions.
+
+**Single shared event-type crate**, each `<brand>-dex` module
+emits it. Consumers subscribing across brands see a uniform
+wire shape — they can union events into one `Vec<DexAction>`
+and key on `(tx_hash, dex_brand, kind)` for stable per-action
+identity.
+
+The `tag = "kind"` shape means new variants land additively;
+existing consumers reading `Swap` continue to work unchanged
+when (e.g.) Splash brings a `LiquidityRemove` shape we haven't
+seen yet.
+
+## Detection-signal stability
+
+Not every action is gated by a Plutus script. CSWAP — and
+likely Splash / others — manages reward distribution via
+**operator-controlled key wallets** rather than a payout
+contract. This affects how we detect those actions:
+
+| Action | Detection key | Stability |
+|---|---|---|
+| `Swap` / `LiquidityAdd` / `LiquidityRemove` | pool script consume+produce | script-based — rock solid |
+| `OrderCancel` | order/batcher script consume + cancel redeemer | script-based |
+| `FarmStake` / `FarmUnstake` | farm script consume+produce + LP-token delta sign | script-based |
+| `RewardClaim` | TX consumes from CSWAP's request-collection **key wallet** + user output carries reward asset | **operator-address-based — fragile** |
+
+Operator wallets can rotate; if CSWAP changes their reward
+distributor key the module misses harvests until the address
+is added to interest. Mitigation: each per-brand module
+documents its operator-wallet dependencies inline, and a
+periodic check (operator publishes a new wallet, or we see a
+sudden drop in `RewardClaim` emissions) prompts a module
+rebuild. We accept this fragility because the alternative
+(skipping `RewardClaim` entirely) leaves a real user-facing
+hole in the consumer UX.
 
 ## Per-module structure
 
 Each module follows the same template:
 
 ```
-community-modules/<brand>-swap/
-├── <brand>_swap.rs           # detection + decode + emit
-├── <brand>_swap.toml         # interest = brand's script addresses
+community-modules/<brand>-dex/
+├── <brand>_dex.rs            # detection + decode + emit
+├── <brand>_dex.toml          # interest = brand's pool + farm + order
+│                             #   script addresses + operator wallets
 └── tests/fixtures/
-    ├── pool-direct-swap/     # simple ADA → token swap, pool-only
-    ├── batcher-routed-swap/  # order-via-batcher path
-    ├── multi-hop-swap/       # if brand supports it
-    └── pool-state-change/    # validates reserves_before/after decode
+    ├── fill-<pair>/          # swap fill — full event
+    ├── order-*/              # order submission TXs — zero events
+    ├── liquidity-add-fill/   # LP add fill — `LiquidityAdd` event
+    ├── liquidity-remove-fill/# LP remove fill — `LiquidityRemove`
+    ├── order-cancel/         # cancel a pending order — `OrderCancel`
+    ├── farm-stake/           # `FarmStake`
+    ├── farm-unstake/         # `FarmUnstake`
+    ├── farm-harvest-request/ # no event (intent, not outcome)
+    └── farm-harvest-fill/    # `RewardClaim`
 ```
 
 ### Algorithm (per module)
 
-Per TX (`handle_events`):
+Per TX (`handle_events`), buffer Consumed + Produced events,
+then at flush dispatch into per-variant detection. The shared
+foundation is the same pattern across all variants:
 
-1. Buffer Consumed + Produced events into a TxBuffer (same
-   pattern marketplace modules use).
-2. **Per-output address categorisation** scoped to this
-   brand's addresses (declared statically in `.toml`):
-   - **Pool**: brand script address in both Consumed + Produced
-     for the same UTxO ref pattern
-   - **Batcher**: brand script address in Produced only (order
-     placement) or Consumed only (order fill / cancel)
-   - **User**: non-script address with asset deltas
-3. Compute per-(address, asset) net deltas across the TX.
-4. **Decode pool datum** from the consumed pool UTxO's
-   `prior_datum` field (or from witness data if hash-only) →
-   `pool_reserves_before`, `pool_fee_bps`, `pool_id` derivation.
-5. **Decode pool datum** from the produced pool UTxO's
-   `output.datum` field → `pool_reserves_after`.
-6. **Compute** `effective_price`, `batcher_fee_lovelace`,
-   `asset_in` / `asset_out` from the net deltas.
-7. Emit one `Swap` event per User who participated.
+1. Buffer Consumed + Produced events into a TxBuffer
+   (marketplace-module pattern).
+2. Decode pool datums where present (consumed prior + produced
+   output) to gate base/quote asset identity per pool.
+3. Identify per-action signals (see table below).
+4. Emit per matched action.
 
 Decoder failure (datum shape changed upstream, unexpected
-variant) → log warn, emit the structural fields only, leave
-richness `None`. Never blocks the emission.
+variant) → log warn, emit structural fields only, leave datum-
+driven richness `None`. Never blocks the emission.
+
+**Per-variant detection signals:**
+
+| Variant | Signal |
+|---|---|
+| `Swap` | Pool consume + produce; reserve deltas have **opposing signs**. Asset_in = side that grew in pool; asset_out = side that shrank. |
+| `LiquidityAdd` | Pool consume + produce; reserve deltas are **both positive**. Find LP token minted to a user wallet output. |
+| `LiquidityRemove` | Pool consume + produce; reserve deltas are **both negative**. Find the corresponding LP-token burn (mint with negative quantity) or LP returning to the user wallet. |
+| `OrderCancel` | Order/batcher script Consumed event with cancel-redeemer constructor (CSWAP: `d87980`). Decode prior datum to determine `order_kind`. Refund recipient identified via wallet output. |
+| `FarmStake` | Farm script consume + produce; LP-token quantity in farm UTxO **grew**. Staker = user wallet that held the LP token in an input. |
+| `FarmUnstake` | Farm script consume + produce; LP-token quantity in farm UTxO **shrank**. Staker = user wallet that received the LP token in an output. |
+| `RewardClaim` | TX consumes from the brand's reward-distribution operator key wallet (per "Detection-signal stability"). Reward asset(s) appear in a user-wallet output. |
 
 ### Interest
 
-Each module ships with `[interest].addresses` populated with
-its brand's known script addresses. Updating the address list
-(adding a Minswap-fork DEX, or new Splash version) is a module
-rebuild + redeploy + evict-and-replace.
+Each module ships `[interest].addresses` populated with:
 
-The internal `address → brand_label` map lives alongside the
-addresses in the `.toml` — operator-readable, no rebuild
-required for label-only tweaks (TBD — could be runtime config
-or compile-time const; lean compile-time for type safety).
+- Pool script address(es) — fixed
+- Order / batcher script address(es) — fixed (used for
+  `OrderCancel` + transitively for batcher-fee derivation)
+- Farm script address(es) — fixed (used for
+  `FarmStake` / `FarmUnstake`)
+- Operator key wallet(s) used for reward distribution —
+  potentially mutable; see "Detection-signal stability".
+
+For CSWAP all four address categories collapse to known
+canonical values: one pool script, one order/batcher script
+payment-cred prefix, one farm script, one reward-distribution
+wallet. Splash will be more involved (per-pool staking-cred
+variation requires prefix-match for the pool interest set).
+
+The internal `address → (brand_label, role)` map lives in the
+module source as a compile-time const — type-safe, rebuild on
+every addition; label/role tweaks are rare enough that the
+rebuild cost is fine.
 
 ## Lift map — what we can pick up
 
@@ -305,68 +494,67 @@ Pre-PR investigation surfaced:
 
 ## Phased delivery
 
-**Phase 1: three brand modules + shared event crate**
+**Phase 1: three brand modules with full DEX-action coverage**
 
-PR 1 (one PR or three sequential — operator preference):
+Each `<brand>-dex` module emits the full `DexAction` variant
+set from day one. Implementation lands sequentially within a
+single PR (commit-by-commit) — module-by-module, then
+variant-by-variant within each module.
 
-- Define event types in `mitos_community_events::dex`
-  (shared by all three modules + consumers)
+Per-brand scope:
+
 - `community-modules/cswap-dex/` — lift existing decoders;
-  smallest scope, validates the per-brand template
+  smallest scope, validates the broad-coverage template
 - `community-modules/splash-dex/` — lift existing V1
-  decoders; confirm V2/V3 coverage or build
+  decoders; confirm V2/V3 coverage or build; per-pool
+  staking-cred prefix matching
 - `community-modules/minswap-dex/` — build Minswap V1 + V2
   decoders from datum-registry references
-- Per-module golden fixtures (4-5 per module covering the
-  brand's known TX shapes)
-- Workspace `run-golden-tests.sh` extends to cover the new
-  fixtures
+
+Per-variant scope (in each module):
+
+| Phase | Variant | Notes |
+|---|---|---|
+| 1a | `Swap` | Reuses Phase-1-pre work for `cswap-dex` |
+| 1b | `LiquidityAdd` / `LiquidityRemove` | Directional-guard split — same-sign pool deltas |
+| 1c | `FarmStake` / `FarmUnstake` | New farm-script interest entry per brand |
+| 1d | `RewardClaim` | Operator-wallet interest; document fragility per brand |
+| 1e | `OrderCancel` | Order/batcher prefix interest + cancel-redeemer check |
+
+Each commit ships fixtures + golden-test coverage for its
+variant. Module-build wasm size stays comfortably under 1 MB
+in release profile.
 
 **Phase 2: classifier handoff**
 
 - Stand up the TapTools-alternative consumer worker (or
   retrofit an existing one) that subscribes to all three
-  `*-swap` modules + `asset-transfer` (for the unknown-DEX
-  gap)
+  `*-dex` modules + `asset-transfer` (for the unknown-DEX gap)
 - Parallel-run against the classifier for 24-48h on prod;
   verify event counts agree per brand + richness fields are
   populated as expected
-- Retire the classifier's `handle_dex_tx` path (similar to
-  the ownership-routing retirement that happened with the
+- Retire the classifier's `handle_dex_tx` path (similar to the
+  ownership-routing retirement that happened with the
   marketplace migration)
 
 **Phase 3: extend brand coverage**
 
-- Add `sundae-swap` (V1 / V2 / V3) and `wingriders-swap` —
-  each its own PR, same per-brand template
-- `genius-yield-swap`, `muesli-swap`, etc. as priorities
-  surface
+- Add `sundae-dex` (V1 / V2 / V3) and `wingriders-dex` — each
+  its own PR, same broad-coverage template
+- `genius-yield-dex`, `muesli-dex`, etc. as priorities surface
 
-**Phase 4: extend event surface beyond Swap**
+**Phase 4: forward-looking variants**
 
-Each `<brand>-dex` module extends its `DexAction` enum with additional
-variants as the consumer use cases emerge. Likely order
-(prioritise by what the TapTools-alternative UI actually needs):
+Reserved for variants we don't yet have a fixture-driven case
+for. Candidates:
 
-- `LiquidityAdd(LiquidityEvent)` — user deposits into a pool;
-  enables LP-position tracking and TVL charts. Decoded from
-  Minswap V2's `Deposit` OrderStep (et al.).
-- `LiquidityRemove(LiquidityEvent)` — symmetric counterpart.
-- `ZapIn(ZapEvent)` — single-sided liquidity provision
-  (Minswap V2 `ZapIn` OrderStep). Enables "I added LP without
-  pairing the assets myself" tracking.
-- `OrderCreate(Order)` / `OrderCancel(OrderRef)` — order
-  lifecycle. Enables "resting orders" UX (e.g. "show me all
-  unfilled Splash orders for asset X"). Per-brand decision
-  since matching consume-side priors back to their original
-  creates is brand-specific.
-- `StakeRewardClaim(ClaimEvent)` — for DEXes with reward
-  tokens or staking pools.
+- DEX governance events (veSPLASH stake/unstake, vote casts)
+- Cross-pool routing markers (the aggregator hop that ties
+  multiple `Swap` events from different pools into one user
+  trade — currently consumers infer this from `tx_hash`)
+- Pool fee changes (Minswap V2 `allowDynamicFee` paths)
 
-Each variant lands as a separate PR with its own golden
-fixtures. The `tag = "kind"` enum shape means consumers
-reading only `Swap` keep working unchanged as new variants
-appear on the wire.
+Same wire-compatibility posture: additive variants only.
 
 ## Reusing modules across brands — the tagging mechanism
 
@@ -405,15 +593,16 @@ brands without operating-system-level churn.
    investigation findings" above.
 
 3. ~~**Beyond Swap — V2's broader OrderStep surface**~~ —
-   **resolved**: module naming (`<brand>-dex`, not
-   `<brand>-swap`) explicitly accommodates the full DEX
-   surface (liquidity add/remove, zap-in, order lifecycle,
-   future stake/claim). Phase 1 ships swap-only `Dex::Swap`
-   emissions to bound scope; later phases add additive
-   variants (`LiquidityAdd`, `LiquidityRemove`, `ZapIn`,
-   `OrderCreate`, `OrderCancel`, etc.) without breaking the
-   wire (tag-discriminated enum). Each new variant is its own
-   PR with its own golden fixtures.
+   **resolved**: Phase 1 broadened to include the full
+   common-action DEX surface in each `<brand>-dex` module from
+   day one. `DexAction` ships with `Swap` /
+   `LiquidityAdd` / `LiquidityRemove` / `OrderCancel` /
+   `FarmStake` / `FarmUnstake` / `RewardClaim` together.
+   `ZapIn` is *not* a separate variant — asymmetric LP
+   provision is just `LiquidityAdd` with uneven `quote_added`
+   / `base_added` quantities (CSWAP exposes this directly).
+   Order-submission TXs (swap / LP-add / LP-remove orders)
+   stay silent because the matching fill carries the outcome.
 
 4. **Asymmetric pool fees (Minswap V2)**. V2 pool datum has
    `feeANumerator` + `feeBNumerator` (different fees per swap
@@ -462,6 +651,25 @@ brands without operating-system-level churn.
    rational keeps integer precision. Consumer divides for
    floating-point display. Alternative: f64 — loses precision
    on large-magnitude swaps. **Recommend the rational.**
+
+9. ~~**LP-token → pool mapping in `LiquidityAdd` / `FarmStake`**~~
+   — **resolved**: out of scope for the module. Events emit
+   `lp_received` / `lp_token` as raw `SwapAsset { policy,
+   asset_name_hex, quantity }`; consumers map LP-policy to
+   pool off-line (the mapping comes from a one-time crawl of
+   pool datums, which doesn't belong inside a per-action
+   community module).
+
+10. ~~**`RewardClaim` operator-wallet fragility**~~ —
+    **resolved**: accept fragility. CSWAP-style brands manage
+    reward distribution via operator key wallets, not Plutus
+    scripts. If the operator rotates wallets, the module
+    misses harvests until the new address is added to
+    interest. Mitigation: document the operator-wallet
+    dependency inline per module, and a monitoring check
+    (sudden drop in `RewardClaim` emissions for an active
+    brand) prompts a module rebuild. Better than skipping
+    `RewardClaim` entirely and leaving a real UX hole.
 
 ## Non-goals
 

@@ -55,7 +55,10 @@
 
 use std::collections::BTreeMap;
 
-use mitos_community_events::dex::{DexAction, PoolReserves, Swap, SwapAsset};
+use mitos_community_events::dex::{
+    DexAction, FarmStake, FarmUnstake, LiquidityAdd, LiquidityRemove, PoolReserves, RewardClaim,
+    Swap, SwapAsset,
+};
 use pallas_codec::minicbor;
 use pallas_primitives::{BigInt, PlutusData};
 
@@ -86,6 +89,35 @@ const POOL_SCRIPT_ADDR: &str =
 const ORDER_SCRIPT_ADDR_PREFIX: &str =
     "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nh";
 
+/// CSWAP farm script address. LP tokens get locked here when a
+/// user stakes for yield. CSWAP uses one canonical farm script
+/// (confirmed against staked-farm fixtures); should new farm
+/// variants appear we'd add their bech32 here.
+const FARM_SCRIPT_ADDR: &str =
+    "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf";
+
+/// CSWAP reward-request collection wallet (key-only `addr1v`).
+/// Users send a flat 2 ADA "claim ticket" here when initiating
+/// a harvest. The distribution TX later consumes this 2 ADA
+/// alongside a reward-asset input from the treasury and pays
+/// the reward to the user — that consume is our detection signal
+/// for `RewardClaim`. CSWAP retains the spread between the flat
+/// fee and the actual TX cost as protocol revenue.
+///
+/// Operator-managed key wallet rather than a Plutus script —
+/// fragile if CSWAP rotates the address. See
+/// "Detection-signal stability" in the design doc.
+const REWARD_REQUEST_WALLET: &str =
+    "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g";
+
+/// CSWAP treasury / reward-source wallet. Observed sourcing
+/// reward assets in distribution TXs. Used as an exclude-list
+/// entry so its outputs aren't mistaken for `RewardClaim`
+/// recipients (the wallet is `addr1v` and would otherwise pass
+/// the user-wallet prefix check).
+const TREASURY_WALLET: &str =
+    "addr1v92ecw588ply6nwk35lczw9nh48u044sxqkwzwfmz4tcneqff35jr";
+
 /// Bech32 prefixes used to identify a *user wallet* output —
 /// payment credential is a key (not a script). Cardano header
 /// byte's payment-type half:
@@ -110,11 +142,12 @@ struct PoolInput {
 }
 
 /// One pool output captured from the event stream. The datum
-/// is decoded only to derive `PairKey` for the BTreeMap; once
-/// keyed, reserves_after comes from `output.lovelace + assets`
-/// gated by the *consumed* pool's datum (we trust the produced
-/// pool to be the same pair when the keys match).
+/// is decoded both to derive `PairKey` for the BTreeMap *and*
+/// to expose `total_lp_tokens` so we can compute the LP-supply
+/// delta over consume/produce — that drives `lp_received` for
+/// `LiquidityAdd` and `lp_burnt` for `LiquidityRemove`.
 struct PoolOutput {
+    datum: CswapPoolDatum,
     output: TypedOutput,
 }
 
@@ -126,12 +159,28 @@ struct TxBuffer {
     /// Pool outputs keyed the same way.
     pool_outputs: BTreeMap<PairKey, PoolOutput>,
     /// All produced outputs — needed at flush to find the user
-    /// wallet output (the non-script recipient of asset_out).
+    /// wallet output (the non-script recipient of asset_out /
+    /// LP / withdrawn liquidity).
     produced: Vec<ProducedEvent>,
-    /// Consumed order/batcher UTxOs — used to derive
-    /// `batcher_fee_lovelace`. Captured at handle-time to avoid
-    /// rescanning `consumed` in flush.
+    /// All consumed events. Used at flush to find user wallet
+    /// inputs (FarmStake staker identification) and for the
+    /// batcher-fee derivation path. Kept as raw events rather
+    /// than pre-filtered so future variants can inspect them
+    /// without a TxBuffer schema change.
+    consumed: Vec<ConsumedEvent>,
+    /// Consumed order/batcher UTxOs — convenience subset of
+    /// `consumed`, populated at handle-time to avoid rescanning
+    /// for the batcher-fee derivation hot path.
     consumed_orders: Vec<ConsumedEvent>,
+    /// Farm-script consume + produce events. CSWAP runs one
+    /// canonical farm script; one consume + one produce per TX
+    /// is the expected shape.
+    farm_input: Option<ConsumedEvent>,
+    farm_output: Option<ProducedEvent>,
+    /// Did this TX consume the CSWAP reward-request collection
+    /// 2 ADA claim ticket? If so, user-wallet outputs holding
+    /// non-ADA assets are reward distributions.
+    consumed_reward_request: bool,
     tx_hash: Option<Vec<u8>>,
     slot: Option<u64>,
 }
@@ -159,10 +208,13 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
             buf.pool_outputs.insert(
                 datum.pair_key(),
                 PoolOutput {
+                    datum,
                     output: p.output.clone(),
                 },
             );
         }
+    } else if p.output.address == FARM_SCRIPT_ADDR {
+        buf.farm_output = Some(p.clone());
     }
     buf.produced.push(p.clone());
 }
@@ -192,7 +244,12 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
         }
     } else if c.prior_output.address.starts_with(ORDER_SCRIPT_ADDR_PREFIX) {
         buf.consumed_orders.push(c.clone());
+    } else if c.prior_output.address == FARM_SCRIPT_ADDR {
+        buf.farm_input = Some(c.clone());
+    } else if c.prior_output.address == REWARD_REQUEST_WALLET {
+        buf.consumed_reward_request = true;
     }
+    buf.consumed.push(c.clone());
 }
 
 fn flush_buffer(buf: TxBuffer) {
@@ -221,6 +278,20 @@ fn flush_buffer(buf: TxBuffer) {
     }
     // Produced pools with no matching consumed (pool creation
     // TXs etc.) aren't swaps; ignore.
+
+    // Farm stake / unstake: one farm consume + one farm produce
+    // in the same TX → LP-token delta tells us direction.
+    if let (Some(fi), Some(fo)) = (buf.farm_input.as_ref(), buf.farm_output.as_ref()) {
+        emit_for_farm_pair(&tx_hash_hex, slot, fi, fo, &buf.consumed, &buf.produced);
+    }
+
+    // Reward distribution: a TX consuming the 2 ADA claim
+    // ticket from the request-collection wallet is paying out
+    // a harvest. Each user wallet output carrying non-ADA
+    // assets is a claimant.
+    if buf.consumed_reward_request {
+        emit_reward_claims(&tx_hash_hex, slot, &buf.produced);
+    }
 }
 
 fn emit_for_pool_pair(
@@ -244,20 +315,88 @@ fn emit_for_pool_pair(
     let delta_quote = quote_after as i128 - quote_before as i128;
     let delta_base = base_after as i128 - base_before as i128;
 
-    // Directional check: exactly one side grew, one shrank.
-    // Liquidity events (both sides grow), pool init, or
-    // accounting weirdness don't qualify as swaps in Phase 1.
-    if !((delta_quote > 0 && delta_base < 0) || (delta_quote < 0 && delta_base > 0)) {
-        logging::log(
-            LogLevel::Info,
-            LOG_TARGET,
-            &format!(
-                "tx={tx_hash_hex}: non-swap pool transition (delta_quote={delta_quote}, delta_base={delta_base}), skipping"
-            ),
-        );
-        return;
-    }
+    let reserves_before = Some(PoolReserves {
+        base_asset: asset_from_pair(&datum.base_policy, &datum.base_name, base_before),
+        quote_asset: asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_before),
+    });
+    let reserves_after = Some(PoolReserves {
+        base_asset: asset_from_pair(&datum.base_policy, &datum.base_name, base_after),
+        quote_asset: asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_after),
+    });
 
+    // Dispatch by reserve-delta sign pattern. Three live shapes:
+    //   - opposing signs → Swap
+    //   - both > 0       → LiquidityAdd
+    //   - both < 0       → LiquidityRemove
+    // Anything else (both zero, or impossible combinations)
+    // gets dropped with a log — pool-init, fee-only updates,
+    // or chain weirdness we haven't characterised.
+    match (delta_quote.signum(), delta_base.signum()) {
+        (1, -1) | (-1, 1) => {
+            emit_swap(
+                tx_hash_hex,
+                slot,
+                datum,
+                delta_quote,
+                delta_base,
+                produced,
+                consumed_orders,
+                reserves_before,
+                reserves_after,
+            );
+        }
+        (1, 1) => {
+            emit_liquidity_add(
+                tx_hash_hex,
+                slot,
+                datum,
+                delta_quote as u64,
+                delta_base as u64,
+                pool_out,
+                produced,
+                consumed_orders,
+                reserves_before,
+                reserves_after,
+            );
+        }
+        (-1, -1) => {
+            emit_liquidity_remove(
+                tx_hash_hex,
+                slot,
+                datum,
+                (-delta_quote) as u64,
+                (-delta_base) as u64,
+                pool_out,
+                produced,
+                consumed_orders,
+                reserves_before,
+                reserves_after,
+            );
+        }
+        _ => {
+            logging::log(
+                LogLevel::Info,
+                LOG_TARGET,
+                &format!(
+                    "tx={tx_hash_hex}: unrecognised pool transition (delta_quote={delta_quote}, delta_base={delta_base}), skipping"
+                ),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_swap(
+    tx_hash_hex: &str,
+    slot: u64,
+    datum: &CswapPoolDatum,
+    delta_quote: i128,
+    delta_base: i128,
+    produced: &[ProducedEvent],
+    consumed_orders: &[ConsumedEvent],
+    reserves_before: Option<PoolReserves>,
+    reserves_after: Option<PoolReserves>,
+) {
     let (asset_in, asset_out, in_qty, out_qty) = if delta_quote > 0 {
         // Swapper paid quote → received base.
         (
@@ -284,20 +423,10 @@ fn emit_for_pool_pair(
         .as_ref()
         .map(|s| s.address.clone())
         .unwrap_or_default();
-
     let batcher_fee_lovelace =
         derive_batcher_fee_lovelace(consumed_orders, &asset_in, swapper.as_ref());
 
-    let reserves_before = Some(PoolReserves {
-        base_asset: asset_from_pair(&datum.base_policy, &datum.base_name, base_before),
-        quote_asset: asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_before),
-    });
-    let reserves_after = Some(PoolReserves {
-        base_asset: asset_from_pair(&datum.base_policy, &datum.base_name, base_after),
-        quote_asset: asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_after),
-    });
-
-    let event = DexAction::Swap(Swap {
+    emit_event(&DexAction::Swap(Swap {
         tx_hash: tx_hash_hex.to_string(),
         slot,
         dex_brand: DEX_BRAND.to_string(),
@@ -311,9 +440,277 @@ fn emit_for_pool_pair(
         pool_fee_bps: u32::try_from(datum.pool_fee_bps).ok(),
         batcher_fee_lovelace,
         effective_price: Some((out_qty, in_qty)),
-    });
+    }));
+}
 
-    emit_event(&event);
+#[allow(clippy::too_many_arguments)]
+fn emit_liquidity_add(
+    tx_hash_hex: &str,
+    slot: u64,
+    datum: &CswapPoolDatum,
+    quote_added_qty: u64,
+    base_added_qty: u64,
+    pool_out: &PoolOutput,
+    produced: &[ProducedEvent],
+    consumed_orders: &[ConsumedEvent],
+    reserves_before: Option<PoolReserves>,
+    reserves_after: Option<PoolReserves>,
+) {
+    let quote_added = asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_added_qty);
+    let base_added = asset_from_pair(&datum.base_policy, &datum.base_name, base_added_qty);
+
+    // LP token minted = supply delta on the consumed→produced
+    // datum's totalLpTokens. Defensive saturating sub so a
+    // datum-decode quirk doesn't panic the module.
+    let lp_minted = pool_out
+        .datum
+        .total_lp_tokens
+        .saturating_sub(datum.total_lp_tokens);
+    let lp_received_asset = SwapAsset::Native {
+        policy: hex::encode(&datum.lp_policy),
+        asset_name_hex: hex::encode(&datum.lp_name),
+        quantity: lp_minted,
+    };
+
+    let provider = find_lp_recipient(produced, &datum.lp_policy, &datum.lp_name);
+    let provider_address = provider
+        .as_ref()
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+
+    let batcher_fee_lovelace = derive_batcher_fee_lovelace(
+        consumed_orders,
+        // The "user paid" side for an LP add is the quote leg
+        // (typically ADA) — same accounting as a quote-in swap.
+        &quote_added,
+        provider.as_ref(),
+    );
+
+    emit_event(&DexAction::LiquidityAdd(LiquidityAdd {
+        tx_hash: tx_hash_hex.to_string(),
+        slot,
+        dex_brand: DEX_BRAND.to_string(),
+        contract_version: None,
+        provider_address,
+        quote_added,
+        base_added,
+        lp_received: lp_received_asset,
+        pool_id: Some(pool_id_for_pair(datum)),
+        pool_reserves_before: reserves_before,
+        pool_reserves_after: reserves_after,
+        pool_fee_bps: u32::try_from(datum.pool_fee_bps).ok(),
+        batcher_fee_lovelace,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_liquidity_remove(
+    tx_hash_hex: &str,
+    slot: u64,
+    datum: &CswapPoolDatum,
+    quote_withdrawn_qty: u64,
+    base_withdrawn_qty: u64,
+    pool_out: &PoolOutput,
+    produced: &[ProducedEvent],
+    consumed_orders: &[ConsumedEvent],
+    reserves_before: Option<PoolReserves>,
+    reserves_after: Option<PoolReserves>,
+) {
+    let quote_withdrawn =
+        asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_withdrawn_qty);
+    let base_withdrawn =
+        asset_from_pair(&datum.base_policy, &datum.base_name, base_withdrawn_qty);
+
+    let lp_burnt = datum
+        .total_lp_tokens
+        .saturating_sub(pool_out.datum.total_lp_tokens);
+    let lp_burnt_asset = SwapAsset::Native {
+        policy: hex::encode(&datum.lp_policy),
+        asset_name_hex: hex::encode(&datum.lp_name),
+        quantity: lp_burnt,
+    };
+
+    // Recipient is the user wallet that received both base and
+    // quote sides. For ADA-paired pools the quote leg (ADA) is
+    // universal so we anchor on the base side — wallet output
+    // holding the base asset is the withdrawer.
+    let recipient = find_wallet_with_asset(produced, &datum.base_policy, &datum.base_name);
+    let provider_address = recipient
+        .as_ref()
+        .map(|r| r.address.clone())
+        .unwrap_or_default();
+
+    // No clean batcher-fee derivation yet for LP removes —
+    // the order-deposit accounting differs from swaps (user's
+    // input includes their LP tokens, not deposit lovelace).
+    // Leave as `None` until we have a fixture to characterise.
+    let _ = consumed_orders;
+    let batcher_fee_lovelace = None;
+
+    emit_event(&DexAction::LiquidityRemove(LiquidityRemove {
+        tx_hash: tx_hash_hex.to_string(),
+        slot,
+        dex_brand: DEX_BRAND.to_string(),
+        contract_version: None,
+        provider_address,
+        lp_burnt: lp_burnt_asset,
+        quote_withdrawn,
+        base_withdrawn,
+        pool_id: Some(pool_id_for_pair(datum)),
+        pool_reserves_before: reserves_before,
+        pool_reserves_after: reserves_after,
+        pool_fee_bps: u32::try_from(datum.pool_fee_bps).ok(),
+        batcher_fee_lovelace,
+    }));
+}
+
+/// Dispatch on the LP-token delta sign in the farm UTxO.
+/// Positive delta → `FarmStake`; negative → `FarmUnstake`.
+/// Zero or all-zero deltas (e.g. a farm-config update that
+/// touches the UTxO without moving LP) get dropped with a log.
+fn emit_for_farm_pair(
+    tx_hash_hex: &str,
+    slot: u64,
+    fi: &ConsumedEvent,
+    fo: &ProducedEvent,
+    consumed: &[ConsumedEvent],
+    produced: &[ProducedEvent],
+) {
+    // Find the asset whose quantity changed across the farm
+    // UTxO's consume/produce. The farm carries a per-farm NFT
+    // (qty 1, unchanged) alongside the staked LP token (qty
+    // changes by ±delta). Walking unique (policy, name) pairs
+    // and selecting the one with a non-zero delta isolates the
+    // LP token without us needing to know the farm-NFT policy.
+    let Some((lp_policy, lp_name, delta)) = farm_lp_delta(&fi.prior_output, &fo.output) else {
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!(
+                "tx={tx_hash_hex}: farm UTxO transition with no LP-token delta, skipping"
+            ),
+        );
+        return;
+    };
+
+    let abs = u64::try_from(delta.unsigned_abs()).unwrap_or(u64::MAX);
+    let lp_token = SwapAsset::Native {
+        policy: hex::encode(&lp_policy),
+        asset_name_hex: hex::encode(&lp_name),
+        quantity: abs,
+    };
+
+    if delta > 0 {
+        // FarmStake: user wallet INPUT carried the LP token in.
+        let staker_address = find_consumed_wallet_with_asset(consumed, &lp_policy, &lp_name)
+            .unwrap_or_default();
+        emit_event(&DexAction::FarmStake(FarmStake {
+            tx_hash: tx_hash_hex.to_string(),
+            slot,
+            dex_brand: DEX_BRAND.to_string(),
+            contract_version: None,
+            staker_address,
+            lp_token,
+        }));
+    } else {
+        // FarmUnstake: user wallet OUTPUT received the LP back.
+        let staker_address = find_wallet_with_asset(produced, &lp_policy, &lp_name)
+            .map(|s| s.address)
+            .unwrap_or_default();
+        emit_event(&DexAction::FarmUnstake(FarmUnstake {
+            tx_hash: tx_hash_hex.to_string(),
+            slot,
+            dex_brand: DEX_BRAND.to_string(),
+            contract_version: None,
+            staker_address,
+            lp_token,
+        }));
+    }
+}
+
+/// Walk the union of native assets in the farm's consumed +
+/// produced UTxO; return the first one with a non-zero quantity
+/// delta. CSWAP farms hold a single LP token + a farm NFT
+/// (qty 1, unchanged), so the non-zero delta uniquely picks the
+/// LP token without naming the farm-NFT policy.
+fn farm_lp_delta(
+    prior: &TypedOutput,
+    new: &TypedOutput,
+) -> Option<(Vec<u8>, Vec<u8>, i128)> {
+    let mut seen: BTreeMap<(Vec<u8>, Vec<u8>), i128> = BTreeMap::new();
+    for e in &prior.assets {
+        *seen
+            .entry((e.asset.policy.clone(), e.asset.name.clone()))
+            .or_insert(0) -= e.quantity as i128;
+    }
+    for e in &new.assets {
+        *seen
+            .entry((e.asset.policy.clone(), e.asset.name.clone()))
+            .or_insert(0) += e.quantity as i128;
+    }
+    seen.into_iter()
+        .find(|(_, d)| *d != 0)
+        .map(|((p, n), d)| (p, n, d))
+}
+
+/// Emit one `RewardClaim` per non-operator wallet output that
+/// received native assets in a harvest-distribution TX.
+/// Operator-managed wallets (`TREASURY_WALLET`) are filtered
+/// out — their outputs are operational change, not rewards. The
+/// detection-signal is the request-collection 2 ADA consume,
+/// not the output addresses themselves, so this stays
+/// distribution-shape agnostic.
+fn emit_reward_claims(tx_hash_hex: &str, slot: u64, produced: &[ProducedEvent]) {
+    for p in produced {
+        let addr = &p.output.address;
+        if !is_user_wallet(addr) || addr == TREASURY_WALLET || addr == REWARD_REQUEST_WALLET {
+            continue;
+        }
+        let rewards: Vec<SwapAsset> = p
+            .output
+            .assets
+            .iter()
+            .map(|e| SwapAsset::Native {
+                policy: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+                quantity: e.quantity,
+            })
+            .collect();
+        if rewards.is_empty() {
+            continue;
+        }
+        emit_event(&DexAction::RewardClaim(RewardClaim {
+            tx_hash: tx_hash_hex.to_string(),
+            slot,
+            dex_brand: DEX_BRAND.to_string(),
+            contract_version: None,
+            claimer_address: addr.clone(),
+            rewards,
+        }));
+    }
+}
+
+/// First user-wallet consumed event that held the named asset.
+/// Used to identify the FarmStake staker from a wallet that
+/// surrendered LP tokens into the farm.
+fn find_consumed_wallet_with_asset(
+    consumed: &[ConsumedEvent],
+    policy: &[u8],
+    name: &[u8],
+) -> Option<String> {
+    for c in consumed {
+        if !is_user_wallet(&c.prior_output.address) {
+            continue;
+        }
+        if c.prior_output
+            .assets
+            .iter()
+            .any(|e| e.asset.policy == policy && e.asset.name == name)
+        {
+            return Some(c.prior_output.address.clone());
+        }
+    }
+    None
 }
 
 /// Sum a pool UTxO's holding of the asset identified by
@@ -369,10 +766,49 @@ fn find_swapper(produced: &[ProducedEvent], asset_out: &SwapAsset) -> Option<Swa
 
 struct SwapperInfo {
     address: String,
-    /// Lovelace held in the swapper's wallet output. For ADA-in
-    /// swaps this is the protocol-mandated ~2 ADA `min_receive`
-    /// ADA leg returned alongside the bought tokens.
+    /// Lovelace held in the recipient's wallet output. For
+    /// ADA-in swaps this is the protocol-mandated ~2 ADA
+    /// `min_receive` ADA leg returned alongside the bought
+    /// tokens. For LP-add fills it's the min-utxo ADA on the
+    /// LP-token output. Either way: the user's residual ADA
+    /// in this TX.
     output_lovelace: u64,
+}
+
+/// First user-wallet produced output containing the LP token.
+/// Used by `LiquidityAdd` to identify the provider.
+fn find_lp_recipient(
+    produced: &[ProducedEvent],
+    lp_policy: &[u8],
+    lp_name: &[u8],
+) -> Option<SwapperInfo> {
+    find_wallet_with_asset(produced, lp_policy, lp_name)
+}
+
+/// First user-wallet produced output that carries the named
+/// native asset. Generic helper used by LP add/remove to
+/// identify the participating user.
+fn find_wallet_with_asset(
+    produced: &[ProducedEvent],
+    policy: &[u8],
+    name: &[u8],
+) -> Option<SwapperInfo> {
+    for p in produced {
+        if !is_user_wallet(&p.output.address) {
+            continue;
+        }
+        if p.output
+            .assets
+            .iter()
+            .any(|e| e.asset.policy == policy && e.asset.name == name)
+        {
+            return Some(SwapperInfo {
+                address: p.output.address.clone(),
+                output_lovelace: p.output.lovelace,
+            });
+        }
+    }
+    None
 }
 
 /// Compute the batcher's lovelace cut for a single-order
@@ -502,17 +938,25 @@ fn chain_point_slot(cp: &ChainPoint) -> Option<u64> {
 // Datum decoder
 // ============================================================
 
-/// Decoded CSWAP pool datum — pair identity + fee. Lifted from
+/// Decoded CSWAP pool datum. Lifted from
 /// `shared-crates/cardano-tx/dex/cswap/pool.rs` and extended to
-/// extract the four pair-identity fields the shared decoder
-/// doesn't surface (the builder side only needs LP + fee).
+/// surface every field the action-recognition pipeline needs:
+/// the four pair-identity fields (the shared decoder skips
+/// them — TX-builder side only needs total LP + fee), the
+/// LP-token identity (used for LiquidityAdd/Remove to find
+/// the recipient wallet output), and the total LP supply
+/// (delta over consume/produce gives `lp_received` /
+/// `lp_burnt` directly without watching mint events).
 #[derive(Debug, Clone)]
 struct CswapPoolDatum {
+    total_lp_tokens: u64,
     pool_fee_bps: u64,
     quote_policy: Vec<u8>,
     quote_name: Vec<u8>,
     base_policy: Vec<u8>,
     base_name: Vec<u8>,
+    lp_policy: Vec<u8>,
+    lp_name: Vec<u8>,
 }
 
 impl CswapPoolDatum {
@@ -543,17 +987,23 @@ fn decode_pool_datum(cbor: &[u8]) -> Option<CswapPoolDatum> {
     if fields.len() != 8 {
         return None;
     }
+    let total_lp_tokens = bigint_u64(&fields[0])?;
     let pool_fee_bps = bigint_u64(&fields[1])?;
     let quote_policy = bounded_bytes(&fields[2])?;
     let quote_name = bounded_bytes(&fields[3])?;
     let base_policy = bounded_bytes(&fields[4])?;
     let base_name = bounded_bytes(&fields[5])?;
+    let lp_policy = bounded_bytes(&fields[6])?;
+    let lp_name = bounded_bytes(&fields[7])?;
     Some(CswapPoolDatum {
+        total_lp_tokens,
         pool_fee_bps,
         quote_policy,
         quote_name,
         base_policy,
         base_name,
+        lp_policy,
+        lp_name,
     })
 }
 
