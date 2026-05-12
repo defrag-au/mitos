@@ -1,14 +1,13 @@
 //! Wire-format event types for the `jpg-store-offer` community
 //! module — offer lifecycle on jpg.store CO contracts.
 //!
-//! Supersedes `mitos_community_events::jpg_co` with a richer
-//! event surface:
+//! Successor to the retired `mitos_community_events::jpg_co`
+//! 2-variant `Created` / `Spent` surface, with a richer
+//! 4-variant event set:
 //!
-//! - `jpg_co::JpgCoChange::Created`  →  `JpgStoreOffer::Create`
-//!   (same field set, finer name)
-//! - `jpg_co::JpgCoChange::Spent`    →  one of
-//!   `JpgStoreOffer::{Cancel, Accept, Update}` based on
-//!   redeemer + produced-output flow
+//! - `Create` (was: `Created`) — same field set, finer name
+//! - `Cancel` / `Accept` / `Update` (was: collapsed under `Spent`)
+//!   — split based on redeemer + produced-output flow
 //!
 //! Consumers tracking offer-state need to distinguish these
 //! three because the chain-level effects differ:
@@ -26,18 +25,12 @@
 //!
 //! All variants surface `bidder_pkh` so downstream "my offers"
 //! views can pivot on the same identity used at create time.
-//!
-//! ## Cutover from `jpg_co`
-//!
-//! `mitos_community_events::jpg_co` continues to ship alongside
-//! this module until the `cnft.dev-workers/workers/jpg-store-mirror`
-//! consumer migrates. Both decode the same datum bytes; the new
-//! event surface is strictly additive over the old.
 
 use serde::{Deserialize, Serialize};
 
-/// jpg.store CO contract version. Matches the existing
-/// `jpg_co::JpgCoVersion` naming for cross-module clarity.
+/// jpg.store CO contract version. V2 and V3 share the same
+/// underlying script; they differ only in address-encoding (V2
+/// uses one staking credential, V3 uses another).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JpgStoreOfferVersion {
     V2,
