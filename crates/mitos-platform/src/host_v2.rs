@@ -72,6 +72,23 @@ pub trait ModuleHostHandle: Send + Sync {
         reason: Option<String>,
         companion_timeout: Duration,
     ) -> PlatformResult<RecaptureOutcome>;
+
+    /// Full module retirement: stop the running slot, drop the
+    /// dialer's in-memory companion connections for this module,
+    /// and surrender the artifact directory back to the
+    /// admin handler for removal. The handler is responsible
+    /// for the final filesystem step (it has the `ModuleStorage`
+    /// reference directly).
+    ///
+    /// Unlike `stop`, this is intended to be permanent — `replace`
+    /// on an evicted module is a fresh upload + activate, not a
+    /// resume.
+    ///
+    /// Returns the list of `companion_key`s whose dial loops got
+    /// cancelled (empty when no companions were active). Caller
+    /// can surface those in the admin response so the operator
+    /// can spot-check what got reaped.
+    async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>>;
 }
 
 /// One dynamic-interest update queued for delivery to a running
@@ -739,6 +756,61 @@ where
             events_emitted: 0,
         })
     }
+
+    /// Full retirement of a running module:
+    ///
+    /// 1. Stop the running slot (calls into `Self::stop`).
+    /// 2. Cancel any in-memory dialer state for this module so
+    ///    stale WS connections to deleted companions get reaped
+    ///    immediately rather than waiting for a service restart.
+    /// 3. Close cached DB handles (`kv.redb`, `emissions.redb`,
+    ///    `cursor.redb`) so the OS file locks release before the
+    ///    admin handler tries to `remove_dir_all` the artifact.
+    ///
+    /// The admin handler is responsible for the filesystem step
+    /// (calling `ModuleStorage::remove_module_dir`) after this
+    /// returns — keeps the storage concern at the storage
+    /// boundary rather than threading the storage handle through
+    /// the host.
+    ///
+    /// Returns the `companion_key`s whose dial loops got
+    /// cancelled in step 2, so the admin response can surface
+    /// what was reaped.
+    ///
+    /// Returns `Ok(vec![])` (without error) when the module isn't
+    /// currently running — idempotent for re-tries against a
+    /// half-retired module.
+    pub async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
+        // 1. Stop the running slot. Safe to call against a
+        //    not-running id (no-op).
+        self.stop(id).await?;
+
+        // 2. Drop dialer in-memory state for the module's
+        //    companions. The dialer is wired post-construction
+        //    via `set_dialer`; in artifact-only test deployments
+        //    it's `None`, in which case there are no in-memory
+        //    connections to drop and we report empty.
+        let cancelled = if let Some(dialer) = self.dialer.get() {
+            dialer.unregister_module(id).await
+        } else {
+            Vec::new()
+        };
+
+        // 3. Close cached DB handles so the redb file locks
+        //    release before the admin handler removes the dir.
+        //    `close_*` is idempotent — no-op when nothing's
+        //    cached for `id`.
+        self.storage.close_kv(id);
+        self.storage.close_emissions(id);
+        self.storage.close_cursor(id);
+
+        tracing::info!(
+            module = %id,
+            cancelled_companions = cancelled.len(),
+            "module evicted (slot stopped, dialer state cleared, DB handles closed)"
+        );
+        Ok(cancelled)
+    }
 }
 
 /// Drop-guard for the per-module recapture mutex set. Ensures
@@ -794,6 +866,9 @@ where
         companion_timeout: Duration,
     ) -> PlatformResult<RecaptureOutcome> {
         ModuleHostV2::recapture_module(self, id, reason, companion_timeout).await
+    }
+    async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
+        ModuleHostV2::evict_module(self, id).await
     }
 }
 

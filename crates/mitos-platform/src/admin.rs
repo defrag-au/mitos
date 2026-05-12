@@ -10,9 +10,14 @@
 //! - `GET  /_admin/modules` — list registered modules
 //! - `GET  /_admin/modules/{id}` — single module status
 //! - `DELETE /_admin/modules/{id}` — stop module + drop slot
+//!   (artifact stays on disk for rollback)
 //! - `POST /_admin/modules/{id}/restart` — re-instantiate
 //! - `POST /_admin/modules/{id}/recapture` — coordinated state
 //!   rebuild for subscribed companions (see `docs/design/RECAPTURE.md`)
+//! - `POST /_admin/modules/{id}/evict` — full retirement:
+//!   stop slot, drop dialer state, remove artifact directory.
+//!   Refuses if companion records exist for the module unless
+//!   `?force=true`. Idempotent across re-invocation.
 //! - `GET  /_admin/modules/{id}/last-trap` — trap-context fixture
 //! - `GET  /_admin/modules/{id}/emissions` — emissions log
 //! - `DELETE /_admin/modules/{id}/emissions` — purge
@@ -36,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Multipart, Path, Request, State};
+use axum::extract::{Multipart, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -172,6 +177,7 @@ fn admin_router_inner(
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
         .route("/_admin/modules/{id}/recapture", post(recapture_module))
+        .route("/_admin/modules/{id}/evict", post(evict_module))
         .route("/_admin/modules/{id}/last-trap", get(last_trap))
         .route(
             "/_admin/modules/{id}/emissions",
@@ -499,6 +505,133 @@ async fn delete_module(
     // matters for "delete."
     tracing::info!(module = %id, "module stopped via DELETE");
     Ok((StatusCode::NO_CONTENT, ()).into_response())
+}
+
+/// Query params for `POST /_admin/modules/{id}/evict`.
+///
+/// `force=true` overrides the "refuse if companions still
+/// registered" safety check. Use when consumer-side cleanup has
+/// already removed the companion records but the on-disk
+/// `companions/<key>.cbor` files still exist (e.g. the dialer
+/// crashed mid-unregister). Logged loudly.
+#[derive(Debug, Default, Deserialize)]
+struct EvictQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// Response body for a successful evict.
+///
+/// `cancelled_companions` is the set of `companion_key`s whose
+/// dial loops got reaped from the dialer's in-memory state.
+/// Companion records on disk get removed as part of the
+/// artifact-directory teardown — they're not enumerated
+/// separately because the dir-removal covers them transitively.
+#[derive(Debug, Serialize)]
+struct EvictResponse {
+    module: String,
+    cancelled_companions: Vec<String>,
+    artifact_removed: bool,
+}
+
+/// Conflict response body when companions are still registered
+/// and `?force=true` wasn't passed. Surfaces the offending keys
+/// so the operator knows which consumers to retire first.
+#[derive(Debug, Serialize)]
+struct EvictConflictBody {
+    error: &'static str,
+    companion_keys: Vec<String>,
+    hint: &'static str,
+}
+
+async fn evict_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(query): Query<EvictQuery>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let Some(host) = &state.host else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no host wired in this admin router",
+        )
+            .into_response());
+    };
+
+    // Safety check: refuse if any companion record exists for
+    // this module, unless the operator passed `?force=true`. The
+    // expectation is consumer-side cleanup retires its companion
+    // record first (via the consumer's own admin surface) so
+    // there's nothing to enumerate by the time evict runs.
+    if !query.force {
+        let companions_dir = state.storage.module_dir_for_companions(&id);
+        if companions_dir.exists() {
+            let read_dir = std::fs::read_dir(&companions_dir).map_err(|e| {
+                HandlerError::Storage(StorageError::Io(std::io::Error::other(format!(
+                    "read companions dir {}: {e}",
+                    companions_dir.display()
+                ))))
+            })?;
+            let entries: Vec<String> = read_dir
+                .filter_map(|r| r.ok())
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|s| s.strip_suffix(".cbor").map(|k| k.to_owned()))
+                })
+                .collect();
+            if !entries.is_empty() {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(EvictConflictBody {
+                        error: "companions still registered",
+                        companion_keys: entries,
+                        hint: "retire consumers + remove their companion records, or pass ?force=true to override",
+                    }),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    // Drive the host-side retirement: stop slot, drop dialer
+    // state, close DB handles. Returns the companion keys we
+    // just cancelled (could be non-empty under `?force=true`).
+    let cancelled_companions = host
+        .evict_module(&id)
+        .await
+        .map_err(|e| HandlerError::Wasmtime(format!("host.evict_module: {e}")))?;
+
+    if query.force && !cancelled_companions.is_empty() {
+        tracing::warn!(
+            module = %id,
+            companions = ?cancelled_companions,
+            "evict --force reaped in-memory companions despite registered records",
+        );
+    }
+
+    // Filesystem step — caller's surface; storage knows the
+    // paths. Idempotent on missing dir (already-half-retired
+    // module).
+    state.storage.remove_module_dir(&id)?;
+
+    tracing::info!(
+        module = %id,
+        cancelled = cancelled_companions.len(),
+        force = query.force,
+        "module evicted (slot stopped, dialer state cleared, artifact removed)",
+    );
+    Ok((
+        StatusCode::OK,
+        Json(EvictResponse {
+            module: id,
+            cancelled_companions,
+            artifact_removed: true,
+        }),
+    )
+        .into_response())
 }
 
 async fn restart_module(

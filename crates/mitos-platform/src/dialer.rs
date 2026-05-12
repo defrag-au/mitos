@@ -271,6 +271,34 @@ impl CompanionDialer {
         }
     }
 
+    /// Cancel every dial loop whose `CompanionId.module_id`
+    /// matches. Returns the `companion_key`s that were active +
+    /// got cancelled — useful for the admin evict path to report
+    /// which subscribers got reaped.
+    ///
+    /// On-disk companion records are left in place; the caller
+    /// (admin evict handler) is responsible for clearing them as
+    /// part of the artifact teardown.
+    ///
+    /// Idempotent — calling against a module with no active
+    /// companions returns an empty vec, no error.
+    pub async fn unregister_module(&self, module_id: &str) -> Vec<String> {
+        let mut tasks = self.tasks.lock().await;
+        let to_remove: Vec<CompanionId> = tasks
+            .keys()
+            .filter(|id| id.module_id == module_id)
+            .cloned()
+            .collect();
+        let mut cancelled_keys = Vec::with_capacity(to_remove.len());
+        for cid in to_remove {
+            if let Some(prev) = tasks.remove(&cid) {
+                prev.cancel.cancel();
+                cancelled_keys.push(cid.companion_key);
+            }
+        }
+        cancelled_keys
+    }
+
     /// Send `ServerMessage::Recapture { module, reason }` to every
     /// active companion subscribed to `module_id` and await
     /// `ClientMessage::RecaptureReady` from each. Returns
