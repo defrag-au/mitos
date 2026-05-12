@@ -19,8 +19,9 @@ decode = ["dep:ciborium", "dep:serde_json"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-# Compact CBOR encoding of raw byte fields (e.g. `jpg_co::CoChange::Created::datum_cbor`).
-# Without this, `Vec<u8>` serialises as a CBOR array of ints with ~10x bloat.
+# Compact CBOR encoding of raw byte fields (e.g.
+# `jpg_store_offer::OfferCreate::datum_cbor`). Without this,
+# `Vec<u8>` serialises as a CBOR array of ints with ~10x bloat.
 serde_bytes = "0.11"
 # Host-side decode path — see `decode` feature flag.
 ciborium = { version = "0.2", optional = true }
