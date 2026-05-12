@@ -1,0 +1,30 @@
+# cswap-dex golden scenario: user unstakes LP tokens from a
+# CSWAP farm — symmetric counterpart to `farm-stake`.
+#
+# TX: 5238db3d79d0f3c218a0213320f29e53fefcba3cfa710ba5116b648618e2a779
+# Slot: 187001980
+# Farm pair: ADA / PERPS (different from the ADA/Aliens farm
+# we cover in `farm-stake` — different LP-token policy).
+# Prior farm block: 183999175 (TX 25411fb5...2f produced the
+# farm UTxO with 79,382,620 LP tokens locked).
+# Companion harvest block: 187001632 (resolves the user wallet
+# input that funds tx fees).
+#
+# Algorithm: farm consume + farm produce; LP-token delta in the
+# farm UTxO is **negative** (LP returned to user). Module emits
+# `FarmUnstake` with `staker_address` identified from the user
+# wallet output that received the LP back.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
+
+[[interest]]
+kind = "at_address"
+address = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf"
+
+[[interest]]
+kind = "at_address"
+address = "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"

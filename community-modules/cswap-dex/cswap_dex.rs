@@ -273,6 +273,7 @@ fn flush_buffer(buf: TxBuffer) {
             &pool_in,
             &pool_out,
             &buf.produced,
+            &buf.consumed,
             &buf.consumed_orders,
         );
     }
@@ -294,12 +295,14 @@ fn flush_buffer(buf: TxBuffer) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_for_pool_pair(
     tx_hash_hex: &str,
     slot: u64,
     pool_in: &PoolInput,
     pool_out: &PoolOutput,
     produced: &[ProducedEvent],
+    consumed: &[ConsumedEvent],
     consumed_orders: &[ConsumedEvent],
 ) {
     let datum = &pool_in.datum;
@@ -324,63 +327,72 @@ fn emit_for_pool_pair(
         quote_asset: asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_after),
     });
 
-    // Dispatch by reserve-delta sign pattern. Three live shapes:
-    //   - opposing signs → Swap
-    //   - both > 0       → LiquidityAdd
-    //   - both < 0       → LiquidityRemove
-    // Anything else (both zero, or impossible combinations)
-    // gets dropped with a log — pool-init, fee-only updates,
-    // or chain weirdness we haven't characterised.
-    match (delta_quote.signum(), delta_base.signum()) {
-        (1, -1) | (-1, 1) => {
-            emit_swap(
-                tx_hash_hex,
-                slot,
-                datum,
-                delta_quote,
-                delta_base,
-                produced,
-                consumed_orders,
-                reserves_before,
-                reserves_after,
-            );
-        }
-        (1, 1) => {
-            emit_liquidity_add(
-                tx_hash_hex,
-                slot,
-                datum,
-                delta_quote as u64,
-                delta_base as u64,
-                pool_out,
-                produced,
-                consumed_orders,
-                reserves_before,
-                reserves_after,
-            );
-        }
-        (-1, -1) => {
-            emit_liquidity_remove(
-                tx_hash_hex,
-                slot,
-                datum,
-                (-delta_quote) as u64,
-                (-delta_base) as u64,
-                pool_out,
-                produced,
-                consumed_orders,
-                reserves_before,
-                reserves_after,
-            );
-        }
+    // Dispatch on LP-supply delta first — that's the
+    // load-bearing signal:
+    //
+    //   - LP supply grew  → LiquidityAdd (any pool-reserve
+    //     shape, including asymmetric "zap-in")
+    //   - LP supply shrank → LiquidityRemove (any pool-reserve
+    //     shape, including asymmetric "zap-out" where only one
+    //     leg's reserves move)
+    //   - LP supply unchanged → must be a Swap (opposing-sign
+    //     reserve deltas) or non-actionable transition
+    //
+    // Using reserve deltas as the primary signal misses
+    // asymmetric LP events; the LP-supply delta is the cleanest
+    // indicator that someone minted/burnt liquidity tokens.
+    let lp_delta = pool_out.datum.total_lp_tokens as i128 - datum.total_lp_tokens as i128;
+
+    match lp_delta.signum() {
+        1 => emit_liquidity_add(
+            tx_hash_hex,
+            slot,
+            datum,
+            delta_quote,
+            delta_base,
+            pool_out,
+            produced,
+            consumed_orders,
+            reserves_before,
+            reserves_after,
+        ),
+        -1 => emit_liquidity_remove(
+            tx_hash_hex,
+            slot,
+            datum,
+            delta_quote,
+            delta_base,
+            pool_out,
+            produced,
+            consumed,
+            consumed_orders,
+            reserves_before,
+            reserves_after,
+        ),
         _ => {
-            logging::log(
-                LogLevel::Info,
-                LOG_TARGET,
-                &format!(
-                    "tx={tx_hash_hex}: unrecognised pool transition (delta_quote={delta_quote}, delta_base={delta_base}), skipping"
+            // LP supply unchanged — opposing reserve-delta signs
+            // mean a swap; anything else is a transition we
+            // haven't characterised.
+            match (delta_quote.signum(), delta_base.signum()) {
+                (1, -1) | (-1, 1) => emit_swap(
+                    tx_hash_hex,
+                    slot,
+                    datum,
+                    delta_quote,
+                    delta_base,
+                    produced,
+                    consumed_orders,
+                    reserves_before,
+                    reserves_after,
                 ),
-            );
+                _ => logging::log(
+                    LogLevel::Info,
+                    LOG_TARGET,
+                    &format!(
+                        "tx={tx_hash_hex}: unrecognised pool transition (lp_delta={lp_delta}, delta_quote={delta_quote}, delta_base={delta_base}), skipping"
+                    ),
+                ),
+            }
         }
     }
 }
@@ -448,14 +460,20 @@ fn emit_liquidity_add(
     tx_hash_hex: &str,
     slot: u64,
     datum: &CswapPoolDatum,
-    quote_added_qty: u64,
-    base_added_qty: u64,
+    delta_quote: i128,
+    delta_base: i128,
     pool_out: &PoolOutput,
     produced: &[ProducedEvent],
     consumed_orders: &[ConsumedEvent],
     reserves_before: Option<PoolReserves>,
     reserves_after: Option<PoolReserves>,
 ) {
+    // For zap-in (asymmetric) adds, one side's delta may be
+    // zero or negative (e.g. the contract internally swaps
+    // before adding). Surface only the positive part so the
+    // event reports "ADA actually added to pool".
+    let quote_added_qty = u64::try_from(delta_quote.max(0)).unwrap_or(u64::MAX);
+    let base_added_qty = u64::try_from(delta_base.max(0)).unwrap_or(u64::MAX);
     let quote_added = asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_added_qty);
     let base_added = asset_from_pair(&datum.base_policy, &datum.base_name, base_added_qty);
 
@@ -508,14 +526,21 @@ fn emit_liquidity_remove(
     tx_hash_hex: &str,
     slot: u64,
     datum: &CswapPoolDatum,
-    quote_withdrawn_qty: u64,
-    base_withdrawn_qty: u64,
+    delta_quote: i128,
+    delta_base: i128,
     pool_out: &PoolOutput,
     produced: &[ProducedEvent],
+    consumed: &[ConsumedEvent],
     consumed_orders: &[ConsumedEvent],
     reserves_before: Option<PoolReserves>,
     reserves_after: Option<PoolReserves>,
 ) {
+    // For zap-out (asymmetric) removes, one side's delta may
+    // be zero — the user took the proceeds entirely on the
+    // other side. Negate the negative pool-delta to get the
+    // amount the user received.
+    let quote_withdrawn_qty = u64::try_from((-delta_quote).max(0)).unwrap_or(u64::MAX);
+    let base_withdrawn_qty = u64::try_from((-delta_base).max(0)).unwrap_or(u64::MAX);
     let quote_withdrawn =
         asset_from_pair(&datum.quote_policy, &datum.quote_name, quote_withdrawn_qty);
     let base_withdrawn =
@@ -530,14 +555,18 @@ fn emit_liquidity_remove(
         quantity: lp_burnt,
     };
 
-    // Recipient is the user wallet that received both base and
-    // quote sides. For ADA-paired pools the quote leg (ADA) is
-    // universal so we anchor on the base side — wallet output
-    // holding the base asset is the withdrawer.
-    let recipient = find_wallet_with_asset(produced, &datum.base_policy, &datum.base_name);
-    let provider_address = recipient
-        .as_ref()
-        .map(|r| r.address.clone())
+    // Recipient identification:
+    //   1) Balanced remove → wallet output holds the base
+    //      asset (preferred — most specific match).
+    //   2) Asymmetric zap-out → base side wasn't withdrawn, so
+    //      address-by-asset fails. Fall through to "user wallet
+    //      output whose lovelace lands within ~5 ADA of the
+    //      quote_withdrawn" — the user's proceeds get a ~2 ADA
+    //      min-utxo overhead, comfortably inside the tolerance.
+    let _ = consumed;
+    let provider_address = find_wallet_with_asset(produced, &datum.base_policy, &datum.base_name)
+        .map(|r| r.address)
+        .or_else(|| find_zap_recipient(produced, quote_withdrawn_qty))
         .unwrap_or_default();
 
     // No clean batcher-fee derivation yet for LP removes —
@@ -711,6 +740,29 @@ fn find_consumed_wallet_with_asset(
         }
     }
     None
+}
+
+/// User wallet output whose lovelace is closest to the target
+/// — used to identify the LP-remove recipient on an asymmetric
+/// (zap-out) flow where the user wallet doesn't carry the base
+/// asset on the way out. The user's "min_receive ADA" lands as
+/// `target_lovelace + min_utxo_overhead`, which sits within
+/// `TOLERANCE` of the actual zap-out quote_withdrawn. The
+/// batcher's own change wallet (which receives ADA orders of
+/// magnitude larger or smaller than the swap proceeds) is
+/// implicitly excluded by the tolerance band.
+const ASYMMETRIC_RECIPIENT_TOLERANCE: u64 = 5_000_000;
+
+fn find_zap_recipient(produced: &[ProducedEvent], target_lovelace: u64) -> Option<String> {
+    let target = target_lovelace as i128;
+    let tol = ASYMMETRIC_RECIPIENT_TOLERANCE as i128;
+    produced
+        .iter()
+        .filter(|p| is_user_wallet(&p.output.address))
+        .map(|p| ((p.output.lovelace as i128 - target).abs(), &p.output.address))
+        .filter(|(d, _)| *d <= tol)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, addr)| addr.clone())
 }
 
 /// Sum a pool UTxO's holding of the asset identified by
