@@ -1,0 +1,29 @@
+abi_version = 2
+
+# Splash DEX surface:
+#   - pool script (canonical addr1x): the pool UTxO holds the
+#     LP-token pre-mint pool (user circulation = max - pool
+#     holdings, so the supply-delta convention inverts from
+#     CSWAP). Single global pool address for Splash V3.
+#   - SpotOrderV3 (addr1z prefix): per-user stake credential
+#     means we prefix-match rather than enumerating. Order
+#     UTxOs live here; the platform delivers their consume
+#     events alongside pool events on a matching TX, which is
+#     enough to power `OrderCancel` detection (redeemer
+#     `d87980` on this script).
+#
+# Note: the prefix match below has 51 chars covering
+# `addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207q` =
+# addr1z + header byte + 28-byte payment hash worth of bech32.
+# Stake cred varies per order.
+[interest]
+addresses = [
+    # Pool — fixed (script payment + script stake)
+    "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z",
+]
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"

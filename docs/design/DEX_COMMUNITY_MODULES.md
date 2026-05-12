@@ -373,11 +373,12 @@ rebuild. We accept this fragility because the alternative
 (skipping `RewardClaim` entirely) leaves a real user-facing
 hole in the consumer UX.
 
-### TODO: `OrderCancel` deferred for CSWAP
+### `OrderCancel` deferred for CSWAP
 
 The `DexAction::OrderCancel` variant is wire-defined in
 `mitos_community_events::dex` but no module currently emits it.
-Investigation against mainnet history (2026-05):
+**CSWAP doesn't have an on-chain cancel path** — confirmed
+empirically (2026-05):
 
 - The CSWAP TX-builder code in cnft.dev-workers
   (`workers/wallet-operations/src/dex.rs`) marks CSWAP order
@@ -385,18 +386,19 @@ Investigation against mainnet history (2026-05):
   implemented"`.
 - Every one of the ~30 most-recent CSWAP order-script consumes
   on-chain uses a fill redeemer (Constr 2 — `d87b9f…`), never
-  the expected cancel redeemer (Constr 0 — `d87980`).
-- The CSWAP UI surfaces a "cancel" affordance, but the TXs it
-  produces are aggregator-mediated re-submissions, not on-chain
-  script unlocks.
+  `d87980`.
+- A controlled experiment placed a deliberately-unfulfillable
+  order (0.0001% slippage on a ~1.5% price-impact swap). The
+  order never reached chain — CSWAP holds orders in an
+  off-chain batcher queue, marking unfulfillable ones as
+  "Discarded". The UI's "Cancel Order" button just discards
+  the queue entry. **No on-chain TX is produced for a cancel.**
 
-Best current theory: CSWAP's contract may not expose a
-user-callable cancel path at all — orders sit at the batcher
-until filled. `splash-dex` (where on-chain cancels are common
-and well-documented, and shared-crates has a working cancel
-builder) will be the first module to actually emit
-`OrderCancel`. If a real CSWAP cancel TX surfaces, the
-detection path is a single-fixture addition to `cswap-dex`.
+`splash-dex` (where on-chain cancels are well-documented and
+shared-crates has a working cancel builder) will be the first
+module to actually emit `OrderCancel`. If CSWAP later adds an
+on-chain cancel path, the detection is a single-fixture
+addition to `cswap-dex`.
 
 ## Per-module structure
 

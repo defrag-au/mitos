@@ -53,29 +53,27 @@
 //! shared decoder doesn't surface — it only returns totalLpTokens
 //! + poolFee for builder-side math).
 //!
-//! ## TODO: `OrderCancel` not emitted
+//! ## `OrderCancel` is not emitted by this module
 //!
 //! The `DexAction::OrderCancel` variant is wire-defined but no
-//! detection runs here. Investigation against mainnet history
-//! (2026-05) showed that:
+//! detection runs here. **CSWAP doesn't have an on-chain cancel
+//! path** — confirmed empirically (2026-05):
 //!
 //! - The CSWAP TX-builder code in cnft.dev-workers marks CSWAP
 //!   order cancellation as "not yet implemented".
-//! - Every one of the ~30 most-recent order-script consumes
-//!   on-chain uses a fill redeemer (Constr 2, `d87b9f…`).
-//!   None used the expected cancel redeemer (`d87980` =
-//!   Constr 0 with empty fields).
-//! - The CSWAP UI shows a "cancel" affordance, but the TXs
-//!   marked as such are aggregator-mediated submissions, not
-//!   on-chain script unlocks.
+//! - Every one of the ~30 most-recent order-script consumes on
+//!   mainnet uses a fill redeemer (Constr 2, `d87b9f…`). None
+//!   used the expected cancel redeemer `d87980`.
+//! - A test placement of a deliberately-unfulfillable order
+//!   (0.0001% slippage on a ~1.5% price-impact swap) showed the
+//!   order never even reaching chain: CSWAP holds orders in an
+//!   off-chain batcher queue, and the UI's "Cancel Order"
+//!   button just discards the queue entry. No on-chain TX is
+//!   produced for a cancel.
 //!
-//! Best current theory: CSWAP's order contract may not expose
-//! a user-callable cancel path at all (orders sit at the
-//! batcher until filled). `OrderCancel` will first land in
-//! `splash-dex`, where Splash supports proper on-chain cancels
-//! with a working builder in shared-crates. If a real CSWAP
-//! cancel TX surfaces in the future, the detection path is a
-//! single-fixture addition to this module.
+//! `OrderCancel` will first land for real in `splash-dex`,
+//! where Splash's on-chain cancel path is well-defined and
+//! has a working builder in shared-crates.
 
 use std::collections::BTreeMap;
 

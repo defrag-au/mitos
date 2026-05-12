@@ -1,0 +1,21 @@
+# splash-dex golden scenario: pool-direct ADA→Aliens swap
+# orchestrated by steelswap aggregator. No order UTxO involved
+# — the aggregator consumes the pool directly with a swap
+# redeemer on the pool script.
+#
+# TX: 5b356d48a2c83f5b81b0e84cbc3ec97ef951fde3e41f192b14caee89c4d2d98b
+# Slot: 186802764
+# Prior pool block: 186800597 (TX 440304fa…da)
+#
+# Pool transition shows opposing-sign reserve deltas + LP-token
+# holding unchanged → dispatches to `emit_swap` via the
+# LP-supply-delta == 0 branch, same as the batcher-routed case.
+# Demonstrates the detection is route-agnostic: it doesn't care
+# whether the swap came through SpotOrderV3 or directly via the
+# pool script.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z"
