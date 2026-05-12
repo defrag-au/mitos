@@ -1,0 +1,32 @@
+# jpg-store-offer golden scenario: 8-offer create batch in one TX.
+#
+# TX:    9c89a39533e0d0e78f7a779c1611bfe842cd2db80ddc0305d464f2d2da21a8c0
+# Slot:  187018998
+# Block: 557a0ac118783de6f9603dc63d08bfcc3c2a5e4acf978c8e60ad4bdbe67081bd
+#
+# Bidder `5e7b4881291f63706f6b1643e268e8da42f73035af1152dfd3917f39`
+# (a single wallet) submits a TX that creates 8 collection offers
+# at the V2 CO script address — outputs 0-7. Output 8 is the
+# wallet-change UTxO at the bidder's own address.
+#
+# This fixture exists as a regression test for the
+# 2026-05-12 buffer-collision bug: `TxBuffer.produced_offers`
+# previously used `BTreeMap<bidder_pkh, ProducedOffer>` and
+# silently overwrote 7 of the 8 entries because all outputs
+# share the same bidder. Only 1 of 8 OfferCreate events ever
+# emitted. The fix flattens the buffer to `Vec<ProducedOffer>`
+# and emits all 8.
+#
+# Expected emission: 8 `Create` events, one per V2 offer
+# output, in output-index order (the module preserves dispatch
+# order for unpaired produced offers in `flush_buffer`).
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p"
