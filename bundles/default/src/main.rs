@@ -1,14 +1,18 @@
-//! Default bundle: Dolos data plane + legacy static indexers
-//! (collection-ownership, marketplace).
+//! Default bundle: Dolos data plane + wasm-module hosting + the
+//! none-match residual-pass indexer.
 //!
-//! Phase 1+: composition logic now lives in `mitos_core::Bundle`. This
-//! file just loads config, constructs the domain, instantiates each
-//! indexer the bundle wants to include, and hands off to `Bundle::run`.
+//! Composition logic lives in `mitos_core::Bundle`. This file just
+//! loads config, constructs the domain, registers the residual
+//! indexer + wasm-module hosting, and hands off to `Bundle::run`.
+//!
+//! The three legacy in-tree indexers (collection-ownership,
+//! marketplace, mint-burn) and the outbound `Replicator` subscription
+//! model were retired once their consumers cut over to platform-v2
+//! community modules. `NoneMatchIndexer` stays as the dispatcher's
+//! residual-pass coordinator (see
+//! `docs/design/DOMAIN_REFACTOR.md`).
 
 use clap::Parser;
-use collection_ownership_indexer::OwnershipIndexer;
-use marketplace_indexer::MarketplaceIndexer;
-use mint_burn_indexer::MintBurnIndexer;
 use mitos_core::Bundle;
 use none_match_indexer::NoneMatchIndexer;
 use tokio_util::sync::CancellationToken;
@@ -27,9 +31,10 @@ struct Args {
     #[arg(long, env = "BUNDLE_LISTEN", default_value = "127.0.0.1:8080")]
     listen: std::net::SocketAddr,
 
-    /// Where mitos stores its own state — the subscription registry
-    /// today, per-indexer materialized views in the future.
-    /// Independent of Dolos's data dir.
+    /// Where mitos stores its own state. Independent of Dolos's
+    /// data dir. Currently used by platform-v2 hosting paths (the
+    /// emissions log + cursor checkpoint per wasm module live
+    /// under `--modules-dir`, which is a separate path).
     #[arg(long, env = "BUNDLE_DATA_DIR", default_value = "./mitos-data")]
     data_dir: std::path::PathBuf,
 
@@ -50,11 +55,10 @@ struct Args {
     #[arg(long, env = "BUNDLE_COMMUNITY_MODULES_DIR")]
     community_modules_dir: Option<std::path::PathBuf>,
 
-    /// Print the loaded configuration + persisted subscriptions to
-    /// stdout, then exit 0 without starting the chain follower or
-    /// HTTP server. Useful for verifying env vars, paths, and the
-    /// state of the redb registry before committing to a long-
-    /// running process.
+    /// Print the loaded configuration to stdout, then exit 0
+    /// without starting the chain follower or HTTP server.
+    /// Useful for verifying env vars and paths before committing
+    /// to a long-running process.
     #[arg(long)]
     print_config_only: bool,
 }
@@ -71,17 +75,7 @@ async fn main() -> anyhow::Result<()> {
     // WAL lock). Lets `--print-config-only` run safely against a
     // dir that's actively being used by another mitos instance.
     if args.print_config_only {
-        mitos_core::print_config_summary(
-            &config,
-            args.listen,
-            &args.data_dir,
-            &[
-                "collection-ownership",
-                "marketplace",
-                "mint-burn",
-                "none-match",
-            ],
-        )?;
+        mitos_core::print_config_summary(&config, args.listen, &args.data_dir, &["none-match"])?;
         return Ok(());
     }
 
@@ -91,15 +85,15 @@ async fn main() -> anyhow::Result<()> {
     let exit = install_exit_handler();
 
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
-    bundle.add_indexer(OwnershipIndexer::new()?);
-    bundle.add_indexer(MarketplaceIndexer::new()?);
-    bundle.add_indexer(MintBurnIndexer::new()?);
 
     // Residual pass: emits `Domain::AssetMovement` for asset
-    // transfers no specific-domain indexer claimed (P2P transfers,
-    // unrecognised marketplace scripts, etc.). Switches the
-    // dispatcher to synchronised mode — see
-    // `docs/design/DOMAIN_REFACTOR.md`.
+    // transfers no specific-domain indexer claimed (the chain-
+    // recognition surface that used to live in
+    // collection-ownership / marketplace / mint-burn indexers now
+    // lives in wasm community modules; `none-match` catches the
+    // residual so consumers tracking generic ownership get
+    // complete coverage). Switches the dispatcher to synchronised
+    // mode — see `docs/design/DOMAIN_REFACTOR.md`.
     let claim_coordinator = bundle.enable_residual_pass();
     bundle.add_indexer(NoneMatchIndexer::new(claim_coordinator));
 

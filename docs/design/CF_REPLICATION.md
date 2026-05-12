@@ -7,7 +7,10 @@
 > register out-of-band via the unified-subscribe HTTPS handshake
 > (`POST /api/companions/subscribe`), and mitos dials back over
 > WS. The legacy `Replicator` (operator-driven
-> `mitos-admin add --target-url ...`) is on the retirement path.
+> `mitos-admin add --target-url ...`) retired alongside the
+> three legacy in-tree indexers in 2026-05 (see
+> `crates/mitos-core/src/replicate.rs` for the remaining
+> server-accepted test surface used by `mitos-tail`).
 >
 > **For the current wire shape:** see
 > `crates/mitos-protocol/src/wire.rs` (CBOR-tagged
@@ -386,11 +389,16 @@ direction. After the upgrade:
 2. Mitos (data source) replies with `ServerMessage::SubscribeReply(...)`.
 3. Mitos streams `Apply` / `Undo` / `Mark` records.
 
-Naming in the codebase reflects this: the `Replicator` on the mitos
-side is the WS client driver, owning the outbound dial loop with
-reconnect/backoff. The `replicate_router` server endpoint stays as a
-test surface (a synthetic CBOR client can speak to it without
-spinning up a CF worker), but is not the production path.
+Naming in the codebase reflected this: the `Replicator` on the
+mitos side was the WS client driver, owning the outbound dial
+loop with reconnect/backoff. **`Replicator` retired in 2026-05**
+once its three in-tree indexer consumers cut over to platform-v2
+community modules — the v2 dialer
+(`mitos_platform::dialer::CompanionDialer`) provides the same
+shape for companion subscriptions. The `replicate_router` server
+endpoint stays as a test surface (a synthetic CBOR client can
+speak to it without spinning up a CF worker), used by
+`mitos-tail` for local debugging.
 
 The Hibernation API decouples socket lifetime from DO billing: CF
 holds the WebSocket, the DO hibernates between messages, and active

@@ -18,7 +18,6 @@ pub mod helpers;
 mod indexer;
 mod indexer_bridge;
 mod replicate;
-mod replicator;
 mod transport;
 
 #[cfg(test)]
@@ -37,7 +36,6 @@ pub use replicate::{
     ClientMessage, ServerMessage, chain_point_from_wire, chain_point_to_wire, decode_client,
     decode_server, encode_client, encode_server, replicate_router, subscribe_reply_to_wire,
 };
-pub use replicator::{Replicator, Subscription, SubscriptionId};
 pub use transport::{AxumWs, TungsteniteWs, WsTransport};
 
 // Re-export the wire-format / selector types so framework-side

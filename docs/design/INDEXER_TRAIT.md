@@ -16,11 +16,12 @@
 > **For new indexers**, follow the community-modules pattern —
 > see `../strategy/COMMUNITY_MODULES.md` and
 > `../HOWTO_CONSUMING_A_COMMUNITY_MODULE.md`. The in-tree trait
-> documented (poorly) here is grandfathered: existing in-tree
-> indexers (`collection-ownership-indexer`, `marketplace-indexer`,
-> `mint-burn-indexer`, `none-match-indexer`) stay until concrete
-> pressure mandates retirement; new chain-recognition work goes
-> to community wasm modules. See
+> documented (poorly) here is grandfathered: the three legacy
+> indexers (`collection-ownership-indexer`,
+> `marketplace-indexer`, `mint-burn-indexer`) retired in 2026-05
+> in favour of community wasm modules. Only `none-match-indexer`
+> still implements this trait — it stays as the dispatcher's
+> residual-pass coordinator. See
 > `../strategy/LAYERED_RESPONSIBILITIES.md` for the layering
 > rationale.
 

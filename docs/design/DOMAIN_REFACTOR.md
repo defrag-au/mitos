@@ -1,5 +1,21 @@
 # Domain refactor: Mint, Burn, AssetMovement
 
+> **Status: completed + then superseded (2026-05).** The domain
+> taxonomy described here (`Mint` / `Burn` / `AssetMovement` as
+> first-class domain arms; ownership as a projection over those
+> events) shipped + remains canonical. The *implementation
+> vehicle* — the three legacy in-tree indexers
+> (`collection-ownership-indexer`, `marketplace-indexer`,
+> `mint-burn-indexer`) — has retired in favour of platform-v2
+> community modules (`asset-transfer`, `jpg-store-*`,
+> `cip-25-mint`, `cip-68-mint`, `standard-burn`, `burn-address`,
+> `asset-metadata-update`). The `none-match-indexer` stays as
+> the residual-pass coordinator the synchronised dispatcher
+> requires.
+>
+> Body below is kept as historical reference for the
+> domain-event taxonomy + synchronised-dispatcher decisions.
+
 Adds three top-tier `Domain` arms to `mitos-protocol` and retires
 the bespoke `OwnershipChange` event type. Per-asset state
 transitions become first-class events on the protocol stream;
