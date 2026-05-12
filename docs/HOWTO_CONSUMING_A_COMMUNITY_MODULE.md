@@ -141,9 +141,10 @@ name; inbound frames route to the channel whose `NAME` matches.
 Community modules typically filter chain events **internally**
 (their `<name>.toml` declares the script addresses or policies
 they watch). The `Interest` API is for orthogonal,
-consumer-driven filtering — e.g. when subscribing to an in-tree
-indexer like `marketplace-indexer` that broadcasts everything and
-relies on the consumer to filter brand/event-kind.
+consumer-driven filtering — the canonical use today is the
+`asset-transfer` community module, which ships with an empty
+static interest and lets each consumer scope its subscription
+to specific policies via `HoldsPolicy` predicates.
 
 For community modules: leave `initial_interests()` empty unless
 the module's docstring explicitly says it honours an `Interest`

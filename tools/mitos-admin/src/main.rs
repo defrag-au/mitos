@@ -1,16 +1,19 @@
 //! `mitos-admin`: thin CLI wrapper around mitos's HTTP admin
 //! surface.
 //!
-//! Subscriptions:
+//! - `health` — pretty-print `/health` (uptime, indexer list).
 //!
-//! - `health` — pretty-print `/health` (uptime, indexer list,
-//!   per-status subscription counts).
-//! - `list` — `GET /_admin/subscriptions` formatted as a table or
-//!   `--json` for piping.
-//! - `add` — `POST /_admin/subscriptions` with friendly args.
-//! - `remove <id>` — `DELETE /_admin/subscriptions/{id}`.
+//! The legacy `list` / `add` / `remove` subcommands (which drove
+//! the outbound `Replicator` subscription model + its
+//! `/_admin/subscriptions` admin routes) retired alongside the
+//! three legacy in-tree indexers (collection-ownership,
+//! marketplace, mint-burn). Platform-v2 wasm modules use the
+//! companion runtime's HTTPS subscribe path
+//! (`/api/companions/subscribe`); manage them via the
+//! `list-modules` / `upload-module` / `evict-module` /
+//! `recapture` subcommands below.
 //!
-//! Modules (the platform v1 deployment surface — see
+//! Modules (the platform-v2 deployment surface — see
 //! `docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md`):
 //!
 //! - `list-modules` — `GET /_admin/modules`.
@@ -27,7 +30,7 @@
 use clap::{Parser, Subcommand};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "manage mitos subscriptions and inspect health")]
@@ -50,42 +53,6 @@ enum Cmd {
     /// Print mitos's /health response (uptime, indexer list,
     /// subscription summary by status).
     Health,
-
-    /// List all registered subscriptions.
-    List {
-        /// Emit raw JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Register a new outbound subscription.
-    Add {
-        /// Indexer name (e.g. `collection-ownership`).
-        #[arg(long)]
-        indexer: String,
-
-        /// Target WebSocket URL (e.g.
-        /// `wss://collections-mitos.<account>.workers.dev/_internal/replicate?policy_id=abc`).
-        #[arg(long)]
-        target: String,
-
-        /// Scope payload as JSON, e.g.
-        /// `--scope-json '{"policy_id":"abc..."}'`. Shape must
-        /// match the indexer's `Scope` type. Use `null` for
-        /// indexers with `Scope = ()`.
-        #[arg(long)]
-        scope_json: String,
-
-        /// Resume cursor: `origin`, `<slot>`, or `<slot>:<hash_hex>`.
-        #[arg(long, default_value = "origin")]
-        cursor: String,
-    },
-
-    /// Drop an existing subscription by id.
-    Remove {
-        /// Subscription id (from `list` or the response of `add`).
-        id: u64,
-    },
 
     /// List registered modules.
     ListModules {
@@ -275,14 +242,6 @@ async fn main() -> anyhow::Result<()> {
 
     match cmd {
         Cmd::Health => cmd_health(&client, &cli).await,
-        Cmd::List { json } => cmd_list(&client, &cli, json).await,
-        Cmd::Add {
-            indexer,
-            target,
-            scope_json,
-            cursor,
-        } => cmd_add(&client, &cli, indexer, target, scope_json, cursor).await,
-        Cmd::Remove { id } => cmd_remove(&client, &cli, id).await,
         Cmd::ListModules { json } => cmd_list_modules(&client, &cli, json).await,
         Cmd::GetModule { id } => cmd_get_module(&client, &cli, id).await,
         Cmd::UploadModule { artifact } => cmd_upload_module(&client, &cli, artifact).await,
@@ -331,16 +290,6 @@ struct HealthResp {
     status: String,
     uptime_secs: u64,
     indexers: Vec<String>,
-    replicator: ReplicatorSummary,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReplicatorSummary {
-    total: usize,
-    connecting: usize,
-    connected: usize,
-    disconnected: usize,
-    backing_off: usize,
 }
 
 async fn cmd_health(client: &Client, cli: &Cli) -> anyhow::Result<()> {
@@ -355,132 +304,6 @@ async fn cmd_health(client: &Client, cli: &Cli) -> anyhow::Result<()> {
     println!("status:        {}", resp.status);
     println!("uptime:        {}", format_duration(resp.uptime_secs));
     println!("indexers:      {}", resp.indexers.join(", "));
-    println!(
-        "subscriptions: total={} connected={} connecting={} backing_off={} disconnected={}",
-        resp.replicator.total,
-        resp.replicator.connected,
-        resp.replicator.connecting,
-        resp.replicator.backing_off,
-        resp.replicator.disconnected,
-    );
-    Ok(())
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SubEntry {
-    id: u64,
-    sub: SubBody,
-    state: ConnStateView,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SubBody {
-    indexer: String,
-    target_url: String,
-    cursor: Value,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ConnStateView {
-    status: String,
-    last_connected_at: Option<u64>,
-    last_error: Option<String>,
-    backoff_secs: u64,
-}
-
-async fn cmd_list(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Result<()> {
-    let url = format!("{}/_admin/subscriptions", cli.mitos);
-    let resp = auth(client.get(&url), cli.token.as_deref())
-        .send()
-        .await?
-        .error_for_status()?;
-
-    if json_out {
-        let v: Value = resp.json().await?;
-        println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-
-    let entries: Vec<SubEntry> = resp.json().await?;
-    if entries.is_empty() {
-        println!("(no subscriptions)");
-        return Ok(());
-    }
-
-    println!(
-        "{:<4}  {:<24}  {:<12}  {:<8}  TARGET",
-        "ID", "INDEXER", "STATUS", "BACKOFF"
-    );
-    for e in entries {
-        let backoff = if e.state.backoff_secs > 0 {
-            format!("{}s", e.state.backoff_secs)
-        } else {
-            "-".into()
-        };
-        println!(
-            "{:<4}  {:<24}  {:<12}  {:<8}  {}",
-            e.id, e.sub.indexer, e.state.status, backoff, e.sub.target_url
-        );
-        if let Some(err) = e.state.last_error {
-            println!("      └─ last_error: {err}");
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_add(
-    client: &Client,
-    cli: &Cli,
-    indexer: String,
-    target: String,
-    scope_json: String,
-    cursor: String,
-) -> anyhow::Result<()> {
-    let scope: Value = serde_json::from_str(&scope_json)
-        .map_err(|e| anyhow::anyhow!("--scope-json is not valid JSON: {e}"))?;
-
-    let body = json!({
-        "indexer": indexer,
-        "target_url": target,
-        "scope": scope,
-        "cursor": cursor,
-    });
-
-    let url = format!("{}/_admin/subscriptions", cli.mitos);
-    let resp = auth(client.post(&url), cli.token.as_deref())
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("add failed: {status}: {text}");
-    }
-
-    #[derive(Deserialize)]
-    struct AddResp {
-        id: u64,
-    }
-    let added: AddResp = resp.json().await?;
-    println!("added subscription id={}", added.id);
-    Ok(())
-}
-
-async fn cmd_remove(client: &Client, cli: &Cli, id: u64) -> anyhow::Result<()> {
-    let url = format!("{}/_admin/subscriptions/{id}", cli.mitos);
-    let resp = auth(client.delete(&url), cli.token.as_deref())
-        .send()
-        .await?;
-    let status = resp.status();
-    if status.as_u16() == 204 {
-        println!("removed subscription id={id}");
-    } else if status.as_u16() == 404 {
-        anyhow::bail!("no subscription with id={id}");
-    } else {
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("remove failed: {status}: {text}");
-    }
     Ok(())
 }
 

@@ -140,13 +140,21 @@ implementation. When designing a new dApp, mirror its layout:
 - `wrangler.toml` — `[vars]` for `MITOS_HOST_URL` + `MITOS_REPLICATE_URL`, secrets store binding for `MITOS_AUTH_TOKEN`
 - `cnft.dev-workers/types/collections-mitos-events/` — shared event-type crate
 
-## Static indexers (legacy — do not start new work here)
+## Static indexers — retired
 
-The crates `crates/collection-ownership-indexer/` and
-`crates/marketplace-indexer/` are legacy static indexers compiled
-into the bundle binary, paired with the legacy `mitos-core::Replicator`
-outbound subscription model. **They are slated for retirement once
-the production consumer migrates onto the wasm-module + companion path.**
+The three legacy static indexers (`collection-ownership-indexer`,
+`marketplace-indexer`, `mint-burn-indexer`) and the outbound
+`mitos-core::Replicator` subscription model retired once their
+consumers cut over to platform-v2 community modules (the
+collection-ownership worker now subscribes to `asset-transfer`;
+the jpg-store-mirror worker subscribes to `jpg-store-offer`;
+mint/burn surfaces are covered by `cip-25-mint`, `cip-68-mint`,
+`standard-burn`, `burn-address`, and `asset-metadata-update`).
+
+The `none-match-indexer` stays as the dispatcher's residual-pass
+coordinator — it emits `Domain::AssetMovement` for asset transfers
+that no specific-domain indexer claims, and the v2 synchronised
+dispatcher requires it (see `docs/design/DOMAIN_REFACTOR.md`).
 
 Don't build new indexers as static crates. The wasm-module path is
 the steady state — single-file source, hot-load via `mitos-admin

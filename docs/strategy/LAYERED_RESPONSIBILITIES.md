@@ -1,5 +1,21 @@
 # Layered responsibilities — where logic lives
 
+> **Status: layered model still canonical; in-tree-indexer layer
+> mostly retired (2026-05).** The three-layer model (in-tree
+> indexer, wasm module, companion DO) and the
+> community-modules-first heuristic that fell out of this
+> analysis remain authoritative. The three legacy in-tree
+> indexers used as examples below (`collection-ownership-indexer`,
+> `marketplace-indexer`, `mint-burn-indexer`) **retired** —
+> their chain-recognition surface now lives in community
+> modules (`asset-transfer`, `jpg-store-{listing,sale,offer}`,
+> `cip-25-mint`, `cip-68-mint`, `standard-burn`,
+> `burn-address`, `asset-metadata-update`). Only the
+> residual-pass `none-match-indexer` remains in-tree.
+>
+> The body below uses past-tense framing for the three retired
+> indexers but the layering reasoning is unchanged.
+
 Mitos's three-layer model: in-tree indexer, wasm module, companion
 DO. This doc names what belongs in each layer, the decision
 heuristic for new work, and the patterns that fall out.

@@ -60,7 +60,13 @@ comment naming the public entry point:
 | `mitos-platform/src/storage.rs::CursorStore::open`         | `ModuleStorage::cursor_store(id)`      | `ModuleStorage::{read,write}_cursor(id, …)`             |
 | `mitos-platform/src/emissions.rs::EmissionsStore::open`    | `ModuleStorage::emissions_store(id)`   | `EmissionsStore::{append,get,update_status,…}`          |
 | `mitos-platform/src/vendored/balius/kv.rs::RedbKv::try_new`| `ModuleStorage::kv_store(id, …)`       | `RedbKv::{get,set,delete,list}_value(module_id, …)`     |
-| `mitos-core/src/replicator.rs::Replicator::new`            | `Replicator` (process singleton)       | `Replicator::{add,remove,list,summary,…}`               |
+
+(The legacy `mitos-core::Replicator` redb store
+`subscriptions.redb` retired in 2026-05 alongside the three
+in-tree indexers; companion subscriptions for platform-v2 wasm
+modules persist as plain CBOR files under
+`<modules_dir>/<id>/companions/<companion_key>.cbor` and don't
+use redb directly.)
 
 All other redb-using code obtains a handle via the public
 surface — never via `Database::create` / `open` / `Builder`.

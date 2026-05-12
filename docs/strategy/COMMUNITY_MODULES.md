@@ -200,31 +200,32 @@ to any per-dApp wasm module that earns wider relevance.
 
 ## What this means for the existing in-tree indexers
 
-`marketplace-indexer`, `mint-burn-indexer`,
-`collection-ownership-indexer`, `none-match-indexer` all
-shipped pre-community-modules. They work, they have consumers,
-they stay. The community-modules-first preference shapes **new**
-chain-recognition work — it doesn't mandate retroactive
-demolition.
+Three of the four legacy in-tree indexers
+(`collection-ownership-indexer`, `marketplace-indexer`,
+`mint-burn-indexer`) **retired in 2026-05** once their consumers
+cut over to platform-v2 community modules. The
+community-modules-first preference shaped new chain-recognition
+work for a year + then drove the retirement of the in-tree path
+once parity was reached.
 
-Concretely:
+Only `none-match-indexer` remains — it stays as the dispatcher's
+residual-pass coordinator (emits `Domain::AssetMovement` for
+asset transfers no specific-domain emitter claimed; required by
+the synchronised dispatcher, not legacy).
 
-- **No rip-and-replace.** Workers that subscribe to in-tree
-  indexers today (jpg-store-mirror's marketplace channel,
-  collections-mitos's ownership channel) keep doing so. The
-  unified-subscribe path treats community modules and in-tree
-  indexers as peers — companions don't notice the distinction.
-- **New brand decode work goes to a community module.** When
-  wayup's CO support lands, it's `wayup-co` next to `jpg-co` —
-  not a payload extension to `marketplace-indexer`. Likewise
-  any new marketplace, DEX, or lending brand.
-- **Retirement is a per-indexer call, not a strategy
-  decision.** If `marketplace-indexer` becomes maintenance
-  dead-weight once `jpg-co` + `wayup-co` + future brand
-  modules cover the same ground, it gets retired then — driven
-  by concrete pressure (a contract change nobody wants to port
-  twice, an indexer payload that's been unused for months),
-  not by principle.
+The retirement playbook each indexer followed:
+
+1. Stand up a community module covering the chain-recognition
+   surface (e.g. `cip-25-mint` for mint events).
+2. Wait for the consumer worker(s) to migrate subscriptions.
+3. Verify zero remaining replicator subscribers via
+   `/_admin/subscriptions` (now removed).
+4. Drop the indexer crate + bundle wiring in one PR.
+
+New brand decode work continues to go to community modules
+(e.g. wayup's CO support lands as `wayup-store-offer` next to
+`jpg-store-offer`), and `Replicator` itself retired alongside
+its last consumer.
 
 The forcing function for any future retirement is the same as
 the one that produced this doc: real second consumers reveal

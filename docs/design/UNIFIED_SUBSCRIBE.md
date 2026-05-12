@@ -1,5 +1,20 @@
 # Unified subscribe — bridging in-tree indexers into companion-runtime
 
+> **Status: largely retired (2026-05).** The motivation here was
+> bridging two parallel subscription models (legacy in-tree
+> indexers + wasm modules) into one. Outcome: rather than
+> bridging, the three legacy in-tree indexers
+> (`collection-ownership-indexer`, `marketplace-indexer`,
+> `mint-burn-indexer`) retired entirely in favour of platform-v2
+> community modules. The `Replicator` retirement section below
+> (under "Replicator retirement") is now complete. Only
+> `none-match-indexer` remains as the dispatcher's residual-pass
+> coordinator; consumers wanting "raw asset movements" subscribe
+> to the `asset-transfer` community module instead.
+>
+> Body retained as historical reference for the unified-subscribe
+> design decisions that shaped the companion-runtime API.
+
 In-tree indexers (`marketplace-indexer`, `mint-burn-indexer`,
 `none-match-indexer`) and wasm modules currently reach consumers
 through two parallel mechanisms with different registration
