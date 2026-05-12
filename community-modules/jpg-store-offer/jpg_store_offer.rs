@@ -457,7 +457,9 @@ fn flush_buffer(mut buf: TxBuffer) {
                 new_output_index: produced.output_index,
                 previous_lovelace: consume.prior_lovelace,
                 new_lovelace: produced.lovelace,
+                datum_cbor: produced.datum_bytes,
                 target_policy: produced.decoded.target_policy,
+                target_asset_names: produced.decoded.target_asset_names,
                 co_version: produced.co_version,
             }));
             continue;
