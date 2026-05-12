@@ -141,10 +141,32 @@ enum Cmd {
     /// stays on disk for rollback per
     /// `MITOS_PLATFORM_DEPLOYMENT.md` §"Resolved design questions"
     /// #1; remove with `rm -rf <storage>/<id>` if you really
-    /// want it gone.
+    /// want it gone — or use `evict-module` for a full retirement
+    /// in one operation.
     DeleteModule {
         /// Module id.
         id: String,
+    },
+
+    /// Fully retire a module: stop the slot, drop the dialer's
+    /// in-memory state for any subscribed companions, and remove
+    /// the artifact directory. Refuses if companion records still
+    /// exist on disk unless `--force` is passed (which logs a
+    /// loud warning on the host).
+    ///
+    /// Use after retiring all consumers of a module. For the
+    /// rollback-friendly "stop slot only" variant, use
+    /// `delete-module` instead.
+    EvictModule {
+        /// Module id.
+        id: String,
+        /// Skip the companions-still-registered safety check.
+        /// Reaps any in-memory dial loops + removes the artifact
+        /// dir regardless of on-disk companion records. Logged
+        /// loudly on the host. Use when the consumer side has
+        /// already retired but cleanup didn't reach the host.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Build then upload — wrangler-deploy ergonomics. Shells out
@@ -267,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::RestartModule { id } => cmd_restart_module(&client, &cli, id).await,
         Cmd::Recapture { id, reason } => cmd_recapture(&client, &cli, id, reason).await,
         Cmd::DeleteModule { id } => cmd_delete_module(&client, &cli, id).await,
+        Cmd::EvictModule { id, force } => cmd_evict_module(&client, &cli, id, force).await,
         Cmd::Deploy {
             crate_name,
             module_id,
@@ -744,6 +767,66 @@ async fn cmd_delete_module(client: &Client, cli: &Cli, id: String) -> anyhow::Re
         anyhow::bail!("delete failed: {status}: {text}");
     }
     println!("deleted module={id} (artifact preserved on disk)");
+    Ok(())
+}
+
+/// JSON-deserialisation shape for `POST .../evict` success.
+/// Mirror of `mitos_platform::admin::EvictResponse`.
+#[derive(serde::Deserialize)]
+struct EvictResponse {
+    module: String,
+    cancelled_companions: Vec<String>,
+    artifact_removed: bool,
+}
+
+/// Conflict body when companions still registered + no `--force`.
+/// Mirror of `mitos_platform::admin::EvictConflictBody`.
+#[derive(serde::Deserialize)]
+struct EvictConflictBody {
+    error: String,
+    companion_keys: Vec<String>,
+    hint: String,
+}
+
+async fn cmd_evict_module(
+    client: &Client,
+    cli: &Cli,
+    id: String,
+    force: bool,
+) -> anyhow::Result<()> {
+    let suffix = if force { "?force=true" } else { "" };
+    let url = format!("{}/_admin/modules/{id}/evict{suffix}", cli.mitos);
+    let resp = auth(client.post(&url), cli.token.as_deref()).send().await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        anyhow::bail!("module `{id}` not registered");
+    }
+    if status.as_u16() == 409 {
+        let body: EvictConflictBody = resp.json().await?;
+        anyhow::bail!(
+            "evict refused for `{id}`: {} ({})\n  registered companion_keys: {}\n  hint: {}",
+            body.error,
+            "pass --force to override",
+            body.companion_keys.join(", "),
+            body.hint,
+        );
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("evict failed: {status}: {text}");
+    }
+    let body: EvictResponse = resp.json().await?;
+    println!(
+        "evicted module={} artifact_removed={} cancelled_companions={}",
+        body.module,
+        body.artifact_removed,
+        body.cancelled_companions.len(),
+    );
+    if !body.cancelled_companions.is_empty() {
+        for k in &body.cancelled_companions {
+            println!("  - {k}");
+        }
+    }
     Ok(())
 }
 

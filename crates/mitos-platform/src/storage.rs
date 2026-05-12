@@ -179,6 +179,36 @@ impl ModuleStorage {
         self.root.join(id)
     }
 
+    /// Remove a module's entire artifact directory
+    /// (`<storage_root>/<id>/`) — wasm, manifest, config.cbor,
+    /// emissions.redb, kv.redb, cursor.redb, companions/.
+    /// Used by the admin **evict** path (`POST
+    /// /_admin/modules/{id}/evict`) to fully retire a module
+    /// rather than just stopping its slot.
+    ///
+    /// **Caller MUST close cached DB handles first** — call
+    /// `close_kv(id)`, `close_emissions(id)`, `close_cursor(id)`
+    /// (or equivalent host-side teardown) before this method.
+    /// Open redb handles hold an OS file lock that prevents
+    /// `remove_dir_all` from cleaning the files. The DELETE-slot
+    /// → drop-dialer-state → close-DB-handles → remove-dir order
+    /// is what the evict handler orchestrates.
+    ///
+    /// Idempotent: a missing dir returns `Ok(())`.
+    pub fn remove_module_dir(&self, id: &str) -> Result<(), StorageError> {
+        let dir = self.module_dir(id);
+        if !dir.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&dir).map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "remove module dir {}: {e}",
+                dir.display()
+            )))
+        })?;
+        Ok(())
+    }
+
     /// Per-module last-trap fixture path. The host's
     /// `TrapContextLogger` writes here on every `init` /
     /// `handle_event` failure; the admin endpoint
