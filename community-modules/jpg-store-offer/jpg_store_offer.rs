@@ -72,11 +72,24 @@ thread_local! {
     static V3_ADDRESS: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// Empty-address guard: an unconfigured slot in the manifest
+/// (e.g. `v3_address = ""` while V3 isn't yet known) must not
+/// match every empty-prefixed address. Concretely, without this
+/// guard the platform would never send empty-addressed events
+/// anyway, but the guard makes the contract explicit and keeps
+/// future ABI additions (e.g. tick events that carry an empty
+/// address field) from accidentally matching.
 fn watched_version(addr: &str) -> Option<JpgStoreOfferVersion> {
-    if V2_ADDRESS.with(|a| a.borrow().as_str() == addr) {
+    if V2_ADDRESS.with(|a| {
+        let a = a.borrow();
+        !a.is_empty() && a.as_str() == addr
+    }) {
         return Some(JpgStoreOfferVersion::V2);
     }
-    if V3_ADDRESS.with(|a| a.borrow().as_str() == addr) {
+    if V3_ADDRESS.with(|a| {
+        let a = a.borrow();
+        !a.is_empty() && a.as_str() == addr
+    }) {
         return Some(JpgStoreOfferVersion::V3);
     }
     None
