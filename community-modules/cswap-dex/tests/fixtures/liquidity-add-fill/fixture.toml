@@ -1,0 +1,26 @@
+# cswap-dex golden scenario: CSWAP batcher fills an
+# add-liquidity order — user deposits BOTH ADA and Aliens
+# into the pool and receives LP tokens back.
+#
+# TX: 5aa63ae66e38df5fcbdf09235a674b36dfc0d5914150bcb5a7ce475cad0f0857
+# Slot: 183609644
+# Pair: ADA / Aliens
+# Companion order TX (separate fixture): da0fc61c...3f (liquidity-add-order)
+# Prior pool block: 183587249 (TX 9d0c5cf0...36)
+#
+# Pool input + pool output both at POOL_SCRIPT_ADDR → module
+# enters its swap-detection path. Critically, BOTH base and
+# quote reserves grow in this TX (user added two-sided
+# liquidity), so the directional check
+# `(delta_quote > 0 && delta_base < 0) || (...)` fails and
+# `emit_for_pool_pair` returns early with a "non-swap pool
+# transition" log line. Expected: zero emissions.
+#
+# This is the load-bearing negative test for Phase 1: proves
+# we don't misclassify liquidity events as swaps.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"

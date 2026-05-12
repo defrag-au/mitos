@@ -10,7 +10,7 @@
       "policy": "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c",
       "quantity": 216550
     },
-    "batcher_fee_lovelace": null,
+    "batcher_fee_lovelace": 1213371,
     "contract_version": null,
     "dex_brand": "CSWAP",
     "effective_price": [

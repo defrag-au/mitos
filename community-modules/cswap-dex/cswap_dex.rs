@@ -69,9 +69,22 @@ const LOG_TARGET: &str = "cswap-dex-module";
 
 const DEX_BRAND: &str = "CSWAP";
 
-/// CSWAP pool script address. All 82 pools live here.
+/// CSWAP pool script address. All 82 pools live here. CSWAP
+/// uses a single canonical stake credential across its pools
+/// (unlike Splash, which varies stake creds per pool — to be
+/// handled with a prefix-match interest set when `splash-dex`
+/// lands).
 const POOL_SCRIPT_ADDR: &str =
     "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
+
+/// CSWAP order / batcher script address prefix (51 chars =
+/// `addr1z` + header byte + 28-byte payment hash worth of bech32).
+/// Each user's order has its own stake credential glued to the
+/// same payment script, so we prefix-match rather than enumerate.
+/// Used at flush time to identify consumed orders so we can
+/// compute `batcher_fee_lovelace`.
+const ORDER_SCRIPT_ADDR_PREFIX: &str =
+    "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nh";
 
 /// Bech32 prefixes used to identify a *user wallet* output —
 /// payment credential is a key (not a script). Cardano header
@@ -115,6 +128,10 @@ struct TxBuffer {
     /// All produced outputs — needed at flush to find the user
     /// wallet output (the non-script recipient of asset_out).
     produced: Vec<ProducedEvent>,
+    /// Consumed order/batcher UTxOs — used to derive
+    /// `batcher_fee_lovelace`. Captured at handle-time to avoid
+    /// rescanning `consumed` in flush.
+    consumed_orders: Vec<ConsumedEvent>,
     tx_hash: Option<Vec<u8>>,
     slot: Option<u64>,
 }
@@ -173,6 +190,8 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
                 },
             );
         }
+    } else if c.prior_output.address.starts_with(ORDER_SCRIPT_ADDR_PREFIX) {
+        buf.consumed_orders.push(c.clone());
     }
 }
 
@@ -191,7 +210,14 @@ fn flush_buffer(buf: TxBuffer) {
             // retirement or unusual flow; not a swap.
             continue;
         };
-        emit_for_pool_pair(&tx_hash_hex, slot, &pool_in, &pool_out, &buf.produced);
+        emit_for_pool_pair(
+            &tx_hash_hex,
+            slot,
+            &pool_in,
+            &pool_out,
+            &buf.produced,
+            &buf.consumed_orders,
+        );
     }
     // Produced pools with no matching consumed (pool creation
     // TXs etc.) aren't swaps; ignore.
@@ -203,6 +229,7 @@ fn emit_for_pool_pair(
     pool_in: &PoolInput,
     pool_out: &PoolOutput,
     produced: &[ProducedEvent],
+    consumed_orders: &[ConsumedEvent],
 ) {
     let datum = &pool_in.datum;
 
@@ -252,7 +279,14 @@ fn emit_for_pool_pair(
         )
     };
 
-    let swapper_address = find_swapper_address(produced, &asset_out).unwrap_or_default();
+    let swapper = find_swapper(produced, &asset_out);
+    let swapper_address = swapper
+        .as_ref()
+        .map(|s| s.address.clone())
+        .unwrap_or_default();
+
+    let batcher_fee_lovelace =
+        derive_batcher_fee_lovelace(consumed_orders, &asset_in, swapper.as_ref());
 
     let reserves_before = Some(PoolReserves {
         base_asset: asset_from_pair(&datum.base_policy, &datum.base_name, base_before),
@@ -275,10 +309,7 @@ fn emit_for_pool_pair(
         pool_reserves_before: reserves_before,
         pool_reserves_after: reserves_after,
         pool_fee_bps: u32::try_from(datum.pool_fee_bps).ok(),
-        // Batcher-fee extraction defers to a fixture — set
-        // `None` until we observe a real batcher-routed TX
-        // and decide how to surface the fee delta.
-        batcher_fee_lovelace: None,
+        batcher_fee_lovelace,
         effective_price: Some((out_qty, in_qty)),
     });
 
@@ -311,22 +342,79 @@ fn asset_from_pair(policy: &[u8], name: &[u8], quantity: u64) -> SwapAsset {
     }
 }
 
-/// First produced output at a non-CSWAP-script address that
-/// carries `asset_out`. Phase 1: single-user assumption — batcher
-/// TXs with multiple fills will return the first matching wallet,
+/// First produced output at a user-wallet address that carries
+/// `asset_out`. Phase 1: single-user assumption — batcher TXs
+/// with multiple fills will return the first matching wallet,
 /// which is a known limitation to be addressed once we have a
 /// batcher-fill golden fixture (the per-order datums govern how
 /// to split fills cleanly).
-fn find_swapper_address(produced: &[ProducedEvent], asset_out: &SwapAsset) -> Option<String> {
+///
+/// Returns the address *and* the output's lovelace, because the
+/// latter is the user's `min_receive` ADA leg — needed for the
+/// `batcher_fee_lovelace` derivation.
+fn find_swapper(produced: &[ProducedEvent], asset_out: &SwapAsset) -> Option<SwapperInfo> {
     for p in produced {
         if !is_user_wallet(&p.output.address) {
             continue;
         }
         if output_contains(&p.output, asset_out) {
-            return Some(p.output.address.clone());
+            return Some(SwapperInfo {
+                address: p.output.address.clone(),
+                output_lovelace: p.output.lovelace,
+            });
         }
     }
     None
+}
+
+struct SwapperInfo {
+    address: String,
+    /// Lovelace held in the swapper's wallet output. For ADA-in
+    /// swaps this is the protocol-mandated ~2 ADA `min_receive`
+    /// ADA leg returned alongside the bought tokens.
+    output_lovelace: u64,
+}
+
+/// Compute the batcher's lovelace cut for a single-order
+/// batcher-routed ADA-in fill:
+///
+/// ```text
+/// batcher_fee = sum(order_deposits) − pool_quote_inflow − swapper_min_utxo_back
+/// ```
+///
+/// Returns `None` when we can't confidently attribute the fee:
+///
+/// - **No consumed orders** → either a pool-direct swap (no
+///   batcher hop) or a flow we haven't characterised yet.
+/// - **Multiple consumed orders** → batcher-multi-fill TX;
+///   per-user fee splitting needs the order datums. Deferred
+///   until we have a multi-fill golden fixture in hand.
+/// - **Non-Lovelace `asset_in`** → token→ADA / token→token; the
+///   ADA-flow arithmetic doesn't apply directly. Deferred.
+/// - **No identifiable swapper output** → can't subtract the
+///   `min_receive` ADA leg, so the residual would conflate
+///   batcher fee + min-utxo carryover.
+/// - **Arithmetic underflow** → defensive guard; means our
+///   understanding of the flow is off for this TX shape.
+fn derive_batcher_fee_lovelace(
+    consumed_orders: &[ConsumedEvent],
+    asset_in: &SwapAsset,
+    swapper: Option<&SwapperInfo>,
+) -> Option<u64> {
+    if consumed_orders.len() != 1 {
+        return None;
+    }
+    let SwapAsset::Lovelace {
+        quantity: pool_inflow,
+    } = asset_in
+    else {
+        return None;
+    };
+    let swapper = swapper?;
+    let deposit = consumed_orders[0].prior_output.lovelace;
+    deposit
+        .checked_sub(*pool_inflow)
+        .and_then(|x| x.checked_sub(swapper.output_lovelace))
 }
 
 fn is_user_wallet(addr: &str) -> bool {
