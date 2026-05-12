@@ -1,0 +1,51 @@
+[
+  {
+    "asset_in": {
+      "kind": "lovelace",
+      "quantity": 348390453
+    },
+    "asset_out": {
+      "asset_name_hex": "4e696b65",
+      "kind": "native",
+      "policy": "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c",
+      "quantity": 216550
+    },
+    "batcher_fee_lovelace": null,
+    "contract_version": null,
+    "dex_brand": "CSWAP",
+    "effective_price": [
+      216550,
+      348390453
+    ],
+    "kind": "swap",
+    "pool_fee_bps": 85,
+    "pool_id": "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c:4e696b65|lovelace",
+    "pool_reserves_after": {
+      "base_asset": {
+        "asset_name_hex": "4e696b65",
+        "kind": "native",
+        "policy": "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c",
+        "quantity": 10469301
+      },
+      "quote_asset": {
+        "kind": "lovelace",
+        "quantity": 17050458568
+      }
+    },
+    "pool_reserves_before": {
+      "base_asset": {
+        "asset_name_hex": "4e696b65",
+        "kind": "native",
+        "policy": "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c",
+        "quantity": 10685851
+      },
+      "quote_asset": {
+        "kind": "lovelace",
+        "quantity": 16702068115
+      }
+    },
+    "slot": 186988684,
+    "swapper_address": "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yrycd2hfm9qpg7d0hf50s599tqx",
+    "tx_hash": "4a09bc1dc440cb5e10dd85988d32b943e4212f65fa739454f6f1df7e37768fac"
+  }
+]

@@ -136,7 +136,8 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
             .datum
             .as_ref()
             .and_then(resolve_datum_bytes)
-            .and_then(|b| decode_pool_datum(&b))
+            .as_deref()
+            .and_then(decode_pool_datum)
         {
             buf.pool_outputs.insert(
                 datum.pair_key(),
@@ -161,7 +162,8 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
             .prior_datum
             .as_ref()
             .and_then(resolve_datum_bytes)
-            .and_then(|b| decode_pool_datum(&b))
+            .as_deref()
+            .and_then(decode_pool_datum)
         {
             buf.pool_inputs.insert(
                 datum.pair_key(),
@@ -220,7 +222,7 @@ fn emit_for_pool_pair(
     // accounting weirdness don't qualify as swaps in Phase 1.
     if !((delta_quote > 0 && delta_base < 0) || (delta_quote < 0 && delta_base > 0)) {
         logging::log(
-            LogLevel::Debug,
+            LogLevel::Info,
             LOG_TARGET,
             &format!(
                 "tx={tx_hash_hex}: non-swap pool transition (delta_quote={delta_quote}, delta_base={delta_base}), skipping"
@@ -299,7 +301,7 @@ fn pool_value(out: &TypedOutput, policy: &[u8], name: &[u8]) -> u64 {
 
 fn asset_from_pair(policy: &[u8], name: &[u8], quantity: u64) -> SwapAsset {
     if policy.is_empty() && name.is_empty() {
-        SwapAsset::Lovelace(quantity)
+        SwapAsset::Lovelace { quantity }
     } else {
         SwapAsset::Native {
             policy: hex::encode(policy),
@@ -334,7 +336,7 @@ fn is_user_wallet(addr: &str) -> bool {
 
 fn output_contains(out: &TypedOutput, asset: &SwapAsset) -> bool {
     match asset {
-        SwapAsset::Lovelace(qty) => out.lovelace >= *qty / 2, // tolerate dust + min-utxo
+        SwapAsset::Lovelace { quantity } => out.lovelace >= *quantity / 2, // tolerate dust + min-utxo
         SwapAsset::Native {
             policy,
             asset_name_hex,
@@ -358,20 +360,26 @@ fn output_contains(out: &TypedOutput, asset: &SwapAsset) -> bool {
 /// Stable, sorted pair fingerprint. Different pools / contract
 /// versions for the same asset pair produce the same `pool_id`
 /// so cross-DEX consumers can union events without fragmenting.
+/// Format: `<side_a>|<side_b>` where each side is either
+/// `"lovelace"` (ADA / empty-policy empty-name) or
+/// `<policy_hex>:<name_hex>`. Sides are sorted alphabetically,
+/// and `"lovelace"` (starts with 'l') sorts after any hex side
+/// (max hex char is 'f'), giving a consistent `<token>|lovelace`
+/// shape for ADA-paired pools.
 fn pool_id_for_pair(d: &CswapPoolDatum) -> String {
-    let a = format!(
-        "{}:{}",
-        hex::encode(&d.quote_policy),
-        hex::encode(&d.quote_name)
-    );
-    let b = format!(
-        "{}:{}",
-        hex::encode(&d.base_policy),
-        hex::encode(&d.base_name)
-    );
+    let a = pair_side(&d.quote_policy, &d.quote_name);
+    let b = pair_side(&d.base_policy, &d.base_name);
     let mut sides = [a, b];
     sides.sort();
     format!("{}|{}", sides[0], sides[1])
+}
+
+fn pair_side(policy: &[u8], name: &[u8]) -> String {
+    if policy.is_empty() && name.is_empty() {
+        "lovelace".to_string()
+    } else {
+        format!("{}:{}", hex::encode(policy), hex::encode(name))
+    }
 }
 
 fn emit_event(event: &DexAction) {

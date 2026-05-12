@@ -1,0 +1,16 @@
+# cswap-dex golden scenario: order-creation TX submitted directly
+# via the CSWAP UI (no aggregator hop).
+#
+# TX: 7476a0f4c6cbc14db944af1d4f25bb1c1bd250941a7abe017d27de4129f78d39
+# Slot: 186922764
+# Pair: ADA / Aliens (companion fill in fill-ada-to-aliens fixture)
+#
+# Order-creation TX → no pool touch → no emissions. Same purpose
+# as the steelswap-aggregator fixture: prove the interest filter
+# skips order-submission TXs irrespective of who submitted them.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"

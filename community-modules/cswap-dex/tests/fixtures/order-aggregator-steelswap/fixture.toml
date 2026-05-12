@@ -1,0 +1,22 @@
+# cswap-dex golden scenario: order-creation TX from a steelswap
+# aggregator that routes through CSWAP.
+#
+# TX: 286c19ba04cdc8a849cc6ec159747448bd0439065f7744815fc2bae2053a36d5
+# Slot: 186988610
+# Pair: ADA / NIKEPIG (companion fill in fill-ada-to-nikepig fixture)
+#
+# This TX submits the order to the order/batcher script — it does
+# *not* touch the pool address. Expected emissions: **none**.
+# The fixture exists to prove that:
+#
+#   1. Module's `at_address(POOL_SCRIPT_ADDR)` interest filter
+#      correctly skips order-creation TXs.
+#   2. Aggregator-routed orders (steelswap, dexhunter, etc.)
+#      don't trigger spurious events at the order-submission
+#      stage — the chain-recognition layer waits for the fill.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"

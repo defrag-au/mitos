@@ -27,10 +27,18 @@ use serde::{Deserialize, Serialize};
 /// One asset moving through a swap. ADA is encoded as `Lovelace`
 /// rather than a synthetic `policy=""/name=""` native to keep
 /// the wire shape unambiguous on the consumer side.
+///
+/// Both variants are struct-shaped (rather than `Lovelace(u64)`)
+/// because the `#[serde(tag = "kind")]` discriminator requires
+/// variants ciborium can encode as maps; a newtype variant
+/// wrapping a primitive (the original `Lovelace(u64)`) trips a
+/// ciborium serializer error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SwapAsset {
-    Lovelace(u64),
+    Lovelace {
+        quantity: u64,
+    },
     Native {
         /// 56-char lowercase hex policy id.
         policy: String,

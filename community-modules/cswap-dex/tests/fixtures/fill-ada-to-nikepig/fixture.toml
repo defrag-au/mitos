@@ -1,0 +1,17 @@
+# cswap-dex golden scenario: CSWAP batcher filling an ADA→NIKEPIG order.
+#
+# TX: 4a09bc1dc440cb5e10dd85988d32b943e4212f65fa739454f6f1df7e37768fac
+# Slot: 186988684
+# Pair: ADA / NIKEPIG (CSWAP is ADA-paired across all pools)
+# Companion order TX (separate fixture): 286c19ba...d5 (steelswap aggregator)
+#
+# This is a fill TX — the pool UTxO is consumed and re-produced
+# at the pool script address. Expected emission: one `Swap`
+# with swapper_address resolved to the user wallet that received
+# the NIKEPIG tokens.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
