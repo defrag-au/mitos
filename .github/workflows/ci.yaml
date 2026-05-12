@@ -96,18 +96,53 @@ jobs:
         with:
           shared-key: "community-modules"
           cache-on-failure: true
+          # Default rust-cache scope covers `~/.cargo/{registry,git}`
+          # and the top-level `target/`. Each community module
+          # materialises its wasm crate at
+          # `community-modules/<name>/target/mitos-build/<name>/`
+          # with its own private `target/` dir, none of which the
+          # default scope sees. Without explicit `cache-directories`
+          # entries every CI run rebuilds each module's wasm deps
+          # (pallas-*, serde, ciborium, …) from scratch.
+          cache-directories: |
+            community-modules/asset-metadata-update/target
+            community-modules/asset-transfer/target
+            community-modules/burn-address/target
+            community-modules/cip-25-mint/target
+            community-modules/cip-68-mint/target
+            community-modules/jpg-co/target
+            community-modules/jpg-store-listing/target
+            community-modules/jpg-store-offer/target
+            community-modules/jpg-store-sale/target
+            community-modules/standard-burn/target
 
       - name: Build host tools (mitos-build + mitos-run)
         run: cargo build --release -p mitos-build -p mitos-run
 
       - name: Build community-module wasm artifacts
+        # `MITOS_BUILD_FAST=1` switches every materialised module's
+        # `[profile.release]` to a CI-friendly profile (no LTO,
+        # 16 codegen units, `opt-level = 1`). Default release
+        # profile (`lto = true`, `codegen-units = 1`,
+        # `opt-level = "z"`) is correct for prod deploys but
+        # dominates CI wall time; fast artifacts produce identical
+        # event emissions so goldens stay green.
+        #
+        # `xargs -P "$(nproc)"` runs the per-module builds in
+        # parallel up to the runner's core count. Each module's
+        # target dir is independent so there's no write
+        # contention. On warm-cache incremental builds (the
+        # common case once caching is established) cross-module
+        # parallelism wins outright; on cold-cache full rebuilds
+        # cargo's internal codegen-unit parallelism would already
+        # saturate cores, so the cross-module dimension is
+        # net-neutral rather than a slowdown — Linux's scheduler
+        # handles the oversubscription.
+        env:
+          MITOS_BUILD_FAST: "1"
         run: |
-          # Walk every community-modules/<name>/ with a <name>.rs
-          # source and produce its mitos-build artifact under
-          # target/mitos/<name>/. Aborts on first failure so a wasm
-          # build break shows up loud — same model as `cargo test`
-          # surfaces test failures.
-          set -e
+          set -euo pipefail
+          modules=()
           for d in community-modules/*/; do
             name=$(basename "$d")
             stem=$(echo "$name" | tr - _)
@@ -116,10 +151,10 @@ jobs:
               echo "skip $name: no $stem.rs"
               continue
             fi
-            echo "::group::build $name"
-            ./target/release/mitos-build --module "$src"
-            echo "::endgroup::"
+            modules+=("$src")
           done
+          printf '%s\n' "${modules[@]}" \
+            | xargs -P "$(nproc)" -I {} ./target/release/mitos-build --module {}
 
       - name: Run golden tests
         run: ./scripts/run-golden-tests.sh
