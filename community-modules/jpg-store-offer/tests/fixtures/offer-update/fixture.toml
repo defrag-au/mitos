@@ -1,0 +1,36 @@
+# jpg-store-offer golden scenario: offer-update on V2 CO.
+#
+# TX:    b7b9c822cc0a7bbf6e9c4f81e15b5e5625296ea2a261efd0d055951d18457d2c
+# Slot:  185319909
+# Prior: 47de42473c9391429e9a1c4eec51c55800e85767540de715cc4da6c60bc13d24
+#        @ slot 185318091 (same bidder; ~30 min earlier)
+#
+# Bidder raises their collection offer from 550 ADA → 600 ADA.
+# Consumes the prior 550 ADA UTxO at the V2 CO address, produces
+# a new 600 ADA UTxO at the same address. Both UTxOs share the
+# same bidder pkh, so the module classifies as `Update` (not
+# `Cancel + Create`).
+#
+# Expected emission: one `Create` event from the prior block, then
+# one `Update` event from the consume block. The Update carries
+# the new offer's full `datum_cbor` (so downstream cancel-TX
+# construction works against the updated offer's on-chain bytes)
+# + `target_asset_names` (same as the prior — updates change
+# price, not target).
+#
+# This fixture exists specifically to lock in the new
+# `datum_cbor` + `target_asset_names` fields on `OfferUpdate`.
+# Without them the worker would either fall back to the prior
+# offer's datum (broken cancels) or skip tracking updates
+# entirely. Per `community-modules/asset-transfer/…` and the
+# jpg-store-mirror cutover plan in cnft.dev-workers.
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
+
+[[interest]]
+kind = "at_address"
+address = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p"

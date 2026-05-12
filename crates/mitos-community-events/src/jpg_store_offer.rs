@@ -122,7 +122,20 @@ pub struct OfferUpdate {
     pub new_output_index: u32,
     pub previous_lovelace: u64,
     pub new_lovelace: u64,
+    /// Raw datum CBOR for the new offer UTxO. Same field as
+    /// `OfferCreate.datum_cbor` — consumers need it so they can
+    /// build a cancel TX against the updated offer's actual
+    /// on-chain bytes (which differ from the prior offer's
+    /// because the lovelace amount is encoded in the datum).
+    /// Without this, downstream cancel-TX construction for an
+    /// updated offer would fail script validation.
+    #[serde(with = "serde_bytes")]
+    pub datum_cbor: Vec<u8>,
     pub target_policy: Option<String>,
+    /// Asset names (lowercase hex) the new offer is constrained
+    /// to. Preserved from the prior offer (updates change price,
+    /// not target). Empty for collection-wide offers.
+    pub target_asset_names: Vec<String>,
     pub co_version: JpgStoreOfferVersion,
 }
 
