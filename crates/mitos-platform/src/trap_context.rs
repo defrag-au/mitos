@@ -29,6 +29,8 @@ use mitos_data_plane::{DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, 
 pub struct TrapContextLog {
     /// `utxos_by_address(addr) -> refs`.
     pub utxos_by_address: Vec<UtxosByAddressCall>,
+    /// `utxos_by_policy(policy) -> refs`.
+    pub utxos_by_policy: Vec<UtxosByPolicyCall>,
     /// `read_utxos(refs, decode) -> [(ref, output)]`.
     pub read_utxos: Vec<ReadUtxosCall>,
     /// `read_output_datums(refs) -> [Option<(hash, payload)>]`.
@@ -50,6 +52,12 @@ pub struct TrapContextLog {
 #[derive(Debug, Clone)]
 pub struct UtxosByAddressCall {
     pub address: String,
+    pub refs: Vec<OutputRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UtxosByPolicyCall {
+    pub policy: Vec<u8>,
     pub refs: Vec<OutputRef>,
 }
 
@@ -156,6 +164,19 @@ impl DataPlaneFacade for TrapContextLogger {
             .utxos_by_address
             .push(UtxosByAddressCall {
                 address: address.to_owned(),
+                refs: result.clone(),
+            });
+        Ok(result)
+    }
+
+    async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        let result = self.inner.utxos_by_policy(policy).await?;
+        self.log
+            .lock()
+            .expect("trap log mutex")
+            .utxos_by_policy
+            .push(UtxosByPolicyCall {
+                policy: policy.to_vec(),
                 refs: result.clone(),
             });
         Ok(result)

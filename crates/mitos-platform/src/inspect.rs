@@ -74,6 +74,13 @@ impl DataPlaneFacade for NullDataPlane {
         Ok(Vec::new())
     }
 
+    async fn utxos_by_policy(
+        &self,
+        _policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        Ok(Vec::new())
+    }
+
     async fn datum_by_hash(
         &self,
         _hash: &[u8; 32],

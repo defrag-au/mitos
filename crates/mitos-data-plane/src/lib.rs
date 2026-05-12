@@ -110,6 +110,24 @@ pub trait ChainDataPlane: Send + Sync {
     /// Result is hard-capped at 100K refs.
     async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>>;
 
+    /// Return every currently-unspent output that holds at
+    /// least one unit of a given policy id (28-byte hash).
+    /// Symmetric primitive to `utxos_by_address` for the
+    /// policy-keyed case. Dolos maintains a first-class
+    /// `BY_POLICY` index (multimap in redb / prefix-keyed in
+    /// fjall), so this is O(log N + M) where M is the number
+    /// of UTxOs currently holding the policy — sub-second
+    /// even for very active policies.
+    ///
+    /// Use cases: cold-start hydration of per-policy holder
+    /// ledgers (`holder-distribution` module), NFT-collection
+    /// scanners, vesting-contract indexers — anything that
+    /// wants the current "all UTxOs of asset X" set without
+    /// writing its own event-replay loop.
+    ///
+    /// Result is hard-capped at 100K refs.
+    async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>>;
+
     /// Bulk datum lookup for a list of output refs. Returns a
     /// parallel `Vec<Option<TypedDatum>>` where the i'th element
     /// is the datum on `refs[i]`, resolved caller-blind (inline

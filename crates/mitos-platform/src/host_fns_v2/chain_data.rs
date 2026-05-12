@@ -40,6 +40,15 @@ impl ChainDataHost for HostStateV2 {
         Ok(refs.into_iter().map(from_dp_ref).collect())
     }
 
+    async fn utxos_by_policy(&mut self, policy: Vec<u8>) -> wasmtime::Result<Vec<WitOutputRef>> {
+        let refs = self
+            .data_plane
+            .utxos_by_policy(&policy)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+
     async fn read_output_datums(
         &mut self,
         refs: Vec<WitOutputRef>,

@@ -252,6 +252,21 @@ interface chain-data {
     /// transparently. Cap: 100K refs.
     utxos-by-address: func(address: string) -> list<output-ref>;
 
+    /// Enumerate the current unspent set holding a given policy
+    /// id (28-byte hash). Symmetric primitive to
+    /// `utxos-by-address` for the policy-keyed case. Dolos
+    /// maintains a first-class `BY_POLICY` index (multimap in
+    /// redb / prefix-keyed in fjall), so this is sub-second
+    /// even for very active policies — O(log N + M) where M is
+    /// the number of UTxOs currently holding the policy.
+    ///
+    /// Use cases: cold-start hydration of per-policy holder
+    /// ledgers (`holder-distribution` module), NFT-collection
+    /// indexers, vesting-contract scanners. Modules that need
+    /// per-policy bootstrap state without writing their own
+    /// event-replay logic. Cap: 100K refs.
+    utxos-by-policy: func(policy: list<u8>) -> list<output-ref>;
+
     /// Bulk caller-blind datum lookup for a list of output refs.
     /// Returns parallel `option<typed-datum>` — `Some` when the
     /// output has a datum (resolved transparently regardless of

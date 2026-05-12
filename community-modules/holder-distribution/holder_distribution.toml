@@ -1,0 +1,18 @@
+abi_version = 2
+
+# `holder-distribution` is dynamic-interest-only. Static
+# interest is empty; consumers register the policies they care
+# about via `update_interest` over the replication WS, and the
+# module performs a cold-start scan via `chain_data::
+# utxos_by_policy(X)` on each newly-added policy.
+#
+# Tracking every policy on mainnet (~2M) isn't feasible, so
+# this opt-in model is intentional.
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-addresses = "1.0.0-alpha.6"
+pallas-primitives = "1.0.0-alpha.6"

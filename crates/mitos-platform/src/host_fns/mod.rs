@@ -33,6 +33,11 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         address: &str,
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
 
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
+
     /// Resolve a datum hash to its raw CBOR bytes via the
     /// underlying state's witness-datum index. Returns `None`
     /// when the hash isn't present (datum was inline-only and
@@ -106,6 +111,13 @@ where
         address: &str,
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         mitos_data_plane::ChainDataPlane::utxos_by_address(self, address).await
+    }
+
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        mitos_data_plane::ChainDataPlane::utxos_by_policy(self, policy).await
     }
 
     async fn datum_by_hash(
@@ -228,6 +240,14 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         mitos_data_plane::ChainDataPlane::utxos_by_address(&plane, address).await
+    }
+
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::utxos_by_policy(&plane, policy).await
     }
 
     async fn tx_metadata(

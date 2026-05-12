@@ -311,6 +311,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn utxos_by_policy(&self, _policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+            Ok(Vec::new())
+        }
+
         async fn tx_metadata(
             &self,
             _tx_hash: &pallas_primitives::Hash<32>,
