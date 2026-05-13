@@ -46,11 +46,21 @@ pub const MITOS_HOST_URL_ENV: &str = "MITOS_HOST_URL";
 pub const MITOS_AUTH_TOKEN_ENV: &str = "MITOS_AUTH_TOKEN";
 
 /// Environment variable name for the dial-back URL template the
-/// host should use when opening its outbound WS to this companion.
-/// Carries `{key}` as a placeholder that mitos substitutes with
-/// the companion key at dial time.
+/// host should use when POSTing emissions to this companion.
 ///
-/// Example: `wss://collections-mitos.cnft.dev/_internal/replicate?policy_id={key}`
+/// Template placeholders (all optional but typically all three are
+/// present in production wrangler config):
+/// - `{key}` → the companion key (= the DO's `id_from_name`)
+/// - `{target}` → the subscribe target name (i.e. the module the
+///   companion subscribes to)
+/// - `{op}` → `apply` or `recapture`, the per-request operation
+///
+/// Example (HTTP delivery, post-migration):
+///   `https://jpgsm.cnft.dev/_internal/{op}-{target}?key={key}`
+///
+/// Multi-target companions MUST include `{target}` so each target
+/// resolves distinctly. `{op}` MUST be present somewhere in the
+/// path so apply and recapture URLs differ.
 pub const MITOS_REPLICATE_URL_ENV: &str = "MITOS_REPLICATE_URL";
 
 /// Read the auth token. dApps configure this in `wrangler.toml`
@@ -213,7 +223,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: Some(DialBackOverride {
-                url: Some("wss://tenant001.example.com/replicate?key={key}".into()),
+                url: Some("https://tenant001.example.com/_internal/{op}-{target}?key={key}".into()),
                 auth_header: Some("X-Custom-Auth".into()),
                 auth_value: Some("token-abc".into()),
             }),

@@ -1,61 +1,64 @@
-//! Companion dial loop.
+//! Companion dial loop (HTTP delivery).
 //!
 //! For each persisted companion (one CBOR file per
 //! `<storage>/<module>/companions/<key>.cbor`), the dialer
-//! maintains an outbound WebSocket back to that companion's
-//! Worker URL. On connect:
+//! maintains a per-companion async task that drains the
+//! per-module `EmissionsStore` via HTTP POST against the
+//! companion's Worker URL.
 //!
-//! 1. Send `ServerMessage::Connected { last_emission_id }` as
-//!    the readiness signal (companion logs it; nothing more).
-//! 2. Drain `EmissionStatus::Queued` rows for this companion
-//!    from the per-module `EmissionsStore`, sending one
-//!    `ServerMessage::Apply` per row and flipping the row to
-//!    `Pending`. Drain proceeds in monotonic-id order.
-//! 3. Tail loop: poll the emissions store for new `Queued` rows
-//!    every `POLL_INTERVAL`, and parse inbound
-//!    `ClientMessage::{Ack, Nack, Unsubscribe, Interest}`
-//!    frames as they arrive (Interest is logged for now —
-//!    follower control-channel wiring is a separate task).
+//! ## Per-task lifecycle
 //!
-//! On disconnect or transport error: exponential backoff up to
-//! `MAX_BACKOFF`, then redial. Cancellation via the supervisor
-//! `CancellationToken` (held in `CompanionDialer.tasks`) cuts
-//! the loop and returns.
+//! 1. **Pending requeue** — on task start, flip any rows left
+//!    `Pending` from a prior host process back to `Queued`.
+//!    Catches the host-crash-mid-request case (analog of the
+//!    legacy reconnect-time requeue).
+//! 2. **Pump loop**:
+//!    - `outbound_rx` carries control frames (currently just
+//!      `Recapture`). When one arrives, POST to the companion's
+//!      `/_internal/recapture-<channel>` endpoint and signal the
+//!      `pending_recaptures` oneshot on 2xx.
+//!    - Poll tick (every `POLL_INTERVAL`) drains the
+//!      `EmissionsStore` for new `Queued` rows. Each row → one
+//!      HTTP POST to `/_internal/apply-<channel>`. Response status
+//!      maps to:
+//!      - `2xx` → `Acked`
+//!      - `422` → `Nacked` (apply errored; won't help to retry)
+//!      - `5xx` / network error → leave `Queued`, back off + retry
+//! 3. **Backoff** — transport errors trigger exponential backoff
+//!    up to `MAX_BACKOFF`. Per-task `CancellationToken` cuts the
+//!    loop and returns.
 //!
-//! ## Why polling, not broadcast
+//! ## Recapture flow
 //!
-//! The drain pump on the bundle side writes new emissions to
-//! the per-module `EmissionsStore` as `Queued`. Per-companion
-//! dial tasks poll for new queued rows. This avoids the
-//! complexity of a per-module broadcast channel + offline-
-//! companion queue split, at the cost of poll latency
-//! (`POLL_INTERVAL` = 1s). Cardano blocks land every 20s on
-//! mainnet, so 1s poll latency is well below the chain cadence
-//! and not visible end-to-end.
+//! `recapture_module` (called by the admin endpoint) pushes a
+//! `ServerMessage::Recapture` frame onto each subscribed
+//! companion's `outbound_tx`. The per-task loop receives it,
+//! POSTs to the companion, signals the oneshot on 2xx. The
+//! admin endpoint awaits each oneshot with `per_companion_timeout`.
+//!
+//! Pause semantics: while the per-task loop is processing a
+//! Recapture POST, it's not draining Apply rows. The companion's
+//! `on_recapture` finishes wiping its table before the loop
+//! resumes draining (which will then deliver the refill events).
 //!
 //! ## Auth
 //!
-//! Each dial carries the module-level `MITOS_AUTH_TOKEN` as a
+//! Each request carries the module-level `MITOS_AUTH_TOKEN` as a
 //! Bearer header by default. Per-companion overrides via
-//! `DialBackOverride.auth_header` / `auth_value` are
-//! supported but rare (multi-tenant SaaS only).
+//! `DialBackOverride.auth_header` / `auth_value` are supported
+//! but rare (multi-tenant SaaS only).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use futures_util::{SinkExt, StreamExt};
 use mitos_protocol::{
-    ChainPoint, ClientMessage, ServerMessage, SubscribeRequest, SubscribeTarget, decode_client,
-    encode_server,
+    ApplyBody, HTTP_DELIVERY_MIME, RecaptureBody, ServerMessage, SubscribeRequest, SubscribeTarget,
+    encode_apply, encode_recapture,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
-};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -70,18 +73,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// How often the pump sweeps for stale `Pending` rows (rows
-/// where the WS is alive but the consumer's `Ack` hasn't
-/// arrived). Catches the "consumer silently dead" / TCP
-/// keepalive variant — the dirty-close case is already handled
-/// by the reconnect-time reclaim in `dial_and_pump`.
-const STALE_PENDING_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Pending rows older than this threshold get requeued by the
-/// pump's stale sweep. 60s is well above a real `apply_event`
-/// round-trip (sub-second to a few seconds) and matches the
-/// design doc's recommended `PENDING_TIMEOUT`.
-const STALE_PENDING_MAX_AGE: Duration = Duration::from_secs(60);
+/// Per-request HTTP timeout. Apply and recapture POSTs share
+/// this — both run synchronously on the worker side and should
+/// complete within seconds. 30s is comfortably above any sane
+/// `apply_event` / `on_recapture` body.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Identifier for one (module, companion_key) pair. Hashable
 /// + cloneable for use as map key.
@@ -101,7 +97,7 @@ impl CompanionId {
 }
 
 /// Successful outcome of `CompanionDialer::recapture_module` —
-/// every targeted companion ACKed `RecaptureReady` within timeout.
+/// every targeted companion ACKed (2xx) within timeout.
 /// See `docs/design/RECAPTURE.md`.
 #[derive(Debug, Clone)]
 pub struct RecaptureSummary {
@@ -122,9 +118,9 @@ pub enum RecaptureError {
     #[error("no companions subscribed to module `{0}`")]
     NoSubscribers(String),
 
-    /// One or more companions failed to ACK `RecaptureReady`
-    /// within the per-companion timeout. The bootstrap-refill MUST
-    /// NOT proceed — running it with some companions still
+    /// One or more companions failed to ACK within the
+    /// per-companion timeout. The bootstrap-refill MUST NOT
+    /// proceed — running it with some companions still
     /// mid-cleanup would seed ghost rows.
     #[error(
         "recapture for `{module}` timed out: {} ready, {} timed out",
@@ -137,10 +133,10 @@ pub enum RecaptureError {
         timed_out_companions: Vec<String>,
     },
 
-    /// Pushing the `Recapture` frame into the companion's
-    /// outbound channel failed — the dial task is gone. The
-    /// recapture is aborted; operator should retry once the
-    /// companion has reconnected.
+    /// Pushing the Recapture frame into the companion's outbound
+    /// channel failed — the dial task is gone. The recapture is
+    /// aborted; operator should retry once the companion has been
+    /// re-registered.
     #[error("send Recapture to {companion:?}: {detail}")]
     FrameSend {
         companion: CompanionId,
@@ -150,10 +146,9 @@ pub enum RecaptureError {
 
 /// Per-companion dial supervisor entry. Owns the task handle,
 /// cancellation token, and an unbounded mpsc sender the recapture
-/// driver uses to push outbound control frames (`Recapture`,
-/// `RecaptureDone`) into the running task. Unbounded so the
-/// driver never has to await capacity; the volume of control
-/// frames per recapture is O(1) per companion.
+/// driver uses to push control frames (`Recapture`) into the
+/// running task. Unbounded so the driver never has to await
+/// capacity; volume is O(1) per recapture.
 struct ActiveCompanion {
     cancel: CancellationToken,
     task: JoinHandle<()>,
@@ -167,10 +162,13 @@ struct ActiveCompanion {
 pub struct CompanionDialer {
     storage: ModuleStorage,
     auth: AuthToken,
-    /// Routes inbound `ClientMessage::Interest` frames into the
-    /// matching module's follower task. `None` in tests / dev
-    /// builds where no `ModuleHost` is wired; production
-    /// always passes `Some(host as Arc<dyn InterestRouter>)`.
+    /// Routes companion-initiated interest updates into the
+    /// matching module's follower task. Kept on the supervisor
+    /// for use by future inbound paths (e.g. dynamic-interest
+    /// HTTP endpoint on mitos). Not consulted by the per-task
+    /// HTTP drain loop today — interest changes flow via the
+    /// companion's re-subscribe path.
+    #[allow(dead_code)]
     interest_router: Option<Arc<dyn InterestRouter>>,
     /// In-tree indexer bridge — handles `SubscribeTarget::Indexer`
     /// dispatch. Provided by `mitos-core::Bundle` at runtime when
@@ -179,10 +177,10 @@ pub struct CompanionDialer {
     indexer_bridge: Option<IndexerBridgeHandle>,
     tasks: Arc<Mutex<HashMap<CompanionId, ActiveCompanion>>>,
     /// One-shot senders the recapture driver uses to await
-    /// `ClientMessage::RecaptureReady` from each targeted
-    /// companion. Registered before `Recapture` is sent; fired
-    /// when the matching `RecaptureReady` arrives on that
-    /// companion's WS. See `docs/design/RECAPTURE.md`.
+    /// "ready" from each targeted companion. Registered before
+    /// the Recapture frame is pushed; fired by the per-task loop
+    /// when its recapture POST returns 2xx. See
+    /// `docs/design/RECAPTURE.md`.
     pending_recaptures: Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
 }
 
@@ -211,14 +209,14 @@ impl CompanionDialer {
     }
 
     /// Scan `<storage_root>/*/companions/*.cbor` and start a
-    /// dial loop for each persisted companion. Failures on
+    /// drain task for each persisted companion. Failures on
     /// individual companion files are logged but don't abort
     /// the scan.
     pub async fn start_all(&self) {
         let modules = match self.storage.list_modules() {
             Ok(m) => m,
             Err(e) => {
-                error!(error = %e, "list_modules failed; no companion dial loops started");
+                error!(error = %e, "list_modules failed; no companion drain tasks started");
                 return;
             }
         };
@@ -249,24 +247,18 @@ impl CompanionDialer {
 
     /// Register (or re-register) a companion. Called from the
     /// `/api/companions/subscribe` handler after persistence +
-    /// validation. Spawns one dial loop per target in the
+    /// validation. Spawns one drain task per target in the
     /// request; multi-target subscribe results in N independent
-    /// outbound WSes (one per target). Cancels any existing dial
-    /// loop for each `(target_name, companion_key)` pair before
-    /// spawning fresh ones — register() is idempotent
-    /// re-registration.
+    /// drain loops. Cancels any existing drain task for each
+    /// `(target_name, companion_key)` pair before spawning fresh
+    /// ones — register() is idempotent re-registration.
     pub async fn register(&self, req: SubscribeRequest) {
-        // Cancel existing tasks for any of the request's targets.
         {
             let mut tasks = self.tasks.lock().await;
             for target in &req.targets {
                 let id = CompanionId::new(target.name(), &req.companion_key);
                 if let Some(prev) = tasks.remove(&id) {
                     prev.cancel.cancel();
-                    // Task self-terminates once it observes the
-                    // cancel token; drop the JoinHandle so the
-                    // underlying tokio task isn't accidentally
-                    // awaited / blocked on here.
                     drop(prev.task);
                 }
             }
@@ -274,7 +266,7 @@ impl CompanionDialer {
         self.spawn(req).await;
     }
 
-    /// Cancel the dial loop for a companion. The on-disk
+    /// Cancel the drain task for a companion. The on-disk
     /// `companions/<key>.cbor` is left in place — caller is
     /// responsible for that.
     pub async fn unregister(&self, id: &CompanionId) {
@@ -284,17 +276,10 @@ impl CompanionDialer {
         }
     }
 
-    /// Cancel every dial loop whose `CompanionId.module_id`
+    /// Cancel every drain task whose `CompanionId.module_id`
     /// matches. Returns the `companion_key`s that were active +
     /// got cancelled — useful for the admin evict path to report
     /// which subscribers got reaped.
-    ///
-    /// On-disk companion records are left in place; the caller
-    /// (admin evict handler) is responsible for clearing them as
-    /// part of the artifact teardown.
-    ///
-    /// Idempotent — calling against a module with no active
-    /// companions returns an empty vec, no error.
     pub async fn unregister_module(&self, module_id: &str) -> Vec<String> {
         let mut tasks = self.tasks.lock().await;
         let to_remove: Vec<CompanionId> = tasks
@@ -312,28 +297,18 @@ impl CompanionDialer {
         cancelled_keys
     }
 
-    /// Send `ServerMessage::Recapture { module, reason }` to every
-    /// active companion subscribed to `module_id` and await
-    /// `ClientMessage::RecaptureReady` from each. Returns
-    /// `Ok(RecaptureSummary)` when every targeted companion has
-    /// ACKed within `per_companion_timeout`; `Err(RecaptureError)`
-    /// on timeout, frame-send failure, or no subscribers.
-    ///
-    /// On timeout, the per-companion oneshot is dropped — a late
-    /// `RecaptureReady` arriving after the timeout is logged as a
-    /// "driver gave up" debug line, no protocol state corruption.
-    ///
-    /// See `mitos/docs/design/RECAPTURE.md`.
+    /// Coordinate a per-module recapture across every subscribed
+    /// companion. Pushes a `ServerMessage::Recapture` frame onto
+    /// each companion's outbound channel (the per-task drain
+    /// loop receives it and runs the HTTP POST), then awaits the
+    /// matching oneshot signal for each companion with
+    /// `per_companion_timeout`.
     pub async fn recapture_module(
         &self,
         module_id: &str,
         reason: Option<String>,
         per_companion_timeout: Duration,
     ) -> Result<RecaptureSummary, RecaptureError> {
-        // Snapshot the targeted companions + their outbound senders.
-        // Holding the tasks lock for the whole recapture would block
-        // re-registration; copy senders out under a short lock then
-        // drop it.
         let targets: Vec<(CompanionId, mpsc::UnboundedSender<ServerMessage>)> = {
             let tasks = self.tasks.lock().await;
             tasks
@@ -353,10 +328,8 @@ impl CompanionDialer {
             "recapture: dispatching Recapture frames to subscribed companions"
         );
 
-        // Register oneshots + send Recapture frames. Done in two
-        // passes so the receivers are all in place before any
-        // frame goes out — race-free if a companion replies before
-        // we get to its register step.
+        // Register oneshots + push Recapture frames in two passes
+        // so receivers are all in place before any frame is sent.
         let mut waiters: Vec<(CompanionId, oneshot::Receiver<()>)> =
             Vec::with_capacity(companion_count);
         {
@@ -373,10 +346,6 @@ impl CompanionDialer {
                 reason: reason.clone(),
             };
             if let Err(e) = tx.send(frame) {
-                // Send failure means the task is gone. Remove
-                // the oneshot we just registered to avoid leaking
-                // it; surface as a typed error so the host can
-                // report which companion failed.
                 let mut pending = self.pending_recaptures.lock().await;
                 pending.remove(id);
                 return Err(RecaptureError::FrameSend {
@@ -386,26 +355,16 @@ impl CompanionDialer {
             }
         }
 
-        // Await each oneshot with per-companion timeout. We use a
-        // single shared deadline so the *whole* recapture has a
-        // bounded latency; per-companion timeouts run in parallel
-        // via `tokio::time::timeout` per waiter rather than
-        // sequentially.
         let mut ready: Vec<String> = Vec::with_capacity(companion_count);
         let mut timed_out: Vec<String> = Vec::new();
         for (id, rx) in waiters {
             match tokio::time::timeout(per_companion_timeout, rx).await {
                 Ok(Ok(())) => ready.push(id.companion_key.clone()),
                 Ok(Err(_recv_err)) => {
-                    // oneshot dropped without sending — task
-                    // disconnected mid-wait. Treat as timeout for
-                    // operator-facing purposes.
                     timed_out.push(id.companion_key.clone());
                 }
                 Err(_elapsed) => {
                     timed_out.push(id.companion_key.clone());
-                    // Drop our remaining pending entry so a late
-                    // arrival doesn't leak.
                     let mut pending = self.pending_recaptures.lock().await;
                     pending.remove(&id);
                 }
@@ -416,7 +375,7 @@ impl CompanionDialer {
             info!(
                 module = %module_id,
                 companion_count,
-                "recapture: all companions acked RecaptureReady"
+                "recapture: all companions acked"
             );
             Ok(RecaptureSummary {
                 module: module_id.to_owned(),
@@ -427,7 +386,7 @@ impl CompanionDialer {
                 module = %module_id,
                 timed_out_count = timed_out.len(),
                 ready_count = ready.len(),
-                "recapture: some companions failed to ack RecaptureReady within timeout"
+                "recapture: some companions failed to ack within timeout"
             );
             Err(RecaptureError::Timeout {
                 module: module_id.to_owned(),
@@ -437,68 +396,17 @@ impl CompanionDialer {
         }
     }
 
-    /// Push `ServerMessage::RecaptureDone { cursor, module,
-    /// events_emitted }` to every active companion subscribed to
-    /// `module_id`. Fire-and-forget — the frame is informational;
-    /// the operator-facing admin endpoint reports success on
-    /// dispatch, not on companion receipt.
-    ///
-    /// See `mitos/docs/design/RECAPTURE.md`.
-    pub async fn send_recapture_done(
-        &self,
-        module_id: &str,
-        cursor: ChainPoint,
-        events_emitted: u64,
-    ) {
-        let senders: Vec<(CompanionId, mpsc::UnboundedSender<ServerMessage>)> = {
-            let tasks = self.tasks.lock().await;
-            tasks
-                .iter()
-                .filter(|(id, _)| id.module_id == module_id)
-                .map(|(id, slot)| (id.clone(), slot.outbound_tx.clone()))
-                .collect()
-        };
-        for (id, tx) in senders {
-            let frame = ServerMessage::RecaptureDone {
-                cursor: cursor.clone(),
-                module: module_id.to_owned(),
-                events_emitted,
-            };
-            if let Err(e) = tx.send(frame) {
-                warn!(
-                    module = %module_id,
-                    companion_key = %id.companion_key,
-                    error = %e,
-                    "send RecaptureDone failed; companion task likely gone"
-                );
-            }
-        }
-    }
-
     async fn spawn(&self, req: SubscribeRequest) {
-        // Spawn one dial loop per target. Each target's dial
-        // gets its own cancellation token + its own entry in
-        // the supervisor map keyed by `(target_name,
-        // companion_key)`. The companion-side runtime accepts
-        // each WS at `/_internal/replicate-<target_name>`
-        // (via the `{target}` substitution in the dial-back URL
-        // template).
         for target in req.targets.clone() {
             let id = CompanionId::new(target.name(), &req.companion_key);
             let cancel = CancellationToken::new();
             let cancel_for_task = cancel.clone();
-            // Per-task outbound control channel — the recapture
-            // driver pushes `Recapture` / `RecaptureDone` frames
-            // through here and the task forwards to the WS sink.
-            // Unbounded so the driver never awaits capacity;
-            // recaptures send O(1) frames per companion.
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
             let task = match &target {
                 SubscribeTarget::Module { .. } => {
                     let storage = self.storage.clone();
                     let auth = self.auth.clone();
-                    let interest_router = self.interest_router.clone();
                     let target_clone = target.clone();
                     let req_clone = req.clone();
                     let pending_recaptures = self.pending_recaptures.clone();
@@ -509,7 +417,6 @@ impl CompanionDialer {
                             target_clone,
                             storage,
                             auth,
-                            interest_router,
                             cancel_for_task,
                             outbound_rx,
                             pending_recaptures,
@@ -523,20 +430,10 @@ impl CompanionDialer {
                         warn!(
                             indexer = %name,
                             companion_key = %req.companion_key,
-                            "indexer-target subscribe but no bridge wired on dialer; skipping dial"
+                            "indexer-target subscribe but no bridge wired on dialer; skipping"
                         );
                         continue;
                     };
-                    // The bridge owns the dial loop for indexer
-                    // targets — it has access to the
-                    // `IndexerHandle::run_subscriber` machinery
-                    // in `mitos-core`. We just track the
-                    // JoinHandle in the supervisor map so
-                    // re-registration can cancel it.
-                    // outbound_rx is dropped on this branch —
-                    // indexer-target dial loops don't currently
-                    // participate in the recapture protocol
-                    // (recapture is a community-module concern).
                     drop(outbound_rx);
                     bridge.spawn_dial(req.clone(), target.clone(), cancel_for_task)
                 }
@@ -562,52 +459,53 @@ fn load_companion(path: &std::path::Path) -> anyhow::Result<SubscribeRequest> {
     Ok(req)
 }
 
-/// Per-companion supervisor: dial → loop with reconnect/backoff
-/// until cancelled.
-///
-/// Parameter count is intentional — each represents an independent
-/// capability the task needs (req shape, target identity, storage,
-/// auth, interest routing, lifecycle cancellation, outbound control
-/// channel, pending-recapture map, companion identity). Bundling
-/// would just move the count into a parameter-bag struct.
+/// Per-companion drain task. Owns one `reqwest::Client` (for
+/// connection pooling across requests to this companion), resolves
+/// the per-`{op}` URLs once, then enters the pump loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_companion(
     req: SubscribeRequest,
     target: SubscribeTarget,
     storage: ModuleStorage,
     auth: AuthToken,
-    interest_router: Option<Arc<dyn InterestRouter>>,
     cancel: CancellationToken,
     mut outbound_rx: mpsc::UnboundedReceiver<ServerMessage>,
     pending_recaptures: Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
     companion_id: CompanionId,
 ) {
     let module_name = target.name().to_string();
-    let url_str = match resolve_dial_url(&req, &target) {
+    let apply_url = match resolve_op_url(&req, &target, "apply") {
         Ok(u) => u,
         Err(e) => {
             error!(
                 module = %module_name,
                 companion_key = %req.companion_key,
                 error = %e,
-                "no dial-back URL configured; companion will not receive emissions"
+                "no apply URL resolvable; companion task exiting"
             );
             return;
         }
     };
-    let parsed = match Url::parse(&url_str) {
+    let recapture_url = match resolve_op_url(&req, &target, "recapture") {
         Ok(u) => u,
         Err(e) => {
             error!(
                 module = %module_name,
                 companion_key = %req.companion_key,
-                url = %url_str,
                 error = %e,
-                "invalid dial-back URL; companion task exiting"
+                "no recapture URL resolvable; companion task exiting"
             );
             return;
         }
     };
+    if Url::parse(&apply_url).is_err() {
+        error!(
+            module = %module_name,
+            url = %apply_url,
+            "apply URL is malformed; companion task exiting"
+        );
+        return;
+    }
 
     let store = match storage.emissions_store(&module_name) {
         Ok(s) => s,
@@ -621,62 +519,308 @@ async fn run_companion(
         }
     };
 
-    let mut backoff = INITIAL_BACKOFF;
-    loop {
-        if cancel.is_cancelled() {
+    let client = match build_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                module = %module_name,
+                error = %e,
+                "build reqwest client failed; companion task exiting"
+            );
             return;
         }
-        match dial_and_pump(
-            &parsed,
-            &req,
-            &auth,
-            &store,
-            interest_router.as_ref(),
-            &cancel,
-            &mut outbound_rx,
-            &pending_recaptures,
-            &companion_id,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(
-                    module = %module_name,
-                    companion_key = %req.companion_key,
-                    "companion dial loop exited cleanly; redialing"
-                );
-                backoff = INITIAL_BACKOFF;
-            }
-            Err(e) => {
-                warn!(
-                    module = %module_name,
-                    companion_key = %req.companion_key,
-                    target = %url_str,
-                    error = %e,
-                    backoff_secs = backoff.as_secs(),
-                    "companion dial errored; backing off",
-                );
-            }
+    };
+
+    let (header_name, header_value) = resolve_auth_header(&req, &auth);
+
+    // Reclaim Pending rows from a previous host process. Catches
+    // the host-crash-mid-request case — rows marked Pending then
+    // never Acked because the host died mid-POST.
+    match store.requeue_pending_for_companion(&req.companion_key, &now_rfc3339()) {
+        Ok(0) => {}
+        Ok(count) => {
+            info!(
+                module = %module_name,
+                companion_key = %req.companion_key,
+                count,
+                "requeued Pending emissions on task start"
+            );
         }
+        Err(e) => {
+            warn!(
+                module = %module_name,
+                companion_key = %req.companion_key,
+                error = %e,
+                "requeue Pending failed on task start"
+            );
+        }
+    }
+
+    info!(
+        module = %module_name,
+        companion_key = %req.companion_key,
+        apply_url = %apply_url,
+        "companion drain task started"
+    );
+
+    let mut backoff = INITIAL_BACKOFF;
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await; // consume the immediate-fire first tick
+
+    loop {
         tokio::select! {
+            biased;
+
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(backoff) => {}
+
+            outbound = outbound_rx.recv() => {
+                let Some(frame) = outbound else {
+                    return; // sender dropped — task deregistered
+                };
+                match frame {
+                    ServerMessage::Recapture { module, reason } => {
+                        let result = post_recapture(
+                            &client,
+                            &recapture_url,
+                            header_name.as_deref(),
+                            header_value.as_deref(),
+                            &module,
+                            reason.as_deref(),
+                        )
+                        .await;
+                        match result {
+                            Ok(()) => {
+                                info!(
+                                    module = %module,
+                                    companion_key = %companion_id.companion_key,
+                                    "Recapture POST succeeded; firing pending_recaptures oneshot"
+                                );
+                                fire_recapture_ready(&pending_recaptures, &companion_id).await;
+                            }
+                            Err(e) => {
+                                error!(
+                                    module = %module,
+                                    companion_key = %companion_id.companion_key,
+                                    error = %e,
+                                    "Recapture POST failed; admin endpoint will time out"
+                                );
+                                // Don't fire the oneshot — admin endpoint's
+                                // timeout is the safer failure mode.
+                            }
+                        }
+                    }
+                    other => {
+                        debug!(?other, "ignoring non-Recapture outbound frame");
+                    }
+                }
+            }
+
+            _ = tick.tick() => {
+                match drain_apply(
+                    &client,
+                    &apply_url,
+                    header_name.as_deref(),
+                    header_value.as_deref(),
+                    &store,
+                    &req.companion_key,
+                ).await {
+                    Ok(()) => {
+                        backoff = INITIAL_BACKOFF;
+                    }
+                    Err(e) => {
+                        warn!(
+                            module = %module_name,
+                            companion_key = %req.companion_key,
+                            error = %e,
+                            backoff_secs = backoff.as_secs(),
+                            "apply drain hit transport error; backing off"
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                }
+            }
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
-/// Resolve the dial-back URL for one target. The URL template
-/// from `dial_back.url` is substituted with both `{key}` (the
-/// companion_key) and `{target}` (the target's name). v1
-/// supports either substitution token; companions with a single
-/// target can omit `{target}` from their template and the
-/// substitution becomes a no-op.
+/// Drain `Queued` rows for this companion in id order. Each row
+/// → one HTTP POST to the apply endpoint. Status updates run
+/// synchronously around the request.
+///
+/// Returns `Err` on transport / 5xx errors so the caller can
+/// apply backoff. Returns `Ok(())` on a successful pass (zero
+/// rows or all rows handled — including Nack responses, which
+/// are application-level failures, not transport failures).
+async fn drain_apply(
+    client: &reqwest::Client,
+    apply_url: &str,
+    header_name: Option<&str>,
+    header_value: Option<&str>,
+    store: &EmissionsStore,
+    companion_key: &str,
+) -> anyhow::Result<()> {
+    let queued = store
+        .list_queued_for_companion(companion_key)
+        .map_err(|e| anyhow::anyhow!("list queued: {e}"))?;
+    if queued.is_empty() {
+        return Ok(());
+    }
+    debug!(
+        companion_key = %companion_key,
+        count = queued.len(),
+        "draining queued emissions"
+    );
+    for row in queued {
+        let now = now_rfc3339();
+        if let Err(e) = store.update_status(row.id, EmissionStatus::Pending, &now, None) {
+            warn!(id = row.id, error = %e, "update_status Queued→Pending failed");
+        }
+        let body = ApplyBody {
+            emission_id: row.id,
+            cursor: row.chain_point.clone(),
+            change: row.payload.clone(),
+        };
+        let body_bytes =
+            encode_apply(&body).map_err(|e| anyhow::anyhow!("encode ApplyBody: {e}"))?;
+        let mut req_builder = client
+            .post(apply_url)
+            .header(reqwest::header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
+            .body(body_bytes);
+        if let (Some(name), Some(value)) = (header_name, header_value) {
+            req_builder = req_builder.header(name, value);
+        }
+        let resp = match req_builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Transport failure — flip row back to Queued so
+                // the next pass retries. Return Err to trigger
+                // the caller's backoff.
+                let now = now_rfc3339();
+                if let Err(rerr) = store.update_status(row.id, EmissionStatus::Queued, &now, None) {
+                    warn!(id = row.id, error = %rerr, "update_status Pending→Queued failed");
+                }
+                return Err(anyhow::anyhow!("apply POST send: {e}"));
+            }
+        };
+        let status = resp.status();
+        let now = now_rfc3339();
+        if status.is_success() {
+            if let Err(e) = store.update_status(row.id, EmissionStatus::Acked, &now, None) {
+                warn!(id = row.id, error = %e, "update_status Pending→Acked failed");
+            }
+            continue;
+        }
+        // 422 → semantic Nack (apply errored; won't help to retry).
+        // Any other non-2xx → transport-ish failure; flip back to
+        // Queued and surface the error for caller backoff.
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let error = resp.text().await.unwrap_or_else(|_| String::new());
+            warn!(
+                id = row.id,
+                companion_key = %companion_key,
+                error = %error,
+                "apply returned 422; marking emission as Nacked"
+            );
+            if let Err(e) = store.update_status(row.id, EmissionStatus::Nacked, &now, Some(error)) {
+                warn!(id = row.id, error = %e, "update_status Pending→Nacked failed");
+            }
+            continue;
+        }
+        let body_text = resp.text().await.unwrap_or_default();
+        if let Err(e) = store.update_status(row.id, EmissionStatus::Queued, &now, None) {
+            warn!(id = row.id, error = %e, "update_status Pending→Queued failed");
+        }
+        return Err(anyhow::anyhow!(
+            "apply POST returned status {status}: {body_text}"
+        ));
+    }
+    Ok(())
+}
+
+/// POST a single Recapture body to the companion. Returns Ok on
+/// 2xx, Err on any non-2xx or transport error.
+async fn post_recapture(
+    client: &reqwest::Client,
+    url: &str,
+    header_name: Option<&str>,
+    header_value: Option<&str>,
+    module: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let body = RecaptureBody {
+        module: module.to_owned(),
+        reason: reason.map(|s| s.to_owned()),
+    };
+    let body_bytes = encode_recapture(&body).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    let mut builder = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
+        .body(body_bytes);
+    if let (Some(name), Some(value)) = (header_name, header_value) {
+        builder = builder.header(name, value);
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("recapture POST send: {e}"))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body_text = resp.text().await.unwrap_or_default();
+    Err(anyhow::anyhow!(
+        "recapture POST returned status {status}: {body_text}"
+    ))
+}
+
+async fn fire_recapture_ready(
+    pending: &Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
+    companion_id: &CompanionId,
+) {
+    let sender = {
+        let mut map = pending.lock().await;
+        map.remove(companion_id)
+    };
+    match sender {
+        Some(tx) => {
+            if tx.send(()).is_err() {
+                debug!(
+                    module = %companion_id.module_id,
+                    companion_key = %companion_id.companion_key,
+                    "recapture ack signal arrived after driver gave up; dropping"
+                );
+            }
+        }
+        None => {
+            warn!(
+                module = %companion_id.module_id,
+                companion_key = %companion_id.companion_key,
+                "recapture ack signal but no pending recapture registered; ignoring"
+            );
+        }
+    }
+}
+
+/// Resolve the per-op URL for one target. The URL template from
+/// `dial_back.url` is substituted with three tokens:
+/// - `{key}` → the companion_key
+/// - `{target}` → the target's name
+/// - `{op}` → `apply` or `recapture` (passed by caller)
 ///
 /// Multi-target companions MUST include `{target}` so each
-/// target's dial-back resolves to a distinct URL — typically
-/// `wss://.../_internal/replicate-{target}?key={key}`.
-fn resolve_dial_url(req: &SubscribeRequest, target: &SubscribeTarget) -> anyhow::Result<String> {
+/// target's URL resolves distinctly. The `{op}` token MUST be
+/// present somewhere in the path so apply and recapture URLs
+/// differ — typically `https://.../_internal/{op}-{target}?key={key}`.
+fn resolve_op_url(
+    req: &SubscribeRequest,
+    target: &SubscribeTarget,
+    op: &str,
+) -> anyhow::Result<String> {
     let url = req
         .dial_back
         .as_ref()
@@ -690,185 +834,8 @@ fn resolve_dial_url(req: &SubscribeRequest, target: &SubscribeTarget) -> anyhow:
         })?;
     Ok(url
         .replace("{key}", &req.companion_key)
-        .replace("{target}", target.name()))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn dial_and_pump(
-    url: &Url,
-    req: &SubscribeRequest,
-    auth: &AuthToken,
-    store: &EmissionsStore,
-    interest_router: Option<&Arc<dyn InterestRouter>>,
-    cancel: &CancellationToken,
-    outbound_rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
-    pending_recaptures: &Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
-    companion_id: &CompanionId,
-) -> anyhow::Result<()> {
-    // Build request with auth header. Per-companion override
-    // takes precedence over the module-level token.
-    let mut request = url
-        .as_str()
-        .into_client_request()
-        .map_err(|e| anyhow::anyhow!("build ws request: {e}"))?;
-    let (header_name, header_value) = resolve_auth_header(req, auth);
-    if let (Some(name), Some(value)) = (header_name, header_value) {
-        let header_name: tokio_tungstenite::tungstenite::http::HeaderName = name
-            .parse()
-            .map_err(|e| anyhow::anyhow!("auth header name: {e}"))?;
-        let header_value = value
-            .parse()
-            .map_err(|e| anyhow::anyhow!("auth header value (must be ASCII): {e}"))?;
-        request.headers_mut().insert(header_name, header_value);
-    }
-
-    let (stream, _resp) = connect_async(request)
-        .await
-        .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
-    info!(
-        module = %req.primary_target_name(),
-        companion_key = %req.companion_key,
-        target = %url,
-        "companion ws connected"
-    );
-
-    let (mut sink, mut source) = stream.split();
-
-    // Send Connected as readiness signal. last_emission_id =
-    // peek_next_id - 1 (the highest assigned id so far).
-    let next_id = store.peek_next_id().unwrap_or(1);
-    let last_emission_id = next_id.saturating_sub(1);
-    send_msg(&mut sink, &ServerMessage::Connected { last_emission_id }).await?;
-
-    // Reclaim any rows left `Pending` by the previous WS. A
-    // dirty close (CF DO hibernation, network drop, host
-    // restart) tears the socket without surfacing the in-flight
-    // frames as Nack, so the rows sit `Pending` forever and
-    // `drain_queued` (which only looks at `Queued`) can't see
-    // them. Flip them back to `Queued` before draining; the
-    // consumer's idempotent `apply_event` absorbs any
-    // double-application when the original Ack was lost in
-    // flight. See `docs/design/EVENT_DELIVERY_RESILIENCE.md`
-    // drop site #2.
-    match store.requeue_pending_for_companion(&req.companion_key, &now_rfc3339()) {
-        Ok(0) => {}
-        Ok(count) => {
-            info!(
-                companion_key = %req.companion_key,
-                count,
-                "requeued pending emissions on reconnect"
-            );
-        }
-        Err(e) => {
-            warn!(
-                companion_key = %req.companion_key,
-                error = %e,
-                "requeue pending emissions failed; drain may miss in-flight rows"
-            );
-        }
-    }
-
-    // Drain queued rows in id order, send Apply, flip to
-    // Pending. New rows arriving while we drain will show up
-    // on the next poll iteration in the main loop.
-    drain_queued(&mut sink, store, &req.companion_key).await?;
-
-    // Main pump: tokio::select! over inbound frames + a poll
-    // tick that re-checks for new Queued rows + a slower tick
-    // that requeues stale `Pending` rows (the consumer-silently-
-    // dead case, see `STALE_PENDING_SWEEP_INTERVAL`).
-    let mut tick = tokio::time::interval(POLL_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tick.tick().await; // consume the immediate-fire first tick
-
-    let mut stale_pending_tick = tokio::time::interval(STALE_PENDING_SWEEP_INTERVAL);
-    stale_pending_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    stale_pending_tick.tick().await; // consume the immediate-fire first tick
-
-    loop {
-        tokio::select! {
-            biased;
-
-            _ = cancel.cancelled() => return Ok(()),
-
-            inbound = source.next() => {
-                match inbound {
-                    Some(Ok(Message::Binary(bytes))) => {
-                        handle_inbound_frame(
-                            &bytes,
-                            store,
-                            interest_router,
-                            companion_id,
-                            pending_recaptures,
-                        )
-                        .await;
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        info!(?frame, "peer closed ws");
-                        return Ok(());
-                    }
-                    Some(Ok(_)) => {} // text/ping/pong/etc — ignore
-                    Some(Err(e)) => {
-                        return Err(anyhow::anyhow!("ws recv: {e}"));
-                    }
-                    None => return Ok(()), // stream exhausted
-                }
-            }
-
-            outbound = outbound_rx.recv() => {
-                let Some(frame) = outbound else {
-                    // Channel closed — dialer dropped the sender,
-                    // meaning the task has been deregistered. Exit
-                    // the pump cleanly; the outer `run_companion`
-                    // loop will observe `cancel` and stop too.
-                    return Ok(());
-                };
-                if let Err(e) = send_msg(&mut sink, &frame).await {
-                    return Err(anyhow::anyhow!(
-                        "send outbound control frame: {e}"
-                    ));
-                }
-            }
-
-            _ = tick.tick() => {
-                drain_queued(&mut sink, store, &req.companion_key).await?;
-            }
-
-            _ = stale_pending_tick.tick() => {
-                let now_secs = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let now_str = now_rfc3339();
-                match store.requeue_stale_pending_for_companion(
-                    &req.companion_key,
-                    now_secs,
-                    STALE_PENDING_MAX_AGE.as_secs(),
-                    &now_str,
-                ) {
-                    Ok(0) => {}
-                    Ok(count) => {
-                        info!(
-                            companion_key = %req.companion_key,
-                            count,
-                            max_age_secs = STALE_PENDING_MAX_AGE.as_secs(),
-                            "requeued stale Pending emissions; consumer Ack timed out"
-                        );
-                        // Re-drain immediately so the requeued rows
-                        // don't wait for the next 1s tick.
-                        drain_queued(&mut sink, store, &req.companion_key).await?;
-                    }
-                    Err(e) => {
-                        warn!(
-                            companion_key = %req.companion_key,
-                            error = %e,
-                            "stale Pending sweep failed"
-                        );
-                    }
-                }
-            }
-        }
-    }
+        .replace("{target}", target.name())
+        .replace("{op}", op))
 }
 
 fn resolve_auth_header(
@@ -889,156 +856,13 @@ fn resolve_auth_header(
     (None, None)
 }
 
-type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    Message,
->;
-
-async fn send_msg(sink: &mut WsSink, msg: &ServerMessage) -> anyhow::Result<()> {
-    let bytes = encode_server(msg).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-    sink.send(Message::Binary(bytes.into()))
-        .await
-        .map_err(|e| anyhow::anyhow!("ws send: {e}"))
-}
-
-/// Drain `Queued` rows for this companion in id order. Each
-/// row → one `ServerMessage::Apply`; status flips to
-/// `Pending` after the send.
-async fn drain_queued(
-    sink: &mut WsSink,
-    store: &EmissionsStore,
-    companion_key: &str,
-) -> anyhow::Result<()> {
-    let queued = store
-        .list_queued_for_companion(companion_key)
-        .map_err(|e| anyhow::anyhow!("list queued: {e}"))?;
-    if queued.is_empty() {
-        return Ok(());
-    }
-    debug!(
-        companion_key = %companion_key,
-        count = queued.len(),
-        "draining queued emissions"
-    );
-    for row in queued {
-        let msg = ServerMessage::Apply {
-            emission_id: row.id,
-            cursor: row.chain_point.clone(),
-            change: row.payload.clone(),
-        };
-        send_msg(sink, &msg).await?;
-        let now = now_rfc3339();
-        if let Err(e) = store.update_status(row.id, EmissionStatus::Pending, &now, None) {
-            warn!(id = row.id, error = %e, "update_status Queued→Pending failed");
-        }
-    }
-    Ok(())
-}
-
-async fn handle_inbound_frame(
-    bytes: &[u8],
-    store: &EmissionsStore,
-    interest_router: Option<&Arc<dyn InterestRouter>>,
-    companion_id: &CompanionId,
-    pending_recaptures: &Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
-) {
-    let msg = match decode_client(bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(error = %e, "decode client frame failed; ignoring");
-            return;
-        }
-    };
-    let module_id = companion_id.module_id.as_str();
-    match msg {
-        ClientMessage::Ack { emission_id } => {
-            let now = now_rfc3339();
-            if let Err(e) = store.update_status(emission_id, EmissionStatus::Acked, &now, None) {
-                warn!(emission_id, error = %e, "update_status Pending→Acked failed");
-            }
-        }
-        ClientMessage::Nack { emission_id, error } => {
-            let now = now_rfc3339();
-            if let Err(e) =
-                store.update_status(emission_id, EmissionStatus::Nacked, &now, Some(error))
-            {
-                warn!(emission_id, error = %e, "update_status Pending→Nacked failed");
-            }
-        }
-        ClientMessage::Interest { op, items } => {
-            let count = items.len();
-            match interest_router {
-                Some(router) => {
-                    if let Err(e) = router.route_interest(module_id, op, items).await {
-                        warn!(
-                            module = %module_id,
-                            error = %e,
-                            "route_interest failed; companion's interest update dropped",
-                        );
-                    } else {
-                        debug!(
-                            module = %module_id,
-                            ?op,
-                            count,
-                            "interest update routed to follower",
-                        );
-                    }
-                }
-                None => {
-                    debug!(
-                        ?op,
-                        count, "Interest frame received but no router wired; dropping"
-                    );
-                }
-            }
-        }
-        ClientMessage::Unsubscribe => {
-            info!("companion sent Unsubscribe; closing pump");
-        }
-        ClientMessage::Subscribe { .. } => {
-            warn!("companion sent unexpected Subscribe frame; ignoring");
-        }
-        ClientMessage::RecaptureReady => {
-            // Recapture protocol — companion has finished its
-            // on_recapture cleanup and is ready for the refill.
-            // Look up the registered oneshot for this companion;
-            // fire it so the host's `recapture_module` driver
-            // can proceed. If there's no pending recapture for
-            // this companion (e.g. spurious frame, or the
-            // driver already timed out + cleaned up), warn-log.
-            let sender = {
-                let mut map = pending_recaptures.lock().await;
-                map.remove(companion_id)
-            };
-            match sender {
-                Some(tx) => {
-                    if tx.send(()).is_err() {
-                        // Receiver dropped — driver already
-                        // moved on (timeout, cancel). Harmless,
-                        // log at debug.
-                        debug!(
-                            module = %module_id,
-                            companion_key = %companion_id.companion_key,
-                            "RecaptureReady arrived after driver gave up; dropping"
-                        );
-                    } else {
-                        info!(
-                            module = %module_id,
-                            companion_key = %companion_id.companion_key,
-                            "RecaptureReady received; unblocking recapture driver"
-                        );
-                    }
-                }
-                None => {
-                    warn!(
-                        module = %module_id,
-                        companion_key = %companion_id.companion_key,
-                        "RecaptureReady received but no pending recapture registered; ignoring"
-                    );
-                }
-            }
-        }
-    }
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        // Keep-alive defaults are fine; reqwest pools connections
+        // per-host automatically via hyper's pool.
+        .build()
+        .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))
 }
 
 fn now_rfc3339() -> String {

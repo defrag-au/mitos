@@ -11,6 +11,7 @@
 //! See `../../docs/design/SUBSCRIPTION_MECHANICS.md` for the full
 //! design rationale.
 
+pub mod http;
 mod interest;
 pub mod protocol;
 pub mod subscribe;
@@ -19,6 +20,10 @@ pub mod wire;
 #[cfg(test)]
 mod interest_tests;
 
+pub use http::{
+    ApplyBody, HTTP_DELIVERY_MIME, RecaptureBody, decode_apply, decode_recapture, encode_apply,
+    encode_recapture,
+};
 pub use interest::{
     AssetMovementSelector, AssetSelector, BurnSelector, DexSelector, DomainSelector, Interest,
     LendingSelector, MarketplaceSelector, MintSelector, ValueFilter, any_interest_matches_asset,
