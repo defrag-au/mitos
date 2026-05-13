@@ -131,6 +131,7 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
             script_ref,
             original_cbor,
             decoded_at: level,
+            resolution: crate::types::Resolution::Resolved,
         })
     }
 
@@ -973,5 +974,6 @@ pub fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> Typ
         script_ref: None,
         original_cbor: None,
         decoded_at: DecodeLevel::Lean,
+        resolution: crate::types::Resolution::Resolved,
     }
 }

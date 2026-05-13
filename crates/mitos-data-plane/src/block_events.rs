@@ -300,6 +300,7 @@ fn project_output_draft(output: &MultiEraOutput<'_>) -> OutputDraft {
         script_ref: None,
         original_cbor: None,
         decoded_at: crate::types::DecodeLevel::Lean,
+        resolution: crate::types::Resolution::Resolved,
     };
 
     let (datum_hash, inline_datum_bytes) = extract_datum_info(output);

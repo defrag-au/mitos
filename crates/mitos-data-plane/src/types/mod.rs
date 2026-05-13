@@ -28,7 +28,7 @@ pub use event::{
     TickEvent, TxContextEvent, TxEventBatch, UtxoEvent, ValidityInterval,
 };
 pub use interest::{InterestPredicate, InterestSet, StakeCred};
-pub use output::{AssetEntry, ScriptLanguage, TypedDatum, TypedOutput, TypedScript};
+pub use output::{AssetEntry, Resolution, ScriptLanguage, TypedDatum, TypedOutput, TypedScript};
 pub use output_ref::OutputRef;
 pub use page::{Page, PageRequest};
 pub use params::ProtocolParameters;

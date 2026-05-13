@@ -29,6 +29,16 @@ const EMISSIONS_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("e
 const NEXT_ID_KEY: &str = "__next_id";
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("meta");
 
+/// Sentinel `companion_id` used by `drain_one` to persist
+/// emissions that fire before any companion has subscribed.
+/// The leading colon is invalid in real companion keys
+/// (validated elsewhere to be `[A-Za-z0-9_-]+`) so this can't
+/// collide with a legitimate key. Subscribed companions claim
+/// these rows via [`EmissionsStore::retarget_companion`].
+///
+/// See `docs/design/EVENT_DELIVERY_RESILIENCE.md` drop site #3.
+pub const UNSUBSCRIBED_COMPANION_ID: &str = ":unsubscribed";
+
 #[derive(Debug, thiserror::Error)]
 pub enum EmissionsError {
     #[error("redb: {0}")]
@@ -220,9 +230,13 @@ impl EmissionsStore {
 
     /// Update an existing row's status. Used on Ack/Nack
     /// (`Pending → Acked/Nacked`), pending-aging
-    /// (`Pending → Timeout`), and queued-drain
-    /// (`Queued → Pending`). Idempotent — re-applying the same
-    /// status is a no-op rewrite.
+    /// (`Pending → Timeout`), queued-drain (`Queued → Pending`),
+    /// and reconnect-requeue (`Pending → Queued`, see
+    /// [`Self::requeue_pending_for_companion`]). Idempotent —
+    /// re-applying the same status is a no-op rewrite. `sent_at`
+    /// is only set on the initial `Queued → non-Queued`
+    /// transition, so a `Pending → Queued → Pending` round-trip
+    /// preserves the original send timestamp as an audit trail.
     pub fn update_status(
         &self,
         id: u64,
@@ -275,6 +289,77 @@ impl EmissionsStore {
         Ok(())
     }
 
+    /// Rewrite `companion_id` on every row that currently holds
+    /// `from` to instead hold `to`. Used by the subscribe
+    /// handler to claim the [`UNSUBSCRIBED_COMPANION_ID`]
+    /// sentinel rows that `drain_one` wrote during the window
+    /// between module-activation and first companion-subscribe
+    /// (drop site #3 in
+    /// `docs/design/EVENT_DELIVERY_RESILIENCE.md`).
+    ///
+    /// Status, payload, timestamps, and chain point are left
+    /// alone — only the routing target changes. Once the
+    /// rewrite commits, the dialer's `drain_queued` picks the
+    /// rows up on the next reconnect and the new companion
+    /// receives them in id order.
+    ///
+    /// **Single-claim semantics.** First subscriber to a
+    /// module claims all sentinel rows; later subscribers see
+    /// nothing to retarget. Acceptable for single-companion
+    /// modules (the current shape of every production module);
+    /// see the design doc's "What this doesn't address" for
+    /// the multi-companion variant.
+    ///
+    /// Returns the number of rows that were rewritten.
+    pub fn retarget_companion(&self, from: &str, to: &str) -> Result<usize, EmissionsError> {
+        let rows = self.list_filtered(|r| r.companion_id == from)?;
+        let count = rows.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        // Re-encode each row with the new companion_id. Same
+        // open-then-write pattern as `update_status`, scoped to
+        // the companion_id field only.
+        for row in rows {
+            let wx = self
+                .db
+                .begin_write()
+                .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+            let updated = {
+                let table = wx
+                    .open_table(EMISSIONS_TABLE)
+                    .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+                let Some(value) = table
+                    .get(row.id)
+                    .map_err(|e| EmissionsError::Redb(e.to_string()))?
+                else {
+                    // Row vanished between the scan and the
+                    // write (e.g. concurrent purge). Skip and
+                    // continue — the iteration result becomes a
+                    // best-effort approximation of "rows claimed."
+                    continue;
+                };
+                let mut record: EmissionRecord = ciborium::de::from_reader(value.value())
+                    .map_err(|e| EmissionsError::Decode(e.to_string()))?;
+                record.companion_id = to.to_string();
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&record, &mut buf)
+                    .map_err(|e| EmissionsError::Encode(e.to_string()))?;
+                buf
+            };
+            let mut table = wx
+                .open_table(EMISSIONS_TABLE)
+                .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+            table
+                .insert(row.id, updated.as_slice())
+                .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+            drop(table);
+            wx.commit()
+                .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+        }
+        Ok(count)
+    }
+
     /// Read all queued rows for a specific companion in
     /// monotonic ID order. Used on companion reconnect to drain
     /// buffered emissions before live stream resumes.
@@ -285,6 +370,83 @@ impl EmissionsStore {
         self.list_filtered(|r| {
             r.companion_id == companion_id && matches!(r.status, EmissionStatus::Queued)
         })
+    }
+
+    /// Flip `Pending` rows older than `max_pending_age_secs` for
+    /// this companion back to `Queued`. Called periodically by
+    /// the dialer's pump loop while the WS is still alive — it
+    /// catches the "consumer silently died" case where the WS
+    /// keepalive holds the socket open but `apply_event` Ack
+    /// never arrives. The age-bound (vs the unconditional
+    /// [`Self::requeue_pending_for_companion`]) keeps the path
+    /// safe to run on a hot loop: only rows that have been
+    /// in-flight longer than a real Ack round-trip get retried.
+    ///
+    /// `now_secs` and the row's `status_at` are both in `unix:N`
+    /// form (produced by the dialer's `now_rfc3339` helper);
+    /// rows whose `status_at` can't be parsed are skipped, same
+    /// pattern as [`Self::compact`].
+    ///
+    /// Returns the number of rows that were flipped, for
+    /// pump-time logging.
+    pub fn requeue_stale_pending_for_companion(
+        &self,
+        companion_id: &str,
+        now_secs: u64,
+        max_pending_age_secs: u64,
+        now_status_at: &str,
+    ) -> Result<usize, EmissionsError> {
+        let threshold = now_secs.saturating_sub(max_pending_age_secs);
+        let stale = self.list_filtered(|r| {
+            if r.companion_id != companion_id || r.status != EmissionStatus::Pending {
+                return false;
+            }
+            parse_unix_secs(&r.status_at)
+                .map(|ts| ts < threshold)
+                .unwrap_or(false)
+        })?;
+        let count = stale.len();
+        for row in stale {
+            self.update_status(row.id, EmissionStatus::Queued, now_status_at, None)?;
+        }
+        Ok(count)
+    }
+
+    /// Flip every `Pending` row for this companion back to
+    /// `Queued`. Called by the dialer on reconnect, before
+    /// [`Self::list_queued_for_companion`] / `drain_queued`, to
+    /// recover rows that were in flight when the previous WS
+    /// died — a dirty close (CF DO hibernation, network drop)
+    /// tears the socket without surfacing the unacked frames as
+    /// `Nack`, so without this they would stay `Pending` forever
+    /// and never appear in the drain.
+    ///
+    /// Safe because consumer `apply_event` is required to be
+    /// idempotent (recapture's bootstrap-refill already relies
+    /// on this). The worst case is double-application of an
+    /// emission whose `Ack` was lost in flight — the consumer
+    /// absorbs it, the new `Ack` arrives, and the row settles.
+    ///
+    /// `sent_at` is intentionally preserved by `update_status`
+    /// (which only writes it on the initial `Queued → non-Queued`
+    /// transition), so the audit trail shows "this was sent at
+    /// T1, requeued at T2."
+    ///
+    /// Returns the number of rows that were flipped, for
+    /// reconnect-time logging.
+    pub fn requeue_pending_for_companion(
+        &self,
+        companion_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<usize, EmissionsError> {
+        let pending = self.list_filtered(|r| {
+            r.companion_id == companion_id && matches!(r.status, EmissionStatus::Pending)
+        })?;
+        let count = pending.len();
+        for row in pending {
+            self.update_status(row.id, EmissionStatus::Queued, now_rfc3339, None)?;
+        }
+        Ok(count)
     }
 
     /// Generic filter over all rows. The closure receives each
@@ -584,6 +746,232 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, 3);
         assert_eq!(queued[0].companion_id, "c1");
+    }
+
+    #[test]
+    fn requeue_pending_flips_only_named_companion() {
+        let (_t, store) = fresh_store();
+        // c1 gets two rows, c2 gets one. All start Pending so we
+        // can verify the requeue is scoped to c1.
+        for c in &["c1", "c1", "c2"] {
+            store
+                .append(
+                    c,
+                    "ownership",
+                    fixed_point(),
+                    vec![],
+                    EmissionStatus::Pending,
+                    "2026-05-05T00:00:00Z",
+                )
+                .unwrap();
+        }
+        let count = store
+            .requeue_pending_for_companion("c1", "2026-05-05T00:00:10Z")
+            .unwrap();
+        assert_eq!(count, 2);
+        // c1's two rows back to Queued, c2's row untouched.
+        let c1_queued = store.list_queued_for_companion("c1").unwrap();
+        assert_eq!(c1_queued.len(), 2);
+        let c2_pending = store
+            .list_filtered(|r| r.companion_id == "c2" && r.status == EmissionStatus::Pending)
+            .unwrap();
+        assert_eq!(c2_pending.len(), 1);
+    }
+
+    #[test]
+    fn requeue_pending_preserves_sent_at_audit_trail() {
+        let (_t, store) = fresh_store();
+        // Initial Pending append populates sent_at to T0.
+        let id = store
+            .append(
+                "c1",
+                "ownership",
+                fixed_point(),
+                vec![],
+                EmissionStatus::Pending,
+                "2026-05-05T00:00:00Z",
+            )
+            .unwrap();
+        // Requeue at T1; sent_at should *not* be cleared (only
+        // status_at moves).
+        store
+            .requeue_pending_for_companion("c1", "2026-05-05T00:00:10Z")
+            .unwrap();
+        let row = store.get(id).unwrap().unwrap();
+        assert_eq!(row.status, EmissionStatus::Queued);
+        assert_eq!(row.sent_at.as_deref(), Some("2026-05-05T00:00:00Z"));
+        assert_eq!(row.status_at, "2026-05-05T00:00:10Z");
+    }
+
+    #[test]
+    fn requeue_stale_pending_respects_threshold() {
+        let (_t, store) = fresh_store();
+        // Two Pending rows: one at T=100 (stale), one at T=190
+        // (still fresh at threshold 60s relative to now=200).
+        let stale_id = store
+            .append(
+                "c1",
+                "ownership",
+                fixed_point(),
+                vec![],
+                EmissionStatus::Pending,
+                "unix:100",
+            )
+            .unwrap();
+        let fresh_id = store
+            .append(
+                "c1",
+                "ownership",
+                fixed_point(),
+                vec![],
+                EmissionStatus::Pending,
+                "unix:190",
+            )
+            .unwrap();
+        let now_secs = 200;
+        let max_age = 60;
+        let count = store
+            .requeue_stale_pending_for_companion("c1", now_secs, max_age, "unix:200")
+            .unwrap();
+        assert_eq!(count, 1, "only the stale row should requeue");
+        assert_eq!(
+            store.get(stale_id).unwrap().unwrap().status,
+            EmissionStatus::Queued
+        );
+        assert_eq!(
+            store.get(fresh_id).unwrap().unwrap().status,
+            EmissionStatus::Pending
+        );
+    }
+
+    #[test]
+    fn requeue_stale_pending_skips_unparseable_timestamps() {
+        let (_t, store) = fresh_store();
+        // Legacy RFC3339-style status_at; parse_unix_secs returns
+        // None → row is left alone rather than treated as
+        // age-zero or age-infinity.
+        store
+            .append(
+                "c1",
+                "ownership",
+                fixed_point(),
+                vec![],
+                EmissionStatus::Pending,
+                "2026-05-05T00:00:00Z",
+            )
+            .unwrap();
+        let count = store
+            .requeue_stale_pending_for_companion("c1", 200, 60, "unix:200")
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn requeue_pending_ignores_non_pending_rows() {
+        let (_t, store) = fresh_store();
+        // Mix of statuses; only the Pending one should flip.
+        for status in [
+            EmissionStatus::Queued,
+            EmissionStatus::Pending,
+            EmissionStatus::Acked,
+            EmissionStatus::Nacked,
+            EmissionStatus::Timeout,
+        ] {
+            store
+                .append(
+                    "c1",
+                    "ownership",
+                    fixed_point(),
+                    vec![],
+                    status,
+                    "2026-05-05T00:00:00Z",
+                )
+                .unwrap();
+        }
+        let count = store
+            .requeue_pending_for_companion("c1", "2026-05-05T00:00:10Z")
+            .unwrap();
+        assert_eq!(count, 1);
+        // Second call is a no-op: nothing left in Pending.
+        let count = store
+            .requeue_pending_for_companion("c1", "2026-05-05T00:00:20Z")
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn retarget_companion_claims_sentinel_rows() {
+        let (_t, store) = fresh_store();
+        // 3 sentinel rows from the "no subscribers yet" window,
+        // plus 1 row that already belongs to a different
+        // companion. Only the sentinel rows should retarget.
+        for _ in 0..3 {
+            store
+                .append(
+                    UNSUBSCRIBED_COMPANION_ID,
+                    "ownership",
+                    fixed_point(),
+                    vec![],
+                    EmissionStatus::Queued,
+                    "2026-05-05T00:00:00Z",
+                )
+                .unwrap();
+        }
+        store
+            .append(
+                "other_companion",
+                "ownership",
+                fixed_point(),
+                vec![],
+                EmissionStatus::Queued,
+                "2026-05-05T00:00:00Z",
+            )
+            .unwrap();
+        let count = store
+            .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a")
+            .unwrap();
+        assert_eq!(count, 3);
+        // After retarget: subscriber_a has the 3 rows ready to
+        // drain; sentinel has none; the other companion is
+        // untouched.
+        let claimed = store.list_queued_for_companion("subscriber_a").unwrap();
+        assert_eq!(claimed.len(), 3);
+        let remaining_sentinel = store
+            .list_queued_for_companion(UNSUBSCRIBED_COMPANION_ID)
+            .unwrap();
+        assert!(remaining_sentinel.is_empty());
+        let other = store.list_queued_for_companion("other_companion").unwrap();
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn retarget_companion_second_claim_is_noop() {
+        let (_t, store) = fresh_store();
+        store
+            .append(
+                UNSUBSCRIBED_COMPANION_ID,
+                "ownership",
+                fixed_point(),
+                vec![],
+                EmissionStatus::Queued,
+                "2026-05-05T00:00:00Z",
+            )
+            .unwrap();
+        // First subscriber claims.
+        assert_eq!(
+            store
+                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a")
+                .unwrap(),
+            1
+        );
+        // Second subscriber sees nothing to claim — single-claim
+        // semantics documented on the method.
+        assert_eq!(
+            store
+                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_b")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

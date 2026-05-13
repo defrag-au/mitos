@@ -280,19 +280,55 @@ async fn validate_and_persist_module(
         "companion target validated + persisted (module)"
     );
 
-    // Companions use this as a sync point — any emission_id at or
-    // below `peek_next_id - 1` is already in the log; anything
-    // above is fresh on this session.
-    let next_emission_id = match state.storage.emissions_store(module_name) {
-        Ok(store) => store.peek_next_id().unwrap_or(1),
+    // Claim any sentinel rows that `drain_one` wrote during the
+    // window before this companion subscribed (drop site #3 in
+    // `docs/design/EVENT_DELIVERY_RESILIENCE.md`). Single-claim
+    // semantics — first subscriber to a module reclaims; later
+    // ones see nothing. The dialer's `drain_queued` picks the
+    // retargeted rows up on the next connection.
+    let store = match state.storage.emissions_store(module_name) {
+        Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!(
                 module = %module_name,
                 error = %e,
-                "open emissions log to peek next_id failed; returning 1"
+                "open emissions log to claim sentinel rows failed; \
+                 unsubscribed-window emissions stay on sentinel until next subscribe"
             );
-            1
+            None
         }
+    };
+    if let Some(store) = &store {
+        match store.retarget_companion(
+            crate::emissions::UNSUBSCRIBED_COMPANION_ID,
+            &request.companion_key,
+        ) {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(
+                    module = %module_name,
+                    companion_key = %request.companion_key,
+                    count,
+                    "claimed unsubscribed-window emissions for new subscriber"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    module = %module_name,
+                    companion_key = %request.companion_key,
+                    error = %e,
+                    "retarget unsubscribed sentinel rows failed; rows stay on sentinel"
+                );
+            }
+        }
+    }
+
+    // Companions use this as a sync point — any emission_id at or
+    // below `peek_next_id - 1` is already in the log; anything
+    // above is fresh on this session.
+    let next_emission_id = match store {
+        Some(s) => s.peek_next_id().unwrap_or(1),
+        None => 1,
     };
     Ok(next_emission_id)
 }
