@@ -48,7 +48,10 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 
-use mitos_protocol::{SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeTarget};
+use mitos_protocol::{
+    HTTP_DELIVERY_MIME, InterestOp, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse,
+    SubscribeTarget, decode_interest_mutation,
+};
 
 use crate::indexer_bridge::IndexerBridgeHandle;
 
@@ -76,6 +79,10 @@ pub fn companion_router(
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
+        .route(
+            "/api/companions/{companion_key}/interest",
+            post(interest_mutation_handler),
+        )
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(auth, require_auth))
 }
@@ -182,6 +189,226 @@ impl IntoResponse for SubscribeError {
         };
         (status, Json(body)).into_response()
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InterestMutationError {
+    #[error("CBOR decode: {0}")]
+    Decode(String),
+    #[error("invalid companion_key: {0}")]
+    InvalidCompanionKey(String),
+    #[error("no companion registrations found for `{0}`")]
+    UnknownCompanion(String),
+    #[error("empty items vec")]
+    EmptyItems,
+    #[error("Replace op not supported on mutation endpoint; use /api/companions/subscribe")]
+    ReplaceNotSupported,
+    #[error("storage io: {0}")]
+    Io(String),
+}
+
+impl IntoResponse for InterestMutationError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            Self::Decode(_) | Self::InvalidCompanionKey(_) | Self::EmptyItems => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::ReplaceNotSupported => StatusCode::BAD_REQUEST,
+            Self::UnknownCompanion(_) => StatusCode::NOT_FOUND,
+            Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let code = match &self {
+            Self::Decode(_) => "cbor_decode",
+            Self::InvalidCompanionKey(_) => "invalid_companion_key",
+            Self::EmptyItems => "empty_items",
+            Self::ReplaceNotSupported => "replace_not_supported",
+            Self::UnknownCompanion(_) => "unknown_companion",
+            Self::Io(_) => "storage_io",
+        };
+        let body = ErrorBody {
+            error: self.to_string(),
+            code,
+        };
+        (status, Json(body)).into_response()
+    }
+}
+
+/// `POST /api/companions/{companion_key}/interest` — targeted
+/// Add/Remove of interest predicates on a companion's filter set
+/// without re-running the full subscribe flow.
+///
+/// Per-companion semantics: a companion's interest set is uniform
+/// across every module it subscribes to (the dispatcher applies
+/// the same set against each module's events). The handler:
+///
+/// 1. Locates every `<storage>/<module>/companions/<key>.cbor`
+///    registration for this companion_key (one per subscribed
+///    module).
+/// 2. Applies the mutation to each persisted set, rewriting the
+///    CBOR atomically.
+/// 3. Calls `dialer.route_interest_mutation(module, op, items)`
+///    for each subscribed module so the running follower's live
+///    filter picks up the change without a respawn.
+///
+/// Returns 200 on success; the response body is empty. Errors:
+/// - 400 for decode failure, empty items, Replace op, malformed key
+/// - 404 if no registrations exist for the companion_key
+/// - 500 for CBOR write failure
+///
+/// The endpoint is per-companion (not per-module-companion) so
+/// callers don't need to discover which modules a companion has
+/// subscribed to — the handler does that discovery internally.
+async fn interest_mutation_handler(
+    State(state): State<CompanionState>,
+    axum::extract::Path(companion_key): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> std::result::Result<Response, InterestMutationError> {
+    validate_companion_key_for_mutation(&companion_key)?;
+
+    let mutation = decode_interest_mutation(&body[..])
+        .map_err(|e| InterestMutationError::Decode(e.to_string()))?;
+    if mutation.items.is_empty() {
+        return Err(InterestMutationError::EmptyItems);
+    }
+    if matches!(mutation.op, InterestOp::Replace) {
+        return Err(InterestMutationError::ReplaceNotSupported);
+    }
+
+    // Discover every (module, registration) the companion has on
+    // disk. Companions can subscribe to multiple modules under
+    // the same key; the mutation applies to all of them.
+    let registrations = load_companion_registrations(&state.storage, &companion_key)
+        .map_err(|e| InterestMutationError::Io(e.to_string()))?;
+    if registrations.is_empty() {
+        return Err(InterestMutationError::UnknownCompanion(companion_key));
+    }
+
+    // Apply the mutation to each persisted registration. Errors
+    // here are 500s — we've already accepted the request as
+    // shape-valid.
+    for (module, path, mut req) in registrations.iter().cloned() {
+        apply_mutation_to_set(&mut req.interests, mutation.op, &mutation.items);
+        let buf = req
+            .encode()
+            .map_err(|e| InterestMutationError::Io(format!("encode {module}: {e}")))?;
+        write_atomic(&path, &buf).map_err(|e| InterestMutationError::Io(e.to_string()))?;
+    }
+
+    // Propagate to each running follower's in-memory filter so
+    // the change is live without waiting for the next host
+    // restart. Best-effort: a follower that's not currently
+    // running surfaces `InterestRouteError::NotRunning` which we
+    // log + swallow (persisted CBOR will be picked up on restart).
+    if let Some(dialer) = &state.dialer {
+        for (module, _, _) in &registrations {
+            match dialer
+                .route_interest_mutation(module, mutation.op, mutation.items.clone())
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        module = %module,
+                        companion_key = %companion_key,
+                        error = %e,
+                        "route_interest_mutation failed; persisted CBOR is correct, restart will resolve"
+                    );
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        companion_key = %companion_key,
+        op = ?mutation.op,
+        item_count = mutation.items.len(),
+        module_count = registrations.len(),
+        "interest mutation applied"
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
+        .body(Body::empty())
+        .expect("response builder"))
+}
+
+/// Apply an Add or Remove to a companion's persisted interest
+/// vector. Add dedupes against existing entries (no
+/// double-registration). Remove strips by equality.
+fn apply_mutation_to_set(
+    current: &mut Vec<mitos_protocol::Interest>,
+    op: InterestOp,
+    items: &[mitos_protocol::Interest],
+) {
+    match op {
+        InterestOp::Add => {
+            for item in items {
+                if !current.contains(item) {
+                    current.push(item.clone());
+                }
+            }
+        }
+        InterestOp::Remove => {
+            current.retain(|existing| !items.contains(existing));
+        }
+        InterestOp::Replace => {
+            // Validated out before this point — defensive no-op.
+        }
+    }
+}
+
+/// Scan `<storage>/*/companions/<key>.cbor` and decode each
+/// matching registration. Returns one entry per module the
+/// companion is subscribed to.
+fn load_companion_registrations(
+    storage: &ModuleStorage,
+    companion_key: &str,
+) -> std::io::Result<Vec<(String, PathBuf, SubscribeRequest)>> {
+    let modules = storage
+        .list_modules()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut out = Vec::new();
+    let file_name = format!("{companion_key}.cbor");
+    for module in modules {
+        let path = storage.module_dir_for_companions(&module).join(&file_name);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let req: SubscribeRequest = match ciborium::de::from_reader(bytes.as_slice()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    module = %module,
+                    companion_key = %companion_key,
+                    error = %e,
+                    "skipping un-decodable companion CBOR"
+                );
+                continue;
+            }
+        };
+        out.push((module, path, req));
+    }
+    Ok(out)
+}
+
+fn validate_companion_key_for_mutation(
+    key: &str,
+) -> std::result::Result<(), InterestMutationError> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(InterestMutationError::InvalidCompanionKey(format!(
+            "len {} not in 1..=128",
+            key.len()
+        )));
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(InterestMutationError::InvalidCompanionKey(key.to_string()));
+    }
+    Ok(())
 }
 
 async fn subscribe_handler(
@@ -482,6 +709,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn interest_mutation_rejects_unknown_companion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let router = build_router_with(storage);
+
+        let body = mitos_protocol::InterestMutationBody {
+            op: mitos_protocol::InterestOp::Add,
+            items: vec![mitos_protocol::Interest::any()],
+        };
+        let bytes = mitos_protocol::encode_interest_mutation(&body).unwrap();
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/customer_42/interest")
+                    .header("content-type", "application/cbor")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn interest_mutation_rejects_empty_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let router = build_router_with(storage);
+
+        let body = mitos_protocol::InterestMutationBody {
+            op: mitos_protocol::InterestOp::Add,
+            items: vec![],
+        };
+        let bytes = mitos_protocol::encode_interest_mutation(&body).unwrap();
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/customer_42/interest")
+                    .header("content-type", "application/cbor")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn interest_mutation_rejects_replace_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let router = build_router_with(storage);
+
+        let body = mitos_protocol::InterestMutationBody {
+            op: mitos_protocol::InterestOp::Replace,
+            items: vec![mitos_protocol::Interest::any()],
+        };
+        let bytes = mitos_protocol::encode_interest_mutation(&body).unwrap();
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/customer_42/interest")
+                    .header("content-type", "application/cbor")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn apply_mutation_add_dedupes() {
+        let mut set = vec![mitos_protocol::Interest::any()];
+        apply_mutation_to_set(
+            &mut set,
+            mitos_protocol::InterestOp::Add,
+            &[mitos_protocol::Interest::any()],
+        );
+        assert_eq!(set.len(), 1, "Add must dedupe against existing items");
+    }
+
+    #[test]
+    fn apply_mutation_remove_strips_matching() {
+        let any = mitos_protocol::Interest::any();
+        let mut set = vec![any.clone()];
+        apply_mutation_to_set(
+            &mut set,
+            mitos_protocol::InterestOp::Remove,
+            std::slice::from_ref(&any),
+        );
+        assert!(set.is_empty(), "Remove must strip matching items");
     }
 
     #[tokio::test]

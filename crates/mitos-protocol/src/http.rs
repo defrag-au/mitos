@@ -31,7 +31,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::wire::ChainPoint;
+use crate::interest::Interest;
+use crate::wire::{ChainPoint, InterestOp};
 
 /// MIME type both directions use for HTTP delivery bodies.
 pub const HTTP_DELIVERY_MIME: &str = "application/cbor";
@@ -101,6 +102,47 @@ pub fn decode_recapture(bytes: &[u8]) -> Result<RecaptureBody, String> {
     ciborium::from_reader(bytes).map_err(|e| format!("decode_recapture: {e}"))
 }
 
+/// Body of `POST /api/companions/{key}/interest`.
+///
+/// Targeted interest mutation — Add or Remove a small set of
+/// predicates without re-running the full
+/// `/api/companions/subscribe` path. Updates the persisted CBOR
+/// registration for every module the companion is subscribed to
+/// AND propagates to each running follower's live filter via the
+/// host's `InterestRouter`. The combination of "update the
+/// persisted set" + "update the in-memory filter" preserves the
+/// invariant that the next restart-time resume produces the same
+/// dispatch behaviour as the post-mutation live state.
+///
+/// `Replace` is intentionally not supported — full-set rewrites
+/// go through the existing `/api/companions/subscribe` flow,
+/// which also recomputes `dial_back` and target lists. The
+/// mutation endpoint stays single-purpose: just the filter delta.
+///
+/// Empty `items` is rejected as a 400 — no useful operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterestMutationBody {
+    /// `Add` appends new predicates (deduped against the
+    /// existing set). `Remove` strips matching predicates.
+    /// `Replace` is rejected — use `/api/companions/subscribe`
+    /// for that.
+    pub op: InterestOp,
+    /// Predicates to apply. Must be non-empty.
+    pub items: Vec<Interest>,
+}
+
+/// CBOR-encode an [`InterestMutationBody`].
+pub fn encode_interest_mutation(body: &InterestMutationBody) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(128);
+    ciborium::into_writer(body, &mut buf).map_err(|e| format!("encode_interest_mutation: {e}"))?;
+    Ok(buf)
+}
+
+/// CBOR-decode an [`InterestMutationBody`].
+pub fn decode_interest_mutation(bytes: &[u8]) -> Result<InterestMutationBody, String> {
+    ciborium::from_reader(bytes).map_err(|e| format!("decode_interest_mutation: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +172,31 @@ mod tests {
         let decoded = decode_recapture(&bytes).unwrap();
         assert_eq!(decoded.module, "jpg-store-offer");
         assert_eq!(decoded.reason.as_deref(), Some("operator triage"));
+    }
+
+    #[test]
+    fn interest_mutation_round_trip_add() {
+        use crate::interest::Interest;
+        let body = InterestMutationBody {
+            op: InterestOp::Add,
+            items: vec![Interest::any()],
+        };
+        let bytes = encode_interest_mutation(&body).unwrap();
+        let decoded = decode_interest_mutation(&bytes).unwrap();
+        assert!(matches!(decoded.op, InterestOp::Add));
+        assert_eq!(decoded.items.len(), 1);
+    }
+
+    #[test]
+    fn interest_mutation_round_trip_remove() {
+        use crate::interest::Interest;
+        let body = InterestMutationBody {
+            op: InterestOp::Remove,
+            items: vec![Interest::any()],
+        };
+        let bytes = encode_interest_mutation(&body).unwrap();
+        let decoded = decode_interest_mutation(&bytes).unwrap();
+        assert!(matches!(decoded.op, InterestOp::Remove));
     }
 
     #[test]

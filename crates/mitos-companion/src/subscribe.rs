@@ -110,6 +110,76 @@ pub fn decode_subscribe_response(bytes: &[u8]) -> Result<SubscribeResponse> {
         .map_err(|e| CompanionError::Wire(format!("decode_subscribe_response: {e}")))
 }
 
+/// Post an interest mutation (`Add` / `Remove`) to the mitos host.
+///
+/// Targets `POST {MITOS_HOST_URL}/api/companions/{key}/interest`
+/// with a CBOR-encoded [`mitos_protocol::InterestMutationBody`].
+/// Used by the runtime's `handle_interest_subscribe` /
+/// `handle_interest_unsubscribe` handlers to push deltas to
+/// mitos without the full re-subscribe round-trip — keeps the
+/// running follower's filter in sync with the companion's local
+/// SQL canonical interest set.
+///
+/// Best-effort from the caller's perspective: the SQL row is the
+/// source of truth, so a transient host-side failure here leaves
+/// the companion correct (the next reconnect-time `Replace` via
+/// `/api/companions/subscribe` rehydrates).
+#[cfg(target_arch = "wasm32")]
+pub async fn post_interest_mutation(
+    env: &worker::Env,
+    companion_key: &str,
+    op: mitos_protocol::InterestOp,
+    items: Vec<mitos_protocol::Interest>,
+) -> Result<()> {
+    use js_sys::Uint8Array;
+    use worker::{Fetch, Headers, Method, Request, RequestInit};
+
+    let host_url = env
+        .var(MITOS_HOST_URL_ENV)
+        .map_err(|e| CompanionError::Wire(format!("read {MITOS_HOST_URL_ENV}: {e}")))?
+        .to_string();
+    let token = read_auth_token(env).await?;
+
+    let body = mitos_protocol::InterestMutationBody { op, items };
+    let body_bytes = mitos_protocol::encode_interest_mutation(&body)
+        .map_err(|e| CompanionError::Wire(format!("encode interest mutation: {e}")))?;
+    let body_array = Uint8Array::from(body_bytes.as_slice());
+
+    let headers = Headers::new();
+    headers
+        .set("authorization", &format!("Bearer {token}"))
+        .map_err(|e| CompanionError::Wire(format!("set auth header: {e}")))?;
+    headers
+        .set("content-type", mitos_protocol::HTTP_DELIVERY_MIME)
+        .map_err(|e| CompanionError::Wire(format!("set content-type: {e}")))?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(body_array.into()));
+
+    let url = format!(
+        "{}/api/companions/{}/interest",
+        host_url.trim_end_matches('/'),
+        companion_key,
+    );
+    let req = Request::new_with_init(&url, &init)
+        .map_err(|e| CompanionError::Wire(format!("build mutation request: {e}")))?;
+
+    let mut response = Fetch::Request(req)
+        .send()
+        .await
+        .map_err(|e| CompanionError::Wire(format!("mutation send: {e}")))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        let body = response.text().await.unwrap_or_default();
+        return Err(CompanionError::Wire(format!(
+            "interest mutation non-2xx ({status}): {body}"
+        )));
+    }
+    Ok(())
+}
+
 /// Post the subscribe call to the mitos host.
 ///
 /// Reads `MITOS_HOST_URL` and `MITOS_AUTH_TOKEN` from the supplied

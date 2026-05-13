@@ -40,7 +40,9 @@ use crate::error::{CompanionError, Result};
 use crate::meta::{self, ensure_schema, migrate_split_row_cursor, write_cursor};
 use crate::subscribe::SubscribeRequest;
 use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
-use mitos_protocol::{ApplyBody, ChainPoint, RecaptureBody, decode_apply, decode_recapture};
+use mitos_protocol::{
+    ApplyBody, ChainPoint, Interest, InterestOp, RecaptureBody, decode_apply, decode_recapture,
+};
 
 /// Companion runtime.
 ///
@@ -444,12 +446,17 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     }
 
     /// `POST /api/_interest/subscribe` — add a single interest
-    /// row. Body: `InterestMutateRequest`. After writing to SQL,
-    /// re-subscribes against mitos so the host picks up the new
-    /// filter immediately. The re-subscribe is the only way to
-    /// communicate dynamic interest changes to mitos in the
-    /// HTTP-delivery model — the legacy WS broadcast path is
-    /// gone.
+    /// row. Body: `InterestMutateRequest`. Writes to the
+    /// companion's local SQL (source of truth) then POSTs a
+    /// targeted Add to mitos's `/api/companions/<key>/interest`
+    /// endpoint. The targeted mutation updates the host's
+    /// persisted CBOR + the running follower's live filter
+    /// without a respawn.
+    ///
+    /// On mutation-endpoint failure, the SQL row stays committed
+    /// and the next `/_internal/wake` (or full subscribe call)
+    /// rehydrates the host. The endpoint is best-effort from
+    /// this handler's perspective — the SQL is canonical.
     async fn handle_interest_subscribe(&self, mut req: Request) -> worker::Result<Response> {
         let payload: crate::interest::InterestMutateRequest = req.json().await?;
         let channel = payload.channel.clone().unwrap_or_default();
@@ -458,14 +465,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let sql = self.state.storage().sql();
         crate::interest::add_interest(&sql, &payload.kind, &payload.value, &channel, &added_at)?;
 
-        // Push the updated interest set to mitos via a fresh
-        // subscribe call. Best-effort: SQL row is the source of
-        // truth, so a failed re-subscribe doesn't lose state —
-        // the next `/_internal/wake` will resync.
-        if let Err(e) = self.resubscribe_after_interest_change().await {
+        if let Err(e) = self
+            .push_interest_mutation(InterestOp::Add, &payload.kind, &payload.value, &channel)
+            .await
+        {
             tracing::warn!(
                 error = %e,
-                "resubscribe after interest add failed; row persisted, host will resync on next wake"
+                "push interest add to mitos failed; row persisted, host will resync on next subscribe"
             );
         }
 
@@ -478,8 +484,8 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     }
 
     /// `POST /api/_interest/unsubscribe` — symmetric to subscribe.
-    /// Body: `InterestMutateRequest`. Re-subscribes against mitos
-    /// after the SQL row is removed so the host drops the filter.
+    /// Removes the SQL row then POSTs a targeted Remove to the
+    /// mitos mutation endpoint.
     async fn handle_interest_unsubscribe(&self, mut req: Request) -> worker::Result<Response> {
         let payload: crate::interest::InterestMutateRequest = req.json().await?;
         let channel = payload.channel.clone().unwrap_or_default();
@@ -487,10 +493,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let sql = self.state.storage().sql();
         crate::interest::remove_interest(&sql, &payload.kind, &payload.value, &channel)?;
 
-        if let Err(e) = self.resubscribe_after_interest_change().await {
+        if let Err(e) = self
+            .push_interest_mutation(InterestOp::Remove, &payload.kind, &payload.value, &channel)
+            .await
+        {
             tracing::warn!(
                 error = %e,
-                "resubscribe after interest remove failed; row persisted, host will resync on next wake"
+                "push interest remove to mitos failed; row persisted, host will resync on next subscribe"
             );
         }
 
@@ -502,41 +511,39 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         })
     }
 
-    /// Re-run the subscribe call against mitos. Used by the
-    /// interest-mutation endpoints to push dynamic interest
-    /// changes to the host. Pulls the same context `handle_wake`
-    /// does — current cursor, full interest set, dial-back URL.
-    async fn resubscribe_after_interest_change(&self) -> Result<()> {
+    /// Translate one `(kind, value, channel)` interest mutation
+    /// row into the wire `Interest` shape and POST it to mitos.
+    /// Encapsulates the SQL-to-wire translation + the auth /
+    /// endpoint plumbing so both handlers share one path.
+    async fn push_interest_mutation(
+        &self,
+        op: InterestOp,
+        kind: &str,
+        value: &str,
+        channel: &str,
+    ) -> Result<()> {
         let companion_key = self
             .state
             .id()
             .name()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let sql = self.state.storage().sql();
-        let resume_from = meta::read_cursor(&sql)?;
-        let interest_rows = crate::interest::list_interests(&sql)?;
-        let mut interests = crate::interest::rows_to_interests(&interest_rows);
-        interests.extend(self.inner.initial_interests());
-        let dial_back = self
-            .env
-            .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
-            .ok()
-            .map(|v| v.to_string())
-            .map(|url| crate::subscribe::DialBackOverride {
-                url: Some(url),
-                auth_header: None,
-                auth_value: None,
-            });
-        let targets = self.inner.subscribe_targets();
-        let request = SubscribeRequest {
-            targets,
-            companion_key,
-            resume_from,
-            interests,
-            dial_back,
+        let row = crate::interest::InterestRow {
+            kind: kind.to_string(),
+            value: value.to_string(),
+            channel: channel.to_string(),
+            added_at: String::new(),
         };
-        subscribe_via_env(&self.env, &request).await.map(|_| ())
+        let items: Vec<Interest> = crate::interest::rows_to_interests(std::slice::from_ref(&row));
+        if items.is_empty() {
+            // Translation didn't yield a wire-shape Interest
+            // (kind/value combination not supported). Soft no-op
+            // — SQL still persists, next full subscribe carries
+            // the row via `rows_to_interests` if it's
+            // serialisable then.
+            return Ok(());
+        }
+        push_interest_mutation_via_env(&self.env, &companion_key, op, items).await
     }
 
     /// `/api/_health` — runtime-owned. Reports cursor + schema
@@ -607,6 +614,28 @@ async fn subscribe_via_env(
 ) -> Result<crate::subscribe::SubscribeResponse> {
     Err(CompanionError::Wire(
         "subscribe_via_env called outside wasm target".into(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn push_interest_mutation_via_env(
+    env: &Env,
+    companion_key: &str,
+    op: InterestOp,
+    items: Vec<Interest>,
+) -> Result<()> {
+    crate::subscribe::post_interest_mutation(env, companion_key, op, items).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn push_interest_mutation_via_env(
+    _env: &Env,
+    _companion_key: &str,
+    _op: InterestOp,
+    _items: Vec<Interest>,
+) -> Result<()> {
+    Err(CompanionError::Wire(
+        "push_interest_mutation_via_env called outside wasm target".into(),
     ))
 }
 
