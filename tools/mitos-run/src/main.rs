@@ -325,13 +325,14 @@ impl FixtureDataPlane {
             // skip non-Shelley shapes (Byron has no Shelley
             // payment part).
             if let Ok(addr) = pallas_addresses::Address::from_bech32(&u.address)
-                && let pallas_addresses::Address::Shelley(s) = addr {
-                    let cred_bytes: [u8; 28] = match s.payment() {
-                        pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
-                        pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
-                    };
-                    by_payment_cred.entry(cred_bytes).or_default().push(oref);
-                }
+                && let pallas_addresses::Address::Shelley(s) = addr
+            {
+                let cred_bytes: [u8; 28] = match s.payment() {
+                    pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
+                    pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
+                };
+                by_payment_cred.entry(cred_bytes).or_default().push(oref);
+            }
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
                 ResolvedUtxo {
@@ -445,16 +446,17 @@ impl FixtureDataPlane {
                     .or_default()
                     .push(oref);
                 if let Ok(addr) = pallas_addresses::Address::from_bech32(&typed_output.address)
-                    && let pallas_addresses::Address::Shelley(s) = addr {
-                        let cred_bytes: [u8; 28] = match s.payment() {
-                            pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
-                            pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
-                        };
-                        self.by_payment_cred
-                            .entry(cred_bytes)
-                            .or_default()
-                            .push(oref);
-                    }
+                    && let pallas_addresses::Address::Shelley(s) = addr
+                {
+                    let cred_bytes: [u8; 28] = match s.payment() {
+                        pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
+                        pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
+                    };
+                    self.by_payment_cred
+                        .entry(cred_bytes)
+                        .or_default()
+                        .push(oref);
+                }
                 self.by_ref.insert(
                     key,
                     ResolvedUtxo {
