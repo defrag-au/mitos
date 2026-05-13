@@ -21,7 +21,8 @@ pub mod wire;
 mod interest_tests;
 
 pub use http::{
-    ApplyBody, HTTP_DELIVERY_MIME, RecaptureBody, decode_apply, decode_recapture, encode_apply,
+    ApplyBody, HTTP_DELIVERY_MIME, InterestMutationBody, RecaptureBody, decode_apply,
+    decode_interest_mutation, decode_recapture, encode_apply, encode_interest_mutation,
     encode_recapture,
 };
 pub use interest::{

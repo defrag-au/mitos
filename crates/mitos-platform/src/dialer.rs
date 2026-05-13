@@ -208,6 +208,31 @@ impl CompanionDialer {
         self
     }
 
+    /// Forward an interest mutation to the running follower's
+    /// live filter. Called from the
+    /// `POST /api/companions/<key>/interest` handler — the
+    /// persistence side (rewriting the CBOR registration) is the
+    /// caller's responsibility; this method only propagates the
+    /// delta to the in-memory follower so the filter takes effect
+    /// without a subscribe round-trip.
+    ///
+    /// `Ok(false)` indicates no `InterestRouter` is wired (test /
+    /// dev build). Production callers should treat that as a soft
+    /// success — the persisted CBOR is still correct, and the
+    /// filter will resolve on next host restart.
+    pub async fn route_interest_mutation(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> std::result::Result<bool, crate::host_v2::InterestRouteError> {
+        let Some(router) = &self.interest_router else {
+            return Ok(false);
+        };
+        router.route_interest(module_id, op, items).await?;
+        Ok(true)
+    }
+
     /// Scan `<storage_root>/*/companions/*.cbor` and start a
     /// drain task for each persisted companion. Failures on
     /// individual companion files are logged but don't abort
