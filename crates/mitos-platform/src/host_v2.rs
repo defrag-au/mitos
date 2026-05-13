@@ -910,23 +910,8 @@ fn drain_one(
     module_id: &str,
     event: emit::EmittedEvent,
 ) {
-    use crate::emissions::EmissionStatus;
+    use crate::emissions::{EmissionStatus, UNSUBSCRIBED_COMPANION_ID};
     let companions_dir = storage.module_dir_for_companions(module_id);
-    if !companions_dir.exists() {
-        return; // no registered companions
-    }
-    let read = match std::fs::read_dir(&companions_dir) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                module = %module_id,
-                dir = %companions_dir.display(),
-                error = %e,
-                "read companions dir failed; emission dropped"
-            );
-            return;
-        }
-    };
     let now = format!(
         "unix:{}",
         std::time::SystemTime::now()
@@ -938,17 +923,61 @@ fn drain_one(
     // dispatch is by string tag. We stringify here; future work
     // could plumb the name through manifest metadata.
     let channel = event.channel.to_string();
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
-            continue;
+
+    // Track whether we wrote at least one per-companion row. If
+    // not (no dir, empty dir, or all entries skipped), fall back
+    // to the sentinel companion-id so the emission isn't silently
+    // dropped during the window before any companion subscribes
+    // (drop site #3 in `docs/design/EVENT_DELIVERY_RESILIENCE.md`).
+    // The first subscribe call for this module reclaims the
+    // sentinel rows via `EmissionsStore::retarget_companion`.
+    let mut wrote_per_companion = false;
+    if companions_dir.exists() {
+        match std::fs::read_dir(&companions_dir) {
+            Ok(read) => {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                        continue;
+                    }
+                    let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    match store.append(
+                        &companion_key,
+                        &channel,
+                        event.chain_point.clone(),
+                        event.payload.clone(),
+                        EmissionStatus::Queued,
+                        &now,
+                    ) {
+                        Ok(_) => wrote_per_companion = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                module = %module_id,
+                                companion_key = %companion_key,
+                                error = %e,
+                                "append emission row failed"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    module = %module_id,
+                    dir = %companions_dir.display(),
+                    error = %e,
+                    "read companions dir failed; falling back to sentinel"
+                );
+            }
         }
-        let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
+    }
+
+    if !wrote_per_companion {
         if let Err(e) = store.append(
-            &companion_key,
+            UNSUBSCRIBED_COMPANION_ID,
             &channel,
             event.chain_point.clone(),
             event.payload.clone(),
@@ -957,9 +986,14 @@ fn drain_one(
         ) {
             tracing::warn!(
                 module = %module_id,
-                companion_key = %companion_key,
                 error = %e,
-                "append emission row failed"
+                "append unsubscribed sentinel emission failed; emission lost"
+            );
+        } else {
+            tracing::debug!(
+                module = %module_id,
+                channel = %channel,
+                "no subscribed companion; emission persisted to sentinel"
             );
         }
     }

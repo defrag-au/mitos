@@ -104,6 +104,32 @@ pub enum ScriptLanguage {
     PlutusV3,
 }
 
+/// Whether a `TypedOutput` carries real chain data or is a
+/// dispatcher-emitted placeholder for an input whose prior
+/// output the data plane couldn't resolve.
+///
+/// `Unresolved` shows up on `ConsumedEvent.prior_output` /
+/// `ReferencedEvent.prior_output` when the input's `OutputRef`
+/// names a UTxO outside the archive horizon (or otherwise
+/// missing from current state + archive). The dispatcher emits
+/// a placeholder so downstream filters can decide whether to
+/// surface or skip — see
+/// `docs/design/EVENT_DELIVERY_RESILIENCE.md` drop site #1.
+///
+/// `address`, `lovelace`, `assets` on an unresolved output are
+/// empty / zero — only the OREF + (for Consumed) the redeemer
+/// carry semantic content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Resolution {
+    /// Real chain output, fully populated to the requested
+    /// `DecodeLevel`.
+    #[default]
+    Resolved,
+    /// Placeholder: the OREF was valid but the data plane
+    /// couldn't return chain data for it (archive horizon, etc).
+    Unresolved,
+}
+
 /// What the data plane returns per output. Field optionality
 /// rules:
 ///
@@ -160,4 +186,48 @@ pub struct TypedOutput {
     /// expected fields are populated. Mirror of the request's
     /// `DecodeLevel`.
     pub decoded_at: DecodeLevel,
+    /// Whether this is real chain data or a dispatcher
+    /// placeholder for an input whose prior output the data
+    /// plane couldn't resolve. See [`Resolution`] for the full
+    /// rationale.
+    #[serde(default)]
+    pub resolution: Resolution,
+}
+
+impl TypedOutput {
+    /// Placeholder for an input whose prior output couldn't be
+    /// resolved. Address is empty, lovelace is zero, asset
+    /// multiset is empty — only the surrounding event's OREF
+    /// (and, for Consumed, the redeemer) carry semantic content.
+    /// Callers must check [`Self::is_resolved`] before relying
+    /// on field values.
+    ///
+    /// Emitted by the dispatcher in place of the previous
+    /// silent-drop when `read_utxos` misses a ref past the
+    /// archive horizon. See
+    /// `docs/design/EVENT_DELIVERY_RESILIENCE.md` drop site #1.
+    pub fn unresolved() -> Self {
+        Self {
+            address: String::new(),
+            lovelace: 0,
+            assets: Vec::new(),
+            datum: None,
+            script_ref: None,
+            original_cbor: None,
+            decoded_at: DecodeLevel::Lean,
+            resolution: Resolution::Unresolved,
+        }
+    }
+
+    /// `true` iff this output is real chain data.
+    pub fn is_resolved(&self) -> bool {
+        matches!(self.resolution, Resolution::Resolved)
+    }
+
+    /// `true` iff this output is a dispatcher placeholder. The
+    /// inverse of [`Self::is_resolved`], spelled out for clarity
+    /// at call sites.
+    pub fn is_unresolved(&self) -> bool {
+        matches!(self.resolution, Resolution::Unresolved)
+    }
 }

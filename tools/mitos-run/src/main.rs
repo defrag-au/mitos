@@ -344,6 +344,7 @@ impl FixtureDataPlane {
                         script_ref: None,
                         original_cbor: None,
                         decoded_at: DecodeLevel::Lean,
+                        resolution: mitos_data_plane::Resolution::Resolved,
                     },
                 },
             );

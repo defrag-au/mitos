@@ -39,9 +39,9 @@ pub use types::{
     AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, ConsumedEvent, ConsumedInput,
     DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate, InterestSet,
     MintEntry, MintedEvent, OutputRef, OutputRefPattern, Page, PageRequest, ProducedEvent,
-    ReferencedEvent, ReferencedInput, RollbackEvent, ScriptLanguage, StakeCred, TickEvent,
-    TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput, TypedScript, UtxoEvent,
-    UtxoPattern, UtxoPredicate, ValidityInterval,
+    ReferencedEvent, ReferencedInput, Resolution, RollbackEvent, ScriptLanguage, StakeCred,
+    TickEvent, TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput, TypedScript,
+    UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
 };
 
 pub use impls::{LocalDataPlane, extract_aux_cbor, project_typed_output};

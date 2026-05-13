@@ -73,9 +73,11 @@ pub async fn build_event_batches<P: ChainDataPlane + Sync>(
     };
     // Build a lookup: ref → (output, datum) for present-in-set
     // refs. Spent / unknown refs simply absent — the dispatcher
-    // emits the corresponding events with empty-but-typed
-    // placeholder shapes (modules treat the absence as
-    // "data plane couldn't resolve" same as today).
+    // emits the corresponding Consumed / Referenced events with
+    // `TypedOutput::unresolved()` placeholder shapes (see drop
+    // site #1 in `docs/design/EVENT_DELIVERY_RESILIENCE.md` —
+    // previously these were silently dropped, masking
+    // archive-horizon Cancel/Accept TXs).
     let mut resolved: HashMap<
         (pallas_primitives::Hash<32>, u32),
         (TypedOutput, Option<TypedDatum>),
@@ -108,30 +110,26 @@ fn build_tx_batch(
     let referenced: Vec<UtxoEvent> = tx
         .reference_inputs
         .iter()
-        .filter_map(|oref| {
-            let (mut prior_output, mut prior_datum) =
-                resolved.get(&(oref.tx_hash, oref.index)).cloned()?;
-            backfill_prior_datum(&mut prior_output, &mut prior_datum, &tx.witness_datums);
-            Some(UtxoEvent::Referenced(ReferencedEvent {
+        .map(|oref| {
+            let (prior_output, prior_datum) = resolve_prior(oref, resolved, &tx.witness_datums);
+            UtxoEvent::Referenced(ReferencedEvent {
                 cursor: cursor.clone(),
                 referencing_tx_hash: tx.tx_hash,
                 referencing_tx_idx: tx.tx_idx,
                 oref: *oref,
                 prior_output,
                 prior_datum,
-            }))
+            })
         })
         .collect();
 
     let consumed: Vec<UtxoEvent> = tx
         .inputs
         .iter()
-        .filter_map(|input: &InputDraft| {
-            let (mut prior_output, mut prior_datum) = resolved
-                .get(&(input.oref.tx_hash, input.oref.index))
-                .cloned()?;
-            backfill_prior_datum(&mut prior_output, &mut prior_datum, &tx.witness_datums);
-            Some(UtxoEvent::Consumed(ConsumedEvent {
+        .map(|input: &InputDraft| {
+            let (prior_output, prior_datum) =
+                resolve_prior(&input.oref, resolved, &tx.witness_datums);
+            UtxoEvent::Consumed(ConsumedEvent {
                 cursor: cursor.clone(),
                 consuming_tx_hash: tx.tx_hash,
                 consuming_tx_idx: tx.tx_idx,
@@ -139,7 +137,7 @@ fn build_tx_batch(
                 prior_output,
                 prior_datum,
                 redeemer: input.redeemer.clone(),
-            }))
+            })
         })
         .collect();
 
@@ -215,6 +213,31 @@ fn build_tx_batch(
         batch.push(e);
     }
     Some(batch)
+}
+
+/// Look up the prior output + datum for one input / reference
+/// input. Returns a [`TypedOutput::unresolved`] placeholder when
+/// the data plane couldn't resolve the ref (typically because
+/// the create-TX block has been pruned past the archive
+/// horizon). The placeholder lets downstream consumers see the
+/// OREF + redeemer + cursor — enough for redeemer-driven event
+/// shapes like jpg.store Cancel — while leaving address-keyed
+/// matching naturally inert (see [`InterestSet::matches_output`]).
+///
+/// The witness-set backfill only runs on the resolved path,
+/// since an unresolved placeholder has no `prior_datum` to fill.
+fn resolve_prior(
+    oref: &OutputRef,
+    resolved: &HashMap<(pallas_primitives::Hash<32>, u32), (TypedOutput, Option<TypedDatum>)>,
+    witness_datums: &[(pallas_primitives::Hash<32>, Vec<u8>)],
+) -> (TypedOutput, Option<TypedDatum>) {
+    match resolved.get(&(oref.tx_hash, oref.index)).cloned() {
+        Some((mut prior_output, mut prior_datum)) => {
+            backfill_prior_datum(&mut prior_output, &mut prior_datum, witness_datums);
+            (prior_output, prior_datum)
+        }
+        None => (TypedOutput::unresolved(), None),
+    }
 }
 
 /// Apply the witness-set fallback to both copies of the prior
@@ -383,6 +406,7 @@ mod tests {
             script_ref: None,
             original_cbor: None,
             decoded_at: DecodeLevel::Lean,
+            resolution: crate::types::Resolution::Resolved,
         };
         let block = DecodedBlockV2 {
             cursor: ChainPoint::Slot(100),
@@ -437,6 +461,7 @@ mod tests {
             script_ref: None,
             original_cbor: None,
             decoded_at: DecodeLevel::Lean,
+            resolution: crate::types::Resolution::Resolved,
         };
         let block = DecodedBlockV2 {
             cursor: ChainPoint::Slot(100),
@@ -493,6 +518,7 @@ mod tests {
             script_ref: None,
             original_cbor: None,
             decoded_at: DecodeLevel::WithDatum,
+            resolution: crate::types::Resolution::Resolved,
         };
         let mut utxos = HashMap::new();
         utxos.insert((prior_tx_hash, 0), prior_output);
@@ -551,6 +577,138 @@ mod tests {
             inline_datum.original_cbor.as_deref(),
             Some(datum_bytes.as_slice()),
             "prior_output.datum.original_cbor backfilled symmetrically",
+        );
+    }
+
+    /// When the data plane can't resolve an input's prior output
+    /// (archive horizon, missing block, etc.), the dispatcher
+    /// previously dropped the Consumed event entirely — masking
+    /// archive-horizon Cancel TXs from downstream modules. After
+    /// drop-#1's fix it must emit a placeholder Consumed whose
+    /// `prior_output.is_unresolved()` is true. Address-keyed
+    /// interest predicates won't match it, so a TX with only an
+    /// unresolved consume produces no batch — but the placeholder
+    /// IS available to redeemer-driven modules that opt in (Unit
+    /// E follow-up).
+    #[tokio::test]
+    async fn unresolved_consumed_is_emitted_as_placeholder() {
+        // Plane returns nothing — input ref is "archive-horizon
+        // pruned" from the dispatcher's POV.
+        let plane = StubPlane {
+            utxos: HashMap::new(),
+        };
+        let watched_addr = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd";
+
+        // TX that consumes an unresolvable input AND produces an
+        // output at the watched address. The produced output
+        // makes the TX relevant; the unresolved consume must
+        // still appear in the batch as a placeholder so an
+        // opt-in module can see the redeemer.
+        let prior_tx_hash = pallas_primitives::Hash::new([0x11; 32]);
+        let consuming_tx_hash = pallas_primitives::Hash::new([0x22; 32]);
+        let produced_output = TypedOutput {
+            address: watched_addr.to_owned(),
+            lovelace: 5_000_000,
+            assets: Vec::new(),
+            datum: None,
+            script_ref: None,
+            original_cbor: None,
+            decoded_at: DecodeLevel::Lean,
+            resolution: crate::types::Resolution::Resolved,
+        };
+        let block = DecodedBlockV2 {
+            cursor: ChainPoint::Slot(200),
+            txs: vec![TxDraft {
+                tx_hash: consuming_tx_hash,
+                tx_idx: 0,
+                validity_interval: Default::default(),
+                required_signers: Vec::new(),
+                inputs: vec![InputDraft {
+                    oref: OutputRef::new(prior_tx_hash, 0),
+                    redeemer: Some(vec![0xd8, 0x7a, 0x80]),
+                }],
+                reference_inputs: Vec::new(),
+                outputs: vec![OutputDraft {
+                    output: produced_output,
+                    datum_hash: None,
+                    inline_datum_bytes: None,
+                }],
+                mints: Vec::new(),
+                aux_data_cbor: None,
+                witness_datums: Vec::new(),
+            }],
+        };
+        let interest = InterestSet::default()
+            .with_predicate(InterestPredicate::AtAddress(watched_addr.to_owned()));
+        let batches = build_event_batches(block, &interest, &plane).await.unwrap();
+
+        assert_eq!(batches.len(), 1, "produced match still triggers batch");
+        let consumed = batches[0]
+            .events
+            .iter()
+            .find_map(|e| match e {
+                UtxoEvent::Consumed(c) => Some(c),
+                _ => None,
+            })
+            .expect("Consumed event must be emitted even with unresolved prior");
+        assert!(
+            consumed.prior_output.is_unresolved(),
+            "prior_output flagged as unresolved placeholder"
+        );
+        assert!(consumed.prior_output.address.is_empty());
+        assert_eq!(consumed.prior_output.lovelace, 0);
+        assert!(consumed.prior_datum.is_none());
+        assert_eq!(
+            consumed.oref,
+            OutputRef::new(prior_tx_hash, 0),
+            "OREF is preserved — redeemer-driven modules need it"
+        );
+        assert_eq!(
+            consumed.redeemer.as_deref(),
+            Some(&[0xd8u8, 0x7a, 0x80][..]),
+            "redeemer is preserved",
+        );
+    }
+
+    /// Counterpart: a TX whose ONLY events are unresolved
+    /// consumes (no produced output at any watched address)
+    /// produces no batch. The unresolved Consumed doesn't
+    /// match any address-keyed predicate, so relevance fails
+    /// — same as the pre-fix behaviour for these TXs, but now
+    /// via filtered emit rather than silent drop.
+    #[tokio::test]
+    async fn unresolved_consumed_alone_produces_no_batch() {
+        let plane = StubPlane {
+            utxos: HashMap::new(),
+        };
+        let watched_addr = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd";
+        let prior_tx_hash = pallas_primitives::Hash::new([0x11; 32]);
+        let consuming_tx_hash = pallas_primitives::Hash::new([0x22; 32]);
+        let block = DecodedBlockV2 {
+            cursor: ChainPoint::Slot(200),
+            txs: vec![TxDraft {
+                tx_hash: consuming_tx_hash,
+                tx_idx: 0,
+                validity_interval: Default::default(),
+                required_signers: Vec::new(),
+                inputs: vec![InputDraft {
+                    oref: OutputRef::new(prior_tx_hash, 0),
+                    redeemer: Some(vec![0xd8, 0x7a, 0x80]),
+                }],
+                reference_inputs: Vec::new(),
+                outputs: Vec::new(),
+                mints: Vec::new(),
+                aux_data_cbor: None,
+                witness_datums: Vec::new(),
+            }],
+        };
+        let interest = InterestSet::default()
+            .with_predicate(InterestPredicate::AtAddress(watched_addr.to_owned()));
+        let batches = build_event_batches(block, &interest, &plane).await.unwrap();
+        assert!(
+            batches.is_empty(),
+            "no batch when only event is an unresolved consume \
+             that no predicate matches"
         );
     }
 }

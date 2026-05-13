@@ -111,7 +111,22 @@ impl InterestSet {
 
     /// Does any predicate in the set match this output?
     /// Used for `produced` / `consumed` / `referenced` events.
+    ///
+    /// Unresolved outputs (dispatcher placeholders for inputs
+    /// whose prior output the data plane couldn't fetch) never
+    /// match. Address-keyed predicates would otherwise spuriously
+    /// match an empty `AtAddress("")` and policy/asset-keyed
+    /// predicates already see an empty asset multiset — the
+    /// short-circuit keeps both paths from accidentally
+    /// dispatching phantom events. Modules that want to react
+    /// to redeemer-driven Cancel-style consumes regardless of
+    /// prior-output resolution will get an explicit opt-in
+    /// predicate variant (drop site #1 follow-up in
+    /// `docs/design/EVENT_DELIVERY_RESILIENCE.md`).
     pub fn matches_output(&self, output: &TypedOutput) -> bool {
+        if output.is_unresolved() {
+            return false;
+        }
         self.predicates
             .iter()
             .any(|p| predicate_matches_output(p, output))
@@ -251,6 +266,7 @@ mod tests {
             script_ref: None,
             original_cbor: None,
             decoded_at: DecodeLevel::Lean,
+            resolution: crate::types::Resolution::Resolved,
         }
     }
 
@@ -341,6 +357,23 @@ mod tests {
 
         let addrs: Vec<&str> = set.watched_addresses().collect();
         assert_eq!(addrs, vec!["addr1xyz", "addr1abc"]);
+    }
+
+    #[test]
+    fn unresolved_output_never_matches() {
+        // A dispatcher placeholder must not match any predicate
+        // shape, even pathological ones like `AtAddress("")`
+        // which would otherwise spuriously match the empty
+        // address of the placeholder.
+        let unresolved = TypedOutput::unresolved();
+        let pathological = InterestSet::default()
+            .with_predicate(InterestPredicate::AtAddress(String::new()))
+            .with_predicate(InterestPredicate::AtPaymentCred([0u8; 28]))
+            .with_predicate(InterestPredicate::HoldsPolicy(policy(0xaa)));
+        assert!(
+            !pathological.matches_output(&unresolved),
+            "unresolved output must short-circuit to false"
+        );
     }
 
     #[test]

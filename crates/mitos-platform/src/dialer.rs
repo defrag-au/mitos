@@ -70,6 +70,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// How often the pump sweeps for stale `Pending` rows (rows
+/// where the WS is alive but the consumer's `Ack` hasn't
+/// arrived). Catches the "consumer silently dead" / TCP
+/// keepalive variant — the dirty-close case is already handled
+/// by the reconnect-time reclaim in `dial_and_pump`.
+const STALE_PENDING_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Pending rows older than this threshold get requeued by the
+/// pump's stale sweep. 60s is well above a real `apply_event`
+/// round-trip (sub-second to a few seconds) and matches the
+/// design doc's recommended `PENDING_TIMEOUT`.
+const STALE_PENDING_MAX_AGE: Duration = Duration::from_secs(60);
+
 /// Identifier for one (module, companion_key) pair. Hashable
 /// + cloneable for use as map key.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -727,16 +740,50 @@ async fn dial_and_pump(
     let last_emission_id = next_id.saturating_sub(1);
     send_msg(&mut sink, &ServerMessage::Connected { last_emission_id }).await?;
 
+    // Reclaim any rows left `Pending` by the previous WS. A
+    // dirty close (CF DO hibernation, network drop, host
+    // restart) tears the socket without surfacing the in-flight
+    // frames as Nack, so the rows sit `Pending` forever and
+    // `drain_queued` (which only looks at `Queued`) can't see
+    // them. Flip them back to `Queued` before draining; the
+    // consumer's idempotent `apply_event` absorbs any
+    // double-application when the original Ack was lost in
+    // flight. See `docs/design/EVENT_DELIVERY_RESILIENCE.md`
+    // drop site #2.
+    match store.requeue_pending_for_companion(&req.companion_key, &now_rfc3339()) {
+        Ok(0) => {}
+        Ok(count) => {
+            info!(
+                companion_key = %req.companion_key,
+                count,
+                "requeued pending emissions on reconnect"
+            );
+        }
+        Err(e) => {
+            warn!(
+                companion_key = %req.companion_key,
+                error = %e,
+                "requeue pending emissions failed; drain may miss in-flight rows"
+            );
+        }
+    }
+
     // Drain queued rows in id order, send Apply, flip to
     // Pending. New rows arriving while we drain will show up
     // on the next poll iteration in the main loop.
     drain_queued(&mut sink, store, &req.companion_key).await?;
 
     // Main pump: tokio::select! over inbound frames + a poll
-    // tick that re-checks for new Queued rows.
+    // tick that re-checks for new Queued rows + a slower tick
+    // that requeues stale `Pending` rows (the consumer-silently-
+    // dead case, see `STALE_PENDING_SWEEP_INTERVAL`).
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // consume the immediate-fire first tick
+
+    let mut stale_pending_tick = tokio::time::interval(STALE_PENDING_SWEEP_INTERVAL);
+    stale_pending_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    stale_pending_tick.tick().await; // consume the immediate-fire first tick
 
     loop {
         tokio::select! {
@@ -785,6 +832,40 @@ async fn dial_and_pump(
 
             _ = tick.tick() => {
                 drain_queued(&mut sink, store, &req.companion_key).await?;
+            }
+
+            _ = stale_pending_tick.tick() => {
+                let now_secs = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let now_str = now_rfc3339();
+                match store.requeue_stale_pending_for_companion(
+                    &req.companion_key,
+                    now_secs,
+                    STALE_PENDING_MAX_AGE.as_secs(),
+                    &now_str,
+                ) {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        info!(
+                            companion_key = %req.companion_key,
+                            count,
+                            max_age_secs = STALE_PENDING_MAX_AGE.as_secs(),
+                            "requeued stale Pending emissions; consumer Ack timed out"
+                        );
+                        // Re-drain immediately so the requeued rows
+                        // don't wait for the next 1s tick.
+                        drain_queued(&mut sink, store, &req.companion_key).await?;
+                    }
+                    Err(e) => {
+                        warn!(
+                            companion_key = %req.companion_key,
+                            error = %e,
+                            "stale Pending sweep failed"
+                        );
+                    }
+                }
             }
         }
     }
