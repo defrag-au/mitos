@@ -16,18 +16,29 @@
 abi_version = 2
 
 # Runtime config — passed to the module's `init(config)` as
-# CBOR-encoded by mitos-build. Mirror of `jpg-co`'s shape.
+# CBOR-encoded by mitos-build.
+#
+# `v3_address` is intentionally empty. The previous toml carried
+# `addr1xxzvcf02fs5e...` here as a "V3" CO address, but the
+# 2026-05-12 investigation decoded it and found it shares jpg.store's
+# marketplace staking cred with the V2 offer contract but uses a
+# different payment script — and that payment cred shows up *inside*
+# V2 offer datums as a payout target. Sampling unspent UTxOs at that
+# address turned up lovelace + NFT assets with no datum, which is
+# operational/treasury state, not a CO. The wasm module's
+# `JpgStoreOfferVersion::V3` enum variant and the `v3_address` config
+# slot stay in place so a real V3 CO contract can drop in when (if)
+# jpg.store ships one — flip the address back on, no schema churn.
 v2_address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
-v3_address = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p"
+v3_address = ""
 
 [interest]
-# jpg.store CO V2 + V3 script addresses. Same set the existing
-# jpg-co module watches.
+# Currently only V2. See the v3_address note above; add a V3 entry
+# here once the correct contract address is identified.
 addresses = [
-    # V2 — payment script + V2 staking credential.
+    # V2 — jpg.store collection-offer payment script + marketplace
+    # staking credential.
     "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd",
-    # V3 — same payment script, V3 staking credential.
-    "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p",
 ]
 policies = []
 

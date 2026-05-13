@@ -74,6 +74,27 @@ impl DataPlaneFacade for NullDataPlane {
         Ok(Vec::new())
     }
 
+    async fn utxos_by_policy(
+        &self,
+        _policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        Ok(Vec::new())
+    }
+
+    async fn utxos_by_payment_cred(
+        &self,
+        _cred: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        Ok(Vec::new())
+    }
+
+    async fn resolve_stake_for_payment_pkh(
+        &self,
+        _pkh: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::StakeCred>> {
+        Ok(None)
+    }
+
     async fn datum_by_hash(
         &self,
         _hash: &[u8; 32],

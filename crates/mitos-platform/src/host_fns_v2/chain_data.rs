@@ -7,7 +7,8 @@
 
 use crate::bindings_v2::{
     self, AssetEntry as WitAssetEntry, AssetId as WitAssetId, ChainDataHost,
-    OutputRef as WitOutputRef, TypedDatum as WitTypedDatum, TypedOutput as WitTypedOutput,
+    OutputRef as WitOutputRef, StakeCred as WitStakeCred, TypedDatum as WitTypedDatum,
+    TypedOutput as WitTypedOutput,
 };
 use crate::host_fns_v2::HostStateV2;
 
@@ -38,6 +39,39 @@ impl ChainDataHost for HostStateV2 {
             .await
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+
+    async fn utxos_by_policy(&mut self, policy: Vec<u8>) -> wasmtime::Result<Vec<WitOutputRef>> {
+        let refs = self
+            .data_plane
+            .utxos_by_policy(&policy)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+
+    async fn utxos_by_payment_cred(
+        &mut self,
+        cred: Vec<u8>,
+    ) -> wasmtime::Result<Vec<WitOutputRef>> {
+        let refs = self
+            .data_plane
+            .utxos_by_payment_cred(&cred)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(refs.into_iter().map(from_dp_ref).collect())
+    }
+
+    async fn resolve_stake_for_payment_pkh(
+        &mut self,
+        pkh: Vec<u8>,
+    ) -> wasmtime::Result<Option<WitStakeCred>> {
+        let cred = self
+            .data_plane
+            .resolve_stake_for_payment_pkh(&pkh)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(cred.map(stake_cred_to_wit))
     }
 
     async fn read_output_datums(
@@ -220,6 +254,13 @@ fn from_dp_ref(r: mitos_data_plane::OutputRef) -> WitOutputRef {
     WitOutputRef {
         tx_hash: r.tx_hash.as_ref().to_vec(),
         index: r.index,
+    }
+}
+
+fn stake_cred_to_wit(c: mitos_data_plane::StakeCred) -> WitStakeCred {
+    match c {
+        mitos_data_plane::StakeCred::KeyHash(b) => WitStakeCred::KeyHash(b.to_vec()),
+        mitos_data_plane::StakeCred::ScriptHash(b) => WitStakeCred::ScriptHash(b.to_vec()),
     }
 }
 

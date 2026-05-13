@@ -239,7 +239,7 @@ interface types {
 /// deadweight — the host has dolos in process and the lookup is
 /// one redb call.
 interface chain-data {
-    use types.{output-ref, typed-output, typed-datum, tx-record};
+    use types.{output-ref, typed-output, typed-datum, tx-record, stake-cred};
 
     /// Bulk lookup of N output refs in one host call.
     read-utxos: func(refs: list<output-ref>) -> list<typed-output>;
@@ -251,6 +251,55 @@ interface chain-data {
     /// platform's interest-driven bootstrap handles it
     /// transparently. Cap: 100K refs.
     utxos-by-address: func(address: string) -> list<output-ref>;
+
+    /// Enumerate the current unspent set holding a given policy
+    /// id (28-byte hash). Symmetric primitive to
+    /// `utxos-by-address` for the policy-keyed case. Dolos
+    /// maintains a first-class `BY_POLICY` index (multimap in
+    /// redb / prefix-keyed in fjall), so this is sub-second
+    /// even for very active policies — O(log N + M) where M is
+    /// the number of UTxOs currently holding the policy.
+    ///
+    /// Use cases: cold-start hydration of per-policy holder
+    /// ledgers (`holder-distribution` module), NFT-collection
+    /// indexers, vesting-contract scanners. Modules that need
+    /// per-policy bootstrap state without writing their own
+    /// event-replay logic. Cap: 100K refs.
+    utxos-by-policy: func(policy: list<u8>) -> list<output-ref>;
+
+    /// Enumerate the current unspent set whose address shares
+    /// a given payment credential (28-byte payment-key hash or
+    /// payment-script hash), regardless of staking part.
+    ///
+    /// Use cases:
+    /// - cold-start hydration for contract sweeps where the
+    ///   payment part is the script identity but the staking
+    ///   part varies per UTxO (e.g. CrowdLock vests — same
+    ///   contract, different derived staking creds per lock)
+    /// - resolving a wallet's stake credential from a payment
+    ///   key hash discovered in a datum (find any UTxO using
+    ///   the PKH; parse its address; read the stake part).
+    ///   `resolve-stake-for-payment-pkh` below wraps this case.
+    ///
+    /// Cap: 100K refs.
+    utxos-by-payment-cred: func(cred: list<u8>) -> list<output-ref>;
+
+    /// Convenience over `utxos-by-payment-cred` for the common
+    /// PKH→stake resolution path: find any current UTxO whose
+    /// address uses the given 28-byte payment credential, parse
+    /// the address, return the stake part.
+    ///
+    /// Returns `None` when:
+    /// - the PKH has no current UTxOs (rare — wallet emptied
+    ///   itself and never reappeared)
+    /// - all UTxOs using the PKH are at enterprise (no-stake)
+    ///   addresses
+    ///
+    /// Implemented host-side as a single redb scan over the
+    /// by-payment-cred index, picking the first result with a
+    /// stake part. Avoids modules pulling the full UTxO list +
+    /// reading each output just to learn one stake cred.
+    resolve-stake-for-payment-pkh: func(pkh: list<u8>) -> option<stake-cred>;
 
     /// Bulk caller-blind datum lookup for a list of output refs.
     /// Returns parallel `option<typed-datum>` — `Some` when the
@@ -309,6 +358,11 @@ interface logging {
 ///
 /// v2 extends the predicate vocabulary:
 /// - `at-address(bech32)` — output's address matches exactly
+/// - `at-payment-cred(bytes)` — output's address shares this
+///   payment credential (28-byte payment-key or payment-script
+///   hash), regardless of staking part. Symmetric counterpart
+///   to `at-stake-cred`; used by contract sweeps where the
+///   staking part varies per UTxO (CrowdLock).
 /// - `at-stake-cred(stake-cred)` — output's address shares this
 ///   stake credential, regardless of payment credential
 /// - `holds-policy(policy_id)` — output's asset multiset
@@ -330,6 +384,7 @@ interface interest {
 
     variant interest-predicate {
         at-address(string),
+        at-payment-cred(list<u8>),
         at-stake-cred(stake-cred),
         holds-policy(list<u8>),
         holds-asset(asset-id),

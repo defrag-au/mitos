@@ -1,0 +1,58 @@
+# vesting-tracker golden scenario: Shield CrowdLock user vest on Aliens.
+#
+# TX: 3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15
+# Block: 13390451 (slot 186647096)
+# Lock contract address (header 0x11 — script payment + key staking):
+#   addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w
+# Payment cred (28 bytes): 381cd9b620ce9d7c73dd45cfe207971cc79df79251003116094f6b36
+# Aliens policy: 16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7
+# Aliens asset_name: 416c69656e73 ("Aliens")
+# Owner PKH (from datum): 373998141ef305075d72dc53c57168fe495d3fb27ab2f94e85410c5b
+# Unlock TS: 1793765349809 ms
+# Lock amount: 12281864 Aliens
+# Metadata 674.msg: "Shield Vest - Crowd Lock" → VestStyle::CrowdLock
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "381cd9b620ce9d7c73dd45cfe207971cc79df79251003116094f6b36"
+
+# The lock UTxO produced by the test TX. `utxos_by_payment_cred`
+# returns this ref; `read_utxos` returns the typed output.
+[[utxo]]
+tx_hash = "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15"
+index = 0
+address = "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w"
+lovelace = 2_000_000
+datum_hash = "e66e53a8e064c04bea090a2c3ef97c0e7d870f4d660e8a3ebac859c3ca01ad33"
+datum_payload_hex = "d879821b000001a1a4bf19b181581c373998141ef305075d72dc53c57168fe495d3fb27ab2f94e85410c5b"
+
+[[utxo.assets]]
+policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"
+asset_name_hex = "416c69656e73"
+quantity = 12281864
+
+# Stand-in for the owner's "any current UTxO using this PKH"
+# that `resolve_stake_for_payment_pkh` walks. The fixture's
+# default impl falls back to `utxos_by_payment_cred(pkh)` +
+# `read_utxo`, so this entry must:
+#   - have an address whose PAYMENT credential matches the
+#     owner PKH from the datum
+#   - have a stake part (otherwise resolution returns None,
+#     which is also a valid test, but here we exercise the
+#     happy path)
+# Owner's wallet address (taken from one of the locking-TX
+# inputs):
+[[utxo]]
+tx_hash = "0000000000000000000000000000000000000000000000000000000000000001"
+index = 0
+address = "addr1qymnnxq5rmes2p6awtw983t3drlyjhflkfat972ws4qscklm56q7dx503mv52y00wp6ynz90ck7qms5z0js73dfl0mgsm4cgx5"
+lovelace = 1_500_000
+
+# TX metadata 674.msg = "Shield Vest - Crowd Lock" (bare
+# metadata-map form — no Tag 259 wrapper). Captured from
+# Maestro `GET /transactions/{tx_hash}/cbor` aux-data slot.
+[[tx_metadata]]
+tx_hash = "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15"
+aux_cbor_hex = "a11902a2a1636d7367817818536869656c642056657374202d2043726f7764204c6f636b"

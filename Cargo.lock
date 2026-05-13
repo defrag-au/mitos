@@ -3458,6 +3458,7 @@ dependencies = [
  "mitos-data-plane",
  "mitos-platform",
  "pallas",
+ "pallas-addresses 1.0.0-alpha.6",
  "pallas-primitives 1.0.0-alpha.6",
  "serde",
  "serde_json",

@@ -446,6 +446,69 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             .collect())
     }
 
+    async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        use dolos_cardano::indexes::CardanoIndexExt;
+
+        // Dolos's policy index keys directly on the 28-byte
+        // policy hash, no encoding transformation needed.
+        let utxo_set = self
+            .domain
+            .indexes()
+            .utxos_by_policy(policy)
+            .map_err(|e| DataPlaneError::Storage(format!("utxos_by_policy: {e:?}")))?;
+
+        // Same 100K hard cap as `utxos_by_address`. Policies
+        // exceeding this need a paginated query path; for now
+        // the bound is what protects host memory.
+        const HARD_CAP: usize = 100_000;
+        let total: Vec<TxoRef> = utxo_set.into_iter().collect();
+        if total.len() > HARD_CAP {
+            tracing::warn!(
+                policy = %hex::encode(policy),
+                returned = HARD_CAP,
+                total = total.len(),
+                "utxos_by_policy result truncated at hard cap"
+            );
+        }
+        Ok(total
+            .into_iter()
+            .take(HARD_CAP)
+            .map(OutputRef::from)
+            .collect())
+    }
+
+    async fn utxos_by_payment_cred(&self, cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        use dolos_cardano::indexes::CardanoIndexExt;
+
+        // Dolos's per-payment-cred index keys directly on the
+        // 28-byte payment-key or payment-script hash, regardless
+        // of staking part. Same shape as `utxos_by_policy`.
+        let utxo_set = self
+            .domain
+            .indexes()
+            .utxos_by_payment(cred)
+            .map_err(|e| DataPlaneError::Storage(format!("utxos_by_payment_cred: {e:?}")))?;
+
+        // Same 100K hard cap as `utxos_by_policy`. Active
+        // payment creds exceeding this need a paginated query
+        // path; for now the bound protects host memory.
+        const HARD_CAP: usize = 100_000;
+        let total: Vec<TxoRef> = utxo_set.into_iter().collect();
+        if total.len() > HARD_CAP {
+            tracing::warn!(
+                payment_cred = %hex::encode(cred),
+                returned = HARD_CAP,
+                total = total.len(),
+                "utxos_by_payment_cred result truncated at hard cap"
+            );
+        }
+        Ok(total
+            .into_iter()
+            .take(HARD_CAP)
+            .map(OutputRef::from)
+            .collect())
+    }
+
     async fn read_datum(
         &self,
         hash: &pallas_primitives::Hash<32>,

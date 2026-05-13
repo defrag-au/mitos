@@ -41,8 +41,13 @@ pub struct BootstrapStats {
     /// Number of policies we actually scanned (ones missing
     /// the completion flag).
     pub policies_scanned: usize,
+    /// Number of `at_payment_cred` predicates seen.
+    pub payment_creds_seen: usize,
+    /// Number of payment creds we actually scanned (ones missing
+    /// the completion flag).
+    pub payment_creds_scanned: usize,
     /// Total UTxOs synthesised into events across all scanned
-    /// addresses + policies.
+    /// addresses + policies + payment creds.
     pub utxos_dispatched: usize,
     /// Number of synthetic `handle-events` calls made.
     pub batches_dispatched: usize,
@@ -67,6 +72,13 @@ fn bootstrap_flag_key_for_address(address: &str) -> String {
 /// state-kv dumps.
 fn bootstrap_flag_key_for_policy(policy: &PolicyId) -> String {
     format!("__platform/bootstrap/policy/{policy}")
+}
+
+/// Reserved state-kv key prefix for per-payment-cred bootstrap
+/// completion flags. Hex-encodes the 28-byte cred so the key is
+/// printable.
+fn bootstrap_flag_key_for_payment_cred(cred: &[u8; 28]) -> String {
+    format!("__platform/bootstrap/payment-cred/{}", hex::encode(cred))
 }
 
 /// Run bootstrap for one module. Walks the interest set,
@@ -116,6 +128,41 @@ pub async fn run_bootstrap<P: ChainDataPlane + Sync>(
             utxos = scanned.utxos,
             batches = scanned.batches,
             "bootstrap: address complete",
+        );
+    }
+
+    // ----- payment-cred scans (current-state hydration via
+    // `utxos_by_payment_cred`). Used by contract sweeps where
+    // the payment part is fixed (script hash) but staking part
+    // varies per UTxO — e.g. CrowdLock vesting.
+    let payment_creds: Vec<[u8; 28]> = interest.watched_payment_creds().copied().collect();
+    stats.payment_creds_seen = payment_creds.len();
+    for cred in payment_creds {
+        let key = bootstrap_flag_key_for_payment_cred(&cred);
+        if has_flag(kv, module_id, &key)? {
+            tracing::debug!(
+                module = %module_id,
+                payment_cred = %hex::encode(cred),
+                "bootstrap: skipping payment cred; already complete",
+            );
+            continue;
+        }
+        tracing::info!(
+            module = %module_id,
+            payment_cred = %hex::encode(cred),
+            "bootstrap: scanning current unspent set at payment cred",
+        );
+        let scanned = scan_one_payment_cred(driver, &cred, plane).await?;
+        stats.payment_creds_scanned += 1;
+        stats.utxos_dispatched += scanned.utxos;
+        stats.batches_dispatched += scanned.batches;
+        set_flag(kv, module_id, &key)?;
+        tracing::info!(
+            module = %module_id,
+            payment_cred = %hex::encode(cred),
+            utxos = scanned.utxos,
+            batches = scanned.batches,
+            "bootstrap: payment cred complete",
         );
     }
 
@@ -195,6 +242,18 @@ pub async fn bootstrap_one_predicate<P: ChainDataPlane + Sync>(
             }
             let scanned = scan_one_policy(driver, policy, plane).await?;
             stats.policies_scanned = 1;
+            stats.utxos_dispatched = scanned.utxos;
+            stats.batches_dispatched = scanned.batches;
+            set_flag(kv, module_id, &key)?;
+        }
+        InterestPredicate::AtPaymentCred(cred) => {
+            stats.payment_creds_seen = 1;
+            let key = bootstrap_flag_key_for_payment_cred(cred);
+            if has_flag(kv, module_id, &key)? {
+                return Ok(stats);
+            }
+            let scanned = scan_one_payment_cred(driver, cred, plane).await?;
+            stats.payment_creds_scanned = 1;
             stats.utxos_dispatched = scanned.utxos;
             stats.batches_dispatched = scanned.batches;
             set_flag(kv, module_id, &key)?;
@@ -322,6 +381,96 @@ async fn scan_one_address<P: ChainDataPlane + Sync>(
         }
 
         // Skip empty groups (every ref unresolved).
+        if group_utxos == 0 {
+            continue;
+        }
+
+        driver
+            .dispatch_synthetic_batch(batch, cursor)
+            .await
+            .map_err(|e| anyhow::anyhow!("dispatch_synthetic_batch: {e}"))?;
+        result.utxos += group_utxos;
+        result.batches += 1;
+    }
+
+    Ok(result)
+}
+
+/// Scan one payment credential: enumerate refs via
+/// `utxos_by_payment_cred`, bulk-resolve outputs + datums,
+/// group by producing TX, dispatch one batch per producing-TX
+/// through the driver. Mirrors `scan_one_address` but works
+/// against the data plane's payment-cred index.
+async fn scan_one_payment_cred<P: ChainDataPlane + Sync>(
+    driver: &mut DriverV2,
+    cred: &[u8; 28],
+    plane: &P,
+) -> anyhow::Result<AddressScanResult> {
+    let refs = plane
+        .utxos_by_payment_cred(cred)
+        .await
+        .map_err(|e| anyhow::anyhow!("utxos_by_payment_cred({}): {e}", hex::encode(cred)))?;
+    if refs.is_empty() {
+        return Ok(AddressScanResult::default());
+    }
+
+    let outputs = plane
+        .read_utxos(&refs, mitos_data_plane::DecodeLevel::Lean)
+        .await
+        .map_err(|e| anyhow::anyhow!("read_utxos: {e}"))?;
+    let datums = plane
+        .read_output_datums(&refs)
+        .await
+        .map_err(|e| anyhow::anyhow!("read_output_datums: {e}"))?;
+
+    let mut output_by_ref: std::collections::HashMap<(Hash<32>, u32), TypedOutput> =
+        std::collections::HashMap::new();
+    for (oref, out) in outputs {
+        output_by_ref.insert((oref.tx_hash, oref.index), out);
+    }
+    let mut datum_by_ref: std::collections::HashMap<(Hash<32>, u32), mitos_data_plane::TypedDatum> =
+        std::collections::HashMap::new();
+    for (oref, datum_opt) in refs.iter().zip(datums) {
+        if let Some(td) = datum_opt {
+            datum_by_ref.insert((oref.tx_hash, oref.index), td);
+        }
+    }
+
+    let mut by_tx: BTreeMap<Hash<32>, Vec<OutputRef>> = BTreeMap::new();
+    for r in refs {
+        by_tx.entry(r.tx_hash).or_default().push(r);
+    }
+
+    let mut result = AddressScanResult::default();
+    for (tx_hash, group_refs) in by_tx {
+        let cursor = ChainPoint::Origin;
+        let mut batch = TxEventBatch::new(0);
+        batch.push(UtxoEvent::TxContext(TxContextEvent {
+            cursor: cursor.clone(),
+            tx_hash,
+            tx_idx: 0,
+            validity_interval: ValidityInterval::default(),
+            required_signers: Vec::new(),
+        }));
+
+        let mut group_utxos = 0;
+        for r in group_refs {
+            let key = (r.tx_hash, r.index);
+            let Some(output) = output_by_ref.remove(&key) else {
+                continue;
+            };
+            let datum = datum_by_ref.remove(&key);
+            batch.push(UtxoEvent::Produced(ProducedEvent {
+                cursor: cursor.clone(),
+                tx_hash,
+                tx_idx: 0,
+                oref: r,
+                output,
+                datum,
+            }));
+            group_utxos += 1;
+        }
+
         if group_utxos == 0 {
             continue;
         }

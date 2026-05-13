@@ -57,11 +57,14 @@ for module_dir in "$ROOT"/community-modules/*/; do
 
         blocks=()
         while IFS= read -r b; do blocks+=("$b"); done < <(find "$scenario_dir" -maxdepth 1 -name '*.block.cbor' | sort)
-        if [[ ${#blocks[@]} -eq 0 ]]; then
-            echo "skip $name/$scenario: no *.block.cbor files"
-            SKIPPED+=1
-            continue
-        fi
+        # Blockless scenarios are valid for modules whose state
+        # is driven entirely by cold-start (interest registration
+        # triggers `update_interest`, the module then calls
+        # chain-data host-fns answered by the fixture). Bootstrap
+        # modules (vesting-tracker, future contract sweeps) tend
+        # to fit this pattern. The runner returns cleanly when
+        # `--block` is absent; the scenario's expected.json then
+        # contains only cold-start emissions.
 
         cmd=("$MITOS_RUN" --artifact "$artifact" --fixture "$fixture" --expected "$expected")
         for b in "${blocks[@]}"; do cmd+=(--block "$b"); done

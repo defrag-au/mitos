@@ -100,6 +100,22 @@ impl ChainDataPlane for FixturePolicyDataPlane {
         Ok(Vec::new())
     }
 
+    async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        // Surface the fixture outputs' refs when the target
+        // policy is queried — mirrors what dolos's `BY_POLICY`
+        // index would return in production.
+        let target_bytes = hex::decode(self.target_policy.as_ref()).unwrap_or_default();
+        if policy == target_bytes.as_slice() {
+            Ok(self.fixture_outputs.iter().map(|(r, _)| *r).collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn utxos_by_payment_cred(&self, _cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(Vec::new())
+    }
+
     async fn tx_metadata(&self, _tx_hash: &Hash<32>) -> DataPlaneResult<Option<Vec<u8>>> {
         Ok(None)
     }

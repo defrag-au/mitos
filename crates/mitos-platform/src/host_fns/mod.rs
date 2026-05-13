@@ -33,6 +33,21 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         address: &str,
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
 
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
+
+    async fn utxos_by_payment_cred(
+        &self,
+        cred: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>>;
+
+    async fn resolve_stake_for_payment_pkh(
+        &self,
+        pkh: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::StakeCred>>;
+
     /// Resolve a datum hash to its raw CBOR bytes via the
     /// underlying state's witness-datum index. Returns `None`
     /// when the hash isn't present (datum was inline-only and
@@ -106,6 +121,27 @@ where
         address: &str,
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         mitos_data_plane::ChainDataPlane::utxos_by_address(self, address).await
+    }
+
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        mitos_data_plane::ChainDataPlane::utxos_by_policy(self, policy).await
+    }
+
+    async fn utxos_by_payment_cred(
+        &self,
+        cred: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        mitos_data_plane::ChainDataPlane::utxos_by_payment_cred(self, cred).await
+    }
+
+    async fn resolve_stake_for_payment_pkh(
+        &self,
+        pkh: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::StakeCred>> {
+        mitos_data_plane::ChainDataPlane::resolve_stake_for_payment_pkh(self, pkh).await
     }
 
     async fn datum_by_hash(
@@ -228,6 +264,22 @@ where
     ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         mitos_data_plane::ChainDataPlane::utxos_by_address(&plane, address).await
+    }
+
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::utxos_by_policy(&plane, policy).await
+    }
+
+    async fn utxos_by_payment_cred(
+        &self,
+        cred: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::utxos_by_payment_cred(&plane, cred).await
     }
 
     async fn tx_metadata(
