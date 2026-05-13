@@ -110,7 +110,7 @@ jobs:
             community-modules/burn-address/target
             community-modules/cip-25-mint/target
             community-modules/cip-68-mint/target
-            community-modules/jpg-co/target
+            community-modules/holder-distribution/target
             community-modules/jpg-store-listing/target
             community-modules/jpg-store-offer/target
             community-modules/jpg-store-sale/target
