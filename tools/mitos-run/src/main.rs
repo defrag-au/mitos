@@ -185,6 +185,7 @@ struct Fixture {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FixtureInterestPredicate {
     AtAddress { address: String },
+    AtPaymentCred { hash: String },
     AtStakeKeyHash { hash: String },
     AtStakeScriptHash { hash: String },
     HoldsPolicy { policy: String },
@@ -250,6 +251,11 @@ struct FixtureTxMetadata {
 struct FixtureDataPlane {
     by_ref: HashMap<(Vec<u8>, u32), ResolvedUtxo>,
     by_address: HashMap<String, Vec<OutputRef>>,
+    /// 28-byte payment credential → refs at addresses sharing
+    /// that payment cred (regardless of staking part). Populated
+    /// from `[[utxo]]` entries by decoding each address's
+    /// payment part.
+    by_payment_cred: HashMap<[u8; 28], Vec<OutputRef>>,
     aux_by_tx: HashMap<Vec<u8>, Vec<u8>>,
     /// Hash → datum-CBOR map. Populated from block witness-data
     /// during harvest so modules calling
@@ -268,6 +274,7 @@ impl FixtureDataPlane {
     fn from_fixture(fixture: Fixture) -> Result<Self> {
         let mut by_ref = HashMap::new();
         let mut by_address: HashMap<String, Vec<OutputRef>> = HashMap::new();
+        let mut by_payment_cred: HashMap<[u8; 28], Vec<OutputRef>> = HashMap::new();
         let mut aux_by_tx = HashMap::new();
 
         for u in fixture.utxo {
@@ -313,6 +320,18 @@ impl FixtureDataPlane {
                 .collect::<Result<Vec<_>>>()?;
 
             by_address.entry(u.address.clone()).or_default().push(oref);
+            // Derive payment cred from the address so
+            // `utxos_by_payment_cred` lookups resolve. Silently
+            // skip non-Shelley shapes (Byron has no Shelley
+            // payment part).
+            if let Ok(addr) = pallas_addresses::Address::from_bech32(&u.address)
+                && let pallas_addresses::Address::Shelley(s) = addr {
+                    let cred_bytes: [u8; 28] = match s.payment() {
+                        pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
+                        pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
+                    };
+                    by_payment_cred.entry(cred_bytes).or_default().push(oref);
+                }
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
                 ResolvedUtxo {
@@ -340,6 +359,7 @@ impl FixtureDataPlane {
         Ok(Self {
             by_ref,
             by_address,
+            by_payment_cred,
             aux_by_tx,
             datums_by_hash: HashMap::new(),
         })
@@ -424,6 +444,17 @@ impl FixtureDataPlane {
                     .entry(typed_output.address.clone())
                     .or_default()
                     .push(oref);
+                if let Ok(addr) = pallas_addresses::Address::from_bech32(&typed_output.address)
+                    && let pallas_addresses::Address::Shelley(s) = addr {
+                        let cred_bytes: [u8; 28] = match s.payment() {
+                            pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
+                            pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
+                        };
+                        self.by_payment_cred
+                            .entry(cred_bytes)
+                            .or_default()
+                            .push(oref);
+                    }
                 self.by_ref.insert(
                     key,
                     ResolvedUtxo {
@@ -483,6 +514,23 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
 
     async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>> {
         Ok(self.by_address.get(address).cloned().unwrap_or_default())
+    }
+
+    async fn utxos_by_policy(&self, _policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        // Fixture replay doesn't index by policy; modules that
+        // depend on this host-fn need to pre-stash refs via
+        // explicit `[[utxo]]` entries the runner already
+        // surfaces through `read_utxos`.
+        Ok(Vec::new())
+    }
+
+    async fn utxos_by_payment_cred(&self, cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        if cred.len() != 28 {
+            return Ok(Vec::new());
+        }
+        let mut key = [0u8; 28];
+        key.copy_from_slice(cred);
+        Ok(self.by_payment_cred.get(&key).cloned().unwrap_or_default())
     }
 
     async fn tx_metadata(
@@ -656,18 +704,54 @@ async fn run_v2(
         std::process::exit(1);
     }
 
-    // Drain any emissions produced during init.
-    let mut emitted = 0;
-    while let Ok(event) = events_rx.try_recv() {
-        emitted += 1;
-        println!(
-            "  emit channel={} payload={} bytes",
-            event.channel,
-            event.payload.len()
-        );
-    }
-    if emitted > 0 {
-        println!("▸ {emitted} event(s) emitted during init");
+    // Emissions collected across init + update_interest + each
+    // dispatched block. Cold-start-only fixtures (no --block)
+    // still produce content here via `update_interest`'s
+    // cold-start path.
+    let mut collected_emits: Vec<serde_json::Value> = Vec::new();
+
+    let drain = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
+                 collected: &mut Vec<serde_json::Value>,
+                 phase: &str| {
+        let mut count = 0;
+        while let Ok(event) = rx.try_recv() {
+            count += 1;
+            let decoded =
+                mitos_community_events::decode_emit(module_id, event.channel, &event.payload);
+            match &decoded {
+                Some(json) => {
+                    println!(
+                        "  [{phase}] emit channel={} payload={} bytes",
+                        event.channel,
+                        event.payload.len()
+                    );
+                    for line in json.lines() {
+                        println!("    {line}");
+                    }
+                }
+                None => println!(
+                    "  [{phase}] emit channel={} payload={} bytes (no typed decoder)",
+                    event.channel,
+                    event.payload.len()
+                ),
+            }
+            let value = decoded
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "channel": event.channel,
+                        "payload_bytes": event.payload.len(),
+                    })
+                });
+            collected.push(value);
+        }
+        count
+    };
+
+    let init_emitted = drain(&mut events_rx, &mut collected_emits, "init");
+    if init_emitted > 0 {
+        println!("▸ {init_emitted} event(s) emitted during init");
     }
     println!("✓ init() returned cleanly");
 
@@ -706,14 +790,17 @@ async fn run_v2(
         }
     }
 
-    if blocks.is_empty() {
-        println!("▸ no --block flags; skipping handle-events dispatch");
-        return Ok(());
+    // Drain cold-start emissions produced by `update_interest`'s
+    // bootstrap path. Modules that subscribe-then-snapshot (e.g.
+    // vesting-tracker) emit here without any block dispatch.
+    let cold_start_emitted = drain(&mut events_rx, &mut collected_emits, "update_interest");
+    if cold_start_emitted > 0 {
+        println!("▸ {cold_start_emitted} event(s) emitted during update_interest");
     }
 
-    // Collected decoded emissions across all blocks — used for the
-    // optional `--expected` golden-file comparison at end of run.
-    let mut collected_emits: Vec<serde_json::Value> = Vec::new();
+    if blocks.is_empty() {
+        println!("▸ no --block flags; cold-start-only run");
+    }
 
     for path in blocks {
         let cbor = fs::read(path).with_context(|| format!("read block {}", path.display()))?;
@@ -730,49 +817,7 @@ async fn run_v2(
                 std::process::exit(1);
             }
         }
-        // Drain emissions per block so they're attributed clearly.
-        // Decode each payload against the module's typed event shape
-        // (registered in `mitos-community-events`) for ergonomic
-        // golden-test style comparisons. Fall back to raw byte
-        // counts when no decoder is registered or the payload fails
-        // to deserialise — the latter is itself a useful signal
-        // (wire-shape drift between module emitter and types crate).
-        let mut block_emitted = 0;
-        while let Ok(event) = events_rx.try_recv() {
-            block_emitted += 1;
-            let decoded =
-                mitos_community_events::decode_emit(module_id, event.channel, &event.payload);
-            match &decoded {
-                Some(json) => {
-                    println!(
-                        "  emit channel={} payload={} bytes",
-                        event.channel,
-                        event.payload.len()
-                    );
-                    for line in json.lines() {
-                        println!("    {line}");
-                    }
-                }
-                None => println!(
-                    "  emit channel={} payload={} bytes (no typed decoder for module-id={module_id:?})",
-                    event.channel,
-                    event.payload.len()
-                ),
-            }
-            if expected_path.is_some() {
-                let value = decoded
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_else(|| {
-                        serde_json::json!({
-                            "channel": event.channel,
-                            "payload_bytes": event.payload.len(),
-                            "undecoded": true,
-                        })
-                    });
-                collected_emits.push(value);
-            }
-        }
+        let block_emitted = drain(&mut events_rx, &mut collected_emits, "block");
         if block_emitted > 0 {
             println!("  ▸ {block_emitted} event(s) emitted");
         }
@@ -840,6 +885,15 @@ fn build_interest_set(preds: &[FixtureInterestPredicate]) -> Result<mitos_data_p
         let pred = match p {
             FixtureInterestPredicate::AtAddress { address } => {
                 InterestPredicate::AtAddress(address.clone())
+            }
+            FixtureInterestPredicate::AtPaymentCred { hash } => {
+                let bytes = hex::decode(hash).context("at_payment_cred hex")?;
+                if bytes.len() != 28 {
+                    bail!("payment cred must be 28 bytes");
+                }
+                let mut arr = [0u8; 28];
+                arr.copy_from_slice(&bytes);
+                InterestPredicate::AtPaymentCred(arr)
             }
             FixtureInterestPredicate::AtStakeKeyHash { hash } => {
                 let bytes = hex::decode(hash).context("at_stake_key_hash hex")?;

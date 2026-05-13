@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::host_fns::DataPlaneFacade;
-use mitos_data_plane::{DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, TypedOutput};
+use mitos_data_plane::{
+    DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef, StakeCred, TypedOutput,
+};
 
 /// Snapshot of one module's data-plane traffic during the most
 /// recent dispatch attempt. Reset by `clear()` between calls so
@@ -31,6 +33,10 @@ pub struct TrapContextLog {
     pub utxos_by_address: Vec<UtxosByAddressCall>,
     /// `utxos_by_policy(policy) -> refs`.
     pub utxos_by_policy: Vec<UtxosByPolicyCall>,
+    /// `utxos_by_payment_cred(cred) -> refs`.
+    pub utxos_by_payment_cred: Vec<UtxosByPaymentCredCall>,
+    /// `resolve_stake_for_payment_pkh(pkh) -> Option<stake-cred>`.
+    pub resolve_stake_for_payment_pkh: Vec<ResolveStakeForPkhCall>,
     /// `read_utxos(refs, decode) -> [(ref, output)]`.
     pub read_utxos: Vec<ReadUtxosCall>,
     /// `read_output_datums(refs) -> [Option<(hash, payload)>]`.
@@ -59,6 +65,18 @@ pub struct UtxosByAddressCall {
 pub struct UtxosByPolicyCall {
     pub policy: Vec<u8>,
     pub refs: Vec<OutputRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UtxosByPaymentCredCall {
+    pub cred: Vec<u8>,
+    pub refs: Vec<OutputRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveStakeForPkhCall {
+    pub pkh: Vec<u8>,
+    pub result: Option<StakeCred>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +196,35 @@ impl DataPlaneFacade for TrapContextLogger {
             .push(UtxosByPolicyCall {
                 policy: policy.to_vec(),
                 refs: result.clone(),
+            });
+        Ok(result)
+    }
+
+    async fn utxos_by_payment_cred(&self, cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        let result = self.inner.utxos_by_payment_cred(cred).await?;
+        self.log
+            .lock()
+            .expect("trap log mutex")
+            .utxos_by_payment_cred
+            .push(UtxosByPaymentCredCall {
+                cred: cred.to_vec(),
+                refs: result.clone(),
+            });
+        Ok(result)
+    }
+
+    async fn resolve_stake_for_payment_pkh(
+        &self,
+        pkh: &[u8],
+    ) -> DataPlaneResult<Option<StakeCred>> {
+        let result = self.inner.resolve_stake_for_payment_pkh(pkh).await?;
+        self.log
+            .lock()
+            .expect("trap log mutex")
+            .resolve_stake_for_payment_pkh
+            .push(ResolveStakeForPkhCall {
+                pkh: pkh.to_vec(),
+                result: result.clone(),
             });
         Ok(result)
     }

@@ -112,6 +112,10 @@ impl ChainDataPlane for FixturePolicyDataPlane {
         }
     }
 
+    async fn utxos_by_payment_cred(&self, _cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(Vec::new())
+    }
+
     async fn tx_metadata(&self, _tx_hash: &Hash<32>) -> DataPlaneResult<Option<Vec<u8>>> {
         Ok(None)
     }

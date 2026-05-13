@@ -1,0 +1,26 @@
+abi_version = 2
+
+# `vesting-tracker` is dynamic-interest-only. Static interest is
+# empty; consumers register the lock-contract addresses (Shield
+# project vests) and payment credentials (Shield CrowdLock user
+# vests) they care about via `update_interest` over the
+# replication WS.
+#
+# Each registration triggers a cold-start scan
+# (`chain_data::utxos_by_address` or `utxos_by_payment_cred`),
+# which decodes the Shield datum on each UTxO, resolves the
+# owner PKH to a stake credential via
+# `resolve_stake_for_payment_pkh`, derives the VestStyle from
+# the locking TX's metadata key 674, and emits a
+# `VestingEvent::Snapshot`.
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-addresses = "1.0.0-alpha.6"
+pallas-primitives = "1.0.0-alpha.6"
+# minicbor decoder + Plutus datum decoder for the Shield vest
+# datum + TX metadata 674 lookup.
+pallas-codec = "1.0.0-alpha.6"

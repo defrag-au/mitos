@@ -41,6 +41,14 @@ pub enum InterestPredicate {
     /// Bech32 payment address; matches outputs whose address
     /// is exactly this string.
     AtAddress(String),
+    /// 28-byte payment credential (payment-key or payment-script
+    /// hash); matches outputs whose address shares this payment
+    /// credential, regardless of staking part.
+    ///
+    /// Use case: contract sweeps where the staking part varies
+    /// per UTxO (e.g. CrowdLock vests — same script payment
+    /// cred, different derived staking creds per lock).
+    AtPaymentCred([u8; 28]),
     /// 28-byte stake credential; matches outputs whose address
     /// shares this stake credential, regardless of payment
     /// credential.
@@ -144,6 +152,18 @@ impl InterestSet {
         })
     }
 
+    /// Iterate all `AtPaymentCred(cred)` predicates. The
+    /// bootstrap orchestrator reads these to scan the current
+    /// UTxO set under each payment credential via the
+    /// by-payment-cred index — payment-cred-side analogue of
+    /// `watched_addresses`.
+    pub fn watched_payment_creds(&self) -> impl Iterator<Item = &[u8; 28]> + '_ {
+        self.predicates.iter().filter_map(|p| match p {
+            InterestPredicate::AtPaymentCred(c) => Some(c),
+            _ => None,
+        })
+    }
+
     /// Iterate all `HoldsPolicy(policy)` predicates. The
     /// bootstrap orchestrator reads these to scan the current
     /// UTxO set under each policy via `search_utxos` and
@@ -160,6 +180,7 @@ impl InterestSet {
 fn predicate_matches_output(p: &InterestPredicate, output: &TypedOutput) -> bool {
     match p {
         InterestPredicate::AtAddress(addr) => output.address == *addr,
+        InterestPredicate::AtPaymentCred(cred) => payment_cred_matches(cred, &output.address),
         InterestPredicate::AtStakeCred(cred) => stake_cred_matches(cred, &output.address),
         InterestPredicate::HoldsPolicy(policy) => output
             .assets
@@ -174,6 +195,25 @@ fn predicate_matches_output(p: &InterestPredicate, output: &TypedOutput) -> bool
         }
         // Tick predicates don't apply to outputs.
         InterestPredicate::TickEvery(_) => false,
+    }
+}
+
+/// Decode the bech32 address and check whether its payment
+/// credential (28-byte payment-key or payment-script hash)
+/// matches `cred`. Falls back to `false` on parse errors —
+/// better to under-match than to over-match a malformed
+/// address.
+fn payment_cred_matches(cred: &[u8; 28], address_bech32: &str) -> bool {
+    let Ok(addr) = pallas_addresses::Address::from_bech32(address_bech32) else {
+        return false;
+    };
+    let pallas_addresses::Address::Shelley(s) = addr else {
+        return false;
+    };
+    use pallas_addresses::ShelleyPaymentPart;
+    match s.payment() {
+        ShelleyPaymentPart::Key(h) => h.as_ref() == cred,
+        ShelleyPaymentPart::Script(h) => h.as_ref() == cred,
     }
 }
 

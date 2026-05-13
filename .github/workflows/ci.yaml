@@ -115,6 +115,7 @@ jobs:
             community-modules/jpg-store-offer/target
             community-modules/jpg-store-sale/target
             community-modules/standard-burn/target
+            community-modules/vesting-tracker/target
 
       - name: Build host tools (mitos-build + mitos-run)
         run: cargo build --release -p mitos-build -p mitos-run

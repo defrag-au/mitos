@@ -128,6 +128,70 @@ pub trait ChainDataPlane: Send + Sync {
     /// Result is hard-capped at 100K refs.
     async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>>;
 
+    /// Enumerate the current unspent set whose address shares a
+    /// given payment credential (28-byte payment-key or
+    /// payment-script hash), regardless of staking part.
+    ///
+    /// Use cases:
+    /// - cold-start hydration for contract sweeps where the
+    ///   payment part is the script identity but the staking
+    ///   part varies per UTxO (CrowdLock vests — same contract,
+    ///   different derived staking creds per lock)
+    /// - resolving a wallet's stake credential from a payment
+    ///   key hash discovered in a datum (find any UTxO using
+    ///   the PKH; parse its address; read the stake part).
+    ///   `resolve_stake_for_payment_pkh` below wraps this case.
+    ///
+    /// Result is hard-capped at 100K refs.
+    async fn utxos_by_payment_cred(&self, cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>>;
+
+    /// Convenience over `utxos_by_payment_cred` for the common
+    /// PKH→stake resolution path. Looks up any current UTxO
+    /// whose address uses the given 28-byte payment credential,
+    /// parses the address, returns the stake part.
+    ///
+    /// Returns `None` when:
+    /// - the PKH has no current UTxOs
+    /// - all UTxOs using the PKH are at enterprise (no-stake)
+    ///   addresses (rare)
+    ///
+    /// Default impl walks `utxos_by_payment_cred` + reads each
+    /// output until a stake part is found. Impls with faster
+    /// paths (single-row index lookup, cached resolution table)
+    /// can override.
+    async fn resolve_stake_for_payment_pkh(
+        &self,
+        pkh: &[u8],
+    ) -> DataPlaneResult<Option<StakeCred>> {
+        let refs = self.utxos_by_payment_cred(pkh).await?;
+        for r in &refs {
+            let Some(out) = self.read_utxo(r, DecodeLevel::Lean).await? else {
+                continue;
+            };
+            let Ok(addr) = pallas_addresses::Address::from_bech32(&out.address) else {
+                continue;
+            };
+            let pallas_addresses::Address::Shelley(s) = addr else {
+                continue;
+            };
+            use pallas_addresses::ShelleyDelegationPart;
+            match s.delegation() {
+                ShelleyDelegationPart::Key(h) => {
+                    let mut bytes = [0u8; 28];
+                    bytes.copy_from_slice(h.as_ref());
+                    return Ok(Some(StakeCred::KeyHash(bytes)));
+                }
+                ShelleyDelegationPart::Script(h) => {
+                    let mut bytes = [0u8; 28];
+                    bytes.copy_from_slice(h.as_ref());
+                    return Ok(Some(StakeCred::ScriptHash(bytes)));
+                }
+                ShelleyDelegationPart::Null | ShelleyDelegationPart::Pointer(_) => continue,
+            }
+        }
+        Ok(None)
+    }
+
     /// Bulk datum lookup for a list of output refs. Returns a
     /// parallel `Vec<Option<TypedDatum>>` where the i'th element
     /// is the datum on `refs[i]`, resolved caller-blind (inline

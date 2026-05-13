@@ -18,6 +18,7 @@ pub mod jpg_store_listing;
 pub mod jpg_store_offer;
 pub mod jpg_store_sale;
 pub mod standard_burn;
+pub mod vesting_tracker;
 
 /// Decode + pretty-print an emit-channel payload for a known
 /// community module. Returns `None` when the `module_id` isn't
@@ -46,6 +47,7 @@ pub fn decode_emit(module_id: &str, channel: u32, payload: &[u8]) -> Option<Stri
         "jpg-store-offer" => jpg_store_offer::decode_emit(channel, payload),
         "jpg-store-sale" => jpg_store_sale::decode_emit(channel, payload),
         "standard-burn" => standard_burn::decode_emit(channel, payload),
+        "vesting-tracker" => vesting_tracker::decode_emit(channel, payload),
         _ => None,
     }
 }

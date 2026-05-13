@@ -29,6 +29,9 @@ cardano-assets = { workspace = true }
 # Pallas hash newtype — the data-plane trait method signatures
 # carry `Hash<32>` / `Hash<28>` directly.
 pallas-primitives = { workspace = true }
+# Address bech32 decode for deriving payment cred from
+# `[[utxo]]` entries so `utxos_by_payment_cred` resolves.
+pallas-addresses = { workspace = true }
 # For pre-harvesting aux-data from `--block` arguments into the
 # fixture data plane so `chain_data::tx_metadata` lookups against
 # TXs in the dispatched block resolve without operator hand-
