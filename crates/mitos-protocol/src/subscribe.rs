@@ -33,13 +33,13 @@ pub struct SubscribeRequest {
     /// target is either a wasm module or an in-tree indexer.
     /// See `docs/design/UNIFIED_SUBSCRIBE.md`.
     ///
-    /// The dialer opens one outbound WS per target. Multi-target
-    /// subscribes are supported end-to-end — each target's WS
-    /// lands at `/_internal/replicate-<target>` on the companion
-    /// (per the `{target}` substitution in
-    /// `MITOS_REPLICATE_URL`) and tags the inbound socket so the
-    /// runtime can route frames to the `MitosChannel` whose
-    /// `NAME` matches.
+    /// The dialer opens one drain task per target. Multi-target
+    /// subscribes are supported end-to-end — each target's HTTP
+    /// POSTs land at `/_internal/apply-<target>` /
+    /// `/_internal/recapture-<target>` on the companion (per the
+    /// `{target}` and `{op}` substitutions in `MITOS_REPLICATE_URL`)
+    /// and the runtime routes by the URL channel suffix to the
+    /// `MitosChannel` whose `NAME` matches.
     pub targets: Vec<SubscribeTarget>,
 
     /// Companion key. dApp's choice — see the design doc's Q8

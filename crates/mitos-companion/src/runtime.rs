@@ -2,35 +2,51 @@
 //!
 //! Plain generic struct (no `#[durable_object]`, no `DurableObject`
 //! impl). The dApp writes a non-generic `#[durable_object]` wrapper
-//! per Companion type and forwards each DO method into the runtime
-//! via `self.runtime.fetch(req).await` etc. See the design doc's
-//! "Runtime DO shape" section for the canonical pattern + the
-//! "Why composition, not a generic `#[durable_object]`" rationale.
+//! per Companion type and forwards `fetch` calls into the runtime
+//! via `self.runtime.fetch(req).await`. See the design doc's
+//! "Runtime DO shape" section for the canonical pattern.
+//!
+//! ## HTTP delivery (post-WS migration)
+//!
+//! The runtime exposes two HTTP POST endpoints for mitos's outbound
+//! delivery:
+//!
+//! - `POST /_internal/apply-<channel>?key=<companion_key>` — one
+//!   emission per request. Body is a CBOR-encoded
+//!   [`mitos_protocol::ApplyBody`]. The runtime decodes, dispatches
+//!   to the matching `MitosChannel::apply_event` via `apply_bytes`,
+//!   advances the persisted cursor, and returns:
+//!   - 200 OK with empty body on success (Ack)
+//!   - 422 Unprocessable with the error text on `apply_event` Err
+//!     (Nack — won't succeed on naive retry)
+//!   - 5xx for transport/runtime errors (dialer retries)
+//! - `POST /_internal/recapture-<channel>?key=<companion_key>` —
+//!   triggers the dApp's `on_recapture` hook. Body is a CBOR-encoded
+//!   [`mitos_protocol::RecaptureBody`]. Returns 200 once the dApp's
+//!   cleanup completes (= RecaptureReady) or 500 if the hook errors.
+//!
+//! The wrapper DO only needs to forward `fetch`. WS-related methods
+//! (`websocket_message`, `websocket_close`, `websocket_error`) are
+//! no longer part of the surface — workers should remove their
+//! overrides.
 
 use std::cell::Cell;
 
 use worker::durable::State;
-use worker::{Env, Headers, Method, Request, Response, WebSocket, WebSocketIncomingMessage};
+use worker::{Env, Headers, Method, Request, Response};
 
 use crate::ctx::Ctx;
 use crate::error::{CompanionError, Result};
 use crate::meta::{self, ensure_schema, migrate_split_row_cursor, write_cursor};
 use crate::subscribe::SubscribeRequest;
 use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
-use crate::wire::{
-    ChainPoint, ClientMessage, InterestOp, ServerMessage, decode_server, encode_client,
-};
-
-/// Default WS Hibernation tag when an upgrade lands on
-/// `/_internal/replicate` without a channel suffix. Single-channel
-/// companions use this.
-const DEFAULT_CHANNEL_TAG: &str = "default";
+use mitos_protocol::{ApplyBody, ChainPoint, RecaptureBody, decode_apply, decode_recapture};
 
 /// Companion runtime.
 ///
-/// Embedded inside the dApp's `#[durable_object]` wrapper struct;
-/// receives forwarded `fetch` / `websocket_message` / `websocket_close`
-/// / `websocket_error` calls.
+/// Embedded inside the dApp's `#[durable_object]` wrapper struct
+/// and receives forwarded `fetch` calls. WS lifecycle methods are
+/// no longer part of the surface — see the module-level docs.
 pub struct MitosCompanionRuntime<C: MitosCompanion> {
     state: State,
     env: Env,
@@ -119,6 +135,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     // ========================================================================
 
     /// Forwarded from `DurableObject::fetch`. Routes by URL path.
+    ///
+    /// Owns:
+    /// - `POST /_internal/apply-<channel>?key=...` — emission delivery
+    /// - `POST /_internal/recapture-<channel>?key=...` — recapture trigger
+    /// - `POST /_internal/wake` — operator-triggered re-subscribe
+    /// - `GET /api/_health`, `GET /api/_meta` — introspection
+    /// - `GET|POST /api/_interest[/subscribe|/unsubscribe]` — interest mutation
     pub async fn fetch(&self, req: Request) -> worker::Result<Response> {
         self.ensure_runtime_ready()?;
 
@@ -126,10 +149,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let path = url.path().to_string();
 
         match (req.method(), path.as_str()) {
-            (Method::Get, "/_internal/replicate") => self.handle_replicate_upgrade(&req, None),
-            (Method::Get, p) if p.starts_with("/_internal/replicate-") => {
-                let channel = p.trim_start_matches("/_internal/replicate-").to_string();
-                self.handle_replicate_upgrade(&req, Some(channel))
+            (Method::Post, p) if p.starts_with("/_internal/apply-") => {
+                let channel = p.trim_start_matches("/_internal/apply-").to_string();
+                self.handle_apply_post(req, channel).await
+            }
+            (Method::Post, p) if p.starts_with("/_internal/recapture-") => {
+                let channel = p.trim_start_matches("/_internal/recapture-").to_string();
+                self.handle_recapture_post(req, channel).await
             }
             (Method::Post, "/_internal/wake") => self.handle_wake().await,
             (Method::Get, "/api/_health") => self.handle_health(),
@@ -141,60 +167,6 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             }
             _ => Response::error("not found", 404),
         }
-    }
-
-    /// Forwarded from `DurableObject::websocket_message`. The
-    /// load-bearing dispatch path: decode → route to channel →
-    /// run `apply_event` → synchronous cursor advance → Ack/Nack.
-    pub async fn websocket_message(
-        &self,
-        ws: WebSocket,
-        msg: WebSocketIncomingMessage,
-    ) -> worker::Result<()> {
-        self.ensure_runtime_ready()?;
-
-        let bytes = match msg {
-            WebSocketIncomingMessage::Binary(b) => b,
-            WebSocketIncomingMessage::String(s) => s.into_bytes(),
-        };
-
-        let server_msg = match decode_server(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(error = %e, "wire decode failed; ignoring frame");
-                return Ok(());
-            }
-        };
-
-        if let Err(e) = self.dispatch_server_message(&ws, server_msg).await {
-            tracing::error!(error = %e, "server message dispatch failed");
-        }
-        Ok(())
-    }
-
-    /// Forwarded from `DurableObject::websocket_close`. Logs the
-    /// disconnect; mitos owns reconnect (Pattern X — see design doc
-    /// "Wake-up: mitos drives all dial-ups").
-    pub async fn websocket_close(
-        &self,
-        _ws: WebSocket,
-        code: usize,
-        reason: String,
-        was_clean: bool,
-    ) -> worker::Result<()> {
-        tracing::info!(
-            code,
-            reason = %reason,
-            was_clean,
-            "WS closed; mitos will redial"
-        );
-        Ok(())
-    }
-
-    /// Forwarded from `DurableObject::websocket_error`. Logs.
-    pub async fn websocket_error(&self, _ws: WebSocket, err: worker::Error) -> worker::Result<()> {
-        tracing::warn!(error = %err, "WS error");
-        Ok(())
     }
 
     // ========================================================================
@@ -213,230 +185,156 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         Ok(())
     }
 
-    /// Dispatch a decoded `ServerMessage`. Errors here are
-    /// logged-only — the runtime should keep streaming.
-    async fn dispatch_server_message(&self, ws: &WebSocket, msg: ServerMessage) -> Result<()> {
-        match msg {
-            ServerMessage::Connected { last_emission_id } => {
-                tracing::info!(last_emission_id, "mitos connected");
-                Ok(())
-            }
-            ServerMessage::Apply {
-                emission_id,
-                cursor,
-                change,
-            } => {
-                let channel = self
-                    .state
-                    .get_tags(ws)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| DEFAULT_CHANNEL_TAG.to_string());
-                self.dispatch_apply(ws, emission_id, cursor, channel, change)
-                    .await
-            }
-            ServerMessage::Undo { cursor } => self.dispatch_undo(cursor).await,
-            ServerMessage::Mark { cursor } => {
-                let sql = self.state.storage().sql();
-                write_cursor(&sql, &cursor)?;
-                Ok(())
-            }
-            ServerMessage::SubscribeReply(reply) => {
-                tracing::info!(?reply, "subscribe reply received");
-                Ok(())
-            }
-            ServerMessage::Error { code, message } => {
-                tracing::warn!(code = %code, message = %message, "host-side error frame");
-                Ok(())
-            }
-            ServerMessage::Recapture { module, reason } => {
-                self.dispatch_recapture(ws, module, reason).await
-            }
-            ServerMessage::RecaptureDone {
-                cursor,
-                module,
-                events_emitted,
-            } => {
-                tracing::info!(
-                    module = %module,
-                    events_emitted,
-                    ?cursor,
-                    "RecaptureDone frame received; informational"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    /// Apply-frame dispatch — the load-bearing happy path.
+    /// Apply HTTP handler — the load-bearing happy path.
     ///
-    /// Per Q3 of the design doc:
-    /// 1. dApp's `apply_event` does any `.await` IO first, then
-    ///    synchronous SQL writes.
-    /// 2. Runtime synchronously appends a cursor advance — output
-    ///    gate wraps both writes atomically.
-    /// 3. Runtime sends Ack (success) or Nack (error) upstream
-    ///    fire-and-forget after the gate flush.
-    async fn dispatch_apply(
+    /// Decodes the CBOR body, dispatches to the channel handler,
+    /// advances the persisted cursor, and translates the result
+    /// to an HTTP status:
+    /// - `Ok(())` → 200 OK with empty body
+    /// - `Err(e)` → 422 Unprocessable Entity with the error text
+    ///   (semantic Nack — dApp's `apply_event` errored)
+    ///
+    /// Cursor always advances regardless of apply outcome — per
+    /// Q5/Q7 of the design doc (keep streaming; Nacked rows are
+    /// surfaced via the host's emissions log for operator review).
+    async fn handle_apply_post(
         &self,
-        ws: &WebSocket,
-        emission_id: u64,
-        cursor: ChainPoint,
+        mut req: Request,
         channel: String,
-        change: Vec<u8>,
-    ) -> Result<()> {
-        let channel_name = channel.clone();
-        let channel_handler = self.lookup_channel(&channel_name)?;
+    ) -> worker::Result<Response> {
+        let bytes = req
+            .bytes()
+            .await
+            .map_err(|e| worker::Error::RustError(format!("read apply body: {e}")))?;
+        let body = match decode_apply(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "decode ApplyBody failed");
+                return Response::error(format!("decode: {e}"), 400);
+            }
+        };
+
+        let ApplyBody {
+            emission_id,
+            cursor,
+            change,
+        } = body;
+
+        let channel_handler = match self.lookup_channel(&channel) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "no handler for channel");
+                return Response::error(format!("unknown channel: {e}"), 404);
+            }
+        };
         let sql = self.state.storage().sql();
-        let ctx = Ctx::new(cursor.clone(), channel_name.clone(), sql.clone());
+        let ctx = Ctx::new(cursor.clone(), channel.clone(), sql.clone());
 
         let apply_result = channel_handler.apply_bytes(&ctx, &change).await;
 
-        // Synchronous cursor advance (output gate wraps it with the
-        // dApp's writes). Runs whether apply succeeded or not — per
-        // Q5/Q7 design: cursor always advances to keep streaming.
-        write_cursor(&sql, &cursor)?;
+        // Cursor advance happens regardless of apply outcome.
+        if let Err(e) = write_cursor(&sql, &cursor) {
+            tracing::error!(
+                channel = %channel,
+                emission_id,
+                error = %e,
+                "cursor advance failed; reporting 5xx so dialer retries"
+            );
+            return Response::error(format!("cursor advance: {e}"), 500);
+        }
 
-        let frame = match apply_result {
-            Ok(()) => ClientMessage::Ack { emission_id },
+        match apply_result {
+            Ok(()) => Response::empty(),
             Err(e) => {
                 tracing::warn!(
-                    channel = %channel_name,
+                    channel = %channel,
                     emission_id,
                     error = %e,
-                    "apply_event failed; sending Nack"
+                    "apply_event failed; returning 422 (Nack equivalent)"
                 );
-                ClientMessage::Nack {
-                    emission_id,
-                    error: e.to_string(),
-                }
-            }
-        };
-        let bytes = encode_client(&frame)?;
-        ws.send_with_bytes(&bytes)
-            .map_err(|e| CompanionError::Wire(format!("send ack/nack: {e}")))?;
-        Ok(())
-    }
-
-    async fn dispatch_undo(&self, cursor: ChainPoint) -> Result<()> {
-        // Default semantics: log + advance cursor. Channels' undo
-        // hooks fire when reorg-aware dApps opt in. Today we fan
-        // the undo call to all channels (broadcast) since the wire
-        // frame doesn't carry a channel name; channels' default
-        // impl just logs. Multi-channel companions that need
-        // channel-targeted undo will require the wire to grow a
-        // channel-name field; not currently a blocker.
-        let sql = self.state.storage().sql();
-        for ch in &self.channels {
-            let ctx = Ctx::new(cursor.clone(), ch.name().to_string(), sql.clone());
-            if let Err(e) = ch.undo(&ctx, cursor.clone()).await {
-                tracing::warn!(error = %e, channel = ch.name(), "undo handler failed");
+                Response::error(format!("{e}"), 422)
             }
         }
-        write_cursor(&sql, &cursor)?;
-        Ok(())
     }
 
-    /// Recapture frame handler. Calls the dApp's `on_recapture`
-    /// hook with the module name carried on the frame, then sends
-    /// `RecaptureReady` to signal the host it can begin the refill
-    /// stream. See `docs/design/RECAPTURE.md`.
+    /// Recapture HTTP handler. Runs the dApp's `on_recapture`
+    /// synchronously; 200 OK ack-equivalent means the dApp's
+    /// table is clean and ready for refill.
     ///
-    /// Error semantics: if `on_recapture` returns `Err`, we DO NOT
-    /// send `RecaptureReady`. The host's per-companion timeout
-    /// (~30s) fires and the admin endpoint returns 504 — the
-    /// operator inspects the companion's logs and retries when
-    /// they've fixed the cleanup. Sending `RecaptureReady` on a
-    /// partial cleanup would tell the host "refill me" while the
-    /// dApp's table is mid-purge, leading to ghost rows for COs
-    /// whose `on_recapture` DELETE didn't fire before the error.
-    /// Timeout-and-investigate is the safer failure mode.
+    /// Error semantics: if `on_recapture` returns `Err`, the
+    /// handler returns 500. The host's admin endpoint surfaces
+    /// the error to the operator who can investigate and retry.
+    /// 200 without a clean dApp body would risk ghost rows
+    /// post-refill — the "fail loud" path is safer.
     ///
     /// Cursor handling: the runtime does NOT reset the persisted
     /// cursor here. Per-module recapture must leave other module
-    /// subscriptions undisturbed, and rewinding the cursor would
-    /// affect all of them. The refill Apply frames advance the
-    /// cursor naturally as they arrive. The `Ctx` we pass to
-    /// `on_recapture` carries the current persisted cursor as
-    /// informational context for the dApp's cleanup body.
-    async fn dispatch_recapture(
+    /// subscriptions undisturbed; rewinding the cursor would
+    /// affect all of them. The refill Apply requests advance the
+    /// cursor naturally.
+    async fn handle_recapture_post(
         &self,
-        ws: &WebSocket,
-        module: String,
-        reason: Option<String>,
-    ) -> Result<()> {
+        mut req: Request,
+        channel: String,
+    ) -> worker::Result<Response> {
+        let bytes = req
+            .bytes()
+            .await
+            .map_err(|e| worker::Error::RustError(format!("read recapture body: {e}")))?;
+        let body = match decode_recapture(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "decode RecaptureBody failed");
+                return Response::error(format!("decode: {e}"), 400);
+            }
+        };
+
+        let RecaptureBody { module, reason } = body;
         let sql = self.state.storage().sql();
         let current_cursor = meta::read_cursor(&sql)
             .ok()
             .flatten()
             .unwrap_or(ChainPoint::Origin);
-        // `channel` field on Ctx is set to the recapturing module
-        // for diagnostic purposes — dApps that share a body across
-        // channels can pattern-match on `ctx.channel` if needed.
         let ctx = Ctx::new(current_cursor, module.clone(), sql.clone());
 
         tracing::info!(
+            channel = %channel,
             module = %module,
             reason = ?reason,
-            "Recapture received; invoking on_recapture"
+            "Recapture HTTP request received; invoking on_recapture"
         );
-        let result = self
+        match self
             .inner
             .on_recapture(&ctx, &module, reason.as_deref())
-            .await;
-
-        match result {
+            .await
+        {
             Ok(()) => {
-                let frame = ClientMessage::RecaptureReady;
-                let bytes = encode_client(&frame)?;
-                ws.send_with_bytes(&bytes)
-                    .map_err(|e| CompanionError::Wire(format!("send RecaptureReady: {e}")))?;
                 tracing::info!(
                     module = %module,
-                    "on_recapture complete; sent RecaptureReady"
+                    "on_recapture complete; returning 200 (RecaptureReady)"
                 );
-                Ok(())
+                Response::empty()
             }
             Err(e) => {
-                // Loud log only. Don't send RecaptureReady — host
-                // times out, admin endpoint returns 504. Operator
-                // sees both the 504 and this log line and can act.
                 tracing::error!(
                     module = %module,
                     reason = ?reason,
                     error = %e,
-                    "on_recapture failed; withholding RecaptureReady — \
-                     host will time out and operator can investigate"
+                    "on_recapture failed; returning 500 so admin endpoint surfaces the error"
                 );
-                Ok(())
+                Response::error(format!("on_recapture failed: {e}"), 500)
             }
         }
     }
 
-    /// Look up a channel handler by tag.
+    /// Look up a channel handler by name.
     ///
-    /// Tags come from `state.get_tags(ws)` set during WS upgrade
-    /// — see `handle_replicate_upgrade`. Naming layers below the
-    /// runtime don't always agree:
-    ///
-    /// - The legacy `IndexerHandle` path tags the WS with the
-    ///   indexer name (e.g. `"collection-ownership"`).
-    /// - The new emit-interception path stringifies the WIT u32
-    ///   channel id (e.g. `"0"`) — the host doesn't know the
-    ///   dApp's channel names, only their indices.
-    /// - The default upgrade route uses `DEFAULT_CHANNEL_TAG`
-    ///   (`"default"`).
-    ///
-    /// None of those match the dApp's `MitosChannel::NAME`
-    /// values directly. v1 fallback: when the tag isn't a
-    /// match, dispatch to the **first registered channel**.
-    /// That's correct for single-channel dApps + matches the
-    /// v1 emit-interception model where every event from
-    /// channel 0 goes through the primary channel handler.
-    /// Multi-channel routing where each channel gets only its
-    /// own events is a v2 problem (will require the wasm module
-    /// to declare its channel-name → u32 mapping at init time
-    /// so the host can tag the dial-back URL appropriately).
+    /// The channel comes from the request URL path
+    /// (`/_internal/apply-<channel>`). Single-channel companions
+    /// can fall through to the first registered channel if the
+    /// URL name doesn't match — preserves the legacy "dispatch
+    /// channel 0 to the primary handler" semantics for callers
+    /// that don't yet plumb the channel name through.
     fn lookup_channel(&self, name: &str) -> Result<&dyn MitosChannelDyn> {
         if let Some(c) = self.channels.iter().find(|c| c.name() == name) {
             return Ok(c.as_ref());
@@ -445,7 +343,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             tracing::debug!(
                 requested = %name,
                 fallback = %first.name(),
-                "channel tag did not match any registered channel; falling back to first",
+                "channel name did not match any registered channel; falling back to first",
             );
             return Ok(first.as_ref());
         }
@@ -456,37 +354,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     // Route handlers
     // ========================================================================
 
-    /// WS upgrade handler — accepts the inbound WS via the
-    /// Hibernation API, tagged with the channel name so multi-channel
-    /// companions can dispatch correctly on each `websocket_message`.
-    fn handle_replicate_upgrade(
-        &self,
-        req: &Request,
-        channel: Option<String>,
-    ) -> worker::Result<Response> {
-        if !is_websocket_upgrade(req) {
-            return Response::error("expected WebSocket upgrade", 426);
-        }
-        let pair = worker::WebSocketPair::new()?;
-        let tag = channel.as_deref().unwrap_or(DEFAULT_CHANNEL_TAG);
-        self.state.accept_websocket_with_tags(&pair.server, &[tag]);
-        Response::from_websocket(pair.client)
-    }
-
     /// `/_internal/wake` — triggered by the dApp Worker during
     /// onboarding to materialise the DO and run the HTTPS subscribe
     /// call against mitos. Reads the persisted cursor from DO SQLite
-    /// (Q4) and the cached interest set from `mitos_companion_interest`
+    /// and the cached interest set from `mitos_companion_interest`
     /// (populated via `/api/_interest/subscribe`), POSTs
     /// `SubscribeRequest` to the mitos host, and caches the result so
     /// subsequent wakes can short-circuit.
-    ///
-    /// dApp Worker pattern (per design doc "Bootstrapping" subsection):
-    ///
-    /// ```ignore
-    /// let stub = env.OWNERSHIP_DO.id_from_name(&customer_id)?.get_stub()?;
-    /// stub.fetch_with_str("/_internal/wake").await?;
-    /// ```
     async fn handle_wake(&self) -> worker::Result<Response> {
         // The companion key is the DO's own name — the dApp Worker
         // creates the DO with `id_from_name(companion_key)`, so
@@ -507,20 +381,18 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // the host as `Vec<mitos_protocol::Interest>` in the
         // subscribe payload — host persists this as the
         // companion's registration; the dialer uses it for the
-        // filter applied to outbound Apply frames.
+        // filter applied to outbound Apply requests.
         let interest_rows = crate::interest::list_interests(&sql)?;
         let mut interests = crate::interest::rows_to_interests(&interest_rows);
         // Append the companion's programmatic initial-interest
         // declarations — used for filter shapes the SQL table
-        // doesn't support (e.g. `DomainSelector::Marketplace`
-        // filters for an in-tree marketplace-indexer target).
-        // See `MitosCompanion::initial_interests`.
+        // doesn't support. See `MitosCompanion::initial_interests`.
         interests.extend(self.inner.initial_interests());
 
-        // Pull the dial-back URL from wrangler env so mitos
-        // knows where to open its outbound WS. Required for
-        // emission delivery — without it the host persists
-        // the registration but the dial loop logs and exits.
+        // Pull the dial-back URL from wrangler env so mitos knows
+        // where to POST. The template carries `{key}` and
+        // `{target}` substitutions (and now also `{op}` for the
+        // apply/recapture path discriminator).
         let dial_back = self
             .env
             .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
@@ -535,9 +407,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // Targets are declared by the companion via
         // `MitosCompanion::subscribe_targets()`. Default is one
         // `Module { name: C::NAME }` for backward compat with
-        // single-wasm-module companions. Multi-target (e.g. one
-        // wasm module + one in-tree indexer for the same DO) is
-        // expressed by overriding the trait method.
+        // single-wasm-module companions.
         let targets = self.inner.subscribe_targets();
         let request = SubscribeRequest {
             targets,
@@ -574,12 +444,12 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     }
 
     /// `POST /api/_interest/subscribe` — add a single interest
-    /// row. Body: `InterestMutateRequest`. On success, emits a
-    /// `ClientMessage::Interest { op: Add, items: [Interest] }`
-    /// frame over the held WS so the host's running module picks
-    /// up the new filter immediately. Host-side receive-loop
-    /// routes the frame into the module's `update-interest`
-    /// export via the `InterestRouter` trait.
+    /// row. Body: `InterestMutateRequest`. After writing to SQL,
+    /// re-subscribes against mitos so the host picks up the new
+    /// filter immediately. The re-subscribe is the only way to
+    /// communicate dynamic interest changes to mitos in the
+    /// HTTP-delivery model — the legacy WS broadcast path is
+    /// gone.
     async fn handle_interest_subscribe(&self, mut req: Request) -> worker::Result<Response> {
         let payload: crate::interest::InterestMutateRequest = req.json().await?;
         let channel = payload.channel.clone().unwrap_or_default();
@@ -588,19 +458,16 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let sql = self.state.storage().sql();
         crate::interest::add_interest(&sql, &payload.kind, &payload.value, &channel, &added_at)?;
 
-        // Translate just-added row to wire `Interest` and emit
-        // `ClientMessage::Interest { op: Add, items: [..] }` over
-        // the held WS. Best-effort — if no WS is currently held
-        // (DO not yet wakened with a live mitos connection), the
-        // canonical SQL row stays committed and the next
-        // reconnect-time `Replace` rehydrates the host.
-        let row = crate::interest::InterestRow {
-            kind: payload.kind.clone(),
-            value: payload.value.clone(),
-            channel: channel.clone(),
-            added_at: added_at.clone(),
-        };
-        self.broadcast_interest_frame(InterestOp::Add, &row);
+        // Push the updated interest set to mitos via a fresh
+        // subscribe call. Best-effort: SQL row is the source of
+        // truth, so a failed re-subscribe doesn't lose state —
+        // the next `/_internal/wake` will resync.
+        if let Err(e) = self.resubscribe_after_interest_change().await {
+            tracing::warn!(
+                error = %e,
+                "resubscribe after interest add failed; row persisted, host will resync on next wake"
+            );
+        }
 
         Response::from_json(&crate::interest::InterestMutateResponse {
             op_result: "added".into(),
@@ -611,9 +478,8 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     }
 
     /// `POST /api/_interest/unsubscribe` — symmetric to subscribe.
-    /// Body: `InterestMutateRequest`. Emits a
-    /// `ClientMessage::Interest { op: Remove, items: [..] }`
-    /// frame on success.
+    /// Body: `InterestMutateRequest`. Re-subscribes against mitos
+    /// after the SQL row is removed so the host drops the filter.
     async fn handle_interest_unsubscribe(&self, mut req: Request) -> worker::Result<Response> {
         let payload: crate::interest::InterestMutateRequest = req.json().await?;
         let channel = payload.channel.clone().unwrap_or_default();
@@ -621,13 +487,12 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let sql = self.state.storage().sql();
         crate::interest::remove_interest(&sql, &payload.kind, &payload.value, &channel)?;
 
-        let row = crate::interest::InterestRow {
-            kind: payload.kind.clone(),
-            value: payload.value.clone(),
-            channel: channel.clone(),
-            added_at: String::new(), // unused by rows_to_interests
-        };
-        self.broadcast_interest_frame(InterestOp::Remove, &row);
+        if let Err(e) = self.resubscribe_after_interest_change().await {
+            tracing::warn!(
+                error = %e,
+                "resubscribe after interest remove failed; row persisted, host will resync on next wake"
+            );
+        }
 
         Response::from_json(&crate::interest::InterestMutateResponse {
             op_result: "removed".into(),
@@ -637,66 +502,41 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         })
     }
 
-    /// Send `ClientMessage::Interest { op, items }` frames to the
-    /// companion's held WS connections, filtering items per
-    /// channel so multi-channel companions don't bleed ownership
-    /// interests into a marketplace WS, etc.
-    ///
-    /// Routing rules:
-    ///
-    /// - **Channel-scoped row** (`row.channel == "ownership"`,
-    ///   say): sent only to WSs tagged `ownership`.
-    /// - **Empty channel** (`row.channel == NO_CHANNEL`): sent
-    ///   to every held WS regardless of tag.
-    ///
-    /// On encode/send failure, logs and continues — the SQL row
-    /// is the source of truth and the next reconnect-time
-    /// `Replace` rehydrates the host.
-    fn broadcast_interest_frame(&self, op: InterestOp, row: &crate::interest::InterestRow) {
-        let rows = std::slice::from_ref(row);
-        if row.channel.is_empty() {
-            // Broadcast to every WS we hold. Single-channel
-            // companions land here; so do explicit
-            // cross-channel interests (NO_CHANNEL marker).
-            self.send_interest_to(op, rows, &self.state.get_websockets());
-            return;
-        }
-        // Channel-scoped: send only to WSs whose Hibernation tag
-        // matches.
-        let targeted = self.state.get_websockets_with_tag(&row.channel);
-        if targeted.is_empty() {
-            tracing::debug!(
-                channel = %row.channel,
-                "no WS held with this channel tag; companion will rehydrate on reconnect"
-            );
-            return;
-        }
-        self.send_interest_to(op, rows, &targeted);
-    }
-
-    fn send_interest_to(
-        &self,
-        op: InterestOp,
-        rows: &[crate::interest::InterestRow],
-        sockets: &[WebSocket],
-    ) {
-        let items = crate::interest::rows_to_interests(rows);
-        if items.is_empty() {
-            return;
-        }
-        let frame = ClientMessage::Interest { op, items };
-        let bytes = match encode_client(&frame) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "encode Interest frame failed");
-                return;
-            }
+    /// Re-run the subscribe call against mitos. Used by the
+    /// interest-mutation endpoints to push dynamic interest
+    /// changes to the host. Pulls the same context `handle_wake`
+    /// does — current cursor, full interest set, dial-back URL.
+    async fn resubscribe_after_interest_change(&self) -> Result<()> {
+        let companion_key = self
+            .state
+            .id()
+            .name()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let sql = self.state.storage().sql();
+        let resume_from = meta::read_cursor(&sql)?;
+        let interest_rows = crate::interest::list_interests(&sql)?;
+        let mut interests = crate::interest::rows_to_interests(&interest_rows);
+        interests.extend(self.inner.initial_interests());
+        let dial_back = self
+            .env
+            .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
+            .ok()
+            .map(|v| v.to_string())
+            .map(|url| crate::subscribe::DialBackOverride {
+                url: Some(url),
+                auth_header: None,
+                auth_value: None,
+            });
+        let targets = self.inner.subscribe_targets();
+        let request = SubscribeRequest {
+            targets,
+            companion_key,
+            resume_from,
+            interests,
+            dial_back,
         };
-        for ws in sockets {
-            if let Err(e) = ws.send_with_bytes(&bytes) {
-                tracing::warn!(error = %e, "send Interest frame failed");
-            }
-        }
+        subscribe_via_env(&self.env, &request).await.map(|_| ())
     }
 
     /// `/api/_health` — runtime-owned. Reports cursor + schema
@@ -748,93 +588,10 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 #[allow(dead_code)]
 fn _channel_trait_witness<T: MitosChannel>() {}
 
-/// Current time as an RFC 3339 / ISO 8601 string. JavaScript's
-/// `Date.toISOString()` returns the canonical RFC 3339 shape
-/// (`2026-05-05T12:34:56.789Z`); we use that directly rather
-/// than pulling chrono into a wasm32 build.
-#[cfg(target_arch = "wasm32")]
-fn current_rfc3339() -> String {
-    let date = js_sys::Date::new_0();
-    date.to_iso_string().as_string().unwrap_or_default()
-}
+// ============================================================================
+// Helpers
+// ============================================================================
 
-/// Native fallback for non-wasm builds (tests run host-side).
-/// Uses `SystemTime::now()` and a tiny formatter.
-#[cfg(not(target_arch = "wasm32"))]
-fn current_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let secs = (nanos / 1_000_000_000) as i64;
-    let nsec = (nanos % 1_000_000_000) as u32;
-    format_rfc3339_secs(secs, nsec)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn format_rfc3339_secs(secs: i64, nsec: u32) -> String {
-    // Minimal RFC 3339 formatter — sufficient for diagnostic
-    // timestamps. Only used in native test builds; production
-    // wasm path goes through the JS Date.toISOString() above.
-    let days_per_400y: i64 = 365 * 400 + 97;
-    let days_per_100y: i64 = 365 * 100 + 24;
-    let days_per_4y: i64 = 365 * 4 + 1;
-    let mut secs = secs;
-    let mut days = secs / 86_400;
-    secs -= days * 86_400;
-    if secs < 0 {
-        secs += 86_400;
-        days -= 1;
-    }
-    let h = secs / 3600;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-
-    days += 11_017; // shift epoch to 2000-03-01
-    let qc_cycles = days / days_per_400y;
-    days %= days_per_400y;
-    let mut c_cycles = days / days_per_100y;
-    if c_cycles == 4 {
-        c_cycles = 3;
-    }
-    days -= c_cycles * days_per_100y;
-    let mut q_cycles = days / days_per_4y;
-    if q_cycles == 25 {
-        q_cycles = 24;
-    }
-    days -= q_cycles * days_per_4y;
-    let mut remyears = days / 365;
-    if remyears == 4 {
-        remyears = 3;
-    }
-    days -= remyears * 365;
-
-    let year = 2000 + remyears + 4 * q_cycles + 100 * c_cycles + 400 * qc_cycles;
-    let months = [31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 31, 29];
-    let mut mon = 0;
-    let mut d = days;
-    while mon < 12 && d >= months[mon] {
-        d -= months[mon];
-        mon += 1;
-    }
-    let (year, mon) = if mon >= 10 {
-        (year + 1, mon - 9)
-    } else {
-        (year, mon + 3)
-    };
-    let day = (d + 1) as u32;
-
-    format!(
-        "{year:04}-{mon:02}-{day:02}T{h:02}:{m:02}:{s:02}.{nsec_ms:03}Z",
-        nsec_ms = nsec / 1_000_000
-    )
-}
-
-/// Wrap the wasm-only `subscribe::post_subscribe` so the runtime can
-/// call it without `cfg` decoration at every call site. On non-wasm
-/// targets this returns a "subscribe disabled in non-wasm builds"
-/// error — those builds are tests-only and don't actually dial mitos.
 #[cfg(target_arch = "wasm32")]
 async fn subscribe_via_env(
     env: &Env,
@@ -849,15 +606,16 @@ async fn subscribe_via_env(
     _request: &SubscribeRequest,
 ) -> Result<crate::subscribe::SubscribeResponse> {
     Err(CompanionError::Wire(
-        "subscribe_via_env: not supported on non-wasm targets".into(),
+        "subscribe_via_env called outside wasm target".into(),
     ))
 }
 
-fn is_websocket_upgrade(req: &Request) -> bool {
-    req.headers()
-        .get("Upgrade")
-        .ok()
-        .flatten()
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
+fn current_rfc3339() -> String {
+    // Diagnostic-only timestamp; consumers treat as opaque string.
+    // Worker-rs's `Date::now().as_millis()` returns the JS epoch
+    // milliseconds without pulling `std::time` (which has no
+    // monotonic clock in wasm32 + would panic at runtime).
+    let millis = worker::Date::now().as_millis();
+    let secs = millis / 1000;
+    format!("unix:{secs}")
 }

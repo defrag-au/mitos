@@ -721,27 +721,12 @@ where
             return Err(e);
         }
 
-        // 5. Send RecaptureDone to each companion. `cursor` here
-        //    is the host's chain tip slot (no hash — the wire
-        //    type is `Slot(u64)`, sufficient for the
-        //    informational marker the design specifies).
-        //    Hash-full cursors would require crossing the
-        //    `mitos-data-plane` → `mitos-protocol` chain-point
-        //    conversion boundary; deferred to a follow-up since
-        //    consumers don't depend on the value for correctness.
-        let tip_cursor = match self.chain_plane.tip().await {
-            Ok(tip) => mitos_protocol::ChainPoint::Slot(tip.point.slot()),
-            Err(e) => {
-                tracing::warn!(
-                    module = %id,
-                    error = %e,
-                    "recapture: failed to read chain tip for RecaptureDone cursor; using Origin"
-                );
-                mitos_protocol::ChainPoint::Origin
-            }
-        };
-        // events_emitted is 0 in v1 — see method docstring.
-        dialer.send_recapture_done(id, tip_cursor.clone(), 0).await;
+        // 5. (Legacy `RecaptureDone` notification dropped — the
+        //    HTTP delivery transport doesn't push informational
+        //    frames to companions. The admin endpoint's success
+        //    response is the canonical "recapture complete" signal
+        //    for operators; companions observe completion via the
+        //    refill Apply requests landing.)
 
         tracing::info!(
             module = %id,
