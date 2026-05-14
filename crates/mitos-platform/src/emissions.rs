@@ -106,6 +106,13 @@ pub struct EmissionRecord {
     pub status_at: String,
     /// Populated only when `status == Nacked`.
     pub error: Option<String>,
+    /// Dialer partition key chosen by the module via
+    /// `emit-event-keyed`. Empty = global lane. Opaque to the
+    /// platform; the dialer uses it as a hash input only.
+    /// `#[serde(default)]` so existing CBOR rows on disk (pre-
+    /// dialer-concurrency) deserialise cleanly as empty.
+    #[serde(default)]
+    pub partition_key: Vec<u8>,
 }
 
 /// Per-module emissions log. Wraps a redb database file with
@@ -146,12 +153,20 @@ impl EmissionsStore {
     /// Append a new row with status `Queued` (companion offline)
     /// or `Pending` (caller will dispatch immediately).
     /// Auto-assigns the next monotonic ID and returns it.
+    ///
+    /// `partition_key` is the dialer's lane identifier (see
+    /// `docs/design/DIALER_CONCURRENCY.md`). Empty = global lane,
+    /// equivalent to legacy single-lane drain. Callers from the
+    /// legacy `emit-event` path pass empty; `emit-event-keyed`
+    /// callers pass the module-declared key.
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &self,
         companion_id: &str,
         channel: &str,
         chain_point: ChainPoint,
         payload: Vec<u8>,
+        partition_key: Vec<u8>,
         initial_status: EmissionStatus,
         now_rfc3339: &str,
     ) -> Result<u64, EmissionsError> {
@@ -189,6 +204,7 @@ impl EmissionsStore {
             status: initial_status,
             status_at: now_rfc3339.to_string(),
             error: None,
+            partition_key,
         };
 
         let mut buf = Vec::new();
@@ -630,6 +646,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![1],
+                vec![],
                 EmissionStatus::Queued,
                 "2026-05-05T00:00:00Z",
             )
@@ -640,6 +657,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![2],
+                vec![],
                 EmissionStatus::Queued,
                 "2026-05-05T00:00:01Z",
             )
@@ -658,6 +676,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![1],
+                vec![],
                 EmissionStatus::Pending,
                 "2026-05-05T00:00:00Z",
             )
@@ -676,6 +695,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![1],
+                vec![],
                 EmissionStatus::Queued,
                 "2026-05-05T00:00:00Z",
             )
@@ -705,6 +725,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![1],
+                vec![],
                 EmissionStatus::Pending,
                 "2026-05-05T00:00:00Z",
             )
@@ -731,6 +752,7 @@ mod tests {
                     c,
                     "ownership",
                     fixed_point(),
+                    vec![],
                     vec![],
                     EmissionStatus::Queued,
                     "2026-05-05T00:00:00Z",
@@ -760,6 +782,7 @@ mod tests {
                     "ownership",
                     fixed_point(),
                     vec![],
+                    vec![],
                     EmissionStatus::Pending,
                     "2026-05-05T00:00:00Z",
                 )
@@ -788,6 +811,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![],
+                vec![],
                 EmissionStatus::Pending,
                 "2026-05-05T00:00:00Z",
             )
@@ -814,6 +838,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![],
+                vec![],
                 EmissionStatus::Pending,
                 "unix:100",
             )
@@ -823,6 +848,7 @@ mod tests {
                 "c1",
                 "ownership",
                 fixed_point(),
+                vec![],
                 vec![],
                 EmissionStatus::Pending,
                 "unix:190",
@@ -856,6 +882,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![],
+                vec![],
                 EmissionStatus::Pending,
                 "2026-05-05T00:00:00Z",
             )
@@ -882,6 +909,7 @@ mod tests {
                     "c1",
                     "ownership",
                     fixed_point(),
+                    vec![],
                     vec![],
                     status,
                     "2026-05-05T00:00:00Z",
@@ -912,6 +940,7 @@ mod tests {
                     "ownership",
                     fixed_point(),
                     vec![],
+                    vec![],
                     EmissionStatus::Queued,
                     "2026-05-05T00:00:00Z",
                 )
@@ -922,6 +951,7 @@ mod tests {
                 "other_companion",
                 "ownership",
                 fixed_point(),
+                vec![],
                 vec![],
                 EmissionStatus::Queued,
                 "2026-05-05T00:00:00Z",
@@ -953,6 +983,7 @@ mod tests {
                 "ownership",
                 fixed_point(),
                 vec![],
+                vec![],
                 EmissionStatus::Queued,
                 "2026-05-05T00:00:00Z",
             )
@@ -983,6 +1014,7 @@ mod tests {
                     "c1",
                     "ownership",
                     fixed_point(),
+                    vec![],
                     vec![],
                     EmissionStatus::Queued,
                     "2026-05-05T00:00:00Z",

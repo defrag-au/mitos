@@ -934,6 +934,7 @@ fn drain_one(
                         &channel,
                         event.chain_point.clone(),
                         event.payload.clone(),
+                        event.partition_key.clone(),
                         EmissionStatus::Queued,
                         &now,
                     ) {
@@ -966,6 +967,7 @@ fn drain_one(
             &channel,
             event.chain_point.clone(),
             event.payload.clone(),
+            event.partition_key.clone(),
             EmissionStatus::Queued,
             &now,
         ) {
