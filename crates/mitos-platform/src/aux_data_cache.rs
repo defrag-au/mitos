@@ -112,10 +112,7 @@ impl AuxDataCache {
         }
     }
 
-    fn try_insert_batch(
-        &self,
-        entries: &[([u8; 32], Vec<u8>)],
-    ) -> Result<(), AuxDataCacheError> {
+    fn try_insert_batch(&self, entries: &[([u8; 32], Vec<u8>)]) -> Result<(), AuxDataCacheError> {
         let wx = self
             .db
             .begin_write()
@@ -134,5 +131,4 @@ impl AuxDataCache {
             .map_err(|e| AuxDataCacheError::Redb(e.to_string()))?;
         Ok(())
     }
-
 }

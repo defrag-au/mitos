@@ -128,10 +128,7 @@ impl ModuleStorage {
     /// the cached handle (cheap clone of the internal Arc).
     pub fn aux_data_cache(
         &self,
-    ) -> Result<
-        crate::aux_data_cache::AuxDataCache,
-        crate::aux_data_cache::AuxDataCacheError,
-    > {
+    ) -> Result<crate::aux_data_cache::AuxDataCache, crate::aux_data_cache::AuxDataCacheError> {
         let mut lock = self.aux_data_cache.lock().expect("aux_data_cache mutex");
         if let Some(cache) = lock.as_ref() {
             return Ok(cache.clone());

@@ -385,7 +385,11 @@ impl CachingDataPlane {
         cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
         maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
     ) -> Self {
-        Self { inner, cache, maestro }
+        Self {
+            inner,
+            cache,
+            maestro,
+        }
     }
 }
 
@@ -456,9 +460,10 @@ impl DataPlaneFacade for CachingDataPlane {
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         // Tier 1: local cache — permanent, free.
         if let Some(cache) = &self.cache
-            && let Some(cached) = cache.get(tx_hash) {
-                return Ok(Some(cached));
-            }
+            && let Some(cached) = cache.get(tx_hash)
+        {
+            return Ok(Some(cached));
+        }
 
         // Tier 2: dolos archive (7-day window).
         let result = self.inner.tx_metadata(tx_hash).await?;

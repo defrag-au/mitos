@@ -45,7 +45,6 @@
 pub mod admin;
 pub mod aux_data_cache;
 pub mod bindings_v2;
-pub mod maestro;
 pub mod bootstrap_v2;
 pub mod compaction;
 pub mod companions;
@@ -60,6 +59,7 @@ pub mod host_v2;
 pub mod indexer_bridge;
 pub mod inspect;
 pub mod lag_tolerant;
+pub mod maestro;
 pub mod manifest;
 pub mod registry_v2;
 pub mod storage;

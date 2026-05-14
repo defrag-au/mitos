@@ -83,8 +83,7 @@ impl MaestroClient {
 
     fn from_env() -> Option<Self> {
         let api_key = std::env::var("MAESTRO_API_KEY").ok()?;
-        let network =
-            std::env::var("MAESTRO_NETWORK").unwrap_or_else(|_| "mainnet".to_owned());
+        let network = std::env::var("MAESTRO_NETWORK").unwrap_or_else(|_| "mainnet".to_owned());
         let max_inflight = std::env::var("MAESTRO_MAX_INFLIGHT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -121,10 +120,7 @@ impl MaestroClient {
     /// - `Ok(None)` — TX found but no aux_data, or 404
     /// - `Err(...)` — exhausted retries on rate-limit or 5xx, or
     ///   a non-retryable transport / decode error
-    pub async fn fetch_aux_data(
-        &self,
-        tx_hash_hex: &str,
-    ) -> Result<Option<Vec<u8>>, MaestroError> {
+    pub async fn fetch_aux_data(&self, tx_hash_hex: &str) -> Result<Option<Vec<u8>>, MaestroError> {
         let url = format!("https://{}/transactions/{tx_hash_hex}/cbor", self.base_url);
 
         // Held across retry sleeps on purpose — see module docs.
@@ -198,8 +194,8 @@ impl MaestroClient {
                 .await
                 .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
 
-            let tx_cbor = hex::decode(&body.data)
-                .map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
+            let tx_cbor =
+                hex::decode(&body.data).map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
 
             return Ok(aux_from_tx_cbor(&tx_cbor));
         }

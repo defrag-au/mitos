@@ -363,11 +363,7 @@ where
         }
 
         let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
-            crate::host_fns::CachingDataPlane::new(
-                self.data_plane.clone(),
-                cache_opt,
-                maestro_opt,
-            ),
+            crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt, maestro_opt),
         );
         let trap_logger = Arc::new(TrapContextLogger::new(caching_plane));
 

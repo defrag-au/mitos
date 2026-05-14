@@ -199,10 +199,7 @@ where
 /// Scan a raw block CBOR and batch-insert all TX aux_data entries
 /// into the cache. Errors are silently discarded — a cache miss
 /// on the next bootstrap is the only consequence.
-fn harvest_block_aux_data(
-    block_bytes: &[u8],
-    cache: &crate::aux_data_cache::AuxDataCache,
-) {
+fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::aux_data_cache::AuxDataCache) {
     let block = match MultiEraBlock::decode(block_bytes) {
         Ok(b) => b,
         Err(_) => return,
