@@ -28,6 +28,11 @@ pub struct EmittedEvent {
     /// shape so downstream (`EmissionsStore`, dialer) can use
     /// it without re-conversion.
     pub chain_point: WireChainPoint,
+    /// Dialer partition key. Empty = global lane (serial,
+    /// identical to v1 single-lane behaviour). Non-empty events
+    /// drain in parallel across keys, serial within a key. See
+    /// `docs/design/DIALER_CONCURRENCY.md`.
+    pub partition_key: Vec<u8>,
 }
 
 impl EventSink {

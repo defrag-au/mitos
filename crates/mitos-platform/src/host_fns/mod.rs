@@ -356,3 +356,155 @@ where
         plane.protocol_params().await
     }
 }
+
+/// Transparent `DataPlaneFacade` wrapper that adds a local
+/// aux-data cache and optional Maestro fallback to `tx_metadata`.
+/// All other methods delegate directly to `inner`.
+///
+/// Resolution order for `tx_metadata`:
+/// 1. Local `AuxDataCache` (fast, on-disk, permanent)
+/// 2. `inner` (dolos archive, 7-day window)
+/// 3. Maestro REST API (when configured and daily budget allows)
+///
+/// Steps 2 and 3 write back to cache (step 1) on a hit so future
+/// calls never reach them again for the same TX.
+///
+/// Sits between the real data plane and the `TrapContextLogger`
+/// so trap fixtures capture results regardless of source. When
+/// `cache` is `None` (cache open failed at startup), acts as a
+/// pure passthrough — no behaviour change, no panic.
+pub struct CachingDataPlane {
+    inner: std::sync::Arc<dyn DataPlaneFacade>,
+    cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
+    maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
+}
+
+impl CachingDataPlane {
+    pub fn new(
+        inner: std::sync::Arc<dyn DataPlaneFacade>,
+        cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
+        maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
+    ) -> Self {
+        Self {
+            inner,
+            cache,
+            maestro,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DataPlaneFacade for CachingDataPlane {
+    async fn read_utxos(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+        decode: mitos_data_plane::DecodeLevel,
+    ) -> mitos_data_plane::DataPlaneResult<
+        Vec<(mitos_data_plane::OutputRef, mitos_data_plane::TypedOutput)>,
+    > {
+        self.inner.read_utxos(refs, decode).await
+    }
+
+    async fn utxos_by_address(
+        &self,
+        address: &str,
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        self.inner.utxos_by_address(address).await
+    }
+
+    async fn utxos_by_policy(
+        &self,
+        policy: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        self.inner.utxos_by_policy(policy).await
+    }
+
+    async fn utxos_by_payment_cred(
+        &self,
+        cred: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<mitos_data_plane::OutputRef>> {
+        self.inner.utxos_by_payment_cred(cred).await
+    }
+
+    async fn resolve_stake_for_payment_pkh(
+        &self,
+        pkh: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::StakeCred>> {
+        self.inner.resolve_stake_for_payment_pkh(pkh).await
+    }
+
+    async fn datum_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        self.inner.datum_by_hash(hash).await
+    }
+
+    async fn read_output_datums(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        self.inner.read_output_datums(refs).await
+    }
+
+    async fn read_output_hashes(
+        &self,
+        refs: &[mitos_data_plane::OutputRef],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<Vec<u8>>>> {
+        self.inner.read_output_hashes(refs).await
+    }
+
+    async fn tx_metadata(
+        &self,
+        tx_hash: &[u8; 32],
+    ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+        // Tier 1: local cache — permanent, free.
+        if let Some(cache) = &self.cache
+            && let Some(cached) = cache.get(tx_hash)
+        {
+            return Ok(Some(cached));
+        }
+
+        // Tier 2: dolos archive (7-day window).
+        let result = self.inner.tx_metadata(tx_hash).await?;
+        if let Some(cbor) = result {
+            if let Some(cache) = &self.cache {
+                cache.insert(tx_hash, &cbor);
+            }
+            return Ok(Some(cbor));
+        }
+
+        // Tier 3: Maestro fallback — only when configured.
+        if let Some(maestro) = &self.maestro {
+            let tx_hex = hex::encode(tx_hash);
+            match maestro.fetch_aux_data(&tx_hex).await {
+                Ok(Some(cbor)) => {
+                    if let Some(cache) = &self.cache {
+                        cache.insert(tx_hash, &cbor);
+                    }
+                    tracing::debug!(tx = %tx_hex, "aux_data resolved via Maestro fallback");
+                    return Ok(Some(cbor));
+                }
+                Ok(None) => {
+                    // TX has no aux_data — nothing to cache.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tx = %tx_hex,
+                        error = %e,
+                        "Maestro aux_data fallback failed",
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn read_tx(
+        &self,
+        tx_hash: &pallas_primitives::Hash<32>,
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
+        self.inner.read_tx(tx_hash).await
+    }
+}

@@ -342,9 +342,38 @@ interface state-kv {
     delete-value: func(key: string);
 }
 
-/// Module-side event emission. Unchanged from v1.
+/// Module-side event emission.
+///
+/// Modules use `emit-event` (no key) when their derived state has
+/// no cross-event invariants — events drain through a single
+/// global lane on the dialer, serial in id-order. Modules with
+/// cross-event state (per-policy aggregates, per-address ledgers,
+/// etc.) use `emit-event-keyed` to declare a partition key; the
+/// dialer drains same-key events serially and different-key events
+/// in parallel.
+///
+/// Key choice rule: the key must cover the widest scope of
+/// module-side state this event could touch. Same-row ops always
+/// share a key by definition (oref); aggregates need a wider key
+/// (policy_id, address, asset_id, stake_credential, etc.). When in
+/// doubt widen — narrowing later is silently correctness-changing,
+/// widening later is only a parallelism loss.
+///
+/// See `docs/design/DIALER_CONCURRENCY.md` for the full design.
 interface emit {
+    /// Emit on the global lane. Equivalent to v1 behaviour.
     emit-event: func(channel: u32, event: list<u8>);
+
+    /// Emit with an explicit partition key. Events sharing a key
+    /// drain serially in id-order; events with different keys
+    /// drain in parallel.
+    ///
+    /// An empty `partition-key` is equivalent to `emit-event`
+    /// (global lane). The platform treats the key as opaque
+    /// bytes — modules choose whatever encoding makes the
+    /// invariant cover correct.
+    emit-event-keyed: func(channel: u32, partition-key: list<u8>,
+                          event: list<u8>);
 }
 
 /// Structured logging. Unchanged from v1.

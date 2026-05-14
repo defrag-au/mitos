@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use dolos_core::{TipEvent, TipSubscription};
 use mitos_data_plane::ChainDataPlane;
+use pallas_traverse::MultiEraBlock;
 use tokio_util::sync::CancellationToken;
 
 use crate::PlatformResult;
@@ -65,6 +66,12 @@ where
     P: ChainDataPlane + Sync + Send + 'static,
 {
     tracing::info!("v2 chain-follower started");
+    // Open the platform-wide aux-data cache once before the loop.
+    // Blocks with aux_data are harvested proactively after each
+    // successful apply so future bootstraps can resolve without
+    // the dolos archive. Failure here is non-fatal — the fallback
+    // is the dolos archive (or Maestro in Phase 2).
+    let aux_cache = storage.aux_data_cache().ok();
     loop {
         // Multiplex tip events with interest updates. `biased`
         // gives tip events priority — dynamic interest is rare
@@ -118,6 +125,11 @@ where
                 match driver.apply_block(block_bytes, data_plane.as_ref()).await {
                     Ok(outcome) => {
                         tracing::trace!(?point, ?outcome, "v2 follower: applied",);
+                        // Proactively cache aux_data from this block
+                        // while the CBOR is still in scope.
+                        if let Some(ref cache) = aux_cache {
+                            harvest_block_aux_data(block_bytes, cache);
+                        }
                         flush_cursor(&storage, &module_id, &driver);
                     }
                     Err(crate::PlatformError::Decode(e)) => {
@@ -182,6 +194,26 @@ where
             }
         }
     }
+}
+
+/// Scan a raw block CBOR and batch-insert all TX aux_data entries
+/// into the cache. Errors are silently discarded — a cache miss
+/// on the next bootstrap is the only consequence.
+fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::aux_data_cache::AuxDataCache) {
+    let block = match MultiEraBlock::decode(block_bytes) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let entries: Vec<([u8; 32], Vec<u8>)> = block
+        .txs()
+        .into_iter()
+        .filter_map(|tx| {
+            let cbor = mitos_data_plane::extract_aux_cbor(&tx)?;
+            let hash: [u8; 32] = tx.hash().as_ref().try_into().ok()?;
+            Some((hash, cbor))
+        })
+        .collect();
+    cache.insert_batch(&entries);
 }
 
 /// Apply one dynamic-interest update: mutate the driver's

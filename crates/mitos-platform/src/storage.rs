@@ -68,6 +68,9 @@ pub struct ModuleStorage {
     cursor_stores: Arc<Mutex<HashMap<String, CursorStore>>>,
     emissions_stores: Arc<Mutex<HashMap<String, crate::emissions::EmissionsStore>>>,
     kv_stores: Arc<Mutex<HashMap<String, crate::vendored::balius::kv::RedbKv>>>,
+    /// Platform-wide aux-data cache. One handle shared across all
+    /// module followers — `None` until first `aux_data_cache()` call.
+    aux_data_cache: Arc<Mutex<Option<crate::aux_data_cache::AuxDataCache>>>,
 }
 
 impl ModuleStorage {
@@ -77,6 +80,7 @@ impl ModuleStorage {
             cursor_stores: Arc::new(Mutex::new(HashMap::new())),
             emissions_stores: Arc::new(Mutex::new(HashMap::new())),
             kv_stores: Arc::new(Mutex::new(HashMap::new())),
+            aux_data_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -115,6 +119,24 @@ impl ModuleStorage {
     pub fn close_kv(&self, id: &str) {
         let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
         cache.remove(id);
+    }
+
+    /// Get-or-open the platform-wide aux-data cache. Stored at
+    /// `<storage_root>/aux_data.redb` (not per-module — aux_data
+    /// is a chain fact shared across all modules). Idempotent;
+    /// first call opens the redb file, subsequent calls return
+    /// the cached handle (cheap clone of the internal Arc).
+    pub fn aux_data_cache(
+        &self,
+    ) -> Result<crate::aux_data_cache::AuxDataCache, crate::aux_data_cache::AuxDataCacheError> {
+        let mut lock = self.aux_data_cache.lock().expect("aux_data_cache mutex");
+        if let Some(cache) = lock.as_ref() {
+            return Ok(cache.clone());
+        }
+        let path = self.root.join("aux_data.redb");
+        let cache = crate::aux_data_cache::AuxDataCache::open(path)?;
+        *lock = Some(cache.clone());
+        Ok(cache)
     }
 
     /// Get-or-open the emissions store for a module. Idempotent;

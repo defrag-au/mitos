@@ -54,8 +54,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use mitos_protocol::{
-    ApplyBody, HTTP_DELIVERY_MIME, RecaptureBody, ServerMessage, SubscribeRequest, SubscribeTarget,
-    encode_apply, encode_recapture,
+    HTTP_DELIVERY_MIME, RecaptureBody, ServerMessage, SubscribeRequest, SubscribeTarget,
+    encode_recapture,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -64,10 +64,12 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::admin::AuthToken;
-use crate::emissions::{EmissionStatus, EmissionsStore};
 use crate::host_v2::InterestRouter;
 use crate::indexer_bridge::IndexerBridgeHandle;
 use crate::storage::ModuleStorage;
+
+mod pool;
+pub use pool::LaneConfig;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -581,12 +583,23 @@ async fn run_companion(
         }
     }
 
+    let lane_config = LaneConfig::from_env();
     info!(
         module = %module_name,
         companion_key = %req.companion_key,
         apply_url = %apply_url,
+        lanes = lane_config.lanes,
         "companion drain task started"
     );
+
+    // The status writer owns redb writes for this companion's
+    // emissions table so parallel lane workers don't contend on
+    // the single-writer txn. At `lanes = 1` the contention is
+    // theoretical, but routing all status writes through the
+    // writer here keeps the path identical at every N — the
+    // lift to N>1 doesn't introduce a new code path on the hot
+    // loop.
+    let status_writer = pool::spawn_status_writer(store.clone(), cancel.clone());
 
     let mut backoff = INITIAL_BACKOFF;
     let mut tick = tokio::time::interval(POLL_INTERVAL);
@@ -597,10 +610,14 @@ async fn run_companion(
         tokio::select! {
             biased;
 
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => {
+                status_writer.shutdown().await;
+                return;
+            }
 
             outbound = outbound_rx.recv() => {
                 let Some(frame) = outbound else {
+                    status_writer.shutdown().await;
                     return; // sender dropped — task deregistered
                 };
                 match frame {
@@ -642,14 +659,18 @@ async fn run_companion(
             }
 
             _ = tick.tick() => {
-                match drain_apply(
-                    &client,
-                    &apply_url,
-                    header_name.as_deref(),
-                    header_value.as_deref(),
-                    &store,
-                    &req.companion_key,
-                ).await {
+                let result = pool::run_tick(pool::PoolContext {
+                    client: &client,
+                    apply_url: &apply_url,
+                    header_name: header_name.as_deref(),
+                    header_value: header_value.as_deref(),
+                    store: &store,
+                    companion_key: &req.companion_key,
+                    status_writer: &status_writer,
+                    lanes: lane_config.lanes,
+                    now: now_rfc3339,
+                }).await;
+                match result {
                     Ok(()) => {
                         backoff = INITIAL_BACKOFF;
                     }
@@ -662,7 +683,10 @@ async fn run_companion(
                             "apply drain hit transport error; backing off"
                         );
                         tokio::select! {
-                            _ = cancel.cancelled() => return,
+                            _ = cancel.cancelled() => {
+                                status_writer.shutdown().await;
+                                return;
+                            }
                             _ = tokio::time::sleep(backoff) => {}
                         }
                         backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -671,100 +695,6 @@ async fn run_companion(
             }
         }
     }
-}
-
-/// Drain `Queued` rows for this companion in id order. Each row
-/// → one HTTP POST to the apply endpoint. Status updates run
-/// synchronously around the request.
-///
-/// Returns `Err` on transport / 5xx errors so the caller can
-/// apply backoff. Returns `Ok(())` on a successful pass (zero
-/// rows or all rows handled — including Nack responses, which
-/// are application-level failures, not transport failures).
-async fn drain_apply(
-    client: &reqwest::Client,
-    apply_url: &str,
-    header_name: Option<&str>,
-    header_value: Option<&str>,
-    store: &EmissionsStore,
-    companion_key: &str,
-) -> anyhow::Result<()> {
-    let queued = store
-        .list_queued_for_companion(companion_key)
-        .map_err(|e| anyhow::anyhow!("list queued: {e}"))?;
-    if queued.is_empty() {
-        return Ok(());
-    }
-    debug!(
-        companion_key = %companion_key,
-        count = queued.len(),
-        "draining queued emissions"
-    );
-    for row in queued {
-        let now = now_rfc3339();
-        if let Err(e) = store.update_status(row.id, EmissionStatus::Pending, &now, None) {
-            warn!(id = row.id, error = %e, "update_status Queued→Pending failed");
-        }
-        let body = ApplyBody {
-            emission_id: row.id,
-            cursor: row.chain_point.clone(),
-            change: row.payload.clone(),
-        };
-        let body_bytes =
-            encode_apply(&body).map_err(|e| anyhow::anyhow!("encode ApplyBody: {e}"))?;
-        let mut req_builder = client
-            .post(apply_url)
-            .header(reqwest::header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
-            .body(body_bytes);
-        if let (Some(name), Some(value)) = (header_name, header_value) {
-            req_builder = req_builder.header(name, value);
-        }
-        let resp = match req_builder.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                // Transport failure — flip row back to Queued so
-                // the next pass retries. Return Err to trigger
-                // the caller's backoff.
-                let now = now_rfc3339();
-                if let Err(rerr) = store.update_status(row.id, EmissionStatus::Queued, &now, None) {
-                    warn!(id = row.id, error = %rerr, "update_status Pending→Queued failed");
-                }
-                return Err(anyhow::anyhow!("apply POST send: {e}"));
-            }
-        };
-        let status = resp.status();
-        let now = now_rfc3339();
-        if status.is_success() {
-            if let Err(e) = store.update_status(row.id, EmissionStatus::Acked, &now, None) {
-                warn!(id = row.id, error = %e, "update_status Pending→Acked failed");
-            }
-            continue;
-        }
-        // 422 → semantic Nack (apply errored; won't help to retry).
-        // Any other non-2xx → transport-ish failure; flip back to
-        // Queued and surface the error for caller backoff.
-        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            let error = resp.text().await.unwrap_or_else(|_| String::new());
-            warn!(
-                id = row.id,
-                companion_key = %companion_key,
-                error = %error,
-                "apply returned 422; marking emission as Nacked"
-            );
-            if let Err(e) = store.update_status(row.id, EmissionStatus::Nacked, &now, Some(error)) {
-                warn!(id = row.id, error = %e, "update_status Pending→Nacked failed");
-            }
-            continue;
-        }
-        let body_text = resp.text().await.unwrap_or_default();
-        if let Err(e) = store.update_status(row.id, EmissionStatus::Queued, &now, None) {
-            warn!(id = row.id, error = %e, "update_status Pending→Queued failed");
-        }
-        return Err(anyhow::anyhow!(
-            "apply POST returned status {status}: {body_text}"
-        ));
-    }
-    Ok(())
 }
 
 /// POST a single Recapture body to the companion. Returns Ok on

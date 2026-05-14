@@ -179,6 +179,23 @@ struct Fixture {
     /// matching events. Ignored for v1 modules.
     #[serde(default)]
     interest: Vec<FixtureInterestPredicate>,
+
+    /// When `true`, invoke the platform's `bootstrap_v2::run_bootstrap`
+    /// after applying the interest set — same path the production
+    /// follower runs at startup to hydrate current-state UTxOs at
+    /// watched addresses / payment-creds / policies. Used to test
+    /// the bootstrap branch of a module's decode pipeline (which
+    /// behaves differently from the in-block apply_block branch —
+    /// e.g. hash-only datums are NOT pre-resolved by the data
+    /// plane during bootstrap, so the module must fall through to
+    /// `chain_data::tx_metadata` + labels-50+ reconstruction).
+    ///
+    /// Default `false` — existing fixtures that rely on
+    /// `[[utxo]]` entries for prior-output resolution during
+    /// block dispatch keep their semantics. Opt in per-fixture
+    /// when you want bootstrap-path coverage.
+    #[serde(default)]
+    bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -801,7 +818,54 @@ async fn run_v2(
         println!("▸ {cold_start_emitted} event(s) emitted during update_interest");
     }
 
-    if blocks.is_empty() {
+    // Platform-driven bootstrap walk (opt-in per fixture). Same
+    // path the production follower runs at startup. Differs from
+    // `update_interest`'s module-driven cold-start in one important
+    // way: hash-only datums come through with `payload: None` from
+    // `read_output_datums`, so modules whose decode path needs the
+    // datum bytes must fall through to `chain_data::tx_metadata`
+    // (labels-50+ reconstruction in jpg-store-offer's case). The
+    // existing in-block fixture path hides this branch because
+    // `apply_block`'s data-plane pre-resolves inline/witness
+    // datums.
+    if fixture.bootstrap {
+        println!("▸ bootstrap: running platform bootstrap walk against fixture data plane");
+        let mut bootstrap_kv = state_kv::ModuleKv::new_in_memory();
+        match mitos_platform::bootstrap_v2::run_bootstrap(
+            &mut driver,
+            module_id,
+            &mut bootstrap_kv,
+            &interest,
+            dp.as_ref(),
+        )
+        .await
+        {
+            Ok(stats) => {
+                println!(
+                    "  ✓ bootstrap complete: addrs_scanned={}/{} policies_scanned={}/{} \
+                     payment_creds_scanned={}/{} utxos_dispatched={} batches_dispatched={}",
+                    stats.addresses_scanned,
+                    stats.addresses_seen,
+                    stats.policies_scanned,
+                    stats.policies_seen,
+                    stats.payment_creds_scanned,
+                    stats.payment_creds_seen,
+                    stats.utxos_dispatched,
+                    stats.batches_dispatched,
+                );
+            }
+            Err(e) => {
+                eprintln!("  ✗ bootstrap failed: {e:?}");
+                std::process::exit(1);
+            }
+        }
+        let bootstrap_emitted = drain(&mut events_rx, &mut collected_emits, "bootstrap");
+        if bootstrap_emitted > 0 {
+            println!("  ▸ {bootstrap_emitted} event(s) emitted during bootstrap");
+        }
+    }
+
+    if blocks.is_empty() && !fixture.bootstrap {
         println!("▸ no --block flags; cold-start-only run");
     }
 
