@@ -1,6 +1,7 @@
 /target
 /Cargo.lock.bak
 **/*.rs.bk
+.env
 .envrc.local
 .DS_Store
 

@@ -43,6 +43,7 @@
 //! consumer needed v1 dispatch.
 
 pub mod admin;
+pub mod aux_data_cache;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
 pub mod compaction;

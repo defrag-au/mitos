@@ -338,7 +338,29 @@ where
         // Trap-context logger wraps the data plane facade so
         // host-fn calls during init or dispatch get captured.
         // Same `last-trap.toml` write path v1 uses.
-        let trap_logger = Arc::new(TrapContextLogger::new(self.data_plane.clone()));
+        // Wrap the shared data plane with the aux-data cache so
+        // `tx_metadata` calls from the module check the persistent
+        // cache before hitting the dolos archive (7-day window).
+        // Failures to open the cache degrade gracefully to a plain
+        // passthrough — same behaviour as before this was added.
+        let cache_opt = match self.storage.aux_data_cache() {
+            Ok(c) => {
+                tracing::debug!(module = %id, "aux_data_cache opened");
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    module = %id,
+                    error = %e,
+                    "aux_data_cache unavailable; tx_metadata bypasses cache",
+                );
+                None
+            }
+        };
+        let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
+            crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt),
+        );
+        let trap_logger = Arc::new(TrapContextLogger::new(caching_plane));
 
         let mut instance = registry
             .instantiate(trap_logger.clone(), kv, sink, self.budget)
