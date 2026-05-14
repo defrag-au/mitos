@@ -358,14 +358,16 @@ where
 }
 
 /// Transparent `DataPlaneFacade` wrapper that adds a local
-/// aux-data cache to `tx_metadata`. All other methods delegate
-/// directly to `inner`.
+/// aux-data cache and optional Maestro fallback to `tx_metadata`.
+/// All other methods delegate directly to `inner`.
 ///
 /// Resolution order for `tx_metadata`:
 /// 1. Local `AuxDataCache` (fast, on-disk, permanent)
 /// 2. `inner` (dolos archive, 7-day window)
-/// On a step-2 hit, the result is written back to cache (step 1)
-/// so future calls never reach step 2 again for the same TX.
+/// 3. Maestro REST API (when configured and daily budget allows)
+///
+/// Steps 2 and 3 write back to cache (step 1) on a hit so future
+/// calls never reach them again for the same TX.
 ///
 /// Sits between the real data plane and the `TrapContextLogger`
 /// so trap fixtures capture results regardless of source. When
@@ -374,14 +376,16 @@ where
 pub struct CachingDataPlane {
     inner: std::sync::Arc<dyn DataPlaneFacade>,
     cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
+    maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
 }
 
 impl CachingDataPlane {
     pub fn new(
         inner: std::sync::Arc<dyn DataPlaneFacade>,
         cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
+        maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
     ) -> Self {
-        Self { inner, cache }
+        Self { inner, cache, maestro }
     }
 }
 
@@ -450,20 +454,47 @@ impl DataPlaneFacade for CachingDataPlane {
         &self,
         tx_hash: &[u8; 32],
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
-        // Cache-first: skip dolos archive entirely on a hit.
+        // Tier 1: local cache — permanent, free.
         if let Some(cache) = &self.cache {
             if let Some(cached) = cache.get(tx_hash) {
                 return Ok(Some(cached));
             }
         }
-        // Miss: delegate to inner (dolos archive).
+
+        // Tier 2: dolos archive (7-day window).
         let result = self.inner.tx_metadata(tx_hash).await?;
-        // Write-through: populate cache so future bootstraps
-        // don't need to reach the archive for this TX.
-        if let (Some(cache), Some(cbor)) = (&self.cache, &result) {
-            cache.insert(tx_hash, cbor);
+        if let Some(cbor) = result {
+            if let Some(cache) = &self.cache {
+                cache.insert(tx_hash, &cbor);
+            }
+            return Ok(Some(cbor));
         }
-        Ok(result)
+
+        // Tier 3: Maestro fallback — only when configured.
+        if let Some(maestro) = &self.maestro {
+            let tx_hex = hex::encode(tx_hash);
+            match maestro.fetch_aux_data(&tx_hex).await {
+                Ok(Some(cbor)) => {
+                    if let Some(cache) = &self.cache {
+                        cache.insert(tx_hash, &cbor);
+                    }
+                    tracing::debug!(tx = %tx_hex, "aux_data resolved via Maestro fallback");
+                    return Ok(Some(cbor));
+                }
+                Ok(None) => {
+                    // TX has no aux_data — nothing to cache.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tx = %tx_hex,
+                        error = %e,
+                        "Maestro aux_data fallback failed",
+                    );
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn read_tx(

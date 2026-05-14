@@ -45,6 +45,7 @@
 pub mod admin;
 pub mod aux_data_cache;
 pub mod bindings_v2;
+pub mod maestro;
 pub mod bootstrap_v2;
 pub mod compaction;
 pub mod companions;
