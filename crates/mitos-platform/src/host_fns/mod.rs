@@ -455,11 +455,10 @@ impl DataPlaneFacade for CachingDataPlane {
         tx_hash: &[u8; 32],
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         // Tier 1: local cache — permanent, free.
-        if let Some(cache) = &self.cache {
-            if let Some(cached) = cache.get(tx_hash) {
+        if let Some(cache) = &self.cache
+            && let Some(cached) = cache.get(tx_hash) {
                 return Ok(Some(cached));
             }
-        }
 
         // Tier 2: dolos archive (7-day window).
         let result = self.inner.tx_metadata(tx_hash).await?;

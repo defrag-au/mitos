@@ -357,10 +357,10 @@ where
                 None
             }
         };
-        let maestro_opt = crate::maestro::MaestroClient::from_env().map(|m| {
+        let maestro_opt = crate::maestro::MaestroClient::shared();
+        if maestro_opt.is_some() {
             tracing::info!(module = %id, "Maestro aux_data fallback enabled");
-            Arc::new(m)
-        });
+        }
 
         let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
             crate::host_fns::CachingDataPlane::new(
