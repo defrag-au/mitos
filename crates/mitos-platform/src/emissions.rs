@@ -388,6 +388,37 @@ impl EmissionsStore {
         })
     }
 
+    /// Read all queued rows for `companion_id`, grouped by
+    /// `partition_key`. Within each group, rows are id-ordered (=
+    /// slot-ordered, since `host_v2::drain_one` emits in chain
+    /// order). Group order is unspecified — the dialer dispatches
+    /// groups to lane workers by hash-of-key, so iteration order
+    /// here doesn't matter.
+    ///
+    /// Used by the lane-aware dialer (see
+    /// `docs/design/DIALER_CONCURRENCY.md`). Single redb read pass
+    /// — bucket sort is O(N) over the queued set, bounded by the
+    /// per-tick scan depth.
+    #[allow(clippy::type_complexity)]
+    pub fn list_queued_for_companion_grouped(
+        &self,
+        companion_id: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<EmissionRecord>)>, EmissionsError> {
+        use std::collections::BTreeMap;
+        // BTreeMap so empty-key (global lane) sorts before any
+        // non-empty key — gives a stable, deterministic iteration
+        // order for tests + log diffs without affecting correctness.
+        let mut groups: BTreeMap<Vec<u8>, Vec<EmissionRecord>> = BTreeMap::new();
+        let rows = self.list_queued_for_companion(companion_id)?;
+        for row in rows {
+            groups
+                .entry(row.partition_key.clone())
+                .or_default()
+                .push(row);
+        }
+        Ok(groups.into_iter().collect())
+    }
+
     /// Flip `Pending` rows older than `max_pending_age_secs` for
     /// this companion back to `Queued`. Called periodically by
     /// the dialer's pump loop while the WS is still alive — it
@@ -741,6 +772,55 @@ mod tests {
         let row = store.get(id).unwrap().unwrap();
         assert_eq!(row.status, EmissionStatus::Nacked);
         assert_eq!(row.error.as_deref(), Some("apply failed: foo"));
+    }
+
+    #[test]
+    fn list_queued_grouped_buckets_by_partition_key() {
+        let (_t, store) = fresh_store();
+        // Three queued rows for c1:
+        //  - id=1: empty key (global lane)
+        //  - id=2: key=b"policy_a"
+        //  - id=3: key=b"policy_a"   (same lane as id=2)
+        //  - id=4: key=b"policy_b"
+        //  - id=5: empty key
+        // Plus one row for c2 we want filtered out.
+        let cases: &[(&str, &[u8])] = &[
+            ("c1", b""),
+            ("c1", b"policy_a"),
+            ("c1", b"policy_a"),
+            ("c1", b"policy_b"),
+            ("c1", b""),
+            ("c2", b"policy_a"),
+        ];
+        for (c, key) in cases {
+            store
+                .append(
+                    c,
+                    "ownership",
+                    fixed_point(),
+                    vec![],
+                    key.to_vec(),
+                    EmissionStatus::Queued,
+                    "2026-05-05T00:00:00Z",
+                )
+                .unwrap();
+        }
+
+        let grouped = store.list_queued_for_companion_grouped("c1").unwrap();
+        assert_eq!(grouped.len(), 3, "three distinct keys for c1");
+
+        // Empty key (global lane) sorts first under BTreeMap order.
+        assert_eq!(grouped[0].0, b"" as &[u8]);
+        let ids: Vec<u64> = grouped[0].1.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 5], "global lane preserves id order");
+
+        assert_eq!(grouped[1].0, b"policy_a" as &[u8]);
+        let ids: Vec<u64> = grouped[1].1.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 3], "same-key rows stay together in id order");
+
+        assert_eq!(grouped[2].0, b"policy_b" as &[u8]);
+        let ids: Vec<u64> = grouped[2].1.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![4]);
     }
 
     #[test]

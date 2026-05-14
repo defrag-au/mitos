@@ -137,52 +137,67 @@ event lands in — never the order it arrives there.
 The rule for module authors: **events that share an invariant
 must hash to the same lane**, and the dialer handles the rest.
 
-## Across-lane coordination: rollbacks and cursors
+## Across-lane coordination: cursors only
 
-Within a lane is easy. Across lanes, two things need explicit
-cross-lane coordination that didn't matter under serial drain.
+Within a lane is easy. Across lanes, there's one thing that
+needs explicit coordination that didn't matter under serial drain:
+cursor advancement.
 
-### Rollbacks are cross-lane barriers
+### Rollbacks aren't a dialer concern
 
-A `RollbackEvent` ([`wit-v2/world.wit:184`]) is a global
-statement: every event with `cursor > to_cursor` is invalid and
-the module's derived state must un-apply them. Under serial
-drain this was trivial — by the time the rollback was the next
-row to apply, all preceding events had already finished applying,
-so the module's `handle-events(rollback)` call saw a quiesced
+`RollbackEvent` ([`wit-v2/world.wit:184`]) is dispatched to the
+*module*, not the companion. The follower calls
+[`DriverV2::dispatch_rollback`] which invokes `handle-events`
+inside the wasm module; the module's rollback logic emits
+*compensating events* (e.g. `OfferRemoved` for offers that were
+added past `to_cursor`) through the normal `emit-event` path.
+The dialer never sees a typed "rollback" message — it just sees
+a stream of regular emissions, some of which happen to undo
+earlier rows.
+
+This means rollback ordering reduces to: **compensating events
+must use the same partition key as the events they compensate.**
+That's a module-author contract in the same shape as idempotency
+("`apply_event` must be safe under re-delivery") — a property of
+the module's emit logic, not the platform's transport. As long
+as `OfferRemoved` for policy X uses the same key as `OfferAdded`
+for policy X (i.e., `policy_id`), the compensating event lands in
+the same lane and arrives after the original by id-order. The
+module's `apply_event` sees them in chain order, un-applies
+correctly, and the lane's state matches the rolled-back chain
 state.
 
-Under parallel lanes, that's no longer true. Lane X might be
-applying slot 1005 while lane Y is mid-flight on slot 1003 while
-a rollback to slot 1000 sits in the queue. If the dialer
-dispatched the rollback eagerly, it would race with Y's in-flight
-POSTs and the module's projection would be inconsistent.
+If a module emits compensating events with *different* keys than
+the originals (e.g., add was keyed by policy, remove keyed by
+oref), parallel lanes can interleave the un-apply with later
+events on the original key — that's a module bug, the platform
+can't prevent it. Module shared crates should keep the key
+extractor co-located with the event definition so this property
+is visible at review time.
 
-Rollback emissions are therefore **barriers**. When the dialer
-sees a rollback in the queue:
-
-1. **Stop dispatching new work to any lane.** New emissions stay
-   `Queued`; lanes complete only their currently in-flight
-   POSTs.
-2. **Wait for every lane to ack its in-flight row.** The
-   coordinated-backoff worker pool already has the machinery
-   for parking lanes; the barrier reuses it.
-3. **Dispatch the rollback as a single sequential POST**,
-   independent of lane assignment. The module's
-   `handle-events(rollback)` runs once, sees a fully-applied
-   pre-rollback state, and un-applies cleanly.
-4. **Release the pool back to parallel.** The queue now contains
-   only post-rollback emissions (possibly including replayed
-   events with new ids), which fan out across lanes again.
-
-Cost: every rollback serialises the dialer briefly. Acceptable
-— rollbacks are rare (chain reorgs of more than a few blocks
-are exceptional), and the barrier window is bounded by the slowest
-in-flight POST. Per-lane backoff would have made this strictly
-harder; pool-level backoff (already a decision) gives us the
-barrier primitive for free.
+So no special dialer plumbing for rollbacks. The lane pool is
+the same shape with or without rollbacks happening; the contract
+just shifts to the module-author guidance section.
 
 ### Cursor advancement is the floor, not the ceiling
+
+**Status: deferred.** The initial Phase 2 landing ships with
+N=8 default *without* floor-stamping — each row's
+`ApplyBody.cursor` is its own `chain_point`, same as the pre-pool
+serial path. This means: when a fast lane acks a high-slot row
+before a slow lane acks a lower-slot row, the companion's
+persisted cursor briefly regresses. The bounded re-application
+window after a host crash is absorbed by the idempotent
+`apply_event` contract, so this is safe but operator-visible.
+
+The proper fix is described in the rest of this section and
+queued as a follow-up. It needs a `ChainPoint::SlotOnly` stamping
+path (or per-lane chain-point tracking) to avoid fabricating
+block hashes, and it's tractable separately from the structural
+pool change. The Phase 2 work is reviewable on its own with the
+caveat flagged in `LaneConfig`'s doc comment.
+
+#### Proper design (follow-up)
 
 Today the DO's chain cursor advances after each `apply_event`
 returns 2xx — it equals the slot of the last successfully-applied
@@ -390,17 +405,20 @@ its draining stays serial). Hash collisions across distinct keys
 just mean those keys share a worker — correct, slightly less
 parallel.
 
-**Worker pool size.** Default `N_LANES = 16`. The bottleneck
+**Worker pool size.** Default `N_LANES = 8`. The bottleneck
 isn't local CPU (each worker's hot path is `await
 client.post(...)`); it's the receiving worker's request budget
-and the network. 16 saturates a CF Workers endpoint reasonably
-without queuing requests against ourselves. Configurable via
-`mitos.toml`:
+and the network. 8 gives us most of the parallelism benefit
+without flooding any single companion endpoint with simultaneous
+POSTs. Operators override via the `MITOS_DIALER_LANES` env var:
 
-```toml
-[dial.concurrency]
-lanes = 16
+```bash
+MITOS_DIALER_LANES=16 mitos-run …
 ```
+
+Setting `MITOS_DIALER_LANES=1` falls back to strictly-serial
+drain, identical to pre-pool behaviour. The `mitos.toml`-shaped
+config is a follow-up; env var only for the initial landing.
 
 **Coordinated backoff per target endpoint.** All N lanes for a
 given `(companion, target)` POST to the *same* Worker URL, so a
@@ -423,16 +441,6 @@ in-flight status.
 422 (semantic Nack) is *not* an endpoint outage and doesn't
 trigger pool backoff — only that row is marked `Nacked`, and
 the lane continues with the next row in id-order.
-
-**Rollback barrier handling.** When the supervisor's queue scan
-encounters a `RollbackEvent` emission, it suppresses dispatch of
-that row and any rows after it, parks the pool until every lane
-acks its in-flight POST, then dispatches the rollback as a
-single non-lane POST. After the rollback's 2xx, the pool resumes
-and the cursor floor jumps to the rollback's `to_cursor`. The
-machinery is the same as the 5xx backoff path — park lanes,
-quiesce, do the thing, resume — just triggered by a queue
-condition rather than a transport error.
 
 **Cursor floor reporting.** The supervisor tracks per-lane
 `last_applied_slot` and computes `min(lanes)` after every ack.
@@ -549,21 +557,29 @@ worth a closer look before Phase 1 lands.
 - Existing modules still call `emit-event` and stay on the
   global lane. Wire and behaviour unchanged on the dialer side.
 
-**Phase 2 — lane-aware dialer (5-7 days).**
-- Add `LaneWorkerPool` in `dialer.rs`.
-- Refactor `spawn_per_target_loop` to dispatch by partition key.
-- Pool-level coordinated backoff (replaces per-task backoff).
-- Rollback barrier handling: park-quiesce-dispatch-resume on
-  encountering a `RollbackEvent` emission.
-- Cursor-floor tracking: per-lane `last_applied_slot` +
-  supervisor-computed `min(lanes)` stamped onto outgoing
-  `ApplyBody.cursor`.
-- Add the serialised status-writer task.
-- Configure `lanes` in `mitos.toml`.
-- Smoke-test: existing modules (no keys) drain through the
-  global lane, end-to-end behaviour identical to today —
-  including a forced rollback test to confirm barrier
-  semantics on the single-lane path.
+**Phase 2 — lane-aware dialer (landed 2026-05-14).**
+- Lane-aware pool in `dialer/pool.rs`: hash-by-key dispatch, per
+  tick scatter-gather across `lanes` workers, joined via `JoinSet`.
+- Serialised `StatusWriter` task — single mpsc → redb so parallel
+  workers don't fight over the single-writer txn.
+- Env-var config (`MITOS_DIALER_LANES`, default 8). `mitos.toml`-
+  shaped config is a follow-up.
+- `EmissionsStore::list_queued_for_companion_grouped` returns
+  rows bucketed by `partition_key`, id-ordered within bucket.
+- Drain at N=1 is bit-exact with the pre-pool serial path; at
+  N=8 (default) the lane pool dispatches in parallel with the
+  cursor caveat noted below.
+
+**Phase 2 follow-ups (open):**
+- **Cursor floor stamping** to remove the brief regression at
+  N>1 — see "Cursor advancement is the floor, not the ceiling"
+  above. Likely a `ChainPoint::SlotOnly` stamping path.
+- **Pool-level coordinated backoff** to replace the per-task
+  exponential backoff. At N>1 a 5xx on one lane currently parks
+  only that lane's batch; the next tick re-discovers the outage
+  on the other lanes' first POSTs. Coordinating backoff state at
+  the pool level avoids the wasted-discovery RTTs.
+- **`mitos.toml`-shaped config** instead of the env-var override.
 
 **Phase 3 — jpg-store-offer migration (1 day).**
 - Update the module's emits to use `emit-event-keyed` with

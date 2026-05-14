@@ -677,7 +677,35 @@ fn emit_offer(event: &JpgStoreOffer) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Dialer lane partition key. Same-policy events serialise
+    // (preserves per-policy `policy_leaders` aggregate ordering
+    // on the companion side); different-policy events parallelise
+    // across dialer lanes. Per-oref invariants are covered because
+    // every event for a given offer carries the same target_policy
+    // from its create-time datum.
+    //
+    // Falls back to empty (global lane) when target_policy is
+    // missing: `emit_accept_partial` for unmatched assets, and
+    // the rare datum-decode-with-no-policy case in `Create`/`Cancel`.
+    let key = partition_key_for_offer(event);
+    emit::emit_event_keyed(0, &key, &buf);
+}
+
+/// Hex bytes of the offer's target policy, or empty when none.
+/// Bytes (not policy-id-decoded) — the dialer uses this opaquely
+/// as a hash input, so the canonicalisation doesn't matter; hex
+/// keeps the code shorter than threading hex-decode failures.
+fn partition_key_for_offer(event: &JpgStoreOffer) -> Vec<u8> {
+    let policy_hex: Option<&str> = match event {
+        JpgStoreOffer::Create(c) => c.target_policy.as_deref(),
+        JpgStoreOffer::Cancel(c) => c.target_policy.as_deref(),
+        JpgStoreOffer::Update(u) => u.target_policy.as_deref(),
+        JpgStoreOffer::Accept(a) if !a.policy.is_empty() => Some(a.policy.as_str()),
+        JpgStoreOffer::Accept(_) => None,
+    };
+    policy_hex
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 // ============================================================
