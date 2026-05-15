@@ -16,6 +16,7 @@ none-match-indexer = { path = "../../crates/none-match-indexer" }
 dolos = { workspace = true }
 dolos-core = { workspace = true }
 dolos-cardano = { workspace = true }
+dolos-minibf = { workspace = true }
 
 # Runtime / HTTP / observability.
 tokio = { workspace = true }

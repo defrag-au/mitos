@@ -69,6 +69,16 @@ pub struct Bundle {
     /// specific-domain indexers within the same Apply event. See
     /// `docs/design/DOMAIN_REFACTOR.md`.
     residual_coordinator: Option<TxClaimCoordinator>,
+    /// Additional axum routers to nest under their respective path
+    /// prefixes. Applied during `run()` before indexer routes so
+    /// indexer names can't accidentally shadow them. Populated via
+    /// `nest_extra` — e.g. the minibf bridge in `bundles/default`.
+    extra_routes: Vec<(String, axum::Router)>,
+    /// Shared-secret token loaded from `MITOS_AUTH_TOKEN` at
+    /// construction time. Stored here so bundle authors can apply
+    /// the same auth to extra routers (e.g. minibf) without calling
+    /// `AuthToken::from_env()` a second time.
+    auth: AuthToken,
 }
 
 impl Bundle {
@@ -94,6 +104,8 @@ impl Bundle {
             modules_dir: None,
             community_modules_dir: None,
             residual_coordinator: None,
+            extra_routes: Vec::new(),
+            auth: AuthToken::from_env(),
         }
     }
 
@@ -166,6 +178,23 @@ impl Bundle {
         self.community_modules_dir = Some(community_modules_dir);
     }
 
+    /// Mount an additional axum router under `prefix`. Applied during
+    /// `run()` before indexer routes so no indexer name can shadow the
+    /// prefix. Used by bundle authors to opt into extra HTTP surfaces
+    /// (e.g. the minibf bridge) without baking them into `mitos-core`.
+    pub fn nest_extra(&mut self, prefix: impl Into<String>, router: axum::Router) -> &mut Self {
+        self.extra_routes.push((prefix.into(), router));
+        self
+    }
+
+    /// The auth token loaded from `MITOS_AUTH_TOKEN` at construction.
+    /// Bundle authors can use this to apply the same shared-secret to
+    /// extra routers (e.g. `from_fn_with_state(bundle.auth().clone(), require_auth)`)
+    /// rather than reading a separate env var.
+    pub fn auth(&self) -> &AuthToken {
+        &self.auth
+    }
+
     /// Run the bundle: spawn the chain-sync pipeline, bootstrap each
     /// indexer, start its dispatcher, mount HTTP routes (per-indexer +
     /// `/replicate/{indexer}` test surface used by `mitos-tail`),
@@ -179,6 +208,8 @@ impl Bundle {
             modules_dir,
             community_modules_dir,
             residual_coordinator,
+            extra_routes,
+            auth,
         } = self;
 
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
@@ -261,8 +292,6 @@ impl Bundle {
                 dispatcher_handles.push(handle);
             }
         }
-
-        let auth = AuthToken::from_env();
 
         // Mount CF replication test surface (server-accepted WS for
         // each registered indexer, consumed by `mitos-tail`). The
@@ -527,6 +556,13 @@ impl Bundle {
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
             );
+        }
+
+        // Extra routers registered via `nest_extra` (e.g. minibf
+        // bridge). Mounted before indexer routes so their prefixes
+        // can't be shadowed by a same-named indexer.
+        for (prefix, router) in extra_routes {
+            app = app.nest(&prefix, router);
         }
 
         // /health — open (no auth) so a status page or LB health

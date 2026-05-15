@@ -3267,6 +3267,7 @@ dependencies = [
  "dolos",
  "dolos-cardano",
  "dolos-core",
+ "dolos-minibf",
  "mitos-core",
  "none-match-indexer",
  "tokio",
