@@ -12,8 +12,9 @@
 //! residual-pass coordinator (see
 //! `docs/design/DOMAIN_REFACTOR.md`).
 
+use axum::middleware::from_fn_with_state;
 use clap::Parser;
-use mitos_core::Bundle;
+use mitos_core::{Bundle, require_auth};
 use none_match_indexer::NoneMatchIndexer;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -84,6 +85,12 @@ async fn main() -> anyhow::Result<()> {
 
     let exit = install_exit_handler();
 
+    // Clone minibf config + domain before they're moved into Bundle::new.
+    // listen_address inside MinibfConfig is vestigial here — we mount the
+    // router on the bundle's existing listener, not a separate bind.
+    let minibf_cfg = config.serve.minibf.clone();
+    let minibf_domain = minibf_cfg.as_ref().map(|_| domain.clone());
+
     let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
 
     // Residual pass: emits `Domain::AssetMovement` for asset
@@ -115,6 +122,14 @@ async fn main() -> anyhow::Result<()> {
                  community-modules auto-load requires wasm-module hosting"
             );
         }
+    }
+
+    if let (Some(cfg), Some(minibf_domain)) = (minibf_cfg, minibf_domain) {
+        let auth = bundle.auth().clone();
+        let router = dolos_minibf::build_router(cfg, minibf_domain)
+            .layer(from_fn_with_state(auth, require_auth));
+        bundle.nest_extra("/minibf", router);
+        info!("minibf bridge enabled at /minibf");
     }
 
     bundle.run(exit).await?;

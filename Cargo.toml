@@ -41,6 +41,7 @@ dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
 dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
 dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
 dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
 
 # Cardano types + parsing. Same pallas version shared-crates uses
 # (bumped from alpha.3 → alpha.6 alongside the utxorpc-spec 0.18

@@ -23,7 +23,7 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
-pub use auth::AuthToken;
+pub use auth::{AuthToken, require_auth};
 pub use bundle::{Bundle, print_config_summary};
 pub use coordinator::TxClaimCoordinator;
 pub use dispatcher::{run_dispatcher, run_synchronized_dispatcher};
