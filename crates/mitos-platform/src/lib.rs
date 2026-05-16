@@ -60,6 +60,7 @@ pub mod indexer_bridge;
 pub mod inspect;
 pub mod lag_tolerant;
 pub mod maestro;
+pub mod maestro_fallback_plane;
 pub mod manifest;
 pub mod registry_v2;
 pub mod storage;

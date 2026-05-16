@@ -461,7 +461,20 @@ where
         let cancel_for_task = cancel.clone();
         let persisted_cursor = self.storage.read_cursor(id)?;
         let subscription = (self.subscription_factory)(persisted_cursor);
-        let chain_plane = self.chain_plane.clone();
+        // Wrap the chain plane so prior-output lookups for inputs
+        // older than the dolos archive horizon fall back to
+        // Maestro. Without this, `build_event_batches` emits
+        // `TypedOutput::unresolved()` for archive-pruned create-
+        // TXs, the InterestSet doesn't match, and the consuming
+        // module sees no event — see
+        // `maestro_fallback_plane.rs` for the failure mode this
+        // fixes. When no Maestro key is configured the wrapper
+        // collapses to a pass-through.
+        let chain_plane: Arc<crate::maestro_fallback_plane::MaestroFallbackPlane<P>> =
+            Arc::new(crate::maestro_fallback_plane::MaestroFallbackPlane::new(
+                self.chain_plane.clone(),
+                crate::maestro::MaestroClient::shared(),
+            ));
         let follower_storage = self.storage.clone();
         let follower_module_id = id.to_owned();
         let id_for_log = id.to_owned();
