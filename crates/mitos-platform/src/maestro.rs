@@ -174,8 +174,8 @@ impl MaestroClient {
         };
         let body: TxCborResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
-        let tx_cbor = hex::decode(&body.data)
-            .map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
+        let tx_cbor =
+            hex::decode(&body.data).map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
         Ok(aux_from_tx_cbor(&tx_cbor))
     }
 
@@ -293,11 +293,7 @@ impl MaestroClient {
             }
 
             let resp = resp.error_for_status()?;
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(MaestroError::Http)?
-                .to_vec();
+            let bytes = resp.bytes().await.map_err(MaestroError::Http)?.to_vec();
             return Ok(Some(bytes));
         }
 

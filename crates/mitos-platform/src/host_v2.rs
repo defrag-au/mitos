@@ -470,12 +470,11 @@ where
         // `maestro_fallback_plane.rs` for the failure mode this
         // fixes. When no Maestro key is configured the wrapper
         // collapses to a pass-through.
-        let chain_plane: Arc<crate::maestro_fallback_plane::MaestroFallbackPlane<P>> = Arc::new(
-            crate::maestro_fallback_plane::MaestroFallbackPlane::new(
+        let chain_plane: Arc<crate::maestro_fallback_plane::MaestroFallbackPlane<P>> =
+            Arc::new(crate::maestro_fallback_plane::MaestroFallbackPlane::new(
                 self.chain_plane.clone(),
                 crate::maestro::MaestroClient::shared(),
-            ),
-        );
+            ));
         let follower_storage = self.storage.clone();
         let follower_module_id = id.to_owned();
         let id_for_log = id.to_owned();
