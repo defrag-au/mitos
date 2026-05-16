@@ -1,9 +1,13 @@
-//! Maestro API client for aux-data fallback.
+//! Maestro API client for chain-data fallback.
 //!
-//! Third resolution tier in `CachingDataPlane::tx_metadata`:
-//! called only after both the local cache and the dolos archive
-//! return `None` (TX is older than the 7-day archive window and
-//! was not cached proactively during `apply_block`).
+//! Used by two resolution tiers in the platform:
+//! - `CachingDataPlane::tx_metadata` → `fetch_aux_data` for aux-data
+//!   CBOR on TXs older than the 7-day dolos archive horizon.
+//! - `MaestroFallbackPlane::read_utxos` → `fetch_output` for prior
+//!   outputs whose create-TX has been pruned past the archive
+//!   horizon. The follower hits this any time it dispatches a TX
+//!   that consumes a UTxO older than ~7 days (cancel of a long-
+//!   standing offer, accept of an old listing, etc.).
 //!
 //! **Process-wide singleton.** `MaestroClient::shared()` returns
 //! the same `Arc<MaestroClient>` for every module in the process,
@@ -23,11 +27,15 @@
 //!
 //! Configuration: read from environment at first `shared()` call.
 //! Missing `MAESTRO_API_KEY` → returns `None` forever →
-//! `CachingDataPlane` skips tier 3 gracefully.
+//! `CachingDataPlane` / `MaestroFallbackPlane` skip their
+//! Maestro tier gracefully.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use cardano_assets::PolicyId;
+use mitos_data_plane::{AssetEntry, DecodeLevel, OutputRef, Resolution, TypedDatum, TypedOutput};
+use pallas_primitives::{Hash, PlutusData};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 
@@ -54,13 +62,52 @@ pub enum MaestroError {
     Server(reqwest::StatusCode, u32),
 }
 
+/// `GET /transactions/{tx_hash}/cbor` response. Maestro wraps
+/// the hex payload in a `data` envelope.
 #[derive(Deserialize)]
 struct TxCborResponse {
     data: String,
 }
 
-/// Lightweight Maestro REST client used solely for
-/// `GET /transactions/{tx_hash}/cbor` aux-data fallback.
+/// `GET /transactions/{tx_hash}/outputs/{index}/txo` response.
+/// Maestro wraps the output in a `data` envelope.
+#[derive(Deserialize)]
+struct TxoResponse {
+    data: TxoData,
+}
+
+#[derive(Deserialize)]
+struct TxoData {
+    address: String,
+    assets: Vec<TxoAsset>,
+    #[serde(default)]
+    datum: Option<TxoDatum>,
+}
+
+#[derive(Deserialize)]
+struct TxoAsset {
+    /// `"lovelace"` for the ADA component, otherwise
+    /// `"{policy_hex}{asset_name_hex}"` (56 + variable hex).
+    unit: String,
+    amount: u64,
+}
+
+#[derive(Deserialize)]
+struct TxoDatum {
+    /// `"hash"` or `"inline"`.
+    #[serde(rename = "type")]
+    _kind: String,
+    hash: String,
+    /// Hex-encoded raw CBOR of the datum payload. Always present
+    /// for inline datums; present for hash-attached datums when
+    /// the indexer that built this Maestro response could resolve
+    /// the bytes (which it usually can — Maestro stores witness-
+    /// set datums indefinitely).
+    #[serde(default)]
+    bytes: Option<String>,
+}
+
+/// Lightweight Maestro REST client.
 ///
 /// Access via `MaestroClient::shared()` — never construct
 /// directly. `Clone` on the returned `Arc` is cheap.
@@ -122,7 +169,63 @@ impl MaestroClient {
     ///   a non-retryable transport / decode error
     pub async fn fetch_aux_data(&self, tx_hash_hex: &str) -> Result<Option<Vec<u8>>, MaestroError> {
         let url = format!("https://{}/transactions/{tx_hash_hex}/cbor", self.base_url);
+        let Some(body_bytes) = self.get_bytes_with_retries(&url, tx_hash_hex).await? else {
+            return Ok(None);
+        };
+        let body: TxCborResponse = serde_json::from_slice(&body_bytes)
+            .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
+        let tx_cbor = hex::decode(&body.data)
+            .map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
+        Ok(aux_from_tx_cbor(&tx_cbor))
+    }
 
+    /// Fetch a single output by reference. Returns `None` when
+    /// Maestro doesn't have the output (404) or the response
+    /// can't be parsed into the typed shape.
+    ///
+    /// Used as the third tier in `read_utxos` resolution —
+    /// after dolos current-state and dolos archive both miss.
+    /// Decode level governs what gets populated:
+    /// - `Lean` — address + lovelace + assets only, no datum
+    /// - `WithDatum` / `Full` — same, plus datum (with payload
+    ///   when Maestro returns the bytes)
+    ///
+    /// `Full` does *not* populate `script_ref` — this endpoint
+    /// doesn't surface reference scripts. Callers needing
+    /// reference scripts after a Maestro fallback are rare
+    /// enough that a separate lookup can be added if they
+    /// appear.
+    pub async fn fetch_output(
+        &self,
+        oref: &OutputRef,
+        level: DecodeLevel,
+    ) -> Result<Option<TypedOutput>, MaestroError> {
+        let tx_hex = hex::encode(oref.tx_hash);
+        let url = format!(
+            "https://{}/transactions/{tx_hex}/outputs/{}/txo",
+            self.base_url, oref.index
+        );
+        let Some(body_bytes) = self.get_bytes_with_retries(&url, &tx_hex).await? else {
+            return Ok(None);
+        };
+        let body: TxoResponse = serde_json::from_slice(&body_bytes)
+            .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
+        Ok(Some(typed_output_from_maestro(body.data, level)))
+    }
+
+    /// Shared retry loop for any `GET` endpoint that wraps its
+    /// payload in Maestro's `{ "data": ... }` envelope. Returns
+    /// `Ok(None)` on 404, `Ok(Some(body))` on 200, propagates
+    /// retry-exhaustion as `MaestroError::{RateLimited, Server}`.
+    ///
+    /// The `tag` is included in 429/5xx warn logs so operators
+    /// can correlate a backoff event with the TX hash or oref
+    /// it pertains to.
+    async fn get_bytes_with_retries(
+        &self,
+        url: &str,
+        tag: &str,
+    ) -> Result<Option<Vec<u8>>, MaestroError> {
         // Held across retry sleeps on purpose — see module docs.
         let _permit = self
             .permits
@@ -132,7 +235,7 @@ impl MaestroClient {
 
         let mut backoff = INITIAL_BACKOFF;
         for attempt in 1..=MAX_ATTEMPTS {
-            let resp = match self.http.get(&url).send().await {
+            let resp = match self.http.get(url).send().await {
                 Ok(r) => r,
                 Err(e) if e.is_timeout() || e.is_connect() => {
                     if attempt == MAX_ATTEMPTS {
@@ -165,7 +268,7 @@ impl MaestroClient {
                 tracing::warn!(
                     attempt,
                     wait_ms = wait.as_millis() as u64,
-                    tx_hash = tx_hash_hex,
+                    tag,
                     "Maestro 429 rate limited, backing off"
                 );
                 tokio::time::sleep(wait).await;
@@ -181,6 +284,7 @@ impl MaestroClient {
                     attempt,
                     status = %status,
                     backoff_ms = backoff.as_millis() as u64,
+                    tag,
                     "Maestro 5xx, retrying"
                 );
                 tokio::time::sleep(backoff).await;
@@ -189,15 +293,12 @@ impl MaestroClient {
             }
 
             let resp = resp.error_for_status()?;
-            let body: TxCborResponse = resp
-                .json()
+            let bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
-
-            let tx_cbor =
-                hex::decode(&body.data).map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
-
-            return Ok(aux_from_tx_cbor(&tx_cbor));
+                .map_err(MaestroError::Http)?
+                .to_vec();
+            return Ok(Some(bytes));
         }
 
         // For-loop returns on every path; unreachable unless
@@ -215,6 +316,92 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let val = headers.get(reqwest::header::RETRY_AFTER)?;
     let secs: u64 = val.to_str().ok()?.parse().ok()?;
     Some(Duration::from_secs(secs.min(MAX_BACKOFF.as_secs())))
+}
+
+/// Build a `TypedOutput` from Maestro's TXO response. Caller-blind
+/// w.r.t. era — Maestro emits the post-decode JSON view, so no
+/// CBOR/era guessing is needed.
+///
+/// Asset units in Maestro's format are `"lovelace"` for ADA, or
+/// `"{policy_hex}{asset_name_hex}"` for native assets. Malformed
+/// units are silently skipped — the resulting `TypedOutput` is
+/// still useful for address-keyed interest matching even if a
+/// stray bad asset entry is dropped.
+fn typed_output_from_maestro(data: TxoData, level: DecodeLevel) -> TypedOutput {
+    let mut lovelace: u64 = 0;
+    let mut assets: Vec<AssetEntry> = Vec::new();
+    for a in data.assets {
+        if a.unit == "lovelace" {
+            lovelace = a.amount;
+            continue;
+        }
+        // unit = policy_hex (56 chars) + asset_name_hex (rest)
+        if a.unit.len() < 56 {
+            tracing::debug!(unit = %a.unit, "Maestro asset unit shorter than 56 chars; skipping");
+            continue;
+        }
+        let policy_hex = &a.unit[..56];
+        let asset_name_hex = a.unit[56..].to_owned();
+        match PolicyId::new(policy_hex) {
+            Ok(policy_id) => assets.push(AssetEntry {
+                policy_id,
+                asset_name_hex,
+                quantity: a.amount,
+            }),
+            Err(e) => {
+                tracing::debug!(unit = %a.unit, error = %e, "Maestro asset unit policy_id parse failed; skipping");
+            }
+        }
+    }
+
+    let datum = match level {
+        DecodeLevel::Lean => None,
+        DecodeLevel::WithDatum | DecodeLevel::Full => data.datum.and_then(datum_from_maestro),
+    };
+
+    TypedOutput {
+        address: data.address,
+        lovelace,
+        assets,
+        datum,
+        // Reference scripts aren't surfaced by /txo. Leave as
+        // None — `DecodeLevel::Full` callers that need them
+        // would need a follow-up lookup we haven't built yet.
+        script_ref: None,
+        original_cbor: None,
+        decoded_at: level,
+        resolution: Resolution::Resolved,
+    }
+}
+
+fn datum_from_maestro(d: TxoDatum) -> Option<TypedDatum> {
+    let hash_bytes = hex::decode(&d.hash).ok()?;
+    if hash_bytes.len() != 32 {
+        return None;
+    }
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&hash_bytes);
+    let hash = Hash::<32>::from(hash_arr);
+
+    let (payload, original_cbor) = if let Some(hex_bytes) = d.bytes {
+        match hex::decode(&hex_bytes) {
+            Ok(cbor) => {
+                let payload = pallas::codec::minicbor::decode::<PlutusData>(&cbor).ok();
+                (payload, Some(cbor))
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Maestro datum bytes hex decode failed");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    Some(TypedDatum {
+        hash,
+        payload,
+        original_cbor,
+    })
 }
 
 /// Extract the auxiliary-data sub-object from a raw Conway/Babbage
