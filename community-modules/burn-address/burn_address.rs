@@ -22,12 +22,13 @@ use std::collections::HashSet;
 use mitos_community_events::burn_address::AddressBurn;
 use serde::Deserialize;
 
+use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 // `DispatchEvent`, `TrapStrategy`, `RetryPolicy`, `InterestOp`,
 // and the `Guest` trait come from world-level `use ...` clauses.
-use crate::mitos::platform_v2::types::{ProducedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{AssetEntry, ProducedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "burn-address-module";
 /// state-kv key under which we persist the resolved
@@ -36,6 +37,11 @@ const LOG_TARGET: &str = "burn-address-module";
 /// cheaper than per-address keys for the small sets typical
 /// of burn-sink consumers.
 const KV_WATCHED_ADDRS: &str = "watched-addresses";
+/// Host-side cap on `utxos_by_address`. A bootstrap walk that
+/// hits it would be partial, so we suppress it rather than emit
+/// an incomplete burn history (mirrors `holder-distribution`'s
+/// `COLD_START_CAP` handling).
+const COLD_START_CAP: usize = 100_000;
 
 // Watched-address set. The platform's v2 dispatch model
 // filters TXs (any matching event qualifies → all events
@@ -86,6 +92,28 @@ fn emit_address_burn(event: &AddressBurn) {
     emit::emit_event(0, &buf);
 }
 
+/// Emit one `AddressBurn` per asset carried by an output that
+/// landed at a watched address. Shared by the live `Produced`
+/// path and the cold-start walk so both emit an identical wire
+/// shape.
+fn emit_output_burns(
+    burn_address: &str,
+    tx_hash_hex: &str,
+    output_index: u32,
+    assets: &[AssetEntry],
+) {
+    for entry in assets {
+        emit_address_burn(&AddressBurn {
+            policy: hex::encode(&entry.asset.policy),
+            asset_name_hex: hex::encode(&entry.asset.name),
+            tx_hash: tx_hash_hex.to_string(),
+            output_index,
+            quantity: entry.quantity,
+            burn_address: burn_address.to_string(),
+        });
+    }
+}
+
 fn handle_produced(p: &ProducedEvent) {
     // Per-output filter: platform dispatches every Produced
     // event in any TX that touched a watched address, NOT just
@@ -102,18 +130,82 @@ fn handle_produced(p: &ProducedEvent) {
         // address).
         return;
     }
-    let burn_address = p.output.address.clone();
-    let tx_hash_hex = hex::encode(&p.tx_hash);
-    for entry in &p.output.assets {
-        emit_address_burn(&AddressBurn {
-            policy: hex::encode(&entry.asset.policy),
-            asset_name_hex: hex::encode(&entry.asset.name),
-            tx_hash: tx_hash_hex.clone(),
-            output_index: p.oref.index,
-            quantity: entry.quantity,
-            burn_address: burn_address.clone(),
-        });
+    emit_output_burns(
+        &p.output.address,
+        &hex::encode(&p.tx_hash),
+        p.oref.index,
+        &p.output.assets,
+    );
+}
+
+/// Bootstrap walk for a newly-watched burn address. Enumerates
+/// the address's current unspent set (`utxos_by_address`),
+/// resolves each output, and emits one `AddressBurn` per
+/// `(asset, output)`.
+///
+/// Burn sinks are never respent, so the current unspent set is
+/// the all-time inflow set — a consumer summing the distinct
+/// `(tx_hash, output_index)` contributions arrives at the full
+/// historical burn balance without needing a dedicated snapshot
+/// event.
+///
+/// Idempotent by design: re-running the walk (address re-added,
+/// or a host recapture) re-emits the same `AddressBurn`s, so
+/// consumers MUST dedup on `(tx_hash, output_index)` rather than
+/// blindly accumulating.
+fn cold_start_address(addr: &str) {
+    let refs = chain_data::utxos_by_address(addr);
+    if refs.len() >= COLD_START_CAP {
+        logging::log(
+            LogLevel::Warn,
+            LOG_TARGET,
+            &format!(
+                "cold-start address={addr}: hit COLD_START_CAP={COLD_START_CAP}; bootstrap walk suppressed"
+            ),
+        );
+        return;
     }
+    let mut burn_events = 0usize;
+    for chunk in refs.chunks(1024) {
+        let chunk = chunk.to_vec();
+        let outputs = chain_data::read_utxos(&chunk);
+        if outputs.len() != chunk.len() {
+            // `read_utxos` is positionally parallel to its
+            // input; a length mismatch means we can't safely
+            // zip refs to outputs. Abort rather than emit
+            // misattributed burns.
+            logging::log(
+                LogLevel::Error,
+                LOG_TARGET,
+                &format!(
+                    "cold-start address={addr}: read_utxos returned {} output(s) for {} ref(s); bootstrap walk aborted",
+                    outputs.len(),
+                    chunk.len()
+                ),
+            );
+            return;
+        }
+        for (oref, output) in chunk.iter().zip(outputs.iter()) {
+            if output.assets.is_empty() {
+                continue;
+            }
+            emit_output_burns(
+                addr,
+                &hex::encode(&oref.tx_hash),
+                oref.index,
+                &output.assets,
+            );
+            burn_events += output.assets.len();
+        }
+    }
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!(
+            "cold-start address={addr}: {} UTxO(s) → {burn_events} burn event(s)",
+            refs.len()
+        ),
+    );
 }
 
 /// Decode the CBOR-encoded interest predicates and update the
@@ -142,15 +234,28 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
             _ => None,
         })
         .collect();
+    // Track addresses *new* to the watched set so the bootstrap
+    // walk runs only for those — re-asserting an already-watched
+    // address (companion reconnect) must not re-scan.
+    let mut added: Vec<String> = Vec::new();
     let final_size = WATCHED_ADDRS.with(|set| {
         let mut set = set.borrow_mut();
         match op {
             InterestOp::Replace => {
-                set.clear();
-                set.extend(addresses);
+                let prev = std::mem::take(&mut *set);
+                set.extend(addresses.iter().cloned());
+                for a in set.iter() {
+                    if !prev.contains(a) {
+                        added.push(a.clone());
+                    }
+                }
             }
             InterestOp::Add => {
-                set.extend(addresses);
+                for a in addresses {
+                    if set.insert(a.clone()) {
+                        added.push(a);
+                    }
+                }
             }
             InterestOp::Remove => {
                 for a in &addresses {
@@ -166,6 +271,14 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
         LOG_TARGET,
         &format!("interest update applied; now watching {final_size} address(es)"),
     );
+
+    // Bootstrap each newly-watched address: synthesise burn
+    // events for its current unspent UTxOs so a fresh consumer
+    // sees the full historical balance, not just burns from now
+    // on.
+    for addr in &added {
+        cold_start_address(addr);
+    }
 }
 
 /// Serialise the current watched-address set as CBOR and write
