@@ -82,6 +82,15 @@ const HASH_BYTES: usize = 28;
 /// companion has subscribed it to.
 const KV_TRACKED_INTERESTS: &str = "tracked-interests";
 
+/// state-kv key for the re-entrant `rebootstrap` continuation
+/// cursor — the index of the predicate currently being
+/// re-scanned (8 BE bytes). Durable so a host restart mid-round
+/// resumes at the right predicate; per-page progress within a
+/// predicate is thread-local + volatile (a trap/restart restarts
+/// the current predicate from page 0, safe — each predicate
+/// emits a full authoritative `Snapshot`).
+const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
+
 /// Per-page hint for the cold-start scan. `utxos_by_address` /
 /// `utxos_by_payment_cred` are paged (`WASM_BUDGET_CHUNKING.md`);
 /// this is a generous upper bound — the host clamps each page to
@@ -100,12 +109,38 @@ thread_local! {
     /// as `TRACKED_ADDRESSES` for the CrowdLock-style sweep.
     static TRACKED_PAYMENT_CREDS: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
 
-    /// Pending `(addresses, payment_creds)` for an in-progress
-    /// `rebootstrap` round. `None` between rounds. The host's
-    /// recapture loop drains this one cold-start per `rebootstrap`
-    /// call so each gets a fresh fuel budget.
-    static REBOOTSTRAP_QUEUE: RefCell<Option<(Vec<String>, Vec<[u8; HASH_BYTES]>)>> =
-        RefCell::new(None);
+    /// In-flight `rebootstrap` round. `None` between rounds.
+    /// Resident in the wasm instance across the host's re-entrant
+    /// call loop; a trap or host restart discards it and the
+    /// round resumes from the state-kv cursor (`predicate_idx`).
+    static REBOOTSTRAP_STATE: RefCell<Option<RebootstrapRound>> = RefCell::new(None);
+}
+
+/// One predicate of a `rebootstrap` round — a watched address or
+/// a watched payment credential.
+enum RebootstrapPredicate {
+    Address(String),
+    PaymentCred([u8; HASH_BYTES]),
+}
+
+/// In-flight `rebootstrap` round state — see `rebootstrap`.
+struct RebootstrapRound {
+    /// Watched predicates: sorted addresses first, then sorted
+    /// payment creds — a stable order so `predicate_idx` survives
+    /// a host restart.
+    predicates: Vec<RebootstrapPredicate>,
+    /// Index of the predicate currently being re-scanned.
+    predicate_idx: usize,
+    /// Continuation token for the next page of the current
+    /// predicate; `None` ⇒ start at page 0.
+    after: Option<Vec<u8>>,
+    /// Accumulating lock entries for the current predicate —
+    /// resident across its pages, drained when it completes.
+    locks: Vec<LockEntry>,
+    /// Tip slot the current predicate's scan is frozen as-of.
+    anchor_slot: u64,
+    /// UTxOs folded into the current predicate so far.
+    utxos_scanned: usize,
 }
 
 // ============================================================
@@ -193,6 +228,25 @@ fn restore_tracked_interests() {
         LOG_TARGET,
         &format!("restored {addr_count} address(es) + {cred_count} payment-cred(s) from state-kv"),
     );
+}
+
+// ============================================================
+// Rebootstrap continuation cursor (durable predicate index)
+// ============================================================
+
+fn save_rebootstrap_cursor(predicate_idx: usize) {
+    state_kv::set_value(KV_REBOOTSTRAP_CURSOR, &(predicate_idx as u64).to_be_bytes());
+}
+
+fn load_rebootstrap_cursor() -> usize {
+    state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(|b| u64::from_be_bytes(b) as usize)
+        .unwrap_or(0)
+}
+
+fn clear_rebootstrap_cursor() {
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
 }
 
 // ============================================================
@@ -894,60 +948,117 @@ impl Guest for Module {
         Ok(())
     }
 
-    /// Re-emit lock snapshots for every tracked address + payment
-    /// credential. `init` restores the tracked sets from
-    /// `state-kv`, so the module already knows what it watches;
-    /// the host's recapture flow calls this after `start()` to
-    /// refill companions whose projected state was just dropped.
-    /// Each `cold_start_*` re-scans the chain and emits a fresh
-    /// `Snapshot` — idempotent.
     /// Re-emit lock snapshots for watched addresses + payment
-    /// credentials. Processes **one predicate per call** so the
-    /// host can refuel between cold-starts — scanning every
-    /// predicate in one wasm call overruns its fuel budget.
-    /// Returns `1` when a predicate was re-scanned, `0` when the
-    /// round is complete; the host's recapture loop calls until
-    /// `0`. Addresses drain first, then payment creds. Each
-    /// `cold_start_*` is a fresh authoritative re-emit —
-    /// idempotent.
-    fn rebootstrap() -> Result<u64, String> {
-        enum Next {
-            Address(String),
-            Cred([u8; HASH_BYTES]),
-            Done,
-        }
-        let next = REBOOTSTRAP_QUEUE.with(|q| {
-            let mut q = q.borrow_mut();
-            if q.is_none() {
-                let addresses: Vec<String> =
+    /// credentials — **one bounded page per call**
+    /// (`WASM_BUDGET_CHUNKING.md`). The host loops, refuelling
+    /// each call, until a step comes back `done`; a page of UTxOs
+    /// fits one fuel budget, a whole busy predicate does not.
+    ///
+    /// Round state (predicate list + page cursor + accumulating
+    /// lock set) is thread-local; the durable cursor in
+    /// `state-kv` is only the `predicate_idx`, so a trap or host
+    /// restart restarts the current predicate from page 0 — safe,
+    /// since each predicate emits a full authoritative `Snapshot`.
+    /// Addresses are scanned before payment creds.
+    ///
+    /// `init` restores the tracked sets from `state-kv`, so the
+    /// module knows what it watches.
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        REBOOTSTRAP_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+
+            // First call of a round (or the thread-local was
+            // wiped by a trap/restart) — rebuild round state. The
+            // predicate list is sorted (addresses, then creds) so
+            // `predicate_idx` is stable across a host restart.
+            if state.is_none() {
+                let mut addresses: Vec<String> =
                     TRACKED_ADDRESSES.with(|s| s.borrow().iter().cloned().collect());
-                let creds: Vec<[u8; HASH_BYTES]> =
+                addresses.sort_unstable();
+                let mut creds: Vec<[u8; HASH_BYTES]> =
                     TRACKED_PAYMENT_CREDS.with(|s| s.borrow().iter().copied().collect());
-                *q = Some((addresses, creds));
+                creds.sort_unstable();
+                let mut predicates: Vec<RebootstrapPredicate> =
+                    Vec::with_capacity(addresses.len() + creds.len());
+                predicates.extend(addresses.into_iter().map(RebootstrapPredicate::Address));
+                predicates.extend(creds.into_iter().map(RebootstrapPredicate::PaymentCred));
+                let predicate_idx = load_rebootstrap_cursor().min(predicates.len());
+                *state = Some(RebootstrapRound {
+                    predicates,
+                    predicate_idx,
+                    after: None,
+                    locks: Vec::new(),
+                    anchor_slot: 0,
+                    utxos_scanned: 0,
+                });
             }
-            let pending = q.as_mut().expect("queue populated above");
-            if let Some(addr) = pending.0.pop() {
-                Next::Address(addr)
-            } else if let Some(cred) = pending.1.pop() {
-                Next::Cred(cred)
-            } else {
-                Next::Done
+            let round = state.as_mut().expect("round initialised above");
+
+            // No predicates left — round done.
+            if round.predicate_idx >= round.predicates.len() {
+                clear_rebootstrap_cursor();
+                *state = None;
+                return Ok(RebootstrapStep {
+                    done: true,
+                    ingested: 0,
+                });
             }
-        });
-        match next {
-            Next::Address(addr) => {
-                cold_start_address(&addr);
-                Ok(1)
+
+            // Process exactly one page of the current predicate.
+            let page = match &round.predicates[round.predicate_idx] {
+                RebootstrapPredicate::Address(addr) => chain_data::utxos_by_address(
+                    addr,
+                    round.after.as_deref(),
+                    COLD_START_PAGE_HINT,
+                ),
+                RebootstrapPredicate::PaymentCred(cred) => chain_data::utxos_by_payment_cred(
+                    cred,
+                    round.after.as_deref(),
+                    COLD_START_PAGE_HINT,
+                ),
+            };
+            let ingested = page.refs.len() as u64;
+            round.anchor_slot = page.anchor_slot;
+            round.utxos_scanned += page.refs.len();
+            let page_locks = build_snapshot_locks(&page.refs);
+            round.locks.extend(page_locks);
+
+            let predicate_done = page.next.is_none();
+            round.after = page.next;
+
+            if !predicate_done {
+                // More pages for this predicate — keep the round.
+                return Ok(RebootstrapStep {
+                    done: false,
+                    ingested,
+                });
             }
-            Next::Cred(cred) => {
-                cold_start_payment_cred(&cred);
-                Ok(1)
+
+            // Predicate fully scanned — emit its snapshot, then
+            // advance the durable cursor to the next predicate.
+            let (kind, value) = match &round.predicates[round.predicate_idx] {
+                RebootstrapPredicate::Address(addr) => (InterestKind::Address, addr.clone()),
+                RebootstrapPredicate::PaymentCred(cred) => {
+                    (InterestKind::PaymentCred, hex::encode(cred))
+                }
+            };
+            let locks = std::mem::take(&mut round.locks);
+            emit_snapshot(kind, value, locks, round.utxos_scanned, round.anchor_slot);
+            round.predicate_idx += 1;
+            round.after = None;
+            round.utxos_scanned = 0;
+            save_rebootstrap_cursor(round.predicate_idx);
+            let round_done = round.predicate_idx >= round.predicates.len();
+
+            if round_done {
+                clear_rebootstrap_cursor();
+                *state = None;
             }
-            Next::Done => {
-                REBOOTSTRAP_QUEUE.with(|q| *q.borrow_mut() = None);
-                Ok(0)
-            }
-        }
+            Ok(RebootstrapStep {
+                done: round_done,
+                ingested,
+            })
+        })
     }
 }
 

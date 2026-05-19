@@ -117,6 +117,21 @@ interface types {
         backoff-cap-ms: u32,
     }
 
+    /// One bounded step of a re-entrant `rebootstrap` round. The
+    /// host loops `rebootstrap`, applying a fresh fuel budget per
+    /// call, until a step comes back `done`. See
+    /// `docs/design/WASM_BUDGET_CHUNKING.md`.
+    record rebootstrap-step {
+        /// `true` ⇒ the whole round is complete; the host stops
+        /// looping. `false` ⇒ more work remains; the host
+        /// refuels and calls again.
+        done: bool,
+        /// UTxOs this step processed. Not a flag — meaningful
+        /// telemetry the host sums into the recapture's
+        /// `events_emitted` ("re-scanned N UTxOs across M steps").
+        ingested: u64,
+    }
+
     // ============================================================
     // Event variants
     // ============================================================
@@ -452,7 +467,7 @@ interface interest {
 }
 
 world mitos-module-v2 {
-    use types.{trap-strategy, retry-policy, dispatch-event};
+    use types.{trap-strategy, retry-policy, dispatch-event, rebootstrap-step};
     use interest.{interest-op};
 
     import chain-data;
@@ -505,15 +520,19 @@ world mitos-module-v2 {
     /// Event-driven modules (whose refill comes from the host
     /// replaying `[interest]` UTxOs through `handle-events`)
     /// implement this as a no-op — `run_bootstrap` already
-    /// covers them. Self-bootstrapping modules
-    /// (`holder-distribution`, `burn-address`, `vesting-tracker`)
-    /// re-scan every predicate in their restored interest set
-    /// and re-emit. MUST be idempotent: recapture may run it
-    /// repeatedly.
+    /// covers them; they return `{ done: true, ingested: 0 }`.
+    /// Self-bootstrapping modules (`holder-distribution`,
+    /// `burn-address`, `vesting-tracker`) re-scan their restored
+    /// interest set and re-emit. MUST be idempotent: recapture
+    /// may run it repeatedly.
     ///
-    /// Returns the number of interest predicates re-bootstrapped
-    /// (one cold-start unit each) — `0` for the no-op case. The
-    /// host surfaces this as the recapture's `events_emitted` so
-    /// an operator can see the refill did real work.
-    export rebootstrap: func() -> result<u64, string>;
+    /// **Re-entrant** (`WASM_BUDGET_CHUNKING.md`): one call does
+    /// one bounded page of work and reports `done` + an
+    /// `ingested` count. The host loops, refuelling each call,
+    /// until a step comes back `done`. A page of UTxOs fits one
+    /// fuel budget; a whole large policy does not — so the
+    /// cold-start scan is spread across many calls. The host
+    /// sums `ingested` and surfaces it as the recapture's
+    /// `events_emitted`.
+    export rebootstrap: func() -> result<rebootstrap-step, string>;
 }

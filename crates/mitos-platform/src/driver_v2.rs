@@ -124,13 +124,14 @@ impl DriverV2 {
     /// was just dropped. Event-driven modules implement it as a
     /// no-op (their refill comes from `run_bootstrap`).
     ///
-    /// Fueled with `fuel_per_call` — the same budget the live
-    /// dynamic-interest path (`call_update_interest`) already runs
-    /// a `cold_start` under, so a module's rebootstrap fits the
-    /// same ceiling. The `Ok` payload is the count of interest
-    /// predicates the module re-bootstrapped (`0` for the no-op
-    /// case); `Err(String)` is the module's typed failure.
-    pub async fn call_rebootstrap(&mut self) -> wasmtime::Result<Result<u64, String>> {
+    /// Fueled with `fuel_per_call` — each call does one bounded
+    /// page of the module's cold-start scan and reports a
+    /// `RebootstrapStep` (`done` + an `ingested` UTxO count). The
+    /// host loops, refuelling per call, until a step comes back
+    /// `done`; `Err(String)` is the module's typed failure.
+    pub async fn call_rebootstrap(
+        &mut self,
+    ) -> wasmtime::Result<Result<crate::bindings_v2::RebootstrapStep, String>> {
         self.instance.store.set_fuel(self.fuel_per_call)?;
         // Clear the per-call OOM flag so `classify_trap` reflects
         // only this invocation if it traps.

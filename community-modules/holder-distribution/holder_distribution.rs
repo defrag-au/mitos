@@ -51,7 +51,7 @@ use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 use crate::mitos::platform_v2::types::{
-    AssetEntry as WitAssetEntry, ConsumedEvent, ProducedEvent, UtxoEvent,
+    AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "holder-distribution-module";
@@ -60,6 +60,15 @@ const LOG_TARGET: &str = "holder-distribution-module";
 /// tracked policies (CBOR list of 56-char hex strings). The
 /// per-policy ledger is keyed `ledger:<policy_hex>`.
 const KV_TRACKED_POLICIES: &str = "tracked-policies";
+
+/// state-kv key for the re-entrant `rebootstrap` continuation
+/// cursor — the index of the predicate currently being
+/// re-scanned (8 BE bytes). Durable so a host restart mid-round
+/// resumes at the right predicate. Per-page progress within a
+/// predicate is thread-local + volatile; a trap or restart
+/// restarts the current predicate from page 0 (safe — each
+/// predicate emits a full authoritative `Snapshot`).
+const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
 
 /// Per-page hint for the cold-start scan. `utxos_by_policy` is
 /// paged (see `WASM_BUDGET_CHUNKING.md`); this is a generous
@@ -79,11 +88,28 @@ thread_local! {
     /// attached companion keeps filtering correctly.
     static TRACKED_POLICIES: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
 
-    /// Pending policies for an in-progress `rebootstrap` round.
-    /// `None` between rounds. The host's recapture loop drains
-    /// this one cold-start per `rebootstrap` call so each gets a
-    /// fresh fuel budget.
-    static REBOOTSTRAP_QUEUE: RefCell<Option<Vec<[u8; HASH_BYTES]>>> = RefCell::new(None);
+    /// In-flight `rebootstrap` round. `None` between rounds.
+    /// Resident in the wasm instance across the host's re-entrant
+    /// call loop; a trap or host restart discards it and the
+    /// round resumes from the state-kv cursor (`predicate_idx`).
+    static REBOOTSTRAP_STATE: RefCell<Option<RebootstrapRound>> = RefCell::new(None);
+}
+
+/// In-flight `rebootstrap` round state — see `rebootstrap`.
+struct RebootstrapRound {
+    /// Tracked policies, **sorted** so `predicate_idx` is stable
+    /// across a host restart (a `HashSet` iteration order is not).
+    policies: Vec<[u8; HASH_BYTES]>,
+    /// Index of the predicate currently being re-scanned.
+    predicate_idx: usize,
+    /// Continuation token for the next page of the current
+    /// predicate; `None` ⇒ start at page 0.
+    after: Option<Vec<u8>>,
+    /// Accumulating ledger for the current predicate — resident
+    /// across its pages, reset when the predicate completes.
+    ledger: PolicyLedger,
+    /// UTxOs folded into the current predicate's ledger so far.
+    utxos_scanned: usize,
 }
 
 /// In-memory ledger key. `Some(stake_hash)` for key/script
@@ -252,57 +278,30 @@ fn apply_consumed_to_ledger(
 // Cold-start
 // ============================================================
 
-/// Run the bootstrap scan for a newly-registered policy:
-/// page through `utxos_by_policy` → `read_utxos` each page →
-/// fold into the ledger → persist → emit `Snapshot`.
-///
-/// The scan is **paged** (`WASM_BUDGET_CHUNKING.md`): each call
-/// to `utxos_by_policy` returns one host-clamped page plus a
-/// continuation token. Only one page of refs + one page of
-/// resolved outputs is ever resident — the accumulating
-/// `PolicyLedger` is bounded by holder count, not UTxO count —
-/// so a large policy can't OOM the guest's linear memory.
-fn cold_start(policy: &[u8; HASH_BYTES]) {
-    let policy_hex = hex::encode(policy);
-
-    let mut ledger = PolicyLedger::default();
-    let mut after: Option<Vec<u8>> = None;
-    // Assigned on every loop iteration before it is read after
-    // the loop — the `loop` body always runs at least once.
-    let mut anchor_slot: u64;
-    let mut total_utxos: usize = 0;
-
-    loop {
-        let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
-        // `anchor_slot` is stable across every page of one frozen
-        // scan — the host stamps each page with the tip the scan
-        // was taken as-of.
-        anchor_slot = page.anchor_slot;
-        total_utxos += page.refs.len();
-
-        // Resolve + fold this page. Both `page.refs` and the
-        // resolved outputs are dropped before the next page.
-        let outputs = chain_data::read_utxos(&page.refs);
-        for out in outputs {
-            let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
-            apply_produced_to_ledger(
-                &mut ledger,
-                policy,
-                &out.address,
-                &out.assets,
-                &mut _touched_dummy,
-            );
-        }
-
-        match page.next {
-            Some(token) => after = Some(token),
-            None => break,
-        }
+/// Resolve + fold one page of a policy scan into `ledger`. Both
+/// `refs` and the resolved outputs are dropped at return, so the
+/// only state that grows across pages is the holder-bounded
+/// `ledger` itself.
+fn fold_page(ledger: &mut PolicyLedger, policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) {
+    let outputs = chain_data::read_utxos(refs);
+    for out in outputs {
+        let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
+        apply_produced_to_ledger(ledger, policy, &out.address, &out.assets, &mut _touched_dummy);
     }
+}
 
-    persist_ledger(&policy_hex, &ledger);
-
-    let holders = ledger_to_holders(&ledger);
+/// Persist a policy's ledger + emit its `Snapshot`. Shared by
+/// the live cold-start (`cold_start`) and the re-entrant
+/// `rebootstrap` page machine.
+fn finalize_policy_snapshot(
+    policy: &[u8; HASH_BYTES],
+    ledger: &PolicyLedger,
+    anchor_slot: u64,
+    total_utxos: usize,
+) {
+    let policy_hex = hex::encode(policy);
+    persist_ledger(&policy_hex, ledger);
+    let holders = ledger_to_holders(ledger);
     let snapshot = HolderSnapshot {
         policy: policy_hex.clone(),
         // `anchor_slot` from the frozen scan — the tip the
@@ -323,6 +322,37 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
             ledger.holders.len()
         ),
     );
+}
+
+/// Run the bootstrap scan for a newly-registered policy in one
+/// call: page through `utxos_by_policy` → fold each page → emit
+/// `Snapshot`. Used by the live `update_interest` add path.
+///
+/// The scan is **paged** (`WASM_BUDGET_CHUNKING.md`): each call
+/// to `utxos_by_policy` returns one host-clamped page, so the
+/// only resident state is the holder-bounded ledger. The
+/// re-entrant `rebootstrap` path (recapture) spreads the same
+/// scan across many fuel-budgeted calls — see `rebootstrap`.
+fn cold_start(policy: &[u8; HASH_BYTES]) {
+    let mut ledger = PolicyLedger::default();
+    let mut after: Option<Vec<u8>> = None;
+    // Assigned on every loop iteration before it is read after
+    // the loop — the `loop` body always runs at least once.
+    let mut anchor_slot: u64;
+    let mut total_utxos: usize = 0;
+
+    loop {
+        let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
+        anchor_slot = page.anchor_slot;
+        total_utxos += page.refs.len();
+        fold_page(&mut ledger, policy, &page.refs);
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
+    }
+
+    finalize_policy_snapshot(policy, &ledger, anchor_slot, total_utxos);
 }
 
 /// Render the in-memory `PolicyLedger` as the wire-shape
@@ -633,6 +663,25 @@ fn load_ledger(policy_hex: &str) -> PolicyLedger {
 }
 
 // ============================================================
+// Rebootstrap continuation cursor (durable predicate index)
+// ============================================================
+
+fn save_rebootstrap_cursor(predicate_idx: usize) {
+    state_kv::set_value(KV_REBOOTSTRAP_CURSOR, &(predicate_idx as u64).to_be_bytes());
+}
+
+fn load_rebootstrap_cursor() -> usize {
+    state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(|b| u64::from_be_bytes(b) as usize)
+        .unwrap_or(0)
+}
+
+fn clear_rebootstrap_cursor() {
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+}
+
+// ============================================================
 // Emit
 // ============================================================
 
@@ -702,39 +751,95 @@ impl Guest for Module {
         Ok(())
     }
 
-    /// Re-emit the holder ledger for tracked policies. Processes
-    /// **one policy per call** so the host can refuel between
-    /// cold-starts — a multi-policy scan overruns a single wasm
-    /// call's fuel budget. Returns `1` when a policy was
-    /// re-scanned, `0` when the round is complete; the host's
-    /// recapture loop calls until `0`.
+    /// Re-emit the holder ledger for tracked policies — **one
+    /// bounded page per call** (`WASM_BUDGET_CHUNKING.md`). The
+    /// host loops, refuelling each call, until a step comes back
+    /// `done`; a page of UTxOs fits one fuel budget, a whole
+    /// large policy does not.
+    ///
+    /// Round state (predicate list + page cursor + accumulating
+    /// ledger) is thread-local — resident in the wasm instance
+    /// across the host's loop. The durable cursor in `state-kv`
+    /// (`KV_REBOOTSTRAP_CURSOR`) is only the `predicate_idx`, so
+    /// a trap or host restart restarts the *current* predicate
+    /// from page 0 — safe, since each predicate emits a full
+    /// authoritative `Snapshot`.
     ///
     /// `init` restores `TRACKED_POLICIES` from `state-kv`, so the
-    /// module knows what to re-scan. `cold_start` re-scans
-    /// `utxos_by_policy` and emits a fresh `Snapshot`, so this is
-    /// idempotent — recapture may run it repeatedly.
-    fn rebootstrap() -> Result<u64, String> {
-        let next = REBOOTSTRAP_QUEUE.with(|q| {
-            let mut q = q.borrow_mut();
-            if q.is_none() {
-                // Start of a round — snapshot the tracked set.
-                *q = Some(
-                    TRACKED_POLICIES.with(|s| s.borrow().iter().copied().collect()),
-                );
+    /// module knows what to re-scan; idempotent — recapture may
+    /// run a round repeatedly.
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        REBOOTSTRAP_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+
+            // First call of a round (or the thread-local was
+            // wiped by a trap/restart) — rebuild round state. The
+            // policy list is sorted so `predicate_idx` is stable.
+            if state.is_none() {
+                let mut policies: Vec<[u8; HASH_BYTES]> =
+                    TRACKED_POLICIES.with(|s| s.borrow().iter().copied().collect());
+                policies.sort_unstable();
+                let predicate_idx = load_rebootstrap_cursor().min(policies.len());
+                *state = Some(RebootstrapRound {
+                    policies,
+                    predicate_idx,
+                    after: None,
+                    ledger: PolicyLedger::default(),
+                    utxos_scanned: 0,
+                });
             }
-            q.as_mut().and_then(|pending| pending.pop())
-        });
-        match next {
-            Some(policy) => {
-                cold_start(&policy);
-                Ok(1)
+            let round = state.as_mut().expect("round initialised above");
+
+            // No predicates left (empty tracked set, or resumed
+            // past the end) — round done.
+            if round.predicate_idx >= round.policies.len() {
+                clear_rebootstrap_cursor();
+                *state = None;
+                return Ok(RebootstrapStep {
+                    done: true,
+                    ingested: 0,
+                });
             }
-            None => {
-                // Round complete — reset for the next recapture.
-                REBOOTSTRAP_QUEUE.with(|q| *q.borrow_mut() = None);
-                Ok(0)
+
+            // Process exactly one page of the current predicate.
+            let policy = round.policies[round.predicate_idx];
+            let page =
+                chain_data::utxos_by_policy(&policy, round.after.as_deref(), COLD_START_PAGE_HINT);
+            let ingested = page.refs.len() as u64;
+            let anchor_slot = page.anchor_slot;
+            fold_page(&mut round.ledger, &policy, &page.refs);
+            round.utxos_scanned += page.refs.len();
+
+            let predicate_done = page.next.is_none();
+            round.after = page.next;
+
+            if !predicate_done {
+                // More pages for this predicate — keep the round.
+                return Ok(RebootstrapStep {
+                    done: false,
+                    ingested,
+                });
             }
-        }
+
+            // Predicate fully scanned — emit its snapshot, then
+            // advance the durable cursor to the next predicate.
+            finalize_policy_snapshot(&policy, &round.ledger, anchor_slot, round.utxos_scanned);
+            round.predicate_idx += 1;
+            round.after = None;
+            round.ledger = PolicyLedger::default();
+            round.utxos_scanned = 0;
+            save_rebootstrap_cursor(round.predicate_idx);
+            let round_done = round.predicate_idx >= round.policies.len();
+
+            if round_done {
+                clear_rebootstrap_cursor();
+                *state = None;
+            }
+            Ok(RebootstrapStep {
+                done: round_done,
+                ingested,
+            })
+        })
     }
 }
 

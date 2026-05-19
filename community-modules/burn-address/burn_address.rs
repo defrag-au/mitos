@@ -28,7 +28,9 @@ use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 // `DispatchEvent`, `TrapStrategy`, `RetryPolicy`, `InterestOp`,
 // and the `Guest` trait come from world-level `use ...` clauses.
-use crate::mitos::platform_v2::types::{AssetEntry, ProducedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{
+    AssetEntry, OutputRef as WitOutputRef, ProducedEvent, UtxoEvent,
+};
 
 const LOG_TARGET: &str = "burn-address-module";
 /// state-kv key under which we persist the resolved
@@ -37,6 +39,15 @@ const LOG_TARGET: &str = "burn-address-module";
 /// cheaper than per-address keys for the small sets typical
 /// of burn-sink consumers.
 const KV_WATCHED_ADDRS: &str = "watched-addresses";
+
+/// state-kv key for the re-entrant `rebootstrap` continuation
+/// cursor — the index of the watched address currently being
+/// re-scanned (8 BE bytes). Durable so a host restart mid-round
+/// resumes at the right address; per-page progress is
+/// thread-local + volatile (a trap/restart restarts the current
+/// address from page 0, safe because burns are idempotent —
+/// consumers dedup on `(tx_hash, output_index)`).
+const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
 /// Per-page hint for the cold-start scan. `utxos_by_address` is
 /// paged (`WASM_BUDGET_CHUNKING.md`); this is a generous upper
 /// bound — the host clamps each page to its own adaptive
@@ -61,11 +72,26 @@ const COLD_START_PAGE_HINT: u32 = 10_000;
 thread_local! {
     static WATCHED_ADDRS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
-    /// Pending addresses for an in-progress `rebootstrap` round.
-    /// `None` between rounds. The host's recapture loop drains
-    /// this one cold-start per `rebootstrap` call so each gets a
-    /// fresh fuel budget.
-    static REBOOTSTRAP_QUEUE: RefCell<Option<Vec<String>>> = RefCell::new(None);
+    /// In-flight `rebootstrap` round. `None` between rounds.
+    /// Resident in the wasm instance across the host's re-entrant
+    /// call loop; a trap or host restart discards it and the
+    /// round resumes from the state-kv cursor (`predicate_idx`).
+    static REBOOTSTRAP_STATE: RefCell<Option<RebootstrapRound>> = RefCell::new(None);
+}
+
+/// In-flight `rebootstrap` round state — see `rebootstrap`.
+/// Burn-address has no resident accumulator: each page emits its
+/// `AddressBurn`s directly, so only the predicate list + page
+/// cursor are carried.
+struct RebootstrapRound {
+    /// Watched addresses, **sorted** so `predicate_idx` is stable
+    /// across a host restart (a `HashSet` iteration order is not).
+    addresses: Vec<String>,
+    /// Index of the address currently being re-scanned.
+    predicate_idx: usize,
+    /// Continuation token for the next page of the current
+    /// address; `None` ⇒ start at page 0.
+    after: Option<Vec<u8>>,
 }
 
 /// Minimal mirror of the on-wire `InterestPredicate` enum.
@@ -160,11 +186,42 @@ fn handle_produced(p: &ProducedEvent) {
 /// or a host recapture) re-emits the same `AddressBurn`s, so
 /// consumers MUST dedup on `(tx_hash, output_index)` rather than
 /// blindly accumulating.
+fn process_address_page(addr: &str, refs: &[WitOutputRef]) -> Option<usize> {
+    let outputs = chain_data::read_utxos(refs);
+    if outputs.len() != refs.len() {
+        // `read_utxos` is positionally parallel to its input; a
+        // length mismatch means we can't safely zip refs to
+        // outputs. Signal abort rather than emit misattributed
+        // burns.
+        logging::log(
+            LogLevel::Error,
+            LOG_TARGET,
+            &format!(
+                "cold-start address={addr}: read_utxos returned {} output(s) for {} ref(s); bootstrap walk aborted",
+                outputs.len(),
+                refs.len()
+            ),
+        );
+        return None;
+    }
+    let mut burn_events = 0usize;
+    for (oref, output) in refs.iter().zip(outputs.iter()) {
+        if output.assets.is_empty() {
+            continue;
+        }
+        emit_output_burns(addr, &hex::encode(&oref.tx_hash), oref.index, &output.assets);
+        burn_events += output.assets.len();
+    }
+    Some(burn_events)
+}
+
 fn cold_start_address(addr: &str) {
     // Paged walk (`WASM_BUDGET_CHUNKING.md`): each
     // `utxos_by_address` call returns one host-clamped page plus
     // a continuation token. Only one page of refs + its resolved
-    // outputs is ever resident.
+    // outputs is ever resident. Used by the live `update_interest`
+    // add path; the re-entrant `rebootstrap` path spreads the
+    // same walk across fuel-budgeted calls.
     let mut burn_events = 0usize;
     let mut total_utxos = 0usize;
     let mut after: Option<Vec<u8>> = None;
@@ -172,37 +229,10 @@ fn cold_start_address(addr: &str) {
     loop {
         let page = chain_data::utxos_by_address(addr, after.as_deref(), COLD_START_PAGE_HINT);
         total_utxos += page.refs.len();
-
-        let outputs = chain_data::read_utxos(&page.refs);
-        if outputs.len() != page.refs.len() {
-            // `read_utxos` is positionally parallel to its
-            // input; a length mismatch means we can't safely
-            // zip refs to outputs. Abort rather than emit
-            // misattributed burns.
-            logging::log(
-                LogLevel::Error,
-                LOG_TARGET,
-                &format!(
-                    "cold-start address={addr}: read_utxos returned {} output(s) for {} ref(s); bootstrap walk aborted",
-                    outputs.len(),
-                    page.refs.len()
-                ),
-            );
-            return;
+        match process_address_page(addr, &page.refs) {
+            Some(n) => burn_events += n,
+            None => return,
         }
-        for (oref, output) in page.refs.iter().zip(outputs.iter()) {
-            if output.assets.is_empty() {
-                continue;
-            }
-            emit_output_burns(
-                addr,
-                &hex::encode(&oref.tx_hash),
-                oref.index,
-                &output.assets,
-            );
-            burn_events += output.assets.len();
-        }
-
         match page.next {
             Some(token) => after = Some(token),
             None => break,
@@ -341,6 +371,25 @@ fn restore_watched_addrs_from_kv() {
 }
 
 // ============================================================
+// Rebootstrap continuation cursor (durable predicate index)
+// ============================================================
+
+fn save_rebootstrap_cursor(predicate_idx: usize) {
+    state_kv::set_value(KV_REBOOTSTRAP_CURSOR, &(predicate_idx as u64).to_be_bytes());
+}
+
+fn load_rebootstrap_cursor() -> usize {
+    state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(|b| u64::from_be_bytes(b) as usize)
+        .unwrap_or(0)
+}
+
+fn clear_rebootstrap_cursor() {
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+}
+
+// ============================================================
 // v2 Guest impl
 // ============================================================
 
@@ -393,41 +442,88 @@ impl Guest for Module {
         Ok(())
     }
 
-    /// Re-emit burn events for every watched address. `init`
-    /// restores `WATCHED_ADDRS` from `state-kv`, so the module
-    /// already knows what it watches; the host's recapture flow
-    /// calls this after `start()` to refill companions whose
-    /// projected state was just dropped. `cold_start_address`
-    /// re-walks each address's current unspent set — idempotent
-    /// (consumers dedup on `(tx_hash, output_index)`).
-    /// Re-emit burn events for watched addresses. Processes **one
-    /// address per call** so the host can refuel between
-    /// cold-start walks — a multi-address walk overruns a single
-    /// wasm call's fuel budget. Returns `1` when an address was
-    /// re-walked, `0` when the round is complete; the host's
-    /// recapture loop calls until `0`. `cold_start_address`
-    /// re-walks the address's current unspent set — idempotent
-    /// (consumers dedup on `(tx_hash, output_index)`).
-    fn rebootstrap() -> Result<u64, String> {
-        let next = REBOOTSTRAP_QUEUE.with(|q| {
-            let mut q = q.borrow_mut();
-            if q.is_none() {
-                *q = Some(
-                    WATCHED_ADDRS.with(|s| s.borrow().iter().cloned().collect()),
-                );
+    /// Re-emit burn events for watched addresses — **one bounded
+    /// page per call** (`WASM_BUDGET_CHUNKING.md`). The host
+    /// loops, refuelling each call, until a step comes back
+    /// `done`; a page of UTxOs fits one fuel budget, a whole
+    /// busy address does not.
+    ///
+    /// Round state (address list + page cursor) is thread-local;
+    /// the durable cursor in `state-kv` is only the
+    /// `predicate_idx`, so a trap or host restart restarts the
+    /// current address from page 0. Safe — burns are idempotent
+    /// (consumers dedup on `(tx_hash, output_index)`), and burn
+    /// sinks are never respent so re-walking re-emits the same
+    /// set.
+    ///
+    /// `init` restores `WATCHED_ADDRS` from `state-kv`, so the
+    /// module knows what it watches.
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        REBOOTSTRAP_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+
+            // First call of a round (or the thread-local was
+            // wiped by a trap/restart) — rebuild round state. The
+            // address list is sorted so `predicate_idx` is stable.
+            if state.is_none() {
+                let mut addresses: Vec<String> =
+                    WATCHED_ADDRS.with(|s| s.borrow().iter().cloned().collect());
+                addresses.sort_unstable();
+                let predicate_idx = load_rebootstrap_cursor().min(addresses.len());
+                *state = Some(RebootstrapRound {
+                    addresses,
+                    predicate_idx,
+                    after: None,
+                });
             }
-            q.as_mut().and_then(|pending| pending.pop())
-        });
-        match next {
-            Some(addr) => {
-                cold_start_address(&addr);
-                Ok(1)
+            let round = state.as_mut().expect("round initialised above");
+
+            // No addresses left — round done.
+            if round.predicate_idx >= round.addresses.len() {
+                clear_rebootstrap_cursor();
+                *state = None;
+                return Ok(RebootstrapStep {
+                    done: true,
+                    ingested: 0,
+                });
             }
-            None => {
-                REBOOTSTRAP_QUEUE.with(|q| *q.borrow_mut() = None);
-                Ok(0)
+
+            // Process exactly one page of the current address.
+            let addr = round.addresses[round.predicate_idx].clone();
+            let page =
+                chain_data::utxos_by_address(&addr, round.after.as_deref(), COLD_START_PAGE_HINT);
+            let ingested = page.refs.len() as u64;
+
+            // A `read_utxos` length mismatch aborts this address —
+            // skip the rest of its pages, advance to the next.
+            let page_ok = process_address_page(&addr, &page.refs).is_some();
+            let has_more_pages = page_ok && page.next.is_some();
+
+            if has_more_pages {
+                // More pages for this address — keep the round.
+                round.after = page.next;
+                return Ok(RebootstrapStep {
+                    done: false,
+                    ingested,
+                });
             }
-        }
+
+            // Address fully walked (or aborted) — advance the
+            // durable cursor to the next address.
+            round.predicate_idx += 1;
+            round.after = None;
+            save_rebootstrap_cursor(round.predicate_idx);
+            let round_done = round.predicate_idx >= round.addresses.len();
+
+            if round_done {
+                clear_rebootstrap_cursor();
+                *state = None;
+            }
+            Ok(RebootstrapStep {
+                done: round_done,
+                ingested,
+            })
+        })
     }
 }
 

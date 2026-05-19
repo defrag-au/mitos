@@ -139,9 +139,13 @@ impl Guest for Module {
 
     /// No-op: event-driven modules are refilled host-side by
     /// `run_bootstrap` over the manifest `[interest]`. See the
-    /// `rebootstrap` export in `wit-v2/world.wit`.
-    fn rebootstrap() -> Result<u64, String> {
-        Ok(0)
+    /// `rebootstrap` export in `wit-v2/world.wit`. One call,
+    /// immediately `done`.
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        Ok(RebootstrapStep {
+            done: true,
+            ingested: 0,
+        })
     }
 }
 

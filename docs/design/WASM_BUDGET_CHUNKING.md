@@ -1,6 +1,6 @@
 # Wasm budget chunking — re-entrant operations for unbounded work
 
-**Status: Phases 1–2 landed** (2026-05-19); Phases 3–5 pending —
+**Status: Phases 1–3 landed** (2026-05-19); Phases 4–5 pending —
 see "Migration / phasing". Prompted by a production
 incident: `holder-distribution`'s `cold_start` trapped in
 `cabi_realloc` during a `recapture`-driven rebootstrap of a large
@@ -388,9 +388,35 @@ already chunks via per-batch `handle-events` calls.
    `cold_start` in one `rebootstrap` call, so per-page adaptation
    and the fuel-axis fix for NIKEPIG-class single policies need
    Phase 3's re-entrancy.
-3. **Re-entrant `cold_start`** in the three self-bootstrapping
-   modules — page loop, resident accumulator, `state-kv`
-   continuation cursor, trap-retry recovery in the host loop.
+3. **Re-entrant `rebootstrap`** in the three self-bootstrapping
+   modules. *Landed 2026-05-19.* `rebootstrap` is now page-grain
+   re-entrant: WIT returns `rebootstrap-step { done, ingested }`;
+   one call does one bounded page; the host loops, refuelling
+   each call, summing `ingested`, until a step comes back `done`.
+   A whole large policy's cold-start is spread across many
+   fuel-budgeted calls — closing the fuel axis for NIKEPIG-class
+   single policies.
+
+   **Cursor model** (deviates from "Cursors" above, deliberately):
+   the durable `state-kv` cursor is the **`predicate_idx` only**.
+   The page cursor (`after` token) + the resident accumulator
+   live in a thread-local, resident across the host's re-entrant
+   loop on one instance — but volatile. A trap or host restart
+   discards the thread-local and **restarts the current
+   predicate from page 0**, which is correct because each
+   predicate emits a full authoritative `Snapshot` (idempotent
+   at the predicate grain). Storing `after` durably would be
+   useless anyway — it indexes the host's in-memory scan cache,
+   which a restart drops (`ScanError::Expired`). The predicate
+   list is sorted so `predicate_idx` is stable across a restart.
+
+   *Not done:* in-loop trap-retry ("halve + retry the same
+   page"). On a `rebootstrap` trap the host aborts the round —
+   but the Phase 2 adaptive clamp has already shrunk, so the
+   next recapture uses a smaller page, and the default page
+   (2048 refs) is sized to fit the per-call fuel budget so a
+   trap shouldn't occur in practice. A refinement, not
+   load-bearing for correctness.
 4. **Chunked snapshot protocol** — `mitos-community-events` +
    consumers. The completeness item; can trail (1)–(3) since most
    real tokens' snapshots still fit one emit.
@@ -417,8 +443,11 @@ without an upper bound.
    has no telemetry — pick a conservative default `limit` and let
    the loop converge. What default? Suggest sizing from the
    manifest fuel budget assuming a mid-weight UTxO.
-4. **Cross-call instance lifetime.** The resident accumulator
-   relies on the host looping *one* instance. Confirm the
-   recapture loop never re-instantiates between pages except on a
-   trap (where re-instantiate + state-kv resume is the intended
-   recovery).
+4. **Cross-call instance lifetime** — *resolved.* The recapture
+   loop in `host_v2.rs::start()` loops `call_rebootstrap` on one
+   `DriverV2`, i.e. one wasm instance — never re-instantiates
+   between pages. The thread-local accumulator survives across
+   the loop. A trap aborts the round (the thread-local is then
+   discarded with the instance); recovery is a fresh recapture,
+   which restarts the current predicate from its durable
+   `predicate_idx` cursor — see Phase 3 in "Migration / phasing".

@@ -489,30 +489,38 @@ where
         // restored interest. No-op for event-driven modules
         // (their refill is `run_bootstrap` above). Only the
         // recapture flow passes `rebootstrap = true`.
-        // Recapture re-bootstrap. A self-bootstrapping module
-        // re-bootstraps ONE interest predicate per `rebootstrap`
-        // call — `call_rebootstrap` returns the count processed by
-        // that call (`1`), or `0` when the round is complete. One
-        // predicate per call keeps each cold-start inside a single
-        // wasm fuel budget; doing every predicate in one call
-        // overruns it. The host loops, refuelling each call.
-        // `rebootstrap_count` is the total re-bootstrapped,
-        // surfaced to the recapture caller as `events_emitted`.
+        //
+        // `rebootstrap` is re-entrant at the *page* grain
+        // (`WASM_BUDGET_CHUNKING.md`): one call does one bounded
+        // page of the module's cold-start scan and reports a
+        // `RebootstrapStep` — `done` plus an `ingested` UTxO
+        // count. A page fits one fuel budget; a whole large
+        // policy does not, so the host loops, refuelling each
+        // call, until a step comes back `done`. `rebootstrap_count`
+        // sums `ingested` across steps — the real count of UTxOs
+        // re-scanned — and is surfaced as the recapture's
+        // `events_emitted`.
         let mut rebootstrap_count: u64 = 0;
         if rebootstrap {
             // Defensive bound — a well-behaved module drains a
-            // finite tracked-interest set; the cap only guards a
-            // module that never returns 0.
-            const REBOOTSTRAP_MAX_PREDICATES: u64 = 100_000;
+            // finite scan; the cap only guards a module that
+            // never returns `done`. Counts host calls (pages),
+            // not UTxOs.
+            const REBOOTSTRAP_MAX_STEPS: u64 = 10_000_000;
+            let mut steps: u64 = 0;
             loop {
                 match driver.call_rebootstrap().await {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        rebootstrap_count += n;
-                        if rebootstrap_count >= REBOOTSTRAP_MAX_PREDICATES {
+                    Ok(Ok(step)) => {
+                        rebootstrap_count += step.ingested;
+                        steps += 1;
+                        if step.done {
+                            break;
+                        }
+                        if steps >= REBOOTSTRAP_MAX_STEPS {
                             tracing::error!(
                                 module = %id,
-                                "v2 rebootstrap exceeded predicate cap; aborting loop",
+                                steps,
+                                "v2 rebootstrap exceeded step cap; aborting loop",
                             );
                             break;
                         }
