@@ -247,10 +247,7 @@ mod tests {
         let items_per_page = 10u64;
         let mut finished = Vec::new();
 
-        loop {
-            let Some(&predicate) = round.current() else {
-                break;
-            };
+        while let Some(&predicate) = round.current() {
             // Simulate one page.
             let page_idx = round.items() / items_per_page;
             *round.acc_mut() += items_per_page;
