@@ -29,22 +29,25 @@
 //!    ledger stays in state-kv (cheap, no GC in Phase 1 —
 //!    explicit re-add re-uses the prior ledger as a cache).
 //!
-//! ## Address → stake credential extraction
+//! ## Address → holder identity
 //!
 //! Uses `pallas-addresses::Address::from_bech32` to parse each
-//! output's bech32 + extract the staking part. Enterprise
-//! addresses (no stake) are aggregated under `stake_cred_hex:
-//! None`; pointer-stake addresses (rare) get hex-encoded
-//! pointer bytes. Byron addresses are ignored (no native asset
-//! support pre-Shelley).
+//! output's bech32. Shelley addresses with a Key or Script
+//! delegation part become `HolderId::Stake(hex)` — grouped by
+//! the 28-byte staking credential. Shelley enterprise addresses
+//! (no delegation part) become `HolderId::Enterprise(addr)` —
+//! each is its own holder, so the worker can classify burn
+//! sinks and other config-flagged enterprise contracts.
+//! Pointer-stake (rare, ~1%) and Byron addresses are dropped.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mitos_community_events::holder_distribution::{
-    AssetBalance, HolderDelta, HolderEntry, HolderEvent, SnapshotBegin, SnapshotChunk, SnapshotEnd,
+    AssetBalance, HolderDelta, HolderEntry, HolderEvent, HolderId, HolderRole, SnapshotBegin,
+    SnapshotChunk, SnapshotEnd,
 };
-use mitos_dex_decode::{cswap, lp_share};
+use mitos_dex_decode::{cswap, lp_share, splash};
 use mitos_module_kit::ReentrantRound;
 use pallas_addresses::{Address, ShelleyDelegationPart};
 use serde::{Deserialize, Serialize};
@@ -159,9 +162,9 @@ struct DecompState {
     lp_policy: [u8; HASH_BYTES],
     /// Page cursor for the LP-token holder scan.
     lp_after: Option<Vec<u8>>,
-    /// LP-token holdings accumulated so far: `stake_cred_bytes
-    /// (empty Vec for enterprise) -> lp_token_quantity`.
-    lp_holders: BTreeMap<Vec<u8>, u64>,
+    /// LP-token holdings accumulated so far: per-holder
+    /// LP-token quantity.
+    lp_holders: BTreeMap<LedgerKey, u64>,
 }
 
 /// A chunked snapshot mid-emit: the materialised holder list for
@@ -176,23 +179,34 @@ struct EmitState {
     offset: usize,
 }
 
-/// In-memory ledger key. `Some(stake_hash)` for key/script
-/// stake creds; `None` for enterprise (no-stake) outputs.
-type LedgerKey = Option<[u8; HASH_BYTES]>;
+/// In-memory ledger key — and the wire identity, in a leaner
+/// internal form. Stake-credential holders are keyed by the
+/// 28-byte cred hash (avoids a per-holder hex roundtrip);
+/// enterprise holders by their full bech32 address (each
+/// enterprise address is its own holder, not collapsed). Pointer
+/// and Byron addresses fall outside this and are dropped at
+/// extraction.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+enum LedgerKey {
+    Stake([u8; HASH_BYTES]),
+    Enterprise(String),
+}
 
 /// `(asset_name_hex_bytes -> quantity)` for one (policy, holder).
 type AssetMap = BTreeMap<Vec<u8>, u64>;
 
 /// Per-policy ledger as held in memory + persisted to state-kv.
-/// Inner map keyed by stake-cred bytes (with the enterprise
-/// bucket under `vec![]` since BTreeMap keys must be Ord +
-/// `Option<[u8;28]>` doesn't serialize to a stable on-wire shape).
-///
-/// The persistence format mirrors this 1-1.
+/// Keyed by `LedgerKey` so enterprise holders are surfaced
+/// distinctly (the old `None`-bucket collapse is retired). The
+/// persistence format mirrors this 1-1; a deploy after a
+/// `LedgerKey` shape change leaves old on-disk ledgers
+/// undeserialisable → `load_ledger` returns default → recapture
+/// rebuilds.
 #[derive(Default, Serialize, Deserialize)]
 struct PolicyLedger {
-    /// `stake_cred_bytes (empty Vec for enterprise) -> {asset_name -> qty}`.
-    holders: BTreeMap<Vec<u8>, AssetMap>,
+    holders: BTreeMap<LedgerKey, AssetMap>,
 }
 
 // ============================================================
@@ -221,48 +235,67 @@ enum InterestPredicateWire {
 }
 
 // ============================================================
-// Stake credential extraction
+// Holder identity + role
 // ============================================================
 
-/// Extract a stake-credential key for ledger storage from a
-/// bech32 address. Returns `None` for enterprise / Byron / any
-/// shape we can't classify — those holders get bucketed under
-/// the no-stake aggregator.
-fn extract_stake_key(address: &str) -> LedgerKey {
+/// Parse a bech32 address into a `LedgerKey`. Shelley addresses
+/// with a Key or Script delegation part become
+/// `LedgerKey::Stake(hash)`; Shelley addresses with no delegation
+/// (enterprise) become `LedgerKey::Enterprise(addr)` — each
+/// enterprise address is its own holder. Pointer-stake addresses
+/// (~1% of addresses) and Byron addresses are dropped (`None`).
+fn extract_holder_key(address: &str) -> Option<LedgerKey> {
     let addr = Address::from_bech32(address).ok()?;
     let shelley = match addr {
         Address::Shelley(s) => s,
-        _ => return None, // Byron, etc.
+        _ => return None, // Byron — no native asset support
     };
     match shelley.delegation() {
         ShelleyDelegationPart::Key(h) => {
             let bytes: [u8; HASH_BYTES] = (**h).into();
-            Some(bytes)
+            Some(LedgerKey::Stake(bytes))
         }
         ShelleyDelegationPart::Script(h) => {
             let bytes: [u8; HASH_BYTES] = (**h).into();
-            Some(bytes)
+            Some(LedgerKey::Stake(bytes))
         }
-        // Pointer and Null get bucketed with enterprise — pointer
-        // delegation is rare (~1% of addresses) and Null is the
-        // enterprise shape. Lumping them is fine for v1; pointer
-        // delegation can be surfaced separately later if needed.
+        ShelleyDelegationPart::Null => {
+            // Enterprise — no stake credential. Surface the
+            // address itself as the holder key so a `/dev/null`
+            // burn sink (or any enterprise wallet) reaches the
+            // worker for config-side classification.
+            Some(LedgerKey::Enterprise(address.to_string()))
+        }
+        // Pointer delegation: rare, dropped (matches the
+        // pre-generalised collapse behaviour for non-Null,
+        // non-Key/Script shapes).
         _ => None,
     }
 }
 
-fn ledger_key_bytes(key: LedgerKey) -> Vec<u8> {
+/// Convert an in-memory `LedgerKey` to its wire `HolderId`.
+fn key_to_id(key: &LedgerKey) -> HolderId {
     match key {
-        Some(h) => h.to_vec(),
-        None => Vec::new(),
+        LedgerKey::Stake(bytes) => HolderId::Stake(hex::encode(bytes)),
+        LedgerKey::Enterprise(addr) => HolderId::Enterprise(addr.clone()),
     }
 }
 
-fn stake_cred_hex(key: &[u8]) -> Option<String> {
-    if key.is_empty() {
-        None
+/// The module's role tag for a holder, from what it recognises
+/// while scanning. Pool addresses come from the shared
+/// `mitos-dex-decode` constants; the worker layers
+/// project-config classification (burns, treasury, …) on top.
+/// Cached on first call — bech32 → cred parse, once.
+fn holder_role_for(key: &LedgerKey) -> HolderRole {
+    use std::sync::LazyLock;
+    static CSWAP_POOL_KEY: LazyLock<Option<LedgerKey>> =
+        LazyLock::new(|| extract_holder_key(cswap::POOL_SCRIPT_ADDR));
+    static SPLASH_POOL_KEY: LazyLock<Option<LedgerKey>> =
+        LazyLock::new(|| extract_holder_key(splash::POOL_SCRIPT_ADDR));
+    if CSWAP_POOL_KEY.as_ref() == Some(key) || SPLASH_POOL_KEY.as_ref() == Some(key) {
+        HolderRole::DexPool
     } else {
-        Some(hex::encode(key))
+        HolderRole::Wallet
     }
 }
 
@@ -272,8 +305,7 @@ fn stake_cred_hex(key: &[u8]) -> Option<String> {
 
 /// Add `(asset_name, qty)` under `(policy, key)` in the ledger.
 fn ledger_add(ledger: &mut PolicyLedger, key: LedgerKey, asset_name: &[u8], qty: u64) {
-    let kbytes = ledger_key_bytes(key);
-    let entry = ledger.holders.entry(kbytes).or_default();
+    let entry = ledger.holders.entry(key).or_default();
     let total = entry.entry(asset_name.to_vec()).or_insert(0);
     *total = total.saturating_add(qty);
 }
@@ -283,9 +315,8 @@ fn ledger_add(ledger: &mut PolicyLedger, key: LedgerKey, asset_name: &[u8], qty:
 /// the holder entry when their last asset hits zero. Saturating
 /// subtract — if a UTxO accounting bug ever drives a balance
 /// negative we'd rather report 0 than crash.
-fn ledger_sub(ledger: &mut PolicyLedger, key: LedgerKey, asset_name: &[u8], qty: u64) {
-    let kbytes = ledger_key_bytes(key);
-    if let Some(entry) = ledger.holders.get_mut(&kbytes) {
+fn ledger_sub(ledger: &mut PolicyLedger, key: &LedgerKey, asset_name: &[u8], qty: u64) {
+    if let Some(entry) = ledger.holders.get_mut(key) {
         if let Some(total) = entry.get_mut(asset_name) {
             *total = total.saturating_sub(qty);
             if *total == 0 {
@@ -293,29 +324,36 @@ fn ledger_sub(ledger: &mut PolicyLedger, key: LedgerKey, asset_name: &[u8], qty:
             }
         }
         if entry.is_empty() {
-            ledger.holders.remove(&kbytes);
+            ledger.holders.remove(key);
         }
     }
 }
 
 /// Apply one `(address, assets)` produced output to the
 /// ledger for a single policy. Touched holders are inserted
-/// into `touched` for later delta emission.
+/// into `touched` for later delta emission. Outputs whose
+/// address doesn't parse to a usable holder key (pointer-stake,
+/// Byron) are dropped.
 fn apply_produced_to_ledger(
     ledger: &mut PolicyLedger,
     policy: &[u8],
     address: &str,
     assets: &[WitAssetEntry],
-    touched: &mut HashSet<Vec<u8>>,
+    touched: &mut HashSet<LedgerKey>,
 ) {
-    let key = extract_stake_key(address);
-    let kbytes = ledger_key_bytes(key);
+    let Some(key) = extract_holder_key(address) else {
+        return;
+    };
+    let mut touched_any = false;
     for entry in assets {
         if entry.asset.policy != policy {
             continue;
         }
-        ledger_add(ledger, key, &entry.asset.name, entry.quantity);
-        touched.insert(kbytes.clone());
+        ledger_add(ledger, key.clone(), &entry.asset.name, entry.quantity);
+        touched_any = true;
+    }
+    if touched_any {
+        touched.insert(key);
     }
 }
 
@@ -325,16 +363,21 @@ fn apply_consumed_to_ledger(
     policy: &[u8],
     address: &str,
     assets: &[WitAssetEntry],
-    touched: &mut HashSet<Vec<u8>>,
+    touched: &mut HashSet<LedgerKey>,
 ) {
-    let key = extract_stake_key(address);
-    let kbytes = ledger_key_bytes(key);
+    let Some(key) = extract_holder_key(address) else {
+        return;
+    };
+    let mut touched_any = false;
     for entry in assets {
         if entry.asset.policy != policy {
             continue;
         }
-        ledger_sub(ledger, key, &entry.asset.name, entry.quantity);
-        touched.insert(kbytes.clone());
+        ledger_sub(ledger, &key, &entry.asset.name, entry.quantity);
+        touched_any = true;
+    }
+    if touched_any {
+        touched.insert(key);
     }
 }
 
@@ -363,7 +406,7 @@ fn fold_page(
 ) -> Option<WitOutputRef> {
     let mut pool_ref: Option<WitOutputRef> = None;
     for (r, out) in chain_data::read_utxos(refs) {
-        let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
+        let mut _touched_dummy: HashSet<LedgerKey> = HashSet::new();
         apply_produced_to_ledger(ledger, policy, &out.address, &out.assets, &mut _touched_dummy);
         if pool_ref.is_none() && out.address == cswap::POOL_SCRIPT_ADDR {
             pool_ref = Some(r);
@@ -516,10 +559,11 @@ fn ledger_to_holders(ledger: &PolicyLedger) -> Vec<HolderEntry> {
     ledger
         .holders
         .iter()
-        .map(|(kbytes, assets)| HolderEntry {
-            stake_cred_hex: stake_cred_hex(kbytes),
+        .map(|(key, assets)| HolderEntry {
+            id: key_to_id(key),
             assets: assets_map_to_vec(assets),
             lp_amount: 0,
+            role: holder_role_for(key),
         })
         .collect()
 }
@@ -582,7 +626,7 @@ fn read_pool_datum(pool_ref: &WitOutputRef) -> Option<cswap::CswapPoolDatum> {
 /// farm UTxO whose datum doesn't decode is skipped — its share
 /// stays with the residual pool entry rather than misattributed.
 fn fold_lp_page(
-    lp_holders: &mut BTreeMap<Vec<u8>, u64>,
+    lp_holders: &mut BTreeMap<LedgerKey, u64>,
     lp_policy: &[u8; HASH_BYTES],
     refs: &[WitOutputRef],
 ) {
@@ -620,7 +664,7 @@ fn fold_lp_page(
         }
         let key: LedgerKey = if out.address == cswap::FARM_SCRIPT_ADDR {
             match staker_by_ref.get(&(r.tx_hash.clone(), r.index)) {
-                Some(hash) => Some(*hash),
+                Some(hash) => LedgerKey::Stake(*hash),
                 None => {
                     logging::log(
                         LogLevel::Warn,
@@ -631,9 +675,12 @@ fn fold_lp_page(
                 }
             }
         } else {
-            extract_stake_key(&out.address)
+            match extract_holder_key(&out.address) {
+                Some(k) => k,
+                None => continue,
+            }
         };
-        *lp_holders.entry(ledger_key_bytes(key)).or_insert(0) += lp_qty;
+        *lp_holders.entry(key).or_insert(0) += lp_qty;
     }
 }
 
@@ -647,18 +694,19 @@ fn fold_lp_page(
 fn decompose_holders(
     ledger: &PolicyLedger,
     total_lp_tokens: u64,
-    lp_holders: &BTreeMap<Vec<u8>, u64>,
+    lp_holders: &BTreeMap<LedgerKey, u64>,
 ) -> Vec<HolderEntry> {
-    let pool_key = ledger_key_bytes(extract_stake_key(cswap::POOL_SCRIPT_ADDR));
+    let pool_key = extract_holder_key(cswap::POOL_SCRIPT_ADDR)
+        .expect("cswap pool address parses to a stake key");
     let pool_reserve: AssetMap = ledger.holders.get(&pool_key).cloned().unwrap_or_default();
 
     // Working set: every holder except the pool, each carrying a
     // running `lp_amount` of how much of the balance is
     // LP-derived (0 for plain holders).
-    let mut out: BTreeMap<Vec<u8>, (AssetMap, u64)> = ledger
+    let mut out: BTreeMap<LedgerKey, (AssetMap, u64)> = ledger
         .holders
         .iter()
-        .filter(|(k, _)| **k != pool_key)
+        .filter(|(k, _)| *k != &pool_key)
         .map(|(k, assets)| (k.clone(), (assets.clone(), 0u64)))
         .collect();
 
@@ -686,10 +734,11 @@ fn decompose_holders(
     }
 
     out.into_iter()
-        .map(|(kbytes, (assets, lp_amount))| HolderEntry {
-            stake_cred_hex: stake_cred_hex(&kbytes),
+        .map(|(key, (assets, lp_amount))| HolderEntry {
+            id: key_to_id(&key),
             assets: assets_map_to_vec(&assets),
             lp_amount,
+            role: holder_role_for(&key),
         })
         .collect()
 }
@@ -731,7 +780,7 @@ fn decompose_or_plain(
         }
     };
 
-    let mut lp_holders: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    let mut lp_holders: BTreeMap<LedgerKey, u64> = BTreeMap::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
         let page = chain_data::utxos_by_policy(&lp_policy, after.as_deref(), COLD_START_PAGE_HINT);
@@ -898,7 +947,7 @@ fn flush_buffer(buf: TxBuffer) {
     for policy in policies {
         let policy_hex = hex::encode(policy);
         let mut ledger = load_ledger(&policy_hex);
-        let mut touched: HashSet<Vec<u8>> = HashSet::new();
+        let mut touched: HashSet<LedgerKey> = HashSet::new();
 
         if let Some(events) = buf.consumed.get(&policy) {
             for c in events {
@@ -930,24 +979,25 @@ fn flush_buffer(buf: TxBuffer) {
         // if the holder dropped to zero and was removed).
         let mut changed: Vec<HolderEntry> = touched
             .into_iter()
-            .map(|kbytes| {
+            .map(|key| {
                 let assets = ledger
                     .holders
-                    .get(&kbytes)
+                    .get(&key)
                     .map(assets_map_to_vec)
                     .unwrap_or_default();
                 HolderEntry {
-                    stake_cred_hex: stake_cred_hex(&kbytes),
+                    id: key_to_id(&key),
                     assets,
                     // Deltas carry raw post-TX balances; LP
                     // attribution is a snapshot-time transform
                     // (`decompose_holders`), recomputed on the
                     // next cold-start / recapture.
                     lp_amount: 0,
+                    role: holder_role_for(&key),
                 }
             })
             .collect();
-        changed.sort_by(|a, b| a.stake_cred_hex.cmp(&b.stake_cred_hex));
+        changed.sort_by(|a, b| a.id.cmp(&b.id));
 
         emit_event(&HolderEvent::Delta(HolderDelta {
             policy: policy_hex,

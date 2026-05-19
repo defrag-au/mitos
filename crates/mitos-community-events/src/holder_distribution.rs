@@ -49,33 +49,74 @@ pub struct AssetBalance {
     pub quantity: u64,
 }
 
+/// How `holder-distribution` identifies a holder. Generalised
+/// from the older `stake_cred_hex: Option<String>` so enterprise
+/// (no-stake-credential) holders are surfaced distinctly rather
+/// than collapsed into a single dropped bucket — required for
+/// worker-side burn classification (a `/dev/null` sink is an
+/// enterprise address) and a latent under-counting fix on its
+/// own (real enterprise wallets were invisible before).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderId {
+    /// Delegated address — grouped by its 28-byte stake
+    /// credential (56-char lowercase hex). The dominant case.
+    Stake(String),
+    /// Enterprise (no-stake) address — the full bech32 address.
+    /// These share no stake-cred grouping, so each is its own
+    /// holder. Pointer-stake and Byron addresses are still
+    /// dropped (not surfaced as enterprise).
+    Enterprise(String),
+}
+
+/// The module's best knowledge of what a credential is, from
+/// the contracts it recognised while decomposing. The worker
+/// refines this with project-config classification (burn sinks,
+/// known wallets, treasury) on top.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderRole {
+    /// A plain holder — the default; also what an enterprise
+    /// holder gets until the worker classifies it.
+    #[default]
+    Wallet,
+    /// A DEX pool the module recognised — either the residual
+    /// after LP decomposition, or a pool kind not decomposed
+    /// yet (Splash, before Splash decomposition lands).
+    DexPool,
+    /// A vesting contract — the residual after vesting
+    /// decomposition (most locked tokens are attributed to
+    /// owners via `HolderEntry::vests`).
+    VestingContract,
+}
+
 /// One holder's stake of one policy. For pure fungible tokens
 /// `assets` is length-1; for NFT-collection policies it can be
 /// length-N where each entry is a distinct asset name held by
-/// this stake credential.
+/// this holder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HolderEntry {
-    /// 56-char lowercase hex of the stake credential (payment
-    /// or staking key/script hash, 28 bytes). `None` aggregates
-    /// all enterprise (no-stake) addresses holding this policy
-    /// — splitting per-enterprise-address would lose the
-    /// stake-cred grouping consumers expect.
-    pub stake_cred_hex: Option<String>,
-    /// Per-asset-name balances under this policy. Sorted by
-    /// `asset_name_hex` for deterministic wire shape (so
-    /// snapshot-diffing across module versions is stable).
+    /// The holder's identity — stake credential for delegated
+    /// addresses, full bech32 for enterprise.
+    pub id: HolderId,
+    /// Liquid holdings of this policy. Vested tokens are NOT
+    /// folded in here — `assets + Σ vests.amount` is the true
+    /// total.
     pub assets: Vec<AssetBalance>,
-    /// LP-decomposition attribution: the quantity of this policy
-    /// attributed to this holder by redistributing a DEX pool's
-    /// aggregate holding to the wallets that provided the
-    /// liquidity. Already included in `assets` — `lp_amount` is
-    /// the *portion* of the holding that is LP-derived, surfaced
-    /// so consumers can split a "Scout Vessels" band out of the
-    /// total. `0` when the holder provided no liquidity, or when
-    /// the policy has no registered LP pool. See
+    /// LP-decomposition attribution — the portion of `assets`
+    /// redistributed from a DEX pool to this holder (the
+    /// "Scout Vessels" band). Already included in `assets`. `0`
+    /// for a non-LP holder. See
     /// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`.
     #[serde(default)]
     pub lp_amount: u64,
+    /// The module's role tag for this holder. The worker's
+    /// classifier reads this first, then overrides with config
+    /// (e.g. enterprise → burn) where applicable.
+    #[serde(default)]
+    pub role: HolderRole,
 }
 
 /// Opens a **chunked snapshot** sequence for one policy. A full

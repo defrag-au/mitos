@@ -15,6 +15,7 @@
 //! over coordination."
 
 pub mod cswap;
+pub mod splash;
 
 /// Redistribute one LP provider's share of a pool's reserve of
 /// some asset: `lp_held / total_lp_supply` of `pool_reserve`.
