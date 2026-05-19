@@ -106,7 +106,7 @@ async fn dynamic_interest_changes_filter_mid_stream() {
         ResourceBudget::default(),
     );
 
-    host.start("test-indexer").await.expect("start");
+    host.start("test-indexer", false).await.expect("start");
 
     // ---- Block #1: empty interest. Should emit nothing.
 

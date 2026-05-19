@@ -148,7 +148,7 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
         ResourceBudget::default(),
     );
 
-    host.start("test-indexer").await.expect("start");
+    host.start("test-indexer", false).await.expect("start");
 
     tx.send(TipEvent::Apply(
         ChainPoint::Slot(186_000_000).into(),

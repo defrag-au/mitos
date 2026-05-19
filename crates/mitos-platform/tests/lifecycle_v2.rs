@@ -86,7 +86,7 @@ async fn start_replace_stop_roundtrip_v2() {
     );
 
     // 1. Start the module.
-    host.start("test-indexer").await.expect("start");
+    host.start("test-indexer", false).await.expect("start");
     assert_eq!(host.list().await, vec!["test-indexer"]);
 
     // 2. Push one Apply event via the synthetic subscription.
@@ -151,7 +151,10 @@ async fn start_replace_stop_roundtrip_v2() {
         emitter_factory,
         ResourceBudget::default(),
     );
-    host_2.start("test-indexer").await.expect("cold restart");
+    host_2
+        .start("test-indexer", false)
+        .await
+        .expect("cold restart");
     assert_eq!(host_2.list().await, vec!["test-indexer"]);
     let after_restart = storage
         .read_cursor("test-indexer")

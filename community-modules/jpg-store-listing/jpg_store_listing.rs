@@ -449,6 +449,13 @@ impl Guest for Module {
         // runtime updates needed.
         Ok(())
     }
+
+    /// No-op: event-driven modules are refilled host-side by
+    /// `run_bootstrap` over the manifest `[interest]`. See the
+    /// `rebootstrap` export in `wit-v2/world.wit`.
+    fn rebootstrap() -> Result<(), String> {
+        Ok(())
+    }
 }
 
 export!(Module);

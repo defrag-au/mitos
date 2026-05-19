@@ -689,6 +689,30 @@ impl Guest for Module {
         apply_interest_update(op, &items_cbor);
         Ok(())
     }
+
+    /// Re-emit the full holder ledger for every tracked policy.
+    /// `init` restores `TRACKED_POLICIES` from `state-kv`, so the
+    /// module already knows what it tracks; the host's recapture
+    /// flow calls this after `start()` to refill companions whose
+    /// projected state was just dropped. `cold_start` re-scans
+    /// `utxos_by_policy` and emits a fresh `Snapshot` per policy,
+    /// so this is idempotent — recapture may run it repeatedly.
+    fn rebootstrap() -> Result<(), String> {
+        let policies: Vec<[u8; HASH_BYTES]> =
+            TRACKED_POLICIES.with(|set| set.borrow().iter().copied().collect());
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!(
+                "rebootstrap: re-scanning {} tracked policy(ies)",
+                policies.len()
+            ),
+        );
+        for policy in &policies {
+            cold_start(policy);
+        }
+        Ok(())
+    }
 }
 
 export!(Module);

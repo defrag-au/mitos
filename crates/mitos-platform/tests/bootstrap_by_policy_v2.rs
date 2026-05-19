@@ -260,7 +260,7 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
         ResourceBudget::default(),
     );
 
-    host.start("test-indexer").await.expect("start");
+    host.start("test-indexer", false).await.expect("start");
 
     // Inject the dynamic-interest Add. The follower's interest
     // multiplexer should: (1) add HoldsPolicy(P) to the driver's

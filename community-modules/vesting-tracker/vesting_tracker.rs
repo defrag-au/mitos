@@ -856,6 +856,36 @@ impl Guest for Module {
         apply_interest_update(op, &items_cbor);
         Ok(())
     }
+
+    /// Re-emit lock snapshots for every tracked address + payment
+    /// credential. `init` restores the tracked sets from
+    /// `state-kv`, so the module already knows what it watches;
+    /// the host's recapture flow calls this after `start()` to
+    /// refill companions whose projected state was just dropped.
+    /// Each `cold_start_*` re-scans the chain and emits a fresh
+    /// `Snapshot` — idempotent.
+    fn rebootstrap() -> Result<(), String> {
+        let addresses: Vec<String> =
+            TRACKED_ADDRESSES.with(|set| set.borrow().iter().cloned().collect());
+        let creds: Vec<[u8; HASH_BYTES]> =
+            TRACKED_PAYMENT_CREDS.with(|set| set.borrow().iter().copied().collect());
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!(
+                "rebootstrap: re-scanning {} address(es) + {} payment cred(s)",
+                addresses.len(),
+                creds.len()
+            ),
+        );
+        for addr in &addresses {
+            cold_start_address(addr);
+        }
+        for cred in &creds {
+            cold_start_payment_cred(cred);
+        }
+        Ok(())
+    }
 }
 
 export!(Module);

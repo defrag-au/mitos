@@ -383,6 +383,30 @@ impl Guest for Module {
         apply_interest_update(op, &items_cbor);
         Ok(())
     }
+
+    /// Re-emit burn events for every watched address. `init`
+    /// restores `WATCHED_ADDRS` from `state-kv`, so the module
+    /// already knows what it watches; the host's recapture flow
+    /// calls this after `start()` to refill companions whose
+    /// projected state was just dropped. `cold_start_address`
+    /// re-walks each address's current unspent set — idempotent
+    /// (consumers dedup on `(tx_hash, output_index)`).
+    fn rebootstrap() -> Result<(), String> {
+        let addrs: Vec<String> =
+            WATCHED_ADDRS.with(|set| set.borrow().iter().cloned().collect());
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!(
+                "rebootstrap: re-walking {} watched address(es)",
+                addrs.len()
+            ),
+        );
+        for addr in &addrs {
+            cold_start_address(addr);
+        }
+        Ok(())
+    }
 }
 
 export!(Module);

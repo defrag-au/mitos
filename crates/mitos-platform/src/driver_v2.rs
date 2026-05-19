@@ -117,6 +117,26 @@ impl DriverV2 {
             .await
     }
 
+    /// Invoke the module's `rebootstrap` WIT export. The host's
+    /// recapture flow (`docs/design/RECAPTURE.md`) calls this
+    /// after `start()` so a self-bootstrapping module re-runs its
+    /// own cold-start and refills companions whose projected state
+    /// was just dropped. Event-driven modules implement it as a
+    /// no-op (their refill comes from `run_bootstrap`).
+    ///
+    /// Fueled with `fuel_per_call` — the same budget the live
+    /// dynamic-interest path (`call_update_interest`) already runs
+    /// a `cold_start` under, so a module's rebootstrap fits the
+    /// same ceiling. Returns the export's typed `Result` for
+    /// logging.
+    pub async fn call_rebootstrap(&mut self) -> wasmtime::Result<Result<(), String>> {
+        self.instance.store.set_fuel(self.fuel_per_call)?;
+        self.instance
+            .bindings
+            .call_rebootstrap(&mut self.instance.store)
+            .await
+    }
+
     /// Apply one block. The driver pulls the InterestSet off the
     /// host state (already populated via `set_interest`) and
     /// resolves prior outputs through the data plane to filter

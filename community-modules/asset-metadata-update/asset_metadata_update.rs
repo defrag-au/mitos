@@ -663,6 +663,13 @@ impl Guest for Module {
     fn update_interest(_op: InterestOp, _items_cbor: Vec<u8>) -> Result<(), String> {
         Ok(())
     }
+
+    /// No-op: event-driven modules are refilled host-side by
+    /// `run_bootstrap` over the manifest `[interest]`. See the
+    /// `rebootstrap` export in `wit-v2/world.wit`.
+    fn rebootstrap() -> Result<(), String> {
+        Ok(())
+    }
 }
 
 export!(Module);

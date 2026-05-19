@@ -465,4 +465,20 @@ world mitos-module-v2 {
     /// `list<interest-predicate>`.
     export update-interest: func(op: interest-op, items-cbor: list<u8>)
                             -> result<_, string>;
+
+    /// Re-emit the module's full current state. Called by the
+    /// host's recapture flow (`docs/design/RECAPTURE.md`) after
+    /// `start()`, so a self-bootstrapping module can re-run its
+    /// own cold-start and refill companions whose projected state
+    /// was just dropped.
+    ///
+    /// Event-driven modules (whose refill comes from the host
+    /// replaying `[interest]` UTxOs through `handle-events`)
+    /// implement this as a no-op — `run_bootstrap` already
+    /// covers them. Self-bootstrapping modules
+    /// (`holder-distribution`, `burn-address`, `vesting-tracker`)
+    /// re-scan every predicate in their restored interest set
+    /// and re-emit. MUST be idempotent: recapture may run it
+    /// repeatedly.
+    export rebootstrap: func() -> result<_, string>;
 }

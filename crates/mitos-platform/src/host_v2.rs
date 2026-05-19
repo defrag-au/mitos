@@ -317,7 +317,13 @@ where
     /// `ModuleHost::start` shape: stop existing slot if any →
     /// instantiate → init (with refuel + trap-context capture)
     /// → spawn follower + emit-drain task.
-    pub async fn start(&self, id: &str) -> PlatformResult<()> {
+    ///
+    /// `rebootstrap`: when `true`, invoke the module's
+    /// `rebootstrap` export after the manifest bootstrap pass —
+    /// used by the recapture flow so a self-bootstrapping module
+    /// re-emits its own state. All non-recapture callers pass
+    /// `false`.
+    pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<()> {
         self.stop(id).await?;
 
         let manifest = self
@@ -456,6 +462,30 @@ where
             }
         }
 
+        // Recapture re-bootstrap: after the host-side manifest
+        // bootstrap pass, let a self-bootstrapping module re-emit
+        // its own state by re-running its cold-start over its
+        // restored interest. No-op for event-driven modules
+        // (their refill is `run_bootstrap` above). Only the
+        // recapture flow passes `rebootstrap = true`.
+        if rebootstrap {
+            match driver.call_rebootstrap().await {
+                Ok(Ok(())) => {
+                    tracing::info!(module = %id, "v2 rebootstrap complete")
+                }
+                Ok(Err(msg)) => tracing::error!(
+                    module = %id,
+                    error = %msg,
+                    "v2 rebootstrap returned an error",
+                ),
+                Err(e) => tracing::error!(
+                    module = %id,
+                    error = %e,
+                    "v2 rebootstrap trapped; continuing without re-emit",
+                ),
+            }
+        }
+
         // Spawn the v2 follower.
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -547,7 +577,7 @@ where
     }
 
     pub async fn replace(&self, id: &str) -> PlatformResult<()> {
-        self.start(id).await
+        self.start(id, false).await
     }
 
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
@@ -616,7 +646,7 @@ where
             }
         };
         for id in module_ids {
-            match self.start(&id).await {
+            match self.start(&id, false).await {
                 Ok(()) => tracing::info!(module = %id, "auto-resumed"),
                 Err(e) => tracing::error!(
                     module = %id,
@@ -752,7 +782,7 @@ where
         //    task. Bootstrap-synthesised events flow through the
         //    broadcast → outbound WSes → companions while this
         //    call is returning.
-        if let Err(e) = self.start(id).await {
+        if let Err(e) = self.start(id, true).await {
             tracing::error!(
                 module = %id,
                 error = %e,
