@@ -358,9 +358,16 @@ already chunks via per-batch `handle-events` calls.
 
 ## Migration / phasing
 
-1. **`ResourceLimiter` + trap classification** (host only). Lands
-   OOM observability + the telemetry the rest depends on. No
-   module changes.
+1. **`ResourceLimiter` + trap classification** (host only).
+   *Landed 2026-05-19.* `crate::budget` — `BudgetLimiter` (a
+   wasmtime `ResourceLimiter` recording peak linear memory +
+   flagging a denied/failed `memory.grow`) wired onto every v2
+   `Store` in `registry_v2::instantiate`, plus `TrapClass`
+   (`OutOfFuel` / `OutOfMemory` / `Timeout` / `Fault`). The host
+   classifies + logs traps at the `init` and `rebootstrap` sites
+   (`host_v2.rs`) with `trap` + `peak_memory_bytes` fields. No
+   host-imposed memory ceiling yet (`max_memory_bytes = None`) —
+   purely observational. No module changes.
 2. **Paged `chain-data` host-fns.** WIT change; the opaque scan
    token; host-side materialise-and-cache + adaptive clamp.
    Existing modules' `cold_start` callsites migrate to the loop

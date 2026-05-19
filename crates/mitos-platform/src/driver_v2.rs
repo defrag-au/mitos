@@ -132,10 +132,29 @@ impl DriverV2 {
     /// case); `Err(String)` is the module's typed failure.
     pub async fn call_rebootstrap(&mut self) -> wasmtime::Result<Result<u64, String>> {
         self.instance.store.set_fuel(self.fuel_per_call)?;
+        // Clear the per-call OOM flag so `classify_trap` reflects
+        // only this invocation if it traps.
+        self.instance.store.data_mut().limiter_mut().reset_call();
         self.instance
             .bindings
             .call_rebootstrap(&mut self.instance.store)
             .await
+    }
+
+    /// Classify a trap returned by a guest call on this driver's
+    /// instance. Reads the budget limiter off the `Store` to tell
+    /// an OOM apart from a fuel exhaustion or a module fault. See
+    /// `crate::budget::TrapClass`.
+    pub fn classify_trap(&self, err: &wasmtime::Error) -> crate::budget::TrapClass {
+        let oom = self.instance.store.data().limiter().hit_oom();
+        crate::budget::TrapClass::classify(err, oom)
+    }
+
+    /// Lifetime peak linear-memory use of this driver's instance,
+    /// in bytes. Telemetry for trap diagnostics + (Phase 2)
+    /// adaptive page sizing.
+    pub fn peak_memory_bytes(&self) -> usize {
+        self.instance.store.data().limiter().peak_memory_bytes()
     }
 
     /// Apply one block. The driver pulls the InterestSet off the

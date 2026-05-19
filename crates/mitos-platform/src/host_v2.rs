@@ -384,21 +384,37 @@ where
 
         let config = self.storage.read_config(id)?.unwrap_or_default();
         instance.store.set_fuel(self.budget.init_fuel)?;
+        // Clear the per-call OOM flag so a trap below classifies
+        // against this `init` call only.
+        instance.store.data_mut().limiter_mut().reset_call();
         if let Err(e) = instance
             .bindings
             .call_init(&mut instance.store, &config)
             .await
         {
+            // Classify the trap — `init` is a heavy bootstrap
+            // call, so OOM (`cabi_realloc`) is a real outcome and
+            // must be told apart from a fuel exhaustion or a
+            // module logic fault. See `crate::budget`.
+            let trap = crate::budget::TrapClass::classify(
+                &e,
+                instance.store.data().limiter().hit_oom(),
+            );
+            let peak_memory = instance.store.data().limiter().peak_memory_bytes();
             let snap = trap_logger.snapshot();
             let path = self.storage.last_trap_path(id);
             match write_fixture(&snap, id, &path) {
                 Ok(()) => tracing::error!(
                     module = %id,
+                    trap = %trap,
+                    peak_memory_bytes = peak_memory,
                     fixture = %path.display(),
                     "v2 init trapped; fixture written for local replay (mitos-run --fixture)",
                 ),
                 Err(write_err) => tracing::warn!(
                     module = %id,
+                    trap = %trap,
+                    peak_memory_bytes = peak_memory,
                     error = %write_err,
                     "v2 init trapped; failed to write trap fixture",
                 ),
@@ -510,8 +526,16 @@ where
                         break;
                     }
                     Err(e) => {
+                        // Classify the trap so operators see
+                        // *why* — an OOM (`cabi_realloc` in a
+                        // large policy's cold-start) needs page
+                        // chunking, a fuel exhaustion needs a
+                        // bigger budget, a fault is a module bug.
+                        let trap = driver.classify_trap(&e);
                         tracing::error!(
                             module = %id,
+                            trap = %trap,
+                            peak_memory_bytes = driver.peak_memory_bytes(),
                             error = %e,
                             "v2 rebootstrap trapped; refill may be partial",
                         );

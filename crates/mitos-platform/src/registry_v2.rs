@@ -129,6 +129,13 @@ impl ModuleRegistryV2 {
         store.fuel_async_yield_interval(Some(budget.fuel_yield_interval))?;
         store.set_epoch_deadline(budget.epoch_deadline_ticks);
 
+        // Wire the budget limiter as the Store's `ResourceLimiter`
+        // before any guest call. It records peak linear memory +
+        // flags a denied/failed `memory.grow`; the host reads it
+        // back via `HostStateV2::limiter` to classify traps. See
+        // `crate::budget` / `WASM_BUDGET_CHUNKING.md`.
+        store.limiter(|state| &mut state.limiter as &mut dyn wasmtime::ResourceLimiter);
+
         let bindings =
             MitosModuleV2::instantiate_async(&mut store, &self.component, &self.linker).await?;
 

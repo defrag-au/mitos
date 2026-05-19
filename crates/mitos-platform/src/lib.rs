@@ -28,6 +28,8 @@
 //!   interfaces (chain-data, state-kv, emit, logging, interest)
 //! - `registry_v2` — load module artifact, version-check,
 //!   instantiate, `ResourceBudget`
+//! - `budget` — per-instance `ResourceLimiter` + trap
+//!   classification (`TrapClass`); see `WASM_BUDGET_CHUNKING.md`
 //! - `driver_v2`, `follower_v2`, `host_v2` — per-block dispatch,
 //!   chain follower, lifecycle manager
 //! - `bootstrap_v2` — synthetic event scan for manifest interest
@@ -46,6 +48,7 @@ pub mod admin;
 pub mod aux_data_cache;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
+pub mod budget;
 pub mod compaction;
 pub mod companions;
 pub mod dialer;
@@ -77,6 +80,7 @@ pub use mitos_data_plane::ChainDataPlane;
 /// `mitos-data-plane` so consumers (like the bundle binary) can
 /// take/return it without a separate dep on `mitos-data-plane`.
 pub use mitos_data_plane::ChainPoint;
+pub use budget::{BudgetLimiter, TrapClass};
 pub use registry_v2::{ModuleInstanceV2, ModuleRegistryV2, ResourceBudget};
 pub use supervisor::{Supervisor, SupervisorOutcome};
 
