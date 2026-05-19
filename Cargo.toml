@@ -18,6 +18,7 @@ members = [
     "crates/mitos-community-events",
     "crates/mitos-module-kit",
     "crates/mitos-dex-decode",
+    "crates/mitos-vesting-decode",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",

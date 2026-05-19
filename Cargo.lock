@@ -3504,6 +3504,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-vesting-decode"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "pallas-codec 1.0.0-alpha.6",
+ "pallas-primitives 1.0.0-alpha.6",
+]
+
+[[package]]
 name = "multer"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

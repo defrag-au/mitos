@@ -20,8 +20,10 @@ policies = []
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
 mitos-module-kit = { path = "../../crates/mitos-module-kit" }
+# Shield / CrowdLock lock-datum decode (shared with
+# `holder-distribution`'s vesting decomposition).
+mitos-vesting-decode = { path = "../../crates/mitos-vesting-decode" }
 pallas-addresses = "1.0.0-alpha.6"
-pallas-primitives = "1.0.0-alpha.6"
-# minicbor decoder + Plutus datum decoder for the Shield vest
-# datum + TX metadata 674 lookup.
+# minicbor decoder for TX metadata 674 lookup (the lock datum
+# itself decodes in `mitos-vesting-decode`).
 pallas-codec = "1.0.0-alpha.6"

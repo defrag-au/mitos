@@ -117,6 +117,13 @@ pub struct HolderEntry {
     /// (e.g. enterprise → burn) where applicable.
     #[serde(default)]
     pub role: HolderRole,
+    /// Vesting decomposition — the lock positions beneficially
+    /// owned by this holder (the "Vested" band). Reuses
+    /// `vesting_tracker::LockEntry` so the per-module
+    /// vocabulary is the detail layer. NOT included in `assets`
+    /// — the holder's true total is `assets + Σ vests.amount`.
+    #[serde(default)]
+    pub vests: Vec<crate::vesting_tracker::LockEntry>,
 }
 
 /// Opens a **chunked snapshot** sequence for one policy. A full

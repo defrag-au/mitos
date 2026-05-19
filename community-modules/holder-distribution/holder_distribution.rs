@@ -564,6 +564,7 @@ fn ledger_to_holders(ledger: &PolicyLedger) -> Vec<HolderEntry> {
             assets: assets_map_to_vec(assets),
             lp_amount: 0,
             role: holder_role_for(key),
+            vests: Vec::new(),
         })
         .collect()
 }
@@ -739,6 +740,7 @@ fn decompose_holders(
             assets: assets_map_to_vec(&assets),
             lp_amount,
             role: holder_role_for(&key),
+            vests: Vec::new(),
         })
         .collect()
 }
@@ -988,12 +990,13 @@ fn flush_buffer(buf: TxBuffer) {
                 HolderEntry {
                     id: key_to_id(&key),
                     assets,
-                    // Deltas carry raw post-TX balances; LP
-                    // attribution is a snapshot-time transform
-                    // (`decompose_holders`), recomputed on the
-                    // next cold-start / recapture.
+                    // Deltas carry raw post-TX balances; LP +
+                    // vesting attribution are snapshot-time
+                    // transforms, recomputed on the next
+                    // cold-start / recapture.
                     lp_amount: 0,
                     role: holder_role_for(&key),
+                    vests: Vec::new(),
                 }
             })
             .collect();
