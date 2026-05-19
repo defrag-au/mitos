@@ -127,9 +127,10 @@ impl DriverV2 {
     /// Fueled with `fuel_per_call` — the same budget the live
     /// dynamic-interest path (`call_update_interest`) already runs
     /// a `cold_start` under, so a module's rebootstrap fits the
-    /// same ceiling. Returns the export's typed `Result` for
-    /// logging.
-    pub async fn call_rebootstrap(&mut self) -> wasmtime::Result<Result<(), String>> {
+    /// same ceiling. The `Ok` payload is the count of interest
+    /// predicates the module re-bootstrapped (`0` for the no-op
+    /// case); `Err(String)` is the module's typed failure.
+    pub async fn call_rebootstrap(&mut self) -> wasmtime::Result<Result<u64, String>> {
         self.instance.store.set_fuel(self.fuel_per_call)?;
         self.instance
             .bindings

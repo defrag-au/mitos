@@ -7,6 +7,17 @@ detected + corrected). Doc preserved as the canonical reference
 for the protocol shape, failure modes, and deferred follow-up
 work.
 
+**Update (2026-05-19) — dynamic-interest modules.** v1 refilled
+companions only via the host-side `run_bootstrap` walk over a
+module's *static manifest `[interest]`*. Dynamic-interest modules
+(`holder-distribution`, `burn-address`, `vesting-tracker`) declare
+an empty manifest `[interest]` by design — their interest is
+consumer-registered at runtime via `update-interest` — so
+recapture was a silent no-op for them: companions dropped their
+projected state on `on_recapture` and were never refilled. Fixed
+by the `rebootstrap` module export — see "The `rebootstrap`
+export" below.
+
 A protocol + admin endpoint that lets an operator trigger a
 clean state rebuild for a community module's subscribed
 companions: the host signals each companion to drop its
@@ -503,6 +514,50 @@ as a fallback if the WS connection is broken and the operator
 needs to nuke dApp state without mitos cooperation. Doc note
 in `do_state.rs` that recapture is the preferred path.
 
+## The `rebootstrap` export — dynamic-interest modules
+
+Recapture's refill has two halves, matching the two bootstrap
+models:
+
+- **Event-driven modules** (`jpg-co`, the marketplace family):
+  the host walks the module's static manifest `[interest]` UTxOs
+  and replays them as synthetic `Produced` events through
+  `handle-events`. That is `run_bootstrap`, run inside `start()`.
+- **Self-bootstrapping modules** (`holder-distribution`,
+  `burn-address`, `vesting-tracker`): the module does its *own*
+  cold-start scan (`chain_data::utxos_by_*`) and emits a domain
+  `Snapshot`. Their manifest `[interest]` is empty, so
+  `run_bootstrap` does nothing for them.
+
+`run_bootstrap` alone therefore cannot refill a self-bootstrapping
+module. The fix is a module-side export, symmetric with the
+companion-side `on_recapture` hook:
+
+```wit
+// wit-v2/world.wit — world mitos-module-v2
+export rebootstrap: func() -> result<u64, string>;
+```
+
+`HostV2::start(id, rebootstrap: bool)` invokes it after the
+`run_bootstrap` pass when `rebootstrap` is `true` — the recapture
+flow passes `true`, every other caller `false`. A self-
+bootstrapping module's `rebootstrap` re-runs its cold-start over
+its *own restored interest*: `init` already rehydrates the
+tracked-interest set from `state-kv`, so the module knows what to
+re-scan and the host never has to recover or replay the dynamic
+interest. Event-driven modules implement `rebootstrap` as a no-op
+returning `0`.
+
+The `u64` return is the count of interest predicates the module
+re-bootstrapped (one cold-start unit each) — surfaced as the
+recapture's `events_emitted` (see open question 4).
+
+**Idempotency.** `rebootstrap` may run repeatedly — recapture is
+re-runnable. Each module's cold-start is a fresh chain re-scan +
+authoritative re-emit, so repeated runs converge; consumers that
+accumulate (e.g. `burn-address`) dedup on event identity, already
+a requirement of those modules' delta contracts.
+
 ## Failure modes + recovery
 
 | Scenario | Behaviour | Recovery |
@@ -596,13 +651,13 @@ once individual `recapture` works.
    give headroom for slower companions / larger tables; can
    tighten to 5s once a second consumer's numbers are in.
 
-4. **Should `RecaptureDone` carry a precise events_emitted
-   count, or just the cursor?** **v1 ships with the field at 0
-   — counter wiring deferred.** Counting requires the host to
-   track per-companion delivery during the bootstrap walk;
-   load-bearing observability comes from the journal's
-   `bootstrap: address complete utxos=N batches=M` lines
-   today. Wire the counter when a consumer asks for it.
+4. **Should the recapture response carry a precise
+   `events_emitted` count?** **Resolved (2026-05-19).** It now
+   carries the `u64` returned by the module's `rebootstrap`
+   export — the count of interest predicates re-bootstrapped
+   (`0` for event-driven modules, whose refill is the host-side
+   `run_bootstrap` walk; that walk's per-address `utxos=N
+   batches=M` journal lines remain the finer-grained signal).
 
 5. **How do we enforce the `source_module` schema contract?**
    v1 documents it (this doc + the HOWTO + trait docstring).

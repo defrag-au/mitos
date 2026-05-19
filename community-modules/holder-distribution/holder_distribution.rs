@@ -77,6 +77,12 @@ thread_local! {
     /// via `KV_TRACKED_POLICIES` so a host restart without an
     /// attached companion keeps filtering correctly.
     static TRACKED_POLICIES: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
+
+    /// Pending policies for an in-progress `rebootstrap` round.
+    /// `None` between rounds. The host's recapture loop drains
+    /// this one cold-start per `rebootstrap` call so each gets a
+    /// fresh fuel budget.
+    static REBOOTSTRAP_QUEUE: RefCell<Option<Vec<[u8; HASH_BYTES]>>> = RefCell::new(None);
 }
 
 /// In-memory ledger key. `Some(stake_hash)` for key/script
@@ -690,28 +696,39 @@ impl Guest for Module {
         Ok(())
     }
 
-    /// Re-emit the full holder ledger for every tracked policy.
+    /// Re-emit the holder ledger for tracked policies. Processes
+    /// **one policy per call** so the host can refuel between
+    /// cold-starts — a multi-policy scan overruns a single wasm
+    /// call's fuel budget. Returns `1` when a policy was
+    /// re-scanned, `0` when the round is complete; the host's
+    /// recapture loop calls until `0`.
+    ///
     /// `init` restores `TRACKED_POLICIES` from `state-kv`, so the
-    /// module already knows what it tracks; the host's recapture
-    /// flow calls this after `start()` to refill companions whose
-    /// projected state was just dropped. `cold_start` re-scans
-    /// `utxos_by_policy` and emits a fresh `Snapshot` per policy,
-    /// so this is idempotent — recapture may run it repeatedly.
-    fn rebootstrap() -> Result<(), String> {
-        let policies: Vec<[u8; HASH_BYTES]> =
-            TRACKED_POLICIES.with(|set| set.borrow().iter().copied().collect());
-        logging::log(
-            LogLevel::Info,
-            LOG_TARGET,
-            &format!(
-                "rebootstrap: re-scanning {} tracked policy(ies)",
-                policies.len()
-            ),
-        );
-        for policy in &policies {
-            cold_start(policy);
+    /// module knows what to re-scan. `cold_start` re-scans
+    /// `utxos_by_policy` and emits a fresh `Snapshot`, so this is
+    /// idempotent — recapture may run it repeatedly.
+    fn rebootstrap() -> Result<u64, String> {
+        let next = REBOOTSTRAP_QUEUE.with(|q| {
+            let mut q = q.borrow_mut();
+            if q.is_none() {
+                // Start of a round — snapshot the tracked set.
+                *q = Some(
+                    TRACKED_POLICIES.with(|s| s.borrow().iter().copied().collect()),
+                );
+            }
+            q.as_mut().and_then(|pending| pending.pop())
+        });
+        match next {
+            Some(policy) => {
+                cold_start(&policy);
+                Ok(1)
+            }
+            None => {
+                // Round complete — reset for the next recapture.
+                REBOOTSTRAP_QUEUE.with(|q| *q.borrow_mut() = None);
+                Ok(0)
+            }
         }
-        Ok(())
     }
 }
 

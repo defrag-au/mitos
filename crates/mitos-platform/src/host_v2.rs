@@ -323,7 +323,12 @@ where
     /// used by the recapture flow so a self-bootstrapping module
     /// re-emits its own state. All non-recapture callers pass
     /// `false`.
-    pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<()> {
+    ///
+    /// Returns the count of interest predicates the module
+    /// re-bootstrapped (`0` unless `rebootstrap` was `true` and
+    /// the module is self-bootstrapping) — the recapture flow
+    /// surfaces it as `events_emitted`.
+    pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
         self.stop(id).await?;
 
         let manifest = self
@@ -468,21 +473,58 @@ where
         // restored interest. No-op for event-driven modules
         // (their refill is `run_bootstrap` above). Only the
         // recapture flow passes `rebootstrap = true`.
+        // Recapture re-bootstrap. A self-bootstrapping module
+        // re-bootstraps ONE interest predicate per `rebootstrap`
+        // call — `call_rebootstrap` returns the count processed by
+        // that call (`1`), or `0` when the round is complete. One
+        // predicate per call keeps each cold-start inside a single
+        // wasm fuel budget; doing every predicate in one call
+        // overruns it. The host loops, refuelling each call.
+        // `rebootstrap_count` is the total re-bootstrapped,
+        // surfaced to the recapture caller as `events_emitted`.
+        let mut rebootstrap_count: u64 = 0;
         if rebootstrap {
-            match driver.call_rebootstrap().await {
-                Ok(Ok(())) => {
-                    tracing::info!(module = %id, "v2 rebootstrap complete")
+            // Defensive bound — a well-behaved module drains a
+            // finite tracked-interest set; the cap only guards a
+            // module that never returns 0.
+            const REBOOTSTRAP_MAX_PREDICATES: u64 = 100_000;
+            loop {
+                match driver.call_rebootstrap().await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        rebootstrap_count += n;
+                        if rebootstrap_count >= REBOOTSTRAP_MAX_PREDICATES {
+                            tracing::error!(
+                                module = %id,
+                                "v2 rebootstrap exceeded predicate cap; aborting loop",
+                            );
+                            break;
+                        }
+                    }
+                    Ok(Err(msg)) => {
+                        tracing::error!(
+                            module = %id,
+                            error = %msg,
+                            "v2 rebootstrap returned an error",
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            module = %id,
+                            error = %e,
+                            "v2 rebootstrap trapped; refill may be partial",
+                        );
+                        break;
+                    }
                 }
-                Ok(Err(msg)) => tracing::error!(
+            }
+            if rebootstrap_count > 0 {
+                tracing::info!(
                     module = %id,
-                    error = %msg,
-                    "v2 rebootstrap returned an error",
-                ),
-                Err(e) => tracing::error!(
-                    module = %id,
-                    error = %e,
-                    "v2 rebootstrap trapped; continuing without re-emit",
-                ),
+                    predicates = rebootstrap_count,
+                    "v2 rebootstrap complete",
+                );
             }
         }
 
@@ -573,11 +615,11 @@ where
             },
         );
         tracing::info!(module = %id, "v2 follower started");
-        Ok(())
+        Ok(rebootstrap_count)
     }
 
     pub async fn replace(&self, id: &str) -> PlatformResult<()> {
-        self.start(id, false).await
+        self.start(id, false).await.map(|_| ())
     }
 
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
@@ -647,7 +689,7 @@ where
         };
         for id in module_ids {
             match self.start(&id, false).await {
-                Ok(()) => tracing::info!(module = %id, "auto-resumed"),
+                Ok(_) => tracing::info!(module = %id, "auto-resumed"),
                 Err(e) => tracing::error!(
                     module = %id,
                     error = %e,
@@ -782,14 +824,17 @@ where
         //    task. Bootstrap-synthesised events flow through the
         //    broadcast → outbound WSes → companions while this
         //    call is returning.
-        if let Err(e) = self.start(id, true).await {
-            tracing::error!(
-                module = %id,
-                error = %e,
-                "recapture: follower restart failed; refill is partial"
-            );
-            return Err(e);
-        }
+        let events_emitted = match self.start(id, true).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(
+                    module = %id,
+                    error = %e,
+                    "recapture: follower restart failed; refill is partial"
+                );
+                return Err(e);
+            }
+        };
 
         // 5. (Legacy `RecaptureDone` notification dropped — the
         //    HTTP delivery transport doesn't push informational
@@ -806,9 +851,10 @@ where
         Ok(RecaptureOutcome {
             module: id.to_owned(),
             companion_count,
-            // Best-effort counter; populated by future bootstrap
-            // instrumentation. See `RECAPTURE.md` open question 4.
-            events_emitted: 0,
+            // Interest predicates the module re-emitted under
+            // `rebootstrap` — 0 for event-driven modules, whose
+            // refill is the host-side `run_bootstrap` pass.
+            events_emitted,
         })
     }
 

@@ -98,6 +98,13 @@ thread_local! {
     /// Watched payment credentials (28-byte hash). Same purpose
     /// as `TRACKED_ADDRESSES` for the CrowdLock-style sweep.
     static TRACKED_PAYMENT_CREDS: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
+
+    /// Pending `(addresses, payment_creds)` for an in-progress
+    /// `rebootstrap` round. `None` between rounds. The host's
+    /// recapture loop drains this one cold-start per `rebootstrap`
+    /// call so each gets a fresh fuel budget.
+    static REBOOTSTRAP_QUEUE: RefCell<Option<(Vec<String>, Vec<[u8; HASH_BYTES]>)>> =
+        RefCell::new(None);
 }
 
 // ============================================================
@@ -864,27 +871,53 @@ impl Guest for Module {
     /// refill companions whose projected state was just dropped.
     /// Each `cold_start_*` re-scans the chain and emits a fresh
     /// `Snapshot` — idempotent.
-    fn rebootstrap() -> Result<(), String> {
-        let addresses: Vec<String> =
-            TRACKED_ADDRESSES.with(|set| set.borrow().iter().cloned().collect());
-        let creds: Vec<[u8; HASH_BYTES]> =
-            TRACKED_PAYMENT_CREDS.with(|set| set.borrow().iter().copied().collect());
-        logging::log(
-            LogLevel::Info,
-            LOG_TARGET,
-            &format!(
-                "rebootstrap: re-scanning {} address(es) + {} payment cred(s)",
-                addresses.len(),
-                creds.len()
-            ),
-        );
-        for addr in &addresses {
-            cold_start_address(addr);
+    /// Re-emit lock snapshots for watched addresses + payment
+    /// credentials. Processes **one predicate per call** so the
+    /// host can refuel between cold-starts — scanning every
+    /// predicate in one wasm call overruns its fuel budget.
+    /// Returns `1` when a predicate was re-scanned, `0` when the
+    /// round is complete; the host's recapture loop calls until
+    /// `0`. Addresses drain first, then payment creds. Each
+    /// `cold_start_*` is a fresh authoritative re-emit —
+    /// idempotent.
+    fn rebootstrap() -> Result<u64, String> {
+        enum Next {
+            Address(String),
+            Cred([u8; HASH_BYTES]),
+            Done,
         }
-        for cred in &creds {
-            cold_start_payment_cred(cred);
+        let next = REBOOTSTRAP_QUEUE.with(|q| {
+            let mut q = q.borrow_mut();
+            if q.is_none() {
+                let addresses: Vec<String> =
+                    TRACKED_ADDRESSES.with(|s| s.borrow().iter().cloned().collect());
+                let creds: Vec<[u8; HASH_BYTES]> =
+                    TRACKED_PAYMENT_CREDS.with(|s| s.borrow().iter().copied().collect());
+                *q = Some((addresses, creds));
+            }
+            let pending = q.as_mut().expect("queue populated above");
+            if let Some(addr) = pending.0.pop() {
+                Next::Address(addr)
+            } else if let Some(cred) = pending.1.pop() {
+                Next::Cred(cred)
+            } else {
+                Next::Done
+            }
+        });
+        match next {
+            Next::Address(addr) => {
+                cold_start_address(&addr);
+                Ok(1)
+            }
+            Next::Cred(cred) => {
+                cold_start_payment_cred(&cred);
+                Ok(1)
+            }
+            Next::Done => {
+                REBOOTSTRAP_QUEUE.with(|q| *q.borrow_mut() = None);
+                Ok(0)
+            }
         }
-        Ok(())
     }
 }
 

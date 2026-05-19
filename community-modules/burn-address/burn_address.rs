@@ -59,6 +59,12 @@ const COLD_START_CAP: usize = 100_000;
 // the full data-plane crate dep.
 thread_local! {
     static WATCHED_ADDRS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+
+    /// Pending addresses for an in-progress `rebootstrap` round.
+    /// `None` between rounds. The host's recapture loop drains
+    /// this one cold-start per `rebootstrap` call so each gets a
+    /// fresh fuel budget.
+    static REBOOTSTRAP_QUEUE: RefCell<Option<Vec<String>>> = RefCell::new(None);
 }
 
 /// Minimal mirror of the on-wire `InterestPredicate` enum.
@@ -391,21 +397,34 @@ impl Guest for Module {
     /// projected state was just dropped. `cold_start_address`
     /// re-walks each address's current unspent set — idempotent
     /// (consumers dedup on `(tx_hash, output_index)`).
-    fn rebootstrap() -> Result<(), String> {
-        let addrs: Vec<String> =
-            WATCHED_ADDRS.with(|set| set.borrow().iter().cloned().collect());
-        logging::log(
-            LogLevel::Info,
-            LOG_TARGET,
-            &format!(
-                "rebootstrap: re-walking {} watched address(es)",
-                addrs.len()
-            ),
-        );
-        for addr in &addrs {
-            cold_start_address(addr);
+    /// Re-emit burn events for watched addresses. Processes **one
+    /// address per call** so the host can refuel between
+    /// cold-start walks — a multi-address walk overruns a single
+    /// wasm call's fuel budget. Returns `1` when an address was
+    /// re-walked, `0` when the round is complete; the host's
+    /// recapture loop calls until `0`. `cold_start_address`
+    /// re-walks the address's current unspent set — idempotent
+    /// (consumers dedup on `(tx_hash, output_index)`).
+    fn rebootstrap() -> Result<u64, String> {
+        let next = REBOOTSTRAP_QUEUE.with(|q| {
+            let mut q = q.borrow_mut();
+            if q.is_none() {
+                *q = Some(
+                    WATCHED_ADDRS.with(|s| s.borrow().iter().cloned().collect()),
+                );
+            }
+            q.as_mut().and_then(|pending| pending.pop())
+        });
+        match next {
+            Some(addr) => {
+                cold_start_address(&addr);
+                Ok(1)
+            }
+            None => {
+                REBOOTSTRAP_QUEUE.with(|q| *q.borrow_mut() = None);
+                Ok(0)
+            }
         }
-        Ok(())
     }
 }
 
