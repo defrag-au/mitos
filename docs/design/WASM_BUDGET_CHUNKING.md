@@ -1,7 +1,7 @@
 # Wasm budget chunking — re-entrant operations for unbounded work
 
-**Status: Phases 1–4 landed** (2026-05-19); Phase 5 pending —
-see "Migration / phasing". Prompted by a production
+**Status: Phases 1–5 landed** (2026-05-19) — see "Migration /
+phasing". Prompted by a production
 incident: `holder-distribution`'s `cold_start` trapped in
 `cabi_realloc` during a `recapture`-driven rebootstrap of a large
 policy (NIKEPIG) — wasm linear-memory exhaustion. Earlier the same
@@ -438,8 +438,17 @@ already chunks via per-batch `handle-events` calls.
    the *serialised emit*, not the accumulator. A million-holder
    token would still need open question 1 (accumulator paged to
    `state-kv`).
-5. **SDK affordance** — a documented re-entrant-step helper in the
-   module SDK so module authors don't re-derive the cursor dance.
+5. **SDK affordance.** *Landed 2026-05-19.* New crate
+   `crates/mitos-module-kit` — `ReentrantRound<P, A>`: a pure,
+   zero-dependency helper that owns the re-entrant scan
+   bookkeeping (predicate list, durable `predicate_idx`, volatile
+   page cursor, per-predicate accumulator `A`). A module author
+   keeps only what varies — predicate type, paged fetch, fold,
+   emit, and ~3 lines of `state-kv` cursor IO. Carries a full
+   worked `rebootstrap` example in its rustdoc + a section in
+   `MITOS_COMPANION_PATTERN.md`. The three self-bootstrapping
+   modules adopted it as the reference (their hand-rolled round
+   structs were deleted). Pure ergonomics — no runtime change.
 
 Phases 1–3 unblock NIKEPIG-class policies. Phase 4 makes it scale
 without an upper bound.

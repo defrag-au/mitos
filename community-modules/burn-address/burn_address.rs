@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use mitos_community_events::burn_address::AddressBurn;
+use mitos_module_kit::ReentrantRound;
 use serde::Deserialize;
 
 use crate::mitos::platform_v2::chain_data;
@@ -73,25 +74,14 @@ thread_local! {
     static WATCHED_ADDRS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
     /// In-flight `rebootstrap` round. `None` between rounds.
-    /// Resident in the wasm instance across the host's re-entrant
-    /// call loop; a trap or host restart discards it and the
-    /// round resumes from the state-kv cursor (`predicate_idx`).
-    static REBOOTSTRAP_STATE: RefCell<Option<RebootstrapRound>> = RefCell::new(None);
-}
-
-/// In-flight `rebootstrap` round state — see `rebootstrap`.
-/// Burn-address has no resident accumulator: each page emits its
-/// `AddressBurn`s directly, so only the predicate list + page
-/// cursor are carried.
-struct RebootstrapRound {
-    /// Watched addresses, **sorted** so `predicate_idx` is stable
-    /// across a host restart (a `HashSet` iteration order is not).
-    addresses: Vec<String>,
-    /// Index of the address currently being re-scanned.
-    predicate_idx: usize,
-    /// Continuation token for the next page of the current
-    /// address; `None` ⇒ start at page 0.
-    after: Option<Vec<u8>>,
+    /// `ReentrantRound` (from `mitos-module-kit`) owns the
+    /// address list, `predicate_idx`, and page cursor. The
+    /// accumulator type is `()` — burn-address has no resident
+    /// accumulator, each page emits its `AddressBurn`s directly.
+    /// Resident across the host's re-entrant call loop; a trap or
+    /// host restart discards it and the round resumes from the
+    /// durable state-kv cursor (`predicate_idx`).
+    static REBOOTSTRAP_STATE: RefCell<Option<ReentrantRound<String, ()>>> = RefCell::new(None);
 }
 
 /// Minimal mirror of the on-wire `InterestPredicate` enum.
@@ -464,65 +454,61 @@ impl Guest for Module {
 
             // First call of a round (or the thread-local was
             // wiped by a trap/restart) — rebuild round state. The
-            // address list is sorted so `predicate_idx` is stable.
+            // address list is sorted so the durable `predicate_idx`
+            // cursor is stable across a host restart.
             if state.is_none() {
                 let mut addresses: Vec<String> =
                     WATCHED_ADDRS.with(|s| s.borrow().iter().cloned().collect());
                 addresses.sort_unstable();
-                let predicate_idx = load_rebootstrap_cursor().min(addresses.len());
-                *state = Some(RebootstrapRound {
-                    addresses,
-                    predicate_idx,
-                    after: None,
-                });
+                *state = Some(ReentrantRound::resume(addresses, load_rebootstrap_cursor()));
             }
             let round = state.as_mut().expect("round initialised above");
 
             // No addresses left — round done.
-            if round.predicate_idx >= round.addresses.len() {
+            let Some(addr) = round.current().cloned() else {
                 clear_rebootstrap_cursor();
                 *state = None;
                 return Ok(RebootstrapStep {
                     done: true,
                     ingested: 0,
                 });
-            }
+            };
 
             // Process exactly one page of the current address.
-            let addr = round.addresses[round.predicate_idx].clone();
             let page =
-                chain_data::utxos_by_address(&addr, round.after.as_deref(), COLD_START_PAGE_HINT);
+                chain_data::utxos_by_address(&addr, round.after(), COLD_START_PAGE_HINT);
             let ingested = page.refs.len() as u64;
 
             // A `read_utxos` length mismatch aborts this address —
             // skip the rest of its pages, advance to the next.
             let page_ok = process_address_page(&addr, &page.refs).is_some();
-            let has_more_pages = page_ok && page.next.is_some();
 
-            if has_more_pages {
-                // More pages for this address — keep the round.
-                round.after = page.next;
-                return Ok(RebootstrapStep {
-                    done: false,
-                    ingested,
-                });
+            match page.next {
+                Some(token) if page_ok => {
+                    // More pages for this address — keep the round.
+                    round.page_more(ingested, token);
+                    Ok(RebootstrapStep {
+                        done: false,
+                        ingested,
+                    })
+                }
+                _ => {
+                    // Address fully walked (or aborted) — advance
+                    // the durable cursor to the next address.
+                    round.page_last(ingested);
+                    let adv = round.finish_predicate();
+                    if adv.round_done {
+                        clear_rebootstrap_cursor();
+                        *state = None;
+                    } else {
+                        save_rebootstrap_cursor(adv.predicate_idx);
+                    }
+                    Ok(RebootstrapStep {
+                        done: adv.round_done,
+                        ingested,
+                    })
+                }
             }
-
-            // Address fully walked (or aborted) — advance the
-            // durable cursor to the next address.
-            round.predicate_idx += 1;
-            round.after = None;
-            save_rebootstrap_cursor(round.predicate_idx);
-            let round_done = round.predicate_idx >= round.addresses.len();
-
-            if round_done {
-                clear_rebootstrap_cursor();
-                *state = None;
-            }
-            Ok(RebootstrapStep {
-                done: round_done,
-                ingested,
-            })
         })
     }
 }

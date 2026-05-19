@@ -1,0 +1,15 @@
+[package]
+name = "mitos-module-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Author-facing helpers for mitos community modules — the re-entrant scan affordance from WASM_BUDGET_CHUNKING.md."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+# Intentionally none. This crate is pure logic — no serde, no
+# WIT bindings, no host-fn coupling — so a wasm community module
+# pulls in nothing transitive by depending on it.

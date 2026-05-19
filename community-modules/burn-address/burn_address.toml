@@ -13,3 +13,4 @@ policies = []
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
+mitos-module-kit = { path = "../../crates/mitos-module-kit" }

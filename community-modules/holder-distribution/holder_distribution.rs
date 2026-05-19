@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use mitos_community_events::holder_distribution::{
     AssetBalance, HolderDelta, HolderEntry, HolderEvent, SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
+use mitos_module_kit::ReentrantRound;
 use pallas_addresses::{Address, ShelleyDelegationPart};
 use serde::{Deserialize, Serialize};
 
@@ -95,27 +96,14 @@ thread_local! {
     static TRACKED_POLICIES: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
 
     /// In-flight `rebootstrap` round. `None` between rounds.
-    /// Resident in the wasm instance across the host's re-entrant
-    /// call loop; a trap or host restart discards it and the
-    /// round resumes from the state-kv cursor (`predicate_idx`).
-    static REBOOTSTRAP_STATE: RefCell<Option<RebootstrapRound>> = RefCell::new(None);
-}
-
-/// In-flight `rebootstrap` round state — see `rebootstrap`.
-struct RebootstrapRound {
-    /// Tracked policies, **sorted** so `predicate_idx` is stable
-    /// across a host restart (a `HashSet` iteration order is not).
-    policies: Vec<[u8; HASH_BYTES]>,
-    /// Index of the predicate currently being re-scanned.
-    predicate_idx: usize,
-    /// Continuation token for the next page of the current
-    /// predicate; `None` ⇒ start at page 0.
-    after: Option<Vec<u8>>,
-    /// Accumulating ledger for the current predicate — resident
-    /// across its pages, reset when the predicate completes.
-    ledger: PolicyLedger,
-    /// UTxOs folded into the current predicate's ledger so far.
-    utxos_scanned: usize,
+    /// `ReentrantRound` (from `mitos-module-kit`) owns the
+    /// predicate list, the `predicate_idx`, the page cursor, and
+    /// the per-predicate `PolicyLedger` accumulator. Resident in
+    /// the wasm instance across the host's re-entrant call loop;
+    /// a trap or host restart discards it and the round resumes
+    /// from the durable state-kv cursor (`predicate_idx`).
+    static REBOOTSTRAP_STATE: RefCell<Option<ReentrantRound<[u8; HASH_BYTES], PolicyLedger>>> =
+        RefCell::new(None);
 }
 
 /// In-memory ledger key. `Some(stake_hash)` for key/script
@@ -792,71 +780,66 @@ impl Guest for Module {
 
             // First call of a round (or the thread-local was
             // wiped by a trap/restart) — rebuild round state. The
-            // policy list is sorted so `predicate_idx` is stable.
+            // policy list is sorted so the durable `predicate_idx`
+            // cursor is stable across a host restart.
             if state.is_none() {
                 let mut policies: Vec<[u8; HASH_BYTES]> =
                     TRACKED_POLICIES.with(|s| s.borrow().iter().copied().collect());
                 policies.sort_unstable();
-                let predicate_idx = load_rebootstrap_cursor().min(policies.len());
-                *state = Some(RebootstrapRound {
-                    policies,
-                    predicate_idx,
-                    after: None,
-                    ledger: PolicyLedger::default(),
-                    utxos_scanned: 0,
-                });
+                *state = Some(ReentrantRound::resume(policies, load_rebootstrap_cursor()));
             }
             let round = state.as_mut().expect("round initialised above");
 
             // No predicates left (empty tracked set, or resumed
             // past the end) — round done.
-            if round.predicate_idx >= round.policies.len() {
+            let Some(&policy) = round.current() else {
                 clear_rebootstrap_cursor();
                 *state = None;
                 return Ok(RebootstrapStep {
                     done: true,
                     ingested: 0,
                 });
-            }
+            };
 
             // Process exactly one page of the current predicate.
-            let policy = round.policies[round.predicate_idx];
             let page =
-                chain_data::utxos_by_policy(&policy, round.after.as_deref(), COLD_START_PAGE_HINT);
+                chain_data::utxos_by_policy(&policy, round.after(), COLD_START_PAGE_HINT);
             let ingested = page.refs.len() as u64;
             let anchor_slot = page.anchor_slot;
-            fold_page(&mut round.ledger, &policy, &page.refs);
-            round.utxos_scanned += page.refs.len();
+            fold_page(round.acc_mut(), &policy, &page.refs);
 
-            let predicate_done = page.next.is_none();
-            round.after = page.next;
-
-            if !predicate_done {
-                // More pages for this predicate — keep the round.
-                return Ok(RebootstrapStep {
-                    done: false,
-                    ingested,
-                });
+            match page.next {
+                Some(token) => {
+                    // More pages for this predicate — keep the round.
+                    round.page_more(ingested, token);
+                    Ok(RebootstrapStep {
+                        done: false,
+                        ingested,
+                    })
+                }
+                None => {
+                    // Predicate fully scanned — emit its snapshot,
+                    // then advance the durable cursor.
+                    round.page_last(ingested);
+                    finalize_policy_snapshot(
+                        &policy,
+                        round.acc(),
+                        anchor_slot,
+                        round.items() as usize,
+                    );
+                    let adv = round.finish_predicate();
+                    if adv.round_done {
+                        clear_rebootstrap_cursor();
+                        *state = None;
+                    } else {
+                        save_rebootstrap_cursor(adv.predicate_idx);
+                    }
+                    Ok(RebootstrapStep {
+                        done: adv.round_done,
+                        ingested,
+                    })
+                }
             }
-
-            // Predicate fully scanned — emit its snapshot, then
-            // advance the durable cursor to the next predicate.
-            finalize_policy_snapshot(&policy, &round.ledger, anchor_slot, round.utxos_scanned);
-            round.predicate_idx += 1;
-            round.after = None;
-            round.ledger = PolicyLedger::default();
-            round.utxos_scanned = 0;
-            save_rebootstrap_cursor(round.predicate_idx);
-            let round_done = round.predicate_idx >= round.policies.len();
-
-            if round_done {
-                clear_rebootstrap_cursor();
-                *state = None;
-            }
-            Ok(RebootstrapStep {
-                done: round_done,
-                ingested,
-            })
         })
     }
 }
