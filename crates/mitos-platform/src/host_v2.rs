@@ -364,10 +364,8 @@ where
             // call, so OOM (`cabi_realloc`) is a real outcome and
             // must be told apart from a fuel exhaustion or a
             // module logic fault. See `crate::budget`.
-            let trap = crate::budget::TrapClass::classify(
-                &e,
-                instance.store.data().limiter().hit_oom(),
-            );
+            let trap =
+                crate::budget::TrapClass::classify(&e, instance.store.data().limiter().hit_oom());
             let peak_memory = instance.store.data().limiter().peak_memory_bytes();
             let snap = trap_logger.snapshot();
             let path = self.storage.last_trap_path(id);
@@ -461,7 +459,14 @@ where
         // `mut` so the follower gets the one matching its
         // (possibly re-instantiated) driver.
         let (mut driver, mut trap_logger) = self
-            .instantiate_driver(id, &registry, caching_plane.clone(), &config, sink.clone(), None)
+            .instantiate_driver(
+                id,
+                &registry,
+                caching_plane.clone(),
+                &config,
+                sink.clone(),
+                None,
+            )
             .await?;
 
         // Bootstrap: hydrate state at watched addresses
@@ -640,8 +645,7 @@ where
                                     }
                                 }
                             }
-                            crate::budget::TrapClass::Timeout
-                            | crate::budget::TrapClass::Fault => {
+                            crate::budget::TrapClass::Timeout | crate::budget::TrapClass::Fault => {
                                 tracing::error!(
                                     module = %id,
                                     trap = %trap,

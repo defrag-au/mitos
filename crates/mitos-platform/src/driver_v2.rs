@@ -152,11 +152,11 @@ impl DriverV2 {
         let fuel_remaining = self.instance.store.get_fuel().unwrap_or(0);
         let fuel_used = self.fuel_per_call.saturating_sub(fuel_remaining);
         let hit_oom = self.instance.store.data().limiter().hit_oom();
-        self.instance
-            .store
-            .data_mut()
-            .adaptive_mut()
-            .observe(fuel_used, self.fuel_per_call, hit_oom);
+        self.instance.store.data_mut().adaptive_mut().observe(
+            fuel_used,
+            self.fuel_per_call,
+            hit_oom,
+        );
 
         result
     }

@@ -242,10 +242,7 @@ mod tests {
     fn unknown_scan_is_expired() {
         let mut cache = ScanCache::default();
         let token = encode_token(999, 0);
-        assert!(matches!(
-            cache.resume(&token, 100),
-            Err(ScanError::Expired)
-        ));
+        assert!(matches!(cache.resume(&token, 100), Err(ScanError::Expired)));
     }
 
     #[test]

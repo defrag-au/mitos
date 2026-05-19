@@ -199,9 +199,7 @@ impl HostStateV2 {
 /// Tip slot to freeze a fresh scan as-of. dolos exposes the tip
 /// as an O(1) cursor-table read, so this is cheap to take once
 /// per scan-start.
-async fn scan_anchor_slot(
-    dp: &dyn crate::host_fns::DataPlaneFacade,
-) -> wasmtime::Result<u64> {
+async fn scan_anchor_slot(dp: &dyn crate::host_fns::DataPlaneFacade) -> wasmtime::Result<u64> {
     let tip = dp
         .tip()
         .await
