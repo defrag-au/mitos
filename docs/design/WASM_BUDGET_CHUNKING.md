@@ -458,6 +458,31 @@ already chunks via per-batch `handle-events` calls.
    the *serialised emit*, not the accumulator. A million-holder
    token would still need open question 1 (accumulator paged to
    `state-kv`).
+
+   **Re-entrant emit — landed 2026-05-19 (prod follow-up).** The
+   first re-entrant-`rebootstrap` recapture in prod proved that
+   chunking the *wire format* wasn't enough: `holder-distribution`
+   still emitted **all** the `SnapshotChunk`s — plus an
+   `O(n log n)` by-quantity sort and the ledger persist — inside
+   a *single* `rebootstrap` call's `finalize`, and that trapped
+   `out-of-fuel` on a large policy (page-shrinking didn't help —
+   `finalize` cost is page-size-independent). Fix, in
+   `holder-distribution`: (a) drop the by-quantity sort from
+   `ledger_to_holders` — it was the dominant cost and the
+   consumer DB-inserts each holder, so wire order is immaterial;
+   (b) make the emit **re-entrant** — when a predicate's scan
+   finishes, `begin_emit` stages the holder list in a
+   `REBOOTSTRAP_EMIT` thread-local and emits `SnapshotBegin`;
+   each subsequent `rebootstrap` call drains exactly one
+   `SnapshotChunk` (then the closing `SnapshotEnd`). The durable
+   `predicate_idx` cursor is **not advanced until the emit
+   closes**, so a trap anywhere in a predicate (scan *or* emit)
+   re-scans + re-emits it cleanly — the consumer's `SnapshotBegin`
+   wipe discards any partial. The live `update_interest` add path
+   (`cold_start`) keeps the one-shot `finalize_policy_snapshot`
+   (that host call isn't re-entrant) — now sort-free, so far
+   lighter. `vesting-tracker` was left one-shot: vest sets are
+   inherently small; the same pattern applies if one ever isn't.
 5. **SDK affordance.** *Landed 2026-05-19.* New crate
    `crates/mitos-module-kit` — `ReentrantRound<P, A>`: a pure,
    zero-dependency helper that owns the re-entrant scan
