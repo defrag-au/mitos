@@ -182,51 +182,55 @@ impl std::fmt::Display for TrapClass {
     }
 }
 
-/// Host-owned adaptive page sizer for the bulk `utxos-by-*`
-/// host-fns. Phase 2 of `WASM_BUDGET_CHUNKING.md` — "Adaptive
-/// page sizing — host-owned."
+/// Smallest page the sizer ever clamps to. Below this, host-call
+/// overhead dominates; if even this traps, the module is
+/// pathological and the host gives up the round.
+const MIN_PAGE: u32 = 64;
+
+/// Page a fresh scan starts at. Conservative — a prod recapture
+/// (2026-05-19) trapped `out-of-fuel` on a 2048-UTxO page of
+/// `holder-distribution` (`read_utxos` + bech32 parse + ledger
+/// fold per UTxO). The sizer only ever probes *down* from here.
+const INITIAL_PAGE: u32 = 256;
+
+/// Host-owned page sizer for the bulk `utxos-by-*` host-fns.
+/// Phase 2 of `WASM_BUDGET_CHUNKING.md`; reworked for Approach A
+/// after the 2026-05-19 prod incident.
 ///
-/// The module is naive: it asks for a generous page (`limit`
-/// hint) and processes exactly what it gets. The host clamps the
-/// returned page to `page_limit()` and, between guest calls,
-/// feeds per-call budget telemetry into `observe`, which adjusts
-/// the clamp AIMD-style (additive increase on spare budget,
-/// multiplicative decrease on pressure or a trap).
+/// **Shrink-only.** It starts at `INITIAL_PAGE` and halves on a
+/// trap or heavy fuel use, probing down to the per-module safe
+/// page; it never grows back up. An upward AIMD step that
+/// overshot the per-call fuel budget is what caused the
+/// incident — the per-UTxO fold cost is data-dependent (a UTxO
+/// with many asset names is far heavier), so no fixed page is
+/// universally safe. The recovery path is "shrink + the host
+/// re-instantiates and retries the predicate" (Approach A), not
+/// "grow back and hope."
 #[derive(Debug, Clone)]
 pub struct AdaptiveSizer {
     /// Current page-size clamp, in refs.
     current: u32,
-    /// Floor — never clamp below this (a too-small page wastes
-    /// host-call overhead).
-    min: u32,
-    /// Ceiling — never clamp above this.
-    max: u32,
-    /// Additive-increase step.
-    step: u32,
 }
 
 impl Default for AdaptiveSizer {
     fn default() -> Self {
         Self {
-            // Conservative cold-start default (open question 3 of
-            // the design doc): sized for a mid-weight UTxO under
-            // the per-call fuel budget. The control loop
-            // converges away from this within a few pages.
-            current: 2_048,
-            min: 64,
-            max: 32_768,
-            step: 2_048,
+            current: INITIAL_PAGE,
         }
     }
 }
 
 impl AdaptiveSizer {
     /// Page size to return now, reconciling the module's hint
-    /// with the adaptive clamp: `min(hint, current)`. A `0` hint
-    /// (module deferring entirely to the host) yields `current`.
+    /// with the clamp: `min(hint, current)`. A `0` hint (module
+    /// deferring entirely to the host) yields `current`.
     pub fn page_limit(&self, hint: u32) -> usize {
-        let hinted = if hint == 0 { self.current } else { hint.min(self.current) };
-        hinted.max(self.min) as usize
+        let hinted = if hint == 0 {
+            self.current
+        } else {
+            hint.min(self.current)
+        };
+        hinted.max(MIN_PAGE) as usize
     }
 
     /// The current clamp, in refs — telemetry / tests.
@@ -234,33 +238,33 @@ impl AdaptiveSizer {
         self.current
     }
 
-    /// Feed one guest call's budget telemetry. AIMD control loop:
-    ///
-    /// - a call that hit OOM → multiplicative decrease (halve);
-    ///   the host should retry the same page at the smaller clamp;
-    /// - `< 50%` of fuel used → additive increase (spare budget);
-    /// - `> 80%` of fuel used → multiplicative decrease;
-    /// - otherwise → hold.
+    /// Feed one guest call's budget telemetry. The sizer halves
+    /// `current` on an OOM or on heavy (`> 80%`) fuel use; it
+    /// never grows. The host carries the shrunk value into a
+    /// re-instantiated module via `seed_current`.
     pub fn observe(&mut self, fuel_used: u64, fuel_limit: u64, hit_oom: bool) {
         if hit_oom {
             self.decrease();
             return;
         }
-        if fuel_limit == 0 {
-            return;
-        }
-        let frac = fuel_used as f64 / fuel_limit as f64;
-        if frac < 0.5 {
-            self.current = self.current.saturating_add(self.step).min(self.max);
-        } else if frac > 0.8 {
+        if fuel_limit > 0 && (fuel_used as f64 / fuel_limit as f64) > 0.8 {
             self.decrease();
         }
     }
 
-    /// Multiplicative decrease — used by `observe` and directly
-    /// by the host loop on a trap with no usable fuel reading.
+    /// Halve the page, floored at `MIN_PAGE`. Used by `observe`
+    /// and directly by the host loop on a trap.
     pub fn decrease(&mut self) {
-        self.current = (self.current / 2).max(self.min);
+        self.current = (self.current / 2).max(MIN_PAGE);
+    }
+
+    /// Seed the page when the host re-instantiates a module
+    /// after a retryable trap (Approach A): the shrunk page from
+    /// the trapped instance is carried into the fresh one so the
+    /// retried predicate resumes at the smaller page rather than
+    /// the default. Clamped to `[MIN_PAGE, INITIAL_PAGE]`.
+    pub fn seed_current(&mut self, page: u32) {
+        self.current = page.clamp(MIN_PAGE, INITIAL_PAGE);
     }
 }
 
@@ -327,32 +331,30 @@ mod tests {
     #[test]
     fn sizer_page_limit_honours_hint_and_clamp() {
         let s = AdaptiveSizer::default();
+        assert_eq!(s.current(), 256);
         // Module hint below the clamp wins.
-        assert_eq!(s.page_limit(500), 500);
+        assert_eq!(s.page_limit(100), 100);
         // Hint above the clamp is clamped to `current`.
-        assert_eq!(s.page_limit(1_000_000), s.current() as usize);
+        assert_eq!(s.page_limit(1_000_000), 256);
         // A zero hint defers entirely to the host.
-        assert_eq!(s.page_limit(0), s.current() as usize);
+        assert_eq!(s.page_limit(0), 256);
     }
 
     #[test]
-    fn sizer_aimd_increase_and_decrease() {
+    fn sizer_shrinks_on_pressure_and_never_grows() {
         let mut s = AdaptiveSizer::default();
-        let base = s.current();
-
-        // Spare fuel → additive increase.
+        // Spare fuel — the sizer does not grow.
         s.observe(10, 100, false);
-        assert!(s.current() > base);
-
-        // Heavy fuel use → multiplicative decrease.
-        let high = s.current();
+        assert_eq!(s.current(), 256);
+        // Heavy (>80%) fuel use → halve.
         s.observe(90, 100, false);
-        assert!(s.current() < high);
-
+        assert_eq!(s.current(), 128);
+        // Still no upward growth on a later spare-fuel call.
+        s.observe(10, 100, false);
+        assert_eq!(s.current(), 128);
         // An OOM halves regardless of fuel.
-        let pre_oom = s.current();
         s.observe(0, 100, true);
-        assert_eq!(s.current(), (pre_oom / 2).max(64));
+        assert_eq!(s.current(), 64);
     }
 
     #[test]
@@ -364,5 +366,17 @@ mod tests {
         assert_eq!(s.current(), 64);
         // The floor still yields a usable page.
         assert_eq!(s.page_limit(1_000_000), 64);
+    }
+
+    #[test]
+    fn sizer_seed_carries_a_shrunk_page_clamped() {
+        let mut s = AdaptiveSizer::default();
+        s.seed_current(128);
+        assert_eq!(s.current(), 128);
+        // Clamped into [MIN_PAGE, INITIAL_PAGE].
+        s.seed_current(5);
+        assert_eq!(s.current(), 64);
+        s.seed_current(99_999);
+        assert_eq!(s.current(), 256);
     }
 }

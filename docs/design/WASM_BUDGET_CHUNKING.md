@@ -379,8 +379,9 @@ already chunks via per-batch `handle-events` calls.
    (the tip the scan was frozen as-of) so snapshots stamp a real
    `cursor_slot`. `budget::AdaptiveSizer` clamps each page; the
    recapture loop feeds it per-call fuel + OOM telemetry
-   (`DriverV2::call_rebootstrap`), so the clamp adapts AIMD-style
-   **between `rebootstrap` calls** (predicate grain). The three
+   (`DriverV2::call_rebootstrap`), which shrinks the page on
+   pressure (see Phase 3 for the reworked shrink-only sizer +
+   trap-retry). The three
    self-bootstrapping modules' `cold_start` now page-loop; the
    resident accumulator is the holder/lock ledger, transient is
    one page. mitos-side only — dolos v1.0.3 used as-is.
@@ -410,13 +411,32 @@ already chunks via per-batch `handle-events` calls.
    which a restart drops (`ScanError::Expired`). The predicate
    list is sorted so `predicate_idx` is stable across a restart.
 
-   *Not done:* in-loop trap-retry ("halve + retry the same
-   page"). On a `rebootstrap` trap the host aborts the round —
-   but the Phase 2 adaptive clamp has already shrunk, so the
-   next recapture uses a smaller page, and the default page
-   (2048 refs) is sized to fit the per-call fuel budget so a
-   trap shouldn't occur in practice. A refinement, not
-   load-bearing for correctness.
+   **Trap-retry — landed (Approach A), 2026-05-19.** The first
+   prod recapture proved trap-retry is *not* optional: the
+   per-UTxO fold cost is data-dependent (a UTxO with many asset
+   names is far heavier), so a page that fits the fuel budget on
+   light UTxOs traps `out-of-fuel` on a heavy cluster — there is
+   no universally safe static page size. On a retryable trap
+   (`OutOfFuel`/`OutOfMemory`), the host now **re-instantiates
+   the module** and retries: `instantiate_driver` builds a fresh
+   instance whose `rebootstrap` re-inits its `ReentrantRound`
+   from the durable `predicate_idx` cursor — a clean restart of
+   the trapped predicate from page 0, no partial-fold from the
+   trapped attempt surviving (fresh wasm memory). The shrunk
+   page from the trapped instance's `AdaptiveSizer` is carried
+   into the fresh one (`seed_current`). Bounded by
+   `REBOOTSTRAP_MAX_REINSTANTIATIONS`. The chunked snapshot
+   protocol (Phase 4) makes the re-emit idempotent — a retry's
+   `SnapshotBegin` wipes any partial chunks from the trapped
+   attempt. Cost: the trapped predicate's earlier pages are
+   re-scanned, bounded since the sizer floors at `MIN_PAGE`.
+
+   Consequently the `AdaptiveSizer` is now **shrink-only**:
+   start at `INITIAL_PAGE` (256), halve on a trap or `>80%`
+   fuel, never grow — upward AIMD was what overshot into the
+   prod trap, and with re-instantiate-retry as the backstop the
+   sizer's only job is to probe *down* to the per-module safe
+   page.
 4. **Chunked snapshot protocol.** *Landed 2026-05-19.*
    `mitos-community-events` — `HolderEvent` and `VestingEvent`
    replace the single `Snapshot` with a `SnapshotBegin` →

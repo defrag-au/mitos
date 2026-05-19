@@ -10,7 +10,11 @@
 use mitos_protocol::ChainPoint as WireChainPoint;
 
 /// Sink for emitted events. One per module instance; drained by
-/// the replication side.
+/// the replication side. `Clone` so the host can hand the same
+/// sink to a re-instantiated module after a retryable trap (see
+/// `host_v2::instantiate_driver`) — all instances feed one
+/// drain channel.
+#[derive(Clone)]
 pub struct EventSink {
     // Crate-visible so the v2 host fns can push events through
     // it without duplicating the emit channel plumbing.

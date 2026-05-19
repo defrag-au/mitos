@@ -313,83 +313,51 @@ where
         }
     }
 
-    /// Start (or restart) the v2 module. Mirrors v1's
-    /// `ModuleHost::start` shape: stop existing slot if any →
-    /// instantiate → init (with refuel + trap-context capture)
-    /// → spawn follower + emit-drain task.
+    /// Instantiate the module artifact, run `init`, and wrap it
+    /// in a `DriverV2`. Factored out of `start` so the recapture
+    /// rebootstrap loop can rebuild the instance after a
+    /// retryable trap (Approach A, `WASM_BUDGET_CHUNKING.md`):
+    /// a fresh instance re-inits its `ReentrantRound` from the
+    /// durable state-kv cursor, cleanly restarting the trapped
+    /// predicate from page 0 — no partial-fold from the trapped
+    /// attempt survives.
     ///
-    /// `rebootstrap`: when `true`, invoke the module's
-    /// `rebootstrap` export after the manifest bootstrap pass —
-    /// used by the recapture flow so a self-bootstrapping module
-    /// re-emits its own state. All non-recapture callers pass
-    /// `false`.
+    /// `seed_page`: when `Some`, the fresh instance's adaptive
+    /// sizer starts at that page — the shrunk size carried from
+    /// the trapped instance — instead of the default.
     ///
-    /// Returns the count of interest predicates the module
-    /// re-bootstrapped (`0` unless `rebootstrap` was `true` and
-    /// the module is self-bootstrapping) — the recapture flow
-    /// surfaces it as `events_emitted`.
-    pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
-        self.stop(id).await?;
-
-        let manifest = self
-            .storage
-            .read_manifest(id)?
-            .ok_or_else(|| PlatformError::Decode(format!("no manifest for {id}")))?;
-        let wasm_path = self
-            .storage
-            .current_wasm_path(id)?
-            .ok_or_else(|| PlatformError::Decode(format!("no current.wasm for {id}")))?;
-
-        let registry =
-            ModuleRegistryV2::load_from_path(self.engine.clone(), id.to_owned(), &wasm_path)?;
-
+    /// Returns the driver plus the instance's `TrapContextLogger`
+    /// (the follower needs the logger matching its instance). An
+    /// `init` trap writes a replay fixture and surfaces as `Err`.
+    async fn instantiate_driver(
+        &self,
+        id: &str,
+        registry: &ModuleRegistryV2,
+        caching_plane: Arc<dyn DataPlaneFacade>,
+        config: &[u8],
+        sink: emit::EventSink,
+        seed_page: Option<u32>,
+    ) -> PlatformResult<(DriverV2, Arc<TrapContextLogger>)> {
         let kv = (self.kv_factory)(id);
-        let (sink, events_rx) = (self.emitter_factory)();
-
-        // Trap-context logger wraps the data plane facade so
-        // host-fn calls during init or dispatch get captured.
-        // Same `last-trap.toml` write path v1 uses.
-        // Wrap the shared data plane with the aux-data cache so
-        // `tx_metadata` calls from the module check the persistent
-        // cache before hitting the dolos archive (7-day window).
-        // Failures to open the cache degrade gracefully to a plain
-        // passthrough — same behaviour as before this was added.
-        let cache_opt = match self.storage.aux_data_cache() {
-            Ok(c) => {
-                tracing::debug!(module = %id, "aux_data_cache opened");
-                Some(Arc::new(c))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    module = %id,
-                    error = %e,
-                    "aux_data_cache unavailable; tx_metadata bypasses cache",
-                );
-                None
-            }
-        };
-        let maestro_opt = crate::maestro::MaestroClient::shared();
-        if maestro_opt.is_some() {
-            tracing::info!(module = %id, "Maestro aux_data fallback enabled");
-        }
-
-        let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
-            crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt, maestro_opt),
-        );
         let trap_logger = Arc::new(TrapContextLogger::new(caching_plane));
 
         let mut instance = registry
             .instantiate(trap_logger.clone(), kv, sink, self.budget)
             .await?;
 
-        let config = self.storage.read_config(id)?.unwrap_or_default();
+        // Carry a shrunk page from a trapped instance into the
+        // fresh sizer, before any guest call.
+        if let Some(page) = seed_page {
+            instance.store.data_mut().adaptive_mut().seed_current(page);
+        }
+
         instance.store.set_fuel(self.budget.init_fuel)?;
-        // Clear the per-call OOM flag so a trap below classifies
-        // against this `init` call only.
+        // Clear the per-call OOM flag so an `init` trap classifies
+        // against this call only.
         instance.store.data_mut().limiter_mut().reset_call();
         if let Err(e) = instance
             .bindings
-            .call_init(&mut instance.store, &config)
+            .call_init(&mut instance.store, config)
             .await
         {
             // Classify the trap — `init` is a heavy bootstrap
@@ -422,7 +390,79 @@ where
             return Err(PlatformError::Wasmtime(e));
         }
 
-        let mut driver = DriverV2::new(instance, self.budget);
+        Ok((DriverV2::new(instance, self.budget), trap_logger))
+    }
+
+    /// Start (or restart) the v2 module. Mirrors v1's
+    /// `ModuleHost::start` shape: stop existing slot if any →
+    /// instantiate → init (with refuel + trap-context capture)
+    /// → spawn follower + emit-drain task.
+    ///
+    /// `rebootstrap`: when `true`, invoke the module's
+    /// `rebootstrap` export after the manifest bootstrap pass —
+    /// used by the recapture flow so a self-bootstrapping module
+    /// re-emits its own state. All non-recapture callers pass
+    /// `false`.
+    ///
+    /// Returns the count of interest predicates the module
+    /// re-bootstrapped (`0` unless `rebootstrap` was `true` and
+    /// the module is self-bootstrapping) — the recapture flow
+    /// surfaces it as `events_emitted`.
+    pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
+        self.stop(id).await?;
+
+        let manifest = self
+            .storage
+            .read_manifest(id)?
+            .ok_or_else(|| PlatformError::Decode(format!("no manifest for {id}")))?;
+        let wasm_path = self
+            .storage
+            .current_wasm_path(id)?
+            .ok_or_else(|| PlatformError::Decode(format!("no current.wasm for {id}")))?;
+
+        let registry =
+            ModuleRegistryV2::load_from_path(self.engine.clone(), id.to_owned(), &wasm_path)?;
+
+        let (sink, events_rx) = (self.emitter_factory)();
+
+        // Wrap the shared data plane with the aux-data cache so
+        // `tx_metadata` calls from the module check the persistent
+        // cache before hitting the dolos archive (7-day window).
+        // Failures to open the cache degrade gracefully to a plain
+        // passthrough — same behaviour as before this was added.
+        let cache_opt = match self.storage.aux_data_cache() {
+            Ok(c) => {
+                tracing::debug!(module = %id, "aux_data_cache opened");
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    module = %id,
+                    error = %e,
+                    "aux_data_cache unavailable; tx_metadata bypasses cache",
+                );
+                None
+            }
+        };
+        let maestro_opt = crate::maestro::MaestroClient::shared();
+        if maestro_opt.is_some() {
+            tracing::info!(module = %id, "Maestro aux_data fallback enabled");
+        }
+        let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
+            crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt, maestro_opt),
+        );
+        let config = self.storage.read_config(id)?.unwrap_or_default();
+
+        // Instantiate + `init` + wrap in a driver. Factored into
+        // `instantiate_driver` so the recapture rebootstrap loop
+        // below can rebuild the instance after a retryable trap
+        // (Approach A, `WASM_BUDGET_CHUNKING.md`). The
+        // trap-context logger is per-instance — `trap_logger` is
+        // `mut` so the follower gets the one matching its
+        // (possibly re-instantiated) driver.
+        let (mut driver, mut trap_logger) = self
+            .instantiate_driver(id, &registry, caching_plane.clone(), &config, sink.clone(), None)
+            .await?;
 
         // Bootstrap: hydrate state at watched addresses
         // declared in the manifest's `[interest]` section.
@@ -507,7 +547,13 @@ where
             // never returns `done`. Counts host calls (pages),
             // not UTxOs.
             const REBOOTSTRAP_MAX_STEPS: u64 = 10_000_000;
+            // A retryable trap re-instantiates the module and
+            // retries at a smaller page (Approach A). Bounded so
+            // a module that traps even at the minimum page can't
+            // loop forever.
+            const REBOOTSTRAP_MAX_REINSTANTIATIONS: u32 = 6;
             let mut steps: u64 = 0;
+            let mut reinstantiations: u32 = 0;
             loop {
                 match driver.call_rebootstrap().await {
                     Ok(Ok(step)) => {
@@ -534,27 +580,85 @@ where
                         break;
                     }
                     Err(e) => {
-                        // Classify the trap so operators see
-                        // *why* — an OOM (`cabi_realloc` in a
-                        // large policy's cold-start) needs page
-                        // chunking, a fuel exhaustion needs a
-                        // bigger budget, a fault is a module bug.
+                        // A trap during a `rebootstrap` page.
+                        // `OutOfFuel`/`OutOfMemory` are retryable:
+                        // the page overran the per-call budget,
+                        // and `call_rebootstrap` already shrank
+                        // the adaptive sizer. Re-instantiate
+                        // carrying the smaller page — the fresh
+                        // instance re-inits its `ReentrantRound`
+                        // from the durable predicate cursor, a
+                        // clean restart of the trapped predicate —
+                        // and retry. `Timeout`/`Fault` are not
+                        // resize-retryable; abort.
                         let trap = driver.classify_trap(&e);
-                        tracing::error!(
-                            module = %id,
-                            trap = %trap,
-                            peak_memory_bytes = driver.peak_memory_bytes(),
-                            error = %e,
-                            "v2 rebootstrap trapped; refill may be partial",
-                        );
-                        break;
+                        match trap {
+                            crate::budget::TrapClass::OutOfFuel
+                            | crate::budget::TrapClass::OutOfMemory => {
+                                let retry_page = driver.adaptive_page_limit();
+                                reinstantiations += 1;
+                                if reinstantiations > REBOOTSTRAP_MAX_REINSTANTIATIONS {
+                                    tracing::error!(
+                                        module = %id,
+                                        trap = %trap,
+                                        "v2 rebootstrap: still trapping at the minimum page \
+                                         after repeated retries; refill may be partial",
+                                    );
+                                    break;
+                                }
+                                tracing::warn!(
+                                    module = %id,
+                                    trap = %trap,
+                                    peak_memory_bytes = driver.peak_memory_bytes(),
+                                    retry_page,
+                                    "v2 rebootstrap page trapped; re-instantiating + retrying \
+                                     at a smaller page",
+                                );
+                                match self
+                                    .instantiate_driver(
+                                        id,
+                                        &registry,
+                                        caching_plane.clone(),
+                                        &config,
+                                        sink.clone(),
+                                        Some(retry_page),
+                                    )
+                                    .await
+                                {
+                                    Ok((d, tl)) => {
+                                        driver = d;
+                                        trap_logger = tl;
+                                    }
+                                    Err(re) => {
+                                        tracing::error!(
+                                            module = %id,
+                                            error = %re,
+                                            "v2 rebootstrap: re-instantiate after trap \
+                                             failed; refill may be partial",
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            crate::budget::TrapClass::Timeout
+                            | crate::budget::TrapClass::Fault => {
+                                tracing::error!(
+                                    module = %id,
+                                    trap = %trap,
+                                    peak_memory_bytes = driver.peak_memory_bytes(),
+                                    error = %e,
+                                    "v2 rebootstrap trapped; refill may be partial",
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
             if rebootstrap_count > 0 {
                 tracing::info!(
                     module = %id,
-                    predicates = rebootstrap_count,
+                    utxos_ingested = rebootstrap_count,
                     adaptive_page_limit = driver.adaptive_page_limit(),
                     "v2 rebootstrap complete",
                 );
