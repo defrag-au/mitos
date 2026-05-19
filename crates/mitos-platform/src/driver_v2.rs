@@ -135,10 +135,35 @@ impl DriverV2 {
         // Clear the per-call OOM flag so `classify_trap` reflects
         // only this invocation if it traps.
         self.instance.store.data_mut().limiter_mut().reset_call();
-        self.instance
+
+        let result = self
+            .instance
             .bindings
             .call_rebootstrap(&mut self.instance.store)
-            .await
+            .await;
+
+        // Feed this call's budget telemetry into the adaptive
+        // page sizer so the *next* `rebootstrap` call's
+        // `utxos-by-*` pages are sized to fit. AIMD: spare fuel
+        // grows the page, fuel pressure or an OOM shrinks it.
+        // `get_fuel` is valid whether the call returned or
+        // trapped — the Store outlives the trap.
+        let fuel_remaining = self.instance.store.get_fuel().unwrap_or(0);
+        let fuel_used = self.fuel_per_call.saturating_sub(fuel_remaining);
+        let hit_oom = self.instance.store.data().limiter().hit_oom();
+        self.instance
+            .store
+            .data_mut()
+            .adaptive_mut()
+            .observe(fuel_used, self.fuel_per_call, hit_oom);
+
+        result
+    }
+
+    /// Current adaptive page-size clamp, in refs — telemetry for
+    /// the recapture loop's logging.
+    pub fn adaptive_page_limit(&self) -> u32 {
+        self.instance.store.data().adaptive.current()
     }
 
     /// Classify a trap returned by a guest call on this driver's

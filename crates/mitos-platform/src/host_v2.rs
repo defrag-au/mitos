@@ -547,6 +547,7 @@ where
                 tracing::info!(
                     module = %id,
                     predicates = rebootstrap_count,
+                    adaptive_page_limit = driver.adaptive_page_limit(),
                     "v2 rebootstrap complete",
                 );
             }

@@ -286,6 +286,13 @@ impl DataPlaneFacade for TrapContextLogger {
             });
         Ok(result)
     }
+
+    async fn tip(&self) -> DataPlaneResult<mitos_data_plane::ChainTip> {
+        // Pass-through — `tip` feeds `utxo-page.anchor-slot`. Not
+        // captured in the trap fixture today; replays default to
+        // origin, which is acceptable for trap-replay debugging.
+        self.inner.tip().await
+    }
 }
 
 /// Render a captured log as a TOML fixture matching the format

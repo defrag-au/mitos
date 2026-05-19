@@ -8,9 +8,10 @@
 use crate::bindings_v2::{
     self, AssetEntry as WitAssetEntry, AssetId as WitAssetId, ChainDataHost,
     OutputRef as WitOutputRef, StakeCred as WitStakeCred, TypedDatum as WitTypedDatum,
-    TypedOutput as WitTypedOutput,
+    TypedOutput as WitTypedOutput, UtxoPage as WitUtxoPage,
 };
 use crate::host_fns_v2::HostStateV2;
+use crate::host_fns_v2::scan_cache::ScanPage;
 
 impl ChainDataHost for HostStateV2 {
     async fn read_utxos(
@@ -32,34 +33,64 @@ impl ChainDataHost for HostStateV2 {
             .collect())
     }
 
-    async fn utxos_by_address(&mut self, address: String) -> wasmtime::Result<Vec<WitOutputRef>> {
-        let refs = self
-            .data_plane
-            .utxos_by_address(&address)
-            .await
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-        Ok(refs.into_iter().map(from_dp_ref).collect())
+    async fn utxos_by_address(
+        &mut self,
+        address: String,
+        after: Option<Vec<u8>>,
+        limit: u32,
+    ) -> wasmtime::Result<WitUtxoPage> {
+        match after {
+            Some(token) => self.resume_scan(&token, limit),
+            None => {
+                let dp = self.data_plane.clone();
+                let refs = dp
+                    .utxos_by_address(&address)
+                    .await
+                    .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+                let anchor = scan_anchor_slot(dp.as_ref()).await?;
+                Ok(self.begin_scan(refs, anchor, limit))
+            }
+        }
     }
 
-    async fn utxos_by_policy(&mut self, policy: Vec<u8>) -> wasmtime::Result<Vec<WitOutputRef>> {
-        let refs = self
-            .data_plane
-            .utxos_by_policy(&policy)
-            .await
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-        Ok(refs.into_iter().map(from_dp_ref).collect())
+    async fn utxos_by_policy(
+        &mut self,
+        policy: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: u32,
+    ) -> wasmtime::Result<WitUtxoPage> {
+        match after {
+            Some(token) => self.resume_scan(&token, limit),
+            None => {
+                let dp = self.data_plane.clone();
+                let refs = dp
+                    .utxos_by_policy(&policy)
+                    .await
+                    .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+                let anchor = scan_anchor_slot(dp.as_ref()).await?;
+                Ok(self.begin_scan(refs, anchor, limit))
+            }
+        }
     }
 
     async fn utxos_by_payment_cred(
         &mut self,
         cred: Vec<u8>,
-    ) -> wasmtime::Result<Vec<WitOutputRef>> {
-        let refs = self
-            .data_plane
-            .utxos_by_payment_cred(&cred)
-            .await
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-        Ok(refs.into_iter().map(from_dp_ref).collect())
+        after: Option<Vec<u8>>,
+        limit: u32,
+    ) -> wasmtime::Result<WitUtxoPage> {
+        match after {
+            Some(token) => self.resume_scan(&token, limit),
+            None => {
+                let dp = self.data_plane.clone();
+                let refs = dp
+                    .utxos_by_payment_cred(&cred)
+                    .await
+                    .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+                let anchor = scan_anchor_slot(dp.as_ref()).await?;
+                Ok(self.begin_scan(refs, anchor, limit))
+            }
+        }
     }
 
     async fn resolve_stake_for_payment_pkh(
@@ -135,6 +166,54 @@ impl ChainDataHost for HostStateV2 {
             .await
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         Ok(record.map(tx_record_to_wit))
+    }
+}
+
+/// Paged-scan helpers for the `utxos-by-*` host-fns. Kept off
+/// the `ChainDataHost` impl so the WIT-trait block stays a thin
+/// shim over these.
+impl HostStateV2 {
+    /// Materialise a fresh scan over `refs` and return its first
+    /// page. `refs` is dolos's dump-all; the scan cache freezes +
+    /// sorts it. The page is clamped to the adaptive sizer.
+    fn begin_scan(
+        &mut self,
+        refs: Vec<mitos_data_plane::OutputRef>,
+        anchor_slot: u64,
+        limit: u32,
+    ) -> WitUtxoPage {
+        let clamp = self.adaptive.page_limit(limit);
+        scan_page_to_wit(self.scan_cache.begin(refs, anchor_slot, clamp))
+    }
+
+    /// Continue a scan from a prior page's opaque token.
+    fn resume_scan(&mut self, token: &[u8], limit: u32) -> wasmtime::Result<WitUtxoPage> {
+        let clamp = self.adaptive.page_limit(limit);
+        self.scan_cache
+            .resume(token, clamp)
+            .map(scan_page_to_wit)
+            .map_err(|e| wasmtime::Error::msg(format!("paged utxo scan: {e}")))
+    }
+}
+
+/// Tip slot to freeze a fresh scan as-of. dolos exposes the tip
+/// as an O(1) cursor-table read, so this is cheap to take once
+/// per scan-start.
+async fn scan_anchor_slot(
+    dp: &dyn crate::host_fns::DataPlaneFacade,
+) -> wasmtime::Result<u64> {
+    let tip = dp
+        .tip()
+        .await
+        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    Ok(tip.slot())
+}
+
+fn scan_page_to_wit(p: ScanPage) -> WitUtxoPage {
+    WitUtxoPage {
+        refs: p.refs.into_iter().map(from_dp_ref).collect(),
+        anchor_slot: p.anchor_slot,
+        next: p.next,
     }
 }
 

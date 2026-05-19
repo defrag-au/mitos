@@ -1,6 +1,7 @@
 # Wasm budget chunking — re-entrant operations for unbounded work
 
-**Status: design draft** (2026-05-19). Prompted by a production
+**Status: Phases 1–2 landed** (2026-05-19); Phases 3–5 pending —
+see "Migration / phasing". Prompted by a production
 incident: `holder-distribution`'s `cold_start` trapped in
 `cabi_realloc` during a `recapture`-driven rebootstrap of a large
 policy (NIKEPIG) — wasm linear-memory exhaustion. Earlier the same
@@ -368,10 +369,25 @@ already chunks via per-batch `handle-events` calls.
    (`host_v2.rs`) with `trap` + `peak_memory_bytes` fields. No
    host-imposed memory ceiling yet (`max_memory_bytes = None`) —
    purely observational. No module changes.
-2. **Paged `chain-data` host-fns.** WIT change; the opaque scan
-   token; host-side materialise-and-cache + adaptive clamp.
-   Existing modules' `cold_start` callsites migrate to the loop
-   form. mitos-side only — dolos v1.0.3 is used as-is.
+2. **Paged `chain-data` host-fns.** *Landed 2026-05-19.*
+   `utxos-by-{policy,address,payment-cred}` are now paged-only —
+   `(target, after: option<list<u8>>, limit: u32) -> utxo-page`.
+   `host_fns_v2::scan_cache` materialises dolos's dump-all into a
+   frozen native-memory ref-set at scan-start (one redb read),
+   sorts it stable, and slices it by an opaque 16-byte
+   `(scan_id, offset)` token; the page carries `anchor-slot`
+   (the tip the scan was frozen as-of) so snapshots stamp a real
+   `cursor_slot`. `budget::AdaptiveSizer` clamps each page; the
+   recapture loop feeds it per-call fuel + OOM telemetry
+   (`DriverV2::call_rebootstrap`), so the clamp adapts AIMD-style
+   **between `rebootstrap` calls** (predicate grain). The three
+   self-bootstrapping modules' `cold_start` now page-loop; the
+   resident accumulator is the holder/lock ledger, transient is
+   one page. mitos-side only — dolos v1.0.3 used as-is.
+   *Remaining:* a single huge policy still runs its whole
+   `cold_start` in one `rebootstrap` call, so per-page adaptation
+   and the fuel-axis fix for NIKEPIG-class single policies need
+   Phase 3's re-entrancy.
 3. **Re-entrant `cold_start`** in the three self-bootstrapping
    modules — page loop, resident accumulator, `state-kv`
    continuation cursor, trap-retry recovery in the host loop.

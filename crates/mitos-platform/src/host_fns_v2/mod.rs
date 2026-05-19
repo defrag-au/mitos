@@ -21,6 +21,7 @@ pub mod chain_data;
 pub mod emit;
 pub mod interest;
 pub mod logging;
+pub mod scan_cache;
 pub mod state_kv;
 
 use std::sync::Arc;
@@ -65,6 +66,16 @@ pub struct HostStateV2 {
     /// so the host can classify a trap as OOM. See
     /// `crate::budget` and `WASM_BUDGET_CHUNKING.md`.
     pub(crate) limiter: crate::budget::BudgetLimiter,
+
+    /// In-flight frozen UTxO scans backing the paged
+    /// `chain-data::utxos-by-*` host-fns. See
+    /// `crate::host_fns_v2::scan_cache`.
+    pub(crate) scan_cache: crate::host_fns_v2::scan_cache::ScanCache,
+
+    /// Host-owned adaptive page sizer. Clamps the page each
+    /// `utxos-by-*` call returns; the host loop feeds it per-call
+    /// budget telemetry between guest calls.
+    pub(crate) adaptive: crate::budget::AdaptiveSizer,
 }
 
 impl HostStateV2 {
@@ -88,6 +99,8 @@ impl HostStateV2 {
             // memory ceiling, so the module's declared maximum
             // stays the sole cap.
             limiter: crate::budget::BudgetLimiter::new(None),
+            scan_cache: crate::host_fns_v2::scan_cache::ScanCache::default(),
+            adaptive: crate::budget::AdaptiveSizer::default(),
         }
     }
 
@@ -102,6 +115,13 @@ impl HostStateV2 {
     /// host intends to classify.
     pub fn limiter_mut(&mut self) -> &mut crate::budget::BudgetLimiter {
         &mut self.limiter
+    }
+
+    /// Mutable access to the adaptive page sizer — the host loop
+    /// feeds it per-call budget telemetry via `observe` between
+    /// guest calls.
+    pub fn adaptive_mut(&mut self) -> &mut crate::budget::AdaptiveSizer {
+        &mut self.adaptive
     }
 
     pub fn module_id(&self) -> &str {

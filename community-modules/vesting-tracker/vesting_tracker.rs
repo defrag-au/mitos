@@ -82,11 +82,12 @@ const HASH_BYTES: usize = 28;
 /// companion has subscribed it to.
 const KV_TRACKED_INTERESTS: &str = "tracked-interests";
 
-/// Read-cap matching the host. Reaching this means the lock
-/// scope has too many active UTxOs to fit in one shot; the
-/// emitted snapshot is suppressed and live deltas apply against
-/// an empty consumer state.
-const COLD_START_CAP: usize = 100_000;
+/// Per-page hint for the cold-start scan. `utxos_by_address` /
+/// `utxos_by_payment_cred` are paged (`WASM_BUDGET_CHUNKING.md`);
+/// this is a generous upper bound — the host clamps each page to
+/// its own adaptive per-call budget, so the scan never holds
+/// more than one clamped page of refs at once.
+const COLD_START_PAGE_HINT: u32 = 10_000;
 
 thread_local! {
     /// Watched lock-contract addresses (bech32). Mirrors the
@@ -552,38 +553,64 @@ fn resolve_owner_stake(owner_pkh_hex: &str) -> Option<String> {
 // ============================================================
 
 /// Snapshot scan for a single newly-added address interest.
+///
+/// Paged (`WASM_BUDGET_CHUNKING.md`): walks `utxos_by_address`
+/// one host-clamped page at a time, building lock entries
+/// page-by-page so only one page of refs is ever resident.
 fn cold_start_address(address: &str) {
-    let refs = chain_data::utxos_by_address(&address.to_string());
-    if refs.len() >= COLD_START_CAP {
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            &format!(
-                "cold-start address={address}: hit COLD_START_CAP={COLD_START_CAP}; snapshot suppressed"
-            ),
-        );
-        return;
+    let mut locks: Vec<LockEntry> = Vec::new();
+    let mut total_utxos: usize = 0;
+    // Assigned on every loop iteration before being read after
+    // the loop — the `loop` body always runs at least once.
+    let mut anchor_slot: u64;
+    let mut after: Option<Vec<u8>> = None;
+
+    loop {
+        let page = chain_data::utxos_by_address(address, after.as_deref(), COLD_START_PAGE_HINT);
+        anchor_slot = page.anchor_slot;
+        total_utxos += page.refs.len();
+        locks.extend(build_snapshot_locks(&page.refs));
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
     }
-    let locks = build_snapshot_locks(&refs);
-    emit_snapshot(InterestKind::Address, address.to_owned(), locks, refs.len());
+    emit_snapshot(
+        InterestKind::Address,
+        address.to_owned(),
+        locks,
+        total_utxos,
+        anchor_slot,
+    );
 }
 
 /// Snapshot scan for a single newly-added payment-cred interest.
+/// Paged identically to `cold_start_address`.
 fn cold_start_payment_cred(cred: &[u8; HASH_BYTES]) {
-    let refs = chain_data::utxos_by_payment_cred(&cred.to_vec());
-    if refs.len() >= COLD_START_CAP {
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            &format!(
-                "cold-start payment_cred={}: hit COLD_START_CAP={COLD_START_CAP}; snapshot suppressed",
-                hex::encode(cred)
-            ),
-        );
-        return;
+    let mut locks: Vec<LockEntry> = Vec::new();
+    let mut total_utxos: usize = 0;
+    // Assigned on every loop iteration before being read after
+    // the loop — the `loop` body always runs at least once.
+    let mut anchor_slot: u64;
+    let mut after: Option<Vec<u8>> = None;
+
+    loop {
+        let page = chain_data::utxos_by_payment_cred(cred, after.as_deref(), COLD_START_PAGE_HINT);
+        anchor_slot = page.anchor_slot;
+        total_utxos += page.refs.len();
+        locks.extend(build_snapshot_locks(&page.refs));
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
     }
-    let locks = build_snapshot_locks(&refs);
-    emit_snapshot(InterestKind::PaymentCred, hex::encode(cred), locks, refs.len());
+    emit_snapshot(
+        InterestKind::PaymentCred,
+        hex::encode(cred),
+        locks,
+        total_utxos,
+        anchor_slot,
+    );
 }
 
 /// Common cold-start body: bulk-resolve each ref's output +
@@ -618,6 +645,7 @@ fn emit_snapshot(
     interest_value: String,
     mut locks: Vec<LockEntry>,
     refs_scanned: usize,
+    anchor_slot: u64,
 ) {
     // Deterministic ordering for stable goldens.
     locks.sort_by(|a, b| {
@@ -630,7 +658,9 @@ fn emit_snapshot(
     let snap = VestingSnapshot {
         interest_kind,
         interest_value: interest_value.clone(),
-        cursor_slot: 0,
+        // `anchor_slot` from the frozen scan — the tip the
+        // materialised UTxO set was consistent as-of.
+        cursor_slot: anchor_slot,
         cursor_hash_hex: String::new(),
         locks,
     };

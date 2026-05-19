@@ -61,11 +61,12 @@ const LOG_TARGET: &str = "holder-distribution-module";
 /// per-policy ledger is keyed `ledger:<policy_hex>`.
 const KV_TRACKED_POLICIES: &str = "tracked-policies";
 
-/// Read-cap for the cold-start scan. Matches the host's
-/// internal cap; reaching this means the policy is too active
-/// to fit in one shot and we should fall back to event-replay
-/// hydration (not yet implemented).
-const COLD_START_CAP: usize = 100_000;
+/// Per-page hint for the cold-start scan. `utxos_by_policy` is
+/// paged (see `WASM_BUDGET_CHUNKING.md`); this is a generous
+/// upper bound — the host clamps each returned page to its own
+/// adaptive per-call budget, so the module never holds more than
+/// one clamped page of refs at once.
+const COLD_START_PAGE_HINT: u32 = 10_000;
 
 /// 28-byte hash size used everywhere for stake credentials,
 /// policy ids, payment hashes.
@@ -252,33 +253,36 @@ fn apply_consumed_to_ledger(
 // ============================================================
 
 /// Run the bootstrap scan for a newly-registered policy:
-/// `utxos_by_policy(X)` → `read_utxos(refs)` → build ledger →
-/// persist → emit `Snapshot`.
+/// page through `utxos_by_policy` → `read_utxos` each page →
+/// fold into the ledger → persist → emit `Snapshot`.
+///
+/// The scan is **paged** (`WASM_BUDGET_CHUNKING.md`): each call
+/// to `utxos_by_policy` returns one host-clamped page plus a
+/// continuation token. Only one page of refs + one page of
+/// resolved outputs is ever resident — the accumulating
+/// `PolicyLedger` is bounded by holder count, not UTxO count —
+/// so a large policy can't OOM the guest's linear memory.
 fn cold_start(policy: &[u8; HASH_BYTES]) {
     let policy_hex = hex::encode(policy);
-    let refs = chain_data::utxos_by_policy(policy);
-    if refs.len() >= COLD_START_CAP {
-        // Hit the host-side cap. The ledger we'd build would be
-        // partial; rather than emit a partial snapshot, log
-        // and leave the policy un-snapshotted. Live deltas will
-        // still arrive and apply against an empty ledger —
-        // consumers will see incorrect cumulative totals until
-        // we surface a pagination story.
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            &format!(
-                "cold-start policy={policy_hex}: hit COLD_START_CAP={COLD_START_CAP}; snapshot suppressed"
-            ),
-        );
-        return;
-    }
 
-    // Bulk-resolve refs in chunks (host enforces its own batch
-    // limits; 1K at a time stays well under any plausible cap).
     let mut ledger = PolicyLedger::default();
-    for chunk in refs.chunks(1024) {
-        let outputs = chain_data::read_utxos(&chunk.to_vec());
+    let mut after: Option<Vec<u8>> = None;
+    // Assigned on every loop iteration before it is read after
+    // the loop — the `loop` body always runs at least once.
+    let mut anchor_slot: u64;
+    let mut total_utxos: usize = 0;
+
+    loop {
+        let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
+        // `anchor_slot` is stable across every page of one frozen
+        // scan — the host stamps each page with the tip the scan
+        // was taken as-of.
+        anchor_slot = page.anchor_slot;
+        total_utxos += page.refs.len();
+
+        // Resolve + fold this page. Both `page.refs` and the
+        // resolved outputs are dropped before the next page.
+        let outputs = chain_data::read_utxos(&page.refs);
         for out in outputs {
             let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
             apply_produced_to_ledger(
@@ -289,6 +293,11 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
                 &mut _touched_dummy,
             );
         }
+
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
     }
 
     persist_ledger(&policy_hex, &ledger);
@@ -296,14 +305,12 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
     let holders = ledger_to_holders(&ledger);
     let snapshot = HolderSnapshot {
         policy: policy_hex.clone(),
-        // Cold-start cursor is "now" — we don't have a clean
-        // anchor without a TX-level event in hand. Consumers
-        // treat the snapshot as authoritative replacement and
-        // start replaying deltas from the first event after it
-        // arrives. The slot field stays 0 in this phase; a
-        // future `chain_data::tip()` host-fn would let us
-        // populate the real cursor.
-        cursor_slot: 0,
+        // `anchor_slot` from the frozen scan — the tip the
+        // materialised UTxO set was consistent as-of. Consumers
+        // treat the snapshot as an authoritative replacement and
+        // resume delta replay from the first event after this
+        // slot.
+        cursor_slot: anchor_slot,
         cursor_hash_hex: String::new(),
         holders,
     };
@@ -312,8 +319,7 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
         LogLevel::Info,
         LOG_TARGET,
         &format!(
-            "cold-start policy={policy_hex}: {} UTxO(s) → {} holder(s)",
-            refs.len(),
+            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {} holder(s) @ slot {anchor_slot}",
             ledger.holders.len()
         ),
     );

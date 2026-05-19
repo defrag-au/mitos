@@ -45,5 +45,5 @@ pub use mitos::platform_v2::types::{
     AssetEntry, AssetId, ChainPoint, ConsumedEvent, ConsumedInput, Host as TypesHost, MintEntry,
     MintedEvent, OutputRef, ProducedEvent, ReferencedEvent, ReferencedInput, RollbackEvent,
     SpecificPoint, StakeCred, TickEvent, TxContextEvent, TxRecord, TypedDatum, TypedOutput,
-    UtxoEvent, ValidityInterval,
+    UtxoEvent, UtxoPage, ValidityInterval,
 };

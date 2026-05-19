@@ -37,11 +37,12 @@ const LOG_TARGET: &str = "burn-address-module";
 /// cheaper than per-address keys for the small sets typical
 /// of burn-sink consumers.
 const KV_WATCHED_ADDRS: &str = "watched-addresses";
-/// Host-side cap on `utxos_by_address`. A bootstrap walk that
-/// hits it would be partial, so we suppress it rather than emit
-/// an incomplete burn history (mirrors `holder-distribution`'s
-/// `COLD_START_CAP` handling).
-const COLD_START_CAP: usize = 100_000;
+/// Per-page hint for the cold-start scan. `utxos_by_address` is
+/// paged (`WASM_BUDGET_CHUNKING.md`); this is a generous upper
+/// bound — the host clamps each page to its own adaptive
+/// per-call budget, so the walk never holds more than one
+/// clamped page of refs at once.
+const COLD_START_PAGE_HINT: u32 = 10_000;
 
 // Watched-address set. The platform's v2 dispatch model
 // filters TXs (any matching event qualifies → all events
@@ -160,22 +161,20 @@ fn handle_produced(p: &ProducedEvent) {
 /// consumers MUST dedup on `(tx_hash, output_index)` rather than
 /// blindly accumulating.
 fn cold_start_address(addr: &str) {
-    let refs = chain_data::utxos_by_address(addr);
-    if refs.len() >= COLD_START_CAP {
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            &format!(
-                "cold-start address={addr}: hit COLD_START_CAP={COLD_START_CAP}; bootstrap walk suppressed"
-            ),
-        );
-        return;
-    }
+    // Paged walk (`WASM_BUDGET_CHUNKING.md`): each
+    // `utxos_by_address` call returns one host-clamped page plus
+    // a continuation token. Only one page of refs + its resolved
+    // outputs is ever resident.
     let mut burn_events = 0usize;
-    for chunk in refs.chunks(1024) {
-        let chunk = chunk.to_vec();
-        let outputs = chain_data::read_utxos(&chunk);
-        if outputs.len() != chunk.len() {
+    let mut total_utxos = 0usize;
+    let mut after: Option<Vec<u8>> = None;
+
+    loop {
+        let page = chain_data::utxos_by_address(addr, after.as_deref(), COLD_START_PAGE_HINT);
+        total_utxos += page.refs.len();
+
+        let outputs = chain_data::read_utxos(&page.refs);
+        if outputs.len() != page.refs.len() {
             // `read_utxos` is positionally parallel to its
             // input; a length mismatch means we can't safely
             // zip refs to outputs. Abort rather than emit
@@ -186,12 +185,12 @@ fn cold_start_address(addr: &str) {
                 &format!(
                     "cold-start address={addr}: read_utxos returned {} output(s) for {} ref(s); bootstrap walk aborted",
                     outputs.len(),
-                    chunk.len()
+                    page.refs.len()
                 ),
             );
             return;
         }
-        for (oref, output) in chunk.iter().zip(outputs.iter()) {
+        for (oref, output) in page.refs.iter().zip(outputs.iter()) {
             if output.assets.is_empty() {
                 continue;
             }
@@ -203,13 +202,17 @@ fn cold_start_address(addr: &str) {
             );
             burn_events += output.assets.len();
         }
+
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
     }
     logging::log(
         LogLevel::Info,
         LOG_TARGET,
         &format!(
-            "cold-start address={addr}: {} UTxO(s) → {burn_events} burn event(s)",
-            refs.len()
+            "cold-start address={addr}: {total_utxos} UTxO(s) → {burn_events} burn event(s)"
         ),
     );
 }
