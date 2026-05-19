@@ -14,7 +14,8 @@
 //!      policy's assets into the address's stake credential,
 //!      and accumulates a per-stake-cred ledger.
 //!    - Persists the ledger to state-kv keyed by policy hex.
-//!    - Emits a `HolderEvent::Snapshot` with the full ledger.
+//!    - Emits the ledger as a chunked `SnapshotBegin` →
+//!      `SnapshotChunk` × N → `SnapshotEnd` sequence.
 //!
 //! 2. Each subsequent `handle_events` batch (one Cardano TX):
 //!    - Walks Produced + Consumed events for tracked policies.
@@ -41,8 +42,9 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mitos_community_events::holder_distribution::{
-    AssetBalance, HolderDelta, HolderEntry, HolderEvent, HolderSnapshot,
+    AssetBalance, HolderDelta, HolderEntry, HolderEvent, SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
+use mitos_module_kit::ReentrantRound;
 use pallas_addresses::{Address, ShelleyDelegationPart};
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +53,7 @@ use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 use crate::mitos::platform_v2::types::{
-    AssetEntry as WitAssetEntry, ConsumedEvent, ProducedEvent, UtxoEvent,
+    AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "holder-distribution-module";
@@ -61,11 +63,26 @@ const LOG_TARGET: &str = "holder-distribution-module";
 /// per-policy ledger is keyed `ledger:<policy_hex>`.
 const KV_TRACKED_POLICIES: &str = "tracked-policies";
 
-/// Read-cap for the cold-start scan. Matches the host's
-/// internal cap; reaching this means the policy is too active
-/// to fit in one shot and we should fall back to event-replay
-/// hydration (not yet implemented).
-const COLD_START_CAP: usize = 100_000;
+/// state-kv key for the re-entrant `rebootstrap` continuation
+/// cursor — the index of the predicate currently being
+/// re-scanned (8 BE bytes). Durable so a host restart mid-round
+/// resumes at the right predicate. Per-page progress within a
+/// predicate is thread-local + volatile; a trap or restart
+/// restarts the current predicate from page 0 (safe — each
+/// predicate emits a full authoritative `Snapshot`).
+const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
+
+/// Per-page hint for the cold-start scan. `utxos_by_policy` is
+/// paged (see `WASM_BUDGET_CHUNKING.md`); this is a generous
+/// upper bound — the host clamps each returned page to its own
+/// adaptive per-call budget, so the module never holds more than
+/// one clamped page of refs at once.
+const COLD_START_PAGE_HINT: u32 = 10_000;
+
+/// Holders per `SnapshotChunk` when emitting a chunked snapshot.
+/// Bounds the CBOR buffer one `emit` builds in wasm memory — see
+/// `WASM_BUDGET_CHUNKING.md` "Output — chunked snapshot emission".
+const SNAPSHOT_CHUNK_HOLDERS: usize = 1_000;
 
 /// 28-byte hash size used everywhere for stake credentials,
 /// policy ids, payment hashes.
@@ -77,6 +94,36 @@ thread_local! {
     /// via `KV_TRACKED_POLICIES` so a host restart without an
     /// attached companion keeps filtering correctly.
     static TRACKED_POLICIES: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
+
+    /// In-flight `rebootstrap` round. `None` between rounds.
+    /// `ReentrantRound` (from `mitos-module-kit`) owns the
+    /// predicate list, the `predicate_idx`, the page cursor, and
+    /// the per-predicate `PolicyLedger` accumulator. Resident in
+    /// the wasm instance across the host's re-entrant call loop;
+    /// a trap or host restart discards it and the round resumes
+    /// from the durable state-kv cursor (`predicate_idx`).
+    static REBOOTSTRAP_STATE: RefCell<Option<ReentrantRound<[u8; HASH_BYTES], PolicyLedger>>> =
+        RefCell::new(None);
+
+    /// In-progress chunked-snapshot emit for the predicate whose
+    /// scan just finished. `None` when no emit is in flight. The
+    /// `rebootstrap` state machine drains one `SnapshotChunk`
+    /// from here per call — emitting the whole holder list in a
+    /// single fuel budget traps for a large policy (prod
+    /// recapture, 2026-05-19). See `rebootstrap` / `begin_emit`.
+    static REBOOTSTRAP_EMIT: RefCell<Option<EmitState>> = RefCell::new(None);
+}
+
+/// A chunked snapshot mid-emit: the materialised holder list for
+/// one predicate, drained `SNAPSHOT_CHUNK_HOLDERS` at a time.
+struct EmitState {
+    /// 56-char hex policy id — every event of the sequence
+    /// carries it.
+    policy_hex: String,
+    /// The full holder list, built once when the scan completed.
+    holders: Vec<HolderEntry>,
+    /// Index of the next holder to emit.
+    offset: usize,
 }
 
 /// In-memory ledger key. `Some(stake_hash)` for key/script
@@ -245,97 +292,157 @@ fn apply_consumed_to_ledger(
 // Cold-start
 // ============================================================
 
-/// Run the bootstrap scan for a newly-registered policy:
-/// `utxos_by_policy(X)` → `read_utxos(refs)` → build ledger →
-/// persist → emit `Snapshot`.
-fn cold_start(policy: &[u8; HASH_BYTES]) {
+/// Resolve + fold one page of a policy scan into `ledger`. Both
+/// `refs` and the resolved outputs are dropped at return, so the
+/// only state that grows across pages is the holder-bounded
+/// `ledger` itself.
+fn fold_page(ledger: &mut PolicyLedger, policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) {
+    let outputs = chain_data::read_utxos(refs);
+    for out in outputs {
+        let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
+        apply_produced_to_ledger(ledger, policy, &out.address, &out.assets, &mut _touched_dummy);
+    }
+}
+
+/// Persist a policy's ledger + emit its snapshot as a chunked
+/// `SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd`
+/// sequence, **in one call**. Used by the live `update_interest`
+/// add path (`cold_start`) — that host call is not re-entrant,
+/// so the emit can't be spread. The recapture path
+/// (`rebootstrap`) instead drains the emit one chunk per call
+/// via `begin_emit` + `REBOOTSTRAP_EMIT`, which keeps a large
+/// policy's snapshot inside the per-call fuel budget.
+fn finalize_policy_snapshot(
+    policy: &[u8; HASH_BYTES],
+    ledger: &PolicyLedger,
+    anchor_slot: u64,
+    total_utxos: usize,
+) {
     let policy_hex = hex::encode(policy);
-    let refs = chain_data::utxos_by_policy(policy);
-    if refs.len() >= COLD_START_CAP {
-        // Hit the host-side cap. The ledger we'd build would be
-        // partial; rather than emit a partial snapshot, log
-        // and leave the policy un-snapshotted. Live deltas will
-        // still arrive and apply against an empty ledger —
-        // consumers will see incorrect cumulative totals until
-        // we surface a pagination story.
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            &format!(
-                "cold-start policy={policy_hex}: hit COLD_START_CAP={COLD_START_CAP}; snapshot suppressed"
-            ),
-        );
-        return;
-    }
+    persist_ledger(&policy_hex, ledger);
+    let holders = ledger_to_holders(ledger);
+    let holder_count = holders.len();
 
-    // Bulk-resolve refs in chunks (host enforces its own batch
-    // limits; 1K at a time stays well under any plausible cap).
-    let mut ledger = PolicyLedger::default();
-    for chunk in refs.chunks(1024) {
-        let outputs = chain_data::read_utxos(&chunk.to_vec());
-        for out in outputs {
-            let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
-            apply_produced_to_ledger(
-                &mut ledger,
-                policy,
-                &out.address,
-                &out.assets,
-                &mut _touched_dummy,
-            );
-        }
-    }
-
-    persist_ledger(&policy_hex, &ledger);
-
-    let holders = ledger_to_holders(&ledger);
-    let snapshot = HolderSnapshot {
+    // `anchor_slot` from the frozen scan — the tip the
+    // materialised UTxO set was consistent as-of. Consumers
+    // treat the sequence as an authoritative replacement and
+    // resume delta replay from the first event after this slot.
+    emit_event(&HolderEvent::SnapshotBegin(SnapshotBegin {
         policy: policy_hex.clone(),
-        // Cold-start cursor is "now" — we don't have a clean
-        // anchor without a TX-level event in hand. Consumers
-        // treat the snapshot as authoritative replacement and
-        // start replaying deltas from the first event after it
-        // arrives. The slot field stays 0 in this phase; a
-        // future `chain_data::tip()` host-fn would let us
-        // populate the real cursor.
-        cursor_slot: 0,
+        cursor_slot: anchor_slot,
         cursor_hash_hex: String::new(),
-        holders,
-    };
-    emit_event(&HolderEvent::Snapshot(snapshot));
+    }));
+    for chunk in holders.chunks(SNAPSHOT_CHUNK_HOLDERS) {
+        emit_event(&HolderEvent::SnapshotChunk(SnapshotChunk {
+            policy: policy_hex.clone(),
+            holders: chunk.to_vec(),
+        }));
+    }
+    emit_event(&HolderEvent::SnapshotEnd(SnapshotEnd {
+        policy: policy_hex.clone(),
+        holder_count: holder_count as u64,
+    }));
+
     logging::log(
         LogLevel::Info,
         LOG_TARGET,
         &format!(
-            "cold-start policy={policy_hex}: {} UTxO(s) → {} holder(s)",
-            refs.len(),
-            ledger.holders.len()
+            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {holder_count} holder(s) @ slot {anchor_slot}"
         ),
     );
 }
 
+/// Open the chunked snapshot emit for a predicate whose
+/// `rebootstrap` scan just completed: persist the ledger,
+/// materialise the holder list, emit `SnapshotBegin`, and stage
+/// the holders in `REBOOTSTRAP_EMIT`. Each subsequent
+/// `rebootstrap` call then drains one `SnapshotChunk` (and a
+/// final `SnapshotEnd`) — so a large holder set's snapshot is
+/// spread across many fuel-budgeted calls, not serialised in
+/// one. `persist_ledger` + `ledger_to_holders` are still one
+/// pass here, but both are sort-free and far lighter than the
+/// chunk emits they used to share a budget with.
+fn begin_emit(
+    policy: &[u8; HASH_BYTES],
+    ledger: &PolicyLedger,
+    anchor_slot: u64,
+    total_utxos: usize,
+) {
+    let policy_hex = hex::encode(policy);
+    persist_ledger(&policy_hex, ledger);
+    let holders = ledger_to_holders(ledger);
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!(
+            "rebootstrap policy={policy_hex}: {total_utxos} UTxO(s) → {} holder(s) @ slot {anchor_slot}; emitting chunked snapshot",
+            holders.len()
+        ),
+    );
+    emit_event(&HolderEvent::SnapshotBegin(SnapshotBegin {
+        policy: policy_hex.clone(),
+        cursor_slot: anchor_slot,
+        cursor_hash_hex: String::new(),
+    }));
+    REBOOTSTRAP_EMIT.with(|cell| {
+        *cell.borrow_mut() = Some(EmitState {
+            policy_hex,
+            holders,
+            offset: 0,
+        });
+    });
+}
+
+/// Run the bootstrap scan for a newly-registered policy in one
+/// call: page through `utxos_by_policy` → fold each page → emit
+/// `Snapshot`. Used by the live `update_interest` add path.
+///
+/// The scan is **paged** (`WASM_BUDGET_CHUNKING.md`): each call
+/// to `utxos_by_policy` returns one host-clamped page, so the
+/// only resident state is the holder-bounded ledger. The
+/// re-entrant `rebootstrap` path (recapture) spreads the same
+/// scan across many fuel-budgeted calls — see `rebootstrap`.
+fn cold_start(policy: &[u8; HASH_BYTES]) {
+    let mut ledger = PolicyLedger::default();
+    let mut after: Option<Vec<u8>> = None;
+    // Assigned on every loop iteration before it is read after
+    // the loop — the `loop` body always runs at least once.
+    let mut anchor_slot: u64;
+    let mut total_utxos: usize = 0;
+
+    loop {
+        let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
+        anchor_slot = page.anchor_slot;
+        total_utxos += page.refs.len();
+        fold_page(&mut ledger, policy, &page.refs);
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
+    }
+
+    finalize_policy_snapshot(policy, &ledger, anchor_slot, total_utxos);
+}
+
 /// Render the in-memory `PolicyLedger` as the wire-shape
-/// `Vec<HolderEntry>` — sorted by total quantity descending
-/// for deterministic golden tests and to make top-N consumer
-/// slicing cheap.
+/// `Vec<HolderEntry>`, in ledger order.
+///
+/// No by-quantity sort: that is an `O(n log n)` pass in a single
+/// fuel budget and a large holder set traps on it (prod
+/// recapture, 2026-05-19 — see `WASM_BUDGET_CHUNKING.md`). The
+/// consumer DB-inserts each holder, so wire order is immaterial;
+/// "top N holders" is a consumer-side query, not a wire
+/// guarantee. Order is still deterministic — `holders` is a
+/// `BTreeMap` keyed by stake credential.
 fn ledger_to_holders(ledger: &PolicyLedger) -> Vec<HolderEntry> {
-    let mut out: Vec<HolderEntry> = ledger
+    ledger
         .holders
         .iter()
         .map(|(kbytes, assets)| HolderEntry {
             stake_cred_hex: stake_cred_hex(kbytes),
             assets: assets_map_to_vec(assets),
         })
-        .collect();
-    out.sort_by(|a, b| {
-        let a_total: u64 = a.assets.iter().map(|e| e.quantity).sum();
-        let b_total: u64 = b.assets.iter().map(|e| e.quantity).sum();
-        b_total
-            .cmp(&a_total)
-            // Tie-break on stake_cred_hex for stable order in
-            // the (rare) case of equal totals.
-            .then_with(|| a.stake_cred_hex.cmp(&b.stake_cred_hex))
-    });
-    out
+        .collect()
 }
 
 fn assets_map_to_vec(map: &AssetMap) -> Vec<AssetBalance> {
@@ -621,6 +728,25 @@ fn load_ledger(policy_hex: &str) -> PolicyLedger {
 }
 
 // ============================================================
+// Rebootstrap continuation cursor (durable predicate index)
+// ============================================================
+
+fn save_rebootstrap_cursor(predicate_idx: usize) {
+    state_kv::set_value(KV_REBOOTSTRAP_CURSOR, &(predicate_idx as u64).to_be_bytes());
+}
+
+fn load_rebootstrap_cursor() -> usize {
+    state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(|b| u64::from_be_bytes(b) as usize)
+        .unwrap_or(0)
+}
+
+fn clear_rebootstrap_cursor() {
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+}
+
+// ============================================================
 // Emit
 // ============================================================
 
@@ -688,6 +814,157 @@ impl Guest for Module {
     fn update_interest(op: InterestOp, items_cbor: Vec<u8>) -> Result<(), String> {
         apply_interest_update(op, &items_cbor);
         Ok(())
+    }
+
+    /// Re-emit the holder ledger for tracked policies — **one
+    /// bounded unit of work per call** (`WASM_BUDGET_CHUNKING.md`).
+    /// The host loops, refuelling each call, until a step comes
+    /// back `done`. Each call does exactly one of:
+    ///
+    /// - **emit phase** — if a chunked snapshot is mid-emit
+    ///   (`REBOOTSTRAP_EMIT`), emit one `SnapshotChunk`, or the
+    ///   closing `SnapshotEnd`;
+    /// - **scan phase** — otherwise, scan one page of the current
+    ///   predicate's UTxO set, folding it into the ledger; when
+    ///   the last page lands, open the chunked emit (`begin_emit`).
+    ///
+    /// A page of UTxOs fits one fuel budget and a chunk of
+    /// holders fits one fuel budget; a whole large policy's scan
+    /// *or* snapshot does not — hence both are spread across
+    /// calls.
+    ///
+    /// Round state (predicate list + page cursor + accumulating
+    /// ledger) and the in-flight emit are thread-local — resident
+    /// across the host's loop. The durable cursor in `state-kv`
+    /// (`KV_REBOOTSTRAP_CURSOR`) is only the `predicate_idx`, and
+    /// it is **not advanced until the predicate's emit closes** —
+    /// so a trap or host restart anywhere in a predicate (scan or
+    /// emit) restarts it from page 0, re-scanning + re-emitting.
+    /// That is safe: the consumer wipes its projection on
+    /// `SnapshotBegin`, so a re-emit discards any partial.
+    ///
+    /// `init` restores `TRACKED_POLICIES` from `state-kv`, so the
+    /// module knows what to re-scan; idempotent — recapture may
+    /// run a round repeatedly.
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        // ── Emit phase ── Drain an in-flight chunked snapshot
+        // one `SnapshotChunk` per call. Emitting the whole holder
+        // list in a single budget traps for a large policy.
+        enum EmitOutcome {
+            NotEmitting,
+            Chunk,
+            Closed,
+        }
+        let outcome = REBOOTSTRAP_EMIT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let Some(state) = slot.as_mut() else {
+                return EmitOutcome::NotEmitting;
+            };
+            if state.offset >= state.holders.len() {
+                emit_event(&HolderEvent::SnapshotEnd(SnapshotEnd {
+                    policy: state.policy_hex.clone(),
+                    holder_count: state.holders.len() as u64,
+                }));
+                *slot = None;
+                EmitOutcome::Closed
+            } else {
+                let end = (state.offset + SNAPSHOT_CHUNK_HOLDERS).min(state.holders.len());
+                emit_event(&HolderEvent::SnapshotChunk(SnapshotChunk {
+                    policy: state.policy_hex.clone(),
+                    holders: state.holders[state.offset..end].to_vec(),
+                }));
+                state.offset = end;
+                EmitOutcome::Chunk
+            }
+        });
+        match outcome {
+            // More chunks (or the `SnapshotEnd`) still to come.
+            EmitOutcome::Chunk => {
+                return Ok(RebootstrapStep {
+                    done: false,
+                    ingested: 0,
+                });
+            }
+            // The predicate's snapshot is fully emitted — advance
+            // the durable cursor past it now.
+            EmitOutcome::Closed => {
+                return REBOOTSTRAP_STATE.with(|cell| {
+                    let mut state = cell.borrow_mut();
+                    let round = state
+                        .as_mut()
+                        .expect("round present while an emit is in flight");
+                    let adv = round.finish_predicate();
+                    if adv.round_done {
+                        clear_rebootstrap_cursor();
+                        *state = None;
+                    } else {
+                        save_rebootstrap_cursor(adv.predicate_idx);
+                    }
+                    Ok(RebootstrapStep {
+                        done: adv.round_done,
+                        ingested: 0,
+                    })
+                });
+            }
+            EmitOutcome::NotEmitting => {}
+        }
+
+        // ── Scan phase ──
+        REBOOTSTRAP_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+
+            // First call of a round (or the thread-local was
+            // wiped by a trap/restart) — rebuild round state. The
+            // policy list is sorted so the durable `predicate_idx`
+            // cursor is stable across a host restart.
+            if state.is_none() {
+                let mut policies: Vec<[u8; HASH_BYTES]> =
+                    TRACKED_POLICIES.with(|s| s.borrow().iter().copied().collect());
+                policies.sort_unstable();
+                *state = Some(ReentrantRound::resume(policies, load_rebootstrap_cursor()));
+            }
+            let round = state.as_mut().expect("round initialised above");
+
+            // No predicates left (empty tracked set, or resumed
+            // past the end) — round done.
+            let Some(&policy) = round.current() else {
+                clear_rebootstrap_cursor();
+                *state = None;
+                return Ok(RebootstrapStep {
+                    done: true,
+                    ingested: 0,
+                });
+            };
+
+            // Process exactly one page of the current predicate.
+            let page =
+                chain_data::utxos_by_policy(&policy, round.after(), COLD_START_PAGE_HINT);
+            let ingested = page.refs.len() as u64;
+            let anchor_slot = page.anchor_slot;
+            fold_page(round.acc_mut(), &policy, &page.refs);
+
+            match page.next {
+                Some(token) => {
+                    // More pages for this predicate — keep the round.
+                    round.page_more(ingested, token);
+                    Ok(RebootstrapStep {
+                        done: false,
+                        ingested,
+                    })
+                }
+                None => {
+                    // Predicate fully scanned. Open the chunked
+                    // emit; the durable cursor is NOT advanced
+                    // until that emit closes (see the doc above).
+                    round.page_last(ingested);
+                    begin_emit(&policy, round.acc(), anchor_slot, round.items() as usize);
+                    Ok(RebootstrapStep {
+                        done: false,
+                        ingested,
+                    })
+                }
+            }
+        })
     }
 }
 

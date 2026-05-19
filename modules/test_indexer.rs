@@ -78,6 +78,17 @@ impl Guest for Module {
         // dynamic-update path isn't exercised here.
         Ok(())
     }
+
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        // No-op: the test fixture's refill comes from the host's
+        // manifest bootstrap. Present so the module satisfies the
+        // `mitos-module-v2` world's `rebootstrap` export. One
+        // call, immediately `done`.
+        Ok(RebootstrapStep {
+            done: true,
+            ingested: 0,
+        })
+    }
 }
 
 fn handle_produced(p: &ProducedEvent) {

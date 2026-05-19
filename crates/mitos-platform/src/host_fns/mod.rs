@@ -95,6 +95,15 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
     ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
         Ok(None)
     }
+
+    /// Current chain tip. The paged `utxos-by-*` host-fns stamp
+    /// its slot into `utxo-page.anchor-slot` so a multi-page scan
+    /// is consistent as-of one point. Default impl returns origin
+    /// (slot 0) so test fakes need not implement it; the blanket
+    /// `impl<T: ChainDataPlane>` overrides for production.
+    async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
+        Ok(mitos_data_plane::ChainTip::origin())
+    }
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -189,6 +198,10 @@ where
         tx_hash: &pallas_primitives::Hash<32>,
     ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
         mitos_data_plane::ChainDataPlane::read_tx(self, tx_hash).await
+    }
+
+    async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
+        mitos_data_plane::ChainDataPlane::tip(self).await
     }
 }
 
@@ -346,7 +359,7 @@ where
 
     async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
-        plane.tip().await
+        mitos_data_plane::ChainDataPlane::tip(&plane).await
     }
 
     async fn protocol_params(
@@ -506,5 +519,9 @@ impl DataPlaneFacade for CachingDataPlane {
         tx_hash: &pallas_primitives::Hash<32>,
     ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::TxRecord>> {
         self.inner.read_tx(tx_hash).await
+    }
+
+    async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
+        self.inner.tip().await
     }
 }

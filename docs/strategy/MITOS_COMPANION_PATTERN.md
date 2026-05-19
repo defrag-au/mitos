@@ -417,6 +417,43 @@ mitos's control plane, deploy companion to CF, register WS
 subscription on mitos pointing at companion. `cargo cardano
 status` queries both halves and reports drift.
 
+## Module-author affordances — `mitos-module-kit`
+
+The indexer half is a wasm module under a hard per-call budget
+(fuel, linear memory, epoch deadline — see
+`docs/design/WASM_BUDGET_CHUNKING.md`). Most module code fits one
+call; **cold-start scans do not** — enumerating every UTxO of a
+busy policy overruns the fuel budget. The fix is to make the
+scan *re-entrant*: one call does one bounded page, the host loops
+with a fresh budget per call. That pattern needs cursor
+bookkeeping a module author should not re-derive.
+
+`crates/mitos-module-kit` is the author-facing helper crate for
+exactly this — pure logic, zero dependencies, no WIT or host-fn
+coupling, so a wasm module pulls in nothing transitive.
+
+**`ReentrantRound<P, A>`** drives a re-entrant predicate scan. It
+owns: the predicate list (the policies / addresses / creds being
+re-scanned), the durable `predicate_idx`, the volatile page
+cursor, and an optional per-predicate accumulator `A`. The module
+keeps only what genuinely varies — the predicate type, the paged
+`utxos-by-*` fetch, the fold, the snapshot emit, and ~3 lines of
+`state-kv` IO for the durable cursor. The crate's rustdoc carries
+a full worked `rebootstrap` example.
+
+Cursor model: the durable `state-kv` cursor is the
+`predicate_idx` *only*; the page cursor + accumulator are
+volatile, so a trap or host restart restarts the current
+predicate from page 0 — safe because each predicate emits a full
+authoritative snapshot. The predicate list **must** be sorted
+before it's handed to `ReentrantRound::resume`, or
+`predicate_idx` would point at a different predicate after a
+restart.
+
+The three self-bootstrapping community modules
+(`holder-distribution`, `burn-address`, `vesting-tracker`) use it
+as the reference adoption.
+
 ## Open questions
 
 1. **WASM ABI for indexer modules.** Borrow Balius's WIT

@@ -117,6 +117,72 @@ impl DriverV2 {
             .await
     }
 
+    /// Invoke the module's `rebootstrap` WIT export. The host's
+    /// recapture flow (`docs/design/RECAPTURE.md`) calls this
+    /// after `start()` so a self-bootstrapping module re-runs its
+    /// own cold-start and refills companions whose projected state
+    /// was just dropped. Event-driven modules implement it as a
+    /// no-op (their refill comes from `run_bootstrap`).
+    ///
+    /// Fueled with `fuel_per_call` — each call does one bounded
+    /// page of the module's cold-start scan and reports a
+    /// `RebootstrapStep` (`done` + an `ingested` UTxO count). The
+    /// host loops, refuelling per call, until a step comes back
+    /// `done`; `Err(String)` is the module's typed failure.
+    pub async fn call_rebootstrap(
+        &mut self,
+    ) -> wasmtime::Result<Result<crate::bindings_v2::RebootstrapStep, String>> {
+        self.instance.store.set_fuel(self.fuel_per_call)?;
+        // Clear the per-call OOM flag so `classify_trap` reflects
+        // only this invocation if it traps.
+        self.instance.store.data_mut().limiter_mut().reset_call();
+
+        let result = self
+            .instance
+            .bindings
+            .call_rebootstrap(&mut self.instance.store)
+            .await;
+
+        // Feed this call's budget telemetry into the adaptive
+        // page sizer so the *next* `rebootstrap` call's
+        // `utxos-by-*` pages are sized to fit. AIMD: spare fuel
+        // grows the page, fuel pressure or an OOM shrinks it.
+        // `get_fuel` is valid whether the call returned or
+        // trapped — the Store outlives the trap.
+        let fuel_remaining = self.instance.store.get_fuel().unwrap_or(0);
+        let fuel_used = self.fuel_per_call.saturating_sub(fuel_remaining);
+        let hit_oom = self.instance.store.data().limiter().hit_oom();
+        self.instance.store.data_mut().adaptive_mut().observe(
+            fuel_used,
+            self.fuel_per_call,
+            hit_oom,
+        );
+
+        result
+    }
+
+    /// Current adaptive page-size clamp, in refs — telemetry for
+    /// the recapture loop's logging.
+    pub fn adaptive_page_limit(&self) -> u32 {
+        self.instance.store.data().adaptive.current()
+    }
+
+    /// Classify a trap returned by a guest call on this driver's
+    /// instance. Reads the budget limiter off the `Store` to tell
+    /// an OOM apart from a fuel exhaustion or a module fault. See
+    /// `crate::budget::TrapClass`.
+    pub fn classify_trap(&self, err: &wasmtime::Error) -> crate::budget::TrapClass {
+        let oom = self.instance.store.data().limiter().hit_oom();
+        crate::budget::TrapClass::classify(err, oom)
+    }
+
+    /// Lifetime peak linear-memory use of this driver's instance,
+    /// in bytes. Telemetry for trap diagnostics + (Phase 2)
+    /// adaptive page sizing.
+    pub fn peak_memory_bytes(&self) -> usize {
+        self.instance.store.data().limiter().peak_memory_bytes()
+    }
+
     /// Apply one block. The driver pulls the InterestSet off the
     /// host state (already populated via `set_interest`) and
     /// resolves prior outputs through the data plane to filter

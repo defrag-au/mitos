@@ -37,13 +37,14 @@ pub use mitos::platform_v2::emit::Host as EmitHost;
 pub use mitos::platform_v2::interest::Host as InterestHost;
 pub use mitos::platform_v2::logging::{Host as LoggingHost, LogLevel};
 pub use mitos::platform_v2::state_kv::Host as StateKvHost;
-// `DispatchEvent`, `TrapStrategy`, `RetryPolicy` are pulled into
-// the top-level scope by the world's `use types.{...}` clause,
-// so they're addressable as `crate::bindings_v2::DispatchEvent`
-// without an explicit re-export here.
+// `DispatchEvent`, `TrapStrategy`, `RetryPolicy`, `RebootstrapStep`
+// are pulled into the top-level scope by the world's
+// `use types.{...}` clause, so they're addressable as
+// `crate::bindings_v2::DispatchEvent` without an explicit
+// re-export here.
 pub use mitos::platform_v2::types::{
     AssetEntry, AssetId, ChainPoint, ConsumedEvent, ConsumedInput, Host as TypesHost, MintEntry,
     MintedEvent, OutputRef, ProducedEvent, ReferencedEvent, ReferencedInput, RollbackEvent,
     SpecificPoint, StakeCred, TickEvent, TxContextEvent, TxRecord, TypedDatum, TypedOutput,
-    UtxoEvent, ValidityInterval,
+    UtxoEvent, UtxoPage, ValidityInterval,
 };

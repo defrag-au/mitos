@@ -19,6 +19,7 @@ policies = []
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
+mitos-module-kit = { path = "../../crates/mitos-module-kit" }
 pallas-addresses = "1.0.0-alpha.6"
 pallas-primitives = "1.0.0-alpha.6"
 # minicbor decoder + Plutus datum decoder for the Shield vest

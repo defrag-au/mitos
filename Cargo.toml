@@ -16,6 +16,7 @@ members = [
     "crates/mitos-core",
     "crates/mitos-companion",
     "crates/mitos-community-events",
+    "crates/mitos-module-kit",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",

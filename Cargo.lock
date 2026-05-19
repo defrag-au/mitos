@@ -3396,6 +3396,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-module-kit"
+version = "0.0.1"
+
+[[package]]
 name = "mitos-platform"
 version = "0.0.1"
 dependencies = [

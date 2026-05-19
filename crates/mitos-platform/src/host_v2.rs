@@ -313,11 +313,100 @@ where
         }
     }
 
+    /// Instantiate the module artifact, run `init`, and wrap it
+    /// in a `DriverV2`. Factored out of `start` so the recapture
+    /// rebootstrap loop can rebuild the instance after a
+    /// retryable trap (Approach A, `WASM_BUDGET_CHUNKING.md`):
+    /// a fresh instance re-inits its `ReentrantRound` from the
+    /// durable state-kv cursor, cleanly restarting the trapped
+    /// predicate from page 0 — no partial-fold from the trapped
+    /// attempt survives.
+    ///
+    /// `seed_page`: when `Some`, the fresh instance's adaptive
+    /// sizer starts at that page — the shrunk size carried from
+    /// the trapped instance — instead of the default.
+    ///
+    /// Returns the driver plus the instance's `TrapContextLogger`
+    /// (the follower needs the logger matching its instance). An
+    /// `init` trap writes a replay fixture and surfaces as `Err`.
+    async fn instantiate_driver(
+        &self,
+        id: &str,
+        registry: &ModuleRegistryV2,
+        caching_plane: Arc<dyn DataPlaneFacade>,
+        config: &[u8],
+        sink: emit::EventSink,
+        seed_page: Option<u32>,
+    ) -> PlatformResult<(DriverV2, Arc<TrapContextLogger>)> {
+        let kv = (self.kv_factory)(id);
+        let trap_logger = Arc::new(TrapContextLogger::new(caching_plane));
+
+        let mut instance = registry
+            .instantiate(trap_logger.clone(), kv, sink, self.budget)
+            .await?;
+
+        // Carry a shrunk page from a trapped instance into the
+        // fresh sizer, before any guest call.
+        if let Some(page) = seed_page {
+            instance.store.data_mut().adaptive_mut().seed_current(page);
+        }
+
+        instance.store.set_fuel(self.budget.init_fuel)?;
+        // Clear the per-call OOM flag so an `init` trap classifies
+        // against this call only.
+        instance.store.data_mut().limiter_mut().reset_call();
+        if let Err(e) = instance
+            .bindings
+            .call_init(&mut instance.store, config)
+            .await
+        {
+            // Classify the trap — `init` is a heavy bootstrap
+            // call, so OOM (`cabi_realloc`) is a real outcome and
+            // must be told apart from a fuel exhaustion or a
+            // module logic fault. See `crate::budget`.
+            let trap =
+                crate::budget::TrapClass::classify(&e, instance.store.data().limiter().hit_oom());
+            let peak_memory = instance.store.data().limiter().peak_memory_bytes();
+            let snap = trap_logger.snapshot();
+            let path = self.storage.last_trap_path(id);
+            match write_fixture(&snap, id, &path) {
+                Ok(()) => tracing::error!(
+                    module = %id,
+                    trap = %trap,
+                    peak_memory_bytes = peak_memory,
+                    fixture = %path.display(),
+                    "v2 init trapped; fixture written for local replay (mitos-run --fixture)",
+                ),
+                Err(write_err) => tracing::warn!(
+                    module = %id,
+                    trap = %trap,
+                    peak_memory_bytes = peak_memory,
+                    error = %write_err,
+                    "v2 init trapped; failed to write trap fixture",
+                ),
+            }
+            return Err(PlatformError::Wasmtime(e));
+        }
+
+        Ok((DriverV2::new(instance, self.budget), trap_logger))
+    }
+
     /// Start (or restart) the v2 module. Mirrors v1's
     /// `ModuleHost::start` shape: stop existing slot if any →
     /// instantiate → init (with refuel + trap-context capture)
     /// → spawn follower + emit-drain task.
-    pub async fn start(&self, id: &str) -> PlatformResult<()> {
+    ///
+    /// `rebootstrap`: when `true`, invoke the module's
+    /// `rebootstrap` export after the manifest bootstrap pass —
+    /// used by the recapture flow so a self-bootstrapping module
+    /// re-emits its own state. All non-recapture callers pass
+    /// `false`.
+    ///
+    /// Returns the count of interest predicates the module
+    /// re-bootstrapped (`0` unless `rebootstrap` was `true` and
+    /// the module is self-bootstrapping) — the recapture flow
+    /// surfaces it as `events_emitted`.
+    pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
         self.stop(id).await?;
 
         let manifest = self
@@ -332,12 +421,8 @@ where
         let registry =
             ModuleRegistryV2::load_from_path(self.engine.clone(), id.to_owned(), &wasm_path)?;
 
-        let kv = (self.kv_factory)(id);
         let (sink, events_rx) = (self.emitter_factory)();
 
-        // Trap-context logger wraps the data plane facade so
-        // host-fn calls during init or dispatch get captured.
-        // Same `last-trap.toml` write path v1 uses.
         // Wrap the shared data plane with the aux-data cache so
         // `tx_metadata` calls from the module check the persistent
         // cache before hitting the dolos archive (7-day window).
@@ -361,41 +446,28 @@ where
         if maestro_opt.is_some() {
             tracing::info!(module = %id, "Maestro aux_data fallback enabled");
         }
-
         let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
             crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt, maestro_opt),
         );
-        let trap_logger = Arc::new(TrapContextLogger::new(caching_plane));
-
-        let mut instance = registry
-            .instantiate(trap_logger.clone(), kv, sink, self.budget)
-            .await?;
-
         let config = self.storage.read_config(id)?.unwrap_or_default();
-        instance.store.set_fuel(self.budget.init_fuel)?;
-        if let Err(e) = instance
-            .bindings
-            .call_init(&mut instance.store, &config)
-            .await
-        {
-            let snap = trap_logger.snapshot();
-            let path = self.storage.last_trap_path(id);
-            match write_fixture(&snap, id, &path) {
-                Ok(()) => tracing::error!(
-                    module = %id,
-                    fixture = %path.display(),
-                    "v2 init trapped; fixture written for local replay (mitos-run --fixture)",
-                ),
-                Err(write_err) => tracing::warn!(
-                    module = %id,
-                    error = %write_err,
-                    "v2 init trapped; failed to write trap fixture",
-                ),
-            }
-            return Err(PlatformError::Wasmtime(e));
-        }
 
-        let mut driver = DriverV2::new(instance, self.budget);
+        // Instantiate + `init` + wrap in a driver. Factored into
+        // `instantiate_driver` so the recapture rebootstrap loop
+        // below can rebuild the instance after a retryable trap
+        // (Approach A, `WASM_BUDGET_CHUNKING.md`). The
+        // trap-context logger is per-instance — `trap_logger` is
+        // `mut` so the follower gets the one matching its
+        // (possibly re-instantiated) driver.
+        let (mut driver, mut trap_logger) = self
+            .instantiate_driver(
+                id,
+                &registry,
+                caching_plane.clone(),
+                &config,
+                sink.clone(),
+                None,
+            )
+            .await?;
 
         // Bootstrap: hydrate state at watched addresses
         // declared in the manifest's `[interest]` section.
@@ -453,6 +525,147 @@ where
                         "v2 bootstrap failed; continuing without full hydration",
                     );
                 }
+            }
+        }
+
+        // Recapture re-bootstrap: after the host-side manifest
+        // bootstrap pass, let a self-bootstrapping module re-emit
+        // its own state by re-running its cold-start over its
+        // restored interest. No-op for event-driven modules
+        // (their refill is `run_bootstrap` above). Only the
+        // recapture flow passes `rebootstrap = true`.
+        //
+        // `rebootstrap` is re-entrant at the *page* grain
+        // (`WASM_BUDGET_CHUNKING.md`): one call does one bounded
+        // page of the module's cold-start scan and reports a
+        // `RebootstrapStep` — `done` plus an `ingested` UTxO
+        // count. A page fits one fuel budget; a whole large
+        // policy does not, so the host loops, refuelling each
+        // call, until a step comes back `done`. `rebootstrap_count`
+        // sums `ingested` across steps — the real count of UTxOs
+        // re-scanned — and is surfaced as the recapture's
+        // `events_emitted`.
+        let mut rebootstrap_count: u64 = 0;
+        if rebootstrap {
+            // Defensive bound — a well-behaved module drains a
+            // finite scan; the cap only guards a module that
+            // never returns `done`. Counts host calls (pages),
+            // not UTxOs.
+            const REBOOTSTRAP_MAX_STEPS: u64 = 10_000_000;
+            // A retryable trap re-instantiates the module and
+            // retries at a smaller page (Approach A). Bounded so
+            // a module that traps even at the minimum page can't
+            // loop forever.
+            const REBOOTSTRAP_MAX_REINSTANTIATIONS: u32 = 6;
+            let mut steps: u64 = 0;
+            let mut reinstantiations: u32 = 0;
+            loop {
+                match driver.call_rebootstrap().await {
+                    Ok(Ok(step)) => {
+                        rebootstrap_count += step.ingested;
+                        steps += 1;
+                        if step.done {
+                            break;
+                        }
+                        if steps >= REBOOTSTRAP_MAX_STEPS {
+                            tracing::error!(
+                                module = %id,
+                                steps,
+                                "v2 rebootstrap exceeded step cap; aborting loop",
+                            );
+                            break;
+                        }
+                    }
+                    Ok(Err(msg)) => {
+                        tracing::error!(
+                            module = %id,
+                            error = %msg,
+                            "v2 rebootstrap returned an error",
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        // A trap during a `rebootstrap` page.
+                        // `OutOfFuel`/`OutOfMemory` are retryable:
+                        // the page overran the per-call budget,
+                        // and `call_rebootstrap` already shrank
+                        // the adaptive sizer. Re-instantiate
+                        // carrying the smaller page — the fresh
+                        // instance re-inits its `ReentrantRound`
+                        // from the durable predicate cursor, a
+                        // clean restart of the trapped predicate —
+                        // and retry. `Timeout`/`Fault` are not
+                        // resize-retryable; abort.
+                        let trap = driver.classify_trap(&e);
+                        match trap {
+                            crate::budget::TrapClass::OutOfFuel
+                            | crate::budget::TrapClass::OutOfMemory => {
+                                let retry_page = driver.adaptive_page_limit();
+                                reinstantiations += 1;
+                                if reinstantiations > REBOOTSTRAP_MAX_REINSTANTIATIONS {
+                                    tracing::error!(
+                                        module = %id,
+                                        trap = %trap,
+                                        "v2 rebootstrap: still trapping at the minimum page \
+                                         after repeated retries; refill may be partial",
+                                    );
+                                    break;
+                                }
+                                tracing::warn!(
+                                    module = %id,
+                                    trap = %trap,
+                                    peak_memory_bytes = driver.peak_memory_bytes(),
+                                    retry_page,
+                                    "v2 rebootstrap page trapped; re-instantiating + retrying \
+                                     at a smaller page",
+                                );
+                                match self
+                                    .instantiate_driver(
+                                        id,
+                                        &registry,
+                                        caching_plane.clone(),
+                                        &config,
+                                        sink.clone(),
+                                        Some(retry_page),
+                                    )
+                                    .await
+                                {
+                                    Ok((d, tl)) => {
+                                        driver = d;
+                                        trap_logger = tl;
+                                    }
+                                    Err(re) => {
+                                        tracing::error!(
+                                            module = %id,
+                                            error = %re,
+                                            "v2 rebootstrap: re-instantiate after trap \
+                                             failed; refill may be partial",
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            crate::budget::TrapClass::Timeout | crate::budget::TrapClass::Fault => {
+                                tracing::error!(
+                                    module = %id,
+                                    trap = %trap,
+                                    peak_memory_bytes = driver.peak_memory_bytes(),
+                                    error = %e,
+                                    "v2 rebootstrap trapped; refill may be partial",
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if rebootstrap_count > 0 {
+                tracing::info!(
+                    module = %id,
+                    utxos_ingested = rebootstrap_count,
+                    adaptive_page_limit = driver.adaptive_page_limit(),
+                    "v2 rebootstrap complete",
+                );
             }
         }
 
@@ -543,11 +756,11 @@ where
             },
         );
         tracing::info!(module = %id, "v2 follower started");
-        Ok(())
+        Ok(rebootstrap_count)
     }
 
     pub async fn replace(&self, id: &str) -> PlatformResult<()> {
-        self.start(id).await
+        self.start(id, false).await.map(|_| ())
     }
 
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
@@ -616,8 +829,8 @@ where
             }
         };
         for id in module_ids {
-            match self.start(&id).await {
-                Ok(()) => tracing::info!(module = %id, "auto-resumed"),
+            match self.start(&id, false).await {
+                Ok(_) => tracing::info!(module = %id, "auto-resumed"),
                 Err(e) => tracing::error!(
                     module = %id,
                     error = %e,
@@ -752,14 +965,17 @@ where
         //    task. Bootstrap-synthesised events flow through the
         //    broadcast → outbound WSes → companions while this
         //    call is returning.
-        if let Err(e) = self.start(id).await {
-            tracing::error!(
-                module = %id,
-                error = %e,
-                "recapture: follower restart failed; refill is partial"
-            );
-            return Err(e);
-        }
+        let events_emitted = match self.start(id, true).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(
+                    module = %id,
+                    error = %e,
+                    "recapture: follower restart failed; refill is partial"
+                );
+                return Err(e);
+            }
+        };
 
         // 5. (Legacy `RecaptureDone` notification dropped — the
         //    HTTP delivery transport doesn't push informational
@@ -776,9 +992,10 @@ where
         Ok(RecaptureOutcome {
             module: id.to_owned(),
             companion_count,
-            // Best-effort counter; populated by future bootstrap
-            // instrumentation. See `RECAPTURE.md` open question 4.
-            events_emitted: 0,
+            // Interest predicates the module re-emitted under
+            // `rebootstrap` — 0 for event-driven modules, whose
+            // refill is the host-side `run_bootstrap` pass.
+            events_emitted,
         })
     }
 

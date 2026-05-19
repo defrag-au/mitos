@@ -28,6 +28,8 @@
 //!   interfaces (chain-data, state-kv, emit, logging, interest)
 //! - `registry_v2` — load module artifact, version-check,
 //!   instantiate, `ResourceBudget`
+//! - `budget` — per-instance `ResourceLimiter` + trap
+//!   classification (`TrapClass`); see `WASM_BUDGET_CHUNKING.md`
 //! - `driver_v2`, `follower_v2`, `host_v2` — per-block dispatch,
 //!   chain follower, lifecycle manager
 //! - `bootstrap_v2` — synthetic event scan for manifest interest
@@ -46,6 +48,7 @@ pub mod admin;
 pub mod aux_data_cache;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
+pub mod budget;
 pub mod compaction;
 pub mod companions;
 pub mod dialer;
@@ -68,6 +71,7 @@ pub mod supervisor;
 pub mod trap_context;
 pub mod vendored;
 
+pub use budget::{AdaptiveSizer, BudgetLimiter, TrapClass};
 /// Re-exported so bundle consumers can construct
 /// `Arc<dyn ChainDataPlane>` to pass into
 /// `admin::admin_router_with_host` without a separate dep on
