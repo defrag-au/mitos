@@ -3396,6 +3396,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-dex-decode"
+version = "0.0.1"
+dependencies = [
+ "pallas-codec 1.0.0-alpha.6",
+ "pallas-primitives 1.0.0-alpha.6",
+]
+
+[[package]]
 name = "mitos-module-kit"
 version = "0.0.1"
 

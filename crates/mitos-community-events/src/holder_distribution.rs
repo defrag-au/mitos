@@ -65,6 +65,17 @@ pub struct HolderEntry {
     /// `asset_name_hex` for deterministic wire shape (so
     /// snapshot-diffing across module versions is stable).
     pub assets: Vec<AssetBalance>,
+    /// LP-decomposition attribution: the quantity of this policy
+    /// attributed to this holder by redistributing a DEX pool's
+    /// aggregate holding to the wallets that provided the
+    /// liquidity. Already included in `assets` — `lp_amount` is
+    /// the *portion* of the holding that is LP-derived, surfaced
+    /// so consumers can split a "Scout Vessels" band out of the
+    /// total. `0` when the holder provided no liquidity, or when
+    /// the policy has no registered LP pool. See
+    /// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`.
+    #[serde(default)]
+    pub lp_amount: u64,
 }
 
 /// Opens a **chunked snapshot** sequence for one policy. A full

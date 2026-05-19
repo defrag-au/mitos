@@ -1,0 +1,14 @@
+[package]
+name = "mitos-dex-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared DEX datum/address decode library for mitos community modules — CSwap (Splash to follow). The genuine reuse unit between cswap-dex and holder-distribution's LP decomposition; see docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+pallas-codec.workspace = true
+pallas-primitives.workspace = true

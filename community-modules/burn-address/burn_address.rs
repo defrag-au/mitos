@@ -177,25 +177,11 @@ fn handle_produced(p: &ProducedEvent) {
 /// consumers MUST dedup on `(tx_hash, output_index)` rather than
 /// blindly accumulating.
 fn process_address_page(addr: &str, refs: &[WitOutputRef]) -> Option<usize> {
-    let outputs = chain_data::read_utxos(refs);
-    if outputs.len() != refs.len() {
-        // `read_utxos` is positionally parallel to its input; a
-        // length mismatch means we can't safely zip refs to
-        // outputs. Signal abort rather than emit misattributed
-        // burns.
-        logging::log(
-            LogLevel::Error,
-            LOG_TARGET,
-            &format!(
-                "cold-start address={addr}: read_utxos returned {} output(s) for {} ref(s); bootstrap walk aborted",
-                outputs.len(),
-                refs.len()
-            ),
-        );
-        return None;
-    }
     let mut burn_events = 0usize;
-    for (oref, output) in refs.iter().zip(outputs.iter()) {
+    // `read_utxos` returns each output paired with its own ref —
+    // the result is not in `refs` order, so the ref for an
+    // emitted burn comes from the tuple, never the input index.
+    for (oref, output) in chain_data::read_utxos(refs) {
         if output.assets.is_empty() {
             continue;
         }
@@ -479,8 +465,7 @@ impl Guest for Module {
                 chain_data::utxos_by_address(&addr, round.after(), COLD_START_PAGE_HINT);
             let ingested = page.refs.len() as u64;
 
-            // A `read_utxos` length mismatch aborts this address —
-            // skip the rest of its pages, advance to the next.
+            // Process one page of this address's current UTxOs.
             let page_ok = process_address_page(&addr, &page.refs).is_some();
 
             match page.next {

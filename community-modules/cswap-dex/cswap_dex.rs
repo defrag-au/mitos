@@ -81,8 +81,10 @@ use mitos_community_events::dex::{
     DexAction, FarmStake, FarmUnstake, LiquidityAdd, LiquidityRemove, PoolReserves, RewardClaim,
     Swap, SwapAsset,
 };
-use pallas_codec::minicbor;
-use pallas_primitives::{BigInt, PlutusData};
+use mitos_dex_decode::cswap::{
+    CswapPoolDatum, FARM_SCRIPT_ADDR, ORDER_SCRIPT_ADDR_PREFIX, POOL_SCRIPT_ADDR, PairKey,
+    decode_pool_datum,
+};
 
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
@@ -94,29 +96,10 @@ const LOG_TARGET: &str = "cswap-dex-module";
 
 const DEX_BRAND: &str = "CSWAP";
 
-/// CSWAP pool script address. All 82 pools live here. CSWAP
-/// uses a single canonical stake credential across its pools
-/// (unlike Splash, which varies stake creds per pool — to be
-/// handled with a prefix-match interest set when `splash-dex`
-/// lands).
-const POOL_SCRIPT_ADDR: &str =
-    "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
-
-/// CSWAP order / batcher script address prefix (51 chars =
-/// `addr1z` + header byte + 28-byte payment hash worth of bech32).
-/// Each user's order has its own stake credential glued to the
-/// same payment script, so we prefix-match rather than enumerate.
-/// Used at flush time to identify consumed orders so we can
-/// compute `batcher_fee_lovelace`.
-const ORDER_SCRIPT_ADDR_PREFIX: &str =
-    "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nh";
-
-/// CSWAP farm script address. LP tokens get locked here when a
-/// user stakes for yield. CSWAP uses one canonical farm script
-/// (confirmed against staked-farm fixtures); should new farm
-/// variants appear we'd add their bech32 here.
-const FARM_SCRIPT_ADDR: &str =
-    "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf";
+// CSWAP pool / order / farm script addresses are owned by the
+// shared decode crate (`mitos_dex_decode::cswap`) — imported
+// above — so `cswap-dex` and `holder-distribution`'s LP
+// decomposition match against one source of truth.
 
 /// CSWAP reward-request collection wallet (key-only `addr1v`).
 /// Users send a flat 2 ADA "claim ticket" here when initiating
@@ -206,11 +189,6 @@ struct TxBuffer {
     tx_hash: Option<Vec<u8>>,
     slot: Option<u64>,
 }
-
-/// `(quote_policy, quote_name, base_policy, base_name)` — the
-/// stable identity of a pool independent of which side of the
-/// swap is happening.
-type PairKey = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
@@ -1008,108 +986,11 @@ fn chain_point_slot(cp: &ChainPoint) -> Option<u64> {
     }
 }
 
-// ============================================================
-// Datum decoder
-// ============================================================
-
-/// Decoded CSWAP pool datum. Lifted from
-/// `shared-crates/cardano-tx/dex/cswap/pool.rs` and extended to
-/// surface every field the action-recognition pipeline needs:
-/// the four pair-identity fields (the shared decoder skips
-/// them — TX-builder side only needs total LP + fee), the
-/// LP-token identity (used for LiquidityAdd/Remove to find
-/// the recipient wallet output), and the total LP supply
-/// (delta over consume/produce gives `lp_received` /
-/// `lp_burnt` directly without watching mint events).
-#[derive(Debug, Clone)]
-struct CswapPoolDatum {
-    total_lp_tokens: u64,
-    pool_fee_bps: u64,
-    quote_policy: Vec<u8>,
-    quote_name: Vec<u8>,
-    base_policy: Vec<u8>,
-    base_name: Vec<u8>,
-    lp_policy: Vec<u8>,
-    lp_name: Vec<u8>,
-}
-
-impl CswapPoolDatum {
-    fn pair_key(&self) -> PairKey {
-        (
-            self.quote_policy.clone(),
-            self.quote_name.clone(),
-            self.base_policy.clone(),
-            self.base_name.clone(),
-        )
-    }
-}
-
-fn decode_pool_datum(cbor: &[u8]) -> Option<CswapPoolDatum> {
-    let pd: PlutusData = minicbor::decode(cbor).ok()?;
-    let constr = match pd {
-        PlutusData::Constr(c) => c,
-        _ => return None,
-    };
-    // CSWAP pool datum: Constr tag 121 (== alternative 0), 8
-    // fields. Tag check guards against unrelated PlutusData
-    // landing at the pool address (shouldn't happen in normal
-    // CSWAP operation, but defensive).
-    if constr.tag != 121 {
-        return None;
-    }
-    let fields: Vec<PlutusData> = constr.fields.into();
-    if fields.len() != 8 {
-        return None;
-    }
-    let total_lp_tokens = bigint_u64(&fields[0])?;
-    let pool_fee_bps = bigint_u64(&fields[1])?;
-    let quote_policy = bounded_bytes(&fields[2])?;
-    let quote_name = bounded_bytes(&fields[3])?;
-    let base_policy = bounded_bytes(&fields[4])?;
-    let base_name = bounded_bytes(&fields[5])?;
-    let lp_policy = bounded_bytes(&fields[6])?;
-    let lp_name = bounded_bytes(&fields[7])?;
-    Some(CswapPoolDatum {
-        total_lp_tokens,
-        pool_fee_bps,
-        quote_policy,
-        quote_name,
-        base_policy,
-        base_name,
-        lp_policy,
-        lp_name,
-    })
-}
-
-fn bigint_u64(pd: &PlutusData) -> Option<u64> {
-    match pd {
-        PlutusData::BigInt(BigInt::Int(i)) => {
-            let v: i128 = (*i).into();
-            if v < 0 {
-                None
-            } else {
-                u64::try_from(v).ok()
-            }
-        }
-        PlutusData::BigInt(BigInt::BigUInt(b)) => {
-            let bytes: &[u8] = b;
-            if bytes.len() > 8 {
-                return None;
-            }
-            let mut buf = [0u8; 8];
-            buf[8 - bytes.len()..].copy_from_slice(bytes);
-            Some(u64::from_be_bytes(buf))
-        }
-        _ => None,
-    }
-}
-
-fn bounded_bytes(pd: &PlutusData) -> Option<Vec<u8>> {
-    match pd {
-        PlutusData::BoundedBytes(b) => Some((**b).to_vec()),
-        _ => None,
-    }
-}
+// The CSWAP pool datum (`CswapPoolDatum` / `decode_pool_datum`)
+// now lives in the shared `mitos_dex_decode::cswap` crate —
+// imported at the top of this file — so the decode logic has a
+// single home shared with `holder-distribution`'s LP
+// decomposition.
 
 // ============================================================
 // v2 Guest impl

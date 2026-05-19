@@ -60,9 +60,19 @@ It is explicitly **not**:
   holder snapshot.
 
 The DEX modules' genuine reuse unit is the **decode library**
-(`cardano-tx::dex::cswap` — pool datum, staking datum, share
+(`mitos-dex-decode::cswap` — pool datum, staking datum, share
 math), which both `cswap-dex` and this decomposition step call.
 Composition over coordination.
+
+> **Note (2026-05-19):** `mitos-dex-decode` does *not* exist yet.
+> The CSwap pool/order/farm address constants and the
+> `decode_pool_datum` / staking-datum decoders currently live
+> **inline inside `cswap-dex/cswap_dex.rs`**, private to that
+> module. Community modules share code only via a crate listed
+> in their `.toml` `[deps]`. So the first implementation step is
+> to extract that decode logic into a new `crates/mitos-dex-decode`
+> crate and refactor `cswap-dex` to depend on it — see *Work
+> breakdown* item 2.
 
 ## Principle: the consumer supplies nothing
 
@@ -90,7 +100,7 @@ policy `X`, after building the holder ledger it additionally:
    — it is simply a holder of `X` whose address is a DEX pool
    script. As each holder UTxO is bucketed, its payment
    credential is also tested against the known DEX pool script
-   hashes (`cardano-tx::dex` constants — see *Auto-discovery*).
+   hashes (`mitos-dex-decode` constants — see *Auto-discovery*).
    A match flags the pool UTxO ref and its `X` balance. No pool
    → no decomposition; the policy is emitted as today.
 2. **Decodes the pool datum.** `read-output-datums` on the
@@ -124,7 +134,7 @@ it needs all come from one of two places:
 - **Protocol constants** — the DEX pool script address(es) and
   farm contract address. These are *not* per-policy: every CSwap
   pool sits at one shared pool script address. They live in
-  `cardano-tx::dex` alongside the datum decoders, exposed as e.g.
+  `mitos-dex-decode` alongside the datum decoders, exposed as e.g.
   `cswap::POOL_SCRIPT_HASH` / `cswap::FARM_SCRIPT_HASH`.
 - **Chain state** — the CSwap pool datum *itself carries*
   `lp_policy_id`, `lp_asset_name_hex` and `total_lp_supply`. Once
@@ -155,7 +165,7 @@ addresses" per DEX. The detected DEX kind selects the datum
 decoder.
 
 CSwap ships first; Splash follows when its constants + decoder
-land in `cardano-tx::dex::splash`.
+land in `mitos-dex-decode::splash`.
 
 ### Future: optional override
 
@@ -194,7 +204,7 @@ pools — but the surface is deliberately narrow:
   O(holders) comparisons against a handful of constants, no extra
   scan.
 - The LP "knowledge" is two things: a constant address set per
-  DEX in `cardano-tx::dex`, and a `match` on the detected DEX
+  DEX in `mitos-dex-decode`, and a `match` on the detected DEX
   kind to a decoder. The module owns *when* to decompose; the
   decode library owns *how* to read a given DEX's datums and
   *where* its pools live.
@@ -237,13 +247,18 @@ scope here.
 1. `HolderEntry.lp_amount` wire field (`mitos-community-events`) +
    `feed_do_mitos` consumer write-through. No other consumer
    change — there is no spec to pass.
-2. `cardano-tx::dex` discovery constants — `cswap::POOL_SCRIPT_
-   HASH` / `cswap::FARM_SCRIPT_HASH` exposed alongside the
-   existing datum/staking decoders.
+2. **Create `crates/mitos-dex-decode`** by extracting the CSwap
+   decode logic from `cswap-dex/cswap_dex.rs`: the pool / order /
+   farm address constants, `CswapPoolDatum` + `decode_pool_datum`,
+   the staking-datum decoder, and the share math. Refactor
+   `cswap-dex` to depend on the new crate (add it to
+   `cswap_dex.toml` `[deps]`, replace the inline copies with
+   `use mitos_dex_decode::cswap::*`). `cswap-dex`'s `tests/` dir
+   is the regression net.
 3. Decomposition step in `holder-distribution`'s cold-start +
    `rebootstrap` scan, as a re-entrant phase: pool detection
    folded into the holder scan, then datum decode + LP-holder
-   enumeration + ledger rewrite, using `cardano-tx::dex::cswap`.
+   enumeration + ledger rewrite, using `mitos-dex-decode::cswap`.
 4. Verify — recapture → dev donut's Mothership + Scout Vessels
    match the legacy prod endpoint.
 

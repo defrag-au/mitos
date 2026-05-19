@@ -668,9 +668,15 @@ fn build_snapshot_locks(refs: &[WitOutputRef]) -> Vec<LockEntry> {
     }
     let mut all_locks = Vec::with_capacity(refs.len());
     for chunk in refs.chunks(1024) {
+        // `read_utxos` returns each output paired with its own
+        // ref, and *not* in input order. Re-derive the ref list
+        // from that returned order so `read_output_datums`
+        // (which is positionally parallel to its input) lines up
+        // 1:1 with the outputs.
         let outputs = chain_data::read_utxos(&chunk.to_vec());
-        let datums = chain_data::read_output_datums(&chunk.to_vec());
-        for ((oref, out), datum) in chunk.iter().zip(outputs.iter()).zip(datums.iter()) {
+        let output_refs: Vec<WitOutputRef> = outputs.iter().map(|(r, _)| r.clone()).collect();
+        let datums = chain_data::read_output_datums(&output_refs);
+        for ((oref, out), datum) in outputs.iter().zip(datums.iter()) {
             let style = vest_style_from_tx(&oref.tx_hash);
             let entries = build_lock_entries(
                 &out.address,

@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use mitos_community_events::holder_distribution::{
     AssetBalance, HolderDelta, HolderEntry, HolderEvent, SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
+use mitos_dex_decode::{cswap, lp_share};
 use mitos_module_kit::ReentrantRound;
 use pallas_addresses::{Address, ShelleyDelegationPart};
 use serde::{Deserialize, Serialize};
@@ -53,7 +54,8 @@ use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 use crate::mitos::platform_v2::types::{
-    AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent, UtxoEvent,
+    AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent,
+    TypedDatum, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "holder-distribution-module";
@@ -98,12 +100,21 @@ thread_local! {
     /// In-flight `rebootstrap` round. `None` between rounds.
     /// `ReentrantRound` (from `mitos-module-kit`) owns the
     /// predicate list, the `predicate_idx`, the page cursor, and
-    /// the per-predicate `PolicyLedger` accumulator. Resident in
+    /// the per-predicate `ScanAcc` accumulator. Resident in
     /// the wasm instance across the host's re-entrant call loop;
     /// a trap or host restart discards it and the round resumes
     /// from the durable state-kv cursor (`predicate_idx`).
-    static REBOOTSTRAP_STATE: RefCell<Option<ReentrantRound<[u8; HASH_BYTES], PolicyLedger>>> =
+    static REBOOTSTRAP_STATE: RefCell<Option<ReentrantRound<[u8; HASH_BYTES], ScanAcc>>> =
         RefCell::new(None);
+
+    /// In-progress LP-pool decomposition for the predicate whose
+    /// holder scan just finished and which has a DEX pool. `None`
+    /// when no decomposition is in flight. Each `rebootstrap`
+    /// call scans one page of the LP-token holder set; when the
+    /// last page lands the ledger is decomposed and the emit
+    /// opens. See `rebootstrap` / `begin_decomp` and
+    /// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`.
+    static REBOOTSTRAP_DECOMP: RefCell<Option<DecompState>> = RefCell::new(None);
 
     /// In-progress chunked-snapshot emit for the predicate whose
     /// scan just finished. `None` when no emit is in flight. The
@@ -112,6 +123,45 @@ thread_local! {
     /// single fuel budget traps for a large policy (prod
     /// recapture, 2026-05-19). See `rebootstrap` / `begin_emit`.
     static REBOOTSTRAP_EMIT: RefCell<Option<EmitState>> = RefCell::new(None);
+}
+
+/// Per-predicate `rebootstrap` scan accumulator. The holder
+/// ledger built page-by-page, plus the output-ref of the DEX
+/// pool UTxO if one was spotted among the holders (auto-discovery
+/// — the pool is just a holder of the policy whose address is a
+/// known DEX pool script). Volatile — discarded on trap.
+#[derive(Default)]
+struct ScanAcc {
+    ledger: PolicyLedger,
+    /// First-spotted DEX pool UTxO holding this policy, if any.
+    pool_ref: Option<WitOutputRef>,
+}
+
+/// An LP-pool decomposition mid-scan: the raw holder ledger of
+/// the policy, plus the LP-token holder enumeration accumulating
+/// page by page. When the LP scan finishes, the ledger is
+/// decomposed (pool aggregate redistributed to LP providers) and
+/// the decomposed holder list is handed to the chunked emit.
+struct DecompState {
+    /// 56-char hex policy id.
+    policy_hex: String,
+    /// Frozen-scan tip the snapshot is consistent as-of.
+    anchor_slot: u64,
+    /// UTxO count from the holder scan — for the log line.
+    total_utxos: usize,
+    /// The raw holder ledger (pool aggregate intact). Persisted
+    /// as-is; decomposition transforms only the *emitted* list.
+    ledger: PolicyLedger,
+    /// Total LP supply in circulation, from the pool datum — the
+    /// share denominator.
+    total_lp_tokens: u64,
+    /// LP-token policy id; the `utxos_by_policy` scan target.
+    lp_policy: [u8; HASH_BYTES],
+    /// Page cursor for the LP-token holder scan.
+    lp_after: Option<Vec<u8>>,
+    /// LP-token holdings accumulated so far: `stake_cred_bytes
+    /// (empty Vec for enterprise) -> lp_token_quantity`.
+    lp_holders: BTreeMap<Vec<u8>, u64>,
 }
 
 /// A chunked snapshot mid-emit: the materialised holder list for
@@ -296,72 +346,88 @@ fn apply_consumed_to_ledger(
 /// `refs` and the resolved outputs are dropped at return, so the
 /// only state that grows across pages is the holder-bounded
 /// `ledger` itself.
-fn fold_page(ledger: &mut PolicyLedger, policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) {
-    let outputs = chain_data::read_utxos(refs);
-    for out in outputs {
+///
+/// Returns the output-ref of a DEX pool UTxO if one is spotted
+/// in this page — the pool is just a holder of the policy whose
+/// address is a known DEX pool script (auto-discovery; see
+/// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`). At
+/// most one is returned per page; the caller keeps the first.
+///
+/// `read_utxos` returns each output paired with its own ref —
+/// the result is not in `refs` order, so the ref must come from
+/// the tuple, never the input position.
+fn fold_page(
+    ledger: &mut PolicyLedger,
+    policy: &[u8; HASH_BYTES],
+    refs: &[WitOutputRef],
+) -> Option<WitOutputRef> {
+    let mut pool_ref: Option<WitOutputRef> = None;
+    for (r, out) in chain_data::read_utxos(refs) {
         let mut _touched_dummy: HashSet<Vec<u8>> = HashSet::new();
         apply_produced_to_ledger(ledger, policy, &out.address, &out.assets, &mut _touched_dummy);
+        if pool_ref.is_none() && out.address == cswap::POOL_SCRIPT_ADDR {
+            pool_ref = Some(r);
+        }
     }
+    pool_ref
 }
 
-/// Persist a policy's ledger + emit its snapshot as a chunked
-/// `SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd`
-/// sequence, **in one call**. Used by the live `update_interest`
-/// add path (`cold_start`) — that host call is not re-entrant,
-/// so the emit can't be spread. The recapture path
-/// (`rebootstrap`) instead drains the emit one chunk per call
-/// via `begin_emit` + `REBOOTSTRAP_EMIT`, which keeps a large
-/// policy's snapshot inside the per-call fuel budget.
-fn finalize_policy_snapshot(
-    policy: &[u8; HASH_BYTES],
-    ledger: &PolicyLedger,
-    anchor_slot: u64,
-    total_utxos: usize,
-) {
-    let policy_hex = hex::encode(policy);
-    persist_ledger(&policy_hex, ledger);
-    let holders = ledger_to_holders(ledger);
-    let holder_count = holders.len();
-
-    // `anchor_slot` from the frozen scan — the tip the
-    // materialised UTxO set was consistent as-of. Consumers
-    // treat the sequence as an authoritative replacement and
-    // resume delta replay from the first event after this slot.
+/// Emit a policy's snapshot as a chunked `SnapshotBegin` →
+/// `SnapshotChunk` × N → `SnapshotEnd` sequence, **in one call**.
+/// Used by the live `update_interest` add path (`cold_start`) —
+/// that host call is not re-entrant, so the emit can't be
+/// spread. The recapture path (`rebootstrap`) instead drains the
+/// emit one chunk per call via `open_chunked_emit` +
+/// `REBOOTSTRAP_EMIT`, which keeps a large policy's snapshot
+/// inside the per-call fuel budget.
+///
+/// `anchor_slot` is the frozen-scan tip the materialised UTxO
+/// set was consistent as-of. Consumers treat the sequence as an
+/// authoritative replacement and resume delta replay from the
+/// first event after this slot.
+fn emit_full_snapshot(policy_hex: &str, holders: Vec<HolderEntry>, anchor_slot: u64) {
     emit_event(&HolderEvent::SnapshotBegin(SnapshotBegin {
-        policy: policy_hex.clone(),
+        policy: policy_hex.to_string(),
         cursor_slot: anchor_slot,
         cursor_hash_hex: String::new(),
     }));
     for chunk in holders.chunks(SNAPSHOT_CHUNK_HOLDERS) {
         emit_event(&HolderEvent::SnapshotChunk(SnapshotChunk {
-            policy: policy_hex.clone(),
+            policy: policy_hex.to_string(),
             holders: chunk.to_vec(),
         }));
     }
     emit_event(&HolderEvent::SnapshotEnd(SnapshotEnd {
-        policy: policy_hex.clone(),
-        holder_count: holder_count as u64,
+        policy: policy_hex.to_string(),
+        holder_count: holders.len() as u64,
     }));
-
-    logging::log(
-        LogLevel::Info,
-        LOG_TARGET,
-        &format!(
-            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {holder_count} holder(s) @ slot {anchor_slot}"
-        ),
-    );
 }
 
-/// Open the chunked snapshot emit for a predicate whose
-/// `rebootstrap` scan just completed: persist the ledger,
-/// materialise the holder list, emit `SnapshotBegin`, and stage
-/// the holders in `REBOOTSTRAP_EMIT`. Each subsequent
-/// `rebootstrap` call then drains one `SnapshotChunk` (and a
-/// final `SnapshotEnd`) — so a large holder set's snapshot is
-/// spread across many fuel-budgeted calls, not serialised in
-/// one. `persist_ledger` + `ledger_to_holders` are still one
-/// pass here, but both are sort-free and far lighter than the
-/// chunk emits they used to share a budget with.
+/// Emit `SnapshotBegin` and stage the holder list in
+/// `REBOOTSTRAP_EMIT` so the `rebootstrap` state machine can
+/// drain one `SnapshotChunk` per call — a large holder set's
+/// snapshot is spread across many fuel-budgeted calls, not
+/// serialised in one.
+fn open_chunked_emit(policy_hex: String, holders: Vec<HolderEntry>, anchor_slot: u64) {
+    emit_event(&HolderEvent::SnapshotBegin(SnapshotBegin {
+        policy: policy_hex.clone(),
+        cursor_slot: anchor_slot,
+        cursor_hash_hex: String::new(),
+    }));
+    REBOOTSTRAP_EMIT.with(|cell| {
+        *cell.borrow_mut() = Some(EmitState {
+            policy_hex,
+            holders,
+            offset: 0,
+        });
+    });
+}
+
+/// Persist a predicate's raw ledger and open its chunked emit —
+/// the no-LP-pool `rebootstrap` path. `persist_ledger` +
+/// `ledger_to_holders` are one pass here, but both are sort-free
+/// and far lighter than the chunk emits they used to share a
+/// budget with.
 fn begin_emit(
     policy: &[u8; HASH_BYTES],
     ledger: &PolicyLedger,
@@ -379,29 +445,20 @@ fn begin_emit(
             holders.len()
         ),
     );
-    emit_event(&HolderEvent::SnapshotBegin(SnapshotBegin {
-        policy: policy_hex.clone(),
-        cursor_slot: anchor_slot,
-        cursor_hash_hex: String::new(),
-    }));
-    REBOOTSTRAP_EMIT.with(|cell| {
-        *cell.borrow_mut() = Some(EmitState {
-            policy_hex,
-            holders,
-            offset: 0,
-        });
-    });
+    open_chunked_emit(policy_hex, holders, anchor_slot);
 }
 
 /// Run the bootstrap scan for a newly-registered policy in one
-/// call: page through `utxos_by_policy` → fold each page → emit
-/// `Snapshot`. Used by the live `update_interest` add path.
+/// call: page through `utxos_by_policy` → fold each page →
+/// (LP-decompose if a DEX pool was found) → emit the snapshot.
+/// Used by the live `update_interest` add path.
 ///
 /// The scan is **paged** (`WASM_BUDGET_CHUNKING.md`): each call
 /// to `utxos_by_policy` returns one host-clamped page, so the
 /// only resident state is the holder-bounded ledger. The
 /// re-entrant `rebootstrap` path (recapture) spreads the same
-/// scan across many fuel-budgeted calls — see `rebootstrap`.
+/// scan — and the LP-token scan — across many fuel-budgeted
+/// calls; see `rebootstrap`.
 fn cold_start(policy: &[u8; HASH_BYTES]) {
     let mut ledger = PolicyLedger::default();
     let mut after: Option<Vec<u8>> = None;
@@ -409,23 +466,44 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
     // the loop — the `loop` body always runs at least once.
     let mut anchor_slot: u64;
     let mut total_utxos: usize = 0;
+    let mut pool_ref: Option<WitOutputRef> = None;
 
     loop {
         let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
         anchor_slot = page.anchor_slot;
         total_utxos += page.refs.len();
-        fold_page(&mut ledger, policy, &page.refs);
+        if let Some(r) = fold_page(&mut ledger, policy, &page.refs) {
+            if pool_ref.is_none() {
+                pool_ref = Some(r);
+            }
+        }
         match page.next {
             Some(token) => after = Some(token),
             None => break,
         }
     }
 
-    finalize_policy_snapshot(policy, &ledger, anchor_slot, total_utxos);
+    let policy_hex = hex::encode(policy);
+    // Persist the *raw* ledger (pool aggregate intact) — deltas
+    // keep accounting against it. Decomposition transforms only
+    // the emitted snapshot.
+    persist_ledger(&policy_hex, &ledger);
+    let holders = decompose_or_plain(&policy_hex, &ledger, pool_ref.as_ref());
+    let holder_count = holders.len();
+    emit_full_snapshot(&policy_hex, holders, anchor_slot);
+
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!(
+            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {holder_count} holder(s) @ slot {anchor_slot}"
+        ),
+    );
 }
 
 /// Render the in-memory `PolicyLedger` as the wire-shape
-/// `Vec<HolderEntry>`, in ledger order.
+/// `Vec<HolderEntry>`, in ledger order, with no LP attribution
+/// (`lp_amount: 0`).
 ///
 /// No by-quantity sort: that is an `O(n log n)` pass in a single
 /// fuel budget and a large holder set traps on it (prod
@@ -441,6 +519,7 @@ fn ledger_to_holders(ledger: &PolicyLedger) -> Vec<HolderEntry> {
         .map(|(kbytes, assets)| HolderEntry {
             stake_cred_hex: stake_cred_hex(kbytes),
             assets: assets_map_to_vec(assets),
+            lp_amount: 0,
         })
         .collect()
 }
@@ -457,6 +536,288 @@ fn assets_map_to_vec(map: &AssetMap) -> Vec<AssetBalance> {
     // ordering on the wire.
     out.sort_by(|a, b| a.asset_name_hex.cmp(&b.asset_name_hex));
     out
+}
+
+// ============================================================
+// LP-pool decomposition
+// ============================================================
+//
+// A DEX liquidity pool holds an aggregate of the tracked policy
+// on behalf of every wallet that provided liquidity. Left alone
+// it shows as one giant "holder". Decomposition redistributes
+// that aggregate to the LP providers, proportional to their
+// LP-token share, and records the redistributed quantity as each
+// holder's `lp_amount`. The pool is auto-discovered (it is a
+// holder of the policy at a known DEX pool script); the LP-token
+// holder set is a second `utxos_by_policy` scan. See
+// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`.
+
+/// Resolve a `TypedDatum` to its CBOR bytes — inline payload if
+/// present, else a hash lookup.
+fn resolve_datum_bytes(d: &TypedDatum) -> Option<Vec<u8>> {
+    if !d.payload.is_empty() {
+        return Some(d.payload.clone());
+    }
+    chain_data::datum_by_hash(&d.hash)
+}
+
+/// Read + decode the CSwap pool datum at a detected pool UTxO.
+fn read_pool_datum(pool_ref: &WitOutputRef) -> Option<cswap::CswapPoolDatum> {
+    let datums = chain_data::read_output_datums(std::slice::from_ref(pool_ref));
+    let cbor = datums
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|d| resolve_datum_bytes(&d))?;
+    cswap::decode_pool_datum(&cbor)
+}
+
+/// Resolve one page of an LP-token policy scan and accumulate
+/// per-stake-credential LP-token holdings into `lp_holders`.
+///
+/// Unstaked LP sits at user wallets — stake credential straight
+/// off the address. Staked LP sits at the CSwap farm contract,
+/// one shared address that carries no staker identity, so the
+/// staker is recovered from the farm UTxO's staking datum. A
+/// farm UTxO whose datum doesn't decode is skipped — its share
+/// stays with the residual pool entry rather than misattributed.
+fn fold_lp_page(
+    lp_holders: &mut BTreeMap<Vec<u8>, u64>,
+    lp_policy: &[u8; HASH_BYTES],
+    refs: &[WitOutputRef],
+) {
+    // `read_utxos` returns each output paired with its own ref
+    // (not in input order). Farm UTxOs carry the staker only in
+    // their datum — collect their refs and bulk-resolve staking
+    // datums. `read_output_datums` *is* positionally parallel to
+    // its input, so the `farm_refs`/`farm_datums` zip is sound.
+    let utxos = chain_data::read_utxos(refs);
+    let farm_refs: Vec<WitOutputRef> = utxos
+        .iter()
+        .filter(|(_, out)| out.address == cswap::FARM_SCRIPT_ADDR)
+        .map(|(r, _)| r.clone())
+        .collect();
+    let farm_datums = chain_data::read_output_datums(&farm_refs);
+    let staker_by_ref: HashMap<(Vec<u8>, u32), [u8; HASH_BYTES]> = farm_refs
+        .iter()
+        .zip(farm_datums)
+        .filter_map(|(r, datum)| {
+            let cbor = datum.as_ref().and_then(resolve_datum_bytes)?;
+            let staker = cswap::decode_staking_datum(&cbor)?;
+            Some(((r.tx_hash.clone(), r.index), staker))
+        })
+        .collect();
+
+    for (r, out) in utxos {
+        let lp_qty: u64 = out
+            .assets
+            .iter()
+            .filter(|a| a.asset.policy.as_slice() == lp_policy.as_slice())
+            .map(|a| a.quantity)
+            .sum();
+        if lp_qty == 0 {
+            continue;
+        }
+        let key: LedgerKey = if out.address == cswap::FARM_SCRIPT_ADDR {
+            match staker_by_ref.get(&(r.tx_hash.clone(), r.index)) {
+                Some(hash) => Some(*hash),
+                None => {
+                    logging::log(
+                        LogLevel::Warn,
+                        LOG_TARGET,
+                        "LP decomposition: a farm UTxO's staking datum did not decode — its share stays with the pool residual",
+                    );
+                    continue;
+                }
+            }
+        } else {
+            extract_stake_key(&out.address)
+        };
+        *lp_holders.entry(ledger_key_bytes(key)).or_insert(0) += lp_qty;
+    }
+}
+
+/// Transform the raw holder ledger into the LP-decomposed holder
+/// list: drop the pool's aggregate holding and redistribute it
+/// to the wallets that provided liquidity, proportional to their
+/// LP-token share. The rounding remainder (and any LP not
+/// enumerated) stays as a residual pool entry. The raw ledger is
+/// untouched — deltas keep accounting against it; only the
+/// emitted list is decomposed.
+fn decompose_holders(
+    ledger: &PolicyLedger,
+    total_lp_tokens: u64,
+    lp_holders: &BTreeMap<Vec<u8>, u64>,
+) -> Vec<HolderEntry> {
+    let pool_key = ledger_key_bytes(extract_stake_key(cswap::POOL_SCRIPT_ADDR));
+    let pool_reserve: AssetMap = ledger.holders.get(&pool_key).cloned().unwrap_or_default();
+
+    // Working set: every holder except the pool, each carrying a
+    // running `lp_amount` of how much of the balance is
+    // LP-derived (0 for plain holders).
+    let mut out: BTreeMap<Vec<u8>, (AssetMap, u64)> = ledger
+        .holders
+        .iter()
+        .filter(|(k, _)| **k != pool_key)
+        .map(|(k, assets)| (k.clone(), (assets.clone(), 0u64)))
+        .collect();
+
+    let mut residual = pool_reserve.clone();
+    for (lp_key, lp_qty) in lp_holders {
+        let entry = out.entry(lp_key.clone()).or_default();
+        for (name, reserve) in &pool_reserve {
+            let share = lp_share(*lp_qty, *reserve, total_lp_tokens);
+            if share == 0 {
+                continue;
+            }
+            *entry.0.entry(name.clone()).or_insert(0) += share;
+            entry.1 += share;
+            if let Some(rem) = residual.get_mut(name) {
+                *rem = rem.saturating_sub(share);
+            }
+        }
+    }
+
+    // Rounding remainder (and any LP not enumerated) stays a
+    // residual pool entry — the Mothership band shrinks to it.
+    let residual: AssetMap = residual.into_iter().filter(|(_, q)| *q > 0).collect();
+    if !residual.is_empty() {
+        out.insert(pool_key, (residual, 0));
+    }
+
+    out.into_iter()
+        .map(|(kbytes, (assets, lp_amount))| HolderEntry {
+            stake_cred_hex: stake_cred_hex(&kbytes),
+            assets: assets_map_to_vec(&assets),
+            lp_amount,
+        })
+        .collect()
+}
+
+/// `cold_start`'s decomposition step: if a DEX pool was found,
+/// read its datum, scan the LP-token holder set (paged loop —
+/// `cold_start` is one host call), and decompose. Otherwise emit
+/// the ledger plainly. A pool whose datum doesn't decode also
+/// falls back to a plain emit.
+fn decompose_or_plain(
+    policy_hex: &str,
+    ledger: &PolicyLedger,
+    pool_ref: Option<&WitOutputRef>,
+) -> Vec<HolderEntry> {
+    let Some(pool_ref) = pool_ref else {
+        return ledger_to_holders(ledger);
+    };
+    let Some(datum) = read_pool_datum(pool_ref) else {
+        logging::log(
+            LogLevel::Warn,
+            LOG_TARGET,
+            &format!(
+                "cold-start policy={policy_hex}: pool UTxO datum did not decode — emitting without LP decomposition"
+            ),
+        );
+        return ledger_to_holders(ledger);
+    };
+    let lp_policy: [u8; HASH_BYTES] = match datum.lp_policy.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            logging::log(
+                LogLevel::Warn,
+                LOG_TARGET,
+                &format!(
+                    "cold-start policy={policy_hex}: pool datum lp_policy is not 28 bytes — skipping LP decomposition"
+                ),
+            );
+            return ledger_to_holders(ledger);
+        }
+    };
+
+    let mut lp_holders: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = chain_data::utxos_by_policy(&lp_policy, after.as_deref(), COLD_START_PAGE_HINT);
+        fold_lp_page(&mut lp_holders, &lp_policy, &page.refs);
+        match page.next {
+            Some(token) => after = Some(token),
+            None => break,
+        }
+    }
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!(
+            "cold-start policy={policy_hex}: DEX pool decomposed across {} LP provider(s)",
+            lp_holders.len()
+        ),
+    );
+    decompose_holders(ledger, datum.total_lp_tokens, &lp_holders)
+}
+
+/// Open the LP-pool decomposition for a `rebootstrap` predicate
+/// whose holder scan just finished and which has a DEX pool.
+/// Persists the raw ledger, reads + decodes the pool datum, and
+/// stages a `DecompState` for the re-entrant LP-token scan.
+/// Falls back to opening the plain chunked emit when the pool
+/// datum doesn't decode.
+fn begin_decomp(
+    policy: &[u8; HASH_BYTES],
+    ledger: PolicyLedger,
+    pool_ref: &WitOutputRef,
+    anchor_slot: u64,
+    total_utxos: usize,
+) {
+    let policy_hex = hex::encode(policy);
+    // Persist the *raw* ledger — decomposition transforms only
+    // the emitted snapshot, not the persisted delta-accounting
+    // state.
+    persist_ledger(&policy_hex, &ledger);
+
+    let datum = read_pool_datum(pool_ref);
+    let lp_policy: Option<[u8; HASH_BYTES]> = datum
+        .as_ref()
+        .and_then(|d| d.lp_policy.as_slice().try_into().ok());
+
+    match (datum, lp_policy) {
+        (Some(datum), Some(lp_policy)) => {
+            logging::log(
+                LogLevel::Info,
+                LOG_TARGET,
+                &format!(
+                    "rebootstrap policy={policy_hex}: DEX pool detected — decomposing LP across holders"
+                ),
+            );
+            REBOOTSTRAP_DECOMP.with(|cell| {
+                *cell.borrow_mut() = Some(DecompState {
+                    policy_hex,
+                    anchor_slot,
+                    total_utxos,
+                    ledger,
+                    total_lp_tokens: datum.total_lp_tokens,
+                    lp_policy,
+                    lp_after: None,
+                    lp_holders: BTreeMap::new(),
+                });
+            });
+        }
+        _ => {
+            logging::log(
+                LogLevel::Warn,
+                LOG_TARGET,
+                &format!(
+                    "rebootstrap policy={policy_hex}: pool UTxO datum did not decode — emitting without LP decomposition"
+                ),
+            );
+            let holders = ledger_to_holders(&ledger);
+            logging::log(
+                LogLevel::Info,
+                LOG_TARGET,
+                &format!(
+                    "rebootstrap policy={policy_hex}: {total_utxos} UTxO(s) → {} holder(s) @ slot {anchor_slot}; emitting chunked snapshot",
+                    holders.len()
+                ),
+            );
+            open_chunked_emit(policy_hex, holders, anchor_slot);
+        }
+    }
 }
 
 // ============================================================
@@ -578,6 +939,11 @@ fn flush_buffer(buf: TxBuffer) {
                 HolderEntry {
                     stake_cred_hex: stake_cred_hex(&kbytes),
                     assets,
+                    // Deltas carry raw post-TX balances; LP
+                    // attribution is a snapshot-time transform
+                    // (`decompose_holders`), recomputed on the
+                    // next cold-start / recapture.
+                    lp_amount: 0,
                 }
             })
             .collect();
@@ -824,14 +1190,20 @@ impl Guest for Module {
     /// - **emit phase** — if a chunked snapshot is mid-emit
     ///   (`REBOOTSTRAP_EMIT`), emit one `SnapshotChunk`, or the
     ///   closing `SnapshotEnd`;
+    /// - **decomposition phase** — if an LP-pool decomposition is
+    ///   mid-scan (`REBOOTSTRAP_DECOMP`), scan one page of the
+    ///   LP-token holder set; when the last page lands, decompose
+    ///   the ledger and open the chunked emit;
     /// - **scan phase** — otherwise, scan one page of the current
     ///   predicate's UTxO set, folding it into the ledger; when
-    ///   the last page lands, open the chunked emit (`begin_emit`).
+    ///   the last page lands, open the LP decomposition
+    ///   (`begin_decomp`) if a DEX pool was found, else the
+    ///   chunked emit (`begin_emit`).
     ///
     /// A page of UTxOs fits one fuel budget and a chunk of
     /// holders fits one fuel budget; a whole large policy's scan
-    /// *or* snapshot does not — hence both are spread across
-    /// calls.
+    /// *or* LP-token scan *or* snapshot does not — hence each is
+    /// spread across calls.
     ///
     /// Round state (predicate list + page cursor + accumulating
     /// ledger) and the in-flight emit are thread-local — resident
@@ -909,6 +1281,86 @@ impl Guest for Module {
             EmitOutcome::NotEmitting => {}
         }
 
+        // ── Decomposition phase ── If an LP-pool decomposition
+        // is in flight (the just-scanned predicate has a DEX
+        // pool), scan one page of the LP-token holder set. When
+        // the last page lands, decompose the ledger and open the
+        // chunked emit. Re-entrant for the same fuel-budget
+        // reasons as the holder scan.
+        enum DecompOutcome {
+            NotDecomposing,
+            More(u64),
+            Done {
+                policy_hex: String,
+                anchor_slot: u64,
+                total_utxos: usize,
+                holders: Vec<HolderEntry>,
+            },
+        }
+        let decomp = REBOOTSTRAP_DECOMP.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let Some(st) = slot.as_mut() else {
+                return DecompOutcome::NotDecomposing;
+            };
+            let page = chain_data::utxos_by_policy(
+                &st.lp_policy,
+                st.lp_after.as_deref(),
+                COLD_START_PAGE_HINT,
+            );
+            let ingested = page.refs.len() as u64;
+            fold_lp_page(&mut st.lp_holders, &st.lp_policy, &page.refs);
+            match page.next {
+                Some(token) => {
+                    st.lp_after = Some(token);
+                    DecompOutcome::More(ingested)
+                }
+                None => {
+                    let holders =
+                        decompose_holders(&st.ledger, st.total_lp_tokens, &st.lp_holders);
+                    let done = DecompOutcome::Done {
+                        policy_hex: st.policy_hex.clone(),
+                        anchor_slot: st.anchor_slot,
+                        total_utxos: st.total_utxos,
+                        holders,
+                    };
+                    *slot = None;
+                    done
+                }
+            }
+        });
+        match decomp {
+            // More LP-token pages still to scan.
+            DecompOutcome::More(ingested) => {
+                return Ok(RebootstrapStep {
+                    done: false,
+                    ingested,
+                });
+            }
+            // LP scan complete — the decomposed holder list is
+            // ready; open the chunked emit.
+            DecompOutcome::Done {
+                policy_hex,
+                anchor_slot,
+                total_utxos,
+                holders,
+            } => {
+                logging::log(
+                    LogLevel::Info,
+                    LOG_TARGET,
+                    &format!(
+                        "rebootstrap policy={policy_hex}: {total_utxos} UTxO(s) → {} holder(s) (LP-decomposed) @ slot {anchor_slot}; emitting chunked snapshot",
+                        holders.len()
+                    ),
+                );
+                open_chunked_emit(policy_hex, holders, anchor_slot);
+                return Ok(RebootstrapStep {
+                    done: false,
+                    ingested: 0,
+                });
+            }
+            DecompOutcome::NotDecomposing => {}
+        }
+
         // ── Scan phase ──
         REBOOTSTRAP_STATE.with(|cell| {
             let mut state = cell.borrow_mut();
@@ -941,7 +1393,13 @@ impl Guest for Module {
                 chain_data::utxos_by_policy(&policy, round.after(), COLD_START_PAGE_HINT);
             let ingested = page.refs.len() as u64;
             let anchor_slot = page.anchor_slot;
-            fold_page(round.acc_mut(), &policy, &page.refs);
+            let hit = fold_page(&mut round.acc_mut().ledger, &policy, &page.refs);
+            if hit.is_some() {
+                let acc = round.acc_mut();
+                if acc.pool_ref.is_none() {
+                    acc.pool_ref = hit;
+                }
+            }
 
             match page.next {
                 Some(token) => {
@@ -953,11 +1411,22 @@ impl Guest for Module {
                     })
                 }
                 None => {
-                    // Predicate fully scanned. Open the chunked
-                    // emit; the durable cursor is NOT advanced
-                    // until that emit closes (see the doc above).
+                    // Predicate fully scanned. If a DEX pool was
+                    // found among the holders, open the LP-pool
+                    // decomposition; otherwise open the chunked
+                    // emit directly. Either way the durable cursor
+                    // is NOT advanced until the emit closes (see
+                    // the doc above).
                     round.page_last(ingested);
-                    begin_emit(&policy, round.acc(), anchor_slot, round.items() as usize);
+                    let total_utxos = round.items() as usize;
+                    let pool_ref = round.acc_mut().pool_ref.take();
+                    let ledger = std::mem::take(&mut round.acc_mut().ledger);
+                    match pool_ref {
+                        Some(pref) => {
+                            begin_decomp(&policy, ledger, &pref, anchor_slot, total_utxos)
+                        }
+                        None => begin_emit(&policy, &ledger, anchor_slot, total_utxos),
+                    }
                     Ok(RebootstrapStep {
                         done: false,
                         ingested,

@@ -17,7 +17,7 @@ impl ChainDataHost for HostStateV2 {
     async fn read_utxos(
         &mut self,
         refs: Vec<WitOutputRef>,
-    ) -> wasmtime::Result<Vec<WitTypedOutput>> {
+    ) -> wasmtime::Result<Vec<(WitOutputRef, WitTypedOutput)>> {
         let dp_refs: Vec<mitos_data_plane::OutputRef> = refs
             .iter()
             .map(into_dp_ref_owned)
@@ -27,9 +27,12 @@ impl ChainDataHost for HostStateV2 {
             .read_utxos(&dp_refs, mitos_data_plane::DecodeLevel::Lean)
             .await
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        // Each output carries its own ref — the data plane
+        // resolves from a UTxO map, so the result is neither in
+        // `refs` order nor 1:1. Guests correlate via the ref.
         Ok(pairs
             .into_iter()
-            .map(|(_, out)| from_dp_output(out))
+            .map(|(oref, out)| (from_dp_ref(oref), from_dp_output(out)))
             .collect())
     }
 

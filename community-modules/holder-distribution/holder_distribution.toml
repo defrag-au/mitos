@@ -15,5 +15,8 @@ policies = []
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
 mitos-module-kit = { path = "../../crates/mitos-module-kit" }
+# Shared DEX decode — CSWAP pool/staking datum + script
+# addresses, for the LP-pool decomposition step.
+mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
 pallas-addresses = "1.0.0-alpha.6"
 pallas-primitives = "1.0.0-alpha.6"
