@@ -47,9 +47,11 @@ use mitos_community_events::holder_distribution::{
     AssetBalance, HolderDelta, HolderEntry, HolderEvent, HolderId, HolderRole, SnapshotBegin,
     SnapshotChunk, SnapshotEnd,
 };
+use mitos_community_events::vesting_tracker::{LockEntry, LockRef, VestStyle};
 use mitos_dex_decode::{cswap, lp_share, splash};
 use mitos_module_kit::ReentrantRound;
-use pallas_addresses::{Address, ShelleyDelegationPart};
+use mitos_vesting_decode::{crowd_lock, decode_vesting_datum};
+use pallas_addresses::{Address, ShelleyDelegationPart, ShelleyPaymentPart};
 use serde::{Deserialize, Serialize};
 
 use crate::mitos::platform_v2::chain_data;
@@ -58,7 +60,7 @@ use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 use crate::mitos::platform_v2::types::{
     AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent,
-    TypedDatum, UtxoEvent,
+    StakeCred as WitStakeCred, TypedDatum, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "holder-distribution-module";
@@ -138,6 +140,19 @@ struct ScanAcc {
     ledger: PolicyLedger,
     /// First-spotted DEX pool UTxO holding this policy, if any.
     pool_ref: Option<WitOutputRef>,
+    /// Output-refs of CrowdLock vesting locks holding this
+    /// policy, accumulated across the holder scan. Drives the
+    /// vesting-decomposition step at scan-end.
+    vesting_lock_refs: Vec<WitOutputRef>,
+}
+
+/// Per-page result from `fold_page`. The scan caller merges
+/// these into its running accumulator (`ScanAcc` for
+/// `rebootstrap`, local fields for `cold_start`).
+#[derive(Default)]
+struct FoldHits {
+    pool_ref: Option<WitOutputRef>,
+    vesting_lock_refs: Vec<WitOutputRef>,
 }
 
 /// An LP-pool decomposition mid-scan: the raw holder ledger of
@@ -165,6 +180,13 @@ struct DecompState {
     /// LP-token holdings accumulated so far: per-holder
     /// LP-token quantity.
     lp_holders: BTreeMap<LedgerKey, u64>,
+    /// CrowdLock vesting-lock UTxO refs collected during the
+    /// holder scan; the vesting-decomposition step processes
+    /// them when the LP scan completes.
+    vesting_lock_refs: Vec<WitOutputRef>,
+    /// Holder's-own policy id, kept for the vesting-decomp call
+    /// (`decompose_vesting` needs it to filter assets).
+    policy: [u8; HASH_BYTES],
 }
 
 /// A chunked snapshot mid-emit: the materialised holder list for
@@ -299,6 +321,30 @@ fn holder_role_for(key: &LedgerKey) -> HolderRole {
     }
 }
 
+/// 28-byte payment credential (key or script) of a bech32
+/// address. `None` for Byron / unparseable.
+fn payment_cred_bytes(address: &str) -> Option<[u8; HASH_BYTES]> {
+    let addr = Address::from_bech32(address).ok()?;
+    let shelley = match addr {
+        Address::Shelley(s) => s,
+        _ => return None,
+    };
+    match shelley.payment() {
+        ShelleyPaymentPart::Key(h) => Some((**h).into()),
+        ShelleyPaymentPart::Script(h) => Some((**h).into()),
+    }
+}
+
+/// True when `address` is a CrowdLock vesting lock — payment
+/// credential matches the platform's shared script hash. Such
+/// outputs bypass the holder ledger; the vesting-decomposition
+/// step attributes their locked tokens to owners' `vests`.
+fn is_crowdlock_lock(address: &str) -> bool {
+    payment_cred_bytes(address)
+        .map(|c| crowd_lock::is_crowd_lock(&c))
+        .unwrap_or(false)
+}
+
 // ============================================================
 // Ledger mutation
 // ============================================================
@@ -341,6 +387,12 @@ fn apply_produced_to_ledger(
     assets: &[WitAssetEntry],
     touched: &mut HashSet<LedgerKey>,
 ) {
+    // CrowdLock vesting locks bypass the ledger: the
+    // vesting-decomposition step attributes their locked X to
+    // the owner's `vests`, never to the contract's stake cred.
+    if is_crowdlock_lock(address) {
+        return;
+    }
     let Some(key) = extract_holder_key(address) else {
         return;
     };
@@ -365,6 +417,11 @@ fn apply_consumed_to_ledger(
     assets: &[WitAssetEntry],
     touched: &mut HashSet<LedgerKey>,
 ) {
+    // Symmetric to `apply_produced_to_ledger`: CrowdLock locks
+    // bypass the ledger in both directions.
+    if is_crowdlock_lock(address) {
+        return;
+    }
     let Some(key) = extract_holder_key(address) else {
         return;
     };
@@ -390,11 +447,10 @@ fn apply_consumed_to_ledger(
 /// only state that grows across pages is the holder-bounded
 /// `ledger` itself.
 ///
-/// Returns the output-ref of a DEX pool UTxO if one is spotted
-/// in this page — the pool is just a holder of the policy whose
-/// address is a known DEX pool script (auto-discovery; see
-/// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`). At
-/// most one is returned per page; the caller keeps the first.
+/// Returns the page's `FoldHits` — the DEX pool UTxO if one is
+/// spotted in this page, plus the refs of any CrowdLock vesting
+/// lock UTxOs (which bypass the ledger; vesting decomposition
+/// attributes their locked X to owners' `vests`).
 ///
 /// `read_utxos` returns each output paired with its own ref —
 /// the result is not in `refs` order, so the ref must come from
@@ -403,16 +459,23 @@ fn fold_page(
     ledger: &mut PolicyLedger,
     policy: &[u8; HASH_BYTES],
     refs: &[WitOutputRef],
-) -> Option<WitOutputRef> {
-    let mut pool_ref: Option<WitOutputRef> = None;
+) -> FoldHits {
+    let mut hits = FoldHits::default();
     for (r, out) in chain_data::read_utxos(refs) {
+        // CrowdLock vesting lock — bypass the ledger; the
+        // vesting-decomposition step attributes locked tokens
+        // to owners' `vests`.
+        if is_crowdlock_lock(&out.address) {
+            hits.vesting_lock_refs.push(r);
+            continue;
+        }
         let mut _touched_dummy: HashSet<LedgerKey> = HashSet::new();
         apply_produced_to_ledger(ledger, policy, &out.address, &out.assets, &mut _touched_dummy);
-        if pool_ref.is_none() && out.address == cswap::POOL_SCRIPT_ADDR {
-            pool_ref = Some(r);
+        if hits.pool_ref.is_none() && out.address == cswap::POOL_SCRIPT_ADDR {
+            hits.pool_ref = Some(r);
         }
     }
-    pool_ref
+    hits
 }
 
 /// Emit a policy's snapshot as a chunked `SnapshotBegin` →
@@ -474,12 +537,25 @@ fn open_chunked_emit(policy_hex: String, holders: Vec<HolderEntry>, anchor_slot:
 fn begin_emit(
     policy: &[u8; HASH_BYTES],
     ledger: &PolicyLedger,
+    vesting_lock_refs: &[WitOutputRef],
     anchor_slot: u64,
     total_utxos: usize,
 ) {
     let policy_hex = hex::encode(policy);
     persist_ledger(&policy_hex, ledger);
-    let holders = ledger_to_holders(ledger);
+    let plain = ledger_to_holders(ledger);
+    let vests = decompose_vesting(policy, vesting_lock_refs);
+    if !vests.is_empty() {
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!(
+                "rebootstrap policy={policy_hex}: vesting decomposed across {} owner(s)",
+                vests.len()
+            ),
+        );
+    }
+    let holders = attach_vests(plain, vests);
     logging::log(
         LogLevel::Info,
         LOG_TARGET,
@@ -510,16 +586,17 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
     let mut anchor_slot: u64;
     let mut total_utxos: usize = 0;
     let mut pool_ref: Option<WitOutputRef> = None;
+    let mut vesting_lock_refs: Vec<WitOutputRef> = Vec::new();
 
     loop {
         let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
         anchor_slot = page.anchor_slot;
         total_utxos += page.refs.len();
-        if let Some(r) = fold_page(&mut ledger, policy, &page.refs) {
-            if pool_ref.is_none() {
-                pool_ref = Some(r);
-            }
+        let hits = fold_page(&mut ledger, policy, &page.refs);
+        if pool_ref.is_none() {
+            pool_ref = hits.pool_ref;
         }
+        vesting_lock_refs.extend(hits.vesting_lock_refs);
         match page.next {
             Some(token) => after = Some(token),
             None => break,
@@ -531,7 +608,13 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
     // keep accounting against it. Decomposition transforms only
     // the emitted snapshot.
     persist_ledger(&policy_hex, &ledger);
-    let holders = decompose_or_plain(&policy_hex, &ledger, pool_ref.as_ref());
+    let holders = build_decomposed_holders(
+        &policy_hex,
+        policy,
+        &ledger,
+        pool_ref.as_ref(),
+        &vesting_lock_refs,
+    );
     let holder_count = holders.len();
     emit_full_snapshot(&policy_hex, holders, anchor_slot);
 
@@ -803,6 +886,164 @@ fn decompose_or_plain(
     decompose_holders(ledger, datum.total_lp_tokens, &lp_holders)
 }
 
+/// Read each CrowdLock lock UTxO, decode its datum, resolve the
+/// owner's stake credential, and group resulting `LockEntry`s
+/// by owner. The locked tokens are deliberately NOT in the
+/// holder ledger (they're skipped at `apply_produced_to_ledger`
+/// / `fold_page` time), so this step just builds the per-owner
+/// vests map — the snapshot construction then attaches each
+/// owner's vests to their `HolderEntry`.
+///
+/// One-shot for v1: large vesting sets may hit the per-call
+/// fuel budget; re-instantiate-on-trap retries with a smaller
+/// adaptive page. Re-entrant chunking can land later if needed.
+fn decompose_vesting(
+    policy: &[u8; HASH_BYTES],
+    lock_refs: &[WitOutputRef],
+) -> BTreeMap<LedgerKey, Vec<LockEntry>> {
+    if lock_refs.is_empty() {
+        return BTreeMap::new();
+    }
+    let utxos = chain_data::read_utxos(lock_refs);
+    let datums = chain_data::read_output_datums(lock_refs);
+    // `read_output_datums` is positionally parallel to its
+    // input; key the datums by ref so we can correlate with the
+    // unordered `read_utxos` outputs.
+    let datum_by_ref: HashMap<(Vec<u8>, u32), TypedDatum> = lock_refs
+        .iter()
+        .zip(datums)
+        .filter_map(|(r, d)| d.map(|d| ((r.tx_hash.clone(), r.index), d)))
+        .collect();
+
+    let policy_hex = hex::encode(policy);
+    let mut out: BTreeMap<LedgerKey, Vec<LockEntry>> = BTreeMap::new();
+    for (lock_ref, out_) in utxos {
+        let Some(datum) = datum_by_ref.get(&(lock_ref.tx_hash.clone(), lock_ref.index)) else {
+            continue;
+        };
+        let Some(cbor) = resolve_datum_bytes(datum) else {
+            continue;
+        };
+        let Some(vd) = decode_vesting_datum(&cbor) else {
+            continue;
+        };
+        let Ok(pkh) = hex::decode(&vd.owner_pkh_hex) else {
+            continue;
+        };
+        let Some(stake_cred) = chain_data::resolve_stake_for_payment_pkh(&pkh) else {
+            logging::log(
+                LogLevel::Warn,
+                LOG_TARGET,
+                &format!(
+                    "vesting decomposition: owner pkh {} did not resolve to a stake cred — lock skipped",
+                    vd.owner_pkh_hex
+                ),
+            );
+            continue;
+        };
+        let owner_bytes: Vec<u8> = match &stake_cred {
+            WitStakeCred::KeyHash(b) | WitStakeCred::ScriptHash(b) => b.clone(),
+        };
+        let owner_hash: [u8; HASH_BYTES] = match owner_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => continue,
+        };
+        let owner_key = LedgerKey::Stake(owner_hash);
+        let owner_stake_cred_hex = Some(hex::encode(&owner_bytes));
+
+        for asset in &out_.assets {
+            if asset.asset.policy != policy {
+                continue;
+            }
+            let lock_entry = LockEntry {
+                utxo_ref: LockRef {
+                    tx_hash: hex::encode(&lock_ref.tx_hash),
+                    index: lock_ref.index,
+                },
+                lock_address: out_.address.clone(),
+                policy: policy_hex.clone(),
+                asset_name_hex: hex::encode(&asset.asset.name),
+                amount: asset.quantity,
+                owner_pkh: vd.owner_pkh_hex.clone(),
+                owner_stake_cred_hex: owner_stake_cred_hex.clone(),
+                unlock_ts_ms: vd.unlock_ts_ms,
+                // VestStyle.CrowdLock — `holder-distribution`
+                // only recognises CrowdLock contracts (shared
+                // payment-cred). Shield's per-project addresses
+                // remain a future extension; until then any
+                // Shield-style lock won't be picked up here and
+                // will surface via `vesting-tracker` events on
+                // the consumer side as today.
+                vest_style: VestStyle::CrowdLock,
+                locked_at_tx: hex::encode(&lock_ref.tx_hash),
+            };
+            out.entry(owner_key.clone()).or_default().push(lock_entry);
+        }
+    }
+    out
+}
+
+/// Attach per-owner vest lists onto an already-built holder
+/// list, creating new `HolderEntry`s for vest-only owners (no
+/// liquid X holdings). Preserves existing `assets` / `lp_amount`
+/// / `role` on holders that already exist.
+fn attach_vests(
+    mut holders: Vec<HolderEntry>,
+    vests: BTreeMap<LedgerKey, Vec<LockEntry>>,
+) -> Vec<HolderEntry> {
+    if vests.is_empty() {
+        return holders;
+    }
+    // Build an index over the existing holders by `HolderId` —
+    // O(n) once, then O(1) lookup per vest owner.
+    let mut idx: HashMap<HolderId, usize> = HashMap::with_capacity(holders.len());
+    for (i, h) in holders.iter().enumerate() {
+        idx.insert(h.id.clone(), i);
+    }
+    for (owner_key, owner_vests) in vests {
+        let owner_id = key_to_id(&owner_key);
+        if let Some(&i) = idx.get(&owner_id) {
+            holders[i].vests = owner_vests;
+        } else {
+            idx.insert(owner_id.clone(), holders.len());
+            holders.push(HolderEntry {
+                id: owner_id,
+                assets: Vec::new(),
+                lp_amount: 0,
+                role: HolderRole::Wallet,
+                vests: owner_vests,
+            });
+        }
+    }
+    holders
+}
+
+/// Unified snapshot construction: LP decomposition + vesting
+/// decomposition + attach. The single entry point used by
+/// `cold_start`; `rebootstrap` uses the same logic but spread
+/// across its re-entrant phases.
+fn build_decomposed_holders(
+    policy_hex: &str,
+    policy: &[u8; HASH_BYTES],
+    ledger: &PolicyLedger,
+    pool_ref: Option<&WitOutputRef>,
+    vesting_lock_refs: &[WitOutputRef],
+) -> Vec<HolderEntry> {
+    let lp_decomposed = decompose_or_plain(policy_hex, ledger, pool_ref);
+    let vests = decompose_vesting(policy, vesting_lock_refs);
+    if !vests.is_empty() {
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!(
+                "policy={policy_hex}: vesting decomposed across {} owner(s)",
+                vests.len()
+            ),
+        );
+    }
+    attach_vests(lp_decomposed, vests)
+}
+
 /// Open the LP-pool decomposition for a `rebootstrap` predicate
 /// whose holder scan just finished and which has a DEX pool.
 /// Persists the raw ledger, reads + decodes the pool datum, and
@@ -813,6 +1054,7 @@ fn begin_decomp(
     policy: &[u8; HASH_BYTES],
     ledger: PolicyLedger,
     pool_ref: &WitOutputRef,
+    vesting_lock_refs: Vec<WitOutputRef>,
     anchor_slot: u64,
     total_utxos: usize,
 ) {
@@ -846,6 +1088,8 @@ fn begin_decomp(
                     lp_policy,
                     lp_after: None,
                     lp_holders: BTreeMap::new(),
+                    vesting_lock_refs,
+                    policy: *policy,
                 });
             });
         }
@@ -857,7 +1101,21 @@ fn begin_decomp(
                     "rebootstrap policy={policy_hex}: pool UTxO datum did not decode — emitting without LP decomposition"
                 ),
             );
-            let holders = ledger_to_holders(&ledger);
+            // Vesting decomposition still runs even when LP
+            // doesn't — the two decompositions are independent.
+            let plain = ledger_to_holders(&ledger);
+            let vests = decompose_vesting(policy, &vesting_lock_refs);
+            if !vests.is_empty() {
+                logging::log(
+                    LogLevel::Info,
+                    LOG_TARGET,
+                    &format!(
+                        "rebootstrap policy={policy_hex}: vesting decomposed across {} owner(s)",
+                        vests.len()
+                    ),
+                );
+            }
+            let holders = attach_vests(plain, vests);
             logging::log(
                 LogLevel::Info,
                 LOG_TARGET,
@@ -1368,10 +1626,27 @@ impl Guest for Module {
                     DecompOutcome::More(ingested)
                 }
                 None => {
-                    let holders =
+                    // LP scan complete. Build the LP-decomposed
+                    // holder list, then run vesting decomp +
+                    // attach in one shot. Both decomps share the
+                    // anchor and the raw ledger.
+                    let lp_holders =
                         decompose_holders(&st.ledger, st.total_lp_tokens, &st.lp_holders);
+                    let vests = decompose_vesting(&st.policy, &st.vesting_lock_refs);
+                    let policy_hex = st.policy_hex.clone();
+                    if !vests.is_empty() {
+                        logging::log(
+                            LogLevel::Info,
+                            LOG_TARGET,
+                            &format!(
+                                "rebootstrap policy={policy_hex}: vesting decomposed across {} owner(s)",
+                                vests.len()
+                            ),
+                        );
+                    }
+                    let holders = attach_vests(lp_holders, vests);
                     let done = DecompOutcome::Done {
-                        policy_hex: st.policy_hex.clone(),
+                        policy_hex,
                         anchor_slot: st.anchor_slot,
                         total_utxos: st.total_utxos,
                         holders,
@@ -1446,12 +1721,13 @@ impl Guest for Module {
                 chain_data::utxos_by_policy(&policy, round.after(), COLD_START_PAGE_HINT);
             let ingested = page.refs.len() as u64;
             let anchor_slot = page.anchor_slot;
-            let hit = fold_page(&mut round.acc_mut().ledger, &policy, &page.refs);
-            if hit.is_some() {
+            let hits = fold_page(&mut round.acc_mut().ledger, &policy, &page.refs);
+            {
                 let acc = round.acc_mut();
                 if acc.pool_ref.is_none() {
-                    acc.pool_ref = hit;
+                    acc.pool_ref = hits.pool_ref;
                 }
+                acc.vesting_lock_refs.extend(hits.vesting_lock_refs);
             }
 
             match page.next {
@@ -1473,12 +1749,25 @@ impl Guest for Module {
                     round.page_last(ingested);
                     let total_utxos = round.items() as usize;
                     let pool_ref = round.acc_mut().pool_ref.take();
+                    let vesting_lock_refs =
+                        std::mem::take(&mut round.acc_mut().vesting_lock_refs);
                     let ledger = std::mem::take(&mut round.acc_mut().ledger);
                     match pool_ref {
-                        Some(pref) => {
-                            begin_decomp(&policy, ledger, &pref, anchor_slot, total_utxos)
-                        }
-                        None => begin_emit(&policy, &ledger, anchor_slot, total_utxos),
+                        Some(pref) => begin_decomp(
+                            &policy,
+                            ledger,
+                            &pref,
+                            vesting_lock_refs,
+                            anchor_slot,
+                            total_utxos,
+                        ),
+                        None => begin_emit(
+                            &policy,
+                            &ledger,
+                            &vesting_lock_refs,
+                            anchor_slot,
+                            total_utxos,
+                        ),
                     }
                     Ok(RebootstrapStep {
                         done: false,
