@@ -14,7 +14,8 @@
 //!      policy's assets into the address's stake credential,
 //!      and accumulates a per-stake-cred ledger.
 //!    - Persists the ledger to state-kv keyed by policy hex.
-//!    - Emits a `HolderEvent::Snapshot` with the full ledger.
+//!    - Emits the ledger as a chunked `SnapshotBegin` →
+//!      `SnapshotChunk` × N → `SnapshotEnd` sequence.
 //!
 //! 2. Each subsequent `handle_events` batch (one Cardano TX):
 //!    - Walks Produced + Consumed events for tracked policies.
@@ -41,7 +42,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mitos_community_events::holder_distribution::{
-    AssetBalance, HolderDelta, HolderEntry, HolderEvent, HolderSnapshot,
+    AssetBalance, HolderDelta, HolderEntry, HolderEvent, SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
 use pallas_addresses::{Address, ShelleyDelegationPart};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,11 @@ const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
 /// adaptive per-call budget, so the module never holds more than
 /// one clamped page of refs at once.
 const COLD_START_PAGE_HINT: u32 = 10_000;
+
+/// Holders per `SnapshotChunk` when emitting a chunked snapshot.
+/// Bounds the CBOR buffer one `emit` builds in wasm memory — see
+/// `WASM_BUDGET_CHUNKING.md` "Output — chunked snapshot emission".
+const SNAPSHOT_CHUNK_HOLDERS: usize = 1_000;
 
 /// 28-byte hash size used everywhere for stake credentials,
 /// policy ids, payment hashes.
@@ -290,8 +296,11 @@ fn fold_page(ledger: &mut PolicyLedger, policy: &[u8; HASH_BYTES], refs: &[WitOu
     }
 }
 
-/// Persist a policy's ledger + emit its `Snapshot`. Shared by
-/// the live cold-start (`cold_start`) and the re-entrant
+/// Persist a policy's ledger + emit its snapshot as a chunked
+/// `SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd`
+/// sequence (`WASM_BUDGET_CHUNKING.md`) — never building the
+/// whole holder-list CBOR in wasm memory at once. Shared by the
+/// live cold-start (`cold_start`) and the re-entrant
 /// `rebootstrap` page machine.
 fn finalize_policy_snapshot(
     policy: &[u8; HASH_BYTES],
@@ -302,24 +311,33 @@ fn finalize_policy_snapshot(
     let policy_hex = hex::encode(policy);
     persist_ledger(&policy_hex, ledger);
     let holders = ledger_to_holders(ledger);
-    let snapshot = HolderSnapshot {
+    let holder_count = holders.len();
+
+    // `anchor_slot` from the frozen scan — the tip the
+    // materialised UTxO set was consistent as-of. Consumers
+    // treat the sequence as an authoritative replacement and
+    // resume delta replay from the first event after this slot.
+    emit_event(&HolderEvent::SnapshotBegin(SnapshotBegin {
         policy: policy_hex.clone(),
-        // `anchor_slot` from the frozen scan — the tip the
-        // materialised UTxO set was consistent as-of. Consumers
-        // treat the snapshot as an authoritative replacement and
-        // resume delta replay from the first event after this
-        // slot.
         cursor_slot: anchor_slot,
         cursor_hash_hex: String::new(),
-        holders,
-    };
-    emit_event(&HolderEvent::Snapshot(snapshot));
+    }));
+    for chunk in holders.chunks(SNAPSHOT_CHUNK_HOLDERS) {
+        emit_event(&HolderEvent::SnapshotChunk(SnapshotChunk {
+            policy: policy_hex.clone(),
+            holders: chunk.to_vec(),
+        }));
+    }
+    emit_event(&HolderEvent::SnapshotEnd(SnapshotEnd {
+        policy: policy_hex.clone(),
+        holder_count: holder_count as u64,
+    }));
+
     logging::log(
         LogLevel::Info,
         LOG_TARGET,
         &format!(
-            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {} holder(s) @ slot {anchor_slot}",
-            ledger.holders.len()
+            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {holder_count} holder(s) @ slot {anchor_slot}"
         ),
     );
 }

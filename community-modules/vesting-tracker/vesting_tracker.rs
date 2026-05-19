@@ -54,8 +54,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use mitos_community_events::vesting_tracker::{
-    InterestKind, LockEntry, LockRef, VestStyle, VestingEvent, VestingLock, VestingSnapshot,
-    VestingUnlock,
+    InterestKind, LockEntry, LockRef, SnapshotBegin, SnapshotChunk, SnapshotEnd, VestStyle,
+    VestingEvent, VestingLock, VestingUnlock,
 };
 use pallas_addresses::{Address, ShelleyPaymentPart};
 use pallas_codec::minicbor::data::Type as CborType;
@@ -97,6 +97,11 @@ const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
 /// its own adaptive per-call budget, so the scan never holds
 /// more than one clamped page of refs at once.
 const COLD_START_PAGE_HINT: u32 = 10_000;
+
+/// Locks per `SnapshotChunk` when emitting a chunked snapshot.
+/// Bounds the CBOR buffer one `emit` builds in wasm memory — see
+/// `WASM_BUDGET_CHUNKING.md` "Output — chunked snapshot emission".
+const SNAPSHOT_CHUNK_LOCKS: usize = 1_000;
 
 thread_local! {
     /// Watched lock-contract addresses (bech32). Mirrors the
@@ -694,6 +699,10 @@ fn build_snapshot_locks(refs: &[WitOutputRef]) -> Vec<LockEntry> {
     all_locks
 }
 
+/// Emit a snapshot as a chunked `SnapshotBegin` →
+/// `SnapshotChunk` × N → `SnapshotEnd` sequence
+/// (`WASM_BUDGET_CHUNKING.md`) — never building the whole
+/// lock-list CBOR in wasm memory at once.
 fn emit_snapshot(
     interest_kind: InterestKind,
     interest_value: String,
@@ -709,25 +718,36 @@ fn emit_snapshot(
             .then_with(|| a.utxo_ref.index.cmp(&b.utxo_ref.index))
             .then_with(|| a.asset_name_hex.cmp(&b.asset_name_hex))
     });
-    let snap = VestingSnapshot {
+    let lock_count = locks.len();
+
+    // `anchor_slot` from the frozen scan — the tip the
+    // materialised UTxO set was consistent as-of.
+    emit_event(&VestingEvent::SnapshotBegin(SnapshotBegin {
         interest_kind,
         interest_value: interest_value.clone(),
-        // `anchor_slot` from the frozen scan — the tip the
-        // materialised UTxO set was consistent as-of.
         cursor_slot: anchor_slot,
         cursor_hash_hex: String::new(),
-        locks,
-    };
+    }));
+    for chunk in locks.chunks(SNAPSHOT_CHUNK_LOCKS) {
+        emit_event(&VestingEvent::SnapshotChunk(SnapshotChunk {
+            interest_kind,
+            interest_value: interest_value.clone(),
+            locks: chunk.to_vec(),
+        }));
+    }
+    emit_event(&VestingEvent::SnapshotEnd(SnapshotEnd {
+        interest_kind,
+        interest_value: interest_value.clone(),
+        lock_count: lock_count as u64,
+    }));
+
     logging::log(
         LogLevel::Info,
         LOG_TARGET,
         &format!(
-            "cold-start {kind:?}={interest_value}: {refs_scanned} UTxO(s) → {n} lock(s)",
-            kind = snap.interest_kind,
-            n = snap.locks.len()
+            "cold-start {interest_kind:?}={interest_value}: {refs_scanned} UTxO(s) → {lock_count} lock(s)"
         ),
     );
-    emit_event(&VestingEvent::Snapshot(snap));
 }
 
 // ============================================================

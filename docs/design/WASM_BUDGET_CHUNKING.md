@@ -1,6 +1,6 @@
 # Wasm budget chunking — re-entrant operations for unbounded work
 
-**Status: Phases 1–3 landed** (2026-05-19); Phases 4–5 pending —
+**Status: Phases 1–4 landed** (2026-05-19); Phase 5 pending —
 see "Migration / phasing". Prompted by a production
 incident: `holder-distribution`'s `cold_start` trapped in
 `cabi_realloc` during a `recapture`-driven rebootstrap of a large
@@ -417,9 +417,27 @@ already chunks via per-batch `handle-events` calls.
    (2048 refs) is sized to fit the per-call fuel budget so a
    trap shouldn't occur in practice. A refinement, not
    load-bearing for correctness.
-4. **Chunked snapshot protocol** — `mitos-community-events` +
-   consumers. The completeness item; can trail (1)–(3) since most
-   real tokens' snapshots still fit one emit.
+4. **Chunked snapshot protocol.** *Landed 2026-05-19.*
+   `mitos-community-events` — `HolderEvent` and `VestingEvent`
+   replace the single `Snapshot` with a `SnapshotBegin` →
+   `SnapshotChunk` × N → `SnapshotEnd` sequence
+   (`SNAPSHOT_CHUNK_HOLDERS`/`_LOCKS` = 1000 per chunk), so a
+   module never builds the whole holder/lock-list CBOR in wasm
+   memory — closing the *output*-memory axis. holder-distribution
+   + vesting-tracker emit the sequence (shared `finalize_*` /
+   `emit_snapshot`); the vesting golden was regenerated.
+   Consumer: `cnft.dev-workers` `holder-map`'s `feed_do_mitos.rs`
+   — `SnapshotBegin` wipes the projection, each `SnapshotChunk`
+   classifies + inserts, `SnapshotEnd` marks it authoritative.
+   This is a `mitos-community-events` wire change: the
+   `holder-map` consumer must land together with a
+   `mitos-community-events` rev bump.
+
+   *Note:* the resident accumulator (the holder/lock ledger
+   itself) is still built whole in wasm memory — Phase 4 chunks
+   the *serialised emit*, not the accumulator. A million-holder
+   token would still need open question 1 (accumulator paged to
+   `state-kv`).
 5. **SDK affordance** — a documented re-entrant-step helper in the
    module SDK so module authors don't re-derive the cursor dance.
 

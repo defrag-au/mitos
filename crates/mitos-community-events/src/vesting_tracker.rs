@@ -127,10 +127,16 @@ pub struct LockEntry {
     pub locked_at_tx: String,
 }
 
-/// Full set of current locks under one interest registration.
-/// Emitted on registration (cold-start) and after rollback.
+/// Opens a **chunked snapshot** sequence for one interest
+/// registration. A full snapshot is a `SnapshotBegin` →
+/// `SnapshotChunk` × N → `SnapshotEnd` sequence rather than a
+/// single event, so the module never builds the whole lock-list
+/// CBOR in wasm linear memory at once (`WASM_BUDGET_CHUNKING.md`).
+///
+/// Consumer semantics: on `SnapshotBegin`, wipe the interest's
+/// projected rows — the sequence is an authoritative replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VestingSnapshot {
+pub struct SnapshotBegin {
     pub interest_kind: InterestKind,
     /// Bech32 address (when `Address`) or hex payment cred
     /// (when `PaymentCred`).
@@ -139,10 +145,27 @@ pub struct VestingSnapshot {
     pub cursor_slot: u64,
     /// 64-char lowercase hex of the block hash at `cursor_slot`.
     pub cursor_hash_hex: String,
-    /// Every current lock under the interest, deterministically
-    /// ordered (by utxo_ref then asset_name_hex) for stable
-    /// golden testing.
+}
+
+/// One bounded chunk of a snapshot's lock list. Many
+/// `SnapshotChunk`s follow one `SnapshotBegin`. Across all
+/// chunks of one sequence, locks are deterministically ordered
+/// (by utxo_ref then asset_name_hex) for stable golden testing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotChunk {
+    pub interest_kind: InterestKind,
+    pub interest_value: String,
     pub locks: Vec<LockEntry>,
+}
+
+/// Closes a chunked snapshot sequence. On receipt the consumer
+/// marks the interest's projection authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotEnd {
+    pub interest_kind: InterestKind,
+    pub interest_value: String,
+    /// Total locks across every `SnapshotChunk` of this sequence.
+    pub lock_count: u64,
 }
 
 /// One lock that came into existence in a TX matching the
@@ -166,11 +189,15 @@ pub struct VestingUnlock {
     pub slot: u64,
 }
 
-/// One emission.
+/// One emission. A chunked snapshot (`SnapshotBegin` →
+/// `SnapshotChunk` × N → `SnapshotEnd`) is an authoritative
+/// full-state replacement; `Locked`/`Unlocked` are incremental.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VestingEvent {
-    Snapshot(VestingSnapshot),
+    SnapshotBegin(SnapshotBegin),
+    SnapshotChunk(SnapshotChunk),
+    SnapshotEnd(SnapshotEnd),
     Locked(VestingLock),
     Unlocked(VestingUnlock),
 }

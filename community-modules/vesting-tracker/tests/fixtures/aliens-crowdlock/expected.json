@@ -1,26 +1,37 @@
 [
   {
-    "kind": "snapshot",
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
     "interest_kind": "payment_cred",
     "interest_value": "381cd9b620ce9d7c73dd45cfe207971cc79df79251003116094f6b36",
-    "cursor_slot": 0,
-    "cursor_hash_hex": "",
+    "kind": "snapshot_begin"
+  },
+  {
+    "interest_kind": "payment_cred",
+    "interest_value": "381cd9b620ce9d7c73dd45cfe207971cc79df79251003116094f6b36",
+    "kind": "snapshot_chunk",
     "locks": [
       {
-        "utxo_ref": {
-          "tx_hash": "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15",
-          "index": 0
-        },
-        "lock_address": "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w",
-        "policy": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7",
-        "asset_name_hex": "416c69656e73",
         "amount": 12281864,
+        "asset_name_hex": "416c69656e73",
+        "lock_address": "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w",
+        "locked_at_tx": "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15",
         "owner_pkh": "373998141ef305075d72dc53c57168fe495d3fb27ab2f94e85410c5b",
         "owner_stake_cred_hex": "fba681e69a8f8ed94511ef70744988afc5bc0dc2827ca1e8b53f7ed1",
+        "policy": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7",
         "unlock_ts_ms": 1793765349809,
-        "vest_style": "crowd_lock",
-        "locked_at_tx": "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15"
+        "utxo_ref": {
+          "index": 0,
+          "tx_hash": "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15"
+        },
+        "vest_style": "crowd_lock"
       }
     ]
+  },
+  {
+    "interest_kind": "payment_cred",
+    "interest_value": "381cd9b620ce9d7c73dd45cfe207971cc79df79251003116094f6b36",
+    "kind": "snapshot_end",
+    "lock_count": 1
   }
 ]

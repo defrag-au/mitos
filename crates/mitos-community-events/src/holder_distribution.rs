@@ -5,15 +5,19 @@
 //! design rationale. The module emits a `HolderEvent` per
 //! tracked policy:
 //!
-//! - `Snapshot` on registration (or after a rollback) — full
-//!   per-stake-credential balance ledger at the cursor.
+//! - A **chunked snapshot** on registration (or after a
+//!   rollback) — `SnapshotBegin` → `SnapshotChunk` × N →
+//!   `SnapshotEnd` — the full per-stake-credential balance
+//!   ledger at the cursor, split into bounded chunks so the
+//!   module never builds the whole holder-list CBOR at once
+//!   (see `WASM_BUDGET_CHUNKING.md`).
 //! - `Delta` on each TX touching a tracked policy — per-wallet
 //!   balance changes resulting from that TX.
 //!
 //! Consumers (e.g. `cnft.dev-workers`'s holder-map worker)
-//! apply the snapshot once and then incrementally update from
-//! deltas. A fresh snapshot is authoritative replacement of
-//! prior state; a delta is additive.
+//! apply a snapshot sequence once and then incrementally update
+//! from deltas. A snapshot sequence is an authoritative
+//! replacement of prior state; a delta is additive.
 //!
 //! ## Why per-asset balances per holder
 //!
@@ -63,11 +67,17 @@ pub struct HolderEntry {
     pub assets: Vec<AssetBalance>,
 }
 
-/// Full holder list for one policy at a specific chain point.
-/// Emitted on initial registration of `holds_policy(X)` and
-/// after rollback events.
+/// Opens a **chunked snapshot** sequence for one policy. A full
+/// snapshot is a `SnapshotBegin` → `SnapshotChunk` × N →
+/// `SnapshotEnd` sequence rather than a single event, so the
+/// emitting module never builds the whole holder-list CBOR in
+/// wasm linear memory at once (see `WASM_BUDGET_CHUNKING.md`).
+///
+/// Consumer semantics: on `SnapshotBegin`, wipe the policy's
+/// projected rows — the sequence is an authoritative
+/// replacement of prior state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HolderSnapshot {
+pub struct SnapshotBegin {
     /// 56-char lowercase hex of the policy id this snapshot
     /// covers.
     pub policy: String,
@@ -75,10 +85,32 @@ pub struct HolderSnapshot {
     pub cursor_slot: u64,
     /// 64-char lowercase hex of the block hash at `cursor_slot`.
     pub cursor_hash_hex: String,
-    /// All current holders sorted by total quantity descending.
-    /// Top-N slicing on the consumer side is cheap; the
-    /// deterministic ordering makes golden testing simpler.
+}
+
+/// One bounded chunk of a snapshot's holder list. Many
+/// `SnapshotChunk`s follow one `SnapshotBegin`. Consumer
+/// inserts each chunk's holders into the (wiped) projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotChunk {
+    /// 56-char lowercase hex of the policy id.
+    pub policy: String,
+    /// A bounded slice of the policy's holders. Across all
+    /// chunks of one sequence, holders are sorted by total
+    /// quantity descending — the deterministic ordering makes
+    /// golden testing simpler and top-N consumer slicing cheap.
     pub holders: Vec<HolderEntry>,
+}
+
+/// Closes a chunked snapshot sequence. On receipt the consumer
+/// marks the policy's projection authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotEnd {
+    /// 56-char lowercase hex of the policy id.
+    pub policy: String,
+    /// Total holders across every `SnapshotChunk` of this
+    /// sequence — lets the consumer sanity-check it received
+    /// the whole sequence.
+    pub holder_count: u64,
 }
 
 /// Holders whose balances changed in one TX touching the
@@ -102,12 +134,15 @@ pub struct HolderDelta {
     pub changed: Vec<HolderEntry>,
 }
 
-/// One emission. `Snapshot` is full state replacement;
-/// `Delta` is incremental update.
+/// One emission. A chunked snapshot (`SnapshotBegin` →
+/// `SnapshotChunk` × N → `SnapshotEnd`) is an authoritative
+/// full-state replacement; `Delta` is an incremental update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HolderEvent {
-    Snapshot(HolderSnapshot),
+    SnapshotBegin(SnapshotBegin),
+    SnapshotChunk(SnapshotChunk),
+    SnapshotEnd(SnapshotEnd),
     Delta(HolderDelta),
 }
 
