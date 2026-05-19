@@ -458,23 +458,19 @@ impl FixtureDataPlane {
                         original_cbor: inline_bytes,
                     });
                 }
-                let oref = mitos_data_plane::OutputRef::from_bytes(tx_hash_bytes_owned, idx as u32);
-                self.by_address
-                    .entry(typed_output.address.clone())
-                    .or_default()
-                    .push(oref);
-                if let Ok(addr) = pallas_addresses::Address::from_bech32(&typed_output.address)
-                    && let pallas_addresses::Address::Shelley(s) = addr
-                {
-                    let cred_bytes: [u8; 28] = match s.payment() {
-                        pallas_addresses::ShelleyPaymentPart::Key(h) => **h,
-                        pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
-                    };
-                    self.by_payment_cred
-                        .entry(cred_bytes)
-                        .or_default()
-                        .push(oref);
-                }
+                // Harvested block outputs feed `by_ref` only, so
+                // `read_utxos` can resolve prior outputs for
+                // Consumed/Referenced events in later blocks. They
+                // are deliberately NOT added to `by_address` /
+                // `by_payment_cred`: those back the cold-start
+                // host-fns (`utxos_by_address` /
+                // `utxos_by_payment_cred`), which must reflect
+                // pre-existing chain state only — explicit
+                // `[[utxo]]` entries. A `--block` is a future event
+                // relative to a cold-start running at
+                // `update_interest` time; surfacing its outputs to
+                // those host-fns makes a cold-start "see the future"
+                // and double-emit against the block's own dispatch.
                 self.by_ref.insert(
                     key,
                     ResolvedUtxo {
