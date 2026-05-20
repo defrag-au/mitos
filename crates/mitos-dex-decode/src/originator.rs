@@ -60,9 +60,10 @@ mod tests {
     // Sample addresses used across the tests. `q` = key+key,
     // `u` = key+pointer, `v` = key+enterprise, `x/z` = script.
     const USER_Q1: &str = "addr1q9xp27xnlm837dz4r6fk63qyrlqt573mqeqm6v2n928565p9n897pq0lovelace";
-    const USER_Q2: &str = "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yryc";
-    const USER_U:  &str = "addr1u8njek8z5jt2cpaupkcpyl0pl85v3k76ejgwtjcx7szlzwc87e3jh";
-    const USER_V:  &str = "addr1vy9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207q";
+    const USER_Q2: &str =
+        "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yryc";
+    const USER_U: &str = "addr1u8njek8z5jt2cpaupkcpyl0pl85v3k76ejgwtjcx7szlzwc87e3jh";
+    const USER_V: &str = "addr1vy9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207q";
     const SCRIPT_X: &str = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrx";
     const SCRIPT_Z: &str = "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nhv88awp8s";
     const TESTNET_Q: &str = "addr_test1qsomewhere";
@@ -99,10 +100,7 @@ mod tests {
         // Without a key-wallet input, we have no originator to
         // surface; consumers fall back to whatever
         // `swapper_address` carries.
-        let inputs = vec![
-            (SCRIPT_X, 15_130_035_312),
-            (SCRIPT_Z, 2_690_000),
-        ];
+        let inputs = vec![(SCRIPT_X, 15_130_035_312), (SCRIPT_Z, 2_690_000)];
         assert_eq!(find_originator(inputs), None);
     }
 
@@ -132,10 +130,7 @@ mod tests {
         // Pool inputs are ~thousands of ADA; the user's input
         // is small in comparison. Make sure the script's huge
         // lovelace doesn't promote it.
-        let inputs = vec![
-            (SCRIPT_X, 15_000_000_000_000),
-            (USER_Q1, 100_000_000),
-        ];
+        let inputs = vec![(SCRIPT_X, 15_000_000_000_000), (USER_Q1, 100_000_000)];
         assert_eq!(find_originator(inputs), Some(USER_Q1));
     }
 
@@ -154,10 +149,7 @@ mod tests {
 
     #[test]
     fn find_originator_handles_testnet_addresses() {
-        let inputs = vec![
-            (SCRIPT_X, 10_000_000_000),
-            (TESTNET_Q, 5_000_000),
-        ];
+        let inputs = vec![(SCRIPT_X, 10_000_000_000), (TESTNET_Q, 5_000_000)];
         assert_eq!(find_originator(inputs), Some(TESTNET_Q));
     }
 
@@ -167,10 +159,7 @@ mod tests {
         // but we don't classify them as "user wallets" for
         // attribution since CSwap/Splash don't accept them as
         // swap origins anyway. Treat them like scripts: ignore.
-        let inputs = vec![
-            (BYRON, 500_000_000),
-            (USER_V, 10_000_000),
-        ];
+        let inputs = vec![(BYRON, 500_000_000), (USER_V, 10_000_000)];
         assert_eq!(find_originator(inputs), Some(USER_V));
     }
 }
