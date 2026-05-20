@@ -318,8 +318,9 @@ impl EmissionsStore {
         Ok(())
     }
 
-    /// Rewrite `companion_id` on every row that currently holds
-    /// `from` to instead hold `to`. Used by the subscribe
+    /// Rewrite `companion_id` and `client_id` on every row that
+    /// currently holds `from` (with the sentinel empty `client_id`)
+    /// to instead hold `(to, client_id)`. Used by the subscribe
     /// handler to claim the [`UNSUBSCRIBED_COMPANION_ID`]
     /// sentinel rows that `drain_one` wrote during the window
     /// between module-activation and first companion-subscribe
@@ -332,6 +333,13 @@ impl EmissionsStore {
     /// rows up on the next reconnect and the new companion
     /// receives them in id order.
     ///
+    /// `client_id` is required (the multi-client identity work
+    /// made it part of every companion's routing key — see
+    /// `docs/design/MULTI_CLIENT_COMPANIONS.md`). Sentinel rows
+    /// land with an empty `client_id`; rewriting it here is what
+    /// makes them surface to a subscriber's
+    /// `list_queued_for_companion(to, client_id)` lookup.
+    ///
     /// **Single-claim semantics.** First subscriber to a
     /// module claims all sentinel rows; later subscribers see
     /// nothing to retarget. Acceptable for single-companion
@@ -340,15 +348,20 @@ impl EmissionsStore {
     /// the multi-companion variant.
     ///
     /// Returns the number of rows that were rewritten.
-    pub fn retarget_companion(&self, from: &str, to: &str) -> Result<usize, EmissionsError> {
+    pub fn retarget_companion(
+        &self,
+        from: &str,
+        to: &str,
+        client_id: &str,
+    ) -> Result<usize, EmissionsError> {
         let rows = self.list_filtered(|r| r.companion_id == from)?;
         let count = rows.len();
         if count == 0 {
             return Ok(0);
         }
-        // Re-encode each row with the new companion_id. Same
-        // open-then-write pattern as `update_status`, scoped to
-        // the companion_id field only.
+        // Re-encode each row with the new companion_id +
+        // client_id. Same open-then-write pattern as
+        // `update_status`, scoped to the routing fields only.
         for row in rows {
             let wx = self
                 .db
@@ -371,6 +384,7 @@ impl EmissionsStore {
                 let mut record: EmissionRecord = ciborium::de::from_reader(value.value())
                     .map_err(|e| EmissionsError::Decode(e.to_string()))?;
                 record.companion_id = to.to_string();
+                record.client_id = client_id.to_string();
                 let mut buf = Vec::new();
                 ciborium::ser::into_writer(&record, &mut buf)
                     .map_err(|e| EmissionsError::Encode(e.to_string()))?;
@@ -1072,7 +1086,7 @@ mod tests {
             )
             .unwrap();
         let count = store
-            .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a")
+            .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a", "client_a")
             .unwrap();
         assert_eq!(count, 3);
         // After retarget: subscriber_a has the 3 rows ready to
@@ -1110,7 +1124,7 @@ mod tests {
         // First subscriber claims.
         assert_eq!(
             store
-                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a")
+                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a", "client_a")
                 .unwrap(),
             1
         );
@@ -1118,7 +1132,7 @@ mod tests {
         // semantics documented on the method.
         assert_eq!(
             store
-                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_b")
+                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_b", "client_b")
                 .unwrap(),
             0
         );

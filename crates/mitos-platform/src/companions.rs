@@ -570,6 +570,7 @@ async fn validate_and_persist_module(
         match store.retarget_companion(
             crate::emissions::UNSUBSCRIBED_COMPANION_ID,
             &request.companion_key,
+            &request.client_id,
         ) {
             Ok(0) => {}
             Ok(count) => {
