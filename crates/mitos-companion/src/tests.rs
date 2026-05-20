@@ -307,6 +307,7 @@ fn subscribe_request_carries_full_interest_set() {
             name: "ownership-indexer".into(),
         }],
         companion_key: "customer_42".into(),
+        client_id: "test-client".into(),
         resume_from: None,
         interests,
         dial_back: None,

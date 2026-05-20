@@ -105,6 +105,21 @@ pub trait MitosCompanion: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Stable, non-empty client instance identifier. Disambiguates
+    /// two consumers that share the same `companion_key` — see
+    /// `docs/design/MULTI_CLIENT_COMPANIONS.md`. Defaults to `None`,
+    /// in which case the runtime derives one from the host portion
+    /// of the dial-back URL (`MITOS_REPLICATE_URL`). Override when
+    /// the URL host doesn't uniquely identify the worker (e.g.
+    /// multiple staging instances share an ingress hostname).
+    ///
+    /// Returning `Some("")` is treated as `None`. The runtime
+    /// panics at subscribe time if no non-empty value can be
+    /// resolved.
+    fn client_id(&self) -> Option<String> {
+        None
+    }
+
     /// Drop the portion of the dApp's projected state that
     /// originated from `module`, in preparation for a refill from
     /// the host's bootstrap pass against that one module. Called

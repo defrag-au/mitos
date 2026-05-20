@@ -395,16 +395,49 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // where to POST. The template carries `{key}` and
         // `{target}` substitutions (and now also `{op}` for the
         // apply/recapture path discriminator).
-        let dial_back = self
+        let dial_back_url = self
             .env
             .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
             .ok()
-            .map(|v| v.to_string())
-            .map(|url| crate::subscribe::DialBackOverride {
-                url: Some(url),
-                auth_header: None,
-                auth_value: None,
-            });
+            .map(|v| v.to_string());
+        let dial_back =
+            dial_back_url
+                .clone()
+                .map(|url| crate::subscribe::DialBackOverride {
+                    url: Some(url),
+                    auth_header: None,
+                    auth_value: None,
+                });
+
+        // Resolve the client_id. Precedence:
+        // 1. Companion's `client_id()` trait override.
+        // 2. Host portion of MITOS_REPLICATE_URL.
+        // No fallback — if neither yields a non-empty value, the
+        // subscribe fails loudly. See
+        // `docs/design/MULTI_CLIENT_COMPANIONS.md` for the
+        // "panic on no identity" rationale.
+        let client_id = match self
+            .inner
+            .client_id()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                dial_back_url
+                    .as_deref()
+                    .and_then(crate::subscribe::host_of_url)
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            }) {
+            Some(id) => id,
+            None => {
+                let msg = "subscribe: no client_id available — \
+                           neither MitosCompanion::client_id() nor \
+                           MITOS_REPLICATE_URL host portion yielded \
+                           a non-empty value. See \
+                           docs/design/MULTI_CLIENT_COMPANIONS.md.";
+                tracing::error!("{msg}");
+                return Response::error(msg, 500);
+            }
+        };
 
         // Targets are declared by the companion via
         // `MitosCompanion::subscribe_targets()`. Default is one
@@ -414,6 +447,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let request = SubscribeRequest {
             targets,
             companion_key,
+            client_id,
             resume_from,
             interests,
             dial_back,

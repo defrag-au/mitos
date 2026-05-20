@@ -48,6 +48,24 @@ pub struct SubscribeRequest {
     /// subscribe-call `companion_key` field).
     pub companion_key: String,
 
+    /// Client instance identifier. dApp-chosen, **required**, must
+    /// be non-empty. Disambiguates two consumers that share the
+    /// same `companion_key` (e.g. a dev worker and a prod worker
+    /// both subscribing to the same policy_id). The companion
+    /// store keys records by `(module_id, client_id,
+    /// companion_key)` so distinct `client_id`s land in parallel
+    /// records and each gets its own dial-back URL slot.
+    ///
+    /// The mitos-companion SDK derives this from the host portion
+    /// of the dial-back URL by default. dApps may override via
+    /// `MitosCompanion::client_id()`. See
+    /// `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Worker-side
+    /// change".
+    ///
+    /// Validated server-side at `/api/companions/subscribe`:
+    /// empty / whitespace-only is rejected with HTTP 400.
+    pub client_id: String,
+
     /// Resume cursor. `None` for fresh companions; otherwise the
     /// last applied chain point from the companion's DO storage.
     #[serde(default)]

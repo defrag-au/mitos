@@ -140,6 +140,8 @@ enum SubscribeError {
     InvalidModuleName(String),
     #[error("invalid companion_key: {0}")]
     InvalidCompanionKey(String),
+    #[error("invalid client_id: {0}")]
+    InvalidClientId(String),
     #[error("storage io: {0}")]
     Io(String),
     #[error("module not registered: {0}")]
@@ -169,7 +171,9 @@ impl IntoResponse for SubscribeError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::Decode(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidModuleName(_) | Self::InvalidCompanionKey(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidModuleName(_)
+            | Self::InvalidCompanionKey(_)
+            | Self::InvalidClientId(_) => StatusCode::BAD_REQUEST,
             Self::UnknownModule(_) | Self::UnknownIndexer(_) => StatusCode::NOT_FOUND,
             Self::InternalIndexer(_) => StatusCode::BAD_REQUEST,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -178,6 +182,7 @@ impl IntoResponse for SubscribeError {
             Self::Decode(_) => "cbor_decode",
             Self::InvalidModuleName(_) => "invalid_module_name",
             Self::InvalidCompanionKey(_) => "invalid_companion_key",
+            Self::InvalidClientId(_) => "invalid_client_id",
             Self::Io(_) => "storage_io",
             Self::UnknownModule(_) => "unknown_module",
             Self::UnknownIndexer(_) => "unknown_indexer",
@@ -371,24 +376,54 @@ fn load_companion_registrations(
     let mut out = Vec::new();
     let file_name = format!("{companion_key}.cbor");
     for module in modules {
-        let path = storage.module_dir_for_companions(&module).join(&file_name);
-        if !path.exists() {
-            continue;
-        }
-        let bytes = std::fs::read(&path)?;
-        let req: SubscribeRequest = match ciborium::de::from_reader(bytes.as_slice()) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    module = %module,
-                    companion_key = %companion_key,
-                    error = %e,
-                    "skipping un-decodable companion CBOR"
-                );
+        // Two-level layout: walk every `<client_id>/` subdir under
+        // the module's companions/ root, picking up any
+        // `<companion_key>.cbor` file. One interest-mutation
+        // targets ALL clients that share the key.
+        let companions_root = storage.module_dir_for_companions(&module);
+        let entries = match std::fs::read_dir(&companions_root) {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        for entry in entries.flatten() {
+            // Skip metadata directories (`.unreachable/`, etc.) and
+            // any bare `.cbor` files left over from a pre-migration
+            // host (the on-start migration moves them, but we
+            // tolerate stragglers).
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
                 continue;
             }
-        };
-        out.push((module, path, req));
+            let client_dir = entry.path();
+            let dir_name = entry.file_name();
+            let dir_name_str = dir_name.to_string_lossy();
+            if dir_name_str.starts_with('.') {
+                continue;
+            }
+            let path = client_dir.join(&file_name);
+            if !path.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            let req: SubscribeRequest = match ciborium::de::from_reader(bytes.as_slice()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        module = %module,
+                        client_id = %dir_name_str,
+                        companion_key = %companion_key,
+                        error = %e,
+                        "skipping un-decodable companion CBOR"
+                    );
+                    continue;
+                }
+            };
+            out.push((module.clone(), path, req));
+        }
     }
     Ok(out)
 }
@@ -419,6 +454,7 @@ async fn subscribe_handler(
         SubscribeRequest::decode(&body[..]).map_err(|e| SubscribeError::Decode(e.to_string()))?;
 
     validate_companion_key(&request.companion_key)?;
+    validate_client_id(&request.client_id)?;
 
     if request.targets.is_empty() {
         return Err(SubscribeError::Decode(
@@ -491,7 +527,11 @@ async fn validate_and_persist_module(
         return Err(SubscribeError::UnknownModule(module_name.to_string()));
     }
 
-    let companions_dir = companions_dir_for(&state.storage, module_name);
+    // Two-level layout: <storage>/<module>/companions/<client_id>/<companion_key>.cbor.
+    // Different `client_id`s for the same `(module, companion_key)`
+    // produce parallel records — see
+    // `docs/design/MULTI_CLIENT_COMPANIONS.md`.
+    let companions_dir = client_companions_dir(&state.storage, module_name, &request.client_id);
     std::fs::create_dir_all(&companions_dir).map_err(|e| SubscribeError::Io(e.to_string()))?;
 
     let path = companions_dir.join(format!("{}.cbor", request.companion_key));
@@ -503,6 +543,7 @@ async fn validate_and_persist_module(
     tracing::info!(
         module = %module_name,
         companion_key = %request.companion_key,
+        client_id = %request.client_id,
         interests = request.interests.len(),
         "companion target validated + persisted (module)"
     );
@@ -588,10 +629,6 @@ fn validate_indexer_target(
     Ok(())
 }
 
-fn companions_dir_for(storage: &ModuleStorage, module_id: &str) -> PathBuf {
-    storage.module_dir_for_companions(module_id)
-}
-
 /// Atomic write: write to `<path>.tmp`, fsync, rename to `<path>`.
 /// Mirrors the artifact-upload pattern in `storage.rs`.
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -633,6 +670,45 @@ fn validate_companion_key(key: &str) -> std::result::Result<(), SubscribeError> 
     Ok(())
 }
 
+/// Validate the dApp-supplied `client_id`. Charset is intentionally
+/// permissive of `.` (URL hosts like `hooks.epochify.space`) and `-`
+/// (UUIDs) on top of the alnum + `_` set we accept for module IDs
+/// and companion keys. Explicitly reject `.` and `..` (path-traversal
+/// sentinels) and any string starting with a dot (so the dotfile-
+/// reserved `.unreachable` directory remains distinguishable from a
+/// legitimate `client_id`).
+fn validate_client_id(client_id: &str) -> std::result::Result<(), SubscribeError> {
+    let trimmed = client_id.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(SubscribeError::InvalidClientId(format!(
+            "len {} not in 1..=128 (after trim)",
+            trimmed.len()
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(SubscribeError::InvalidClientId(trimmed.to_string()));
+    }
+    if trimmed == "." || trimmed == ".." || trimmed.starts_with('.') {
+        return Err(SubscribeError::InvalidClientId(trimmed.to_string()));
+    }
+    Ok(())
+}
+
+/// On-disk directory holding all companion registrations for a single
+/// `(module_id, client_id)` pair. Layout:
+/// `<storage>/<module>/companions/<client_id>/`. `client_id` is the
+/// raw value — validation guarantees it's filesystem-safe.
+fn client_companions_dir(
+    storage: &ModuleStorage,
+    module_id: &str,
+    client_id: &str,
+) -> PathBuf {
+    storage.module_dir_for_companions(module_id).join(client_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +738,7 @@ mod tests {
                 name: "nonexistent".into(),
             }],
             companion_key: "customer_42".into(),
+            client_id: "test-client".into(),
             resume_from: None,
             interests: vec![],
             dial_back: None,
@@ -692,6 +769,7 @@ mod tests {
                 name: "ownership-indexer".into(),
             }],
             companion_key: "../escape".into(),
+            client_id: "test-client".into(),
             resume_from: None,
             interests: vec![],
             dial_back: None,
@@ -837,6 +915,7 @@ mod tests {
                 name: "ownership".into(),
             }],
             companion_key: "customer_7".into(),
+            client_id: "test-client".into(),
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![],
             dial_back: None,
@@ -845,6 +924,7 @@ mod tests {
         let decoded: SubscribeRequest = ciborium::de::from_reader(&bytes[..]).unwrap();
         assert_eq!(decoded.single_module_target(), Some("ownership"));
         assert_eq!(decoded.companion_key, "customer_7");
+        assert_eq!(decoded.client_id, "test-client");
     }
 
     #[test]
