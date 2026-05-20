@@ -855,7 +855,6 @@ mod tests {
             store
                 .append(
                     c,
-
                     "client_a",
                     "ownership",
                     fixed_point(),
@@ -886,7 +885,6 @@ mod tests {
             store
                 .append(
                     c,
-
                     "client_a",
                     "ownership",
                     fixed_point(),
@@ -1080,13 +1078,17 @@ mod tests {
         // After retarget: subscriber_a has the 3 rows ready to
         // drain; sentinel has none; the other companion is
         // untouched.
-        let claimed = store.list_queued_for_companion("subscriber_a", "client_a").unwrap();
+        let claimed = store
+            .list_queued_for_companion("subscriber_a", "client_a")
+            .unwrap();
         assert_eq!(claimed.len(), 3);
         let remaining_sentinel = store
             .list_queued_for_companion(UNSUBSCRIBED_COMPANION_ID, "")
             .unwrap();
         assert!(remaining_sentinel.is_empty());
-        let other = store.list_queued_for_companion("other_companion", "client_a").unwrap();
+        let other = store
+            .list_queued_for_companion("other_companion", "client_a")
+            .unwrap();
         assert_eq!(other.len(), 1);
     }
 

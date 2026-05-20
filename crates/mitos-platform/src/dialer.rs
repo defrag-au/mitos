@@ -614,11 +614,7 @@ async fn run_companion(
     // Reclaim Pending rows from a previous host process. Catches
     // the host-crash-mid-request case — rows marked Pending then
     // never Acked because the host died mid-POST.
-    match store.requeue_pending_for_companion(
-        &req.companion_key,
-        &req.client_id,
-        &now_rfc3339(),
-    ) {
+    match store.requeue_pending_for_companion(&req.companion_key, &req.client_id, &now_rfc3339()) {
         Ok(0) => {}
         Ok(count) => {
             info!(

@@ -400,14 +400,13 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             .var(crate::subscribe::MITOS_REPLICATE_URL_ENV)
             .ok()
             .map(|v| v.to_string());
-        let dial_back =
-            dial_back_url
-                .clone()
-                .map(|url| crate::subscribe::DialBackOverride {
-                    url: Some(url),
-                    auth_header: None,
-                    auth_value: None,
-                });
+        let dial_back = dial_back_url
+            .clone()
+            .map(|url| crate::subscribe::DialBackOverride {
+                url: Some(url),
+                auth_header: None,
+                auth_value: None,
+            });
 
         // Resolve the client_id. Precedence:
         // 1. Companion's `client_id()` trait override.

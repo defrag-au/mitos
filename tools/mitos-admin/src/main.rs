@@ -698,15 +698,15 @@ async fn cmd_delete_companion(
         .await?;
     let status = resp.status();
     if status.as_u16() == 404 {
-        anyhow::bail!("no such companion record (module={module}, client_id={client_id}, key={key})");
+        anyhow::bail!(
+            "no such companion record (module={module}, client_id={client_id}, key={key})"
+        );
     }
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         anyhow::bail!("delete-companion failed: {status}: {text}");
     }
-    println!(
-        "deleted companion module={module} client_id={client_id} companion_key={key}"
-    );
+    println!("deleted companion module={module} client_id={client_id} companion_key={key}");
     Ok(())
 }
 

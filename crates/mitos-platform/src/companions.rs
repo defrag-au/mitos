@@ -826,8 +826,8 @@ fn migrate_one(legacy_bytes: &[u8], client_id: &str) -> Result<Vec<u8>, String> 
         dial_back: Option<DialBackOverride>,
     }
 
-    let m: MigratableRequest = ciborium::de::from_reader(legacy_bytes)
-        .map_err(|e| format!("decode legacy: {e}"))?;
+    let m: MigratableRequest =
+        ciborium::de::from_reader(legacy_bytes).map_err(|e| format!("decode legacy: {e}"))?;
     let req = SubscribeRequest {
         targets: m.targets,
         companion_key: m.companion_key,
@@ -919,11 +919,7 @@ fn validate_client_id(client_id: &str) -> std::result::Result<(), SubscribeError
 /// `(module_id, client_id)` pair. Layout:
 /// `<storage>/<module>/companions/<client_id>/`. `client_id` is the
 /// raw value — validation guarantees it's filesystem-safe.
-fn client_companions_dir(
-    storage: &ModuleStorage,
-    module_id: &str,
-    client_id: &str,
-) -> PathBuf {
+fn client_companions_dir(storage: &ModuleStorage, module_id: &str, client_id: &str) -> PathBuf {
     storage.module_dir_for_companions(module_id).join(client_id)
 }
 
@@ -1429,8 +1425,7 @@ crate_version = "0.0.0"
                 interests: vec![],
                 dial_back: Some(DialBackOverride {
                     url: Some(
-                        "https://hooks.dev.epochify.space/_internal/{op}-{target}?key={key}"
-                            .into(),
+                        "https://hooks.dev.epochify.space/_internal/{op}-{target}?key={key}".into(),
                     ),
                     auth_header: None,
                     auth_value: None,
