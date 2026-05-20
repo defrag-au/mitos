@@ -102,6 +102,17 @@ pub struct EmissionRecord {
     /// Companion key. Match the companion's
     /// `id_from_name(companion_key)` — see Q8 of the design doc.
     pub companion_id: String,
+    /// Client instance identifier — disambiguates two companions
+    /// that share the same `companion_id` (e.g. dev + prod workers
+    /// consuming the same policy). One emission row per
+    /// `(companion_id, client_id)` pair. `#[serde(default)]` so
+    /// pre-multi-client rows deserialise as the empty string;
+    /// queries that filter on `client_id` should treat "" as
+    /// "legacy-pre-fix" and not match modern subscribers.
+    ///
+    /// See `docs/design/MULTI_CLIENT_COMPANIONS.md`.
+    #[serde(default)]
+    pub client_id: String,
     pub status: EmissionStatus,
     pub status_at: String,
     /// Populated only when `status == Nacked`.
@@ -163,6 +174,7 @@ impl EmissionsStore {
     pub fn append(
         &self,
         companion_id: &str,
+        client_id: &str,
         channel: &str,
         chain_point: ChainPoint,
         payload: Vec<u8>,
@@ -201,6 +213,7 @@ impl EmissionsStore {
             channel: channel.to_string(),
             payload,
             companion_id: companion_id.to_string(),
+            client_id: client_id.to_string(),
             status: initial_status,
             status_at: now_rfc3339.to_string(),
             error: None,
@@ -305,8 +318,9 @@ impl EmissionsStore {
         Ok(())
     }
 
-    /// Rewrite `companion_id` on every row that currently holds
-    /// `from` to instead hold `to`. Used by the subscribe
+    /// Rewrite `companion_id` and `client_id` on every row that
+    /// currently holds `from` (with the sentinel empty `client_id`)
+    /// to instead hold `(to, client_id)`. Used by the subscribe
     /// handler to claim the [`UNSUBSCRIBED_COMPANION_ID`]
     /// sentinel rows that `drain_one` wrote during the window
     /// between module-activation and first companion-subscribe
@@ -319,6 +333,13 @@ impl EmissionsStore {
     /// rows up on the next reconnect and the new companion
     /// receives them in id order.
     ///
+    /// `client_id` is required (the multi-client identity work
+    /// made it part of every companion's routing key — see
+    /// `docs/design/MULTI_CLIENT_COMPANIONS.md`). Sentinel rows
+    /// land with an empty `client_id`; rewriting it here is what
+    /// makes them surface to a subscriber's
+    /// `list_queued_for_companion(to, client_id)` lookup.
+    ///
     /// **Single-claim semantics.** First subscriber to a
     /// module claims all sentinel rows; later subscribers see
     /// nothing to retarget. Acceptable for single-companion
@@ -327,15 +348,20 @@ impl EmissionsStore {
     /// the multi-companion variant.
     ///
     /// Returns the number of rows that were rewritten.
-    pub fn retarget_companion(&self, from: &str, to: &str) -> Result<usize, EmissionsError> {
+    pub fn retarget_companion(
+        &self,
+        from: &str,
+        to: &str,
+        client_id: &str,
+    ) -> Result<usize, EmissionsError> {
         let rows = self.list_filtered(|r| r.companion_id == from)?;
         let count = rows.len();
         if count == 0 {
             return Ok(0);
         }
-        // Re-encode each row with the new companion_id. Same
-        // open-then-write pattern as `update_status`, scoped to
-        // the companion_id field only.
+        // Re-encode each row with the new companion_id +
+        // client_id. Same open-then-write pattern as
+        // `update_status`, scoped to the routing fields only.
         for row in rows {
             let wx = self
                 .db
@@ -358,6 +384,7 @@ impl EmissionsStore {
                 let mut record: EmissionRecord = ciborium::de::from_reader(value.value())
                     .map_err(|e| EmissionsError::Decode(e.to_string()))?;
                 record.companion_id = to.to_string();
+                record.client_id = client_id.to_string();
                 let mut buf = Vec::new();
                 ciborium::ser::into_writer(&record, &mut buf)
                     .map_err(|e| EmissionsError::Encode(e.to_string()))?;
@@ -376,40 +403,37 @@ impl EmissionsStore {
         Ok(count)
     }
 
-    /// Read all queued rows for a specific companion in
-    /// monotonic ID order. Used on companion reconnect to drain
-    /// buffered emissions before live stream resumes.
+    /// Read all queued rows for a specific `(companion_id,
+    /// client_id)` pair in monotonic ID order. Used on companion
+    /// reconnect to drain buffered emissions before live stream
+    /// resumes. Two consumers sharing a `companion_id` but with
+    /// different `client_id`s drain independently.
     pub fn list_queued_for_companion(
         &self,
         companion_id: &str,
+        client_id: &str,
     ) -> Result<Vec<EmissionRecord>, EmissionsError> {
         self.list_filtered(|r| {
-            r.companion_id == companion_id && matches!(r.status, EmissionStatus::Queued)
+            r.companion_id == companion_id
+                && r.client_id == client_id
+                && matches!(r.status, EmissionStatus::Queued)
         })
     }
 
-    /// Read all queued rows for `companion_id`, grouped by
-    /// `partition_key`. Within each group, rows are id-ordered (=
-    /// slot-ordered, since `host_v2::drain_one` emits in chain
-    /// order). Group order is unspecified — the dialer dispatches
-    /// groups to lane workers by hash-of-key, so iteration order
-    /// here doesn't matter.
-    ///
-    /// Used by the lane-aware dialer (see
-    /// `docs/design/DIALER_CONCURRENCY.md`). Single redb read pass
-    /// — bucket sort is O(N) over the queued set, bounded by the
-    /// per-tick scan depth.
+    /// Read all queued rows for `(companion_id, client_id)`,
+    /// grouped by `partition_key`. Within each group, rows are
+    /// id-ordered (= slot-ordered, since `host_v2::drain_one` emits
+    /// in chain order). Group order is unspecified — the dialer
+    /// dispatches groups to lane workers by hash-of-key.
     #[allow(clippy::type_complexity)]
     pub fn list_queued_for_companion_grouped(
         &self,
         companion_id: &str,
+        client_id: &str,
     ) -> Result<Vec<(Vec<u8>, Vec<EmissionRecord>)>, EmissionsError> {
         use std::collections::BTreeMap;
-        // BTreeMap so empty-key (global lane) sorts before any
-        // non-empty key — gives a stable, deterministic iteration
-        // order for tests + log diffs without affecting correctness.
         let mut groups: BTreeMap<Vec<u8>, Vec<EmissionRecord>> = BTreeMap::new();
-        let rows = self.list_queued_for_companion(companion_id)?;
+        let rows = self.list_queued_for_companion(companion_id, client_id)?;
         for row in rows {
             groups
                 .entry(row.partition_key.clone())
@@ -439,13 +463,17 @@ impl EmissionsStore {
     pub fn requeue_stale_pending_for_companion(
         &self,
         companion_id: &str,
+        client_id: &str,
         now_secs: u64,
         max_pending_age_secs: u64,
         now_status_at: &str,
     ) -> Result<usize, EmissionsError> {
         let threshold = now_secs.saturating_sub(max_pending_age_secs);
         let stale = self.list_filtered(|r| {
-            if r.companion_id != companion_id || r.status != EmissionStatus::Pending {
+            if r.companion_id != companion_id
+                || r.client_id != client_id
+                || r.status != EmissionStatus::Pending
+            {
                 return false;
             }
             parse_unix_secs(&r.status_at)
@@ -484,10 +512,13 @@ impl EmissionsStore {
     pub fn requeue_pending_for_companion(
         &self,
         companion_id: &str,
+        client_id: &str,
         now_rfc3339: &str,
     ) -> Result<usize, EmissionsError> {
         let pending = self.list_filtered(|r| {
-            r.companion_id == companion_id && matches!(r.status, EmissionStatus::Pending)
+            r.companion_id == companion_id
+                && r.client_id == client_id
+                && matches!(r.status, EmissionStatus::Pending)
         })?;
         let count = pending.len();
         for row in pending {
@@ -674,6 +705,7 @@ mod tests {
         let id1 = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![1],
@@ -685,6 +717,7 @@ mod tests {
         let id2 = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![2],
@@ -704,6 +737,7 @@ mod tests {
         let id = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![1],
@@ -723,6 +757,7 @@ mod tests {
         let id = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![1],
@@ -753,6 +788,7 @@ mod tests {
         let id = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![1],
@@ -796,6 +832,7 @@ mod tests {
             store
                 .append(
                     c,
+                    "client_a",
                     "ownership",
                     fixed_point(),
                     vec![],
@@ -806,7 +843,9 @@ mod tests {
                 .unwrap();
         }
 
-        let grouped = store.list_queued_for_companion_grouped("c1").unwrap();
+        let grouped = store
+            .list_queued_for_companion_grouped("c1", "client_a")
+            .unwrap();
         assert_eq!(grouped.len(), 3, "three distinct keys for c1");
 
         // Empty key (global lane) sorts first under BTreeMap order.
@@ -830,6 +869,7 @@ mod tests {
             store
                 .append(
                     c,
+                    "client_a",
                     "ownership",
                     fixed_point(),
                     vec![],
@@ -844,7 +884,7 @@ mod tests {
         store
             .update_status(1, EmissionStatus::Pending, "2026-05-05T00:00:01Z", None)
             .unwrap();
-        let queued = store.list_queued_for_companion("c1").unwrap();
+        let queued = store.list_queued_for_companion("c1", "client_a").unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, 3);
         assert_eq!(queued[0].companion_id, "c1");
@@ -859,6 +899,7 @@ mod tests {
             store
                 .append(
                     c,
+                    "client_a",
                     "ownership",
                     fixed_point(),
                     vec![],
@@ -869,11 +910,11 @@ mod tests {
                 .unwrap();
         }
         let count = store
-            .requeue_pending_for_companion("c1", "2026-05-05T00:00:10Z")
+            .requeue_pending_for_companion("c1", "client_a", "2026-05-05T00:00:10Z")
             .unwrap();
         assert_eq!(count, 2);
         // c1's two rows back to Queued, c2's row untouched.
-        let c1_queued = store.list_queued_for_companion("c1").unwrap();
+        let c1_queued = store.list_queued_for_companion("c1", "client_a").unwrap();
         assert_eq!(c1_queued.len(), 2);
         let c2_pending = store
             .list_filtered(|r| r.companion_id == "c2" && r.status == EmissionStatus::Pending)
@@ -888,6 +929,7 @@ mod tests {
         let id = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![],
@@ -899,7 +941,7 @@ mod tests {
         // Requeue at T1; sent_at should *not* be cleared (only
         // status_at moves).
         store
-            .requeue_pending_for_companion("c1", "2026-05-05T00:00:10Z")
+            .requeue_pending_for_companion("c1", "client_a", "2026-05-05T00:00:10Z")
             .unwrap();
         let row = store.get(id).unwrap().unwrap();
         assert_eq!(row.status, EmissionStatus::Queued);
@@ -915,6 +957,7 @@ mod tests {
         let stale_id = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![],
@@ -926,6 +969,7 @@ mod tests {
         let fresh_id = store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![],
@@ -937,7 +981,7 @@ mod tests {
         let now_secs = 200;
         let max_age = 60;
         let count = store
-            .requeue_stale_pending_for_companion("c1", now_secs, max_age, "unix:200")
+            .requeue_stale_pending_for_companion("c1", "client_a", now_secs, max_age, "unix:200")
             .unwrap();
         assert_eq!(count, 1, "only the stale row should requeue");
         assert_eq!(
@@ -959,6 +1003,7 @@ mod tests {
         store
             .append(
                 "c1",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![],
@@ -968,7 +1013,7 @@ mod tests {
             )
             .unwrap();
         let count = store
-            .requeue_stale_pending_for_companion("c1", 200, 60, "unix:200")
+            .requeue_stale_pending_for_companion("c1", "client_a", 200, 60, "unix:200")
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -987,6 +1032,7 @@ mod tests {
             store
                 .append(
                     "c1",
+                    "client_a",
                     "ownership",
                     fixed_point(),
                     vec![],
@@ -997,12 +1043,12 @@ mod tests {
                 .unwrap();
         }
         let count = store
-            .requeue_pending_for_companion("c1", "2026-05-05T00:00:10Z")
+            .requeue_pending_for_companion("c1", "client_a", "2026-05-05T00:00:10Z")
             .unwrap();
         assert_eq!(count, 1);
         // Second call is a no-op: nothing left in Pending.
         let count = store
-            .requeue_pending_for_companion("c1", "2026-05-05T00:00:20Z")
+            .requeue_pending_for_companion("c1", "client_a", "2026-05-05T00:00:20Z")
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -1017,6 +1063,7 @@ mod tests {
             store
                 .append(
                     UNSUBSCRIBED_COMPANION_ID,
+                    "",
                     "ownership",
                     fixed_point(),
                     vec![],
@@ -1029,6 +1076,7 @@ mod tests {
         store
             .append(
                 "other_companion",
+                "client_a",
                 "ownership",
                 fixed_point(),
                 vec![],
@@ -1038,19 +1086,23 @@ mod tests {
             )
             .unwrap();
         let count = store
-            .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a")
+            .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a", "client_a")
             .unwrap();
         assert_eq!(count, 3);
         // After retarget: subscriber_a has the 3 rows ready to
         // drain; sentinel has none; the other companion is
         // untouched.
-        let claimed = store.list_queued_for_companion("subscriber_a").unwrap();
+        let claimed = store
+            .list_queued_for_companion("subscriber_a", "client_a")
+            .unwrap();
         assert_eq!(claimed.len(), 3);
         let remaining_sentinel = store
-            .list_queued_for_companion(UNSUBSCRIBED_COMPANION_ID)
+            .list_queued_for_companion(UNSUBSCRIBED_COMPANION_ID, "")
             .unwrap();
         assert!(remaining_sentinel.is_empty());
-        let other = store.list_queued_for_companion("other_companion").unwrap();
+        let other = store
+            .list_queued_for_companion("other_companion", "client_a")
+            .unwrap();
         assert_eq!(other.len(), 1);
     }
 
@@ -1060,6 +1112,7 @@ mod tests {
         store
             .append(
                 UNSUBSCRIBED_COMPANION_ID,
+                "",
                 "ownership",
                 fixed_point(),
                 vec![],
@@ -1071,7 +1124,7 @@ mod tests {
         // First subscriber claims.
         assert_eq!(
             store
-                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a")
+                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_a", "client_a")
                 .unwrap(),
             1
         );
@@ -1079,7 +1132,7 @@ mod tests {
         // semantics documented on the method.
         assert_eq!(
             store
-                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_b")
+                .retarget_companion(UNSUBSCRIBED_COMPANION_ID, "subscriber_b", "client_b")
                 .unwrap(),
             0
         );
@@ -1092,6 +1145,7 @@ mod tests {
             store
                 .append(
                     "c1",
+                    "client_a",
                     "ownership",
                     fixed_point(),
                     vec![],

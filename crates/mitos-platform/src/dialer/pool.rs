@@ -205,6 +205,7 @@ pub struct PoolContext<'a> {
     pub header_value: Option<&'a str>,
     pub store: &'a EmissionsStore,
     pub companion_key: &'a str,
+    pub client_id: &'a str,
     pub status_writer: &'a StatusWriterHandle,
     pub lanes: usize,
     pub now: fn() -> String,
@@ -213,7 +214,7 @@ pub struct PoolContext<'a> {
 pub async fn run_tick(ctx: PoolContext<'_>) -> anyhow::Result<()> {
     let grouped = ctx
         .store
-        .list_queued_for_companion_grouped(ctx.companion_key)
+        .list_queued_for_companion_grouped(ctx.companion_key, ctx.client_id)
         .map_err(|e| anyhow::anyhow!("list queued grouped: {e}"))?;
     if grouped.is_empty() {
         return Ok(());
@@ -221,6 +222,7 @@ pub async fn run_tick(ctx: PoolContext<'_>) -> anyhow::Result<()> {
     let total_rows: usize = grouped.iter().map(|(_, v)| v.len()).sum();
     debug!(
         companion_key = %ctx.companion_key,
+        client_id = %ctx.client_id,
         lanes = ctx.lanes,
         keys = grouped.len(),
         rows = total_rows,

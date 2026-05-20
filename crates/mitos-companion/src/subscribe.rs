@@ -86,6 +86,83 @@ async fn read_auth_token(env: &worker::Env) -> Result<String> {
         .map_err(|e| CompanionError::Wire(format!("read {MITOS_AUTH_TOKEN_ENV}: {e}")))
 }
 
+/// Parse the host portion out of a URL. Used by the runtime as
+/// the default `client_id` derivation source (see
+/// `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Worker-side
+/// change"). Lightweight parser: skips an optional `<scheme>://`,
+/// strips optional `userinfo@`, then takes everything up to the
+/// next `/`, `?`, `#`, or end-of-string. The URL may carry the
+/// unresolved `{op}` / `{target}` / `{key}` template placeholders
+/// in its path; those sit after the host portion, so the result is
+/// unaffected.
+///
+/// Returns `None` for inputs we can't usefully extract a host from
+/// (empty, no host at all).
+pub fn host_of_url(url: &str) -> Option<&str> {
+    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
+    let after_userinfo = after_scheme
+        .find('@')
+        .map(|i| &after_scheme[i + 1..])
+        .unwrap_or(after_scheme);
+    let end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    let host = &after_userinfo[..end];
+    if host.is_empty() { None } else { Some(host) }
+}
+
+#[cfg(test)]
+mod host_of_url_tests {
+    use super::host_of_url;
+
+    #[test]
+    fn extracts_host_from_https_url() {
+        assert_eq!(
+            host_of_url("https://hooks.epochify.space/_internal/apply-x?key=y"),
+            Some("hooks.epochify.space"),
+        );
+    }
+
+    #[test]
+    fn extracts_host_with_unsubstituted_template() {
+        assert_eq!(
+            host_of_url("https://hooks.dev.epochify.space/_internal/{op}-{target}?key={key}"),
+            Some("hooks.dev.epochify.space"),
+        );
+    }
+
+    #[test]
+    fn strips_userinfo() {
+        assert_eq!(
+            host_of_url("https://user:pass@hooks.example.com/path"),
+            Some("hooks.example.com"),
+        );
+    }
+
+    #[test]
+    fn handles_no_path() {
+        assert_eq!(host_of_url("https://example.com"), Some("example.com"));
+    }
+
+    #[test]
+    fn handles_no_scheme() {
+        // Falls through to "everything up to /". Cheap-and-cheerful;
+        // the runtime caller always passes a fully-qualified URL in
+        // practice, this is just defensive.
+        assert_eq!(host_of_url("example.com/path"), Some("example.com"));
+    }
+
+    #[test]
+    fn empty_returns_none() {
+        assert_eq!(host_of_url(""), None);
+    }
+
+    #[test]
+    fn only_scheme_returns_none() {
+        assert_eq!(host_of_url("https://"), None);
+    }
+}
+
 /// CBOR-encode a `SubscribeRequest` for transport. Thin wrapper
 /// over `SubscribeRequest::encode` that surfaces the codec error
 /// as a `CompanionError`.
@@ -257,6 +334,7 @@ mod tests {
                 name: "ownership-indexer".into(),
             }],
             companion_key: "customer_42".into(),
+            client_id: "test-client".into(),
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![Interest::any()],
             dial_back: None,
@@ -290,6 +368,7 @@ mod tests {
                 name: "tenant-saas".into(),
             }],
             companion_key: "tenant_001".into(),
+            client_id: "tenant001.example.com".into(),
             resume_from: None,
             interests: vec![],
             dial_back: Some(DialBackOverride {

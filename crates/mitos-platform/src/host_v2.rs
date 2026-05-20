@@ -89,6 +89,13 @@ pub trait ModuleHostHandle: Send + Sync {
     /// can surface those in the admin response so the operator
     /// can spot-check what got reaped.
     async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>>;
+
+    /// Cancel the in-memory dialer task for a single `(module,
+    /// client_id, companion_key)` tuple. Used by the admin
+    /// `delete-companion` handler before removing the on-disk
+    /// record so the next drain tick doesn't re-spawn it from a
+    /// not-yet-deleted file. No-op when the task isn't running.
+    async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str);
 }
 
 /// One dynamic-interest update queued for delivery to a running
@@ -1112,6 +1119,12 @@ where
     async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
         ModuleHostV2::evict_module(self, id).await
     }
+    async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str) {
+        if let Some(dialer) = self.dialer.get() {
+            let cid = crate::dialer::CompanionId::new(module_id, client_id, companion_key);
+            dialer.unregister(&cid).await;
+        }
+    }
 }
 
 /// Drain task — pull events off the per-module emit channel and
@@ -1166,43 +1179,80 @@ fn drain_one(
     // could plumb the name through manifest metadata.
     let channel = event.channel.to_string();
 
-    // Track whether we wrote at least one per-companion row. If
-    // not (no dir, empty dir, or all entries skipped), fall back
-    // to the sentinel companion-id so the emission isn't silently
-    // dropped during the window before any companion subscribes
-    // (drop site #3 in `docs/design/EVENT_DELIVERY_RESILIENCE.md`).
-    // The first subscribe call for this module reclaims the
-    // sentinel rows via `EmissionsStore::retarget_companion`.
+    // Two-level walk: `<module>/companions/<client_id>/<companion_key>.cbor`.
+    // Each `(client_id, companion_key)` pair is a distinct
+    // subscriber and gets its own emission row. See
+    // `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Dispatch fan-out".
+    // If we end up writing zero rows (no dir, no subscribers, or
+    // every entry skipped), fall back to the sentinel companion_id
+    // so the emission isn't silently dropped during the window
+    // before any companion subscribes (drop site #3 in
+    // `docs/design/EVENT_DELIVERY_RESILIENCE.md`). The first
+    // subscribe reclaims sentinel rows via
+    // `EmissionsStore::retarget_companion`.
     let mut wrote_per_companion = false;
     if companions_dir.exists() {
         match std::fs::read_dir(&companions_dir) {
             Ok(read) => {
                 for entry in read.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                    let file_type = match entry.file_type() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if !file_type.is_dir() {
                         continue;
                     }
-                    let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
-                        Some(s) => s.to_string(),
+                    let dir_name = entry.file_name();
+                    let client_id = match dir_name.to_str() {
+                        Some(s) => s,
                         None => continue,
                     };
-                    match store.append(
-                        &companion_key,
-                        &channel,
-                        event.chain_point.clone(),
-                        event.payload.clone(),
-                        event.partition_key.clone(),
-                        EmissionStatus::Queued,
-                        &now,
-                    ) {
-                        Ok(_) => wrote_per_companion = true,
+                    // Skip metadata dirs (`.unreachable/` etc.).
+                    if client_id.starts_with('.') {
+                        continue;
+                    }
+                    let client_dir = entry.path();
+                    let client_files = match std::fs::read_dir(&client_dir) {
+                        Ok(r) => r,
                         Err(e) => {
                             tracing::warn!(
                                 module = %module_id,
-                                companion_key = %companion_key,
+                                client_dir = %client_dir.display(),
                                 error = %e,
-                                "append emission row failed"
+                                "read client-dir failed"
                             );
+                            continue;
+                        }
+                    };
+                    for client_entry in client_files.flatten() {
+                        let path = client_entry.path();
+                        if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                            continue;
+                        }
+                        let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        match store.append(
+                            &companion_key,
+                            client_id,
+                            &channel,
+                            event.chain_point.clone(),
+                            event.payload.clone(),
+                            event.partition_key.clone(),
+                            EmissionStatus::Queued,
+                            &now,
+                        ) {
+                            Ok(_) => wrote_per_companion = true,
+                            Err(e) => {
+                                tracing::warn!(
+                                    module = %module_id,
+                                    client_id = %client_id,
+                                    companion_key = %companion_key,
+                                    error = %e,
+                                    "append emission row failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -1221,6 +1271,7 @@ fn drain_one(
     if !wrote_per_companion {
         if let Err(e) = store.append(
             UNSUBSCRIBED_COMPANION_ID,
+            "",
             &channel,
             event.chain_point.clone(),
             event.payload.clone(),

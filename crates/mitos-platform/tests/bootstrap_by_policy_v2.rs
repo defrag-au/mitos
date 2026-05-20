@@ -285,7 +285,7 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
         .emissions_store("test-indexer")
         .expect("emissions store");
     let rows = emissions
-        .list_queued_for_companion("test-companion")
+        .list_queued_for_companion("test-companion", "test-client")
         .expect("list emissions");
     assert!(
         !rows.is_empty(),
