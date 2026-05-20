@@ -1,11 +1,36 @@
 # Event delivery resilience — closing the silent-drop paths
 
-**Status: design draft** (2026-05-12). No code changes yet. The
-problems are surfaced from a production triage: jpg.store offer
-cancels landed on chain, mitos's emissions log had no
-corresponding rows, and the consumer's projection drifted into
-zombies. Recapture cleared it; this doc is how we stop needing
-to recapture.
+**Status: shipped (2026-05).** All three drop sites described
+below have been fixed in code; this doc is preserved as the
+design rationale + audit trail for the work.
+
+Concretely:
+
+- **Drop #1** — dispatcher discards Consumed events with
+  unresolvable prior outputs. Fixed at
+  `crates/mitos-data-plane/src/dispatch.rs` — the filter_map was
+  replaced with a `.map(...)` that calls `resolve_prior(...)`,
+  which returns a `TypedOutput::unresolved()` placeholder on miss
+  instead of dropping the input. Modules now see Consumed events
+  for every input.
+- **Drop #2** — Pending emissions stranded by a WS death. Fixed
+  in `crates/mitos-platform/src/dialer.rs` — the dial loop calls
+  `store.requeue_pending_for_companion(...)` on entry so a dial
+  restart re-queues anything left in `Pending` state from a prior
+  loop iteration. See the dialer.rs preamble doc-comment.
+- **Drop #3** — `drain_one` discards emissions without
+  companions. Fixed in `crates/mitos-platform/src/host_v2.rs`
+  via the `UNSUBSCRIBED_COMPANION_ID` sentinel: emissions emitted
+  before any companion subscribes are still durably stored,
+  re-keyed when the first companion subscribes.
+
+Original triage context (preserved for historical reference): the
+problems below were surfaced from a production incident where
+jpg.store offer cancels landed on chain, mitos's emissions log
+had no corresponding rows, and the consumer's projection drifted
+into zombies. Recapture cleared it; the fixes below are how we
+stopped needing to recapture for these specific classes of
+silent drop.
 
 The mitos event pipeline has three silent-drop paths between
 "chain block decoded" and "consumer's `apply_event` runs." Each

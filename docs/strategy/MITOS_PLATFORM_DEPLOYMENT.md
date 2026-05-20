@@ -1,5 +1,12 @@
 # Mitos platform deployment
 
+> **Status (2026-05): shipped (Phases 1–3 of the build-out below
+> landed).** The deploy tool ships as **`mitos-admin`**, not
+> `mitos-admin` — the rename anticipated in this doc never
+> happened. References to `mitos-admin` throughout the body should
+> be read as `mitos-admin`. See `tools/mitos-admin/src/main.rs`
+> for the live subcommand surface.
+
 How a dApp builder gets a wasm indexer module from "compiles
 locally" to "running inside a deployed mitos host." Targets
 **wrangler-deploy-style ergonomics**: a focused build tool, a
@@ -7,7 +14,7 @@ focused deploy tool, a typed manifest between them, and a
 host-side admin endpoint that accepts the artifact.
 
 Cross-references:
-- `MITOS_PLATFORM_V1.md` — the runtime this deployment story
+- `MITOS_PLATFORM_V2.md` — the runtime this deployment story
   feeds into; the WIT ABI module artifacts conform to
 - `MITOS_COMPANION_PATTERN.md` — paired-deployable thesis;
   this doc is the mitos-side half of `cargo cardano deploy`
@@ -33,13 +40,13 @@ The wrangler/worker-build split is the model. Concretely:
 ```bash
 # In the dApp's repo:
 mitos-build              # produces target/mitos/<module>.wasm + manifest.toml
-mitos-cli deploy         # uploads the artifact to a configured mitos host
+mitos-admin deploy         # uploads the artifact to a configured mitos host
 ```
 
 Or as a one-shot:
 
 ```bash
-mitos-cli deploy         # build then upload, like `wrangler deploy`
+mitos-admin deploy         # build then upload, like `wrangler deploy`
 ```
 
 Both halves run from the dApp builder's laptop. The mitos host
@@ -60,7 +67,7 @@ Calling these out so they don't drift into scope:
   hot-swap is a v2+ refinement.
 - **CF companion orchestration.** Companion-side `wrangler
   deploy` happens via wrangler itself, possibly chained from
-  `mitos-cli`; we don't reimplement the CF deploy.
+  `mitos-admin`; we don't reimplement the CF deploy.
 - **`cargo cardano init`.** Scaffolding new dApps is a separate
   workstream once the deploy story is solid enough to template
   against.
@@ -155,15 +162,15 @@ The host validates `version_major` against its `HOST_ABI_MAJOR`
 mirrors the Balius-PR-#98 problem we explicitly designed against
 in `MITOS_PLATFORM_V1.md`.
 
-### 3. `mitos-cli upload-module` — the deploy tool
+### 3. `mitos-admin upload-module` — the deploy tool
 
 Extends the existing `tools/mitos-admin/` (renaming to
-`mitos-cli` if we're committing to it as the umbrella; otherwise
+`mitos-admin` if we're committing to it as the umbrella; otherwise
 just adds a subcommand). Follows the same SSH/HTTP-talker pattern
 already proven by `tools/capture-block/` and `tools/mitos-admin/`.
 
 ```bash
-mitos-cli upload-module \
+mitos-admin upload-module \
     --artifact target/mitos/my-indexer/ \
     --to https://mitos.example.com \
     [--config mitos.toml]
@@ -187,23 +194,23 @@ Composability:
 
 ```bash
 # Build then upload — what `wrangler deploy` does
-mitos-cli deploy --to https://mitos.example.com
+mitos-admin deploy --to https://mitos.example.com
   ↓
   mitos-build --crate <auto>
-  mitos-cli upload-module --artifact target/mitos/<auto>/ --to ...
+  mitos-admin upload-module --artifact target/mitos/<auto>/ --to ...
 ```
 
-`mitos-cli deploy` is a thin convenience that runs both halves;
+`mitos-admin deploy` is a thin convenience that runs both halves;
 power users can run them separately for CI/CD.
 
 Other subcommands the CLI gets for free by extending
 `mitos-admin`:
 
 ```bash
-mitos-cli list-modules                     # GET /_admin/modules
-mitos-cli get-module <id>                  # GET /_admin/modules/<id>
-mitos-cli delete-module <id>               # DELETE /_admin/modules/<id>
-mitos-cli restart-module <id>              # POST /_admin/modules/<id>/restart
+mitos-admin list-modules                     # GET /_admin/modules
+mitos-admin get-module <id>                  # GET /_admin/modules/<id>
+mitos-admin delete-module <id>               # DELETE /_admin/modules/<id>
+mitos-admin restart-module <id>              # POST /_admin/modules/<id>/restart
 ```
 
 ### 4. Mitos host `/_admin/modules/*` routes
@@ -263,7 +270,7 @@ before activation:
 - `WitMismatch` — module's WIT world isn't `mitos:platform/mitos-module`
 - `ManifestDriftedFromWasm` — manifest claims trap-policy=replay but wasm exports skip-and-mark
 - `WasmInvalid` — wasmtime can't parse the component
-- `Quarantined` — previous instance was quarantined; refuses upload until manual `mitos-cli restart-module --force` clears the flag (avoids "redeploy as workaround for quarantine investigation")
+- `Quarantined` — previous instance was quarantined; refuses upload until manual `mitos-admin restart-module --force` clears the flag (avoids "redeploy as workaround for quarantine investigation")
 
 ## What we tap into
 
@@ -342,7 +349,7 @@ What to build, in order, each item shippable independently:
    by `MITOS_AUTH_TOKEN`. Stores artifacts under
    `/var/lib/mitos/modules/<id>/`. Returns 200 with sha.
 2. **`GET /_admin/modules` + `GET /_admin/modules/{id}`** —
-   read-only state inspection. Powers `mitos-cli list-modules`
+   read-only state inspection. Powers `mitos-admin list-modules`
    / `get-module`.
 3. **`DELETE /_admin/modules/{id}` + `POST .../restart`** —
    completes the lifecycle CRUD.
@@ -363,7 +370,7 @@ What to build, in order, each item shippable independently:
    inside a configured workspace member, no flags needed.
 4. **`--json` output** — for CI integration.
 
-### Phase 3 — `mitos-cli upload-module` + `deploy` (mitos repo)
+### Phase 3 — `mitos-admin upload-module` + `deploy` (mitos repo)
 
 1. **`upload-module` subcommand** added to `mitos-admin`. Reads
    artifact + manifest, multipart-uploads, surfaces structured
@@ -372,14 +379,14 @@ What to build, in order, each item shippable independently:
    into one ergonomic call.
 3. **`list-modules` / `get-module` / `delete-module` /
    `restart-module`** — round out the CRUD CLI.
-4. **Rename `mitos-admin` → `mitos-cli`** if we're committing
+4. **Rename `mitos-admin` → `mitos-admin`** if we're committing
    to it as the umbrella. Backwards-compat shim for one
    release cycle.
 
 ### Phase 4 — companion-side orchestration (deferred)
 
 Companion-half deploy still goes through wrangler, unchanged.
-Future enhancement: `mitos-cli deploy --with-companion` runs
+Future enhancement: `mitos-admin deploy --with-companion` runs
 `wrangler deploy` after the module upload succeeds, with
 ordering guarantees (companion ready before module starts
 emitting). Out of v1 scope.
@@ -411,9 +418,9 @@ Atomic activation: write `<new-sha>.wasm`, `ln -sf
 <new-sha>.wasm current.wasm.tmp`, `mv current.wasm.tmp
 current.wasm`. Readers see either old or new, never partial.
 
-Rollback (`mitos-cli rollback <sha>`) is trivial: re-point
+Rollback (`mitos-admin rollback <sha>`) is trivial: re-point
 `current.wasm` at any historical sha that's still on disk. Old
-shas get pruned by a future `mitos-cli prune-modules
+shas get pruned by a future `mitos-admin prune-modules
 --keep-last N` (defer until disk pressure becomes real).
 
 ### 2. Cursor handling on upload-replaces-running — RESOLVED: resume
@@ -625,7 +632,7 @@ metrics: when OpenTelemetry surfaces are wired into the host).
 - **`worker-build` does ONE thing well** (build a wasm-bindgen
   Rust crate into a CF Workers-compatible artifact). Wrangler
   does the deploy. Don't merge them. Same lesson here:
-  `mitos-build` and `mitos-cli upload-module` stay separate.
+  `mitos-build` and `mitos-admin upload-module` stay separate.
 - **wasmtime's component validation is exhaustive** — let it
   do the work. Don't try to hand-roll a wasm sanity-checker.
   The only wrapper we add is "pretty-print the failure to a

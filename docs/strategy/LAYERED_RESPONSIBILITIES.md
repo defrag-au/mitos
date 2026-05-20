@@ -260,12 +260,12 @@ Over time:
    could live in a `mitos-module-helpers` crate. Worth doing
    once the second or third community module wants the same
    helper.
-4. **Existing in-tree indexer end-state.** `marketplace-indexer`,
-   `mint-burn-indexer`, `collection-ownership-indexer` shipped
-   pre-community-modules. They work and stay. If they become
-   maintenance dead-weight, a per-brand community module set
-   replaces them — but only when there's concrete pressure,
-   not on principle.
+4. ~~**Existing in-tree indexer end-state.**~~ Resolved (2026-05):
+   `marketplace-indexer`, `mint-burn-indexer`, and
+   `collection-ownership-indexer` all retired in favour of
+   community modules — see the status banner at the top of this
+   doc. `none-match-indexer` remains as the residual-pass
+   coordinator; new in-tree indexers aren't anticipated.
 
 ## Cross-references
 

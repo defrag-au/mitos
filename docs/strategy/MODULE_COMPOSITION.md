@@ -50,17 +50,28 @@ module stays focused; the composition lives in declarations.
 
 ### Scenario 2 — cross-dApp community module reuse
 
-(Composes with the tier model in `LAYERED_RESPONSIBILITIES.md`.)
+(Composes with the community-modules-first preference in
+`LAYERED_RESPONSIBILITIES.md`.)
 
-A community-published `floor-price` module (tier 1) is consumed
-by multiple dApps. A new dApp wanting alerts based on floor
-price declares dependency on the community module — its own
-module receives `FloorPriceUpdated` events ready to consume,
-without re-implementing floor-price tracking.
+A community-published `floor-price` module is consumed by
+multiple dApps. A new dApp wanting alerts based on floor price
+declares dependency on the community module — its own module
+receives `FloorPriceUpdated` events ready to consume, without
+re-implementing floor-price tracking.
 
 This is the natural endpoint of the wasm-module promotion
-pathway: tier-1 community modules become **building blocks**,
-not just leaves.
+pathway: community modules become **building blocks**, not just
+leaves.
+
+**The first informal example already exists in code.**
+`holder-distribution` consumes datum decoders from
+`mitos-vesting-decode` (extracted out of `vesting-tracker`) to
+decompose vested holdings into per-owner balances. The
+extraction was performed manually — there's no `[depends_on]`
+declaration, no DAG, no cross-module event delivery via the
+host yet. But the shape of the dependency (`holder-distribution`
+needs vesting recognition; `vesting-tracker` already does it) is
+exactly the case `[depends_on]` would formalise.
 
 ## Declaration shape (sketch)
 
@@ -136,9 +147,9 @@ companion-side reassembly) are sufficient.
 
 ## Cross-references
 
-- `LAYERED_RESPONSIBILITIES.md` — the three-layer split this
-  composes on top of; tier-1 community modules are the
-  cross-dApp case of this composition idea
+- `LAYERED_RESPONSIBILITIES.md` — the layering this composes on
+  top of; community modules are the cross-dApp case of this
+  composition idea
 - `MITOS_PLATFORM_V2.md` — the wasm-module hosting
   architecture this would extend
 - `docs/design/SUBSCRIPTION_MECHANICS.md` — `Interest` is the

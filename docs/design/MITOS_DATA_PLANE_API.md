@@ -598,16 +598,14 @@ Until this primitive exists:
 
 ### Datum / script witness-set resolution
 
-Already noted under "Phase A scope explicitly deferred" but
-worth flagging here too. `DecodeLevel::WithDatum` and `Full`
-are honoured at the API surface (caller can request them, the
-`decoded_at` field reflects the request) but the
-`LocalDataPlane` impl always returns `datum: None` /
-`script_ref: None` because the witness-set lookup primitive
-isn't built. Affects any consumer that needs decoded datum
-content on outputs — not used by Phase A's ownership backfill,
-will be needed for tx-template construction in the framework
-context.
+**Resolved (2026-05).** Inline datum + witness-set datum
+backfill landed alongside the v2 dispatch path (see
+`crates/mitos-data-plane/src/dispatch.rs::backfill_prior_datum`
+and the `produced-event` / `consumed-event` shapes in
+`wit-v2/world.wit`). `DecodeLevel::WithDatum` now returns
+populated `typed-datum` payloads for outputs whose datum the
+host can resolve. `script_ref` resolution remains a follow-up;
+see the per-mode notes below for the current state.
 
 ## Phase A implementation notes
 
@@ -692,9 +690,9 @@ handles it via the predicate-driven search).
   semantics; works fine for ~10K-output collections, fails for
   millions)
 - Predicate matcher beyond `Match(UtxoPattern { asset: Policy(_) })`
-- Witness-set datum resolution at `DecodeLevel::WithDatum` (the
-  level is honoured by `decoded_at`, but the actual resolution
-  isn't built — `datum: None` always)
+- ~~Witness-set datum resolution at `DecodeLevel::WithDatum`~~
+  — landed 2026-05 alongside the v2 dispatch path; see
+  `dispatch.rs::backfill_prior_datum`.
 
 ## Lessons banked
 

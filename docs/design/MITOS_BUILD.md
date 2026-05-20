@@ -270,21 +270,24 @@ touch <50 datums of interest; lookup is sub-millisecond redb read).
 
 ### What the module must export
 
-The bundled WIT world `mitos:platform/mitos-module` requires five
-exports (`crates/mitos-platform/wit/world.wit:165-208`):
+The bundled WIT world `mitos:platform-v2/mitos-module-v2` requires
+six exports (`crates/mitos-platform/wit-v2/world.wit:488-544`):
 
 | Export | When called | Purpose |
 |---|---|---|
-| `module-version() -> (u32, u32)` | Once, at module load before init | ABI handshake. Host refuses incompatible majors. |
+| `module-version() -> (u32, u32)` | Once, at module load before init | ABI handshake; v2 modules return `(2, 0)`. |
 | `trap-policy() -> (trap-strategy, retry-policy)` | Once, at module load | Declares replay/skip-and-mark/quarantine + retry shape |
 | `init(config: list<u8>)` | Once, after handshake | CBOR-decode `config.cbor` into your `Config` |
-| `handle-event(channel: u32, block: borrow<resolved-block>)` | Per dispatched block | Walk the block, emit events, mutate `state-kv` |
+| `handle-events(events: list<dispatch-event>)` | Per dispatched TX (or bootstrap chunk, tick, or rollback batch) | Decide what to emit; mutate `state-kv` |
 | `update-interest(op, items-cbor) -> result<_, string>` | Each time the companion mutates Interest | CBOR-decode `Vec<Interest>`, apply to module's filter |
+| `rebootstrap() -> result<rebootstrap-step, string>` | Recapture refill; re-entrant — host loops calls per fuel budget | Self-bootstrapping modules re-scan their interest set + re-emit. Event-driven modules return `{done: true, ingested: 0}`. |
 
 `wit-bindgen` generates the trait surface; you implement
 `Guest`/`GuestExports` per the macro's docs. See
-`workers/collections-mitos/modules/ownership.rs` for a
-worked reference.
+`community-modules/standard-burn/standard_burn.rs` for a
+worked reference and
+`community-modules/holder-distribution/holder_distribution.rs`
+for a non-trivial `rebootstrap` implementation.
 
 ## CLI
 
@@ -381,7 +384,7 @@ upload time (`crates/mitos-platform/src/admin.rs`).
 
 `trap_policy.strategy` is read once at module load by the host
 supervisor and consulted on every trap. `replay` requires
-`handle-event` idempotency.
+`handle-events` idempotency (per-batch).
 
 ## Path baking
 

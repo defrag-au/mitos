@@ -18,7 +18,10 @@
 >   `AssetSelector`, `DomainSelector`, `ValueFilter` types +
 >   `match_event` implementation.
 > - `crates/mitos-protocol/src/subscribe.rs` — `SubscribeRequest`
->   / `SubscribeResponse` shapes.
+>   / `SubscribeResponse` shapes. **Carries a required `client_id`
+>   field** for multi-client companion identity — see
+>   `docs/design/MULTI_CLIENT_COMPANIONS.md`. The subscribe wire
+>   sketch in this doc predates that work.
 > - `docs/design/UNIFIED_SUBSCRIBE.md` — the subscribe handshake.
 
 How a CF-side consumer expresses *what events it wants* and how

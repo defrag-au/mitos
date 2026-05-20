@@ -276,6 +276,18 @@ hold heterogeneous channels.
 /// Implemented once per dApp companion. Owns the channel set,
 /// config, schema, and dApp RPC routes. The runtime fans
 /// inbound mitos events out to the right channel by tag.
+///
+/// **Sketch only — see `crates/mitos-companion/src/traits.rs`
+/// for the live trait**, which has grown additional methods
+/// since this doc was written:
+/// - `subscribe_targets()` — declare module / indexer / multi-target subscriptions
+///   (see `docs/design/UNIFIED_SUBSCRIBE.md`).
+/// - `initial_interests()` — programmatic Interest declarations beyond the
+///   SQL-table-backed dynamic set.
+/// - `client_id()` — REQUIRED per `docs/design/MULTI_CLIENT_COMPANIONS.md`;
+///   disambiguates two consumers sharing the same `companion_key`.
+/// - `on_recapture()` — scoped state cleanup hook called when an operator
+///   runs `mitos-admin recapture <module>` (see `docs/design/RECAPTURE.md`).
 pub trait MitosCompanion: Send + Sync + 'static {
     /// Stable name (matches the indexer's `name()` on the
     /// mitos side). Used for routing, logging, schema isolation.
@@ -298,11 +310,10 @@ pub trait MitosCompanion: Send + Sync + 'static {
         Ok(())
     }
 
-    /// dApp's RPC routes. Mounted under `/api/*` by the runtime.
-    /// Runtime reserves `/api/_*` (health, meta, interest).
-    fn rpc_routes(&self) -> worker::Router {
-        worker::Router::new()
-    }
+    // Live trait has subscribe_targets / initial_interests /
+    // client_id / on_recapture beyond this sketch. dApp RPC
+    // routes mount under /api/* via the wrapping DO's fetch
+    // handler, not via a trait method.
 }
 
 /// Implemented once per channel a companion subscribes to.

@@ -3,8 +3,13 @@
 **The default home for chain-recognition logic.** Wasm modules
 that ship with mitos, auto-load on host startup, and are
 addressable by name from any companion. The canonical example is
-`jpg-co` — contract-specific datum decode for jpg.store
+`jpg-store-offer` — contract-specific datum decode for jpg.store
 collection offers that *any* dApp tracking COs benefits from.
+Twelve community modules ship today (`asset-metadata-update`,
+`asset-transfer`, `burn-address`, `cip-25-mint`, `cip-68-mint`,
+`cswap-dex`, `holder-distribution`, `jpg-store-listing`,
+`jpg-store-offer`, `jpg-store-sale`, `splash-dex`,
+`standard-burn`, `vesting-tracker`).
 
 Per `LAYERED_RESPONSIBILITIES.md`'s layering:
 
@@ -34,20 +39,25 @@ Per `LAYERED_RESPONSIBILITIES.md`'s layering:
 ```
 mitos/
 ├── community-modules/
-│   ├── jpg-co/
-│   │   ├── jpg_co.rs          # single-file module source
-│   │   ├── jpg_co.toml        # manifest (V2/V3 addresses, deps)
+│   ├── jpg-store-offer/
+│   │   ├── jpg_store_offer.rs # single-file module source
+│   │   ├── jpg_store_offer.toml # manifest (V2/V3 addresses, deps)
 │   │   └── fixtures/          # test fixtures
-│   ├── wayup-co/              # future
+│   ├── jpg-store-listing/
 │   │   └── ...
-│   └── ...
+│   ├── asset-transfer/
+│   │   └── ...
+│   ├── holder-distribution/
+│   │   └── ...
+│   └── ...                    # 12 modules total
 └── crates/
     └── mitos-community-events/
         ├── Cargo.toml
         └── src/
-            ├── lib.rs         # `pub mod jpg_co; pub mod wayup_co; ...`
-            ├── jpg_co.rs      # `pub enum CoChange { Created { ... }, Spent { ... } }`
-            ├── wayup_co.rs    # future
+            ├── lib.rs         # `pub mod jpg_store_offer; pub mod asset_transfer; ...`
+            ├── jpg_store_offer.rs  # `pub enum JpgStoreOffer { Create, Cancel, Accept, Update }`
+            ├── asset_transfer.rs
+            ├── holder_distribution.rs
             └── ...
 ```
 
@@ -55,7 +65,7 @@ Note the events crate is **single** with one submodule per
 community module — not one crate per module. Keeps shared types
 discoverable in one place; saves on Cargo workspace overhead;
 each community module's events form a submodule that consumers
-can `use mitos_community_events::jpg_co::CoChange;`.
+can `use mitos_community_events::jpg_store_offer::JpgStoreOffer;`.
 
 ## Auto-load mechanism
 
@@ -80,7 +90,7 @@ back to building from source only in dev.
 **Opt-out:** v1 has none — all modules under
 `community-modules/` auto-load. Operators wanting fewer modules
 patch their mitos checkout to remove the unused directories.
-A config-driven `[community_modules] enabled = ["jpg-co"]`
+A config-driven `[community_modules] enabled = ["jpg-store-offer"]`
 allowlist is a future refinement when the catalogue grows.
 
 ## Consumer pattern
@@ -90,7 +100,7 @@ exactly as it would to any wasm module:
 
 ```rust
 // In the dApp's worker:
-use mitos_community_events::jpg_co::CoChange;
+use mitos_community_events::jpg_store_offer::JpgStoreOffer;
 use mitos_protocol::SubscribeTarget;
 
 impl MitosCompanion for JpgStoreMirror {
@@ -99,27 +109,27 @@ impl MitosCompanion for JpgStoreMirror {
     fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
         vec![
             // Community module — provided by mitos's auto-load.
-            SubscribeTarget::Module { name: "jpg-co".into() },
+            SubscribeTarget::Module { name: "jpg-store-offer".into() },
             // Other targets (in-tree indexers, other community
             // modules) as needed.
         ]
     }
 
     fn channels(&self) -> Vec<Box<dyn MitosChannelDyn>> {
-        vec![Box::new(JpgCoChannel { /* ... */ })]
+        vec![Box::new(JpgStoreOfferChannel { /* ... */ })]
     }
 }
 
-struct JpgCoChannel { /* ... */ }
-impl MitosChannel for JpgCoChannel {
-    const NAME: &'static str = "jpg-co";
-    type Event = CoChange;  // ← from mitos-community-events
+struct JpgStoreOfferChannel { /* ... */ }
+impl MitosChannel for JpgStoreOfferChannel {
+    const NAME: &'static str = "jpg-store-offer";
+    type Event = JpgStoreOffer;  // ← from mitos-community-events
     // ...
 }
 ```
 
 The dApp owns **zero chain-decoding code**. The wasm module
-(jpg-co) lives in mitos. The event types are in
+(jpg-store-offer) lives in mitos. The event types are in
 `mitos-community-events`. The dApp's repo holds only the
 projection logic — what the dApp does with the events.
 
@@ -144,54 +154,61 @@ mitos-community-events = { path = "../mitos/crates/mitos-community-events" }
 
 ## Migration playbook — promoting a private module to community
 
-Concrete steps using jpg-co as the worked example. Generalises
+> **Historical reference.** The `jpg-store-offer` migration below
+> shipped — the module now lives at
+> `mitos/community-modules/jpg-store-offer/` and the events crate
+> at `mitos/crates/mitos-community-events/`. It was originally
+> named `jpg-co` in this doc; the rename happened during the move.
+> Retained as a worked example for future promotions.
+
+Concrete steps using jpg-store-offer as the worked example. Generalises
 to any per-dApp wasm module that earns wider relevance.
 
 ### Source moves
 
-1. `cnft.dev-workers/workers/jpg-store-mirror/modules/jpg_co.rs`
-   → `mitos/community-modules/jpg-co/jpg_co.rs`
-2. `cnft.dev-workers/workers/jpg-store-mirror/modules/jpg_co.toml`
-   → `mitos/community-modules/jpg-co/jpg_co.toml`
+1. `cnft.dev-workers/workers/jpg-store-mirror/modules/jpg_store_offer.rs`
+   → `mitos/community-modules/jpg-store-offer/jpg_store_offer.rs`
+2. `cnft.dev-workers/workers/jpg-store-mirror/modules/jpg_store_offer.toml`
+   → `mitos/community-modules/jpg-store-offer/jpg_store_offer.toml`
 3. `cnft.dev-workers/workers/jpg-store-mirror/modules/fixtures/`
-   → `mitos/community-modules/jpg-co/fixtures/`
+   → `mitos/community-modules/jpg-store-offer/fixtures/`
 
 ### Events crate
 
 1. Create `mitos/crates/mitos-community-events/` with
    `lib.rs` re-exporting one submodule per community module.
-2. Move `cnft.dev-workers/types/jpg-co-events/src/lib.rs` →
-   `mitos/crates/mitos-community-events/src/jpg_co.rs`.
-3. Delete `cnft.dev-workers/types/jpg-co-events/`.
+2. Move `cnft.dev-workers/types/jpg-store-offer-events/src/lib.rs` →
+   `mitos/crates/mitos-community-events/src/jpg_store_offer.rs`.
+3. Delete `cnft.dev-workers/types/jpg-store-offer-events/`.
 
 ### Build / manifest reference updates
 
-1. `jpg_co.toml` `[deps]` section: previously referenced
-   `jpg-co-events = { path = "../../../types/jpg-co-events" }`.
-   Now: `jpg-co-events = { path = "../../crates/mitos-community-events" }`
+1. `jpg_store_offer.toml` `[deps]` section: previously referenced
+   `jpg-store-offer-events = { path = "../../../types/jpg-store-offer-events" }`.
+   Now: `jpg-store-offer-events = { path = "../../crates/mitos-community-events" }`
    or — once the crate lives in mitos workspace — simply
    `mitos-community-events = { workspace = true }`.
 
 ### cnft.dev-workers updates
 
 1. `workers/jpg-store-mirror/Cargo.toml`: drop
-   `jpg-co-events = { path = "../../types/jpg-co-events" }`; add
+   `jpg-store-offer-events = { path = "../../types/jpg-store-offer-events" }`; add
    `mitos-community-events = { workspace = true }`.
 2. `do_state.rs`: change
-   `use jpg_co_events::CoChange;` →
-   `use mitos_community_events::jpg_co::CoChange;`.
+   `use jpg_store_offer_events::JpgStoreOffer;` →
+   `use mitos_community_events::jpg_store_offer::JpgStoreOffer;`.
 3. Delete `workers/jpg-store-mirror/modules/` entirely.
 
 ### Auto-load setup
 
 1. Add the community-module preload pass to `Bundle::run`'s
    startup sequence (before `host.auto_resume()`).
-2. Operators upgrading to this mitos version pick up jpg-co
+2. Operators upgrading to this mitos version pick up jpg-store-offer
    automatically on next deploy.
 
 ### Verification
 
-- After deploy: `mitos-admin list-modules` shows `jpg-co` as
+- After deploy: `mitos-admin list-modules` shows `jpg-store-offer` as
   registered (auto-loaded, not operator-uploaded).
 - jpg-store-mirror worker's companion DO subscribes by name
   exactly as today; events flow identically.
@@ -223,8 +240,9 @@ The retirement playbook each indexer followed:
 4. Drop the indexer crate + bundle wiring in one PR.
 
 New brand decode work continues to go to community modules
-(e.g. wayup's CO support lands as `wayup-store-offer` next to
-`jpg-store-offer`), and `Replicator` itself retired alongside
+(e.g. a hypothetical wayup CO module would land as
+`wayup-store-offer` next to `jpg-store-offer`), and `Replicator`
+itself retired alongside
 its last consumer.
 
 The forcing function for any future retirement is the same as
@@ -234,7 +252,7 @@ where the duplication actually lives.
 ## Operational concern: shared community module efficiency
 
 When multiple workers subscribe to the same community module
-(e.g. jpg-co serving five different dApps), the host processes
+(e.g. jpg-store-offer serving five different dApps), the host processes
 events once per chain block, fans events out to N subscribers.
 Per-event compute is bounded; the broadcast channel handles
 fan-out without re-running the wasm classification logic per
@@ -252,7 +270,7 @@ That's the theory. **In practice**, watch:
   module's input stream)
 - WS connection count per host (one outbound dial per
   subscriber per target — five dApps each subscribing to
-  jpg-co = five concurrent WSes per host)
+  jpg-store-offer = five concurrent WSes per host)
 - The wasm module's per-tx cost itself if it does expensive
   state-kv lookups
 
@@ -271,7 +289,7 @@ task; not blocking initial adoption.**
    v1: same repo (PR to mitos). Future: external registry +
    signing + per-tier promotion path. Out of scope until a
    non-defrag-au community module exists.
-3. **Per-module config.** Today `jpg_co.toml` carries V2/V3
+3. **Per-module config.** Today `jpg_store_offer.toml` carries V2/V3
    addresses. If those addresses are operator-specific (per
    testnet vs mainnet), config-by-environment becomes a need.
    Not urgent.

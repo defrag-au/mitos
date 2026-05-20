@@ -80,14 +80,29 @@ Shipped + in production:
   name. Design:
   [`COMMUNITY_MODULES.md`](docs/strategy/COMMUNITY_MODULES.md).
 - **Companion runtime v1.** CF Worker Durable Object SDK
-  (`mitos-companion`) absorbing the per-companion subscribe / WS
-  Hibernation / emission-id / recapture-hook boilerplate. Production
-  consumers: `jpg-store-mirror`, `collections-mitos`. Design:
+  (`mitos-companion`) absorbing the per-companion subscribe / HTTP
+  apply-and-recapture delivery / emission-id / multi-client identity
+  boilerplate. Production consumers: `jpg-store-mirror`,
+  `collections-mitos`. Design:
   [`MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md).
+- **HTTP companion delivery.** Per-emission HTTP POST to
+  `/_internal/apply-<channel>` / `/_internal/recapture-<channel>`
+  on the companion, with 200 / 422 / 5xx mapping to Ack / Nack /
+  transport-retry. Replaced the original WebSocket / Hibernation
+  surface. Per-companion partition-keyed lane pool keeps ordering
+  within a key while parallelising across keys
+  ([`DIALER_CONCURRENCY.md`](docs/design/DIALER_CONCURRENCY.md)).
+- **Multi-client companion identity.** Companion records keyed by
+  `(module_id, client_id, companion_key)` so two consumers sharing
+  the same `companion_key` (e.g. dev + prod) get independent
+  emission streams. Design:
+  [`MULTI_CLIENT_COMPANIONS.md`](docs/design/MULTI_CLIENT_COMPANIONS.md).
 - **Recapture v1.** Coordinated state rebuild — host signals each
   subscribed companion to drop projected state, then re-runs the module's
-  bootstrap into a clean target. Replaces the manual multi-step reset.
-  Design: [`RECAPTURE.md`](docs/design/RECAPTURE.md).
+  bootstrap (re-entrant via the `rebootstrap` export) into a clean
+  target. Replaces the manual multi-step reset. Design:
+  [`RECAPTURE.md`](docs/design/RECAPTURE.md) +
+  [`WASM_BUDGET_CHUNKING.md`](docs/design/WASM_BUDGET_CHUNKING.md).
 - **Tiered aux-data cache + Maestro fallback.** TX aux-data CBOR cached
   permanently in `<storage_root>/aux_data.redb` — populated proactively
   from live blocks, written through on archive hits, and resolved lazily
@@ -95,9 +110,12 @@ Shipped + in production:
   horizon. The Maestro tier is rate-limit-aware (process-wide semaphore,
   `Retry-After`-respecting backoff). Lets bootstrap resolve years-old
   TXs the local archive has pruned.
-- **CF replication.** Apply/Undo/Mark protocol over WebSocket between
-  mitos and Cloudflare Durable Objects. Live in production. Design:
-  [`CF_REPLICATION.md`](docs/design/CF_REPLICATION.md).
+- **Minibf bridge.** Blockfrost-compatible HTTP surface from Dolos's
+  `dolos_minibf` router mounted at `/minibf` on the bundle, gated by
+  the bundle's shared auth middleware. Lets consumers query the
+  underlying chain data over Blockfrost-shaped endpoints without
+  taking a Maestro dependency. Design:
+  [`MINIBF_BRIDGE.md`](docs/design/MINIBF_BRIDGE.md).
 
 For the longer arc see [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) and
 [`docs/strategy/MODULE_COMPOSITION.md`](docs/strategy/MODULE_COMPOSITION.md)
@@ -108,12 +126,15 @@ For the longer arc see [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) and
 ```
 mitos/
 ├── crates/
-│   ├── mitos-core/                # dispatcher, CF replication, in-tree indexer trait
-│   ├── mitos-protocol/            # framework-free wire types (wire ↔ companions)
+│   ├── mitos-core/                # dispatcher, `Bundle`, replicate-router test surface, in-tree `Indexer` trait
+│   ├── mitos-protocol/            # framework-free wire types (subscribe, interest, wire frames)
 │   ├── mitos-data-plane/          # typed chain-data lookups over Dolos
-│   ├── mitos-platform/            # wasm module runtime (v2 dispatch, aux-data cache, Maestro fallback)
-│   ├── mitos-companion/           # CF Worker DO runtime SDK (companion-side)
+│   ├── mitos-platform/            # wasm module runtime (v2 dispatch, aux-data cache, Maestro fallback, dialer)
+│   ├── mitos-companion/           # CF Worker DO runtime SDK (companion-side; HTTP apply / recapture)
 │   ├── mitos-community-events/    # shared event types for community modules
+│   ├── mitos-module-kit/          # module-side helpers (budget limiter, page sizer, re-entrant chunking)
+│   ├── mitos-dex-decode/          # shared DEX datum decoders (cswap / splash)
+│   ├── mitos-vesting-decode/      # shared vesting datum decoders (Shield, CrowdLock)
 │   └── none-match-indexer/        # residual-pass coordinator for the synchronised dispatcher
 ├── community-modules/             # wasm modules loaded at bundle startup
 │   ├── asset-metadata-update/
@@ -132,10 +153,10 @@ mitos/
 ├── bundles/
 │   └── default/                   # composite binary: Dolos + Platform v2 runtime
 ├── tools/
-│   ├── mitos-admin/               # admin HTTP client (`health`; legacy subscribe routes retired)
+│   ├── mitos-admin/               # admin HTTP client (modules, recapture, emissions, companions)
 │   ├── mitos-build/               # builds wasm module artifacts + manifests
 │   ├── mitos-run/                 # local fixture-driven module test runner
-│   ├── mitos-tail/                # observability CLI for the CF replication path
+│   ├── mitos-tail/                # WS CBOR client for the `/replicate/{indexer}` test surface
 │   ├── capture-block/             # capture chain blocks for tests
 │   └── diff-collection-ownership/ # parallel-run convergence diff harness
 └── docs/
@@ -199,10 +220,10 @@ process-wide concurrent Maestro requests.
 
 ## Testing
 
-End-to-end recipes for exercising the CF replication path —
-protocol-only loop with `mitos-tail`, full mitos↔CF DO round-trip,
-and the parallel-run convergence diff against an existing CF
-Worker indexer — are in [`docs/TESTING.md`](docs/TESTING.md).
+End-to-end recipes for exercising a running host + community
+modules + a companion — bring-up of a bundle with wasm-module
+hosting, end-to-end mitos → CF companion delivery, forced
+recapture — are in [`docs/TESTING.md`](docs/TESTING.md).
 
 Local module-level testing without the production host or a Dolos
 snapshot uses `mitos-run` against fixture-driven inputs — see
@@ -222,8 +243,8 @@ start here:
   walkthrough using current tooling (`mitos-build`, `mitos-admin`,
   `mitos-companion`).
 - [`docs/HOWTO_CONSUMING_A_COMMUNITY_MODULE.md`](docs/HOWTO_CONSUMING_A_COMMUNITY_MODULE.md)
-  — companion-side trait surface, `on_recapture` hook, multi-target
-  subscribe, WS Hibernation + emission-id semantics.
+  — companion-side trait surface, `client_id` + `on_recapture`
+  hooks, multi-target subscribe, HTTP apply / recapture delivery.
 - [`docs/HOWTO_TESTING_COMMUNITY_MODULES.md`](docs/HOWTO_TESTING_COMMUNITY_MODULES.md)
   — fixture-driven local runs via `mitos-run`.
 - [`docs/HOWTO_DEBUG_TRAPS.md`](docs/HOWTO_DEBUG_TRAPS.md) /
@@ -241,7 +262,9 @@ If you want to **understand mitos** rather than run it, read in this order:
 5. [`docs/strategy/LAYERED_RESPONSIBILITIES.md`](docs/strategy/LAYERED_RESPONSIBILITIES.md) — worker vs community module vs in-tree crate.
 6. [`docs/strategy/MITOS_COMPANION_PATTERN.md`](docs/strategy/MITOS_COMPANION_PATTERN.md) — the paired-deployable thesis.
 7. [`docs/strategy/MITOS_COMPANION_RUNTIME_V1.md`](docs/strategy/MITOS_COMPANION_RUNTIME_V1.md) — the CF-side SDK.
-8. [`docs/design/CF_REPLICATION.md`](docs/design/CF_REPLICATION.md) — the WS protocol.
-9. [`docs/design/RECAPTURE.md`](docs/design/RECAPTURE.md) — coordinated state rebuild.
-10. [`docs/design/DOMAIN_REFACTOR.md`](docs/design/DOMAIN_REFACTOR.md) — the Mint / Burn / AssetMovement domain taxonomy + synchronised-dispatcher rationale.
-11. [`docs/strategy/MODULE_COMPOSITION.md`](docs/strategy/MODULE_COMPOSITION.md) — upstream-module-dependency roadmap item.
+8. [`docs/design/RECAPTURE.md`](docs/design/RECAPTURE.md) — coordinated state rebuild.
+9. [`docs/design/WASM_BUDGET_CHUNKING.md`](docs/design/WASM_BUDGET_CHUNKING.md) — re-entrant `rebootstrap` + chunked snapshot emission for large policies.
+10. [`docs/design/DIALER_CONCURRENCY.md`](docs/design/DIALER_CONCURRENCY.md) — partition-keyed parallel HTTP delivery.
+11. [`docs/design/DOMAIN_REFACTOR.md`](docs/design/DOMAIN_REFACTOR.md) — the Mint / Burn / AssetMovement domain taxonomy + synchronised-dispatcher rationale.
+12. [`docs/design/CF_REPLICATION.md`](docs/design/CF_REPLICATION.md) — original WS replication wire shapes (historical; superseded by HTTP delivery, retained as protocol reference).
+13. [`docs/strategy/MODULE_COMPOSITION.md`](docs/strategy/MODULE_COMPOSITION.md) — upstream-module-dependency roadmap item.

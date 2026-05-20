@@ -210,8 +210,14 @@ ServerMessage::RecaptureDone {
     /// completes. Typically the host's current tip cursor at
     /// the moment bootstrap_v2 finished its UTxO walk.
     cursor: ChainPoint,
+    /// The source module whose recapture is now complete.
+    /// Matches the `module` carried in the preceding
+    /// `Recapture` frame so multi-target companions know which
+    /// channel just finished refilling.
+    module: String,
     /// How many synthetic events the host emitted for this
-    /// companion's view. Useful for logs + operator feedback.
+    /// companion's view. Best-effort counter — companions MUST
+    /// NOT depend on the value for correctness.
     events_emitted: u64,
 }
 ```

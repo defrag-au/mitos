@@ -1,11 +1,19 @@
 # Minibf bridge — expose Blockfrost-compatible queries from mitos
 
-> **Status: design, not implemented.** Trigger: cnft.dev-workers
-> `wallet-viewer` worker needs "all assets at this stake address"
-> and we'd rather not take a Maestro dependency for it. minibf
-> (Dolos's Blockfrost-shaped HTTP API) is already a transitive dep
-> via `dolos = "v1.0.3"` and exposes a composable axum router —
-> wiring it into the existing bundle is mechanical.
+> **Status: shipped (2026-05).** The Option B wiring described
+> in this doc landed in `bundles/default/src/main.rs:127-133`:
+> the bundle builds Dolos's `dolos_minibf::build_router(cfg, domain)`
+> layered with the bundle's `require_auth` middleware and mounts it
+> at `/minibf` via `bundle.nest_extra("/minibf", router)`. Auth is
+> via the bundle's shared `MITOS_AUTH_TOKEN`, not the `x-mitos-key`
+> env-var sketch from the original draft.
+>
+> Original trigger preserved below for design rationale: the
+> cnft.dev-workers `wallet-viewer` worker needs "all assets at this
+> stake address" and we'd rather not take a Maestro dependency for
+> it. minibf (Dolos's Blockfrost-shaped HTTP API) is already a
+> transitive dep via the workspace Dolos pin and exposes a
+> composable axum router.
 
 Cross-references:
 - `MITOS_DATA_PLANE_API.md` — sister API. data-plane is the

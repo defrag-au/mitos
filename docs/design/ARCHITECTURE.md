@@ -1,5 +1,28 @@
 # Architecture
 
+> **Status (2026-05): partial rewrite.** The "Indexer trait surface"
+> and "How indexers compose in a bundle" sections below describe the
+> v1 static-bundle model — the three legacy in-tree indexers
+> (`collection-ownership`, `marketplace`, `mint-burn`) and the
+> `Indexer` trait sketch retired once consumers cut over to
+> platform-v2 wasm community modules. The current dispatch unit is
+> the eUTXO event filtered by declared interest, delivered to wasm
+> modules via `handle-events`, with CF Worker companions consuming
+> module emissions over HTTP. Current authorities:
+>
+> - `docs/strategy/MITOS_PLATFORM_V2.md` — runtime model + WIT ABI
+> - `docs/strategy/MITOS_COMPANION_PATTERN.md` — the host/companion split
+> - `docs/strategy/COMMUNITY_MODULES.md` — community-modules-first preference
+> - `crates/mitos-platform/wit-v2/world.wit` — exact ABI
+> - `bundles/default/src/main.rs` — actual bundle composition (residual
+>   `none-match-indexer` + wasm-module hosting)
+> - `crates/mitos-core/src/indexer.rs` — the live `Indexer` trait
+>
+> The "Why embed Dolos as a library," "Why one process per box,"
+> "Storage discipline," "Reorg correctness," "Where mitos lives in
+> the stack," and "The Dolos coupling" sections remain accurate
+> architectural rationale and are kept verbatim.
+
 This is a focused implementation companion to
 `~/code/defrag/cnft.dev-workers/docs/design/CARDANO-SHIKU.md` — the broader
 architectural rationale lives there. This doc covers the implementation
@@ -8,12 +31,16 @@ choices specific to this framework.
 ## One-paragraph summary
 
 A bundle is a single OS process that links Dolos's chain-follower + state
-store + secondary indexes as Rust library code, and dispatches every chain
-tip event (Apply, Undo, Mark) to one or more `Indexer` trait implementations
-linked into the same binary. Each indexer owns its own decoder, materialized
-view, and HTTP routes; all indexers share the chain data plane via direct
-function calls into Dolos's `Domain` trait. The result is one process per
-deployment unit, with N modules contributing functionality.
+store + secondary indexes as Rust library code, dispatches every chain
+tip event through the platform-v2 eUTXO event composer, and runs N wasm
+community modules in-process via wasmtime. Each module declares an
+interest set; the platform filters TXs against it and dispatches typed
+events (`produced`, `consumed`, `referenced`, `minted`, `tx-context`,
+plus `tick` and `rollback` markers) to the module's `handle-events`
+export. Module emissions are POSTed to subscribed CF Worker companions
+via HTTP. One process per deployment unit, with N wasm modules
+contributing functionality and one residual `none-match-indexer` for
+asset-movement coverage no specific-domain module claims.
 
 ## Why embed Dolos as a library
 
@@ -50,74 +77,54 @@ points at trust: Balius supports untrusted third-party modules; this
 framework is for trusted first-party code where sandboxing isn't the
 constraint.
 
-## The Indexer trait surface
+## The Indexer trait surface (historical)
 
-Three methods. Specifics in `INDEXER_TRAIT.md`.
+The original `Indexer` trait sketch — three methods (`name`,
+`bootstrap`, `handle_event`, `routes`) on a `Box<dyn Indexer>` —
+described the v1 static-bundle model that has been retired in
+favour of wasm community modules. The live `Indexer` trait at
+`crates/mitos-core/src/indexer.rs` is the residual surface for the
+`none-match-indexer` coordinator and the unified-subscribe bridge;
+new chain-recognition code does **not** implement it. See
+`INDEXER_TRAIT.md` for the current shape and
+`docs/design/DOMAIN_REFACTOR.md` for the model shift.
 
-```rust
-trait Indexer: Send + Sync {
-    fn name(&self) -> &'static str;
+## How modules compose in a bundle
 
-    /// One-time pull of current state at startup.
-    /// Returns the chain point we caught up to.
-    async fn bootstrap(&mut self, domain: &Domain) -> Result<ChainPoint>;
-
-    /// Apply or roll back a single block, or update cursor on Mark.
-    async fn handle_event(&mut self, domain: &Domain, event: &TipEvent) -> Result<()>;
-
-    /// HTTP routes the bundle should mount for this indexer.
-    fn routes(&self) -> axum::Router;
-}
-```
-
-Backed by:
-
-- **Bootstrap**: `domain.indexes().utxos_by_policy(&p)`,
-  `domain.state().get_utxos(refs)`, `domain.query().plutus_data(&hash)` —
-  all in-process, no gRPC.
-- **Apply**: `TipEvent::Apply(ChainPoint, RawBlock)` carries the full
-  block CBOR. Indexers parse via `pallas-traverse`, find outputs at
-  watched addresses, decode datums (inline OR from witness set —
-  hash-referenced datums are in the same TX). No round-trip to Dolos.
-- **Undo**: `TipEvent::Undo(ChainPoint, RawBlock)` carries the rolled-back
-  block — we have the inverse operation directly. No op-log needed at
-  the framework level.
-- **Mark**: cursor checkpoint. Each indexer persists its position on its
-  own cadence.
-
-## How indexers compose in a bundle
-
-A bundle's `main.rs` looks roughly like:
+A bundle's `main.rs` (see `bundles/default/src/main.rs`) is small
+and almost entirely composition:
 
 ```rust
-let domain = setup_domain(&config)?;          // Dolos init
+let domain = mitos_core::setup_domain(&config)?;
+let mut bundle = Bundle::new(domain, config, listen, data_dir);
 
-let mut indexers: Vec<Box<dyn Indexer>> = vec![
-    Box::new(JpgCoIndexer::new(&config)?),
-    Box::new(JpgListingsIndexer::new(&config)?),
-    // ... other indexers this bundle includes
-];
+// Residual pass: emits AssetMovement events for asset transfers
+// that no specific-domain module claimed. Switches the dispatcher
+// to synchronised mode.
+let claim_coordinator = bundle.enable_residual_pass();
+bundle.add_indexer(NoneMatchIndexer::new(claim_coordinator));
 
-// bootstrap each
-for ix in &mut indexers {
-    let from = ix.bootstrap(&domain).await?;
-    // spawn its event loop
-    spawn_dispatcher(ix.box_clone(), domain.watch_tip(Some(from))?);
-}
+// Wasm-module hosting + community-module auto-load.
+bundle.enable_modules(modules_dir);
+bundle.enable_community_modules(community_modules_dir);
 
-// merge HTTP surfaces
-let app = indexers.iter().fold(Router::new(), |r, ix| r.merge(ix.routes()));
-axum::serve(listener, app).await
+bundle.run(exit).await?;
 ```
 
-The dispatcher is a tokio task per indexer that loops on
-`TipSubscription::next_tip().await`, calls `ix.handle_event(&domain, &ev)`,
-logs errors, retries forever.
+The chain-sync pipeline feeds the platform's TX-claim coordinator,
+which composes each TX into a `DispatchEvent` stream. Each wasm
+module's interest predicates are evaluated host-side; matching
+events are dispatched to the module's `handle-events` export.
+Module emissions accumulate in a per-module `EmissionsStore`,
+and a per-module dialer pool POSTs them to subscribed companions
+over HTTP. See `docs/design/DIALER_CONCURRENCY.md` for the
+parallel-keyed delivery model.
 
-Per-indexer subscriptions are cheap because Dolos's `DomainAdapter` uses
-a `tokio::sync::broadcast::Sender<TipEvent>` internally — every
-subscriber gets every event independently, with the broadcast queue depth
-being the only shared resource.
+The trait dispatch shape is preserved internally for the residual
+`none-match-indexer` and the unified-subscribe bridge — but adding
+recognition for a new contract or token shape is now a matter of
+adding a wasm module under `community-modules/<name>/` (or in a
+dApp's own repo) rather than implementing the `Indexer` trait.
 
 ## Storage discipline per indexer
 

@@ -1,11 +1,11 @@
 # HOWTO: consume a community module from a Cloudflare Worker
 
 You're writing a CF Worker companion that wants events from a
-mitos-hosted community module (e.g. `jpg-co`, or — Phase 4 of the
-relayering plan — `wayup-co`). This doc walks through the minimal
-declaration surface, the boot-time handshake, and the operational
-flows (recapture, debugging) for the community-modules-first
-shape.
+mitos-hosted community module (e.g. `jpg-store-offer`,
+`asset-transfer`, `holder-distribution`). This doc walks through
+the minimal declaration surface, the boot-time handshake, and the
+operational flows (recapture, debugging) for the
+community-modules-first shape.
 
 If you're building a *private* per-dApp wasm module that ships in
 the worker's own repo, see `HOWTO_FIRST_MODULE.md` — different
@@ -27,21 +27,29 @@ Cross-references:
 
 ## What the worker actually expresses
 
-A companion's "needs declaration" is **three names and one
-typed event**:
+A companion's "needs declaration" is **three names, one typed
+event, and a client id**:
 
 | Declaration | Where | Example |
 |---|---|---|
-| Companion identity | `MitosCompanion::NAME` | `"jpg-co"` |
-| Subscribe target name | derived from `NAME` by default, or override | `Module("jpg-co")` |
-| Channel routing name | `MitosChannel::NAME` | `"jpg-co"` |
-| Decoded event type | `MitosChannel::Event` | `JpgCoChange` |
+| Companion identity | `MitosCompanion::NAME` | `"jpg-store-offer"` |
+| Subscribe target name | derived from `NAME` by default, or override | `Module("jpg-store-offer")` |
+| Channel routing name | `MitosChannel::NAME` | `"jpg-store-offer"` |
+| Decoded event type | `MitosChannel::Event` | `JpgStoreOffer` |
+| Client id | `MitosCompanion::client_id` (or SDK derives) | `"jpgsm.cnft.dev"` |
 
 Nothing else — no version pin, no contract-address list (those live
 in the module's own `<name>.toml`), no schema reference.
 Wire-format compatibility is enforced by both sides depending on
 the same `mitos_community_events::<name>` submodule for typed
 event payloads.
+
+`client_id` is required so multiple consumers can share the same
+`companion_key` without colliding in the host's per-companion
+store — e.g. a dev worker and a prod worker subscribed to the
+same module + key. The SDK derives a sensible default from the
+dial-back URL host; override only when that isn't unique. See
+`docs/design/MULTI_CLIENT_COMPANIONS.md`.
 
 ## Minimal companion shape
 
@@ -51,34 +59,35 @@ load-bearing parts:
 
 ```rust
 use async_trait::async_trait;
-use mitos_community_events::jpg_co::JpgCoChange;
+use mitos_community_events::jpg_store_offer::JpgStoreOffer;
 use mitos_companion::{Ctx, MitosChannel, MitosChannelDyn, MitosCompanion};
 
-const COMPANION_NAME: &str = "jpg-co";
+const COMPANION_NAME: &str = "jpg-store-offer";
 
-pub struct JpgCoImpl { /* per-DO state */ }
+pub struct JpgStoreOfferImpl { /* per-DO state */ }
 
-impl MitosCompanion for JpgCoImpl {
+#[async_trait(?Send)]
+impl MitosCompanion for JpgStoreOfferImpl {
     const NAME: &'static str = COMPANION_NAME;
     type Config = ();
 
     fn channels(&self) -> Vec<Box<dyn MitosChannelDyn>> {
-        vec![Box::new(JpgCoChannel { /* … */ })]
+        vec![Box::new(JpgStoreOfferChannel { /* … */ })]
     }
 
     // subscribe_targets() and initial_interests() defaults
-    // give us `Module("jpg-co")` + empty interest. No override
-    // needed for the single-community-module case.
+    // give us `Module("jpg-store-offer")` + empty interest.
+    // No override needed for the single-community-module case.
 }
 
-pub struct JpgCoChannel { /* … */ }
+pub struct JpgStoreOfferChannel { /* … */ }
 
 #[async_trait(?Send)]
-impl MitosChannel for JpgCoChannel {
-    const NAME: &'static str = "jpg-co";
-    type Event = JpgCoChange;
+impl MitosChannel for JpgStoreOfferChannel {
+    const NAME: &'static str = "jpg-store-offer";
+    type Event = JpgStoreOffer;
 
-    async fn apply_event(&self, ctx: &Ctx, event: JpgCoChange)
+    async fn apply_event(&self, ctx: &Ctx, event: JpgStoreOffer)
         -> mitos_companion::Result<()>
     {
         // SQL mutations, broadcast queueing, etc.
@@ -98,43 +107,49 @@ fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
 fn initial_interests(&self) -> Vec<Interest> {
     Vec::new()
 }
+fn client_id(&self) -> Option<String> {
+    None  // SDK derives from MITOS_REPLICATE_URL host
+}
 ```
 
-So a companion named `"jpg-co"` automatically subscribes to a
-module named `"jpg-co"`.
+So a companion named `"jpg-store-offer"` automatically subscribes
+to a module named `"jpg-store-offer"`.
 
 ## Multiple community modules
 
 When the worker wants events from more than one community module
-(e.g. covering both jpg.store and wayup COs), override
+(e.g. covering both offer and listing flows on jpg.store), override
 `subscribe_targets()` to widen the set:
 
 ```rust
 impl MitosCompanion for JpgStoreMirror {
-    const NAME: &'static str = "jpg-co";   // primary
+    const NAME: &'static str = "jpg-store-offer";   // primary
 
     fn subscribe_targets(&self) -> Vec<SubscribeTarget> {
         vec![
-            SubscribeTarget::Module { name: "jpg-co".into() },
-            SubscribeTarget::Module { name: "wayup-co".into() },
+            SubscribeTarget::Module { name: "jpg-store-offer".into() },
+            SubscribeTarget::Module { name: "jpg-store-listing".into() },
         ]
     }
 
     fn channels(&self) -> Vec<Box<dyn MitosChannelDyn>> {
         vec![
-            Box::new(JpgCoChannel { /* … */ }),
-            Box::new(WayupCoChannel { /* … */ }),
+            Box::new(JpgStoreOfferChannel { /* … */ }),
+            Box::new(JpgStoreListingChannel { /* … */ }),
         ]
     }
 }
 ```
 
-Each target gets its own outbound WS. Mitos substitutes
-`{target}` into `MITOS_REPLICATE_URL` (see below) so the WSes
-land at distinct paths on the worker
-(`/_internal/replicate-jpg-co`, `/_internal/replicate-wayup-co`).
-The runtime's WS Hibernation tags each socket with the target
-name; inbound frames route to the channel whose `NAME` matches.
+Each target gets its own dial-back POST stream. Mitos substitutes
+`{target}` (the subscribe-target's name) and `{op}` (`apply` or
+`recapture`) into `MITOS_REPLICATE_URL` (see below) so POSTs land
+at distinct paths on the worker (e.g.
+`/_internal/apply-jpg-store-offer`,
+`/_internal/apply-jpg-store-listing`,
+`/_internal/recapture-jpg-store-offer`, etc.). The runtime parses
+the URL path's channel suffix and routes the decoded event to the
+`MitosChannel` whose `NAME` matches.
 
 ## When do you need `initial_interests()`?
 
@@ -167,16 +182,17 @@ secrets_store_secrets = [
 MITOS_HOST_URL = "https://mitos.defrag.cc"
 
 # Dial-back URL template. Mitos substitutes:
-#   {target} → the subscribe-target's name (e.g. "jpg-co")
+#   {op}     → "apply" or "recapture" per request
+#   {target} → the subscribe-target's name (e.g. "jpg-store-offer")
 #   {key}    → the companion key at dial time
-# Single-target companions resolve to a single WS path; multi-target
-# companions get one WS per target, each at a distinct path that
-# matches a MitosChannel's NAME.
-MITOS_REPLICATE_URL = "wss://jpgsm.cnft.dev/_internal/replicate-{target}"
+# All three placeholders MUST be present so apply / recapture
+# URLs differ and multi-target companions land at distinct paths.
+MITOS_REPLICATE_URL = "https://jpgsm.cnft.dev/_internal/{op}-{target}?key={key}"
 
 [assets]
 run_worker_first = [
-    # /_internal/replicate-* is where mitos's dial-back WS lands.
+    # /_internal/apply-* and /_internal/recapture-* are where
+    # mitos's dial-back POSTs land.
     # /_internal/wake is the runtime's "fresh subscribe" trigger.
     "/_internal/*",
     # /_admin/* covers the dApp's operator-facing endpoints
@@ -188,7 +204,7 @@ run_worker_first = [
 bindings = [
     # Class name is locked once shipped — CF storage is keyed by
     # class. Rename = orphaned state.
-    { name = "JPG_CO", class_name = "MitosJpgCoDO" },
+    { name = "JPG_STORE_OFFER", class_name = "MitosJpgStoreOfferDO" },
 ]
 ```
 
@@ -200,31 +216,37 @@ What happens when a fresh DO instance comes up:
    reads the companion's persisted registration row from local
    SQL storage (`mitos_companion_registration`).
 2. **Subscribe POST.** Runtime sends `POST {MITOS_HOST_URL}/api/companions/subscribe`
-   with the companion's `subscribe_targets()` +
-   `initial_interests()` payload, authenticated via
+   with a CBOR-encoded `SubscribeRequest` carrying the companion's
+   `subscribe_targets()`, `initial_interests()`, `companion_key`,
+   `client_id`, and `resume_from` cursor — authenticated via
    `MITOS_AUTH_TOKEN`.
 3. **Mitos accepts.** For each target:
    - `SubscribeTarget::Module { name }` → mitos validates the
      name exists under `<modules_dir>/<name>/`.
    - The companion is persisted under
-     `<modules_dir>/<name>/companions/<companion_key>` (per-module
-     companion registry).
-4. **Dial-back.** `CompanionDialer` opens an outbound WS to the
-   substituted `MITOS_REPLICATE_URL`. Each target gets its own
-   socket.
+     `<modules_dir>/<name>/companions/<client_id>/<companion_key>.cbor`
+     (per-module, per-client companion registry).
+4. **Dialer launches.** `CompanionDialer` spawns one drain task
+   per `(module, companion)` pair. The task substitutes `{op}`,
+   `{target}`, `{key}` into `MITOS_REPLICATE_URL` and POSTs
+   pending emissions one at a time.
 5. **Steady state.** As the wasm community module emits events,
-   they flow through mitos's per-module broadcast channel →
-   outbound WS → the worker's `/_internal/replicate-<target>`
-   route → runtime hibernation tags the frame `<target>` → routes
-   to the `MitosChannel` whose `NAME` matches → `apply_event`
-   decodes the CBOR into the channel's `type Event`.
+   they accumulate in the per-module `EmissionsStore`. The dialer
+   POSTs each one to `<MITOS_REPLICATE_URL>` substituted with
+   `op=apply` + `target=<channel>` → the worker's
+   `/_internal/apply-<target>` route → the runtime decodes the
+   CBOR body, dispatches to the matching channel's `apply_event`,
+   advances the persisted cursor, and returns 200 (Ack), 422
+   (Nack — apply errored), or 5xx (transport retry).
 
 Watch the journal during a worker deploy and you should see
 something like:
 
 ```
-mitos_platform::companions: subscribe accepted module=jpg-co companion_key=jpg-co
-mitos_platform::dialer: companion ws connected module=jpg-co target=wss://jpgsm.cnft.dev/_internal/replicate-jpg-co
+mitos_platform::companions: subscribe accepted module=jpg-store-offer
+  client_id=jpgsm.cnft.dev companion_key=jpg-store-offer
+mitos_platform::dialer: dial loop started target=jpg-store-offer
+  companion=jpg-store-offer
 ```
 
 ## Recapture: resetting state for a fresh re-emission
@@ -266,8 +288,8 @@ scope by `source_module` per the schema contract in
 
 ```rust
 #[async_trait(?Send)]
-impl MitosCompanion for JpgCoImpl {
-    const NAME: &'static str = "jpg-co";
+impl MitosCompanion for JpgStoreOfferImpl {
+    const NAME: &'static str = "jpg-store-offer";
     type Config = ();
 
     async fn on_recapture(
@@ -308,7 +330,7 @@ times out the per-companion ACK.
 From a machine with access to mitos's admin endpoint:
 
 ```bash
-mitos-admin --token "$MITOS_AUTH_TOKEN" recapture jpg-co \
+mitos-admin --token "$MITOS_AUTH_TOKEN" recapture jpg-store-offer \
     --reason "schema migration post-deploy"
 ```
 
@@ -319,25 +341,26 @@ ssh root@<mitos-host> 'TOKEN=$(grep ^MITOS_AUTH_TOKEN= /etc/default/mitos-mainne
     curl -sS -X POST \
         -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" \
-        -d "{\"reason\": \"schema migration post-deploy\"}" \
-        http://127.0.0.1:8181/_admin/modules/jpg-co/recapture | jq'
+        -d "{\"companion\": \"*\", \"reason\": \"schema migration post-deploy\"}" \
+        http://127.0.0.1:8181/_admin/modules/jpg-store-offer/recapture | jq'
 ```
 
 Expected response shape:
 
 ```json
 {
-  "module": "jpg-co",
+  "module": "jpg-store-offer",
   "companions_targeted": 1,
-  "events_emitted": 0,
+  "events_emitted": 1247,
   "duration_ms": 5276
 }
 ```
 
-`events_emitted` is `0` in v1 — the counter is wired but not
-populated; companions MUST NOT depend on the value. The
-load-bearing signal is the bootstrap walk's journal output
-which shows actual UTxO counts dispatched.
+`events_emitted` is best-effort — counts refill events for this
+companion's view during the recapture. The protocol is correct
+without it (the Apply stream does all the load-bearing work); the
+counter is for ops visibility. Companions MUST NOT depend on the
+value for correctness.
 
 Verifying end-to-end via the journal:
 
@@ -365,7 +388,7 @@ corrected.
 
 The v1 endpoint targets **all** subscribers of a module
 (`companion=*` — the only value accepted). With one subscriber
-per community module today (jpg-store-mirror → jpg-co), this is
+per community module today (jpg-store-mirror → jpg-store-offer), this is
 fine. With multiple subscribers, all of them get refilled
 simultaneously — disruptive but correct.
 
@@ -433,27 +456,31 @@ ssh root@<mitos-host> 'journalctl -u mitos-mainnet -f --no-pager | \
 
 If the module is running and emitting, but no events reach the
 worker, suspect the dial-back URL. Re-check `MITOS_REPLICATE_URL`
-and make sure `/_internal/replicate-<target>` is listed in the
-worker's `run_worker_first` so the path doesn't fall through to
-the SPA asset handler.
+(must include all three of `{op}`, `{target}`, `{key}` placeholders),
+and make sure `/_internal/*` is listed in the worker's
+`run_worker_first` so the dial-back POSTs don't fall through to
+the SPA asset handler. Also inspect the host-side emissions log:
+
+```bash
+mitos-admin --token "$MITOS_AUTH_TOKEN" \
+    emissions --module <name> --status pending
+```
+
+Rows stuck in `pending` indicate the dialer is delivering but the
+worker is returning non-2xx (or unreachable).
 
 ### Worker subscribe POST fails
 
-```bash
-# Test the subscribe endpoint manually with the same auth the
-# worker uses. Replace <key>, <target>, etc.
-TOKEN=<MITOS_AUTH_TOKEN value>
-curl -X POST \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "companion_key": "test-companion",
-      "targets": [{"kind": "Module", "name": "jpg-co"}],
-      "interests": [],
-      "dial_back_url": "wss://example.invalid/_internal/replicate-{target}"
-    }' \
-    https://mitos.defrag.cc/api/companions/subscribe
-```
+The subscribe endpoint takes CBOR (not JSON) and the wire shape
+mirrors `mitos_protocol::SubscribeRequest`. The runtime encodes
+this for you; if you need to reproduce a subscribe manually,
+easiest is to inspect a successful subscribe from the worker side
+(`tracing::info!` line at runtime startup includes the full
+target + client_id payload).
+
+The host responds with 200 + CBOR `SubscribeResponse` on success;
+on failure, it returns JSON (`{ "error": ..., "code": ... }`) so
+operators can read errors directly from `curl`.
 
 Common causes:
 - Wrong bearer token (must match `/etc/default/mitos-mainnet`'s
@@ -463,6 +490,10 @@ Common causes:
 - Module not yet activated (auto-load skipped it because the
   `community-modules/<name>/build/` directory is missing or
   manifests don't validate).
+- `client_id` empty or whitespace-only — server rejects with HTTP
+  400. Set `MitosCompanion::client_id()` explicitly, or ensure
+  `MITOS_REPLICATE_URL` has a parseable host the SDK can fall
+  back to.
 
 ### The Phase 2 acceptance gate (auto-load idempotency)
 

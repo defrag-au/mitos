@@ -336,23 +336,25 @@ this in (tracked separately). In summary:
 ## Work breakdown / sequencing
 
 1. **LP decomposition** — DONE, deployed (slice 1).
-2. **Generalised holder identity** — `HolderId` enum; ledger key
-   handles enterprise creds; stop the `None`-collapse. Wire
-   change.
-3. **`role` field** — module tags `Wallet` / `DexPool` /
-   `VestingContract`.
-4. **Vesting-decode crate** — extract Shield + CrowdLock datum
-   decoders from `vesting-tracker`.
-5. **Vesting decomposition phase** in `holder-distribution`
-   (cold-start + `rebootstrap`); `HolderEntry.vests`.
+2. **Generalised holder identity** — DONE. `HolderId` enum is
+   live (`Stake` / `Enterprise`); ledger key handles enterprise
+   creds.
+3. **`role` field** — DONE. Module tags `Wallet` / `DexPool` /
+   `VestingContract` via `HolderRole`.
+4. **Vesting-decode crate** — DONE. `mitos-vesting-decode`
+   carries the Shield + CrowdLock datum decoders;
+   `holder-distribution` consumes `decompose_vesting()`.
+5. **Vesting decomposition phase** in `holder-distribution` —
+   DONE. `HolderEntry.vests` is populated at cold-start and via
+   `rebootstrap`.
 6. **Worker** — consume `id` / `role` / `lp_amount` / `vests`;
    add burn classification; collapse the legacy `classify()`
-   heuristics onto `role` + config.
-7. **Verify** — dev donut vs prod, every band.
+   heuristics onto `role` + config. **Remaining work.**
+7. **Verify** — dev donut vs prod, every band. **Remaining work.**
 
-Slices 2–6 are independent of one another only loosely; the
-identity generalisation (step 2) is a prerequisite for both
-burn (step 6) and a clean `role` (step 3).
+Steps 2–5 landed alongside the chunked-snapshot work
+(`docs/design/WASM_BUDGET_CHUNKING.md`); slices 6 + 7 are the
+consumer-side cutover.
 
 ## Open questions
 

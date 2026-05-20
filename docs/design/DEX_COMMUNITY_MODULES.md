@@ -58,13 +58,17 @@ that family's script addresses, decoding its datums for rich
 event payloads. Same posture as `jpg-store-{listing,sale,offer}`
 for marketplace work.
 
-For PR 1 / Phase 1:
+Shipped in Phase 1:
 
-- `minswap-dex` — Minswap V1 + V2 contracts (one module
-  spanning both versions; same brand family)
 - `cswap-dex` — CSWAP contracts (all 82 pools at single script
   address)
 - `splash-dex` — Splash V1 / V2 / V3 contracts
+
+Planned but not yet built:
+
+- `minswap-dex` — Minswap V1 + V2 contracts. The brand-family
+  approach below applies once the module lands; deferred while
+  cswap + splash bed in.
 
 ### Why per-brand, not hybrid
 
@@ -130,8 +134,16 @@ pub struct Swap {
     /// version).
     pub contract_version: Option<String>,
     /// Bech32 address of the wallet that received the
-    /// `asset_out` (= the user).
+    /// `asset_out` (= the user). For aggregator-routed swaps
+    /// this may be an aggregator-controlled intermediary, not
+    /// the originating wallet — see `originator_address` below.
     pub swapper_address: String,
+    /// Bech32 address of the wallet that *initiated* the swap,
+    /// surfaced separately from `swapper_address` for aggregator
+    /// routes that funnel user funds through their own
+    /// intermediary. `None` when the route is direct (the
+    /// initiator and the recipient are the same).
+    pub originator_address: Option<String>,
     /// What the swapper sent in. Lovelace or native asset.
     pub asset_in: SwapAsset,
     /// What the swapper got out.

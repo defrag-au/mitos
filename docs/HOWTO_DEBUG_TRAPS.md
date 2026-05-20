@@ -12,8 +12,9 @@ platform supports today: capture the failing data plane state
 on the host, fetch it as a fixture, replay locally with full
 debug symbols, then iterate without touching production. It is
 the path to use when a deployed module won't `init` or its
-`handle_event` traps on a specific block — every step below was
-exercised end-to-end on the jpg-co bootstrap trap of 2026-05.
+`handle_events` (v2 ABI; plural — one batch per TX) traps on a
+specific block — every step below was exercised end-to-end on
+the jpg-store-offer bootstrap trap of 2026-05.
 
 The process is designed to need no input from a senior
 operator: a fresh context can follow this top-to-bottom and get
@@ -24,7 +25,7 @@ Cross-references:
 - `crates/mitos-platform/src/trap_context.rs` — the in-host
   data-plane logger that captures fixtures
 - `tools/mitos-run/` — the local replayer
-- `strategy/MITOS_PLATFORM_V1.md` — what's being instantiated
+- `strategy/MITOS_PLATFORM_V2.md` — what's being instantiated
 - `HOWTO_FIRST_MODULE.md` — the shape of a module before it
   goes wrong
 
@@ -69,7 +70,7 @@ This tells you the trap is live and where it surfaces, but not
 
 ## Step 2 — Pull the trap fixture
 
-Every time `init()` (and, in a follow-up, `handle_event()`)
+Every time `init()` (and, in a follow-up, `handle_events()`)
 returns a wasm error, the host's `TrapContextLogger` snapshots
 every host-fn call the module made and serialises it to
 `<modules-dir>/<id>/last-trap.toml`. Pull it:
@@ -204,13 +205,13 @@ consumer repo's deploy script if it wraps that).
 
 ## What this doesn't cover yet
 
-- **`handle_event` traps**: the trap-context logger captures
-  data-plane calls during dispatch too, but the per-block CBOR
-  capture and `mitos-run --block` replay are follow-up work.
+- **`handle_events` traps**: the trap-context logger captures
+  data-plane calls during dispatch too, but the per-batch CBOR
+  capture and `mitos-run --events` replay are follow-up work.
   Today, dispatch traps surface as wasmtime errors in the
   follower's logs without an automatic fixture dump. When this
-  lands, the same workflow applies — fetch fixture, run with
-  `--block`, repro locally.
+  lands, the same workflow applies — fetch fixture, replay
+  locally.
 - **Cross-block lookups**: the fixture only captures host-fn
   calls the module made in the trapping pass. A module that
   calls `read_utxo` for a tx the host didn't surface in the

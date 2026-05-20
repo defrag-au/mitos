@@ -1,5 +1,26 @@
 # Holder Distribution Community Module
 
+> **Status (2026-05): historical baseline + superseded in
+> places.** The base shape described here shipped, but the
+> `HolderEntry` and event taxonomy have evolved past what this
+> doc describes:
+>
+> - `HolderEntry` now carries `{ id: HolderId, assets, lp_amount,
+>   role: HolderRole, vests: Vec<LockEntry> }` rather than the
+>   stake-cred-keyed `{ stake_cred_hex, assets }` sketch below.
+>   See `crates/mitos-community-events/src/holder_distribution.rs`.
+> - The single `Snapshot` event was replaced with a chunked
+>   `SnapshotBegin` → `SnapshotChunk` → `SnapshotEnd` sequence
+>   per `docs/design/WASM_BUDGET_CHUNKING.md`.
+> - LP + vesting decomposition is now performed **inside** the
+>   module, contradicting the "Edge case 2 — classification stays
+>   in the consumer" position below. See
+>   `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md` for the
+>   current model.
+>
+> Body retained for the original rationale + the
+> data-plane-host-fn justification, which both still hold.
+
 ## Goal
 
 A mitos community module that exposes the **current set of

@@ -121,7 +121,7 @@ Then mitos has done its job — the consumer is the suspect.
   is:
 
   ```bash
-  mitos-admin emissions-replay <emission-id>
+  mitos-admin emissions-replay --module <id> <emission-id>
   ```
 
   which flips the row back to `Queued`. The dialer picks it
@@ -146,16 +146,17 @@ mitos-admin get-module <id>     # last-trap line
 
 If it's clean, you've narrowed to two possibilities:
 
-1. **Dispatcher dropped the event.** Today, the data-plane
-   dispatcher silently drops `Consumed` events whose prior
-   output can't be resolved (`crates/mitos-data-plane/src/
-   dispatch.rs::build_tx_batch`, `filter_map` with `cloned()?`).
-   The biggest real-world trigger is the dolos archive horizon
-   — outputs from blocks past the prune window can't be
-   resolved by `read_utxo_from_archive`, so any TX that
-   consumes one of those outputs has its consume event
-   dropped before the module ever sees it. See
-   `design/EVENT_DELIVERY_RESILIENCE.md` for the planned fix.
+1. **Dispatcher emitted a `Consumed` with an unresolved prior
+   output.** The dispatcher no longer drops these (per
+   `design/EVENT_DELIVERY_RESILIENCE.md`, drop #1 was fixed):
+   when `read_utxo_from_archive` can't resolve a prior output
+   (typically because the producing block is past dolos's
+   archive horizon), the event still dispatches with a
+   `TypedOutput::unresolved()` placeholder. If your module's
+   handler treats unresolved priors as "skip silently," it can
+   look like the event was dropped when in fact it reached the
+   module. Add an `info!` / `debug!` log on the unresolved
+   branch so this case is visible.
 2. **Module decoded but silently skipped.** The wasm module's
    own logic dropped the event — e.g., datum CBOR didn't
    match the expected shape, address didn't match the watched
@@ -184,7 +185,7 @@ zombie rows from the silent drops. Don't try to surgically
 delete them — use `recapture`:
 
 ```bash
-mitos-admin recapture --module <id>
+mitos-admin recapture <id>
 ```
 
 `design/RECAPTURE.md` covers the protocol. Briefly: the host

@@ -1,10 +1,16 @@
 # Dialer concurrency — partition-keyed parallel delivery
 
-**Status: design draft** (2026-05-14). No code changes yet. The
-problem surfaced during a routine `jpg-store-offer` recapture:
-the post-WS HTTP dialer ([`dialer.rs:684-770`]) is strictly
-serial per `(companion, target)` and delivers at ~6 acks/sec on
-the production link to `jpgsm.cnft.dev`. The refill emitted
+**Status: shipped (2026-05).** Phases 1+2 landed; the dialer
+maintains a per-companion partition-keyed lane pool (default 8
+lanes via `MITOS_DIALER_LANES`, configurable per LaneConfig).
+The cursor-floor stamping follow-up remains deferred. The
+problem analysis + design rationale below are preserved as the
+audit trail for the work.
+
+The problem surfaced during a routine `jpg-store-offer` recapture:
+the post-WS HTTP dialer was strictly serial per `(companion,
+target)` and delivered at ~6 acks/sec on the production link to
+`jpgsm.cnft.dev`. The refill emitted
 ~7,300 events; the DO's `collection_offers` count climbed at the
 same ~6/s rate (348 → 518 across 30s of observation), making
 recapture a >15-minute operation where the WS-transport era took
@@ -54,9 +60,9 @@ Cross-references:
 ## Why the existing parallelism doesn't help
 
 The dialer is already parallel across `(companion, target)` —
-[`spawn_per_target_loop` at `dialer.rs:580`] launches one tokio
-task per companion's subscribed target, each with its own
-emissions table and its own HTTP client. But:
+the per-target spawn function in `crates/mitos-platform/src/dialer.rs`
+launches one tokio task per companion's subscribed target, each
+with its own emissions table and its own HTTP client. But:
 
 1. **Most modules have one production companion.** `jpg-store-offer`
    has exactly one: `jpgsm.cnft.dev`. So the per-companion
@@ -65,11 +71,12 @@ emissions table and its own HTTP client. But:
    channel (`OfferEvent`). The per-target parallelism doesn't
    split it either.
 3. **Within a `(companion, target)` task, drain is serial.**
-   [`drain_apply` at `dialer.rs:684`] is a `for row in queued`
-   loop — each row is `Queued → Pending → POST → ack/nack`
-   before the next row starts. Even if we added a second
-   companion or channel, this serial inner loop is the bottleneck
-   for any single high-volume stream.
+   The drain loop in `crates/mitos-platform/src/dialer.rs` was a
+   `for row in queued` loop — each row went
+   `Queued → Pending → POST → ack/nack` before the next row
+   started. Even with a second companion or channel, this serial
+   inner loop was the bottleneck for any single high-volume
+   stream. Phase 2 replaced this with the lane pool.
 
 Recapture concentrates everything into one stream, so it hits
 this worst case maximally. But the same ceiling applies to live

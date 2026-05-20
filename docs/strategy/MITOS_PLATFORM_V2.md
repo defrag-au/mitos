@@ -632,35 +632,43 @@ What the v2 contract guarantees:
 
 ## Migration from v1
 
-Hard cutover. Three modules to migrate:
-- `collection-ownership` — host-internal, owned in mitos repo
-- `marketplace` — host-internal, owned in mitos repo
-- `jpg-co` — external (cnft.dev-workers), uses companion pattern
+> **Completed (2026-05).** All three steps below shipped and the
+> v1 dispatch path was removed. The narrative is retained as the
+> audit trail.
 
-Order of operations:
-1. Land WIT v2 in `mitos-platform/wit/world.wit` as a parallel
-   world (`mitos-module-v2`). Old world stays for v1 modules
-   during the transition.
-2. Implement v2 dispatch path in `mitos-platform`:
-   - Block decoder → Interest filter → per-TX event batches
+Hard cutover. Three modules were migrated:
+- `collection-ownership` — host-internal, owned in mitos repo —
+  retired in favour of `asset-transfer` + `none-match-indexer`
+  + per-consumer companion projections.
+- `marketplace` — host-internal, owned in mitos repo — retired
+  in favour of `jpg-store-{listing,offer,sale}` community
+  modules.
+- `jpg-co` — external (cnft.dev-workers), companion pattern —
+  promoted to the `jpg-store-offer` community module under
+  `mitos/community-modules/`.
+
+Order of operations (as executed):
+1. Landed WIT v2 in `mitos-platform/wit-v2/world.wit` as a
+   parallel world (`mitos-module-v2`). The v1 world was
+   retained briefly for the transition.
+2. Implemented the v2 dispatch path in `mitos-platform`:
+   - Block decoder → Interest filter → per-TX event batches.
    - Bootstrap orchestration: `utxos_by_address` walk →
-     synthesise events per producing-TX → dispatch
-   - Rollback emission on `TipEvent::Undo`
-   - `bootstrap_cursor` persistence in `ModuleStorage`
-3. Wire ABI version handshake to route v2 modules through
-   v2 dispatch and v1 modules through the existing path.
-4. Migrate `jpg-co` first — smallest, has captured trap
-   fixtures we can use as regression tests via `mitos-run`.
-   Validate the bootstrap-as-events path against
-   `last-trap.toml` from the v1 trap.
-5. Migrate `collection-ownership` and `marketplace`.
-6. Delete v1 dispatch path; remove `block-context` resource
-   from the WIT.
+     synthesise events per producing-TX → dispatch.
+   - Rollback emission on `TipEvent::Undo`.
+   - `bootstrap_cursor` persistence in `ModuleStorage`.
+3. Wired the ABI version handshake to route v2 modules through
+   v2 dispatch and v1 modules through the legacy path.
+4. Migrated `jpg-co` first (smallest, with captured trap fixtures
+   for regression tests via `mitos-run`); validated the
+   bootstrap-as-events path against `last-trap.toml`.
+5. Migrated `collection-ownership` and `marketplace`.
+6. Deleted the v1 dispatch path and removed the `block-context`
+   resource from the WIT. The v1 world remained for a short
+   tail of in-flight cleanup then was dropped.
 
-`mitos-run` updates in lockstep with each step:
-- Step 2: synthesise events from the existing fixture
-  format (utxo + tx_metadata) and dispatch through v2
-- Step 4: jpg-co fixture replays validate the migration
+`mitos-run` and the trap-capture fixture format were updated in
+lockstep across each step.
 
 ## Edge cases / non-goals
 

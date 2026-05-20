@@ -1,23 +1,28 @@
-# Testing the CF replication prototype
+# Testing mitos
 
-End-to-end recipes for exercising the mitos ↔ CF DO replication path.
-Three scenarios in increasing scope; do them in order on first
+End-to-end recipes for exercising the wasm-module + companion path.
+Three scopes in increasing depth; do them in order on first
 contact.
 
-The architecture this is testing is in `design/CF_REPLICATION.md`.
-The Phase 4.5 build order + success criteria are in
-`design/ROADMAP.md`.
+For the **unit-test / golden-fixture** loop on a single community
+module (the fast inner loop most module work happens in) see
+[`HOWTO_TESTING_COMMUNITY_MODULES.md`](HOWTO_TESTING_COMMUNITY_MODULES.md).
+The scenarios below cover end-to-end host + companion behaviour
+that golden fixtures can't reach.
 
 ## Prerequisites
 
-- A Dolos data directory you control (mitos can read it; pin must
-  match — see ROADMAP Phase 1 lessons banked).
+- A Dolos data directory you control (mitos can read it; the
+  workspace's `dolos-core` pin must match the writer that built
+  the data dir — see
+  [`reference_mitos_archive_horizon`](memory) for the horizon
+  caveat).
 - `nix develop` shell available in `~/code/defrag/mitos` (via the
   repo's `flake.nix`). Provides `cargo`, `rustc`, `clippy`, plus
   `wrangler` for the CF worker side of Scenario 2+.
 
-Pick a shared secret you'll use for `MITOS_AUTH_TOKEN` /
-`MITOS_TOKEN` — both sides need to agree. A 32-char alphanumeric is
+Pick a shared secret you'll use for `MITOS_AUTH_TOKEN` — both the
+mitos host and the worker need to agree. A 32-char hex string is
 fine for testing.
 
 ```sh
@@ -25,256 +30,227 @@ export MITOS_AUTH_TOKEN="$(openssl rand -hex 16)"
 echo "$MITOS_AUTH_TOKEN"   # save somewhere; you'll paste this into wrangler
 ```
 
-## Scenario 1: protocol round-trip with `mitos-tail`
+## Scenario 1: bring up a host with community modules
 
-Validates the wire format, subscribe handshake, backfill, and live
-tail against a real Dolos data dir. **No CF involved.** Fastest
-sanity check.
+Validates that the bundle loads, the data plane reads, and the
+community-module auto-load path activates each module under
+`community-modules/`. No companion involved.
 
 ```sh
-# Terminal 1 — start mitos
+# Terminal 1 — start mitos with wasm-module hosting + community-module auto-load
 cd ~/code/defrag/mitos
-MITOS_AUTH_TOKEN=$MITOS_AUTH_TOKEN \
 nix develop -c cargo run --release -p mitos -- \
     --config /opt/mitos/mainnet/dolos.toml \
     --listen 127.0.0.1:8181 \
-    --data-dir /opt/mitos/mainnet/mitos-data
+    --data-dir /opt/mitos/mainnet/mitos-data \
+    --modules-dir /opt/mitos/mainnet/modules \
+    --community-modules-dir ./community-modules
 ```
 
-You should see:
+The bundle:
+1. Opens the Dolos data dir, hands its domain to mitos.
+2. Registers `none-match-indexer` (residual-pass coordinator —
+   the three legacy in-tree indexers retired; see
+   `docs/design/DOMAIN_REFACTOR.md`).
+3. Activates each pre-built community module whose sha differs
+   from `--modules-dir`. First boot will instantiate all 12
+   shipped modules.
+4. Starts the chain-sync pipeline + HTTP server.
+
+You should see lines like:
 ```
 INFO mitos: mitos starting
-INFO mitos_core::domain: domain initialized
+INFO mitos: wasm-module hosting enabled
+INFO mitos: community-modules auto-load enabled
+INFO mitos_platform: module activated id=asset-transfer
+INFO mitos_platform: module activated id=jpg-store-offer
+...
 INFO mitos_core: chain-sync pipeline spawned
-INFO mitos_core: indexer bootstrapped indexer="jpg-co"
-INFO mitos_core: indexer bootstrapped indexer="collection-ownership"
-INFO mitos_core::dispatcher: dispatcher started indexer="..."
 INFO mitos_core::bundle: HTTP server listening
 ```
 
-Pick a real policy ID (use any tracked PFP collection — `bedwars`,
-`pfp-city`, etc.). Then:
+Confirm via `mitos-admin`:
 
 ```sh
-# Terminal 2 — tail the collection-ownership feed
-cd ~/code/defrag/mitos
-MITOS_AUTH_TOKEN=$MITOS_AUTH_TOKEN \
-nix develop -c cargo run --release -p mitos-tail -- \
+nix develop -c cargo run --release -p mitos-admin -- \
     --mitos http://127.0.0.1:8181 \
-    --indexer collection-ownership \
-    --scope-json '{"policy_id":"<28-byte-policy-hex>"}' \
-    --cursor origin \
-    --validate \
-    --max-records 200
+    --token "$MITOS_AUTH_TOKEN" \
+    list-modules
 ```
 
-Expected output:
-1. **One** `subscribe reply` log line with a Resume cursor.
-2. **N** `apply` lines (the backfill — one per asset under the
-   policy currently held in a UTxO).
-3. **Live tail** of `apply` / `mark` lines as the chain advances.
-4. A summary on exit: counts of apply / undo / mark / error and any
-   `undo_without_prior_apply` invariant violations (should be zero
-   under steady-state).
+Expect a table listing all activated modules with their sha, ABI
+version (should be v2), trap strategy, and size.
 
-If the backfill count matches the collection's known asset count
-(or close to it — burn/CIP-68 reference NFTs may differ slightly),
-the protocol path works.
-
-## Scenario 2: end-to-end mitos → CF DO
-
-Adds the actual CF Durable Object as the data sink, exercising the
-full hibernation-API path.
-
-### 2.1 Deploy the worker
+For a quick offline pre-flight (paths, env, persisted state) use
+`--print-config-only`:
 
 ```sh
-cd ~/code/defrag/cnft.dev-workers/workers/collections-mitos
-
-# Configure the auth token CF-side (same value as mitos):
-nix develop -c wrangler secret put MITOS_TOKEN
-# (paste $MITOS_AUTH_TOKEN when prompted)
-
-# Either deploy:
-nix develop -c wrangler deploy
-# (note the *.workers.dev URL it prints, or your custom domain
-#  ownership-mitos.cnft.dev)
-
-# …or run locally:
-nix develop -c wrangler dev
-# (note the local URL, typically http://localhost:8787)
-```
-
-### 2.2 Verify mitos config offline (optional but recommended)
-
-Before starting the long-running process, dump everything mitos
-*will* load to confirm paths and env are set correctly:
-
-```sh
-cd ~/code/defrag/mitos
-MITOS_AUTH_TOKEN=$MITOS_AUTH_TOKEN \
 nix develop -c cargo run --release -p mitos -- \
     --config /opt/mitos/mainnet/dolos.toml \
     --data-dir /opt/mitos/mainnet/mitos-data \
     --print-config-only
 ```
 
-Output is a one-shot summary: listen address, data_dir, dolos
-storage paths, registered indexers, auth status, persisted
-subscriptions. Exits 0 without starting the chain follower or HTTP
-server. If anything looks wrong (e.g. `auth: OPEN` when you set the
-env, or persisted subs missing after a restart), fix it before
-moving on.
+## Scenario 2: end-to-end mitos → CF companion
 
-### 2.3 Start mitos pointing at it
+Adds the actual CF Durable Object as the data sink, exercising the
+full HTTP delivery path against a real chain feed.
 
-Same command as Scenario 1, with `MITOS_AUTH_TOKEN` set.
+### 2.1 Deploy the companion
 
-### 2.4 Register an outbound subscription
-
-Use `mitos-admin` (sibling tool, friendly args, no JSON
-heredocs):
+Use a worker that subscribes to a community module. The two
+reference companions in `~/code/defrag/cnft.dev-workers/workers/`
+are `collections-mitos` (subscribes to `asset-transfer`) and
+`jpg-store-mirror` (subscribes to `jpg-store-offer`).
 
 ```sh
-TARGET="wss://collections-mitos.<account>.workers.dev/_internal/replicate?policy_id=<hex>"
+cd ~/code/defrag/cnft.dev-workers/workers/collections-mitos
+
+# Configure the shared auth token CF-side (same value as mitos):
+nix develop -c wrangler secret put MITOS_AUTH_TOKEN
+# (paste $MITOS_AUTH_TOKEN when prompted)
+
+# Either deploy:
+nix develop -c wrangler deploy
+# (note the *.workers.dev URL it prints, or your custom domain)
+
+# …or run locally:
+nix develop -c wrangler dev
+# (note the local URL, typically http://localhost:8787)
+```
+
+Make sure the worker's `wrangler.toml` sets:
+
+- `MITOS_HOST_URL` — base URL of the mitos host (e.g.
+  `http://127.0.0.1:8181` for local tests).
+- `MITOS_REPLICATE_URL` — dial-back URL template the host POSTs
+  emissions to, e.g.
+  `https://collections-mitos.example.com/_internal/{op}-{target}?key={key}`.
+  All three placeholders (`{op}`, `{target}`, `{key}`) must be
+  present.
+
+### 2.2 Start mitos (same as Scenario 1)
+
+Make sure `--modules-dir` is set so the community modules host and
+`/api/companions/subscribe` is mounted.
+
+### 2.3 Wake the companion
+
+The worker's DO self-registers on first wake. Hit any endpoint
+that routes into the DO — for `collections-mitos` that's typically
+the read API at `/api/stats/<policy>` (the DO read-path
+implicitly wakes the DO and triggers the subscribe call):
+
+```sh
+BASE="https://collections-mitos.<account>.workers.dev"
 POLICY="<28-byte-policy-hex>"
 
-cd ~/code/defrag/mitos
+curl "$BASE/api/stats/$POLICY"   # wakes DO, triggers subscribe
+```
+
+Watch the mitos logs for:
+```
+INFO mitos_platform::companions: companion registered module=asset-transfer
+   client_id=collections-mitos.<account>.workers.dev companion_key=...
+INFO mitos_platform::dialer: dial loop started target=asset-transfer
+   companion=...
+```
+
+The host begins backfilling and POSTing emissions to the worker.
+
+### 2.4 Inspect emissions
+
+```sh
 nix develop -c cargo run --release -p mitos-admin -- \
     --mitos http://127.0.0.1:8181 \
-    add \
-    --indexer collection-ownership \
-    --target  "$TARGET" \
-    --scope-json "{\"policy_id\":\"$POLICY\"}" \
-    --cursor   origin
+    --token "$MITOS_AUTH_TOKEN" \
+    emissions --module asset-transfer
 ```
 
-Expected output: `added subscription id=1`.
-
-Watch mitos's logs for:
-```
-INFO mitos_core::replicator: outbound ws connected
-INFO collection_ownership_indexer: subscribe policy_id=... new=true backfilled=N
-```
-
-Confirm via:
-
-```sh
-nix develop -c cargo run --release -p mitos-admin -- list
-```
-
-```
-ID    INDEXER                   STATUS        BACKOFF   TARGET
-1     collection-ownership      connected     -         wss://...
-```
-
-The `health` subcommand gives a roll-up:
-
-```sh
-nix develop -c cargo run --release -p mitos-admin -- health
-```
-
-```
-status:        ok
-uptime:        12m45s
-indexers:      jpg-co, collection-ownership
-subscriptions: total=1 connected=1 connecting=0 backing_off=0 disconnected=0
-```
+Expected: rows transitioning `queued` → `pending` → `acked` as
+the worker's `apply_event` succeeds. `nacked` rows surface decode
+or apply errors — inspect with `--json` for the full error string.
 
 ### 2.5 Probe the DO's read APIs
 
 ```sh
-BASE="https://collections-mitos.<account>.workers.dev"
-
-# Asset count for the policy:
 curl "$BASE/api/stats/$POLICY"
-
-# Owner of a specific asset (no auth needed for reads):
 curl "$BASE/api/owner/$POLICY?asset=<asset_name_hex>"
-
-# All assets a stake holds in this policy:
 curl "$BASE/api/bundle/$POLICY?stake=stake1u..."
-
-# Whether a specific stake owns a specific asset:
 curl "$BASE/api/check/$POLICY?asset=<asset_name_hex>&stake=stake1u..."
 ```
 
-Compare to the existing `collection-ownership` worker's responses
-for the same policy — they should match.
+Compare to the production worker's responses for the same
+policy — they should match.
 
-### 2.6 Verify subscription persistence
+### 2.6 Force a recapture
+
+Verifies the `on_recapture` → `rebootstrap` → refill path end to
+end:
 
 ```sh
-# Confirm the subscription is registered:
-nix develop -c cargo run --release -p mitos-admin -- list
-
-# Restart mitos (Ctrl+C, then re-run the start command).
-# The subscription should re-appear automatically:
-nix develop -c cargo run --release -p mitos-admin -- list
-# (same id and target_url)
+nix develop -c cargo run --release -p mitos-admin -- \
+    --mitos http://127.0.0.1:8181 \
+    --token "$MITOS_AUTH_TOKEN" \
+    recapture asset-transfer --reason "testing TESTING.md scenario 2"
 ```
 
-You can also confirm offline via `--print-config-only` — it reads
-the persisted redb without spinning up the rest of the process.
+Expected:
+1. The mitos host POSTs `/_internal/recapture-asset-transfer` to
+   each subscribed companion.
+2. Each companion runs its `on_recapture` (typically scoped DELETE
+   of `source_module = 'asset-transfer'` rows).
+3. The host runs the module's `rebootstrap` (re-scans the
+   declared interest set, re-emits events).
+4. `mitos-admin recapture` returns once all companions reach
+   `RecaptureDone` with `companions_targeted`, `events_emitted`,
+   and `duration_ms`.
 
 ### 2.7 Tear down
 
 ```sh
-nix develop -c cargo run --release -p mitos-admin -- remove 1
+# Surgically remove this companion's record:
+nix develop -c cargo run --release -p mitos-admin -- \
+    --mitos http://127.0.0.1:8181 \
+    --token "$MITOS_AUTH_TOKEN" \
+    delete-companion \
+    --module asset-transfer \
+    --client-id collections-mitos.<account>.workers.dev \
+    --key <companion-key>
 ```
 
-Mitos disconnects, the DO's hibernating WS gets a close.
-
-## Cost validation (hibernation actually working)
-
-After Scenario 2 has been running for an hour or more, check the CF
-dashboard for the `collections-mitos` worker:
-
-- DO → Active duration should be **~3 min/day per consumer**, not
-  24 hours.
-- DO → Request count should be one per WebSocket message
-  (~dozens-to-hundreds per hour per active policy, depending on
-  chain activity).
-
-If Active duration is anywhere close to 24h/day, the hibernation
-API isn't engaging — likely the DO is treating the upgrade as a
-fetch handler and never calling `state.accept_web_socket(&server)`.
-Re-check the upgrade path in `do_state.rs::handle_replicate_upgrade`.
+The worker can re-register simply by waking the DO again.
 
 ## Reorg validation
 
 Reorgs are rare on Cardano (1-2 blocks deep, ~weekly on mainnet).
-With `mitos-tail --validate` running, any natural reorg during the
-session will produce visible Undo records and the validator will
-warn on any malformed Apply/Undo sequences.
+Any natural reorg during a running Scenario 2 session produces
+visible `rollback-event` dispatches to the module and (if the
+module emits cancelling events) downstream `nacked` rows if the
+companion can't apply them cleanly.
 
 For a *forced* reorg test you'd need a Dolos data directory from
 just before a known historical reorg slot, which is a separate
-fixture-setup task. Track that as part of the Phase 4.5
-"reorg validation" success criterion.
+fixture-setup task.
 
 ## Common issues
 
-**"401 Unauthorized" on register or upgrade.** Token mismatch
-between `MITOS_AUTH_TOKEN` (mitos env) and `MITOS_TOKEN` (CF
-secret). Reset both to the same value.
+**"401 Unauthorized" on subscribe.** Token mismatch between
+`MITOS_AUTH_TOKEN` on the mitos host and `MITOS_AUTH_TOKEN` on
+the worker. Reset both to the same value.
 
-**"unknown indexer" on POST.** Either a typo in the name (the
-in-tree indexers are `collection-ownership`, `marketplace`,
-`mint-burn`, `none-match`) or the bundle hasn't registered it.
-For wasm modules (community or operator-uploaded), `unknown
-module` is the analogous error — check `mitos-admin list-modules`.
-The in-tree indexer set lives in `bundles/default/src/main.rs`;
-community modules auto-load from `BUNDLE_COMMUNITY_MODULES_DIR`
-at host startup.
+**"module not registered" on emissions or recapture.** The
+module's name doesn't match anything in `mitos-admin list-modules`.
+Check the bundle started with `--modules-dir` and
+`--community-modules-dir` pointing at the right paths; check
+`activated` lines in the bundle log.
 
 **"WAL schema not compatible".** Your mitos build's Dolos pin
 doesn't match the data dir's writer version. Bump the pin in
-`Cargo.toml` (`tag = "v1.0.3"` etc) and rebuild. Phase 1 lessons
-banked has the full diagnosis.
+`Cargo.toml` and rebuild.
 
-**"consumer lagged by N records; reconnect"** in the mitos logs.
-Backpressure: the broadcast channel filled because the consumer
-couldn't drain fast enough (slow link, slow DO). The Replicator
-will reconnect on the next dial loop iteration. If sustained, raise
-`BROADCAST_CAPACITY` in `handle.rs`.
+**Companion never receives emissions.** Check `mitos-admin
+emissions --module <id> --status pending` — if rows pile up in
+`pending`, the dial loop isn't reaching the worker. Verify
+`MITOS_REPLICATE_URL` on the worker side resolves to a host the
+mitos box can reach, and that the worker accepts the auth header.

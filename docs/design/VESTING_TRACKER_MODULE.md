@@ -82,7 +82,9 @@ pub struct LockEntry {
 }
 
 pub enum VestingEvent {
-    Snapshot(VestingSnapshot),
+    SnapshotBegin(VestingSnapshotBegin),
+    SnapshotChunk(VestingSnapshotChunk),
+    SnapshotEnd(VestingSnapshotEnd),
     Locked(VestingLock),
     Unlocked(VestingUnlock),
 }
@@ -97,10 +99,21 @@ three.
 
 ### Snapshot semantics
 
-`Snapshot` is full-state replacement scoped to one
-`(interest_kind, interest_value)` pair. Consumers wipe prior
-locks under the same key and re-insert. Emitted on cold-start
-registration and after rollbacks.
+Full-state replacement scoped to one `(interest_kind,
+interest_value)` pair, delivered as a three-phase chunked
+sequence per `docs/design/WASM_BUDGET_CHUNKING.md`:
+
+1. `SnapshotBegin` carries the `(interest_kind, interest_value,
+   anchor_slot)` triple. Consumers wipe prior locks under the
+   same key.
+2. One or more `SnapshotChunk` events deliver `LockEntry`
+   batches. Consumers insert each batch.
+3. `SnapshotEnd` closes the sequence. Consumers commit / mark
+   the snapshot complete.
+
+The `anchor_slot` rides the sequence so live `Locked`/`Unlocked`
+deltas resume from the right point. Emitted on cold-start
+registration, recapture refills, and after rollbacks.
 
 ### Locked / Unlocked semantics
 
