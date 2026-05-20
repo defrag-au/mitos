@@ -76,7 +76,23 @@ pub struct Swap {
     /// `None` for single-version brands like CSWAP.
     pub contract_version: Option<String>,
     /// Bech32 address of the wallet that received `asset_out`.
+    /// May be an empty string when the immediate beneficiary is
+    /// a script address (e.g. an aggregator-wrapped order); in
+    /// that case `originator_address` carries the actual user
+    /// wallet that funded the swap, if discoverable.
     pub swapper_address: String,
+    /// Bech32 address of the dominant user wallet (by lovelace)
+    /// among the consuming TX's inputs, surfaced when the
+    /// immediate `swapper_address` is empty (no user-wallet
+    /// `asset_out` output found — typically because the
+    /// destination is a script address belonging to an
+    /// aggregator / order-routing wrapper). `None` when the
+    /// `swapper_address` already identifies the user wallet
+    /// directly, or when no key-wallet input could be found.
+    /// Consumers wanting "who initiated the trade" should prefer
+    /// this field over `swapper_address` when present.
+    #[serde(default)]
+    pub originator_address: Option<String>,
     /// What the swapper sent in.
     pub asset_in: SwapAsset,
     /// What the swapper got out.
