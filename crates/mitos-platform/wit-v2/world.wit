@@ -284,7 +284,14 @@ interface chain-data {
     /// Bulk lookup of N output refs in one host call. Caller
     /// must pass a bounded chunk — pair it with one `utxo-page`
     /// from the paged scans below, never an unbounded list.
-    read-utxos: func(refs: list<output-ref>) -> list<typed-output>;
+    ///
+    /// Each result carries its own `output-ref`: the host
+    /// resolves outputs from a UTxO *map*, so the returned list
+    /// is neither in input order nor guaranteed 1:1 (a ref that
+    /// fails to resolve is dropped). Callers that need to
+    /// correlate an output back to its ref MUST use the ref in
+    /// the tuple, never the input position.
+    read-utxos: func(refs: list<output-ref>) -> list<tuple<output-ref, typed-output>>;
 
     /// Paged enumeration of the current unspent set at one
     /// Cardano address. `after` is `none` for the first page,

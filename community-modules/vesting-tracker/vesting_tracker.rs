@@ -58,9 +58,9 @@ use mitos_community_events::vesting_tracker::{
     VestingEvent, VestingLock, VestingUnlock,
 };
 use mitos_module_kit::ReentrantRound;
+use mitos_vesting_decode::decode_vesting_datum;
 use pallas_addresses::{Address, ShelleyPaymentPart};
 use pallas_codec::minicbor::data::Type as CborType;
-use pallas_primitives::PlutusData;
 use serde::{Deserialize, Serialize};
 
 use crate::mitos::platform_v2::chain_data;
@@ -241,74 +241,11 @@ fn clear_rebootstrap_cursor() {
     state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
 }
 
-// ============================================================
-// Datum decode — Shield / CrowdLock unified shape
-// ============================================================
-
-struct DecodedDatum {
-    unlock_ts_ms: u64,
-    owner_pkh_hex: String,
-}
-
-/// Decode a Shield datum:
-/// `Constructor 0 [ Int(unlock_ts_ms), List[ Bytes(owner_pkh) ] ]`.
-fn decode_shield_datum(cbor: &[u8]) -> Option<DecodedDatum> {
-    let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
-    let outer = match pd {
-        PlutusData::Constr(c) => c,
-        _ => return None,
-    };
-    // Field 0: unlock_ts_ms as positive int
-    let fields: Vec<PlutusData> = outer.fields.into();
-    if fields.len() < 2 {
-        return None;
-    }
-    let unlock_ts_ms = match &fields[0] {
-        PlutusData::BigInt(i) => bigint_to_u64(i)?,
-        _ => return None,
-    };
-    // Field 1: list with one entry = owner PKH bytes
-    let owner_pkh = match &fields[1] {
-        PlutusData::Array(items) => match items.first()? {
-            PlutusData::BoundedBytes(b) => {
-                let raw: &[u8] = &**b;
-                if raw.len() != HASH_BYTES {
-                    return None;
-                }
-                hex::encode(raw)
-            }
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some(DecodedDatum {
-        unlock_ts_ms,
-        owner_pkh_hex: owner_pkh,
-    })
-}
-
-fn bigint_to_u64(i: &pallas_primitives::BigInt) -> Option<u64> {
-    match i {
-        pallas_primitives::BigInt::Int(n) => {
-            let v = i128::from(*n);
-            if v < 0 {
-                None
-            } else {
-                u64::try_from(v).ok()
-            }
-        }
-        pallas_primitives::BigInt::BigUInt(b) => {
-            let bytes: &[u8] = &**b;
-            if bytes.len() > 8 {
-                return None;
-            }
-            let mut buf = [0u8; 8];
-            buf[8 - bytes.len()..].copy_from_slice(bytes);
-            Some(u64::from_be_bytes(buf))
-        }
-        pallas_primitives::BigInt::BigNInt(_) => None,
-    }
-}
+// Vesting lock datum decode lives in the shared
+// `mitos_vesting_decode` crate (imported above) so this module
+// and `holder-distribution`'s vesting decomposition share one
+// source of truth. `VestingDatum` is the rename of the local
+// `DecodedDatum` from the pre-extraction layout.
 
 /// Resolve a `TypedDatum` to its raw CBOR bytes. Inline datums
 /// carry `payload` directly; hash-only datums fall back to
@@ -549,7 +486,7 @@ fn build_lock_entries(
     let Some(datum_bytes) = resolve_datum_bytes(datum) else {
         return Vec::new();
     };
-    let Some(decoded) = decode_shield_datum(&datum_bytes) else {
+    let Some(decoded) = decode_vesting_datum(&datum_bytes) else {
         return Vec::new();
     };
 
@@ -668,9 +605,15 @@ fn build_snapshot_locks(refs: &[WitOutputRef]) -> Vec<LockEntry> {
     }
     let mut all_locks = Vec::with_capacity(refs.len());
     for chunk in refs.chunks(1024) {
+        // `read_utxos` returns each output paired with its own
+        // ref, and *not* in input order. Re-derive the ref list
+        // from that returned order so `read_output_datums`
+        // (which is positionally parallel to its input) lines up
+        // 1:1 with the outputs.
         let outputs = chain_data::read_utxos(&chunk.to_vec());
-        let datums = chain_data::read_output_datums(&chunk.to_vec());
-        for ((oref, out), datum) in chunk.iter().zip(outputs.iter()).zip(datums.iter()) {
+        let output_refs: Vec<WitOutputRef> = outputs.iter().map(|(r, _)| r.clone()).collect();
+        let datums = chain_data::read_output_datums(&output_refs);
+        for ((oref, out), datum) in outputs.iter().zip(datums.iter()) {
             let style = vest_style_from_tx(&oref.tx_hash);
             let entries = build_lock_entries(
                 &out.address,

@@ -25,5 +25,9 @@ policies = []
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
+# Splash pool / order script-address constants live in the
+# shared decode crate (used by `holder-distribution` for
+# `DexPool` role tagging).
+mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
 pallas-primitives = "1.0.0-alpha.6"
 pallas-codec = "1.0.0-alpha.6"

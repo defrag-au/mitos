@@ -29,5 +29,6 @@ policies = []
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
-pallas-primitives = "1.0.0-alpha.6"
-pallas-codec = "1.0.0-alpha.6"
+# CSWAP datum / address decode lives in the shared decode crate;
+# it pulls pallas-primitives / pallas-codec transitively.
+mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
