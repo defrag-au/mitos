@@ -123,7 +123,7 @@ async fn dynamic_interest_changes_filter_mid_stream() {
         .emissions_store("test-indexer")
         .expect("emissions store");
     let baseline_rows = emissions
-        .list_queued_for_companion("test-companion")
+        .list_queued_for_companion("test-companion", "test-client")
         .expect("list emissions");
     assert!(
         baseline_rows.is_empty(),
@@ -162,7 +162,7 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     host.stop("test-indexer").await.expect("stop");
 
     let post_update_rows = emissions
-        .list_queued_for_companion("test-companion")
+        .list_queued_for_companion("test-companion", "test-client")
         .expect("list emissions");
     assert!(
         !post_update_rows.is_empty(),

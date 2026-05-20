@@ -638,6 +638,224 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Migration: flat companion files → two-level (client_id, companion_key)
+// layout. Pre-fix hosts wrote `<storage>/<module>/companions/<key>.cbor`;
+// post-fix hosts write `<storage>/<module>/companions/<client_id>/<key>.cbor`.
+// On host start, `migrate_flat_companions_for_module` decodes each pre-fix
+// file, derives `client_id` from its `dial_back.url` host portion, and
+// rewrites it under the new path with the `client_id` field populated.
+// Records without a usable URL are quarantined under
+// `<module>/companions/.unreachable/` for operator review.
+// See `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Migration".
+// ============================================================================
+
+/// Reserved subdirectory holding companion records that couldn't be
+/// migrated (no `dial_back.url`, so no way to derive `client_id`).
+const UNREACHABLE_DIR: &str = ".unreachable";
+
+/// Minimal pre-migration shape — old persisted CBOR has no
+/// `client_id` field. We only need the URL during migration; everything
+/// else stays in the original bytes.
+#[derive(serde::Deserialize)]
+struct LegacyDialBackProbe {
+    #[serde(default)]
+    dial_back: Option<LegacyDialBackOverride>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyDialBackOverride {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// One-time migration of pre-fix flat companion files into the
+/// two-level layout. Idempotent — re-running on an already-migrated
+/// module is a no-op (no flat files left to find).
+///
+/// Returns `(migrated, quarantined)` counts.
+pub(crate) fn migrate_flat_companions_for_module(
+    storage: &ModuleStorage,
+    module_id: &str,
+) -> std::io::Result<(usize, usize)> {
+    let companions_root = storage.module_dir_for_companions(module_id);
+    if !companions_root.exists() {
+        return Ok((0, 0));
+    }
+    let entries = std::fs::read_dir(&companions_root)?;
+
+    let mut migrated = 0usize;
+    let mut quarantined = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only consider files (skip the new <client_id>/ subdirs and
+        // any `.unreachable/` directory).
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+            continue;
+        }
+
+        let companion_key = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "migrate: skipping file with no stem"
+                );
+                continue;
+            }
+        };
+
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "migrate: failed to read companion file"
+                );
+                continue;
+            }
+        };
+
+        // Probe the dial_back URL host without committing to the
+        // full SubscribeRequest decode — the old CBOR lacks
+        // `client_id`, so a full decode against the new struct
+        // would error.
+        let probe: LegacyDialBackProbe = match ciborium::de::from_reader(bytes.as_slice()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "migrate: failed to probe legacy CBOR; leaving in place"
+                );
+                continue;
+            }
+        };
+
+        let url = probe.dial_back.and_then(|d| d.url);
+        let client_id = url.as_deref().and_then(url_host).map(|s| s.to_string());
+
+        match client_id {
+            Some(client_id) if !client_id.is_empty() => {
+                // Synthesise the new client_id field into the CBOR
+                // by full decode-with-default → re-encode. We can't
+                // use the current `SubscribeRequest` struct directly
+                // (its `client_id` is non-Option), so we go through
+                // a transitional shape.
+                match migrate_one(&bytes, &client_id) {
+                    Ok(new_bytes) => {
+                        let dest_dir = companions_root.join(&client_id);
+                        std::fs::create_dir_all(&dest_dir)?;
+                        let dest = dest_dir.join(format!("{companion_key}.cbor"));
+                        write_atomic(&dest, &new_bytes)?;
+                        std::fs::remove_file(&path)?;
+                        migrated += 1;
+                        tracing::info!(
+                            module = %module_id,
+                            client_id = %client_id,
+                            companion_key = %companion_key,
+                            "migrate: relocated companion to two-level layout"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %module_id,
+                            companion_key = %companion_key,
+                            error = %e,
+                            "migrate: failed to rewrite CBOR; leaving in place"
+                        );
+                    }
+                }
+            }
+            _ => {
+                // No URL → quarantine under .unreachable/. The file
+                // is preserved so an operator can inspect + clean up.
+                let dest_dir = companions_root.join(UNREACHABLE_DIR);
+                std::fs::create_dir_all(&dest_dir)?;
+                let dest = dest_dir.join(format!("{companion_key}.cbor"));
+                std::fs::rename(&path, &dest)?;
+                quarantined += 1;
+                tracing::warn!(
+                    module = %module_id,
+                    companion_key = %companion_key,
+                    "migrate: companion has no dial_back.url; quarantined to .unreachable/"
+                );
+            }
+        }
+    }
+
+    if migrated > 0 || quarantined > 0 {
+        tracing::info!(
+            module = %module_id,
+            migrated,
+            quarantined,
+            "migrate: companion layout migration complete"
+        );
+    }
+    Ok((migrated, quarantined))
+}
+
+/// Re-encode a legacy companion CBOR with the new `client_id` field
+/// populated. Decoding goes through a transitional `MigratableRequest`
+/// shape that mirrors the modern `SubscribeRequest` but with
+/// `client_id: Option<String>` so legacy bytes (which lack the field)
+/// decode cleanly; then we substitute the derived `client_id` and
+/// re-encode via the canonical type.
+fn migrate_one(legacy_bytes: &[u8], client_id: &str) -> Result<Vec<u8>, String> {
+    use mitos_protocol::{ChainPoint, DialBackOverride, Interest, SubscribeTarget};
+
+    #[derive(serde::Deserialize)]
+    struct MigratableRequest {
+        targets: Vec<SubscribeTarget>,
+        companion_key: String,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        resume_from: Option<ChainPoint>,
+        #[serde(default)]
+        interests: Vec<Interest>,
+        #[serde(default)]
+        dial_back: Option<DialBackOverride>,
+    }
+
+    let m: MigratableRequest = ciborium::de::from_reader(legacy_bytes)
+        .map_err(|e| format!("decode legacy: {e}"))?;
+    let req = SubscribeRequest {
+        targets: m.targets,
+        companion_key: m.companion_key,
+        client_id: m.client_id.unwrap_or_else(|| client_id.to_string()),
+        resume_from: m.resume_from,
+        interests: m.interests,
+        dial_back: m.dial_back,
+    };
+    req.encode().map_err(|e| format!("re-encode: {e}"))
+}
+
+/// Parse the host portion out of a dial-back URL. Mirrors the
+/// runtime-side helper in `mitos-companion::subscribe::host_of_url`
+/// but lives here to keep the platform side dep-free of
+/// `mitos-companion`.
+fn url_host(url: &str) -> Option<&str> {
+    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
+    let after_userinfo = after_scheme
+        .find('@')
+        .map(|i| &after_scheme[i + 1..])
+        .unwrap_or(after_scheme);
+    let end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    let host = &after_userinfo[..end];
+    if host.is_empty() { None } else { Some(host) }
+}
+
 fn validate_module_id(id: &str) -> std::result::Result<(), SubscribeError> {
     if id.is_empty() || id.len() > 64 {
         return Err(SubscribeError::InvalidModuleName(format!(
@@ -714,7 +932,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
-    use mitos_protocol::{ChainPoint, SubscribeTarget};
+    use mitos_protocol::{ChainPoint, DialBackOverride, SubscribeTarget};
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
@@ -945,5 +1163,354 @@ mod tests {
         assert!(validate_companion_key("../escape").is_err());
 
         let _ = to_bytes;
+    }
+
+    #[test]
+    fn validate_client_id_accepts_url_host_shape() {
+        assert!(validate_client_id("hooks.epochify.space").is_ok());
+        assert!(validate_client_id("hooks.dev.epochify.space").is_ok());
+        assert!(validate_client_id("worker-prod").is_ok());
+        assert!(validate_client_id("client_a").is_ok());
+        // UUID-like.
+        assert!(validate_client_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
+    }
+
+    #[test]
+    fn validate_client_id_rejects_unsafe_inputs() {
+        assert!(validate_client_id("").is_err());
+        assert!(validate_client_id("   ").is_err());
+        assert!(validate_client_id(".").is_err());
+        assert!(validate_client_id("..").is_err());
+        // Path traversal attempts.
+        assert!(validate_client_id("../escape").is_err());
+        assert!(validate_client_id(".hidden").is_err());
+        // Disallowed characters.
+        assert!(validate_client_id("has space").is_err());
+        assert!(validate_client_id("has/slash").is_err());
+        assert!(validate_client_id("has\\backslash").is_err());
+    }
+
+    #[test]
+    fn url_host_parser_extracts_expected_hosts() {
+        assert_eq!(
+            super::url_host("https://hooks.epochify.space/_internal/{op}-{target}?key={key}"),
+            Some("hooks.epochify.space"),
+        );
+        assert_eq!(
+            super::url_host("https://hooks.dev.epochify.space/_internal/apply-x?key=y"),
+            Some("hooks.dev.epochify.space"),
+        );
+        assert_eq!(super::url_host(""), None);
+        assert_eq!(super::url_host("https://"), None);
+    }
+
+    #[tokio::test]
+    async fn two_clients_one_key_persist_independently() {
+        // Architectural-fix integration test for
+        // `docs/design/MULTI_CLIENT_COMPANIONS.md`. Two subscribes
+        // with the same `companion_key` but distinct `client_id`s
+        // must land in parallel on-disk records, each with its own
+        // dial-back URL.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+
+        // Hand-install a fake manifest so the subscribe handler's
+        // "module must be registered" check passes. Writing the
+        // manifest file directly is fine — `read_manifest` reads
+        // from disk every call.
+        let module_id = "ownership-indexer";
+        let module_dir = tmp.path().join(module_id);
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let manifest_toml = format!(
+            r#"
+[module]
+id = "{module_id}"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_bytes = 0
+
+[abi]
+version_major = 2
+version_minor = 0
+wit_package = "mitos:platform-v2"
+wit_world = "mitos-module-v2"
+
+[trap_policy]
+strategy = "replay"
+max_retries = 3
+backoff_cap_ms = 1000
+
+[build]
+rust_version = "0.0"
+target = "wasm32-wasip2"
+profile = "release"
+build_id = "1970-01-01T00:00:00Z"
+crate_version = "0.0.0"
+"#
+        );
+        std::fs::write(module_dir.join("manifest.toml"), manifest_toml).unwrap();
+
+        let router = build_router_with(storage.clone());
+
+        // Two subscribes sharing companion_key but differing in
+        // client_id + dial-back URL.
+        let mut requests = vec![
+            SubscribeRequest {
+                targets: vec![SubscribeTarget::Module {
+                    name: module_id.into(),
+                }],
+                companion_key: "shared_policy_id".into(),
+                client_id: "hooks.dev.epochify.space".into(),
+                resume_from: None,
+                interests: vec![],
+                dial_back: Some(DialBackOverride {
+                    url: Some(
+                        "https://hooks.dev.epochify.space/_internal/{op}-{target}?key={key}".into(),
+                    ),
+                    auth_header: None,
+                    auth_value: None,
+                }),
+            },
+            SubscribeRequest {
+                targets: vec![SubscribeTarget::Module {
+                    name: module_id.into(),
+                }],
+                companion_key: "shared_policy_id".into(),
+                client_id: "hooks.epochify.space".into(),
+                resume_from: None,
+                interests: vec![],
+                dial_back: Some(DialBackOverride {
+                    url: Some(
+                        "https://hooks.epochify.space/_internal/{op}-{target}?key={key}".into(),
+                    ),
+                    auth_header: None,
+                    auth_value: None,
+                }),
+            },
+        ];
+        for req in requests.drain(..) {
+            let body = cbor(&req);
+            let response = router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/api/companions/subscribe")
+                        .header("content-type", "application/cbor")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Both records exist under distinct client_id subdirs.
+        let dev_path = storage
+            .module_dir_for_companions(module_id)
+            .join("hooks.dev.epochify.space")
+            .join("shared_policy_id.cbor");
+        let prod_path = storage
+            .module_dir_for_companions(module_id)
+            .join("hooks.epochify.space")
+            .join("shared_policy_id.cbor");
+        assert!(dev_path.exists(), "dev client_id subdir+file expected");
+        assert!(prod_path.exists(), "prod client_id subdir+file expected");
+
+        // Decode + sanity-check the persisted dial-back URLs are
+        // distinct. This is the architectural property the bug
+        // violated: two records, two URLs, one storage layer.
+        let dev_req: SubscribeRequest =
+            ciborium::de::from_reader(std::fs::read(&dev_path).unwrap().as_slice()).unwrap();
+        let prod_req: SubscribeRequest =
+            ciborium::de::from_reader(std::fs::read(&prod_path).unwrap().as_slice()).unwrap();
+        assert_eq!(dev_req.client_id, "hooks.dev.epochify.space");
+        assert_eq!(prod_req.client_id, "hooks.epochify.space");
+        assert!(
+            dev_req
+                .dial_back
+                .as_ref()
+                .and_then(|d| d.url.as_deref())
+                .unwrap_or("")
+                .contains("hooks.dev.epochify.space")
+        );
+        assert!(
+            prod_req
+                .dial_back
+                .as_ref()
+                .and_then(|d| d.url.as_deref())
+                .unwrap_or("")
+                .contains("hooks.epochify.space")
+                && !prod_req
+                    .dial_back
+                    .as_ref()
+                    .and_then(|d| d.url.as_deref())
+                    .unwrap_or("")
+                    .contains("dev.epochify.space"),
+            "prod URL must not collide with dev's"
+        );
+
+        // `load_companion_registrations(companion_key)` walks the
+        // two-level layout and surfaces BOTH records under the
+        // shared key.
+        let registrations =
+            load_companion_registrations(&storage, "shared_policy_id").expect("load OK");
+        assert_eq!(
+            registrations.len(),
+            2,
+            "expected one record per (client_id, companion_key)"
+        );
+    }
+
+    #[test]
+    fn subscribe_rejects_empty_client_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let router = build_router_with(storage);
+
+        let req = SubscribeRequest {
+            targets: vec![SubscribeTarget::Module {
+                name: "ownership-indexer".into(),
+            }],
+            companion_key: "customer_42".into(),
+            client_id: "".into(),
+            resume_from: None,
+            interests: vec![],
+            dial_back: None,
+        };
+        let body = cbor(&req);
+        let response = tokio::runtime::Runtime::new().unwrap().block_on(
+            router.oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/subscribe")
+                    .header("content-type", "application/cbor")
+                    .body(Body::from(body))
+                    .unwrap(),
+            ),
+        );
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn migrate_flat_companions_moves_legacy_into_two_level() {
+        // Synthesise a pre-fix flat companion record (no
+        // client_id field, written directly under
+        // `<storage>/<module>/companions/<companion_key>.cbor`).
+        // The migration must move it into the two-level layout
+        // with `client_id` derived from `dial_back.url`'s host.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let module_id = "ownership-indexer";
+
+        let companions_root = storage.module_dir_for_companions(module_id);
+        std::fs::create_dir_all(&companions_root).unwrap();
+
+        // Encode a legacy SubscribeRequest shape (no client_id)
+        // via a transitional struct so we don't depend on the
+        // modern type being able to skip the field.
+        let legacy_cbor = {
+            #[derive(serde::Serialize)]
+            struct LegacyReq {
+                targets: Vec<SubscribeTarget>,
+                companion_key: String,
+                resume_from: Option<ChainPoint>,
+                interests: Vec<mitos_protocol::Interest>,
+                dial_back: Option<DialBackOverride>,
+            }
+            let r = LegacyReq {
+                targets: vec![SubscribeTarget::Module {
+                    name: module_id.into(),
+                }],
+                companion_key: "policy_x".into(),
+                resume_from: None,
+                interests: vec![],
+                dial_back: Some(DialBackOverride {
+                    url: Some(
+                        "https://hooks.dev.epochify.space/_internal/{op}-{target}?key={key}"
+                            .into(),
+                    ),
+                    auth_header: None,
+                    auth_value: None,
+                }),
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&r, &mut buf).unwrap();
+            buf
+        };
+        std::fs::write(companions_root.join("policy_x.cbor"), &legacy_cbor).unwrap();
+
+        let (migrated, quarantined) =
+            migrate_flat_companions_for_module(&storage, module_id).unwrap();
+        assert_eq!(migrated, 1);
+        assert_eq!(quarantined, 0);
+
+        // Flat file is gone.
+        assert!(!companions_root.join("policy_x.cbor").exists());
+        // Relocated to two-level path.
+        let new_path = companions_root
+            .join("hooks.dev.epochify.space")
+            .join("policy_x.cbor");
+        assert!(new_path.exists());
+
+        // Decoded record carries the synthesised client_id.
+        let req: SubscribeRequest =
+            ciborium::de::from_reader(std::fs::read(&new_path).unwrap().as_slice()).unwrap();
+        assert_eq!(req.client_id, "hooks.dev.epochify.space");
+        assert_eq!(req.companion_key, "policy_x");
+
+        // Re-running the migration is a no-op (idempotent).
+        let (m, q) = migrate_flat_companions_for_module(&storage, module_id).unwrap();
+        assert_eq!(m, 0);
+        assert_eq!(q, 0);
+    }
+
+    #[test]
+    fn migrate_flat_companions_quarantines_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let module_id = "ownership-indexer";
+        let companions_root = storage.module_dir_for_companions(module_id);
+        std::fs::create_dir_all(&companions_root).unwrap();
+
+        // Legacy record with NO dial_back.url — unmigratable.
+        let legacy_cbor = {
+            #[derive(serde::Serialize)]
+            struct LegacyReq {
+                targets: Vec<SubscribeTarget>,
+                companion_key: String,
+                resume_from: Option<ChainPoint>,
+                interests: Vec<mitos_protocol::Interest>,
+                dial_back: Option<DialBackOverride>,
+            }
+            let r = LegacyReq {
+                targets: vec![SubscribeTarget::Module {
+                    name: module_id.into(),
+                }],
+                companion_key: "orphan".into(),
+                resume_from: None,
+                interests: vec![],
+                dial_back: None,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&r, &mut buf).unwrap();
+            buf
+        };
+        std::fs::write(companions_root.join("orphan.cbor"), &legacy_cbor).unwrap();
+
+        let (migrated, quarantined) =
+            migrate_flat_companions_for_module(&storage, module_id).unwrap();
+        assert_eq!(migrated, 0);
+        assert_eq!(quarantined, 1);
+
+        assert!(!companions_root.join("orphan.cbor").exists());
+        assert!(
+            companions_root
+                .join(".unreachable")
+                .join("orphan.cbor")
+                .exists()
+        );
     }
 }

@@ -81,18 +81,27 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// `apply_event` / `on_recapture` body.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Identifier for one (module, companion_key) pair. Hashable
-/// + cloneable for use as map key.
+/// Identifier for one `(module, client_id, companion_key)` tuple.
+/// Hashable + cloneable for use as map key. `client_id`
+/// disambiguates two consumers that share the same
+/// `companion_key` — see
+/// `docs/design/MULTI_CLIENT_COMPANIONS.md`.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct CompanionId {
     pub module_id: String,
+    pub client_id: String,
     pub companion_key: String,
 }
 
 impl CompanionId {
-    pub fn new(module_id: impl Into<String>, companion_key: impl Into<String>) -> Self {
+    pub fn new(
+        module_id: impl Into<String>,
+        client_id: impl Into<String>,
+        companion_key: impl Into<String>,
+    ) -> Self {
         Self {
             module_id: module_id.into(),
+            client_id: client_id.into(),
             companion_key: companion_key.into(),
         }
     }
@@ -248,6 +257,16 @@ impl CompanionDialer {
             }
         };
         for module_id in modules {
+            // One-time migration of pre-fix flat companion files
+            // into the two-level `<client_id>/<companion_key>.cbor`
+            // layout. Idempotent — no-op once migrated. See
+            // `docs/design/MULTI_CLIENT_COMPANIONS.md`.
+            if let Err(e) =
+                crate::companions::migrate_flat_companions_for_module(&self.storage, &module_id)
+            {
+                warn!(module = %module_id, error = %e, "companion layout migration failed; continuing");
+            }
+
             let dir = self.storage.module_dir_for_companions(&module_id);
             if !dir.exists() {
                 continue;
@@ -259,14 +278,46 @@ impl CompanionDialer {
                     continue;
                 }
             };
+            // Two-level walk: each entry under `<module>/companions/`
+            // is a `<client_id>/` subdirectory; each file under that
+            // is a `<companion_key>.cbor`. Skip the reserved
+            // `.unreachable/` quarantine dir + any leftover flat
+            // `.cbor` files that survived migration.
             for entry in read.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                let file_type = match entry.file_type() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "file type probe failed");
+                        continue;
+                    }
+                };
+                if !file_type.is_dir() {
                     continue;
                 }
-                match load_companion(&path) {
-                    Ok(req) => self.spawn(req).await,
-                    Err(e) => warn!(path = %path.display(), error = %e, "load companion failed"),
+                let dir_name = entry.file_name();
+                let dir_name_str = dir_name.to_string_lossy();
+                if dir_name_str.starts_with('.') {
+                    continue;
+                }
+                let client_files = match std::fs::read_dir(&path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(client_dir = %path.display(), error = %e, "read client-dir failed");
+                        continue;
+                    }
+                };
+                for client_entry in client_files.flatten() {
+                    let cpath = client_entry.path();
+                    if cpath.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                        continue;
+                    }
+                    match load_companion(&cpath) {
+                        Ok(req) => self.spawn(req).await,
+                        Err(e) => {
+                            warn!(path = %cpath.display(), error = %e, "load companion failed")
+                        }
+                    }
                 }
             }
         }
@@ -283,7 +334,7 @@ impl CompanionDialer {
         {
             let mut tasks = self.tasks.lock().await;
             for target in &req.targets {
-                let id = CompanionId::new(target.name(), &req.companion_key);
+                let id = CompanionId::new(target.name(), &req.client_id, &req.companion_key);
                 if let Some(prev) = tasks.remove(&id) {
                     prev.cancel.cancel();
                     drop(prev.task);
@@ -425,7 +476,7 @@ impl CompanionDialer {
 
     async fn spawn(&self, req: SubscribeRequest) {
         for target in req.targets.clone() {
-            let id = CompanionId::new(target.name(), &req.companion_key);
+            let id = CompanionId::new(target.name(), &req.client_id, &req.companion_key);
             let cancel = CancellationToken::new();
             let cancel_for_task = cancel.clone();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -563,7 +614,11 @@ async fn run_companion(
     // Reclaim Pending rows from a previous host process. Catches
     // the host-crash-mid-request case — rows marked Pending then
     // never Acked because the host died mid-POST.
-    match store.requeue_pending_for_companion(&req.companion_key, &now_rfc3339()) {
+    match store.requeue_pending_for_companion(
+        &req.companion_key,
+        &req.client_id,
+        &now_rfc3339(),
+    ) {
         Ok(0) => {}
         Ok(count) => {
             info!(
@@ -666,6 +721,7 @@ async fn run_companion(
                     header_value: header_value.as_deref(),
                     store: &store,
                     companion_key: &req.companion_key,
+                    client_id: &req.client_id,
                     status_writer: &status_writer,
                     lanes: lane_config.lanes,
                     now: now_rfc3339,
@@ -831,9 +887,12 @@ fn now_rfc3339() -> String {
     format!("unix:{secs}")
 }
 
-/// Internal path helper (re-exported via storage).
+/// Internal path helper. Resolves to the two-level layout:
+/// `<storage>/<module>/companions/<client_id>/<companion_key>.cbor`.
+/// See `docs/design/MULTI_CLIENT_COMPANIONS.md`.
 pub fn companion_path_for(storage: &ModuleStorage, id: &CompanionId) -> PathBuf {
     storage
         .module_dir_for_companions(&id.module_id)
+        .join(&id.client_id)
         .join(format!("{}.cbor", id.companion_key))
 }

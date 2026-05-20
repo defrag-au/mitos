@@ -178,6 +178,10 @@ fn admin_router_inner(
         .route("/_admin/modules/{id}/restart", post(restart_module))
         .route("/_admin/modules/{id}/recapture", post(recapture_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
+        .route(
+            "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
+            axum::routing::delete(delete_companion),
+        )
         .route("/_admin/modules/{id}/last-trap", get(last_trap))
         .route(
             "/_admin/modules/{id}/emissions",
@@ -565,23 +569,53 @@ async fn evict_module(
     // expectation is consumer-side cleanup retires its companion
     // record first (via the consumer's own admin surface) so
     // there's nothing to enumerate by the time evict runs.
+    //
+    // Companions live under the two-level layout
+    // `<storage>/<id>/companions/<client_id>/<companion_key>.cbor`
+    // (see `docs/design/MULTI_CLIENT_COMPANIONS.md`). The reported
+    // identifiers are `client_id:companion_key` so an operator can
+    // distinguish two consumers that share a key.
     if !query.force {
         let companions_dir = state.storage.module_dir_for_companions(&id);
         if companions_dir.exists() {
+            let mut entries: Vec<String> = Vec::new();
             let read_dir = std::fs::read_dir(&companions_dir).map_err(|e| {
                 HandlerError::Storage(StorageError::Io(std::io::Error::other(format!(
                     "read companions dir {}: {e}",
                     companions_dir.display()
                 ))))
             })?;
-            let entries: Vec<String> = read_dir
-                .filter_map(|r| r.ok())
-                .filter_map(|e| {
-                    e.file_name()
+            for client_entry in read_dir.flatten() {
+                let file_type = match client_entry.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let client_id = match client_entry.file_name().to_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                // Skip the `.unreachable/` quarantine dir.
+                if client_id.starts_with('.') {
+                    continue;
+                }
+                let client_dir = client_entry.path();
+                let inner = match std::fs::read_dir(&client_dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                for inner_entry in inner.flatten() {
+                    if let Some(key) = inner_entry
+                        .file_name()
                         .to_str()
-                        .and_then(|s| s.strip_suffix(".cbor").map(|k| k.to_owned()))
-                })
-                .collect();
+                        .and_then(|s| s.strip_suffix(".cbor"))
+                    {
+                        entries.push(format!("{client_id}:{key}"));
+                    }
+                }
+            }
             if !entries.is_empty() {
                 return Ok((
                     StatusCode::CONFLICT,
@@ -632,6 +666,74 @@ async fn evict_module(
         }),
     )
         .into_response())
+}
+
+/// `DELETE /_admin/modules/{id}/companions/{client_id}/{companion_key}`
+/// — surgically remove a single companion record from the host's
+/// store. Leaves other clients sharing the same `companion_key`
+/// (or the same `client_id` with other keys) untouched. The
+/// dialer's in-memory task for that exact tuple is also
+/// cancelled. Returns:
+///
+/// - 204 No Content on success (record removed).
+/// - 404 Not Found if the module or record doesn't exist.
+/// - 500 on storage errors.
+///
+/// See `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Admin
+/// operations".
+#[derive(Debug, Deserialize)]
+struct DeleteCompanionParams {
+    id: String,
+    client_id: String,
+    companion_key: String,
+}
+
+async fn delete_companion(
+    State(state): State<AdminState>,
+    Path(params): Path<DeleteCompanionParams>,
+) -> Result<Response, HandlerError> {
+    let DeleteCompanionParams {
+        id,
+        client_id,
+        companion_key,
+    } = params;
+
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+
+    let path = state
+        .storage
+        .module_dir_for_companions(&id)
+        .join(&client_id)
+        .join(format!("{companion_key}.cbor"));
+    if !path.exists() {
+        return Ok((StatusCode::NOT_FOUND, "no such companion record").into_response());
+    }
+
+    // Cancel the in-memory dialer task before removing the file —
+    // otherwise the next drain tick might re-spawn it from a
+    // not-yet-deleted record. Best-effort: nothing breaks if the
+    // task wasn't running.
+    if let Some(host) = &state.host {
+        host.cancel_companion_task(&id, &client_id, &companion_key)
+            .await;
+    }
+
+    std::fs::remove_file(&path).map_err(|e| {
+        HandlerError::Storage(StorageError::Io(std::io::Error::other(format!(
+            "remove {}: {e}",
+            path.display()
+        ))))
+    })?;
+
+    tracing::info!(
+        module = %id,
+        client_id = %client_id,
+        companion_key = %companion_key,
+        "companion record deleted"
+    );
+    Ok((StatusCode::NO_CONTENT, "").into_response())
 }
 
 async fn restart_module(

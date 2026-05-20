@@ -136,6 +136,27 @@ enum Cmd {
         force: bool,
     },
 
+    /// Surgically remove a single companion record from a module's
+    /// store. Cancels the in-memory dial task for that exact
+    /// `(client_id, companion_key)` pair and deletes the on-disk
+    /// `.cbor` file. Other consumers of the same module — same
+    /// `companion_key` with a different `client_id`, or a
+    /// different key entirely — stay registered. See
+    /// `docs/design/MULTI_CLIENT_COMPANIONS.md`.
+    DeleteCompanion {
+        /// Module id.
+        #[arg(long)]
+        module: String,
+        /// Client instance identifier (e.g. the dial-back URL
+        /// host portion: `hooks.epochify.space`).
+        #[arg(long = "client-id")]
+        client_id: String,
+        /// Companion key (the dApp-chosen identity passed in
+        /// `SubscribeRequest.companion_key`).
+        #[arg(long)]
+        key: String,
+    },
+
     /// Build then upload — wrangler-deploy ergonomics. Shells out
     /// to `mitos-build`, then POSTs the artifact via
     /// `upload-module`. Equivalent to running both steps by hand.
@@ -249,6 +270,11 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Recapture { id, reason } => cmd_recapture(&client, &cli, id, reason).await,
         Cmd::DeleteModule { id } => cmd_delete_module(&client, &cli, id).await,
         Cmd::EvictModule { id, force } => cmd_evict_module(&client, &cli, id, force).await,
+        Cmd::DeleteCompanion {
+            module,
+            client_id,
+            key,
+        } => cmd_delete_companion(&client, &cli, module, client_id, key).await,
         Cmd::Deploy {
             crate_name,
             module_id,
@@ -650,6 +676,37 @@ async fn cmd_evict_module(
             println!("  - {k}");
         }
     }
+    Ok(())
+}
+
+async fn cmd_delete_companion(
+    client: &Client,
+    cli: &Cli,
+    module: String,
+    client_id: String,
+    key: String,
+) -> anyhow::Result<()> {
+    // URL-encode the path segments lazily — `client_id` charset is
+    // restricted to `[a-zA-Z0-9._-]` server-side so this is mostly
+    // defensive; `companion_key` is restricted to `[a-zA-Z0-9_-]`.
+    let url = format!(
+        "{}/_admin/modules/{module}/companions/{client_id}/{key}",
+        cli.mitos
+    );
+    let resp = auth(client.delete(&url), cli.token.as_deref())
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        anyhow::bail!("no such companion record (module={module}, client_id={client_id}, key={key})");
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("delete-companion failed: {status}: {text}");
+    }
+    println!(
+        "deleted companion module={module} client_id={client_id} companion_key={key}"
+    );
     Ok(())
 }
 

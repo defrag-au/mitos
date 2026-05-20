@@ -167,7 +167,7 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
         .emissions_store("test-indexer")
         .expect("emissions store");
     let rows = emissions
-        .list_queued_for_companion("test-companion")
+        .list_queued_for_companion("test-companion", "test-client")
         .expect("list emissions");
 
     assert_eq!(
