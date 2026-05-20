@@ -1,0 +1,21 @@
+abi_version = 2
+
+# `collection-holders` is dynamic-interest-only. Static interest
+# is empty; consumers register the policies they care about via
+# `update_interest` over the replication WS, and the module
+# performs a cold-start scan via `chain_data::utxos_by_policy(X)`
+# on each newly-added policy.
+#
+# Sibling to `holder-distribution`: covers policies where every
+# asset name is a distinct collectible identity (NFT + RFT
+# shape), not CNT distribution. See
+# `docs/design/COLLECTION_MODULES.md`.
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+mitos-module-kit = { path = "../../crates/mitos-module-kit" }
+pallas-addresses = "1.0.0-alpha.6"
+pallas-primitives = "1.0.0-alpha.6"

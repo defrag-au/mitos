@@ -12,6 +12,7 @@ pub mod asset_transfer;
 pub mod burn_address;
 pub mod cip25_mint;
 pub mod cip68_mint;
+pub mod collection_holders;
 pub mod dex;
 pub mod holder_distribution;
 pub mod jpg_store_listing;
@@ -40,6 +41,7 @@ pub fn decode_emit(module_id: &str, channel: u32, payload: &[u8]) -> Option<Stri
         "burn-address" => burn_address::decode_emit(channel, payload),
         "cip-25-mint" => cip25_mint::decode_emit(channel, payload),
         "cip-68-mint" => cip68_mint::decode_emit(channel, payload),
+        "collection-holders" => collection_holders::decode_emit(channel, payload),
         "cswap-dex" => dex::decode_emit(channel, payload),
         "splash-dex" => dex::decode_emit(channel, payload),
         "holder-distribution" => holder_distribution::decode_emit(channel, payload),
