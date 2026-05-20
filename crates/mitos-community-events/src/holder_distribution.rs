@@ -73,9 +73,7 @@ pub enum HolderId {
 /// the contracts it recognised while decomposing. The worker
 /// refines this with project-config classification (burn sinks,
 /// known wallets, treasury) on top.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HolderRole {
     /// A plain holder — the default; also what an enterprise

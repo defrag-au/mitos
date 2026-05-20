@@ -12,22 +12,19 @@ use pallas_primitives::{BigInt, Constr, PlutusData};
 /// CSwap pool script address. All 82 pools live at this one
 /// address (CSwap uses a single canonical stake credential
 /// across its pools).
-pub const POOL_SCRIPT_ADDR: &str =
-    "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
+pub const POOL_SCRIPT_ADDR: &str = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
 
 /// CSwap order / batcher script address prefix (51 chars =
 /// `addr1z` + header byte + 28-byte payment hash worth of
 /// bech32). Each user's order glues its own stake credential to
 /// the same payment script, so consumers prefix-match.
-pub const ORDER_SCRIPT_ADDR_PREFIX: &str =
-    "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nh";
+pub const ORDER_SCRIPT_ADDR_PREFIX: &str = "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nh";
 
 /// CSwap farm script address. LP tokens are locked here when a
 /// user stakes for yield. CSwap uses one canonical farm script;
 /// staked-LP UTxOs all sit at this address and carry the
 /// staker's identity in their datum (see [`decode_staking_datum`]).
-pub const FARM_SCRIPT_ADDR: &str =
-    "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf";
+pub const FARM_SCRIPT_ADDR: &str = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf";
 
 /// Plutus constructor tag for alternative 0 (`Constr` tag 121).
 /// Both the CSwap pool datum and the staking datum are

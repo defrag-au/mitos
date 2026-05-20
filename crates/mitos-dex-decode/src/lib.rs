@@ -54,9 +54,6 @@ mod tests {
     fn lp_share_no_overflow_on_large_inputs() {
         // Large reserve × large holding would overflow u64 before
         // the divide; the u128 intermediate keeps it exact.
-        assert_eq!(
-            lp_share(u64::MAX, u64::MAX, u64::MAX),
-            u64::MAX,
-        );
+        assert_eq!(lp_share(u64::MAX, u64::MAX, u64::MAX), u64::MAX,);
     }
 }
