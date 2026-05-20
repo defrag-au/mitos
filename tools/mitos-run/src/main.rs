@@ -13,7 +13,7 @@
 //!           --fixture path/to/fixture.toml
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -273,6 +273,12 @@ struct FixtureDataPlane {
     /// from `[[utxo]]` entries by decoding each address's
     /// payment part.
     by_payment_cred: HashMap<[u8; 28], Vec<OutputRef>>,
+    /// 28-byte policy id → refs at outputs whose asset multiset
+    /// contains that policy. Populated from each `[[utxo]]`
+    /// entry's `[[utxo.assets]]` table. Enables `holds_policy`-
+    /// shaped cold-start scans (used by `holder-distribution`,
+    /// `collection-holders`).
+    by_policy: HashMap<Vec<u8>, Vec<OutputRef>>,
     aux_by_tx: HashMap<Vec<u8>, Vec<u8>>,
     /// Hash → datum-CBOR map. Populated from block witness-data
     /// during harvest so modules calling
@@ -292,6 +298,7 @@ impl FixtureDataPlane {
         let mut by_ref = HashMap::new();
         let mut by_address: HashMap<String, Vec<OutputRef>> = HashMap::new();
         let mut by_payment_cred: HashMap<[u8; 28], Vec<OutputRef>> = HashMap::new();
+        let mut by_policy: HashMap<Vec<u8>, Vec<OutputRef>> = HashMap::new();
         let mut aux_by_tx = HashMap::new();
 
         for u in fixture.utxo {
@@ -350,6 +357,23 @@ impl FixtureDataPlane {
                 };
                 by_payment_cred.entry(cred_bytes).or_default().push(oref);
             }
+            // Index this UTxO under every distinct policy it
+            // holds. A single UTxO can carry assets from multiple
+            // policies (rare for NFT collections, common for
+            // CNT-mixed wallets); dedupe at the policy level so
+            // the same ref doesn't appear twice.
+            let mut seen_policies: HashSet<[u8; 28]> = HashSet::new();
+            for a in &assets {
+                let Ok(policy_bytes) = a.policy_id.as_bytes() else {
+                    continue;
+                };
+                if seen_policies.insert(policy_bytes) {
+                    by_policy
+                        .entry(policy_bytes.to_vec())
+                        .or_default()
+                        .push(oref);
+                }
+            }
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
                 ResolvedUtxo {
@@ -379,6 +403,7 @@ impl FixtureDataPlane {
             by_ref,
             by_address,
             by_payment_cred,
+            by_policy,
             aux_by_tx,
             datums_by_hash: HashMap::new(),
         })
@@ -532,12 +557,8 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
         Ok(self.by_address.get(address).cloned().unwrap_or_default())
     }
 
-    async fn utxos_by_policy(&self, _policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
-        // Fixture replay doesn't index by policy; modules that
-        // depend on this host-fn need to pre-stash refs via
-        // explicit `[[utxo]]` entries the runner already
-        // surfaces through `read_utxos`.
-        Ok(Vec::new())
+    async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(self.by_policy.get(policy).cloned().unwrap_or_default())
     }
 
     async fn utxos_by_payment_cred(&self, cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
