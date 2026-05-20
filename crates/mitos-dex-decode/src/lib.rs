@@ -15,6 +15,7 @@
 //! over coordination."
 
 pub mod cswap;
+pub mod originator;
 pub mod splash;
 
 /// Redistribute one LP provider's share of a pool's reserve of

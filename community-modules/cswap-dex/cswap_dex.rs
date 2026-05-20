@@ -85,6 +85,7 @@ use mitos_dex_decode::cswap::{
     CswapPoolDatum, FARM_SCRIPT_ADDR, ORDER_SCRIPT_ADDR_PREFIX, POOL_SCRIPT_ADDR, PairKey,
     decode_pool_datum,
 };
+use mitos_dex_decode::originator::{find_originator as decode_find_originator, is_user_wallet};
 
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
@@ -131,13 +132,6 @@ const TREASURY_WALLET: &str =
 /// - `addr1u` — key payment + pointer stake (rare)
 /// - `addr1v` — key-only enterprise (no stake)
 ///
-/// Script-locked addresses (`addr1z` / `addr1x` / `addr1w`) are
-/// pool / order / batcher / aggregator-router outputs that we
-/// don't credit as the swapper. Testnet variants
-/// (`addr_test1q` / `…u` / `…v`) covered by the helper below.
-const MAINNET_USER_PREFIXES: &[&str] = &["addr1q", "addr1u", "addr1v"];
-const TESTNET_USER_PREFIXES: &[&str] = &["addr_test1q", "addr_test1u", "addr_test1v"];
-
 /// One pool input captured from the event stream.
 struct PoolInput {
     /// Decoded pool datum (asset pair + fee).
@@ -381,6 +375,7 @@ fn emit_for_pool_pair(
                     delta_quote,
                     delta_base,
                     produced,
+                    consumed,
                     consumed_orders,
                     reserves_before,
                     reserves_after,
@@ -405,6 +400,7 @@ fn emit_swap(
     delta_quote: i128,
     delta_base: i128,
     produced: &[ProducedEvent],
+    consumed: &[ConsumedEvent],
     consumed_orders: &[ConsumedEvent],
     reserves_before: Option<PoolReserves>,
     reserves_after: Option<PoolReserves>,
@@ -438,12 +434,26 @@ fn emit_swap(
     let batcher_fee_lovelace =
         derive_batcher_fee_lovelace(consumed_orders, &asset_in, swapper.as_ref());
 
+    // Aggregator-routed swaps land `asset_out` at a script
+    // address (the routing wrapper's escrow), so `find_swapper`
+    // returns None and `swapper_address` is empty. Surface the
+    // dominant key-wallet input by lovelace as a best-effort
+    // user-identity fallback. `None` for direct swaps (already
+    // identified by `swapper_address`) and for swaps with no
+    // recognisable key-wallet inputs.
+    let originator_address = if swapper_address.is_empty() {
+        find_originator(consumed)
+    } else {
+        None
+    };
+
     emit_event(&DexAction::Swap(Swap {
         tx_hash: tx_hash_hex.to_string(),
         slot,
         dex_brand: DEX_BRAND.to_string(),
         contract_version: None,
         swapper_address,
+        originator_address,
         asset_in,
         asset_out,
         pool_id: Some(pool_id_for_pair(datum)),
@@ -816,6 +826,19 @@ fn find_swapper(produced: &[ProducedEvent], asset_out: &SwapAsset) -> Option<Swa
     None
 }
 
+/// Project the `ConsumedEvent` slice into the
+/// `(address, lovelace)` shape `mitos-dex-decode::originator`
+/// expects, then delegate to the shared helper. Returns the
+/// owned `String` since `ConsumedEvent` is not `'static`.
+fn find_originator(consumed: &[ConsumedEvent]) -> Option<String> {
+    decode_find_originator(
+        consumed
+            .iter()
+            .map(|c| (c.prior_output.address.as_str(), c.prior_output.lovelace)),
+    )
+    .map(String::from)
+}
+
 struct SwapperInfo {
     address: String,
     /// Lovelace held in the recipient's wallet output. For
@@ -903,11 +926,6 @@ fn derive_batcher_fee_lovelace(
     deposit
         .checked_sub(*pool_inflow)
         .and_then(|x| x.checked_sub(swapper.output_lovelace))
-}
-
-fn is_user_wallet(addr: &str) -> bool {
-    MAINNET_USER_PREFIXES.iter().any(|p| addr.starts_with(p))
-        || TESTNET_USER_PREFIXES.iter().any(|p| addr.starts_with(p))
 }
 
 fn output_contains(out: &TypedOutput, asset: &SwapAsset) -> bool {

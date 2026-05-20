@@ -80,8 +80,7 @@ const DEX_BRAND: &str = "Splash";
 #[allow(dead_code)]
 const CANCEL_REDEEMER: &[u8] = &[0xd8, 0x79, 0x80];
 
-const MAINNET_USER_PREFIXES: &[&str] = &["addr1q", "addr1u", "addr1v"];
-const TESTNET_USER_PREFIXES: &[&str] = &["addr_test1q", "addr_test1u", "addr_test1v"];
+use mitos_dex_decode::originator::{find_originator as decode_find_originator, is_user_wallet};
 
 /// One pool input captured from the event stream.
 struct PoolInput {
@@ -106,8 +105,9 @@ struct TxBuffer {
     produced: Vec<ProducedEvent>,
     /// All consumed events — kept generic so future variants
     /// (OrderCancel etc.) can inspect them without a buffer
-    /// schema change.
-    #[allow(dead_code)]
+    /// schema change. `emit_swap`'s `find_originator` consumes
+    /// this to surface the user-funded address on
+    /// aggregator-routed swaps.
     consumed: Vec<ConsumedEvent>,
     tx_hash: Option<Vec<u8>>,
     slot: Option<u64>,
@@ -183,7 +183,14 @@ fn flush_buffer(buf: TxBuffer) {
         let Some(pool_out) = pool_outputs.remove(&pair) else {
             continue;
         };
-        emit_for_pool_pair(&tx_hash_hex, slot, &pool_in, &pool_out, &buf.produced);
+        emit_for_pool_pair(
+            &tx_hash_hex,
+            slot,
+            &pool_in,
+            &pool_out,
+            &buf.produced,
+            &buf.consumed,
+        );
     }
 }
 
@@ -193,6 +200,7 @@ fn emit_for_pool_pair(
     pool_in: &PoolInput,
     pool_out: &PoolOutput,
     produced: &[ProducedEvent],
+    consumed: &[ConsumedEvent],
 ) {
     let datum = &pool_in.datum;
 
@@ -255,6 +263,7 @@ fn emit_for_pool_pair(
                 delta_quote,
                 delta_base,
                 produced,
+                consumed,
                 reserves_before,
                 reserves_after,
             ),
@@ -277,6 +286,7 @@ fn emit_swap(
     delta_quote: i128,
     delta_base: i128,
     produced: &[ProducedEvent],
+    consumed: &[ConsumedEvent],
     reserves_before: Option<PoolReserves>,
     reserves_after: Option<PoolReserves>,
 ) {
@@ -304,12 +314,26 @@ fn emit_swap(
         .map(|s| s.address)
         .unwrap_or_default();
 
+    // Aggregator-routed swaps land `asset_out` at a script
+    // address (the routing wrapper's escrow), so `find_swapper`
+    // returns None and `swapper_address` is empty. Surface the
+    // dominant key-wallet input by lovelace as a best-effort
+    // user-identity fallback. `None` for direct swaps (already
+    // identified by `swapper_address`) and for swaps with no
+    // recognisable key-wallet inputs.
+    let originator_address = if swapper_address.is_empty() {
+        find_originator(consumed)
+    } else {
+        None
+    };
+
     emit_event(&DexAction::Swap(Swap {
         tx_hash: tx_hash_hex.to_string(),
         slot,
         dex_brand: DEX_BRAND.to_string(),
         contract_version: Some("V3".to_string()),
         swapper_address,
+        originator_address,
         asset_in,
         asset_out,
         pool_id: Some(pool_id_for_pair(datum)),
@@ -323,6 +347,19 @@ fn emit_swap(
         batcher_fee_lovelace: None,
         effective_price: Some((out_qty, in_qty)),
     }));
+}
+
+/// Project the `ConsumedEvent` slice into the
+/// `(address, lovelace)` shape `mitos-dex-decode::originator`
+/// expects, then delegate to the shared helper. Returns the
+/// owned `String` since `ConsumedEvent` is not `'static`.
+fn find_originator(consumed: &[ConsumedEvent]) -> Option<String> {
+    decode_find_originator(
+        consumed
+            .iter()
+            .map(|c| (c.prior_output.address.as_str(), c.prior_output.lovelace)),
+    )
+    .map(String::from)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -524,11 +561,6 @@ fn find_zap_recipient(produced: &[ProducedEvent], target_lovelace: u64) -> Optio
         .filter(|(d, _)| *d <= tol)
         .min_by_key(|(d, _)| *d)
         .map(|(_, addr)| addr.clone())
-}
-
-fn is_user_wallet(addr: &str) -> bool {
-    MAINNET_USER_PREFIXES.iter().any(|p| addr.starts_with(p))
-        || TESTNET_USER_PREFIXES.iter().any(|p| addr.starts_with(p))
 }
 
 fn pool_id_for_pair(d: &SplashPoolDatum) -> String {

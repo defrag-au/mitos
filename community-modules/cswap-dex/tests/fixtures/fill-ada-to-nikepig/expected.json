@@ -18,6 +18,7 @@
       348390453
     ],
     "kind": "swap",
+    "originator_address": null,
     "pool_fee_bps": 85,
     "pool_id": "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c:4e696b65|lovelace",
     "pool_reserves_after": {

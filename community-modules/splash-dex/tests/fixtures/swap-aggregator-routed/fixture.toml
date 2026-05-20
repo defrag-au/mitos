@@ -1,0 +1,52 @@
+# splash-dex golden scenario: aggregator-routed ADA→Aliens swap.
+#
+# Demonstrates the `originator_address` fallback: the swap's
+# token-output beneficiary is a script address belonging to an
+# external aggregator (an `addr1z…` order-routing wrapper). Our
+# `find_swapper(produced)` filter to user-wallets returns None
+# for this TX → `swapper_address` is empty → the new
+# `find_originator(consumed)` helper surfaces the user wallet
+# from the consuming-TX's inputs (largest key-wallet input by
+# lovelace, in this case the user's `addr1q9xp27xnlm…`).
+#
+# TX:           78f10cfc54c5fd40765cd33b1e2e39bb9fa430df6d4b369307255ad3b5c420d8
+# Slot:         187549571 (epoch 631, 2026-05-18 14:51:02 UTC)
+# Prior pool:   block at slot 187549559 (TX
+#               37d3182332342b2400818458f4c8db9e5408cbfdc9572f24a2f4773375a09bb7)
+#               — a 14.24M Aliens SELL into the same pool that
+#               immediately precedes our buy.
+# Aggregator:   addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6n…
+# Originator:   addr1q9xp27xnlm837dz4r6fk63qyrlqt573mqeqm6v2n928565p…
+#               (the user's key+key wallet — IN[0] + IN[2] of
+#               the fill TX; also receives the 47 ADA change).
+#
+# User paid ~230 ADA into the pool → 5,546,736 Aliens routed
+# through the aggregator's escrow. Pool gave up 5,546,736
+# Aliens (372,782,038 → 367,235,302).
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z"
+
+# The user's two wallet UTxOs that funded the swap. The
+# consuming TX consumes IN[0] (138 ADA) + IN[1] (pool) + IN[2]
+# (142 ADA); IN[0] and IN[2] are produced in blocks well outside
+# the fixture set, so `resolve_prior` falls back to
+# `TypedOutput::unresolved()` and the user's address never
+# reaches the module unless we synthesise the prior outputs by
+# hand here. Without these entries `find_originator` sees an
+# empty-address consumed slice and returns None — exactly the
+# bug this fixture is designed to catch.
+[[utxo]]
+tx_hash = "0f43f03a4f85757a4f74ea31f138750a72a11e3cbe02789e5f603ee0eab3c1a2"
+index = 2
+address = "addr1q9xp27xnlm837dz4r6fk63qyrlqt573mqeqm6v2n928565p9n897pq0u8ngd7afkzeh970lsrhpcluf9uq8djwe7ql0s3j28q7"
+lovelace = 138_008_395
+
+[[utxo]]
+tx_hash = "eb8927944ea0129124823e9714681475a5a8143ea882f5fa35e55e9b8de0c3fa"
+index = 1
+address = "addr1q9xp27xnlm837dz4r6fk63qyrlqt573mqeqm6v2n928565p9n897pq0u8ngd7afkzeh970lsrhpcluf9uq8djwe7ql0s3j28q7"
+lovelace = 142_451_763
