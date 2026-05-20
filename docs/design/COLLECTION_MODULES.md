@@ -1,6 +1,6 @@
 # Collection Modules — Holders & Metadata
 
-> **Status: design draft (2026-05-20).** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives.
+> **Status: design draft (2026-05-20, validated against platform v2 on 2026-05-21).** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives. **Target dispatch model: platform v2** ([`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md)) — both modules consume interest-filtered `produced` / `consumed` events per TX, not block-iteration. Bootstrap, backfill, and tip dispatch flow through the same path on v2.
 
 ## Goal
 
@@ -301,16 +301,14 @@ pub enum MetadataEvent {
 
 **Cold-start — CIP-25 path (historical, may require Maestro fallback):**
 
-1. Call `chain_data::mint_history_by_policy(X)` — *proposed new host-fn*, see [Required Data Plane Additions](#required-data-plane-additions). Returns `Vec<(asset_name_hex, mint_tx_hash)>` for all mints under the policy.
-2. For each mint TX:
-   - Try `chain_data::tx_metadata(tx_hash)` — Dolos's `aux_data.redb` cache + live archive
-   - If unavailable (TX past archive horizon and not cached), `MaestroFallbackPlane` resolves via `fetch_aux_data(tx_hash)`
-3. Parse `tx_metadata[721][policy_hex][asset_name]` → `CanonicalMetadata`
+1. Call `chain_data::utxos_by_policy(X)` → derive the set of currently-held `asset_name_hex` values from the typed outputs. This is the set of assets whose metadata we need.
+2. Resolve `asset_name → mint_tx_hash` via the module-internal Maestro path (`/policy/{id}/assets` catalog + per-asset `/assets/{id}/txs?type=mint`). The data plane's existing `MaestroClient` is the call site; rate-limit envelope is shared.
+3. For each `(asset_name, mint_tx_hash)`:
+   - Call `chain_data::tx_metadata(tx_hash)` — tiered: Dolos archive first, `MaestroFallbackPlane` via `fetch_aux_data` for TXs past the horizon
+   - Decode the CBOR aux-data payload, extract `[721][policy_hex][asset_name]` → `CanonicalMetadata`
 4. Emit `MetadataSnapshot`
 
-The Maestro fallback is **already present** in the platform for UTxO resolution past the archive horizon (see `crates/mitos-platform/src/maestro_fallback_plane.rs`). Extending it to mint-metadata backfill requires:
-- Confirming `MaestroClient::fetch_aux_data` returns CIP-25 (`721`) metadata labels (likely yes — Maestro's `/transactions/{hash}/metadata` endpoint surfaces all labels)
-- Adding `tx_metadata` to the data-plane trait if not already present, with the same tiered resolution as `read_utxos`
+Both `tx_metadata` (data plane API at `lib.rs:241`) and `MaestroFallbackPlane` (UTxO fallback at `crates/mitos-platform/src/maestro_fallback_plane.rs`) are already in place. The only platform-side work for the CIP-25 path is verifying that `MaestroClient::fetch_aux_data` returns aux-data CBOR including the CIP-25 (`721`) label across all known Maestro response shapes.
 
 **Cold-start — Hybrid (policy uses both, common during CIP-25→CIP-68 migrations):**
 
@@ -348,23 +346,24 @@ For large CIP-25 collections, **snapshot emission is the dominant cost**. Chunki
 - **Asset minted before policy was tracked by mitos.** Cold-start covers via the history scan. No "missed mint" gap.
 - **Multiple mint TXs for same asset_name (RFT supply growth).** Each mint emits a `MetadataInitial` if it carries new metadata; subsequent re-mints of the same asset_name with same metadata are silently deduped by version comparison. (Edge case — most RFTs mint identical metadata across all copies.)
 
-### Required data plane additions
+### Data plane surface
 
-To support both modules cleanly, the host-fn surface needs the following additions (each is a small extension of an existing data-plane shape — none represent novel chain indexing):
+What's already available (verified 2026-05-21 against `crates/mitos-data-plane/src/lib.rs`):
 
 | Host-fn | Used by | Status |
 |---|---|---|
-| `chain_data::utxos_by_policy(policy_id) -> Vec<OutputRef>` | both | exists (`holder-distribution` uses it) |
-| `chain_data::read_utxos(refs) -> Vec<(OutputRef, TypedOutput)>` | both | exists (with Maestro fallback) |
-| `chain_data::tx_metadata(tx_hash) -> Option<TxMetadata>` | `collection-metadata` | **new** — needs implementation + Maestro fallback |
-| `chain_data::mint_history_by_policy(policy_id) -> Vec<(asset_name_hex, tx_hash)>` | `collection-metadata` | **new** — depends on Dolos exposing a mint-history index |
+| `chain_data::utxos_by_policy(policy_id) -> Vec<OutputRef>` | both | `lib.rs:129` — exists (`holder-distribution` uses it) |
+| `chain_data::read_utxos(refs) -> Vec<(OutputRef, TypedOutput)>` | both | `lib.rs:81` — exists with Maestro fallback via `MaestroFallbackPlane` |
+| `chain_data::tx_metadata(tx_hash) -> Option<Vec<u8>>` | `collection-metadata` | `lib.rs:241` — **already shipped**, returns CBOR aux-data payload (CIP-25 metadata at label 721 is decoded by the module) |
 
-The `mint_history_by_policy` host-fn is the riskiest unknown. Dolos's existing indices are UTxO-set-shaped, not mint-history-shaped. Two implementation paths:
+What still needs to land for the CIP-25 historical bootstrap path:
 
-1. **Walk policy history via existing TX index.** For each TX referencing the policy in its mint set, record `(asset_name, tx_hash)`. Build incrementally as blocks apply.
-2. **Defer to Maestro.** Maestro's `/policy/{id}/assets` endpoint returns the catalog; pair with per-asset `/assets/{id}/mints` to get the mint TX. N+1 but fully outside the chain index. Acceptable as a phase-1 fallback while a native Dolos index is evaluated.
+**Mint-TX resolution for currently-held assets.** Given a `policy_id` and the set of currently-held `asset_name_hex` values (derivable from `utxos_by_policy` + `read_utxos`), we need to find each asset's mint TX hash so we can call `tx_metadata` against it. Two implementation paths, neither requiring a new host-fn:
 
-Phase 1 should default to option 2 (Maestro fallback for historical CIP-25) to keep the module-side surface small. Native Dolos indexing is a phase-3 optimisation if the cold-start cost proves material.
+1. **Module-internal Maestro enumeration.** The module calls Maestro's `/policy/{id}/assets` (catalog) and `/assets/{id}/txs?type=mint` (or equivalent) via the data plane's existing Maestro client, builds the `asset_name → mint_tx_hash` map, then runs `tx_metadata` per mint TX. The Maestro client and its rate-limit envelope (`MAESTRO_MAX_INFLIGHT`) are already in place; this just calls them.
+2. **Native Dolos mint-by-policy index.** Add a `mint_history_by_policy` host-fn backed by a Dolos index. Defer until cold-start performance dictates; module-internal path works fine for tens-of-thousands-of-asset collections.
+
+Option 1 is the right Phase 3 default. No new host-fn proposal. The module-internal pattern is consistent with how `holder-distribution` derives ledger state from `utxos_by_policy` results without needing the platform to surface a "holder ledger" primitive.
 
 ### Interest model
 
@@ -492,15 +491,16 @@ Estimated: 3–5 days.
 
 Estimated: 3–4 days. CIP-25 path explicitly deferred.
 
-### Phase 3 — `collection-metadata` CIP-25 facade + Maestro fallback
+### Phase 3 — `collection-metadata` CIP-25 facade
 
-- Add `chain_data::tx_metadata` host-fn with Maestro fallback
-- Add `chain_data::mint_history_by_policy` host-fn (initial implementation backed by Maestro `/policy/{id}/assets`)
-- CIP-25 cold-start path: enumerate mint TXs, fetch metadata via tiered resolution
+- Module-internal Maestro enumeration (`/policy/{id}/assets` + per-asset mint TX lookup) using the data plane's existing Maestro client
+- Use existing `chain_data::tx_metadata` host-fn (`crates/mitos-data-plane/src/lib.rs:241`) with its existing fallback for aux-data resolution
+- CIP-25 cold-start path: derive asset_name set from `utxos_by_policy`, resolve mint TX per asset via Maestro, fetch metadata via `tx_metadata`
 - CanonicalMetadata normalisation across CIP-25 and CIP-68
+- Verify `MaestroClient::fetch_aux_data` surfaces label-721 metadata across Maestro response shapes
 - Acceptance: subscribed against islanova_apex_legends (CIP-25, historical), receives full metadata snapshot including script-locked supply's metadata. Maestro call count is bounded by collection size and one-time per policy.
 
-Estimated: 4–6 days. Includes platform-side host-fn work.
+Estimated: 3–4 days. No new host-fn work — data plane surface is sufficient as-is.
 
 ### Phase 4 — `collection-ownership` worker cuts over to mitos bootstrap
 
@@ -511,9 +511,10 @@ Estimated: 4–6 days. Includes platform-side host-fn work.
 
 Estimated: 3–5 days.
 
-### Phase 5 — Mint-history native indexing (optional, deferred)
+### Phase 5 — `mint_history_by_policy` native host-fn (optional, deferred)
 
-- Dolos-side `mint_history` index (drops the Maestro-mediated CIP-25 history fetch in favour of a native scan)
+- New `chain_data::mint_history_by_policy(policy_id) -> Vec<(asset_name_hex, tx_hash)>` host-fn backed by a Dolos mint index
+- Replaces the module-internal Maestro enumeration in Phase 3 with a single host-fn call
 - Only needed if phase-3 cold-start cost is material in practice
 
 Estimated: 5–10 days. Deferred until phase 4 telemetry justifies the work.
@@ -555,14 +556,16 @@ This is a soft dependency: collection-holders + collection-metadata work without
 
 ## References
 
-- [`HOLDER_DISTRIBUTION_MODULE.md`](./HOLDER_DISTRIBUTION_MODULE.md) — sibling module for CNT distribution; pattern reference
-- [`DOMAIN_REFACTOR.md`](./DOMAIN_REFACTOR.md) — top-level domain taxonomy these modules project from
-- [`MULTI_CLIENT_COMPANIONS.md`](./MULTI_CLIENT_COMPANIONS.md) — `(module_id, client_id, companion_key)` triple identity
+- [`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md) — **target dispatch model**: eUTXO-event-filtered-by-interest, not block-iteration. Both modules implement against this surface.
+- [`MULTI_CLIENT_COMPANIONS.md`](./MULTI_CLIENT_COMPANIONS.md) — `(module_id, client_id, companion_key)` triple identity (now required, not optional)
+- [`WASM_BUDGET_CHUNKING.md`](./WASM_BUDGET_CHUNKING.md) — snapshot chunking for large emissions (Phases 1–5 shipped 2026-05-19)
 - [`EVENT_DELIVERY_RESILIENCE.md`](./EVENT_DELIVERY_RESILIENCE.md) — at-least-once delivery, recapture semantics, Maestro fallback context
-- [`WASM_BUDGET_CHUNKING.md`](./WASM_BUDGET_CHUNKING.md) — snapshot chunking for large emissions
-- [`DIALER_BULK_APPLY.md`](./DIALER_BULK_APPLY.md) — bulk-apply throughput design; soft dependency for efficient snapshot delivery
-- [`DIALER_CONCURRENCY.md`](./DIALER_CONCURRENCY.md) — partition-keyed pool underpinning per-policy lanes
+- [`DIALER_CONCURRENCY.md`](./DIALER_CONCURRENCY.md) — partition-keyed pool underpinning per-policy lanes (shipped 2026-05-14 at lanes=8)
+- [`DIALER_BULK_APPLY.md`](./DIALER_BULK_APPLY.md) — bulk-apply throughput design; soft dependency for efficient snapshot delivery (design draft)
+- [`HOLDER_DISTRIBUTION_MODULE.md`](./HOLDER_DISTRIBUTION_MODULE.md) — sibling CNT module; superseded in specifics but pattern reference holds
+- [`DOMAIN_REFACTOR.md`](./DOMAIN_REFACTOR.md) — superseded as implementation vehicle, but the `Mint` / `Burn` / `AssetMovement` taxonomy remains canonical and underpins these modules' event shapes
 - [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md) — consumer-side worker migration plan
+- `crates/mitos-data-plane/src/lib.rs:81,129,241` — host-fns these modules use (`read_utxos`, `utxos_by_policy`, `tx_metadata` all already shipped)
 - `crates/mitos-platform/src/maestro_fallback_plane.rs` — existing Maestro fallback implementation
 - `crates/mitos-platform/src/maestro.rs` — Maestro client + `aux_data.redb` cache
 - `community-modules/holder-distribution/holder_distribution.rs` — implementation reference for module structure
