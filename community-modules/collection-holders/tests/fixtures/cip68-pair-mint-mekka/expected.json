@@ -1,0 +1,213 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56"
+  },
+  {
+    "holding_count": 0,
+    "kind": "snapshot_end",
+    "policy": "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56"
+  },
+  {
+    "kind": "delta",
+    "movements": [
+      {
+        "asset_name_hex": "000643b04d4430393539",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4431303639",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4432313539",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4432353630",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4432363931",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4432393938",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4433323338",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4433363333",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4433383832",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4434323632",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4434353630",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000643b04d4435303030",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "92a3490ecd1a36081d287a6b9bbf066c8ce0d73a7e908571be3c1e96"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4430393539",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4431303639",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4432313539",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4432353630",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4432363931",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4432393938",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4433323338",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4433363333",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4433383832",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4434323632",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4434353630",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      },
+      {
+        "asset_name_hex": "000de1404d4435303030",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+        }
+      }
+    ],
+    "policy": "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56",
+    "slot": 165639806,
+    "tx_hash": "3c60bfff18b8a7f385a64c744cb44837ceff64f9966f07b5c81cb9a0edad54f9"
+  }
+]

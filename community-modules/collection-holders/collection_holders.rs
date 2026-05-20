@@ -824,8 +824,17 @@ fn flush_buffer(buf: TxBuffer) {
             // overlap. Unmatched negative residue is a burn
             // (to = None); unmatched positive residue is a
             // mint (from = None).
+            //
+            // Guard with `is_empty` checks rather than
+            // `while let (Some, Some) = (pos.pop(), neg.pop())`:
+            // the latter pops from BOTH sides unconditionally
+            // each iteration, so a pure-mint TX (neg empty,
+            // pos non-empty) would `pop()` the gainer from pos,
+            // fail the pattern match, and silently discard it.
             let asset_name_hex = hex::encode(&asset_name);
-            while let (Some(mut p), Some(mut n)) = (pos.pop(), neg.pop()) {
+            while !pos.is_empty() && !neg.is_empty() {
+                let mut p = pos.pop().unwrap();
+                let mut n = neg.pop().unwrap();
                 let q = p.1.min(n.1);
                 movements.push(Movement {
                     asset_name_hex: asset_name_hex.clone(),
