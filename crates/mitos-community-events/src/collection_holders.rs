@@ -48,9 +48,14 @@ use serde::{Deserialize, Serialize};
 /// shapes seen on collectible policies:
 ///
 /// - `Stake` — delegated address with a stake credential
-///   (typical user wallets). The 56-char lowercase hex is the
-///   28-byte staking credential — same shape as
-///   `holder_distribution::HolderId::Stake`.
+///   (typical user wallets). 56-char lowercase hex of the
+///   28-byte staking credential. Network-agnostic on the
+///   wire — consumers compute `stake1...` (mainnet) /
+///   `stake_test1...` (testnet) bech32 themselves using
+///   their deployment context. The hex collapses Key vs
+///   Script delegation; consumers that need to distinguish
+///   handle the rare Script-staking case via byte-level
+///   credential comparison.
 /// - `Payment` — enterprise / no-stake address (rare for
 ///   typical wallets, common for multi-sig or
 ///   programmatically-generated addresses). Carries the full
@@ -64,6 +69,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum HolderRef {
     /// 56-char lowercase hex of the 28-byte stake credential.
+    /// Network-agnostic; consumer derives bech32.
     Stake(String),
     /// Bech32 enterprise / no-stake address.
     Payment(String),

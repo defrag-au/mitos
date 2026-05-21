@@ -164,19 +164,28 @@ struct EmitState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 enum HolderKey {
     /// 28-byte stake credential (Key or Script delegation
-    /// part). Most common case.
+    /// part). Both delegation kinds collapse to the same
+    /// representation — the wire format is intentionally
+    /// network-agnostic, so consumers compute the bech32
+    /// stake address themselves at presentation time. The
+    /// Key-vs-Script edge (rare for NFT holdings) is
+    /// recoverable consumer-side via byte-level credential
+    /// comparison.
     Stake([u8; HASH_BYTES]),
     /// Enterprise (no-stake-cred) wallet with a `Key` payment
     /// credential. Bech32 carries the full address.
     Payment(String),
-    /// Script address — `Script` payment credential, any
-    /// delegation. Marketplaces, vesting contracts, escrows.
+    /// Script address — `Script` payment credential, no
+    /// delegation (`addr1w...` enterprise script). Frankenscript
+    /// addresses (`addr1z...` / `addr1x...` — Script payment +
+    /// stake-delegated) are emitted as `Stake` instead, since
+    /// the stake credential is the owner's identity.
     Script(String),
 }
 
 impl HolderKey {
     /// Build the wire-shape `HolderRef` for emission. Script
-    /// labels resolve here via the (TODO Chunk 2 follow-up)
+    /// labels resolve here via the (TODO follow-up)
     /// `address-registry` — `None` for now keeps the wire
     /// shape stable and the lookup integration small.
     fn to_wire(&self) -> HolderRef {
@@ -260,19 +269,29 @@ fn clear_rebootstrap_cursor() {
 /// for unsupported address shapes (Byron, pointer-stake) — the
 /// caller drops the holding rather than mis-categorising.
 ///
+/// **Frankenaddress note:** modern Cardano smart contracts
+/// (jpg.store v3, Splash, etc.) use Script-payment +
+/// Key-delegation addresses where the staking part carries the
+/// owner's stake key. The contract locks the asset but the
+/// owner's identity travels with it via the stake credential.
+/// We promote these to `Stake` rather than `Script` — the
+/// stake credential IS the asset owner from a downstream
+/// consumer's perspective. Only true enterprise-script
+/// (`addr1w...`, no stake part) remain as `Script`.
+///
 /// Decision tree:
-/// - Byron / non-Shelley → `None` (no native asset support
-///   in practice on these shapes)
-/// - Shelley with `Script` payment cred → `Script(addr)` —
-///   marketplaces, escrows, vesting contracts. Surfaces
-///   regardless of delegation part.
-/// - Shelley with `Key` payment cred + `Key`/`Script`
-///   delegation → `Stake(28-byte cred)` — the typical
-///   delegated wallet case.
-/// - Shelley with `Key` payment cred + `Null` delegation →
+/// - Byron / non-Shelley → `None`
+/// - Shelley + any payment + `Key`/`Script` delegation →
+///   `Stake(28-byte cred)` — covers both regular delegated
+///   wallets AND frankenscript marketplace lockings. Both
+///   delegation kinds collapse to the same 28-byte
+///   representation; consumers compute bech32 themselves
+///   using their network context.
+/// - Shelley + `Key` payment + `Null` delegation →
 ///   `Payment(addr)` — enterprise wallet, no stake key.
-/// - Shelley with `Key` payment + `Pointer` delegation →
-///   `None` (rare, ~1% historically, dropped).
+/// - Shelley + `Script` payment + `Null` delegation →
+///   `Script(addr)` — true enterprise-script (rare).
+/// - Shelley + `Pointer` delegation → `None` (rare, dropped).
 fn extract_holder_key(address: &str) -> Option<HolderKey> {
     let addr = Address::from_bech32(address).ok()?;
     let shelley = match addr {
@@ -280,26 +299,28 @@ fn extract_holder_key(address: &str) -> Option<HolderKey> {
         _ => return None,
     };
 
-    // Script payment credential dominates: a marketplace
-    // contract is a script address regardless of any stake
-    // credential attached.
-    if matches!(shelley.payment(), ShelleyPaymentPart::Script(_)) {
-        return Some(HolderKey::Script(address.to_string()));
-    }
-
-    // Key payment credential — categorise by delegation.
+    // If the address has a stake-delegation credential (Key or
+    // Script), the stake credential IS the holder identity.
+    // This is the dominant case — regular wallets AND
+    // frankenscript marketplace lockings both fall here.
     match shelley.delegation() {
         ShelleyDelegationPart::Key(h) => {
             let bytes: [u8; HASH_BYTES] = (**h).into();
-            Some(HolderKey::Stake(bytes))
+            return Some(HolderKey::Stake(bytes));
         }
         ShelleyDelegationPart::Script(h) => {
             let bytes: [u8; HASH_BYTES] = (**h).into();
-            Some(HolderKey::Stake(bytes))
+            return Some(HolderKey::Stake(bytes));
         }
-        ShelleyDelegationPart::Null => Some(HolderKey::Payment(address.to_string())),
+        ShelleyDelegationPart::Null => {}
         // Pointer delegation: rare, dropped.
-        _ => None,
+        _ => return None,
+    }
+
+    // No stake delegation — branch on payment credential type.
+    match shelley.payment() {
+        ShelleyPaymentPart::Key(_) => Some(HolderKey::Payment(address.to_string())),
+        ShelleyPaymentPart::Script(_) => Some(HolderKey::Script(address.to_string())),
     }
 }
 
