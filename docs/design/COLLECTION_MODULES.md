@@ -1,6 +1,8 @@
 # Collection Modules — Holders & Metadata
 
-> **Status: design draft (2026-05-20, validated against platform v2 on 2026-05-21).** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives. **Target dispatch model: platform v2** ([`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md)) — both modules consume interest-filtered `produced` / `consumed` events per TX, not block-iteration. Bootstrap, backfill, and tip dispatch flow through the same path on v2.
+> **Status: Phase 1 shipped (2026-05-20). Phases 2–5 pending.** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives. **Target dispatch model: platform v2** ([`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md)) — both modules consume interest-filtered `produced` / `consumed` events per TX, not block-iteration. Bootstrap, backfill, and tip dispatch flow through the same path on v2.
+>
+> **Phase 1 shipped at `community-modules/collection-holders/`** (event types in `mitos-community-events::collection_holders`), with four golden fixtures under `tests/fixtures/`: `cip68-pair-mint-mekka`, `cold-start-mixed-holders`, `cip25-single-mint-perp`, `cip68-datum-update-noop`. Mitos-run gained a `by_policy` index in the fixture data plane to support cold-start tests for holder-shaped modules. **Outstanding Phase 1 follow-ups:** `HolderRef::Script.label` lookup via `address-registry` (deferred per Resolved Decision #3); FT-classified policy hard-reject; 48-hour live acceptance test against a deployed mitos host.
 
 ## Goal
 
@@ -10,7 +12,7 @@ Two collection-shaped primitives:
 
 | Module | Subscribe → emits |
 |---|---|
-| `collection-holders` | `CollectionSnapshot` (all `(asset_name, holder, qty)` tuples at a cursor) + `CollectionDelta` events on asset movement |
+| `collection-holders` | `Snapshot{Begin,Chunk,End}` (all `(asset_name, holder, qty)` tuples at a cursor) + `CollectionDelta` events on asset movement |
 | `collection-metadata` | `MetadataSnapshot` (all `(asset_name, metadata)` pairs at a cursor) + `MetadataUpdate` events for CIP-68 datum rotations |
 
 A consumer subscribing to both for the same `companion_key` gets the entire "what does this collection currently look like, and how does it change" picture in two parallel typed event streams. CIP-25 and CIP-68 are presented uniformly — see [The CIP-68 Facade](#the-cip-68-facade-for-cip-25).
@@ -58,7 +60,7 @@ Why not reuse `holder-distribution`? That module is CNT-shaped (`holder → tota
               │    Produced/Consumed deltas        ─ live tail   │
               │                                                  │
               │  Outputs:                                        │
-              │    CollectionSnapshot                            │
+              │    Snapshot{Begin,Chunk,End}                            │
               │    CollectionDelta                               │
               └──────────────────────────────────────────────────┘
 
@@ -95,17 +97,9 @@ Both modules share the dynamic-interest pattern from `holder-distribution`: empt
 
 ### Event surface
 
-```rust
-/// Emitted once on subscription when the interest set first includes
-/// a policy, and again on a `Recapture` request. Carries the full
-/// per-asset-name ledger at the named chain cursor.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CollectionSnapshot {
-    pub policy: PolicyId,
-    pub cursor: ChainPoint,
-    pub holdings: Vec<Holding>,
-}
+The snapshot is emitted as a **chunked sequence** (`SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd`), not as a single event. Building the whole holdings list as one CBOR payload traps for large policies under the per-call WASM fuel budget — same pattern + same reason as `holder-distribution` (see `WASM_BUDGET_CHUNKING.md`). Consumer semantics: on `SnapshotBegin`, wipe the policy's projection; the sequence is an authoritative replacement.
 
+```rust
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Holding {
     pub asset_name_hex: String,
@@ -118,32 +112,58 @@ pub struct Holding {
 /// stake-credential-grouping limitations of asset-by-policy APIs.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HolderRef {
-    Stake(String),                                       // bech32 stake_addr
+    Stake(String),                                       // 56-char hex stake credential
     Payment(String),                                     // bech32 payment_addr (no stake credential)
     Script { addr: String, label: Option<String> },      // script addr + known-marketplace tag
 }
 
-/// Emitted for each TX touching the policy.
+/// Opens a chunked snapshot for one policy.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotBegin {
+    pub policy: String,                  // 56-char hex
+    pub cursor_slot: u64,
+    pub cursor_hash_hex: String,         // empty when host doesn't surface a block hash
+}
+
+/// One bounded slice of the snapshot's holdings list.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotChunk {
+    pub policy: String,
+    pub holdings: Vec<Holding>,          // ≤ SNAPSHOT_CHUNK_HOLDINGS per chunk
+}
+
+/// Closes a chunked snapshot. Consumer marks the projection authoritative.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotEnd {
+    pub policy: String,
+    pub holding_count: u64,              // sanity check across the sequence
+}
+
+/// Emitted for each TX touching the policy that produces a non-empty
+/// movement list. Same-holder zero-delta movements (change outputs) are
+/// netted out before emission.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CollectionDelta {
-    pub policy: PolicyId,
-    pub cursor: ChainPoint,
-    pub tx_hash: TxHash,
-    pub movements: Vec<Movement>,  // net per-TX, after change netting
+    pub policy: String,
+    pub tx_hash: String,                 // 64-char hex
+    pub slot: u64,
+    pub movements: Vec<Movement>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Movement {
     pub asset_name_hex: String,
-    pub from: Option<HolderRef>,   // None on mint
-    pub to: Option<HolderRef>,     // None on burn
+    pub from: Option<HolderRef>,         // None on mint
+    pub to: Option<HolderRef>,           // None on burn
     pub quantity: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CollectionHoldersEvent {
-    Snapshot(CollectionSnapshot),
+pub enum CollectionEvent {
+    SnapshotBegin(SnapshotBegin),
+    SnapshotChunk(SnapshotChunk),
+    SnapshotEnd(SnapshotEnd),
     Delta(CollectionDelta),
 }
 ```
@@ -160,7 +180,7 @@ pub enum CollectionHoldersEvent {
    - Decode address → `HolderRef::Stake | Payment | Script`
    - For each asset in the output's value where `policy == X`, emit a `Holding`
 4. Aggregate into the state ledger, persist under `holder_ledger:<policy_hex>`.
-5. Emit `CollectionSnapshot` at the current cursor.
+5. Emit a `SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd` sequence at the current cursor.
 
 **Live updates (per block):**
 
@@ -172,21 +192,17 @@ For each TX touching policy `X`:
 
 **Rollback:**
 
-On `Undo(point)`:
-1. Re-emit Movements in reverse for TXs between `tip` and `point`
-2. Apply reverse to ledger
-3. Update cursor to `point`
-
-This matches `holder-distribution`'s rollback strategy exactly; no novel semantics needed.
+Platform v2 contract: the host re-feeds events from the rollback cursor forward, and the chain-point-keyed dApp `apply_event` handler re-applies idempotently (per `MITOS_COMPANION_RUNTIME_V1.md` Q3). The module logs the rollback for operator visibility but maintains no per-cursor undo log on the module side — convergence comes from re-apply, not rewind.
 
 ### State management
 
-Per-policy storage in mitos kv-state:
+Storage in mitos kv-state:
 
 | Key | Value |
 |---|---|
-| `holder_ledger:<policy_hex>` | CBOR-encoded `HashMap<(asset_name_hex, holder_key), u64>` |
-| `holder_cursor:<policy_hex>` | Last applied `ChainPoint` |
+| `tracked-policies` | CBOR `Vec<String>` of 56-char policy-id hexes (the active interest set; restored on `init`) |
+| `ledger:<policy_hex>` | CBOR `PolicyLedger { holdings: BTreeMap<HolderKey, BTreeMap<Vec<u8>, u64>> }` — nest-by-holder, keyed on the in-memory `HolderKey` (no `Script.label`, that's a presentation concern resolved at emit time) |
+| `rebootstrap-cursor` | 8-byte BE `predicate_idx` into the sorted tracked-policy list — drives the chunked re-entrant rebootstrap. Single global key, not per-policy: the round walks policies in sorted order and the cursor advances only when a policy's emit closes |
 
 Size estimates:
 - 10k-supply NFT collection, ~3k distinct holders: ~10k entries × ~80 bytes = **~800KB**
@@ -214,7 +230,7 @@ Interest::Holds(Policy(X))
 
 Identical to `holder-distribution`'s shape. Module is dynamic-interest only — no static config. Adding/removing interest on the fly is supported via the standard mutation endpoint.
 
-A subscription's `Add` triggers cold-start scan + `CollectionSnapshot` emission. `Remove` clears the ledger from state (or refcounts it if multiple companions still want it — see [Open Questions](#open-questions)).
+A subscription's `Add` triggers cold-start scan + chunked snapshot emission. `Remove` clears the ledger from state immediately (per Resolved Decisions #1 — no TTL, no refcount; rebuild on next subscribe).
 
 ## `collection-metadata` module
 
@@ -425,14 +441,14 @@ SubscribeRequest {
 }
 ```
 
-Both modules independently dial back to the worker's `/_internal/apply-<channel>` endpoints. Subscribed companions see two separate event streams, demuxed by channel name. Snapshot semantics are independent — `CollectionSnapshot` and `MetadataSnapshot` may arrive at slightly different cursors, and the worker reconciles them when both have caught up. (Versioning by cursor makes this safe — see [Open Questions](#open-questions) for cross-stream cursor coordination.)
+Both modules independently dial back to the worker's `/_internal/apply-<channel>` endpoints. Subscribed companions see two separate event streams, demuxed by channel name. Snapshot semantics are independent — `Snapshot{Begin,Chunk,End}` and `MetadataSnapshot` may arrive at slightly different cursors, and the worker reconciles them when both have caught up. (Versioning by cursor makes this safe — see [Open Questions](#open-questions) for cross-stream cursor coordination.)
 
 ### `collection-ownership` worker integration
 
 The worker's current `handle_configure` path (per [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md)) already embeds the mitos companion runtime. Wiring in collection-holders + collection-metadata is additive:
 
 1. On policy onboarding, the worker subscribes to both targets in one call.
-2. `CollectionSnapshot` apply → `ownership` table populated. Same SQL path as today's `reconcile_full_with_traits`, but with explicit `HolderRef::Script` handling (either include with script address as owner, or filter — per-policy config).
+2. `Snapshot{Begin,Chunk,End}` apply → `ownership` table populated. Same SQL path as today's `reconcile_full_with_traits`, but with explicit `HolderRef::Script` handling (either include with script address as owner, or filter — per-policy config).
 3. `MetadataSnapshot` apply → `asset_traits` table populated. Same trait-bitmap construction as today's D1 trait-reconcile path, but sourced from typed events rather than Maestro/cnft.tools fetches.
 4. `CollectionDelta` → existing transfer SQL path (already runs from `apply_transfer`).
 5. `MetadataUpdate::Initial` → trait bitmap insert.
@@ -446,7 +462,7 @@ The Maestro client in the worker is retained as a defensive fallback (the [`COLL
 For a future TCG worker, the same subscription pattern applies. Differences:
 
 - The `MetadataSnapshot` is the card definition catalogue (200 cards × ~3KB datum = ~600KB)
-- The `CollectionSnapshot` is per-player inventory (10k user tokens × ~80 bytes = ~800KB)
+- The `Snapshot{Begin,Chunk,End}` is per-player inventory (10k user tokens × ~80 bytes = ~800KB)
 - `MetadataUpdate::Updated` fires when card art / stats are rotated (e.g. seasonal balance changes via datum updates)
 - `Movement` events drive UI: card purchased, card listed, card transferred, booster opened
 - `Movement.from = None` events specifically surface as "new card minted to your wallet" UX
@@ -470,16 +486,14 @@ The two modules are explicitly *peers*, not alternatives. A policy that has both
 
 ## Phased delivery
 
-### Phase 1 — `collection-holders` module ships
+### Phase 1 — `collection-holders` module ships ✅
 
-- Module implementation in `community-modules/collection-holders/`
-- Cold-start via `utxos_by_policy` + `read_utxos`
-- Live tail via Produced/Consumed walk
-- Snapshot + Delta emission with chunking
-- Script-address `HolderRef::Script` with empty label registry (labels added in a later phase)
-- Acceptance: a test consumer subscribes to a known policy (suggest islanova_apex_legends or aliens), receives full snapshot with non-zero script-address holdings, deltas track live transfers correctly for 48 hours
+**Shipped 2026-05-20.** Implementation at `community-modules/collection-holders/collection_holders.rs`. All six v2 Guest exports implemented including the chunked re-entrant `rebootstrap`. Wire types at `crates/mitos-community-events/src/collection_holders.rs`. Four golden fixtures land alongside.
 
-Estimated: 3–5 days.
+**Acceptance work outstanding:**
+- 48-hour live test against a known policy (suggest islanova_apex_legends or aliens) — requires deployed mitos host.
+- `HolderRef::Script.label` registry wire-up (per Resolved Decision #3).
+- FT-classified policy hard-reject on subscribe (defensive guard against accidental CNT subscriptions).
 
 ### Phase 2 — `collection-metadata` (CIP-68 path only)
 
@@ -525,11 +539,11 @@ These were open during initial drafting and have since been closed out. Captured
 
 1. **GC on `Remove` interest.** Clear `holder_ledger:<policy_hex>` and `metadata_ledger:<policy_hex>` immediately when the last companion drops interest. Rationale: without an active consumer, the ledger stops receiving deltas and goes stale fast; retaining it is worse than rebuilding on the next subscription. Cold-start cost is the same whether the data was retained-and-stale or absent.
 
-2. **Cross-module cursor coordination.** Consumer reconciles. `CollectionSnapshot` and `MetadataSnapshot` may arrive at different cursors; the consumer applies deltas from each stream forward independently. Matches the existing emission-id ordering semantics; no module-side coordination needed.
+2. **Cross-module cursor coordination.** Consumer reconciles. `Snapshot{Begin,Chunk,End}` and `MetadataSnapshot` may arrive at different cursors; the consumer applies deltas from each stream forward independently. Matches the existing emission-id ordering semantics; no module-side coordination needed.
 
 3. **`HolderRef::Script` label registry.** Use the existing `shared-crates/address-registry` crate. It already has rich typed labelling for marketplaces (`JpgStoreV1`–`V4`, `Wayup`), DEXes (Splash, DexHunter, Minswap, CSWAP, SaturnSwap), and vesting contracts (CrowdLock). The `collection-holders` module looks up `HolderRef::Script.label` via this registry at emission time. Avoids duplicating known-script knowledge; the registry becomes the single source of truth across mitos modules and consumer workers.
 
-4. **Catalog completeness on RFT policies.** Ref tokens are tracked from the moment they hit chain, regardless of whether any user tokens exist yet. For a TCG, this means card definitions appear in `MetadataSnapshot` as soon as the treasury mints the ref tokens (typically all at once at project launch). Treasury ref-token holdings appear in `CollectionSnapshot` as regular `HolderRef::Stake` entries against the treasury stake address. Consumers filter via standard projection logic.
+4. **Catalog completeness on RFT policies.** Ref tokens are tracked from the moment they hit chain, regardless of whether any user tokens exist yet. For a TCG, this means card definitions appear in `MetadataSnapshot` as soon as the treasury mints the ref tokens (typically all at once at project launch). Treasury ref-token holdings appear in `Snapshot{Begin,Chunk,End}` as regular `HolderRef::Stake` entries against the treasury stake address. Consumers filter via standard projection logic.
 
 5. **Metadata version semantics.** Use the CIP-68 datum-version field directly (per spec). CIP-25 entries get `version = 1` always. Consumers detect updates by hash-comparing `payload` across `MetadataEntry` revisions; the module doesn't maintain a separate monotonic counter.
 

@@ -1,0 +1,98 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32"
+  },
+  {
+    "entry_count": 0,
+    "kind": "snapshot_end",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32"
+  },
+  {
+    "entry": {
+      "asset_name_hex": "4e696b65766572736530393830",
+      "immutable": false,
+      "metadata_json": "{\"background\":\"Satoshi\",\"body\":\"Satoshi\",\"clothes\":\"Satoshi\",\"eyes\":\"Satoshi\",\"head\":\"Satoshi\",\"image\":\"ipfs://QmQztWG9TsQ4ANXMkAnhLBHLyauuoJ84hmzwgPepGvS9D4\",\"mediaType\":\"image/png\",\"name\":\"Satoshi Matrix\",\"nose\":\"Satoshi\",\"tier\":\"Elder Series\"}",
+      "source_tx": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8",
+      "standard": "cip68_v1",
+      "version": 1
+    },
+    "kind": "initial",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32",
+    "slot": 156189660,
+    "tx_hash": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8"
+  },
+  {
+    "entry": {
+      "asset_name_hex": "4e696b65766572736531303039",
+      "immutable": false,
+      "metadata_json": "{\"background\":\"Satoshi\",\"body\":\"Satoshi\",\"clothes\":\"Satoshi\",\"eyes\":\"Satoshi\",\"head\":\"Satoshi\",\"image\":\"ipfs://QmWKDsMiZmZvbuRdYSn22a2ik55snLZFBLh49cvBSjse8D\",\"mediaType\":\"image/png\",\"name\":\"Satoshi Cipher\",\"nose\":\"Satoshi\",\"tier\":\"Elder Series\"}",
+      "source_tx": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8",
+      "standard": "cip68_v1",
+      "version": 1
+    },
+    "kind": "initial",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32",
+    "slot": 156189660,
+    "tx_hash": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8"
+  },
+  {
+    "entry": {
+      "asset_name_hex": "4e696b65766572736531353031",
+      "immutable": false,
+      "metadata_json": "{\"background\":\"1/1\",\"body\":\"1/1\",\"clothes\":\"1/1\",\"eyes\":\"1/1\",\"head\":\"1/1\",\"image\":\"ipfs://QmQVcekGM1VRMHZnDjNPvYiEQ3mYYRaXiEAPs2qwHHk8kv\",\"mediaType\":\"image/png\",\"name\":\"Guthix\",\"nose\":\"1/1\",\"tier\":\"Elder\"}",
+      "source_tx": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8",
+      "standard": "cip68_v1",
+      "version": 1
+    },
+    "kind": "initial",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32",
+    "slot": 156189660,
+    "tx_hash": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8"
+  },
+  {
+    "entry": {
+      "asset_name_hex": "4e696b65766572736531383532",
+      "immutable": false,
+      "metadata_json": "{\"background\":\"1/1\",\"body\":\"1/1\",\"clothes\":\"1/1\",\"eyes\":\"1/1\",\"head\":\"1/1\",\"image\":\"ipfs://QmQVcekGM1VRMHZnDjNPvYiEQ3mYYRaXiEAPs2qwHHk8kv\",\"mediaType\":\"image/png\",\"name\":\"Nel\",\"nose\":\"1/1\",\"tier\":\"Elder\"}",
+      "source_tx": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8",
+      "standard": "cip68_v1",
+      "version": 1
+    },
+    "kind": "initial",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32",
+    "slot": 156189660,
+    "tx_hash": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8"
+  },
+  {
+    "entry": {
+      "asset_name_hex": "4e696b65766572736532383437",
+      "immutable": false,
+      "metadata_json": "{\"background\":\"1/1\",\"body\":\"1/1\",\"clothes\":\"1/1\",\"eyes\":\"1/1\",\"head\":\"1/1\",\"image\":\"ipfs://QmQVcekGM1VRMHZnDjNPvYiEQ3mYYRaXiEAPs2qwHHk8kv\",\"mediaType\":\"image/png\",\"name\":\"Charles Hoskinson\",\"nose\":\"1/1\",\"tier\":\"Elder\"}",
+      "source_tx": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8",
+      "standard": "cip68_v1",
+      "version": 1
+    },
+    "kind": "initial",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32",
+    "slot": 156189660,
+    "tx_hash": "8752991539db26baf3c28ab340caf8098a1f382ca4b98a2ec8b89fdfcfd0fbf8"
+  },
+  {
+    "entry": {
+      "asset_name_hex": "4e696b65766572736531353031",
+      "immutable": false,
+      "metadata_json": "{\"background\":\"1/1\",\"body\":\"1/1\",\"clothes\":\"1/1\",\"eyes\":\"1/1\",\"head\":\"1/1\",\"image\":\"ipfs://bafybeidw54qa6bcbbjnztbbj6cd7qzazr33instef33ql4lws45mp6uw3e\",\"mediaType\":\"image/png\",\"name\":\"Guthix\",\"nose\":\"1/1\",\"tier\":\"Elder\"}",
+      "source_tx": "14402c8ce49c68d7c14c01129fce175ac274c2d5a26e20fa10ff2860210a252a",
+      "standard": "cip68_v1",
+      "version": 1
+    },
+    "kind": "updated",
+    "policy": "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32",
+    "prior_version": 1,
+    "slot": 172076571,
+    "tx_hash": "14402c8ce49c68d7c14c01129fce175ac274c2d5a26e20fa10ff2860210a252a"
+  }
+]

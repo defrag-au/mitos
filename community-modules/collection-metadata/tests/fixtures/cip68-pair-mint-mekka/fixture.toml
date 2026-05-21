@@ -1,0 +1,27 @@
+# mitos-run fixture for collection-metadata against the
+# Mekka Dynasty 12-pair CIP-68 mint in block 165639806.
+#
+# Reuses the block from `cip-68-mint`'s mekka-dynasty fixture.
+#
+# Policy:   29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56
+# Ref tokens minted: 12 (each `_100`-prefixed, each carrying
+#   a CIP-68 `Constructor 0 [metadata, version]` datum)
+#
+# Expected emission shape:
+#   1. `SnapshotBegin` + `SnapshotEnd` — empty cold-start
+#      (no pre-existing UTxOs for this policy in the fixture).
+#   2. 12 `MetadataEvent::Initial` events, one per ref token.
+#      Each carries the decoded CIP-68 metadata as JSON in
+#      `metadata_json`, `standard: cip68_v1`, `version: 1`,
+#      `immutable: false`, and `source_tx` set to the
+#      Mekka mint TX hash.
+#
+# This is the canonical happy-path test for Phase 2: a fresh
+# subscription sees the ref tokens hit chain and emits the
+# metadata for each.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56"

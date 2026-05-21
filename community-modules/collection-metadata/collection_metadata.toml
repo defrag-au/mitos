@@ -1,0 +1,33 @@
+abi_version = 2
+
+# `collection-metadata` is dynamic-interest-only. Consumers
+# register the policies they care about via `update_interest`;
+# the module performs a cold-start scan via
+# `chain_data::utxos_by_policy(X)` filtered for CIP-68
+# reference-token (`000643b0`-prefixed) assets and decodes their
+# datums to extract CIP-68 metadata.
+#
+# Sibling to `collection-holders`: same subscription model,
+# different projection. See `docs/design/COLLECTION_MODULES.md`.
+#
+# Phase 2 (CIP-68 only): this file at landing time.
+# Phase 3 (CIP-25 facade): adds module-internal Maestro
+#   enumeration via the data plane's existing Maestro client.
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+mitos-module-kit = { path = "../../crates/mitos-module-kit" }
+# Datum decode via PlutusData walking — CIP-68 reference outputs
+# carry the metadata as inline datum (Constructor 0 with the
+# `[metadata_map, version, extra?]` field tuple). Mirrors
+# `cip-68-mint`'s decode toolkit.
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"
+minicbor = { version = "0.20", features = ["std"] }
+# JSON serialisation of the decoded metadata for the
+# `metadata_json` wire field (matches the `cip-25-mint`
+# precedent).
+serde_json = "1"
