@@ -642,16 +642,20 @@ fn fold_page(ledger: &mut MetadataLedger, policy: &[u8; HASH_BYTES], refs: &[Wit
             let Some(suffix) = cip68_ref_token_suffix(&asset.asset.name) else {
                 continue;
             };
-            // Need the datum payload to decode. Hash-only
-            // datums (payload empty) mean the host couldn't
-            // resolve; we skip — CIP-68 ref tokens almost
-            // always carry inline datums, so this is rare.
+            // Resolve the datum bytes. Inline datums arrive with a
+            // populated `payload`; hash-only datums (common — many
+            // minters store the CIP-68 datum by hash rather than
+            // inline in the ref UTxO) arrive payload-empty and need
+            // the `datum_by_hash` fallback. Use the same resolver as
+            // the live `handle_produced` path so cold-start has
+            // identical coverage — without this, hash-only-datum
+            // assets are silently dropped from the snapshot.
             let Some(datum) = datum_opt else { continue };
-            if datum.payload.is_empty() {
+            let Some(datum_bytes) = resolve_datum_bytes(datum) else {
                 continue;
-            }
+            };
             let Some((metadata_json, version, standard)) =
-                decode_cip68_datum(&datum.payload)
+                decode_cip68_datum(&datum_bytes)
             else {
                 continue;
             };
