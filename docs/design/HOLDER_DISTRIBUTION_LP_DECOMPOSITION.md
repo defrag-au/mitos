@@ -11,6 +11,17 @@ piece of work where its data lives.
 > The filename still says `LP_DECOMPOSITION`; the doc outgrew it.
 > Kept to avoid breaking cross-references.
 
+> **Scaling note (2026-05-23).** The decomposition described here is
+> correct but still runs on the **resident** ledger + a single-blob
+> `persist_ledger`, so it traps `out-of-fuel` on a large policy (the same
+> whole-ledger trap collection-holders had pre-SB4). The sharded,
+> re-entrant migration — incl. a kit `decomp_step` hook that writes the
+> decomposed set to a second `decomp:` shard prefix the emit pages — is
+> **fully specified but DEFERRED** in
+> [`HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md`](HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md)
+> ("SB5 — Plan A"). Parked to keep focus on the CNFT path; the financial
+> redistribution logic in this doc carries over verbatim.
+
 Cross-references:
 - `HOLDER_DISTRIBUTION_MODULE.md` — the module this extends.
 - `cnft.dev-workers/docs/design/HOLDER_MAP_MITOS_CUTOVER_PLAN.md`
