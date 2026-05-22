@@ -116,11 +116,15 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
     // Register a synthetic companion so the host's drain task
     // appends emission rows to the redb store (drain skips when
     // the companions dir is empty — see `host_v2::drain_one`).
-    // The drain only reads file stems for the companion key;
-    // contents are irrelevant for this test.
-    let companions_dir = storage.module_dir_for_companions("test-indexer");
-    std::fs::create_dir_all(&companions_dir).expect("companions dir");
-    std::fs::write(companions_dir.join("test-companion.cbor"), b"").expect("companion stub");
+    // Unbounded interest (`Interest::any()`) so the host's
+    // per-companion fan-out filter delivers every policy's events.
+    common::write_companion_subscription(
+        &storage,
+        "test-indexer",
+        "test-client",
+        "test-companion",
+        vec![mitos_protocol::Interest::any()],
+    );
 
     let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(NullChainDataPlane);

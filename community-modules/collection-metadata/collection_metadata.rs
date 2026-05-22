@@ -507,7 +507,24 @@ fn emit_event(event: &MetadataEvent) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Partition key = policy hex bytes: per-policy dialer lane +
+    // host-side per-companion interest routing (prevents recapture
+    // cross-contamination across companions). See
+    // `docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5.
+    emit::emit_event_keyed(0, event_policy(event).as_bytes(), &buf);
+}
+
+/// The policy hex every `MetadataEvent` carries — used as the
+/// emission partition / interest-routing key.
+fn event_policy(event: &MetadataEvent) -> &str {
+    match event {
+        MetadataEvent::SnapshotBegin(b) => &b.policy,
+        MetadataEvent::SnapshotChunk(c) => &c.policy,
+        MetadataEvent::SnapshotEnd(e) => &e.policy,
+        MetadataEvent::Initial(i) => &i.policy,
+        MetadataEvent::Updated(u) => &u.policy,
+        MetadataEvent::Burned(b) => &b.policy,
+    }
 }
 
 /// Emit the full chunked snapshot sequence for one policy in

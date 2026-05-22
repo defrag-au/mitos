@@ -1148,14 +1148,96 @@ pub(crate) async fn run_emit_drain(
             return;
         }
     };
+    // Per-companion interest projection cache. Lives for the
+    // lifetime of the drain task so the fan-out filter doesn't
+    // re-read + CBOR-decode every companion `.cbor` on each
+    // emission. Refreshed per-file on mtime change (re-subscribe
+    // rewrites the file). See `InterestCache`.
+    let mut interest_cache = InterestCache::default();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             event = events_rx.recv() => {
                 let Some(event) = event else { return };
-                drain_one(&storage, &store, &module_id, event);
+                drain_one(&storage, &store, &module_id, event, &mut interest_cache);
             }
         }
+    }
+}
+
+/// Per-companion interest projection cache for the emit fan-out
+/// filter (`drain_one`). Keyed by companion `.cbor` path; an entry
+/// is refreshed when the file's mtime changes (a re-subscribe
+/// rewrites the file with a new interest set).
+///
+/// `watched == None` means **unbounded** — deliver everything. That
+/// covers both an `Any`/`Fingerprint` interest *and* the
+/// no-declared-interest case, so the filter is never *narrower* than
+/// the pre-filter broadcast: a companion only loses an emission when
+/// it has explicitly declared one or more bounded policy interests
+/// that the event's policy isn't in. Any read/decode failure also
+/// resolves to `None` (fail open — never drop a delivery because the
+/// filter couldn't load).
+#[derive(Default)]
+pub(crate) struct InterestCache {
+    entries: HashMap<std::path::PathBuf, CachedInterest>,
+}
+
+struct CachedInterest {
+    /// File mtime at cache time; `None` if unstattable. A changed
+    /// (or newly-readable) mtime invalidates the entry.
+    mtime: Option<std::time::SystemTime>,
+    /// Watched policy hex set, or `None` for unbounded interest.
+    watched: Option<HashSet<String>>,
+}
+
+impl InterestCache {
+    /// Whether the companion persisted at `path` wants an event
+    /// keyed by `event_policy_hex`.
+    ///
+    /// - `event_policy_hex == None` (event carries no policy key):
+    ///   always yes — the host can't route it, so deliver as before.
+    /// - companion interest unbounded (`watched == None`): always yes.
+    /// - otherwise: yes iff the policy is in the companion's set.
+    fn companion_wants(&mut self, path: &std::path::Path, event_policy_hex: Option<&str>) -> bool {
+        let Some(policy) = event_policy_hex else {
+            return true;
+        };
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let needs_refresh = self
+            .entries
+            .get(path)
+            .map(|c| c.mtime != mtime)
+            .unwrap_or(true);
+        if needs_refresh {
+            self.entries.insert(
+                path.to_path_buf(),
+                CachedInterest {
+                    mtime,
+                    watched: load_watched_policies(path),
+                },
+            );
+        }
+        match &self.entries.get(path).expect("just inserted").watched {
+            None => true,
+            Some(set) => set.contains(policy),
+        }
+    }
+}
+
+/// Read a companion `.cbor` and project its declared interest to a
+/// watched-policy hex set. Returns `None` (unbounded) when the
+/// interest is unbounded, when no policy interest is declared, or on
+/// any read/decode error — all "deliver everything" outcomes.
+fn load_watched_policies(path: &std::path::Path) -> Option<HashSet<String>> {
+    let bytes = std::fs::read(path).ok()?;
+    let req = mitos_protocol::SubscribeRequest::decode(&bytes).ok()?;
+    match mitos_protocol::watched_policies(&req.interests) {
+        // Unbounded interest (Any/Fingerprint present) → all.
+        None => None,
+        // No declared policy interest → don't narrow (back-compat).
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(s.into_iter().map(|p| p.as_str().to_string()).collect()),
     }
 }
 
@@ -1164,6 +1246,7 @@ fn drain_one(
     store: &crate::emissions::EmissionsStore,
     module_id: &str,
     event: emit::EmittedEvent,
+    interest_cache: &mut InterestCache,
 ) {
     use crate::emissions::{EmissionStatus, UNSUBSCRIBED_COMPANION_ID};
     let companions_dir = storage.module_dir_for_companions(module_id);
@@ -1179,18 +1262,39 @@ fn drain_one(
     // could plumb the name through manifest metadata.
     let channel = event.channel.to_string();
 
+    // Per-companion interest filter routing key. By convention a
+    // non-empty `partition_key` carrying valid UTF-8 is the policy
+    // hex the event pertains to (collection-holders /
+    // collection-metadata / jpg-store-offer emit this; the dialer
+    // also uses it as a concurrency-lane hash, which is compatible).
+    // A module emitting a binary or empty key yields `None` here →
+    // the filter broadcasts (unchanged behaviour). See the
+    // recapture cross-contamination fix in
+    // `docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5.
+    let event_policy_hex: Option<&str> = if event.partition_key.is_empty() {
+        None
+    } else {
+        std::str::from_utf8(&event.partition_key).ok()
+    };
+
     // Two-level walk: `<module>/companions/<client_id>/<companion_key>.cbor`.
     // Each `(client_id, companion_key)` pair is a distinct
-    // subscriber and gets its own emission row. See
+    // subscriber and gets its own emission row — *if* its declared
+    // interest matches this event's policy (see `event_policy_hex` +
+    // `InterestCache`). See
     // `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Dispatch fan-out".
-    // If we end up writing zero rows (no dir, no subscribers, or
-    // every entry skipped), fall back to the sentinel companion_id
-    // so the emission isn't silently dropped during the window
-    // before any companion subscribes (drop site #3 in
-    // `docs/design/EVENT_DELIVERY_RESILIENCE.md`). The first
-    // subscribe reclaims sentinel rows via
-    // `EmissionsStore::retarget_companion`.
+    //
+    // Sentinel fallback (drop site #3 in
+    // `docs/design/EVENT_DELIVERY_RESILIENCE.md`): only when *no*
+    // companion is subscribed at all (`!saw_companion`) — so an
+    // emission isn't lost in the window before the first subscribe;
+    // the first subscribe reclaims sentinel rows via
+    // `EmissionsStore::retarget_companion`. When companions exist but
+    // none are interested in this policy, the event is genuinely
+    // unwanted and is dropped — sentineling it would let a future
+    // unrelated subscriber wrongly reclaim another policy's emission.
     let mut wrote_per_companion = false;
+    let mut saw_companion = false;
     if companions_dir.exists() {
         match std::fs::read_dir(&companions_dir) {
             Ok(read) => {
@@ -1233,6 +1337,21 @@ fn drain_one(
                             Some(s) => s.to_string(),
                             None => continue,
                         };
+                        saw_companion = true;
+                        // Per-companion interest filter: skip companions
+                        // whose declared interest doesn't cover this
+                        // event's policy. Unbounded / no-interest /
+                        // keyless events always pass (see InterestCache).
+                        if !interest_cache.companion_wants(&path, event_policy_hex) {
+                            tracing::trace!(
+                                module = %module_id,
+                                client_id = %client_id,
+                                companion_key = %companion_key,
+                                policy = event_policy_hex.unwrap_or(""),
+                                "emission filtered out — companion not interested in policy"
+                            );
+                            continue;
+                        }
                         match store.append(
                             &companion_key,
                             client_id,
@@ -1268,7 +1387,11 @@ fn drain_one(
         }
     }
 
-    if !wrote_per_companion {
+    // Sentinel only when there are no subscribers at all. If
+    // companions exist but the interest filter dropped this event
+    // for all of them, it's genuinely unwanted — don't sentinel
+    // (a later unrelated subscribe must not reclaim it).
+    if !saw_companion && !wrote_per_companion {
         if let Err(e) = store.append(
             UNSUBSCRIBED_COMPANION_ID,
             "",
@@ -1372,5 +1495,147 @@ where
             })
             .map_err(|_| InterestRouteError::ChannelClosed(module_id.to_owned()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod interest_filter_tests {
+    //! Unit coverage for the per-companion emit fan-out filter
+    //! (`InterestCache` / `companion_wants`) — the host side of the
+    //! recapture cross-contamination fix
+    //! (`docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5).
+
+    use super::{CachedInterest, InterestCache};
+    use cardano_assets::PolicyId;
+    use mitos_protocol::{
+        AssetSelector, DialBackOverride, Interest, SubscribeRequest, SubscribeTarget,
+    };
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    // Two distinct, valid (56 lowercase-hex) policies.
+    const POLICY_A: &str = "43a056aabbccddeeff00112233445566778899aabbccddeeff001122";
+    const POLICY_B: &str = "de79250aabbccddeeff00112233445566778899aabbccddeeff001122";
+
+    fn write_companion(dir: &Path, interests: Vec<Interest>) -> std::path::PathBuf {
+        let req = SubscribeRequest {
+            targets: vec![SubscribeTarget::Module {
+                name: "collection-holders".into(),
+            }],
+            companion_key: "k".into(),
+            client_id: "c".into(),
+            resume_from: None,
+            interests,
+            dial_back: Some(DialBackOverride {
+                url: Some("https://x/_internal/{op}-{target}?key={key}".into()),
+                auth_header: None,
+                auth_value: None,
+            }),
+        };
+        let path = dir.join("companion.cbor");
+        std::fs::write(&path, req.encode().expect("encode")).expect("write");
+        path
+    }
+
+    fn policy_interest(hex: &str) -> Interest {
+        Interest {
+            asset: AssetSelector::Policy(PolicyId::new(hex).expect("valid policy")),
+            ..Interest::any()
+        }
+    }
+
+    #[test]
+    fn bounded_interest_routes_only_matching_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mut cache = InterestCache::default();
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(!cache.companion_wants(&path, Some(POLICY_B)));
+    }
+
+    #[test]
+    fn keyless_event_always_delivered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mut cache = InterestCache::default();
+        // No partition key → host can't route → deliver (unchanged).
+        assert!(cache.companion_wants(&path, None));
+    }
+
+    #[test]
+    fn unbounded_interest_delivers_every_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `Interest::any()` → `AssetSelector::Any` → unbounded.
+        let path = write_companion(tmp.path(), vec![Interest::any()]);
+        let mut cache = InterestCache::default();
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(cache.companion_wants(&path, Some(POLICY_B)));
+    }
+
+    #[test]
+    fn no_declared_interest_is_not_narrower_than_broadcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty interest set must NOT drop everything — back-compat:
+        // a companion that subscribed without declaring interest still
+        // receives all policies (the pre-filter broadcast behaviour).
+        let path = write_companion(tmp.path(), vec![]);
+        let mut cache = InterestCache::default();
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(cache.companion_wants(&path, Some(POLICY_B)));
+    }
+
+    #[test]
+    fn unreadable_file_fails_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.cbor");
+        let mut cache = InterestCache::default();
+        // Read failure → unbounded → deliver. Never drop a delivery
+        // because the filter couldn't load the interest.
+        assert!(cache.companion_wants(&missing, Some(POLICY_A)));
+    }
+
+    #[test]
+    fn cache_hit_uses_cached_entry_without_reread() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk says POLICY_A …
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mtime = std::fs::metadata(&path).unwrap().modified().ok();
+        let mut cache = InterestCache::default();
+        // … but we pre-seed the cache with the *current* mtime and a
+        // POLICY_B watch-set. Same mtime ⇒ cache hit ⇒ no re-read, so
+        // the cached B set wins.
+        let mut set = HashSet::new();
+        set.insert(POLICY_B.to_string());
+        cache.entries.insert(
+            path.clone(),
+            CachedInterest {
+                mtime,
+                watched: Some(set),
+            },
+        );
+        assert!(cache.companion_wants(&path, Some(POLICY_B)));
+        assert!(!cache.companion_wants(&path, Some(POLICY_A)));
+    }
+
+    #[test]
+    fn stale_mtime_triggers_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk says POLICY_A …
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mut cache = InterestCache::default();
+        // … but the cached entry carries a bogus (old) mtime and a
+        // POLICY_B watch-set. mtime mismatch ⇒ refresh from disk ⇒
+        // the real POLICY_A set wins.
+        let mut set = HashSet::new();
+        set.insert(POLICY_B.to_string());
+        cache.entries.insert(
+            path.clone(),
+            CachedInterest {
+                mtime: Some(std::time::UNIX_EPOCH),
+                watched: Some(set),
+            },
+        );
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(!cache.companion_wants(&path, Some(POLICY_B)));
     }
 }

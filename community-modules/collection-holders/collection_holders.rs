@@ -518,7 +518,25 @@ fn emit_event(event: &CollectionEvent) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Partition key = policy hex bytes. Two purposes: the dialer
+    // serialises same-policy events into one lane (snapshot
+    // ordering) and parallelises across policies, AND the host's
+    // per-companion fan-out filter routes each emission only to
+    // companions interested in this policy — without it, a
+    // multi-policy recapture cross-contaminates every companion.
+    // See `docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5.
+    emit::emit_event_keyed(0, event_policy(event).as_bytes(), &buf);
+}
+
+/// The policy hex every `CollectionEvent` carries — used as the
+/// emission partition / interest-routing key.
+fn event_policy(event: &CollectionEvent) -> &str {
+    match event {
+        CollectionEvent::SnapshotBegin(b) => &b.policy,
+        CollectionEvent::SnapshotChunk(c) => &c.policy,
+        CollectionEvent::SnapshotEnd(e) => &e.policy,
+        CollectionEvent::Delta(d) => &d.policy,
+    }
 }
 
 /// Emit the full chunked snapshot sequence for one policy in a
