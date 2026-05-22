@@ -34,16 +34,55 @@
 //! `StatusUpdate` messages; the writer is the only thread that
 //! touches the table.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use mitos_protocol::{ApplyBody, HTTP_DELIVERY_MIME, encode_apply};
+use mitos_protocol::{
+    ApplyBody, ApplyBulkRequest, BulkEmission, BulkEmissionResult, HTTP_DELIVERY_MIME, encode_apply,
+    encode_apply_bulk,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::emissions::{EmissionRecord, EmissionStatus, EmissionsStore};
+
+/// Bulk-apply capability cache states. One `AtomicU8` per
+/// (companion, target) dial task, shared across its lanes.
+/// `UNKNOWN` until the first bulk POST resolves it; `SUPPORTED`
+/// after a 2xx (or transient 5xx — those keep retrying bulk);
+/// `UNSUPPORTED` after a 404/415 (companion has no bulk route),
+/// after which the task drains per-row for its lifetime.
+pub(crate) const BULK_UNKNOWN: u8 = 0;
+const BULK_SUPPORTED: u8 = 1;
+const BULK_UNSUPPORTED: u8 = 2;
+
+/// Bulk-apply batch sizing. The lane's per-tick row snapshot is the
+/// implicit flush window (the doc's W); `max` is the per-POST cap M.
+#[derive(Debug, Clone, Copy)]
+pub struct BulkConfig {
+    /// Max emissions per bulk POST. `1` disables bulk (each POST is
+    /// one row — semantically the per-row path). Default 50.
+    pub max: usize,
+}
+
+impl BulkConfig {
+    /// Read `MITOS_BULK_BATCH_MAX` (default 50). Set to `1` to roll
+    /// out the new path without changing throughput characteristics
+    /// (per `DIALER_BULK_APPLY.md` Phase 2 step 9).
+    pub fn from_env() -> Self {
+        let max = std::env::var("MITOS_BULK_BATCH_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(50);
+        Self { max }
+    }
+}
 
 /// Pool configuration. Loaded from `mitos.toml` (see
 /// [`Self::from_env`]) or constructed inline for tests.
@@ -201,6 +240,17 @@ fn apply_status_update(store: &EmissionsStore, msg: StatusUpdate) {
 pub struct PoolContext<'a> {
     pub client: &'a reqwest::Client,
     pub apply_url: &'a str,
+    /// Bulk-apply URL (`apply_url` with `-bulk` before the query).
+    /// Empty disables the bulk path.
+    pub bulk_url: &'a str,
+    /// Per-(companion,target) bulk capability cache, shared across
+    /// this tick's lanes. See [`BULK_UNKNOWN`].
+    pub bulk_capability: Arc<AtomicU8>,
+    /// Max emissions per bulk POST; `<= 1` disables bulk.
+    pub bulk_max: usize,
+    /// Channel / module name carried in the `ApplyBulkRequest`
+    /// (informational — the consumer routes by the URL path).
+    pub channel: &'a str,
     pub header_name: Option<&'a str>,
     pub header_value: Option<&'a str>,
     pub store: &'a EmissionsStore,
@@ -251,6 +301,10 @@ pub async fn run_tick(ctx: PoolContext<'_>) -> anyhow::Result<()> {
         }
         let client = ctx.client.clone();
         let apply_url = ctx.apply_url.to_string();
+        let bulk_url = ctx.bulk_url.to_string();
+        let bulk_capability = ctx.bulk_capability.clone();
+        let bulk_max = ctx.bulk_max;
+        let channel = ctx.channel.to_string();
         let header_name = ctx.header_name.map(|s| s.to_string());
         let header_value = ctx.header_value.map(|s| s.to_string());
         let writer_tx = StatusWriterSender {
@@ -264,6 +318,10 @@ pub async fn run_tick(ctx: PoolContext<'_>) -> anyhow::Result<()> {
                 rows,
                 client,
                 apply_url,
+                bulk_url,
+                bulk_capability,
+                bulk_max,
+                channel,
                 header_name,
                 header_value,
                 companion_key,
@@ -319,6 +377,10 @@ struct LaneArgs {
     rows: Vec<EmissionRecord>,
     client: reqwest::Client,
     apply_url: String,
+    bulk_url: String,
+    bulk_capability: Arc<AtomicU8>,
+    bulk_max: usize,
+    channel: String,
     header_name: Option<String>,
     header_value: Option<String>,
     companion_key: String,
@@ -332,6 +394,10 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
         rows,
         client,
         apply_url,
+        bulk_url,
+        bulk_capability,
+        bulk_max,
+        channel,
         header_name,
         header_value,
         companion_key,
@@ -346,27 +412,110 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
         "lane drain start"
     );
 
+    // Bulk path is taken unless M<=1, no bulk URL, or the companion
+    // was already found not to support bulk (cached UNSUPPORTED).
+    let bulk_enabled = bulk_max > 1
+        && !bulk_url.is_empty()
+        && bulk_capability.load(Ordering::Relaxed) != BULK_UNSUPPORTED;
+
+    if !bulk_enabled {
+        return drain_rows_single(
+            &rows,
+            &client,
+            &apply_url,
+            header_name.as_deref(),
+            header_value.as_deref(),
+            &companion_key,
+            &writer_tx,
+            now_fn,
+            slot_idx,
+        )
+        .await;
+    }
+
+    // Chunk the lane's rows into batches of `bulk_max`, one POST per
+    // batch. Within-key order is preserved (rows arrive key-grouped
+    // from `run_tick`), which is the only ordering that matters —
+    // cross-key/cross-partition order is unconstrained by design.
+    let mut start = 0;
+    while start < rows.len() {
+        let end = (start + bulk_max).min(rows.len());
+        let chunk = &rows[start..end];
+        match bulk_post_chunk(
+            &client,
+            &bulk_url,
+            header_name.as_deref(),
+            header_value.as_deref(),
+            &channel,
+            chunk,
+            &writer_tx,
+            now_fn,
+        )
+        .await
+        {
+            BulkOutcome::Applied => {
+                bulk_capability.store(BULK_SUPPORTED, Ordering::Relaxed);
+                start = end;
+            }
+            BulkOutcome::NoBulk => {
+                bulk_capability.store(BULK_UNSUPPORTED, Ordering::Relaxed);
+                debug!(
+                    companion_key = %companion_key,
+                    "companion has no bulk route; falling back to per-row drain for the lane remainder"
+                );
+                // Drain the current chunk + everything after it
+                // per-row (the bulk POST left these rows Pending; the
+                // single path re-marks + applies them).
+                return drain_rows_single(
+                    &rows[start..],
+                    &client,
+                    &apply_url,
+                    header_name.as_deref(),
+                    header_value.as_deref(),
+                    &companion_key,
+                    &writer_tx,
+                    now_fn,
+                    slot_idx,
+                )
+                .await;
+            }
+            BulkOutcome::Transport(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Per-row drain — one HTTP POST per emission. The pre-bulk path,
+/// retained as the fallback when a companion has no bulk route
+/// (404/415) and the `bulk_max <= 1` opt-out.
+#[allow(clippy::too_many_arguments)]
+async fn drain_rows_single(
+    rows: &[EmissionRecord],
+    client: &reqwest::Client,
+    apply_url: &str,
+    header_name: Option<&str>,
+    header_value: Option<&str>,
+    companion_key: &str,
+    writer_tx: &StatusWriterSender,
+    now_fn: fn() -> String,
+    slot_idx: usize,
+) -> anyhow::Result<()> {
     for row in rows {
         let now = (now_fn)();
         writer_tx.send(StatusUpdate::Pending(row.id, now));
 
         let body = ApplyBody {
             emission_id: row.id,
-            // For this iteration we stamp the row's own chain
-            // point — bit-exact with the pre-pool path. The
-            // floor-stamping discussed in the design doc is a
-            // follow-up; with lanes = 1 the row's slot IS the
-            // floor by construction.
             cursor: row.chain_point.clone(),
             change: row.payload.clone(),
         };
         let body_bytes =
             encode_apply(&body).map_err(|e| anyhow::anyhow!("encode ApplyBody: {e}"))?;
         let mut req_builder = client
-            .post(&apply_url)
+            .post(apply_url)
             .header(reqwest::header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
             .body(body_bytes);
-        if let (Some(name), Some(value)) = (header_name.as_deref(), header_value.as_deref()) {
+        if let (Some(name), Some(value)) = (header_name, header_value) {
             req_builder = req_builder.header(name, value);
         }
         let resp = match req_builder.send().await {
@@ -402,6 +551,145 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Pure demux of a bulk response onto the chunk's emission ids, in
+/// chunk order. The load-bearing partial-success logic:
+/// - `applied: true`  → `Acked`
+/// - `applied: false` → `Nacked` (carries the rejection error)
+/// - id **missing** from `results` → `Queued` (retry next tick;
+///   covers a companion that truncated its response mid-batch)
+/// - extra ids in `results` (not in the chunk) → ignored
+fn demux_bulk_results(
+    chunk_ids: &[u64],
+    results: &[BulkEmissionResult],
+    now: &str,
+) -> Vec<StatusUpdate> {
+    let by_id: HashMap<u64, &BulkEmissionResult> =
+        results.iter().map(|r| (r.emission_id, r)).collect();
+    chunk_ids
+        .iter()
+        .map(|id| match by_id.get(id) {
+            Some(r) if r.applied => StatusUpdate::Acked(*id, now.to_string()),
+            Some(r) => StatusUpdate::Nacked(*id, now.to_string(), r.error.clone().unwrap_or_default()),
+            None => StatusUpdate::Queued(*id, now.to_string()),
+        })
+        .collect()
+}
+
+/// Outcome of one bulk POST.
+enum BulkOutcome {
+    /// 2xx — per-emission results demuxed into the status writer.
+    Applied,
+    /// 404/415 — companion has no bulk route. Caller flips capability
+    /// to UNSUPPORTED and drains per-row. Rows left Pending.
+    NoBulk,
+    /// 5xx / network / encode-decode — all rows re-Queued; lane
+    /// returns this error so the caller backs off.
+    Transport(anyhow::Error),
+}
+
+/// POST one batch of emissions to the companion's bulk endpoint and
+/// demux the per-emission results into the status writer.
+#[allow(clippy::too_many_arguments)]
+async fn bulk_post_chunk(
+    client: &reqwest::Client,
+    bulk_url: &str,
+    header_name: Option<&str>,
+    header_value: Option<&str>,
+    channel: &str,
+    chunk: &[EmissionRecord],
+    writer_tx: &StatusWriterSender,
+    now_fn: fn() -> String,
+) -> BulkOutcome {
+    // Mark all Pending up front: a host crash mid-POST leaves them
+    // Pending → requeued on task restart (same crash-safety the
+    // per-row path gets).
+    for row in chunk {
+        writer_tx.send(StatusUpdate::Pending(row.id, (now_fn)()));
+    }
+
+    let emissions: Vec<BulkEmission> = chunk
+        .iter()
+        .map(|r| BulkEmission {
+            emission_id: r.id,
+            cursor: r.chain_point.clone(),
+            change: r.payload.clone(),
+        })
+        .collect();
+    let body = ApplyBulkRequest {
+        channel: channel.to_string(),
+        emissions,
+    };
+    let body_bytes = match encode_apply_bulk(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            for row in chunk {
+                writer_tx.send(StatusUpdate::Queued(row.id, (now_fn)()));
+            }
+            return BulkOutcome::Transport(anyhow::anyhow!("encode ApplyBulkRequest: {e}"));
+        }
+    };
+
+    let mut req_builder = client
+        .post(bulk_url)
+        .header(reqwest::header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
+        .body(body_bytes);
+    if let (Some(name), Some(value)) = (header_name, header_value) {
+        req_builder = req_builder.header(name, value);
+    }
+    let resp = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            for row in chunk {
+                writer_tx.send(StatusUpdate::Queued(row.id, (now_fn)()));
+            }
+            return BulkOutcome::Transport(anyhow::anyhow!("bulk POST send: {e}"));
+        }
+    };
+
+    let status = resp.status();
+    // No bulk route (or wrong media type) → fall back to per-row.
+    if status == reqwest::StatusCode::NOT_FOUND
+        || status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    {
+        return BulkOutcome::NoBulk;
+    }
+    if status.is_success() {
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                for row in chunk {
+                    writer_tx.send(StatusUpdate::Queued(row.id, (now_fn)()));
+                }
+                return BulkOutcome::Transport(anyhow::anyhow!("read bulk response: {e}"));
+            }
+        };
+        let parsed = match mitos_protocol::decode_apply_bulk_response(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                for row in chunk {
+                    writer_tx.send(StatusUpdate::Queued(row.id, (now_fn)()));
+                }
+                return BulkOutcome::Transport(anyhow::anyhow!("decode bulk response: {e}"));
+            }
+        };
+        let chunk_ids: Vec<u64> = chunk.iter().map(|r| r.id).collect();
+        for update in demux_bulk_results(&chunk_ids, &parsed.results, &(now_fn)()) {
+            writer_tx.send(update);
+        }
+        return BulkOutcome::Applied;
+    }
+
+    // 5xx / other non-2xx → all back to Queued, surface as transport
+    // error so the caller applies backoff.
+    let body_text = resp.text().await.unwrap_or_default();
+    for row in chunk {
+        writer_tx.send(StatusUpdate::Queued(row.id, (now_fn)()));
+    }
+    BulkOutcome::Transport(anyhow::anyhow!(
+        "bulk POST returned status {status}: {body_text}"
+    ))
 }
 
 /// Hash a partition key to a worker slot in `[0, n)`. Empty key
@@ -484,6 +772,91 @@ mod tests {
         unsafe {
             std::env::remove_var("MITOS_DIALER_LANES_TEST_VALID");
         }
+    }
+
+    fn result(id: u64, applied: bool, error: Option<&str>) -> BulkEmissionResult {
+        BulkEmissionResult {
+            emission_id: id,
+            applied,
+            error: error.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn demux_all_applied() {
+        let updates = demux_bulk_results(
+            &[1, 2, 3],
+            &[
+                result(1, true, None),
+                result(2, true, None),
+                result(3, true, None),
+            ],
+            "t",
+        );
+        assert!(updates
+            .iter()
+            .all(|u| matches!(u, StatusUpdate::Acked(_, _))));
+        assert_eq!(updates.len(), 3);
+    }
+
+    #[test]
+    fn demux_mixed_applied_and_rejected() {
+        let updates = demux_bulk_results(
+            &[1, 2, 3],
+            &[
+                result(1, true, None),
+                result(2, false, Some("datum mismatch")),
+                result(3, true, None),
+            ],
+            "t",
+        );
+        assert!(matches!(updates[0], StatusUpdate::Acked(1, _)));
+        match &updates[1] {
+            StatusUpdate::Nacked(id, _, err) => {
+                assert_eq!(*id, 2);
+                assert_eq!(err, "datum mismatch");
+            }
+            other => panic!("expected Nacked, got {other:?}"),
+        }
+        assert!(matches!(updates[2], StatusUpdate::Acked(3, _)));
+    }
+
+    #[test]
+    fn demux_missing_id_is_requeued() {
+        // Companion truncated — id 2 omitted from results. It must be
+        // re-Queued (retry), not silently lost or marked applied.
+        let updates =
+            demux_bulk_results(&[1, 2, 3], &[result(1, true, None), result(3, true, None)], "t");
+        assert!(matches!(updates[0], StatusUpdate::Acked(1, _)));
+        assert!(matches!(updates[1], StatusUpdate::Queued(2, _)));
+        assert!(matches!(updates[2], StatusUpdate::Acked(3, _)));
+    }
+
+    #[test]
+    fn demux_extra_id_is_ignored() {
+        // Result for id 99 (not in the chunk) is ignored; output is
+        // exactly one update per chunk id, in chunk order.
+        let updates = demux_bulk_results(
+            &[1, 2],
+            &[
+                result(1, true, None),
+                result(99, true, None),
+                result(2, false, Some("x")),
+            ],
+            "t",
+        );
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(updates[0], StatusUpdate::Acked(1, _)));
+        assert!(matches!(updates[1], StatusUpdate::Nacked(2, _, _)));
+    }
+
+    #[test]
+    fn bulk_config_defaults_to_50() {
+        // SAFETY: single-threaded var manipulation in test.
+        unsafe {
+            std::env::remove_var("MITOS_BULK_BATCH_MAX");
+        }
+        assert_eq!(BulkConfig::from_env().max, 50);
     }
 
     #[test]

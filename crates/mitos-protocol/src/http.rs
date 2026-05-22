@@ -90,6 +90,89 @@ pub fn decode_apply(bytes: &[u8]) -> Result<ApplyBody, String> {
     ciborium::from_reader(bytes).map_err(|e| format!("decode_apply: {e}"))
 }
 
+/// One emission inside an [`ApplyBulkRequest`]. Mirrors the
+/// per-row fields of [`ApplyBody`] minus `channel`, which is shared
+/// at the batch level (all emissions in a bulk POST target one
+/// channel / one partition lane).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkEmission {
+    /// Monotonic emission id from the host's `EmissionsStore`. The
+    /// host uses it to demux the per-emission result back into the
+    /// store; opaque to the consumer (NOT a dedup key — applies are
+    /// chain-point-idempotent; see `docs/design/DIALER_BULK_APPLY.md`).
+    pub emission_id: u64,
+    /// Chain point of this emission.
+    pub cursor: ChainPoint,
+    /// CBOR-encoded event payload — same bytes `apply_bytes` decodes.
+    #[serde(with = "serde_bytes")]
+    pub change: Vec<u8>,
+}
+
+/// Body of `POST /_internal/apply-<channel>-bulk?key=<companion_key>`.
+///
+/// Carries up to M emissions for one channel (one partition lane),
+/// applied by the consumer **in slice order**. Collapses M HTTP
+/// round-trips into one. See `docs/design/DIALER_BULK_APPLY.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyBulkRequest {
+    /// Channel tag — same value the per-row `apply-<channel>` URL
+    /// carries. All `emissions` belong to this channel.
+    pub channel: String,
+    /// Emissions to apply, in order.
+    pub emissions: Vec<BulkEmission>,
+}
+
+/// Per-emission outcome in an [`ApplyBulkResponse`]. `applied =
+/// false` carries the rejection reason in `error` (the bulk
+/// analogue of a per-row 422 Nack); the lane keeps moving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkEmissionResult {
+    pub emission_id: u64,
+    /// `true` → Ack-equivalent; `false` → Nack-equivalent (terminal,
+    /// won't help to retry).
+    pub applied: bool,
+    /// Rejection reason when `applied == false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response body for `POST /_internal/apply-<channel>-bulk`.
+///
+/// HTTP 200 carries one [`BulkEmissionResult`] per applied/rejected
+/// emission. The host demuxes by `emission_id`: `applied` → Acked,
+/// `!applied` → Nacked, and any requested id **missing** from
+/// `results` is left Queued for the next tick (defensive: covers a
+/// companion that truncated mid-batch). A 5xx on the whole POST
+/// means none applied — all rows go back to Queued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyBulkResponse {
+    pub results: Vec<BulkEmissionResult>,
+}
+
+/// CBOR-encode an [`ApplyBulkRequest`].
+pub fn encode_apply_bulk(body: &ApplyBulkRequest) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(256);
+    ciborium::into_writer(body, &mut buf).map_err(|e| format!("encode_apply_bulk: {e}"))?;
+    Ok(buf)
+}
+
+/// CBOR-decode an [`ApplyBulkRequest`].
+pub fn decode_apply_bulk(bytes: &[u8]) -> Result<ApplyBulkRequest, String> {
+    ciborium::from_reader(bytes).map_err(|e| format!("decode_apply_bulk: {e}"))
+}
+
+/// CBOR-encode an [`ApplyBulkResponse`].
+pub fn encode_apply_bulk_response(body: &ApplyBulkResponse) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(128);
+    ciborium::into_writer(body, &mut buf).map_err(|e| format!("encode_apply_bulk_response: {e}"))?;
+    Ok(buf)
+}
+
+/// CBOR-decode an [`ApplyBulkResponse`].
+pub fn decode_apply_bulk_response(bytes: &[u8]) -> Result<ApplyBulkResponse, String> {
+    ciborium::from_reader(bytes).map_err(|e| format!("decode_apply_bulk_response: {e}"))
+}
+
 /// CBOR-encode a [`RecaptureBody`].
 pub fn encode_recapture(body: &RecaptureBody) -> Result<Vec<u8>, String> {
     let mut buf = Vec::with_capacity(64);
@@ -160,6 +243,56 @@ mod tests {
         assert_eq!(decoded.cursor.slot(), Some(123));
         assert_eq!(decoded.cursor.hash(), Some("deadbeef"));
         assert_eq!(decoded.change, vec![0xd8, 0x79, 0x9f, 0xff]);
+    }
+
+    #[test]
+    fn apply_bulk_round_trip() {
+        let req = ApplyBulkRequest {
+            channel: "collection-holders".into(),
+            emissions: vec![
+                BulkEmission {
+                    emission_id: 10,
+                    cursor: ChainPoint::Slot(100),
+                    change: vec![1, 2, 3],
+                },
+                BulkEmission {
+                    emission_id: 11,
+                    cursor: ChainPoint::Specific(101, "abcd".into()),
+                    change: vec![4, 5],
+                },
+            ],
+        };
+        let bytes = encode_apply_bulk(&req).unwrap();
+        let decoded = decode_apply_bulk(&bytes).unwrap();
+        assert_eq!(decoded.channel, "collection-holders");
+        assert_eq!(decoded.emissions.len(), 2);
+        assert_eq!(decoded.emissions[0].emission_id, 10);
+        assert_eq!(decoded.emissions[1].cursor.hash(), Some("abcd"));
+        assert_eq!(decoded.emissions[1].change, vec![4, 5]);
+    }
+
+    #[test]
+    fn apply_bulk_response_round_trip() {
+        let resp = ApplyBulkResponse {
+            results: vec![
+                BulkEmissionResult {
+                    emission_id: 10,
+                    applied: true,
+                    error: None,
+                },
+                BulkEmissionResult {
+                    emission_id: 11,
+                    applied: false,
+                    error: Some("datum hash mismatch".into()),
+                },
+            ],
+        };
+        let bytes = encode_apply_bulk_response(&resp).unwrap();
+        let decoded = decode_apply_bulk_response(&bytes).unwrap();
+        assert_eq!(decoded.results.len(), 2);
+        assert!(decoded.results[0].applied);
+        assert!(!decoded.results[1].applied);
+        assert_eq!(decoded.results[1].error.as_deref(), Some("datum hash mismatch"));
     }
 
     #[test]

@@ -635,11 +635,21 @@ async fn run_companion(
     }
 
     let lane_config = LaneConfig::from_env();
+    // Bulk-apply setup. `bulk_url` is `apply_url` with `-bulk`
+    // spliced before the query; the capability cache is shared across
+    // this task's lanes and lazily resolves whether the companion has
+    // the bulk route (404/415 → fall back to per-row for the task's
+    // life). See `docs/design/DIALER_BULK_APPLY.md`.
+    let bulk_url = bulk_url_from_apply(&apply_url);
+    let bulk_config = pool::BulkConfig::from_env();
+    let bulk_capability =
+        std::sync::Arc::new(std::sync::atomic::AtomicU8::new(pool::BULK_UNKNOWN));
     info!(
         module = %module_name,
         companion_key = %req.companion_key,
         apply_url = %apply_url,
         lanes = lane_config.lanes,
+        bulk_max = bulk_config.max,
         "companion drain task started"
     );
 
@@ -713,6 +723,10 @@ async fn run_companion(
                 let result = pool::run_tick(pool::PoolContext {
                     client: &client,
                     apply_url: &apply_url,
+                    bulk_url: &bulk_url,
+                    bulk_capability: bulk_capability.clone(),
+                    bulk_max: bulk_config.max,
+                    channel: &module_name,
                     header_name: header_name.as_deref(),
                     header_value: header_value.as_deref(),
                     store: &store,
@@ -845,6 +859,17 @@ fn resolve_op_url(
         .replace("{op}", op))
 }
 
+/// Derive the bulk-apply URL from the resolved per-row apply URL by
+/// splicing `-bulk` onto the path segment, before any query string.
+/// `…/_internal/apply-collection-holders?policy_id=X` →
+/// `…/_internal/apply-collection-holders-bulk?policy_id=X`.
+fn bulk_url_from_apply(apply_url: &str) -> String {
+    match apply_url.split_once('?') {
+        Some((path, query)) => format!("{path}-bulk?{query}"),
+        None => format!("{apply_url}-bulk"),
+    }
+}
+
 fn resolve_auth_header(
     req: &SubscribeRequest,
     auth: &AuthToken,
@@ -891,4 +916,35 @@ pub fn companion_path_for(storage: &ModuleStorage, id: &CompanionId) -> PathBuf 
         .module_dir_for_companions(&id.module_id)
         .join(&id.client_id)
         .join(format!("{}.cbor", id.companion_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bulk_url_from_apply;
+
+    #[test]
+    fn bulk_url_splices_before_query() {
+        assert_eq!(
+            bulk_url_from_apply(
+                "https://ownership.dev.cnft.dev/_internal/apply-collection-holders?policy_id=abc"
+            ),
+            "https://ownership.dev.cnft.dev/_internal/apply-collection-holders-bulk?policy_id=abc"
+        );
+    }
+
+    #[test]
+    fn bulk_url_no_query_appends() {
+        assert_eq!(
+            bulk_url_from_apply("https://x/_internal/apply-collection-holders"),
+            "https://x/_internal/apply-collection-holders-bulk"
+        );
+    }
+
+    #[test]
+    fn bulk_url_preserves_multi_param_query() {
+        assert_eq!(
+            bulk_url_from_apply("https://x/_internal/apply-mod?key=k&policy_id=p"),
+            "https://x/_internal/apply-mod-bulk?key=k&policy_id=p"
+        );
+    }
 }
