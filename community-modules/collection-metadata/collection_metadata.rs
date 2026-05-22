@@ -628,13 +628,25 @@ fn fold_page(ledger: &mut MetadataLedger, policy: &[u8; HASH_BYTES], refs: &[Wit
     let utxos = chain_data::read_utxos(refs);
     let datums = chain_data::read_output_datums(refs);
 
-    // The host returns both lists in the same order as `refs`,
-    // but `read_utxos` is `Vec<(OutputRef, TypedOutput)>` while
-    // `read_output_datums` is `Vec<Option<TypedDatum>>`. Index
-    // datums by position so we can zip them up. A page where
-    // sizes mismatch is a host-bug; skip the surplus.
-    for (idx, (oref, out)) in utxos.iter().enumerate() {
-        let datum_opt = datums.get(idx).and_then(|d| d.as_ref());
+    // CRITICAL: `read_utxos` is NOT parallel to `refs` — the host
+    // skips outputs that fail to project and appends archive-fallback
+    // hits in a second pass, so its order and length differ from the
+    // input. `read_output_datums`, by contrast, IS strictly parallel
+    // to `refs` (one entry per ref, in order). Pairing them by
+    // positional index therefore mis-assigns each datum to the wrong
+    // UTxO — putting one asset's metadata onto another asset. Key the
+    // datums by output-ref and look each UTxO's datum up by its own
+    // ref. (One `read_output_datums` pass — same cost as before.)
+    let mut datum_idx: BTreeMap<(Vec<u8>, u32), usize> = BTreeMap::new();
+    for (i, r) in refs.iter().enumerate() {
+        datum_idx.insert((r.tx_hash.clone(), r.index), i);
+    }
+
+    for (oref, out) in utxos.iter() {
+        let datum_opt = datum_idx
+            .get(&(oref.tx_hash.clone(), oref.index))
+            .and_then(|&i| datums.get(i))
+            .and_then(|d| d.as_ref());
         for asset in &out.assets {
             if asset.asset.policy != policy {
                 continue;
