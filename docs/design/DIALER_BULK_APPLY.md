@@ -8,6 +8,16 @@ on top of the partition-keyed dialer pool
 `jpgsm.cnft.dev` — much closer to the WS-transport era's
 ~700 events/sec but still ~10× short of it.
 
+> **Update 2026-05-23.** Open question 1 (companion idempotency) is
+> **resolved** — the v1 runtime audit (see "Idempotency requirement"
+> below) shows applies are chain-point-idempotent at the application
+> layer, so Phase 1 needs no runtime dedup work. The doc's original
+> emission-id dedup model was inaccurate and has been corrected.
+> A second motivation has also surfaced from the collection-ownership
+> dev recovery: bulk apply fixes recapture **coordination timeouts**,
+> not just raw speed (see "Why this also fixes recapture timeouts").
+> Still no code; Phase 1/2 are ready to build.
+
 The remaining gap is structural: with the pool deployed, the per-
 lane drain is `for emission in queued { POST, await ack, next }`.
 Throughput is `lanes × (1 / round-trip-latency)`. At 8 lanes and
@@ -68,6 +78,38 @@ partition keys still define ordering and parallelism, the
 emissions store still tracks per-row status. The change is
 purely in the wire shape of the POST, plus the companion-side
 handler that interprets a batch.
+
+## Why this also fixes recapture timeouts (not just speed)
+
+Observed during the collection-ownership dev recovery (2026-05-23,
+the SB6 cross-contamination fix). A `companion=*` recapture of
+`collection-holders` over two policies **timed out** — `1 ready,
+1 timed out` — and the host correctly aborted the bootstrap-refill
+rather than seed ghost rows.
+
+The cause was throughput, not a recapture bug. One companion's DO
+(a Cloudflare Durable Object) was saturated draining an in-flight
+cold-start backlog: ~1,500 tiny per-emission Apply POSTs, applied
+one-at-a-time because CF DOs **serialise all inbound requests**.
+The recapture's `on_recapture` POST queued behind that backlog and
+couldn't ACK inside the per-companion timeout, so coordination
+failed.
+
+Bulk apply removes the saturation: the same backlog drains in a
+handful of batched POSTs instead of ~1,500 single-row ones, the DO
+request queue stays short, and `on_recapture` is serviced
+promptly. So bulk apply is not only "recapture finishes faster"
+(75s → ~3–5s per the recapture cross-ref) but "recapture
+**coordination stops timing out** under any concurrent
+cold-start/backfill load." For multi-policy hosts this is the
+difference between recapture being reliable and being a coin-flip
+whenever a DO is busy.
+
+(The dev recovery's slowest leg was actually the dynamic-interest
+`Add` cold-start, which dispatches many tiny per-batch Delta
+emissions rather than a few large `SnapshotChunk`s — the
+worst-case shape for the per-row drain, and the best-case win for
+bulk.)
 
 ## Response model — per-emission results vs applied-through
 
@@ -138,37 +180,55 @@ companion committed) is covered by idempotency below.
 
 ## Idempotency requirement
 
-Every emission carries a stable `id` (the row's monotonic
-auto-increment in the emissions store). Companions MUST treat
-`id` as the dedup key when applying a batch:
+**Resolved by audit (2026-05-20, re-verified 2026-05-21).** The
+load-bearing property is **chain-point idempotency at the
+application layer**, *not* emission-id dedup at the protocol layer.
+An earlier draft of this section required companions to track
+`emission.id` and dedup on it; that was wrong about how the v1
+runtime works, and the dedup it described is neither present nor
+needed. Corrected below.
+
+What the audit found in the mitos-companion v1 runtime:
+- `emission_id` is opaque to the companion. There is **no**
+  persistent emission-id tracking table (the schema has only
+  `mitos_companion_meta`, `_interest`, `_registration`).
+- `apply_bytes` (`mitos-companion/src/runtime.rs:235`) is invoked
+  **unconditionally** on every Apply — there is no `seen(id)`
+  short-circuit.
+- Idempotency is the dApp `apply_event` handler's responsibility,
+  keyed on **chain points** — `tx_hash`+`output_index` for typical
+  Cardano events, slot+hash for the cursor (`INSERT OR REPLACE`).
+  This is the documented Q3 contract in
+  [`MITOS_COMPANION_RUNTIME_V1.md`](../strategy/MITOS_COMPANION_RUNTIME_V1.md)
+  (§Q3, ~lines 640–650).
+
+Why that's sufficient for bulk + retry: Cardano events are
+naturally idempotent. Re-applying `Transfer { tx_hash,
+output_index }` (or a `SnapshotChunk` of holdings keyed by asset
+name) yields the same state; the cursor advance is
+`INSERT OR REPLACE` on the chain point. A double-apply on the
+"applied but response lost" retry **converges** — it doesn't
+corrupt. So the bulk handler can be the plain loop:
 
 ```
-on apply_bulk(batch):
-    for emission in batch:
-        if seen(emission.id):
-            results.append({ id, status: "applied" })  # idempotent re-ack
-            continue
+on apply_bulk(batch):              # batch is one partition (= one
+    for emission in batch:         # policy, post-SB6 keying), in order
         try:
-            apply(emission.payload)
-            record_seen(emission.id)
+            apply(emission.payload)     # chain-point-idempotent
             results.append({ id, status: "applied" })
         except ApplicationError as e:
             results.append({ id, status: "rejected", error: e.message })
     return { results }
 ```
 
-Without this, any retry after a "applied but response lost"
-failure double-applies. The mitos-companion v1 runtime already
-tracks emission IDs for ack purposes
-([`MITOS_COMPANION_RUNTIME_V1.md`](../strategy/MITOS_COMPANION_RUNTIME_V1.md));
-the bulk path reuses that machinery. Worth a code audit before
-relying on it — the WS path's emission-id semantics were about
-ordering and replay-after-reconnect, not idempotent re-apply.
+No `seen(emission.id)` table; the `id` is used only by the host to
+demux per-row status back into the emissions store, never by the
+companion as a dedup key.
 
-If the audit shows companion idempotency is partial (e.g.
-companion dedups acks at the protocol layer but the application
-handler isn't keyed on emission id), that's a prerequisite to
-fix before bulk lands.
+**Implication:** Phase 1 proceeds with **zero runtime-side dedup
+work**. The only hard requirement — dApp handlers being
+chain-point-idempotent — is already a v1 runtime contract every
+companion satisfies today.
 
 ## Ordering within a batch
 
@@ -346,17 +406,19 @@ Still much faster than M HTTP round-trips.
 | All apply cleanly | M applied | 200 with M `applied` results | M Acked |
 | One per-row 422 | M-1 applied, 1 rejected | 200 with `applied`+`rejected` mix | M-1 Acked, 1 Nacked |
 | Companion overrides `apply_bulk` with tx, throws mid-batch | 0 applied (rollback) | 5xx | M back to Queued |
-| Companion crashes mid-batch (no tx) | K applied (committed), N-K not | (no response or 5xx after timeout) | M back to Queued; retry replays full batch; companion idempotency dedups K |
-| Network drop after companion commits | M applied | (no response) | M back to Queued; retry replays; companion idempotency dedups M (returns 200 with M `applied`) |
+| Companion crashes mid-batch (no tx) | K applied (committed), N-K not | (no response or 5xx after timeout) | M back to Queued; retry replays full batch; chain-point idempotency makes re-applying K converge |
+| Network drop after companion commits | M applied | (no response) | M back to Queued; retry replays; re-applying M converges (returns 200 with M `applied`) |
 | Companion responds 200 but omits some IDs | depends | 200 with K<M results | K mapped to results, M-K back to Queued for retry |
 | Companion responds 200 with IDs we didn't send | n/a | 200 | Ignore unknown IDs |
 | Companion doesn't know the bulk endpoint | nothing | 404 | Cache "no bulk"; fall back to single-row drain |
 | Companion rejects batch size | nothing | 413 | Halve M for this companion; retry |
 
 The two "still queued after retry" cases (truncated response,
-crash before response) both rely on companion idempotency to
-avoid double-apply on the retry. That's the load-bearing
-property; everything else is mechanical demuxing.
+crash before response) both rely on **chain-point idempotency**
+(re-applying the same chain event converges) to make the retry's
+double-apply harmless. That's the load-bearing property — already
+a v1 runtime contract, not new work; everything else is mechanical
+demuxing.
 
 ## Status writer load
 
@@ -377,11 +439,13 @@ spread out). Bulk concentrates them.
 
 ## Open questions
 
-1. **Companion idempotency audit.** What exactly does
-   mitos-companion v1 dedup on today? Verify before relying on
-   `id` as the apply-side dedup key. If it's protocol-layer-only
-   (ack dedup but the application handler runs every time),
-   we need to extend the handler runtime.
+1. ~~**Companion idempotency audit.**~~ **RESOLVED (2026-05-20,
+   re-verified 05-21).** The v1 runtime does *not* dedup on
+   emission id — `apply_bytes` runs unconditionally, no tracking
+   table. Safety comes from chain-point idempotency in the dApp
+   handler (a documented v1 contract). No handler-runtime change
+   needed. See "Idempotency requirement". The `seen(id)` dedup the
+   earlier draft assumed has been removed from this doc.
 2. **413 handling.** If a companion's batch-size limit is
    different from ours, do we want config-level negotiation
    (companion advertises max in subscribe) or pure runtime
@@ -415,7 +479,9 @@ and revertable:
 2. Wire `/_internal/apply-<module>-bulk` route in the companion
    runtime to call `apply_bulk` and emit the per-emission result
    array.
-3. Companion idempotency audit + fix (per open question 1).
+3. ~~Companion idempotency audit + fix.~~ **Done** — audit
+   resolved (open question 1); no fix needed, applies are
+   chain-point-idempotent.
 4. Roll out to `jpgsm.cnft.dev` and a test companion. Verify
    the route responds correctly with hand-crafted POSTs.
 
