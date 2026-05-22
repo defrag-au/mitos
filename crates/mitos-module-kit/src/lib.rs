@@ -277,12 +277,12 @@ pub enum Phase {
     Emit,
 }
 
-/// Durable progress for a [`ChunkedBootstrap`]. Encoded to a fixed
-/// 26-byte layout (no serde — the kit is dependency-free) and
-/// stored by the module in `state-kv` so a trap / host restart
-/// resumes exactly. [`BootstrapCursor::encode`] /
-/// [`BootstrapCursor::decode`] are the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Durable progress for a [`ChunkedBootstrap`]. Encoded (no serde —
+/// the kit is dependency-free) and stored by the module in
+/// `state-kv` so a trap / host restart resumes exactly.
+/// [`BootstrapCursor::encode`] / [`BootstrapCursor::decode`] are the
+/// wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapCursor {
     /// Index into the sorted predicate list.
     pub predicate_idx: u64,
@@ -290,27 +290,32 @@ pub struct BootstrapCursor {
     pub phase: Phase,
     /// `anchor_slot` frozen for the predicate being scanned/emitted.
     pub anchor_slot: u64,
-    /// Index into the (sorted) shard-key list — only meaningful in
-    /// [`Phase::Emit`].
-    pub emit_offset: u64,
+    /// The last `entry_key` emitted (a **key cursor**, not an offset)
+    /// — only meaningful in [`Phase::Emit`]. The emit pages forward
+    /// with `shard_scan(after = emit_after)`. A key cursor (vs an
+    /// offset) is robust to concurrent live-tail shard mutations
+    /// during a long emit. `None` ⇒ emit not started / from the start.
+    pub emit_after: Option<Vec<u8>>,
 }
 
 impl BootstrapCursor {
-    const VERSION: u8 = 1;
-    const LEN: usize = 1 + 1 + 8 + 8 + 8;
+    const VERSION: u8 = 2;
 
     fn fresh() -> Self {
         Self {
             predicate_idx: 0,
             phase: Phase::Scan,
             anchor_slot: 0,
-            emit_offset: 0,
+            emit_after: None,
         }
     }
 
-    /// Encode to the durable 26-byte form for `state-kv`.
+    /// Encode to the durable form for `state-kv`:
+    /// `version(1) | phase(1) | predicate_idx(8 BE) | anchor_slot(8 BE)
+    /// | emit_after_len(4 BE) | emit_after`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(Self::LEN);
+        let after = self.emit_after.as_deref().unwrap_or(&[]);
+        let mut b = Vec::with_capacity(1 + 1 + 8 + 8 + 4 + after.len());
         b.push(Self::VERSION);
         b.push(match self.phase {
             Phase::Scan => 0,
@@ -318,14 +323,17 @@ impl BootstrapCursor {
         });
         b.extend_from_slice(&self.predicate_idx.to_be_bytes());
         b.extend_from_slice(&self.anchor_slot.to_be_bytes());
-        b.extend_from_slice(&self.emit_offset.to_be_bytes());
+        // `None` and empty are encoded identically; only meaningful in
+        // Emit, where `None` means "from the start".
+        b.extend_from_slice(&(after.len() as u32).to_be_bytes());
+        b.extend_from_slice(after);
         b
     }
 
     /// Decode from `state-kv`. `None` on a malformed / wrong-version
     /// blob (treated as "no cursor" → fresh round).
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::LEN || bytes[0] != Self::VERSION {
+        if bytes.len() < 22 || bytes[0] != Self::VERSION {
             return None;
         }
         let phase = match bytes[1] {
@@ -335,12 +343,18 @@ impl BootstrapCursor {
         };
         let predicate_idx = u64::from_be_bytes(bytes[2..10].try_into().ok()?);
         let anchor_slot = u64::from_be_bytes(bytes[10..18].try_into().ok()?);
-        let emit_offset = u64::from_be_bytes(bytes[18..26].try_into().ok()?);
+        let after_len = u32::from_be_bytes(bytes[18..22].try_into().ok()?) as usize;
+        let after = bytes.get(22..22 + after_len)?;
+        let emit_after = if after.is_empty() {
+            None
+        } else {
+            Some(after.to_vec())
+        };
         Some(Self {
             predicate_idx,
             phase,
             anchor_slot,
-            emit_offset,
+            emit_after,
         })
     }
 }
@@ -373,16 +387,27 @@ pub trait BootstrapIo {
     /// Scan one page of `predicate`. `after == None` ⇒ page 0.
     fn scan_page(&mut self, predicate: &[u8], after: Option<&[u8]>) -> ScannedPage<Self::Entry>;
 
-    // ---- sharded per-asset store -----------------------------------
-    /// Read one asset's stored bytes (`None` ⇒ absent).
-    fn shard_get(&self, predicate: &[u8], entry_key: &[u8]) -> Option<Vec<u8>>;
-    /// Write one asset's bytes.
-    fn shard_put(&mut self, predicate: &[u8], entry_key: &[u8], bytes: &[u8]);
-    /// List a predicate's `entry_key`s in sorted order (backed by
-    /// `state-kv list-values`). The single source of truth for which
-    /// assets exist — no separate index.
-    fn shard_list(&self, predicate: &[u8]) -> Vec<Vec<u8>>;
-    /// Delete every shard for a predicate (before a fresh scan).
+    // ---- sharded per-asset store (batched / paginated) -------------
+    /// Batched read of many shards' bytes, parallel to `keys`
+    /// (`None` ⇒ absent). One read txn (backed by `state-kv get-many`).
+    /// Only called on the SUM path (`accumulates`), once per scan page.
+    fn shard_get_many(&self, predicate: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>>;
+    /// Batched write of a page's shards in one txn (backed by
+    /// `state-kv set-many`) — one fsync per page, not per entry.
+    fn shard_put_many(&mut self, predicate: &[u8], entries: &[(Vec<u8>, Vec<u8>)]);
+    /// Paginated `(entry_key, entry_bytes)` scan, sorted, `after`
+    /// EXCLUSIVE (`None` ⇒ from the start), up to `limit`. Backed by
+    /// `state-kv kv-scan` — pages the emit through shards O(n) total,
+    /// nothing resident, values inline (no follow-up gets). The kv
+    /// keys are the single source of truth for which assets exist.
+    fn shard_scan(
+        &self,
+        predicate: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)>;
+    /// Delete every shard for a predicate in one txn (before a fresh
+    /// scan; backed by `state-kv delete-prefix`).
     fn shard_clear(&mut self, predicate: &[u8]);
 
     // ---- entry (de)serialization (module owns the codec) ----------
@@ -441,6 +466,12 @@ pub struct ChunkedBootstrap {
     /// re-instantiation re-clears, which is correct (the re-scan
     /// starts clean).
     cleared_current: bool,
+    /// Best-effort running count of entries emitted for the current
+    /// predicate, reported in `SnapshotEnd`. Resident (not durable):
+    /// a re-instantiation mid-emit resets it, so the reported count
+    /// can undercount after a trap. Informational only — the consumer
+    /// wipes on `SnapshotBegin` and doesn't depend on the count.
+    emit_count: u64,
 }
 
 impl ChunkedBootstrap {
@@ -458,12 +489,13 @@ impl ChunkedBootstrap {
             cursor,
             after: None,
             cleared_current: false,
+            emit_count: 0,
         }
     }
 
     /// The current durable cursor (mirror of what's in `state-kv`).
     pub fn cursor(&self) -> BootstrapCursor {
-        self.cursor
+        self.cursor.clone()
     }
 
     /// Do one bounded unit of work: one scan page, or one emit
@@ -497,18 +529,30 @@ impl ChunkedBootstrap {
         let page = io.scan_page(predicate, self.after.as_deref());
         self.cursor.anchor_slot = page.anchor_slot;
 
-        let accumulates = io.accumulates();
-        for (key, entry) in page.entries {
-            let stored = if accumulates {
-                let prior = io
-                    .shard_get(predicate, &key)
-                    .and_then(|b| io.decode_entry(&b));
-                io.merge(prior, entry)
-            } else {
-                entry
-            };
-            let bytes = io.encode_entry(&stored);
-            io.shard_put(predicate, &key, &bytes);
+        // Build the page's writes: one batched read (SUM only) + one
+        // batched write per page — no per-entry fsync, no per-entry
+        // get. For SUM, the read-modify-write makes cross-page sums
+        // durable (page N sees page N-1's committed writes).
+        let writes: Vec<(Vec<u8>, Vec<u8>)> = if io.accumulates() {
+            let keys: Vec<Vec<u8>> = page.entries.iter().map(|(k, _)| k.clone()).collect();
+            let priors = io.shard_get_many(predicate, &keys);
+            page.entries
+                .into_iter()
+                .zip(priors)
+                .map(|((key, entry), prior_bytes)| {
+                    let prior = prior_bytes.and_then(|b| io.decode_entry(&b));
+                    let merged = io.merge(prior, entry);
+                    (key, io.encode_entry(&merged))
+                })
+                .collect()
+        } else {
+            page.entries
+                .into_iter()
+                .map(|(key, entry)| (key, io.encode_entry(&entry)))
+                .collect()
+        };
+        if !writes.is_empty() {
+            io.shard_put_many(predicate, &writes);
         }
 
         match page.next {
@@ -525,7 +569,8 @@ impl ChunkedBootstrap {
                 // + cursor flip. No whole-ledger op (values already
                 // sharded), so this transition can't trap on size.
                 self.cursor.phase = Phase::Emit;
-                self.cursor.emit_offset = 0;
+                self.cursor.emit_after = None;
+                self.emit_count = 0;
                 self.after = None;
                 io.emit_begin(predicate, self.cursor.anchor_slot);
                 io.save_cursor(&self.cursor.encode());
@@ -538,16 +583,18 @@ impl ChunkedBootstrap {
     }
 
     fn step_emit<IO: BootstrapIo>(&mut self, io: &mut IO, predicate: &[u8]) -> StepOutcome {
-        let keys = io.shard_list(predicate); // sorted; single source of truth
-        let off = self.cursor.emit_offset as usize;
+        // Page forward by key cursor — `shard_scan` returns sorted
+        // (key, value) pairs after `emit_after`, values inline.
+        let page = io.shard_scan(predicate, self.cursor.emit_after.as_deref(), io.chunk_size());
 
-        if off >= keys.len() {
-            io.emit_end(predicate, keys.len() as u64);
+        if page.is_empty() {
+            io.emit_end(predicate, self.emit_count);
             // Advance to the next predicate.
             self.cursor.predicate_idx += 1;
             self.cursor.phase = Phase::Scan;
-            self.cursor.emit_offset = 0;
+            self.cursor.emit_after = None;
             self.cleared_current = false;
+            self.emit_count = 0;
             let done = self.cursor.predicate_idx as usize >= self.predicates.len();
             if done {
                 io.clear_cursor();
@@ -557,15 +604,15 @@ impl ChunkedBootstrap {
             return StepOutcome { done, ingested: 0 };
         }
 
-        let end = (off + io.chunk_size()).min(keys.len());
-        let entries: Vec<IO::Entry> = keys[off..end]
-            .iter()
-            .filter_map(|k| io.shard_get(predicate, k))
-            .filter_map(|b| io.decode_entry(&b))
+        let last_key = page.last().map(|(k, _)| k.clone());
+        self.emit_count += page.len() as u64;
+        let entries: Vec<IO::Entry> = page
+            .into_iter()
+            .filter_map(|(_, v)| io.decode_entry(&v))
             .collect();
         io.emit_chunk(predicate, entries);
-        self.cursor.emit_offset = end as u64;
-        io.save_cursor(&self.cursor.encode()); // durable emit offset
+        self.cursor.emit_after = last_key; // durable key cursor
+        io.save_cursor(&self.cursor.encode());
         StepOutcome {
             done: false,
             ingested: 0,
@@ -728,21 +775,31 @@ mod tests {
             }
         }
 
-        fn shard_get(&self, predicate: &[u8], entry_key: &[u8]) -> Option<Vec<u8>> {
-            self.shards
-                .get(&(predicate.to_vec(), entry_key.to_vec()))
-                .cloned()
+        fn shard_get_many(&self, predicate: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+            keys.iter()
+                .map(|k| self.shards.get(&(predicate.to_vec(), k.clone())).cloned())
+                .collect()
         }
-        fn shard_put(&mut self, predicate: &[u8], entry_key: &[u8], bytes: &[u8]) {
-            self.shards
-                .insert((predicate.to_vec(), entry_key.to_vec()), bytes.to_vec());
+        fn shard_put_many(&mut self, predicate: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) {
+            for (k, v) in entries {
+                self.shards
+                    .insert((predicate.to_vec(), k.clone()), v.clone());
+            }
         }
-        fn shard_list(&self, predicate: &[u8]) -> Vec<Vec<u8>> {
-            // BTreeMap iterates sorted → keys come back sorted.
+        fn shard_scan(
+            &self,
+            predicate: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Vec<(Vec<u8>, Vec<u8>)> {
+            // BTreeMap iterates sorted → filter predicate + `> after`,
+            // take limit (matches host kv-scan semantics).
             self.shards
-                .keys()
-                .filter(|(p, _)| p == predicate)
-                .map(|(_, k)| k.clone())
+                .iter()
+                .filter(|((p, _), _)| p == predicate)
+                .filter(|((_, k), _)| after.map(|a| k.as_slice() > a).unwrap_or(true))
+                .map(|((_, k), v)| (k.clone(), v.clone()))
+                .take(limit)
                 .collect()
         }
         fn shard_clear(&mut self, predicate: &[u8]) {
@@ -911,7 +968,7 @@ mod tests {
         // entries exactly once, then End.
         {
             let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
-            assert!(matches!(cursor, Some(c) if c.phase == Phase::Emit));
+            assert!(matches!(cursor, Some(ref c) if c.phase == Phase::Emit));
             let mut drv = ChunkedBootstrap::resume(vec![vec![0xAA]], cursor);
             for _ in 0..100 {
                 if drv.step(&mut io).done {
@@ -936,13 +993,22 @@ mod tests {
 
     #[test]
     fn cursor_round_trips() {
+        // With a key cursor set.
         let c = BootstrapCursor {
             predicate_idx: 7,
             phase: Phase::Emit,
             anchor_slot: 123456,
-            emit_offset: 42,
+            emit_after: Some(vec![0xde, 0xad, 0xbe, 0xef]),
         };
         assert_eq!(BootstrapCursor::decode(&c.encode()), Some(c));
+        // With no key cursor (Scan phase / emit not started).
+        let c2 = BootstrapCursor {
+            predicate_idx: 0,
+            phase: Phase::Scan,
+            anchor_slot: 0,
+            emit_after: None,
+        };
+        assert_eq!(BootstrapCursor::decode(&c2.encode()), Some(c2));
         assert_eq!(BootstrapCursor::decode(&[]), None);
         assert_eq!(BootstrapCursor::decode(&[9, 9, 9]), None);
     }

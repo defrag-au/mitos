@@ -184,22 +184,9 @@ fn shard_delete_entry(policy_hex: &str, suffix: &[u8]) {
 }
 
 /// Delete every shard for a policy (on un-track / before a fresh
-/// re-scan). The kv keys are the source of truth, so this is just
-/// a prefix-scan + delete.
+/// re-scan) in one txn.
 fn shard_clear_policy(policy_hex: &str) {
-    for key in state_kv::list_values(&shard_prefix(policy_hex)) {
-        state_kv::delete_value(&key);
-    }
-}
-
-/// List a policy's ref-token suffixes (sorted), decoded from the
-/// shard kv keys.
-fn shard_list_suffixes(policy_hex: &str) -> Vec<Vec<u8>> {
-    let prefix = shard_prefix(policy_hex);
-    state_kv::list_values(&prefix)
-        .into_iter()
-        .filter_map(|k| k.strip_prefix(prefix.as_str()).and_then(|h| hex::decode(h).ok()))
-        .collect()
+    state_kv::delete_prefix(&shard_prefix(policy_hex));
 }
 
 // ============================================================
@@ -1029,14 +1016,37 @@ impl BootstrapIo for MetadataIo {
         }
     }
 
-    fn shard_get(&self, predicate: &[u8], entry_key: &[u8]) -> Option<Vec<u8>> {
-        state_kv::get_value(&shard_key_for(&hex::encode(predicate), entry_key))
+    fn shard_get_many(&self, predicate: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let policy_hex = hex::encode(predicate);
+        let kv_keys: Vec<String> = keys.iter().map(|k| shard_key_for(&policy_hex, k)).collect();
+        state_kv::get_many(&kv_keys)
     }
-    fn shard_put(&mut self, predicate: &[u8], entry_key: &[u8], bytes: &[u8]) {
-        state_kv::set_value(&shard_key_for(&hex::encode(predicate), entry_key), bytes);
+    fn shard_put_many(&mut self, predicate: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) {
+        let policy_hex = hex::encode(predicate);
+        let kv_entries: Vec<(String, Vec<u8>)> = entries
+            .iter()
+            .map(|(k, v)| (shard_key_for(&policy_hex, k), v.clone()))
+            .collect();
+        state_kv::set_many(&kv_entries);
     }
-    fn shard_list(&self, predicate: &[u8]) -> Vec<Vec<u8>> {
-        shard_list_suffixes(&hex::encode(predicate))
+    fn shard_scan(
+        &self,
+        predicate: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let policy_hex = hex::encode(predicate);
+        let prefix = shard_prefix(&policy_hex);
+        let after_key = after.map(|a| shard_key_for(&policy_hex, a));
+        state_kv::kv_scan(&prefix, after_key.as_deref(), limit as u32)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                // strip `prefix` + hex-decode → the suffix entry_key.
+                k.strip_prefix(prefix.as_str())
+                    .and_then(|h| hex::decode(h).ok())
+                    .map(|ek| (ek, v))
+            })
+            .collect()
     }
     fn shard_clear(&mut self, predicate: &[u8]) {
         shard_clear_policy(&hex::encode(predicate));

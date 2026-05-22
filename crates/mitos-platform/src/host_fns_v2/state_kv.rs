@@ -71,4 +71,65 @@ impl StateKvHost for HostStateV2 {
             }
         }
     }
+
+    async fn kv_scan(
+        &mut self,
+        prefix: String,
+        after: Option<String>,
+        limit: u32,
+    ) -> wasmtime::Result<Vec<(String, Vec<u8>)>> {
+        match &self.kv {
+            // InMemory stores logical keys. Filter (prefix + > after),
+            // sort, truncate — matching redb's ordered range semantics.
+            ModuleKv::InMemory(map) => {
+                let mut pairs: Vec<(String, Vec<u8>)> = map
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .filter(|(k, _)| after.as_deref().map(|a| k.as_str() > a).unwrap_or(true))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                pairs.truncate(limit as usize);
+                Ok(pairs)
+            }
+            ModuleKv::Redb(redb) => redb
+                .scan(&self.module_id, &prefix, after.as_deref(), limit as usize)
+                .map_err(|e| wasmtime::Error::msg(e.to_string())),
+        }
+    }
+
+    async fn get_many(&mut self, keys: Vec<String>) -> wasmtime::Result<Vec<Option<Vec<u8>>>> {
+        match &self.kv {
+            ModuleKv::InMemory(map) => Ok(keys.iter().map(|k| map.get(k).cloned()).collect()),
+            ModuleKv::Redb(redb) => redb
+                .get_many(&self.module_id, &keys)
+                .map_err(|e| wasmtime::Error::msg(e.to_string())),
+        }
+    }
+
+    async fn set_many(&mut self, entries: Vec<(String, Vec<u8>)>) -> wasmtime::Result<()> {
+        match &mut self.kv {
+            ModuleKv::InMemory(map) => {
+                for (k, v) in entries {
+                    map.insert(k, v);
+                }
+                Ok(())
+            }
+            ModuleKv::Redb(redb) => redb
+                .set_many(&self.module_id, &entries)
+                .map_err(|e| wasmtime::Error::msg(e.to_string())),
+        }
+    }
+
+    async fn delete_prefix(&mut self, prefix: String) -> wasmtime::Result<()> {
+        match &mut self.kv {
+            ModuleKv::InMemory(map) => {
+                map.retain(|k, _| !k.starts_with(&prefix));
+                Ok(())
+            }
+            ModuleKv::Redb(redb) => redb
+                .delete_prefix(&self.module_id, &prefix)
+                .map_err(|e| wasmtime::Error::msg(e.to_string())),
+        }
+    }
 }

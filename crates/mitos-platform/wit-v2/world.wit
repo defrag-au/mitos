@@ -398,6 +398,28 @@ interface state-kv {
     /// returns the module's logical keys (the `{module_id}-` storage
     /// namespace prefix is stripped). Backed by a redb range scan.
     list-values: func(prefix: string) -> list<string>;
+
+    /// Paginated `(key, value)` range scan under `prefix`, keys
+    /// sorted, `after` (a logical key) EXCLUSIVE (`none` ⇒ from the
+    /// start), up to `limit` rows. Values are returned alongside keys
+    /// so a chunked snapshot emit pages through sharded state O(n)
+    /// total with nothing resident and no follow-up gets — the
+    /// primitive that makes ~420K-entry bootstraps scale. See
+    /// docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md.
+    kv-scan: func(prefix: string, after: option<string>, limit: u32)
+        -> list<tuple<string, list<u8>>>;
+
+    /// Batched random-access get — one read txn for many keys.
+    /// Result is parallel to `keys` (`none` ⇒ absent). Used by the
+    /// SUM bootstrap to read a page's existing shards at once.
+    get-many: func(keys: list<string>) -> list<option<list<u8>>>;
+
+    /// Batched write — one write txn (one fsync) for a page's
+    /// shards. Replaces N per-entry `set-value` fsyncs.
+    set-many: func(entries: list<tuple<string, list<u8>>>);
+
+    /// Delete every key under `prefix` in one write txn.
+    delete-prefix: func(prefix: string);
 }
 
 /// Module-side event emission.
