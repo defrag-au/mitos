@@ -232,6 +232,347 @@ impl<P, A: Default> ReentrantRound<P, A> {
     }
 }
 
+// ============================================================
+// ChunkedBootstrap — re-entrant scan + sharded persist + chunked
+// emit, for modules whose per-asset payload is large enough that a
+// single whole-ledger serialize traps (the deferred "pathological
+// accumulator" case in `WASM_BUDGET_CHUNKING.md`).
+// ============================================================
+
+// ## Why a second driver
+//
+// `ReentrantRound` pages the *scan* but leaves the module to
+// accumulate a resident ledger and persist/emit it. For modules
+// whose per-entry payload is small (a holding ≈ 80 B) that's fine.
+// For a metadata module (a CIP-68 `metadata_json` per asset ≈ KB),
+// the resident ledger reaches multiple MB and the last-page
+// `persist_ledger` + clone + emit-open traps `out-of-fuel` — and,
+// because the durable cursor only advanced at emit-close, the
+// re-instantiate-on-trap loop re-emits `SnapshotBegin` forever.
+//
+// `ChunkedBootstrap` removes the resident ledger entirely:
+//
+// - Scan pages the policy and writes one kv key per asset
+//   (sharded) as it goes — no accumulator, no big serialize.
+// - Emit lists the shards (`state-kv list-values`, the single
+//   source of truth — no separate key index to drift) and drains
+//   one bounded `SnapshotChunk` per call, the emit offset durable
+//   in the cursor.
+// - Every progress field (predicate index, phase, emit offset) is
+//   durable in `state-kv`, so a re-instantiation mid-emit resumes
+//   at the offset instead of restarting the policy. No call ever
+//   touches the whole ledger, so the per-call cost shrinks with the
+//   page and can't trap on size.
+//
+// The kit stays pure: all host IO (chain scan, kv get/set/list,
+// typed event emit) is supplied by the module through `BootstrapIo`,
+// exactly as `ReentrantRound` leaves IO to the module.
+
+/// Phase of a [`ChunkedBootstrap`] for one predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Paging `utxos-by-*` and sharding each entry to `state-kv`.
+    Scan,
+    /// Draining `SnapshotChunk`s from the sharded entries.
+    Emit,
+}
+
+/// Durable progress for a [`ChunkedBootstrap`]. Encoded to a fixed
+/// 26-byte layout (no serde — the kit is dependency-free) and
+/// stored by the module in `state-kv` so a trap / host restart
+/// resumes exactly. [`BootstrapCursor::encode`] /
+/// [`BootstrapCursor::decode`] are the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapCursor {
+    /// Index into the sorted predicate list.
+    pub predicate_idx: u64,
+    /// Phase within the current predicate.
+    pub phase: Phase,
+    /// `anchor_slot` frozen for the predicate being scanned/emitted.
+    pub anchor_slot: u64,
+    /// Index into the (sorted) shard-key list — only meaningful in
+    /// [`Phase::Emit`].
+    pub emit_offset: u64,
+}
+
+impl BootstrapCursor {
+    const VERSION: u8 = 1;
+    const LEN: usize = 1 + 1 + 8 + 8 + 8;
+
+    fn fresh() -> Self {
+        Self {
+            predicate_idx: 0,
+            phase: Phase::Scan,
+            anchor_slot: 0,
+            emit_offset: 0,
+        }
+    }
+
+    /// Encode to the durable 26-byte form for `state-kv`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(Self::LEN);
+        b.push(Self::VERSION);
+        b.push(match self.phase {
+            Phase::Scan => 0,
+            Phase::Emit => 1,
+        });
+        b.extend_from_slice(&self.predicate_idx.to_be_bytes());
+        b.extend_from_slice(&self.anchor_slot.to_be_bytes());
+        b.extend_from_slice(&self.emit_offset.to_be_bytes());
+        b
+    }
+
+    /// Decode from `state-kv`. `None` on a malformed / wrong-version
+    /// blob (treated as "no cursor" → fresh round).
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::LEN || bytes[0] != Self::VERSION {
+            return None;
+        }
+        let phase = match bytes[1] {
+            0 => Phase::Scan,
+            1 => Phase::Emit,
+            _ => return None,
+        };
+        let predicate_idx = u64::from_be_bytes(bytes[2..10].try_into().ok()?);
+        let anchor_slot = u64::from_be_bytes(bytes[10..18].try_into().ok()?);
+        let emit_offset = u64::from_be_bytes(bytes[18..26].try_into().ok()?);
+        Some(Self {
+            predicate_idx,
+            phase,
+            anchor_slot,
+            emit_offset,
+        })
+    }
+}
+
+/// One scanned page handed back from [`BootstrapIo::scan_page`].
+pub struct ScannedPage<E> {
+    /// `(entry_key, entry)` pairs decoded from this page. `entry_key`
+    /// is the opaque per-asset shard key (the module owns its
+    /// format); the kit only routes it back through
+    /// [`BootstrapIo::shard_get`] / [`BootstrapIo::shard_put`].
+    pub entries: Vec<(Vec<u8>, E)>,
+    /// Continuation token for the next page; `None` ⇒ last page.
+    pub next: Option<Vec<u8>>,
+    /// Anchor slot for this scan (frozen into the cursor).
+    pub anchor_slot: u64,
+    /// UTxOs seen this page (telemetry only).
+    pub ingested: u64,
+}
+
+/// All host IO a [`ChunkedBootstrap`] needs, supplied by the module
+/// using its own WIT host bindings. The kit never calls host-fns;
+/// this trait is the seam.
+pub trait BootstrapIo {
+    /// The module's per-asset entry, ready for snapshot emission.
+    /// The kit stores it via [`encode_entry`](Self::encode_entry) /
+    /// [`decode_entry`](Self::decode_entry) and never inspects it.
+    type Entry;
+
+    // ---- chain scan (one page) -------------------------------------
+    /// Scan one page of `predicate`. `after == None` ⇒ page 0.
+    fn scan_page(&mut self, predicate: &[u8], after: Option<&[u8]>) -> ScannedPage<Self::Entry>;
+
+    // ---- sharded per-asset store -----------------------------------
+    /// Read one asset's stored bytes (`None` ⇒ absent).
+    fn shard_get(&self, predicate: &[u8], entry_key: &[u8]) -> Option<Vec<u8>>;
+    /// Write one asset's bytes.
+    fn shard_put(&mut self, predicate: &[u8], entry_key: &[u8], bytes: &[u8]);
+    /// List a predicate's `entry_key`s in sorted order (backed by
+    /// `state-kv list-values`). The single source of truth for which
+    /// assets exist — no separate index.
+    fn shard_list(&self, predicate: &[u8]) -> Vec<Vec<u8>>;
+    /// Delete every shard for a predicate (before a fresh scan).
+    fn shard_clear(&mut self, predicate: &[u8]);
+
+    // ---- entry (de)serialization (module owns the codec) ----------
+    fn encode_entry(&self, entry: &Self::Entry) -> Vec<u8>;
+    fn decode_entry(&self, bytes: &[u8]) -> Option<Self::Entry>;
+
+    /// `true` if the same `entry_key` legitimately recurs across
+    /// UTxOs/pages and must be combined (e.g. holder balances SUM).
+    /// `false` (default) ⇒ last-write-wins (CIP-68 datum rotation,
+    /// one-NFT-per-name) and the driver skips the read-before-write.
+    fn accumulates(&self) -> bool {
+        false
+    }
+    /// Combine a freshly scanned entry with whatever is stored.
+    /// Only called when [`accumulates`](Self::accumulates) is `true`;
+    /// the default (replace) returns `incoming`.
+    fn merge(&self, _prior: Option<Self::Entry>, incoming: Self::Entry) -> Self::Entry {
+        incoming
+    }
+
+    // ---- durable driver cursor ------------------------------------
+    fn load_cursor(&self) -> Option<Vec<u8>>;
+    fn save_cursor(&mut self, bytes: &[u8]);
+    fn clear_cursor(&mut self);
+
+    // ---- typed emission -------------------------------------------
+    fn emit_begin(&mut self, predicate: &[u8], anchor_slot: u64);
+    fn emit_chunk(&mut self, predicate: &[u8], entries: Vec<Self::Entry>);
+    fn emit_end(&mut self, predicate: &[u8], total: u64);
+
+    /// Entries per `SnapshotChunk`. Module-owned (metadata ≈ 100,
+    /// holders/holder-distribution ≈ 1000).
+    fn chunk_size(&self) -> usize;
+}
+
+/// Result of one [`ChunkedBootstrap::step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepOutcome {
+    /// `true` when every predicate has been scanned + emitted.
+    pub done: bool,
+    /// UTxOs ingested this step (telemetry).
+    pub ingested: u64,
+}
+
+/// A re-entrant scan→shard→emit driver. Held in a module
+/// thread-local across the host's re-entrant loop on one wasm
+/// instance; on a trap the host drops it and the module rebuilds it
+/// from the durable cursor via [`ChunkedBootstrap::resume`].
+pub struct ChunkedBootstrap {
+    predicates: Vec<Vec<u8>>,
+    cursor: BootstrapCursor,
+    /// Volatile page token for the predicate currently scanning.
+    after: Option<Vec<u8>>,
+    /// Whether the current predicate's stale shards were cleared
+    /// this run (once, before its first scan page). Volatile — a
+    /// re-instantiation re-clears, which is correct (the re-scan
+    /// starts clean).
+    cleared_current: bool,
+}
+
+impl ChunkedBootstrap {
+    /// Begin — or resume — a round. `predicates` MUST be sorted
+    /// (deterministic), same rule as [`ReentrantRound`]. `cursor` is
+    /// the decoded durable cursor (`None` ⇒ fresh).
+    pub fn resume(predicates: Vec<Vec<u8>>, cursor: Option<BootstrapCursor>) -> Self {
+        let mut cursor = cursor.unwrap_or_else(BootstrapCursor::fresh);
+        // Clamp a stale cursor past the end.
+        if cursor.predicate_idx as usize > predicates.len() {
+            cursor.predicate_idx = predicates.len() as u64;
+        }
+        Self {
+            predicates,
+            cursor,
+            after: None,
+            cleared_current: false,
+        }
+    }
+
+    /// The current durable cursor (mirror of what's in `state-kv`).
+    pub fn cursor(&self) -> BootstrapCursor {
+        self.cursor
+    }
+
+    /// Do one bounded unit of work: one scan page, or one emit
+    /// chunk, or one phase/predicate transition. The host loops this
+    /// (refuelling each call) until `done`.
+    pub fn step<IO: BootstrapIo>(&mut self, io: &mut IO) -> StepOutcome {
+        let Some(predicate) = self.predicates.get(self.cursor.predicate_idx as usize).cloned()
+        else {
+            io.clear_cursor();
+            return StepOutcome {
+                done: true,
+                ingested: 0,
+            };
+        };
+
+        match self.cursor.phase {
+            Phase::Scan => self.step_scan(io, &predicate),
+            Phase::Emit => self.step_emit(io, &predicate),
+        }
+    }
+
+    fn step_scan<IO: BootstrapIo>(&mut self, io: &mut IO, predicate: &[u8]) -> StepOutcome {
+        // Clear stale shards once before this predicate's first page
+        // so a re-scan after a trap can't double-count accumulating
+        // entries (and replace entries start clean too).
+        if self.after.is_none() && !self.cleared_current {
+            io.shard_clear(predicate);
+            self.cleared_current = true;
+        }
+
+        let page = io.scan_page(predicate, self.after.as_deref());
+        self.cursor.anchor_slot = page.anchor_slot;
+
+        let accumulates = io.accumulates();
+        for (key, entry) in page.entries {
+            let stored = if accumulates {
+                let prior = io
+                    .shard_get(predicate, &key)
+                    .and_then(|b| io.decode_entry(&b));
+                io.merge(prior, entry)
+            } else {
+                entry
+            };
+            let bytes = io.encode_entry(&stored);
+            io.shard_put(predicate, &key, &bytes);
+        }
+
+        match page.next {
+            Some(token) => {
+                self.after = Some(token);
+                io.save_cursor(&self.cursor.encode());
+                StepOutcome {
+                    done: false,
+                    ingested: page.ingested,
+                }
+            }
+            None => {
+                // Last page → open the emit. Light: just SnapshotBegin
+                // + cursor flip. No whole-ledger op (values already
+                // sharded), so this transition can't trap on size.
+                self.cursor.phase = Phase::Emit;
+                self.cursor.emit_offset = 0;
+                self.after = None;
+                io.emit_begin(predicate, self.cursor.anchor_slot);
+                io.save_cursor(&self.cursor.encode());
+                StepOutcome {
+                    done: false,
+                    ingested: page.ingested,
+                }
+            }
+        }
+    }
+
+    fn step_emit<IO: BootstrapIo>(&mut self, io: &mut IO, predicate: &[u8]) -> StepOutcome {
+        let keys = io.shard_list(predicate); // sorted; single source of truth
+        let off = self.cursor.emit_offset as usize;
+
+        if off >= keys.len() {
+            io.emit_end(predicate, keys.len() as u64);
+            // Advance to the next predicate.
+            self.cursor.predicate_idx += 1;
+            self.cursor.phase = Phase::Scan;
+            self.cursor.emit_offset = 0;
+            self.cleared_current = false;
+            let done = self.cursor.predicate_idx as usize >= self.predicates.len();
+            if done {
+                io.clear_cursor();
+            } else {
+                io.save_cursor(&self.cursor.encode());
+            }
+            return StepOutcome { done, ingested: 0 };
+        }
+
+        let end = (off + io.chunk_size()).min(keys.len());
+        let entries: Vec<IO::Entry> = keys[off..end]
+            .iter()
+            .filter_map(|k| io.shard_get(predicate, k))
+            .filter_map(|b| io.decode_entry(&b))
+            .collect();
+        io.emit_chunk(predicate, entries);
+        self.cursor.emit_offset = end as u64;
+        io.save_cursor(&self.cursor.encode()); // durable emit offset
+        StepOutcome {
+            done: false,
+            ingested: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +653,297 @@ mod tests {
         assert!(adv.round_done);
         // Page cursor cleared for the (non-existent) next predicate.
         assert!(round.after().is_none());
+    }
+
+    // ====================================================
+    // ChunkedBootstrap
+    // ====================================================
+
+    use std::collections::BTreeMap;
+
+    /// Test entry: carries its own key so emitted chunks are
+    /// inspectable.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TE {
+        key: Vec<u8>,
+        val: u64,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ev {
+        Begin(Vec<u8>),
+        Chunk(Vec<TE>),
+        End(Vec<u8>, u64),
+    }
+
+    struct MockIo {
+        /// Scripted scan pages per predicate (immutable, so a re-scan
+        /// after a simulated re-instantiation replays identically).
+        script: BTreeMap<Vec<u8>, Vec<Vec<(Vec<u8>, u64)>>>,
+        /// (predicate, entry_key) -> encoded entry.
+        shards: BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+        cursor: Option<Vec<u8>>,
+        events: Vec<Ev>,
+        accumulates: bool,
+        chunk: usize,
+    }
+
+    impl MockIo {
+        fn new(accumulates: bool, chunk: usize) -> Self {
+            Self {
+                script: BTreeMap::new(),
+                shards: BTreeMap::new(),
+                cursor: None,
+                events: Vec::new(),
+                accumulates,
+                chunk,
+            }
+        }
+    }
+
+    impl BootstrapIo for MockIo {
+        type Entry = TE;
+
+        fn scan_page(&mut self, predicate: &[u8], after: Option<&[u8]>) -> ScannedPage<TE> {
+            let pages = self.script.get(predicate).cloned().unwrap_or_default();
+            let idx = after.map(|b| b[0] as usize).unwrap_or(0);
+            let entries: Vec<(Vec<u8>, TE)> = pages
+                .get(idx)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| (k.clone(), TE { key: k, val: v }))
+                .collect();
+            let ingested = entries.len() as u64;
+            let next = if idx + 1 < pages.len() {
+                Some(vec![(idx + 1) as u8])
+            } else {
+                None
+            };
+            ScannedPage {
+                entries,
+                next,
+                anchor_slot: 100,
+                ingested,
+            }
+        }
+
+        fn shard_get(&self, predicate: &[u8], entry_key: &[u8]) -> Option<Vec<u8>> {
+            self.shards
+                .get(&(predicate.to_vec(), entry_key.to_vec()))
+                .cloned()
+        }
+        fn shard_put(&mut self, predicate: &[u8], entry_key: &[u8], bytes: &[u8]) {
+            self.shards
+                .insert((predicate.to_vec(), entry_key.to_vec()), bytes.to_vec());
+        }
+        fn shard_list(&self, predicate: &[u8]) -> Vec<Vec<u8>> {
+            // BTreeMap iterates sorted → keys come back sorted.
+            self.shards
+                .keys()
+                .filter(|(p, _)| p == predicate)
+                .map(|(_, k)| k.clone())
+                .collect()
+        }
+        fn shard_clear(&mut self, predicate: &[u8]) {
+            self.shards.retain(|(p, _), _| p != predicate);
+        }
+
+        fn encode_entry(&self, e: &TE) -> Vec<u8> {
+            let mut b = vec![e.key.len() as u8];
+            b.extend_from_slice(&e.key);
+            b.extend_from_slice(&e.val.to_be_bytes());
+            b
+        }
+        fn decode_entry(&self, bytes: &[u8]) -> Option<TE> {
+            let klen = *bytes.first()? as usize;
+            let key = bytes.get(1..1 + klen)?.to_vec();
+            let val = u64::from_be_bytes(bytes.get(1 + klen..1 + klen + 8)?.try_into().ok()?);
+            Some(TE { key, val })
+        }
+
+        fn accumulates(&self) -> bool {
+            self.accumulates
+        }
+        fn merge(&self, prior: Option<TE>, incoming: TE) -> TE {
+            match prior {
+                Some(p) => TE {
+                    key: incoming.key,
+                    val: p.val + incoming.val,
+                },
+                None => incoming,
+            }
+        }
+
+        fn load_cursor(&self) -> Option<Vec<u8>> {
+            self.cursor.clone()
+        }
+        fn save_cursor(&mut self, bytes: &[u8]) {
+            self.cursor = Some(bytes.to_vec());
+        }
+        fn clear_cursor(&mut self) {
+            self.cursor = None;
+        }
+
+        fn emit_begin(&mut self, predicate: &[u8], _anchor: u64) {
+            self.events.push(Ev::Begin(predicate.to_vec()));
+        }
+        fn emit_chunk(&mut self, _predicate: &[u8], entries: Vec<TE>) {
+            self.events.push(Ev::Chunk(entries));
+        }
+        fn emit_end(&mut self, predicate: &[u8], total: u64) {
+            self.events.push(Ev::End(predicate.to_vec(), total));
+        }
+        fn chunk_size(&self) -> usize {
+            self.chunk
+        }
+    }
+
+    /// Drive a fresh driver to completion (no re-instantiation).
+    fn run_to_done(io: &mut MockIo, predicates: Vec<Vec<u8>>) {
+        let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
+        let mut drv = ChunkedBootstrap::resume(predicates, cursor);
+        for _ in 0..10_000 {
+            if drv.step(io).done {
+                return;
+            }
+        }
+        panic!("did not finish within step budget");
+    }
+
+    fn begins(io: &MockIo) -> usize {
+        io.events
+            .iter()
+            .filter(|e| matches!(e, Ev::Begin(_)))
+            .count()
+    }
+    fn ends(io: &MockIo) -> usize {
+        io.events
+            .iter()
+            .filter(|e| matches!(e, Ev::End(_, _)))
+            .count()
+    }
+    fn emitted_entries(io: &MockIo) -> Vec<TE> {
+        io.events
+            .iter()
+            .flat_map(|e| match e {
+                Ev::Chunk(es) => es.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replace_round_emits_each_asset_once_sorted() {
+        let mut io = MockIo::new(false, 2);
+        io.script.insert(
+            vec![0xAA],
+            vec![
+                vec![(vec![3], 30), (vec![1], 10)],
+                vec![(vec![2], 20)],
+            ],
+        );
+        run_to_done(&mut io, vec![vec![0xAA]]);
+
+        assert_eq!(begins(&io), 1);
+        assert_eq!(ends(&io), 1);
+        let got = emitted_entries(&io);
+        // Sorted by key, each once.
+        assert_eq!(
+            got,
+            vec![
+                TE { key: vec![1], val: 10 },
+                TE { key: vec![2], val: 20 },
+                TE { key: vec![3], val: 30 },
+            ]
+        );
+        assert!(matches!(io.events.last(), Some(Ev::End(_, 3))));
+    }
+
+    #[test]
+    fn sum_merge_combines_same_key_across_pages() {
+        let mut io = MockIo::new(true, 100);
+        io.script.insert(
+            vec![0xAA],
+            vec![
+                vec![(vec![1], 10), (vec![2], 5)],
+                vec![(vec![1], 7)], // same key 1 again → sums to 17
+            ],
+        );
+        run_to_done(&mut io, vec![vec![0xAA]]);
+
+        let got = emitted_entries(&io);
+        assert_eq!(
+            got,
+            vec![
+                TE { key: vec![1], val: 17 },
+                TE { key: vec![2], val: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn reinstantiate_mid_emit_resumes_without_rebegin() {
+        // Build shards via a full scan, but stop partway through the
+        // emit, drop the driver (simulating an out-of-fuel trap), and
+        // rebuild from the durable cursor.
+        let mut io = MockIo::new(false, 1); // chunk=1 → many emit steps
+        io.script.insert(
+            vec![0xAA],
+            vec![vec![(vec![1], 10), (vec![2], 20), (vec![3], 30)]],
+        );
+
+        // Phase 1: drive until we've emitted at least one chunk.
+        {
+            let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
+            let mut drv = ChunkedBootstrap::resume(vec![vec![0xAA]], cursor);
+            // scan page (1 step) + begin transition is folded into the
+            // last scan step; then emit chunks one per step.
+            drv.step(&mut io); // scan last page → emit_begin
+            drv.step(&mut io); // emit chunk 0 (key 1)
+            // Driver dropped here — thread-local lost (trap).
+            assert_eq!(begins(&io), 1);
+            assert_eq!(emitted_entries(&io).len(), 1);
+        }
+
+        // Phase 2: rebuild from the durable cursor + persisted shards
+        // and finish. Must NOT re-emit Begin, must emit the remaining
+        // entries exactly once, then End.
+        {
+            let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
+            assert!(matches!(cursor, Some(c) if c.phase == Phase::Emit));
+            let mut drv = ChunkedBootstrap::resume(vec![vec![0xAA]], cursor);
+            for _ in 0..100 {
+                if drv.step(&mut io).done {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(begins(&io), 1, "SnapshotBegin must be emitted exactly once");
+        assert_eq!(ends(&io), 1);
+        let got = emitted_entries(&io);
+        assert_eq!(
+            got,
+            vec![
+                TE { key: vec![1], val: 10 },
+                TE { key: vec![2], val: 20 },
+                TE { key: vec![3], val: 30 },
+            ],
+            "every asset emitted exactly once across the re-instantiation"
+        );
+    }
+
+    #[test]
+    fn cursor_round_trips() {
+        let c = BootstrapCursor {
+            predicate_idx: 7,
+            phase: Phase::Emit,
+            anchor_slot: 123456,
+            emit_offset: 42,
+        };
+        assert_eq!(BootstrapCursor::decode(&c.encode()), Some(c));
+        assert_eq!(BootstrapCursor::decode(&[]), None);
+        assert_eq!(BootstrapCursor::decode(&[9, 9, 9]), None);
     }
 }

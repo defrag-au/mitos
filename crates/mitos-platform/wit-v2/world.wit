@@ -387,11 +387,17 @@ interface chain-data {
 }
 
 /// Module-private KV state. Backed by a per-module redb table
-/// host-side. Unchanged from v1.
+/// host-side.
 interface state-kv {
     get-value: func(key: string) -> option<list<u8>>;
     set-value: func(key: string, value: list<u8>);
     delete-value: func(key: string);
+    /// List the module's keys that start with `prefix`, in sorted
+    /// (lexicographic) order. Enables sharded state — one kv key per
+    /// asset — without a separate, drift-prone key index. The host
+    /// returns the module's logical keys (the `{module_id}-` storage
+    /// namespace prefix is stripped). Backed by a redb range scan.
+    list-values: func(prefix: string) -> list<string>;
 }
 
 /// Module-side event emission.

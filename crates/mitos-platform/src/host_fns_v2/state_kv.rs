@@ -42,4 +42,33 @@ impl StateKvHost for HostStateV2 {
                 .map_err(|e| wasmtime::Error::msg(e.to_string())),
         }
     }
+
+    async fn list_values(&mut self, prefix: String) -> wasmtime::Result<Vec<String>> {
+        match &self.kv {
+            // InMemory stores logical keys directly (no namespace
+            // prefix). Filter + sort to match redb's ordered range.
+            ModuleKv::InMemory(map) => {
+                let mut keys: Vec<String> = map
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                keys.sort();
+                Ok(keys)
+            }
+            // RedbKv::list_values returns full `{module_id}-{key}`
+            // storage keys in sorted order; strip the namespace so
+            // the module sees its own logical keys.
+            ModuleKv::Redb(redb) => {
+                let namespace = format!("{}-", self.module_id);
+                let logical = redb
+                    .list_values(&self.module_id, &prefix)
+                    .map_err(|e| wasmtime::Error::msg(e.to_string()))?
+                    .into_iter()
+                    .map(|k| k.strip_prefix(&namespace).map(String::from).unwrap_or(k))
+                    .collect();
+                Ok(logical)
+            }
+        }
+    }
 }

@@ -39,7 +39,7 @@ use mitos_community_events::collection_metadata::{
     MetadataBurned, MetadataEntry, MetadataEvent, MetadataInitial, MetadataStandard,
     MetadataUpdated, SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
-use mitos_module_kit::ReentrantRound;
+use mitos_module_kit::{BootstrapCursor, BootstrapIo, ChunkedBootstrap, ScannedPage};
 use pallas_primitives::PlutusData;
 use serde::{Deserialize, Serialize};
 
@@ -64,16 +64,19 @@ const CIP68_REF_TOKEN_PREFIX: [u8; 4] = [0x00, 0x06, 0x43, 0xb0];
 const COLD_START_PAGE_HINT: u32 = 10_000;
 
 /// state-kv key under which we persist the set of currently-
-/// tracked policies (CBOR list of 56-char hex strings). The
-/// per-policy metadata ledger is keyed `metadata_ledger:<policy_hex>`.
+/// tracked policies (CBOR list of 56-char hex strings).
 const KV_TRACKED_POLICIES: &str = "tracked-policies";
 
-/// state-kv key prefix for per-policy metadata ledgers. Full
-/// key: `metadata_ledger:<policy_hex>`. Populated by the
-/// cold-start scan (Phase 2B) and mutated by per-TX events
-/// (Phase 2C).
-#[allow(dead_code)]
-const KV_METADATA_LEDGER_PREFIX: &str = "metadata_ledger:";
+/// state-kv key prefix for the **sharded** per-asset metadata
+/// store: one kv key per ref-token, `mentry:<policy_hex>:<suffix_hex>`
+/// → CBOR `StoredEntry`. Sharded (vs a single per-policy blob) so
+/// no rebootstrap/cold-start/live-tail call ever serializes the
+/// whole ledger — the deferred "pathological accumulator" fix from
+/// `WASM_BUDGET_CHUNKING.md`. The kv keys themselves are the single
+/// source of truth for which assets exist (enumerated via
+/// `state_kv::list_values`), so there's no separate key index to
+/// drift.
+const KV_SHARD_PREFIX: &str = "mentry:";
 
 /// state-kv key for the re-entrant `rebootstrap` continuation
 /// cursor — the index of the policy currently being re-scanned
@@ -101,31 +104,15 @@ thread_local! {
     /// without an attached companion keeps filtering correctly.
     static TRACKED_POLICIES: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
 
-    /// In-flight `rebootstrap` round. `None` between rounds.
-    /// Same shape + same rationale as collection-holders'
-    /// REBOOTSTRAP_STATE — accumulator is a per-policy
-    /// `MetadataLedger`; durable cursor in state-kv is just
-    /// the `predicate_idx`.
-    static REBOOTSTRAP_STATE: RefCell<Option<ReentrantRound<[u8; HASH_BYTES], MetadataLedger>>> =
-        const { RefCell::new(None) };
-
-    /// In-progress chunked-snapshot emit for the policy whose
-    /// scan just finished. Drained one `SnapshotChunk` per
-    /// `rebootstrap` call.
-    static REBOOTSTRAP_EMIT: RefCell<Option<EmitState>> = const { RefCell::new(None) };
-}
-
-/// A chunked metadata snapshot mid-emit. Drained
-/// `SNAPSHOT_CHUNK_ENTRIES` at a time.
-struct EmitState {
-    /// 56-char hex policy id — every event of the sequence
-    /// carries it.
-    policy_hex: String,
-    /// The full entries list, built once when the scan
-    /// completed.
-    entries: Vec<MetadataEntry>,
-    /// Offset into `entries` — the next chunk starts here.
-    offset: usize,
+    /// In-flight re-entrant `rebootstrap` driver. `None` between
+    /// rounds; rebuilt from the durable cursor
+    /// (`KV_REBOOTSTRAP_CURSOR`) after a trap drops the wasm
+    /// instance. Holds no resident ledger — entries are sharded to
+    /// state-kv as they're scanned, and the emit phase reads them
+    /// back by offset, so a re-instantiation resumes mid-snapshot
+    /// instead of restarting (the metadata-loop fix). See
+    /// `mitos_module_kit::ChunkedBootstrap`.
+    static REBOOTSTRAP_DRIVER: RefCell<Option<ChunkedBootstrap>> = const { RefCell::new(None) };
 }
 
 // ============================================================
@@ -160,48 +147,59 @@ struct MetadataLedger {
     entries: BTreeMap<Vec<u8>, StoredEntry>,
 }
 
-fn ledger_key(policy_hex: &str) -> String {
-    format!("{KV_METADATA_LEDGER_PREFIX}{policy_hex}")
+// ── Sharded per-asset metadata store ──
+// One kv key per ref-token: `mentry:<policy_hex>:<suffix_hex>` →
+// CBOR `StoredEntry`. No single call ever serializes the whole
+// ledger, and `state_kv::list_values` enumerates a policy's assets
+// directly (single source of truth — no separate key index).
+
+fn shard_prefix(policy_hex: &str) -> String {
+    format!("{KV_SHARD_PREFIX}{policy_hex}:")
 }
 
-#[allow(dead_code)] // used by Phase 2C `handle_produced`
-fn load_ledger(policy_hex: &str) -> MetadataLedger {
-    let Some(bytes) = state_kv::get_value(&ledger_key(policy_hex)) else {
-        return MetadataLedger::default();
-    };
-    ciborium::de::from_reader(bytes.as_slice()).unwrap_or_default()
+fn shard_key_for(policy_hex: &str, suffix: &[u8]) -> String {
+    format!("{KV_SHARD_PREFIX}{policy_hex}:{}", hex::encode(suffix))
 }
 
-fn persist_ledger(policy_hex: &str, ledger: &MetadataLedger) {
-    let mut buf = Vec::with_capacity(4096);
-    if let Err(e) = ciborium::ser::into_writer(ledger, &mut buf) {
+fn shard_get_entry(policy_hex: &str, suffix: &[u8]) -> Option<StoredEntry> {
+    let bytes = state_kv::get_value(&shard_key_for(policy_hex, suffix))?;
+    ciborium::de::from_reader(bytes.as_slice()).ok()
+}
+
+fn shard_put_entry(policy_hex: &str, suffix: &[u8], stored: &StoredEntry) {
+    let mut buf = Vec::with_capacity(256);
+    if let Err(e) = ciborium::ser::into_writer(stored, &mut buf) {
         logging::log(
             LogLevel::Error,
             LOG_TARGET,
-            &format!("encode metadata ledger for {policy_hex}: {e}"),
+            &format!("encode metadata shard for {policy_hex}: {e}"),
         );
         return;
     }
-    state_kv::set_value(&ledger_key(policy_hex), &buf);
+    state_kv::set_value(&shard_key_for(policy_hex, suffix), &buf);
 }
 
-fn delete_ledger(policy_hex: &str) {
-    state_kv::delete_value(&ledger_key(policy_hex));
+fn shard_delete_entry(policy_hex: &str, suffix: &[u8]) {
+    state_kv::delete_value(&shard_key_for(policy_hex, suffix));
 }
 
-fn save_rebootstrap_cursor(predicate_idx: usize) {
-    state_kv::set_value(KV_REBOOTSTRAP_CURSOR, &(predicate_idx as u64).to_be_bytes());
+/// Delete every shard for a policy (on un-track / before a fresh
+/// re-scan). The kv keys are the source of truth, so this is just
+/// a prefix-scan + delete.
+fn shard_clear_policy(policy_hex: &str) {
+    for key in state_kv::list_values(&shard_prefix(policy_hex)) {
+        state_kv::delete_value(&key);
+    }
 }
 
-fn load_rebootstrap_cursor() -> usize {
-    state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
-        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
-        .map(|b| u64::from_be_bytes(b) as usize)
-        .unwrap_or(0)
-}
-
-fn clear_rebootstrap_cursor() {
-    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+/// List a policy's ref-token suffixes (sorted), decoded from the
+/// shard kv keys.
+fn shard_list_suffixes(policy_hex: &str) -> Vec<Vec<u8>> {
+    let prefix = shard_prefix(policy_hex);
+    state_kv::list_values(&prefix)
+        .into_iter()
+        .filter_map(|k| k.strip_prefix(prefix.as_str()).and_then(|h| hex::decode(h).ok()))
+        .collect()
 }
 
 // ============================================================
@@ -450,11 +448,11 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
     // refcount; rebuild on next subscribe.
     for policy in &removed {
         let policy_hex = hex::encode(policy);
-        delete_ledger(&policy_hex);
+        shard_clear_policy(&policy_hex);
         logging::log(
             LogLevel::Info,
             LOG_TARGET,
-            &format!("dropped metadata ledger for untracked policy {policy_hex}"),
+            &format!("dropped metadata shards for untracked policy {policy_hex}"),
         );
     }
 
@@ -525,24 +523,6 @@ fn emit_event(event: &MetadataEvent) {
     emit::emit_event(0, &buf);
 }
 
-/// Emit `SnapshotBegin` and stage the entries in
-/// `REBOOTSTRAP_EMIT` so the `rebootstrap` state machine
-/// drains one `SnapshotChunk` per call.
-fn open_chunked_emit(policy_hex: String, entries: Vec<MetadataEntry>, anchor_slot: u64) {
-    emit_event(&MetadataEvent::SnapshotBegin(SnapshotBegin {
-        policy: policy_hex.clone(),
-        cursor_slot: anchor_slot,
-        cursor_hash_hex: String::new(),
-    }));
-    REBOOTSTRAP_EMIT.with(|cell| {
-        *cell.borrow_mut() = Some(EmitState {
-            policy_hex,
-            entries,
-            offset: 0,
-        });
-    });
-}
-
 /// Emit the full chunked snapshot sequence for one policy in
 /// a single fuel budget: `SnapshotBegin` → `SnapshotChunk` × N
 /// → `SnapshotEnd`. Used by the live `update_interest(Add,
@@ -589,8 +569,14 @@ fn emit_full_snapshot(policy_hex: &str, ledger: &MetadataLedger, anchor_slot: u6
 /// the same ref list. The two arrays are positionally
 /// aligned per the host-fn contract.
 fn cold_start(policy: &[u8; HASH_BYTES]) {
+    let policy_hex = hex::encode(policy);
+    // Clear any stale shards so a re-add starts clean.
+    shard_clear_policy(&policy_hex);
+
     let mut ledger = MetadataLedger::default();
     let mut after: Option<Vec<u8>> = None;
+    // Assigned on every loop iteration before it's read after the
+    // loop — the `loop` body always runs at least once.
     let mut anchor_slot: u64;
     let mut total_utxos: usize = 0;
 
@@ -598,16 +584,22 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
         let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
         anchor_slot = page.anchor_slot;
         total_utxos += page.refs.len();
-        fold_page(&mut ledger, policy, &page.refs);
+        for (suffix, stored) in decode_page(policy, &page.refs) {
+            // Persist per-asset (sharded) + keep in-memory for the
+            // one-shot emit below. cold-start (live `update_interest`
+            // Add) is a single non-re-entrant call — fine for small
+            // policies; large ones rely on the re-entrant `rebootstrap`
+            // recapture path, which shares the same sharded store.
+            shard_put_entry(&policy_hex, &suffix, &stored);
+            ledger.entries.insert(suffix, stored);
+        }
         match page.next {
             Some(token) => after = Some(token),
             None => break,
         }
     }
 
-    let policy_hex = hex::encode(policy);
     let entry_count = ledger.entries.len();
-    persist_ledger(&policy_hex, &ledger);
     emit_full_snapshot(&policy_hex, &ledger, anchor_slot);
 
     logging::log(
@@ -619,11 +611,12 @@ fn cold_start(policy: &[u8; HASH_BYTES]) {
     );
 }
 
-/// For one page of UTxOs, resolve `(typed_output, datum)` per
-/// ref and fold any CIP-68 ref-token entries into the ledger.
-fn fold_page(ledger: &mut MetadataLedger, policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) {
+/// Decode one page of UTxOs into `(suffix, StoredEntry)` pairs for
+/// every CIP-68 ref token of `policy`. Shared by `cold_start` and
+/// the re-entrant `rebootstrap` driver's `scan_page`.
+fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>, StoredEntry)> {
     if refs.is_empty() {
-        return;
+        return Vec::new();
     }
     let utxos = chain_data::read_utxos(refs);
     let datums = chain_data::read_output_datums(refs);
@@ -636,18 +629,19 @@ fn fold_page(ledger: &mut MetadataLedger, policy: &[u8; HASH_BYTES], refs: &[Wit
     // positional index therefore mis-assigns each datum to the wrong
     // UTxO — putting one asset's metadata onto another asset. Key the
     // datums by output-ref and look each UTxO's datum up by its own
-    // ref. (One `read_output_datums` pass — same cost as before.)
+    // ref. (One `read_output_datums` pass.)
     let mut datum_idx: BTreeMap<(Vec<u8>, u32), usize> = BTreeMap::new();
     for (i, r) in refs.iter().enumerate() {
         datum_idx.insert((r.tx_hash.clone(), r.index), i);
     }
 
-    for (oref, out) in utxos.iter() {
+    let mut out = Vec::new();
+    for (oref, output) in utxos.iter() {
         let datum_opt = datum_idx
             .get(&(oref.tx_hash.clone(), oref.index))
             .and_then(|&i| datums.get(i))
             .and_then(|d| d.as_ref());
-        for asset in &out.assets {
+        for asset in &output.assets {
             if asset.asset.policy != policy {
                 continue;
             }
@@ -658,17 +652,14 @@ fn fold_page(ledger: &mut MetadataLedger, policy: &[u8; HASH_BYTES], refs: &[Wit
             // populated `payload`; hash-only datums (common — many
             // minters store the CIP-68 datum by hash rather than
             // inline in the ref UTxO) arrive payload-empty and need
-            // the `datum_by_hash` fallback. Use the same resolver as
-            // the live `handle_produced` path so cold-start has
-            // identical coverage — without this, hash-only-datum
-            // assets are silently dropped from the snapshot.
+            // the `datum_by_hash` fallback. Same resolver as the live
+            // `handle_produced` path so cold-start/rebootstrap have
+            // identical coverage.
             let Some(datum) = datum_opt else { continue };
             let Some(datum_bytes) = resolve_datum_bytes(datum) else {
                 continue;
             };
-            let Some((metadata_json, version, standard)) =
-                decode_cip68_datum(&datum_bytes)
-            else {
+            let Some((metadata_json, version, standard)) = decode_cip68_datum(&datum_bytes) else {
                 continue;
             };
             let entry = MetadataEntry {
@@ -679,15 +670,16 @@ fn fold_page(ledger: &mut MetadataLedger, policy: &[u8; HASH_BYTES], refs: &[Wit
                 immutable: false,
                 source_tx: hex::encode(&oref.tx_hash),
             };
-            ledger.entries.insert(
+            out.push((
                 suffix.to_vec(),
                 StoredEntry {
                     entry,
                     datum_hash: datum.hash.clone(),
                 },
-            );
+            ));
         }
     }
+    out
 }
 
 // ============================================================
@@ -852,8 +844,6 @@ fn flush_buffer(buf: TxBuffer) {
 
     for (policy, entries) in by_policy {
         let policy_hex = hex::encode(policy);
-        let mut ledger = load_ledger(&policy_hex);
-        let mut mutated = false;
 
         for (suffix, datum_opt) in entries {
             let asset_name_hex = hex::encode(&suffix);
@@ -872,7 +862,8 @@ fn flush_buffer(buf: TxBuffer) {
                         immutable: false,
                         source_tx: tx_hash_hex.clone(),
                     };
-                    match ledger.entries.get(&suffix) {
+                    // Per-asset shard lookup — no whole-ledger load.
+                    match shard_get_entry(&policy_hex, &suffix) {
                         None => {
                             // First sighting — Initial.
                             emit_event(&MetadataEvent::Initial(MetadataInitial {
@@ -881,14 +872,7 @@ fn flush_buffer(buf: TxBuffer) {
                                 tx_hash: tx_hash_hex.clone(),
                                 entry: entry.clone(),
                             }));
-                            ledger.entries.insert(
-                                suffix.clone(),
-                                StoredEntry {
-                                    entry,
-                                    datum_hash,
-                                },
-                            );
-                            mutated = true;
+                            shard_put_entry(&policy_hex, &suffix, &StoredEntry { entry, datum_hash });
                         }
                         Some(prev) if prev.datum_hash == datum_hash => {
                             // Same-datum respend — no emit. Could
@@ -906,14 +890,7 @@ fn flush_buffer(buf: TxBuffer) {
                                 entry: entry.clone(),
                                 prior_version,
                             }));
-                            ledger.entries.insert(
-                                suffix.clone(),
-                                StoredEntry {
-                                    entry,
-                                    datum_hash,
-                                },
-                            );
-                            mutated = true;
+                            shard_put_entry(&policy_hex, &suffix, &StoredEntry { entry, datum_hash });
                         }
                     }
                 }
@@ -925,15 +902,9 @@ fn flush_buffer(buf: TxBuffer) {
                         tx_hash: tx_hash_hex.clone(),
                         asset_name_hex,
                     }));
-                    if ledger.entries.remove(&suffix).is_some() {
-                        mutated = true;
-                    }
+                    shard_delete_entry(&policy_hex, &suffix);
                 }
             }
-        }
-
-        if mutated {
-            persist_ledger(&policy_hex, &ledger);
         }
     }
 }
@@ -996,132 +967,124 @@ impl Guest for Module {
         Ok(())
     }
 
-    /// Re-emit the metadata ledger for tracked policies — one
-    /// bounded unit of work per call. Mirrors
-    /// `collection-holders::rebootstrap`'s two-phase state
-    /// machine: drain in-flight `SnapshotChunk` emissions
-    /// first, otherwise scan one page of the current policy.
+    /// Re-emit the metadata snapshot for tracked policies, one
+    /// bounded unit of work per call, via the shared re-entrant
+    /// [`ChunkedBootstrap`] driver: scan a page → shard each entry →
+    /// emit one `SnapshotChunk` per call from the shards. Every
+    /// progress field is durable in state-kv, so a trap mid-emit
+    /// resumes at the offset instead of restarting the policy (the
+    /// out-of-fuel `SnapshotBegin`-loop fix). No call ever
+    /// serializes the whole ledger.
     fn rebootstrap() -> Result<RebootstrapStep, String> {
-        // ── Emit phase ──
-        enum EmitOutcome {
-            NotEmitting,
-            Chunk,
-            Closed,
-        }
-        let outcome = REBOOTSTRAP_EMIT.with(|cell| {
+        REBOOTSTRAP_DRIVER.with(|cell| {
             let mut slot = cell.borrow_mut();
-            let Some(state) = slot.as_mut() else {
-                return EmitOutcome::NotEmitting;
-            };
-            if state.offset >= state.entries.len() {
-                emit_event(&MetadataEvent::SnapshotEnd(SnapshotEnd {
-                    policy: state.policy_hex.clone(),
-                    entry_count: state.entries.len() as u64,
-                }));
+            if slot.is_none() {
+                let mut predicates: Vec<Vec<u8>> =
+                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect());
+                predicates.sort_unstable();
+                let cursor =
+                    state_kv::get_value(KV_REBOOTSTRAP_CURSOR).and_then(|b| BootstrapCursor::decode(&b));
+                *slot = Some(ChunkedBootstrap::resume(predicates, cursor));
+            }
+            let driver = slot.as_mut().expect("driver initialised above");
+            let mut io = MetadataIo;
+            let out = driver.step(&mut io);
+            if out.done {
                 *slot = None;
-                EmitOutcome::Closed
-            } else {
-                let end =
-                    (state.offset + SNAPSHOT_CHUNK_ENTRIES).min(state.entries.len());
-                emit_event(&MetadataEvent::SnapshotChunk(SnapshotChunk {
-                    policy: state.policy_hex.clone(),
-                    entries: state.entries[state.offset..end].to_vec(),
-                }));
-                state.offset = end;
-                EmitOutcome::Chunk
             }
-        });
-        match outcome {
-            EmitOutcome::Chunk => {
-                return Ok(RebootstrapStep {
-                    done: false,
-                    ingested: 0,
-                });
-            }
-            EmitOutcome::Closed => {
-                return REBOOTSTRAP_STATE.with(|cell| {
-                    let mut state = cell.borrow_mut();
-                    let round = state
-                        .as_mut()
-                        .expect("round present while an emit is in flight");
-                    let adv = round.finish_predicate();
-                    if adv.round_done {
-                        clear_rebootstrap_cursor();
-                        *state = None;
-                    } else {
-                        save_rebootstrap_cursor(adv.predicate_idx);
-                    }
-                    Ok(RebootstrapStep {
-                        done: adv.round_done,
-                        ingested: 0,
-                    })
-                });
-            }
-            EmitOutcome::NotEmitting => {}
-        }
-
-        // ── Scan phase ──
-        REBOOTSTRAP_STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-
-            if state.is_none() {
-                let mut policies: Vec<[u8; HASH_BYTES]> =
-                    TRACKED_POLICIES.with(|s| s.borrow().iter().copied().collect());
-                policies.sort_unstable();
-                *state = Some(ReentrantRound::resume(policies, load_rebootstrap_cursor()));
-            }
-            let round = state.as_mut().expect("round initialised above");
-
-            let Some(&policy) = round.current() else {
-                clear_rebootstrap_cursor();
-                *state = None;
-                return Ok(RebootstrapStep {
-                    done: true,
-                    ingested: 0,
-                });
-            };
-
-            let page =
-                chain_data::utxos_by_policy(&policy, round.after(), COLD_START_PAGE_HINT);
-            let ingested = page.refs.len() as u64;
-            let anchor_slot = page.anchor_slot;
-            fold_page(round.acc_mut(), &policy, &page.refs);
-
-            match page.next {
-                Some(token) => {
-                    round.page_more(ingested, token);
-                    Ok(RebootstrapStep {
-                        done: false,
-                        ingested,
-                    })
-                }
-                None => {
-                    round.page_last(ingested);
-                    let total_utxos = round.items() as usize;
-                    let ledger = std::mem::take(round.acc_mut());
-                    let policy_hex = hex::encode(policy);
-                    persist_ledger(&policy_hex, &ledger);
-                    let entries: Vec<MetadataEntry> = ledger
-                        .entries
-                        .values()
-                        .map(|stored| stored.entry.clone())
-                        .collect();
-                    logging::log(
-                        LogLevel::Info,
-                        LOG_TARGET,
-                        &format!(
-                            "rebootstrap policy={policy_hex}: {total_utxos} UTxO(s) → {} entry(ies) @ slot {anchor_slot}; opening chunked emit",
-                            entries.len()
-                        ),
-                    );
-                    open_chunked_emit(policy_hex, entries, anchor_slot);
-                    Ok(RebootstrapStep {
-                        done: false,
-                        ingested,
-                    })
-                }
-            }
+            Ok(RebootstrapStep {
+                done: out.done,
+                ingested: out.ingested,
+            })
         })
+    }
+}
+
+/// `BootstrapIo` adapter wiring the kit driver to this module's
+/// host-fns (chain scan, sharded state-kv, typed emission). A
+/// zero-sized handle — all state lives in state-kv / the chain.
+struct MetadataIo;
+
+/// Coerce a predicate slice (always a 28-byte policy hash) to the
+/// array form the chain-data host-fn wants.
+fn policy_arr(predicate: &[u8]) -> [u8; HASH_BYTES] {
+    let mut a = [0u8; HASH_BYTES];
+    a.copy_from_slice(predicate);
+    a
+}
+
+impl BootstrapIo for MetadataIo {
+    type Entry = StoredEntry;
+
+    fn scan_page(&mut self, predicate: &[u8], after: Option<&[u8]>) -> ScannedPage<StoredEntry> {
+        let policy = policy_arr(predicate);
+        let page = chain_data::utxos_by_policy(&policy, after, COLD_START_PAGE_HINT);
+        let ingested = page.refs.len() as u64;
+        let entries = decode_page(&policy, &page.refs);
+        ScannedPage {
+            entries,
+            next: page.next,
+            anchor_slot: page.anchor_slot,
+            ingested,
+        }
+    }
+
+    fn shard_get(&self, predicate: &[u8], entry_key: &[u8]) -> Option<Vec<u8>> {
+        state_kv::get_value(&shard_key_for(&hex::encode(predicate), entry_key))
+    }
+    fn shard_put(&mut self, predicate: &[u8], entry_key: &[u8], bytes: &[u8]) {
+        state_kv::set_value(&shard_key_for(&hex::encode(predicate), entry_key), bytes);
+    }
+    fn shard_list(&self, predicate: &[u8]) -> Vec<Vec<u8>> {
+        shard_list_suffixes(&hex::encode(predicate))
+    }
+    fn shard_clear(&mut self, predicate: &[u8]) {
+        shard_clear_policy(&hex::encode(predicate));
+    }
+
+    fn encode_entry(&self, entry: &StoredEntry) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        let _ = ciborium::ser::into_writer(entry, &mut buf);
+        buf
+    }
+    fn decode_entry(&self, bytes: &[u8]) -> Option<StoredEntry> {
+        ciborium::de::from_reader(bytes).ok()
+    }
+
+    // CIP-68 datum rotation replaces; each ref-token appears once →
+    // last-write-wins (the default). No `accumulates`/`merge` override.
+
+    fn load_cursor(&self) -> Option<Vec<u8>> {
+        state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+    }
+    fn save_cursor(&mut self, bytes: &[u8]) {
+        state_kv::set_value(KV_REBOOTSTRAP_CURSOR, bytes);
+    }
+    fn clear_cursor(&mut self) {
+        state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+    }
+
+    fn emit_begin(&mut self, predicate: &[u8], anchor_slot: u64) {
+        emit_event(&MetadataEvent::SnapshotBegin(SnapshotBegin {
+            policy: hex::encode(predicate),
+            cursor_slot: anchor_slot,
+            cursor_hash_hex: String::new(),
+        }));
+    }
+    fn emit_chunk(&mut self, predicate: &[u8], entries: Vec<StoredEntry>) {
+        emit_event(&MetadataEvent::SnapshotChunk(SnapshotChunk {
+            policy: hex::encode(predicate),
+            entries: entries.into_iter().map(|s| s.entry).collect(),
+        }));
+    }
+    fn emit_end(&mut self, predicate: &[u8], total: u64) {
+        emit_event(&MetadataEvent::SnapshotEnd(SnapshotEnd {
+            policy: hex::encode(predicate),
+            entry_count: total,
+        }));
+    }
+    fn chunk_size(&self) -> usize {
+        SNAPSHOT_CHUNK_ENTRIES
     }
 }
 
