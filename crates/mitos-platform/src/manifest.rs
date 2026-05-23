@@ -59,10 +59,13 @@ pub struct InterestSection {
 /// flag for exactly these (no static interest) modules. Revisit as a
 /// manifest field if the serializer is fixed or the manifest moves to
 /// CBOR. Other modules must NOT be listed here — a pump on a module
-/// that also cold-starts inline (vesting-tracker, burn-address,
-/// holder-distribution) would double-emit.
+/// that also cold-starts inline (vesting-tracker, burn-address) would
+/// double-emit.
 pub fn is_chunked_cold_start_module(module_id: &str) -> bool {
-    matches!(module_id, "collection-holders" | "collection-metadata")
+    matches!(
+        module_id,
+        "collection-holders" | "collection-metadata" | "holder-distribution"
+    )
 }
 
 impl InterestSection {
