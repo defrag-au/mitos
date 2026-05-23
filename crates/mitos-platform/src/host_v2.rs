@@ -268,6 +268,10 @@ where
     /// admin endpoint returns a clear error rather than
     /// panicking.
     dialer: std::sync::OnceLock<crate::dialer::CompanionDialer>,
+    /// Shared operational-events ring (recapture/trap). Set after
+    /// construction via `set_event_ring` (OnceLock, like `dialer`).
+    /// `None` (unset) → events aren't recorded (artifact-only / tests).
+    event_ring: std::sync::OnceLock<crate::events::EventRing>,
 }
 
 impl<S, P> ModuleHostV2<S, P>
@@ -305,7 +309,17 @@ where
             interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recapture_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dialer: std::sync::OnceLock::new(),
+            event_ring: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Inject the shared operational-events ring. `&self` via
+    /// `OnceLock` (like `set_dialer`) so the lifecycle constructor's
+    /// signature stays put. Call once at bundle startup **before**
+    /// `auto_resume` so spawned followers capture the same ring the
+    /// admin router reads. Unset → events simply aren't recorded.
+    pub fn set_event_ring(&self, ring: crate::events::EventRing) {
+        let _ = self.event_ring.set(ring);
     }
 
     /// Wire the companion dialer into the host. Must be called
@@ -722,6 +736,7 @@ where
 
         let follower_kv_factory = self.kv_factory.clone();
         let follower_trap_logger = trap_logger.clone();
+        let follower_event_ring = self.event_ring.get().cloned();
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -733,6 +748,7 @@ where
                 follower_module_id,
                 follower_kv_factory,
                 follower_trap_logger,
+                follower_event_ring,
             )
             .await;
             match &result {

@@ -123,6 +123,10 @@ struct AdminState {
     /// `/health` endpoint. Artifact-only routers capture their own
     /// build time, which is process start for those deployments.
     started_at: SystemTime,
+    /// Shared operational-events ring. The admin router reads it for
+    /// `GET /_admin/events` + records recapture events; the host /
+    /// follower record traps into the same instance.
+    events: crate::events::EventRing,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -134,7 +138,15 @@ struct AdminState {
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
 pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
-    admin_router_inner(storage, None, Vec::new(), None, SystemTime::now(), auth)
+    admin_router_inner(
+        storage,
+        None,
+        Vec::new(),
+        None,
+        SystemTime::now(),
+        crate::events::EventRing::new(),
+        auth,
+    )
 }
 
 /// Build the admin router with the running-instance lifecycle
@@ -151,12 +163,14 @@ pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
 /// `chain_data` enables the `GET /_admin/blocks/{slot}` block-
 /// fetch route. Pass `None` to disable that route (the handler
 /// returns 503 in that case).
+#[allow(clippy::too_many_arguments)]
 pub fn admin_router_with_host(
     storage: ModuleStorage,
     host: Arc<dyn crate::host_v2::ModuleHostHandle>,
     reserved_names: Vec<String>,
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     started_at: SystemTime,
+    events: crate::events::EventRing,
     auth: AuthToken,
 ) -> axum::Router {
     admin_router_inner(
@@ -165,16 +179,19 @@ pub fn admin_router_with_host(
         reserved_names,
         chain_data,
         started_at,
+        events,
         auth,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admin_router_inner(
     storage: ModuleStorage,
     host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
     reserved_names: Vec<String>,
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     started_at: SystemTime,
+    events: crate::events::EventRing,
     auth: AuthToken,
 ) -> axum::Router {
     let state = AdminState {
@@ -183,9 +200,11 @@ fn admin_router_inner(
         reserved_names,
         chain_data,
         started_at,
+        events,
     };
     axum::Router::new()
         .route("/_admin/status", get(status))
+        .route("/_admin/events", get(list_events))
         .route("/_admin/modules", get(list_modules))
         .route(
             "/_admin/modules/{id}",
@@ -340,6 +359,32 @@ pub struct CompanionsResponse {
     /// A recapture is currently in flight for this module.
     pub recapture_in_progress: bool,
     pub companions: Vec<CompanionDetail>,
+}
+
+/// Query for `GET /_admin/events`.
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    /// Only events with `seq >= after`. Poll cursor: pass the prior
+    /// response's `latest_seq` to get strictly-newer events.
+    #[serde(default)]
+    after: Option<u64>,
+    /// Filter to one module.
+    #[serde(default)]
+    module: Option<String>,
+    /// Filter to one event kind (e.g. `trap`, `recapture_completed`).
+    #[serde(default)]
+    kind: Option<String>,
+    /// Max events returned (default 200, capped 1000).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventsResponse {
+    events: Vec<crate::events::AdminEvent>,
+    /// Highest seq assigned so far — the cursor to poll with as
+    /// `?after=` for newer events (`mitos-admin tail --follow`).
+    latest_seq: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -537,6 +582,25 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         archive_horizon_slot: None,
         modules,
     }))
+}
+
+/// `GET /_admin/events` — recent operational events (recapture,
+/// trap) from the in-memory ring. Read-only; safe to poll. The
+/// structured replacement for `journalctl | grep`. Surfaced as
+/// `mitos-admin tail`.
+async fn list_events(
+    State(state): State<AdminState>,
+    axum::extract::Query(q): axum::extract::Query<EventsQuery>,
+) -> Json<EventsResponse> {
+    let after = q.after.unwrap_or(0);
+    let limit = q.limit.unwrap_or(200).min(1000);
+    let module = q.module.as_deref().filter(|s| !s.is_empty());
+    let kind = q.kind.as_deref().filter(|s| !s.is_empty());
+    let events = state.events.snapshot(after, module, kind, limit);
+    Json(EventsResponse {
+        events,
+        latest_seq: state.events.latest_seq(),
+    })
 }
 
 /// Best-effort count of a module's `Queued` + `Pending` emissions —
@@ -1190,6 +1254,12 @@ async fn recapture_module(
         reason = ?req.reason,
         "recapture: admin endpoint dispatching"
     );
+    state.events.record(
+        id.as_str(),
+        crate::events::EventKind::RecaptureStarted {
+            reason: req.reason.clone(),
+        },
+    );
 
     match host
         .recapture_module(&id, req.reason, RECAPTURE_COMPANION_TIMEOUT)
@@ -1203,6 +1273,13 @@ async fn recapture_module(
                 duration_ms,
                 "recapture: complete"
             );
+            state.events.record(
+                id.as_str(),
+                crate::events::EventKind::RecaptureCompleted {
+                    companions_targeted: outcome.companion_count,
+                    duration_ms,
+                },
+            );
             Ok(Json(RecaptureResponse {
                 module: outcome.module,
                 companions_targeted: outcome.companion_count,
@@ -1215,6 +1292,14 @@ async fn recapture_module(
             Err(HandlerError::RecaptureInProgress(m))
         }
         Err(crate::PlatformError::RecaptureCoordination(detail)) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            state.events.record(
+                id.as_str(),
+                crate::events::EventKind::RecaptureFailed {
+                    error: detail.clone(),
+                    duration_ms,
+                },
+            );
             // Distinguish "dialer not wired" (operator
             // misconfiguration; 503) from in-flight timeout /
             // companion failure (504). The dialer-unwired path
@@ -1227,10 +1312,18 @@ async fn recapture_module(
             }
         }
         Err(other) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
             tracing::error!(
                 module = %id,
                 error = %other,
                 "recapture: unexpected platform error"
+            );
+            state.events.record(
+                id.as_str(),
+                crate::events::EventKind::RecaptureFailed {
+                    error: other.to_string(),
+                    duration_ms,
+                },
             );
             Err(HandlerError::Wasmtime(format!("recapture: {other}")))
         }

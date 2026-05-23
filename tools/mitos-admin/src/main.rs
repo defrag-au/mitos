@@ -65,6 +65,24 @@ enum Cmd {
         json: bool,
     },
 
+    /// Tail the host's recent operational events (recaptures,
+    /// traps) from `/_admin/events` — the structured replacement for
+    /// `journalctl | grep`. `--follow` polls for new events.
+    Tail {
+        /// Only events for this module.
+        #[arg(long)]
+        module: Option<String>,
+        /// Only this event kind (e.g. `trap`, `recapture_completed`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Poll continuously (every 2s) for new events.
+        #[arg(long)]
+        follow: bool,
+        /// Emit raw JSON, one object per event.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List registered modules.
     ListModules {
         /// Emit raw JSON instead of the human-readable table.
@@ -275,6 +293,12 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         Cmd::Health => cmd_health(&client, &cli).await,
         Cmd::Status { json } => cmd_status(&client, &cli, json).await,
+        Cmd::Tail {
+            module,
+            kind,
+            follow,
+            json,
+        } => cmd_tail(&client, &cli, module, kind, follow, json).await,
         Cmd::ListModules { json } => cmd_list_modules(&client, &cli, json).await,
         Cmd::GetModule { id } => cmd_get_module(&client, &cli, id).await,
         Cmd::UploadModule { artifact } => cmd_upload_module(&client, &cli, artifact).await,
@@ -426,6 +450,93 @@ async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Resul
         println!("  {:<28}  {} companion(s){suffix}", m.id, m.companions);
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsResp {
+    events: Vec<Value>,
+    latest_seq: u64,
+}
+
+async fn cmd_tail(
+    client: &Client,
+    cli: &Cli,
+    module: Option<String>,
+    kind: Option<String>,
+    follow: bool,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let mut after: u64 = 0;
+    let mut first = true;
+    loop {
+        let mut url = format!("{}/_admin/events?after={after}&limit=1000", cli.mitos);
+        if let Some(m) = module.as_deref().filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&module={m}"));
+        }
+        if let Some(k) = kind.as_deref().filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&kind={k}"));
+        }
+        let resp: EventsResp = auth(client.get(&url), cli.token.as_deref())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if first && resp.events.is_empty() && !follow {
+            println!("(no events recorded)");
+        }
+        for ev in &resp.events {
+            if json_out {
+                println!("{}", serde_json::to_string(ev)?);
+            } else {
+                print_event(ev);
+            }
+        }
+        after = resp.latest_seq;
+        first = false;
+        if !follow {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    Ok(())
+}
+
+/// Human-readable one-liner for an event JSON object:
+/// `[seq]  <age> ago  <kind>  <module>  <variant fields>`.
+fn print_event(ev: &Value) {
+    let seq = ev.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    let module = ev.get("module").and_then(Value::as_str).unwrap_or("?");
+    let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("?");
+    let ts = ev.get("ts_unix").and_then(Value::as_u64).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = format_duration(now.saturating_sub(ts));
+    let extras: Vec<String> = ev
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "seq" | "ts_unix" | "module" | "kind"))
+                .map(|(k, v)| format!("{k}={}", compact_value(v)))
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "[{seq:>4}] {age:>9} ago  {kind:<22} {module}  {}",
+        extras.join(" ")
+    );
+}
+
+/// Render a JSON value compactly for event output — bare strings
+/// (no quotes), `null`, else the JSON form.
+fn compact_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------

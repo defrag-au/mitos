@@ -418,6 +418,14 @@ impl Bundle {
                 budget,
             ));
 
+            // Shared operational-events ring. One instance, recorded
+            // into by the host/follower (traps) + the admin router
+            // (recaptures), read by `GET /_admin/events`. Set on the
+            // host BEFORE `auto_resume` so spawned followers capture
+            // the same instance the admin router holds.
+            let event_ring = mitos_platform::events::EventRing::new();
+            host.set_event_ring(event_ring.clone());
+
             // Reserved-name check: any on-disk module whose id
             // collides with an in-tree indexer's name must abort
             // startup. Loud failure beats silent shadowing —
@@ -539,6 +547,7 @@ impl Bundle {
                 reserved_names,
                 Some(chain_data),
                 started_at,
+                event_ring,
                 platform_auth,
             ));
 

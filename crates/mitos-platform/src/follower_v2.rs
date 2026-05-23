@@ -60,6 +60,7 @@ pub async fn run_chain_follower_v2<S, P>(
     module_id: String,
     kv_factory: KvFactory,
     trap_logger: Arc<TrapContextLogger>,
+    event_ring: Option<crate::events::EventRing>,
 ) -> PlatformResult<()>
 where
     S: TipSubscription,
@@ -164,6 +165,17 @@ where
                                 ?point,
                                 "v2 dispatch trapped; failed to write trap fixture",
                             ),
+                        }
+                        // Surface the trap on the operational events
+                        // ring so `mitos-admin tail` / `GET
+                        // /_admin/events` see it without a journal grep.
+                        if let Some(ring) = &event_ring {
+                            ring.record(
+                                module_id.clone(),
+                                crate::events::EventKind::Trap {
+                                    reason: e.to_string(),
+                                },
+                            );
                         }
                         // Supervisor wiring is a v2.x follow-up;
                         // for now surface to the spawning task.
