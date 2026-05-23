@@ -73,8 +73,33 @@ pub enum InterestPredicate {
 /// `state-kv` so a host restart without an attached companion
 /// keeps filtering correctly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "InterestSetShadow")]
 pub struct InterestSet {
     pub predicates: Vec<InterestPredicate>,
+    /// Index of the `HoldsPolicy` predicates' policy ids for O(1)
+    /// per-output matching — the hot path at scale. A module
+    /// watching ~1k policies would otherwise linear-scan every
+    /// predicate for every output of every block. Derived from
+    /// `predicates`, kept in sync by the mutators; never serialized
+    /// (rebuilt on deserialize via `InterestSetShadow`).
+    #[serde(skip)]
+    policy_index: std::collections::HashSet<PolicyId>,
+}
+
+/// Deserialize shadow: only `predicates` is persisted. `serde(from)`
+/// routes `InterestSet`'s `Deserialize` through this so `policy_index`
+/// is rebuilt from the loaded predicates (a host restart's persisted
+/// interest filters correctly).
+#[derive(Deserialize)]
+struct InterestSetShadow {
+    #[serde(default)]
+    predicates: Vec<InterestPredicate>,
+}
+
+impl From<InterestSetShadow> for InterestSet {
+    fn from(shadow: InterestSetShadow) -> Self {
+        Self::from_predicates(shadow.predicates)
+    }
 }
 
 impl InterestSet {
@@ -82,23 +107,55 @@ impl InterestSet {
         Self::default()
     }
 
+    /// Build from a predicate list, indexing every `HoldsPolicy`.
+    pub fn from_predicates(predicates: Vec<InterestPredicate>) -> Self {
+        let policy_index = predicates
+            .iter()
+            .filter_map(|p| match p {
+                InterestPredicate::HoldsPolicy(pid) => Some(pid.clone()),
+                _ => None,
+            })
+            .collect();
+        Self {
+            predicates,
+            policy_index,
+        }
+    }
+
     pub fn with_predicate(mut self, p: InterestPredicate) -> Self {
+        if let InterestPredicate::HoldsPolicy(pid) = &p {
+            self.policy_index.insert(pid.clone());
+        }
         self.predicates.push(p);
         self
     }
 
     pub fn add(&mut self, p: InterestPredicate) {
         if !self.predicates.contains(&p) {
+            if let InterestPredicate::HoldsPolicy(pid) = &p {
+                self.policy_index.insert(pid.clone());
+            }
             self.predicates.push(p);
         }
     }
 
     pub fn remove(&mut self, p: &InterestPredicate) {
         self.predicates.retain(|q| q != p);
+        if let InterestPredicate::HoldsPolicy(pid) = p {
+            // Drop from the index only if no remaining predicate
+            // still holds it (predicates dedupe, so at most one —
+            // defensive against future non-deduped inserts).
+            let still_held = self.predicates.iter().any(
+                |q| matches!(q, InterestPredicate::HoldsPolicy(x) if x == pid),
+            );
+            if !still_held {
+                self.policy_index.remove(pid);
+            }
+        }
     }
 
     pub fn replace(&mut self, predicates: Vec<InterestPredicate>) {
-        self.predicates = predicates;
+        *self = Self::from_predicates(predicates);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -127,9 +184,23 @@ impl InterestSet {
         if output.is_unresolved() {
             return false;
         }
-        self.predicates
-            .iter()
-            .any(|p| predicate_matches_output(p, output))
+        // Fast path: `HoldsPolicy` via the index — O(assets_on_output)
+        // (typically 1–few) instead of O(predicates). This is the
+        // dominant predicate kind at scale.
+        if !self.policy_index.is_empty()
+            && output
+                .assets
+                .iter()
+                .any(|e| self.policy_index.contains(&e.policy_id))
+        {
+            return true;
+        }
+        // Remaining kinds (addresses, creds, HoldsAsset) — usually
+        // few; `HoldsPolicy` is already covered by the index above.
+        self.predicates.iter().any(|p| {
+            !matches!(p, InterestPredicate::HoldsPolicy(_))
+                && predicate_matches_output(p, output)
+        })
     }
 
     /// Does any predicate in the set match this `(policy,
@@ -137,8 +208,11 @@ impl InterestSet {
     /// Only `HoldsPolicy` / `HoldsAsset` predicates apply —
     /// mints have no address.
     pub fn matches_mint(&self, policy: &PolicyId, asset_name: &[u8]) -> bool {
+        // `HoldsPolicy` via the index; `HoldsAsset` is rare → linear.
+        if self.policy_index.contains(policy) {
+            return true;
+        }
         self.predicates.iter().any(|p| match p {
-            InterestPredicate::HoldsPolicy(pp) => pp == policy,
             InterestPredicate::HoldsAsset {
                 policy: pp,
                 asset_name: an,
@@ -308,6 +382,42 @@ mod tests {
 
         assert!(set.matches_output(&with_match));
         assert!(!set.matches_output(&without_match));
+    }
+
+    #[test]
+    fn policy_index_rebuilt_on_deserialize() {
+        // The `policy_index` is `#[serde(skip)]` — a round-trip must
+        // rebuild it from the persisted predicates, or a host restart
+        // would silently stop matching by policy.
+        let mut set = InterestSet::new();
+        set.add(InterestPredicate::HoldsPolicy(policy(0xaa)));
+        let json = serde_json::to_string(&set).unwrap();
+        let restored: InterestSet = serde_json::from_str(&json).unwrap();
+        let with_match = output("addr1", vec![asset(0xaa, "T", 1)]);
+        assert!(
+            restored.matches_output(&with_match),
+            "policy match lost across (de)serialize"
+        );
+    }
+
+    #[test]
+    fn policy_index_sync_on_remove_and_replace() {
+        let mut set = InterestSet::new();
+        set.add(InterestPredicate::HoldsPolicy(policy(0xaa)));
+        set.add(InterestPredicate::HoldsPolicy(policy(0xbb)));
+        let out_aa = output("addr1", vec![asset(0xaa, "T", 1)]);
+        let out_bb = output("addr1", vec![asset(0xbb, "T", 1)]);
+        assert!(set.matches_output(&out_aa) && set.matches_output(&out_bb));
+
+        // remove drops only that policy from the index
+        set.remove(&InterestPredicate::HoldsPolicy(policy(0xaa)));
+        assert!(!set.matches_output(&out_aa));
+        assert!(set.matches_output(&out_bb));
+
+        // replace rebuilds the index from scratch
+        set.replace(vec![InterestPredicate::HoldsPolicy(policy(0xaa))]);
+        assert!(set.matches_output(&out_aa));
+        assert!(!set.matches_output(&out_bb));
     }
 
     #[test]

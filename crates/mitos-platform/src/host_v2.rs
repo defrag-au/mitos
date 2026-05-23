@@ -796,6 +796,12 @@ where
         let follower_kv_factory = self.kv_factory.clone();
         let follower_trap_logger = trap_logger.clone();
         let follower_event_ring = self.event_ring.get().cloned();
+        // Page-oriented modules cold-start a freshly-added predicate
+        // via the budget-safe chunked `rebootstrap` pump; others use
+        // the host's inline synthetic bootstrap. See
+        // `manifest::is_chunked_cold_start_module` +
+        // `follower_v2::apply_interest_update`.
+        let follower_chunked_cold_start = crate::manifest::is_chunked_cold_start_module(id);
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -808,6 +814,7 @@ where
                 follower_kv_factory,
                 follower_trap_logger,
                 follower_event_ring,
+                follower_chunked_cold_start,
             )
             .await;
             match &result {

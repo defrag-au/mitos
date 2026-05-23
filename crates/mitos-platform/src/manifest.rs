@@ -46,6 +46,25 @@ pub struct InterestSection {
     pub policies: Vec<String>,
 }
 
+/// Modules that cold-start a newly-subscribed predicate via the
+/// budget-safe chunked `rebootstrap` pump (the host drives it after
+/// `update-interest` on an Add) rather than the host's inline
+/// synthetic bootstrap. These page-oriented modules dropped their
+/// inline single-fuel cold-start (which trapped + emitted nothing
+/// for large collections) and seed a scoped onboard set instead.
+///
+/// Hardcoded rather than manifest-driven: the natural home is a
+/// manifest `[interest]` flag, but `toml::to_string` drops a trailing
+/// nested table whose siblings are empty-skipped, silently losing the
+/// flag for exactly these (no static interest) modules. Revisit as a
+/// manifest field if the serializer is fixed or the manifest moves to
+/// CBOR. Other modules must NOT be listed here — a pump on a module
+/// that also cold-starts inline (vesting-tracker, burn-address,
+/// holder-distribution) would double-emit.
+pub fn is_chunked_cold_start_module(module_id: &str) -> bool {
+    matches!(module_id, "collection-holders" | "collection-metadata")
+}
+
 impl InterestSection {
     pub fn is_empty(&self) -> bool {
         self.addresses.is_empty() && self.policies.is_empty()

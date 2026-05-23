@@ -85,6 +85,15 @@ const KV_SHARD_PREFIX: &str = "mentry:";
 /// thread-local + volatile.
 const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
 
+/// Scope for the *next* `rebootstrap` pump: the policies a
+/// subscribe-time Add just brought in. When present, `rebootstrap`
+/// cold-starts only these (the per-policy auto-onboard, driven by
+/// the host pump after `update-interest`); when absent, `rebootstrap`
+/// is a full recapture over all tracked policies. Cleared once the
+/// scoped round completes. Encoded as ciborium `Vec<Vec<u8>>` of
+/// 28-byte policy hashes.
+const KV_ONBOARD_PREDICATES: &str = "onboard-predicates";
+
 /// Entries per `SnapshotChunk` when emitting a chunked
 /// metadata snapshot. Metadata payloads are larger than
 /// holdings (KB per entry vs ~80 bytes per holding), so the
@@ -136,15 +145,6 @@ struct StoredEntry {
     /// entry. Used in Phase 2C to detect no-op respends
     /// (same datum hash → same datum → no `Updated` emit).
     datum_hash: Vec<u8>,
-}
-
-/// Per-policy metadata ledger as held in memory + persisted to
-/// state-kv. Keyed by the `_100`-suffix bytes so a consumer
-/// joining holdings → metadata strips the user-token prefix
-/// once and looks up directly.
-#[derive(Default, Serialize, Deserialize)]
-struct MetadataLedger {
-    entries: BTreeMap<Vec<u8>, StoredEntry>,
 }
 
 // ── Sharded per-asset metadata store ──
@@ -443,14 +443,45 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
         );
     }
 
-    // Cold-start each newly-added policy. Single fuel budget per
-    // call; for very large collections the host's adaptive page
-    // sizing on `utxos_by_policy` keeps each call within budget.
-    // Pathological cases (100k+ ref tokens) recover via the
-    // chunked `rebootstrap` path (Phase 2C).
-    for policy in &added {
-        cold_start(policy);
+    // Cold-start each newly-added policy via the budget-safe chunked
+    // `rebootstrap` pump rather than an inline single-fuel scan. The
+    // inline scan traps + rolls back for large collections (10k+),
+    // emitting nothing — so add-collection silently failed to ingest
+    // big collections. Instead, record the added policies as the next
+    // rebootstrap's scope; the host pumps the re-entrant chunked
+    // rebootstrap over just these after `update-interest` returns,
+    // cold-starting any size. Idempotent: re-adds merge into the scope.
+    if !added.is_empty() {
+        seed_onboard_scope(&added);
     }
+}
+
+/// Record `added` policies as the scope for the next `rebootstrap`
+/// pump. Merges with any still-pending scope (rapid successive adds
+/// all cold-start) and resets the durable cursor + in-process driver
+/// so the pump restarts cleanly over the scoped set.
+fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
+    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
+    for p in added {
+        let v = p.to_vec();
+        if !scope.contains(&v) {
+            scope.push(v);
+        }
+    }
+    scope.sort_unstable();
+    let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
+    if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
+        state_kv::set_value(KV_ONBOARD_PREDICATES, &buf);
+    }
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+    REBOOTSTRAP_DRIVER.with(|c| *c.borrow_mut() = None);
+}
+
+/// Decode the pending onboard scope (policies a subscribe-time Add
+/// queued for cold-start), if any.
+fn read_onboard_scope() -> Option<Vec<Vec<u8>>> {
+    let bytes = state_kv::get_value(KV_ONBOARD_PREDICATES)?;
+    ciborium::de::from_reader(&bytes[..]).ok()
 }
 
 fn persist_tracked_policies() {
@@ -527,97 +558,9 @@ fn event_policy(event: &MetadataEvent) -> &str {
     }
 }
 
-/// Emit the full chunked snapshot sequence for one policy in
-/// a single fuel budget: `SnapshotBegin` → `SnapshotChunk` × N
-/// → `SnapshotEnd`. Used by the live `update_interest(Add,
-/// ...)` cold-start path. The recapture path (`rebootstrap`)
-/// spreads emission across many calls via the re-entrant
-/// state machine.
-fn emit_full_snapshot(policy_hex: &str, ledger: &MetadataLedger, anchor_slot: u64) {
-    emit_event(&MetadataEvent::SnapshotBegin(SnapshotBegin {
-        policy: policy_hex.to_string(),
-        cursor_slot: anchor_slot,
-        cursor_hash_hex: String::new(),
-    }));
-    let entries: Vec<MetadataEntry> = ledger
-        .entries
-        .values()
-        .map(|stored| stored.entry.clone())
-        .collect();
-    let total = entries.len() as u64;
-    for chunk in entries.chunks(SNAPSHOT_CHUNK_ENTRIES) {
-        emit_event(&MetadataEvent::SnapshotChunk(SnapshotChunk {
-            policy: policy_hex.to_string(),
-            entries: chunk.to_vec(),
-        }));
-    }
-    emit_event(&MetadataEvent::SnapshotEnd(SnapshotEnd {
-        policy: policy_hex.to_string(),
-        entry_count: total,
-    }));
-}
-
-// ============================================================
-// Cold-start scan
-// ============================================================
-
-/// Run the bootstrap scan for a newly-tracked policy. Page
-/// through `utxos_by_policy`, ask the host for each page's
-/// datums via `read_output_datums`, decode `_100`-prefixed
-/// ref-token outputs as CIP-68 Constructor 0, build the
-/// ledger, emit the chunked snapshot.
-///
-/// `typed-output` doesn't carry the datum in v2's data plane —
-/// `read_utxos` only resolves address + value. We get the
-/// datums via a parallel `read_output_datums` call against
-/// the same ref list. The two arrays are positionally
-/// aligned per the host-fn contract.
-fn cold_start(policy: &[u8; HASH_BYTES]) {
-    let policy_hex = hex::encode(policy);
-    // Clear any stale shards so a re-add starts clean.
-    shard_clear_policy(&policy_hex);
-
-    let mut ledger = MetadataLedger::default();
-    let mut after: Option<Vec<u8>> = None;
-    // Assigned on every loop iteration before it's read after the
-    // loop — the `loop` body always runs at least once.
-    let mut anchor_slot: u64;
-    let mut total_utxos: usize = 0;
-
-    loop {
-        let page = chain_data::utxos_by_policy(policy, after.as_deref(), COLD_START_PAGE_HINT);
-        anchor_slot = page.anchor_slot;
-        total_utxos += page.refs.len();
-        for (suffix, stored) in decode_page(policy, &page.refs) {
-            // Persist per-asset (sharded) + keep in-memory for the
-            // one-shot emit below. cold-start (live `update_interest`
-            // Add) is a single non-re-entrant call — fine for small
-            // policies; large ones rely on the re-entrant `rebootstrap`
-            // recapture path, which shares the same sharded store.
-            shard_put_entry(&policy_hex, &suffix, &stored);
-            ledger.entries.insert(suffix, stored);
-        }
-        match page.next {
-            Some(token) => after = Some(token),
-            None => break,
-        }
-    }
-
-    let entry_count = ledger.entries.len();
-    emit_full_snapshot(&policy_hex, &ledger, anchor_slot);
-
-    logging::log(
-        LogLevel::Info,
-        LOG_TARGET,
-        &format!(
-            "cold-start policy={policy_hex}: {total_utxos} UTxO(s) → {entry_count} ref-token entry(ies) @ slot {anchor_slot}"
-        ),
-    );
-}
-
 /// Decode one page of UTxOs into `(suffix, StoredEntry)` pairs for
-/// every CIP-68 ref token of `policy`. Shared by `cold_start` and
-/// the re-entrant `rebootstrap` driver's `scan_page`.
+/// every CIP-68 ref token of `policy`. Used by the re-entrant
+/// `rebootstrap` driver's `scan_page` (cold-start + recapture).
 fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>, StoredEntry)> {
     if refs.is_empty() {
         return Vec::new();
@@ -983,8 +926,13 @@ impl Guest for Module {
         REBOOTSTRAP_DRIVER.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                let mut predicates: Vec<Vec<u8>> =
-                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect());
+                // Scope the round: a pending onboard set (subscribe-time
+                // Add) cold-starts just those policies; otherwise this is
+                // a full recapture over every tracked policy. The host
+                // pumps this same export in both cases.
+                let mut predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
+                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
+                });
                 predicates.sort_unstable();
                 let cursor =
                     state_kv::get_value(KV_REBOOTSTRAP_CURSOR).and_then(|b| BootstrapCursor::decode(&b));
@@ -995,6 +943,9 @@ impl Guest for Module {
             let out = driver.step(&mut io);
             if out.done {
                 *slot = None;
+                // Clear the scoped onboard set so a future recapture
+                // defaults to the full tracked set.
+                state_kv::delete_value(KV_ONBOARD_PREDICATES);
             }
             Ok(RebootstrapStep {
                 done: out.done,

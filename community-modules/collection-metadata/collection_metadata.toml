@@ -16,6 +16,11 @@ abi_version = 2
 [interest]
 addresses = []
 policies = []
+# Cold-start of newly-subscribed policies uses the budget-safe chunked
+# `rebootstrap` pump (host-driven after `update-interest` on an Add).
+# Wired host-side via `manifest::is_chunked_cold_start_module` — see
+# the note there on why this isn't a manifest flag (toml drops the
+# trailing nested table). See `follower_v2::apply_interest_update`.
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }

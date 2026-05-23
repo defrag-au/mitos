@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
         &wasm_path,
         &config_bytes,
         args.expected.as_deref(),
+        mitos_platform::manifest::is_chunked_cold_start_module(&module_id),
     )
     .await
 }
@@ -694,6 +695,7 @@ fn default_abi_major() -> u32 {
 // each block is decoded + filtered + dispatched per `handle-events`
 // in chain order.
 
+#[allow(clippy::too_many_arguments)]
 async fn run_v2(
     blocks: &[PathBuf],
     fixture: &Fixture,
@@ -701,6 +703,7 @@ async fn run_v2(
     wasm_path: &std::path::Path,
     config_bytes: &[u8],
     expected_path: Option<&std::path::Path>,
+    chunked_cold_start: bool,
 ) -> Result<()> {
     use mitos_platform::driver_v2::{ApplyOutcomeV2, DriverV2};
     use mitos_platform::host_fns::{emit, state_kv};
@@ -854,12 +857,44 @@ async fn run_v2(
         }
     }
 
-    // Drain cold-start emissions produced by `update_interest`'s
-    // bootstrap path. Modules that subscribe-then-snapshot (e.g.
-    // vesting-tracker) emit here without any block dispatch.
+    // For modules that opt into chunked cold-start (manifest
+    // `[interest] chunked_cold_start`), pump the module's chunked
+    // `rebootstrap` to completion — the production follower does this
+    // after `update_interest` to cold-start newly-added policies via
+    // the budget-safe scoped rebootstrap (page-oriented modules seed
+    // their onboard scope in `update_interest`; the inline single-fuel
+    // cold-start was removed). Other modules cold-start inline in
+    // `update_interest` and must NOT be pumped here, or they'd
+    // double-emit. Each call refuels one bounded page.
+    if chunked_cold_start {
+        let mut steps = 0u64;
+        loop {
+            match driver.call_rebootstrap().await {
+                Ok(Ok(step)) => {
+                    steps += 1;
+                    if step.done || steps >= 10_000_000 {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("✗ rebootstrap returned Err: {e}");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("✗ rebootstrap trapped: {e:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Drain cold-start emissions produced by `update_interest` +
+    // the rebootstrap pump above. Modules that subscribe-then-
+    // snapshot (e.g. vesting-tracker) emit here without any block
+    // dispatch.
     let cold_start_emitted = drain(&mut events_rx, &mut collected_emits, "update_interest");
     if cold_start_emitted > 0 {
-        println!("▸ {cold_start_emitted} event(s) emitted during update_interest");
+        println!("▸ {cold_start_emitted} event(s) emitted during cold-start");
     }
 
     // Platform-driven bootstrap walk (opt-in per fixture). Same
