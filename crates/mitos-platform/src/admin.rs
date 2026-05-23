@@ -382,9 +382,26 @@ pub struct StatusModule {
     /// per-module mutex is held). Answers "is a recapture still
     /// running?" without a journal grep.
     pub recapture_in_progress: bool,
+    /// A bootstrap/rebootstrap pass (`start`) is currently running.
+    pub bootstrap_in_progress: bool,
+    /// Result of the module's last rebootstrap (survives the bounded
+    /// events ring). `None` if none has run this process.
+    pub last_result: Option<StatusLastResult>,
     /// Age of the last captured trap fixture, or `None` if none.
     /// A small value means a module recently trapped.
     pub last_trap_secs_ago: Option<u64>,
+}
+
+/// Serialized view of a module's last rebootstrap result.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusLastResult {
+    /// What ran (`rebootstrap`).
+    pub kind: String,
+    pub utxos_ingested: u64,
+    pub duration_ms: u64,
+    /// `completed` | `partial` | `failed`.
+    pub outcome: String,
+    pub secs_ago: u64,
 }
 
 /// Per-companion detail for `GET /_admin/modules/{id}/companions`.
@@ -682,13 +699,25 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         None => (None, None),
     };
 
-    // One snapshot of in-flight recaptures for the whole summary.
-    let recapturing: std::collections::HashSet<String> = match &state.host {
-        Some(host) => host.recapture_in_flight().await.into_iter().collect(),
-        None => std::collections::HashSet::new(),
+    // Snapshots of host-side state for the whole summary.
+    let (recapturing, bootstrapping, last_results): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+        std::collections::HashMap<String, crate::host_v2::LastResult>,
+    ) = match &state.host {
+        Some(host) => (
+            host.recapture_in_flight().await.into_iter().collect(),
+            host.bootstrap_in_flight().await.into_iter().collect(),
+            host.last_results().await.into_iter().collect(),
+        ),
+        None => Default::default(),
     };
 
     let now = SystemTime::now();
+    let now_unix = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let ids = state.storage.list_modules()?;
     let mut modules = Vec::with_capacity(ids.len());
     for id in ids {
@@ -704,13 +733,21 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         // atomic counters on the emit/drain path. Degrades to 0/0 if
         // the store can't be opened (e.g. no emissions yet).
         let (queued, pending) = emission_backlog(&state, &id);
-        let recapture_in_progress = recapturing.contains(&id);
+        let last_result = last_results.get(&id).map(|r| StatusLastResult {
+            kind: r.kind.to_string(),
+            utxos_ingested: r.utxos_ingested,
+            duration_ms: r.duration_ms,
+            outcome: r.outcome.to_string(),
+            secs_ago: now_unix.saturating_sub(r.at_unix),
+        });
         modules.push(StatusModule {
-            id,
+            id: id.clone(),
             companions,
             queued,
             pending,
-            recapture_in_progress,
+            recapture_in_progress: recapturing.contains(&id),
+            bootstrap_in_progress: bootstrapping.contains(&id),
+            last_result,
             last_trap_secs_ago,
         });
     }
@@ -813,9 +850,17 @@ async fn metrics(State(state): State<AdminState>) -> Response {
     }
 
     // ----- gather per-module + per-companion -----
-    let recapturing: std::collections::HashSet<String> = match &state.host {
-        Some(host) => host.recapture_in_flight().await.into_iter().collect(),
-        None => std::collections::HashSet::new(),
+    let (recapturing, bootstrapping, last_results): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+        std::collections::HashMap<String, crate::host_v2::LastResult>,
+    ) = match &state.host {
+        Some(host) => (
+            host.recapture_in_flight().await.into_iter().collect(),
+            host.bootstrap_in_flight().await.into_iter().collect(),
+            host.last_results().await.into_iter().collect(),
+        ),
+        None => Default::default(),
     };
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -827,6 +872,8 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         module: String,
         companions: usize,
         recapture: bool,
+        bootstrap: bool,
+        last_rebootstrap: Option<(u64, u64)>, // (utxos_ingested, secs_ago)
         last_trap_age: Option<u64>,
         status_totals: [usize; 5], // queued, pending, acked, nacked, timeout
         comps: Vec<CompMetrics>,
@@ -865,10 +912,15 @@ async fn metrics(State(state): State<AdminState>) -> Response {
                 oldest_queued_age: s.oldest_queued_unix.map(|u| now.saturating_sub(u)),
             });
         }
+        let last_rebootstrap = last_results
+            .get(id)
+            .map(|r| (r.utxos_ingested, now.saturating_sub(r.at_unix)));
         mods.push(ModMetrics {
             module: id.clone(),
             companions: state.storage.count_companions(id),
             recapture: recapturing.contains(id),
+            bootstrap: bootstrapping.contains(id),
+            last_rebootstrap,
             last_trap_age,
             status_totals,
             comps,
@@ -906,6 +958,53 @@ async fn metrics(State(state): State<AdminState>) -> Response {
             esc_label(&m.module),
             u8::from(m.recapture),
         );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_bootstrap_in_progress",
+        "1 if a bootstrap/rebootstrap pass is currently running for the module.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_bootstrap_in_progress{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            u8::from(m.bootstrap),
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_last_rebootstrap_utxos",
+        "UTxOs ingested by the module's most recent rebootstrap (omitted if none).",
+        "gauge",
+    );
+    for m in &mods {
+        if let Some((utxos, _age)) = m.last_rebootstrap {
+            let _ = writeln!(
+                out,
+                "mitos_last_rebootstrap_utxos{{module=\"{}\"}} {utxos}",
+                esc_label(&m.module),
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_last_rebootstrap_age_seconds",
+        "Seconds since the module's most recent rebootstrap (omitted if none).",
+        "gauge",
+    );
+    for m in &mods {
+        if let Some((_utxos, age)) = m.last_rebootstrap {
+            let _ = writeln!(
+                out,
+                "mitos_last_rebootstrap_age_seconds{{module=\"{}\"}} {age}",
+                esc_label(&m.module),
+            );
+        }
     }
 
     metric_header(
@@ -1588,6 +1687,13 @@ async fn delete_companion(
         client_id = %client_id,
         companion_key = %companion_key,
         "companion record deleted"
+    );
+    state.events.record(
+        id.as_str(),
+        crate::events::EventKind::CompanionEvicted {
+            client_id,
+            companion_key,
+        },
     );
     Ok((StatusCode::NO_CONTENT, "").into_response())
 }

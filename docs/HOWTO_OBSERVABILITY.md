@@ -239,9 +239,10 @@ scrape at it. Highest-value series:
 | `mitos_companion_oldest_queued_age_seconds{module,companion,client}` | **Stall alert.** Oldest undelivered emission; a high value = a lane that stopped draining. |
 | `mitos_companion_last_drain_age_seconds{…}` | Time since last successful dial. |
 | `mitos_module_emissions{module,status}` | Backlog (`queued`+`pending`) and lifecycle totals per module. |
-| `mitos_recapture_in_progress{module}` | 1 while a recapture runs (alert if stuck high). |
+| `mitos_recapture_in_progress{module}` · `mitos_bootstrap_in_progress{module}` | 1 while a recapture / (re)bootstrap runs (alert if stuck high). |
+| `mitos_last_rebootstrap_utxos{module}` · `mitos_last_rebootstrap_age_seconds{module}` | Size + recency of the last rebootstrap. |
 | `mitos_module_last_trap_age_seconds{module}` | Recent trap detector. |
-| `mitos_events_total{module,kind}` | Cumulative recaptures/traps (rate alerts). |
+| `mitos_events_total{module,kind}` | Cumulative events by kind (recapture/rebootstrap/trap/companion) — rate alerts. |
 | `mitos_archive_horizon_slot` | Oldest slot still in the archive. Lookups below it miss → empty CIP-68 traits. |
 | `mitos_chain_tip_slot`, `mitos_uptime_seconds`, `mitos_build_info` | Liveness / position / what's deployed. |
 
@@ -305,9 +306,14 @@ by `recapture_completed` in the tail — no SSH at any step.
 
 ---
 
-## Not here yet (deferred)
+## Event taxonomy
 
-- Events ring covers `recapture_*` + `trap`; `rebootstrap_completed` and
-  `companion_subscribed/evicted` are planned additions.
-- Recapture/bootstrap `last_result` (`utxos_ingested`, `completed|trapped`)
-  — only the in-progress flag exists today.
+`mitos-admin tail` / `GET /_admin/events` surface these typed kinds
+(filter with `--kind`): `recapture_started`, `recapture_completed`,
+`recapture_failed`, `rebootstrap_completed` (with `utxos_ingested`),
+`companion_subscribed`, `companion_evicted`, `trap`. The ring is
+in-memory + bounded (~512, resets on restart); `mitos_events_total`
+gives the cumulative-since-start counts, and `/_admin/status` carries
+`bootstrap_in_progress` + the last rebootstrap `last_result`
+(`utxos_ingested`, `duration_ms`, `outcome`) which survive ring
+eviction.

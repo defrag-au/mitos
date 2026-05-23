@@ -528,6 +528,7 @@ impl Bundle {
                 platform_auth.clone(),
                 Some(dialer.clone()),
                 Some(indexer_bridge),
+                event_ring.clone(),
             ));
 
             // Pass the reserved-names set so the upload handler

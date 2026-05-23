@@ -71,11 +71,13 @@ pub fn companion_router(
     auth: AuthToken,
     dialer: Option<CompanionDialer>,
     indexer_bridge: Option<IndexerBridgeHandle>,
+    events: crate::events::EventRing,
 ) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
         dialer,
         indexer_bridge,
+        events,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -97,6 +99,8 @@ struct CompanionState {
     /// `SubscribeTarget::Module { ... }` requests (no in-tree
     /// indexers wired into the unified path).
     indexer_bridge: Option<IndexerBridgeHandle>,
+    /// Shared operational-events ring — records `companion_subscribed`.
+    events: crate::events::EventRing,
 }
 
 // Local re-implementation of the admin auth middleware so the
@@ -478,6 +482,13 @@ async fn subscribe_handler(
                 if next_emission_id == 0 {
                     next_emission_id = id;
                 }
+                state.events.record(
+                    name.as_str(),
+                    crate::events::EventKind::CompanionSubscribed {
+                        client_id: request.client_id.clone(),
+                        companion_key: request.companion_key.clone(),
+                    },
+                );
             }
             SubscribeTarget::Indexer { name } => {
                 validate_indexer_target(&state, name)?;
@@ -933,7 +944,13 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
-        companion_router(storage, AuthToken(None), None, None)
+        companion_router(
+            storage,
+            AuthToken(None),
+            None,
+            None,
+            crate::events::EventRing::new(),
+        )
     }
 
     fn cbor(req: &SubscribeRequest) -> Vec<u8> {

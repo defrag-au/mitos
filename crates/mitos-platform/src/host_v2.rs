@@ -103,6 +103,14 @@ pub trait ModuleHostHandle: Send + Sync {
     /// `GET /_admin/status` + the companions endpoint so "is a
     /// recapture still running?" is a field, not a journal grep.
     async fn recapture_in_flight(&self) -> Vec<String>;
+
+    /// Module ids whose `start` (bootstrap/rebootstrap) pass is
+    /// currently running. Backs `bootstrap_in_progress`.
+    async fn bootstrap_in_flight(&self) -> Vec<String>;
+
+    /// Last rebootstrap result per module (`(module_id, result)`).
+    /// Backs the `last_result` field in `/_admin/status`.
+    async fn last_results(&self) -> Vec<(String, LastResult)>;
 }
 
 /// One dynamic-interest update queued for delivery to a running
@@ -258,6 +266,13 @@ where
     /// operations are check-insert-or-reject and remove — no
     /// awaiting needed.
     recapture_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Module ids whose `start` (bootstrap/rebootstrap pass) is in
+    /// flight. Backs `bootstrap_in_progress` in `/_admin/status`.
+    bootstrap_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Last rebootstrap result per module (survives across the bounded
+    /// events ring + host restarts within a process). Backs the
+    /// `last_result` field in `/_admin/status`.
+    last_results: Arc<std::sync::Mutex<HashMap<String, LastResult>>>,
     /// Companion dialer the recapture orchestrator drives.
     /// Wired post-construction via `set_dialer` because the
     /// dialer borrows the host as its `InterestRouter` — host
@@ -308,6 +323,8 @@ where
             slots: Arc::new(Mutex::new(HashMap::new())),
             interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recapture_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            bootstrap_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            last_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialer: std::sync::OnceLock::new(),
             event_ring: std::sync::OnceLock::new(),
         }
@@ -436,6 +453,21 @@ where
     /// surfaces it as `events_emitted`.
     pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
         self.stop(id).await?;
+
+        // Mark the module as bootstrapping for the duration of `start`
+        // (bootstrap + optional rebootstrap pass). Drop-guard clears it
+        // on any exit. Backs `bootstrap_in_progress` in the admin API.
+        {
+            let mut bf = self
+                .bootstrap_in_flight
+                .lock()
+                .expect("bootstrap_in_flight mutex poisoned");
+            bf.insert(id.to_owned());
+        }
+        let _bootstrap_guard = InFlightGuard {
+            set: self.bootstrap_in_flight.clone(),
+            id: id.to_owned(),
+        };
 
         let manifest = self
             .storage
@@ -575,6 +607,8 @@ where
         // `events_emitted`.
         let mut rebootstrap_count: u64 = 0;
         if rebootstrap {
+            let rebootstrap_started = std::time::Instant::now();
+            let mut rebootstrap_outcome = "partial";
             // Defensive bound — a well-behaved module drains a
             // finite scan; the cap only guards a module that
             // never returns `done`. Counts host calls (pages),
@@ -593,6 +627,7 @@ where
                         rebootstrap_count += step.ingested;
                         steps += 1;
                         if step.done {
+                            rebootstrap_outcome = "completed";
                             break;
                         }
                         if steps >= REBOOTSTRAP_MAX_STEPS {
@@ -605,6 +640,7 @@ where
                         }
                     }
                     Ok(Err(msg)) => {
+                        rebootstrap_outcome = "failed";
                         tracing::error!(
                             module = %id,
                             error = %msg,
@@ -693,6 +729,29 @@ where
                     utxos_ingested = rebootstrap_count,
                     adaptive_page_limit = driver.adaptive_page_limit(),
                     "v2 rebootstrap complete",
+                );
+            }
+            if let Some(ring) = self.event_ring.get() {
+                ring.record(
+                    id,
+                    crate::events::EventKind::RebootstrapCompleted {
+                        utxos_ingested: rebootstrap_count,
+                    },
+                );
+            }
+            if let Ok(mut results) = self.last_results.lock() {
+                results.insert(
+                    id.to_owned(),
+                    LastResult {
+                        kind: "rebootstrap",
+                        utxos_ingested: rebootstrap_count,
+                        duration_ms: rebootstrap_started.elapsed().as_millis() as u64,
+                        outcome: rebootstrap_outcome,
+                        at_unix: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    },
                 );
             }
         }
@@ -917,6 +976,22 @@ where
             .unwrap_or_default()
     }
 
+    /// Snapshot of module ids whose bootstrap/rebootstrap is running.
+    pub fn bootstraps_in_flight(&self) -> Vec<String> {
+        self.bootstrap_in_flight
+            .lock()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of the last rebootstrap result per module.
+    pub fn last_results_snapshot(&self) -> Vec<(String, LastResult)> {
+        self.last_results
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     pub async fn recapture_module(
         &self,
         id: &str,
@@ -942,7 +1017,7 @@ where
         // Drop-guard ensures the mutex set is cleaned up even on
         // early-return / panic. Using an explicit struct rather
         // than `defer!` to keep deps minimal.
-        let _release = RecaptureGuard {
+        let _release = InFlightGuard {
             set: self.recapture_in_flight.clone(),
             id: id.to_owned(),
         };
@@ -1094,20 +1169,38 @@ where
     }
 }
 
-/// Drop-guard for the per-module recapture mutex set. Ensures
-/// the module is removed from `recapture_in_flight` even if the
-/// `recapture_module` body panics or early-returns.
-struct RecaptureGuard {
+/// Drop-guard for a per-module in-flight set. Ensures the module is
+/// removed from the set even if the guarded body panics or
+/// early-returns. Used for both `recapture_in_flight` and
+/// `bootstrap_in_flight`.
+struct InFlightGuard {
     set: Arc<std::sync::Mutex<HashSet<String>>>,
     id: String,
 }
 
-impl Drop for RecaptureGuard {
+impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = self.set.lock() {
             set.remove(&self.id);
         }
     }
+}
+
+/// Last rebootstrap result for a module, retained by the host so
+/// `/_admin/status` can answer "how did the last (re)bootstrap go?"
+/// without depending on the bounded events ring (which loses old
+/// entries + resets on restart).
+#[derive(Debug, Clone)]
+pub struct LastResult {
+    /// What ran (`"rebootstrap"`).
+    pub kind: &'static str,
+    pub utxos_ingested: u64,
+    pub duration_ms: u64,
+    /// `"completed"` (drained to `done`), `"partial"` (hit a cap /
+    /// trap-abort), or `"failed"` (module returned an error).
+    pub outcome: &'static str,
+    /// Unix seconds when it finished.
+    pub at_unix: u64,
 }
 
 /// Outcome of a successful `recapture_module` call. Surfaced
@@ -1153,6 +1246,12 @@ where
     }
     async fn recapture_in_flight(&self) -> Vec<String> {
         ModuleHostV2::recaptures_in_flight(self)
+    }
+    async fn bootstrap_in_flight(&self) -> Vec<String> {
+        ModuleHostV2::bootstraps_in_flight(self)
+    }
+    async fn last_results(&self) -> Vec<(String, LastResult)> {
+        ModuleHostV2::last_results_snapshot(self)
     }
     async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str) {
         if let Some(dialer) = self.dialer.get() {

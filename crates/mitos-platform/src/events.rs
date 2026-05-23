@@ -37,6 +37,20 @@ pub enum EventKind {
     },
     /// A recapture errored (timeout / coordination failure).
     RecaptureFailed { error: String, duration_ms: u64 },
+    /// A module's rebootstrap pass finished (the cold-start re-walk a
+    /// recapture / self-bootstrapping start triggers). `utxos_ingested`
+    /// is the count re-scanned across all pages.
+    RebootstrapCompleted { utxos_ingested: u64 },
+    /// A companion registered (subscribed) to a module.
+    CompanionSubscribed {
+        client_id: String,
+        companion_key: String,
+    },
+    /// A companion record was removed (admin `delete-companion`).
+    CompanionEvicted {
+        client_id: String,
+        companion_key: String,
+    },
     /// A wasm module trapped during dispatch (out-of-fuel, realloc,
     /// or a module-side panic). `reason` is the host error text; the
     /// full replay fixture lands at `last-trap.toml` (see `last-trap`).
@@ -51,6 +65,9 @@ impl EventKind {
             EventKind::RecaptureStarted { .. } => "recapture_started",
             EventKind::RecaptureCompleted { .. } => "recapture_completed",
             EventKind::RecaptureFailed { .. } => "recapture_failed",
+            EventKind::RebootstrapCompleted { .. } => "rebootstrap_completed",
+            EventKind::CompanionSubscribed { .. } => "companion_subscribed",
+            EventKind::CompanionEvicted { .. } => "companion_evicted",
             EventKind::Trap { .. } => "trap",
         }
     }

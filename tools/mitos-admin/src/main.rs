@@ -400,7 +400,20 @@ struct StatusModule {
     pending: usize,
     #[serde(default)]
     recapture_in_progress: bool,
+    #[serde(default)]
+    bootstrap_in_progress: bool,
+    #[serde(default)]
+    last_result: Option<StatusLastResult>,
     last_trap_secs_ago: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusLastResult {
+    kind: String,
+    utxos_ingested: u64,
+    duration_ms: u64,
+    outcome: String,
+    secs_ago: u64,
 }
 
 async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Result<()> {
@@ -439,6 +452,9 @@ async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Resul
         if m.recapture_in_progress {
             notes.push("RECAPTURING".to_string());
         }
+        if m.bootstrap_in_progress {
+            notes.push("BOOTSTRAPPING".to_string());
+        }
         if let Some(secs) = m.last_trap_secs_ago {
             notes.push(format!("last trap {} ago", format_duration(secs)));
         }
@@ -448,6 +464,16 @@ async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Resul
             format!("  [{}]", notes.join(", "))
         };
         println!("  {:<28}  {} companion(s){suffix}", m.id, m.companions);
+        if let Some(lr) = &m.last_result {
+            println!(
+                "      last {}: {} ({} utxos, {}ms) {} ago",
+                lr.kind,
+                lr.outcome,
+                lr.utxos_ingested,
+                lr.duration_ms,
+                format_duration(lr.secs_ago),
+            );
+        }
     }
     Ok(())
 }
