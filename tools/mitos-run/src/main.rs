@@ -174,6 +174,16 @@ struct Fixture {
     #[serde(default)]
     tx_metadata: Vec<FixtureTxMetadata>,
 
+    /// Datum preimages keyed by datum hash, for
+    /// `chain_data::datum_by_hash` resolution. Normally these are
+    /// harvested from a `--block`'s witness set; this section lets
+    /// a blockless fixture supply them directly — the canonical
+    /// case being a cold-start over a CIP-68 ref token whose datum
+    /// is attached by hash (no inline bytes), exercising the
+    /// `read_output_datums` → `datum_by_hash` fallback path.
+    #[serde(default)]
+    datum: Vec<FixtureDatum>,
+
     /// v2-only: the module's interest set. Applied before any
     /// `handle-events` dispatch so the platform can filter
     /// matching events. Ignored for v1 modules.
@@ -259,6 +269,15 @@ struct FixtureTxMetadata {
     tx_hash: String,
     /// Hex-encoded auxiliary-data CBOR.
     aux_cbor_hex: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureDatum {
+    /// 64-hex datum hash (the value an output's hash-attached
+    /// datum references).
+    hash: String,
+    /// Hex-encoded datum CBOR (the preimage).
+    cbor_hex: String,
 }
 
 // -----------------------------------------------------------------------------
@@ -399,13 +418,21 @@ impl FixtureDataPlane {
             aux_by_tx.insert(tx_hash.to_vec(), bytes);
         }
 
+        let mut datums_by_hash = HashMap::new();
+        for d in fixture.datum {
+            let hash = decode_32(&d.hash).with_context(|| format!("datum hash {}", d.hash))?;
+            let cbor =
+                hex::decode(&d.cbor_hex).with_context(|| format!("datum cbor_hex for {}", d.hash))?;
+            datums_by_hash.insert(hash.to_vec(), cbor);
+        }
+
         Ok(Self {
             by_ref,
             by_address,
             by_payment_cred,
             by_policy,
             aux_by_tx,
-            datums_by_hash: HashMap::new(),
+            datums_by_hash,
         })
     }
 

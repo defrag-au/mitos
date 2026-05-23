@@ -1,0 +1,55 @@
+# mitos-run fixture for collection-metadata — cold-start over a
+# CIP-68 reference token whose datum is attached BY HASH (no
+# inline bytes on the output).
+#
+# WHY THIS EXISTS (regression guard for CO3):
+#   Every other collection-metadata fixture (mekka, nikeverse)
+#   carries its CIP-68 datum INLINE in a block, so the cold-start
+#   hash-only path was never exercised. That path had a silent
+#   bug: the `read_output_datums` facade collapsed an unresolved
+#   datum (`original_cbor == None`) to `None`, dropping the hash.
+#   `decode_page` then skipped the asset and emitted NO Initial —
+#   the "5555 staged, traits written = 0" Nikeverse symptom.
+#
+#   The fix preserves the hash on the unresolved entry so
+#   `resolve_datum_bytes` falls through to `datum_by_hash`, which
+#   resolves the preimage (here from `[[datum]]`; in production
+#   from dolos `DATUM_NS` or the Maestro datum fallback). The
+#   single `initial` event in expected.json — carrying decoded
+#   `background`/`body`/`eyes` traits — is the assertion. Revert
+#   the facade fix and this fixture emits only snapshot_begin /
+#   snapshot_end (no initial), failing the golden.
+#
+# SYNTHETIC DATA — policy, asset, and datum are hand-built, not
+# captured from chain. The datum CBOR is a CIP-68 V1
+# `Constr 0 [metadata_map, version=1]`; its hash is the real
+# blake2b-256 of the CBOR (see README.md for the generator).
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "decafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecafbad"
+
+# Pre-existing reference-token UTxO. `datum_hash` is set but
+# `datum_payload_hex` is ABSENT — the hash-only shape (host
+# couldn't resolve the bytes inline). The preimage is supplied
+# out-of-band in [[datum]], mirroring a witness-set / Maestro
+# `datum_by_hash` resolution.
+[[utxo]]
+tx_hash = "00000000000000000000000000000000000000000000000000000000000000aa"
+index = 0
+address = "addr1q8pay93een8vr9gwjcud6f093fqjq0gyz6ylg8088r69jnsttadnk66gcdwcaykj7v243uxecjeu5wed6ljf0lrpflhs96f7f2"
+lovelace = 1500000
+datum_hash = "7f19067ef2e2078c488eb2f8aa639d1061159a143ddcb9d7a3b7ed68a53138cf"
+
+[[utxo.assets]]
+policy = "decafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecafbad"
+# 000643b0 (CIP-67 label 100, reference token) + "Hashfox0001"
+asset_name_hex = "000643b048617368666f7830303031"
+
+# The datum preimage, resolvable by hash — what `datum_by_hash`
+# returns when `decode_page` falls through on the empty payload.
+[[datum]]
+hash = "7f19067ef2e2078c488eb2f8aa639d1061159a143ddcb9d7a3b7ed68a53138cf"
+cbor_hex = "d8799fa5446e616d654d48617368666f7820233030303145696d6167655830697066733a2f2f6261666b72656968617368666f7830303031696d616765636964706c616365686f6c646572303030314a6261636b67726f756e6446436f62616c7444626f6479454d656368614465796573454c6173657201ff"
