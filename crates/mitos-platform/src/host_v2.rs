@@ -96,6 +96,13 @@ pub trait ModuleHostHandle: Send + Sync {
     /// record so the next drain tick doesn't re-spawn it from a
     /// not-yet-deleted file. No-op when the task isn't running.
     async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str);
+
+    /// Module ids with a recapture currently in flight (the
+    /// per-module mutex set guarding `recapture_module`). Cheap and
+    /// side-effect free — backs the `recapture_in_progress` field in
+    /// `GET /_admin/status` + the companions endpoint so "is a
+    /// recapture still running?" is a field, not a journal grep.
+    async fn recapture_in_flight(&self) -> Vec<String>;
 }
 
 /// One dynamic-interest update queued for delivery to a running
@@ -885,6 +892,15 @@ where
     /// `companion_timeout` is the per-companion budget for the
     /// `RecaptureReady` ACK. Reasonable default at the call site
     /// is 30s (matches the design doc's open question 3).
+    /// Snapshot of module ids with an in-flight recapture. Reads the
+    /// per-module mutex set; degrades to empty on lock poisoning.
+    pub fn recaptures_in_flight(&self) -> Vec<String> {
+        self.recapture_in_flight
+            .lock()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn recapture_module(
         &self,
         id: &str,
@@ -1118,6 +1134,9 @@ where
     }
     async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
         ModuleHostV2::evict_module(self, id).await
+    }
+    async fn recapture_in_flight(&self) -> Vec<String> {
+        ModuleHostV2::recaptures_in_flight(self)
     }
     async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str) {
         if let Some(dialer) = self.dialer.get() {

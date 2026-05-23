@@ -374,6 +374,8 @@ struct StatusModule {
     companions: usize,
     queued: usize,
     pending: usize,
+    #[serde(default)]
+    recapture_in_progress: bool,
     last_trap_secs_ago: Option<u64>,
 }
 
@@ -409,6 +411,9 @@ async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Resul
         let mut notes = Vec::new();
         if m.queued + m.pending > 0 {
             notes.push(format!("BACKLOG {}q/{}p", m.queued, m.pending));
+        }
+        if m.recapture_in_progress {
+            notes.push("RECAPTURING".to_string());
         }
         if let Some(secs) = m.last_trap_secs_ago {
             notes.push(format!("last trap {} ago", format_duration(secs)));
@@ -471,6 +476,30 @@ async fn cmd_list_modules(client: &Client, cli: &Cli, json_out: bool) -> anyhow:
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct CompanionsResp {
+    #[serde(default)]
+    recapture_in_progress: bool,
+    companions: Vec<CompanionDetailResp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompanionDetailResp {
+    client_id: String,
+    companion_key: String,
+    #[serde(default)]
+    watched_policies: Vec<String>,
+    #[serde(default)]
+    unbounded_interest: bool,
+    resume_slot: Option<u64>,
+    queued: usize,
+    pending: usize,
+    acked: usize,
+    nacked: usize,
+    timeout: usize,
+    last_drain_secs_ago: Option<u64>,
+}
+
 async fn cmd_get_module(client: &Client, cli: &Cli, id: String) -> anyhow::Result<()> {
     let url = format!("{}/_admin/modules/{id}", cli.mitos);
     let resp = auth(client.get(&url), cli.token.as_deref()).send().await?;
@@ -486,6 +515,47 @@ async fn cmd_get_module(client: &Client, cli: &Cli, id: String) -> anyhow::Resul
     println!("abi_version:   {}", m.abi_version);
     println!("trap_strategy: {}", m.trap_strategy);
     println!("crate_version: {}", m.crate_version);
+
+    // Companion detail — interest, resume cursor, per-status emission
+    // counts, last-drain age. The per-companion stall view.
+    let curl = format!("{}/_admin/modules/{id}/companions", cli.mitos);
+    let c: CompanionsResp = auth(client.get(&curl), cli.token.as_deref())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let recap = if c.recapture_in_progress {
+        "  [RECAPTURE IN PROGRESS]"
+    } else {
+        ""
+    };
+    println!("companions:    {}{recap}", c.companions.len());
+    for comp in &c.companions {
+        let interest = if comp.unbounded_interest {
+            "all policies".to_string()
+        } else {
+            format!("{} policies", comp.watched_policies.len())
+        };
+        let cursor = comp
+            .resume_slot
+            .map(|s| format!("slot {s}"))
+            .unwrap_or_else(|| "fresh".to_string());
+        let drain = match comp.last_drain_secs_ago {
+            Some(secs) => format!("drained {} ago", format_duration(secs)),
+            None => "never drained".to_string(),
+        };
+        println!(
+            "  {}/{}  [{interest}]  cursor {cursor}  q={} p={} a={} n={} t={}  {drain}",
+            comp.companion_key,
+            comp.client_id,
+            comp.queued,
+            comp.pending,
+            comp.acked,
+            comp.nacked,
+            comp.timeout,
+        );
+    }
     Ok(())
 }
 

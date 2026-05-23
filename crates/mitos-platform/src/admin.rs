@@ -194,6 +194,7 @@ fn admin_router_inner(
         .route("/_admin/modules/{id}/restart", post(restart_module))
         .route("/_admin/modules/{id}/recapture", post(recapture_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
+        .route("/_admin/modules/{id}/companions", get(list_companions))
         .route(
             "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
             axum::routing::delete(delete_companion),
@@ -291,9 +292,54 @@ pub struct StatusModule {
     pub queued: usize,
     /// Emissions dialed but not yet acked (in flight).
     pub pending: usize,
+    /// A recapture is currently in flight for this module (the
+    /// per-module mutex is held). Answers "is a recapture still
+    /// running?" without a journal grep.
+    pub recapture_in_progress: bool,
     /// Age of the last captured trap fixture, or `None` if none.
     /// A small value means a module recently trapped.
     pub last_trap_secs_ago: Option<u64>,
+}
+
+/// Per-companion detail for `GET /_admin/modules/{id}/companions`.
+/// Replaces the journal greps for "which companions are subscribed +
+/// draining" and "where is companion X up to". LLM-decodable: the
+/// `queued`/`last_drain_secs_ago` pair is the per-companion stall
+/// signal; the source for `/metrics` per-companion gauges.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionDetail {
+    pub client_id: String,
+    pub companion_key: String,
+    /// Subscribed targets (module / indexer names).
+    pub targets: Vec<String>,
+    /// Watched policy hexes. Empty when interest is unbounded (see
+    /// `unbounded_interest`) or no policy narrowing was declared.
+    pub watched_policies: Vec<String>,
+    /// Interest matches every policy (an `Any`/`Fingerprint`
+    /// selector, or no policy narrowing) rather than the
+    /// `watched_policies` list.
+    pub unbounded_interest: bool,
+    /// Host's resume cursor slot for this companion (last applied
+    /// chain point it reported at subscribe). `None` for a fresh
+    /// companion that hasn't checkpointed.
+    pub resume_slot: Option<u64>,
+    /// Per-status emission counts scoped to this companion.
+    pub queued: usize,
+    pub pending: usize,
+    pub acked: usize,
+    pub nacked: usize,
+    pub timeout: usize,
+    /// Age of the most recent dial (max `sent_at`). `None` if never
+    /// dialed. Large/growing with non-zero `queued` = a stalled lane.
+    pub last_drain_secs_ago: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionsResponse {
+    pub module: String,
+    /// A recapture is currently in flight for this module.
+    pub recapture_in_progress: bool,
+    pub companions: Vec<CompanionDetail>,
 }
 
 #[derive(Debug, Serialize)]
@@ -447,6 +493,12 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         None => None,
     };
 
+    // One snapshot of in-flight recaptures for the whole summary.
+    let recapturing: std::collections::HashSet<String> = match &state.host {
+        Some(host) => host.recapture_in_flight().await.into_iter().collect(),
+        None => std::collections::HashSet::new(),
+    };
+
     let now = SystemTime::now();
     let ids = state.storage.list_modules()?;
     let mut modules = Vec::with_capacity(ids.len());
@@ -463,11 +515,13 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         // atomic counters on the emit/drain path. Degrades to 0/0 if
         // the store can't be opened (e.g. no emissions yet).
         let (queued, pending) = emission_backlog(&state, &id);
+        let recapture_in_progress = recapturing.contains(&id);
         modules.push(StatusModule {
             id,
             companions,
             queued,
             pending,
+            recapture_in_progress,
             last_trap_secs_ago,
         });
     }
@@ -507,6 +561,159 @@ fn emission_backlog(state: &AdminState, id: &str) -> (usize, usize) {
         }
     }
     (queued, pending)
+}
+
+/// Per-companion emission accumulator, built from one scan of a
+/// module's emissions store keyed by `(companion_id, client_id)`.
+#[derive(Default)]
+struct CompanionEmissionStat {
+    queued: usize,
+    pending: usize,
+    acked: usize,
+    nacked: usize,
+    timeout: usize,
+    /// Max `sent_at` (unix secs) across the companion's rows.
+    last_sent_unix: Option<u64>,
+}
+
+/// Parse an emissions-store timestamp (`"unix:<secs>"`) to epoch secs.
+fn parse_emission_unix(s: &str) -> Option<u64> {
+    s.strip_prefix("unix:")
+        .and_then(|n| n.trim().parse::<u64>().ok())
+}
+
+/// Scan a module's emissions store once, bucketing per-status counts
+/// (and the latest dial time) per `(companion_id, client_id)`. Empty
+/// map if the store can't be opened. The store's `companion_id` is
+/// the raw companion key, so it joins directly against the companion
+/// record's `companion_key`.
+fn companion_emission_stats(
+    state: &AdminState,
+    id: &str,
+) -> std::collections::HashMap<(String, String), CompanionEmissionStat> {
+    use crate::emissions::EmissionStatus::{Acked, Nacked, Pending, Queued, Timeout};
+    let mut map: std::collections::HashMap<(String, String), CompanionEmissionStat> =
+        std::collections::HashMap::new();
+    let Ok(store) = state.storage.emissions_store(id) else {
+        return map;
+    };
+    let Ok(rows) = store.list_filtered(|_| true) else {
+        return map;
+    };
+    for r in &rows {
+        let entry = map
+            .entry((r.companion_id.clone(), r.client_id.clone()))
+            .or_default();
+        match r.status {
+            Queued => entry.queued += 1,
+            Pending => entry.pending += 1,
+            Acked => entry.acked += 1,
+            Nacked => entry.nacked += 1,
+            Timeout => entry.timeout += 1,
+        }
+        if let Some(sent) = r.sent_at.as_deref().and_then(parse_emission_unix) {
+            entry.last_sent_unix = Some(entry.last_sent_unix.map_or(sent, |cur| cur.max(sent)));
+        }
+    }
+    map
+}
+
+/// `GET /_admin/modules/{id}/companions` — per-companion interest,
+/// resume cursor, emission counts, and last-drain age. Read-only.
+async fn list_companions(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+
+    let recapture_in_progress = match &state.host {
+        Some(host) => host.recapture_in_flight().await.iter().any(|m| m == &id),
+        None => false,
+    };
+
+    let stats = companion_emission_stats(&state, &id);
+    let now_unix = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut companions = Vec::new();
+    let root = state.storage.module_dir_for_companions(&id);
+    if let Ok(clients) = std::fs::read_dir(&root) {
+        for client in clients.flatten() {
+            // Two-level layout: skip non-dirs + metadata dirs.
+            if !client.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if client.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(client.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let path = f.path();
+                if path.extension().is_none_or(|e| e != "cbor") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(req) = mitos_protocol::SubscribeRequest::decode(&bytes) else {
+                    continue;
+                };
+
+                let (watched_policies, unbounded_interest) =
+                    match mitos_protocol::watched_policies(&req.interests) {
+                        // Unbounded (Any/Fingerprint) or no narrowing
+                        // declared → matches every policy.
+                        None => (Vec::new(), true),
+                        Some(s) if s.is_empty() => (Vec::new(), true),
+                        Some(s) => (
+                            s.into_iter().map(|p| p.as_str().to_string()).collect(),
+                            false,
+                        ),
+                    };
+                let targets = req.targets.iter().map(|t| t.name().to_string()).collect();
+                let resume_slot = req.resume_from.as_ref().and_then(|c| c.slot());
+
+                let stat = stats.get(&(req.companion_key.clone(), req.client_id.clone()));
+                let last_drain_secs_ago = stat
+                    .and_then(|s| s.last_sent_unix)
+                    .map(|sent| now_unix.saturating_sub(sent));
+
+                companions.push(CompanionDetail {
+                    client_id: req.client_id,
+                    companion_key: req.companion_key,
+                    targets,
+                    watched_policies,
+                    unbounded_interest,
+                    resume_slot,
+                    queued: stat.map_or(0, |s| s.queued),
+                    pending: stat.map_or(0, |s| s.pending),
+                    acked: stat.map_or(0, |s| s.acked),
+                    nacked: stat.map_or(0, |s| s.nacked),
+                    timeout: stat.map_or(0, |s| s.timeout),
+                    last_drain_secs_ago,
+                });
+            }
+        }
+    }
+
+    // Stable order for diff-friendly output across polls.
+    companions.sort_by(|a, b| {
+        (a.companion_key.as_str(), a.client_id.as_str())
+            .cmp(&(b.companion_key.as_str(), b.client_id.as_str()))
+    });
+
+    Ok(Json(CompanionsResponse {
+        module: id,
+        recapture_in_progress,
+        companions,
+    })
+    .into_response())
 }
 
 async fn list_modules(
