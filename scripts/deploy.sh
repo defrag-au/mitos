@@ -125,8 +125,15 @@ step_rsync() {
 }
 
 step_build() {
-    log "2/5 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build (on box; ~5min cold, ~30s incremental)"
-    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
+    # The rsync excludes .git/, so on-box `git` can't resolve a build
+    # SHA. Compute it from the LOCAL working tree (the source of truth
+    # for what's being deployed) and inject it as MITOS_BUILD_SHA — the
+    # platform build.rs prefers this over on-box git. `--dirty` flags
+    # an uncommitted deploy honestly. Surfaced via `GET /_admin/status`.
+    local build_sha
+    build_sha=$(cd "$MITOS_SRC_LOCAL" && git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+    log "2/5 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build (on box; ~5min cold, ~30s incremental; build=$build_sha)"
+    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && MITOS_BUILD_SHA=$build_sha cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
 }
 
 step_build_community_modules() {
