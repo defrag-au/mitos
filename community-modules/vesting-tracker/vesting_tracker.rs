@@ -57,7 +57,7 @@ use mitos_community_events::vesting_tracker::{
     InterestKind, LockEntry, LockRef, SnapshotBegin, SnapshotChunk, SnapshotEnd, VestStyle,
     VestingEvent, VestingLock, VestingUnlock,
 };
-use mitos_module_kit::ReentrantRound;
+use mitos_module_kit::{BootstrapCursor, BootstrapIo, ChunkedBootstrap, ScannedPage};
 use mitos_vesting_decode::decode_vesting_datum;
 use pallas_addresses::{Address, ShelleyPaymentPart};
 use pallas_codec::minicbor::data::Type as CborType;
@@ -99,6 +99,24 @@ const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
 /// more than one clamped page of refs at once.
 const COLD_START_PAGE_HINT: u32 = 10_000;
 
+/// Sharded lock store prefix: one kv key per lock entry,
+/// `vlock:<predicate_hex>:<entry_key_hex>` → CBOR `LockEntry`, where
+/// `entry_key` = `tx_hash(32) ‖ index(4 BE) ‖ asset_name` (sorts as
+/// `(tx_hash, index, asset_name)` — the deterministic snapshot order,
+/// without the O(n log n) single-budget sort the resident-Vec path
+/// needed). `predicate_hex` namespaces each watched address / payment
+/// cred. Sharded so no cold-start / recapture call ever materialises
+/// the whole lock set in wasm memory. See
+/// `docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md`.
+const KV_LOCK_SHARD_PREFIX: &str = "vlock:";
+
+/// Scope for the *next* `rebootstrap` pump: the predicates a
+/// subscribe-time Add brought in (per-predicate auto-onboard, driven
+/// by the host pump after `update-interest`). Absent ⇒ full recapture
+/// over all tracked predicates. ciborium `Vec<Vec<u8>>` of encoded
+/// predicates (see [`encode_predicate`]).
+const KV_ONBOARD_PREDICATES: &str = "onboard-predicates";
+
 /// Locks per `SnapshotChunk` when emitting a chunked snapshot.
 /// Bounds the CBOR buffer one `emit` builds in wasm memory — see
 /// `WASM_BUDGET_CHUNKING.md` "Output — chunked snapshot emission".
@@ -115,16 +133,11 @@ thread_local! {
     /// as `TRACKED_ADDRESSES` for the CrowdLock-style sweep.
     static TRACKED_PAYMENT_CREDS: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
 
-    /// In-flight `rebootstrap` round. `None` between rounds.
-    /// `ReentrantRound` (from `mitos-module-kit`) owns the
-    /// predicate list, `predicate_idx`, page cursor, and the
-    /// per-predicate `Vec<LockEntry>` accumulator. Resident
-    /// across the host's re-entrant call loop; a trap or host
-    /// restart discards it and the round resumes from the
-    /// durable state-kv cursor (`predicate_idx`).
-    static REBOOTSTRAP_STATE: RefCell<
-        Option<ReentrantRound<RebootstrapPredicate, Vec<LockEntry>>>,
-    > = RefCell::new(None);
+    /// In-flight re-entrant `rebootstrap` driver. `None` between
+    /// rounds; rebuilt from the durable cursor after a trap. Holds no
+    /// resident lock set — locks shard to state-kv per page (REPLACE),
+    /// emit pages them back by key cursor. See [`ChunkedBootstrap`].
+    static REBOOTSTRAP_DRIVER: RefCell<Option<ChunkedBootstrap>> = const { RefCell::new(None) };
 }
 
 /// One predicate of a `rebootstrap` round — a watched address or
@@ -133,6 +146,75 @@ thread_local! {
 enum RebootstrapPredicate {
     Address(String),
     PaymentCred([u8; HASH_BYTES]),
+}
+
+impl RebootstrapPredicate {
+    /// Encode to the kit's opaque `Vec<u8>` predicate form:
+    /// tag(1) ‖ payload. `0x00` = address utf8, `0x01` = 28-byte cred.
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            RebootstrapPredicate::Address(addr) => {
+                let mut v = Vec::with_capacity(1 + addr.len());
+                v.push(0x00);
+                v.extend_from_slice(addr.as_bytes());
+                v
+            }
+            RebootstrapPredicate::PaymentCred(cred) => {
+                let mut v = Vec::with_capacity(1 + HASH_BYTES);
+                v.push(0x01);
+                v.extend_from_slice(cred);
+                v
+            }
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        match bytes.split_first() {
+            Some((0x00, rest)) => {
+                Some(RebootstrapPredicate::Address(String::from_utf8(rest.to_vec()).ok()?))
+            }
+            Some((0x01, rest)) => {
+                Some(RebootstrapPredicate::PaymentCred(<[u8; HASH_BYTES]>::try_from(rest).ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The wire `(InterestKind, interest_value)` this predicate emits
+    /// its snapshot under.
+    fn interest(&self) -> (InterestKind, String) {
+        match self {
+            RebootstrapPredicate::Address(addr) => (InterestKind::Address, addr.clone()),
+            RebootstrapPredicate::PaymentCred(cred) => {
+                (InterestKind::PaymentCred, hex::encode(cred))
+            }
+        }
+    }
+}
+
+// ── Sharded per-lock store ──
+// `vlock:<predicate_hex>:<entry_key_hex>` → CBOR `LockEntry`. The kv
+// keys are the source of truth; the kit driver pages them.
+
+/// Sortable per-lock shard key: `tx_hash(32) ‖ index(4 BE) ‖
+/// asset_name`. Sorts as `(tx_hash, index, asset_name)` — the
+/// deterministic snapshot order the resident-Vec path achieved with a
+/// full sort.
+fn lock_entry_key(lock: &LockEntry) -> Vec<u8> {
+    let tx = hex::decode(&lock.utxo_ref.tx_hash).unwrap_or_default();
+    let name = hex::decode(&lock.asset_name_hex).unwrap_or_default();
+    let mut k = Vec::with_capacity(tx.len() + 4 + name.len());
+    k.extend_from_slice(&tx);
+    k.extend_from_slice(&lock.utxo_ref.index.to_be_bytes());
+    k.extend_from_slice(&name);
+    k
+}
+
+fn lock_shard_prefix(predicate_hex: &str) -> String {
+    format!("{KV_LOCK_SHARD_PREFIX}{predicate_hex}:")
+}
+fn lock_shard_kv_key(predicate_hex: &str, entry_key: &[u8]) -> String {
+    format!("{KV_LOCK_SHARD_PREFIX}{predicate_hex}:{}", hex::encode(entry_key))
 }
 
 // ============================================================
@@ -222,24 +304,10 @@ fn restore_tracked_interests() {
     );
 }
 
-// ============================================================
-// Rebootstrap continuation cursor (durable predicate index)
-// ============================================================
-
-fn save_rebootstrap_cursor(predicate_idx: usize) {
-    state_kv::set_value(KV_REBOOTSTRAP_CURSOR, &(predicate_idx as u64).to_be_bytes());
-}
-
-fn load_rebootstrap_cursor() -> usize {
-    state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
-        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
-        .map(|b| u64::from_be_bytes(b) as usize)
-        .unwrap_or(0)
-}
-
-fn clear_rebootstrap_cursor() {
-    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
-}
+// The re-entrant `rebootstrap` continuation cursor is owned by the
+// shared [`ChunkedBootstrap`] driver (kit-encoded), persisted via
+// [`VestingIo`]'s `load_cursor` / `save_cursor` / `clear_cursor` on
+// `KV_REBOOTSTRAP_CURSOR`.
 
 // Vesting lock datum decode lives in the shared
 // `mitos_vesting_decode` crate (imported above) so this module
@@ -532,68 +600,37 @@ fn resolve_owner_stake(owner_pkh_hex: &str) -> Option<String> {
 }
 
 // ============================================================
-// Cold-start
+// Cold-start (onboard scope → host-pumped chunked rebootstrap)
 // ============================================================
 
-/// Snapshot scan for a single newly-added address interest.
-///
-/// Paged (`WASM_BUDGET_CHUNKING.md`): walks `utxos_by_address`
-/// one host-clamped page at a time, building lock entries
-/// page-by-page so only one page of refs is ever resident.
-fn cold_start_address(address: &str) {
-    let mut locks: Vec<LockEntry> = Vec::new();
-    let mut total_utxos: usize = 0;
-    // Assigned on every loop iteration before being read after
-    // the loop — the `loop` body always runs at least once.
-    let mut anchor_slot: u64;
-    let mut after: Option<Vec<u8>> = None;
-
-    loop {
-        let page = chain_data::utxos_by_address(address, after.as_deref(), COLD_START_PAGE_HINT);
-        anchor_slot = page.anchor_slot;
-        total_utxos += page.refs.len();
-        locks.extend(build_snapshot_locks(&page.refs));
-        match page.next {
-            Some(token) => after = Some(token),
-            None => break,
+/// Record `added` predicates as the scope for the next `rebootstrap`
+/// pump. Merges with any still-pending scope (rapid successive adds
+/// all cold-start) and resets the durable cursor + in-process driver
+/// so the pump restarts cleanly over the scoped set. Mirrors
+/// collection-holders / holder-distribution — the inline single-fuel
+/// cold-start (resident Vec + sort) is gone; the host pumps the
+/// budget-safe chunked rebootstrap over just these predicates.
+fn seed_onboard_scope(added: &[RebootstrapPredicate]) {
+    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
+    for p in added {
+        let enc = p.encode();
+        if !scope.contains(&enc) {
+            scope.push(enc);
         }
     }
-    emit_snapshot(
-        InterestKind::Address,
-        address.to_owned(),
-        locks,
-        total_utxos,
-        anchor_slot,
-    );
+    scope.sort_unstable();
+    let mut buf = Vec::with_capacity(64 + scope.len() * 40);
+    if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
+        state_kv::set_value(KV_ONBOARD_PREDICATES, &buf);
+    }
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+    REBOOTSTRAP_DRIVER.with(|c| *c.borrow_mut() = None);
 }
 
-/// Snapshot scan for a single newly-added payment-cred interest.
-/// Paged identically to `cold_start_address`.
-fn cold_start_payment_cred(cred: &[u8; HASH_BYTES]) {
-    let mut locks: Vec<LockEntry> = Vec::new();
-    let mut total_utxos: usize = 0;
-    // Assigned on every loop iteration before being read after
-    // the loop — the `loop` body always runs at least once.
-    let mut anchor_slot: u64;
-    let mut after: Option<Vec<u8>> = None;
-
-    loop {
-        let page = chain_data::utxos_by_payment_cred(cred, after.as_deref(), COLD_START_PAGE_HINT);
-        anchor_slot = page.anchor_slot;
-        total_utxos += page.refs.len();
-        locks.extend(build_snapshot_locks(&page.refs));
-        match page.next {
-            Some(token) => after = Some(token),
-            None => break,
-        }
-    }
-    emit_snapshot(
-        InterestKind::PaymentCred,
-        hex::encode(cred),
-        locks,
-        total_utxos,
-        anchor_slot,
-    );
+/// Decode the pending onboard scope (encoded predicates), if any.
+fn read_onboard_scope() -> Option<Vec<Vec<u8>>> {
+    let bytes = state_kv::get_value(KV_ONBOARD_PREDICATES)?;
+    ciborium::de::from_reader(&bytes[..]).ok()
 }
 
 /// Common cold-start body: bulk-resolve each ref's output +
@@ -629,56 +666,10 @@ fn build_snapshot_locks(refs: &[WitOutputRef]) -> Vec<LockEntry> {
     all_locks
 }
 
-/// Emit a snapshot as a chunked `SnapshotBegin` →
-/// `SnapshotChunk` × N → `SnapshotEnd` sequence
-/// (`WASM_BUDGET_CHUNKING.md`) — never building the whole
-/// lock-list CBOR in wasm memory at once.
-fn emit_snapshot(
-    interest_kind: InterestKind,
-    interest_value: String,
-    mut locks: Vec<LockEntry>,
-    refs_scanned: usize,
-    anchor_slot: u64,
-) {
-    // Deterministic ordering for stable goldens.
-    locks.sort_by(|a, b| {
-        a.utxo_ref
-            .tx_hash
-            .cmp(&b.utxo_ref.tx_hash)
-            .then_with(|| a.utxo_ref.index.cmp(&b.utxo_ref.index))
-            .then_with(|| a.asset_name_hex.cmp(&b.asset_name_hex))
-    });
-    let lock_count = locks.len();
-
-    // `anchor_slot` from the frozen scan — the tip the
-    // materialised UTxO set was consistent as-of.
-    emit_event(&VestingEvent::SnapshotBegin(SnapshotBegin {
-        interest_kind,
-        interest_value: interest_value.clone(),
-        cursor_slot: anchor_slot,
-        cursor_hash_hex: String::new(),
-    }));
-    for chunk in locks.chunks(SNAPSHOT_CHUNK_LOCKS) {
-        emit_event(&VestingEvent::SnapshotChunk(SnapshotChunk {
-            interest_kind,
-            interest_value: interest_value.clone(),
-            locks: chunk.to_vec(),
-        }));
-    }
-    emit_event(&VestingEvent::SnapshotEnd(SnapshotEnd {
-        interest_kind,
-        interest_value: interest_value.clone(),
-        lock_count: lock_count as u64,
-    }));
-
-    logging::log(
-        LogLevel::Info,
-        LOG_TARGET,
-        &format!(
-            "cold-start {interest_kind:?}={interest_value}: {refs_scanned} UTxO(s) → {lock_count} lock(s)"
-        ),
-    );
-}
+// Snapshot emission is driven by the shared [`ChunkedBootstrap`]
+// driver via [`VestingIo`]'s `emit_begin` / `emit_chunk` / `emit_end`
+// — the locks are sharded (sorted by `lock_entry_key`) so the emit
+// pages them in order, with no resident lock-list + sort.
 
 // ============================================================
 // Live event handling
@@ -818,16 +809,31 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
                     set.remove(c);
                 }
             });
+            // Drop the sharded lock state for each removed predicate.
+            for a in &new_addresses {
+                let pred = RebootstrapPredicate::Address(a.clone());
+                state_kv::delete_prefix(&lock_shard_prefix(&hex::encode(pred.encode())));
+            }
+            for c in &new_creds {
+                let pred = RebootstrapPredicate::PaymentCred(*c);
+                state_kv::delete_prefix(&lock_shard_prefix(&hex::encode(pred.encode())));
+            }
         }
     }
 
     persist_tracked_interests();
 
-    for a in added_addresses {
-        cold_start_address(&a);
-    }
-    for c in added_creds {
-        cold_start_payment_cred(&c);
+    // Cold-start each newly-added predicate via the budget-safe chunked
+    // `rebootstrap` pump (the host drives it after `update-interest`)
+    // rather than an inline single-fuel scan: record the added
+    // predicates as the next rebootstrap's scope.
+    let added: Vec<RebootstrapPredicate> = added_addresses
+        .into_iter()
+        .map(RebootstrapPredicate::Address)
+        .chain(added_creds.into_iter().map(RebootstrapPredicate::PaymentCred))
+        .collect();
+    if !added.is_empty() {
+        seed_onboard_scope(&added);
     }
 }
 
@@ -899,107 +905,189 @@ impl Guest for Module {
     }
 
     /// Re-emit lock snapshots for watched addresses + payment
-    /// credentials — **one bounded page per call**
-    /// (`WASM_BUDGET_CHUNKING.md`). The host loops, refuelling
-    /// each call, until a step comes back `done`; a page of UTxOs
-    /// fits one fuel budget, a whole busy predicate does not.
-    ///
-    /// Round state (predicate list + page cursor + accumulating
-    /// lock set) is thread-local; the durable cursor in
-    /// `state-kv` is only the `predicate_idx`, so a trap or host
-    /// restart restarts the current predicate from page 0 — safe,
-    /// since each predicate emits a full authoritative `Snapshot`.
-    /// Addresses are scanned before payment creds.
-    ///
-    /// `init` restores the tracked sets from `state-kv`, so the
-    /// module knows what it watches.
+    /// credentials via the shared re-entrant [`ChunkedBootstrap`]
+    /// driver: scan a page → shard each lock (REPLACE) → emit one
+    /// `SnapshotChunk` per call from the sorted shards. No resident
+    /// lock set + sort; every progress field is durable.
     fn rebootstrap() -> Result<RebootstrapStep, String> {
-        REBOOTSTRAP_STATE.with(|cell| {
-            let mut state = cell.borrow_mut();
-
-            // First call of a round (or the thread-local was
-            // wiped by a trap/restart) — rebuild round state. The
-            // predicate list is sorted (addresses, then creds) so
-            // the durable `predicate_idx` cursor is stable across
-            // a host restart.
-            if state.is_none() {
-                let mut addresses: Vec<String> =
-                    TRACKED_ADDRESSES.with(|s| s.borrow().iter().cloned().collect());
-                addresses.sort_unstable();
-                let mut creds: Vec<[u8; HASH_BYTES]> =
-                    TRACKED_PAYMENT_CREDS.with(|s| s.borrow().iter().copied().collect());
-                creds.sort_unstable();
-                let mut predicates: Vec<RebootstrapPredicate> =
-                    Vec::with_capacity(addresses.len() + creds.len());
-                predicates.extend(addresses.into_iter().map(RebootstrapPredicate::Address));
-                predicates.extend(creds.into_iter().map(RebootstrapPredicate::PaymentCred));
-                *state = Some(ReentrantRound::resume(predicates, load_rebootstrap_cursor()));
-            }
-            let round = state.as_mut().expect("round initialised above");
-
-            // No predicates left — round done.
-            let Some(predicate) = round.current().cloned() else {
-                clear_rebootstrap_cursor();
-                *state = None;
-                return Ok(RebootstrapStep {
-                    done: true,
-                    ingested: 0,
+        REBOOTSTRAP_DRIVER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                // Scope: a pending onboard set (subscribe-time Add)
+                // cold-starts just those predicates; else a full
+                // recapture over every tracked predicate. Predicates
+                // are kit-encoded `Vec<u8>` (addresses, then creds).
+                let predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
+                    let mut addrs: Vec<String> =
+                        TRACKED_ADDRESSES.with(|s| s.borrow().iter().cloned().collect());
+                    addrs.sort_unstable();
+                    let mut creds: Vec<[u8; HASH_BYTES]> =
+                        TRACKED_PAYMENT_CREDS.with(|s| s.borrow().iter().copied().collect());
+                    creds.sort_unstable();
+                    let mut preds: Vec<Vec<u8>> = addrs
+                        .into_iter()
+                        .map(|a| RebootstrapPredicate::Address(a).encode())
+                        .collect();
+                    preds.extend(
+                        creds
+                            .into_iter()
+                            .map(|c| RebootstrapPredicate::PaymentCred(c).encode()),
+                    );
+                    preds
                 });
-            };
-
-            // Process exactly one page of the current predicate.
-            let page = match &predicate {
-                RebootstrapPredicate::Address(addr) => {
-                    chain_data::utxos_by_address(addr, round.after(), COLD_START_PAGE_HINT)
-                }
-                RebootstrapPredicate::PaymentCred(cred) => {
-                    chain_data::utxos_by_payment_cred(cred, round.after(), COLD_START_PAGE_HINT)
-                }
-            };
-            let ingested = page.refs.len() as u64;
-            let anchor_slot = page.anchor_slot;
-            let page_locks = build_snapshot_locks(&page.refs);
-            round.acc_mut().extend(page_locks);
-
-            match page.next {
-                Some(token) => {
-                    // More pages for this predicate — keep the round.
-                    round.page_more(ingested, token);
-                    Ok(RebootstrapStep {
-                        done: false,
-                        ingested,
-                    })
-                }
-                None => {
-                    // Predicate fully scanned — emit its snapshot,
-                    // then advance the durable cursor.
-                    round.page_last(ingested);
-                    let (kind, value) = match &predicate {
-                        RebootstrapPredicate::Address(addr) => {
-                            (InterestKind::Address, addr.clone())
-                        }
-                        RebootstrapPredicate::PaymentCred(cred) => {
-                            (InterestKind::PaymentCred, hex::encode(cred))
-                        }
-                    };
-                    let refs_scanned = round.items() as usize;
-                    let locks = std::mem::take(round.acc_mut());
-                    emit_snapshot(kind, value, locks, refs_scanned, anchor_slot);
-                    let adv = round.finish_predicate();
-                    if adv.round_done {
-                        clear_rebootstrap_cursor();
-                        *state = None;
-                    } else {
-                        save_rebootstrap_cursor(adv.predicate_idx);
-                    }
-                    Ok(RebootstrapStep {
-                        done: adv.round_done,
-                        ingested,
-                    })
-                }
+                let mut predicates = predicates;
+                predicates.sort_unstable();
+                let cursor = state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+                    .and_then(|b| BootstrapCursor::decode(&b));
+                *slot = Some(ChunkedBootstrap::resume(predicates, cursor));
             }
+            let driver = slot.as_mut().expect("driver initialised above");
+            let mut io = VestingIo;
+            let out = driver.step(&mut io);
+            if out.done {
+                *slot = None;
+                state_kv::delete_value(KV_ONBOARD_PREDICATES);
+            }
+            Ok(RebootstrapStep {
+                done: out.done,
+                ingested: out.ingested,
+            })
         })
     }
+}
+
+/// `BootstrapIo` adapter wiring the kit driver to vesting-tracker's
+/// host-fns. REPLACE semantics — each lock UTxO is a distinct entry
+/// (no SUM, no decomp). Predicates are kit-encoded
+/// [`RebootstrapPredicate`]s; shards are namespaced per predicate.
+struct VestingIo;
+
+impl BootstrapIo for VestingIo {
+    type Entry = LockEntry;
+
+    fn scan_page(&mut self, predicate: &[u8], after: Option<&[u8]>) -> ScannedPage<LockEntry> {
+        let page = match RebootstrapPredicate::decode(predicate) {
+            Some(RebootstrapPredicate::Address(addr)) => {
+                chain_data::utxos_by_address(&addr, after, COLD_START_PAGE_HINT)
+            }
+            Some(RebootstrapPredicate::PaymentCred(cred)) => {
+                chain_data::utxos_by_payment_cred(&cred, after, COLD_START_PAGE_HINT)
+            }
+            None => {
+                return ScannedPage {
+                    entries: Vec::new(),
+                    next: None,
+                    anchor_slot: 0,
+                    ingested: 0,
+                };
+            }
+        };
+        let ingested = page.refs.len() as u64;
+        let entries: Vec<(Vec<u8>, LockEntry)> = build_snapshot_locks(&page.refs)
+            .into_iter()
+            .map(|lock| (lock_entry_key(&lock), lock))
+            .collect();
+        ScannedPage {
+            entries,
+            next: page.next,
+            anchor_slot: page.anchor_slot,
+            ingested,
+        }
+    }
+
+    fn shard_get_many(&self, predicate: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        // REPLACE (`accumulates = false`) — the kit never reads priors.
+        let _ = (predicate, keys);
+        keys.iter().map(|_| None).collect()
+    }
+    fn shard_put_many(&mut self, predicate: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) {
+        let predicate_hex = hex::encode(predicate);
+        let kv_entries: Vec<(String, Vec<u8>)> = entries
+            .iter()
+            .map(|(k, v)| (lock_shard_kv_key(&predicate_hex, k), v.clone()))
+            .collect();
+        state_kv::set_many(&kv_entries);
+    }
+    fn shard_scan(
+        &self,
+        predicate: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let predicate_hex = hex::encode(predicate);
+        let prefix = lock_shard_prefix(&predicate_hex);
+        let after_key = after.map(|a| lock_shard_kv_key(&predicate_hex, a));
+        state_kv::kv_scan(&prefix, after_key.as_deref(), limit as u32)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix(prefix.as_str())
+                    .and_then(|h| hex::decode(h).ok())
+                    .map(|ek| (ek, v))
+            })
+            .collect()
+    }
+    fn shard_clear(&mut self, predicate: &[u8]) {
+        state_kv::delete_prefix(&lock_shard_prefix(&hex::encode(predicate)));
+    }
+
+    fn encode_entry(&self, entry: &LockEntry) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        let _ = ciborium::ser::into_writer(entry, &mut buf);
+        buf
+    }
+    fn decode_entry(&self, bytes: &[u8]) -> Option<LockEntry> {
+        ciborium::de::from_reader(bytes).ok()
+    }
+    // REPLACE — each lock UTxO is distinct; default `accumulates=false`
+    // + `merge`=replace are correct.
+
+    fn load_cursor(&self) -> Option<Vec<u8>> {
+        state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+    }
+    fn save_cursor(&mut self, bytes: &[u8]) {
+        state_kv::set_value(KV_REBOOTSTRAP_CURSOR, bytes);
+    }
+    fn clear_cursor(&mut self) {
+        state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+    }
+
+    fn emit_begin(&mut self, predicate: &[u8], anchor_slot: u64) {
+        let (interest_kind, interest_value) = predicate_interest(predicate);
+        emit_event(&VestingEvent::SnapshotBegin(SnapshotBegin {
+            interest_kind,
+            interest_value,
+            cursor_slot: anchor_slot,
+            cursor_hash_hex: String::new(),
+        }));
+    }
+    fn emit_chunk(&mut self, predicate: &[u8], entries: Vec<LockEntry>) {
+        let (interest_kind, interest_value) = predicate_interest(predicate);
+        emit_event(&VestingEvent::SnapshotChunk(SnapshotChunk {
+            interest_kind,
+            interest_value,
+            locks: entries,
+        }));
+    }
+    fn emit_end(&mut self, predicate: &[u8], total: u64) {
+        let (interest_kind, interest_value) = predicate_interest(predicate);
+        emit_event(&VestingEvent::SnapshotEnd(SnapshotEnd {
+            interest_kind,
+            interest_value,
+            lock_count: total,
+        }));
+    }
+    fn chunk_size(&self) -> usize {
+        SNAPSHOT_CHUNK_LOCKS
+    }
+}
+
+/// Resolve a kit predicate to the wire `(InterestKind, value)`; a
+/// malformed predicate (shouldn't happen) degrades to an Address scope
+/// with an empty value rather than panicking the emit.
+fn predicate_interest(predicate: &[u8]) -> (InterestKind, String) {
+    RebootstrapPredicate::decode(predicate)
+        .map(|p| p.interest())
+        .unwrap_or((InterestKind::Address, String::new()))
 }
 
 export!(Module);
