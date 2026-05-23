@@ -355,26 +355,33 @@ Nikeverse holders won't refill cleanly until this work ships.
   `POST https://mitos.defrag.cc/_admin/modules/<id>/recapture {"companion":"*"}`
   (Bearer `MITOS_AUTH_TOKEN` from the box's `/etc/default/mitos-mainnet`).
 
-## SB5 — Plan A: full holder-distribution migration (DEFERRED 2026-05-23)
+## SB5 — Plan A: full holder-distribution migration (SHIPPED 2026-05-23)
 
-**Status: DEFERRED, fully specified.** SB1–SB4 + SB6 + SB7 + bulk-apply
-shipped (the CNFT path — collection-holders / collection-metadata —
-scales and is contamination-free). holder-distribution is the **CNT**
-side (fungible-token analytics, consumed by epochify), and the only
-remaining migration. It is parked deliberately to keep focus on CNFTs;
-this section is the complete, fresh-session-ready pickup.
+**Status: SHIPPED + verified on prod (build `76e1d205e916`).** Implemented
+exactly as specified below: kit `Phase::Decomp` + `decomp_step` (no-op
+default), `meta:` side-state shard, `decomp:` prefix, paged materialise,
+sharded SUM raw ledger + sharded deltas; vesting-tracker migrated alongside
+(REPLACE, sort eliminated). 3 new holder-distribution goldens authored
+first (raw / LP-pool / vesting) — all green, byte-identical pre/post; 51
+goldens total. Post-deploy: a `holder-distribution` recapture ran the new
+sharded + decomp path on **real Aliens data (CSwap pool + CrowdLock
+vesting), 11430 UTxOs, no trap**, all 4 epochify companions drained clean —
+the real-on-chain exercise the synthetic goldens couldn't give. A
+`collection-holders` recapture confirmed the kit `Phase::Decomp` change is
+neutral for the CNFT path. The original "why it's hard / why deferred"
+analysis is retained below as the audit trail.
 
-**Re-confirmed parked 2026-05-23** (during the B1/B2 dialer-scaling work).
-Re-evaluated whether SB5 was a quick port now that SB1–SB4 landed — it is
-**not**. The shipped driver only covers a straight `Scan → Emit` module;
-holder-distribution still needs the net-new kit `Phase::Decomp` /
-`decomp_step` hook (below), a `meta:` side-state shard, the `decomp:`
-prefix, **and** the 3 goldens that don't exist yet (financial output has
-zero regression net today). So "the hard part is done" holds for the SUM
-core but **not** for this module's decomposition. Combined with the live
-evidence that there is **no scale pressure** — the only consumer (epochify,
-`hooks.epochify.space` + dev) tracks 2 policies at ~33 emissions each, for
-which the resident-ledger model is entirely fine — the right call is to
+### Original deferral analysis (resolved by the shipped work)
+
+**Was parked 2026-05-23** (during the B1/B2 dialer-scaling work) because at
+that point: the shipped driver only covered a straight `Scan → Emit`
+module; holder-distribution needed the net-new kit `Phase::Decomp` /
+`decomp_step` hook, a `meta:` side-state shard, the `decomp:` prefix, **and**
+3 goldens that didn't exist (financial output had zero regression net).
+Combined with the live evidence that there was **no scale pressure** — the
+only consumer (epochify, `hooks.epochify.space` + dev) tracks 2 policies at
+~33 emissions each, for which the resident-ledger model is entirely fine —
+the call at the time was to
 fold this into the dedicated fuel-exhaustion sweep as the documented
 headline resident-ledger risk, and pick up this spec when a real
 large-CNT (Hosky-class) consumer materialises. Don't re-litigate "is it a
