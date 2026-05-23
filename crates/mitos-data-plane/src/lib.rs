@@ -338,4 +338,14 @@ pub trait ChainDataPlane: Send + Sync {
 
     /// Current protocol parameters at the chain tip.
     async fn protocol_params(&self) -> DataPlaneResult<types::ProtocolParameters>;
+
+    /// Oldest slot whose block body is still retained by the archive —
+    /// the "archive horizon". Inputs/datums older than this can't be
+    /// resolved from the archive: e.g. hash-only CIP-68 reference
+    /// datums below the horizon resolve to nothing, yielding empty
+    /// trait metadata. `None` when unknown, the archive is empty, or
+    /// the plane has no dolos archive in scope (the default).
+    async fn archive_horizon_slot(&self) -> DataPlaneResult<Option<u64>> {
+        Ok(None)
+    }
 }

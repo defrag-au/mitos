@@ -1,0 +1,30 @@
+# mitos-run fixture for collection-holders against the 12-pair
+# CIP-68 mint in block 165639806 (the Mekka Dynasty mint TX).
+#
+# TX: 3c60bfff18b8a7f385a64c744cb44837ceff64f9966f07b5c81cb9a0edad54f9
+# Policy: 29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56
+# Pairs minted: 12 (`_100` reference + `_222` user-token each)
+#
+# Exercises the key collection-holders concern from
+# `docs/design/COLLECTION_MODULES.md`: both CIP-68 reference
+# tokens AND user tokens surface as movements. Maestro's
+# `/policy/{id}/accounts` aggregates by stake credential and
+# may omit the reference tokens (treasury-held); `utxos_by_policy`
+# returns the complete UTxO set and we emit both halves.
+#
+# Expected emission shape:
+#   - On `update_interest(Add, holds_policy)`: a `SnapshotBegin`
+#     → `SnapshotChunk` → `SnapshotEnd` sequence reflecting the
+#     pre-mint UTxO set for this policy. In this fixture there
+#     are no pre-existing UTxOs, so the snapshot is empty
+#     (begin + end, no chunk).
+#   - On the mint TX's `handle_events` dispatch: one
+#     `CollectionDelta` carrying 24 `Movement` entries — 12
+#     reference-token (`000643b0...`) + 12 user-token
+#     (`000de140...`) — each with `from: None` (mint).
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56"

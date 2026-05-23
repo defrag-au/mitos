@@ -1,0 +1,27 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "decafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecafbad"
+  },
+  {
+    "entries": [
+      {
+        "asset_name_hex": "48617368666f7830303031",
+        "immutable": false,
+        "metadata_json": "{\"background\":\"Cobalt\",\"body\":\"Mecha\",\"eyes\":\"Laser\",\"image\":\"ipfs://bafkreihashfox0001imagecidplaceholder0001\",\"name\":\"Hashfox #0001\"}",
+        "source_tx": "00000000000000000000000000000000000000000000000000000000000000aa",
+        "standard": "cip68_v1",
+        "version": 1
+      }
+    ],
+    "kind": "snapshot_chunk",
+    "policy": "decafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecafbad"
+  },
+  {
+    "entry_count": 1,
+    "kind": "snapshot_end",
+    "policy": "decafbaddecafbaddecafbaddecafbaddecafbaddecafbaddecafbad"
+  }
+]

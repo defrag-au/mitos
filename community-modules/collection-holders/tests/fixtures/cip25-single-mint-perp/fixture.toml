@@ -1,0 +1,22 @@
+# mitos-run fixture for collection-holders against the Perp5158
+# single-asset CIP-25 mint in block 186913993.
+#
+# Reuses the block from `cip-25-mint`'s perp-policy fixture.
+#
+# Policy:  e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0
+# Asset:   5065727035313538 (UTF-8 "Perp5158")
+# Mint qty: 1
+#
+# Sanity-check for the simplest case: a single CIP-25 user-token
+# mint shows up as a `CollectionDelta` with one `Movement` —
+# `from: None` (mint), `to: <recipient stake>`, `quantity: 1`.
+#
+# Pairs with `cip68-pair-mint-mekka` to cover both metadata
+# standards' mint shapes; pairs with `cold-start-mixed-holders`
+# to cover the snapshot-vs-delta split.
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"

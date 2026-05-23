@@ -1,0 +1,47 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "aa11bb22cc33dd44ee55ff66112233445566778899aabbccddeeff00"
+  },
+  {
+    "holdings": [
+      {
+        "asset_name_hex": "cafe",
+        "holder": {
+          "stake": "0b5f5b3b6b48c35d8e92d2f31558f0d9c4b3ca3b2dd7e497fc614fef"
+        },
+        "quantity": 1
+      },
+      {
+        "asset_name_hex": "f00d",
+        "holder": {
+          "stake": "0b5f5b3b6b48c35d8e92d2f31558f0d9c4b3ca3b2dd7e497fc614fef"
+        },
+        "quantity": 1
+      },
+      {
+        "asset_name_hex": "dead",
+        "holder": {
+          "stake": "2c967f4bd28944b06462e13c5e3f5d5fa6e03f8567569438cd833e6d"
+        },
+        "quantity": 5
+      },
+      {
+        "asset_name_hex": "beef",
+        "holder": {
+          "payment": "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"
+        },
+        "quantity": 1
+      }
+    ],
+    "kind": "snapshot_chunk",
+    "policy": "aa11bb22cc33dd44ee55ff66112233445566778899aabbccddeeff00"
+  },
+  {
+    "holding_count": 4,
+    "kind": "snapshot_end",
+    "policy": "aa11bb22cc33dd44ee55ff66112233445566778899aabbccddeeff00"
+  }
+]

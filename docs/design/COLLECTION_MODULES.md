@@ -1,6 +1,8 @@
 # Collection Modules — Holders & Metadata
 
-> **Status: design draft (2026-05-20).** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives.
+> **Status: Phase 1 shipped (2026-05-20). Phases 2–5 pending.** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives. **Target dispatch model: platform v2** ([`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md)) — both modules consume interest-filtered `produced` / `consumed` events per TX, not block-iteration. Bootstrap, backfill, and tip dispatch flow through the same path on v2.
+>
+> **Phase 1 shipped at `community-modules/collection-holders/`** (event types in `mitos-community-events::collection_holders`), with four golden fixtures under `tests/fixtures/`: `cip68-pair-mint-mekka`, `cold-start-mixed-holders`, `cip25-single-mint-perp`, `cip68-datum-update-noop`. Mitos-run gained a `by_policy` index in the fixture data plane to support cold-start tests for holder-shaped modules. **Outstanding Phase 1 follow-ups:** `HolderRef::Script.label` lookup via `address-registry` (deferred per Resolved Decision #3); FT-classified policy hard-reject; 48-hour live acceptance test against a deployed mitos host.
 
 ## Goal
 
@@ -10,7 +12,7 @@ Two collection-shaped primitives:
 
 | Module | Subscribe → emits |
 |---|---|
-| `collection-holders` | `CollectionSnapshot` (all `(asset_name, holder, qty)` tuples at a cursor) + `CollectionDelta` events on asset movement |
+| `collection-holders` | `Snapshot{Begin,Chunk,End}` (all `(asset_name, holder, qty)` tuples at a cursor) + `CollectionDelta` events on asset movement |
 | `collection-metadata` | `MetadataSnapshot` (all `(asset_name, metadata)` pairs at a cursor) + `MetadataUpdate` events for CIP-68 datum rotations |
 
 A consumer subscribing to both for the same `companion_key` gets the entire "what does this collection currently look like, and how does it change" picture in two parallel typed event streams. CIP-25 and CIP-68 are presented uniformly — see [The CIP-68 Facade](#the-cip-68-facade-for-cip-25).
@@ -58,7 +60,7 @@ Why not reuse `holder-distribution`? That module is CNT-shaped (`holder → tota
               │    Produced/Consumed deltas        ─ live tail   │
               │                                                  │
               │  Outputs:                                        │
-              │    CollectionSnapshot                            │
+              │    Snapshot{Begin,Chunk,End}                            │
               │    CollectionDelta                               │
               └──────────────────────────────────────────────────┘
 
@@ -82,8 +84,9 @@ Why not reuse `holder-distribution`? That module is CNT-shaped (`holder → tota
                                                              │
                                                              │
               ┌──────────────────────────────────────────────▼────┐
-              │  MaestroFallbackPlane (existing infrastructure)   │
-              │  - tx aux_data fetch + cache (aux_data.redb)      │
+              │  Maestro fallback (existing infrastructure)       │
+              │  - aux_data + datum fetch + cache                 │
+              │    (indexer_data.redb)                            │
               │  - per-process semaphore (MAESTRO_MAX_INFLIGHT)   │
               │  - in-flight coalescing, 429-aware backoff        │
               └───────────────────────────────────────────────────┘
@@ -95,17 +98,9 @@ Both modules share the dynamic-interest pattern from `holder-distribution`: empt
 
 ### Event surface
 
-```rust
-/// Emitted once on subscription when the interest set first includes
-/// a policy, and again on a `Recapture` request. Carries the full
-/// per-asset-name ledger at the named chain cursor.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CollectionSnapshot {
-    pub policy: PolicyId,
-    pub cursor: ChainPoint,
-    pub holdings: Vec<Holding>,
-}
+The snapshot is emitted as a **chunked sequence** (`SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd`), not as a single event. Building the whole holdings list as one CBOR payload traps for large policies under the per-call WASM fuel budget — same pattern + same reason as `holder-distribution` (see `WASM_BUDGET_CHUNKING.md`). Consumer semantics: on `SnapshotBegin`, wipe the policy's projection; the sequence is an authoritative replacement.
 
+```rust
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Holding {
     pub asset_name_hex: String,
@@ -118,32 +113,58 @@ pub struct Holding {
 /// stake-credential-grouping limitations of asset-by-policy APIs.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HolderRef {
-    Stake(String),                                       // bech32 stake_addr
+    Stake(String),                                       // 56-char hex stake credential
     Payment(String),                                     // bech32 payment_addr (no stake credential)
     Script { addr: String, label: Option<String> },      // script addr + known-marketplace tag
 }
 
-/// Emitted for each TX touching the policy.
+/// Opens a chunked snapshot for one policy.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotBegin {
+    pub policy: String,                  // 56-char hex
+    pub cursor_slot: u64,
+    pub cursor_hash_hex: String,         // empty when host doesn't surface a block hash
+}
+
+/// One bounded slice of the snapshot's holdings list.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotChunk {
+    pub policy: String,
+    pub holdings: Vec<Holding>,          // ≤ SNAPSHOT_CHUNK_HOLDINGS per chunk
+}
+
+/// Closes a chunked snapshot. Consumer marks the projection authoritative.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnapshotEnd {
+    pub policy: String,
+    pub holding_count: u64,              // sanity check across the sequence
+}
+
+/// Emitted for each TX touching the policy that produces a non-empty
+/// movement list. Same-holder zero-delta movements (change outputs) are
+/// netted out before emission.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CollectionDelta {
-    pub policy: PolicyId,
-    pub cursor: ChainPoint,
-    pub tx_hash: TxHash,
-    pub movements: Vec<Movement>,  // net per-TX, after change netting
+    pub policy: String,
+    pub tx_hash: String,                 // 64-char hex
+    pub slot: u64,
+    pub movements: Vec<Movement>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Movement {
     pub asset_name_hex: String,
-    pub from: Option<HolderRef>,   // None on mint
-    pub to: Option<HolderRef>,     // None on burn
+    pub from: Option<HolderRef>,         // None on mint
+    pub to: Option<HolderRef>,           // None on burn
     pub quantity: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CollectionHoldersEvent {
-    Snapshot(CollectionSnapshot),
+pub enum CollectionEvent {
+    SnapshotBegin(SnapshotBegin),
+    SnapshotChunk(SnapshotChunk),
+    SnapshotEnd(SnapshotEnd),
     Delta(CollectionDelta),
 }
 ```
@@ -160,7 +181,7 @@ pub enum CollectionHoldersEvent {
    - Decode address → `HolderRef::Stake | Payment | Script`
    - For each asset in the output's value where `policy == X`, emit a `Holding`
 4. Aggregate into the state ledger, persist under `holder_ledger:<policy_hex>`.
-5. Emit `CollectionSnapshot` at the current cursor.
+5. Emit a `SnapshotBegin` → `SnapshotChunk` × N → `SnapshotEnd` sequence at the current cursor.
 
 **Live updates (per block):**
 
@@ -172,21 +193,17 @@ For each TX touching policy `X`:
 
 **Rollback:**
 
-On `Undo(point)`:
-1. Re-emit Movements in reverse for TXs between `tip` and `point`
-2. Apply reverse to ledger
-3. Update cursor to `point`
-
-This matches `holder-distribution`'s rollback strategy exactly; no novel semantics needed.
+Platform v2 contract: the host re-feeds events from the rollback cursor forward, and the chain-point-keyed dApp `apply_event` handler re-applies idempotently (per `MITOS_COMPANION_RUNTIME_V1.md` Q3). The module logs the rollback for operator visibility but maintains no per-cursor undo log on the module side — convergence comes from re-apply, not rewind.
 
 ### State management
 
-Per-policy storage in mitos kv-state:
+Storage in mitos kv-state:
 
 | Key | Value |
 |---|---|
-| `holder_ledger:<policy_hex>` | CBOR-encoded `HashMap<(asset_name_hex, holder_key), u64>` |
-| `holder_cursor:<policy_hex>` | Last applied `ChainPoint` |
+| `tracked-policies` | CBOR `Vec<String>` of 56-char policy-id hexes (the active interest set; restored on `init`) |
+| `ledger:<policy_hex>` | CBOR `PolicyLedger { holdings: BTreeMap<HolderKey, BTreeMap<Vec<u8>, u64>> }` — nest-by-holder, keyed on the in-memory `HolderKey` (no `Script.label`, that's a presentation concern resolved at emit time) |
+| `rebootstrap-cursor` | 8-byte BE `predicate_idx` into the sorted tracked-policy list — drives the chunked re-entrant rebootstrap. Single global key, not per-policy: the round walks policies in sorted order and the cursor advances only when a policy's emit closes |
 
 Size estimates:
 - 10k-supply NFT collection, ~3k distinct holders: ~10k entries × ~80 bytes = **~800KB**
@@ -214,7 +231,7 @@ Interest::Holds(Policy(X))
 
 Identical to `holder-distribution`'s shape. Module is dynamic-interest only — no static config. Adding/removing interest on the fly is supported via the standard mutation endpoint.
 
-A subscription's `Add` triggers cold-start scan + `CollectionSnapshot` emission. `Remove` clears the ledger from state (or refcounts it if multiple companions still want it — see [Open Questions](#open-questions)).
+A subscription's `Add` triggers cold-start scan + chunked snapshot emission. `Remove` clears the ledger from state immediately (per Resolved Decisions #1 — no TTL, no refcount; rebuild on next subscribe).
 
 ## `collection-metadata` module
 
@@ -301,16 +318,14 @@ pub enum MetadataEvent {
 
 **Cold-start — CIP-25 path (historical, may require Maestro fallback):**
 
-1. Call `chain_data::mint_history_by_policy(X)` — *proposed new host-fn*, see [Required Data Plane Additions](#required-data-plane-additions). Returns `Vec<(asset_name_hex, mint_tx_hash)>` for all mints under the policy.
-2. For each mint TX:
-   - Try `chain_data::tx_metadata(tx_hash)` — Dolos's `aux_data.redb` cache + live archive
-   - If unavailable (TX past archive horizon and not cached), `MaestroFallbackPlane` resolves via `fetch_aux_data(tx_hash)`
-3. Parse `tx_metadata[721][policy_hex][asset_name]` → `CanonicalMetadata`
+1. Call `chain_data::utxos_by_policy(X)` → derive the set of currently-held `asset_name_hex` values from the typed outputs. This is the set of assets whose metadata we need.
+2. Resolve `asset_name → mint_tx_hash` via the module-internal Maestro path (`/policy/{id}/assets` catalog + per-asset `/assets/{id}/txs?type=mint`). The data plane's existing `MaestroClient` is the call site; rate-limit envelope is shared.
+3. For each `(asset_name, mint_tx_hash)`:
+   - Call `chain_data::tx_metadata(tx_hash)` — tiered: Dolos archive first, `MaestroFallbackPlane` via `fetch_aux_data` for TXs past the horizon
+   - Decode the CBOR aux-data payload, extract `[721][policy_hex][asset_name]` → `CanonicalMetadata`
 4. Emit `MetadataSnapshot`
 
-The Maestro fallback is **already present** in the platform for UTxO resolution past the archive horizon (see `crates/mitos-platform/src/maestro_fallback_plane.rs`). Extending it to mint-metadata backfill requires:
-- Confirming `MaestroClient::fetch_aux_data` returns CIP-25 (`721`) metadata labels (likely yes — Maestro's `/transactions/{hash}/metadata` endpoint surfaces all labels)
-- Adding `tx_metadata` to the data-plane trait if not already present, with the same tiered resolution as `read_utxos`
+Both `tx_metadata` (data plane API at `lib.rs:241`) and `MaestroFallbackPlane` (UTxO fallback at `crates/mitos-platform/src/maestro_fallback_plane.rs`) are already in place. The only platform-side work for the CIP-25 path is verifying that `MaestroClient::fetch_aux_data` returns aux-data CBOR including the CIP-25 (`721`) label across all known Maestro response shapes.
 
 **Cold-start — Hybrid (policy uses both, common during CIP-25→CIP-68 migrations):**
 
@@ -348,23 +363,24 @@ For large CIP-25 collections, **snapshot emission is the dominant cost**. Chunki
 - **Asset minted before policy was tracked by mitos.** Cold-start covers via the history scan. No "missed mint" gap.
 - **Multiple mint TXs for same asset_name (RFT supply growth).** Each mint emits a `MetadataInitial` if it carries new metadata; subsequent re-mints of the same asset_name with same metadata are silently deduped by version comparison. (Edge case — most RFTs mint identical metadata across all copies.)
 
-### Required data plane additions
+### Data plane surface
 
-To support both modules cleanly, the host-fn surface needs the following additions (each is a small extension of an existing data-plane shape — none represent novel chain indexing):
+What's already available (verified 2026-05-21 against `crates/mitos-data-plane/src/lib.rs`):
 
 | Host-fn | Used by | Status |
 |---|---|---|
-| `chain_data::utxos_by_policy(policy_id) -> Vec<OutputRef>` | both | exists (`holder-distribution` uses it) |
-| `chain_data::read_utxos(refs) -> Vec<(OutputRef, TypedOutput)>` | both | exists (with Maestro fallback) |
-| `chain_data::tx_metadata(tx_hash) -> Option<TxMetadata>` | `collection-metadata` | **new** — needs implementation + Maestro fallback |
-| `chain_data::mint_history_by_policy(policy_id) -> Vec<(asset_name_hex, tx_hash)>` | `collection-metadata` | **new** — depends on Dolos exposing a mint-history index |
+| `chain_data::utxos_by_policy(policy_id) -> Vec<OutputRef>` | both | `lib.rs:129` — exists (`holder-distribution` uses it) |
+| `chain_data::read_utxos(refs) -> Vec<(OutputRef, TypedOutput)>` | both | `lib.rs:81` — exists with Maestro fallback via `MaestroFallbackPlane` |
+| `chain_data::tx_metadata(tx_hash) -> Option<Vec<u8>>` | `collection-metadata` | `lib.rs:241` — **already shipped**, returns CBOR aux-data payload (CIP-25 metadata at label 721 is decoded by the module) |
 
-The `mint_history_by_policy` host-fn is the riskiest unknown. Dolos's existing indices are UTxO-set-shaped, not mint-history-shaped. Two implementation paths:
+What still needs to land for the CIP-25 historical bootstrap path:
 
-1. **Walk policy history via existing TX index.** For each TX referencing the policy in its mint set, record `(asset_name, tx_hash)`. Build incrementally as blocks apply.
-2. **Defer to Maestro.** Maestro's `/policy/{id}/assets` endpoint returns the catalog; pair with per-asset `/assets/{id}/mints` to get the mint TX. N+1 but fully outside the chain index. Acceptable as a phase-1 fallback while a native Dolos index is evaluated.
+**Mint-TX resolution for currently-held assets.** Given a `policy_id` and the set of currently-held `asset_name_hex` values (derivable from `utxos_by_policy` + `read_utxos`), we need to find each asset's mint TX hash so we can call `tx_metadata` against it. Two implementation paths, neither requiring a new host-fn:
 
-Phase 1 should default to option 2 (Maestro fallback for historical CIP-25) to keep the module-side surface small. Native Dolos indexing is a phase-3 optimisation if the cold-start cost proves material.
+1. **Module-internal Maestro enumeration.** The module calls Maestro's `/policy/{id}/assets` (catalog) and `/assets/{id}/txs?type=mint` (or equivalent) via the data plane's existing Maestro client, builds the `asset_name → mint_tx_hash` map, then runs `tx_metadata` per mint TX. The Maestro client and its rate-limit envelope (`MAESTRO_MAX_INFLIGHT`) are already in place; this just calls them.
+2. **Native Dolos mint-by-policy index.** Add a `mint_history_by_policy` host-fn backed by a Dolos index. Defer until cold-start performance dictates; module-internal path works fine for tens-of-thousands-of-asset collections.
+
+Option 1 is the right Phase 3 default. No new host-fn proposal. The module-internal pattern is consistent with how `holder-distribution` derives ledger state from `utxos_by_policy` results without needing the platform to surface a "holder ledger" primitive.
 
 ### Interest model
 
@@ -392,7 +408,7 @@ A core principle of this design: **workers do not call Maestro directly.** Mitos
 ### Why centralise the fallback
 
 - **Single rate-limit envelope.** Today's `collection-ownership` worker hits Maestro from its own DO, with its own retry logic and no coordination with other workers. Centralising in mitos means one process-wide semaphore (`MAESTRO_MAX_INFLIGHT`) governs all fallback traffic across all consumers.
-- **One cache.** `aux_data.redb` already caches resolved aux data. Pulling CIP-25 metadata via the platform means the cache amortises across all metadata consumers, not per-worker.
+- **One cache.** `indexer_data.redb` already caches resolved aux data (and datums). Pulling CIP-25/CIP-68 metadata via the platform means the cache amortises across all metadata consumers, not per-worker.
 - **One classification path.** FT-detection, malformed-metadata handling, ref-token parsing — all live in the module, applied uniformly. Workers consume typed events.
 - **Easier to swap.** When the Dolos archive horizon extends, or when Maestro is replaced by a different fallback source (a self-hosted Blockfrost-shape, a different indexer), only the platform changes.
 
@@ -402,7 +418,7 @@ The cost concern with Maestro-mediated bootstrap is the per-asset metadata fetch
 
 - 10k-supply collection past archive horizon → up to 10k Maestro aux-data fetches at cold-start
 - With `MAESTRO_MAX_INFLIGHT=4` and ~200ms per call → ~8 minutes wall time, fully sequenced
-- One-time per policy. Cached forever in `aux_data.redb` after.
+- One-time per policy. Cached forever in `indexer_data.redb` after.
 
 This is comparable to the current `cnft.tools` paginated bootstrap that `collection-ownership` runs today (minutes for active policies). It's acceptable, and the cache means subsequent subscriptions for the same policy are free.
 
@@ -426,14 +442,14 @@ SubscribeRequest {
 }
 ```
 
-Both modules independently dial back to the worker's `/_internal/apply-<channel>` endpoints. Subscribed companions see two separate event streams, demuxed by channel name. Snapshot semantics are independent — `CollectionSnapshot` and `MetadataSnapshot` may arrive at slightly different cursors, and the worker reconciles them when both have caught up. (Versioning by cursor makes this safe — see [Open Questions](#open-questions) for cross-stream cursor coordination.)
+Both modules independently dial back to the worker's `/_internal/apply-<channel>` endpoints. Subscribed companions see two separate event streams, demuxed by channel name. Snapshot semantics are independent — `Snapshot{Begin,Chunk,End}` and `MetadataSnapshot` may arrive at slightly different cursors, and the worker reconciles them when both have caught up. (Versioning by cursor makes this safe — see [Open Questions](#open-questions) for cross-stream cursor coordination.)
 
 ### `collection-ownership` worker integration
 
 The worker's current `handle_configure` path (per [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md)) already embeds the mitos companion runtime. Wiring in collection-holders + collection-metadata is additive:
 
 1. On policy onboarding, the worker subscribes to both targets in one call.
-2. `CollectionSnapshot` apply → `ownership` table populated. Same SQL path as today's `reconcile_full_with_traits`, but with explicit `HolderRef::Script` handling (either include with script address as owner, or filter — per-policy config).
+2. `Snapshot{Begin,Chunk,End}` apply → `ownership` table populated. Same SQL path as today's `reconcile_full_with_traits`, but with explicit `HolderRef::Script` handling (either include with script address as owner, or filter — per-policy config).
 3. `MetadataSnapshot` apply → `asset_traits` table populated. Same trait-bitmap construction as today's D1 trait-reconcile path, but sourced from typed events rather than Maestro/cnft.tools fetches.
 4. `CollectionDelta` → existing transfer SQL path (already runs from `apply_transfer`).
 5. `MetadataUpdate::Initial` → trait bitmap insert.
@@ -447,7 +463,7 @@ The Maestro client in the worker is retained as a defensive fallback (the [`COLL
 For a future TCG worker, the same subscription pattern applies. Differences:
 
 - The `MetadataSnapshot` is the card definition catalogue (200 cards × ~3KB datum = ~600KB)
-- The `CollectionSnapshot` is per-player inventory (10k user tokens × ~80 bytes = ~800KB)
+- The `Snapshot{Begin,Chunk,End}` is per-player inventory (10k user tokens × ~80 bytes = ~800KB)
 - `MetadataUpdate::Updated` fires when card art / stats are rotated (e.g. seasonal balance changes via datum updates)
 - `Movement` events drive UI: card purchased, card listed, card transferred, booster opened
 - `Movement.from = None` events specifically surface as "new card minted to your wallet" UX
@@ -471,16 +487,14 @@ The two modules are explicitly *peers*, not alternatives. A policy that has both
 
 ## Phased delivery
 
-### Phase 1 — `collection-holders` module ships
+### Phase 1 — `collection-holders` module ships ✅
 
-- Module implementation in `community-modules/collection-holders/`
-- Cold-start via `utxos_by_policy` + `read_utxos`
-- Live tail via Produced/Consumed walk
-- Snapshot + Delta emission with chunking
-- Script-address `HolderRef::Script` with empty label registry (labels added in a later phase)
-- Acceptance: a test consumer subscribes to a known policy (suggest islanova_apex_legends or aliens), receives full snapshot with non-zero script-address holdings, deltas track live transfers correctly for 48 hours
+**Shipped 2026-05-20.** Implementation at `community-modules/collection-holders/collection_holders.rs`. All six v2 Guest exports implemented including the chunked re-entrant `rebootstrap`. Wire types at `crates/mitos-community-events/src/collection_holders.rs`. Four golden fixtures land alongside.
 
-Estimated: 3–5 days.
+**Acceptance work outstanding:**
+- 48-hour live test against a known policy (suggest islanova_apex_legends or aliens) — requires deployed mitos host.
+- `HolderRef::Script.label` registry wire-up (per Resolved Decision #3).
+- FT-classified policy hard-reject on subscribe (defensive guard against accidental CNT subscriptions).
 
 ### Phase 2 — `collection-metadata` (CIP-68 path only)
 
@@ -492,15 +506,16 @@ Estimated: 3–5 days.
 
 Estimated: 3–4 days. CIP-25 path explicitly deferred.
 
-### Phase 3 — `collection-metadata` CIP-25 facade + Maestro fallback
+### Phase 3 — `collection-metadata` CIP-25 facade
 
-- Add `chain_data::tx_metadata` host-fn with Maestro fallback
-- Add `chain_data::mint_history_by_policy` host-fn (initial implementation backed by Maestro `/policy/{id}/assets`)
-- CIP-25 cold-start path: enumerate mint TXs, fetch metadata via tiered resolution
+- Module-internal Maestro enumeration (`/policy/{id}/assets` + per-asset mint TX lookup) using the data plane's existing Maestro client
+- Use existing `chain_data::tx_metadata` host-fn (`crates/mitos-data-plane/src/lib.rs:241`) with its existing fallback for aux-data resolution
+- CIP-25 cold-start path: derive asset_name set from `utxos_by_policy`, resolve mint TX per asset via Maestro, fetch metadata via `tx_metadata`
 - CanonicalMetadata normalisation across CIP-25 and CIP-68
+- Verify `MaestroClient::fetch_aux_data` surfaces label-721 metadata across Maestro response shapes
 - Acceptance: subscribed against islanova_apex_legends (CIP-25, historical), receives full metadata snapshot including script-locked supply's metadata. Maestro call count is bounded by collection size and one-time per policy.
 
-Estimated: 4–6 days. Includes platform-side host-fn work.
+Estimated: 3–4 days. No new host-fn work — data plane surface is sufficient as-is.
 
 ### Phase 4 — `collection-ownership` worker cuts over to mitos bootstrap
 
@@ -511,9 +526,10 @@ Estimated: 4–6 days. Includes platform-side host-fn work.
 
 Estimated: 3–5 days.
 
-### Phase 5 — Mint-history native indexing (optional, deferred)
+### Phase 5 — `mint_history_by_policy` native host-fn (optional, deferred)
 
-- Dolos-side `mint_history` index (drops the Maestro-mediated CIP-25 history fetch in favour of a native scan)
+- New `chain_data::mint_history_by_policy(policy_id) -> Vec<(asset_name_hex, tx_hash)>` host-fn backed by a Dolos mint index
+- Replaces the module-internal Maestro enumeration in Phase 3 with a single host-fn call
 - Only needed if phase-3 cold-start cost is material in practice
 
 Estimated: 5–10 days. Deferred until phase 4 telemetry justifies the work.
@@ -524,11 +540,11 @@ These were open during initial drafting and have since been closed out. Captured
 
 1. **GC on `Remove` interest.** Clear `holder_ledger:<policy_hex>` and `metadata_ledger:<policy_hex>` immediately when the last companion drops interest. Rationale: without an active consumer, the ledger stops receiving deltas and goes stale fast; retaining it is worse than rebuilding on the next subscription. Cold-start cost is the same whether the data was retained-and-stale or absent.
 
-2. **Cross-module cursor coordination.** Consumer reconciles. `CollectionSnapshot` and `MetadataSnapshot` may arrive at different cursors; the consumer applies deltas from each stream forward independently. Matches the existing emission-id ordering semantics; no module-side coordination needed.
+2. **Cross-module cursor coordination.** Consumer reconciles. `Snapshot{Begin,Chunk,End}` and `MetadataSnapshot` may arrive at different cursors; the consumer applies deltas from each stream forward independently. Matches the existing emission-id ordering semantics; no module-side coordination needed.
 
 3. **`HolderRef::Script` label registry.** Use the existing `shared-crates/address-registry` crate. It already has rich typed labelling for marketplaces (`JpgStoreV1`–`V4`, `Wayup`), DEXes (Splash, DexHunter, Minswap, CSWAP, SaturnSwap), and vesting contracts (CrowdLock). The `collection-holders` module looks up `HolderRef::Script.label` via this registry at emission time. Avoids duplicating known-script knowledge; the registry becomes the single source of truth across mitos modules and consumer workers.
 
-4. **Catalog completeness on RFT policies.** Ref tokens are tracked from the moment they hit chain, regardless of whether any user tokens exist yet. For a TCG, this means card definitions appear in `MetadataSnapshot` as soon as the treasury mints the ref tokens (typically all at once at project launch). Treasury ref-token holdings appear in `CollectionSnapshot` as regular `HolderRef::Stake` entries against the treasury stake address. Consumers filter via standard projection logic.
+4. **Catalog completeness on RFT policies.** Ref tokens are tracked from the moment they hit chain, regardless of whether any user tokens exist yet. For a TCG, this means card definitions appear in `MetadataSnapshot` as soon as the treasury mints the ref tokens (typically all at once at project launch). Treasury ref-token holdings appear in `Snapshot{Begin,Chunk,End}` as regular `HolderRef::Stake` entries against the treasury stake address. Consumers filter via standard projection logic.
 
 5. **Metadata version semantics.** Use the CIP-68 datum-version field directly (per spec). CIP-25 entries get `version = 1` always. Consumers detect updates by hash-comparing `payload` across `MetadataEntry` revisions; the module doesn't maintain a separate monotonic counter.
 
@@ -555,16 +571,20 @@ This is a soft dependency: collection-holders + collection-metadata work without
 
 ## References
 
-- [`HOLDER_DISTRIBUTION_MODULE.md`](./HOLDER_DISTRIBUTION_MODULE.md) — sibling module for CNT distribution; pattern reference
-- [`DOMAIN_REFACTOR.md`](./DOMAIN_REFACTOR.md) — top-level domain taxonomy these modules project from
-- [`MULTI_CLIENT_COMPANIONS.md`](./MULTI_CLIENT_COMPANIONS.md) — `(module_id, client_id, companion_key)` triple identity
+- [`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md) — **target dispatch model**: eUTXO-event-filtered-by-interest, not block-iteration. Both modules implement against this surface.
+- [`MULTI_CLIENT_COMPANIONS.md`](./MULTI_CLIENT_COMPANIONS.md) — `(module_id, client_id, companion_key)` triple identity (now required, not optional)
+- [`WASM_BUDGET_CHUNKING.md`](./WASM_BUDGET_CHUNKING.md) — snapshot chunking for large emissions (Phases 1–5 shipped 2026-05-19)
 - [`EVENT_DELIVERY_RESILIENCE.md`](./EVENT_DELIVERY_RESILIENCE.md) — at-least-once delivery, recapture semantics, Maestro fallback context
-- [`WASM_BUDGET_CHUNKING.md`](./WASM_BUDGET_CHUNKING.md) — snapshot chunking for large emissions
-- [`DIALER_BULK_APPLY.md`](./DIALER_BULK_APPLY.md) — bulk-apply throughput design; soft dependency for efficient snapshot delivery
-- [`DIALER_CONCURRENCY.md`](./DIALER_CONCURRENCY.md) — partition-keyed pool underpinning per-policy lanes
+- [`DIALER_CONCURRENCY.md`](./DIALER_CONCURRENCY.md) — partition-keyed pool underpinning per-policy lanes (shipped 2026-05-14 at lanes=8)
+- [`DIALER_BULK_APPLY.md`](./DIALER_BULK_APPLY.md) — bulk-apply throughput design; soft dependency for efficient snapshot delivery (design draft)
+- [`HOLDER_DISTRIBUTION_MODULE.md`](./HOLDER_DISTRIBUTION_MODULE.md) — sibling CNT module; superseded in specifics but pattern reference holds
+- [`DOMAIN_REFACTOR.md`](./DOMAIN_REFACTOR.md) — superseded as implementation vehicle, but the `Mint` / `Burn` / `AssetMovement` taxonomy remains canonical and underpins these modules' event shapes
 - [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md) — consumer-side worker migration plan
-- `crates/mitos-platform/src/maestro_fallback_plane.rs` — existing Maestro fallback implementation
-- `crates/mitos-platform/src/maestro.rs` — Maestro client + `aux_data.redb` cache
+- `crates/mitos-data-plane/src/lib.rs:81,129,241` — host-fns these modules use (`read_utxos`, `utxos_by_policy`, `tx_metadata` all already shipped)
+- `crates/mitos-platform/src/maestro_fallback_plane.rs` — Maestro fallback for `read_utxos` (prior-output resolution)
+- `crates/mitos-platform/src/host_fns/mod.rs` (`CachingDataPlane`) — Maestro + cache fallback for `tx_metadata` (aux_data) and `datum_by_hash` (datums)
+- `crates/mitos-platform/src/maestro.rs` — Maestro client (`fetch_aux_data`, `fetch_datum`, `fetch_output`)
+- `crates/mitos-platform/src/indexer_data_cache.rs` — persistent `indexer_data.redb` cache (aux_data + datum namespaces)
 - `community-modules/holder-distribution/holder_distribution.rs` — implementation reference for module structure
 - `~/code/defrag/shared-crates/address-registry/src/registry.rs` — typed marketplace / DEX / vesting script labels used for `HolderRef::Script.label`
 - CIP-25 spec: <https://cips.cardano.org/cip/CIP-25>

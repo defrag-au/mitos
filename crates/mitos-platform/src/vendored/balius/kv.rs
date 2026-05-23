@@ -203,6 +203,132 @@ impl RedbKv {
         }
         Ok(result)
     }
+
+    // ── mitos additions: batched / paginated ops for sharded module
+    // state at scale (see docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md).
+    // Not part of the vendored upstream.
+
+    /// Paginated `(logical_key, value)` range scan under `prefix`,
+    /// keys sorted, `after` (a logical key) **exclusive**, up to
+    /// `limit` rows. Values are returned alongside keys (redb range
+    /// yields both) so a chunked emit needs no follow-up gets.
+    /// Logical keys have the `{module_id}-` namespace stripped.
+    pub fn scan(
+        &self,
+        module_id: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        use std::ops::Bound;
+        let rx = self
+            .db
+            .begin_read()
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        let table = rx
+            .open_table(Self::DEF)
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+
+        let storage_prefix = Self::key_for_module(module_id, prefix);
+        let lower = match after {
+            Some(a) => Bound::Excluded(Self::key_for_module(module_id, a)),
+            None => Bound::Included(storage_prefix.clone()),
+        };
+        let range = table
+            .range::<String>((lower, Bound::Unbounded))
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+
+        let namespace = Self::key_for_module(module_id, "");
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for item in range {
+            if out.len() >= limit {
+                break;
+            }
+            let (k, v) = item.map_err(|err| KvError::Internal(err.to_string()))?;
+            let full = k.value();
+            if !full.starts_with(&storage_prefix) {
+                break;
+            }
+            let logical = full
+                .strip_prefix(&namespace)
+                .map(String::from)
+                .unwrap_or(full);
+            out.push((logical, v.value()));
+        }
+        Ok(out)
+    }
+
+    /// Batched random-access get — one read txn for many keys.
+    /// Result is parallel to `keys` (`None` ⇒ absent).
+    pub fn get_many(
+        &self,
+        module_id: &str,
+        keys: &[String],
+    ) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        let rx = self
+            .db
+            .begin_read()
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        let table = rx
+            .open_table(Self::DEF)
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let v = table
+                .get(Self::key_for_module(module_id, key))
+                .map_err(|err| KvError::Internal(err.to_string()))?
+                .map(|g| g.value());
+            out.push(v);
+        }
+        Ok(out)
+    }
+
+    /// Batched write — one write txn (one fsync) for many keys.
+    pub fn set_many(&self, module_id: &str, entries: &[(String, Vec<u8>)]) -> Result<(), KvError> {
+        let wx = self
+            .db
+            .begin_write()
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        {
+            let mut table = wx
+                .open_table(Self::DEF)
+                .map_err(|err| KvError::Internal(err.to_string()))?;
+            for (key, value) in entries {
+                table
+                    .insert(Self::key_for_module(module_id, key), value.clone())
+                    .map_err(|err| KvError::Internal(err.to_string()))?;
+            }
+        }
+        wx.commit()
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete every key under `prefix` in one write txn.
+    pub fn delete_prefix(&self, module_id: &str, prefix: &str) -> Result<(), KvError> {
+        // `list_values` returns full storage keys (`{module_id}-{logical}`).
+        let storage_keys = self.list_values(module_id, prefix)?;
+        if storage_keys.is_empty() {
+            return Ok(());
+        }
+        let wx = self
+            .db
+            .begin_write()
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        {
+            let mut table = wx
+                .open_table(Self::DEF)
+                .map_err(|err| KvError::Internal(err.to_string()))?;
+            for full_key in storage_keys {
+                table
+                    .remove(full_key)
+                    .map_err(|err| KvError::Internal(err.to_string()))?;
+            }
+        }
+        wx.commit()
+            .map_err(|err| KvError::Internal(err.to_string()))?;
+        Ok(())
+    }
 }
 
 // Tests below are mitos-side additions, not part of the
@@ -264,6 +390,79 @@ mod tests {
             kv.get_value("mod-a", "k").unwrap_err(),
             KvError::NotFound(_)
         ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_many_get_many_round_trip() {
+        let path = tempdir_path("set_get_many");
+        let kv = RedbKv::try_new(&path, Some(1)).unwrap();
+        kv.set_many(
+            "mod-a",
+            &[
+                ("p:1".into(), b"one".to_vec()),
+                ("p:2".into(), b"two".to_vec()),
+            ],
+        )
+        .unwrap();
+        let got = kv
+            .get_many("mod-a", &["p:2".into(), "p:missing".into(), "p:1".into()])
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![Some(b"two".to_vec()), None, Some(b"one".to_vec())]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_paginates_sorted_after_exclusive() {
+        let path = tempdir_path("scan");
+        let kv = RedbKv::try_new(&path, Some(1)).unwrap();
+        // Two prefixes + another module sharing key tails.
+        kv.set_many(
+            "mod-a",
+            &[
+                ("e:b".into(), b"B".to_vec()),
+                ("e:a".into(), b"A".to_vec()),
+                ("e:c".into(), b"C".to_vec()),
+                ("other:z".into(), b"Z".to_vec()),
+            ],
+        )
+        .unwrap();
+        kv.set_value("mod-b", "e:a", b"OTHER-MOD".to_vec()).unwrap();
+
+        // First page: sorted, prefix-scoped, module-scoped.
+        let page1 = kv.scan("mod-a", "e:", None, 2).unwrap();
+        assert_eq!(
+            page1,
+            vec![("e:a".into(), b"A".to_vec()), ("e:b".into(), b"B".to_vec())]
+        );
+        // Next page: after the last key, exclusive.
+        let page2 = kv.scan("mod-a", "e:", Some("e:b"), 2).unwrap();
+        assert_eq!(page2, vec![("e:c".into(), b"C".to_vec())]);
+        // Exhausted.
+        assert!(kv.scan("mod-a", "e:", Some("e:c"), 2).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_prefix_clears_only_matching() {
+        let path = tempdir_path("delete_prefix");
+        let kv = RedbKv::try_new(&path, Some(1)).unwrap();
+        kv.set_many(
+            "mod-a",
+            &[
+                ("e:1".into(), b"1".to_vec()),
+                ("e:2".into(), b"2".to_vec()),
+                ("keep:1".into(), b"k".to_vec()),
+            ],
+        )
+        .unwrap();
+        kv.delete_prefix("mod-a", "e:").unwrap();
+        assert!(kv.scan("mod-a", "e:", None, 10).unwrap().is_empty());
+        assert_eq!(kv.get_value("mod-a", "keep:1").unwrap(), b"k");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,0 +1,36 @@
+# mitos-run fixture for collection-holders against the full
+# Nikeverse1501 CIP-68 lifecycle: initial ref-token mint
+# (block 156189660) followed by a datum refresh (block
+# 172076571). Reuses both blocks from
+# `asset-metadata-update`'s nikeverse1501 fixture.
+#
+# Policy: de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32
+# Ref asset: 000643b04e696b65766572736531353031 ("Nikeverse1501")
+#
+# Expected emission shape:
+#   1. `SnapshotBegin` + `SnapshotEnd` — empty cold-start
+#      (no pre-existing UTxOs for this policy in the fixture).
+#   2. `CollectionDelta` for block 156189660 — the initial
+#      mint. One `Movement` with `from: None` (mint), `to:
+#      <treasury stake>`, qty 1.
+#   3. **No CollectionDelta** for block 172076571 — the datum
+#      update is a Consumed + Produced cycle at the same
+#      holder. Per-(asset, holder) deltas net to zero, so
+#      `flush_buffer`'s `if !movements.is_empty()` guard skips
+#      emission.
+#
+# This is the negative half of the CIP-68 lifecycle coverage —
+# pairs with `cip68-pair-mint-mekka`:
+#   - Mekka: ref tokens ARE noticed at mint (initial movement).
+#   - Nikeverse update: ref tokens are NOT spuriously surfaced
+#     on datum-only updates.
+#
+# `collection-holders` is supply-tracking, not state-tracking;
+# datum updates are `collection-metadata`'s concern (when that
+# module ships).
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "de79250af8caffc7a64645d86939159f665d4107c3f198562007bf32"

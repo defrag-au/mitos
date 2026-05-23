@@ -38,7 +38,7 @@
 //! on a single `MITOS_AUTH_TOKEN`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, Request, State};
@@ -71,25 +71,74 @@ impl AuthToken {
     pub fn as_deref(&self) -> Option<&str> {
         self.0.as_deref()
     }
+
+    /// Optional **read-only** scope token from `MITOS_READONLY_TOKEN`.
+    /// When set, it authorizes `GET` (read-only) admin endpoints but
+    /// not the mutating ones (recapture/evict/restart/upload/delete/
+    /// purge/replay) — handy for dashboards + agents that should
+    /// observe but not act. Unset → only the full token works.
+    pub fn readonly_from_env() -> Option<String> {
+        match std::env::var("MITOS_READONLY_TOKEN") {
+            Ok(t) if !t.is_empty() => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Auth scopes for the admin middleware: a full-access token (any
+/// method) and an optional read-only token (`GET` only). Open mode
+/// (no full token) allows everything, preserving prior behaviour.
+#[derive(Clone)]
+struct AuthScopes {
+    full: Option<String>,
+    readonly: Option<String>,
 }
 
 async fn require_auth(
-    State(token): State<AuthToken>,
+    State(scopes): State<AuthScopes>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(expected) = token.as_deref() {
-        let provided = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "));
-        match provided {
-            Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => {}
-            _ => return Err(StatusCode::UNAUTHORIZED),
-        }
+    // Open mode: no full token configured → allow everything
+    // (mirrors the prior behaviour; the read-only scope is moot).
+    let Some(full) = scopes.full.as_deref() else {
+        return Ok(next.run(req).await);
+    };
+
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+
+    if authorize(full, scopes.readonly.as_deref(), req.method(), provided) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
     }
-    Ok(next.run(req).await)
+}
+
+/// Pure authorization decision (extracted for unit testing). `full` is
+/// the configured full token (caller handles open mode). Returns true
+/// when `provided` matches the full token (any method), or matches the
+/// read-only token on a `GET`.
+fn authorize(
+    full: &str,
+    readonly: Option<&str>,
+    method: &axum::http::Method,
+    provided: Option<&str>,
+) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    if constant_time_eq(provided.as_bytes(), full.as_bytes()) {
+        return true;
+    }
+    // Read-only token → GET only. Every read endpoint in this router is
+    // a GET; every mutation is POST/DELETE, so method is a sound proxy
+    // for "read-only-safe".
+    method == axum::http::Method::GET
+        && readonly.is_some_and(|ro| constant_time_eq(provided.as_bytes(), ro.as_bytes()))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -118,6 +167,15 @@ struct AdminState {
     /// router is mounted without a dolos archive in scope
     /// (artifact-only deployments, tests).
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
+    /// Process start time, threaded from the bundle so `GET
+    /// /_admin/status` reports the same `uptime_secs` as the open
+    /// `/health` endpoint. Artifact-only routers capture their own
+    /// build time, which is process start for those deployments.
+    started_at: SystemTime,
+    /// Shared operational-events ring. The admin router reads it for
+    /// `GET /_admin/events` + records recapture events; the host /
+    /// follower record traps into the same instance.
+    events: crate::events::EventRing,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -129,7 +187,15 @@ struct AdminState {
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
 pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
-    admin_router_inner(storage, None, Vec::new(), None, auth)
+    admin_router_inner(
+        storage,
+        None,
+        Vec::new(),
+        None,
+        SystemTime::now(),
+        crate::events::EventRing::new(),
+        auth,
+    )
 }
 
 /// Build the admin router with the running-instance lifecycle
@@ -146,21 +212,35 @@ pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
 /// `chain_data` enables the `GET /_admin/blocks/{slot}` block-
 /// fetch route. Pass `None` to disable that route (the handler
 /// returns 503 in that case).
+#[allow(clippy::too_many_arguments)]
 pub fn admin_router_with_host(
     storage: ModuleStorage,
     host: Arc<dyn crate::host_v2::ModuleHostHandle>,
     reserved_names: Vec<String>,
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
+    started_at: SystemTime,
+    events: crate::events::EventRing,
     auth: AuthToken,
 ) -> axum::Router {
-    admin_router_inner(storage, Some(host), reserved_names, chain_data, auth)
+    admin_router_inner(
+        storage,
+        Some(host),
+        reserved_names,
+        chain_data,
+        started_at,
+        events,
+        auth,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admin_router_inner(
     storage: ModuleStorage,
     host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
     reserved_names: Vec<String>,
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
+    started_at: SystemTime,
+    events: crate::events::EventRing,
     auth: AuthToken,
 ) -> axum::Router {
     let state = AdminState {
@@ -168,8 +248,22 @@ fn admin_router_inner(
         host,
         reserved_names,
         chain_data,
+        started_at,
+        events,
     };
-    axum::Router::new()
+    // Auth scopes: the full token (any method) + an optional
+    // read-only token (`GET` only) from `MITOS_READONLY_TOKEN`.
+    let scopes = AuthScopes {
+        full: auth.0,
+        readonly: AuthToken::readonly_from_env(),
+    };
+
+    // Bearer-gated admin surface. The auth layer is applied to this
+    // sub-router only, so the open `/metrics` route below is exempt.
+    let authed = axum::Router::new()
+        .route("/_admin", get(admin_index))
+        .route("/_admin/status", get(status))
+        .route("/_admin/events", get(list_events))
         .route("/_admin/modules", get(list_modules))
         .route(
             "/_admin/modules/{id}",
@@ -178,6 +272,7 @@ fn admin_router_inner(
         .route("/_admin/modules/{id}/restart", post(restart_module))
         .route("/_admin/modules/{id}/recapture", post(recapture_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
+        .route("/_admin/modules/{id}/companions", get(list_companions))
         .route(
             "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
             axum::routing::delete(delete_companion),
@@ -193,8 +288,15 @@ fn admin_router_inner(
         )
         .route("/_admin/blocks/{slot}", get(get_block_by_slot))
         .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+        .layer(axum::middleware::from_fn_with_state(scopes, require_auth));
+
+    // `/metrics` is OPEN (no auth), like `/health` — operational
+    // gauges/counters for Prometheus, no secrets. Kept in this router
+    // (rather than the bundle) so it shares `AdminState` + the
+    // emission-scan helpers.
+    let open = axum::Router::new().route("/metrics", get(metrics));
+
+    authed.merge(open).with_state(state)
 }
 
 // -----------------------------------------------------------------------------
@@ -228,6 +330,144 @@ impl From<&Manifest> for ModuleSummary {
 pub struct UploadResponse {
     pub ok: bool,
     pub module: ModuleSummary,
+}
+
+/// Whole-host health snapshot for `GET /_admin/status`. One call an
+/// agent can poll for version / liveness / chain position / per-
+/// module summary. Read-only and side-effect free (safe to poll).
+/// LLM-decodable: stable keys, decision-oriented fields, `*_secs_ago`
+/// deltas rather than raw timestamps the caller must diff.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusResponse {
+    /// Crate version (`CARGO_PKG_VERSION`). Currently the static
+    /// workspace `0.0.1`; `build_sha` is the meaningful identifier.
+    pub version: String,
+    /// Git short SHA stamped at build time (`build.rs`). `"unknown"`
+    /// for non-checkout builds.
+    pub build_sha: String,
+    /// Seconds since process start (same clock as `/health`).
+    pub uptime_secs: u64,
+    /// Chain tip the data plane is reading from. `None` when no
+    /// chain-data handle is wired (artifact-only) or the query fails.
+    pub tip: Option<StatusTip>,
+    /// Oldest slot whose block body is still in the archive. Below
+    /// this, `datum_by_hash` / block fetch fail (explains empty
+    /// CIP-68 metadata for old assets). `None` until wired to dolos.
+    pub archive_horizon_slot: Option<u64>,
+    /// Per-module summary.
+    pub modules: Vec<StatusModule>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusTip {
+    pub slot: u64,
+    /// Block hash hex; `None` for `Origin` / slot-only tips.
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusModule {
+    pub id: String,
+    /// Number of registered companions across the two-level
+    /// `<client_id>/<companion_key>` layout.
+    pub companions: usize,
+    /// Undelivered emissions waiting to be dialed. The headline
+    /// "is this module backed up?" signal — a non-draining `queued`
+    /// is a stalled lane (see the dialer-backoff incident).
+    pub queued: usize,
+    /// Emissions dialed but not yet acked (in flight).
+    pub pending: usize,
+    /// A recapture is currently in flight for this module (the
+    /// per-module mutex is held). Answers "is a recapture still
+    /// running?" without a journal grep.
+    pub recapture_in_progress: bool,
+    /// A bootstrap/rebootstrap pass (`start`) is currently running.
+    pub bootstrap_in_progress: bool,
+    /// Result of the module's last rebootstrap (survives the bounded
+    /// events ring). `None` if none has run this process.
+    pub last_result: Option<StatusLastResult>,
+    /// Age of the last captured trap fixture, or `None` if none.
+    /// A small value means a module recently trapped.
+    pub last_trap_secs_ago: Option<u64>,
+}
+
+/// Serialized view of a module's last rebootstrap result.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusLastResult {
+    /// What ran (`rebootstrap`).
+    pub kind: String,
+    pub utxos_ingested: u64,
+    pub duration_ms: u64,
+    /// `completed` | `partial` | `failed`.
+    pub outcome: String,
+    pub secs_ago: u64,
+}
+
+/// Per-companion detail for `GET /_admin/modules/{id}/companions`.
+/// Replaces the journal greps for "which companions are subscribed +
+/// draining" and "where is companion X up to". LLM-decodable: the
+/// `queued`/`last_drain_secs_ago` pair is the per-companion stall
+/// signal; the source for `/metrics` per-companion gauges.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionDetail {
+    pub client_id: String,
+    pub companion_key: String,
+    /// Subscribed targets (module / indexer names).
+    pub targets: Vec<String>,
+    /// Watched policy hexes. Empty when interest is unbounded (see
+    /// `unbounded_interest`) or no policy narrowing was declared.
+    pub watched_policies: Vec<String>,
+    /// Interest matches every policy (an `Any`/`Fingerprint`
+    /// selector, or no policy narrowing) rather than the
+    /// `watched_policies` list.
+    pub unbounded_interest: bool,
+    /// Host's resume cursor slot for this companion (last applied
+    /// chain point it reported at subscribe). `None` for a fresh
+    /// companion that hasn't checkpointed.
+    pub resume_slot: Option<u64>,
+    /// Per-status emission counts scoped to this companion.
+    pub queued: usize,
+    pub pending: usize,
+    pub acked: usize,
+    pub nacked: usize,
+    pub timeout: usize,
+    /// Age of the most recent dial (max `sent_at`). `None` if never
+    /// dialed. Large/growing with non-zero `queued` = a stalled lane.
+    pub last_drain_secs_ago: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionsResponse {
+    pub module: String,
+    /// A recapture is currently in flight for this module.
+    pub recapture_in_progress: bool,
+    pub companions: Vec<CompanionDetail>,
+}
+
+/// Query for `GET /_admin/events`.
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    /// Only events with `seq >= after`. Poll cursor: pass the prior
+    /// response's `latest_seq` to get strictly-newer events.
+    #[serde(default)]
+    after: Option<u64>,
+    /// Filter to one module.
+    #[serde(default)]
+    module: Option<String>,
+    /// Filter to one event kind (e.g. `trap`, `recapture_completed`).
+    #[serde(default)]
+    kind: Option<String>,
+    /// Max events returned (default 200, capped 1000).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventsResponse {
+    events: Vec<crate::events::AdminEvent>,
+    /// Highest seq assigned so far — the cursor to poll with as
+    /// `?after=` for newer events (`mitos-admin tail --follow`).
+    latest_seq: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +595,825 @@ impl IntoResponse for HandlerError {
 // -----------------------------------------------------------------------------
 // Handlers
 // -----------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct AdminIndex {
+    service: &'static str,
+    version: &'static str,
+    build_sha: &'static str,
+    /// One-line auth summary.
+    auth: &'static str,
+    endpoints: Vec<EndpointDoc>,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointDoc {
+    method: &'static str,
+    path: &'static str,
+    /// `full` (any token), `read-only` (GET, full or read-only token),
+    /// or `open` (no auth).
+    auth: &'static str,
+    description: &'static str,
+}
+
+/// The admin surface, source of truth for `GET /_admin`. Keep in sync
+/// with the routes in `admin_router_inner`.
+const ADMIN_ENDPOINTS: &[(&str, &str, &str, &str)] = &[
+    (
+        "GET",
+        "/_admin",
+        "read-only",
+        "This self-describing endpoint index.",
+    ),
+    (
+        "GET",
+        "/_admin/status",
+        "read-only",
+        "Whole-host health: version, uptime, tip, per-module backlog/companions/trap-age.",
+    ),
+    (
+        "GET",
+        "/_admin/events",
+        "read-only",
+        "Recent operational events ring (recapture/trap). Query: after, module, kind, limit.",
+    ),
+    (
+        "GET",
+        "/_admin/modules",
+        "read-only",
+        "List registered modules.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}",
+        "read-only",
+        "One module's manifest summary.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}",
+        "full",
+        "Upload + activate a mitos-build artifact (multipart).",
+    ),
+    (
+        "DELETE",
+        "/_admin/modules/{id}",
+        "full",
+        "Stop the module + drop its slot.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/restart",
+        "full",
+        "Re-instantiate the running module.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/recapture",
+        "full",
+        "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/evict",
+        "full",
+        "Full retirement: stop + clear dialer state + remove artifact.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}/companions",
+        "read-only",
+        "Per-companion interest, cursor, emission counts, last-drain age.",
+    ),
+    (
+        "DELETE",
+        "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
+        "full",
+        "Remove one companion record.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}/last-trap",
+        "read-only",
+        "Most recent trap fixture (TOML) for local replay.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}/emissions",
+        "read-only",
+        "Emissions log. Query: status, companion, limit, after_id.",
+    ),
+    (
+        "DELETE",
+        "/_admin/modules/{id}/emissions",
+        "full",
+        "Purge emissions (requires explicit ?status=).",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/emissions/{emission_id}/replay",
+        "full",
+        "Re-queue one emission for delivery.",
+    ),
+    (
+        "GET",
+        "/_admin/blocks/{slot}",
+        "read-only",
+        "Raw block CBOR at a slot (fixture capture).",
+    ),
+    (
+        "GET",
+        "/_admin/blocks/by-tx/{tx_hash}",
+        "read-only",
+        "Raw block CBOR resolved by tx hash.",
+    ),
+    (
+        "GET",
+        "/metrics",
+        "open",
+        "Prometheus text exposition (gauges + counters).",
+    ),
+    (
+        "GET",
+        "/health",
+        "open",
+        "Liveness + uptime + indexer list.",
+    ),
+];
+
+/// `GET /_admin` — self-describing index of the admin surface so a
+/// fresh operator/agent can discover endpoints + their auth scope
+/// without reading source. Read-only.
+async fn admin_index() -> Json<AdminIndex> {
+    Json(AdminIndex {
+        service: "mitos-admin",
+        version: env!("CARGO_PKG_VERSION"),
+        build_sha: env!("MITOS_BUILD_SHA"),
+        auth: "Bearer MITOS_AUTH_TOKEN = full (any method); MITOS_READONLY_TOKEN = GET-only; /metrics + /health are open",
+        endpoints: ADMIN_ENDPOINTS
+            .iter()
+            .map(|&(method, path, auth, description)| EndpointDoc {
+                method,
+                path,
+                auth,
+                description,
+            })
+            .collect(),
+    })
+}
+
+/// `GET /_admin/status` — whole-host health for `mitos-admin status`
+/// and polling agents. Read-only; aggregates already-tracked state
+/// (build stamp, uptime, chain tip, module/companion/trap summary).
+async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>, HandlerError> {
+    let uptime_secs = SystemTime::now()
+        .duration_since(state.started_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Tip + archive horizon are best-effort: a failed query (or no
+    // chain-data handle) degrades to `None` rather than failing the
+    // whole status call.
+    let (tip, archive_horizon_slot) = match &state.chain_data {
+        Some(cd) => {
+            let tip = match cd.tip().await {
+                Ok(t) => Some(StatusTip {
+                    slot: t.slot(),
+                    hash: t.point.hash().map(hex::encode),
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "status: chain tip query failed");
+                    None
+                }
+            };
+            let horizon = match cd.archive_horizon_slot().await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, "status: archive horizon query failed");
+                    None
+                }
+            };
+            (tip, horizon)
+        }
+        None => (None, None),
+    };
+
+    // Snapshots of host-side state for the whole summary.
+    let (recapturing, bootstrapping, last_results): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+        std::collections::HashMap<String, crate::host_v2::LastResult>,
+    ) = match &state.host {
+        Some(host) => (
+            host.recapture_in_flight().await.into_iter().collect(),
+            host.bootstrap_in_flight().await.into_iter().collect(),
+            host.last_results().await.into_iter().collect(),
+        ),
+        None => Default::default(),
+    };
+
+    let now = SystemTime::now();
+    let now_unix = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ids = state.storage.list_modules()?;
+    let mut modules = Vec::with_capacity(ids.len());
+    for id in ids {
+        let last_trap_secs_ago = std::fs::metadata(state.storage.last_trap_path(&id))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|d| d.as_secs());
+        let companions = state.storage.count_companions(&id);
+        // Backlog depth. Best-effort full-scan of the emissions log
+        // (O(rows)) — fine for a polled status call at current sizes;
+        // if scrape latency bites, cache with a short TTL or maintain
+        // atomic counters on the emit/drain path. Degrades to 0/0 if
+        // the store can't be opened (e.g. no emissions yet).
+        let (queued, pending) = emission_backlog(&state, &id);
+        let last_result = last_results.get(&id).map(|r| StatusLastResult {
+            kind: r.kind.to_string(),
+            utxos_ingested: r.utxos_ingested,
+            duration_ms: r.duration_ms,
+            outcome: r.outcome.to_string(),
+            secs_ago: now_unix.saturating_sub(r.at_unix),
+        });
+        modules.push(StatusModule {
+            id: id.clone(),
+            companions,
+            queued,
+            pending,
+            recapture_in_progress: recapturing.contains(&id),
+            bootstrap_in_progress: bootstrapping.contains(&id),
+            last_result,
+            last_trap_secs_ago,
+        });
+    }
+
+    Ok(Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_sha: env!("MITOS_BUILD_SHA").to_string(),
+        uptime_secs,
+        tip,
+        archive_horizon_slot,
+        modules,
+    }))
+}
+
+/// `GET /_admin/events` — recent operational events (recapture,
+/// trap) from the in-memory ring. Read-only; safe to poll. The
+/// structured replacement for `journalctl | grep`. Surfaced as
+/// `mitos-admin tail`.
+async fn list_events(
+    State(state): State<AdminState>,
+    axum::extract::Query(q): axum::extract::Query<EventsQuery>,
+) -> Json<EventsResponse> {
+    let after = q.after.unwrap_or(0);
+    let limit = q.limit.unwrap_or(200).min(1000);
+    let module = q.module.as_deref().filter(|s| !s.is_empty());
+    let kind = q.kind.as_deref().filter(|s| !s.is_empty());
+    let events = state.events.snapshot(after, module, kind, limit);
+    Json(EventsResponse {
+        events,
+        latest_seq: state.events.latest_seq(),
+    })
+}
+
+/// Escape a Prometheus label value (`\`, `"`, newline).
+fn esc_label(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Write a metric family header (`# HELP` + `# TYPE`).
+fn metric_header(out: &mut String, name: &str, help: &str, kind: &str) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+/// `GET /metrics` — Prometheus text exposition. **Open** (no auth,
+/// like `/health`): operational gauges + counters for a dashboard /
+/// alerting, no secrets. Computed at scrape time from the same
+/// sources as the JSON endpoints — one emissions-store scan per
+/// module (see the cost note on `emission_backlog`); cache or move to
+/// atomic counters if scrape latency becomes a problem.
+async fn metrics(State(state): State<AdminState>) -> Response {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(8192);
+
+    // ----- global -----
+    let uptime = SystemTime::now()
+        .duration_since(state.started_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    metric_header(
+        &mut out,
+        "mitos_build_info",
+        "Build version + git sha (value always 1).",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "mitos_build_info{{version=\"{}\",build_sha=\"{}\"}} 1",
+        esc_label(env!("CARGO_PKG_VERSION")),
+        esc_label(env!("MITOS_BUILD_SHA")),
+    );
+    metric_header(
+        &mut out,
+        "mitos_uptime_seconds",
+        "Seconds since process start.",
+        "gauge",
+    );
+    let _ = writeln!(out, "mitos_uptime_seconds {uptime}");
+
+    if let Some(cd) = &state.chain_data {
+        if let Ok(tip) = cd.tip().await {
+            metric_header(
+                &mut out,
+                "mitos_chain_tip_slot",
+                "Current chain tip slot.",
+                "gauge",
+            );
+            let _ = writeln!(out, "mitos_chain_tip_slot {}", tip.slot());
+        }
+        if let Ok(Some(horizon)) = cd.archive_horizon_slot().await {
+            metric_header(
+                &mut out,
+                "mitos_archive_horizon_slot",
+                "Oldest slot still in the archive; datum/input lookups below this miss (empty CIP-68 traits).",
+                "gauge",
+            );
+            let _ = writeln!(out, "mitos_archive_horizon_slot {horizon}");
+        }
+    }
+
+    // ----- gather per-module + per-companion -----
+    let (recapturing, bootstrapping, last_results): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+        std::collections::HashMap<String, crate::host_v2::LastResult>,
+    ) = match &state.host {
+        Some(host) => (
+            host.recapture_in_flight().await.into_iter().collect(),
+            host.bootstrap_in_flight().await.into_iter().collect(),
+            host.last_results().await.into_iter().collect(),
+        ),
+        None => Default::default(),
+    };
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ids = state.storage.list_modules().unwrap_or_default();
+
+    struct ModMetrics {
+        module: String,
+        companions: usize,
+        recapture: bool,
+        bootstrap: bool,
+        last_rebootstrap: Option<(u64, u64)>, // (utxos_ingested, secs_ago)
+        last_trap_age: Option<u64>,
+        status_totals: [usize; 5], // queued, pending, acked, nacked, timeout
+        comps: Vec<CompMetrics>,
+    }
+    struct CompMetrics {
+        companion: String,
+        client: String,
+        queued: usize,
+        pending: usize,
+        last_drain_age: Option<u64>,
+        oldest_queued_age: Option<u64>,
+    }
+
+    let mut mods = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let last_trap_age = std::fs::metadata(state.storage.last_trap_path(id))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+            .map(|d| d.as_secs());
+        let stats = companion_emission_stats(&state, id);
+        let mut status_totals = [0usize; 5];
+        let mut comps = Vec::with_capacity(stats.len());
+        for ((companion, client), s) in &stats {
+            status_totals[0] += s.queued;
+            status_totals[1] += s.pending;
+            status_totals[2] += s.acked;
+            status_totals[3] += s.nacked;
+            status_totals[4] += s.timeout;
+            comps.push(CompMetrics {
+                companion: companion.clone(),
+                client: client.clone(),
+                queued: s.queued,
+                pending: s.pending,
+                last_drain_age: s.last_sent_unix.map(|u| now.saturating_sub(u)),
+                oldest_queued_age: s.oldest_queued_unix.map(|u| now.saturating_sub(u)),
+            });
+        }
+        let last_rebootstrap = last_results
+            .get(id)
+            .map(|r| (r.utxos_ingested, now.saturating_sub(r.at_unix)));
+        mods.push(ModMetrics {
+            module: id.clone(),
+            companions: state.storage.count_companions(id),
+            recapture: recapturing.contains(id),
+            bootstrap: bootstrapping.contains(id),
+            last_rebootstrap,
+            last_trap_age,
+            status_totals,
+            comps,
+        });
+    }
+
+    // ----- emit, grouped by metric family -----
+    const STATUS_NAMES: [&str; 5] = ["queued", "pending", "acked", "nacked", "timeout"];
+
+    metric_header(
+        &mut out,
+        "mitos_module_companions",
+        "Registered companions per module.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_module_companions{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            m.companions,
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_recapture_in_progress",
+        "1 if a recapture is currently in flight for the module.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_recapture_in_progress{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            u8::from(m.recapture),
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_bootstrap_in_progress",
+        "1 if a bootstrap/rebootstrap pass is currently running for the module.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_bootstrap_in_progress{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            u8::from(m.bootstrap),
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_last_rebootstrap_utxos",
+        "UTxOs ingested by the module's most recent rebootstrap (omitted if none).",
+        "gauge",
+    );
+    for m in &mods {
+        if let Some((utxos, _age)) = m.last_rebootstrap {
+            let _ = writeln!(
+                out,
+                "mitos_last_rebootstrap_utxos{{module=\"{}\"}} {utxos}",
+                esc_label(&m.module),
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_last_rebootstrap_age_seconds",
+        "Seconds since the module's most recent rebootstrap (omitted if none).",
+        "gauge",
+    );
+    for m in &mods {
+        if let Some((_utxos, age)) = m.last_rebootstrap {
+            let _ = writeln!(
+                out,
+                "mitos_last_rebootstrap_age_seconds{{module=\"{}\"}} {age}",
+                esc_label(&m.module),
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_module_last_trap_age_seconds",
+        "Age of the module's last trap fixture (omitted if none).",
+        "gauge",
+    );
+    for m in &mods {
+        if let Some(age) = m.last_trap_age {
+            let _ = writeln!(
+                out,
+                "mitos_module_last_trap_age_seconds{{module=\"{}\"}} {age}",
+                esc_label(&m.module),
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_module_emissions",
+        "Emission count by status per module (queued+pending = backlog).",
+        "gauge",
+    );
+    for m in &mods {
+        for (i, status) in STATUS_NAMES.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "mitos_module_emissions{{module=\"{}\",status=\"{status}\"}} {}",
+                esc_label(&m.module),
+                m.status_totals[i],
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_companion_backlog",
+        "Undelivered emissions per companion by status (queued/pending).",
+        "gauge",
+    );
+    for m in &mods {
+        for c in &m.comps {
+            for (status, val) in [("queued", c.queued), ("pending", c.pending)] {
+                let _ = writeln!(
+                    out,
+                    "mitos_companion_backlog{{module=\"{}\",companion=\"{}\",client=\"{}\",status=\"{status}\"}} {val}",
+                    esc_label(&m.module),
+                    esc_label(&c.companion),
+                    esc_label(&c.client),
+                );
+            }
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_companion_last_drain_age_seconds",
+        "Seconds since the companion's most recent dial (omitted if never).",
+        "gauge",
+    );
+    for m in &mods {
+        for c in &m.comps {
+            if let Some(age) = c.last_drain_age {
+                let _ = writeln!(
+                    out,
+                    "mitos_companion_last_drain_age_seconds{{module=\"{}\",companion=\"{}\",client=\"{}\"}} {age}",
+                    esc_label(&m.module),
+                    esc_label(&c.companion),
+                    esc_label(&c.client),
+                );
+            }
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_companion_oldest_queued_age_seconds",
+        "Age of the companion's oldest undelivered emission (a stalled lane signal; omitted if none queued).",
+        "gauge",
+    );
+    for m in &mods {
+        for c in &m.comps {
+            if let Some(age) = c.oldest_queued_age {
+                let _ = writeln!(
+                    out,
+                    "mitos_companion_oldest_queued_age_seconds{{module=\"{}\",companion=\"{}\",client=\"{}\"}} {age}",
+                    esc_label(&m.module),
+                    esc_label(&c.companion),
+                    esc_label(&c.client),
+                );
+            }
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_events_total",
+        "Cumulative operational events since start, by kind (e.g. trap, recapture_completed).",
+        "counter",
+    );
+    for (module, kind, count) in state.events.totals() {
+        let _ = writeln!(
+            out,
+            "mitos_events_total{{module=\"{}\",kind=\"{kind}\"}} {count}",
+            esc_label(&module),
+        );
+    }
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+/// Best-effort count of a module's `Queued` + `Pending` emissions —
+/// the backlog depth surfaced in `/_admin/status`. A module that has
+/// never emitted (no store) counts as `(0, 0)`. Shared with the
+/// `/metrics` exposition once that lands.
+fn emission_backlog(state: &AdminState, id: &str) -> (usize, usize) {
+    use crate::emissions::EmissionStatus::{Pending, Queued};
+    let Ok(store) = state.storage.emissions_store(id) else {
+        return (0, 0);
+    };
+    let Ok(rows) = store.list_filtered(|r| matches!(r.status, Queued | Pending)) else {
+        return (0, 0);
+    };
+    let mut queued = 0;
+    let mut pending = 0;
+    for r in &rows {
+        match r.status {
+            Queued => queued += 1,
+            Pending => pending += 1,
+            _ => {}
+        }
+    }
+    (queued, pending)
+}
+
+/// Per-companion emission accumulator, built from one scan of a
+/// module's emissions store keyed by `(companion_id, client_id)`.
+#[derive(Default)]
+struct CompanionEmissionStat {
+    queued: usize,
+    pending: usize,
+    acked: usize,
+    nacked: usize,
+    timeout: usize,
+    /// Max `sent_at` (unix secs) across the companion's rows.
+    last_sent_unix: Option<u64>,
+    /// Min `matched_at` (unix secs) across the companion's still-
+    /// `Queued` rows — the age of the oldest undelivered emission.
+    /// Distinguishes a transient burst from a genuine stall.
+    oldest_queued_unix: Option<u64>,
+}
+
+/// Parse an emissions-store timestamp (`"unix:<secs>"`) to epoch secs.
+fn parse_emission_unix(s: &str) -> Option<u64> {
+    s.strip_prefix("unix:")
+        .and_then(|n| n.trim().parse::<u64>().ok())
+}
+
+/// Scan a module's emissions store once, bucketing per-status counts
+/// (and the latest dial time) per `(companion_id, client_id)`. Empty
+/// map if the store can't be opened. The store's `companion_id` is
+/// the raw companion key, so it joins directly against the companion
+/// record's `companion_key`.
+fn companion_emission_stats(
+    state: &AdminState,
+    id: &str,
+) -> std::collections::HashMap<(String, String), CompanionEmissionStat> {
+    use crate::emissions::EmissionStatus::{Acked, Nacked, Pending, Queued, Timeout};
+    let mut map: std::collections::HashMap<(String, String), CompanionEmissionStat> =
+        std::collections::HashMap::new();
+    let Ok(store) = state.storage.emissions_store(id) else {
+        return map;
+    };
+    let Ok(rows) = store.list_filtered(|_| true) else {
+        return map;
+    };
+    for r in &rows {
+        let entry = map
+            .entry((r.companion_id.clone(), r.client_id.clone()))
+            .or_default();
+        match r.status {
+            Queued => entry.queued += 1,
+            Pending => entry.pending += 1,
+            Acked => entry.acked += 1,
+            Nacked => entry.nacked += 1,
+            Timeout => entry.timeout += 1,
+        }
+        if let Some(sent) = r.sent_at.as_deref().and_then(parse_emission_unix) {
+            entry.last_sent_unix = Some(entry.last_sent_unix.map_or(sent, |cur| cur.max(sent)));
+        }
+        if matches!(r.status, Queued)
+            && let Some(matched) = parse_emission_unix(&r.matched_at)
+        {
+            entry.oldest_queued_unix = Some(
+                entry
+                    .oldest_queued_unix
+                    .map_or(matched, |cur| cur.min(matched)),
+            );
+        }
+    }
+    map
+}
+
+/// `GET /_admin/modules/{id}/companions` — per-companion interest,
+/// resume cursor, emission counts, and last-drain age. Read-only.
+async fn list_companions(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+
+    let recapture_in_progress = match &state.host {
+        Some(host) => host.recapture_in_flight().await.iter().any(|m| m == &id),
+        None => false,
+    };
+
+    let stats = companion_emission_stats(&state, &id);
+    let now_unix = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut companions = Vec::new();
+    let root = state.storage.module_dir_for_companions(&id);
+    if let Ok(clients) = std::fs::read_dir(&root) {
+        for client in clients.flatten() {
+            // Two-level layout: skip non-dirs + metadata dirs.
+            if !client.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if client.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(client.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let path = f.path();
+                if path.extension().is_none_or(|e| e != "cbor") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(req) = mitos_protocol::SubscribeRequest::decode(&bytes) else {
+                    continue;
+                };
+
+                let (watched_policies, unbounded_interest) =
+                    match mitos_protocol::watched_policies(&req.interests) {
+                        // Unbounded (Any/Fingerprint) or no narrowing
+                        // declared → matches every policy.
+                        None => (Vec::new(), true),
+                        Some(s) if s.is_empty() => (Vec::new(), true),
+                        Some(s) => (
+                            s.into_iter().map(|p| p.as_str().to_string()).collect(),
+                            false,
+                        ),
+                    };
+                let targets = req.targets.iter().map(|t| t.name().to_string()).collect();
+                let resume_slot = req.resume_from.as_ref().and_then(|c| c.slot());
+
+                let stat = stats.get(&(req.companion_key.clone(), req.client_id.clone()));
+                let last_drain_secs_ago = stat
+                    .and_then(|s| s.last_sent_unix)
+                    .map(|sent| now_unix.saturating_sub(sent));
+
+                companions.push(CompanionDetail {
+                    client_id: req.client_id,
+                    companion_key: req.companion_key,
+                    targets,
+                    watched_policies,
+                    unbounded_interest,
+                    resume_slot,
+                    queued: stat.map_or(0, |s| s.queued),
+                    pending: stat.map_or(0, |s| s.pending),
+                    acked: stat.map_or(0, |s| s.acked),
+                    nacked: stat.map_or(0, |s| s.nacked),
+                    timeout: stat.map_or(0, |s| s.timeout),
+                    last_drain_secs_ago,
+                });
+            }
+        }
+    }
+
+    // Stable order for diff-friendly output across polls.
+    companions.sort_by(|a, b| {
+        (a.companion_key.as_str(), a.client_id.as_str())
+            .cmp(&(b.companion_key.as_str(), b.client_id.as_str()))
+    });
+
+    Ok(Json(CompanionsResponse {
+        module: id,
+        recapture_in_progress,
+        companions,
+    })
+    .into_response())
+}
 
 async fn list_modules(
     State(state): State<AdminState>,
@@ -733,6 +1792,13 @@ async fn delete_companion(
         companion_key = %companion_key,
         "companion record deleted"
     );
+    state.events.record(
+        id.as_str(),
+        crate::events::EventKind::CompanionEvicted {
+            client_id,
+            companion_key,
+        },
+    );
     Ok((StatusCode::NO_CONTENT, "").into_response())
 }
 
@@ -830,6 +1896,12 @@ async fn recapture_module(
         reason = ?req.reason,
         "recapture: admin endpoint dispatching"
     );
+    state.events.record(
+        id.as_str(),
+        crate::events::EventKind::RecaptureStarted {
+            reason: req.reason.clone(),
+        },
+    );
 
     match host
         .recapture_module(&id, req.reason, RECAPTURE_COMPANION_TIMEOUT)
@@ -843,6 +1915,13 @@ async fn recapture_module(
                 duration_ms,
                 "recapture: complete"
             );
+            state.events.record(
+                id.as_str(),
+                crate::events::EventKind::RecaptureCompleted {
+                    companions_targeted: outcome.companion_count,
+                    duration_ms,
+                },
+            );
             Ok(Json(RecaptureResponse {
                 module: outcome.module,
                 companions_targeted: outcome.companion_count,
@@ -855,6 +1934,14 @@ async fn recapture_module(
             Err(HandlerError::RecaptureInProgress(m))
         }
         Err(crate::PlatformError::RecaptureCoordination(detail)) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            state.events.record(
+                id.as_str(),
+                crate::events::EventKind::RecaptureFailed {
+                    error: detail.clone(),
+                    duration_ms,
+                },
+            );
             // Distinguish "dialer not wired" (operator
             // misconfiguration; 503) from in-flight timeout /
             // companion failure (504). The dialer-unwired path
@@ -867,10 +1954,18 @@ async fn recapture_module(
             }
         }
         Err(other) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
             tracing::error!(
                 module = %id,
                 error = %other,
                 "recapture: unexpected platform error"
+            );
+            state.events.record(
+                id.as_str(),
+                crate::events::EventKind::RecaptureFailed {
+                    error: other.to_string(),
+                    duration_ms,
+                },
             );
             Err(HandlerError::Wasmtime(format!("recapture: {other}")))
         }
@@ -1308,4 +2403,40 @@ fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
     let _component = wasmtime::component::Component::from_binary(&engine, wasm_bytes)
         .map_err(|e| HandlerError::Wasmtime(format!("component: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authorize;
+    use axum::http::Method;
+
+    const FULL: &str = "full-secret";
+    const RO: &str = "ro-secret";
+
+    #[test]
+    fn full_token_authorizes_any_method() {
+        for m in [Method::GET, Method::POST, Method::DELETE] {
+            assert!(authorize(FULL, Some(RO), &m, Some(FULL)));
+        }
+    }
+
+    #[test]
+    fn readonly_token_authorizes_only_get() {
+        assert!(authorize(FULL, Some(RO), &Method::GET, Some(RO)));
+        assert!(!authorize(FULL, Some(RO), &Method::POST, Some(RO)));
+        assert!(!authorize(FULL, Some(RO), &Method::DELETE, Some(RO)));
+    }
+
+    #[test]
+    fn wrong_or_missing_token_rejected() {
+        assert!(!authorize(FULL, Some(RO), &Method::GET, Some("nope")));
+        assert!(!authorize(FULL, Some(RO), &Method::GET, None));
+        assert!(!authorize(FULL, Some(RO), &Method::POST, None));
+    }
+
+    #[test]
+    fn readonly_unset_means_only_full_works() {
+        assert!(!authorize(FULL, None, &Method::GET, Some(RO)));
+        assert!(authorize(FULL, None, &Method::GET, Some(FULL)));
+    }
 }

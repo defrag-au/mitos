@@ -103,13 +103,17 @@ Shipped + in production:
   target. Replaces the manual multi-step reset. Design:
   [`RECAPTURE.md`](docs/design/RECAPTURE.md) +
   [`WASM_BUDGET_CHUNKING.md`](docs/design/WASM_BUDGET_CHUNKING.md).
-- **Tiered aux-data cache + Maestro fallback.** TX aux-data CBOR cached
-  permanently in `<storage_root>/aux_data.redb` — populated proactively
-  from live blocks, written through on archive hits, and resolved lazily
-  via Maestro when bootstrap walks TXs older than the Dolos archive
-  horizon. The Maestro tier is rate-limit-aware (process-wide semaphore,
+- **Tiered indexer-data cache + Maestro fallback.** Hash-addressable
+  chain facts cached permanently in `<storage_root>/indexer_data.redb`
+  (two namespaces: TX aux-data CBOR keyed by tx_hash, Plutus datum CBOR
+  keyed by datum_hash). aux-data is populated proactively from live
+  blocks and written through on archive hits; both namespaces resolve
+  lazily via Maestro on a local miss — aux-data for TXs older than the
+  Dolos archive horizon, datums for hash-only CIP-68 reference datums
+  whose preimage never landed in Dolos's `DATUM_NS` (the snapshot-gap).
+  The Maestro tier is rate-limit-aware (process-wide semaphore,
   `Retry-After`-respecting backoff). Lets bootstrap resolve years-old
-  TXs the local archive has pruned.
+  TXs and datums the local node can't.
 - **Minibf bridge.** Blockfrost-compatible HTTP surface from Dolos's
   `dolos_minibf` router mounted at `/minibf` on the bundle, gated by
   the bundle's shared auth middleware. Lets consumers query the
@@ -212,11 +216,13 @@ mitos experiments, **stop Dolos cleanly** first, then `cp -a` the whole
 data dir. Filesystem-level snapshots taken while Dolos is writing will
 produce a state that fails to recover.
 
-The aux-data cache at `<storage_root>/aux_data.redb` is independent of
-the Dolos directory and persists across bundle restarts. Setting
-`MAESTRO_API_KEY` enables the third resolution tier for TXs older than
-the Dolos archive horizon; `MAESTRO_MAX_INFLIGHT` (default 4) caps
-process-wide concurrent Maestro requests.
+The indexer-data cache at `<storage_root>/indexer_data.redb` (aux-data
++ datums) is independent of the Dolos directory and persists across
+bundle restarts. An older `aux_data.redb` is migrated in place on first
+open. Setting `MAESTRO_API_KEY` enables the Maestro resolution tier (TXs
+older than the Dolos archive horizon, plus snapshot-gapped datums);
+`MAESTRO_MAX_INFLIGHT` (default 4) caps process-wide concurrent Maestro
+requests.
 
 ## Testing
 

@@ -1,0 +1,53 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+  },
+  {
+    "holding_count": 0,
+    "kind": "snapshot_end",
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+  },
+  {
+    "kind": "delta",
+    "movements": [
+      {
+        "asset_name_hex": "5065727035313538",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "fcc32dfc95820b81d29f51dd2430bac51a62fd981d6f81b2829cba32"
+        }
+      }
+    ],
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0",
+    "slot": 186913993,
+    "tx_hash": "3f99d88cf07027d69a1f36cd0d9dec1b90fb1366b675a36e7625cb9f05ab9644"
+  },
+  {
+    "kind": "delta",
+    "movements": [
+      {
+        "asset_name_hex": "5065727030303437",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "f32a942ae7cb52d2d69ca1a19ec61417e076b7405b6b0a6997f94b0d"
+        }
+      },
+      {
+        "asset_name_hex": "5065727032313231",
+        "from": null,
+        "quantity": 1,
+        "to": {
+          "stake": "f32a942ae7cb52d2d69ca1a19ec61417e076b7405b6b0a6997f94b0d"
+        }
+      }
+    ],
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0",
+    "slot": 186913993,
+    "tx_hash": "cc1358bc9b7f09c45cc628bbcabae8fe725f7d627b10e8e6176c5d6687ff68ef"
+  }
+]

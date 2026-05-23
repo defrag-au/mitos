@@ -178,6 +178,44 @@ pub fn fixture_block_cbor() -> Option<Vec<u8>> {
     path.exists().then(|| std::fs::read(path).ok()).flatten()
 }
 
+/// Write a valid companion subscription `.cbor` at the two-level
+/// layout the production emit-drain walk expects
+/// (`<companions>/<client_id>/<companion_key>.cbor`). The drain task
+/// (`host_v2::drain_one`) only descends into `<client_id>/`
+/// subdirectories — a flat `companions/<key>.cbor` is silently
+/// skipped (the pre-`multi-client-companions` layout), so tests that
+/// stub a companion MUST use this helper to get emission rows.
+///
+/// `interests` drives the host's per-companion fan-out filter
+/// (`InterestCache`): pass `vec![mitos_protocol::Interest::any()]`
+/// for the "receive every policy" behaviour these tests assume, or a
+/// `Policy(p)` interest to assert the filter routes by policy.
+pub fn write_companion_subscription(
+    storage: &mitos_platform::storage::ModuleStorage,
+    module_id: &str,
+    client_id: &str,
+    companion_key: &str,
+    interests: Vec<mitos_protocol::Interest>,
+) {
+    let dir = storage.module_dir_for_companions(module_id).join(client_id);
+    std::fs::create_dir_all(&dir).expect("companion client dir");
+    let req = mitos_protocol::SubscribeRequest {
+        targets: vec![mitos_protocol::SubscribeTarget::Module {
+            name: module_id.to_string(),
+        }],
+        companion_key: companion_key.to_string(),
+        client_id: client_id.to_string(),
+        resume_from: None,
+        interests,
+        dial_back: None,
+    };
+    std::fs::write(
+        dir.join(format!("{companion_key}.cbor")),
+        req.encode().expect("encode subscribe"),
+    )
+    .expect("write companion cbor");
+}
+
 /// Build a v2 `Manifest` for a wasm whose bytes are passed in.
 /// Tests that need bespoke interest predicates clone + tweak the
 /// `interest` field after.

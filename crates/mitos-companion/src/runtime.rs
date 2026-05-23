@@ -41,7 +41,8 @@ use crate::meta::{self, ensure_schema, migrate_split_row_cursor, write_cursor};
 use crate::subscribe::SubscribeRequest;
 use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
 use mitos_protocol::{
-    ApplyBody, ChainPoint, Interest, InterestOp, RecaptureBody, decode_apply, decode_recapture,
+    ApplyBody, ApplyBulkResponse, BulkEmissionResult, ChainPoint, Interest, InterestOp,
+    RecaptureBody, decode_apply, decode_apply_bulk, decode_recapture, encode_apply_bulk_response,
 };
 
 /// Companion runtime.
@@ -151,6 +152,16 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         let path = url.path().to_string();
 
         match (req.method(), path.as_str()) {
+            // Bulk arm must precede the generic apply arm — a bulk
+            // URL also starts with `/_internal/apply-`. Strip both the
+            // prefix and the `-bulk` suffix to recover the channel.
+            (Method::Post, p) if p.starts_with("/_internal/apply-") && p.ends_with("-bulk") => {
+                let channel = p
+                    .trim_start_matches("/_internal/apply-")
+                    .trim_end_matches("-bulk")
+                    .to_string();
+                self.handle_apply_bulk_post(req, channel).await
+            }
             (Method::Post, p) if p.starts_with("/_internal/apply-") => {
                 let channel = p.trim_start_matches("/_internal/apply-").to_string();
                 self.handle_apply_post(req, channel).await
@@ -257,6 +268,119 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 Response::error(format!("{e}"), 422)
             }
         }
+    }
+
+    /// Bulk apply HTTP handler — the batched analogue of
+    /// [`Self::handle_apply_post`]. Decodes an `ApplyBulkRequest`,
+    /// applies each emission **in slice order** via the same
+    /// `apply_bytes` path, and returns 200 with one
+    /// `BulkEmissionResult` per emission.
+    ///
+    /// Semantics mirror the per-row path exactly:
+    /// - A per-emission apply error → `applied: false` + error text
+    ///   (the bulk analogue of a 422 Nack); the loop keeps going.
+    /// - The persisted cursor advances **once**, to the last
+    ///   emission's cursor, regardless of individual outcomes
+    ///   (same "always advance" policy as the single path).
+    /// - A decode failure or empty batch → 400.
+    /// - An unknown channel → 404 (lets the host's capability probe
+    ///   distinguish "no bulk route" — which is a path 404 from
+    ///   `fetch` — from "bulk route exists, unknown channel").
+    /// - A cursor-write failure → 500 (whole batch retried).
+    ///
+    /// Idempotency: none here. Applies are chain-point-idempotent at
+    /// the dApp handler layer (a v1 runtime contract), so a retry of
+    /// an already-applied batch converges. See
+    /// `docs/design/DIALER_BULK_APPLY.md`.
+    async fn handle_apply_bulk_post(
+        &self,
+        mut req: Request,
+        channel: String,
+    ) -> worker::Result<Response> {
+        let bytes = req
+            .bytes()
+            .await
+            .map_err(|e| worker::Error::RustError(format!("read apply-bulk body: {e}")))?;
+        let batch = match decode_apply_bulk(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "decode ApplyBulkRequest failed");
+                return Response::error(format!("decode: {e}"), 400);
+            }
+        };
+        if batch.emissions.is_empty() {
+            return Response::error("empty bulk batch", 400);
+        }
+
+        let channel_handler = match self.lookup_channel(&channel) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "no handler for channel");
+                return Response::error(format!("unknown channel: {e}"), 404);
+            }
+        };
+        let sql = self.state.storage().sql();
+
+        let mut results = Vec::with_capacity(batch.emissions.len());
+        let mut last_cursor: Option<ChainPoint> = None;
+        let mut applied = 0usize;
+        let mut rejected = 0usize;
+        for emission in &batch.emissions {
+            let ctx = Ctx::new(emission.cursor.clone(), channel.clone(), sql.clone());
+            match channel_handler.apply_bytes(&ctx, &emission.change).await {
+                Ok(()) => {
+                    applied += 1;
+                    results.push(BulkEmissionResult {
+                        emission_id: emission.emission_id,
+                        applied: true,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    rejected += 1;
+                    results.push(BulkEmissionResult {
+                        emission_id: emission.emission_id,
+                        applied: false,
+                        error: Some(format!("{e}")),
+                    });
+                }
+            }
+            last_cursor = Some(emission.cursor.clone());
+        }
+
+        // Advance the persisted cursor once, to the final emission's
+        // chain point — monotonic + correct regardless of per-row
+        // outcomes (Nacked rows are surfaced via the host's emissions
+        // log, same as the single path). A write failure means we
+        // can't safely report progress, so 5xx → host retries the
+        // whole batch (idempotent re-apply converges).
+        if let Some(cursor) = last_cursor
+            && let Err(e) = write_cursor(&sql, &cursor)
+        {
+            tracing::error!(
+                channel = %channel,
+                error = %e,
+                "bulk cursor advance failed; reporting 5xx so dialer retries"
+            );
+            return Response::error(format!("cursor advance: {e}"), 500);
+        }
+
+        tracing::info!(
+            channel = %channel,
+            applied,
+            rejected,
+            total = batch.emissions.len(),
+            "apply-bulk processed"
+        );
+
+        let body = match encode_apply_bulk_response(&ApplyBulkResponse { results }) {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("encode bulk response: {e}"), 500),
+        };
+        let resp = Response::from_bytes(body)?;
+        let headers = Headers::new();
+        let _ = headers.set("content-type", mitos_protocol::HTTP_DELIVERY_MIME);
+        Ok(resp.with_headers(headers))
     }
 
     /// Recapture HTTP handler. Runs the dApp's `on_recapture`

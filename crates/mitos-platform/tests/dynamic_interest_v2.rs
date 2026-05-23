@@ -74,11 +74,17 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     let storage = ModuleStorage::new(&storage_dir);
     storage.activate(&manifest, &wasm).expect("activate");
 
-    // Fake companion subscription so the drain task records
-    // rows for our assertion. Same pattern dispatch_v2 uses.
-    let companions_dir = storage.module_dir_for_companions("test-indexer");
-    std::fs::create_dir_all(&companions_dir).expect("companions dir");
-    std::fs::write(companions_dir.join("test-companion.cbor"), b"").expect("companion stub");
+    // Fake companion subscription so the drain task records rows
+    // for our assertion. Unbounded interest so the host fan-out
+    // filter delivers every policy's events. Same pattern
+    // dispatch_v2 uses.
+    common::write_companion_subscription(
+        &storage,
+        "test-indexer",
+        "test-client",
+        "test-companion",
+        vec![WireInterest::any()],
+    );
 
     let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(NullChainDataPlane);

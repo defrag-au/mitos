@@ -568,6 +568,22 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             .map_err(|e| DataPlaneError::Storage(format!("get_block_by_slot: {e:?}")))
     }
 
+    async fn archive_horizon_slot(&self) -> DataPlaneResult<Option<u64>> {
+        // The archive prunes old block bodies (Dolos `prune_history`);
+        // the oldest one still retained is the horizon. `get_range`
+        // yields blocks oldest-first, so the first entry's slot is it.
+        // Reads one block body to surface its slot — cheap enough for a
+        // status/metrics call (one seek + read per request).
+        let oldest = self
+            .domain
+            .archive()
+            .get_range(None, None)
+            .map_err(|e| DataPlaneError::Storage(format!("get_range: {e:?}")))?
+            .next()
+            .map(|(slot, _body)| slot);
+        Ok(oldest)
+    }
+
     async fn slot_by_tx_hash(
         &self,
         tx_hash: &pallas_primitives::Hash<32>,

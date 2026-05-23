@@ -96,6 +96,21 @@ pub trait ModuleHostHandle: Send + Sync {
     /// record so the next drain tick doesn't re-spawn it from a
     /// not-yet-deleted file. No-op when the task isn't running.
     async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str);
+
+    /// Module ids with a recapture currently in flight (the
+    /// per-module mutex set guarding `recapture_module`). Cheap and
+    /// side-effect free — backs the `recapture_in_progress` field in
+    /// `GET /_admin/status` + the companions endpoint so "is a
+    /// recapture still running?" is a field, not a journal grep.
+    async fn recapture_in_flight(&self) -> Vec<String>;
+
+    /// Module ids whose `start` (bootstrap/rebootstrap) pass is
+    /// currently running. Backs `bootstrap_in_progress`.
+    async fn bootstrap_in_flight(&self) -> Vec<String>;
+
+    /// Last rebootstrap result per module (`(module_id, result)`).
+    /// Backs the `last_result` field in `/_admin/status`.
+    async fn last_results(&self) -> Vec<(String, LastResult)>;
 }
 
 /// One dynamic-interest update queued for delivery to a running
@@ -251,6 +266,13 @@ where
     /// operations are check-insert-or-reject and remove — no
     /// awaiting needed.
     recapture_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Module ids whose `start` (bootstrap/rebootstrap pass) is in
+    /// flight. Backs `bootstrap_in_progress` in `/_admin/status`.
+    bootstrap_in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Last rebootstrap result per module (survives across the bounded
+    /// events ring + host restarts within a process). Backs the
+    /// `last_result` field in `/_admin/status`.
+    last_results: Arc<std::sync::Mutex<HashMap<String, LastResult>>>,
     /// Companion dialer the recapture orchestrator drives.
     /// Wired post-construction via `set_dialer` because the
     /// dialer borrows the host as its `InterestRouter` — host
@@ -261,6 +283,10 @@ where
     /// admin endpoint returns a clear error rather than
     /// panicking.
     dialer: std::sync::OnceLock<crate::dialer::CompanionDialer>,
+    /// Shared operational-events ring (recapture/trap). Set after
+    /// construction via `set_event_ring` (OnceLock, like `dialer`).
+    /// `None` (unset) → events aren't recorded (artifact-only / tests).
+    event_ring: std::sync::OnceLock<crate::events::EventRing>,
 }
 
 impl<S, P> ModuleHostV2<S, P>
@@ -297,8 +323,20 @@ where
             slots: Arc::new(Mutex::new(HashMap::new())),
             interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recapture_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            bootstrap_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            last_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialer: std::sync::OnceLock::new(),
+            event_ring: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Inject the shared operational-events ring. `&self` via
+    /// `OnceLock` (like `set_dialer`) so the lifecycle constructor's
+    /// signature stays put. Call once at bundle startup **before**
+    /// `auto_resume` so spawned followers capture the same ring the
+    /// admin router reads. Unset → events simply aren't recorded.
+    pub fn set_event_ring(&self, ring: crate::events::EventRing) {
+        let _ = self.event_ring.set(ring);
     }
 
     /// Wire the companion dialer into the host. Must be called
@@ -416,6 +454,21 @@ where
     pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
         self.stop(id).await?;
 
+        // Mark the module as bootstrapping for the duration of `start`
+        // (bootstrap + optional rebootstrap pass). Drop-guard clears it
+        // on any exit. Backs `bootstrap_in_progress` in the admin API.
+        {
+            let mut bf = self
+                .bootstrap_in_flight
+                .lock()
+                .expect("bootstrap_in_flight mutex poisoned");
+            bf.insert(id.to_owned());
+        }
+        let _bootstrap_guard = InFlightGuard {
+            set: self.bootstrap_in_flight.clone(),
+            id: id.to_owned(),
+        };
+
         let manifest = self
             .storage
             .read_manifest(id)?
@@ -435,16 +488,16 @@ where
         // cache before hitting the dolos archive (7-day window).
         // Failures to open the cache degrade gracefully to a plain
         // passthrough — same behaviour as before this was added.
-        let cache_opt = match self.storage.aux_data_cache() {
+        let cache_opt = match self.storage.indexer_data_cache() {
             Ok(c) => {
-                tracing::debug!(module = %id, "aux_data_cache opened");
+                tracing::debug!(module = %id, "indexer_data_cache opened");
                 Some(Arc::new(c))
             }
             Err(e) => {
                 tracing::warn!(
                     module = %id,
                     error = %e,
-                    "aux_data_cache unavailable; tx_metadata bypasses cache",
+                    "indexer_data_cache unavailable; tx_metadata/datum bypass cache",
                 );
                 None
             }
@@ -554,6 +607,8 @@ where
         // `events_emitted`.
         let mut rebootstrap_count: u64 = 0;
         if rebootstrap {
+            let rebootstrap_started = std::time::Instant::now();
+            let mut rebootstrap_outcome = "partial";
             // Defensive bound — a well-behaved module drains a
             // finite scan; the cap only guards a module that
             // never returns `done`. Counts host calls (pages),
@@ -572,6 +627,7 @@ where
                         rebootstrap_count += step.ingested;
                         steps += 1;
                         if step.done {
+                            rebootstrap_outcome = "completed";
                             break;
                         }
                         if steps >= REBOOTSTRAP_MAX_STEPS {
@@ -584,6 +640,7 @@ where
                         }
                     }
                     Ok(Err(msg)) => {
+                        rebootstrap_outcome = "failed";
                         tracing::error!(
                             module = %id,
                             error = %msg,
@@ -674,6 +731,29 @@ where
                     "v2 rebootstrap complete",
                 );
             }
+            if let Some(ring) = self.event_ring.get() {
+                ring.record(
+                    id,
+                    crate::events::EventKind::RebootstrapCompleted {
+                        utxos_ingested: rebootstrap_count,
+                    },
+                );
+            }
+            if let Ok(mut results) = self.last_results.lock() {
+                results.insert(
+                    id.to_owned(),
+                    LastResult {
+                        kind: "rebootstrap",
+                        utxos_ingested: rebootstrap_count,
+                        duration_ms: rebootstrap_started.elapsed().as_millis() as u64,
+                        outcome: rebootstrap_outcome,
+                        at_unix: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    },
+                );
+            }
         }
 
         // Spawn the v2 follower.
@@ -715,6 +795,13 @@ where
 
         let follower_kv_factory = self.kv_factory.clone();
         let follower_trap_logger = trap_logger.clone();
+        let follower_event_ring = self.event_ring.get().cloned();
+        // Page-oriented modules cold-start a freshly-added predicate
+        // via the budget-safe chunked `rebootstrap` pump; others use
+        // the host's inline synthetic bootstrap. See
+        // `manifest::is_chunked_cold_start_module` +
+        // `follower_v2::apply_interest_update`.
+        let follower_chunked_cold_start = crate::manifest::is_chunked_cold_start_module(id);
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -726,6 +813,8 @@ where
                 follower_module_id,
                 follower_kv_factory,
                 follower_trap_logger,
+                follower_event_ring,
+                follower_chunked_cold_start,
             )
             .await;
             match &result {
@@ -885,6 +974,31 @@ where
     /// `companion_timeout` is the per-companion budget for the
     /// `RecaptureReady` ACK. Reasonable default at the call site
     /// is 30s (matches the design doc's open question 3).
+    /// Snapshot of module ids with an in-flight recapture. Reads the
+    /// per-module mutex set; degrades to empty on lock poisoning.
+    pub fn recaptures_in_flight(&self) -> Vec<String> {
+        self.recapture_in_flight
+            .lock()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of module ids whose bootstrap/rebootstrap is running.
+    pub fn bootstraps_in_flight(&self) -> Vec<String> {
+        self.bootstrap_in_flight
+            .lock()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of the last rebootstrap result per module.
+    pub fn last_results_snapshot(&self) -> Vec<(String, LastResult)> {
+        self.last_results
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     pub async fn recapture_module(
         &self,
         id: &str,
@@ -910,7 +1024,7 @@ where
         // Drop-guard ensures the mutex set is cleaned up even on
         // early-return / panic. Using an explicit struct rather
         // than `defer!` to keep deps minimal.
-        let _release = RecaptureGuard {
+        let _release = InFlightGuard {
             set: self.recapture_in_flight.clone(),
             id: id.to_owned(),
         };
@@ -1062,20 +1176,38 @@ where
     }
 }
 
-/// Drop-guard for the per-module recapture mutex set. Ensures
-/// the module is removed from `recapture_in_flight` even if the
-/// `recapture_module` body panics or early-returns.
-struct RecaptureGuard {
+/// Drop-guard for a per-module in-flight set. Ensures the module is
+/// removed from the set even if the guarded body panics or
+/// early-returns. Used for both `recapture_in_flight` and
+/// `bootstrap_in_flight`.
+struct InFlightGuard {
     set: Arc<std::sync::Mutex<HashSet<String>>>,
     id: String,
 }
 
-impl Drop for RecaptureGuard {
+impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = self.set.lock() {
             set.remove(&self.id);
         }
     }
+}
+
+/// Last rebootstrap result for a module, retained by the host so
+/// `/_admin/status` can answer "how did the last (re)bootstrap go?"
+/// without depending on the bounded events ring (which loses old
+/// entries + resets on restart).
+#[derive(Debug, Clone)]
+pub struct LastResult {
+    /// What ran (`"rebootstrap"`).
+    pub kind: &'static str,
+    pub utxos_ingested: u64,
+    pub duration_ms: u64,
+    /// `"completed"` (drained to `done`), `"partial"` (hit a cap /
+    /// trap-abort), or `"failed"` (module returned an error).
+    pub outcome: &'static str,
+    /// Unix seconds when it finished.
+    pub at_unix: u64,
 }
 
 /// Outcome of a successful `recapture_module` call. Surfaced
@@ -1119,6 +1251,15 @@ where
     async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
         ModuleHostV2::evict_module(self, id).await
     }
+    async fn recapture_in_flight(&self) -> Vec<String> {
+        ModuleHostV2::recaptures_in_flight(self)
+    }
+    async fn bootstrap_in_flight(&self) -> Vec<String> {
+        ModuleHostV2::bootstraps_in_flight(self)
+    }
+    async fn last_results(&self) -> Vec<(String, LastResult)> {
+        ModuleHostV2::last_results_snapshot(self)
+    }
     async fn cancel_companion_task(&self, module_id: &str, client_id: &str, companion_key: &str) {
         if let Some(dialer) = self.dialer.get() {
             let cid = crate::dialer::CompanionId::new(module_id, client_id, companion_key);
@@ -1148,14 +1289,96 @@ pub(crate) async fn run_emit_drain(
             return;
         }
     };
+    // Per-companion interest projection cache. Lives for the
+    // lifetime of the drain task so the fan-out filter doesn't
+    // re-read + CBOR-decode every companion `.cbor` on each
+    // emission. Refreshed per-file on mtime change (re-subscribe
+    // rewrites the file). See `InterestCache`.
+    let mut interest_cache = InterestCache::default();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             event = events_rx.recv() => {
                 let Some(event) = event else { return };
-                drain_one(&storage, &store, &module_id, event);
+                drain_one(&storage, &store, &module_id, event, &mut interest_cache);
             }
         }
+    }
+}
+
+/// Per-companion interest projection cache for the emit fan-out
+/// filter (`drain_one`). Keyed by companion `.cbor` path; an entry
+/// is refreshed when the file's mtime changes (a re-subscribe
+/// rewrites the file with a new interest set).
+///
+/// `watched == None` means **unbounded** — deliver everything. That
+/// covers both an `Any`/`Fingerprint` interest *and* the
+/// no-declared-interest case, so the filter is never *narrower* than
+/// the pre-filter broadcast: a companion only loses an emission when
+/// it has explicitly declared one or more bounded policy interests
+/// that the event's policy isn't in. Any read/decode failure also
+/// resolves to `None` (fail open — never drop a delivery because the
+/// filter couldn't load).
+#[derive(Default)]
+pub(crate) struct InterestCache {
+    entries: HashMap<std::path::PathBuf, CachedInterest>,
+}
+
+struct CachedInterest {
+    /// File mtime at cache time; `None` if unstattable. A changed
+    /// (or newly-readable) mtime invalidates the entry.
+    mtime: Option<std::time::SystemTime>,
+    /// Watched policy hex set, or `None` for unbounded interest.
+    watched: Option<HashSet<String>>,
+}
+
+impl InterestCache {
+    /// Whether the companion persisted at `path` wants an event
+    /// keyed by `event_policy_hex`.
+    ///
+    /// - `event_policy_hex == None` (event carries no policy key):
+    ///   always yes — the host can't route it, so deliver as before.
+    /// - companion interest unbounded (`watched == None`): always yes.
+    /// - otherwise: yes iff the policy is in the companion's set.
+    fn companion_wants(&mut self, path: &std::path::Path, event_policy_hex: Option<&str>) -> bool {
+        let Some(policy) = event_policy_hex else {
+            return true;
+        };
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let needs_refresh = self
+            .entries
+            .get(path)
+            .map(|c| c.mtime != mtime)
+            .unwrap_or(true);
+        if needs_refresh {
+            self.entries.insert(
+                path.to_path_buf(),
+                CachedInterest {
+                    mtime,
+                    watched: load_watched_policies(path),
+                },
+            );
+        }
+        match &self.entries.get(path).expect("just inserted").watched {
+            None => true,
+            Some(set) => set.contains(policy),
+        }
+    }
+}
+
+/// Read a companion `.cbor` and project its declared interest to a
+/// watched-policy hex set. Returns `None` (unbounded) when the
+/// interest is unbounded, when no policy interest is declared, or on
+/// any read/decode error — all "deliver everything" outcomes.
+fn load_watched_policies(path: &std::path::Path) -> Option<HashSet<String>> {
+    let bytes = std::fs::read(path).ok()?;
+    let req = mitos_protocol::SubscribeRequest::decode(&bytes).ok()?;
+    match mitos_protocol::watched_policies(&req.interests) {
+        // Unbounded interest (Any/Fingerprint present) → all.
+        None => None,
+        // No declared policy interest → don't narrow (back-compat).
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(s.into_iter().map(|p| p.as_str().to_string()).collect()),
     }
 }
 
@@ -1164,6 +1387,7 @@ fn drain_one(
     store: &crate::emissions::EmissionsStore,
     module_id: &str,
     event: emit::EmittedEvent,
+    interest_cache: &mut InterestCache,
 ) {
     use crate::emissions::{EmissionStatus, UNSUBSCRIBED_COMPANION_ID};
     let companions_dir = storage.module_dir_for_companions(module_id);
@@ -1179,18 +1403,39 @@ fn drain_one(
     // could plumb the name through manifest metadata.
     let channel = event.channel.to_string();
 
+    // Per-companion interest filter routing key. By convention a
+    // non-empty `partition_key` carrying valid UTF-8 is the policy
+    // hex the event pertains to (collection-holders /
+    // collection-metadata / jpg-store-offer emit this; the dialer
+    // also uses it as a concurrency-lane hash, which is compatible).
+    // A module emitting a binary or empty key yields `None` here →
+    // the filter broadcasts (unchanged behaviour). See the
+    // recapture cross-contamination fix in
+    // `docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5.
+    let event_policy_hex: Option<&str> = if event.partition_key.is_empty() {
+        None
+    } else {
+        std::str::from_utf8(&event.partition_key).ok()
+    };
+
     // Two-level walk: `<module>/companions/<client_id>/<companion_key>.cbor`.
     // Each `(client_id, companion_key)` pair is a distinct
-    // subscriber and gets its own emission row. See
+    // subscriber and gets its own emission row — *if* its declared
+    // interest matches this event's policy (see `event_policy_hex` +
+    // `InterestCache`). See
     // `docs/design/MULTI_CLIENT_COMPANIONS.md` — "Dispatch fan-out".
-    // If we end up writing zero rows (no dir, no subscribers, or
-    // every entry skipped), fall back to the sentinel companion_id
-    // so the emission isn't silently dropped during the window
-    // before any companion subscribes (drop site #3 in
-    // `docs/design/EVENT_DELIVERY_RESILIENCE.md`). The first
-    // subscribe reclaims sentinel rows via
-    // `EmissionsStore::retarget_companion`.
+    //
+    // Sentinel fallback (drop site #3 in
+    // `docs/design/EVENT_DELIVERY_RESILIENCE.md`): only when *no*
+    // companion is subscribed at all (`!saw_companion`) — so an
+    // emission isn't lost in the window before the first subscribe;
+    // the first subscribe reclaims sentinel rows via
+    // `EmissionsStore::retarget_companion`. When companions exist but
+    // none are interested in this policy, the event is genuinely
+    // unwanted and is dropped — sentineling it would let a future
+    // unrelated subscriber wrongly reclaim another policy's emission.
     let mut wrote_per_companion = false;
+    let mut saw_companion = false;
     if companions_dir.exists() {
         match std::fs::read_dir(&companions_dir) {
             Ok(read) => {
@@ -1233,6 +1478,21 @@ fn drain_one(
                             Some(s) => s.to_string(),
                             None => continue,
                         };
+                        saw_companion = true;
+                        // Per-companion interest filter: skip companions
+                        // whose declared interest doesn't cover this
+                        // event's policy. Unbounded / no-interest /
+                        // keyless events always pass (see InterestCache).
+                        if !interest_cache.companion_wants(&path, event_policy_hex) {
+                            tracing::trace!(
+                                module = %module_id,
+                                client_id = %client_id,
+                                companion_key = %companion_key,
+                                policy = event_policy_hex.unwrap_or(""),
+                                "emission filtered out — companion not interested in policy"
+                            );
+                            continue;
+                        }
                         match store.append(
                             &companion_key,
                             client_id,
@@ -1268,7 +1528,11 @@ fn drain_one(
         }
     }
 
-    if !wrote_per_companion {
+    // Sentinel only when there are no subscribers at all. If
+    // companions exist but the interest filter dropped this event
+    // for all of them, it's genuinely unwanted — don't sentinel
+    // (a later unrelated subscribe must not reclaim it).
+    if !saw_companion && !wrote_per_companion {
         if let Err(e) = store.append(
             UNSUBSCRIBED_COMPANION_ID,
             "",
@@ -1372,5 +1636,147 @@ where
             })
             .map_err(|_| InterestRouteError::ChannelClosed(module_id.to_owned()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod interest_filter_tests {
+    //! Unit coverage for the per-companion emit fan-out filter
+    //! (`InterestCache` / `companion_wants`) — the host side of the
+    //! recapture cross-contamination fix
+    //! (`docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5).
+
+    use super::{CachedInterest, InterestCache};
+    use cardano_assets::PolicyId;
+    use mitos_protocol::{
+        AssetSelector, DialBackOverride, Interest, SubscribeRequest, SubscribeTarget,
+    };
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    // Two distinct, valid (56 lowercase-hex) policies.
+    const POLICY_A: &str = "43a056aabbccddeeff00112233445566778899aabbccddeeff001122";
+    const POLICY_B: &str = "de79250aabbccddeeff00112233445566778899aabbccddeeff001122";
+
+    fn write_companion(dir: &Path, interests: Vec<Interest>) -> std::path::PathBuf {
+        let req = SubscribeRequest {
+            targets: vec![SubscribeTarget::Module {
+                name: "collection-holders".into(),
+            }],
+            companion_key: "k".into(),
+            client_id: "c".into(),
+            resume_from: None,
+            interests,
+            dial_back: Some(DialBackOverride {
+                url: Some("https://x/_internal/{op}-{target}?key={key}".into()),
+                auth_header: None,
+                auth_value: None,
+            }),
+        };
+        let path = dir.join("companion.cbor");
+        std::fs::write(&path, req.encode().expect("encode")).expect("write");
+        path
+    }
+
+    fn policy_interest(hex: &str) -> Interest {
+        Interest {
+            asset: AssetSelector::Policy(PolicyId::new(hex).expect("valid policy")),
+            ..Interest::any()
+        }
+    }
+
+    #[test]
+    fn bounded_interest_routes_only_matching_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mut cache = InterestCache::default();
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(!cache.companion_wants(&path, Some(POLICY_B)));
+    }
+
+    #[test]
+    fn keyless_event_always_delivered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mut cache = InterestCache::default();
+        // No partition key → host can't route → deliver (unchanged).
+        assert!(cache.companion_wants(&path, None));
+    }
+
+    #[test]
+    fn unbounded_interest_delivers_every_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `Interest::any()` → `AssetSelector::Any` → unbounded.
+        let path = write_companion(tmp.path(), vec![Interest::any()]);
+        let mut cache = InterestCache::default();
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(cache.companion_wants(&path, Some(POLICY_B)));
+    }
+
+    #[test]
+    fn no_declared_interest_is_not_narrower_than_broadcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty interest set must NOT drop everything — back-compat:
+        // a companion that subscribed without declaring interest still
+        // receives all policies (the pre-filter broadcast behaviour).
+        let path = write_companion(tmp.path(), vec![]);
+        let mut cache = InterestCache::default();
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(cache.companion_wants(&path, Some(POLICY_B)));
+    }
+
+    #[test]
+    fn unreadable_file_fails_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.cbor");
+        let mut cache = InterestCache::default();
+        // Read failure → unbounded → deliver. Never drop a delivery
+        // because the filter couldn't load the interest.
+        assert!(cache.companion_wants(&missing, Some(POLICY_A)));
+    }
+
+    #[test]
+    fn cache_hit_uses_cached_entry_without_reread() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk says POLICY_A …
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mtime = std::fs::metadata(&path).unwrap().modified().ok();
+        let mut cache = InterestCache::default();
+        // … but we pre-seed the cache with the *current* mtime and a
+        // POLICY_B watch-set. Same mtime ⇒ cache hit ⇒ no re-read, so
+        // the cached B set wins.
+        let mut set = HashSet::new();
+        set.insert(POLICY_B.to_string());
+        cache.entries.insert(
+            path.clone(),
+            CachedInterest {
+                mtime,
+                watched: Some(set),
+            },
+        );
+        assert!(cache.companion_wants(&path, Some(POLICY_B)));
+        assert!(!cache.companion_wants(&path, Some(POLICY_A)));
+    }
+
+    #[test]
+    fn stale_mtime_triggers_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk says POLICY_A …
+        let path = write_companion(tmp.path(), vec![policy_interest(POLICY_A)]);
+        let mut cache = InterestCache::default();
+        // … but the cached entry carries a bogus (old) mtime and a
+        // POLICY_B watch-set. mtime mismatch ⇒ refresh from disk ⇒
+        // the real POLICY_A set wins.
+        let mut set = HashSet::new();
+        set.insert(POLICY_B.to_string());
+        cache.entries.insert(
+            path.clone(),
+            CachedInterest {
+                mtime: Some(std::time::UNIX_EPOCH),
+                watched: Some(set),
+            },
+        );
+        assert!(cache.companion_wants(&path, Some(POLICY_A)));
+        assert!(!cache.companion_wants(&path, Some(POLICY_B)));
     }
 }

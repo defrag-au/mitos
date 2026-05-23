@@ -13,7 +13,7 @@
 //!           --fixture path/to/fixture.toml
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
         &wasm_path,
         &config_bytes,
         args.expected.as_deref(),
+        mitos_platform::manifest::is_chunked_cold_start_module(&module_id),
     )
     .await
 }
@@ -173,6 +174,16 @@ struct Fixture {
     /// Auxiliary-data CBOR keyed by tx_hash. Hex-encoded.
     #[serde(default)]
     tx_metadata: Vec<FixtureTxMetadata>,
+
+    /// Datum preimages keyed by datum hash, for
+    /// `chain_data::datum_by_hash` resolution. Normally these are
+    /// harvested from a `--block`'s witness set; this section lets
+    /// a blockless fixture supply them directly — the canonical
+    /// case being a cold-start over a CIP-68 ref token whose datum
+    /// is attached by hash (no inline bytes), exercising the
+    /// `read_output_datums` → `datum_by_hash` fallback path.
+    #[serde(default)]
+    datum: Vec<FixtureDatum>,
 
     /// v2-only: the module's interest set. Applied before any
     /// `handle-events` dispatch so the platform can filter
@@ -261,6 +272,15 @@ struct FixtureTxMetadata {
     aux_cbor_hex: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureDatum {
+    /// 64-hex datum hash (the value an output's hash-attached
+    /// datum references).
+    hash: String,
+    /// Hex-encoded datum CBOR (the preimage).
+    cbor_hex: String,
+}
+
 // -----------------------------------------------------------------------------
 // Data plane backed by the fixture
 // -----------------------------------------------------------------------------
@@ -273,6 +293,12 @@ struct FixtureDataPlane {
     /// from `[[utxo]]` entries by decoding each address's
     /// payment part.
     by_payment_cred: HashMap<[u8; 28], Vec<OutputRef>>,
+    /// 28-byte policy id → refs at outputs whose asset multiset
+    /// contains that policy. Populated from each `[[utxo]]`
+    /// entry's `[[utxo.assets]]` table. Enables `holds_policy`-
+    /// shaped cold-start scans (used by `holder-distribution`,
+    /// `collection-holders`).
+    by_policy: HashMap<Vec<u8>, Vec<OutputRef>>,
     aux_by_tx: HashMap<Vec<u8>, Vec<u8>>,
     /// Hash → datum-CBOR map. Populated from block witness-data
     /// during harvest so modules calling
@@ -292,6 +318,7 @@ impl FixtureDataPlane {
         let mut by_ref = HashMap::new();
         let mut by_address: HashMap<String, Vec<OutputRef>> = HashMap::new();
         let mut by_payment_cred: HashMap<[u8; 28], Vec<OutputRef>> = HashMap::new();
+        let mut by_policy: HashMap<Vec<u8>, Vec<OutputRef>> = HashMap::new();
         let mut aux_by_tx = HashMap::new();
 
         for u in fixture.utxo {
@@ -350,6 +377,23 @@ impl FixtureDataPlane {
                 };
                 by_payment_cred.entry(cred_bytes).or_default().push(oref);
             }
+            // Index this UTxO under every distinct policy it
+            // holds. A single UTxO can carry assets from multiple
+            // policies (rare for NFT collections, common for
+            // CNT-mixed wallets); dedupe at the policy level so
+            // the same ref doesn't appear twice.
+            let mut seen_policies: HashSet<[u8; 28]> = HashSet::new();
+            for a in &assets {
+                let Ok(policy_bytes) = a.policy_id.as_bytes() else {
+                    continue;
+                };
+                if seen_policies.insert(policy_bytes) {
+                    by_policy
+                        .entry(policy_bytes.to_vec())
+                        .or_default()
+                        .push(oref);
+                }
+            }
             by_ref.insert(
                 (tx_hash.to_vec(), u.index),
                 ResolvedUtxo {
@@ -375,12 +419,21 @@ impl FixtureDataPlane {
             aux_by_tx.insert(tx_hash.to_vec(), bytes);
         }
 
+        let mut datums_by_hash = HashMap::new();
+        for d in fixture.datum {
+            let hash = decode_32(&d.hash).with_context(|| format!("datum hash {}", d.hash))?;
+            let cbor = hex::decode(&d.cbor_hex)
+                .with_context(|| format!("datum cbor_hex for {}", d.hash))?;
+            datums_by_hash.insert(hash.to_vec(), cbor);
+        }
+
         Ok(Self {
             by_ref,
             by_address,
             by_payment_cred,
+            by_policy,
             aux_by_tx,
-            datums_by_hash: HashMap::new(),
+            datums_by_hash,
         })
     }
 
@@ -532,12 +585,8 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
         Ok(self.by_address.get(address).cloned().unwrap_or_default())
     }
 
-    async fn utxos_by_policy(&self, _policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
-        // Fixture replay doesn't index by policy; modules that
-        // depend on this host-fn need to pre-stash refs via
-        // explicit `[[utxo]]` entries the runner already
-        // surfaces through `read_utxos`.
-        Ok(Vec::new())
+    async fn utxos_by_policy(&self, policy: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
+        Ok(self.by_policy.get(policy).cloned().unwrap_or_default())
     }
 
     async fn utxos_by_payment_cred(&self, cred: &[u8]) -> DataPlaneResult<Vec<OutputRef>> {
@@ -646,6 +695,7 @@ fn default_abi_major() -> u32 {
 // each block is decoded + filtered + dispatched per `handle-events`
 // in chain order.
 
+#[allow(clippy::too_many_arguments)]
 async fn run_v2(
     blocks: &[PathBuf],
     fixture: &Fixture,
@@ -653,6 +703,7 @@ async fn run_v2(
     wasm_path: &std::path::Path,
     config_bytes: &[u8],
     expected_path: Option<&std::path::Path>,
+    chunked_cold_start: bool,
 ) -> Result<()> {
     use mitos_platform::driver_v2::{ApplyOutcomeV2, DriverV2};
     use mitos_platform::host_fns::{emit, state_kv};
@@ -806,12 +857,44 @@ async fn run_v2(
         }
     }
 
-    // Drain cold-start emissions produced by `update_interest`'s
-    // bootstrap path. Modules that subscribe-then-snapshot (e.g.
-    // vesting-tracker) emit here without any block dispatch.
+    // For modules that opt into chunked cold-start (manifest
+    // `[interest] chunked_cold_start`), pump the module's chunked
+    // `rebootstrap` to completion — the production follower does this
+    // after `update_interest` to cold-start newly-added policies via
+    // the budget-safe scoped rebootstrap (page-oriented modules seed
+    // their onboard scope in `update_interest`; the inline single-fuel
+    // cold-start was removed). Other modules cold-start inline in
+    // `update_interest` and must NOT be pumped here, or they'd
+    // double-emit. Each call refuels one bounded page.
+    if chunked_cold_start {
+        let mut steps = 0u64;
+        loop {
+            match driver.call_rebootstrap().await {
+                Ok(Ok(step)) => {
+                    steps += 1;
+                    if step.done || steps >= 10_000_000 {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("✗ rebootstrap returned Err: {e}");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("✗ rebootstrap trapped: {e:?}");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Drain cold-start emissions produced by `update_interest` +
+    // the rebootstrap pump above. Modules that subscribe-then-
+    // snapshot (e.g. vesting-tracker) emit here without any block
+    // dispatch.
     let cold_start_emitted = drain(&mut events_rx, &mut collected_emits, "update_interest");
     if cold_start_emitted > 0 {
-        println!("▸ {cold_start_emitted} event(s) emitted during update_interest");
+        println!("▸ {cold_start_emitted} event(s) emitted during cold-start");
     }
 
     // Platform-driven bootstrap walk (opt-in per fixture). Same

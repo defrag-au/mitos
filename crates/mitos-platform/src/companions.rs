@@ -18,8 +18,8 @@
 //!   middleware.
 //!
 //! The actual outbound dial + Apply-frame delivery lives in
-//! `dialer.rs` (`CompanionDialer::run_companion`); this module
-//! only handles registration intake.
+//! `dialer.rs` (the per-module `run_module_drain` task); this
+//! module only handles registration intake.
 //!
 //! ## Still deferred
 //!
@@ -71,11 +71,13 @@ pub fn companion_router(
     auth: AuthToken,
     dialer: Option<CompanionDialer>,
     indexer_bridge: Option<IndexerBridgeHandle>,
+    events: crate::events::EventRing,
 ) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
         dialer,
         indexer_bridge,
+        events,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -97,6 +99,8 @@ struct CompanionState {
     /// `SubscribeTarget::Module { ... }` requests (no in-tree
     /// indexers wired into the unified path).
     indexer_bridge: Option<IndexerBridgeHandle>,
+    /// Shared operational-events ring — records `companion_subscribed`.
+    events: crate::events::EventRing,
 }
 
 // Local re-implementation of the admin auth middleware so the
@@ -478,6 +482,13 @@ async fn subscribe_handler(
                 if next_emission_id == 0 {
                     next_emission_id = id;
                 }
+                state.events.record(
+                    name.as_str(),
+                    crate::events::EventKind::CompanionSubscribed {
+                        client_id: request.client_id.clone(),
+                        companion_key: request.companion_key.clone(),
+                    },
+                );
             }
             SubscribeTarget::Indexer { name } => {
                 validate_indexer_target(&state, name)?;
@@ -489,6 +500,43 @@ async fn subscribe_handler(
     // to spawn per-target dial loops.
     if let Some(dialer) = &state.dialer {
         dialer.register(request.clone()).await;
+
+        // Propagate the subscriber's interest into each MODULE
+        // target's scan-interest. `register` above only wires up
+        // the per-companion FANOUT interest (the persisted CBOR,
+        // read back by `GET …/companions` as `watched_policies`).
+        // The module's own watch/scan set — the driver `InterestSet`
+        // the cold-start + recapture walk via `utxos_by_policy`, plus
+        // the module's `update_interest` export — is updated ONLY by
+        // routing an interest mutation into the follower. Without
+        // this, a subscribe registers the companion but its policy
+        // never enters the module's scan-interest, so cold-start
+        // never fires and the companion never drains (CO1: an added
+        // collection that never captures). The incremental
+        // `/api/companions/{key}/interest` endpoint already routes,
+        // but a subscribe that races/misses that separate push is
+        // left stranded; routing here makes the subscribe itself
+        // self-sufficient. `Add` is union-preserving (Replace would
+        // wipe other companions' policies from the shared module
+        // interest) and idempotent — re-subscribes dedup and the
+        // per-scope bootstrap flag suppresses re-cold-start, so this
+        // only hydrates genuinely-new policies.
+        if !request.interests.is_empty() {
+            for target in &request.targets {
+                if let SubscribeTarget::Module { name } = target
+                    && let Err(e) = dialer
+                        .route_interest_mutation(name, InterestOp::Add, request.interests.clone())
+                        .await
+                {
+                    tracing::warn!(
+                        module = %name,
+                        error = %e,
+                        "subscribe: routing interest into module scan-set failed; \
+                         companion fanout-interest still registered",
+                    );
+                }
+            }
+        }
     }
     let response = SubscribeResponse {
         status: "subscribed".to_string(),
@@ -933,7 +981,13 @@ mod tests {
     use tower::ServiceExt;
 
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
-        companion_router(storage, AuthToken(None), None, None)
+        companion_router(
+            storage,
+            AuthToken(None),
+            None,
+            None,
+            crate::events::EventRing::new(),
+        )
     }
 
     fn cbor(req: &SubscribeRequest) -> Vec<u8> {

@@ -1,0 +1,1070 @@
+//! Collection-holders community module — emits a per-policy
+//! ledger of `(asset_name, holder, quantity)` holdings and
+//! per-TX movement deltas for NFT- and RFT-shaped policies.
+//!
+//! Sibling to `holder-distribution`: covers policies where
+//! every asset name is a distinct collectible identity (NFT /
+//! RFT shape) rather than CNT distribution. See
+//! `docs/design/COLLECTION_MODULES.md`.
+//!
+//! ## Lifecycle
+//!
+//! 1. Consumer registers `holds_policy(X)` via
+//!    `update_interest(Add, ...)`. The module:
+//!    - Calls `chain_data::utxos_by_policy(X)` to enumerate
+//!      every current UTxO holding the policy (dolos's
+//!      `BY_POLICY` index — sub-second even for active
+//!      policies).
+//!    - Decodes each output's address into a `HolderRef`
+//!      (`Stake` / `Payment` / `Script`) and accumulates a
+//!      per-`(asset_name, holder)` ledger.
+//!    - Persists the ledger to state-kv keyed by policy hex.
+//!    - Emits the ledger as a chunked `SnapshotBegin` →
+//!      `SnapshotChunk` × N → `SnapshotEnd` sequence.
+//!
+//! 2. Each subsequent `handle_events` batch (one Cardano TX):
+//!    - Walks Produced + Consumed events for tracked policies.
+//!    - Computes per-asset movements from the TX's net effect.
+//!    - Persists the updated ledger.
+//!    - Emits a `CollectionDelta` enumerating the movements.
+//!
+//! 3. Removing `holds_policy(X)` (`update_interest(Remove, ...)`)
+//!    clears the in-memory tracking set; the persisted ledger
+//!    is dropped from state-kv (per `COLLECTION_MODULES.md`
+//!    resolved-decision #1 — clear immediately, no TTL).
+//!
+//! ## Why script addresses surface as data
+//!
+//! Maestro's `/policy/{id}/accounts` groups by stake credential
+//! and omits script-locked supply (marketplace escrows). For
+//! collectible policies that's a real data loss — listed NFTs
+//! are part of the supply picture. This module surfaces
+//! `HolderRef::Script` so consumers (collection-ownership,
+//! TCG worker) can include, exclude, or re-attribute
+//! marketplace-held supply via their own policy.
+//!
+//! ## Chunk 1 scope (this file at landing time)
+//!
+//! - Module scaffolding: all v2 Guest exports stubbed.
+//! - Interest management: tracked-policy set persisted to
+//!   state-kv, restored on init.
+//! - Wire-format event types via
+//!   `mitos_community_events::collection_holders`.
+//! - Cold-start (`Chunk 2`) and per-TX delta walk (`Chunk 3`)
+//!   are stubbed with explicit TODOs; the module compiles and
+//!   is dispatch-safe but doesn't yet emit anything.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use mitos_community_events::collection_holders::{
+    CollectionDelta, CollectionEvent, Holding, HolderRef, Movement, SnapshotBegin, SnapshotChunk,
+    SnapshotEnd,
+};
+use mitos_module_kit::{BootstrapCursor, BootstrapIo, ChunkedBootstrap, ScannedPage};
+use pallas_addresses::{Address, ShelleyDelegationPart, ShelleyPaymentPart};
+use serde::{Deserialize, Serialize};
+
+use crate::mitos::platform_v2::chain_data;
+use crate::mitos::platform_v2::emit;
+use crate::mitos::platform_v2::logging::{self, LogLevel};
+use crate::mitos::platform_v2::state_kv;
+use crate::mitos::platform_v2::types::{
+    AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent,
+    RollbackEvent, UtxoEvent,
+};
+
+const LOG_TARGET: &str = "collection-holders-module";
+
+/// state-kv key under which we persist the set of currently-
+/// tracked policies (CBOR list of 56-char hex strings). The
+/// per-policy ledger is keyed `ledger:<policy_hex>`.
+const KV_TRACKED_POLICIES: &str = "tracked-policies";
+
+/// state-kv key prefix for the **sharded** per-holding store: one
+/// kv key per `(holder, asset)`, `lentry:<policy_hex>:<entry_key_hex>`
+/// → CBOR `Holding`, where `entry_key` is CBOR `(HolderKey,
+/// asset_name_bytes)`. Sharded (vs a single per-policy blob) so no
+/// rebootstrap/cold-start/live-tail call ever serializes the whole
+/// ledger — the scalable-bootstrap fix
+/// (`docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md`).
+const KV_SHARD_PREFIX: &str = "lentry:";
+
+/// state-kv key for the re-entrant `rebootstrap` continuation
+/// cursor — the index of the policy currently being re-scanned
+/// (8 BE bytes). Durable so a host restart mid-round resumes
+/// at the right policy. Per-page progress within a policy is
+/// thread-local + volatile; a trap or restart restarts the
+/// current policy from page 0 (safe — each policy emits a full
+/// authoritative `SnapshotBegin` → ... → `SnapshotEnd`).
+const KV_REBOOTSTRAP_CURSOR: &str = "rebootstrap-cursor";
+
+/// Scope for the *next* `rebootstrap` pump: the policies a
+/// subscribe-time Add just brought in. When present, `rebootstrap`
+/// cold-starts only these (the per-policy auto-onboard, driven by
+/// the host pump after `update-interest`); when absent, `rebootstrap`
+/// is a full recapture over all tracked policies. Cleared once the
+/// scoped round completes. Encoded as ciborium `Vec<Vec<u8>>` of
+/// 28-byte policy hashes.
+const KV_ONBOARD_PREDICATES: &str = "onboard-predicates";
+
+/// Holdings per `SnapshotChunk` when emitting a chunked
+/// snapshot. Bounds the CBOR buffer one `emit` builds in wasm
+/// memory — see `WASM_BUDGET_CHUNKING.md` "Output — chunked
+/// snapshot emission".
+const SNAPSHOT_CHUNK_HOLDINGS: usize = 1_000;
+
+/// Per-page hint for the cold-start scan. `utxos_by_policy` is
+/// paged; the host clamps each returned page to its own
+/// adaptive per-call budget, so the module never holds more
+/// than one clamped page of refs at once.
+const COLD_START_PAGE_HINT: u32 = 10_000;
+
+/// 28-byte hash size used everywhere for policy ids and stake
+/// credentials.
+const HASH_BYTES: usize = 28;
+
+thread_local! {
+    /// Currently-tracked policy ids (28-byte hashes). Cleared
+    /// on `Remove`/`Replace` ops, repopulated on `Add`.
+    /// Persisted via `KV_TRACKED_POLICIES` so a host restart
+    /// without an attached companion keeps filtering correctly.
+    static TRACKED_POLICIES: RefCell<HashSet<[u8; HASH_BYTES]>> = RefCell::new(HashSet::new());
+
+    /// In-flight re-entrant `rebootstrap` driver. `None` between
+    /// rounds; rebuilt from the durable cursor after a trap drops
+    /// the wasm instance. Holds no resident ledger — holdings are
+    /// sharded to state-kv per page (batched), emit pages them back
+    /// by key cursor. See `mitos_module_kit::ChunkedBootstrap`.
+    static REBOOTSTRAP_DRIVER: RefCell<Option<ChunkedBootstrap>> = const { RefCell::new(None) };
+}
+
+// ============================================================
+// In-memory ledger
+// ============================================================
+
+/// Internal stable identity for a holder. Mirrors the wire
+/// `HolderRef` variants but **without the `Script.label` field**
+/// — labels are a presentation concern derived from the
+/// `address-registry` at emission time, not a ledger key. Two
+/// holdings at the same script address are the same holder
+/// regardless of whether the registry has been updated between
+/// snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+enum HolderKey {
+    /// 28-byte stake credential (Key or Script delegation
+    /// part). Both delegation kinds collapse to the same
+    /// representation — the wire format is intentionally
+    /// network-agnostic, so consumers compute the bech32
+    /// stake address themselves at presentation time. The
+    /// Key-vs-Script edge (rare for NFT holdings) is
+    /// recoverable consumer-side via byte-level credential
+    /// comparison.
+    Stake([u8; HASH_BYTES]),
+    /// Enterprise (no-stake-cred) wallet with a `Key` payment
+    /// credential. Bech32 carries the full address.
+    Payment(String),
+    /// Script address — `Script` payment credential, no
+    /// delegation (`addr1w...` enterprise script). Frankenscript
+    /// addresses (`addr1z...` / `addr1x...` — Script payment +
+    /// stake-delegated) are emitted as `Stake` instead, since
+    /// the stake credential is the owner's identity.
+    Script(String),
+}
+
+impl HolderKey {
+    /// Build the wire-shape `HolderRef` for emission. Script
+    /// labels resolve here via the (TODO follow-up)
+    /// `address-registry` — `None` for now keeps the wire
+    /// shape stable and the lookup integration small.
+    fn to_wire(&self) -> HolderRef {
+        match self {
+            HolderKey::Stake(bytes) => HolderRef::Stake(hex::encode(bytes)),
+            HolderKey::Payment(addr) => HolderRef::Payment(addr.clone()),
+            HolderKey::Script(addr) => HolderRef::Script {
+                addr: addr.clone(),
+                // TODO(follow-up): resolve via
+                // shared-crates/address-registry once the
+                // wasm-build compatibility of that crate is
+                // verified. Resolved decision #3 in
+                // `docs/design/COLLECTION_MODULES.md`.
+                label: None,
+            },
+        }
+    }
+}
+
+/// `asset_name_hex_bytes -> quantity` for one (policy, holder).
+/// Matches the holder-distribution pattern — nest-by-holder.
+type AssetMap = BTreeMap<Vec<u8>, u64>;
+
+/// Per-policy ledger as held in memory + persisted to state-kv.
+/// Keyed by `HolderKey` so script-held supply surfaces
+/// distinctly from stake-delegated supply.
+#[derive(Default, Serialize, Deserialize)]
+struct PolicyLedger {
+    holdings: BTreeMap<HolderKey, AssetMap>,
+}
+
+// ── Sharded per-(holder,asset) holding store ──
+// One kv key per holding: `lentry:<policy_hex>:<entry_key_hex>` →
+// CBOR `Holding`. `entry_key` = CBOR `(HolderKey, asset_name)` —
+// opaque to the kit driver. The kv keys are the source of truth.
+
+/// Opaque per-holding shard key: CBOR `(HolderKey, asset_name)`.
+fn holding_entry_key(holder: &HolderKey, asset_name: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    let _ = ciborium::ser::into_writer(&(holder, asset_name), &mut buf);
+    buf
+}
+
+fn shard_prefix(policy_hex: &str) -> String {
+    format!("{KV_SHARD_PREFIX}{policy_hex}:")
+}
+
+fn shard_kv_key(policy_hex: &str, entry_key: &[u8]) -> String {
+    format!("{KV_SHARD_PREFIX}{policy_hex}:{}", hex::encode(entry_key))
+}
+
+fn shard_get_holding(policy_hex: &str, entry_key: &[u8]) -> Option<Holding> {
+    let bytes = state_kv::get_value(&shard_kv_key(policy_hex, entry_key))?;
+    ciborium::de::from_reader(bytes.as_slice()).ok()
+}
+
+fn shard_put_holding(policy_hex: &str, entry_key: &[u8], holding: &Holding) {
+    let mut buf = Vec::with_capacity(128);
+    if let Err(e) = ciborium::ser::into_writer(holding, &mut buf) {
+        logging::log(
+            LogLevel::Error,
+            LOG_TARGET,
+            &format!("encode holding shard for {policy_hex}: {e}"),
+        );
+        return;
+    }
+    state_kv::set_value(&shard_kv_key(policy_hex, entry_key), &buf);
+}
+
+fn shard_delete_holding(policy_hex: &str, entry_key: &[u8]) {
+    state_kv::delete_value(&shard_kv_key(policy_hex, entry_key));
+}
+
+/// Delete every holding shard for a policy (on un-track / before a
+/// fresh re-scan) in one txn.
+fn shard_clear_policy(policy_hex: &str) {
+    state_kv::delete_prefix(&shard_prefix(policy_hex));
+}
+
+// ============================================================
+// Address → HolderKey
+// ============================================================
+
+/// Decode a bech32 address into a `HolderKey`. Returns `None`
+/// for unsupported address shapes (Byron, pointer-stake) — the
+/// caller drops the holding rather than mis-categorising.
+///
+/// **Frankenaddress note:** modern Cardano smart contracts
+/// (jpg.store v3, Splash, etc.) use Script-payment +
+/// Key-delegation addresses where the staking part carries the
+/// owner's stake key. The contract locks the asset but the
+/// owner's identity travels with it via the stake credential.
+/// We promote these to `Stake` rather than `Script` — the
+/// stake credential IS the asset owner from a downstream
+/// consumer's perspective. Only true enterprise-script
+/// (`addr1w...`, no stake part) remain as `Script`.
+///
+/// Decision tree:
+/// - Byron / non-Shelley → `None`
+/// - Shelley + any payment + `Key`/`Script` delegation →
+///   `Stake(28-byte cred)` — covers both regular delegated
+///   wallets AND frankenscript marketplace lockings. Both
+///   delegation kinds collapse to the same 28-byte
+///   representation; consumers compute bech32 themselves
+///   using their network context.
+/// - Shelley + `Key` payment + `Null` delegation →
+///   `Payment(addr)` — enterprise wallet, no stake key.
+/// - Shelley + `Script` payment + `Null` delegation →
+///   `Script(addr)` — true enterprise-script (rare).
+/// - Shelley + `Pointer` delegation → `None` (rare, dropped).
+fn extract_holder_key(address: &str) -> Option<HolderKey> {
+    let addr = Address::from_bech32(address).ok()?;
+    let shelley = match addr {
+        Address::Shelley(s) => s,
+        _ => return None,
+    };
+
+    // If the address has a stake-delegation credential (Key or
+    // Script), the stake credential IS the holder identity.
+    // This is the dominant case — regular wallets AND
+    // frankenscript marketplace lockings both fall here.
+    match shelley.delegation() {
+        ShelleyDelegationPart::Key(h) => {
+            let bytes: [u8; HASH_BYTES] = (**h).into();
+            return Some(HolderKey::Stake(bytes));
+        }
+        ShelleyDelegationPart::Script(h) => {
+            let bytes: [u8; HASH_BYTES] = (**h).into();
+            return Some(HolderKey::Stake(bytes));
+        }
+        ShelleyDelegationPart::Null => {}
+        // Pointer delegation: rare, dropped.
+        _ => return None,
+    }
+
+    // No stake delegation — branch on payment credential type.
+    match shelley.payment() {
+        ShelleyPaymentPart::Key(_) => Some(HolderKey::Payment(address.to_string())),
+        ShelleyPaymentPart::Script(_) => Some(HolderKey::Script(address.to_string())),
+    }
+}
+
+// ============================================================
+// Ledger mutation — apply a single output
+// ============================================================
+
+/// Add an output's policy-X assets to the ledger. Idempotent
+/// at the (asset_name, holder) level — repeated calls for the
+/// same UTxO accumulate, which is correct since one wallet
+/// can hold multiple UTxOs each carrying the same asset (RFT
+/// holdings split across UTxOs).
+fn apply_output_to_ledger(
+    ledger: &mut PolicyLedger,
+    policy: &[u8],
+    address: &str,
+    assets: &[WitAssetEntry],
+) {
+    let Some(key) = extract_holder_key(address) else {
+        return;
+    };
+    let entry = ledger.holdings.entry(key).or_default();
+    for asset in assets {
+        if asset.asset.policy != policy {
+            continue;
+        }
+        *entry.entry(asset.asset.name.clone()).or_insert(0) += asset.quantity;
+    }
+}
+
+/// Read one page of UTxOs and fold their policy-X holdings
+/// into the ledger.
+fn fold_page(ledger: &mut PolicyLedger, policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) {
+    for (_oref, out) in chain_data::read_utxos(refs) {
+        apply_output_to_ledger(ledger, policy, &out.address, &out.assets);
+    }
+}
+
+// ============================================================
+// Wire-side interest predicate mirror
+// ============================================================
+
+/// Minimal mirror of the on-wire `InterestPredicate` enum —
+/// same pattern as `holder-distribution`. We only care about
+/// `HoldsPolicy` but capture the other variants so the
+/// deserialiser can step over them without erroring.
+///
+/// `PolicyId` serializes as a 56-char hex string (not raw
+/// bytes) — that's the canonical shape from `cardano-assets`.
+#[derive(Debug, Deserialize)]
+enum InterestPredicateWire {
+    AtAddress(serde::de::IgnoredAny),
+    AtStakeCred(serde::de::IgnoredAny),
+    HoldsPolicy(String),
+    HoldsAsset {
+        #[allow(dead_code)]
+        policy: serde::de::IgnoredAny,
+        #[allow(dead_code)]
+        asset_name: serde::de::IgnoredAny,
+    },
+    TickEvery(#[allow(dead_code)] u32),
+}
+
+// ============================================================
+// Interest management
+// ============================================================
+
+fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
+    let predicates: Vec<InterestPredicateWire> = match ciborium::de::from_reader(items_cbor) {
+        Ok(v) => v,
+        Err(e) => {
+            logging::log(
+                LogLevel::Error,
+                LOG_TARGET,
+                &format!("decode interest predicates failed: {e}"),
+            );
+            return;
+        }
+    };
+
+    let policies: Vec<[u8; HASH_BYTES]> = predicates
+        .into_iter()
+        .filter_map(|p| match p {
+            InterestPredicateWire::HoldsPolicy(hex_str) => {
+                let bytes = hex::decode(&hex_str).ok()?;
+                if bytes.len() != HASH_BYTES {
+                    return None;
+                }
+                let mut arr = [0u8; HASH_BYTES];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut added: Vec<[u8; HASH_BYTES]> = Vec::new();
+    let mut removed: Vec<[u8; HASH_BYTES]> = Vec::new();
+    TRACKED_POLICIES.with(|set| {
+        let mut set = set.borrow_mut();
+        match op {
+            InterestOp::Replace => {
+                let prev = std::mem::take(&mut *set);
+                set.extend(policies.iter().copied());
+                for p in set.iter() {
+                    if !prev.contains(p) {
+                        added.push(*p);
+                    }
+                }
+                for p in prev.iter() {
+                    if !set.contains(p) {
+                        removed.push(*p);
+                    }
+                }
+            }
+            InterestOp::Add => {
+                for p in &policies {
+                    if set.insert(*p) {
+                        added.push(*p);
+                    }
+                }
+            }
+            InterestOp::Remove => {
+                for p in &policies {
+                    if set.remove(p) {
+                        removed.push(*p);
+                    }
+                }
+            }
+        }
+    });
+
+    persist_tracked_policies();
+
+    // Drop per-policy ledger state for any policy that just
+    // left the tracked set. Resolved-decision #1 in the design
+    // doc — no TTL, no refcount; rebuild on next subscribe.
+    for policy in &removed {
+        let policy_hex = hex::encode(policy);
+        shard_clear_policy(&policy_hex);
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!("dropped holding shards for untracked policy {policy_hex}"),
+        );
+    }
+
+    // Cold-start each newly-added policy via the budget-safe chunked
+    // `rebootstrap` pump rather than an inline single-fuel scan. The
+    // inline scan traps + rolls back for large collections (10k+),
+    // emitting nothing — so add-collection silently failed to ingest
+    // big collections. Instead, record the added policies as the next
+    // rebootstrap's scope; the host pumps the re-entrant chunked
+    // rebootstrap over just these after `update-interest` returns,
+    // cold-starting any size. Idempotent: re-adds merge into the scope.
+    if !added.is_empty() {
+        seed_onboard_scope(&added);
+    }
+}
+
+/// Record `added` policies as the scope for the next `rebootstrap`
+/// pump. Merges with any still-pending scope (rapid successive adds
+/// all cold-start) and resets the durable cursor + in-process driver
+/// so the pump restarts cleanly over the scoped set.
+fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
+    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
+    for p in added {
+        let v = p.to_vec();
+        if !scope.contains(&v) {
+            scope.push(v);
+        }
+    }
+    scope.sort_unstable();
+    let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
+    if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
+        state_kv::set_value(KV_ONBOARD_PREDICATES, &buf);
+    }
+    state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+    REBOOTSTRAP_DRIVER.with(|c| *c.borrow_mut() = None);
+}
+
+/// Decode the pending onboard scope (policies a subscribe-time Add
+/// queued for cold-start), if any.
+fn read_onboard_scope() -> Option<Vec<Vec<u8>>> {
+    let bytes = state_kv::get_value(KV_ONBOARD_PREDICATES)?;
+    ciborium::de::from_reader(&bytes[..]).ok()
+}
+
+fn persist_tracked_policies() {
+    let policies: Vec<String> =
+        TRACKED_POLICIES.with(|set| set.borrow().iter().map(hex::encode).collect());
+    let mut buf = Vec::with_capacity(64 + policies.len() * 64);
+    if ciborium::ser::into_writer(&policies, &mut buf).is_ok() {
+        state_kv::set_value(KV_TRACKED_POLICIES, &buf);
+    }
+}
+
+fn restore_tracked_policies() {
+    let Some(bytes) = state_kv::get_value(KV_TRACKED_POLICIES) else {
+        return;
+    };
+    let policies: Vec<String> = match ciborium::de::from_reader(bytes.as_slice()) {
+        Ok(v) => v,
+        Err(e) => {
+            logging::log(
+                LogLevel::Warn,
+                LOG_TARGET,
+                &format!("decode tracked-policies failed: {e}"),
+            );
+            return;
+        }
+    };
+    TRACKED_POLICIES.with(|set| {
+        let mut set = set.borrow_mut();
+        for hex_str in policies {
+            let Ok(bytes) = hex::decode(&hex_str) else {
+                continue;
+            };
+            if bytes.len() != HASH_BYTES {
+                continue;
+            }
+            let mut arr = [0u8; HASH_BYTES];
+            arr.copy_from_slice(&bytes);
+            set.insert(arr);
+        }
+    });
+}
+
+// ============================================================
+// Emission helpers
+// ============================================================
+
+fn emit_event(event: &CollectionEvent) {
+    let mut buf = Vec::with_capacity(512);
+    if let Err(e) = ciborium::ser::into_writer(event, &mut buf) {
+        logging::log(
+            LogLevel::Error,
+            LOG_TARGET,
+            &format!("encode CollectionEvent failed: {e}"),
+        );
+        return;
+    }
+    // Partition key = policy hex bytes. Two purposes: the dialer
+    // serialises same-policy events into one lane (snapshot
+    // ordering) and parallelises across policies, AND the host's
+    // per-companion fan-out filter routes each emission only to
+    // companions interested in this policy — without it, a
+    // multi-policy recapture cross-contaminates every companion.
+    // See `docs/design/HOLDER_DISTRIBUTION_DRIVER_MIGRATION.md` §5.
+    emit::emit_event_keyed(0, event_policy(event).as_bytes(), &buf);
+}
+
+/// The policy hex every `CollectionEvent` carries — used as the
+/// emission partition / interest-routing key.
+fn event_policy(event: &CollectionEvent) -> &str {
+    match event {
+        CollectionEvent::SnapshotBegin(b) => &b.policy,
+        CollectionEvent::SnapshotChunk(c) => &c.policy,
+        CollectionEvent::SnapshotEnd(e) => &e.policy,
+        CollectionEvent::Delta(d) => &d.policy,
+    }
+}
+
+// ============================================================
+// Per-TX event handling
+// ============================================================
+
+/// Per-`handle_events` buffer. One Cardano TX's worth of
+/// produced + consumed events filtered to tracked policies.
+/// Flushed (deltas computed + ledger updated + `CollectionDelta`
+/// emitted) at the end of the dispatch call.
+#[derive(Default)]
+struct TxBuffer {
+    tx_hash: Option<Vec<u8>>,
+    slot: u64,
+    /// Per-policy: produced events affecting that policy.
+    produced: HashMap<[u8; HASH_BYTES], Vec<ProducedEvent>>,
+    /// Per-policy: consumed events affecting that policy.
+    consumed: HashMap<[u8; HASH_BYTES], Vec<ConsumedEvent>>,
+}
+
+fn touches_policy(assets: &[WitAssetEntry], policy: &[u8; HASH_BYTES]) -> bool {
+    assets.iter().any(|e| e.asset.policy == policy)
+}
+
+fn slot_from_cursor(c: &crate::mitos::platform_v2::types::ChainPoint) -> u64 {
+    match c {
+        crate::mitos::platform_v2::types::ChainPoint::Specific(sp) => sp.slot,
+        crate::mitos::platform_v2::types::ChainPoint::SlotOnly(s) => *s,
+        crate::mitos::platform_v2::types::ChainPoint::Origin => 0,
+    }
+}
+
+fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
+    if buf.tx_hash.is_none() {
+        buf.tx_hash = Some(p.tx_hash.clone());
+    }
+    if buf.slot == 0 {
+        buf.slot = slot_from_cursor(&p.cursor);
+    }
+    TRACKED_POLICIES.with(|set| {
+        let set = set.borrow();
+        for policy in set.iter() {
+            if touches_policy(&p.output.assets, policy) {
+                buf.produced.entry(*policy).or_default().push(p.clone());
+            }
+        }
+    });
+}
+
+fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
+    if buf.tx_hash.is_none() {
+        buf.tx_hash = Some(c.consuming_tx_hash.clone());
+    }
+    if buf.slot == 0 {
+        buf.slot = slot_from_cursor(&c.cursor);
+    }
+    TRACKED_POLICIES.with(|set| {
+        let set = set.borrow();
+        for policy in set.iter() {
+            if touches_policy(&c.prior_output.assets, policy) {
+                buf.consumed.entry(*policy).or_default().push(c.clone());
+            }
+        }
+    });
+}
+
+fn handle_rollback(r: &RollbackEvent) {
+    // The v2 contract: companion's apply_event must be idempotent
+    // at the chain-point level, and the host re-applies events
+    // after a rollback (consumer's UPSERT/DELETE pattern handles
+    // re-delivery). Per `MITOS_PLATFORM_V2.md` "Rollbacks", the
+    // platform re-feeds events from `to_cursor` forward and the
+    // chain-point-keyed ledger naturally converges.
+    //
+    // We log here for operator visibility; no module-side
+    // bookkeeping is needed since we don't keep a per-cursor
+    // history. The persisted ledger will diverge briefly between
+    // `to_cursor` and the next re-application sweep — acceptable,
+    // as the consumer's projection isn't authoritative until
+    // events catch back up.
+    let slot = slot_from_cursor(&r.to_cursor);
+    logging::log(
+        LogLevel::Info,
+        LOG_TARGET,
+        &format!("rollback to slot {slot} — relying on re-apply convergence"),
+    );
+}
+
+/// Compute per-(asset, holder) net deltas across the TX, then
+/// emit `Movement`s with greedy from/to pairing. Updates the
+/// persisted ledger as a side-effect.
+fn flush_buffer(buf: TxBuffer) {
+    let Some(tx_hash) = buf.tx_hash else {
+        return;
+    };
+    let tx_hash_hex = hex::encode(&tx_hash);
+    let slot = buf.slot;
+
+    let mut policies: HashSet<[u8; HASH_BYTES]> = HashSet::new();
+    policies.extend(buf.produced.keys().copied());
+    policies.extend(buf.consumed.keys().copied());
+
+    for policy in policies {
+        let policy_hex = hex::encode(policy);
+
+        // Build per-asset, per-holder net delta map.
+        // Positive = produced (gained), negative = consumed (lost).
+        // i64 — RFT quantities fit in i64 comfortably for realistic
+        // edition sizes; CNT-scale supply would overflow but those
+        // shouldn't be routed here (the module hard-rejects FT
+        // classification — Chunk 2 follow-up).
+        let mut deltas: BTreeMap<Vec<u8>, BTreeMap<HolderKey, i64>> = BTreeMap::new();
+
+        if let Some(events) = buf.consumed.get(&policy) {
+            for c in events {
+                let Some(key) = extract_holder_key(&c.prior_output.address) else {
+                    continue;
+                };
+                for asset in &c.prior_output.assets {
+                    if asset.asset.policy != policy {
+                        continue;
+                    }
+                    let per_asset = deltas.entry(asset.asset.name.clone()).or_default();
+                    *per_asset.entry(key.clone()).or_insert(0) -= asset.quantity as i64;
+                }
+            }
+        }
+        if let Some(events) = buf.produced.get(&policy) {
+            for p in events {
+                let Some(key) = extract_holder_key(&p.output.address) else {
+                    continue;
+                };
+                for asset in &p.output.assets {
+                    if asset.asset.policy != policy {
+                        continue;
+                    }
+                    let per_asset = deltas.entry(asset.asset.name.clone()).or_default();
+                    *per_asset.entry(key.clone()).or_insert(0) += asset.quantity as i64;
+                }
+            }
+        }
+
+        // Apply non-zero deltas to the ledger + build Movement
+        // list with greedy from/to pairing per asset.
+        let mut movements: Vec<Movement> = Vec::new();
+
+        for (asset_name, per_holder) in deltas {
+            // Update the persisted ledger first — same-holder
+            // zero deltas (change outputs) net out and never
+            // surface as movements, but they don't need ledger
+            // updates either.
+            for (key, delta) in &per_holder {
+                if *delta == 0 {
+                    continue;
+                }
+                // Per-shard read-modify-write — no whole-ledger load.
+                let entry_key = holding_entry_key(key, &asset_name);
+                let prev = shard_get_holding(&policy_hex, &entry_key)
+                    .map(|h| h.quantity)
+                    .unwrap_or(0) as i64;
+                let new = prev + delta;
+                if new <= 0 {
+                    shard_delete_holding(&policy_hex, &entry_key);
+                } else {
+                    shard_put_holding(
+                        &policy_hex,
+                        &entry_key,
+                        &Holding {
+                            asset_name_hex: hex::encode(&asset_name),
+                            holder: key.to_wire(),
+                            quantity: new as u64,
+                        },
+                    );
+                }
+            }
+
+            // Split per-holder deltas into positive (gainers)
+            // and negative (losers, qty absolute).
+            let mut pos: Vec<(HolderKey, u64)> = Vec::new();
+            let mut neg: Vec<(HolderKey, u64)> = Vec::new();
+            for (key, delta) in per_holder {
+                match delta.cmp(&0) {
+                    std::cmp::Ordering::Greater => pos.push((key, delta as u64)),
+                    std::cmp::Ordering::Less => neg.push((key, (-delta) as u64)),
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+
+            // Greedy pairing: match negative with positive,
+            // emitting a single `from→to` Movement for the
+            // overlap. Unmatched negative residue is a burn
+            // (to = None); unmatched positive residue is a
+            // mint (from = None).
+            //
+            // Guard with `is_empty` checks rather than
+            // `while let (Some, Some) = (pos.pop(), neg.pop())`:
+            // the latter pops from BOTH sides unconditionally
+            // each iteration, so a pure-mint TX (neg empty,
+            // pos non-empty) would `pop()` the gainer from pos,
+            // fail the pattern match, and silently discard it.
+            let asset_name_hex = hex::encode(&asset_name);
+            while !pos.is_empty() && !neg.is_empty() {
+                let mut p = pos.pop().unwrap();
+                let mut n = neg.pop().unwrap();
+                let q = p.1.min(n.1);
+                movements.push(Movement {
+                    asset_name_hex: asset_name_hex.clone(),
+                    from: Some(n.0.to_wire()),
+                    to: Some(p.0.to_wire()),
+                    quantity: q,
+                });
+                p.1 -= q;
+                n.1 -= q;
+                if p.1 > 0 {
+                    pos.push(p);
+                }
+                if n.1 > 0 {
+                    neg.push(n);
+                }
+            }
+            for (key, qty) in pos {
+                movements.push(Movement {
+                    asset_name_hex: asset_name_hex.clone(),
+                    from: None,
+                    to: Some(key.to_wire()),
+                    quantity: qty,
+                });
+            }
+            for (key, qty) in neg {
+                movements.push(Movement {
+                    asset_name_hex: asset_name_hex.clone(),
+                    from: Some(key.to_wire()),
+                    to: None,
+                    quantity: qty,
+                });
+            }
+        }
+
+        if !movements.is_empty() {
+            emit_event(&CollectionEvent::Delta(CollectionDelta {
+                policy: policy_hex,
+                tx_hash: tx_hash_hex.clone(),
+                slot,
+                movements,
+            }));
+        }
+    }
+}
+
+// ============================================================
+// v2 Guest impl
+// ============================================================
+
+struct Module;
+
+impl Guest for Module {
+    fn module_version() -> (u32, u32) {
+        (2, 0)
+    }
+
+    fn trap_policy() -> (TrapStrategy, RetryPolicy) {
+        (
+            TrapStrategy::Replay,
+            RetryPolicy {
+                max_retries: 3,
+                backoff_cap_ms: 1_000,
+            },
+        )
+    }
+
+    fn init(config: Vec<u8>) {
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!("init: enter (config_bytes={})", config.len()),
+        );
+        restore_tracked_policies();
+        let count = TRACKED_POLICIES.with(|s| s.borrow().len());
+        logging::log(
+            LogLevel::Info,
+            LOG_TARGET,
+            &format!("init: restored {count} tracked policies"),
+        );
+    }
+
+    fn handle_events(events: Vec<DispatchEvent>) {
+        let any_tracked = TRACKED_POLICIES.with(|s| !s.borrow().is_empty());
+        if !any_tracked {
+            return;
+        }
+        let mut buf = TxBuffer::default();
+        for event in events {
+            match event {
+                DispatchEvent::Utxo(UtxoEvent::Produced(p)) => handle_produced(&p, &mut buf),
+                DispatchEvent::Utxo(UtxoEvent::Consumed(c)) => handle_consumed(&c, &mut buf),
+                DispatchEvent::Rollback(r) => handle_rollback(&r),
+                // tx-context, referenced, minted, tick — not
+                // consumed by collection-holders. Mints surface
+                // as Produced events (asset materialising into
+                // a holder) which the produced handler covers;
+                // burns surface as Consumed without matching
+                // Produced.
+                _ => {}
+            }
+        }
+        flush_buffer(buf);
+    }
+
+    fn update_interest(op: InterestOp, items_cbor: Vec<u8>) -> Result<(), String> {
+        apply_interest_update(op, &items_cbor);
+        Ok(())
+    }
+
+    /// Re-emit the holder snapshot for tracked policies, one bounded
+    /// unit of work per call, via the shared re-entrant
+    /// [`ChunkedBootstrap`] driver: scan a page → shard each holding
+    /// (SUM merge, batched read+write per page) → emit one
+    /// `SnapshotChunk` per call from the shards. Every progress field
+    /// is durable in state-kv; no call serializes the whole ledger
+    /// and writes are one txn/page, so large policies complete
+    /// without trapping.
+    fn rebootstrap() -> Result<RebootstrapStep, String> {
+        REBOOTSTRAP_DRIVER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                // Scope the round: a pending onboard set (subscribe-time
+                // Add) cold-starts just those policies; otherwise this is
+                // a full recapture over every tracked policy. The host
+                // pumps this same export in both cases.
+                let mut predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
+                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
+                });
+                predicates.sort_unstable();
+                let cursor =
+                    state_kv::get_value(KV_REBOOTSTRAP_CURSOR).and_then(|b| BootstrapCursor::decode(&b));
+                *slot = Some(ChunkedBootstrap::resume(predicates, cursor));
+            }
+            let driver = slot.as_mut().expect("driver initialised above");
+            let mut io = HoldersIo;
+            let out = driver.step(&mut io);
+            if out.done {
+                *slot = None;
+                // Clear the scoped onboard set so a future recapture
+                // defaults to the full tracked set.
+                state_kv::delete_value(KV_ONBOARD_PREDICATES);
+            }
+            Ok(RebootstrapStep {
+                done: out.done,
+                ingested: out.ingested,
+            })
+        })
+    }
+}
+
+/// `BootstrapIo` adapter wiring the kit driver to this module's
+/// host-fns. SUM semantics — a holder×asset recurs across UTxOs,
+/// quantities add.
+struct HoldersIo;
+
+/// Coerce a predicate slice (always a 28-byte policy hash) to the
+/// array form the chain-data host-fn wants.
+fn policy_arr(predicate: &[u8]) -> [u8; HASH_BYTES] {
+    let mut a = [0u8; HASH_BYTES];
+    a.copy_from_slice(predicate);
+    a
+}
+
+impl BootstrapIo for HoldersIo {
+    type Entry = Holding;
+
+    fn scan_page(&mut self, predicate: &[u8], after: Option<&[u8]>) -> ScannedPage<Holding> {
+        let policy = policy_arr(predicate);
+        let page = chain_data::utxos_by_policy(&policy, after, COLD_START_PAGE_HINT);
+        let ingested = page.refs.len() as u64;
+        // Fold the page (sums within-page dups for the same
+        // holder×asset); the driver's SUM merge combines across pages.
+        let mut ledger = PolicyLedger::default();
+        fold_page(&mut ledger, &policy, &page.refs);
+        let mut entries: Vec<(Vec<u8>, Holding)> = Vec::new();
+        for (key, assets) in ledger.holdings {
+            let holder = key.to_wire();
+            for (name_bytes, qty) in assets {
+                entries.push((
+                    holding_entry_key(&key, &name_bytes),
+                    Holding {
+                        asset_name_hex: hex::encode(&name_bytes),
+                        holder: holder.clone(),
+                        quantity: qty,
+                    },
+                ));
+            }
+        }
+        ScannedPage {
+            entries,
+            next: page.next,
+            anchor_slot: page.anchor_slot,
+            ingested,
+        }
+    }
+
+    fn shard_get_many(&self, predicate: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let policy_hex = hex::encode(predicate);
+        let kv_keys: Vec<String> = keys.iter().map(|k| shard_kv_key(&policy_hex, k)).collect();
+        state_kv::get_many(&kv_keys)
+    }
+    fn shard_put_many(&mut self, predicate: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) {
+        let policy_hex = hex::encode(predicate);
+        let kv_entries: Vec<(String, Vec<u8>)> = entries
+            .iter()
+            .map(|(k, v)| (shard_kv_key(&policy_hex, k), v.clone()))
+            .collect();
+        state_kv::set_many(&kv_entries);
+    }
+    fn shard_scan(
+        &self,
+        predicate: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let policy_hex = hex::encode(predicate);
+        let prefix = shard_prefix(&policy_hex);
+        let after_key = after.map(|a| shard_kv_key(&policy_hex, a));
+        state_kv::kv_scan(&prefix, after_key.as_deref(), limit as u32)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix(prefix.as_str())
+                    .and_then(|h| hex::decode(h).ok())
+                    .map(|ek| (ek, v))
+            })
+            .collect()
+    }
+    fn shard_clear(&mut self, predicate: &[u8]) {
+        shard_clear_policy(&hex::encode(predicate));
+    }
+
+    fn encode_entry(&self, entry: &Holding) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        let _ = ciborium::ser::into_writer(entry, &mut buf);
+        buf
+    }
+    fn decode_entry(&self, bytes: &[u8]) -> Option<Holding> {
+        ciborium::de::from_reader(bytes).ok()
+    }
+
+    // A holder×asset legitimately recurs across UTxOs/pages → SUM.
+    fn accumulates(&self) -> bool {
+        true
+    }
+    fn merge(&self, prior: Option<Holding>, incoming: Holding) -> Holding {
+        match prior {
+            Some(p) => Holding {
+                quantity: p.quantity + incoming.quantity,
+                ..incoming
+            },
+            None => incoming,
+        }
+    }
+
+    fn load_cursor(&self) -> Option<Vec<u8>> {
+        state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+    }
+    fn save_cursor(&mut self, bytes: &[u8]) {
+        state_kv::set_value(KV_REBOOTSTRAP_CURSOR, bytes);
+    }
+    fn clear_cursor(&mut self) {
+        state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
+    }
+
+    fn emit_begin(&mut self, predicate: &[u8], anchor_slot: u64) {
+        emit_event(&CollectionEvent::SnapshotBegin(SnapshotBegin {
+            policy: hex::encode(predicate),
+            cursor_slot: anchor_slot,
+            cursor_hash_hex: String::new(),
+        }));
+    }
+    fn emit_chunk(&mut self, predicate: &[u8], entries: Vec<Holding>) {
+        emit_event(&CollectionEvent::SnapshotChunk(SnapshotChunk {
+            policy: hex::encode(predicate),
+            holdings: entries,
+        }));
+    }
+    fn emit_end(&mut self, predicate: &[u8], total: u64) {
+        emit_event(&CollectionEvent::SnapshotEnd(SnapshotEnd {
+            policy: hex::encode(predicate),
+            holding_count: total,
+        }));
+    }
+    fn chunk_size(&self) -> usize {
+        SNAPSHOT_CHUNK_HOLDINGS
+    }
+}
+
+export!(Module);

@@ -68,9 +68,10 @@ pub struct ModuleStorage {
     cursor_stores: Arc<Mutex<HashMap<String, CursorStore>>>,
     emissions_stores: Arc<Mutex<HashMap<String, crate::emissions::EmissionsStore>>>,
     kv_stores: Arc<Mutex<HashMap<String, crate::vendored::balius::kv::RedbKv>>>,
-    /// Platform-wide aux-data cache. One handle shared across all
-    /// module followers — `None` until first `aux_data_cache()` call.
-    aux_data_cache: Arc<Mutex<Option<crate::aux_data_cache::AuxDataCache>>>,
+    /// Platform-wide indexer-data cache (aux_data + datums). One
+    /// handle shared across all module followers — `None` until
+    /// first `indexer_data_cache()` call.
+    indexer_data_cache: Arc<Mutex<Option<crate::indexer_data_cache::IndexerDataCache>>>,
 }
 
 impl ModuleStorage {
@@ -80,7 +81,7 @@ impl ModuleStorage {
             cursor_stores: Arc::new(Mutex::new(HashMap::new())),
             emissions_stores: Arc::new(Mutex::new(HashMap::new())),
             kv_stores: Arc::new(Mutex::new(HashMap::new())),
-            aux_data_cache: Arc::new(Mutex::new(None)),
+            indexer_data_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -121,20 +122,44 @@ impl ModuleStorage {
         cache.remove(id);
     }
 
-    /// Get-or-open the platform-wide aux-data cache. Stored at
-    /// `<storage_root>/aux_data.redb` (not per-module — aux_data
-    /// is a chain fact shared across all modules). Idempotent;
-    /// first call opens the redb file, subsequent calls return
-    /// the cached handle (cheap clone of the internal Arc).
-    pub fn aux_data_cache(
+    /// Get-or-open the platform-wide indexer-data cache holding
+    /// aux_data and datums. Stored at
+    /// `<storage_root>/indexer_data.redb` (not per-module — these
+    /// are chain facts shared across all modules). Idempotent;
+    /// first call opens the redb file, subsequent calls return the
+    /// cached handle (cheap clone of the internal Arc).
+    pub fn indexer_data_cache(
         &self,
-    ) -> Result<crate::aux_data_cache::AuxDataCache, crate::aux_data_cache::AuxDataCacheError> {
-        let mut lock = self.aux_data_cache.lock().expect("aux_data_cache mutex");
+    ) -> Result<
+        crate::indexer_data_cache::IndexerDataCache,
+        crate::indexer_data_cache::IndexerDataCacheError,
+    > {
+        let mut lock = self
+            .indexer_data_cache
+            .lock()
+            .expect("indexer_data_cache mutex");
         if let Some(cache) = lock.as_ref() {
             return Ok(cache.clone());
         }
-        let path = self.root.join("aux_data.redb");
-        let cache = crate::aux_data_cache::AuxDataCache::open(path)?;
+        let path = self.root.join("indexer_data.redb");
+        // One-time migration: the cache was previously named
+        // `aux_data.redb` (aux_data only). Rename it in place so an
+        // existing deployment keeps its warm aux_data entries
+        // instead of cold-starting; the `datums` table is created
+        // lazily on open. Best-effort — a failed rename just means
+        // a cold start, not an error.
+        let legacy = self.root.join("aux_data.redb");
+        if !path.exists() && legacy.exists() {
+            if let Err(e) = std::fs::rename(&legacy, &path) {
+                tracing::warn!(
+                    error = %e,
+                    "indexer_data_cache: failed to migrate aux_data.redb; starting cold",
+                );
+            } else {
+                tracing::info!("indexer_data_cache: migrated aux_data.redb -> indexer_data.redb");
+            }
+        }
+        let cache = crate::indexer_data_cache::IndexerDataCache::open(path)?;
         *lock = Some(cache.clone());
         Ok(cache)
     }
@@ -247,6 +272,35 @@ impl ModuleStorage {
     /// where each registered companion's `SubscribeRequest` lives.
     pub fn module_dir_for_companions(&self, id: &str) -> PathBuf {
         self.module_dir(id).join("companions")
+    }
+
+    /// Count registered companions for a module across the two-level
+    /// `<client_id>/<companion_key>.cbor` layout. Best-effort: a
+    /// missing companions root (no subscribers yet) counts as 0, and
+    /// metadata dirs (`.unreachable/`, etc.) are skipped — mirroring
+    /// the walk in `companions::*`. Feeds the `/_admin/status`
+    /// per-module summary.
+    pub fn count_companions(&self, id: &str) -> usize {
+        let root = self.module_dir_for_companions(id);
+        let Ok(clients) = std::fs::read_dir(&root) else {
+            return 0;
+        };
+        let mut count = 0;
+        for client in clients.flatten() {
+            if !client.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if client.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(client.path()) {
+                count += files
+                    .flatten()
+                    .filter(|f| f.path().extension().is_some_and(|ext| ext == "cbor"))
+                    .count();
+            }
+        }
+        count
     }
 
     /// Per-module emissions log path. Single redb file at

@@ -60,6 +60,8 @@ pub async fn run_chain_follower_v2<S, P>(
     module_id: String,
     kv_factory: KvFactory,
     trap_logger: Arc<TrapContextLogger>,
+    event_ring: Option<crate::events::EventRing>,
+    chunked_cold_start: bool,
 ) -> PlatformResult<()>
 where
     S: TipSubscription,
@@ -71,7 +73,7 @@ where
     // successful apply so future bootstraps can resolve without
     // the dolos archive. Failure here is non-fatal — the fallback
     // is the dolos archive (or Maestro in Phase 2).
-    let aux_cache = storage.aux_data_cache().ok();
+    let aux_cache = storage.indexer_data_cache().ok();
     loop {
         // Multiplex tip events with interest updates. `biased`
         // gives tip events priority — dynamic interest is rare
@@ -92,6 +94,7 @@ where
                             update,
                             data_plane.as_ref(),
                             &kv_factory,
+                            chunked_cold_start,
                         )
                         .await;
                         continue;
@@ -165,6 +168,17 @@ where
                                 "v2 dispatch trapped; failed to write trap fixture",
                             ),
                         }
+                        // Surface the trap on the operational events
+                        // ring so `mitos-admin tail` / `GET
+                        // /_admin/events` see it without a journal grep.
+                        if let Some(ring) = &event_ring {
+                            ring.record(
+                                module_id.clone(),
+                                crate::events::EventKind::Trap {
+                                    reason: e.to_string(),
+                                },
+                            );
+                        }
                         // Supervisor wiring is a v2.x follow-up;
                         // for now surface to the spawning task.
                         return Err(e);
@@ -199,7 +213,7 @@ where
 /// Scan a raw block CBOR and batch-insert all TX aux_data entries
 /// into the cache. Errors are silently discarded — a cache miss
 /// on the next bootstrap is the only consequence.
-fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::aux_data_cache::AuxDataCache) {
+fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::indexer_data_cache::IndexerDataCache) {
     let block = match MultiEraBlock::decode(block_bytes) {
         Ok(b) => b,
         Err(_) => return,
@@ -213,7 +227,7 @@ fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::aux_data_cache::Aux
             Some((hash, cbor))
         })
         .collect();
-    cache.insert_batch(&entries);
+    cache.insert_aux_batch(&entries);
 }
 
 /// Apply one dynamic-interest update: mutate the driver's
@@ -233,6 +247,7 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     update: InterestUpdate,
     plane: &P,
     kv_factory: &KvFactory,
+    chunked_cold_start: bool,
 ) {
     use mitos_protocol::InterestOp as WireOp;
 
@@ -262,50 +277,12 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     }
     driver.set_interest(current);
 
-    // 2. Bootstrap any newly-added predicates that have a
-    //    current-state hydration path (addresses + policies).
-    //    Idempotent via the per-scope state-kv flag — no-op
-    //    when the predicate's already been bootstrapped on a
-    //    previous Add or via the manifest-driven pass at start.
-    //    Only runs on Add (Remove never hydrates; Replace is
-    //    typically used at companion reconnect for re-asserting
-    //    state, not for fresh onboarding).
-    if matches!(update.op, WireOp::Add) {
-        let mut bootstrap_kv = kv_factory(module_id);
-        for predicate in &update.predicates {
-            match crate::bootstrap_v2::bootstrap_one_predicate(
-                driver,
-                module_id,
-                &mut bootstrap_kv,
-                predicate,
-                plane,
-            )
-            .await
-            {
-                Ok(stats) => {
-                    if stats.utxos_dispatched > 0 {
-                        tracing::info!(
-                            module = %module_id,
-                            predicate = ?predicate,
-                            utxos = stats.utxos_dispatched,
-                            batches = stats.batches_dispatched,
-                            "v2 dynamic-interest bootstrap complete",
-                        );
-                    }
-                }
-                Err(e) => tracing::error!(
-                    module = %module_id,
-                    predicate = ?predicate,
-                    error = %e,
-                    "v2 dynamic-interest bootstrap failed; live dispatch still applies",
-                ),
-            }
-        }
-    }
-
-    // 3. Forward to the module's update-interest export. Map
-    //    the wire op enum to the bindgen op enum (same variants,
-    //    different generated types).
+    // 2. Forward to the module's update-interest export FIRST, so a
+    //    page-oriented module records the newly-added policies as a
+    //    scoped cold-start (read back when we pump `rebootstrap`
+    //    below). Runs for every op to keep the module's persisted
+    //    interest in sync. Map the wire op to the bindgen op (same
+    //    variants, different generated types).
     let bindgen_op = match update.op {
         WireOp::Add => crate::bindings_v2::InterestOp::Add,
         WireOp::Remove => crate::bindings_v2::InterestOp::Remove,
@@ -339,6 +316,131 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
             );
         }
     }
+
+    // 3. Cold-start newly-added predicates (Add only; Remove never
+    //    hydrates, Replace is reconnect re-assert). Two paths, gated
+    //    by the module's manifest `[interest] chunked_cold_start`:
+    if matches!(update.op, WireOp::Add) {
+        if chunked_cold_start {
+            // Page-oriented modules (collection-holders/metadata)
+            // seeded a scoped onboard set in update-interest above;
+            // pump their budget-safe chunked `rebootstrap` to
+            // completion over just those policies. This is how an
+            // added collection of any size cold-starts on subscribe —
+            // the old inline single-fuel scan trapped + emitted
+            // nothing for large collections.
+            pump_onboard_rebootstrap(driver, module_id).await;
+        } else {
+            // Every other module: the host's synthetic-event
+            // bootstrap (unchanged). Pumping `rebootstrap` here would
+            // double-fire a module that also cold-starts inline (e.g.
+            // vesting-tracker), so it's opt-in via the manifest flag.
+            // Idempotent via the per-scope state-kv flag.
+            let mut bootstrap_kv = kv_factory(module_id);
+            for predicate in &update.predicates {
+                match crate::bootstrap_v2::bootstrap_one_predicate(
+                    driver,
+                    module_id,
+                    &mut bootstrap_kv,
+                    predicate,
+                    plane,
+                )
+                .await
+                {
+                    Ok(stats) => {
+                        if stats.utxos_dispatched > 0 {
+                            tracing::info!(
+                                module = %module_id,
+                                predicate = ?predicate,
+                                utxos = stats.utxos_dispatched,
+                                batches = stats.batches_dispatched,
+                                "v2 dynamic-interest bootstrap complete (synthetic)",
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        module = %module_id,
+                        predicate = ?predicate,
+                        error = %e,
+                        "v2 dynamic-interest bootstrap failed; live dispatch still applies",
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Pump a module's chunked `rebootstrap` export to completion for a
+/// freshly-added interest predicate's *scoped* cold-start (the module
+/// seeded the scope in its `update-interest` handler). Returns total
+/// UTxOs ingested — `0` means the module has no chunked bootstrap, so
+/// the caller falls back to the synthetic `bootstrap_one_predicate`.
+///
+/// Each `call_rebootstrap` refuels + does one bounded page, so the
+/// loop is budget-safe per page for normal collections. Unlike the
+/// recapture pump in `host_v2::start`, this does NOT re-instantiate
+/// on an out-of-fuel trap (the follower lacks the registry context):
+/// a pathological single page that overruns even a fresh budget logs
+/// and stops, with operator `recapture` as the safety net (the same
+/// posture the old inline cold-start documented). Bounded by a step
+/// cap so a misbehaving module can't spin forever.
+///
+/// NOTE: this blocks the follower's tip processing for the duration
+/// of the pump (seconds for a large collection). Acceptable for an
+/// infrequent subscribe-time onboard — the module resumes from its
+/// durable cursor. Interleaving the pump with tip events is a
+/// possible follow-up if onboard latency becomes a concern.
+async fn pump_onboard_rebootstrap(driver: &mut DriverV2, module_id: &str) -> u64 {
+    // Mirrors `host_v2`'s recapture step cap: counts host calls
+    // (pages), not UTxOs.
+    const MAX_STEPS: u64 = 10_000_000;
+    let mut total: u64 = 0;
+    let mut steps: u64 = 0;
+    loop {
+        match driver.call_rebootstrap().await {
+            Ok(Ok(step)) => {
+                total += step.ingested;
+                steps += 1;
+                if step.done {
+                    break;
+                }
+                if steps >= MAX_STEPS {
+                    tracing::error!(
+                        module = %module_id,
+                        steps,
+                        "onboard rebootstrap exceeded step cap; aborting",
+                    );
+                    break;
+                }
+            }
+            Ok(Err(msg)) => {
+                tracing::error!(
+                    module = %module_id,
+                    error = %msg,
+                    "onboard rebootstrap returned an error",
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    module = %module_id,
+                    error = %e,
+                    "onboard rebootstrap trapped; cold-start may be partial — \
+                     operator recapture is the safety net",
+                );
+                break;
+            }
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            module = %module_id,
+            utxos = total,
+            steps,
+            "onboard cold-start complete (scoped rebootstrap)",
+        );
+    }
+    total
 }
 
 /// Persist the driver's post-apply cursor to module storage.

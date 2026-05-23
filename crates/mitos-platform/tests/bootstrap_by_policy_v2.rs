@@ -223,10 +223,17 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
     storage.activate(&manifest, &wasm).expect("activate");
 
     // Companion stub so the emissions store records rows for our
-    // assertion. Same pattern dispatch_v2 / dynamic_interest_v2 use.
-    let companions_dir = storage.module_dir_for_companions("test-indexer");
-    std::fs::create_dir_all(&companions_dir).expect("companions dir");
-    std::fs::write(companions_dir.join("test-companion.cbor"), b"").expect("companion stub");
+    // assertion. Unbounded interest so the host fan-out filter
+    // delivers every policy's events (the test-indexer emits with
+    // no partition key, so routing is a no-op here regardless).
+    // Same pattern dispatch_v2 / dynamic_interest_v2 use.
+    common::write_companion_subscription(
+        &storage,
+        "test-indexer",
+        "test-client",
+        "test-companion",
+        vec![WireInterest::any()],
+    );
 
     let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
     let chain_plane = Arc::new(FixturePolicyDataPlane {
