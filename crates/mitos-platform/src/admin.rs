@@ -202,7 +202,9 @@ fn admin_router_inner(
         started_at,
         events,
     };
-    axum::Router::new()
+    // Bearer-gated admin surface. The auth layer is applied to this
+    // sub-router only, so the open `/metrics` route below is exempt.
+    let authed = axum::Router::new()
         .route("/_admin/status", get(status))
         .route("/_admin/events", get(list_events))
         .route("/_admin/modules", get(list_modules))
@@ -229,8 +231,15 @@ fn admin_router_inner(
         )
         .route("/_admin/blocks/{slot}", get(get_block_by_slot))
         .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+        .layer(axum::middleware::from_fn_with_state(auth, require_auth));
+
+    // `/metrics` is OPEN (no auth), like `/health` — operational
+    // gauges/counters for Prometheus, no secrets. Kept in this router
+    // (rather than the bundle) so it shares `AdminState` + the
+    // emission-scan helpers.
+    let open = axum::Router::new().route("/metrics", get(metrics));
+
+    authed.merge(open).with_state(state)
 }
 
 // -----------------------------------------------------------------------------
@@ -603,6 +612,278 @@ async fn list_events(
     })
 }
 
+/// Escape a Prometheus label value (`\`, `"`, newline).
+fn esc_label(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+/// Write a metric family header (`# HELP` + `# TYPE`).
+fn metric_header(out: &mut String, name: &str, help: &str, kind: &str) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+/// `GET /metrics` — Prometheus text exposition. **Open** (no auth,
+/// like `/health`): operational gauges + counters for a dashboard /
+/// alerting, no secrets. Computed at scrape time from the same
+/// sources as the JSON endpoints — one emissions-store scan per
+/// module (see the cost note on `emission_backlog`); cache or move to
+/// atomic counters if scrape latency becomes a problem.
+async fn metrics(State(state): State<AdminState>) -> Response {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(8192);
+
+    // ----- global -----
+    let uptime = SystemTime::now()
+        .duration_since(state.started_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    metric_header(
+        &mut out,
+        "mitos_build_info",
+        "Build version + git sha (value always 1).",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "mitos_build_info{{version=\"{}\",build_sha=\"{}\"}} 1",
+        esc_label(env!("CARGO_PKG_VERSION")),
+        esc_label(env!("MITOS_BUILD_SHA")),
+    );
+    metric_header(
+        &mut out,
+        "mitos_uptime_seconds",
+        "Seconds since process start.",
+        "gauge",
+    );
+    let _ = writeln!(out, "mitos_uptime_seconds {uptime}");
+
+    if let Some(cd) = &state.chain_data
+        && let Ok(tip) = cd.tip().await
+    {
+        metric_header(
+            &mut out,
+            "mitos_chain_tip_slot",
+            "Current chain tip slot.",
+            "gauge",
+        );
+        let _ = writeln!(out, "mitos_chain_tip_slot {}", tip.slot());
+    }
+
+    // ----- gather per-module + per-companion -----
+    let recapturing: std::collections::HashSet<String> = match &state.host {
+        Some(host) => host.recapture_in_flight().await.into_iter().collect(),
+        None => std::collections::HashSet::new(),
+    };
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ids = state.storage.list_modules().unwrap_or_default();
+
+    struct ModMetrics {
+        module: String,
+        companions: usize,
+        recapture: bool,
+        last_trap_age: Option<u64>,
+        status_totals: [usize; 5], // queued, pending, acked, nacked, timeout
+        comps: Vec<CompMetrics>,
+    }
+    struct CompMetrics {
+        companion: String,
+        client: String,
+        queued: usize,
+        pending: usize,
+        last_drain_age: Option<u64>,
+        oldest_queued_age: Option<u64>,
+    }
+
+    let mut mods = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let last_trap_age = std::fs::metadata(state.storage.last_trap_path(id))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+            .map(|d| d.as_secs());
+        let stats = companion_emission_stats(&state, id);
+        let mut status_totals = [0usize; 5];
+        let mut comps = Vec::with_capacity(stats.len());
+        for ((companion, client), s) in &stats {
+            status_totals[0] += s.queued;
+            status_totals[1] += s.pending;
+            status_totals[2] += s.acked;
+            status_totals[3] += s.nacked;
+            status_totals[4] += s.timeout;
+            comps.push(CompMetrics {
+                companion: companion.clone(),
+                client: client.clone(),
+                queued: s.queued,
+                pending: s.pending,
+                last_drain_age: s.last_sent_unix.map(|u| now.saturating_sub(u)),
+                oldest_queued_age: s.oldest_queued_unix.map(|u| now.saturating_sub(u)),
+            });
+        }
+        mods.push(ModMetrics {
+            module: id.clone(),
+            companions: state.storage.count_companions(id),
+            recapture: recapturing.contains(id),
+            last_trap_age,
+            status_totals,
+            comps,
+        });
+    }
+
+    // ----- emit, grouped by metric family -----
+    const STATUS_NAMES: [&str; 5] = ["queued", "pending", "acked", "nacked", "timeout"];
+
+    metric_header(
+        &mut out,
+        "mitos_module_companions",
+        "Registered companions per module.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_module_companions{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            m.companions,
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_recapture_in_progress",
+        "1 if a recapture is currently in flight for the module.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_recapture_in_progress{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            u8::from(m.recapture),
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_module_last_trap_age_seconds",
+        "Age of the module's last trap fixture (omitted if none).",
+        "gauge",
+    );
+    for m in &mods {
+        if let Some(age) = m.last_trap_age {
+            let _ = writeln!(
+                out,
+                "mitos_module_last_trap_age_seconds{{module=\"{}\"}} {age}",
+                esc_label(&m.module),
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_module_emissions",
+        "Emission count by status per module (queued+pending = backlog).",
+        "gauge",
+    );
+    for m in &mods {
+        for (i, status) in STATUS_NAMES.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "mitos_module_emissions{{module=\"{}\",status=\"{status}\"}} {}",
+                esc_label(&m.module),
+                m.status_totals[i],
+            );
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_companion_backlog",
+        "Undelivered emissions per companion by status (queued/pending).",
+        "gauge",
+    );
+    for m in &mods {
+        for c in &m.comps {
+            for (status, val) in [("queued", c.queued), ("pending", c.pending)] {
+                let _ = writeln!(
+                    out,
+                    "mitos_companion_backlog{{module=\"{}\",companion=\"{}\",client=\"{}\",status=\"{status}\"}} {val}",
+                    esc_label(&m.module),
+                    esc_label(&c.companion),
+                    esc_label(&c.client),
+                );
+            }
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_companion_last_drain_age_seconds",
+        "Seconds since the companion's most recent dial (omitted if never).",
+        "gauge",
+    );
+    for m in &mods {
+        for c in &m.comps {
+            if let Some(age) = c.last_drain_age {
+                let _ = writeln!(
+                    out,
+                    "mitos_companion_last_drain_age_seconds{{module=\"{}\",companion=\"{}\",client=\"{}\"}} {age}",
+                    esc_label(&m.module),
+                    esc_label(&c.companion),
+                    esc_label(&c.client),
+                );
+            }
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_companion_oldest_queued_age_seconds",
+        "Age of the companion's oldest undelivered emission (a stalled lane signal; omitted if none queued).",
+        "gauge",
+    );
+    for m in &mods {
+        for c in &m.comps {
+            if let Some(age) = c.oldest_queued_age {
+                let _ = writeln!(
+                    out,
+                    "mitos_companion_oldest_queued_age_seconds{{module=\"{}\",companion=\"{}\",client=\"{}\"}} {age}",
+                    esc_label(&m.module),
+                    esc_label(&c.companion),
+                    esc_label(&c.client),
+                );
+            }
+        }
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_events_total",
+        "Cumulative operational events since start, by kind (e.g. trap, recapture_completed).",
+        "counter",
+    );
+    for (module, kind, count) in state.events.totals() {
+        let _ = writeln!(
+            out,
+            "mitos_events_total{{module=\"{}\",kind=\"{kind}\"}} {count}",
+            esc_label(&module),
+        );
+    }
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
+}
+
 /// Best-effort count of a module's `Queued` + `Pending` emissions —
 /// the backlog depth surfaced in `/_admin/status`. A module that has
 /// never emitted (no store) counts as `(0, 0)`. Shared with the
@@ -638,6 +919,10 @@ struct CompanionEmissionStat {
     timeout: usize,
     /// Max `sent_at` (unix secs) across the companion's rows.
     last_sent_unix: Option<u64>,
+    /// Min `matched_at` (unix secs) across the companion's still-
+    /// `Queued` rows — the age of the oldest undelivered emission.
+    /// Distinguishes a transient burst from a genuine stall.
+    oldest_queued_unix: Option<u64>,
 }
 
 /// Parse an emissions-store timestamp (`"unix:<secs>"`) to epoch secs.
@@ -677,6 +962,12 @@ fn companion_emission_stats(
         }
         if let Some(sent) = r.sent_at.as_deref().and_then(parse_emission_unix) {
             entry.last_sent_unix = Some(entry.last_sent_unix.map_or(sent, |cur| cur.max(sent)));
+        }
+        if matches!(r.status, Queued)
+            && let Some(matched) = parse_emission_unix(&r.matched_at)
+        {
+            entry.oldest_queued_unix =
+                Some(entry.oldest_queued_unix.map_or(matched, |cur| cur.min(matched)));
         }
     }
     map

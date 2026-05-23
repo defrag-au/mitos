@@ -11,7 +11,7 @@
 //! log (that's the journal) and NOT a source of cumulative counters
 //! (those are separate atomics for `/metrics`) — it's the recent feed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,6 +75,12 @@ pub struct AdminEvent {
 pub struct EventRing {
     events: Arc<Mutex<VecDeque<AdminEvent>>>,
     seq: Arc<AtomicU64>,
+    /// Cumulative count per `(module, kind tag)`, incremented on every
+    /// `record`. Unlike the bounded ring this never loses history, so
+    /// it backs the `mitos_events_total` counter in `/metrics`
+    /// (`traps_total`, `recaptures_total`). Module set is bounded
+    /// (~15) so the map stays small.
+    totals: Arc<Mutex<HashMap<(String, &'static str), u64>>>,
 }
 
 impl Default for EventRing {
@@ -82,6 +88,7 @@ impl Default for EventRing {
         Self {
             events: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))),
             seq: Arc::new(AtomicU64::new(0)),
+            totals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -95,6 +102,12 @@ impl EventRing {
     /// dropping the oldest event when at capacity. Lock poisoning is
     /// swallowed (observability must never break the hot path).
     pub fn record(&self, module: impl Into<String>, kind: EventKind) {
+        let module = module.into();
+        let tag = kind.tag();
+        // Cumulative counter first — survives ring eviction.
+        if let Ok(mut totals) = self.totals.lock() {
+            *totals.entry((module.clone(), tag)).or_insert(0) += 1;
+        }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let ts_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -103,7 +116,7 @@ impl EventRing {
         let event = AdminEvent {
             seq,
             ts_unix,
-            module: module.into(),
+            module,
             kind,
         };
         if let Ok(mut q) = self.events.lock() {
@@ -112,6 +125,15 @@ impl EventRing {
             }
             q.push_back(event);
         }
+    }
+
+    /// Cumulative `(module, kind tag, count)` totals since process
+    /// start. Backs the `mitos_events_total` counter.
+    pub fn totals(&self) -> Vec<(String, &'static str, u64)> {
+        self.totals
+            .lock()
+            .map(|t| t.iter().map(|((m, k), v)| (m.clone(), *k, *v)).collect())
+            .unwrap_or_default()
     }
 
     /// Highest `seq` assigned so far — the cursor a poller passes back
@@ -199,5 +221,20 @@ mod tests {
         assert_eq!(all.len(), RING_CAPACITY);
         // Oldest 10 evicted: lowest retained seq is 10.
         assert_eq!(all[0].seq, 10);
+    }
+
+    #[test]
+    fn totals_survive_ring_eviction() {
+        let ring = EventRing::new();
+        for _ in 0..RING_CAPACITY + 25 {
+            ring.record("m", EventKind::Trap { reason: "x".into() });
+        }
+        // Ring is capped, but the cumulative total counts every record.
+        let totals = ring.totals();
+        let trap_total = totals
+            .iter()
+            .find(|(m, k, _)| m == "m" && *k == "trap")
+            .map(|(_, _, v)| *v);
+        assert_eq!(trap_total, Some((RING_CAPACITY + 25) as u64));
     }
 }
