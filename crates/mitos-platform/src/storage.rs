@@ -272,6 +272,35 @@ impl ModuleStorage {
         self.module_dir(id).join("companions")
     }
 
+    /// Count registered companions for a module across the two-level
+    /// `<client_id>/<companion_key>.cbor` layout. Best-effort: a
+    /// missing companions root (no subscribers yet) counts as 0, and
+    /// metadata dirs (`.unreachable/`, etc.) are skipped — mirroring
+    /// the walk in `companions::*`. Feeds the `/_admin/status`
+    /// per-module summary.
+    pub fn count_companions(&self, id: &str) -> usize {
+        let root = self.module_dir_for_companions(id);
+        let Ok(clients) = std::fs::read_dir(&root) else {
+            return 0;
+        };
+        let mut count = 0;
+        for client in clients.flatten() {
+            if !client.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if client.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(client.path()) {
+                count += files
+                    .flatten()
+                    .filter(|f| f.path().extension().is_some_and(|ext| ext == "cbor"))
+                    .count();
+            }
+        }
+        count
+    }
+
     /// Per-module emissions log path. Single redb file at
     /// `<storage_root>/<id>/emissions.redb` — feeds the companion
     /// dialer's outbound Apply stream with per-row delivery state.

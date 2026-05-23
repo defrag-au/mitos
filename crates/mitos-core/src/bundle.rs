@@ -538,6 +538,7 @@ impl Bundle {
                 host_for_admin,
                 reserved_names,
                 Some(chain_data),
+                started_at,
                 platform_auth,
             ));
 

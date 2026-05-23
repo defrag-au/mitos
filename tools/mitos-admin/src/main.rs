@@ -54,6 +54,17 @@ enum Cmd {
     /// subscription summary by status).
     Health,
 
+    /// Print mitos's authed /_admin/status: version + build SHA,
+    /// uptime, chain tip, archive horizon, and a per-module
+    /// companion + last-trap summary. The first call to reach for
+    /// when diagnosing host health (replaces SSH `systemctl` +
+    /// `journalctl` for liveness).
+    Status {
+        /// Emit raw JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List registered modules.
     ListModules {
         /// Emit raw JSON instead of the human-readable table.
@@ -263,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cmd {
         Cmd::Health => cmd_health(&client, &cli).await,
+        Cmd::Status { json } => cmd_status(&client, &cli, json).await,
         Cmd::ListModules { json } => cmd_list_modules(&client, &cli, json).await,
         Cmd::GetModule { id } => cmd_get_module(&client, &cli, id).await,
         Cmd::UploadModule { artifact } => cmd_upload_module(&client, &cli, artifact).await,
@@ -338,6 +350,77 @@ fn auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBu
         Some(t) => req.bearer_auth(t),
         None => req,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusResp {
+    version: String,
+    build_sha: String,
+    uptime_secs: u64,
+    tip: Option<StatusTip>,
+    archive_horizon_slot: Option<u64>,
+    modules: Vec<StatusModule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusTip {
+    slot: u64,
+    hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusModule {
+    id: String,
+    companions: usize,
+    queued: usize,
+    pending: usize,
+    last_trap_secs_ago: Option<u64>,
+}
+
+async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Result<()> {
+    let url = format!("{}/_admin/status", cli.mitos);
+    let resp = auth(client.get(&url), cli.token.as_deref())
+        .send()
+        .await?
+        .error_for_status()?;
+    if json_out {
+        let v: Value = resp.json().await?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let s: StatusResp = resp.json().await?;
+    println!("version:        {}", s.version);
+    println!("build:          {}", s.build_sha);
+    println!("uptime:         {}", format_duration(s.uptime_secs));
+    match &s.tip {
+        Some(t) => println!(
+            "tip:            slot {} {}",
+            t.slot,
+            t.hash.as_deref().unwrap_or("(no hash)")
+        ),
+        None => println!("tip:            (unavailable)"),
+    }
+    match s.archive_horizon_slot {
+        Some(slot) => println!("archive horizon: slot {slot}"),
+        None => println!("archive horizon: (not reported)"),
+    }
+    println!("modules:        {}", s.modules.len());
+    for m in &s.modules {
+        let mut notes = Vec::new();
+        if m.queued + m.pending > 0 {
+            notes.push(format!("BACKLOG {}q/{}p", m.queued, m.pending));
+        }
+        if let Some(secs) = m.last_trap_secs_ago {
+            notes.push(format!("last trap {} ago", format_duration(secs)));
+        }
+        let suffix = if notes.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", notes.join(", "))
+        };
+        println!("  {:<28}  {} companion(s){suffix}", m.id, m.companions);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

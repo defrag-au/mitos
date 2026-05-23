@@ -38,7 +38,7 @@
 //! on a single `MITOS_AUTH_TOKEN`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, Request, State};
@@ -118,6 +118,11 @@ struct AdminState {
     /// router is mounted without a dolos archive in scope
     /// (artifact-only deployments, tests).
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
+    /// Process start time, threaded from the bundle so `GET
+    /// /_admin/status` reports the same `uptime_secs` as the open
+    /// `/health` endpoint. Artifact-only routers capture their own
+    /// build time, which is process start for those deployments.
+    started_at: SystemTime,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -129,7 +134,7 @@ struct AdminState {
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
 pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
-    admin_router_inner(storage, None, Vec::new(), None, auth)
+    admin_router_inner(storage, None, Vec::new(), None, SystemTime::now(), auth)
 }
 
 /// Build the admin router with the running-instance lifecycle
@@ -151,9 +156,17 @@ pub fn admin_router_with_host(
     host: Arc<dyn crate::host_v2::ModuleHostHandle>,
     reserved_names: Vec<String>,
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
+    started_at: SystemTime,
     auth: AuthToken,
 ) -> axum::Router {
-    admin_router_inner(storage, Some(host), reserved_names, chain_data, auth)
+    admin_router_inner(
+        storage,
+        Some(host),
+        reserved_names,
+        chain_data,
+        started_at,
+        auth,
+    )
 }
 
 fn admin_router_inner(
@@ -161,6 +174,7 @@ fn admin_router_inner(
     host: Option<Arc<dyn crate::host_v2::ModuleHostHandle>>,
     reserved_names: Vec<String>,
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
+    started_at: SystemTime,
     auth: AuthToken,
 ) -> axum::Router {
     let state = AdminState {
@@ -168,8 +182,10 @@ fn admin_router_inner(
         host,
         reserved_names,
         chain_data,
+        started_at,
     };
     axum::Router::new()
+        .route("/_admin/status", get(status))
         .route("/_admin/modules", get(list_modules))
         .route(
             "/_admin/modules/{id}",
@@ -228,6 +244,56 @@ impl From<&Manifest> for ModuleSummary {
 pub struct UploadResponse {
     pub ok: bool,
     pub module: ModuleSummary,
+}
+
+/// Whole-host health snapshot for `GET /_admin/status`. One call an
+/// agent can poll for version / liveness / chain position / per-
+/// module summary. Read-only and side-effect free (safe to poll).
+/// LLM-decodable: stable keys, decision-oriented fields, `*_secs_ago`
+/// deltas rather than raw timestamps the caller must diff.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusResponse {
+    /// Crate version (`CARGO_PKG_VERSION`). Currently the static
+    /// workspace `0.0.1`; `build_sha` is the meaningful identifier.
+    pub version: String,
+    /// Git short SHA stamped at build time (`build.rs`). `"unknown"`
+    /// for non-checkout builds.
+    pub build_sha: String,
+    /// Seconds since process start (same clock as `/health`).
+    pub uptime_secs: u64,
+    /// Chain tip the data plane is reading from. `None` when no
+    /// chain-data handle is wired (artifact-only) or the query fails.
+    pub tip: Option<StatusTip>,
+    /// Oldest slot whose block body is still in the archive. Below
+    /// this, `datum_by_hash` / block fetch fail (explains empty
+    /// CIP-68 metadata for old assets). `None` until wired to dolos.
+    pub archive_horizon_slot: Option<u64>,
+    /// Per-module summary.
+    pub modules: Vec<StatusModule>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusTip {
+    pub slot: u64,
+    /// Block hash hex; `None` for `Origin` / slot-only tips.
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusModule {
+    pub id: String,
+    /// Number of registered companions across the two-level
+    /// `<client_id>/<companion_key>` layout.
+    pub companions: usize,
+    /// Undelivered emissions waiting to be dialed. The headline
+    /// "is this module backed up?" signal — a non-draining `queued`
+    /// is a stalled lane (see the dialer-backoff incident).
+    pub queued: usize,
+    /// Emissions dialed but not yet acked (in flight).
+    pub pending: usize,
+    /// Age of the last captured trap fixture, or `None` if none.
+    /// A small value means a module recently trapped.
+    pub last_trap_secs_ago: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +421,93 @@ impl IntoResponse for HandlerError {
 // -----------------------------------------------------------------------------
 // Handlers
 // -----------------------------------------------------------------------------
+
+/// `GET /_admin/status` — whole-host health for `mitos-admin status`
+/// and polling agents. Read-only; aggregates already-tracked state
+/// (build stamp, uptime, chain tip, module/companion/trap summary).
+async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>, HandlerError> {
+    let uptime_secs = SystemTime::now()
+        .duration_since(state.started_at)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Tip is best-effort: a failed query (or no chain-data handle)
+    // degrades to `None` rather than failing the whole status call.
+    let tip = match &state.chain_data {
+        Some(cd) => match cd.tip().await {
+            Ok(t) => Some(StatusTip {
+                slot: t.slot(),
+                hash: t.point.hash().map(hex::encode),
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "status: chain tip query failed");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let now = SystemTime::now();
+    let ids = state.storage.list_modules()?;
+    let mut modules = Vec::with_capacity(ids.len());
+    for id in ids {
+        let last_trap_secs_ago = std::fs::metadata(state.storage.last_trap_path(&id))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|d| d.as_secs());
+        let companions = state.storage.count_companions(&id);
+        // Backlog depth. Best-effort full-scan of the emissions log
+        // (O(rows)) — fine for a polled status call at current sizes;
+        // if scrape latency bites, cache with a short TTL or maintain
+        // atomic counters on the emit/drain path. Degrades to 0/0 if
+        // the store can't be opened (e.g. no emissions yet).
+        let (queued, pending) = emission_backlog(&state, &id);
+        modules.push(StatusModule {
+            id,
+            companions,
+            queued,
+            pending,
+            last_trap_secs_ago,
+        });
+    }
+
+    Ok(Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_sha: env!("MITOS_BUILD_SHA").to_string(),
+        uptime_secs,
+        tip,
+        // Wired to dolos's immutable boundary in a follow-up; the
+        // field ships now so `mitos-admin status` + agents have a
+        // stable shape to depend on.
+        archive_horizon_slot: None,
+        modules,
+    }))
+}
+
+/// Best-effort count of a module's `Queued` + `Pending` emissions —
+/// the backlog depth surfaced in `/_admin/status`. A module that has
+/// never emitted (no store) counts as `(0, 0)`. Shared with the
+/// `/metrics` exposition once that lands.
+fn emission_backlog(state: &AdminState, id: &str) -> (usize, usize) {
+    use crate::emissions::EmissionStatus::{Pending, Queued};
+    let Ok(store) = state.storage.emissions_store(id) else {
+        return (0, 0);
+    };
+    let Ok(rows) = store.list_filtered(|r| matches!(r.status, Queued | Pending)) else {
+        return (0, 0);
+    };
+    let mut queued = 0;
+    let mut pending = 0;
+    for r in &rows {
+        match r.status {
+            Queued => queued += 1,
+            Pending => pending += 1,
+            _ => {}
+        }
+    }
+    (queued, pending)
+}
 
 async fn list_modules(
     State(state): State<AdminState>,
