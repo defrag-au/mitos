@@ -71,25 +71,75 @@ impl AuthToken {
     pub fn as_deref(&self) -> Option<&str> {
         self.0.as_deref()
     }
+
+    /// Optional **read-only** scope token from `MITOS_READONLY_TOKEN`.
+    /// When set, it authorizes `GET` (read-only) admin endpoints but
+    /// not the mutating ones (recapture/evict/restart/upload/delete/
+    /// purge/replay) — handy for dashboards + agents that should
+    /// observe but not act. Unset → only the full token works.
+    pub fn readonly_from_env() -> Option<String> {
+        match std::env::var("MITOS_READONLY_TOKEN") {
+            Ok(t) if !t.is_empty() => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Auth scopes for the admin middleware: a full-access token (any
+/// method) and an optional read-only token (`GET` only). Open mode
+/// (no full token) allows everything, preserving prior behaviour.
+#[derive(Clone)]
+struct AuthScopes {
+    full: Option<String>,
+    readonly: Option<String>,
 }
 
 async fn require_auth(
-    State(token): State<AuthToken>,
+    State(scopes): State<AuthScopes>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(expected) = token.as_deref() {
-        let provided = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "));
-        match provided {
-            Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => {}
-            _ => return Err(StatusCode::UNAUTHORIZED),
-        }
+    // Open mode: no full token configured → allow everything
+    // (mirrors the prior behaviour; the read-only scope is moot).
+    let Some(full) = scopes.full.as_deref() else {
+        return Ok(next.run(req).await);
+    };
+
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+
+    if authorize(full, scopes.readonly.as_deref(), req.method(), provided) {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
     }
-    Ok(next.run(req).await)
+}
+
+/// Pure authorization decision (extracted for unit testing). `full` is
+/// the configured full token (caller handles open mode). Returns true
+/// when `provided` matches the full token (any method), or matches the
+/// read-only token on a `GET`.
+fn authorize(
+    full: &str,
+    readonly: Option<&str>,
+    method: &axum::http::Method,
+    provided: Option<&str>,
+) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    if constant_time_eq(provided.as_bytes(), full.as_bytes()) {
+        return true;
+    }
+    // Read-only token → GET only. Every read endpoint in this router is
+    // a GET; every mutation is POST/DELETE, so method is a sound proxy
+    // for "read-only-safe".
+    method == axum::http::Method::GET
+        && readonly
+            .is_some_and(|ro| constant_time_eq(provided.as_bytes(), ro.as_bytes()))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -202,9 +252,17 @@ fn admin_router_inner(
         started_at,
         events,
     };
+    // Auth scopes: the full token (any method) + an optional
+    // read-only token (`GET` only) from `MITOS_READONLY_TOKEN`.
+    let scopes = AuthScopes {
+        full: auth.0,
+        readonly: AuthToken::readonly_from_env(),
+    };
+
     // Bearer-gated admin surface. The auth layer is applied to this
     // sub-router only, so the open `/metrics` route below is exempt.
     let authed = axum::Router::new()
+        .route("/_admin", get(admin_index))
         .route("/_admin/status", get(status))
         .route("/_admin/events", get(list_events))
         .route("/_admin/modules", get(list_modules))
@@ -231,7 +289,7 @@ fn admin_router_inner(
         )
         .route("/_admin/blocks/{slot}", get(get_block_by_slot))
         .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
-        .layer(axum::middleware::from_fn_with_state(auth, require_auth));
+        .layer(axum::middleware::from_fn_with_state(scopes, require_auth));
 
     // `/metrics` is OPEN (no auth), like `/health` — operational
     // gauges/counters for Prometheus, no secrets. Kept in this router
@@ -521,6 +579,72 @@ impl IntoResponse for HandlerError {
 // -----------------------------------------------------------------------------
 // Handlers
 // -----------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct AdminIndex {
+    service: &'static str,
+    version: &'static str,
+    build_sha: &'static str,
+    /// One-line auth summary.
+    auth: &'static str,
+    endpoints: Vec<EndpointDoc>,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointDoc {
+    method: &'static str,
+    path: &'static str,
+    /// `full` (any token), `read-only` (GET, full or read-only token),
+    /// or `open` (no auth).
+    auth: &'static str,
+    description: &'static str,
+}
+
+/// The admin surface, source of truth for `GET /_admin`. Keep in sync
+/// with the routes in `admin_router_inner`.
+const ADMIN_ENDPOINTS: &[(&str, &str, &str, &str)] = &[
+    ("GET", "/_admin", "read-only", "This self-describing endpoint index."),
+    ("GET", "/_admin/status", "read-only", "Whole-host health: version, uptime, tip, per-module backlog/companions/trap-age."),
+    ("GET", "/_admin/events", "read-only", "Recent operational events ring (recapture/trap). Query: after, module, kind, limit."),
+    ("GET", "/_admin/modules", "read-only", "List registered modules."),
+    ("GET", "/_admin/modules/{id}", "read-only", "One module's manifest summary."),
+    ("POST", "/_admin/modules/{id}", "full", "Upload + activate a mitos-build artifact (multipart)."),
+    ("DELETE", "/_admin/modules/{id}", "full", "Stop the module + drop its slot."),
+    ("POST", "/_admin/modules/{id}/restart", "full", "Re-instantiate the running module."),
+    ("POST", "/_admin/modules/{id}/recapture", "full", "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}."),
+    ("POST", "/_admin/modules/{id}/evict", "full", "Full retirement: stop + clear dialer state + remove artifact."),
+    ("GET", "/_admin/modules/{id}/companions", "read-only", "Per-companion interest, cursor, emission counts, last-drain age."),
+    ("DELETE", "/_admin/modules/{id}/companions/{client_id}/{companion_key}", "full", "Remove one companion record."),
+    ("GET", "/_admin/modules/{id}/last-trap", "read-only", "Most recent trap fixture (TOML) for local replay."),
+    ("GET", "/_admin/modules/{id}/emissions", "read-only", "Emissions log. Query: status, companion, limit, after_id."),
+    ("DELETE", "/_admin/modules/{id}/emissions", "full", "Purge emissions (requires explicit ?status=)."),
+    ("POST", "/_admin/modules/{id}/emissions/{emission_id}/replay", "full", "Re-queue one emission for delivery."),
+    ("GET", "/_admin/blocks/{slot}", "read-only", "Raw block CBOR at a slot (fixture capture)."),
+    ("GET", "/_admin/blocks/by-tx/{tx_hash}", "read-only", "Raw block CBOR resolved by tx hash."),
+    ("GET", "/metrics", "open", "Prometheus text exposition (gauges + counters)."),
+    ("GET", "/health", "open", "Liveness + uptime + indexer list."),
+];
+
+/// `GET /_admin` — self-describing index of the admin surface so a
+/// fresh operator/agent can discover endpoints + their auth scope
+/// without reading source. Read-only.
+async fn admin_index() -> Json<AdminIndex> {
+    Json(AdminIndex {
+        service: "mitos-admin",
+        version: env!("CARGO_PKG_VERSION"),
+        build_sha: env!("MITOS_BUILD_SHA"),
+        auth: "Bearer MITOS_AUTH_TOKEN = full (any method); MITOS_READONLY_TOKEN = GET-only; /metrics + /health are open",
+        endpoints: ADMIN_ENDPOINTS
+            .iter()
+            .map(|&(method, path, auth, description)| EndpointDoc {
+                method,
+                path,
+                auth,
+                description,
+            })
+            .collect(),
+    })
+}
 
 /// `GET /_admin/status` — whole-host health for `mitos-admin status`
 /// and polling agents. Read-only; aggregates already-tracked state
@@ -2052,4 +2176,40 @@ fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
     let _component = wasmtime::component::Component::from_binary(&engine, wasm_bytes)
         .map_err(|e| HandlerError::Wasmtime(format!("component: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authorize;
+    use axum::http::Method;
+
+    const FULL: &str = "full-secret";
+    const RO: &str = "ro-secret";
+
+    #[test]
+    fn full_token_authorizes_any_method() {
+        for m in [Method::GET, Method::POST, Method::DELETE] {
+            assert!(authorize(FULL, Some(RO), &m, Some(FULL)));
+        }
+    }
+
+    #[test]
+    fn readonly_token_authorizes_only_get() {
+        assert!(authorize(FULL, Some(RO), &Method::GET, Some(RO)));
+        assert!(!authorize(FULL, Some(RO), &Method::POST, Some(RO)));
+        assert!(!authorize(FULL, Some(RO), &Method::DELETE, Some(RO)));
+    }
+
+    #[test]
+    fn wrong_or_missing_token_rejected() {
+        assert!(!authorize(FULL, Some(RO), &Method::GET, Some("nope")));
+        assert!(!authorize(FULL, Some(RO), &Method::GET, None));
+        assert!(!authorize(FULL, Some(RO), &Method::POST, None));
+    }
+
+    #[test]
+    fn readonly_unset_means_only_full_works() {
+        assert!(!authorize(FULL, None, &Method::GET, Some(RO)));
+        assert!(authorize(FULL, None, &Method::GET, Some(FULL)));
+    }
 }
