@@ -188,7 +188,12 @@ mod tests {
     #[test]
     fn records_and_snapshots_in_order() {
         let ring = EventRing::new();
-        ring.record("m1", EventKind::Trap { reason: "boom".into() });
+        ring.record(
+            "m1",
+            EventKind::Trap {
+                reason: "boom".into(),
+            },
+        );
         ring.record(
             "m2",
             EventKind::RecaptureCompleted {
@@ -219,13 +224,14 @@ mod tests {
     fn filters_by_module_and_kind() {
         let ring = EventRing::new();
         ring.record("a", EventKind::Trap { reason: "x".into() });
-        ring.record(
-            "b",
-            EventKind::RecaptureStarted { reason: None },
-        );
+        ring.record("b", EventKind::RecaptureStarted { reason: None });
         assert_eq!(ring.snapshot(0, Some("a"), None, 100).len(), 1);
         assert_eq!(ring.snapshot(0, None, Some("trap"), 100).len(), 1);
-        assert_eq!(ring.snapshot(0, Some("a"), Some("recapture_started"), 100).len(), 0);
+        assert_eq!(
+            ring.snapshot(0, Some("a"), Some("recapture_started"), 100)
+                .len(),
+            0
+        );
     }
 
     #[test]

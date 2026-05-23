@@ -422,8 +422,8 @@ impl FixtureDataPlane {
         let mut datums_by_hash = HashMap::new();
         for d in fixture.datum {
             let hash = decode_32(&d.hash).with_context(|| format!("datum hash {}", d.hash))?;
-            let cbor =
-                hex::decode(&d.cbor_hex).with_context(|| format!("datum cbor_hex for {}", d.hash))?;
+            let cbor = hex::decode(&d.cbor_hex)
+                .with_context(|| format!("datum cbor_hex for {}", d.hash))?;
             datums_by_hash.insert(hash.to_vec(), cbor);
         }
 

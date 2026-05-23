@@ -284,11 +284,7 @@ impl RedbKv {
     }
 
     /// Batched write — one write txn (one fsync) for many keys.
-    pub fn set_many(
-        &self,
-        module_id: &str,
-        entries: &[(String, Vec<u8>)],
-    ) -> Result<(), KvError> {
+    pub fn set_many(&self, module_id: &str, entries: &[(String, Vec<u8>)]) -> Result<(), KvError> {
         let wx = self
             .db
             .begin_write()

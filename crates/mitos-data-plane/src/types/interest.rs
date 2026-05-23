@@ -145,9 +145,10 @@ impl InterestSet {
             // Drop from the index only if no remaining predicate
             // still holds it (predicates dedupe, so at most one —
             // defensive against future non-deduped inserts).
-            let still_held = self.predicates.iter().any(
-                |q| matches!(q, InterestPredicate::HoldsPolicy(x) if x == pid),
-            );
+            let still_held = self
+                .predicates
+                .iter()
+                .any(|q| matches!(q, InterestPredicate::HoldsPolicy(x) if x == pid));
             if !still_held {
                 self.policy_index.remove(pid);
             }
@@ -198,8 +199,7 @@ impl InterestSet {
         // Remaining kinds (addresses, creds, HoldsAsset) — usually
         // few; `HoldsPolicy` is already covered by the index above.
         self.predicates.iter().any(|p| {
-            !matches!(p, InterestPredicate::HoldsPolicy(_))
-                && predicate_matches_output(p, output)
+            !matches!(p, InterestPredicate::HoldsPolicy(_)) && predicate_matches_output(p, output)
         })
     }
 

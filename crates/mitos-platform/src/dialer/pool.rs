@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use mitos_protocol::{
-    ApplyBody, ApplyBulkRequest, BulkEmission, BulkEmissionResult, HTTP_DELIVERY_MIME, encode_apply,
-    encode_apply_bulk,
+    ApplyBody, ApplyBulkRequest, BulkEmission, BulkEmissionResult, HTTP_DELIVERY_MIME,
+    encode_apply, encode_apply_bulk,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -586,7 +586,9 @@ fn demux_bulk_results(
         .iter()
         .map(|id| match by_id.get(id) {
             Some(r) if r.applied => StatusUpdate::Acked(*id, now.to_string()),
-            Some(r) => StatusUpdate::Nacked(*id, now.to_string(), r.error.clone().unwrap_or_default()),
+            Some(r) => {
+                StatusUpdate::Nacked(*id, now.to_string(), r.error.clone().unwrap_or_default())
+            }
             None => StatusUpdate::Queued(*id, now.to_string()),
         })
         .collect()
@@ -808,9 +810,11 @@ mod tests {
             ],
             "t",
         );
-        assert!(updates
-            .iter()
-            .all(|u| matches!(u, StatusUpdate::Acked(_, _))));
+        assert!(
+            updates
+                .iter()
+                .all(|u| matches!(u, StatusUpdate::Acked(_, _)))
+        );
         assert_eq!(updates.len(), 3);
     }
 
@@ -840,8 +844,11 @@ mod tests {
     fn demux_missing_id_is_requeued() {
         // Companion truncated — id 2 omitted from results. It must be
         // re-Queued (retry), not silently lost or marked applied.
-        let updates =
-            demux_bulk_results(&[1, 2, 3], &[result(1, true, None), result(3, true, None)], "t");
+        let updates = demux_bulk_results(
+            &[1, 2, 3],
+            &[result(1, true, None), result(3, true, None)],
+            "t",
+        );
         assert!(matches!(updates[0], StatusUpdate::Acked(1, _)));
         assert!(matches!(updates[1], StatusUpdate::Queued(2, _)));
         assert!(matches!(updates[2], StatusUpdate::Acked(3, _)));

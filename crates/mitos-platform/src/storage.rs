@@ -130,8 +130,10 @@ impl ModuleStorage {
     /// cached handle (cheap clone of the internal Arc).
     pub fn indexer_data_cache(
         &self,
-    ) -> Result<crate::indexer_data_cache::IndexerDataCache, crate::indexer_data_cache::IndexerDataCacheError>
-    {
+    ) -> Result<
+        crate::indexer_data_cache::IndexerDataCache,
+        crate::indexer_data_cache::IndexerDataCacheError,
+    > {
         let mut lock = self
             .indexer_data_cache
             .lock()

@@ -138,8 +138,7 @@ fn authorize(
     // a GET; every mutation is POST/DELETE, so method is a sound proxy
     // for "read-only-safe".
     method == axum::http::Method::GET
-        && readonly
-            .is_some_and(|ro| constant_time_eq(provided.as_bytes(), ro.as_bytes()))
+        && readonly.is_some_and(|ro| constant_time_eq(provided.as_bytes(), ro.as_bytes()))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -620,26 +619,126 @@ struct EndpointDoc {
 /// The admin surface, source of truth for `GET /_admin`. Keep in sync
 /// with the routes in `admin_router_inner`.
 const ADMIN_ENDPOINTS: &[(&str, &str, &str, &str)] = &[
-    ("GET", "/_admin", "read-only", "This self-describing endpoint index."),
-    ("GET", "/_admin/status", "read-only", "Whole-host health: version, uptime, tip, per-module backlog/companions/trap-age."),
-    ("GET", "/_admin/events", "read-only", "Recent operational events ring (recapture/trap). Query: after, module, kind, limit."),
-    ("GET", "/_admin/modules", "read-only", "List registered modules."),
-    ("GET", "/_admin/modules/{id}", "read-only", "One module's manifest summary."),
-    ("POST", "/_admin/modules/{id}", "full", "Upload + activate a mitos-build artifact (multipart)."),
-    ("DELETE", "/_admin/modules/{id}", "full", "Stop the module + drop its slot."),
-    ("POST", "/_admin/modules/{id}/restart", "full", "Re-instantiate the running module."),
-    ("POST", "/_admin/modules/{id}/recapture", "full", "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}."),
-    ("POST", "/_admin/modules/{id}/evict", "full", "Full retirement: stop + clear dialer state + remove artifact."),
-    ("GET", "/_admin/modules/{id}/companions", "read-only", "Per-companion interest, cursor, emission counts, last-drain age."),
-    ("DELETE", "/_admin/modules/{id}/companions/{client_id}/{companion_key}", "full", "Remove one companion record."),
-    ("GET", "/_admin/modules/{id}/last-trap", "read-only", "Most recent trap fixture (TOML) for local replay."),
-    ("GET", "/_admin/modules/{id}/emissions", "read-only", "Emissions log. Query: status, companion, limit, after_id."),
-    ("DELETE", "/_admin/modules/{id}/emissions", "full", "Purge emissions (requires explicit ?status=)."),
-    ("POST", "/_admin/modules/{id}/emissions/{emission_id}/replay", "full", "Re-queue one emission for delivery."),
-    ("GET", "/_admin/blocks/{slot}", "read-only", "Raw block CBOR at a slot (fixture capture)."),
-    ("GET", "/_admin/blocks/by-tx/{tx_hash}", "read-only", "Raw block CBOR resolved by tx hash."),
-    ("GET", "/metrics", "open", "Prometheus text exposition (gauges + counters)."),
-    ("GET", "/health", "open", "Liveness + uptime + indexer list."),
+    (
+        "GET",
+        "/_admin",
+        "read-only",
+        "This self-describing endpoint index.",
+    ),
+    (
+        "GET",
+        "/_admin/status",
+        "read-only",
+        "Whole-host health: version, uptime, tip, per-module backlog/companions/trap-age.",
+    ),
+    (
+        "GET",
+        "/_admin/events",
+        "read-only",
+        "Recent operational events ring (recapture/trap). Query: after, module, kind, limit.",
+    ),
+    (
+        "GET",
+        "/_admin/modules",
+        "read-only",
+        "List registered modules.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}",
+        "read-only",
+        "One module's manifest summary.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}",
+        "full",
+        "Upload + activate a mitos-build artifact (multipart).",
+    ),
+    (
+        "DELETE",
+        "/_admin/modules/{id}",
+        "full",
+        "Stop the module + drop its slot.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/restart",
+        "full",
+        "Re-instantiate the running module.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/recapture",
+        "full",
+        "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}.",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/evict",
+        "full",
+        "Full retirement: stop + clear dialer state + remove artifact.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}/companions",
+        "read-only",
+        "Per-companion interest, cursor, emission counts, last-drain age.",
+    ),
+    (
+        "DELETE",
+        "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
+        "full",
+        "Remove one companion record.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}/last-trap",
+        "read-only",
+        "Most recent trap fixture (TOML) for local replay.",
+    ),
+    (
+        "GET",
+        "/_admin/modules/{id}/emissions",
+        "read-only",
+        "Emissions log. Query: status, companion, limit, after_id.",
+    ),
+    (
+        "DELETE",
+        "/_admin/modules/{id}/emissions",
+        "full",
+        "Purge emissions (requires explicit ?status=).",
+    ),
+    (
+        "POST",
+        "/_admin/modules/{id}/emissions/{emission_id}/replay",
+        "full",
+        "Re-queue one emission for delivery.",
+    ),
+    (
+        "GET",
+        "/_admin/blocks/{slot}",
+        "read-only",
+        "Raw block CBOR at a slot (fixture capture).",
+    ),
+    (
+        "GET",
+        "/_admin/blocks/by-tx/{tx_hash}",
+        "read-only",
+        "Raw block CBOR resolved by tx hash.",
+    ),
+    (
+        "GET",
+        "/metrics",
+        "open",
+        "Prometheus text exposition (gauges + counters).",
+    ),
+    (
+        "GET",
+        "/health",
+        "open",
+        "Liveness + uptime + indexer list.",
+    ),
 ];
 
 /// `GET /_admin` — self-describing index of the admin surface so a
@@ -783,7 +882,9 @@ async fn list_events(
 
 /// Escape a Prometheus label value (`\`, `"`, newline).
 fn esc_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Write a metric family header (`# HELP` + `# TYPE`).
@@ -1206,8 +1307,11 @@ fn companion_emission_stats(
         if matches!(r.status, Queued)
             && let Some(matched) = parse_emission_unix(&r.matched_at)
         {
-            entry.oldest_queued_unix =
-                Some(entry.oldest_queued_unix.map_or(matched, |cur| cur.min(matched)));
+            entry.oldest_queued_unix = Some(
+                entry
+                    .oldest_queued_unix
+                    .map_or(matched, |cur| cur.min(matched)),
+            );
         }
     }
     map

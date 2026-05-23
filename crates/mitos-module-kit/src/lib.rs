@@ -502,7 +502,10 @@ impl ChunkedBootstrap {
     /// chunk, or one phase/predicate transition. The host loops this
     /// (refuelling each call) until `done`.
     pub fn step<IO: BootstrapIo>(&mut self, io: &mut IO) -> StepOutcome {
-        let Some(predicate) = self.predicates.get(self.cursor.predicate_idx as usize).cloned()
+        let Some(predicate) = self
+            .predicates
+            .get(self.cursor.predicate_idx as usize)
+            .cloned()
         else {
             io.clear_cursor();
             return StepOutcome {
@@ -585,7 +588,11 @@ impl ChunkedBootstrap {
     fn step_emit<IO: BootstrapIo>(&mut self, io: &mut IO, predicate: &[u8]) -> StepOutcome {
         // Page forward by key cursor — `shard_scan` returns sorted
         // (key, value) pairs after `emit_after`, values inline.
-        let page = io.shard_scan(predicate, self.cursor.emit_after.as_deref(), io.chunk_size());
+        let page = io.shard_scan(
+            predicate,
+            self.cursor.emit_after.as_deref(),
+            io.chunk_size(),
+        );
 
         if page.is_empty() {
             io.emit_end(predicate, self.emit_count);
@@ -708,6 +715,11 @@ mod tests {
 
     use std::collections::BTreeMap;
 
+    /// Scripted scan pages per predicate: `predicate -> pages ->
+    /// (entry_key, value)`. Immutable per predicate so a re-scan
+    /// after a simulated re-instantiation replays identically.
+    type ScanScript = BTreeMap<Vec<u8>, Vec<Vec<(Vec<u8>, u64)>>>;
+
     /// Test entry: carries its own key so emitted chunks are
     /// inspectable.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -724,9 +736,8 @@ mod tests {
     }
 
     struct MockIo {
-        /// Scripted scan pages per predicate (immutable, so a re-scan
-        /// after a simulated re-instantiation replays identically).
-        script: BTreeMap<Vec<u8>, Vec<Vec<(Vec<u8>, u64)>>>,
+        /// Scripted scan pages per predicate (see [`ScanScript`]).
+        script: ScanScript,
         /// (predicate, entry_key) -> encoded entry.
         shards: BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
         cursor: Option<Vec<u8>>,
@@ -895,10 +906,7 @@ mod tests {
         let mut io = MockIo::new(false, 2);
         io.script.insert(
             vec![0xAA],
-            vec![
-                vec![(vec![3], 30), (vec![1], 10)],
-                vec![(vec![2], 20)],
-            ],
+            vec![vec![(vec![3], 30), (vec![1], 10)], vec![(vec![2], 20)]],
         );
         run_to_done(&mut io, vec![vec![0xAA]]);
 
@@ -909,9 +917,18 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                TE { key: vec![1], val: 10 },
-                TE { key: vec![2], val: 20 },
-                TE { key: vec![3], val: 30 },
+                TE {
+                    key: vec![1],
+                    val: 10
+                },
+                TE {
+                    key: vec![2],
+                    val: 20
+                },
+                TE {
+                    key: vec![3],
+                    val: 30
+                },
             ]
         );
         assert!(matches!(io.events.last(), Some(Ev::End(_, 3))));
@@ -933,8 +950,14 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                TE { key: vec![1], val: 17 },
-                TE { key: vec![2], val: 5 },
+                TE {
+                    key: vec![1],
+                    val: 17
+                },
+                TE {
+                    key: vec![2],
+                    val: 5
+                },
             ]
         );
     }
@@ -983,9 +1006,18 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                TE { key: vec![1], val: 10 },
-                TE { key: vec![2], val: 20 },
-                TE { key: vec![3], val: 30 },
+                TE {
+                    key: vec![1],
+                    val: 10
+                },
+                TE {
+                    key: vec![2],
+                    val: 20
+                },
+                TE {
+                    key: vec![3],
+                    val: 30
+                },
             ],
             "every asset emitted exactly once across the re-instantiation"
         );

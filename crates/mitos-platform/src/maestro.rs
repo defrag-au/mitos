@@ -240,10 +240,7 @@ impl MaestroClient {
     /// (the metadata bytes aren't on the current ref UTxO, only the
     /// hash is). Maestro indexes all witnessed datums, so it can
     /// resolve them regardless of horizon.
-    pub async fn fetch_datum(
-        &self,
-        datum_hash_hex: &str,
-    ) -> Result<Option<Vec<u8>>, MaestroError> {
+    pub async fn fetch_datum(&self, datum_hash_hex: &str) -> Result<Option<Vec<u8>>, MaestroError> {
         let url = format!("https://{}/datums/{datum_hash_hex}", self.base_url);
         let Some(body_bytes) = self.get_bytes_with_retries(&url, datum_hash_hex).await? else {
             return Ok(None);

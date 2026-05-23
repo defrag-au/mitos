@@ -164,7 +164,8 @@ pub fn decode_apply_bulk(bytes: &[u8]) -> Result<ApplyBulkRequest, String> {
 /// CBOR-encode an [`ApplyBulkResponse`].
 pub fn encode_apply_bulk_response(body: &ApplyBulkResponse) -> Result<Vec<u8>, String> {
     let mut buf = Vec::with_capacity(128);
-    ciborium::into_writer(body, &mut buf).map_err(|e| format!("encode_apply_bulk_response: {e}"))?;
+    ciborium::into_writer(body, &mut buf)
+        .map_err(|e| format!("encode_apply_bulk_response: {e}"))?;
     Ok(buf)
 }
 
@@ -292,7 +293,10 @@ mod tests {
         assert_eq!(decoded.results.len(), 2);
         assert!(decoded.results[0].applied);
         assert!(!decoded.results[1].applied);
-        assert_eq!(decoded.results[1].error.as_deref(), Some("datum hash mismatch"));
+        assert_eq!(
+            decoded.results[1].error.as_deref(),
+            Some("datum hash mismatch")
+        );
     }
 
     #[test]

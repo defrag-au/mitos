@@ -155,9 +155,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             // Bulk arm must precede the generic apply arm — a bulk
             // URL also starts with `/_internal/apply-`. Strip both the
             // prefix and the `-bulk` suffix to recover the channel.
-            (Method::Post, p)
-                if p.starts_with("/_internal/apply-") && p.ends_with("-bulk") =>
-            {
+            (Method::Post, p) if p.starts_with("/_internal/apply-") && p.ends_with("-bulk") => {
                 let channel = p
                     .trim_start_matches("/_internal/apply-")
                     .trim_end_matches("-bulk")

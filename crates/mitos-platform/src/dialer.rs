@@ -1052,7 +1052,10 @@ fn group_by_partition(rows: Vec<EmissionRecord>) -> Vec<(Vec<u8>, Vec<EmissionRe
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<Vec<u8>, Vec<EmissionRecord>> = BTreeMap::new();
     for row in rows {
-        groups.entry(row.partition_key.clone()).or_default().push(row);
+        groups
+            .entry(row.partition_key.clone())
+            .or_default()
+            .push(row);
     }
     groups.into_iter().collect()
 }

@@ -958,13 +958,23 @@ mod tests {
         assert_eq!(grouped.len(), 2, "two distinct companions");
 
         // BTreeMap key order: policy_a sorts before policy_b.
-        assert_eq!(grouped[0].0, ("policy_a".to_string(), "client_x".to_string()));
+        assert_eq!(
+            grouped[0].0,
+            ("policy_a".to_string(), "client_x".to_string())
+        );
         let a_ids: Vec<u64> = grouped[0].1.iter().map(|r| r.id).collect();
         assert_eq!(a_ids, vec![1, 3], "policy_a queued rows in id order");
 
-        assert_eq!(grouped[1].0, ("policy_b".to_string(), "client_x".to_string()));
+        assert_eq!(
+            grouped[1].0,
+            ("policy_b".to_string(), "client_x".to_string())
+        );
         let b_ids: Vec<u64> = grouped[1].1.iter().map(|r| r.id).collect();
-        assert_eq!(b_ids, vec![2, 5], "policy_b queued rows in id order; Acked id=4 excluded");
+        assert_eq!(
+            b_ids,
+            vec![2, 5],
+            "policy_b queued rows in id order; Acked id=4 excluded"
+        );
     }
 
     #[test]
@@ -993,10 +1003,15 @@ mod tests {
         let count = store.requeue_all_pending("2026-05-05T00:00:10Z").unwrap();
         assert_eq!(count, 2, "both companions' Pending rows flipped");
         // All three rows are now Queued.
-        let queued = store.list_filtered(|r| r.status == EmissionStatus::Queued).unwrap();
+        let queued = store
+            .list_filtered(|r| r.status == EmissionStatus::Queued)
+            .unwrap();
         assert_eq!(queued.len(), 3);
         // Second call is a no-op.
-        assert_eq!(store.requeue_all_pending("2026-05-05T00:00:20Z").unwrap(), 0);
+        assert_eq!(
+            store.requeue_all_pending("2026-05-05T00:00:20Z").unwrap(),
+            0
+        );
     }
 
     #[test]

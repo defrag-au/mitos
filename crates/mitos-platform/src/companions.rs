@@ -525,11 +525,7 @@ async fn subscribe_handler(
             for target in &request.targets {
                 if let SubscribeTarget::Module { name } = target
                     && let Err(e) = dialer
-                        .route_interest_mutation(
-                            name,
-                            InterestOp::Add,
-                            request.interests.clone(),
-                        )
+                        .route_interest_mutation(name, InterestOp::Add, request.interests.clone())
                         .await
                 {
                     tracing::warn!(
