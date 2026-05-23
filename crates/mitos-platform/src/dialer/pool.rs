@@ -9,8 +9,9 @@
 //!
 //! ## Why a pool instead of N persistent tasks
 //!
-//! Each tick of `run_companion` (every `POLL_INTERVAL`) drains a
-//! snapshot of the queued set. Spawning one short-lived task per
+//! Each companion drain (`run_tick`, one per active companion per
+//! module tick) drains a snapshot of that companion's queued set.
+//! Spawning one short-lived task per
 //! lane per tick is cheaper than maintaining N long-lived worker
 //! tasks plus their channels: less plumbing, no work-stealing
 //! between idle workers, natural backpressure (we don't dispatch
@@ -168,8 +169,16 @@ pub struct StatusWriterHandle {
 }
 
 impl StatusWriterHandle {
+    /// Clone the send side so a per-companion drain can enqueue
+    /// status transitions. The per-module drain holds one writer
+    /// for the whole module store and hands each spawned
+    /// companion-drain its own cloned sender.
+    pub fn sender(&self) -> mpsc::UnboundedSender<StatusUpdate> {
+        self.tx.clone()
+    }
+
     /// Drop the sender so the writer task drains and exits, then
-    /// await its termination. Called from `run_companion` on
+    /// await its termination. Called from `run_module_drain` on
     /// cancellation so we don't leak the task.
     pub async fn shutdown(mut self) {
         drop(self.tx);
@@ -225,66 +234,72 @@ fn apply_status_update(store: &EmissionsStore, msg: StatusUpdate) {
     }
 }
 
-/// Run one tick of the lane pool: scan queued rows, group by
-/// partition_key, hash-assign to slots, drain in parallel.
+/// Run one drain pass for a single companion: take its
+/// pre-fetched, partition-key-grouped queued rows, hash-assign
+/// each group to a lane slot, and drain the lanes in parallel.
 ///
 /// Returns `Ok(())` if every dispatched lane completed without a
 /// transport failure (422 nacks count as success — they're
 /// application-level). Returns `Err` if *any* lane saw a 5xx /
-/// transport error so the caller can apply backoff.
+/// transport error so the caller can apply per-companion backoff.
+///
+/// The rows are supplied by the per-module drain loop's single
+/// store scan (`EmissionsStore::list_queued_grouped_by_companion`),
+/// so this function does no redb reads itself — it's spawnable
+/// (all fields owned + `'static`) and the module loop runs one per
+/// active companion concurrently.
 ///
 /// At `lanes = 1`, the function still groups (cheap) but ends up
 /// dispatching every group into the single worker slot in a
 /// deterministic id order — bit-exact with the pre-pool serial
 /// drain.
-pub struct PoolContext<'a> {
-    pub client: &'a reqwest::Client,
-    pub apply_url: &'a str,
+pub struct TickArgs {
+    pub client: reqwest::Client,
+    pub apply_url: String,
     /// Bulk-apply URL (`apply_url` with `-bulk` before the query).
     /// Empty disables the bulk path.
-    pub bulk_url: &'a str,
-    /// Per-(companion,target) bulk capability cache, shared across
-    /// this tick's lanes. See [`BULK_UNKNOWN`].
+    pub bulk_url: String,
+    /// Per-companion bulk capability cache, shared across this
+    /// companion's lanes (and across ticks). See [`BULK_UNKNOWN`].
     pub bulk_capability: Arc<AtomicU8>,
     /// Max emissions per bulk POST; `<= 1` disables bulk.
     pub bulk_max: usize,
     /// Channel / module name carried in the `ApplyBulkRequest`
     /// (informational — the consumer routes by the URL path).
-    pub channel: &'a str,
-    pub header_name: Option<&'a str>,
-    pub header_value: Option<&'a str>,
-    pub store: &'a EmissionsStore,
-    pub companion_key: &'a str,
-    pub client_id: &'a str,
-    pub status_writer: &'a StatusWriterHandle,
+    pub channel: String,
+    pub header_name: Option<String>,
+    pub header_value: Option<String>,
+    /// Pre-fetched queued rows for this companion, grouped by
+    /// `partition_key` (the form produced per-companion from the
+    /// module-wide scan). Empty groups are skipped.
+    pub grouped: Vec<(Vec<u8>, Vec<EmissionRecord>)>,
+    pub companion_key: String,
+    /// Cloned send side of the module's single status writer.
+    pub status_tx: mpsc::UnboundedSender<StatusUpdate>,
     pub lanes: usize,
     pub now: fn() -> String,
 }
 
-pub async fn run_tick(ctx: PoolContext<'_>) -> anyhow::Result<()> {
-    let grouped = ctx
-        .store
-        .list_queued_for_companion_grouped(ctx.companion_key, ctx.client_id)
-        .map_err(|e| anyhow::anyhow!("list queued grouped: {e}"))?;
+pub async fn run_tick(args: TickArgs) -> anyhow::Result<()> {
+    let grouped = args.grouped;
     if grouped.is_empty() {
         return Ok(());
     }
     let total_rows: usize = grouped.iter().map(|(_, v)| v.len()).sum();
     debug!(
-        companion_key = %ctx.companion_key,
-        client_id = %ctx.client_id,
-        lanes = ctx.lanes,
+        companion_key = %args.companion_key,
+        lanes = args.lanes,
         keys = grouped.len(),
         rows = total_rows,
-        "lane pool tick: draining queued emissions"
+        "companion drain: applying queued emissions"
     );
 
-    let n = ctx.lanes.max(1);
+    let n = args.lanes.max(1);
     // Bucket groups by slot. Within a bucket, rows from different
     // partition keys still stay grouped by their original key —
     // but since they end up on the same worker, they're drained
     // sequentially. Order across keys within a bucket is the
-    // BTreeMap insertion order from `list_queued_for_companion_grouped`,
+    // BTreeMap insertion order from the per-companion grouping,
     // which sorts by key bytes (empty key first).
     let mut buckets: Vec<Vec<EmissionRecord>> = (0..n).map(|_| Vec::new()).collect();
     for (key, rows) in grouped {
@@ -299,19 +314,19 @@ pub async fn run_tick(ctx: PoolContext<'_>) -> anyhow::Result<()> {
         if rows.is_empty() {
             continue;
         }
-        let client = ctx.client.clone();
-        let apply_url = ctx.apply_url.to_string();
-        let bulk_url = ctx.bulk_url.to_string();
-        let bulk_capability = ctx.bulk_capability.clone();
-        let bulk_max = ctx.bulk_max;
-        let channel = ctx.channel.to_string();
-        let header_name = ctx.header_name.map(|s| s.to_string());
-        let header_value = ctx.header_value.map(|s| s.to_string());
+        let client = args.client.clone();
+        let apply_url = args.apply_url.clone();
+        let bulk_url = args.bulk_url.clone();
+        let bulk_capability = args.bulk_capability.clone();
+        let bulk_max = args.bulk_max;
+        let channel = args.channel.clone();
+        let header_name = args.header_name.clone();
+        let header_value = args.header_value.clone();
         let writer_tx = StatusWriterSender {
-            inner: ctx.status_writer.tx.clone(),
+            inner: args.status_tx.clone(),
         };
-        let companion_key = ctx.companion_key.to_string();
-        let now_fn = ctx.now;
+        let companion_key = args.companion_key.clone();
+        let now_fn = args.now;
         tasks.spawn(async move {
             drain_lane(LaneArgs {
                 slot_idx,

@@ -615,3 +615,96 @@ worth a closer look before Phase 1 lands.
   add when an indexer-side bottleneck materialises.
 - Cross-companion replay ordering. Each companion's emissions
   log is independent. The design doesn't change that.
+
+## Per-module drain (shipped 2026-05-23)
+
+**Status: shipped + verified on prod (build `bb1ad151393f`).**
+48 goldens + platform unit tests green pre-deploy; post-deploy
+smoke = a `collection-holders` recapture coordinated all 4
+companions (`recapture_completed companions_targeted=4`,
+`rebootstrap utxos_ingested=16437`) and the per-module drain
+delivered the refill to every active companion (drain age reset to
+~12s, `q=0 p=0 n=0 t=0`). The lane pool above parallelises
+delivery *within* one companion. This section is the orthogonal
+axis: how many *companions* the dialer can carry without the
+per-companion poll cost going quadratic.
+
+### The problem it removes
+
+The original dialer ran **one drain task per companion**, each
+polling the module's shared `EmissionsStore` every `POLL_INTERVAL`
+(1s). Each poll was a `list_queued_for_companion(...)` which —
+because redb is keyed by monotonic emission id, not by companion —
+is a **full table scan** filtered to that companion's rows. With
+the collection-ownership worker subscribing each tracked policy to
+6 modules, 1K collections is ~6K companion tasks; on a module like
+`collection-holders` (1K policies → 1K companions sharing one
+store) that is **1K full-table-scans per second**, each O(rows in
+the store). The idle-poll cost is O(companions × rows) — quadratic
+in collection count, and it bites even when nothing is queued.
+
+### The shape
+
+One **drain task per module** (`run_module_drain` in
+`dialer.rs`), not per companion:
+
+1. **Scan once per tick.** `EmissionsStore::list_queued_grouped_by_companion`
+   does a single read txn over the store and buckets all `Queued`
+   rows by `(companion_id, client_id)`. 6K scans/sec → ~6/sec
+   (one per module).
+2. **Fan out.** For each registered companion that has rows, is
+   not backing off, and is not mid-recapture, spawn a
+   `pool::run_tick` drain (the same lane pool as above) against
+   that companion's resolved apply URL. Bounded by
+   `MITOS_DIALER_MODULE_CONCURRENCY` (default 64) so a refill
+   burst across many companions doesn't thunder.
+3. **Per-companion backoff.** A companion's transport errors set
+   its own `next_retry_at` in the task's `retry` map; the loop
+   keeps ticking for everyone else.
+4. **One status writer per module.** Strictly fewer writers
+   contending on the single-writer redb txn than the old
+   one-writer-per-companion model.
+
+The registry (`HashMap<CompanionId, CompanionDial>`) is shared
+between the supervisor (mutates on subscribe/unsubscribe) and the
+task (snapshots each tick). A [`CompanionDial`] holds the
+once-resolved apply/recapture URLs + auth + the per-companion bulk
+capability cache that used to live in the per-companion task.
+
+### Recapture invariant preserved
+
+The load-bearing rule from `RECAPTURE.md` — *no apply POST to a
+companion while its table-wipe POST is in flight* — is preserved
+without a per-companion task. Recapture frames travel on the
+module task's control channel; the task handles them in its
+`select!` loop, **mutually exclusive with the tick-drain** (the
+tick arm awaits its full delivery batch before yielding back to
+`select!`). On a frame the task sets the companion's
+`recapturing` flag (synchronously, before any tick can run), then
+spawns the wipe POST; the tick skips flagged companions; the flag
+clears when the wipe settles and the `pending_recaptures` oneshot
+fires on 2xx. Because the flag is set in the same single-threaded
+loop that builds the tick work-list, an apply can never race the
+wipe.
+
+### Crash recovery
+
+`requeue_all_pending` runs once at module-task start (flips every
+`Pending` row back to `Queued`), replacing the per-companion
+`requeue_pending_for_companion` the old task ran on its start.
+Steady-state Pending recovery is unchanged: the apply response
+handler always transitions a row out of `Pending`.
+
+### Indexer targets
+
+`SubscribeTarget::Indexer` companions keep the legacy
+one-task-per-companion shape (dispatched through the in-tree
+indexer bridge). In-tree indexers are a small fixed set, not the
+per-policy fan-out this optimises.
+
+### Knobs
+
+- `MITOS_DIALER_MODULE_CONCURRENCY` (default 64) — max companions
+  a module delivers to concurrently per tick.
+- `MITOS_DIALER_LANES` / `MITOS_BULK_BATCH_MAX` — unchanged; they
+  govern within-companion parallelism, which composes underneath.

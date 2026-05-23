@@ -420,6 +420,52 @@ impl EmissionsStore {
         })
     }
 
+    /// Read **every** queued row in the store in one read txn,
+    /// grouped by `(companion_id, client_id)`. Rows within each
+    /// group are id-ordered (= chain order, since `table.iter()`
+    /// yields ascending keys and `host_v2::drain_one` emits in
+    /// chain order).
+    ///
+    /// This is the per-module-drain entry point: one full table
+    /// scan per poll tick fans out to all the module's companions,
+    /// replacing the previous one-scan-per-companion model (which
+    /// was O(companions × rows) per second). See
+    /// `docs/design/DIALER_CONCURRENCY.md` ("Per-module drain").
+    ///
+    /// Group order is the `BTreeMap` order of the
+    /// `(companion_id, client_id)` key — deterministic but not
+    /// otherwise meaningful; the dialer looks each group up in its
+    /// registry independently.
+    #[allow(clippy::type_complexity)]
+    pub fn list_queued_grouped_by_companion(
+        &self,
+    ) -> Result<Vec<((String, String), Vec<EmissionRecord>)>, EmissionsError> {
+        use std::collections::BTreeMap;
+        let rx = self
+            .db
+            .begin_read()
+            .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+        let table = rx
+            .open_table(EMISSIONS_TABLE)
+            .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+        let iter = table
+            .iter()
+            .map_err(|e| EmissionsError::Redb(e.to_string()))?;
+        let mut groups: BTreeMap<(String, String), Vec<EmissionRecord>> = BTreeMap::new();
+        for entry in iter {
+            let (_, value) = entry.map_err(|e| EmissionsError::Redb(e.to_string()))?;
+            let record: EmissionRecord = ciborium::de::from_reader(value.value())
+                .map_err(|e| EmissionsError::Decode(e.to_string()))?;
+            if matches!(record.status, EmissionStatus::Queued) {
+                groups
+                    .entry((record.companion_id.clone(), record.client_id.clone()))
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Ok(groups.into_iter().collect())
+    }
+
     /// Read all queued rows for `(companion_id, client_id)`,
     /// grouped by `partition_key`. Within each group, rows are
     /// id-ordered (= slot-ordered, since `host_v2::drain_one` emits
@@ -520,6 +566,25 @@ impl EmissionsStore {
                 && r.client_id == client_id
                 && matches!(r.status, EmissionStatus::Pending)
         })?;
+        let count = pending.len();
+        for row in pending {
+            self.update_status(row.id, EmissionStatus::Queued, now_rfc3339, None)?;
+        }
+        Ok(count)
+    }
+
+    /// Flip **every** `Pending` row in the store back to `Queued`,
+    /// regardless of companion. Called once at per-module-drain
+    /// task start to recover rows left `Pending` by a prior host
+    /// process that died mid-POST — the per-module analog of the
+    /// per-companion [`Self::requeue_pending_for_companion`] the
+    /// old one-task-per-companion dialer ran on task start.
+    ///
+    /// Safe because consumer `apply_event` is required to be
+    /// idempotent (see [`Self::requeue_pending_for_companion`] for
+    /// the full argument). Returns the number of rows flipped.
+    pub fn requeue_all_pending(&self, now_rfc3339: &str) -> Result<usize, EmissionsError> {
+        let pending = self.list_filtered(|r| matches!(r.status, EmissionStatus::Pending))?;
         let count = pending.len();
         for row in pending {
             self.update_status(row.id, EmissionStatus::Queued, now_rfc3339, None)?;
@@ -860,6 +925,78 @@ mod tests {
         assert_eq!(grouped[2].0, b"policy_b" as &[u8]);
         let ids: Vec<u64> = grouped[2].1.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![4]);
+    }
+
+    #[test]
+    fn list_queued_grouped_by_companion_buckets_per_companion() {
+        let (_t, store) = fresh_store();
+        // Two companions on this module's store, each with two
+        // queued rows, plus one Acked row that must be excluded.
+        let cases: &[(&str, &str, EmissionStatus)] = &[
+            ("policy_a", "client_x", EmissionStatus::Queued),
+            ("policy_b", "client_x", EmissionStatus::Queued),
+            ("policy_a", "client_x", EmissionStatus::Queued),
+            ("policy_b", "client_x", EmissionStatus::Acked),
+            ("policy_b", "client_x", EmissionStatus::Queued),
+        ];
+        for (companion, client, status) in cases {
+            store
+                .append(
+                    companion,
+                    client,
+                    "collection-holders",
+                    fixed_point(),
+                    vec![],
+                    vec![],
+                    *status,
+                    "2026-05-05T00:00:00Z",
+                )
+                .unwrap();
+        }
+
+        let grouped = store.list_queued_grouped_by_companion().unwrap();
+        assert_eq!(grouped.len(), 2, "two distinct companions");
+
+        // BTreeMap key order: policy_a sorts before policy_b.
+        assert_eq!(grouped[0].0, ("policy_a".to_string(), "client_x".to_string()));
+        let a_ids: Vec<u64> = grouped[0].1.iter().map(|r| r.id).collect();
+        assert_eq!(a_ids, vec![1, 3], "policy_a queued rows in id order");
+
+        assert_eq!(grouped[1].0, ("policy_b".to_string(), "client_x".to_string()));
+        let b_ids: Vec<u64> = grouped[1].1.iter().map(|r| r.id).collect();
+        assert_eq!(b_ids, vec![2, 5], "policy_b queued rows in id order; Acked id=4 excluded");
+    }
+
+    #[test]
+    fn requeue_all_pending_flips_every_pending_companion() {
+        let (_t, store) = fresh_store();
+        // Pending rows across two companions + one Queued row that
+        // must be left alone.
+        for (companion, status) in [
+            ("c1", EmissionStatus::Pending),
+            ("c2", EmissionStatus::Pending),
+            ("c1", EmissionStatus::Queued),
+        ] {
+            store
+                .append(
+                    companion,
+                    "client_a",
+                    "ownership",
+                    fixed_point(),
+                    vec![],
+                    vec![],
+                    status,
+                    "2026-05-05T00:00:00Z",
+                )
+                .unwrap();
+        }
+        let count = store.requeue_all_pending("2026-05-05T00:00:10Z").unwrap();
+        assert_eq!(count, 2, "both companions' Pending rows flipped");
+        // All three rows are now Queued.
+        let queued = store.list_filtered(|r| r.status == EmissionStatus::Queued).unwrap();
+        assert_eq!(queued.len(), 3);
+        // Second call is a no-op.
+        assert_eq!(store.requeue_all_pending("2026-05-05T00:00:20Z").unwrap(), 0);
     }
 
     #[test]

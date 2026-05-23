@@ -18,8 +18,8 @@
 //!   middleware.
 //!
 //! The actual outbound dial + Apply-frame delivery lives in
-//! `dialer.rs` (`CompanionDialer::run_companion`); this module
-//! only handles registration intake.
+//! `dialer.rs` (the per-module `run_module_drain` task); this
+//! module only handles registration intake.
 //!
 //! ## Still deferred
 //!
