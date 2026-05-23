@@ -1,0 +1,69 @@
+# Cold-start scenario: raw / NFT shape — a synthetic policy held
+# across stake-delegated, enterprise, and script holders, with NO
+# DEX pool and NO vesting. This is the plain `Scan → Emit` path:
+# `cold_start` folds the UTxO set into the holder ledger and emits
+# a chunked snapshot with no LP / vesting decomposition.
+#
+# This is the regression net for the SUM core ahead of the SB5
+# sharded migration — capturing CURRENT behaviour so the migration
+# (page-oriented sharding) must reproduce it exactly.
+#
+# Policy: a0a0a0a0...a0 (synthetic; short hex asset labels)
+#
+# Holdings:
+#   - addr1q... (stake-key delegation)  -> "01" qty 1, "02" qty 1
+#   - addr1v... (enterprise, no stake)  -> "03" qty 1
+#   - addr1x... (script payment+deleg)  -> "04" qty 5
+#
+# Addresses reused verbatim from the collection-holders
+# `cold-start-mixed-holders` fixture (known-good across all three
+# `extract_holder_key` shapes: Stake / Enterprise / Stake-via-script).
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+
+# Stake-delegated wallet — two distinct asset names.
+[[utxo]]
+tx_hash = "1111111111111111111111111111111111111111111111111111111111111111"
+index = 0
+address = "addr1q8pay93een8vr9gwjcud6f093fqjq0gyz6ylg8088r69jnsttadnk66gcdwcaykj7v243uxecjeu5wed6ljf0lrpflhs96f7f2"
+lovelace = 2000000
+
+[[utxo.assets]]
+policy = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+asset_name_hex = "01"
+quantity = 1
+
+[[utxo.assets]]
+policy = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+asset_name_hex = "02"
+quantity = 1
+
+# Enterprise wallet (no stake credential) — surfaces as
+# `HolderId::Enterprise`.
+[[utxo]]
+tx_hash = "2222222222222222222222222222222222222222222222222222222222222222"
+index = 0
+address = "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"
+lovelace = 2000000
+
+[[utxo.assets]]
+policy = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+asset_name_hex = "03"
+quantity = 1
+
+# Script address (script payment + script delegation) — grouped by
+# its 28-byte staking credential, so `HolderId::Stake`.
+[[utxo]]
+tx_hash = "3333333333333333333333333333333333333333333333333333333333333333"
+index = 0
+address = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd"
+lovelace = 2000000
+
+[[utxo.assets]]
+policy = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+asset_name_hex = "04"
+quantity = 5

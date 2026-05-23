@@ -1,0 +1,69 @@
+# Cold-start scenario: vesting decomposition — a tracked token
+# (Aliens) with one plain liquid holder plus tokens locked in a
+# CrowdLock vesting contract on behalf of an owner. The locked
+# tokens bypass the holder ledger (they're not the contract's
+# holdings); the vesting-decomposition step reads each lock datum,
+# resolves the owner's stake credential, and attaches the lock to
+# the owner as a `vests` entry — creating a vest-only `HolderEntry`
+# when the owner holds no liquid tokens.
+#
+# Exercises: `is_crowdlock_lock` ledger bypass → `decompose_vesting`
+# (datum decode + `resolve_stake_for_payment_pkh`) → `attach_vests`.
+# Captures CURRENT behaviour as the regression net for the SB5
+# sharded migration.
+#
+# REAL Aliens data, reused from the vesting-tracker
+# `aliens-crowdlock` fixture (lock address, vesting datum, owner
+# wallet) so the decode + stake-resolution paths run against an
+# on-chain-shaped datum:
+#   Aliens policy:   16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7
+#   Lock contract:   addr1zyupekd… (payment cred == crowd_lock::PAYMENT_CRED)
+#   Owner PKH:       373998141ef305075d72dc53c57168fe495d3fb27ab2f94e85410c5b
+#   Locked amount:   12281864 Aliens   (unlock 1793765349809 ms)
+#
+# Expected: two holders — a plain liquid holder (5 Aliens) and the
+# vest-only owner (0 liquid, one CrowdLock vest of 12281864).
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"
+
+# Plain liquid holder of Aliens.
+[[utxo]]
+tx_hash = "00000000000000000000000000000000000000000000000000000000000000c1"
+index = 0
+address = "addr1q8pay93een8vr9gwjcud6f093fqjq0gyz6ylg8088r69jnsttadnk66gcdwcaykj7v243uxecjeu5wed6ljf0lrpflhs96f7f2"
+lovelace = 2000000
+
+[[utxo.assets]]
+policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"
+asset_name_hex = "416c69656e73"
+quantity = 5
+
+# CrowdLock vesting lock holding the owner's Aliens. Payment cred
+# matches `crowd_lock::PAYMENT_CRED`, so the holder scan bypasses
+# these tokens; the datum carries the owner PKH + unlock timestamp.
+[[utxo]]
+tx_hash = "3c1b6d37fba643feb85ffa4aa13dfe11746115bf0ce449eec640524130955e15"
+index = 0
+address = "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w"
+lovelace = 2000000
+datum_hash = "e66e53a8e064c04bea090a2c3ef97c0e7d870f4d660e8a3ebac859c3ca01ad33"
+datum_payload_hex = "d879821b000001a1a4bf19b181581c373998141ef305075d72dc53c57168fe495d3fb27ab2f94e85410c5b"
+
+[[utxo.assets]]
+policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"
+asset_name_hex = "416c69656e73"
+quantity = 12281864
+
+# Owner's wallet UTxO — payment credential == the datum's owner
+# PKH, with a stake part, so `resolve_stake_for_payment_pkh`'s
+# default walk (`utxos_by_payment_cred` → read) resolves the
+# owner's stake credential. Holds no Aliens (vest-only owner).
+[[utxo]]
+tx_hash = "0000000000000000000000000000000000000000000000000000000000000001"
+index = 0
+address = "addr1qymnnxq5rmes2p6awtw983t3drlyjhflkfat972ws4qscklm56q7dx503mv52y00wp6ynz90ck7qms5z0js73dfl0mgsm4cgx5"
+lovelace = 1500000

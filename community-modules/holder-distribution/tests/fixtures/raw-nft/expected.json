@@ -1,0 +1,65 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+  },
+  {
+    "holders": [
+      {
+        "assets": [
+          {
+            "asset_name_hex": "01",
+            "quantity": 1
+          },
+          {
+            "asset_name_hex": "02",
+            "quantity": 1
+          }
+        ],
+        "id": {
+          "stake": "0b5f5b3b6b48c35d8e92d2f31558f0d9c4b3ca3b2dd7e497fc614fef"
+        },
+        "lp_amount": 0,
+        "role": "wallet",
+        "vests": []
+      },
+      {
+        "assets": [
+          {
+            "asset_name_hex": "04",
+            "quantity": 5
+          }
+        ],
+        "id": {
+          "stake": "2c967f4bd28944b06462e13c5e3f5d5fa6e03f8567569438cd833e6d"
+        },
+        "lp_amount": 0,
+        "role": "wallet",
+        "vests": []
+      },
+      {
+        "assets": [
+          {
+            "asset_name_hex": "03",
+            "quantity": 1
+          }
+        ],
+        "id": {
+          "enterprise": "addr1vyw4d7mypuwvt54twjr49z9ctzl86wv3ee8sv7guuv5ft7gd7y66g"
+        },
+        "lp_amount": 0,
+        "role": "wallet",
+        "vests": []
+      }
+    ],
+    "kind": "snapshot_chunk",
+    "policy": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+  },
+  {
+    "holder_count": 3,
+    "kind": "snapshot_end",
+    "policy": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+  }
+]
