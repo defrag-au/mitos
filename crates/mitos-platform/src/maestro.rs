@@ -69,6 +69,20 @@ struct TxCborResponse {
     data: String,
 }
 
+/// `GET /datums/{datum_hash}` response. Maestro wraps the datum
+/// in a `data` envelope carrying the raw CBOR `bytes` (hex) and a
+/// decoded `json` view; we only need the bytes.
+#[derive(Deserialize)]
+struct DatumResponse {
+    data: DatumData,
+}
+
+#[derive(Deserialize)]
+struct DatumData {
+    /// Hex-encoded raw CBOR of the datum.
+    bytes: String,
+}
+
 /// `GET /transactions/{tx_hash}/outputs/{index}/txo` response.
 /// Maestro wraps the output in a `data` envelope.
 #[derive(Deserialize)]
@@ -211,6 +225,34 @@ impl MaestroClient {
         let body: TxoResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
         Ok(Some(typed_output_from_maestro(body.data, level)))
+    }
+
+    /// Fetch a datum's raw CBOR by its hash via
+    /// `GET /datums/{datum_hash}`. Returns:
+    /// - `Ok(Some(cbor))` — Maestro has the datum preimage
+    /// - `Ok(None)` — 404 (Maestro doesn't have it)
+    /// - `Err(...)` — retry exhaustion / transport / decode error
+    ///
+    /// Used as the datum-resolution fallback in
+    /// `MaestroFallbackPlane::read_datum` when dolos's `DATUM_NS`
+    /// misses — e.g. hash-only CIP-68 reference datums whose
+    /// witnessing block predates the dolos sync/archive coverage
+    /// (the metadata bytes aren't on the current ref UTxO, only the
+    /// hash is). Maestro indexes all witnessed datums, so it can
+    /// resolve them regardless of horizon.
+    pub async fn fetch_datum(
+        &self,
+        datum_hash_hex: &str,
+    ) -> Result<Option<Vec<u8>>, MaestroError> {
+        let url = format!("https://{}/datums/{datum_hash_hex}", self.base_url);
+        let Some(body_bytes) = self.get_bytes_with_retries(&url, datum_hash_hex).await? else {
+            return Ok(None);
+        };
+        let body: DatumResponse = serde_json::from_slice(&body_bytes)
+            .map_err(|e| MaestroError::Decode(format!("json: {e}")))?;
+        let cbor =
+            hex::decode(&body.data.bytes).map_err(|e| MaestroError::Decode(format!("hex: {e}")))?;
+        Ok(Some(cbor))
     }
 
     /// Shared retry loop for any `GET` endpoint that wraps its

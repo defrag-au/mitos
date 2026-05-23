@@ -71,7 +71,7 @@ where
     // successful apply so future bootstraps can resolve without
     // the dolos archive. Failure here is non-fatal — the fallback
     // is the dolos archive (or Maestro in Phase 2).
-    let aux_cache = storage.aux_data_cache().ok();
+    let aux_cache = storage.indexer_data_cache().ok();
     loop {
         // Multiplex tip events with interest updates. `biased`
         // gives tip events priority — dynamic interest is rare
@@ -199,7 +199,7 @@ where
 /// Scan a raw block CBOR and batch-insert all TX aux_data entries
 /// into the cache. Errors are silently discarded — a cache miss
 /// on the next bootstrap is the only consequence.
-fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::aux_data_cache::AuxDataCache) {
+fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::indexer_data_cache::IndexerDataCache) {
     let block = match MultiEraBlock::decode(block_bytes) {
         Ok(b) => b,
         Err(_) => return,
@@ -213,7 +213,7 @@ fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::aux_data_cache::Aux
             Some((hash, cbor))
         })
         .collect();
-    cache.insert_batch(&entries);
+    cache.insert_aux_batch(&entries);
 }
 
 /// Apply one dynamic-interest update: mutate the driver's

@@ -84,8 +84,9 @@ Why not reuse `holder-distribution`? That module is CNT-shaped (`holder → tota
                                                              │
                                                              │
               ┌──────────────────────────────────────────────▼────┐
-              │  MaestroFallbackPlane (existing infrastructure)   │
-              │  - tx aux_data fetch + cache (aux_data.redb)      │
+              │  Maestro fallback (existing infrastructure)       │
+              │  - aux_data + datum fetch + cache                 │
+              │    (indexer_data.redb)                            │
               │  - per-process semaphore (MAESTRO_MAX_INFLIGHT)   │
               │  - in-flight coalescing, 429-aware backoff        │
               └───────────────────────────────────────────────────┘
@@ -407,7 +408,7 @@ A core principle of this design: **workers do not call Maestro directly.** Mitos
 ### Why centralise the fallback
 
 - **Single rate-limit envelope.** Today's `collection-ownership` worker hits Maestro from its own DO, with its own retry logic and no coordination with other workers. Centralising in mitos means one process-wide semaphore (`MAESTRO_MAX_INFLIGHT`) governs all fallback traffic across all consumers.
-- **One cache.** `aux_data.redb` already caches resolved aux data. Pulling CIP-25 metadata via the platform means the cache amortises across all metadata consumers, not per-worker.
+- **One cache.** `indexer_data.redb` already caches resolved aux data (and datums). Pulling CIP-25/CIP-68 metadata via the platform means the cache amortises across all metadata consumers, not per-worker.
 - **One classification path.** FT-detection, malformed-metadata handling, ref-token parsing — all live in the module, applied uniformly. Workers consume typed events.
 - **Easier to swap.** When the Dolos archive horizon extends, or when Maestro is replaced by a different fallback source (a self-hosted Blockfrost-shape, a different indexer), only the platform changes.
 
@@ -417,7 +418,7 @@ The cost concern with Maestro-mediated bootstrap is the per-asset metadata fetch
 
 - 10k-supply collection past archive horizon → up to 10k Maestro aux-data fetches at cold-start
 - With `MAESTRO_MAX_INFLIGHT=4` and ~200ms per call → ~8 minutes wall time, fully sequenced
-- One-time per policy. Cached forever in `aux_data.redb` after.
+- One-time per policy. Cached forever in `indexer_data.redb` after.
 
 This is comparable to the current `cnft.tools` paginated bootstrap that `collection-ownership` runs today (minutes for active policies). It's acceptable, and the cache means subsequent subscriptions for the same policy are free.
 
@@ -580,8 +581,10 @@ This is a soft dependency: collection-holders + collection-metadata work without
 - [`DOMAIN_REFACTOR.md`](./DOMAIN_REFACTOR.md) — superseded as implementation vehicle, but the `Mint` / `Burn` / `AssetMovement` taxonomy remains canonical and underpins these modules' event shapes
 - [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md) — consumer-side worker migration plan
 - `crates/mitos-data-plane/src/lib.rs:81,129,241` — host-fns these modules use (`read_utxos`, `utxos_by_policy`, `tx_metadata` all already shipped)
-- `crates/mitos-platform/src/maestro_fallback_plane.rs` — existing Maestro fallback implementation
-- `crates/mitos-platform/src/maestro.rs` — Maestro client + `aux_data.redb` cache
+- `crates/mitos-platform/src/maestro_fallback_plane.rs` — Maestro fallback for `read_utxos` (prior-output resolution)
+- `crates/mitos-platform/src/host_fns/mod.rs` (`CachingDataPlane`) — Maestro + cache fallback for `tx_metadata` (aux_data) and `datum_by_hash` (datums)
+- `crates/mitos-platform/src/maestro.rs` — Maestro client (`fetch_aux_data`, `fetch_datum`, `fetch_output`)
+- `crates/mitos-platform/src/indexer_data_cache.rs` — persistent `indexer_data.redb` cache (aux_data + datum namespaces)
 - `community-modules/holder-distribution/holder_distribution.rs` — implementation reference for module structure
 - `~/code/defrag/shared-crates/address-registry/src/registry.rs` — typed marketplace / DEX / vesting script labels used for `HolderRef::Script.label`
 - CIP-25 spec: <https://cips.cardano.org/cip/CIP-25>

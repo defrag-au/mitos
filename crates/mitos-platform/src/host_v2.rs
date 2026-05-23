@@ -435,16 +435,16 @@ where
         // cache before hitting the dolos archive (7-day window).
         // Failures to open the cache degrade gracefully to a plain
         // passthrough — same behaviour as before this was added.
-        let cache_opt = match self.storage.aux_data_cache() {
+        let cache_opt = match self.storage.indexer_data_cache() {
             Ok(c) => {
-                tracing::debug!(module = %id, "aux_data_cache opened");
+                tracing::debug!(module = %id, "indexer_data_cache opened");
                 Some(Arc::new(c))
             }
             Err(e) => {
                 tracing::warn!(
                     module = %id,
                     error = %e,
-                    "aux_data_cache unavailable; tx_metadata bypasses cache",
+                    "indexer_data_cache unavailable; tx_metadata/datum bypass cache",
                 );
                 None
             }

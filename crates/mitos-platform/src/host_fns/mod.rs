@@ -172,7 +172,16 @@ where
         Ok(datums
             .into_iter()
             .map(|opt| {
-                opt.and_then(|td| td.original_cbor.map(|payload| (td.hash.to_vec(), payload)))
+                // Preserve the hash even when the bytes are
+                // unresolved (`original_cbor == None`): a hash-only
+                // datum the local plane couldn't resolve still
+                // carries a meaningful hash, and the caller falls
+                // back to `datum_by_hash` (which has the Maestro
+                // fallback) on an empty payload. Collapsing this to
+                // `None` would drop the hash and strand cold-start
+                // for snapshot-gapped CIP-68 ref datums. `None`
+                // remains "no datum on the output."
+                opt.map(|td| (td.hash.to_vec(), td.original_cbor.unwrap_or_default()))
             })
             .collect())
     }
@@ -370,17 +379,21 @@ where
     }
 }
 
-/// Transparent `DataPlaneFacade` wrapper that adds a local
-/// aux-data cache and optional Maestro fallback to `tx_metadata`.
-/// All other methods delegate directly to `inner`.
+/// Transparent `DataPlaneFacade` wrapper that adds the persistent
+/// `IndexerDataCache` and an optional Maestro fallback to the two
+/// hash-addressable lookups — `tx_metadata` (aux_data) and
+/// `datum_by_hash` (Plutus datums). All other methods delegate
+/// directly to `inner`.
 ///
-/// Resolution order for `tx_metadata`:
-/// 1. Local `AuxDataCache` (fast, on-disk, permanent)
-/// 2. `inner` (dolos archive, 7-day window)
-/// 3. Maestro REST API (when configured and daily budget allows)
+/// Resolution order (same shape for both lookups):
+/// 1. Local `IndexerDataCache` (fast, on-disk, permanent)
+/// 2. `inner` (dolos: archive for aux_data, `DATUM_NS` for datums)
+/// 3. Maestro REST API (when configured)
 ///
 /// Steps 2 and 3 write back to cache (step 1) on a hit so future
-/// calls never reach them again for the same TX.
+/// calls never reach them again for the same hash. The datum
+/// path's step-3 hit covers the CIP-68 snapshot-gap (hash-only
+/// ref datums whose preimage never landed in `DATUM_NS`).
 ///
 /// Sits between the real data plane and the `TrapContextLogger`
 /// so trap fixtures capture results regardless of source. When
@@ -388,14 +401,14 @@ where
 /// pure passthrough — no behaviour change, no panic.
 pub struct CachingDataPlane {
     inner: std::sync::Arc<dyn DataPlaneFacade>,
-    cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
+    cache: Option<std::sync::Arc<crate::indexer_data_cache::IndexerDataCache>>,
     maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
 }
 
 impl CachingDataPlane {
     pub fn new(
         inner: std::sync::Arc<dyn DataPlaneFacade>,
-        cache: Option<std::sync::Arc<crate::aux_data_cache::AuxDataCache>>,
+        cache: Option<std::sync::Arc<crate::indexer_data_cache::IndexerDataCache>>,
         maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
     ) -> Self {
         Self {
@@ -450,7 +463,52 @@ impl DataPlaneFacade for CachingDataPlane {
         &self,
         hash: &[u8; 32],
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
-        self.inner.datum_by_hash(hash).await
+        // Tier 1: local cache — permanent, free.
+        if let Some(cache) = &self.cache
+            && let Some(cached) = cache.get_datum(hash)
+        {
+            return Ok(Some(cached));
+        }
+
+        // Tier 2: dolos `DATUM_NS` (refcounted witness datums).
+        if let Some(cbor) = self.inner.datum_by_hash(hash).await? {
+            if let Some(cache) = &self.cache {
+                cache.insert_datum(hash, &cbor);
+            }
+            return Ok(Some(cbor));
+        }
+
+        // Tier 3: Maestro fallback — only when configured. Covers
+        // the CIP-68 snapshot-gap: hash-only ref datums whose
+        // preimage never landed in `DATUM_NS` (pre-snapshot ref
+        // UTxOs on a snapshot-bootstrapped node). Maestro indexes
+        // all witnessed datums, so it resolves them regardless of
+        // the local horizon.
+        if let Some(maestro) = &self.maestro {
+            let hash_hex = hex::encode(hash);
+            match maestro.fetch_datum(&hash_hex).await {
+                Ok(Some(cbor)) => {
+                    if let Some(cache) = &self.cache {
+                        cache.insert_datum(hash, &cbor);
+                    }
+                    tracing::debug!(datum = %hash_hex, "datum resolved via Maestro fallback");
+                    return Ok(Some(cbor));
+                }
+                Ok(None) => {
+                    // Maestro doesn't know this datum either —
+                    // nothing to cache.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        datum = %hash_hex,
+                        error = %e,
+                        "Maestro datum fallback failed",
+                    );
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn read_output_datums(
@@ -473,7 +531,7 @@ impl DataPlaneFacade for CachingDataPlane {
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
         // Tier 1: local cache — permanent, free.
         if let Some(cache) = &self.cache
-            && let Some(cached) = cache.get(tx_hash)
+            && let Some(cached) = cache.get_aux(tx_hash)
         {
             return Ok(Some(cached));
         }
@@ -482,7 +540,7 @@ impl DataPlaneFacade for CachingDataPlane {
         let result = self.inner.tx_metadata(tx_hash).await?;
         if let Some(cbor) = result {
             if let Some(cache) = &self.cache {
-                cache.insert(tx_hash, &cbor);
+                cache.insert_aux(tx_hash, &cbor);
             }
             return Ok(Some(cbor));
         }
@@ -493,7 +551,7 @@ impl DataPlaneFacade for CachingDataPlane {
             match maestro.fetch_aux_data(&tx_hex).await {
                 Ok(Some(cbor)) => {
                     if let Some(cache) = &self.cache {
-                        cache.insert(tx_hash, &cbor);
+                        cache.insert_aux(tx_hash, &cbor);
                     }
                     tracing::debug!(tx = %tx_hex, "aux_data resolved via Maestro fallback");
                     return Ok(Some(cbor));
