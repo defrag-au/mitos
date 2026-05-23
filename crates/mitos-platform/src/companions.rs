@@ -500,6 +500,47 @@ async fn subscribe_handler(
     // to spawn per-target dial loops.
     if let Some(dialer) = &state.dialer {
         dialer.register(request.clone()).await;
+
+        // Propagate the subscriber's interest into each MODULE
+        // target's scan-interest. `register` above only wires up
+        // the per-companion FANOUT interest (the persisted CBOR,
+        // read back by `GET …/companions` as `watched_policies`).
+        // The module's own watch/scan set — the driver `InterestSet`
+        // the cold-start + recapture walk via `utxos_by_policy`, plus
+        // the module's `update_interest` export — is updated ONLY by
+        // routing an interest mutation into the follower. Without
+        // this, a subscribe registers the companion but its policy
+        // never enters the module's scan-interest, so cold-start
+        // never fires and the companion never drains (CO1: an added
+        // collection that never captures). The incremental
+        // `/api/companions/{key}/interest` endpoint already routes,
+        // but a subscribe that races/misses that separate push is
+        // left stranded; routing here makes the subscribe itself
+        // self-sufficient. `Add` is union-preserving (Replace would
+        // wipe other companions' policies from the shared module
+        // interest) and idempotent — re-subscribes dedup and the
+        // per-scope bootstrap flag suppresses re-cold-start, so this
+        // only hydrates genuinely-new policies.
+        if !request.interests.is_empty() {
+            for target in &request.targets {
+                if let SubscribeTarget::Module { name } = target
+                    && let Err(e) = dialer
+                        .route_interest_mutation(
+                            name,
+                            InterestOp::Add,
+                            request.interests.clone(),
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        module = %name,
+                        error = %e,
+                        "subscribe: routing interest into module scan-set failed; \
+                         companion fanout-interest still registered",
+                    );
+                }
+            }
+        }
     }
     let response = SubscribeResponse {
         status: "subscribed".to_string(),
