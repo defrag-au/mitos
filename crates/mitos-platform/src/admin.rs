@@ -655,20 +655,31 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Tip is best-effort: a failed query (or no chain-data handle)
-    // degrades to `None` rather than failing the whole status call.
-    let tip = match &state.chain_data {
-        Some(cd) => match cd.tip().await {
-            Ok(t) => Some(StatusTip {
-                slot: t.slot(),
-                hash: t.point.hash().map(hex::encode),
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "status: chain tip query failed");
-                None
-            }
-        },
-        None => None,
+    // Tip + archive horizon are best-effort: a failed query (or no
+    // chain-data handle) degrades to `None` rather than failing the
+    // whole status call.
+    let (tip, archive_horizon_slot) = match &state.chain_data {
+        Some(cd) => {
+            let tip = match cd.tip().await {
+                Ok(t) => Some(StatusTip {
+                    slot: t.slot(),
+                    hash: t.point.hash().map(hex::encode),
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "status: chain tip query failed");
+                    None
+                }
+            };
+            let horizon = match cd.archive_horizon_slot().await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, "status: archive horizon query failed");
+                    None
+                }
+            };
+            (tip, horizon)
+        }
+        None => (None, None),
     };
 
     // One snapshot of in-flight recaptures for the whole summary.
@@ -709,10 +720,7 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         build_sha: env!("MITOS_BUILD_SHA").to_string(),
         uptime_secs,
         tip,
-        // Wired to dolos's immutable boundary in a follow-up; the
-        // field ships now so `mitos-admin status` + agents have a
-        // stable shape to depend on.
-        archive_horizon_slot: None,
+        archive_horizon_slot,
         modules,
     }))
 }
@@ -783,16 +791,25 @@ async fn metrics(State(state): State<AdminState>) -> Response {
     );
     let _ = writeln!(out, "mitos_uptime_seconds {uptime}");
 
-    if let Some(cd) = &state.chain_data
-        && let Ok(tip) = cd.tip().await
-    {
-        metric_header(
-            &mut out,
-            "mitos_chain_tip_slot",
-            "Current chain tip slot.",
-            "gauge",
-        );
-        let _ = writeln!(out, "mitos_chain_tip_slot {}", tip.slot());
+    if let Some(cd) = &state.chain_data {
+        if let Ok(tip) = cd.tip().await {
+            metric_header(
+                &mut out,
+                "mitos_chain_tip_slot",
+                "Current chain tip slot.",
+                "gauge",
+            );
+            let _ = writeln!(out, "mitos_chain_tip_slot {}", tip.slot());
+        }
+        if let Ok(Some(horizon)) = cd.archive_horizon_slot().await {
+            metric_header(
+                &mut out,
+                "mitos_archive_horizon_slot",
+                "Oldest slot still in the archive; datum/input lookups below this miss (empty CIP-68 traits).",
+                "gauge",
+            );
+            let _ = writeln!(out, "mitos_archive_horizon_slot {horizon}");
+        }
     }
 
     // ----- gather per-module + per-companion -----

@@ -377,6 +377,11 @@ where
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         plane.protocol_params().await
     }
+
+    async fn archive_horizon_slot(&self) -> mitos_data_plane::DataPlaneResult<Option<u64>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        plane.archive_horizon_slot().await
+    }
 }
 
 /// Transparent `DataPlaneFacade` wrapper that adds the persistent

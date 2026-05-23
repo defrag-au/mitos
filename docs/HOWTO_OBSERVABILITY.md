@@ -193,6 +193,21 @@ Recapture wipes + rebuilds the module's state from current-state UTxOs;
 only live state re-materialises, so stale/zombie rows drop. See
 `design/RECAPTURE.md`.
 
+### "A consumer's CIP-68 traits / metadata come back empty (for older assets)"
+The trait-resolution failure class: a module resolves a CIP-68 reference
+datum by hash, but the datum lives in a block *below the archive
+horizon* (dolos pruned the body), so it resolves to nothing → empty
+metadata. Check the horizon against the asset's mint slot:
+
+```bash
+mitos-admin status | grep -i "archive horizon"      # e.g. "slot 152000000"
+curl -s "$MITOS_URL/metrics" | grep mitos_archive_horizon_slot
+```
+If the asset was minted *below* `archive_horizon_slot`, that's the root
+cause — the datum body is gone, not a module bug. Fixes live outside
+mitos (a hash→datum cache / Maestro fallback on the consumer side);
+this field just tells you definitively whether the horizon is to blame.
+
 ### "A module trapped"
 ```bash
 mitos-admin tail --kind trap                                  # what + when
@@ -227,6 +242,7 @@ scrape at it. Highest-value series:
 | `mitos_recapture_in_progress{module}` | 1 while a recapture runs (alert if stuck high). |
 | `mitos_module_last_trap_age_seconds{module}` | Recent trap detector. |
 | `mitos_events_total{module,kind}` | Cumulative recaptures/traps (rate alerts). |
+| `mitos_archive_horizon_slot` | Oldest slot still in the archive. Lookups below it miss → empty CIP-68 traits. |
 | `mitos_chain_tip_slot`, `mitos_uptime_seconds`, `mitos_build_info` | Liveness / position / what's deployed. |
 
 Suggested alerts: `oldest_queued_age_seconds > 600` (lane stalled),
@@ -291,9 +307,6 @@ by `recapture_completed` in the tail — no SSH at any step.
 
 ## Not here yet (deferred)
 
-- `archive_horizon_slot` in `/_admin/status` is a `null` placeholder
-  (dolos owns the boundary; wiring pending). It's the field that
-  explains empty CIP-68 metadata for assets below the horizon.
 - Events ring covers `recapture_*` + `trap`; `rebootstrap_completed` and
   `companion_subscribed/evicted` are planned additions.
 - Recapture/bootstrap `last_result` (`utxos_ingested`, `completed|trapped`)
