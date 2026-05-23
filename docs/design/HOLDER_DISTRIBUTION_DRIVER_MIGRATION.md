@@ -364,6 +364,22 @@ side (fungible-token analytics, consumed by epochify), and the only
 remaining migration. It is parked deliberately to keep focus on CNFTs;
 this section is the complete, fresh-session-ready pickup.
 
+**Re-confirmed parked 2026-05-23** (during the B1/B2 dialer-scaling work).
+Re-evaluated whether SB5 was a quick port now that SB1–SB4 landed — it is
+**not**. The shipped driver only covers a straight `Scan → Emit` module;
+holder-distribution still needs the net-new kit `Phase::Decomp` /
+`decomp_step` hook (below), a `meta:` side-state shard, the `decomp:`
+prefix, **and** the 3 goldens that don't exist yet (financial output has
+zero regression net today). So "the hard part is done" holds for the SUM
+core but **not** for this module's decomposition. Combined with the live
+evidence that there is **no scale pressure** — the only consumer (epochify,
+`hooks.epochify.space` + dev) tracks 2 policies at ~33 emissions each, for
+which the resident-ledger model is entirely fine — the right call is to
+fold this into the dedicated fuel-exhaustion sweep as the documented
+headline resident-ledger risk, and pick up this spec when a real
+large-CNT (Hosky-class) consumer materialises. Don't re-litigate "is it a
+quick port" — it isn't; the answer is captured here.
+
 **Why it's the hard one.** Unlike the other two modules, it applies two
 **financial** transforms *between* scan and emit — and the kit's
 `ChunkedBootstrap` is a straight `Scan → Emit` machine with no hook in
