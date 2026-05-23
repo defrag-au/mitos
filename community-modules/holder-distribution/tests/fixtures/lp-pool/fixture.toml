@@ -1,0 +1,97 @@
+# Cold-start scenario: LP-pool decomposition — the load-bearing
+# financial golden. A tracked token (TOK) is held partly by a
+# plain wallet and partly aggregated in a CSwap DEX pool. The
+# module auto-discovers the pool (a holder at `cswap::POOL_SCRIPT_ADDR`),
+# reads its datum (total_lp_tokens + lp_policy), scans the LP-token
+# holder set, and redistributes the pool's aggregate to LP
+# providers proportional to their LP share — recording each
+# provider's `lp_amount` and keeping the rounding remainder as a
+# residual pool entry.
+#
+# Exercises: `decompose_or_plain` → `read_pool_datum` →
+# `fold_lp_page` (incl. CSwap farm staking-datum resolution) →
+# `decompose_holders`. Captures CURRENT behaviour as the regression
+# net for the SB5 sharded migration.
+#
+# SYNTHETIC: policy/asset/LP-policy are hand-built; the pool +
+# staking datums are valid CBOR generated via mitos-dex-decode's
+# own constructors (decode_pool_datum / decode_staking_datum).
+#
+# Tracked policy TOK: b1b1...b1, asset "TOK" (544f4b).
+# LP-token policy:    cccc...cc, asset "LP"  (4c50).
+# Pool datum:         total_lp_tokens = 1000, lp_policy = cc..cc.
+#
+# Holdings + LP shares (reserve = 1000 TOK, total_lp = 1000):
+#   - Pool @ POOL_SCRIPT_ADDR: 1000 TOK aggregate  (the reserve)
+#   - W1   @ addr1q8pay93…:       50 TOK  (plain holder, lp_amount 0)
+#   - W2   @ addr1qymnnxq5…:      600 LP → 600 TOK attributed (lp_amount 600)
+#   - Farm @ FARM_SCRIPT_ADDR:   300 LP → 300 TOK attributed to the
+#                                staker (stake cred d3..d3 from the
+#                                farm staking datum), lp_amount 300
+#   - Residual: 1000 − 600 − 300 = 100 TOK stays with the pool
+#               (role DexPool)
+
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+
+# ── Main-policy (TOK) holders ──────────────────────────────────
+
+# The DEX pool — auto-discovered by address. Holds the aggregate
+# reserve + carries the pool datum inline.
+[[utxo]]
+tx_hash = "00000000000000000000000000000000000000000000000000000000000000a1"
+index = 0
+address = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e"
+lovelace = 5000000
+datum_hash = "0000000000000000000000000000000000000000000000000000000000000010"
+datum_payload_hex = "d8799f1903e818554040581cb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b143544f4b581ccccccccccccccccccccccccccccccccccccccccccccccccccccccccc424c50ff"
+
+[[utxo.assets]]
+policy = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+asset_name_hex = "544f4b"
+quantity = 1000
+
+# Plain wallet holder of TOK (not an LP provider).
+[[utxo]]
+tx_hash = "00000000000000000000000000000000000000000000000000000000000000a2"
+index = 0
+address = "addr1q8pay93een8vr9gwjcud6f093fqjq0gyz6ylg8088r69jnsttadnk66gcdwcaykj7v243uxecjeu5wed6ljf0lrpflhs96f7f2"
+lovelace = 2000000
+
+[[utxo.assets]]
+policy = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+asset_name_hex = "544f4b"
+quantity = 50
+
+# ── LP-token (cc..cc) holders ──────────────────────────────────
+
+# Unstaked LP provider — LP sits at the user's own wallet.
+[[utxo]]
+tx_hash = "00000000000000000000000000000000000000000000000000000000000000b1"
+index = 0
+address = "addr1qymnnxq5rmes2p6awtw983t3drlyjhflkfat972ws4qscklm56q7dx503mv52y00wp6ynz90ck7qms5z0js73dfl0mgsm4cgx5"
+lovelace = 2000000
+
+[[utxo.assets]]
+policy = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+asset_name_hex = "4c50"
+quantity = 600
+
+# Farm-staked LP — sits at the shared CSwap farm address; the
+# staker (stake cred d3..d3) is recovered from the farm UTxO's
+# staking datum.
+[[utxo]]
+tx_hash = "00000000000000000000000000000000000000000000000000000000000000b2"
+index = 0
+address = "addr1z9xf82dwn6aaaftz6dnjslhkgu0pvtxrhfqsxqm8h42u7uggjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5qt8sqcf"
+lovelace = 2000000
+datum_hash = "0000000000000000000000000000000000000000000000000000000000000011"
+datum_payload_hex = "d8799fd8799fd8799f581c11111111111111111111111111111111111111111111111111111111ffd8799fd8799fd8799f581cd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3ffffffff0000ff"
+
+[[utxo.assets]]
+policy = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+asset_name_hex = "4c50"
+quantity = 300

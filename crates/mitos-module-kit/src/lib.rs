@@ -273,8 +273,33 @@ impl<P, A: Default> ReentrantRound<P, A> {
 pub enum Phase {
     /// Paging `utxos-by-*` and sharding each entry to `state-kv`.
     Scan,
+    /// Re-entrant post-scan transform between [`Scan`](Phase::Scan)
+    /// and [`Emit`](Phase::Emit), driven by
+    /// [`BootstrapIo::decomp_step`]. A no-op for modules that don't
+    /// override `decomp_step` (the default reports done on the first
+    /// call, so the machine flips straight through to `Emit` with no
+    /// behaviour change). Used by sharded modules that must transform
+    /// the scanned shards before emitting — e.g. holder-distribution's
+    /// LP-pool + vesting decomposition, which writes a second
+    /// `decomp:` shard prefix the emit then pages.
+    Decomp,
     /// Draining `SnapshotChunk`s from the sharded entries.
     Emit,
+}
+
+/// One bounded unit of a [`BootstrapIo::decomp_step`] — the
+/// re-entrant analog of a scan page for the [`Phase::Decomp`] phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecompStep {
+    /// `true` when the decomposition for this predicate is complete;
+    /// the driver flips to [`Phase::Emit`].
+    pub done: bool,
+    /// Items processed this step (telemetry only).
+    pub ingested: u64,
+    /// Opaque module-owned continuation cursor for the next
+    /// `decomp_step` call, persisted in [`BootstrapCursor::decomp_cursor`]
+    /// so a trap mid-decomp resumes. Ignored when `done`.
+    pub next_cursor: Option<Vec<u8>>,
 }
 
 /// Durable progress for a [`ChunkedBootstrap`]. Encoded (no serde —
@@ -296,10 +321,19 @@ pub struct BootstrapCursor {
     /// offset) is robust to concurrent live-tail shard mutations
     /// during a long emit. `None` ⇒ emit not started / from the start.
     pub emit_after: Option<Vec<u8>>,
+    /// Opaque module-owned continuation for the [`Phase::Decomp`]
+    /// phase (e.g. an LP-token scan `after` token + sub-phase). The
+    /// kit threads it through [`BootstrapIo::decomp_step`] and never
+    /// inspects it. `None` outside Decomp / at decomp start.
+    pub decomp_cursor: Option<Vec<u8>>,
 }
 
 impl BootstrapCursor {
-    const VERSION: u8 = 2;
+    // v3 adds the Decomp phase + `decomp_cursor`. A v2 blob (no
+    // decomp field) decodes as `None` → fresh round; safe because a
+    // restart re-runs the round idempotently. Only an in-flight
+    // rebootstrap at deploy time is affected (it restarts).
+    const VERSION: u8 = 3;
 
     fn fresh() -> Self {
         Self {
@@ -307,19 +341,22 @@ impl BootstrapCursor {
             phase: Phase::Scan,
             anchor_slot: 0,
             emit_after: None,
+            decomp_cursor: None,
         }
     }
 
     /// Encode to the durable form for `state-kv`:
     /// `version(1) | phase(1) | predicate_idx(8 BE) | anchor_slot(8 BE)
-    /// | emit_after_len(4 BE) | emit_after`.
+    /// | emit_after_len(4 BE) | emit_after | decomp_len(4 BE) | decomp_cursor`.
     pub fn encode(&self) -> Vec<u8> {
         let after = self.emit_after.as_deref().unwrap_or(&[]);
-        let mut b = Vec::with_capacity(1 + 1 + 8 + 8 + 4 + after.len());
+        let decomp = self.decomp_cursor.as_deref().unwrap_or(&[]);
+        let mut b = Vec::with_capacity(1 + 1 + 8 + 8 + 4 + after.len() + 4 + decomp.len());
         b.push(Self::VERSION);
         b.push(match self.phase {
             Phase::Scan => 0,
-            Phase::Emit => 1,
+            Phase::Decomp => 1,
+            Phase::Emit => 2,
         });
         b.extend_from_slice(&self.predicate_idx.to_be_bytes());
         b.extend_from_slice(&self.anchor_slot.to_be_bytes());
@@ -327,6 +364,8 @@ impl BootstrapCursor {
         // Emit, where `None` means "from the start".
         b.extend_from_slice(&(after.len() as u32).to_be_bytes());
         b.extend_from_slice(after);
+        b.extend_from_slice(&(decomp.len() as u32).to_be_bytes());
+        b.extend_from_slice(decomp);
         b
     }
 
@@ -338,7 +377,8 @@ impl BootstrapCursor {
         }
         let phase = match bytes[1] {
             0 => Phase::Scan,
-            1 => Phase::Emit,
+            1 => Phase::Decomp,
+            2 => Phase::Emit,
             _ => return None,
         };
         let predicate_idx = u64::from_be_bytes(bytes[2..10].try_into().ok()?);
@@ -350,11 +390,21 @@ impl BootstrapCursor {
         } else {
             Some(after.to_vec())
         };
+        // decomp_cursor follows emit_after (v3+).
+        let dpos = 22 + after_len;
+        let decomp_len = u32::from_be_bytes(bytes.get(dpos..dpos + 4)?.try_into().ok()?) as usize;
+        let decomp = bytes.get(dpos + 4..dpos + 4 + decomp_len)?;
+        let decomp_cursor = if decomp.is_empty() {
+            None
+        } else {
+            Some(decomp.to_vec())
+        };
         Some(Self {
             predicate_idx,
             phase,
             anchor_slot,
             emit_after,
+            decomp_cursor,
         })
     }
 }
@@ -426,6 +476,32 @@ pub trait BootstrapIo {
     /// the default (replace) returns `incoming`.
     fn merge(&self, _prior: Option<Self::Entry>, incoming: Self::Entry) -> Self::Entry {
         incoming
+    }
+
+    // ---- post-scan decomposition (re-entrant, optional) -----------
+    /// One bounded unit of the [`Phase::Decomp`] phase, called once
+    /// per `step` after the last scan page until it reports `done`,
+    /// before the emit. The module owns the work + its `cursor`
+    /// (threaded through [`BootstrapCursor::decomp_cursor`]); typical
+    /// use is a paged secondary scan (e.g. LP-token holders) folded
+    /// into a second `decomp:` shard prefix the emit then pages via
+    /// [`shard_scan`](Self::shard_scan).
+    ///
+    /// **Default is a no-op** (`done: true` on the first call), so
+    /// modules that don't decompose flip straight `Scan → Emit` with
+    /// no behaviour change — only an internal extra step that emits
+    /// nothing.
+    fn decomp_step(
+        &mut self,
+        _predicate: &[u8],
+        _anchor_slot: u64,
+        _cursor: Option<&[u8]>,
+    ) -> DecompStep {
+        DecompStep {
+            done: true,
+            ingested: 0,
+            next_cursor: None,
+        }
     }
 
     // ---- durable driver cursor ------------------------------------
@@ -516,6 +592,7 @@ impl ChunkedBootstrap {
 
         match self.cursor.phase {
             Phase::Scan => self.step_scan(io, &predicate),
+            Phase::Decomp => self.step_decomp(io, &predicate),
             Phase::Emit => self.step_emit(io, &predicate),
         }
     }
@@ -568,20 +645,50 @@ impl ChunkedBootstrap {
                 }
             }
             None => {
-                // Last page → open the emit. Light: just SnapshotBegin
-                // + cursor flip. No whole-ledger op (values already
-                // sharded), so this transition can't trap on size.
-                self.cursor.phase = Phase::Emit;
-                self.cursor.emit_after = None;
-                self.emit_count = 0;
+                // Last page → enter the Decomp phase. Light: just a
+                // cursor flip (values already sharded), so it can't
+                // trap on size. `emit_begin` is deferred to the
+                // Decomp→Emit transition so a decomposing module's
+                // SnapshotBegin still precedes its first chunk; the
+                // no-op default decomp flips straight through.
+                self.cursor.phase = Phase::Decomp;
+                self.cursor.decomp_cursor = None;
                 self.after = None;
-                io.emit_begin(predicate, self.cursor.anchor_slot);
                 io.save_cursor(&self.cursor.encode());
                 StepOutcome {
                     done: false,
                     ingested: page.ingested,
                 }
             }
+        }
+    }
+
+    /// Drive one bounded unit of the post-scan [`Phase::Decomp`]
+    /// transform. The no-op default flips straight to `Emit`; a
+    /// decomposing module pages its secondary work here, resuming via
+    /// the durable `decomp_cursor` on a trap.
+    fn step_decomp<IO: BootstrapIo>(&mut self, io: &mut IO, predicate: &[u8]) -> StepOutcome {
+        let step = io.decomp_step(
+            predicate,
+            self.cursor.anchor_slot,
+            self.cursor.decomp_cursor.as_deref(),
+        );
+        if step.done {
+            // Decomposition complete → open the emit (SnapshotBegin +
+            // flip). Reset emit state.
+            self.cursor.phase = Phase::Emit;
+            self.cursor.emit_after = None;
+            self.cursor.decomp_cursor = None;
+            self.emit_count = 0;
+            io.emit_begin(predicate, self.cursor.anchor_slot);
+            io.save_cursor(&self.cursor.encode());
+        } else {
+            self.cursor.decomp_cursor = step.next_cursor;
+            io.save_cursor(&self.cursor.encode());
+        }
+        StepOutcome {
+            done: false,
+            ingested: step.ingested,
         }
     }
 
@@ -744,6 +851,14 @@ mod tests {
         events: Vec<Ev>,
         accumulates: bool,
         chunk: usize,
+        /// Number of `decomp_step` calls required before the decomp
+        /// reports done. `0` ⇒ done on the first call (= the trait
+        /// default no-op shape). The step count is carried in the
+        /// (durable) decomp cursor so a re-instantiation resumes.
+        decomp_target: u64,
+        /// Total `decomp_step` invocations across this instance's life
+        /// (resident telemetry; resets on re-instantiation).
+        decomp_calls: u64,
     }
 
     impl MockIo {
@@ -755,6 +870,8 @@ mod tests {
                 events: Vec::new(),
                 accumulates,
                 chunk,
+                decomp_target: 0,
+                decomp_calls: 0,
             }
         }
     }
@@ -840,6 +957,35 @@ mod tests {
                     val: p.val + incoming.val,
                 },
                 None => incoming,
+            }
+        }
+
+        fn decomp_step(
+            &mut self,
+            _predicate: &[u8],
+            _anchor_slot: u64,
+            cursor: Option<&[u8]>,
+        ) -> DecompStep {
+            self.decomp_calls += 1;
+            // Decomp progress lives in the (durable) decomp cursor as a
+            // BE u64 step count, so a re-instantiation resumes from it.
+            let done_so_far = cursor
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            let next = done_so_far + 1;
+            if next >= self.decomp_target {
+                DecompStep {
+                    done: true,
+                    ingested: 1,
+                    next_cursor: None,
+                }
+            } else {
+                DecompStep {
+                    done: false,
+                    ingested: 1,
+                    next_cursor: Some(next.to_be_bytes().to_vec()),
+                }
             }
         }
 
@@ -973,14 +1119,19 @@ mod tests {
             vec![vec![(vec![1], 10), (vec![2], 20), (vec![3], 30)]],
         );
 
-        // Phase 1: drive until we've emitted at least one chunk.
+        // Phase 1: drive until we've emitted exactly one chunk, then
+        // "trap" (drop the driver). Scan → Decomp (no-op) → Emit takes
+        // a few transition steps before the first chunk; loop rather
+        // than hardcode the count.
         {
             let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
             let mut drv = ChunkedBootstrap::resume(vec![vec![0xAA]], cursor);
-            // scan page (1 step) + begin transition is folded into the
-            // last scan step; then emit chunks one per step.
-            drv.step(&mut io); // scan last page → emit_begin
-            drv.step(&mut io); // emit chunk 0 (key 1)
+            for _ in 0..100 {
+                drv.step(&mut io);
+                if emitted_entries(&io).len() == 1 {
+                    break;
+                }
+            }
             // Driver dropped here — thread-local lost (trap).
             assert_eq!(begins(&io), 1);
             assert_eq!(emitted_entries(&io).len(), 1);
@@ -1024,6 +1175,68 @@ mod tests {
     }
 
     #[test]
+    fn chunked_bootstrap_decomp_phase_resumes() {
+        // A module requiring 3 decomp steps before emit. Verify
+        // (1) emit_begin does NOT fire until decomp is done (decomp
+        // gates emit), and (2) a re-instantiation mid-decomp resumes
+        // from the durable decomp cursor and finishes correctly.
+        let mut io = MockIo::new(false, 10);
+        io.decomp_target = 3;
+        io.script
+            .insert(vec![0xAA], vec![vec![(vec![1], 10), (vec![2], 20)]]);
+
+        // Phase 1: drive until partway through decomp, then drop the
+        // driver (simulated trap). decomp_target=3 guarantees the
+        // first decomp step is not-done (sets a decomp cursor).
+        {
+            let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
+            let mut drv = ChunkedBootstrap::resume(vec![vec![0xAA]], cursor);
+            for _ in 0..100 {
+                drv.step(&mut io);
+                let c = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
+                if matches!(&c, Some(c) if c.phase == Phase::Decomp && c.decomp_cursor.is_some()) {
+                    break;
+                }
+            }
+            assert_eq!(
+                begins(&io),
+                0,
+                "emit_begin must not fire until decomp reports done"
+            );
+        }
+
+        // Phase 2: rebuild from the durable cursor (mid-Decomp) and
+        // finish.
+        {
+            let cursor = io.load_cursor().and_then(|b| BootstrapCursor::decode(&b));
+            assert!(matches!(&cursor, Some(c) if c.phase == Phase::Decomp));
+            let mut drv = ChunkedBootstrap::resume(vec![vec![0xAA]], cursor);
+            for _ in 0..100 {
+                if drv.step(&mut io).done {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(begins(&io), 1, "SnapshotBegin emitted exactly once");
+        assert_eq!(ends(&io), 1);
+        assert_eq!(
+            emitted_entries(&io),
+            vec![
+                TE {
+                    key: vec![1],
+                    val: 10
+                },
+                TE {
+                    key: vec![2],
+                    val: 20
+                },
+            ],
+            "all entries emitted once after the mid-decomp re-instantiation"
+        );
+    }
+
+    #[test]
     fn cursor_round_trips() {
         // With a key cursor set.
         let c = BootstrapCursor {
@@ -1031,6 +1244,7 @@ mod tests {
             phase: Phase::Emit,
             anchor_slot: 123456,
             emit_after: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            decomp_cursor: None,
         };
         assert_eq!(BootstrapCursor::decode(&c.encode()), Some(c));
         // With no key cursor (Scan phase / emit not started).
@@ -1039,8 +1253,27 @@ mod tests {
             phase: Phase::Scan,
             anchor_slot: 0,
             emit_after: None,
+            decomp_cursor: None,
         };
         assert_eq!(BootstrapCursor::decode(&c2.encode()), Some(c2));
+        // Decomp phase with a decomp sub-cursor set.
+        let c3 = BootstrapCursor {
+            predicate_idx: 2,
+            phase: Phase::Decomp,
+            anchor_slot: 999,
+            emit_after: None,
+            decomp_cursor: Some(vec![0x01, 0x02, 0x03]),
+        };
+        assert_eq!(BootstrapCursor::decode(&c3.encode()), Some(c3));
+        // Both cursors set (defensive — decomp_cursor independent of emit_after).
+        let c4 = BootstrapCursor {
+            predicate_idx: 1,
+            phase: Phase::Emit,
+            anchor_slot: 1,
+            emit_after: Some(vec![0xaa]),
+            decomp_cursor: Some(vec![0xbb, 0xcc]),
+        };
+        assert_eq!(BootstrapCursor::decode(&c4.encode()), Some(c4));
         assert_eq!(BootstrapCursor::decode(&[]), None);
         assert_eq!(BootstrapCursor::decode(&[9, 9, 9]), None);
     }

@@ -1,0 +1,75 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+  },
+  {
+    "holders": [
+      {
+        "assets": [
+          {
+            "asset_name_hex": "544f4b",
+            "quantity": 50
+          }
+        ],
+        "id": {
+          "stake": "0b5f5b3b6b48c35d8e92d2f31558f0d9c4b3ca3b2dd7e497fc614fef"
+        },
+        "lp_amount": 0,
+        "role": "wallet",
+        "vests": []
+      },
+      {
+        "assets": [
+          {
+            "asset_name_hex": "544f4b",
+            "quantity": 300
+          }
+        ],
+        "id": {
+          "stake": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3"
+        },
+        "lp_amount": 300,
+        "role": "wallet",
+        "vests": []
+      },
+      {
+        "assets": [
+          {
+            "asset_name_hex": "544f4b",
+            "quantity": 100
+          }
+        ],
+        "id": {
+          "stake": "f1feff38edd67922285e28845a207ddd28e4219baeb3b75e35c5e9af"
+        },
+        "lp_amount": 0,
+        "role": "dex_pool",
+        "vests": []
+      },
+      {
+        "assets": [
+          {
+            "asset_name_hex": "544f4b",
+            "quantity": 600
+          }
+        ],
+        "id": {
+          "stake": "fba681e69a8f8ed94511ef70744988afc5bc0dc2827ca1e8b53f7ed1"
+        },
+        "lp_amount": 600,
+        "role": "wallet",
+        "vests": []
+      }
+    ],
+    "kind": "snapshot_chunk",
+    "policy": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+  },
+  {
+    "holder_count": 4,
+    "kind": "snapshot_end",
+    "policy": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+  }
+]
