@@ -1,64 +1,37 @@
 # wayup-store-offer golden fixtures
 
-## Runnable now
+Four scenarios, all replaying real mainnet data and passing under
+`scripts/run-golden-tests.sh`.
 
-- **`offer-create-bootstrap/`** — cold-start create decode via the
-  payment-credential bootstrap path. Real mainnet offers (one
-  collection-wide, one asset-specific `PRED03385`); hash-only
-  datums resolved through `chain_data::datum_by_hash`
-  (`[[datum]]`), no block CBOR required. Covers every
-  wayup-specific decode path: payment-cred watch, non-positional
-  target payout, collection-wide vs asset-specific.
+| scenario | source | asserts |
+|---|---|---|
+| `offer-create-bootstrap` | offers `3938ca11…` (out 1) + `42f7a522…` (out 1), via payment-cred bootstrap | two `create` — collection-wide (`a316bcf7…`) + asset-specific (`PRED03385` / `73056bff…`); hash-only datum via `datum_by_hash`; non-positional target payout |
+| `offer-accept` | spend `361985963006a6ed…` (slot 188007187) | one `accept`, Mekanism2212 under `ffa56051…`, 55 ADA — the asset paid to the bidder, not the seller's change Mekanisms |
+| `offer-cancel` | spend `ec1019f4…` (slot 188007620) | two `cancel` — bidder `cba51a…` in `required_signers`, no delivery |
+| `offer-accept-batched` | spend `3fc138a4…` (slot 188010024) | one `accept`, HouseOfTitans**6219** under `53d6297f…`, 150 ADA — the recipient-match picks the asset paid to the bidder, NOT the 5984 listed to the sale script in the same TX |
 
-## Pending block capture (accept / cancel / batched accept)
+The create scenario is bootstrap-style (`bootstrap = true`,
+`[[utxo]]` + `[[datum]]`, no block). The accept/cancel scenarios
+replay the spend block; the consumed offer's prior output + datum
+are supplied via `[[utxo]]`/`[[datum]]` (hash-verified) since the
+offer's create TX isn't in the spend block.
 
-These need real block CBOR, since Consumed events only come from
-`--block` dispatch (the `mitos-run` fixture format can't
-synthesise a consume). The three fixtures are **pre-authored in
-`.staging/`** — interest + the consumed offer's `[[utxo]]` +
-`[[datum]]` (datum CBOR verified to its hash) are filled in; only
-the spend `*.block.cbor` is missing. They live under the
-dot-prefixed `.staging/` so `run-golden-tests.sh` (which globs
-`*/`) skips them and the suite stays green until they're promoted.
+## Regenerating / adding scenarios
 
-Each needs only the **spend block** — the consumed offer's prior
-output + datum come from the fixture entries (the offer's create
-TX need not be captured).
-
-| staged scenario | spend slot | spend TX | expect |
-|---|---|---|---|
-| `offer-accept` | `188007187` | `361985963006a6ed…` | one `accept`, Mekanism2212 under `ffa56051…`, price 55 ADA |
-| `offer-cancel` | `188007620` | `ec1019f4…` | two `cancel` (bidder `cba51a…` in `required_signers`, no delivery) |
-| `offer-accept-batched` | `188010024` | `3fc138a4…` | one `accept`, HouseOfTitans**6219** under `53d6297f…` — NOT the 5984 listed to the sale script in the same TX |
-
-`capture-block` reads a local dolos archive (exclusive redb lock
-— stop the writer first), so run it on the dolos node. To
-activate each (example for cancel):
+Blocks were pulled from production mitos's read-only admin
+endpoint (no service downtime — `capture-block` is the
+stop-the-writer alternative):
 
 ```sh
-cargo build --release --bin capture-block --bin mitos-build --bin mitos-run
-S=community-modules/wayup-store-offer/tests/fixtures
-./target/release/capture-block --config dolos.toml --slot 188007620 \
-  --out $S/.staging/offer-cancel/188007620.block.cbor
-mv $S/.staging/offer-cancel $S/offer-cancel          # promote out of .staging
-./target/release/mitos-build --module community-modules/wayup-store-offer/wayup_store_offer.rs --fast
-UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh        # generates expected.json
+TOKEN=$(ssh root@159.195.57.187 'grep ^MITOS_AUTH_TOKEN= /etc/default/mitos-mainnet | cut -d= -f2')
+ssh root@159.195.57.187 "curl -sS -D /tmp/h.txt -H 'Authorization: Bearer $TOKEN' \
+  http://127.0.0.1:8181/_admin/blocks/by-tx/<tx_hash> -o /tmp/b.cbor; grep -i x-mitos-block-slot /tmp/h.txt"
+scp root@159.195.57.187:/tmp/b.cbor <scenario>/<slot>.block.cbor
 ```
 
-**Review the generated `expected.json` before committing** —
-`UPDATE_GOLDEN` records whatever the module emits, so it captures
-regressions thereafter but does NOT verify first-time
-correctness. Check it against the "expect" column above (e.g. the
-batched accept must report `486f7573654f66546974616e7336323139`
-= HouseOfTitans6219, the asset paid to the bidder, not the listed
-5984).
-
-### Discrimination these assert
-
-Accept and cancel both spend with redeemer `d87a80`, so the
-goldens are what pin the redeemer-agnostic logic: **accept** iff a
-target-policy asset is delivered to a non-offer output AND the
-bidder's owner key is NOT in the TX's `required_signers`;
-otherwise **cancel**. The batched-accept scenario additionally
-asserts that batching the accept with unrelated operations (a
-listing to the sale script) still yields exactly one `accept`.
+Then `mitos-build --module …/wayup_store_offer.rs --fast` and
+`UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh`. **Review the
+generated `expected.json`** — `UPDATE_GOLDEN` records whatever the
+module emits, so it pins regressions but not first-time
+correctness; check it against the on-chain truth (asset names,
+counts) before committing.

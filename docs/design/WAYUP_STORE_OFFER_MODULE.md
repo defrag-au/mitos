@@ -7,16 +7,14 @@ relayering plan
 (`cnft.dev-workers/docs/JPG_STORE_MIRROR_RELAYERING.md`, which
 sketched it under the placeholder name `wayup-co`).
 
-Status: **Phases 1–2 implemented; module built + create golden
-passing.** Phase 1 (static payment-cred manifest interest) and
+Status: **Phases 1–2 complete; all four goldens passing
+(55/55).** Phase 1 (static payment-cred manifest interest) and
 Phase 2 (the `wayup-store-offer` module + `wayup_store_offer`
-event types) are in the working tree. The create-path golden
-(`tests/fixtures/offer-create-bootstrap/`) replays real mainnet
-offers (collection-wide + asset-specific) and passes via the full
-golden suite. Accept/cancel/update goldens need real block CBOR
-(`capture-block` against a dolos archive) and are scaffolded in
-`tests/fixtures/README.md`. Consumer-side wiring (Phase 3) is the
-remaining work, in `cnft.dev-workers`.
+event types) are in the working tree, with real-mainnet goldens
+for create (bootstrap), accept, cancel, and batched-accept
+(blocks pulled live from production mitos's
+`/_admin/blocks/by-tx` endpoint — no downtime). Consumer-side
+wiring (Phase 3) is the remaining work, in `cnft.dev-workers`.
 
 The headline finding: Wayup's offers decode to **the same
 shape** as jpg.store's (`Constr0[bidder, [payouts]]`, hash-only
@@ -300,17 +298,14 @@ Phase 4 (consumer-repo work):
    + `mitos_community_events::wayup_store_offer`. Datum decode
    (non-positional target payout), `required_signers`+asset
    accept/cancel discrimination, `datum_by_hash` resolution (no
-   metadata fallback). **Create golden passing**
-   (`offer-create-bootstrap`, collection-wide + asset-specific,
-   real datum CBOR via the payment-cred bootstrap path) — runs in
-   the full `run-golden-tests.sh` suite (52/52). Accept/cancel/
-   batched-accept goldens are **pre-authored in
-   `tests/fixtures/.staging/`** (interest + consumed-offer
-   `[[utxo]]`/`[[datum]]` filled, hash-verified) and need only the
-   spend `*.block.cbor` (slots 188007187 / 188007620 / 188010024)
-   captured via `capture-block`, then promoted out of `.staging/`
-   + `UPDATE_GOLDEN`. The `.staging/` dot-prefix keeps the suite
-   green meanwhile. See `tests/fixtures/README.md`.
+   metadata fallback). **All four goldens passing** in
+   `run-golden-tests.sh` (55/55): `offer-create-bootstrap`
+   (collection-wide + asset-specific via the payment-cred
+   bootstrap path), `offer-accept` (Mekanism2212, 55 ADA),
+   `offer-cancel` (two cancels, bidder in `required_signers`),
+   `offer-accept-batched` (HouseOfTitans6219 — recipient-match
+   excludes the same-collection 5984 listed to the sale script in
+   the same TX). See `tests/fixtures/README.md`.
 3. **worker companion:** `source_module` column +
    `WayupStoreOfferChannel` + scoped recapture (consumer repo).
    *Gate:* Wayup COs appear in `co-stats` alongside jpg.store;

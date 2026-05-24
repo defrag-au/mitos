@@ -1,0 +1,14 @@
+[
+  {
+    "asset_name_hex": "4d656b616e69736d32323132",
+    "bidder_pkh": "cba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad",
+    "co_version": "V1",
+    "kind": "accept",
+    "policy": "ffa56051fda3d106a96f09c3d209d4bf24a117406fb813fb8b4548e3",
+    "price_lovelace": 55000000,
+    "prior_output_index": 1,
+    "prior_tx_hash": "a6d2229a5f6fcdec6c1f4473df516e80e60fbf47d6a8c263384c6448a1a77f88",
+    "seller_address": "",
+    "tx_hash": "361985963006a6ed1e3ab4a338d8ee19a464712f7d62d8d03772e2b0553651f7"
+  }
+]
