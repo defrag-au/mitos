@@ -767,7 +767,11 @@ mod tests {
         let set = interest_from_manifest(
             &[],
             &[],
-            &["nothex".to_owned(), "dead".to_owned(), WAYUP_CRED.to_owned()],
+            &[
+                "nothex".to_owned(),
+                "dead".to_owned(),
+                WAYUP_CRED.to_owned(),
+            ],
         );
         let cred_count = set
             .predicates

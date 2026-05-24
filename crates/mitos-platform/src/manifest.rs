@@ -81,9 +81,7 @@ pub fn is_chunked_cold_start_module(module_id: &str) -> bool {
 
 impl InterestSection {
     pub fn is_empty(&self) -> bool {
-        self.addresses.is_empty()
-            && self.policies.is_empty()
-            && self.payment_credentials.is_empty()
+        self.addresses.is_empty() && self.policies.is_empty() && self.payment_credentials.is_empty()
     }
 }
 

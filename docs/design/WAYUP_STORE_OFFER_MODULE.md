@@ -12,11 +12,11 @@ manifest interest) + Phase 2 (the `wayup-store-offer` module +
 `wayup_store_offer` event types, five real-mainnet goldens
 passing 56/56, blocks pulled live from prod mitos's
 `/_admin/blocks/by-tx` — no downtime) are in the mitos working
-tree. Phase 3 (consumer wiring) is in the `cnft.dev-workers`
-working tree: `jpg-store-mirror` now subscribes to both modules
-and projects both into `collection_offers` (see "Consumer
-wiring" below). Remaining: UI brand-filter (frontend) +
-deploy/commit sequencing.
+tree. Phases 3–4 (consumer wiring + UI) are in the `cnft.dev-workers`
+working tree: `jpg-store-mirror` subscribes to both modules,
+projects both into `collection_offers`, and the egui "My Offers"
+tab badges each offer with its marketplace (see "Consumer
+wiring" below). Remaining: deploy/commit sequencing.
 
 The headline finding: Wayup's offers decode to **the same
 shape** as jpg.store's (`Constr0[bidder, [payouts]]`, hash-only
@@ -301,9 +301,41 @@ Implemented in `src/do_state.rs` (builds + clippy clean on
    collection-wide CO across jpg.store + Wayup. No change needed;
    revisit only if a per-marketplace leader is wanted.
 
-**Still to do:** UI brand-aware filtering / badging (frontend);
-`co-stats` still groups by `co_version` only (V1 now appears
-alongside V2/V3 — operator-only, left as-is).
+6. **UI marketplace badging (DONE)** — `mirror-types::UnspentCo`
+   gains a `source_module` field (+ `marketplace_label()`),
+   threaded through `/api/my-cos` + the ui-flow snapshot/delta into
+   the frontend's `DiscoveredOffer`. The egui "My Offers" tab now
+   attributes each offer: collection-wide tiles sub-group by
+   `(marketplace, price)` and show the marketplace name in place of
+   the generic "CO" glyph; asset-specific tiles carry it in the
+   corner badge; both surface it in the hover tooltip. Builds +
+   clippy clean on `wasm32-unknown-unknown` (types + worker +
+   frontend).
+
+7. **Dual-credential "My Offers" matching (DONE)** — the two
+   marketplaces key `offerer_pkh` on *different* credentials:
+   jpg.store on the bidder's **payment** cred (datum field 0),
+   Wayup on the **stake** cred (datum field 0 = the offer
+   frankenaddress's staking part / cancel signer). The frontend's
+   wallet-derived `extract_payment_pkh` alone therefore found jpg
+   offers but missed every Wayup one. Fix (consumer-side only, no
+   module change — the rows are already keyed correctly): the
+   frontend also derives the stake cred (`extract_stake_pkh`) and
+   passes `?pkh=<payment>&stake=<stake>` to the snapshot + flow WS;
+   `handle_my_cos` matches `offerer_pkh IN (payment, stake)` (the
+   two are distinct 28-byte hashes, so each marketplace's rows
+   match the right cred); `handle_flow_upgrade` tags the socket
+   `flow:<payment>` **and** `flow:<stake>` so live Wayup deltas
+   (stake-cred `bidder_pkh`) land on the same socket (delta routing
+   unchanged). Wayup identity deliberately stays the stake cred —
+   robust to a delivery address ≠ the connected wallet, and to
+   connecting a different payment address under the same stake key.
+
+**Still to do:** `co-stats` still groups by `co_version` only (V1
+now appears alongside V2/V3 — operator-only, left as-is); the
+`mirror-types` JSDoc/schemars output should be regenerated
+(`cargo run -p mirror-types --bin mirror-types-jsdoc …`) so the
+collection-explorer picks up the new `source_module` field.
 
 ### Deploy / commit sequencing
 
@@ -350,7 +382,10 @@ uncommitted). So, in order:
    wasm target). See "Consumer wiring" above. *Gate (post-deploy):*
    Wayup COs appear alongside jpg.store; recapture of one brand
    leaves the other intact.
-4. **UI:** brand filter. *Gate:* relayering Phase 4 gate.
+4. **UI (DONE):** per-offer marketplace badge in the "My Offers"
+   tab (`source_module` on the wire → tile label / corner badge /
+   tooltip). Builds + clippy clean (wasm). *Gate (post-deploy):*
+   jpg.store + Wayup offers both visible, each clearly attributed.
 
 Phase 1 is independent and reusable (any future payment-cred
 module benefits). Phases 2–4 follow the `jpg-store-offer`
