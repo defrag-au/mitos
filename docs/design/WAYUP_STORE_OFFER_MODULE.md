@@ -7,14 +7,16 @@ relayering plan
 (`cnft.dev-workers/docs/JPG_STORE_MIRROR_RELAYERING.md`, which
 sketched it under the placeholder name `wayup-co`).
 
-Status: **Phases 1–2 complete; all five goldens passing
-(56/56).** Phase 1 (static payment-cred manifest interest) and
-Phase 2 (the `wayup-store-offer` module + `wayup_store_offer`
-event types) are in the working tree, with real-mainnet goldens
-for create (bootstrap + in-block), accept, cancel, and
-batched-accept (blocks pulled live from production mitos's
-`/_admin/blocks/by-tx` endpoint — no downtime). Consumer-side
-wiring (Phase 3) is the remaining work, in `cnft.dev-workers`.
+Status: **Phases 1–3 complete.** Phase 1 (static payment-cred
+manifest interest) + Phase 2 (the `wayup-store-offer` module +
+`wayup_store_offer` event types, five real-mainnet goldens
+passing 56/56, blocks pulled live from prod mitos's
+`/_admin/blocks/by-tx` — no downtime) are in the mitos working
+tree. Phase 3 (consumer wiring) is in the `cnft.dev-workers`
+working tree: `jpg-store-mirror` now subscribes to both modules
+and projects both into `collection_offers` (see "Consumer
+wiring" below). Remaining: UI brand-filter (frontend) +
+deploy/commit sequencing.
 
 The headline finding: Wayup's offers decode to **the same
 shape** as jpg.store's (`Constr0[bidder, [payouts]]`, hash-only
@@ -266,31 +268,58 @@ over unchanged.
 > for the module id and `wayup_store_offer` for the events
 > submodule.
 
-## Companion changes (`cnft.dev-workers/workers/jpg-store-mirror`)
+## Consumer wiring (`cnft.dev-workers/workers/jpg-store-mirror`) — Phase 3 DONE
 
-The companion already stores jpg.store offers in
-`collection_offers` and was built anticipating a second source.
-Phase 4 (consumer-repo work):
+Implemented in `src/do_state.rs` (builds + clippy clean on
+`wasm32-unknown-unknown`):
 
-1. **`source_module` column** on `collection_offers` (the
-   `do_state.rs` note already flags this). Backfill existing rows
-   to `'jpg-store-offer'`.
-2. **`WayupStoreOfferChannel`** — a second `MitosChannel`
-   subscribing to `Module("wayup-store-offer")`, mapping
-   `WayupStoreOffer::{Create→insert, Cancel/Accept→delete,
-   Update→delete+insert}` to the same SQL, stamping
-   `source_module = 'wayup-store-offer'`.
-3. **Scope recapture** — `on_recapture`'s unconditional
-   `DELETE FROM collection_offers` becomes
-   `WHERE source_module = ?` so recapturing one brand doesn't wipe
-   the other.
-4. **Leader tracking** is per-policy and source-agnostic; decide
-   whether the policy leader spans both marketplaces or is
-   per-source. (Likely span both — the "best collection-wide
-   offer" is a cross-marketplace fact. If so, recompute over the
-   union; no schema change beyond the column.)
-5. **UI** — brand-aware filtering / badging (jpg.store vs Wayup),
-   per the relayering acceptance gate.
+1. **`source_module` column** on `collection_offers` — added to
+   `CREATE TABLE` and via an idempotent `ALTER … ADD COLUMN …
+   DEFAULT 'jpg-store-offer'` so pre-existing rows (all jpg.store)
+   backfill correctly.
+2. **`WayupStoreOfferChannel`** (`NAME = "wayup-store-offer"`,
+   `Event = WayupStoreOffer`) registered alongside
+   `JpgStoreOfferChannel` in `channels()`. Both events are mapped
+   onto a source-neutral `OfferEvent`/`OfferRowInput` and share
+   one SQL projection (`apply_create`/`apply_spent`/`apply_update`
+   refactored to be source-agnostic); each channel stamps its own
+   `source_module` + `co_version` string at the conversion
+   boundary (`wayup_co_version_str` → `"V1"`).
+3. **`subscribe_targets()` override** returns both
+   `SubscribeTarget::Module` (jpg + wayup). The runtime opens a
+   dial-back per target at `/_internal/apply-<name>` (worker's
+   `:target` wildcard route) and routes by name
+   (`trim_start_matches("/_internal/apply-")` → `lookup_channel`).
+   Added `mitos-protocol` as a worker dep for `SubscribeTarget`.
+4. **Recapture scoped by module** — `on_recapture` now does
+   `DELETE FROM collection_offers WHERE source_module = ?` (the
+   `module` arg == the channel name == the stamped `source_module`),
+   so recapturing one brand leaves the other intact.
+5. **Leader tracking spans both marketplaces** — `query_policy_leader`
+   is source-agnostic (`WHERE target_policy = ? AND
+   target_asset_names IS NULL`), so the policy leader is the best
+   collection-wide CO across jpg.store + Wayup. No change needed;
+   revisit only if a per-marketplace leader is wanted.
+
+**Still to do:** UI brand-aware filtering / badging (frontend);
+`co-stats` still groups by `co_version` only (V1 now appears
+alongside V2/V3 — operator-only, left as-is).
+
+### Deploy / commit sequencing
+
+The worker now references `mitos_community_events::wayup_store_offer`,
+which only exists in the **local mitos working tree** (Phase 2,
+uncommitted). So, in order:
+
+1. Commit mitos Phase 1+2 and publish a rev that includes
+   `wayup_store_offer` + the deployed `wayup-store-offer` module.
+2. Bump the `[workspace.dependencies]` mitos rev in
+   `cnft.dev-workers` and **re-comment the `[patch."…/mitos"]`
+   block** (local-dev patch must not ship — CI uses the git rev).
+3. Deploy mitos (so the host hosts `wayup-store-offer`) **before**
+   the worker re-subscribes — verify the multi-target subscribe
+   degrades gracefully if the host doesn't yet know the module
+   (one bad target must not drop the jpg subscription).
 
 ## Phases
 
@@ -315,10 +344,12 @@ Phase 4 (consumer-repo work):
    `offer-accept-batched` (HouseOfTitans6219 — recipient-match
    excludes the same-collection 5984 listed to the sale script in
    the same TX). See `tests/fixtures/README.md`.
-3. **worker companion:** `source_module` column +
-   `WayupStoreOfferChannel` + scoped recapture (consumer repo).
-   *Gate:* Wayup COs appear in `co-stats` alongside jpg.store;
-   recapture of one brand leaves the other intact.
+3. **worker companion (DONE):** `source_module` column +
+   `WayupStoreOfferChannel` + multi-target `subscribe_targets()` +
+   scoped recapture, in `cnft.dev-workers` (builds + clippy clean,
+   wasm target). See "Consumer wiring" above. *Gate (post-deploy):*
+   Wayup COs appear alongside jpg.store; recapture of one brand
+   leaves the other intact.
 4. **UI:** brand filter. *Gate:* relayering Phase 4 gate.
 
 Phase 1 is independent and reusable (any future payment-cred
