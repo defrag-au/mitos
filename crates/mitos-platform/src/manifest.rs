@@ -44,6 +44,18 @@ pub struct InterestSection {
     /// Bootstrap walks `utxos_by_policy` when set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policies: Vec<String>,
+    /// 56-char lowercase hex payment credentials (payment-key
+    /// or payment-script hashes) to watch. Maps to
+    /// `at-payment-cred` predicates; matches outputs whose
+    /// address shares this payment credential regardless of the
+    /// staking part. Bootstrap walks `utxos_by_payment_cred`.
+    ///
+    /// Use case: contract sweeps where the staking part varies
+    /// per UTxO — e.g. CrowdLock vests, or marketplace offers
+    /// that embed the bidder's own stake key (Wayup
+    /// collection offers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payment_credentials: Vec<String>,
 }
 
 /// Modules that cold-start a newly-subscribed predicate via the
@@ -69,7 +81,7 @@ pub fn is_chunked_cold_start_module(module_id: &str) -> bool {
 
 impl InterestSection {
     pub fn is_empty(&self) -> bool {
-        self.addresses.is_empty() && self.policies.is_empty()
+        self.addresses.is_empty() && self.policies.is_empty() && self.payment_credentials.is_empty()
     }
 }
 
@@ -287,6 +299,29 @@ mod tests {
         let s = m.to_toml().unwrap();
         let parsed = Manifest::parse(&s).unwrap();
         assert_eq!(m, parsed);
+    }
+
+    #[test]
+    fn interest_payment_credentials_round_trip() {
+        // Guard against the TOML serializer silently dropping the
+        // nested `[interest]` table — the failure mode called out
+        // for the (empty-siblings) chunked-cold-start flag. Here
+        // addresses/policies are empty but payment_credentials is
+        // set, so the table has exactly one non-empty array.
+        let bytes = b"hello wasm";
+        let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
+        m.interest = InterestSection {
+            addresses: vec![],
+            policies: vec![],
+            payment_credentials: vec![
+                "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea".to_owned(),
+            ],
+        };
+        let s = m.to_toml().unwrap();
+        let parsed = Manifest::parse(&s).unwrap();
+        assert_eq!(m, parsed);
+        assert_eq!(parsed.interest.payment_credentials.len(), 1);
+        assert!(!parsed.interest.is_empty());
     }
 
     #[test]

@@ -1,0 +1,54 @@
+# wayup-store-offer golden: bootstrap-path create decode.
+#
+# Exercises the production cold-start path: a payment-credential
+# interest is registered, `run_bootstrap` walks
+# `utxos_by_payment_cred`, and each open offer UTxO is surfaced
+# as a synthetic Produced event. The hash-only datum is NOT
+# pre-resolved during bootstrap, so the module falls through to
+# `chain_data::datum_by_hash` (served here by `[[datum]]`).
+#
+# Covers the wayup-specific decode paths:
+#   - payment-credential watch (staking part varies per bidder)
+#   - hash-only datum via datum_by_hash (no metadata fallback)
+#   - non-positional target payout (scan for the non-ADA policy)
+#   - collection-wide (empty asset-name map) AND asset-specific
+#     (PRED03385) offers
+#
+# Offers (real mainnet, bidder cba51a…):
+#   1. collection-wide, policy a316bcf7…, 6 ADA
+#      (TX 3938ca11…, output 1, datum 0d46ce59…)
+#   2. asset-specific PRED03385, policy 73056bff…, 150 ADA
+#      (TX 42f7a522…, output 1, datum c4c6a021…)
+#
+# Datum CBOR verified to blake2b-256 to its datum hash.
+
+version = 1
+bootstrap = true
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"
+
+# Collection-wide offer.
+[[utxo]]
+tx_hash = "3938ca11327828f9d9efdf10399f949132f48c80af88686003e262d05a090c08"
+index = 1
+address = "addr1zynagmktaj2tq5kclp6u7wl2l58gefqw3tgxnanhuzsj36kt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksy9ssnc"
+lovelace = 6000000
+datum_hash = "0d46ce59bab033869c50e4df1aaedbf90ccc925dbbe832b73262de2d9560afef"
+
+# Asset-specific offer (PRED03385).
+[[utxo]]
+tx_hash = "42f7a522b72f44e66b0c1eecc3968a39514652a2dab75349ef9a5370abb0b2cc"
+index = 1
+address = "addr1zynagmktaj2tq5kclp6u7wl2l58gefqw3tgxnanhuzsj36kt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksy9ssnc"
+lovelace = 150000000
+datum_hash = "c4c6a021440261b43b9379adfb8677bdccfd7845c035a5b1d366fe6413178357"
+
+[[datum]]
+hash = "0d46ce59bab033869c50e4df1aaedbf90ccc925dbbe832b73262de2d9560afef"
+cbor_hex = "d8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad9fd8799fd8799fd8799f581c5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283ffd8799fd8799fd8799f581c28f17fdd2d8b8f559ad61e899e31eae90b9e209cbedb1ee8a8c6c7d1ffffffffa140d8799f00a1401a000f4240ffffd8799fd8799fd8799f581c4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922ffd8799fd8799fd8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82adffffffffa1581ca316bcf768f0309be743b4b7d067f3348017bf0f00f6a29562aebda2d8799f01a0ffffd8799fd8799fd8799f581c04bdd97da6dfacd1fb4c5d5e1a14292e4ee0f2015a46f8543e552c49ffd8799fd8799fd8799f581c8eaef6e3337032021c887b180b74dfc0ff625d167df78b77e476b68dffffffffa140d8799f00a1401a000f4240ffffffff"
+
+[[datum]]
+hash = "c4c6a021440261b43b9379adfb8677bdccfd7845c035a5b1d366fe6413178357"
+cbor_hex = "d8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad9fd8799fd8799fd8799f581c5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283ffd8799fd8799fd8799f581c28f17fdd2d8b8f559ad61e899e31eae90b9e209cbedb1ee8a8c6c7d1ffffffffa140d8799f00a1401a002dc6c0ffffd8799fd8799fd8799f581c4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922ffd8799fd8799fd8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82adffffffffa1581c73056bffdf28f82da5db1f5ac7c06d030c8a551f43889f7f85746a4ad8799f00a14950524544303333383501ffffd8799fd8799fd8799f581cff6775cf48f9b3cdfc270fed4c934dd2c2bd949e825fffea4de01f16ffd8799fd8799fd8799f581c4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129ffffffffa140d8799f00a1401a00e4e1c0ffffffff"

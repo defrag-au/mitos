@@ -690,13 +690,18 @@ pub fn interest_from_addresses(addresses: &[String]) -> InterestSet {
     set
 }
 
-/// Build an `InterestSet` from manifest-declared addresses +
-/// policies. Both predicate kinds participate in the bootstrap
-/// scan: addresses hydrate via `utxos_by_address` and policies
-/// hydrate via `search_utxos(holds_policy)`. Idempotent — the
-/// per-scope state-kv flag prevents repeated scans across
-/// restarts.
-pub fn interest_from_manifest(addresses: &[String], policy_hexes: &[String]) -> InterestSet {
+/// Build an `InterestSet` from manifest-declared addresses,
+/// policies + payment credentials. All three predicate kinds
+/// participate in the bootstrap scan: addresses hydrate via
+/// `utxos_by_address`, policies via `search_utxos(holds_policy)`,
+/// and payment credentials via `utxos_by_payment_cred`.
+/// Idempotent — the per-scope state-kv flag prevents repeated
+/// scans across restarts.
+pub fn interest_from_manifest(
+    addresses: &[String],
+    policy_hexes: &[String],
+    payment_cred_hexes: &[String],
+) -> InterestSet {
     let mut set = interest_from_addresses(addresses);
     for hex in policy_hexes {
         match cardano_assets::PolicyId::new(hex.clone()) {
@@ -710,5 +715,75 @@ pub fn interest_from_manifest(addresses: &[String], policy_hexes: &[String]) -> 
             }
         }
     }
+    for hex_str in payment_cred_hexes {
+        match decode_payment_cred(hex_str) {
+            Ok(cred) => set.add(InterestPredicate::AtPaymentCred(cred)),
+            Err(e) => {
+                tracing::warn!(
+                    payment_cred = %hex_str,
+                    error = %e,
+                    "interest_from_manifest: skipping invalid payment credential",
+                );
+            }
+        }
+    }
     set
+}
+
+/// Decode a 56-char hex payment credential into a 28-byte array.
+fn decode_payment_cred(hex_str: &str) -> Result<[u8; 28], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
+    let arr: [u8; 28] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("expected 28 bytes, got {}", v.len()))?;
+    Ok(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The Wayup collection-offer payment script (staking part
+    // varies per bidder) — the motivating case for static
+    // payment-credential interest.
+    const WAYUP_CRED: &str = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea";
+
+    #[test]
+    fn manifest_payment_cred_becomes_at_payment_cred() {
+        let set = interest_from_manifest(&[], &[], &[WAYUP_CRED.to_owned()]);
+        let mut bytes = [0u8; 28];
+        bytes.copy_from_slice(&hex::decode(WAYUP_CRED).unwrap());
+        assert!(
+            set.predicates
+                .contains(&InterestPredicate::AtPaymentCred(bytes)),
+            "manifest payment_credentials should map to an AtPaymentCred predicate"
+        );
+    }
+
+    #[test]
+    fn manifest_skips_malformed_payment_creds() {
+        // Non-hex, and correct-hex-but-wrong-length both skipped
+        // (warn-and-continue, same as the invalid-policy path).
+        let set = interest_from_manifest(
+            &[],
+            &[],
+            &[
+                "nothex".to_owned(),
+                "dead".to_owned(),
+                WAYUP_CRED.to_owned(),
+            ],
+        );
+        let cred_count = set
+            .predicates
+            .iter()
+            .filter(|p| matches!(p, InterestPredicate::AtPaymentCred(_)))
+            .count();
+        assert_eq!(cred_count, 1, "only the valid 28-byte cred should survive");
+    }
+
+    #[test]
+    fn decode_payment_cred_rejects_wrong_length() {
+        assert!(decode_payment_cred("dead").is_err());
+        assert!(decode_payment_cred(WAYUP_CRED).is_ok());
+    }
 }

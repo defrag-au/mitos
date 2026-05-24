@@ -795,9 +795,9 @@ fn build_manifest(
 }
 
 /// Read `[interest]` from the module's `<name>.toml` if
-/// present. Today supports only `addresses = [...]`; richer
-/// predicate vocabulary lands when the manifest schema does
-/// (likely v2.1).
+/// present. Supports `addresses = [...]`, `policies = [...]`,
+/// and `payment_credentials = [...]` (56-char hex payment-key /
+/// payment-script hashes, staking-part-independent).
 fn read_interest_section(
     config_path: Option<&Path>,
 ) -> anyhow::Result<mitos_platform::manifest::InterestSection> {
@@ -825,9 +825,17 @@ fn read_interest_section(
             .collect(),
         _ => Vec::new(),
     };
+    let payment_credentials: Vec<String> = match interest.get("payment_credentials") {
+        Some(toml::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+            .collect(),
+        _ => Vec::new(),
+    };
     Ok(mitos_platform::manifest::InterestSection {
         addresses,
         policies,
+        payment_credentials,
     })
 }
 

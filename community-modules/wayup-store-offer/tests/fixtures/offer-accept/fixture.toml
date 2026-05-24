@@ -1,0 +1,38 @@
+# wayup-store-offer golden (STAGED — needs block CBOR).
+#
+# Accept of a collection-wide offer. To activate:
+#   1. capture the spend block:
+#      capture-block --config dolos.toml --slot 188007187 \
+#        --out <this-dir>/188007187.block.cbor
+#   2. promote: mv .staging/offer-accept ../offer-accept
+#   3. UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh
+#
+# Spend TX: 361985963006a6ed1e3ab4a338d8ee19a464712f7d62d8d03772e2b0553651f7
+# Consumed offer: a6d2229a…:1 (55 ADA, datum 629d0d3c…), bidder cba51a…,
+# target policy ffa56051… (Mekanism), collection-wide.
+#
+# EXPECTED: one `accept` — bidder NOT in required_signers, and
+# Mekanism2212 (asset name 4d656b616e69736d32323132) delivered to
+# the bidder's wallet (payment cred 4a00e504…). Note the seller's
+# change output also carries other Mekanisms under the same
+# policy; the accept-finder must report 2212 (delivered to the
+# bidder), NOT a change asset. price_lovelace = 55000000.
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"
+
+# The consumed offer (prior output) — resolved from the fixture
+# since its create TX isn't in the spend block.
+[[utxo]]
+tx_hash = "a6d2229a5f6fcdec6c1f4473df516e80e60fbf47d6a8c263384c6448a1a77f88"
+index = 1
+address = "addr1zynagmktaj2tq5kclp6u7wl2l58gefqw3tgxnanhuzsj36kt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksy9ssnc"
+lovelace = 55000000
+datum_hash = "629d0d3cf0e5863a8aabd08a99ca590eba88315e367559b19f2635c890e5127b"
+
+[[datum]]
+hash = "629d0d3cf0e5863a8aabd08a99ca590eba88315e367559b19f2635c890e5127b"
+cbor_hex = "d8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad9fd8799fd8799fd8799f581c5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283ffd8799fd8799fd8799f581c28f17fdd2d8b8f559ad61e899e31eae90b9e209cbedb1ee8a8c6c7d1ffffffffa140d8799f00a1401a0010c8e0ffffd8799fd8799fd8799f581c4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922ffd8799fd8799fd8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82adffffffffa1581cffa56051fda3d106a96f09c3d209d4bf24a117406fb813fb8b4548e3d8799f01a0ffffd8799fd8799fd8799f581cf32d80def34c2b88fcf3e35d105d52ccc80f06d39f12c1fd7e511ed9ffd8799fd8799fd8799f581ca4334ffe273878ea169e3d90a7271639e250724bcb2bc86c4b029dcbffffffffa140d8799f00a1401a003abf11ffffffff"

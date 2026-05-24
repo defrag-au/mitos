@@ -1,0 +1,40 @@
+# wayup-store-offer golden (STAGED — needs block CBOR).
+#
+# Cancel batch: two offers withdrawn in one TX. To activate:
+#   1. capture-block --config dolos.toml --slot 188007620 \
+#        --out <this-dir>/188007620.block.cbor
+#   2. mv .staging/offer-cancel ../offer-cancel
+#   3. UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh
+#
+# Spend TX: ec1019f4c0bd2a1e52ca6c8bd96bec571206d6d51f2d3716e580330ad04e19b1
+# Consumes 5950e808…:0 and :1 (20 ADA each, datum eb69d845…),
+# bidder cba51a…. The bidder's owner key cba51a… IS in the TX's
+# required_signers, and no NFT is delivered (funds return to the
+# bidder), so both consumes classify as Cancel.
+#
+# EXPECTED: two `cancel` events (one per consumed offer), target
+# policy ffa56051…, in input order.
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"
+
+[[utxo]]
+tx_hash = "5950e808e042cee88d32eb7360994d75ada1fcff3e5b4e8cb6666d9a4bfd817a"
+index = 0
+address = "addr1zynagmktaj2tq5kclp6u7wl2l58gefqw3tgxnanhuzsj36kt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksy9ssnc"
+lovelace = 20000000
+datum_hash = "eb69d8455b04b9136da69d92d8bc3eec6994e8125a8778416d1a298eb21c6ec6"
+
+[[utxo]]
+tx_hash = "5950e808e042cee88d32eb7360994d75ada1fcff3e5b4e8cb6666d9a4bfd817a"
+index = 1
+address = "addr1zynagmktaj2tq5kclp6u7wl2l58gefqw3tgxnanhuzsj36kt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksy9ssnc"
+lovelace = 20000000
+datum_hash = "eb69d8455b04b9136da69d92d8bc3eec6994e8125a8778416d1a298eb21c6ec6"
+
+[[datum]]
+hash = "eb69d8455b04b9136da69d92d8bc3eec6994e8125a8778416d1a298eb21c6ec6"
+cbor_hex = "d8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad9fd8799fd8799fd8799f581c5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283ffd8799fd8799fd8799f581c28f17fdd2d8b8f559ad61e899e31eae90b9e209cbedb1ee8a8c6c7d1ffffffffa140d8799f00a1401a000f4240ffffd8799fd8799fd8799f581c4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922ffd8799fd8799fd8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82adffffffffa1581cffa56051fda3d106a96f09c3d209d4bf24a117406fb813fb8b4548e3d8799f01a0ffffd8799fd8799fd8799f581cf32d80def34c2b88fcf3e35d105d52ccc80f06d39f12c1fd7e511ed9ffd8799fd8799fd8799f581ca4334ffe273878ea169e3d90a7271639e250724bcb2bc86c4b029dcbffffffffa140d8799f00a1401a00155cc1ffffffff"

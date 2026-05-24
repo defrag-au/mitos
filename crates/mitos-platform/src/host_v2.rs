@@ -542,8 +542,11 @@ where
             // the driver so subsequent block dispatch filters
             // correctly even if no companion-driven
             // update-interest arrives.
-            let interest =
-                interest_from_manifest(&manifest.interest.addresses, &manifest.interest.policies);
+            let interest = interest_from_manifest(
+                &manifest.interest.addresses,
+                &manifest.interest.policies,
+                &manifest.interest.payment_credentials,
+            );
             driver.set_interest(interest.clone());
 
             // Hand the bootstrap orchestrator a mutable
