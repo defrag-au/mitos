@@ -185,6 +185,13 @@ struct Fixture {
     #[serde(default)]
     datum: Vec<FixtureDatum>,
 
+    /// Per-asset mint provenance answering `chain_data::asset_state`
+    /// — the `(policy, asset_name) → initial_tx` map the CIP-25 facade
+    /// uses to find a plain token's mint TX. Normally derived from
+    /// dolos `AssetState`; a fixture supplies it directly.
+    #[serde(default)]
+    asset_state: Vec<FixtureAssetState>,
+
     /// v2-only: the module's interest set. Applied before any
     /// `handle-events` dispatch so the platform can filter
     /// matching events. Ignored for v1 modules.
@@ -281,6 +288,21 @@ struct FixtureDatum {
     cbor_hex: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureAssetState {
+    /// 56-hex policy id.
+    policy: String,
+    /// Lowercase hex asset name.
+    asset_name_hex: String,
+    /// 64-hex mint transaction hash — what `chain_data::asset_state`
+    /// returns as `initial_tx`. The CIP-25 facade resolves a plain
+    /// token's mint TX from here, then `tx_metadata(initial_tx)`.
+    initial_tx: String,
+    /// Slot of the mint TX (cosmetic for the facade).
+    #[serde(default)]
+    initial_slot: Option<u64>,
+}
+
 // -----------------------------------------------------------------------------
 // Data plane backed by the fixture
 // -----------------------------------------------------------------------------
@@ -306,6 +328,9 @@ struct FixtureDataPlane {
     /// resolution being the canonical case) resolve correctly
     /// from the fixture.
     datums_by_hash: HashMap<Vec<u8>, Vec<u8>>,
+    /// `(policy, asset_name)` → mint provenance, answering
+    /// `chain_data::asset_state`. Populated from `[[asset_state]]`.
+    asset_state_by_key: HashMap<(Vec<u8>, Vec<u8>), mitos_data_plane::AssetMintState>,
 }
 
 #[derive(Clone)]
@@ -427,6 +452,26 @@ impl FixtureDataPlane {
             datums_by_hash.insert(hash.to_vec(), cbor);
         }
 
+        let mut asset_state_by_key = HashMap::new();
+        for a in fixture.asset_state {
+            let policy = hex::decode(&a.policy)
+                .with_context(|| format!("asset_state policy {}", a.policy))?;
+            let asset_name = hex::decode(&a.asset_name_hex)
+                .with_context(|| format!("asset_state asset_name_hex {}", a.asset_name_hex))?;
+            let initial_tx = decode_32(&a.initial_tx)
+                .with_context(|| format!("asset_state initial_tx {}", a.initial_tx))?;
+            asset_state_by_key.insert(
+                (policy, asset_name),
+                mitos_data_plane::AssetMintState {
+                    initial_tx: Some(initial_tx),
+                    initial_slot: a.initial_slot,
+                    mint_tx_count: 1,
+                    metadata_tx: None,
+                    quantity: 1,
+                },
+            );
+        }
+
         Ok(Self {
             by_ref,
             by_address,
@@ -434,6 +479,7 @@ impl FixtureDataPlane {
             by_policy,
             aux_by_tx,
             datums_by_hash,
+            asset_state_by_key,
         })
     }
 
@@ -603,6 +649,17 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
         tx_hash: &pallas_primitives::Hash<32>,
     ) -> DataPlaneResult<Option<Vec<u8>>> {
         Ok(self.aux_by_tx.get(tx_hash.as_ref() as &[u8]).cloned())
+    }
+
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        Ok(self
+            .asset_state_by_key
+            .get(&(policy.to_vec(), asset_name.to_vec()))
+            .cloned())
     }
 
     async fn read_datum(

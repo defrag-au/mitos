@@ -1,0 +1,20 @@
+# CIP-25 live-mint facade test for collection-metadata.
+#
+# Reuses the Perp5158 mint block. The mint's produced plain token is
+# classified CIP-25 by handle_produced → flush_buffer resolves it
+# (asset_state.initial_tx → tx_metadata harvested from the block →
+# cardano_assets::cip25 decode) → emits one Initial{standard = cip25}.
+version = 1
+
+[[interest]]
+kind = "holds_policy"
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+
+# asset_state answers: Perp5158 → its mint TX. For a live mint the
+# initial_tx is the dispatched block's mint TX, whose aux-data the
+# runner harvests from the block (no [[tx_metadata]] entry needed).
+[[asset_state]]
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+asset_name_hex = "5065727035313538"
+initial_tx = "3f99d88cf07027d69a1f36cd0d9dec1b90fb1366b675a36e7625cb9f05ab9644"
+initial_slot = 186913993
