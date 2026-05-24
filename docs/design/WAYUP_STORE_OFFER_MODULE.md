@@ -7,11 +7,16 @@ relayering plan
 (`cnft.dev-workers/docs/JPG_STORE_MIRROR_RELAYERING.md`, which
 sketched it under the placeholder name `wayup-co`).
 
-Status: **Phase 1 (host change) implemented + tested; module
-not yet built.** On-chain format decoded and verified against
-mainnet samples (2026-05-24); bootstrap feasibility confirmed.
-Static payment-credential interest now lands declaratively via
-the manifest (see "The one required mitos host change" below).
+Status: **Phases 1–2 implemented; module built + create golden
+passing.** Phase 1 (static payment-cred manifest interest) and
+Phase 2 (the `wayup-store-offer` module + `wayup_store_offer`
+event types) are in the working tree. The create-path golden
+(`tests/fixtures/offer-create-bootstrap/`) replays real mainnet
+offers (collection-wide + asset-specific) and passes via the full
+golden suite. Accept/cancel/update goldens need real block CBOR
+(`capture-block` against a dolos archive) and are scaffolded in
+`tests/fixtures/README.md`. Consumer-side wiring (Phase 3) is the
+remaining work, in `cnft.dev-workers`.
 
 The headline finding: Wayup's offers decode to **the same
 shape** as jpg.store's (`Constr0[bidder, [payouts]]`, hash-only
@@ -27,7 +32,7 @@ drive the whole design — everything else is a rename.
 | | jpg.store (`jpg-store-offer`) | Wayup (`wayup-store-offer`) |
 |---|---|---|
 | **Watch target** | one fixed bech32 address (shared marketplace staking cred) | **payment credential only** — staking cred is the *bidder's own stake key*, so each bidder's offers sit at a different full address sharing payment script `27d46ecb…128ea` |
-| **Accept vs Cancel** | inverted redeemer: `d87980`=Cancel, `d87a80`=Accept | **both use `d87a80`** — no redeemer signal; discriminate by asset delivery |
+| **Accept vs Cancel** | inverted redeemer: `d87980`=Cancel, `d87a80`=Accept | **both use `d87a80`** — no redeemer signal; discriminate by asset delivery + `required_signers` |
 | **Datum recovery** | hash-only, bytes published in metadata labels 50–63 (self-recovering) | hash-only, **no metadata chunks** (label 674 only) — relies on host `DATUM_NS` (witness-set) + Maestro fallback |
 | **Target payout** | last payout in the list | **whichever payout carries a non-ADA policy** (it's the middle one: fee / buyer / royalty) |
 
@@ -92,11 +97,21 @@ find the non-ADA one instead of taking `.last()`.
   bidder's owner key (datum field 0) appears in
   `additional_signers`.
 
-Because accept and cancel share a redeemer, discrimination is
-**asset-delivery only** — drop `jpg-store-offer`'s `is_cancel`
-redeemer branch. The accept-finder (produced non-script output
-holding an asset under `target_policy`, with the asset-name
-allow-list for asset-specific offers) is otherwise identical.
+Because accept and cancel share a redeemer, the `is_cancel`
+redeemer branch from `jpg-store-offer` is dropped. The
+implemented rule (`flush_buffer`): a consume is an **Accept** iff
+the bidder's owner key is **NOT** in the TX's `required_signers`
+**AND** an asset under `target_policy` is delivered to a non-offer
+output; otherwise it's a **Cancel**. The `required_signers` guard
+(the bidder signs only to reclaim) prevents the rare false-accept
+where a cancel's change output coincidentally carries a
+target-policy asset; the asset-delivery requirement prevents a
+false-accept when a cancel omits `required_signers`. The
+accept-finder (non-offer output holding an asset under
+`target_policy`, with the asset-name allow-list for
+asset-specific offers) is otherwise identical to jpg.store's.
+`required_signers` arrives on the `TxContextEvent` the host emits
+first for every matching TX.
 
 ### Accept payment mechanics (the non-atomic gotcha)
 
@@ -273,15 +288,19 @@ Phase 4 (consumer-repo work):
    `AtPaymentCred` bootstrap dispatch path
    (`scan_one_payment_cred`); a manifest-driven golden lands with
    the module fixtures in Phase 2.
-2. **mitos module:** `community-modules/wayup-store-offer/` +
-   `mitos_community_events::wayup_store_offer`. Datum decode
-   (non-positional target payout), asset-delivery-only accept,
-   no metadata fallback. Golden fixtures from the verified
-   sample TXs (create-many `3938ca11…`, accept `361985963006a6ed…`,
-   cancel `ec1019f4…`, asset-specific `42f7a522…`,
-   batched-accept `3fc138a4…`). *Gate:* fixtures replay to the
-   expected Create/Accept/Cancel set; collection-wide and
-   asset-specific both decode.
+2. **mitos module (DONE):** `community-modules/wayup-store-offer/`
+   + `mitos_community_events::wayup_store_offer`. Datum decode
+   (non-positional target payout), `required_signers`+asset
+   accept/cancel discrimination, `datum_by_hash` resolution (no
+   metadata fallback). **Create golden passing**
+   (`offer-create-bootstrap`, collection-wide + asset-specific,
+   real datum CBOR via the payment-cred bootstrap path) — runs in
+   the full `run-golden-tests.sh` suite (52/52). Accept/cancel/
+   update goldens (TXs `361985963006a6ed…`, `ec1019f4…`,
+   batched-accept `3fc138a4…`) are **pending block capture** —
+   the `mitos-run` fixture format can't synthesise a Consumed
+   event, so they need real `*.block.cbor` from `capture-block`
+   (see `tests/fixtures/README.md`).
 3. **worker companion:** `source_module` column +
    `WayupStoreOfferChannel` + scoped recapture (consumer repo).
    *Gate:* Wayup COs appear in `co-stats` alongside jpg.store;

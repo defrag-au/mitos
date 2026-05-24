@@ -1,0 +1,32 @@
+# mitos.toml — module config for the wayup-store-offer indexer.
+#
+# Offer lifecycle on the Wayup collection/asset-offer contract.
+# Sibling of `jpg-store-offer` with the same 4-variant event
+# surface (Create / Cancel / Accept / Update). See
+# docs/design/WAYUP_STORE_OFFER_MODULE.md.
+
+abi_version = 2
+
+# Runtime config — CBOR-encoded by mitos-build, deserialised by
+# the module's `init`. The offer contract's payment-script hash:
+# offer UTxOs share this payment credential but embed the
+# bidder's own stake key as the staking part, so they sit at
+# different full addresses. The module identifies offer outputs
+# by matching this payment credential.
+payment_cred = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"
+
+[interest]
+# Watch by payment credential (NOT a full address) — the staking
+# part varies per bidder. Bootstrap hydrates the current open
+# offer book via `utxos_by_payment_cred` (dolos by-payment index).
+payment_credentials = [
+    "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea",
+]
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"
+# bech32 → payment-credential extraction (identify offer outputs;
+# the staking part varies per bidder so a string compare won't do).
+pallas-addresses = "1.0.0-alpha.6"
