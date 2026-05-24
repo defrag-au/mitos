@@ -154,6 +154,19 @@ impl ChainDataHost for HostStateV2 {
             .map_err(|e| wasmtime::Error::msg(e.to_string()))
     }
 
+    async fn asset_state(
+        &mut self,
+        policy: Vec<u8>,
+        asset_name: Vec<u8>,
+    ) -> wasmtime::Result<Option<bindings_v2::AssetMintState>> {
+        let state = self
+            .data_plane
+            .asset_state(&policy, &asset_name)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(state.map(asset_mint_state_to_wit))
+    }
+
     async fn read_tx(
         &mut self,
         tx_hash: Vec<u8>,
@@ -215,6 +228,15 @@ fn scan_page_to_wit(p: ScanPage) -> WitUtxoPage {
         refs: p.refs.into_iter().map(from_dp_ref).collect(),
         anchor_slot: p.anchor_slot,
         next: p.next,
+    }
+}
+
+fn asset_mint_state_to_wit(s: mitos_data_plane::AssetMintState) -> bindings_v2::AssetMintState {
+    bindings_v2::AssetMintState {
+        initial_tx: s.initial_tx.map(|h| h.to_vec()),
+        initial_slot: s.initial_slot,
+        mint_tx_count: s.mint_tx_count,
+        metadata_tx: s.metadata_tx.map(|h| h.to_vec()),
     }
 }
 

@@ -270,6 +270,21 @@ interface types {
         /// `tx-metadata` returns. `None` when no aux-data.
         aux-data: option<list<u8>>,
     }
+
+    /// Per-asset mint provenance projected from dolos's always-on
+    /// `AssetState` ledger. This is *state*, not archive — the
+    /// pointers survive the archive horizon even after the minting
+    /// block body is pruned. `initial-tx` is the mint transaction
+    /// (for CIP-25, the tx carrying label-721 metadata); pair it
+    /// with `tx-metadata` to read the payload. `metadata-tx` is the
+    /// tx dolos flagged as carrying the asset's metadata (CIP-25
+    /// label 721 / CIP-68 label 100). Hashes are 32-byte `list<u8>`.
+    record asset-mint-state {
+        initial-tx: option<list<u8>>,
+        initial-slot: option<u64>,
+        mint-tx-count: u64,
+        metadata-tx: option<list<u8>>,
+    }
 }
 
 /// Snapshot chain-state queries. Proxies into `mitos-data-plane`
@@ -279,7 +294,8 @@ interface types {
 /// deadweight — the host has dolos in process and the lookup is
 /// one redb call.
 interface chain-data {
-    use types.{output-ref, typed-output, typed-datum, tx-record, stake-cred, utxo-page};
+    use types.{output-ref, typed-output, typed-datum, tx-record, asset-mint-state, stake-cred,
+        utxo-page};
 
     /// Bulk lookup of N output refs in one host call. Caller
     /// must pass a bounded chunk — pair it with one `utxo-page`
@@ -371,6 +387,18 @@ interface chain-data {
     /// for callers that have a hash but not the containing
     /// UTxO context (rare).
     datum-by-hash: func(hash: list<u8>) -> option<list<u8>>;
+
+    /// Per-asset mint provenance from dolos's `AssetState` ledger:
+    /// the mint TX (`initial-tx`), the metadata-bearing TX
+    /// (`metadata-tx`), and the mint count. `policy` is the 28-byte
+    /// policy id; `asset-name` is the raw on-chain asset name (no
+    /// CIP-67 prefix handling). `None` when the asset is unknown to
+    /// dolos state. Unlike `tx-metadata` this is *state*, not
+    /// archive, so the mint pointer survives pruning — pair with
+    /// `tx-metadata(initial-tx)` to read the (possibly Maestro-
+    /// backed) CIP-25 metadata payload. See `COLLECTION_MODULES.md`.
+    asset-state: func(policy: list<u8>, asset-name: list<u8>)
+               -> option<asset-mint-state>;
 
     /// Full TX rollup — single call returns every component a
     /// module might need: inputs (with prior outputs and

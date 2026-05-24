@@ -7,6 +7,7 @@
 //! exists in part to give the rest of the framework typed
 //! contracts that the compiler enforces.
 
+mod asset_state;
 mod chain_point;
 mod decode;
 mod error;
@@ -20,6 +21,7 @@ mod predicate;
 mod tip;
 mod tx_record;
 
+pub use asset_state::AssetMintState;
 pub use chain_point::ChainPoint;
 pub use decode::DecodeLevel;
 pub use error::{DataPlaneError, DataPlaneResult};

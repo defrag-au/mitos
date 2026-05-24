@@ -36,12 +36,12 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    AddressPattern, AssetEntry, AssetPattern, ChainPoint, ChainTip, ConsumedEvent, ConsumedInput,
-    DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate, InterestSet,
-    MintEntry, MintedEvent, OutputRef, OutputRefPattern, Page, PageRequest, ProducedEvent,
-    ReferencedEvent, ReferencedInput, Resolution, RollbackEvent, ScriptLanguage, StakeCred,
-    TickEvent, TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput, TypedScript,
-    UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
+    AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip, ConsumedEvent,
+    ConsumedInput, DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate,
+    InterestSet, MintEntry, MintedEvent, OutputRef, OutputRefPattern, Page, PageRequest,
+    ProducedEvent, ReferencedEvent, ReferencedInput, Resolution, RollbackEvent, ScriptLanguage,
+    StakeCred, TickEvent, TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput,
+    TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
 };
 
 pub use impls::{LocalDataPlane, extract_aux_cbor, project_typed_output};
@@ -324,6 +324,22 @@ pub trait ChainDataPlane: Send + Sync {
         policy: &PolicyId,
         asset_name_hex: Option<&str>,
     ) -> DataPlaneResult<u64>;
+
+    /// Per-asset mint/burn provenance from dolos's `AssetState`
+    /// ledger: the mint TX (`initial_tx`), the metadata-bearing TX
+    /// (`metadata_tx`), the mint count, and net supply. This is
+    /// *state*, retained across the archive horizon — so `initial_tx`
+    /// resolves the CIP-25 label-721 mint TX even when its block body
+    /// has been pruned. `policy` is the 28-byte policy id; `asset_name`
+    /// is the raw on-chain asset name (no CIP-67 prefix handling).
+    /// Default returns `None` (planes with no dolos state store).
+    async fn asset_state(
+        &self,
+        _policy: &[u8],
+        _asset_name: &[u8],
+    ) -> DataPlaneResult<Option<types::AssetMintState>> {
+        Ok(None)
+    }
 
     /// Number of distinct holders of any asset under a policy.
     /// Holder is defined by the address holding the asset; stake-

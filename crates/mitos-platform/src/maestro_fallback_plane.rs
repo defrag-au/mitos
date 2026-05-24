@@ -327,6 +327,14 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
         self.inner.total_supply(policy, asset_name_hex).await
     }
 
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        self.inner.asset_state(policy, asset_name).await
+    }
+
     async fn holder_count(&self, policy: &PolicyId) -> DataPlaneResult<u64> {
         self.inner.holder_count(policy).await
     }

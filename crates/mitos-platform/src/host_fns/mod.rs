@@ -104,6 +104,17 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
     async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
         Ok(mitos_data_plane::ChainTip::origin())
     }
+
+    /// Per-asset mint provenance from dolos's `AssetState`. Default
+    /// impl returns `None` so test fakes need not implement it; the
+    /// blanket `impl<T: ChainDataPlane>` overrides for production.
+    async fn asset_state(
+        &self,
+        _policy: &[u8],
+        _asset_name: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        Ok(None)
+    }
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -211,6 +222,14 @@ where
 
     async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
         mitos_data_plane::ChainDataPlane::tip(self).await
+    }
+
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        mitos_data_plane::ChainDataPlane::asset_state(self, policy, asset_name).await
     }
 }
 
@@ -356,6 +375,15 @@ where
     ) -> mitos_data_plane::DataPlaneResult<u64> {
         let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
         plane.total_supply(policy, asset_name_hex).await
+    }
+
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        let plane = mitos_data_plane::LocalDataPlane::new(&self.domain);
+        mitos_data_plane::ChainDataPlane::asset_state(&plane, policy, asset_name).await
     }
 
     async fn holder_count(
