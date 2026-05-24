@@ -1,0 +1,24 @@
+# wayup-store-offer golden: in-block create, mixed with a sale.
+#
+# Spend/create TX: 0dfadb5de54b86ea2883d190e2cac7e497113c00c1a5f43b4ae68c9efc07d867
+# (slot 188018722). The buyer (stake cred fcc32dfc…) buys a listed
+# Perp (Perp2470) from the sale script AND creates six asset-specific
+# Perp offers (outputs 1-6, 40 ADA each) in the same TX.
+#
+# Covers, beyond the bootstrap create fixture:
+#   - the in-block produced-datum path (datum resolved from the
+#     block, not a hand-authored [[datum]])
+#   - creates batched with an unrelated sale: the purchased Perp2470
+#     delivered to the buyer (output 10) must NOT spawn a spurious
+#     event — no offer is consumed, so only Creates emit.
+#
+# EXPECTED: six `create` events in output order (outputs 1-6),
+# bidder fcc32dfc…, policy e6ba9c0f… (Perp), 40 ADA each,
+# asset-specific: Perp0498, Perp2187, Perp2736, Perp2680, Perp5303,
+# Perp2414.
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"

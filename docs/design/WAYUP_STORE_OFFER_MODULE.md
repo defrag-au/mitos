@@ -7,12 +7,12 @@ relayering plan
 (`cnft.dev-workers/docs/JPG_STORE_MIRROR_RELAYERING.md`, which
 sketched it under the placeholder name `wayup-co`).
 
-Status: **Phases 1–2 complete; all four goldens passing
-(55/55).** Phase 1 (static payment-cred manifest interest) and
+Status: **Phases 1–2 complete; all five goldens passing
+(56/56).** Phase 1 (static payment-cred manifest interest) and
 Phase 2 (the `wayup-store-offer` module + `wayup_store_offer`
 event types) are in the working tree, with real-mainnet goldens
-for create (bootstrap), accept, cancel, and batched-accept
-(blocks pulled live from production mitos's
+for create (bootstrap + in-block), accept, cancel, and
+batched-accept (blocks pulled live from production mitos's
 `/_admin/blocks/by-tx` endpoint — no downtime). Consumer-side
 wiring (Phase 3) is the remaining work, in `cnft.dev-workers`.
 
@@ -227,12 +227,19 @@ payload" — drop the labels-50+ parser entirely. The payload must
 be populated from the witness-set datum (`DATUM_NS`), with the
 Maestro `datum_by_hash` fallback that the collection-ownership
 CIP-68 datum-resolution work added covering snapshot gaps.
-**Confirm during build** that the host resolves witness-set
-datums for both produced (create) and consumed (accept/cancel)
-offers, and — critically — for the **synthetic bootstrap**
-events (existing open offers resolved via `utxos_by_payment_cred`
-must still get their datum bytes). This is the main
-implementation risk; everything else is mechanical.
+**Confirmed (in-block creates):** Wayup reveals the offer datum
+in the **create TX's witness set** — the `offer-create-sale`
+golden resolves all six creates from the block with no
+hand-authored `[[datum]]`, so dolos `DATUM_NS` (which indexes
+witness datums) resolves creates live. Consumes likewise carry
+the datum in the spending TX's witness set (Plutus requires the
+spender to supply it). The remaining unverified case is the
+**bootstrap** path for *long-open* offers: if an offer's create
+block has been pruned past the archive horizon, its witness datum
+may be absent from `DATUM_NS`, falling to the Maestro
+`datum_by_hash` fallback (the CIP-68 hash-only datum-resolution
+mechanism in collection-ownership). Low risk, but worth a
+recapture smoke on a long-standing offer.
 
 ## Wire events
 
@@ -298,10 +305,12 @@ Phase 4 (consumer-repo work):
    + `mitos_community_events::wayup_store_offer`. Datum decode
    (non-positional target payout), `required_signers`+asset
    accept/cancel discrimination, `datum_by_hash` resolution (no
-   metadata fallback). **All four goldens passing** in
-   `run-golden-tests.sh` (55/55): `offer-create-bootstrap`
+   metadata fallback). **All five goldens passing** in
+   `run-golden-tests.sh` (56/56): `offer-create-bootstrap`
    (collection-wide + asset-specific via the payment-cred
-   bootstrap path), `offer-accept` (Mekanism2212, 55 ADA),
+   bootstrap path), `offer-create-sale` (six asset-specific
+   creates via the in-block path, batched with a sale that must
+   not emit), `offer-accept` (Mekanism2212, 55 ADA),
    `offer-cancel` (two cancels, bidder in `required_signers`),
    `offer-accept-batched` (HouseOfTitans6219 — recipient-match
    excludes the same-collection 5984 listed to the sale script in
@@ -319,8 +328,10 @@ jpg.store path.
 
 ## Open questions
 
-- **Witness-set datum resolution on bootstrap** — the main risk
-  (see caveat above). Confirm before Phase 2.
+- **Witness-set datum resolution** — creates + consumes confirmed
+  in-block (see caveat). Residual: bootstrap of a *long-open*
+  offer whose create block is pruned past the archive horizon
+  (Maestro fallback covers it; smoke on recapture).
 - **In-place offer edit** — does Wayup expose one (consume +
   re-produce same bidder)? If not, the Update path is dead code
   but harmless. Decode a wider TX sample to confirm.

@@ -9,6 +9,7 @@ Four scenarios, all replaying real mainnet data and passing under
 | `offer-accept` | spend `361985963006a6ed…` (slot 188007187) | one `accept`, Mekanism2212 under `ffa56051…`, 55 ADA — the asset paid to the bidder, not the seller's change Mekanisms |
 | `offer-cancel` | spend `ec1019f4…` (slot 188007620) | two `cancel` — bidder `cba51a…` in `required_signers`, no delivery |
 | `offer-accept-batched` | spend `3fc138a4…` (slot 188010024) | one `accept`, HouseOfTitans**6219** under `53d6297f…`, 150 ADA — the recipient-match picks the asset paid to the bidder, NOT the 5984 listed to the sale script in the same TX |
+| `offer-create-sale` | TX `0dfadb5d…` (slot 188018722) | six `create` (asset-specific Perps under `e6ba9c0f…`, 40 ADA each) — in-block create path (datums resolved from the block's witness set, no `[[datum]]`), batched with a Perp2470 *sale* that must NOT spawn a spurious event |
 
 The create scenario is bootstrap-style (`bootstrap = true`,
 `[[utxo]]` + `[[datum]]`, no block). The accept/cancel scenarios
