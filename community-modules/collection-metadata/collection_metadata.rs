@@ -206,6 +206,38 @@ fn cip68_ref_token_suffix(asset_name: &[u8]) -> Option<&[u8]> {
     Some(&asset_name[CIP68_REF_TOKEN_PREFIX.len()..])
 }
 
+/// CIP-67 label `222` byte prefix — a CIP-68 *user* token (the NFT
+/// half of a CIP-68 pair). Its metadata lives on the paired
+/// `000643b0` reference token, so the CIP-25 facade skips it.
+/// 4 bytes: `0x00 0x0d 0xe1 0x40`.
+const CIP68_USER_TOKEN_PREFIX: [u8; 4] = [0x00, 0x0d, 0xe1, 0x40];
+
+/// Whether `asset_name` is a CIP-68 user token (label 222).
+fn is_cip68_user_token(asset_name: &[u8]) -> bool {
+    asset_name.len() >= CIP68_USER_TOKEN_PREFIX.len()
+        && &asset_name[..CIP68_USER_TOKEN_PREFIX.len()] == CIP68_USER_TOKEN_PREFIX.as_slice()
+}
+
+/// Resolve a plain (CIP-25) asset's mint-time metadata to JSON.
+///
+/// CIP-25 metadata lives only in the mint transaction's aux-data
+/// (label 721) — there is no current-state datum. We find the mint
+/// TX via dolos `AssetState.initial_tx` (the `asset-state` host-fn,
+/// retained across the archive horizon), read its aux-data via
+/// `tx_metadata` (dolos archive, Maestro fallback for pruned blocks),
+/// and decode label 721 for this asset with the shared
+/// `cardano_assets::cip25` decoder — the same decoder `cip-25-mint`
+/// uses, so cold-start and live emit byte-identical `metadata_json`.
+/// Returns `(metadata_json, source_tx_hex)`, or `None` if the mint TX
+/// or its label-721 entry can't be resolved.
+fn resolve_cip25(policy: &[u8], asset_name: &[u8]) -> Option<(String, String)> {
+    let state = chain_data::asset_state(policy, asset_name)?;
+    let mint_tx = state.initial_tx?;
+    let aux = chain_data::tx_metadata(&mint_tx)?;
+    let metadata_json = cardano_assets::cip25::cip25_metadata_json(&aux, policy, asset_name)?;
+    Some((metadata_json, hex::encode(&mint_tx)))
+}
+
 /// Decode a CIP-68 datum (PlutusData Constructor 0). Returns
 /// `(metadata_json, version, standard)` on success, `None` if
 /// the CBOR doesn't match the spec.
@@ -293,8 +325,7 @@ fn plutus_to_json_value(pd: &PlutusData) -> Result<serde_json::Value, String> {
                     Value::String(raw.to_string())
                 }
             }
-            pallas_primitives::BigInt::BigUInt(b)
-            | pallas_primitives::BigInt::BigNInt(b) => {
+            pallas_primitives::BigInt::BigUInt(b) | pallas_primitives::BigInt::BigNInt(b) => {
                 Value::String(format!("0x{}", hex::encode(&**b)))
             }
         },
@@ -592,36 +623,66 @@ fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>
             if asset.asset.policy != policy {
                 continue;
             }
-            let Some(suffix) = cip68_ref_token_suffix(&asset.asset.name) else {
-                continue;
-            };
-            // Resolve the datum bytes. Inline datums arrive with a
-            // populated `payload`; hash-only datums (common — many
-            // minters store the CIP-68 datum by hash rather than
-            // inline in the ref UTxO) arrive payload-empty and need
-            // the `datum_by_hash` fallback. Same resolver as the live
-            // `handle_produced` path so cold-start/rebootstrap have
+            let name = &asset.asset.name;
+            // CIP-68 reference token: metadata is in its inline /
+            // hash-resolved datum. Inline datums arrive with a populated
+            // `payload`; hash-only datums (common) arrive payload-empty
+            // and need the `datum_by_hash` fallback. Same resolver as the
+            // live `handle_produced` path so cold-start/rebootstrap have
             // identical coverage.
-            let Some(datum) = datum_opt else { continue };
-            let Some(datum_bytes) = resolve_datum_bytes(datum) else {
+            if let Some(suffix) = cip68_ref_token_suffix(name) {
+                let Some(datum) = datum_opt else { continue };
+                let Some(datum_bytes) = resolve_datum_bytes(datum) else {
+                    continue;
+                };
+                let Some((metadata_json, version, standard)) = decode_cip68_datum(&datum_bytes)
+                else {
+                    continue;
+                };
+                let entry = MetadataEntry {
+                    asset_name_hex: hex::encode(suffix),
+                    metadata_json,
+                    standard,
+                    version,
+                    immutable: false,
+                    source_tx: hex::encode(&oref.tx_hash),
+                };
+                out.push((
+                    suffix.to_vec(),
+                    StoredEntry {
+                        entry,
+                        datum_hash: datum.hash.clone(),
+                    },
+                ));
                 continue;
-            };
-            let Some((metadata_json, version, standard)) = decode_cip68_datum(&datum_bytes) else {
+            }
+            // CIP-68 user token (label 222) — metadata lives on its ref
+            // token (handled above); skip to avoid a wasted CIP-25 lookup
+            // that would find no label-721 entry.
+            if is_cip68_user_token(name) {
+                continue;
+            }
+            // Plain token → CIP-25 facade. Resolve mint-time label-721
+            // metadata via dolos `AssetState.initial_tx` + the shared
+            // decoder. Keyed by the FULL asset name (no prefix strip);
+            // the consumer keys CIP-25 by the bare name and CIP-68 by
+            // `000de140`+suffix, discriminating on the `standard` field.
+            let Some((metadata_json, source_tx)) = resolve_cip25(policy, name) else {
                 continue;
             };
             let entry = MetadataEntry {
-                asset_name_hex: hex::encode(suffix),
-                metadata_json,
-                standard,
-                version,
-                immutable: false,
-                source_tx: hex::encode(&oref.tx_hash),
+                asset_name_hex: hex::encode(name),
+                metadata_json: Some(metadata_json),
+                standard: MetadataStandard::Cip25,
+                version: 1,
+                immutable: true,
+                source_tx,
             };
             out.push((
-                suffix.to_vec(),
+                name.to_vec(),
                 StoredEntry {
                     entry,
-                    datum_hash: datum.hash.clone(),
+                    datum_hash: Vec::new(),
                 },
             ));
         }
@@ -650,6 +711,11 @@ struct TxBuffer {
     /// here without a matching `produced_refs` entry at flush
     /// time is a burn.
     consumed_refs: BTreeSet<([u8; HASH_BYTES], Vec<u8>)>,
+    /// `(policy, full_asset_name)` set of produced **plain** tokens
+    /// (no CIP-67 prefix) — CIP-25 NFT candidates. A first sighting at
+    /// flush resolves mint-time label-721 metadata and emits `Initial`;
+    /// CIP-25 is immutable, so there's no Updated/Burned.
+    produced_plain: BTreeSet<([u8; HASH_BYTES], Vec<u8>)>,
 }
 
 fn slot_from_cursor(c: &crate::mitos::platform_v2::types::ChainPoint) -> u64 {
@@ -667,30 +733,34 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.slot == 0 {
         buf.slot = slot_from_cursor(&p.cursor);
     }
-    let Some(datum) = &p.datum else {
-        return;
-    };
-    // Resolve the datum bytes. Live dispatch carries inline
-    // datum bytes in `payload`; hash-only datums arrive with
-    // `payload` empty and we fall back to `datum_by_hash`
-    // (witness datums harvested from the block, or whatever the
-    // data plane resolves). Same pattern as `cip-68-mint`.
-    let Some(payload) = resolve_datum_bytes(datum) else {
-        return;
-    };
+    // The output's datum (if any) is present for CIP-68 ref tokens,
+    // absent for plain CIP-25 tokens. Resolve once: inline `payload`,
+    // or `datum_by_hash` for hash-only datums (same as `cip-68-mint`).
+    let datum_payload: Option<(Vec<u8>, Vec<u8>)> = p
+        .datum
+        .as_ref()
+        .and_then(|d| resolve_datum_bytes(d).map(|payload| (d.hash.clone(), payload)));
     TRACKED_POLICIES.with(|set| {
         let set = set.borrow();
         for asset in &p.output.assets {
             let Some(policy_arr) = policy_in_set(&asset.asset.policy, &set) else {
                 continue;
             };
-            let Some(suffix) = cip68_ref_token_suffix(&asset.asset.name) else {
-                continue;
-            };
-            buf.produced_refs.insert(
-                (policy_arr, suffix.to_vec()),
-                (datum.hash.clone(), payload.clone()),
-            );
+            let name = &asset.asset.name;
+            if let Some(suffix) = cip68_ref_token_suffix(name) {
+                // CIP-68 ref token — buffer with the output's datum.
+                if let Some((hash, payload)) = &datum_payload {
+                    buf.produced_refs.insert(
+                        (policy_arr, suffix.to_vec()),
+                        (hash.clone(), payload.clone()),
+                    );
+                }
+            } else if is_cip68_user_token(name) {
+                // CIP-68 user token — metadata on its ref token; skip.
+            } else {
+                // Plain token → CIP-25 candidate (resolved at flush).
+                buf.produced_plain.insert((policy_arr, name.to_vec()));
+            }
         }
     });
 }
@@ -730,10 +800,7 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
 /// Return the 28-byte array form of `policy_bytes` if and only
 /// if it's in the tracked set. Avoids allocating a `Vec` per
 /// asset just to do the contains-check.
-fn policy_in_set(
-    policy_bytes: &[u8],
-    set: &HashSet<[u8; HASH_BYTES]>,
-) -> Option<[u8; HASH_BYTES]> {
+fn policy_in_set(policy_bytes: &[u8], set: &HashSet<[u8; HASH_BYTES]>) -> Option<[u8; HASH_BYTES]> {
     if policy_bytes.len() != HASH_BYTES {
         return None;
     }
@@ -819,7 +886,11 @@ fn flush_buffer(buf: TxBuffer) {
                                 tx_hash: tx_hash_hex.clone(),
                                 entry: entry.clone(),
                             }));
-                            shard_put_entry(&policy_hex, &suffix, &StoredEntry { entry, datum_hash });
+                            shard_put_entry(
+                                &policy_hex,
+                                &suffix,
+                                &StoredEntry { entry, datum_hash },
+                            );
                         }
                         Some(prev) if prev.datum_hash == datum_hash => {
                             // Same-datum respend — no emit. Could
@@ -837,7 +908,11 @@ fn flush_buffer(buf: TxBuffer) {
                                 entry: entry.clone(),
                                 prior_version,
                             }));
-                            shard_put_entry(&policy_hex, &suffix, &StoredEntry { entry, datum_hash });
+                            shard_put_entry(
+                                &policy_hex,
+                                &suffix,
+                                &StoredEntry { entry, datum_hash },
+                            );
                         }
                     }
                 }
@@ -853,6 +928,43 @@ fn flush_buffer(buf: TxBuffer) {
                 }
             }
         }
+    }
+
+    // CIP-25 live mints: produced plain tokens. A first sighting
+    // resolves mint-time label-721 metadata (via `AssetState.initial_tx`)
+    // and emits `Initial`. CIP-25 metadata is immutable — no `Updated`;
+    // and a CIP-25 burn just orphans the metadata (the consumer's
+    // ownership reconcile drops it), so no `Burned` either.
+    for (policy, name) in buf.produced_plain {
+        let policy_hex = hex::encode(policy);
+        if shard_get_entry(&policy_hex, &name).is_some() {
+            continue; // already recorded — CIP-25 metadata never changes
+        }
+        let Some((metadata_json, source_tx)) = resolve_cip25(&policy, &name) else {
+            continue;
+        };
+        let entry = MetadataEntry {
+            asset_name_hex: hex::encode(&name),
+            metadata_json: Some(metadata_json),
+            standard: MetadataStandard::Cip25,
+            version: 1,
+            immutable: true,
+            source_tx,
+        };
+        emit_event(&MetadataEvent::Initial(MetadataInitial {
+            policy: policy_hex.clone(),
+            slot,
+            tx_hash: tx_hash_hex.clone(),
+            entry: entry.clone(),
+        }));
+        shard_put_entry(
+            &policy_hex,
+            &name,
+            &StoredEntry {
+                entry,
+                datum_hash: Vec::new(),
+            },
+        );
     }
 }
 
@@ -934,8 +1046,8 @@ impl Guest for Module {
                     TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
                 });
                 predicates.sort_unstable();
-                let cursor =
-                    state_kv::get_value(KV_REBOOTSTRAP_CURSOR).and_then(|b| BootstrapCursor::decode(&b));
+                let cursor = state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+                    .and_then(|b| BootstrapCursor::decode(&b));
                 *slot = Some(ChunkedBootstrap::resume(predicates, cursor));
             }
             let driver = slot.as_mut().expect("driver initialised above");
