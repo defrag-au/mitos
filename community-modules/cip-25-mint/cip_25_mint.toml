@@ -13,7 +13,5 @@ policies = []
 mitos-community-events = { path = "../../crates/mitos-community-events" }
 # Shared CIP-25 (label-721) decoder — single source with the
 # `collection-metadata` facade (replaced this module's local minicbor
-# walker, so both emit identical `metadata_json`). Path dep for local
-# dev (patch-override style); switch to the shared-crates git rev on
-# commit (and bump the mitos rev once shared-crates is pushed).
-cardano-assets = { path = "../../../shared-crates/cardano-assets", default-features = false, features = ["cip25"] }
+# walker, so both emit identical `metadata_json`).
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "d547c95c94a52bba618328ea7bf3b4474589abf1", default-features = false, features = ["cip25"] }

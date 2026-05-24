@@ -38,7 +38,5 @@ minicbor = { version = "0.20", features = ["std"] }
 serde_json = "1"
 # Shared CIP-25 (label-721) decoder — the same decoder cip-25-mint
 # uses, so the facade's cold-start and live paths emit identical
-# `metadata_json`. Path dep for local dev (patch-override style per
-# the cross-repo workflow); switch to the shared-crates git rev on
-# commit (and bump the mitos rev once shared-crates is pushed).
-cardano-assets = { path = "../../../shared-crates/cardano-assets", default-features = false, features = ["cip25"] }
+# `metadata_json`.
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "d547c95c94a52bba618328ea7bf3b4474589abf1", default-features = false, features = ["cip25"] }
