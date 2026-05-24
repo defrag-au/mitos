@@ -19,13 +19,19 @@
 //! Population paths:
 //! - aux_data: **proactive** (every applied block is scanned;
 //!   any TX with aux_data gets an entry — free, the block CBOR is
-//!   already in memory) + **write-through**
-//!   (`CachingDataPlane::tx_metadata` archive / Maestro hits).
-//! - datums: **write-through only**
-//!   (`CachingDataPlane::datum_by_hash` Maestro hits). Live block
-//!   apply already populates dolos `DATUM_NS`, so no proactive
-//!   datum harvest is needed — only the historical / snapshot gap
-//!   ever reaches Maestro.
+//!   already in memory) + **write-through** on both resolution
+//!   tiers of `CachingDataPlane::tx_metadata` (the dolos archive
+//!   hit *and* the Maestro fallback).
+//! - datums: **write-through** on both resolution tiers of
+//!   `CachingDataPlane::datum_by_hash` — the dolos `DATUM_NS` hit
+//!   *and* the Maestro fallback. There's no proactive per-block
+//!   harvest (unlike aux_data) because live block apply already
+//!   populates dolos `DATUM_NS`; the cache only needs to capture
+//!   datums as they're resolved. Caching the `DATUM_NS` hit (not
+//!   just the Maestro miss) is deliberate: a datum then survives
+//!   here even after dolos drops it from its refcounted index when
+//!   the last referencing UTxO is spent — the same "outlive
+//!   pruning" guarantee aux_data gets.
 //!
 //! **Thread safety**: `Arc<redb::Database>` internally; `Clone`
 //! is cheap (one Arc increment). Concurrent reads via separate
