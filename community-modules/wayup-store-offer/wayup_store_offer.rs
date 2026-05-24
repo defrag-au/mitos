@@ -96,6 +96,13 @@ struct DecodedOfferDatum {
     bidder_pkh: String,
     target_policy: Option<String>,
     target_asset_names: Vec<String>,
+    /// Payment credential of the NFT-payout recipient (the
+    /// bidder's wallet). An Accept must deliver the asset to
+    /// *this* address — distinguishing the genuine delivery from
+    /// other outputs that coincidentally carry the target policy
+    /// (the seller's change, or — in a batched TX — a listing of
+    /// another asset from the same collection to the sale script).
+    target_recipient: Option<[u8; 28]>,
 }
 
 /// Decode a Wayup offer datum: `Constr0[bidder_owner_key,
@@ -120,19 +127,20 @@ fn decode_offer_datum(cbor: &[u8]) -> Option<DecodedOfferDatum> {
     };
     // Scan all payouts for the one carrying a non-ADA (28-byte)
     // policy key — the buyer payout (fee/royalty payouts carry
-    // the empty ADA policy and decode to `None`).
-    let (target_policy, target_asset_names) = match &fields[1] {
+    // the empty ADA policy and yield `None`).
+    let (target_policy, target_asset_names, target_recipient) = match &fields[1] {
         PlutusData::Array(payouts) => payouts
             .iter()
-            .map(extract_target_policy_and_assets)
-            .find(|(p, _)| p.is_some())
-            .unwrap_or_default(),
-        _ => Default::default(),
+            .find_map(extract_payout_target)
+            .map(|(p, n, r)| (Some(p), n, Some(r)))
+            .unwrap_or((None, Vec::new(), None)),
+        _ => (None, Vec::new(), None),
     };
     Some(DecodedOfferDatum {
         bidder_pkh,
         target_policy,
         target_asset_names,
+        target_recipient,
     })
 }
 
@@ -141,30 +149,48 @@ fn is_constructor_zero(c: &Constr<PlutusData>) -> bool {
 }
 
 /// A payout is `Constr0[Address, Value]` where `Value` is
-/// `Map<PolicyId, Constr0[flag, Map<AssetName, qty>]>`. Returns
-/// the target policy + asset names when the value map carries a
-/// 28-byte (non-ADA) policy key; `(None, [])` otherwise (ADA
-/// fee/royalty payouts).
-fn extract_target_policy_and_assets(payout: &PlutusData) -> (Option<String>, Vec<String>) {
+/// `Map<PolicyId, Constr0[flag, Map<AssetName, qty>]>`. For the
+/// buyer payout (value map carries a 28-byte non-ADA policy key)
+/// returns `(policy_hex, asset_names, recipient_payment_cred)`;
+/// `None` for ADA fee/royalty payouts.
+fn extract_payout_target(payout: &PlutusData) -> Option<(String, Vec<String>, [u8; 28])> {
     let PlutusData::Constr(constr) = payout else {
-        return Default::default();
+        return None;
     };
     if !is_constructor_zero(constr) || constr.fields.len() != 2 {
-        return Default::default();
+        return None;
     }
     let PlutusData::Map(pairs) = &constr.fields[1] else {
-        return Default::default();
+        return None;
     };
-    for (k, v) in pairs.iter() {
-        let PlutusData::BoundedBytes(policy_bytes) = k else {
-            continue;
-        };
-        if policy_bytes.len() != 28 {
-            continue;
+    let (policy_hex, names) = pairs.iter().find_map(|(k, v)| match k {
+        PlutusData::BoundedBytes(b) if b.len() == 28 => {
+            Some((hex::encode(&**b), extract_asset_names(v)))
         }
-        return (Some(hex::encode(&**policy_bytes)), extract_asset_names(v));
-    }
-    Default::default()
+        _ => None,
+    })?;
+    // Address is `constr.fields[0]` = Constr0[Credential, Maybe<Staking>].
+    let recipient = extract_address_payment_cred(&constr.fields[0])?;
+    Some((policy_hex, names, recipient))
+}
+
+/// Payment credential (28 bytes) from a Plutus `Address`
+/// (`Constr[Credential, ...]`, where `Credential` is
+/// `Constr0[pkh]` for a key or `Constr1[hash]` for a script).
+fn extract_address_payment_cred(addr: &PlutusData) -> Option<[u8; 28]> {
+    let PlutusData::Constr(c) = addr else {
+        return None;
+    };
+    let PlutusData::Constr(cred) = c.fields.first()? else {
+        return None;
+    };
+    let bytes = cred.fields.iter().find_map(|f| match f {
+        PlutusData::BoundedBytes(b) if b.len() == 28 => Some(b),
+        _ => None,
+    })?;
+    let mut out = [0u8; 28];
+    out.copy_from_slice(bytes);
+    Some(out)
 }
 
 /// Asset names from a value entry `Constr0[flag, Map<name, qty>]`.
@@ -225,6 +251,7 @@ struct ProducedOffer {
 /// accept-delivery target (the bidder receiving their NFT).
 #[derive(Clone)]
 struct ProducedNonScript {
+    address: String,
     assets: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -277,7 +304,10 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
         .map(|a| (a.asset.policy.clone(), a.asset.name.clone()))
         .collect();
     if !assets.is_empty() {
-        buf.produced_other.push(ProducedNonScript { assets });
+        buf.produced_other.push(ProducedNonScript {
+            address: p.output.address.clone(),
+            assets,
+        });
     }
 }
 
@@ -432,17 +462,21 @@ fn bidder_in_signers(bidder_pkh: &str, signers: &[Vec<u8>]) -> bool {
     signers.iter().any(|s| s.as_slice() == bidder.as_slice())
 }
 
-/// Find a produced non-offer output that received an asset
-/// matching the offer's target. Collection-wide offers accept
-/// any asset under `target_policy`; asset-specific offers require
-/// the asset name to be in the allow-list. Returns
-/// `(policy_hex, asset_name_hex)` of the delivered asset.
+/// Find the produced output that delivered the offer's target
+/// asset **to the bidder** (the datum's NFT-payout recipient).
+/// Matching on the recipient's payment credential — not just the
+/// policy — is what excludes the seller's change and, in a
+/// batched TX, a listing of another asset from the same
+/// collection. Collection-wide offers accept any asset under
+/// `target_policy`; asset-specific offers require the asset name
+/// to be in the allow-list. Returns `(policy_hex, asset_name_hex)`.
 fn find_delivered_asset(
     decoded: &DecodedOfferDatum,
     produced_other: &[ProducedNonScript],
 ) -> Option<(String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
     let target_policy_bytes = hex::decode(target_policy).ok()?;
+    let target_recipient = decoded.target_recipient?;
     let target_asset_set: Option<Vec<Vec<u8>>> = if decoded.target_asset_names.is_empty() {
         None
     } else {
@@ -455,6 +489,9 @@ fn find_delivered_asset(
         )
     };
     for out in produced_other {
+        if address_payment_cred(&out.address) != Some(target_recipient) {
+            continue;
+        }
         for (policy, name) in &out.assets {
             if policy.as_slice() != target_policy_bytes.as_slice() {
                 continue;

@@ -101,15 +101,23 @@ Because accept and cancel share a redeemer, the `is_cancel`
 redeemer branch from `jpg-store-offer` is dropped. The
 implemented rule (`flush_buffer`): a consume is an **Accept** iff
 the bidder's owner key is **NOT** in the TX's `required_signers`
-**AND** an asset under `target_policy` is delivered to a non-offer
-output; otherwise it's a **Cancel**. The `required_signers` guard
-(the bidder signs only to reclaim) prevents the rare false-accept
-where a cancel's change output coincidentally carries a
-target-policy asset; the asset-delivery requirement prevents a
-false-accept when a cancel omits `required_signers`. The
-accept-finder (non-offer output holding an asset under
-`target_policy`, with the asset-name allow-list for
-asset-specific offers) is otherwise identical to jpg.store's.
+**AND** the target asset is delivered to the **bidder's payout
+address**; otherwise it's a **Cancel**. The `required_signers`
+guard (the bidder signs only to reclaim) prevents the rare
+false-accept where a cancel's change coincidentally carries a
+target-policy asset; the delivery requirement prevents a
+false-accept when a cancel omits `required_signers`.
+
+The accept-finder matches the delivered asset by the **recipient's
+payment credential** (the datum's NFT-payout address), not just
+the policy. This is load-bearing: an accept TX routinely produces
+*other* outputs under the same policy — the seller's change
+(holding more of the collection) and, when the accept is batched
+with a listing, a same-collection asset sent to the sale script.
+Matching only on policy would report the wrong asset name; the
+recipient match pins the actual delivery (verified by the
+`offer-accept-batched` golden: HouseOfTitans6219 to the bidder,
+not the 5984 listed to the sale script in the same TX).
 `required_signers` arrives on the `TxContextEvent` the host emits
 first for every matching TX.
 
@@ -296,11 +304,13 @@ Phase 4 (consumer-repo work):
    (`offer-create-bootstrap`, collection-wide + asset-specific,
    real datum CBOR via the payment-cred bootstrap path) — runs in
    the full `run-golden-tests.sh` suite (52/52). Accept/cancel/
-   update goldens (TXs `361985963006a6ed…`, `ec1019f4…`,
-   batched-accept `3fc138a4…`) are **pending block capture** —
-   the `mitos-run` fixture format can't synthesise a Consumed
-   event, so they need real `*.block.cbor` from `capture-block`
-   (see `tests/fixtures/README.md`).
+   batched-accept goldens are **pre-authored in
+   `tests/fixtures/.staging/`** (interest + consumed-offer
+   `[[utxo]]`/`[[datum]]` filled, hash-verified) and need only the
+   spend `*.block.cbor` (slots 188007187 / 188007620 / 188010024)
+   captured via `capture-block`, then promoted out of `.staging/`
+   + `UPDATE_GOLDEN`. The `.staging/` dot-prefix keeps the suite
+   green meanwhile. See `tests/fixtures/README.md`.
 3. **worker companion:** `source_module` column +
    `WayupStoreOfferChannel` + scoped recapture (consumer repo).
    *Gate:* Wayup COs appear in `co-stats` alongside jpg.store;

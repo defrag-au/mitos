@@ -1,0 +1,40 @@
+# wayup-store-offer golden (STAGED — needs block CBOR).
+#
+# Accept BATCHED with an unrelated listing — the discriminator
+# stress test. To activate:
+#   1. capture-block --config dolos.toml --slot 188010024 \
+#        --out <this-dir>/188010024.block.cbor
+#   2. mv .staging/offer-accept-batched ../offer-accept-batched
+#   3. UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh
+#
+# Spend TX: 3fc138a4b9cb28c7be0f12737139520ffd7124312dc78832bcda6fab02d367ea
+# Consumed offer: b0e66535…:1 (150 ADA, datum d20c47b7…), bidder
+# cc927c8d…, target policy 53d6297f… (HouseOfTitans),
+# collection-wide. The SAME TX also lists HouseOfTitans5984 to the
+# sale script (a different payment cred) — same policy as the
+# delivered NFT.
+#
+# EXPECTED: exactly one `accept`. The bidder cc927c8d… is NOT in
+# required_signers (the seller signed). The delivered asset must
+# be HouseOfTitans6219 (asset name 486f7573654f66546974616e7336323139)
+# — the one paid to the bidder's wallet (payment cred 4fa23dc8…) —
+# NOT the listed 5984 going to the sale script. price_lovelace =
+# 150000000. This is the case that exercises the recipient-match
+# in `find_delivered_asset`.
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"
+
+[[utxo]]
+tx_hash = "b0e66535af309838f90ac2bb9772e785631c7d02d57e30754e877ec4cdffe7d5"
+index = 1
+address = "addr1zynagmktaj2tq5kclp6u7wl2l58gefqw3tgxnanhuzsj36kvjf7gmul8kjcxz4umujuckva59523lurt8247cn9nlhls3ryn3m"
+lovelace = 150000000
+datum_hash = "d20c47b7aec402815780566d57a83f913b9d9f66328dbe3927fd3c73a5ca060d"
+
+[[datum]]
+hash = "d20c47b7aec402815780566d57a83f913b9d9f66328dbe3927fd3c73a5ca060d"
+cbor_hex = "d8799f581ccc927c8df3e7b4b061579be4b98b33b42d151ff06b3aabec4cb3fdff9fd8799fd8799fd8799f581c5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283ffd8799fd8799fd8799f581c28f17fdd2d8b8f559ad61e899e31eae90b9e209cbedb1ee8a8c6c7d1ffffffffa140d8799f00a1401a002dc6c0ffffd8799fd8799fd8799f581c4fa23dc8a5f8d1568304c0bf1132fc9cb9e9c82efaec0ede3e5b2e7fffd8799fd8799fd8799f581ccc927c8df3e7b4b061579be4b98b33b42d151ff06b3aabec4cb3fdffffffffffa1581c53d6297f4ede5cd3bfed7281b73fad3dac8dc86a950f7454d84c16add8799f01a0ffffd8799fd8799fd8799f581c43c0cb39dccbca417507fc870f853fb7e462f1c8dd0a2aca1f34defcffd8799fd8799fd8799f581ca5b1f6420699c140427566d865d56aa4a6c550a434ef0226af71b468ffffffffa140d8799f00a1401a00b71b00ffffffff"

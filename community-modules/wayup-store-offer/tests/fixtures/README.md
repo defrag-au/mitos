@@ -10,41 +10,48 @@
   wayup-specific decode path: payment-cred watch, non-positional
   target payout, collection-wide vs asset-specific.
 
-## Pending block capture (accept / cancel / update)
+## Pending block capture (accept / cancel / batched accept)
 
 These need real block CBOR, since Consumed events only come from
 `--block` dispatch (the `mitos-run` fixture format can't
-synthesise a consume). `capture-block` reads a local dolos
-archive (exclusive redb lock — stop the writer first), which
-isn't reachable from CI; capture against the dolos node and drop
-the `*.block.cbor` files in, then `UPDATE_GOLDEN=1` to generate
-`expected.json`.
+synthesise a consume). The three fixtures are **pre-authored in
+`.staging/`** — interest + the consumed offer's `[[utxo]]` +
+`[[datum]]` (datum CBOR verified to its hash) are filled in; only
+the spend `*.block.cbor` is missing. They live under the
+dot-prefixed `.staging/` so `run-golden-tests.sh` (which globs
+`*/`) skips them and the suite stays green until they're promoted.
 
-Each scenario needs **two** blocks: the offer's create block (so
-the harness harvests the witness-set datum + the prior output)
-and the spend block.
+Each needs only the **spend block** — the consumed offer's prior
+output + datum come from the fixture entries (the offer's create
+TX need not be captured).
 
-| scenario | spend TX | spend slot | create TX (datum source) | expect |
-|---|---|---|---|---|
-| `offer-accept` | `361985963006a6ed1e3ab4a338d8ee19a464712f7d62d8d03772e2b0553651f7` | _capture_ | the offer's create TX | one `accept` (asset under `ffa56051…`, price = offer lovelace, bidder not in `required_signers`) |
-| `offer-cancel` | `ec1019f4c0bd2a1e52ca6c8bd96bec571206d6d51f2d3716e580330ad04e19b1` | _capture_ | the offers' create TX(s) | `cancel`(s) — bidder owner key `cba51a…` IS in `required_signers`, no asset delivered |
-| `offer-accept-batched` | `3fc138a4b9cb28c7be0f12737139520ffd7124312dc78832bcda6fab02d367ea` | _capture_ | the offer's create TX | one `accept` (HouseOfTitans `53d6297f…`) — the accept is batched with a listing to a different script; only the offer-script spend should emit |
+| staged scenario | spend slot | spend TX | expect |
+|---|---|---|---|
+| `offer-accept` | `188007187` | `361985963006a6ed…` | one `accept`, Mekanism2212 under `ffa56051…`, price 55 ADA |
+| `offer-cancel` | `188007620` | `ec1019f4…` | two `cancel` (bidder `cba51a…` in `required_signers`, no delivery) |
+| `offer-accept-batched` | `188010024` | `3fc138a4…` | one `accept`, HouseOfTitans**6219** under `53d6297f…` — NOT the 5984 listed to the sale script in the same TX |
 
-Capture (example):
-
-```sh
-cargo build --release --bin capture-block
-./target/release/capture-block --config dolos.toml --slot <SLOT> \
-  --out community-modules/wayup-store-offer/tests/fixtures/offer-cancel/<SLOT>.block.cbor
-```
-
-Then:
+`capture-block` reads a local dolos archive (exclusive redb lock
+— stop the writer first), so run it on the dolos node. To
+activate each (example for cancel):
 
 ```sh
-cargo build --release --bin mitos-build --bin mitos-run
+cargo build --release --bin capture-block --bin mitos-build --bin mitos-run
+S=community-modules/wayup-store-offer/tests/fixtures
+./target/release/capture-block --config dolos.toml --slot 188007620 \
+  --out $S/.staging/offer-cancel/188007620.block.cbor
+mv $S/.staging/offer-cancel $S/offer-cancel          # promote out of .staging
 ./target/release/mitos-build --module community-modules/wayup-store-offer/wayup_store_offer.rs --fast
-UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh   # review the diff before committing
+UPDATE_GOLDEN=1 ./scripts/run-golden-tests.sh        # generates expected.json
 ```
+
+**Review the generated `expected.json` before committing** —
+`UPDATE_GOLDEN` records whatever the module emits, so it captures
+regressions thereafter but does NOT verify first-time
+correctness. Check it against the "expect" column above (e.g. the
+batched accept must report `486f7573654f66546974616e7336323139`
+= HouseOfTitans6219, the asset paid to the bidder, not the listed
+5984).
 
 ### Discrimination these assert
 
