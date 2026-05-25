@@ -97,6 +97,7 @@ where
                             &kv_factory,
                             chunked_cold_start,
                             &backfill,
+                            event_ring.as_ref(),
                         )
                         .await;
                         continue;
@@ -243,6 +244,7 @@ fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::indexer_data_cache:
 /// the follower — the host's filter is the source of truth for
 /// dispatch, the module's persisted copy is a best-effort
 /// resilience aid.
+#[allow(clippy::too_many_arguments)]
 async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     driver: &mut DriverV2,
     module_id: &str,
@@ -251,6 +253,7 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     kv_factory: &KvFactory,
     chunked_cold_start: bool,
     backfill: &crate::backfill_v2::BackfillFactory,
+    event_ring: Option<&crate::events::EventRing>,
 ) {
     use mitos_protocol::InterestOp as WireOp;
 
@@ -320,10 +323,15 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
         }
     }
 
-    // 3. Cold-start newly-added predicates (Add only; Remove never
-    //    hydrates, Replace is reconnect re-assert). Two paths, gated
-    //    by the module's manifest `[interest] chunked_cold_start`:
-    if matches!(update.op, WireOp::Add) {
+    // 3. Cold-start newly-added predicates. `Remove` never hydrates.
+    //    Both `Add` and `Replace` can introduce genuinely-new policies
+    //    (Replace is what the boot-time reconcile routes to drop
+    //    orphans + assert the live companion set). The module's
+    //    `update-interest` seeds ONLY the newly-added policies into the
+    //    onboard scope, so a re-assert of already-tracked policies
+    //    seeds nothing and the Onboard pump below is a no-op. Two
+    //    paths, gated by `chunked_cold_start`:
+    if matches!(update.op, WireOp::Add | WireOp::Replace) {
         if chunked_cold_start {
             // Page-oriented modules (collection-holders/metadata)
             // seeded a scoped onboard set in update-interest above
@@ -337,7 +345,18 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
             // `Arc<Database>` state-kv, so the live driver sees the
             // refilled holder map on the next event. See
             // `COLD_START_TRAP_ISOLATION.md`.
-            let outcome = crate::backfill_v2::run_rebootstrap_pump(backfill).await;
+            //
+            // ONBOARD mode: the pump scans ONLY the just-seeded onboard
+            // scope. An empty scope (a no-op re-assert) is a no-op,
+            // NEVER a full re-scan of every tracked policy — that's
+            // recapture's job (`RebootstrapMode::Full`). This is what
+            // stops a boot reconcile / re-subscribe from re-scanning
+            // (and re-resolving via Maestro) every collection.
+            let outcome = crate::backfill_v2::run_rebootstrap_pump(
+                backfill,
+                crate::bindings_v2::RebootstrapMode::Onboard,
+            )
+            .await;
             if outcome.ingested > 0 {
                 tracing::info!(
                     module = %module_id,
@@ -348,7 +367,20 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
                     "v2 onboard cold-start complete (backfill plane)",
                 );
             }
-        } else {
+            // Record onboard health to the events ring (the recapture
+            // path already records; onboard was previously blind to
+            // `/_admin/events` + `/metrics`, only in journald). Records
+            // every run, including no-ops, so the cadence is visible.
+            if let Some(ring) = event_ring {
+                ring.record(
+                    module_id,
+                    crate::events::EventKind::OnboardCompleted {
+                        utxos_ingested: outcome.ingested,
+                        outcome: outcome.outcome.to_owned(),
+                    },
+                );
+            }
+        } else if matches!(update.op, WireOp::Add) {
             // Every other module: the host's synthetic-event
             // bootstrap (unchanged). Pumping `rebootstrap` here would
             // double-fire a module that also cold-starts inline (e.g.

@@ -41,6 +41,17 @@ pub enum EventKind {
     /// recapture / self-bootstrapping start triggers). `utxos_ingested`
     /// is the count re-scanned across all pages.
     RebootstrapCompleted { utxos_ingested: u64 },
+    /// A subscribe-time onboard cold-start finished (the follower's
+    /// scoped `rebootstrap` pump for a newly-added policy). Recorded
+    /// for every Add/Replace that runs the chunked pump — including
+    /// no-op runs (`utxos_ingested: 0`, an empty onboard scope) — so
+    /// `/_admin/events` + `/metrics` show onboard health, which was
+    /// previously only in journald. `outcome` is `completed`,
+    /// `partial`, or `failed`.
+    OnboardCompleted {
+        utxos_ingested: u64,
+        outcome: String,
+    },
     /// A companion registered (subscribed) to a module.
     CompanionSubscribed {
         client_id: String,
@@ -66,6 +77,7 @@ impl EventKind {
             EventKind::RecaptureCompleted { .. } => "recapture_completed",
             EventKind::RecaptureFailed { .. } => "recapture_failed",
             EventKind::RebootstrapCompleted { .. } => "rebootstrap_completed",
+            EventKind::OnboardCompleted { .. } => "onboard_completed",
             EventKind::CompanionSubscribed { .. } => "companion_subscribed",
             EventKind::CompanionEvicted { .. } => "companion_evicted",
             EventKind::Trap { .. } => "trap",

@@ -178,7 +178,10 @@ const MAX_TRAP_REBUILDS: u32 = 64;
 ///   terminates. The absolute cap is the guarantee.)
 ///
 /// The disposable instance is dropped on return.
-pub(crate) async fn run_rebootstrap_pump(factory: &BackfillFactory) -> BackfillOutcome {
+pub(crate) async fn run_rebootstrap_pump(
+    factory: &BackfillFactory,
+    mode: crate::bindings_v2::RebootstrapMode,
+) -> BackfillOutcome {
     let module_id = factory.module_id.as_str();
 
     let (mut driver, mut trap_logger) = match factory.instantiate(None).await {
@@ -208,7 +211,7 @@ pub(crate) async fn run_rebootstrap_pump(factory: &BackfillFactory) -> BackfillO
     let mut trap_rebuilds: u32 = 0;
 
     let outcome = loop {
-        match driver.call_rebootstrap().await {
+        match driver.call_rebootstrap(mode).await {
             Ok(Ok(step)) => {
                 ingested += step.ingested;
                 steps += 1;

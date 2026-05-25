@@ -540,7 +540,13 @@ where
         let mut rebootstrap_count: u64 = 0;
         if rebootstrap {
             let rebootstrap_started = std::time::Instant::now();
-            let result = crate::backfill_v2::run_rebootstrap_pump(&backfill).await;
+            // Recapture = full re-scan of every tracked policy,
+            // ignoring any pending onboard scope.
+            let result = crate::backfill_v2::run_rebootstrap_pump(
+                &backfill,
+                crate::bindings_v2::RebootstrapMode::Full,
+            )
+            .await;
             rebootstrap_count = result.ingested;
             if let Some(ring) = self.event_ring.get() {
                 ring.record(

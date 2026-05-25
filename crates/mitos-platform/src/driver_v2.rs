@@ -131,6 +131,7 @@ impl DriverV2 {
     /// `done`; `Err(String)` is the module's typed failure.
     pub async fn call_rebootstrap(
         &mut self,
+        mode: crate::bindings_v2::RebootstrapMode,
     ) -> wasmtime::Result<Result<crate::bindings_v2::RebootstrapStep, String>> {
         self.instance.store.set_fuel(self.fuel_per_call)?;
         // Clear the per-call OOM flag so `classify_trap` reflects
@@ -140,7 +141,7 @@ impl DriverV2 {
         let result = self
             .instance
             .bindings
-            .call_rebootstrap(&mut self.instance.store)
+            .call_rebootstrap(&mut self.instance.store, mode)
             .await;
 
         // Feed this call's budget telemetry into the adaptive

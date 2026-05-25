@@ -132,6 +132,25 @@ interface types {
         ingested: u64,
     }
 
+    /// Which job the host is asking `rebootstrap` to do. Makes the
+    /// onboard-vs-recapture intent EXPLICIT rather than inferring it
+    /// from whether a scoped onboard set happens to be present —
+    /// the old implicit convention meant an empty scope was read as
+    /// "scan everything" by the recapture caller but should mean
+    /// "nothing to do" for the onboard caller, so a no-op onboard
+    /// (e.g. a boot-time interest re-assert) silently became a full
+    /// re-scan of every tracked policy.
+    enum rebootstrap-mode {
+        /// Cold-start only the policies seeded into the onboard
+        /// scope by the most recent `update-interest` add. An empty
+        /// scope is a no-op (`done: true, ingested: 0`) — NEVER a
+        /// full scan. Driven by the follower after a subscribe.
+        onboard,
+        /// Re-scan every tracked policy, ignoring the onboard
+        /// scope. Driven by the host recapture flow.
+        full,
+    }
+
     // ============================================================
     // Event variants
     // ============================================================
@@ -548,7 +567,7 @@ interface interest {
 }
 
 world mitos-module-v2 {
-    use types.{trap-strategy, retry-policy, dispatch-event, rebootstrap-step};
+    use types.{trap-strategy, retry-policy, dispatch-event, rebootstrap-step, rebootstrap-mode};
     use interest.{interest-op};
 
     import chain-data;
@@ -615,5 +634,5 @@ world mitos-module-v2 {
     /// cold-start scan is spread across many calls. The host
     /// sums `ingested` and surfaces it as the recapture's
     /// `events_emitted`.
-    export rebootstrap: func() -> result<rebootstrap-step, string>;
+    export rebootstrap: func(mode: rebootstrap-mode) -> result<rebootstrap-step, string>;
 }

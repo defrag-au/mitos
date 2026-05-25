@@ -170,12 +170,12 @@ impl RebootstrapPredicate {
 
     fn decode(bytes: &[u8]) -> Option<Self> {
         match bytes.split_first() {
-            Some((0x00, rest)) => {
-                Some(RebootstrapPredicate::Address(String::from_utf8(rest.to_vec()).ok()?))
-            }
-            Some((0x01, rest)) => {
-                Some(RebootstrapPredicate::PaymentCred(<[u8; HASH_BYTES]>::try_from(rest).ok()?))
-            }
+            Some((0x00, rest)) => Some(RebootstrapPredicate::Address(
+                String::from_utf8(rest.to_vec()).ok()?,
+            )),
+            Some((0x01, rest)) => Some(RebootstrapPredicate::PaymentCred(
+                <[u8; HASH_BYTES]>::try_from(rest).ok()?,
+            )),
             _ => None,
         }
     }
@@ -214,7 +214,10 @@ fn lock_shard_prefix(predicate_hex: &str) -> String {
     format!("{KV_LOCK_SHARD_PREFIX}{predicate_hex}:")
 }
 fn lock_shard_kv_key(predicate_hex: &str, entry_key: &[u8]) -> String {
-    format!("{KV_LOCK_SHARD_PREFIX}{predicate_hex}:{}", hex::encode(entry_key))
+    format!(
+        "{KV_LOCK_SHARD_PREFIX}{predicate_hex}:{}",
+        hex::encode(entry_key)
+    )
 }
 
 // ============================================================
@@ -603,21 +606,16 @@ fn resolve_owner_stake(owner_pkh_hex: &str) -> Option<String> {
 // Cold-start (onboard scope → host-pumped chunked rebootstrap)
 // ============================================================
 
-/// Record `added` predicates as the scope for the next `rebootstrap`
-/// pump. Merges with any still-pending scope (rapid successive adds
-/// all cold-start) and resets the durable cursor + in-process driver
-/// so the pump restarts cleanly over the scoped set. Mirrors
+/// Record `added` predicates as the scope for the next onboard
+/// `rebootstrap` pump. REPLACES (not merges) the pending scope — see
+/// the matching note in collection-holders: onboards run sequentially,
+/// so replacing prevents a never-completing predicate from wedging the
+/// scope and being re-scanned on every future add. Mirrors
 /// collection-holders / holder-distribution — the inline single-fuel
 /// cold-start (resident Vec + sort) is gone; the host pumps the
 /// budget-safe chunked rebootstrap over just these predicates.
 fn seed_onboard_scope(added: &[RebootstrapPredicate]) {
-    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
-    for p in added {
-        let enc = p.encode();
-        if !scope.contains(&enc) {
-            scope.push(enc);
-        }
-    }
+    let mut scope: Vec<Vec<u8>> = added.iter().map(|p| p.encode()).collect();
     scope.sort_unstable();
     let mut buf = Vec::with_capacity(64 + scope.len() * 40);
     if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
@@ -830,7 +828,11 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
     let added: Vec<RebootstrapPredicate> = added_addresses
         .into_iter()
         .map(RebootstrapPredicate::Address)
-        .chain(added_creds.into_iter().map(RebootstrapPredicate::PaymentCred))
+        .chain(
+            added_creds
+                .into_iter()
+                .map(RebootstrapPredicate::PaymentCred),
+        )
         .collect();
     if !added.is_empty() {
         seed_onboard_scope(&added);
@@ -909,33 +911,43 @@ impl Guest for Module {
     /// driver: scan a page → shard each lock (REPLACE) → emit one
     /// `SnapshotChunk` per call from the sorted shards. No resident
     /// lock set + sort; every progress field is durable.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         REBOOTSTRAP_DRIVER.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                // Scope: a pending onboard set (subscribe-time Add)
-                // cold-starts just those predicates; else a full
-                // recapture over every tracked predicate. Predicates
-                // are kit-encoded `Vec<u8>` (addresses, then creds).
-                let predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
-                    let mut addrs: Vec<String> =
-                        TRACKED_ADDRESSES.with(|s| s.borrow().iter().cloned().collect());
-                    addrs.sort_unstable();
-                    let mut creds: Vec<[u8; HASH_BYTES]> =
-                        TRACKED_PAYMENT_CREDS.with(|s| s.borrow().iter().copied().collect());
-                    creds.sort_unstable();
-                    let mut preds: Vec<Vec<u8>> = addrs
-                        .into_iter()
-                        .map(|a| RebootstrapPredicate::Address(a).encode())
-                        .collect();
-                    preds.extend(
-                        creds
+                // Explicit mode (no implicit scope-or-full inference).
+                // Predicates are kit-encoded `Vec<u8>` (addresses,
+                // then creds).
+                //   Onboard → only the seeded onboard scope.
+                //   Full    → every tracked predicate (recapture).
+                let mut predicates: Vec<Vec<u8>> = match mode {
+                    RebootstrapMode::Onboard => read_onboard_scope().unwrap_or_default(),
+                    RebootstrapMode::Full => {
+                        let mut addrs: Vec<String> =
+                            TRACKED_ADDRESSES.with(|s| s.borrow().iter().cloned().collect());
+                        addrs.sort_unstable();
+                        let mut creds: Vec<[u8; HASH_BYTES]> =
+                            TRACKED_PAYMENT_CREDS.with(|s| s.borrow().iter().copied().collect());
+                        creds.sort_unstable();
+                        let mut preds: Vec<Vec<u8>> = addrs
                             .into_iter()
-                            .map(|c| RebootstrapPredicate::PaymentCred(c).encode()),
-                    );
-                    preds
-                });
-                let mut predicates = predicates;
+                            .map(|a| RebootstrapPredicate::Address(a).encode())
+                            .collect();
+                        preds.extend(
+                            creds
+                                .into_iter()
+                                .map(|c| RebootstrapPredicate::PaymentCred(c).encode()),
+                        );
+                        preds
+                    }
+                };
+                // An empty Onboard scope is a no-op — never a full scan.
+                if predicates.is_empty() {
+                    return Ok(RebootstrapStep {
+                        done: true,
+                        ingested: 0,
+                    });
+                }
                 predicates.sort_unstable();
                 let cursor = state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
                     .and_then(|b| BootstrapCursor::decode(&b));
@@ -946,7 +958,9 @@ impl Guest for Module {
             let out = driver.step(&mut io);
             if out.done {
                 *slot = None;
-                state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                if matches!(mode, RebootstrapMode::Onboard) {
+                    state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                }
             }
             Ok(RebootstrapStep {
                 done: out.done,

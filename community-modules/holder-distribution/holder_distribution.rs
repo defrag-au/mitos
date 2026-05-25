@@ -64,7 +64,7 @@ use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::state_kv;
 use crate::mitos::platform_v2::types::{
     AssetEntry as WitAssetEntry, ConsumedEvent, OutputRef as WitOutputRef, ProducedEvent,
-    TypedDatum, UtxoEvent, StakeCred as WitStakeCred,
+    StakeCred as WitStakeCred, TypedDatum, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "holder-distribution-module";
@@ -686,20 +686,22 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
             &format!("dropped state for untracked policy {policy_hex}"),
         );
     }
+    // Evict removed policies from any pending onboard scope so a
+    // dropped orphan can't be re-scanned by the next onboard pump.
+    drop_from_onboard_scope(&removed);
 
     if !added.is_empty() {
         seed_onboard_scope(&added);
     }
 }
 
+/// Record `added` policies as the scope for the next onboard
+/// `rebootstrap` pump. REPLACES (not merges) the pending scope — see
+/// the matching note in collection-holders: onboards run sequentially,
+/// so replacing prevents a never-completing policy from wedging the
+/// scope and being re-scanned on every future add.
 fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
-    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
-    for p in added {
-        let v = p.to_vec();
-        if !scope.contains(&v) {
-            scope.push(v);
-        }
-    }
+    let mut scope: Vec<Vec<u8>> = added.iter().map(|p| p.to_vec()).collect();
     scope.sort_unstable();
     let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
     if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
@@ -708,6 +710,31 @@ fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
     state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
     REBOOTSTRAP_DRIVER.with(|c| *c.borrow_mut() = None);
     DECOMP_STATE.with(|c| *c.borrow_mut() = None);
+}
+
+/// Drop `removed` policies from any pending onboard scope (on
+/// Remove/Replace), so an untracked orphan can't linger and be
+/// re-scanned. Deletes the key once empty.
+fn drop_from_onboard_scope(removed: &[[u8; HASH_BYTES]]) {
+    if removed.is_empty() {
+        return;
+    }
+    let Some(mut scope) = read_onboard_scope() else {
+        return;
+    };
+    let before = scope.len();
+    scope.retain(|p| !removed.iter().any(|r| r.as_slice() == p.as_slice()));
+    if scope.len() == before {
+        return;
+    }
+    if scope.is_empty() {
+        state_kv::delete_value(KV_ONBOARD_PREDICATES);
+    } else {
+        let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
+        if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
+            state_kv::set_value(KV_ONBOARD_PREDICATES, &buf);
+        }
+    }
 }
 
 fn read_onboard_scope() -> Option<Vec<Vec<u8>>> {
@@ -998,13 +1025,26 @@ impl Guest for Module {
     /// Re-emit the holder snapshot for tracked policies via the shared
     /// re-entrant [`ChunkedBootstrap`] driver: scan→shard (SUM) →
     /// decompose (LP + vesting) → emit, one bounded unit per call.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         REBOOTSTRAP_DRIVER.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                let mut predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
-                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
-                });
+                // Explicit mode (no implicit scope-or-full inference):
+                // Onboard scans only the seeded onboard scope; Full
+                // re-scans every tracked policy (recapture).
+                let mut predicates: Vec<Vec<u8>> = match mode {
+                    RebootstrapMode::Onboard => read_onboard_scope().unwrap_or_default(),
+                    RebootstrapMode::Full => {
+                        TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
+                    }
+                };
+                // An empty Onboard scope is a no-op — never a full scan.
+                if predicates.is_empty() {
+                    return Ok(RebootstrapStep {
+                        done: true,
+                        ingested: 0,
+                    });
+                }
                 predicates.sort_unstable();
                 let cursor = state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
                     .and_then(|b| BootstrapCursor::decode(&b));
@@ -1015,7 +1055,9 @@ impl Guest for Module {
             let out = driver.step(&mut io);
             if out.done {
                 *slot = None;
-                state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                if matches!(mode, RebootstrapMode::Onboard) {
+                    state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                }
             }
             Ok(RebootstrapStep {
                 done: out.done,
@@ -1291,8 +1333,11 @@ impl BootstrapIo for HolderDistIo {
             match st.sub {
                 DecompSub::LpScan => {
                     let lp_policy = st.lp_policy.expect("lp_policy set in LpScan");
-                    let page =
-                        chain_data::utxos_by_policy(&lp_policy, st.lp_after.as_deref(), COLD_START_PAGE_HINT);
+                    let page = chain_data::utxos_by_policy(
+                        &lp_policy,
+                        st.lp_after.as_deref(),
+                        COLD_START_PAGE_HINT,
+                    );
                     let ingested = page.refs.len() as u64;
                     fold_lp_page(&mut st.lp_holders, &lp_policy, &page.refs);
                     match page.next {

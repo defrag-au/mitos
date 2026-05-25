@@ -434,7 +434,7 @@ impl Guest for Module {
     ///
     /// `init` restores `WATCHED_ADDRS` from `state-kv`, so the
     /// module knows what it watches.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         REBOOTSTRAP_STATE.with(|cell| {
             let mut state = cell.borrow_mut();
 

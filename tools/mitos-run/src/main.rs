@@ -926,7 +926,15 @@ async fn run_v2(
     if chunked_cold_start {
         let mut steps = 0u64;
         loop {
-            match driver.call_rebootstrap().await {
+            // Onboard mode: the `update_interest(Replace)` above seeded
+            // the onboard scope with the (here, all) newly-tracked
+            // predicates, exactly as a production subscribe does; pump
+            // that scope. (Full mode is the recapture path, driven by
+            // the host, not this harness.)
+            match driver
+                .call_rebootstrap(mitos_platform::bindings_v2::RebootstrapMode::Onboard)
+                .await
+            {
                 Ok(Ok(step)) => {
                     steps += 1;
                     if step.done || steps >= 10_000_000 {

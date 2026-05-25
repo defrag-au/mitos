@@ -473,6 +473,9 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
             &format!("dropped metadata shards for untracked policy {policy_hex}"),
         );
     }
+    // Also evict removed policies from any pending onboard scope so a
+    // dropped orphan can't be re-scanned by the next onboard pump.
+    drop_from_onboard_scope(&removed);
 
     // Cold-start each newly-added policy via the budget-safe chunked
     // `rebootstrap` pump rather than an inline single-fuel scan. The
@@ -488,17 +491,19 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
 }
 
 /// Record `added` policies as the scope for the next `rebootstrap`
-/// pump. Merges with any still-pending scope (rapid successive adds
-/// all cold-start) and resets the durable cursor + in-process driver
-/// so the pump restarts cleanly over the scoped set.
+/// onboard pump. REPLACES (not merges) any still-pending scope, and
+/// resets the durable cursor + in-process driver so the pump restarts
+/// cleanly over exactly this set.
+///
+/// Replace, not merge: onboards run sequentially (the host follower
+/// awaits each pump before processing the next interest update), so
+/// there is no concurrent add to preserve — and replacing prevents a
+/// never-completing policy (e.g. an oversized collection whose pump
+/// always gives up "partial", so the scope is never cleared on `done`)
+/// from wedging itself into the scope and being re-scanned on every
+/// future add.
 fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
-    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
-    for p in added {
-        let v = p.to_vec();
-        if !scope.contains(&v) {
-            scope.push(v);
-        }
-    }
+    let mut scope: Vec<Vec<u8>> = added.iter().map(|p| p.to_vec()).collect();
     scope.sort_unstable();
     let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
     if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
@@ -506,6 +511,33 @@ fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
     }
     state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
     REBOOTSTRAP_DRIVER.with(|c| *c.borrow_mut() = None);
+}
+
+/// Drop `removed` policies from any pending onboard scope. Called on
+/// `Remove`/`Replace` so an untracked policy (e.g. an orphan dropped
+/// by the boot-time `Replace` reconcile) can't linger in the scope and
+/// get re-scanned by the next onboard pump. Deletes the scope key
+/// entirely once empty.
+fn drop_from_onboard_scope(removed: &[[u8; HASH_BYTES]]) {
+    if removed.is_empty() {
+        return;
+    }
+    let Some(mut scope) = read_onboard_scope() else {
+        return;
+    };
+    let before = scope.len();
+    scope.retain(|p| !removed.iter().any(|r| r.as_slice() == p.as_slice()));
+    if scope.len() == before {
+        return;
+    }
+    if scope.is_empty() {
+        state_kv::delete_value(KV_ONBOARD_PREDICATES);
+    } else {
+        let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
+        if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
+            state_kv::set_value(KV_ONBOARD_PREDICATES, &buf);
+        }
+    }
 }
 
 /// Decode the pending onboard scope (policies a subscribe-time Add
@@ -1034,17 +1066,33 @@ impl Guest for Module {
     /// resumes at the offset instead of restarting the policy (the
     /// out-of-fuel `SnapshotBegin`-loop fix). No call ever
     /// serializes the whole ledger.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         REBOOTSTRAP_DRIVER.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                // Scope the round: a pending onboard set (subscribe-time
-                // Add) cold-starts just those policies; otherwise this is
-                // a full recapture over every tracked policy. The host
-                // pumps this same export in both cases.
-                let mut predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
-                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
-                });
+                // Pick the scan set by EXPLICIT mode — no implicit
+                // "scope present? scoped : full" inference (the old
+                // form silently turned a no-op onboard into a full
+                // re-scan of every tracked policy):
+                //   Onboard → only the policies the most recent
+                //             `update-interest` add seeded into the
+                //             onboard scope.
+                //   Full    → every tracked policy, ignoring the scope
+                //             (the recapture flow).
+                let mut predicates: Vec<Vec<u8>> = match mode {
+                    RebootstrapMode::Onboard => read_onboard_scope().unwrap_or_default(),
+                    RebootstrapMode::Full => {
+                        TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
+                    }
+                };
+                // An empty Onboard scope (a no-op interest re-assert)
+                // is done immediately — NEVER a full scan.
+                if predicates.is_empty() {
+                    return Ok(RebootstrapStep {
+                        done: true,
+                        ingested: 0,
+                    });
+                }
                 predicates.sort_unstable();
                 let cursor = state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
                     .and_then(|b| BootstrapCursor::decode(&b));
@@ -1055,9 +1103,11 @@ impl Guest for Module {
             let out = driver.step(&mut io);
             if out.done {
                 *slot = None;
-                // Clear the scoped onboard set so a future recapture
-                // defaults to the full tracked set.
-                state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                // Clear the onboard scope only after an ONBOARD round
+                // completes; a Full recapture doesn't own the scope.
+                if matches!(mode, RebootstrapMode::Onboard) {
+                    state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                }
             }
             Ok(RebootstrapStep {
                 done: out.done,

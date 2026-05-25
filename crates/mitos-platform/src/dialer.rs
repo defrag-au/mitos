@@ -463,13 +463,27 @@ impl CompanionDialer {
             // and it never captures (CO1). One union `Add` per module
             // self-heals — already-tracked policies are idempotent no-ops,
             // only a genuinely-missing policy cold-starts.
+            // Reconcile op. For the chunked cold-start modules (whose
+            // scan-interest IS the durable tracked-policy set) use
+            // `Replace` so the reload asserts EXACTLY the live
+            // companion set: a policy whose companion was deleted is
+            // dropped from the module's tracked set + onboard scope +
+            // shards, instead of lingering as an orphan that gets
+            // re-scanned (and, for CIP-25, re-resolved via Maestro) on
+            // every restart. `Replace` with no genuinely-new policies
+            // seeds no onboard scope, so the follower's Onboard pump is
+            // a no-op — the restart no longer re-scans every
+            // collection. Other modules keep `Add` (their
+            // update-interest isn't a full-set authority and their
+            // bootstrap is idempotent + cheap).
+            let reconcile_op = if crate::manifest::is_chunked_cold_start_module(&module_id) {
+                mitos_protocol::InterestOp::Replace
+            } else {
+                mitos_protocol::InterestOp::Add
+            };
             if !module_interests.is_empty()
                 && let Err(e) = self
-                    .route_interest_mutation(
-                        &module_id,
-                        mitos_protocol::InterestOp::Add,
-                        module_interests,
-                    )
+                    .route_interest_mutation(&module_id, reconcile_op, module_interests)
                     .await
             {
                 warn!(

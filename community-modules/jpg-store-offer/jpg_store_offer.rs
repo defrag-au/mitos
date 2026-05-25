@@ -774,7 +774,7 @@ impl Guest for Module {
     /// `run_bootstrap` over the manifest `[interest]`. See the
     /// `rebootstrap` export in `wit-v2/world.wit`. One call,
     /// immediately `done`.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,
             ingested: 0,
