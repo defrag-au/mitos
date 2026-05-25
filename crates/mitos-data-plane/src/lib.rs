@@ -36,13 +36,13 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip, Cip25Resolution,
-    ConsumedEvent, ConsumedInput, DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent,
-    InterestPredicate,
-    InterestSet, MintEntry, MintedEvent, OutputRef, OutputRefPattern, Page, PageRequest,
-    ProducedEvent, ReferencedEvent, ReferencedInput, Resolution, RollbackEvent, ScriptLanguage,
-    StakeCred, TickEvent, TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput,
-    TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate, ValidityInterval,
+    AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip,
+    Cip25Resolution, ConsumedEvent, ConsumedInput, DataPlaneError, DataPlaneResult, DecodeLevel,
+    DispatchEvent, InterestPredicate, InterestSet, MintEntry, MintedEvent, OutputRef,
+    OutputRefPattern, Page, PageRequest, ProducedEvent, ReferencedEvent, ReferencedInput,
+    Resolution, RollbackEvent, ScriptLanguage, StakeCred, TickEvent, TxContextEvent, TxEventBatch,
+    TxRecord, TypedDatum, TypedOutput, TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate,
+    ValidityInterval,
 };
 
 pub use impls::{LocalDataPlane, extract_aux_cbor, project_typed_output};
