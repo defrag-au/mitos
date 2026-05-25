@@ -169,7 +169,13 @@ fn emit_transfer(event: &AssetTransfer) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Key the emission by policy hex so the host fans it only to
+    // companions interested in this policy (the SB6b interest filter in
+    // `route_emission`). A keyless `emit_event` is unroutable, so the
+    // host broadcasts it to every companion — polluting other
+    // collections' DOs with this collection's transfers.
+    let AssetTransfer::Transfer(t) = event;
+    emit::emit_event_keyed(0, t.policy.as_bytes(), &buf);
 }
 
 // ============================================================

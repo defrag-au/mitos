@@ -77,7 +77,10 @@ fn emit_cip25_mint(event: &Cip25Mint) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Key by policy hex so the host's SB6b interest filter fans this
+    // mint only to companions watching this policy (a keyless emission
+    // is broadcast to every companion — cross-policy pollution).
+    emit::emit_event_keyed(0, event.policy.as_bytes(), &buf);
 }
 
 fn handle_minted(m: &MintedEvent) {
