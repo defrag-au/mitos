@@ -556,10 +556,9 @@ fn typed_output_from_koios(entry: UtxoInfoEntry, level: DecodeLevel) -> TypedOut
 
     let datum = match level {
         DecodeLevel::Lean => None,
-        DecodeLevel::WithDatum | DecodeLevel::Full => datum_from_koios(
-            entry.datum_hash.as_deref(),
-            entry.inline_datum.as_ref(),
-        ),
+        DecodeLevel::WithDatum | DecodeLevel::Full => {
+            datum_from_koios(entry.datum_hash.as_deref(), entry.inline_datum.as_ref())
+        }
     };
 
     TypedOutput {
@@ -580,7 +579,10 @@ fn typed_output_from_koios(entry: UtxoInfoEntry, level: DecodeLevel) -> TypedOut
 /// Build a [`TypedDatum`] from a Koios output's datum fields. Prefers
 /// the inline datum's CBOR `bytes` (decoding `PlutusData`); falls back
 /// to a hash-only datum when only `datum_hash` is present.
-fn datum_from_koios(datum_hash: Option<&str>, inline: Option<&KoiosInlineDatum>) -> Option<TypedDatum> {
+fn datum_from_koios(
+    datum_hash: Option<&str>,
+    inline: Option<&KoiosInlineDatum>,
+) -> Option<TypedDatum> {
     // Inline datums arrive with the CBOR bytes but no explicit hash,
     // so we derive the hash (blake2b-256) from those bytes. Hash-only
     // outputs give us `datum_hash` directly but no preimage.
@@ -815,9 +817,15 @@ mod tests {
         assert!(json.contains("Foo #1"), "missing name value: {json}");
         assert!(json.contains("Background"), "missing trait key: {json}");
         assert!(json.contains("Blue"), "missing trait value: {json}");
-        assert!(json.contains("image/png"), "missing nested file field: {json}");
+        assert!(
+            json.contains("image/png"),
+            "missing nested file field: {json}"
+        );
         // Integer round-trips as a JSON number, not a string.
-        assert!(json.contains("\"edition\":1"), "edition not a number: {json}");
+        assert!(
+            json.contains("\"edition\":1"),
+            "edition not a number: {json}"
+        );
     }
 
     #[test]
