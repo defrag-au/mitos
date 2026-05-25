@@ -47,6 +47,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures_util::future::join_all;
+
 use cardano_assets::PolicyId;
 use mitos_data_plane::{AssetEntry, DecodeLevel, OutputRef, Resolution, TypedDatum, TypedOutput};
 use pallas_primitives::alonzo::AuxiliaryData;
@@ -57,11 +59,15 @@ use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_INFLIGHT: usize = 4;
 /// Max refs per Koios bulk POST. Koios rejects oversized bodies with
-/// `413 Request Entity Too Large` (observed at ~274 tx hashes), so the
-/// batch methods split their input into chunks of this size. 50 keeps
-/// each body well under the limit (~3.5 KB) while still collapsing a
-/// cold-start page into a handful of round-trips. A failed chunk is
-/// skipped, not fatal — the caller re-resolves its gaps individually.
+/// `413 Request Entity Too Large` — observed at BOTH 274 AND 150 hashes,
+/// but NOT at 50, so the per-request cap sits between 50 and 150 (well
+/// under the byte estimate — likely an array-length limit). 50 is the
+/// proven-safe value (a 10k one-tx-per-asset cold start ran it with 0×
+/// 413). Do NOT raise without re-testing the live API: an oversized
+/// chunk 413s, which drops the whole chunk to the per-asset fallback and
+/// triggers a 429 storm. The throughput lever for big old collections is
+/// the Koios PRO tier (250 req/10 s), not bigger chunks. A failed chunk
+/// is skipped, not fatal — the caller re-resolves its gaps.
 const KOIOS_BATCH_CHUNK: usize = 50;
 const MAX_ATTEMPTS: u32 = 5;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
@@ -330,44 +336,55 @@ impl KoiosProvider {
         &self,
         tx_hash_hexes: &[String],
     ) -> Result<HashMap<String, Vec<u8>>, KoiosError> {
+        // Chunk + POST concurrently (bounded by the inflight semaphore).
+        let partials: Vec<HashMap<String, Vec<u8>>> = join_all(
+            tx_hash_hexes
+                .chunks(KOIOS_BATCH_CHUNK)
+                .map(|chunk| async move {
+                    let mut m = HashMap::new();
+                    let body = TxMetadataRequest { tx_hashes: chunk };
+                    let bytes = match self
+                        .post_bytes_with_retries("/tx_metadata", &body, "tx_metadata")
+                        .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error = %e, chunk = chunk.len(), "Koios /tx_metadata chunk failed; skipping");
+                            return m;
+                        }
+                    };
+                    let entries: Vec<TxMetadataEntry> = match serde_json::from_slice(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Koios /tx_metadata chunk decode failed; skipping");
+                            return m;
+                        }
+                    };
+                    for entry in entries {
+                        let Some(metadata) = entry.metadata else {
+                            continue;
+                        };
+                        // Koios returns `metadata: {}` (or `null`) for txs
+                        // with no metadata; skip rather than encode empty.
+                        if metadata.as_object().is_none_or(|o| o.is_empty()) {
+                            continue;
+                        }
+                        match koios_metadata_to_aux_cbor(&metadata) {
+                            Some(aux_cbor) => {
+                                m.insert(entry.tx_hash, aux_cbor);
+                            }
+                            None => {
+                                tracing::debug!(tx = %entry.tx_hash, "Koios metadata re-encode produced nothing; skipping");
+                            }
+                        }
+                    }
+                    m
+                }),
+        )
+        .await;
         let mut out = HashMap::new();
-        for chunk in tx_hash_hexes.chunks(KOIOS_BATCH_CHUNK) {
-            let body = TxMetadataRequest { tx_hashes: chunk };
-            let bytes = match self
-                .post_bytes_with_retries("/tx_metadata", &body, "tx_metadata")
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(error = %e, chunk = chunk.len(), "Koios /tx_metadata chunk failed; skipping");
-                    continue;
-                }
-            };
-            let entries: Vec<TxMetadataEntry> = match serde_json::from_slice(&bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Koios /tx_metadata chunk decode failed; skipping");
-                    continue;
-                }
-            };
-            for entry in entries {
-                let Some(metadata) = entry.metadata else {
-                    continue;
-                };
-                // Koios returns `metadata: {}` (or `null`) for txs with no
-                // metadata; skip those rather than encode an empty map.
-                if metadata.as_object().is_none_or(|m| m.is_empty()) {
-                    continue;
-                }
-                match koios_metadata_to_aux_cbor(&metadata) {
-                    Some(aux_cbor) => {
-                        out.insert(entry.tx_hash, aux_cbor);
-                    }
-                    None => {
-                        tracing::debug!(tx = %entry.tx_hash, "Koios metadata re-encode produced nothing; skipping");
-                    }
-                }
-            }
+        for m in partials {
+            out.extend(m);
         }
         Ok(out)
     }
@@ -378,41 +395,48 @@ impl KoiosProvider {
         &self,
         hashes: &[String],
     ) -> Result<HashMap<String, Vec<u8>>, KoiosError> {
-        let mut out = HashMap::new();
-        for chunk in hashes.chunks(KOIOS_BATCH_CHUNK) {
-            let body = DatumInfoRequest {
-                datum_hashes: chunk,
-            };
-            let bytes = match self
-                .post_bytes_with_retries("/datum_info", &body, "datum_info")
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(error = %e, chunk = chunk.len(), "Koios /datum_info chunk failed; skipping");
-                    continue;
-                }
-            };
-            let entries: Vec<DatumInfoEntry> = match serde_json::from_slice(&bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Koios /datum_info chunk decode failed; skipping");
-                    continue;
-                }
-            };
-            for entry in entries {
-                let Some(hex_bytes) = entry.bytes else {
-                    continue;
+        let partials: Vec<HashMap<String, Vec<u8>>> =
+            join_all(hashes.chunks(KOIOS_BATCH_CHUNK).map(|chunk| async move {
+                let mut m = HashMap::new();
+                let body = DatumInfoRequest {
+                    datum_hashes: chunk,
                 };
-                match hex::decode(&hex_bytes) {
-                    Ok(cbor) => {
-                        out.insert(entry.datum_hash, cbor);
-                    }
+                let bytes = match self
+                    .post_bytes_with_retries("/datum_info", &body, "datum_info")
+                    .await
+                {
+                    Ok(b) => b,
                     Err(e) => {
-                        tracing::debug!(hash = %entry.datum_hash, error = %e, "Koios datum bytes hex decode failed; skipping");
+                        tracing::warn!(error = %e, chunk = chunk.len(), "Koios /datum_info chunk failed; skipping");
+                        return m;
+                    }
+                };
+                let entries: Vec<DatumInfoEntry> = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Koios /datum_info chunk decode failed; skipping");
+                        return m;
+                    }
+                };
+                for entry in entries {
+                    let Some(hex_bytes) = entry.bytes else {
+                        continue;
+                    };
+                    match hex::decode(&hex_bytes) {
+                        Ok(cbor) => {
+                            m.insert(entry.datum_hash, cbor);
+                        }
+                        Err(e) => {
+                            tracing::debug!(hash = %entry.datum_hash, error = %e, "Koios datum bytes hex decode failed; skipping");
+                        }
                     }
                 }
-            }
+                m
+            }))
+            .await;
+        let mut out = HashMap::new();
+        for m in partials {
+            out.extend(m);
         }
         Ok(out)
     }
@@ -425,41 +449,47 @@ impl KoiosProvider {
         orefs: &[OutputRef],
         level: DecodeLevel,
     ) -> Result<HashMap<(Hash<32>, u32), TypedOutput>, KoiosError> {
+        let partials: Vec<HashMap<(Hash<32>, u32), TypedOutput>> =
+            join_all(orefs.chunks(KOIOS_BATCH_CHUNK).map(|chunk| async move {
+                    let mut m = HashMap::new();
+                    let refs: Vec<String> = chunk
+                        .iter()
+                        .map(|o| format!("{}#{}", hex::encode(o.tx_hash), o.index))
+                        .collect();
+                    let body = UtxoInfoRequest {
+                        utxo_refs: &refs,
+                        extended: true,
+                    };
+                    let bytes = match self
+                        .post_bytes_with_retries("/utxo_info", &body, "utxo_info")
+                        .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error = %e, chunk = chunk.len(), "Koios /utxo_info chunk failed; skipping");
+                            return m;
+                        }
+                    };
+                    let entries: Vec<UtxoInfoEntry> = match serde_json::from_slice(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Koios /utxo_info chunk decode failed; skipping");
+                            return m;
+                        }
+                    };
+                    for entry in entries {
+                        let Some(tx_hash) = parse_hash32(&entry.tx_hash) else {
+                            tracing::debug!(tx = %entry.tx_hash, "Koios utxo_info tx_hash parse failed; skipping");
+                            continue;
+                        };
+                        m.insert((tx_hash, entry.tx_index), typed_output_from_koios(entry, level));
+                    }
+                    m
+                }))
+                .await;
         let mut out = HashMap::new();
-        for chunk in orefs.chunks(KOIOS_BATCH_CHUNK) {
-            let refs: Vec<String> = chunk
-                .iter()
-                .map(|o| format!("{}#{}", hex::encode(o.tx_hash), o.index))
-                .collect();
-            let body = UtxoInfoRequest {
-                utxo_refs: &refs,
-                extended: true,
-            };
-            let bytes = match self
-                .post_bytes_with_retries("/utxo_info", &body, "utxo_info")
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(error = %e, chunk = chunk.len(), "Koios /utxo_info chunk failed; skipping");
-                    continue;
-                }
-            };
-            let entries: Vec<UtxoInfoEntry> = match serde_json::from_slice(&bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Koios /utxo_info chunk decode failed; skipping");
-                    continue;
-                }
-            };
-            for entry in entries {
-                let Some(tx_hash) = parse_hash32(&entry.tx_hash) else {
-                    tracing::debug!(tx = %entry.tx_hash, "Koios utxo_info tx_hash parse failed; skipping");
-                    continue;
-                };
-                let key = (tx_hash, entry.tx_index);
-                out.insert(key, typed_output_from_koios(entry, level));
-            }
+        for m in partials {
+            out.extend(m);
         }
         Ok(out)
     }
