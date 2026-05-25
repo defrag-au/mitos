@@ -115,6 +115,39 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
     ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
         Ok(None)
     }
+
+    /// Resolve an asset's CIP-25 (label-721) metadata fully host-side:
+    /// `asset_state` → `tx_metadata(initial_tx)` → shared label-721
+    /// decode. Composed from this trait's own (forwarded) methods, so
+    /// every wrapper inherits it without a bespoke override AND reuses
+    /// the `tx_metadata` aux cache. Runs in the host so the wasm caller
+    /// pays no fuel for the aux-CBOR parse and no large aux crosses the
+    /// component boundary — see the fuel-trap follow-on in
+    /// `docs/design/COLLECTION_MODULES.md`.
+    async fn cip25_metadata(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::Cip25Resolution>> {
+        let Some(state) = self.asset_state(policy, asset_name).await? else {
+            return Ok(None);
+        };
+        let Some(mint_tx) = state.initial_tx else {
+            return Ok(None);
+        };
+        let Some(aux) = self.tx_metadata(&mint_tx).await? else {
+            return Ok(None);
+        };
+        let Some(metadata_json) =
+            cardano_assets::cip25::cip25_metadata_json(&aux, policy, asset_name)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(mitos_data_plane::Cip25Resolution {
+            metadata_json,
+            source_tx: hex::encode(mint_tx),
+        }))
+    }
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -614,5 +647,19 @@ impl DataPlaneFacade for CachingDataPlane {
 
     async fn tip(&self) -> mitos_data_plane::DataPlaneResult<mitos_data_plane::ChainTip> {
         self.inner.tip().await
+    }
+
+    /// Pass-through to the inner plane's dolos `AssetState` read.
+    /// Missing this override silently inherited the `DataPlaneFacade`
+    /// default (`Ok(None)`), which broke the CIP-25 facade: every
+    /// `resolve_cip25` got `None` for `asset_state` and emitted zero
+    /// entries. Not cached here — `AssetState` is cheap in-process
+    /// state, unlike the aux-data/datum tiers above.
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        self.inner.asset_state(policy, asset_name).await
     }
 }

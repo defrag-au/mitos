@@ -21,7 +21,7 @@ mod predicate;
 mod tip;
 mod tx_record;
 
-pub use asset_state::AssetMintState;
+pub use asset_state::{AssetMintState, Cip25Resolution};
 pub use chain_point::ChainPoint;
 pub use decode::DecodeLevel;
 pub use error::{DataPlaneError, DataPlaneResult};

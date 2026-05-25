@@ -1039,11 +1039,38 @@ where
         );
 
         // 2. Send Recapture + await RecaptureReady from each.
+        //
+        // A companion that doesn't ack in time (dead registration, or
+        // a cold/hibernated CF Durable Object slow to wake) must NOT
+        // abort the whole recapture — that lets one stale collection
+        // wedge every other collection's refill. Proceed with the
+        // companions that DID ack; the laggards converge on their next
+        // snapshot (re-emitted to all via the broadcast in step 4) or
+        // their next reconnect — snapshots are chain-point idempotent.
+        // Only hard transport errors (no subscribers, frame-send
+        // failure) abort.
         let ready = match dialer
             .recapture_module(id, reason.clone(), companion_timeout)
             .await
         {
             Ok(s) => s,
+            Err(crate::dialer::RecaptureError::Timeout {
+                ready_companions,
+                timed_out_companions,
+                ..
+            }) => {
+                tracing::warn!(
+                    module = %id,
+                    ready_count = ready_companions.len(),
+                    timed_out = ?timed_out_companions,
+                    "recapture: some companions didn't ack in time; proceeding with \
+                     bootstrap-refill for the rest (laggards converge on next snapshot)"
+                );
+                crate::dialer::RecaptureSummary {
+                    module: id.to_owned(),
+                    ready_companions,
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     module = %id,

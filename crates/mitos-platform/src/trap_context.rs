@@ -293,6 +293,20 @@ impl DataPlaneFacade for TrapContextLogger {
         // origin, which is acceptable for trap-replay debugging.
         self.inner.tip().await
     }
+
+    /// Pass-through to the wrapped plane's dolos `AssetState` read.
+    /// Without this override the wrapper inherited the
+    /// `DataPlaneFacade` default (`Ok(None)`) and short-circuited the
+    /// CIP-25 facade before reaching the real plane — every
+    /// `resolve_cip25` got `None`. Not captured in the trap fixture
+    /// (like `tip`).
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        self.inner.asset_state(policy, asset_name).await
+    }
 }
 
 /// Render a captured log as a TOML fixture matching the format

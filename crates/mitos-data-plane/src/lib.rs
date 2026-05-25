@@ -36,8 +36,9 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip, ConsumedEvent,
-    ConsumedInput, DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent, InterestPredicate,
+    AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip, Cip25Resolution,
+    ConsumedEvent, ConsumedInput, DataPlaneError, DataPlaneResult, DecodeLevel, DispatchEvent,
+    InterestPredicate,
     InterestSet, MintEntry, MintedEvent, OutputRef, OutputRefPattern, Page, PageRequest,
     ProducedEvent, ReferencedEvent, ReferencedInput, Resolution, RollbackEvent, ScriptLanguage,
     StakeCred, TickEvent, TxContextEvent, TxEventBatch, TxRecord, TypedDatum, TypedOutput,

@@ -28,3 +28,17 @@ pub struct AssetMintState {
     /// Net supply = total minted − total burned (`0` ⇒ fully burned).
     pub quantity: i128,
 }
+
+/// Fully-resolved CIP-25 metadata for one asset — the output of the
+/// host-side `cip25_metadata` resolver (asset_state → tx_metadata →
+/// label-721 decode). Computed in the host so the wasm module pays no
+/// fuel for the aux-CBOR parse and no large aux crosses the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cip25Resolution {
+    /// Label-721 metadata for this asset, rendered to the same JSON
+    /// wire shape the CIP-68 path produces.
+    pub metadata_json: String,
+    /// Hex of the mint tx the metadata came from (the asset's
+    /// `source_tx`).
+    pub source_tx: String,
+}

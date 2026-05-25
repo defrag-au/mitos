@@ -746,6 +746,7 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             .state()
             .read_entity_typed::<AssetState>(AssetState::NS, &key)
             .map_err(|e| DataPlaneError::Storage(format!("read_entity_typed(asset): {e:?}")))?;
+
         Ok(state.map(|s| crate::types::AssetMintState {
             initial_tx: s.initial_tx.map(|h| *h),
             initial_slot: s.initial_slot,

@@ -285,6 +285,15 @@ interface types {
         mint-tx-count: u64,
         metadata-tx: option<list<u8>>,
     }
+
+    /// Fully-resolved CIP-25 (label-721) metadata for one asset,
+    /// computed host-side (asset-state → tx-metadata → decode). The
+    /// module receives the small JSON directly, so it pays no fuel
+    /// for the aux-CBOR parse.
+    record cip25-metadata-result {
+        metadata-json: string,
+        source-tx: string,
+    }
 }
 
 /// Snapshot chain-state queries. Proxies into `mitos-data-plane`
@@ -294,8 +303,8 @@ interface types {
 /// deadweight — the host has dolos in process and the lookup is
 /// one redb call.
 interface chain-data {
-    use types.{output-ref, typed-output, typed-datum, tx-record, asset-mint-state, stake-cred,
-        utxo-page};
+    use types.{output-ref, typed-output, typed-datum, tx-record, asset-mint-state,
+        cip25-metadata-result, stake-cred, utxo-page};
 
     /// Bulk lookup of N output refs in one host call. Caller
     /// must pass a bounded chunk — pair it with one `utxo-page`
@@ -399,6 +408,15 @@ interface chain-data {
     /// backed) CIP-25 metadata payload. See `COLLECTION_MODULES.md`.
     asset-state: func(policy: list<u8>, asset-name: list<u8>)
                -> option<asset-mint-state>;
+
+    /// Resolve an asset's CIP-25 (label-721) metadata in one host
+    /// call: asset-state → tx-metadata(initial-tx) → label-721
+    /// decode, all host-side. Preferred over composing `asset-state`
+    /// + `tx-metadata` + a wasm-side decoder for cold-start scans:
+    /// the heavy aux-CBOR parse runs in the host (no wasm fuel) and
+    /// the large aux never crosses the component boundary.
+    cip25-metadata: func(policy: list<u8>, asset-name: list<u8>)
+                  -> option<cip25-metadata-result>;
 
     /// Full TX rollup — single call returns every component a
     /// module might need: inputs (with prior outputs and

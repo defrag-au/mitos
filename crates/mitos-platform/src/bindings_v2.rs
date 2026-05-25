@@ -43,7 +43,8 @@ pub use mitos::platform_v2::state_kv::Host as StateKvHost;
 // `crate::bindings_v2::DispatchEvent` without an explicit
 // re-export here.
 pub use mitos::platform_v2::types::{
-    AssetEntry, AssetId, AssetMintState, ChainPoint, ConsumedEvent, ConsumedInput,
+    AssetEntry, AssetId, AssetMintState, ChainPoint, Cip25MetadataResult, ConsumedEvent,
+    ConsumedInput,
     Host as TypesHost, MintEntry, MintedEvent, OutputRef, ProducedEvent, ReferencedEvent,
     ReferencedInput, RollbackEvent, SpecificPoint, StakeCred, TickEvent, TxContextEvent, TxRecord,
     TypedDatum, TypedOutput, UtxoEvent, UtxoPage, ValidityInterval,

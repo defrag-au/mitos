@@ -622,12 +622,14 @@ dependencies = [
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=01ad0b70089fccdbb05c3905335fa2983848ee05#01ad0b70089fccdbb05c3905335fa2983848ee05"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d547c95c94a52bba618328ea7bf3b4474589abf1#d547c95c94a52bba618328ea7bf3b4474589abf1"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
  "hex",
  "indexmap 2.14.0",
+ "pallas-codec 1.0.0-alpha.6",
+ "pallas-primitives 1.0.0-alpha.6",
  "serde",
  "serde_json",
  "serde_plain",
@@ -4284,7 +4286,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pipeline-types"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=01ad0b70089fccdbb05c3905335fa2983848ee05#01ad0b70089fccdbb05c3905335fa2983848ee05"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d547c95c94a52bba618328ea7bf3b4474589abf1#d547c95c94a52bba618328ea7bf3b4474589abf1"
 dependencies = [
  "cardano-assets",
  "hex",
@@ -6311,7 +6313,7 @@ dependencies = [
 [[package]]
 name = "tx_insights"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=01ad0b70089fccdbb05c3905335fa2983848ee05#01ad0b70089fccdbb05c3905335fa2983848ee05"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d547c95c94a52bba618328ea7bf3b4474589abf1#d547c95c94a52bba618328ea7bf3b4474589abf1"
 dependencies = [
  "cardano-assets",
  "serde",
@@ -6704,7 +6706,7 @@ dependencies = [
 [[package]]
 name = "wasm_safe_serde"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=01ad0b70089fccdbb05c3905335fa2983848ee05#01ad0b70089fccdbb05c3905335fa2983848ee05"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d547c95c94a52bba618328ea7bf3b4474589abf1#d547c95c94a52bba618328ea7bf3b4474589abf1"
 dependencies = [
  "serde",
  "serde_json",

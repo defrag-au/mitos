@@ -221,21 +221,21 @@ fn is_cip68_user_token(asset_name: &[u8]) -> bool {
 /// Resolve a plain (CIP-25) asset's mint-time metadata to JSON.
 ///
 /// CIP-25 metadata lives only in the mint transaction's aux-data
-/// (label 721) — there is no current-state datum. We find the mint
-/// TX via dolos `AssetState.initial_tx` (the `asset-state` host-fn,
-/// retained across the archive horizon), read its aux-data via
-/// `tx_metadata` (dolos archive, Maestro fallback for pruned blocks),
-/// and decode label 721 for this asset with the shared
-/// `cardano_assets::cip25` decoder — the same decoder `cip-25-mint`
-/// uses, so cold-start and live emit byte-identical `metadata_json`.
-/// Returns `(metadata_json, source_tx_hex)`, or `None` if the mint TX
-/// or its label-721 entry can't be resolved.
+/// (label 721) — there is no current-state datum. The `cip25-metadata`
+/// host-fn does the whole resolution host-side (dolos
+/// `AssetState.initial_tx` → `tx_metadata` → shared label-721 decode,
+/// the same decoder `cip-25-mint` uses) and returns just the small
+/// JSON, so the cold-start scan pays no wasm fuel for the aux-CBOR
+/// parse and the large mint-tx aux never crosses the boundary. Returns
+/// `(metadata_json, source_tx_hex)`, or `None` if the mint TX or its
+/// label-721 entry can't be resolved.
 fn resolve_cip25(policy: &[u8], asset_name: &[u8]) -> Option<(String, String)> {
-    let state = chain_data::asset_state(policy, asset_name)?;
-    let mint_tx = state.initial_tx?;
-    let aux = chain_data::tx_metadata(&mint_tx)?;
-    let metadata_json = cardano_assets::cip25::cip25_metadata_json(&aux, policy, asset_name)?;
-    Some((metadata_json, hex::encode(&mint_tx)))
+    // Single host-fn: the host does asset_state → tx_metadata →
+    // label-721 decode and returns just the small JSON, so the
+    // cold-start scan pays no wasm fuel for the aux-CBOR parse (and
+    // the large mint-tx aux never crosses the component boundary).
+    let r = chain_data::cip25_metadata(policy, asset_name)?;
+    Some((r.metadata_json, r.source_tx))
 }
 
 /// Decode a CIP-68 datum (PlutusData Constructor 0). Returns

@@ -167,6 +167,22 @@ impl ChainDataHost for HostStateV2 {
         Ok(state.map(asset_mint_state_to_wit))
     }
 
+    async fn cip25_metadata(
+        &mut self,
+        policy: Vec<u8>,
+        asset_name: Vec<u8>,
+    ) -> wasmtime::Result<Option<bindings_v2::Cip25MetadataResult>> {
+        let resolution = self
+            .data_plane
+            .cip25_metadata(&policy, &asset_name)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(resolution.map(|r| bindings_v2::Cip25MetadataResult {
+            metadata_json: r.metadata_json,
+            source_tx: r.source_tx,
+        }))
+    }
+
     async fn read_tx(
         &mut self,
         tx_hash: Vec<u8>,
