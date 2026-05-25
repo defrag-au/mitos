@@ -171,6 +171,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                 self.handle_recapture_post(req, channel).await
             }
             (Method::Post, "/_internal/wake") => self.handle_wake().await,
+            (Method::Post, "/_internal/teardown") => self.handle_interest_teardown().await,
             (Method::Get, "/api/_health") => self.handle_health(),
             (Method::Get, "/api/_meta") => self.handle_meta(),
             (Method::Get, "/api/_interest") => self.handle_interest_list(),
@@ -666,6 +667,41 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             value: payload.value,
             channel,
         })
+    }
+
+    /// `POST /_internal/teardown` — full companion teardown, called
+    /// from the dApp's DO-reset path when a collection is removed.
+    /// Removes EVERY local interest row and pushes a `Remove` to the
+    /// host for each, so the host drops the policy from each subscribed
+    /// module's scan-interest (and its shards) and — once a
+    /// registration's interest set goes empty — deletes the companion
+    /// record. Without this, a removed collection's host record
+    /// survives and the host's startup reconcile re-routes it into the
+    /// scan-interest, resurrecting (and re-cold-starting) a collection
+    /// the dApp already dropped. Idempotent: a second call finds no
+    /// rows and no-ops. Host pushes are best-effort — local SQL is
+    /// cleared regardless, and the host converges on the now-empty
+    /// record at its next reconcile.
+    async fn handle_interest_teardown(&self) -> worker::Result<Response> {
+        let sql = self.state.storage().sql();
+        let rows = crate::interest::list_interests(&sql)?;
+        let count = rows.len();
+        for row in &rows {
+            if let Err(e) = self
+                .push_interest_mutation(InterestOp::Remove, &row.kind, &row.value, &row.channel)
+                .await
+            {
+                tracing::warn!(
+                    kind = %row.kind,
+                    value = %row.value,
+                    error = %e,
+                    "teardown: host interest-remove push failed; clearing local row anyway",
+                );
+            }
+            crate::interest::remove_interest(&sql, &row.kind, &row.value, &row.channel)?;
+        }
+        tracing::info!(removed = count, "companion teardown complete");
+        Response::ok(format!("{{\"torn_down\":{count}}}"))
     }
 
     /// Translate one `(kind, value, channel)` interest mutation

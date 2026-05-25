@@ -297,10 +297,30 @@ async fn interest_mutation_handler(
     // shape-valid.
     for (module, path, mut req) in registrations.iter().cloned() {
         apply_mutation_to_set(&mut req.interests, mutation.op, &mutation.items);
-        let buf = req
-            .encode()
-            .map_err(|e| InterestMutationError::Io(format!("encode {module}: {e}")))?;
-        write_atomic(&path, &buf).map_err(|e| InterestMutationError::Io(e.to_string()))?;
+        if req.interests.is_empty() {
+            // Teardown: the last interest was removed (the dApp dropped
+            // this collection). DELETE the registration rather than
+            // persisting an empty record, so the host's startup
+            // reconcile (`dialer.start_all`, which re-routes reloaded
+            // companions' interest into the module scan-interest) can't
+            // resurrect — and re-cold-start — a collection that's gone.
+            // The follower's live filter is cleared by the
+            // `route_interest_mutation(Remove)` below.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(InterestMutationError::Io(format!(
+                        "remove emptied registration {module}: {e}"
+                    )));
+                }
+            }
+        } else {
+            let buf = req
+                .encode()
+                .map_err(|e| InterestMutationError::Io(format!("encode {module}: {e}")))?;
+            write_atomic(&path, &buf).map_err(|e| InterestMutationError::Io(e.to_string()))?;
+        }
     }
 
     // Propagate to each running follower's in-memory filter so

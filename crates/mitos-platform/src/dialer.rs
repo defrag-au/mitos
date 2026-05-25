@@ -394,6 +394,11 @@ impl CompanionDialer {
             // is a `<companion_key>.cbor`. Skip the reserved
             // `.unreachable/` quarantine dir + any leftover flat
             // `.cbor` files that survived migration.
+            //
+            // Accumulate every reloaded companion's interest for THIS
+            // module; a single union `Add` after the walk reconciles the
+            // module scan-interest in one mutation (see below).
+            let mut module_interests: Vec<mitos_protocol::Interest> = Vec::new();
             for entry in read.flatten() {
                 let path = entry.path();
                 let file_type = match entry.file_type() {
@@ -424,12 +429,55 @@ impl CompanionDialer {
                         continue;
                     }
                     match load_companion(&cpath) {
-                        Ok(req) => self.register(req).await,
+                        Ok(req) => {
+                            // Accumulate this companion's interest for the
+                            // single union `Add` routed after the walk (see
+                            // below) — collected here, applied once per
+                            // module to avoid re-triggering the module's
+                            // cold-start machinery per companion.
+                            for i in &req.interests {
+                                if !module_interests.contains(i) {
+                                    module_interests.push(i.clone());
+                                }
+                            }
+                            self.register(req).await;
+                        }
                         Err(e) => {
                             warn!(path = %cpath.display(), error = %e, "load companion failed")
                         }
                     }
                 }
+            }
+
+            // Reconcile THIS module's scan-interest from the union of its
+            // reloaded companions. `register` above only restores the
+            // per-companion FANOUT interest; the module's SCAN-interest
+            // (walked by cold-start + recapture via `utxos_by_policy`,
+            // persisted in module state-kv via `update_interest`) is
+            // updated only by routing a mutation into the follower — what
+            // `subscribe_handler` does, but reload skipped. A companion
+            // whose policy never entered the scan-interest (a subscribe
+            // that raced/predated interest-routing) otherwise stays
+            // stranded across EVERY restart: fanout re-registered but the
+            // scan set never updated, so cold-start + recapture skip it
+            // and it never captures (CO1). One union `Add` per module
+            // self-heals — already-tracked policies are idempotent no-ops,
+            // only a genuinely-missing policy cold-starts.
+            if !module_interests.is_empty()
+                && let Err(e) = self
+                    .route_interest_mutation(
+                        &module_id,
+                        mitos_protocol::InterestOp::Add,
+                        module_interests,
+                    )
+                    .await
+            {
+                warn!(
+                    module = %module_id,
+                    error = %e,
+                    "start_all: reconciling module scan-interest from reloaded \
+                     companions failed; fanout-interest still registered",
+                );
             }
         }
     }
