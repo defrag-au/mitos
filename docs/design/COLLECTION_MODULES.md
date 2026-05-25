@@ -1,6 +1,6 @@
 # Collection Modules — Holders & Metadata
 
-> **Status: Phase 1 shipped (2026-05-20). Phases 2–5 pending.** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives. **Target dispatch model: platform v2** ([`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md)) — both modules consume interest-filtered `produced` / `consumed` events per TX, not block-iteration. Bootstrap, backfill, and tip dispatch flow through the same path on v2.
+> **Status: Phase 1 shipped (2026-05-20); Phase 2 (`collection-metadata`, CIP-68) shipped; Phase 4 worker cutover live on dev (2026-05-22); Phase 3 (CIP-25 facade) designed below — revised 2026-05-24 to a Dolos `AssetState`-based mint-tx lookup; Phase 5 (native mint-by-policy index) deferred as unnecessary.** Proposes two peer community modules — `collection-holders` and `collection-metadata` — that together replace Maestro as the bootstrap data source for `cnft.dev-workers`'s `collection-ownership` worker and provide forward-looking primitives for a future trading-card-game (TCG) consumer. Companion to [`COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md`](../../../cnft.dev-workers/docs/design/COLLECTION_OWNERSHIP_MITOS_INTEGRATION.md), which scopes the worker-side migration; this doc scopes the module-side primitives. **Target dispatch model: platform v2** ([`MITOS_PLATFORM_V2.md`](../strategy/MITOS_PLATFORM_V2.md)) — both modules consume interest-filtered `produced` / `consumed` events per TX, not block-iteration. Bootstrap, backfill, and tip dispatch flow through the same path on v2.
 >
 > **Phase 1 shipped at `community-modules/collection-holders/`** (event types in `mitos-community-events::collection_holders`), with four golden fixtures under `tests/fixtures/`: `cip68-pair-mint-mekka`, `cold-start-mixed-holders`, `cip25-single-mint-perp`, `cip68-datum-update-noop`. Mitos-run gained a `by_policy` index in the fixture data plane to support cold-start tests for holder-shaped modules. **Outstanding Phase 1 follow-ups:** `HolderRef::Script.label` lookup via `address-registry` (deferred per Resolved Decision #3); FT-classified policy hard-reject; 48-hour live acceptance test against a deployed mitos host.
 
@@ -316,16 +316,16 @@ pub enum MetadataEvent {
 3. Build `MetadataEntry` per discovered ref token
 4. Emit `MetadataSnapshot`
 
-**Cold-start — CIP-25 path (historical, may require Maestro fallback):**
+**Cold-start — CIP-25 path (mint TX resolved from Dolos asset state):**
 
 1. Call `chain_data::utxos_by_policy(X)` → derive the set of currently-held `asset_name_hex` values from the typed outputs. This is the set of assets whose metadata we need.
-2. Resolve `asset_name → mint_tx_hash` via the module-internal Maestro path (`/policy/{id}/assets` catalog + per-asset `/assets/{id}/txs?type=mint`). The data plane's existing `MaestroClient` is the call site; rate-limit envelope is shared.
+2. For each `asset_name`, look up its **mint TX hash** from Dolos's per-asset `AssetState` ledger (`initial_tx`) via a new `chain_data::asset_state` host-fn (see *Data plane surface* below). This is Dolos-native and **retained across the archive horizon** — `AssetState` is *state*, not archive, so the pointer survives even when the mint block body is pruned. Verified 2026-05-24: `initial_tx` is populated even for assets minted long before the node's Mithril-snapshot bootstrap point (a Feb-2025 Black Flag asset resolved its real Feb-2025 mint TX on a node bootstrapped at ~May 2026). **No Maestro call is needed to *find* the mint TX.**
 3. For each `(asset_name, mint_tx_hash)`:
-   - Call `chain_data::tx_metadata(tx_hash)` — tiered: Dolos archive first, `MaestroFallbackPlane` via `fetch_aux_data` for TXs past the horizon
-   - Decode the CBOR aux-data payload, extract `[721][policy_hex][asset_name]` → `CanonicalMetadata`
+   - Call `chain_data::tx_metadata(mint_tx_hash)` — tiered: `IndexerDataCache` → Dolos archive → `MaestroFallbackPlane` via `fetch_aux_data` for TXs whose block is past the horizon
+   - Decode the CBOR aux-data payload, extract `[721][policy_hex][asset_name]` → `CanonicalMetadata`, using the **same decoder the live `cip-25-mint` path uses** so cold-start and live emit byte-identical `metadata_json` (no bitmap churn on the consumer)
 4. Emit `MetadataSnapshot`
 
-Both `tx_metadata` (data plane API at `lib.rs:241`) and `MaestroFallbackPlane` (UTxO fallback at `crates/mitos-platform/src/maestro_fallback_plane.rs`) are already in place. The only platform-side work for the CIP-25 path is verifying that `MaestroClient::fetch_aux_data` returns aux-data CBOR including the CIP-25 (`721`) label across all known Maestro response shapes.
+Why `AssetState.initial_tx` rather than a Maestro asset catalog: Dolos already records per-asset mint provenance (`initial_tx`, `initial_slot`, `mint_tx_count`, net `quantity`, and a CIP-25/CIP-68-aware `metadata_tx`) in its always-on `AssetState` ledger (`dolos-cardano` `roll/assets.rs`, namespace `"assets"`). We use `initial_tx` (always populated) rather than `metadata_tx` (may be null for pre-bootstrap assets). The **only** residual Maestro dependency is fetching the raw aux-data CBOR for mint TXs whose block is past the horizon — and that self-shrinks over time, because `IndexerDataCache` proactively harvests aux-data from every block mitos applies, so any CIP-25 mint observed live is cached permanently (zero Maestro for anything minted after mitos began caching). `tx_metadata` (`lib.rs:241`) and `MaestroFallbackPlane` (`crates/mitos-platform/src/maestro_fallback_plane.rs`) are already in place; the only verification still owed is that `MaestroClient::fetch_aux_data` returns aux-data CBOR including the CIP-25 (`721`) label across all known Maestro response shapes.
 
 **Cold-start — Hybrid (policy uses both, common during CIP-25→CIP-68 migrations):**
 
@@ -356,7 +356,7 @@ For large CIP-25 collections, **snapshot emission is the dominant cost**. Chunki
 
 ### Edge cases
 
-- **Historical CIP-25 collection past archive horizon.** Mint TXs are pruned from Dolos. Maestro fallback resolves via `fetch_aux_data`. Bootstrap cost: 1 Maestro call per asset_name (N+1 against a 10k collection = real cost, but bounded and one-time per policy). Subsequent state lives in `metadata_ledger`; no re-fetch needed.
+- **Historical CIP-25 collection past archive horizon.** The mint TX *hash* is still resolvable from Dolos `AssetState.initial_tx` (state survives pruning), so finding the TX costs nothing. The mint *block body* is gone, so `tx_metadata` falls back to Maestro `fetch_aux_data` for the raw aux-data CBOR. Bootstrap cost: ≤1 Maestro call per asset_name, bounded and one-time per policy, and only for assets minted before mitos began caching — `IndexerDataCache`'s per-block aux-data harvest means anything minted since is already local (zero Maestro). Subsequent state lives in the metadata ledger; no re-fetch needed.
 - **Mint TX metadata is malformed.** Some CIP-25 mints have non-spec-compliant metadata. Module emits `Initial` with whatever can be parsed; logs a warning. Consumer decides whether to drop or accept partials.
 - **CIP-68 ref token rotated to new policy.** Rare. Treated as Burn under old policy + Initial under new — symmetric with mint/burn semantics.
 - **CIP-68 datum points at off-chain data (URI in metadata).** Module captures the URI verbatim. Following the URI is consumer-side (e.g. archivist preservation workflow).
@@ -371,16 +371,13 @@ What's already available (verified 2026-05-21 against `crates/mitos-data-plane/s
 |---|---|---|
 | `chain_data::utxos_by_policy(policy_id) -> Vec<OutputRef>` | both | `lib.rs:129` — exists (`holder-distribution` uses it) |
 | `chain_data::read_utxos(refs) -> Vec<(OutputRef, TypedOutput)>` | both | `lib.rs:81` — exists with Maestro fallback via `MaestroFallbackPlane` |
-| `chain_data::tx_metadata(tx_hash) -> Option<Vec<u8>>` | `collection-metadata` | `lib.rs:241` — **already shipped**, returns CBOR aux-data payload (CIP-25 metadata at label 721 is decoded by the module) |
+| `chain_data::tx_metadata(tx_hash) -> Option<Vec<u8>>` | `collection-metadata` | `lib.rs:241` — **already shipped**, returns CBOR aux-data payload; tiered through `IndexerDataCache` → Dolos archive → Maestro `fetch_aux_data` |
 
 What still needs to land for the CIP-25 historical bootstrap path:
 
-**Mint-TX resolution for currently-held assets.** Given a `policy_id` and the set of currently-held `asset_name_hex` values (derivable from `utxos_by_policy` + `read_utxos`), we need to find each asset's mint TX hash so we can call `tx_metadata` against it. Two implementation paths, neither requiring a new host-fn:
+**One new host-fn: per-asset mint provenance from Dolos state.** Add `chain_data::asset_state(policy, asset_name) -> Option<AssetState>` (or a narrower `mint_tx_for_asset(policy, asset_name) -> Option<(tx_hash, slot)>`) that reads Dolos's `AssetState` entity — namespace `"assets"`, key `hash(policy ‖ asset_name)`, defined in `dolos-cardano` `model/assets.rs` and populated by the always-on `AssetStateVisitor` in `roll/assets.rs`. It exposes `initial_tx`/`initial_slot` (the mint TX), `mint_tx_count`, net `quantity` (mint − burn; `0` ⇒ fully burned), and `metadata_tx`. Wiring is the standard chain-data pattern: WIT `world.wit` → `bindings_v2` → `ChainDataPlane` trait (`mitos-data-plane/src/lib.rs`) → `LocalDataPlane` impl reading the Dolos state entity → `host_fns_v2/chain_data.rs` binding. **No new `MaestroClient` method is required** — the existing `tx_metadata` fallback supplies the bytes.
 
-1. **Module-internal Maestro enumeration.** The module calls Maestro's `/policy/{id}/assets` (catalog) and `/assets/{id}/txs?type=mint` (or equivalent) via the data plane's existing Maestro client, builds the `asset_name → mint_tx_hash` map, then runs `tx_metadata` per mint TX. The Maestro client and its rate-limit envelope (`MAESTRO_MAX_INFLIGHT`) are already in place; this just calls them.
-2. **Native Dolos mint-by-policy index.** Add a `mint_history_by_policy` host-fn backed by a Dolos index. Defer until cold-start performance dictates; module-internal path works fine for tens-of-thousands-of-asset collections.
-
-Option 1 is the right Phase 3 default. No new host-fn proposal. The module-internal pattern is consistent with how `holder-distribution` derives ledger state from `utxos_by_policy` results without needing the platform to surface a "holder ledger" primitive.
+This **supersedes** the earlier (pre-2026-05-24) plan of resolving `asset_name → mint_tx_hash` via Maestro catalog enumeration (`/policy/{id}/assets` + `/assets/{id}/txs?type=mint`). That plan was an N+1 Maestro dependency and relied on Maestro endpoints that aren't wrapped in `MaestroClient` today; the Dolos `AssetState` path is native, horizon-proof (verified — see *Cold-start — CIP-25 path*), and needs no Maestro to *find* the TX. The native `mint_history_by_policy` index (Phase 5) stays deferred and is now unnecessary for this purpose — `AssetState` already carries the per-asset mint pointer. (Per-*policy* enumeration of the asset set still comes from `utxos_by_policy`; `AssetState` is keyed per-asset, not a per-policy feed.)
 
 ### Interest model
 
@@ -401,9 +398,9 @@ A core principle of this design: **workers do not call Maestro directly.** Mitos
 | Current UTxO set for policy | `chain_data::utxos_by_policy` (Dolos `BY_POLICY` index) | None — always current |
 | UTxO content (address, value, datum hash) | `chain_data::read_utxos` (Dolos) | `/transactions/{tx}/outputs/{idx}/txo` |
 | CIP-25 mint metadata (recent) | `chain_data::tx_metadata` from Dolos aux-data archive | None needed |
-| CIP-25 mint metadata (historical, past archive horizon) | — | `/transactions/{tx}/metadata` via `MaestroClient::fetch_aux_data` |
+| CIP-25 mint metadata (historical, past archive horizon) | — | `/transactions/{tx}/cbor` via `MaestroClient::fetch_aux_data` |
 | CIP-68 ref-token datum | `chain_data::read_utxos` (current UTxO state) | None — always current |
-| Asset catalog for policy (`mint_history_by_policy`) | (proposed) Dolos mint index or aux fallback | `/policy/{id}/assets` (phase-1 fallback) |
+| Asset set + per-asset mint TX for policy | `utxos_by_policy` (asset set) + `asset_state.initial_tx` (Dolos `AssetState`, mint pointer) | None — both Dolos-native and horizon-proof; the old `/policy/{id}/assets` catalog fallback is no longer needed |
 
 ### Why centralise the fallback
 
@@ -414,7 +411,7 @@ A core principle of this design: **workers do not call Maestro directly.** Mitos
 
 ### Cost shape
 
-The cost concern with Maestro-mediated bootstrap is the per-asset metadata fetch for historical CIP-25 collections. Order-of-magnitude:
+The cost concern with Maestro-mediated bootstrap is the per-asset metadata *byte* fetch for historical CIP-25 collections (finding each mint TX is free via Dolos `AssetState.initial_tx`; only the aux-data CBOR of pre-horizon, pre-cache mints is fetched). Order-of-magnitude:
 
 - 10k-supply collection past archive horizon → up to 10k Maestro aux-data fetches at cold-start
 - With `MAESTRO_MAX_INFLIGHT=4` and ~200ms per call → ~8 minutes wall time, fully sequenced

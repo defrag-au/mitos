@@ -36,3 +36,7 @@ minicbor = { version = "0.20", features = ["std"] }
 # `metadata_json` wire field (matches the `cip-25-mint`
 # precedent).
 serde_json = "1"
+# CIP-25 (label-721) resolution moved host-side: the module calls the
+# `cip25-metadata` host-fn (asset_state → tx_metadata → decode all in
+# the host), so it no longer needs the wasm-side `cardano-assets::cip25`
+# decoder. Keeps cold-start scans off the wasm fuel budget.

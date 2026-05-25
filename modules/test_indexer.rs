@@ -79,7 +79,7 @@ impl Guest for Module {
         Ok(())
     }
 
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         // No-op: the test fixture's refill comes from the host's
         // manifest bootstrap. Present so the module satisfies the
         // `mitos-module-v2` world's `rebootstrap` export. One

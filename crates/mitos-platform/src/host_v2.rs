@@ -29,12 +29,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap_v2::{interest_from_manifest, run_bootstrap};
-use crate::driver_v2::DriverV2;
 use crate::follower_v2::run_chain_follower_v2;
 use crate::host_fns::{DataPlaneFacade, emit, state_kv};
 use crate::registry_v2::{ModuleRegistryV2, ResourceBudget};
 use crate::storage::ModuleStorage;
-use crate::trap_context::{TrapContextLogger, write_fixture};
 use crate::{PlatformError, PlatformResult};
 
 // ============================================================================
@@ -358,84 +356,6 @@ where
         }
     }
 
-    /// Instantiate the module artifact, run `init`, and wrap it
-    /// in a `DriverV2`. Factored out of `start` so the recapture
-    /// rebootstrap loop can rebuild the instance after a
-    /// retryable trap (Approach A, `WASM_BUDGET_CHUNKING.md`):
-    /// a fresh instance re-inits its `ReentrantRound` from the
-    /// durable state-kv cursor, cleanly restarting the trapped
-    /// predicate from page 0 — no partial-fold from the trapped
-    /// attempt survives.
-    ///
-    /// `seed_page`: when `Some`, the fresh instance's adaptive
-    /// sizer starts at that page — the shrunk size carried from
-    /// the trapped instance — instead of the default.
-    ///
-    /// Returns the driver plus the instance's `TrapContextLogger`
-    /// (the follower needs the logger matching its instance). An
-    /// `init` trap writes a replay fixture and surfaces as `Err`.
-    async fn instantiate_driver(
-        &self,
-        id: &str,
-        registry: &ModuleRegistryV2,
-        caching_plane: Arc<dyn DataPlaneFacade>,
-        config: &[u8],
-        sink: emit::EventSink,
-        seed_page: Option<u32>,
-    ) -> PlatformResult<(DriverV2, Arc<TrapContextLogger>)> {
-        let kv = (self.kv_factory)(id);
-        let trap_logger = Arc::new(TrapContextLogger::new(caching_plane));
-
-        let mut instance = registry
-            .instantiate(trap_logger.clone(), kv, sink, self.budget)
-            .await?;
-
-        // Carry a shrunk page from a trapped instance into the
-        // fresh sizer, before any guest call.
-        if let Some(page) = seed_page {
-            instance.store.data_mut().adaptive_mut().seed_current(page);
-        }
-
-        instance.store.set_fuel(self.budget.init_fuel)?;
-        // Clear the per-call OOM flag so an `init` trap classifies
-        // against this call only.
-        instance.store.data_mut().limiter_mut().reset_call();
-        if let Err(e) = instance
-            .bindings
-            .call_init(&mut instance.store, config)
-            .await
-        {
-            // Classify the trap — `init` is a heavy bootstrap
-            // call, so OOM (`cabi_realloc`) is a real outcome and
-            // must be told apart from a fuel exhaustion or a
-            // module logic fault. See `crate::budget`.
-            let trap =
-                crate::budget::TrapClass::classify(&e, instance.store.data().limiter().hit_oom());
-            let peak_memory = instance.store.data().limiter().peak_memory_bytes();
-            let snap = trap_logger.snapshot();
-            let path = self.storage.last_trap_path(id);
-            match write_fixture(&snap, id, &path) {
-                Ok(()) => tracing::error!(
-                    module = %id,
-                    trap = %trap,
-                    peak_memory_bytes = peak_memory,
-                    fixture = %path.display(),
-                    "v2 init trapped; fixture written for local replay (mitos-run --fixture)",
-                ),
-                Err(write_err) => tracing::warn!(
-                    module = %id,
-                    trap = %trap,
-                    peak_memory_bytes = peak_memory,
-                    error = %write_err,
-                    "v2 init trapped; failed to write trap fixture",
-                ),
-            }
-            return Err(PlatformError::Wasmtime(e));
-        }
-
-        Ok((DriverV2::new(instance, self.budget), trap_logger))
-    }
-
     /// Start (or restart) the v2 module. Mirrors v1's
     /// `ModuleHost::start` shape: stop existing slot if any →
     /// instantiate → init (with refuel + trap-context capture)
@@ -478,8 +398,11 @@ where
             .current_wasm_path(id)?
             .ok_or_else(|| PlatformError::Decode(format!("no current.wasm for {id}")))?;
 
-        let registry =
-            ModuleRegistryV2::load_from_path(self.engine.clone(), id.to_owned(), &wasm_path)?;
+        let registry = Arc::new(ModuleRegistryV2::load_from_path(
+            self.engine.clone(),
+            id.to_owned(),
+            &wasm_path,
+        )?);
 
         let (sink, events_rx) = (self.emitter_factory)();
 
@@ -502,32 +425,44 @@ where
                 None
             }
         };
-        let maestro_opt = crate::maestro::MaestroClient::shared();
-        if maestro_opt.is_some() {
-            tracing::info!(module = %id, "Maestro aux_data fallback enabled");
+        let fallback_opt = crate::fallback::shared();
+        if fallback_opt.is_some() {
+            tracing::info!(module = %id, "chain-data fallback provider enabled");
         }
-        let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
-            crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt, maestro_opt),
-        );
+        let caching_plane: Arc<dyn DataPlaneFacade> =
+            Arc::new(crate::host_fns::CachingDataPlane::new(
+                self.data_plane.clone(),
+                cache_opt,
+                fallback_opt.clone(),
+            ));
         let config = self.storage.read_config(id)?.unwrap_or_default();
 
-        // Instantiate + `init` + wrap in a driver. Factored into
-        // `instantiate_driver` so the recapture rebootstrap loop
-        // below can rebuild the instance after a retryable trap
-        // (Approach A, `WASM_BUDGET_CHUNKING.md`). The
-        // trap-context logger is per-instance — `trap_logger` is
-        // `mut` so the follower gets the one matching its
-        // (possibly re-instantiated) driver.
-        let (mut driver, mut trap_logger) = self
-            .instantiate_driver(
-                id,
-                &registry,
-                caching_plane.clone(),
-                &config,
-                sink.clone(),
-                None,
-            )
-            .await?;
+        // The backfill plane (`COLD_START_TRAP_ISOLATION.md`): a factory
+        // that builds fresh, *disposable* instances for unbounded
+        // cold-start work — recapture rebootstrap here, onboard
+        // cold-starts in the follower. It shares the live `sink` (so
+        // backfill snapshots land on the same drain task) and state-kv
+        // (a shared `Arc<Database>` per module), so a disposable
+        // instance's output reaches companions and the live instance
+        // sees the refilled state.
+        let backfill = crate::backfill_v2::BackfillFactory {
+            module_id: id.to_owned(),
+            registry: registry.clone(),
+            caching_plane: caching_plane.clone(),
+            config: config.clone(),
+            sink: sink.clone(),
+            kv_factory: self.kv_factory.clone(),
+            storage: self.storage.clone(),
+            budget: self.budget,
+        };
+
+        // Live dispatch instance — born clean and never runs unbounded
+        // backfill work (Fix D, the two-plane split). All cold-start /
+        // recapture scans run on the backfill plane's disposable
+        // instances, so a scan trap can never poison this instance and
+        // brick live holder tracking. The trap-context logger is
+        // per-instance; the follower gets the one matching this driver.
+        let (mut driver, trap_logger) = backfill.instantiate(None).await?;
 
         // Bootstrap: hydrate state at watched addresses
         // declared in the manifest's `[interest]` section.
@@ -598,147 +533,29 @@ where
         // (their refill is `run_bootstrap` above). Only the
         // recapture flow passes `rebootstrap = true`.
         //
-        // `rebootstrap` is re-entrant at the *page* grain
-        // (`WASM_BUDGET_CHUNKING.md`): one call does one bounded
-        // page of the module's cold-start scan and reports a
-        // `RebootstrapStep` — `done` plus an `ingested` UTxO
-        // count. A page fits one fuel budget; a whole large
-        // policy does not, so the host loops, refuelling each
-        // call, until a step comes back `done`. `rebootstrap_count`
-        // sums `ingested` across steps — the real count of UTxOs
-        // re-scanned — and is surfaced as the recapture's
-        // `events_emitted`.
+        // This runs on a DISPOSABLE backfill instance, NOT the live
+        // `driver` above (Fix D, `COLD_START_TRAP_ISOLATION.md`): the
+        // cold-start scan is unbounded and may trap, and a trap poisons
+        // the wasm instance — so it must never touch the instance that
+        // becomes the live follower. The pump re-instantiates +
+        // recycles internally to grind a large policy to completion
+        // without exhausting a fixed re-instantiation budget.
         let mut rebootstrap_count: u64 = 0;
         if rebootstrap {
             let rebootstrap_started = std::time::Instant::now();
-            let mut rebootstrap_outcome = "partial";
-            // Defensive bound — a well-behaved module drains a
-            // finite scan; the cap only guards a module that
-            // never returns `done`. Counts host calls (pages),
-            // not UTxOs.
-            const REBOOTSTRAP_MAX_STEPS: u64 = 10_000_000;
-            // A retryable trap re-instantiates the module and
-            // retries at a smaller page (Approach A). Bounded so
-            // a module that traps even at the minimum page can't
-            // loop forever.
-            const REBOOTSTRAP_MAX_REINSTANTIATIONS: u32 = 6;
-            let mut steps: u64 = 0;
-            let mut reinstantiations: u32 = 0;
-            loop {
-                match driver.call_rebootstrap().await {
-                    Ok(Ok(step)) => {
-                        rebootstrap_count += step.ingested;
-                        steps += 1;
-                        if step.done {
-                            rebootstrap_outcome = "completed";
-                            break;
-                        }
-                        if steps >= REBOOTSTRAP_MAX_STEPS {
-                            tracing::error!(
-                                module = %id,
-                                steps,
-                                "v2 rebootstrap exceeded step cap; aborting loop",
-                            );
-                            break;
-                        }
-                    }
-                    Ok(Err(msg)) => {
-                        rebootstrap_outcome = "failed";
-                        tracing::error!(
-                            module = %id,
-                            error = %msg,
-                            "v2 rebootstrap returned an error",
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        // A trap during a `rebootstrap` page.
-                        // `OutOfFuel`/`OutOfMemory` are retryable:
-                        // the page overran the per-call budget,
-                        // and `call_rebootstrap` already shrank
-                        // the adaptive sizer. Re-instantiate
-                        // carrying the smaller page — the fresh
-                        // instance re-inits its `ReentrantRound`
-                        // from the durable predicate cursor, a
-                        // clean restart of the trapped predicate —
-                        // and retry. `Timeout`/`Fault` are not
-                        // resize-retryable; abort.
-                        let trap = driver.classify_trap(&e);
-                        match trap {
-                            crate::budget::TrapClass::OutOfFuel
-                            | crate::budget::TrapClass::OutOfMemory => {
-                                let retry_page = driver.adaptive_page_limit();
-                                reinstantiations += 1;
-                                if reinstantiations > REBOOTSTRAP_MAX_REINSTANTIATIONS {
-                                    tracing::error!(
-                                        module = %id,
-                                        trap = %trap,
-                                        "v2 rebootstrap: still trapping at the minimum page \
-                                         after repeated retries; refill may be partial",
-                                    );
-                                    break;
-                                }
-                                tracing::warn!(
-                                    module = %id,
-                                    trap = %trap,
-                                    peak_memory_bytes = driver.peak_memory_bytes(),
-                                    retry_page,
-                                    "v2 rebootstrap page trapped; re-instantiating + retrying \
-                                     at a smaller page",
-                                );
-                                match self
-                                    .instantiate_driver(
-                                        id,
-                                        &registry,
-                                        caching_plane.clone(),
-                                        &config,
-                                        sink.clone(),
-                                        Some(retry_page),
-                                    )
-                                    .await
-                                {
-                                    Ok((d, tl)) => {
-                                        driver = d;
-                                        trap_logger = tl;
-                                    }
-                                    Err(re) => {
-                                        tracing::error!(
-                                            module = %id,
-                                            error = %re,
-                                            "v2 rebootstrap: re-instantiate after trap \
-                                             failed; refill may be partial",
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                            crate::budget::TrapClass::Timeout | crate::budget::TrapClass::Fault => {
-                                tracing::error!(
-                                    module = %id,
-                                    trap = %trap,
-                                    peak_memory_bytes = driver.peak_memory_bytes(),
-                                    error = %e,
-                                    "v2 rebootstrap trapped; refill may be partial",
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if rebootstrap_count > 0 {
-                tracing::info!(
-                    module = %id,
-                    utxos_ingested = rebootstrap_count,
-                    adaptive_page_limit = driver.adaptive_page_limit(),
-                    "v2 rebootstrap complete",
-                );
-            }
+            // Recapture = full re-scan of every tracked policy,
+            // ignoring any pending onboard scope.
+            let result = crate::backfill_v2::run_rebootstrap_pump(
+                &backfill,
+                crate::bindings_v2::RebootstrapMode::Full,
+            )
+            .await;
+            rebootstrap_count = result.ingested;
             if let Some(ring) = self.event_ring.get() {
                 ring.record(
                     id,
                     crate::events::EventKind::RebootstrapCompleted {
-                        utxos_ingested: rebootstrap_count,
+                        utxos_ingested: result.ingested,
                     },
                 );
             }
@@ -747,9 +564,9 @@ where
                     id.to_owned(),
                     LastResult {
                         kind: "rebootstrap",
-                        utxos_ingested: rebootstrap_count,
+                        utxos_ingested: result.ingested,
                         duration_ms: rebootstrap_started.elapsed().as_millis() as u64,
-                        outcome: rebootstrap_outcome,
+                        outcome: result.outcome,
                         at_unix: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
@@ -776,7 +593,7 @@ where
         let chain_plane: Arc<crate::maestro_fallback_plane::MaestroFallbackPlane<P>> =
             Arc::new(crate::maestro_fallback_plane::MaestroFallbackPlane::new(
                 self.chain_plane.clone(),
-                crate::maestro::MaestroClient::shared(),
+                fallback_opt,
             ));
         let follower_storage = self.storage.clone();
         let follower_module_id = id.to_owned();
@@ -818,6 +635,7 @@ where
                 follower_trap_logger,
                 follower_event_ring,
                 follower_chunked_cold_start,
+                backfill,
             )
             .await;
             match &result {
@@ -1039,11 +857,38 @@ where
         );
 
         // 2. Send Recapture + await RecaptureReady from each.
+        //
+        // A companion that doesn't ack in time (dead registration, or
+        // a cold/hibernated CF Durable Object slow to wake) must NOT
+        // abort the whole recapture — that lets one stale collection
+        // wedge every other collection's refill. Proceed with the
+        // companions that DID ack; the laggards converge on their next
+        // snapshot (re-emitted to all via the broadcast in step 4) or
+        // their next reconnect — snapshots are chain-point idempotent.
+        // Only hard transport errors (no subscribers, frame-send
+        // failure) abort.
         let ready = match dialer
             .recapture_module(id, reason.clone(), companion_timeout)
             .await
         {
             Ok(s) => s,
+            Err(crate::dialer::RecaptureError::Timeout {
+                ready_companions,
+                timed_out_companions,
+                ..
+            }) => {
+                tracing::warn!(
+                    module = %id,
+                    ready_count = ready_companions.len(),
+                    timed_out = ?timed_out_companions,
+                    "recapture: some companions didn't ack in time; proceeding with \
+                     bootstrap-refill for the rest (laggards converge on next snapshot)"
+                );
+                crate::dialer::RecaptureSummary {
+                    module: id.to_owned(),
+                    ready_companions,
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     module = %id,

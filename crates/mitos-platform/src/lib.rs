@@ -45,6 +45,7 @@
 //! consumer needed v1 dispatch.
 
 pub mod admin;
+pub mod backfill_v2;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
 pub mod budget;
@@ -55,6 +56,7 @@ pub mod driver_v2;
 pub mod emissions;
 pub mod event_bindings;
 pub mod events;
+pub mod fallback;
 pub mod follower_v2;
 pub mod host_fns;
 pub mod host_fns_v2;
@@ -62,6 +64,7 @@ pub mod host_v2;
 pub mod indexer_bridge;
 pub mod indexer_data_cache;
 pub mod inspect;
+pub mod koios;
 pub mod lag_tolerant;
 pub mod maestro;
 pub mod maestro_fallback_plane;

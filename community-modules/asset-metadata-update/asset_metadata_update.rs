@@ -149,7 +149,15 @@ fn emit_event(event: &AssetMetadataUpdate) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Key by policy hex so the host's SB6b interest filter fans this
+    // update only to companions watching this policy (a keyless
+    // emission is broadcast to every companion — cross-policy
+    // pollution). Both variants carry the policy.
+    let policy = match event {
+        AssetMetadataUpdate::Cip25 { policy, .. } => policy,
+        AssetMetadataUpdate::Cip68 { policy, .. } => policy,
+    };
+    emit::emit_event_keyed(0, policy.as_bytes(), &buf);
 }
 
 fn resolve_datum_bytes(d: &DatumPayload) -> Option<Vec<u8>> {
@@ -668,7 +676,7 @@ impl Guest for Module {
     /// `run_bootstrap` over the manifest `[interest]`. See the
     /// `rebootstrap` export in `wit-v2/world.wit`. One call,
     /// immediately `done`.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,
             ingested: 0,

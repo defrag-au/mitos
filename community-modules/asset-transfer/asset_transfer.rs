@@ -169,7 +169,13 @@ fn emit_transfer(event: &AssetTransfer) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Key the emission by policy hex so the host fans it only to
+    // companions interested in this policy (the SB6b interest filter in
+    // `route_emission`). A keyless `emit_event` is unroutable, so the
+    // host broadcasts it to every companion — polluting other
+    // collections' DOs with this collection's transfers.
+    let AssetTransfer::Transfer(t) = event;
+    emit::emit_event_keyed(0, t.policy.as_bytes(), &buf);
 }
 
 // ============================================================
@@ -232,7 +238,7 @@ impl Guest for Module {
     /// `run_bootstrap` over the manifest `[interest]`. See the
     /// `rebootstrap` export in `wit-v2/world.wit`. One call,
     /// immediately `done`.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,
             ingested: 0,

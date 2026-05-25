@@ -293,6 +293,29 @@ impl DataPlaneFacade for TrapContextLogger {
         // origin, which is acceptable for trap-replay debugging.
         self.inner.tip().await
     }
+
+    /// Pass-through to the wrapped plane's dolos `AssetState` read.
+    /// Without this override the wrapper inherited the
+    /// `DataPlaneFacade` default (`Ok(None)`) and short-circuited the
+    /// CIP-25 facade before reaching the real plane — every
+    /// `resolve_cip25` got `None`. Not captured in the trap fixture
+    /// (like `tip`).
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
+        self.inner.asset_state(policy, asset_name).await
+    }
+
+    /// Forward to the wrapped plane so the batched aux-cache warm
+    /// reaches `CachingDataPlane`'s override. Without this forward the
+    /// wrapper would inherit the slow serial default — same forwarding
+    /// requirement that bit `asset_state` above. Not captured in the
+    /// trap fixture (a cache warm, no per-call replay value).
+    async fn prefetch_tx_metadata(&self, tx_hashes: &[[u8; 32]]) {
+        self.inner.prefetch_tx_metadata(tx_hashes).await;
+    }
 }
 
 /// Render a captured log as a TOML fixture matching the format

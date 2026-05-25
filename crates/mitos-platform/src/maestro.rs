@@ -465,3 +465,41 @@ fn aux_from_tx_cbor(cbor: &[u8]) -> Option<Vec<u8>> {
         }
     }
 }
+
+/// Maestro as a [`crate::fallback::FallbackProvider`]. Maestro has no
+/// native batch endpoint, so the batch methods use the trait's
+/// default bounded-concurrency fan-out — throttled further by
+/// Maestro's own inflight semaphore. Maps `MaestroError` →
+/// `FallbackError` (call sites only log the message). The inherent
+/// methods are called explicitly so the trait method bodies don't
+/// resolve back onto themselves.
+#[async_trait::async_trait]
+impl crate::fallback::FallbackProvider for MaestroClient {
+    async fn fetch_aux_data(
+        &self,
+        tx_hash_hex: &str,
+    ) -> Result<Option<Vec<u8>>, crate::fallback::FallbackError> {
+        MaestroClient::fetch_aux_data(self, tx_hash_hex)
+            .await
+            .map_err(|e| crate::fallback::FallbackError(e.to_string()))
+    }
+
+    async fn fetch_output(
+        &self,
+        oref: &OutputRef,
+        level: DecodeLevel,
+    ) -> Result<Option<TypedOutput>, crate::fallback::FallbackError> {
+        MaestroClient::fetch_output(self, oref, level)
+            .await
+            .map_err(|e| crate::fallback::FallbackError(e.to_string()))
+    }
+
+    async fn fetch_datum(
+        &self,
+        datum_hash_hex: &str,
+    ) -> Result<Option<Vec<u8>>, crate::fallback::FallbackError> {
+        MaestroClient::fetch_datum(self, datum_hash_hex)
+            .await
+            .map_err(|e| crate::fallback::FallbackError(e.to_string()))
+    }
+}

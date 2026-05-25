@@ -15,7 +15,7 @@
 
 use async_trait::async_trait;
 use cardano_assets::PolicyId;
-use dolos_cardano::model::{DATUM_NS, DatumState};
+use dolos_cardano::model::{AssetState, DATUM_NS, DatumState, FixedNamespace};
 use dolos_core::{
     ArchiveStore, ChainPoint, Domain, EntityKey, EraCbor, IndexStore, StateStore, TxoRef,
 };
@@ -726,6 +726,34 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
             }
         }
         Ok(addresses.len() as u64)
+    }
+
+    async fn asset_state(
+        &self,
+        policy: &[u8],
+        asset_name: &[u8],
+    ) -> DataPlaneResult<Option<crate::types::AssetMintState>> {
+        // Key into dolos's per-asset `AssetState` ledger:
+        // blake2b-256(policy ‖ asset_name), matching the key the
+        // `AssetStateVisitor` writes (dolos-cardano `model/assets.rs`).
+        // This is *state*, so the pointers survive archive pruning.
+        let mut hasher = pallas::crypto::hash::Hasher::<256>::new();
+        hasher.input(policy);
+        hasher.input(asset_name);
+        let key = EntityKey::from(hasher.finalize());
+        let state = self
+            .domain
+            .state()
+            .read_entity_typed::<AssetState>(AssetState::NS, &key)
+            .map_err(|e| DataPlaneError::Storage(format!("read_entity_typed(asset): {e:?}")))?;
+
+        Ok(state.map(|s| crate::types::AssetMintState {
+            initial_tx: s.initial_tx.map(|h| *h),
+            initial_slot: s.initial_slot,
+            mint_tx_count: s.mint_tx_count,
+            metadata_tx: s.metadata_tx.map(|h| *h),
+            quantity: i128::from_be_bytes(s.quantity_bytes),
+        }))
     }
 
     async fn tip(&self) -> DataPlaneResult<ChainTip> {

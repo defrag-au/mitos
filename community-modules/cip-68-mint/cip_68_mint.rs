@@ -137,7 +137,10 @@ fn emit_cip68_mint(event: &Cip68Mint) {
         );
         return;
     }
-    emit::emit_event(0, &buf);
+    // Key by policy hex so the host's SB6b interest filter fans this
+    // mint only to companions watching this policy (a keyless emission
+    // is broadcast to every companion — cross-policy pollution).
+    emit::emit_event_keyed(0, event.policy.as_bytes(), &buf);
 }
 
 /// Resolve datum bytes. If the produced event carried inline
@@ -441,7 +444,7 @@ impl Guest for Module {
     /// `run_bootstrap` over the manifest `[interest]`. See the
     /// `rebootstrap` export in `wit-v2/world.wit`. One call,
     /// immediately `done`.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,
             ingested: 0,

@@ -132,6 +132,25 @@ interface types {
         ingested: u64,
     }
 
+    /// Which job the host is asking `rebootstrap` to do. Makes the
+    /// onboard-vs-recapture intent EXPLICIT rather than inferring it
+    /// from whether a scoped onboard set happens to be present —
+    /// the old implicit convention meant an empty scope was read as
+    /// "scan everything" by the recapture caller but should mean
+    /// "nothing to do" for the onboard caller, so a no-op onboard
+    /// (e.g. a boot-time interest re-assert) silently became a full
+    /// re-scan of every tracked policy.
+    enum rebootstrap-mode {
+        /// Cold-start only the policies seeded into the onboard
+        /// scope by the most recent `update-interest` add. An empty
+        /// scope is a no-op (`done: true, ingested: 0`) — NEVER a
+        /// full scan. Driven by the follower after a subscribe.
+        onboard,
+        /// Re-scan every tracked policy, ignoring the onboard
+        /// scope. Driven by the host recapture flow.
+        full,
+    }
+
     // ============================================================
     // Event variants
     // ============================================================
@@ -270,6 +289,30 @@ interface types {
         /// `tx-metadata` returns. `None` when no aux-data.
         aux-data: option<list<u8>>,
     }
+
+    /// Per-asset mint provenance projected from dolos's always-on
+    /// `AssetState` ledger. This is *state*, not archive — the
+    /// pointers survive the archive horizon even after the minting
+    /// block body is pruned. `initial-tx` is the mint transaction
+    /// (for CIP-25, the tx carrying label-721 metadata); pair it
+    /// with `tx-metadata` to read the payload. `metadata-tx` is the
+    /// tx dolos flagged as carrying the asset's metadata (CIP-25
+    /// label 721 / CIP-68 label 100). Hashes are 32-byte `list<u8>`.
+    record asset-mint-state {
+        initial-tx: option<list<u8>>,
+        initial-slot: option<u64>,
+        mint-tx-count: u64,
+        metadata-tx: option<list<u8>>,
+    }
+
+    /// Fully-resolved CIP-25 (label-721) metadata for one asset,
+    /// computed host-side (asset-state → tx-metadata → decode). The
+    /// module receives the small JSON directly, so it pays no fuel
+    /// for the aux-CBOR parse.
+    record cip25-metadata-result {
+        metadata-json: string,
+        source-tx: string,
+    }
 }
 
 /// Snapshot chain-state queries. Proxies into `mitos-data-plane`
@@ -279,7 +322,8 @@ interface types {
 /// deadweight — the host has dolos in process and the lookup is
 /// one redb call.
 interface chain-data {
-    use types.{output-ref, typed-output, typed-datum, tx-record, stake-cred, utxo-page};
+    use types.{output-ref, typed-output, typed-datum, tx-record, asset-mint-state,
+        cip25-metadata-result, stake-cred, utxo-page};
 
     /// Bulk lookup of N output refs in one host call. Caller
     /// must pass a bounded chunk — pair it with one `utxo-page`
@@ -371,6 +415,39 @@ interface chain-data {
     /// for callers that have a hash but not the containing
     /// UTxO context (rare).
     datum-by-hash: func(hash: list<u8>) -> option<list<u8>>;
+
+    /// Per-asset mint provenance from dolos's `AssetState` ledger:
+    /// the mint TX (`initial-tx`), the metadata-bearing TX
+    /// (`metadata-tx`), and the mint count. `policy` is the 28-byte
+    /// policy id; `asset-name` is the raw on-chain asset name (no
+    /// CIP-67 prefix handling). `None` when the asset is unknown to
+    /// dolos state. Unlike `tx-metadata` this is *state*, not
+    /// archive, so the mint pointer survives pruning — pair with
+    /// `tx-metadata(initial-tx)` to read the (possibly Maestro-
+    /// backed) CIP-25 metadata payload. See `COLLECTION_MODULES.md`.
+    asset-state: func(policy: list<u8>, asset-name: list<u8>)
+               -> option<asset-mint-state>;
+
+    /// Resolve an asset's CIP-25 (label-721) metadata in one host
+    /// call: asset-state → tx-metadata(initial-tx) → label-721
+    /// decode, all host-side. Preferred over composing `asset-state`
+    /// + `tx-metadata` + a wasm-side decoder for cold-start scans:
+    /// the heavy aux-CBOR parse runs in the host (no wasm fuel) and
+    /// the large aux never crosses the component boundary.
+    cip25-metadata: func(policy: list<u8>, asset-name: list<u8>)
+                  -> option<cip25-metadata-result>;
+
+    /// Batch form of `cip25-metadata` for a whole cold-start page.
+    /// Returns a list parallel to `asset-names` (one entry each,
+    /// `none` where unresolved). The host resolves each asset's mint
+    /// tx (`asset-state`), then **prefetches the distinct mint txs'
+    /// metadata in one provider call** (warming the aux cache) before
+    /// decoding — so a page of N assets costs ~1 fallback round-trip
+    /// instead of N serial ones. Use this from a page-oriented
+    /// cold-start instead of calling `cip25-metadata` per asset.
+    /// See `docs/design/FALLBACK_PROVIDER_AND_BATCH_PREFETCH.md`.
+    cip25-metadata-batch: func(policy: list<u8>, asset-names: list<list<u8>>)
+                        -> list<option<cip25-metadata-result>>;
 
     /// Full TX rollup — single call returns every component a
     /// module might need: inputs (with prior outputs and
@@ -502,7 +579,7 @@ interface interest {
 }
 
 world mitos-module-v2 {
-    use types.{trap-strategy, retry-policy, dispatch-event, rebootstrap-step};
+    use types.{trap-strategy, retry-policy, dispatch-event, rebootstrap-step, rebootstrap-mode};
     use interest.{interest-op};
 
     import chain-data;
@@ -569,5 +646,5 @@ world mitos-module-v2 {
     /// cold-start scan is spread across many calls. The host
     /// sums `ingested` and surfaces it as the recapture's
     /// `events_emitted`.
-    export rebootstrap: func() -> result<rebootstrap-step, string>;
+    export rebootstrap: func(mode: rebootstrap-mode) -> result<rebootstrap-step, string>;
 }

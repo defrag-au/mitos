@@ -618,7 +618,7 @@ impl Guest for Module {
     /// `run_bootstrap` over the manifest `[interest]`
     /// (`payment_credentials` → `utxos_by_payment_cred`). One
     /// call, immediately `done`.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,
             ingested: 0,

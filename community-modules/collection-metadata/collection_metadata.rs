@@ -206,6 +206,38 @@ fn cip68_ref_token_suffix(asset_name: &[u8]) -> Option<&[u8]> {
     Some(&asset_name[CIP68_REF_TOKEN_PREFIX.len()..])
 }
 
+/// CIP-67 label `222` byte prefix — a CIP-68 *user* token (the NFT
+/// half of a CIP-68 pair). Its metadata lives on the paired
+/// `000643b0` reference token, so the CIP-25 facade skips it.
+/// 4 bytes: `0x00 0x0d 0xe1 0x40`.
+const CIP68_USER_TOKEN_PREFIX: [u8; 4] = [0x00, 0x0d, 0xe1, 0x40];
+
+/// Whether `asset_name` is a CIP-68 user token (label 222).
+fn is_cip68_user_token(asset_name: &[u8]) -> bool {
+    asset_name.len() >= CIP68_USER_TOKEN_PREFIX.len()
+        && &asset_name[..CIP68_USER_TOKEN_PREFIX.len()] == CIP68_USER_TOKEN_PREFIX.as_slice()
+}
+
+/// Resolve a plain (CIP-25) asset's mint-time metadata to JSON.
+///
+/// CIP-25 metadata lives only in the mint transaction's aux-data
+/// (label 721) — there is no current-state datum. The `cip25-metadata`
+/// host-fn does the whole resolution host-side (dolos
+/// `AssetState.initial_tx` → `tx_metadata` → shared label-721 decode,
+/// the same decoder `cip-25-mint` uses) and returns just the small
+/// JSON, so the cold-start scan pays no wasm fuel for the aux-CBOR
+/// parse and the large mint-tx aux never crosses the boundary. Returns
+/// `(metadata_json, source_tx_hex)`, or `None` if the mint TX or its
+/// label-721 entry can't be resolved.
+fn resolve_cip25(policy: &[u8], asset_name: &[u8]) -> Option<(String, String)> {
+    // Single host-fn: the host does asset_state → tx_metadata →
+    // label-721 decode and returns just the small JSON, so the
+    // cold-start scan pays no wasm fuel for the aux-CBOR parse (and
+    // the large mint-tx aux never crosses the component boundary).
+    let r = chain_data::cip25_metadata(policy, asset_name)?;
+    Some((r.metadata_json, r.source_tx))
+}
+
 /// Decode a CIP-68 datum (PlutusData Constructor 0). Returns
 /// `(metadata_json, version, standard)` on success, `None` if
 /// the CBOR doesn't match the spec.
@@ -293,8 +325,7 @@ fn plutus_to_json_value(pd: &PlutusData) -> Result<serde_json::Value, String> {
                     Value::String(raw.to_string())
                 }
             }
-            pallas_primitives::BigInt::BigUInt(b)
-            | pallas_primitives::BigInt::BigNInt(b) => {
+            pallas_primitives::BigInt::BigUInt(b) | pallas_primitives::BigInt::BigNInt(b) => {
                 Value::String(format!("0x{}", hex::encode(&**b)))
             }
         },
@@ -442,6 +473,9 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
             &format!("dropped metadata shards for untracked policy {policy_hex}"),
         );
     }
+    // Also evict removed policies from any pending onboard scope so a
+    // dropped orphan can't be re-scanned by the next onboard pump.
+    drop_from_onboard_scope(&removed);
 
     // Cold-start each newly-added policy via the budget-safe chunked
     // `rebootstrap` pump rather than an inline single-fuel scan. The
@@ -457,17 +491,19 @@ fn apply_interest_update(op: InterestOp, items_cbor: &[u8]) {
 }
 
 /// Record `added` policies as the scope for the next `rebootstrap`
-/// pump. Merges with any still-pending scope (rapid successive adds
-/// all cold-start) and resets the durable cursor + in-process driver
-/// so the pump restarts cleanly over the scoped set.
+/// onboard pump. REPLACES (not merges) any still-pending scope, and
+/// resets the durable cursor + in-process driver so the pump restarts
+/// cleanly over exactly this set.
+///
+/// Replace, not merge: onboards run sequentially (the host follower
+/// awaits each pump before processing the next interest update), so
+/// there is no concurrent add to preserve — and replacing prevents a
+/// never-completing policy (e.g. an oversized collection whose pump
+/// always gives up "partial", so the scope is never cleared on `done`)
+/// from wedging itself into the scope and being re-scanned on every
+/// future add.
 fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
-    let mut scope: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_default();
-    for p in added {
-        let v = p.to_vec();
-        if !scope.contains(&v) {
-            scope.push(v);
-        }
-    }
+    let mut scope: Vec<Vec<u8>> = added.iter().map(|p| p.to_vec()).collect();
     scope.sort_unstable();
     let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
     if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
@@ -475,6 +511,33 @@ fn seed_onboard_scope(added: &[[u8; HASH_BYTES]]) {
     }
     state_kv::delete_value(KV_REBOOTSTRAP_CURSOR);
     REBOOTSTRAP_DRIVER.with(|c| *c.borrow_mut() = None);
+}
+
+/// Drop `removed` policies from any pending onboard scope. Called on
+/// `Remove`/`Replace` so an untracked policy (e.g. an orphan dropped
+/// by the boot-time `Replace` reconcile) can't linger in the scope and
+/// get re-scanned by the next onboard pump. Deletes the scope key
+/// entirely once empty.
+fn drop_from_onboard_scope(removed: &[[u8; HASH_BYTES]]) {
+    if removed.is_empty() {
+        return;
+    }
+    let Some(mut scope) = read_onboard_scope() else {
+        return;
+    };
+    let before = scope.len();
+    scope.retain(|p| !removed.iter().any(|r| r.as_slice() == p.as_slice()));
+    if scope.len() == before {
+        return;
+    }
+    if scope.is_empty() {
+        state_kv::delete_value(KV_ONBOARD_PREDICATES);
+    } else {
+        let mut buf = Vec::with_capacity(8 + scope.len() * (HASH_BYTES + 2));
+        if ciborium::ser::into_writer(&scope, &mut buf).is_ok() {
+            state_kv::set_value(KV_ONBOARD_PREDICATES, &buf);
+        }
+    }
 }
 
 /// Decode the pending onboard scope (policies a subscribe-time Add
@@ -582,6 +645,38 @@ fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>
         datum_idx.insert((r.tx_hash.clone(), r.index), i);
     }
 
+    // Pre-pass: collect this page's plain-token (CIP-25) asset names
+    // and resolve their label-721 metadata in ONE batched host call.
+    // The host prefetches the DISTINCT mint txs' aux-data in a single
+    // fallback-provider round-trip (warming the cache), so a page of N
+    // CIP-25 assets costs ~1 provider call instead of N serial ones —
+    // the cold-start speedup. See
+    // `docs/design/FALLBACK_PROVIDER_AND_BATCH_PREFETCH.md`.
+    let mut cip25_names: Vec<Vec<u8>> = Vec::new();
+    for (_oref, output) in utxos.iter() {
+        for asset in &output.assets {
+            if asset.asset.policy != policy {
+                continue;
+            }
+            let name = &asset.asset.name;
+            if cip68_ref_token_suffix(name).is_some() || is_cip68_user_token(name) {
+                continue;
+            }
+            cip25_names.push(name.clone());
+        }
+    }
+    cip25_names.sort_unstable();
+    cip25_names.dedup();
+    let mut cip25_map: BTreeMap<Vec<u8>, (String, String)> = BTreeMap::new();
+    if !cip25_names.is_empty() {
+        let results = chain_data::cip25_metadata_batch(policy, &cip25_names);
+        for (name, res) in cip25_names.iter().zip(results) {
+            if let Some(r) = res {
+                cip25_map.insert(name.clone(), (r.metadata_json, r.source_tx));
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for (oref, output) in utxos.iter() {
         let datum_opt = datum_idx
@@ -592,36 +687,66 @@ fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>
             if asset.asset.policy != policy {
                 continue;
             }
-            let Some(suffix) = cip68_ref_token_suffix(&asset.asset.name) else {
-                continue;
-            };
-            // Resolve the datum bytes. Inline datums arrive with a
-            // populated `payload`; hash-only datums (common — many
-            // minters store the CIP-68 datum by hash rather than
-            // inline in the ref UTxO) arrive payload-empty and need
-            // the `datum_by_hash` fallback. Same resolver as the live
-            // `handle_produced` path so cold-start/rebootstrap have
+            let name = &asset.asset.name;
+            // CIP-68 reference token: metadata is in its inline /
+            // hash-resolved datum. Inline datums arrive with a populated
+            // `payload`; hash-only datums (common) arrive payload-empty
+            // and need the `datum_by_hash` fallback. Same resolver as the
+            // live `handle_produced` path so cold-start/rebootstrap have
             // identical coverage.
-            let Some(datum) = datum_opt else { continue };
-            let Some(datum_bytes) = resolve_datum_bytes(datum) else {
+            if let Some(suffix) = cip68_ref_token_suffix(name) {
+                let Some(datum) = datum_opt else { continue };
+                let Some(datum_bytes) = resolve_datum_bytes(datum) else {
+                    continue;
+                };
+                let Some((metadata_json, version, standard)) = decode_cip68_datum(&datum_bytes)
+                else {
+                    continue;
+                };
+                let entry = MetadataEntry {
+                    asset_name_hex: hex::encode(suffix),
+                    metadata_json,
+                    standard,
+                    version,
+                    immutable: false,
+                    source_tx: hex::encode(&oref.tx_hash),
+                };
+                out.push((
+                    suffix.to_vec(),
+                    StoredEntry {
+                        entry,
+                        datum_hash: datum.hash.clone(),
+                    },
+                ));
                 continue;
-            };
-            let Some((metadata_json, version, standard)) = decode_cip68_datum(&datum_bytes) else {
+            }
+            // CIP-68 user token (label 222) — metadata lives on its ref
+            // token (handled above); skip to avoid a wasted CIP-25 lookup
+            // that would find no label-721 entry.
+            if is_cip68_user_token(name) {
+                continue;
+            }
+            // Plain token → CIP-25 facade. Resolve mint-time label-721
+            // metadata via dolos `AssetState.initial_tx` + the shared
+            // decoder. Keyed by the FULL asset name (no prefix strip);
+            // the consumer keys CIP-25 by the bare name and CIP-68 by
+            // `000de140`+suffix, discriminating on the `standard` field.
+            let Some((metadata_json, source_tx)) = cip25_map.get(name).cloned() else {
                 continue;
             };
             let entry = MetadataEntry {
-                asset_name_hex: hex::encode(suffix),
-                metadata_json,
-                standard,
-                version,
-                immutable: false,
-                source_tx: hex::encode(&oref.tx_hash),
+                asset_name_hex: hex::encode(name),
+                metadata_json: Some(metadata_json),
+                standard: MetadataStandard::Cip25,
+                version: 1,
+                immutable: true,
+                source_tx,
             };
             out.push((
-                suffix.to_vec(),
+                name.to_vec(),
                 StoredEntry {
                     entry,
-                    datum_hash: datum.hash.clone(),
+                    datum_hash: Vec::new(),
                 },
             ));
         }
@@ -650,6 +775,11 @@ struct TxBuffer {
     /// here without a matching `produced_refs` entry at flush
     /// time is a burn.
     consumed_refs: BTreeSet<([u8; HASH_BYTES], Vec<u8>)>,
+    /// `(policy, full_asset_name)` set of produced **plain** tokens
+    /// (no CIP-67 prefix) — CIP-25 NFT candidates. A first sighting at
+    /// flush resolves mint-time label-721 metadata and emits `Initial`;
+    /// CIP-25 is immutable, so there's no Updated/Burned.
+    produced_plain: BTreeSet<([u8; HASH_BYTES], Vec<u8>)>,
 }
 
 fn slot_from_cursor(c: &crate::mitos::platform_v2::types::ChainPoint) -> u64 {
@@ -667,30 +797,34 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.slot == 0 {
         buf.slot = slot_from_cursor(&p.cursor);
     }
-    let Some(datum) = &p.datum else {
-        return;
-    };
-    // Resolve the datum bytes. Live dispatch carries inline
-    // datum bytes in `payload`; hash-only datums arrive with
-    // `payload` empty and we fall back to `datum_by_hash`
-    // (witness datums harvested from the block, or whatever the
-    // data plane resolves). Same pattern as `cip-68-mint`.
-    let Some(payload) = resolve_datum_bytes(datum) else {
-        return;
-    };
+    // The output's datum (if any) is present for CIP-68 ref tokens,
+    // absent for plain CIP-25 tokens. Resolve once: inline `payload`,
+    // or `datum_by_hash` for hash-only datums (same as `cip-68-mint`).
+    let datum_payload: Option<(Vec<u8>, Vec<u8>)> = p
+        .datum
+        .as_ref()
+        .and_then(|d| resolve_datum_bytes(d).map(|payload| (d.hash.clone(), payload)));
     TRACKED_POLICIES.with(|set| {
         let set = set.borrow();
         for asset in &p.output.assets {
             let Some(policy_arr) = policy_in_set(&asset.asset.policy, &set) else {
                 continue;
             };
-            let Some(suffix) = cip68_ref_token_suffix(&asset.asset.name) else {
-                continue;
-            };
-            buf.produced_refs.insert(
-                (policy_arr, suffix.to_vec()),
-                (datum.hash.clone(), payload.clone()),
-            );
+            let name = &asset.asset.name;
+            if let Some(suffix) = cip68_ref_token_suffix(name) {
+                // CIP-68 ref token — buffer with the output's datum.
+                if let Some((hash, payload)) = &datum_payload {
+                    buf.produced_refs.insert(
+                        (policy_arr, suffix.to_vec()),
+                        (hash.clone(), payload.clone()),
+                    );
+                }
+            } else if is_cip68_user_token(name) {
+                // CIP-68 user token — metadata on its ref token; skip.
+            } else {
+                // Plain token → CIP-25 candidate (resolved at flush).
+                buf.produced_plain.insert((policy_arr, name.to_vec()));
+            }
         }
     });
 }
@@ -730,10 +864,7 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
 /// Return the 28-byte array form of `policy_bytes` if and only
 /// if it's in the tracked set. Avoids allocating a `Vec` per
 /// asset just to do the contains-check.
-fn policy_in_set(
-    policy_bytes: &[u8],
-    set: &HashSet<[u8; HASH_BYTES]>,
-) -> Option<[u8; HASH_BYTES]> {
+fn policy_in_set(policy_bytes: &[u8], set: &HashSet<[u8; HASH_BYTES]>) -> Option<[u8; HASH_BYTES]> {
     if policy_bytes.len() != HASH_BYTES {
         return None;
     }
@@ -819,7 +950,11 @@ fn flush_buffer(buf: TxBuffer) {
                                 tx_hash: tx_hash_hex.clone(),
                                 entry: entry.clone(),
                             }));
-                            shard_put_entry(&policy_hex, &suffix, &StoredEntry { entry, datum_hash });
+                            shard_put_entry(
+                                &policy_hex,
+                                &suffix,
+                                &StoredEntry { entry, datum_hash },
+                            );
                         }
                         Some(prev) if prev.datum_hash == datum_hash => {
                             // Same-datum respend — no emit. Could
@@ -837,7 +972,11 @@ fn flush_buffer(buf: TxBuffer) {
                                 entry: entry.clone(),
                                 prior_version,
                             }));
-                            shard_put_entry(&policy_hex, &suffix, &StoredEntry { entry, datum_hash });
+                            shard_put_entry(
+                                &policy_hex,
+                                &suffix,
+                                &StoredEntry { entry, datum_hash },
+                            );
                         }
                     }
                 }
@@ -853,6 +992,43 @@ fn flush_buffer(buf: TxBuffer) {
                 }
             }
         }
+    }
+
+    // CIP-25 live mints: produced plain tokens. A first sighting
+    // resolves mint-time label-721 metadata (via `AssetState.initial_tx`)
+    // and emits `Initial`. CIP-25 metadata is immutable — no `Updated`;
+    // and a CIP-25 burn just orphans the metadata (the consumer's
+    // ownership reconcile drops it), so no `Burned` either.
+    for (policy, name) in buf.produced_plain {
+        let policy_hex = hex::encode(policy);
+        if shard_get_entry(&policy_hex, &name).is_some() {
+            continue; // already recorded — CIP-25 metadata never changes
+        }
+        let Some((metadata_json, source_tx)) = resolve_cip25(&policy, &name) else {
+            continue;
+        };
+        let entry = MetadataEntry {
+            asset_name_hex: hex::encode(&name),
+            metadata_json: Some(metadata_json),
+            standard: MetadataStandard::Cip25,
+            version: 1,
+            immutable: true,
+            source_tx,
+        };
+        emit_event(&MetadataEvent::Initial(MetadataInitial {
+            policy: policy_hex.clone(),
+            slot,
+            tx_hash: tx_hash_hex.clone(),
+            entry: entry.clone(),
+        }));
+        shard_put_entry(
+            &policy_hex,
+            &name,
+            &StoredEntry {
+                entry,
+                datum_hash: Vec::new(),
+            },
+        );
     }
 }
 
@@ -922,20 +1098,36 @@ impl Guest for Module {
     /// resumes at the offset instead of restarting the policy (the
     /// out-of-fuel `SnapshotBegin`-loop fix). No call ever
     /// serializes the whole ledger.
-    fn rebootstrap() -> Result<RebootstrapStep, String> {
+    fn rebootstrap(mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         REBOOTSTRAP_DRIVER.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                // Scope the round: a pending onboard set (subscribe-time
-                // Add) cold-starts just those policies; otherwise this is
-                // a full recapture over every tracked policy. The host
-                // pumps this same export in both cases.
-                let mut predicates: Vec<Vec<u8>> = read_onboard_scope().unwrap_or_else(|| {
-                    TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
-                });
+                // Pick the scan set by EXPLICIT mode — no implicit
+                // "scope present? scoped : full" inference (the old
+                // form silently turned a no-op onboard into a full
+                // re-scan of every tracked policy):
+                //   Onboard → only the policies the most recent
+                //             `update-interest` add seeded into the
+                //             onboard scope.
+                //   Full    → every tracked policy, ignoring the scope
+                //             (the recapture flow).
+                let mut predicates: Vec<Vec<u8>> = match mode {
+                    RebootstrapMode::Onboard => read_onboard_scope().unwrap_or_default(),
+                    RebootstrapMode::Full => {
+                        TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
+                    }
+                };
+                // An empty Onboard scope (a no-op interest re-assert)
+                // is done immediately — NEVER a full scan.
+                if predicates.is_empty() {
+                    return Ok(RebootstrapStep {
+                        done: true,
+                        ingested: 0,
+                    });
+                }
                 predicates.sort_unstable();
-                let cursor =
-                    state_kv::get_value(KV_REBOOTSTRAP_CURSOR).and_then(|b| BootstrapCursor::decode(&b));
+                let cursor = state_kv::get_value(KV_REBOOTSTRAP_CURSOR)
+                    .and_then(|b| BootstrapCursor::decode(&b));
                 *slot = Some(ChunkedBootstrap::resume(predicates, cursor));
             }
             let driver = slot.as_mut().expect("driver initialised above");
@@ -943,9 +1135,11 @@ impl Guest for Module {
             let out = driver.step(&mut io);
             if out.done {
                 *slot = None;
-                // Clear the scoped onboard set so a future recapture
-                // defaults to the full tracked set.
-                state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                // Clear the onboard scope only after an ONBOARD round
+                // completes; a Full recapture doesn't own the scope.
+                if matches!(mode, RebootstrapMode::Onboard) {
+                    state_kv::delete_value(KV_ONBOARD_PREDICATES);
+                }
             }
             Ok(RebootstrapStep {
                 done: out.done,
