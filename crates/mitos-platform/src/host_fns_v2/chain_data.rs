@@ -183,6 +183,27 @@ impl ChainDataHost for HostStateV2 {
         }))
     }
 
+    async fn cip25_metadata_batch(
+        &mut self,
+        policy: Vec<u8>,
+        asset_names: Vec<Vec<u8>>,
+    ) -> wasmtime::Result<Vec<Option<bindings_v2::Cip25MetadataResult>>> {
+        let resolutions = self
+            .data_plane
+            .cip25_metadata_batch(&policy, &asset_names)
+            .await
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        Ok(resolutions
+            .into_iter()
+            .map(|opt| {
+                opt.map(|r| bindings_v2::Cip25MetadataResult {
+                    metadata_json: r.metadata_json,
+                    source_tx: r.source_tx,
+                })
+            })
+            .collect())
+    }
+
     async fn read_tx(
         &mut self,
         tx_hash: Vec<u8>,

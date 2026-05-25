@@ -645,6 +645,38 @@ fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>
         datum_idx.insert((r.tx_hash.clone(), r.index), i);
     }
 
+    // Pre-pass: collect this page's plain-token (CIP-25) asset names
+    // and resolve their label-721 metadata in ONE batched host call.
+    // The host prefetches the DISTINCT mint txs' aux-data in a single
+    // fallback-provider round-trip (warming the cache), so a page of N
+    // CIP-25 assets costs ~1 provider call instead of N serial ones —
+    // the cold-start speedup. See
+    // `docs/design/FALLBACK_PROVIDER_AND_BATCH_PREFETCH.md`.
+    let mut cip25_names: Vec<Vec<u8>> = Vec::new();
+    for (_oref, output) in utxos.iter() {
+        for asset in &output.assets {
+            if asset.asset.policy != policy {
+                continue;
+            }
+            let name = &asset.asset.name;
+            if cip68_ref_token_suffix(name).is_some() || is_cip68_user_token(name) {
+                continue;
+            }
+            cip25_names.push(name.clone());
+        }
+    }
+    cip25_names.sort_unstable();
+    cip25_names.dedup();
+    let mut cip25_map: BTreeMap<Vec<u8>, (String, String)> = BTreeMap::new();
+    if !cip25_names.is_empty() {
+        let results = chain_data::cip25_metadata_batch(policy, &cip25_names);
+        for (name, res) in cip25_names.iter().zip(results) {
+            if let Some(r) = res {
+                cip25_map.insert(name.clone(), (r.metadata_json, r.source_tx));
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for (oref, output) in utxos.iter() {
         let datum_opt = datum_idx
@@ -699,7 +731,7 @@ fn decode_page(policy: &[u8; HASH_BYTES], refs: &[WitOutputRef]) -> Vec<(Vec<u8>
             // decoder. Keyed by the FULL asset name (no prefix strip);
             // the consumer keys CIP-25 by the bare name and CIP-68 by
             // `000de140`+suffix, discriminating on the `standard` field.
-            let Some((metadata_json, source_tx)) = resolve_cip25(policy, name) else {
+            let Some((metadata_json, source_tx)) = cip25_map.get(name).cloned() else {
                 continue;
             };
             let entry = MetadataEntry {

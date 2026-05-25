@@ -437,6 +437,18 @@ interface chain-data {
     cip25-metadata: func(policy: list<u8>, asset-name: list<u8>)
                   -> option<cip25-metadata-result>;
 
+    /// Batch form of `cip25-metadata` for a whole cold-start page.
+    /// Returns a list parallel to `asset-names` (one entry each,
+    /// `none` where unresolved). The host resolves each asset's mint
+    /// tx (`asset-state`), then **prefetches the distinct mint txs'
+    /// metadata in one provider call** (warming the aux cache) before
+    /// decoding — so a page of N assets costs ~1 fallback round-trip
+    /// instead of N serial ones. Use this from a page-oriented
+    /// cold-start instead of calling `cip25-metadata` per asset.
+    /// See `docs/design/FALLBACK_PROVIDER_AND_BATCH_PREFETCH.md`.
+    cip25-metadata-batch: func(policy: list<u8>, asset-names: list<list<u8>>)
+                        -> list<option<cip25-metadata-result>>;
+
     /// Full TX rollup — single call returns every component a
     /// module might need: inputs (with prior outputs and
     /// redeemers), reference inputs, outputs, mint field,

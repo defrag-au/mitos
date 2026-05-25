@@ -56,6 +56,7 @@ pub mod driver_v2;
 pub mod emissions;
 pub mod event_bindings;
 pub mod events;
+pub mod fallback;
 pub mod follower_v2;
 pub mod host_fns;
 pub mod host_fns_v2;

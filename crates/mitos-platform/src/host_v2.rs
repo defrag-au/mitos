@@ -425,13 +425,16 @@ where
                 None
             }
         };
-        let maestro_opt = crate::maestro::MaestroClient::shared();
-        if maestro_opt.is_some() {
-            tracing::info!(module = %id, "Maestro aux_data fallback enabled");
+        let fallback_opt = crate::fallback::shared();
+        if fallback_opt.is_some() {
+            tracing::info!(module = %id, "chain-data fallback provider enabled");
         }
-        let caching_plane: Arc<dyn DataPlaneFacade> = Arc::new(
-            crate::host_fns::CachingDataPlane::new(self.data_plane.clone(), cache_opt, maestro_opt),
-        );
+        let caching_plane: Arc<dyn DataPlaneFacade> =
+            Arc::new(crate::host_fns::CachingDataPlane::new(
+                self.data_plane.clone(),
+                cache_opt,
+                fallback_opt.clone(),
+            ));
         let config = self.storage.read_config(id)?.unwrap_or_default();
 
         // The backfill plane (`COLD_START_TRAP_ISOLATION.md`): a factory
@@ -590,7 +593,7 @@ where
         let chain_plane: Arc<crate::maestro_fallback_plane::MaestroFallbackPlane<P>> =
             Arc::new(crate::maestro_fallback_plane::MaestroFallbackPlane::new(
                 self.chain_plane.clone(),
-                crate::maestro::MaestroClient::shared(),
+                fallback_opt,
             ));
         let follower_storage = self.storage.clone();
         let follower_module_id = id.to_owned();

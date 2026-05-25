@@ -148,6 +148,68 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
             source_tx: hex::encode(mint_tx),
         }))
     }
+
+    /// Warm the aux (tx-metadata) cache for a batch of mint txs. The
+    /// default fills serially via `tx_metadata` (correct, no speedup);
+    /// `CachingDataPlane` overrides to batch the cache-missing,
+    /// past-horizon txs into ONE fallback-provider call. Best-effort —
+    /// misses/errors are swallowed; a later per-tx `tx_metadata`
+    /// re-resolves any gap.
+    ///
+    /// Wrappers between the module-facing facade and `CachingDataPlane`
+    /// MUST forward this, or they hit the slow default — the same
+    /// forwarding requirement that bit `asset_state` (see
+    /// `project_cip25_asset_state_wrapper_bug`).
+    async fn prefetch_tx_metadata(&self, tx_hashes: &[[u8; 32]]) {
+        for tx in tx_hashes {
+            let _ = self.tx_metadata(tx).await;
+        }
+    }
+
+    /// Batch [`Self::cip25_metadata`] for a cold-start page. Resolves
+    /// each asset's mint tx (`asset_state`), prefetches the DISTINCT
+    /// mint txs' metadata in one provider call (warming the aux
+    /// cache), then decodes each — so a page of N assets costs ~1
+    /// fallback round-trip instead of N serial ones. Returns a Vec
+    /// parallel to `asset_names`. A pure default composed from
+    /// forwarded methods, so every wrapper inherits it.
+    async fn cip25_metadata_batch(
+        &self,
+        policy: &[u8],
+        asset_names: &[Vec<u8>],
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<mitos_data_plane::Cip25Resolution>>> {
+        // 1. Resolve each asset's mint tx (dolos-local, cheap).
+        let mut mint_txs: Vec<Option<[u8; 32]>> = Vec::with_capacity(asset_names.len());
+        for name in asset_names {
+            let tx = match self.asset_state(policy, name).await? {
+                Some(state) => state.initial_tx,
+                None => None,
+            };
+            mint_txs.push(tx);
+        }
+        // 2. Distinct mint txs → one batched prefetch (the win).
+        let mut distinct: Vec<[u8; 32]> = mint_txs.iter().flatten().copied().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        self.prefetch_tx_metadata(&distinct).await;
+        // 3. Decode each — `tx_metadata` now hits the warmed cache.
+        let mut out = Vec::with_capacity(asset_names.len());
+        for (name, mint_tx) in asset_names.iter().zip(mint_txs) {
+            let resolution = match mint_tx {
+                Some(tx) => match self.tx_metadata(&tx).await? {
+                    Some(aux) => cardano_assets::cip25::cip25_metadata_json(&aux, policy, name)
+                        .map(|metadata_json| mitos_data_plane::Cip25Resolution {
+                            metadata_json,
+                            source_tx: hex::encode(tx),
+                        }),
+                    None => None,
+                },
+                None => None,
+            };
+            out.push(resolution);
+        }
+        Ok(out)
+    }
 }
 
 /// Blanket impl: any `ChainDataPlane` is a `DataPlaneFacade`.
@@ -468,19 +530,19 @@ where
 pub struct CachingDataPlane {
     inner: std::sync::Arc<dyn DataPlaneFacade>,
     cache: Option<std::sync::Arc<crate::indexer_data_cache::IndexerDataCache>>,
-    maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
+    fallback: Option<std::sync::Arc<dyn crate::fallback::FallbackProvider>>,
 }
 
 impl CachingDataPlane {
     pub fn new(
         inner: std::sync::Arc<dyn DataPlaneFacade>,
         cache: Option<std::sync::Arc<crate::indexer_data_cache::IndexerDataCache>>,
-        maestro: Option<std::sync::Arc<crate::maestro::MaestroClient>>,
+        fallback: Option<std::sync::Arc<dyn crate::fallback::FallbackProvider>>,
     ) -> Self {
         Self {
             inner,
             cache,
-            maestro,
+            fallback,
         }
     }
 }
@@ -550,25 +612,25 @@ impl DataPlaneFacade for CachingDataPlane {
         // UTxOs on a snapshot-bootstrapped node). Maestro indexes
         // all witnessed datums, so it resolves them regardless of
         // the local horizon.
-        if let Some(maestro) = &self.maestro {
+        if let Some(fallback) = &self.fallback {
             let hash_hex = hex::encode(hash);
-            match maestro.fetch_datum(&hash_hex).await {
+            match fallback.fetch_datum(&hash_hex).await {
                 Ok(Some(cbor)) => {
                     if let Some(cache) = &self.cache {
                         cache.insert_datum(hash, &cbor);
                     }
-                    tracing::debug!(datum = %hash_hex, "datum resolved via Maestro fallback");
+                    tracing::debug!(datum = %hash_hex, "datum resolved via fallback provider");
                     return Ok(Some(cbor));
                 }
                 Ok(None) => {
-                    // Maestro doesn't know this datum either —
+                    // The provider doesn't know this datum either —
                     // nothing to cache.
                 }
                 Err(e) => {
                     tracing::warn!(
                         datum = %hash_hex,
                         error = %e,
-                        "Maestro datum fallback failed",
+                        "datum fallback failed",
                     );
                 }
             }
@@ -612,14 +674,14 @@ impl DataPlaneFacade for CachingDataPlane {
         }
 
         // Tier 3: Maestro fallback — only when configured.
-        if let Some(maestro) = &self.maestro {
+        if let Some(fallback) = &self.fallback {
             let tx_hex = hex::encode(tx_hash);
-            match maestro.fetch_aux_data(&tx_hex).await {
+            match fallback.fetch_aux_data(&tx_hex).await {
                 Ok(Some(cbor)) => {
                     if let Some(cache) = &self.cache {
                         cache.insert_aux(tx_hash, &cbor);
                     }
-                    tracing::debug!(tx = %tx_hex, "aux_data resolved via Maestro fallback");
+                    tracing::debug!(tx = %tx_hex, "aux_data resolved via fallback provider");
                     return Ok(Some(cbor));
                 }
                 Ok(None) => {
@@ -629,13 +691,56 @@ impl DataPlaneFacade for CachingDataPlane {
                     tracing::warn!(
                         tx = %tx_hex,
                         error = %e,
-                        "Maestro aux_data fallback failed",
+                        "aux_data fallback failed",
                     );
                 }
             }
         }
 
         Ok(None)
+    }
+
+    /// Batched aux-cache warm. Mirrors `tx_metadata`'s tiers but
+    /// batches the slow one: skip cache hits, serve dolos-archive
+    /// hits locally (cheap, in-process), and resolve the remaining
+    /// past-horizon txs in ONE fallback-provider call. After this, a
+    /// per-asset `tx_metadata` for any of `tx_hashes` is a cache hit.
+    async fn prefetch_tx_metadata(&self, tx_hashes: &[[u8; 32]]) {
+        let mut dolos_miss: Vec<[u8; 32]> = Vec::new();
+        for tx in tx_hashes {
+            // Tier 1: already cached → nothing to do.
+            if let Some(cache) = &self.cache
+                && cache.get_aux(tx).is_some()
+            {
+                continue;
+            }
+            // Tier 2: dolos archive (local, cheap). Cache the hit.
+            match self.inner.tx_metadata(tx).await {
+                Ok(Some(cbor)) => {
+                    if let Some(cache) = &self.cache {
+                        cache.insert_aux(tx, &cbor);
+                    }
+                }
+                // Past horizon (or transient miss) → batch via provider.
+                _ => dolos_miss.push(*tx),
+            }
+        }
+        // Tier 3: ONE batched provider call for the past-horizon txs.
+        if let Some(fallback) = &self.fallback
+            && !dolos_miss.is_empty()
+        {
+            let hexes: Vec<String> = dolos_miss.iter().map(hex::encode).collect();
+            let resolved = fallback.fetch_aux_data_batch(&hexes).await;
+            if let Some(cache) = &self.cache {
+                for (tx_hex, aux) in resolved {
+                    if let Ok(bytes) = hex::decode(&tx_hex)
+                        && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+                    {
+                        cache.insert_aux(&arr, &aux);
+                    }
+                }
+            }
+        }
     }
 
     async fn read_tx(

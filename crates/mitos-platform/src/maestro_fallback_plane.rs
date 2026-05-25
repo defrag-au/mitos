@@ -44,7 +44,7 @@ use mitos_data_plane::{
     types::{ProtocolParameters, StakeCred, TxRecord},
 };
 
-use crate::maestro::MaestroClient;
+use crate::fallback::FallbackProvider;
 
 /// Cache key for Maestro-resolved outputs. Different `DecodeLevel`s
 /// populate different fields (e.g. datum payload only at
@@ -112,7 +112,7 @@ fn inflight() -> &'static std::sync::Mutex<InflightMap> {
 /// Returns `None` when Maestro returned 404 / errored / isn't
 /// configured. Errors are logged inside the leader.
 async fn fetch_dedup(
-    maestro: &MaestroClient,
+    provider: &dyn FallbackProvider,
     oref: &OutputRef,
     decode: DecodeLevel,
 ) -> Option<TypedOutput> {
@@ -136,12 +136,12 @@ async fn fetch_dedup(
     // its result.
     let result = cell
         .get_or_init(|| async {
-            match maestro.fetch_output(oref, decode).await {
+            match provider.fetch_output(oref, decode).await {
                 Ok(Some(typed)) => {
                     tracing::debug!(
                         tx_hash = %hex::encode(oref.tx_hash),
                         index = oref.index,
-                        "prior output resolved via Maestro fallback"
+                        "prior output resolved via fallback provider"
                     );
                     cache_put(key, typed.clone());
                     Some(typed)
@@ -150,7 +150,7 @@ async fn fetch_dedup(
                     tracing::debug!(
                         tx_hash = %hex::encode(oref.tx_hash),
                         index = oref.index,
-                        "Maestro fallback: utxo not found"
+                        "fallback provider: utxo not found"
                     );
                     None
                 }
@@ -159,7 +159,7 @@ async fn fetch_dedup(
                         tx_hash = %hex::encode(oref.tx_hash),
                         index = oref.index,
                         error = %e,
-                        "Maestro fallback: utxo lookup failed"
+                        "fallback provider: utxo lookup failed"
                     );
                     None
                 }
@@ -183,16 +183,16 @@ async fn fetch_dedup(
 /// other method passes through unchanged.
 pub struct MaestroFallbackPlane<P> {
     inner: Arc<P>,
-    maestro: Option<Arc<MaestroClient>>,
+    fallback: Option<Arc<dyn FallbackProvider>>,
 }
 
 impl<P> MaestroFallbackPlane<P> {
-    /// `maestro = None` collapses this wrapper to a no-op
+    /// `fallback = None` collapses this wrapper to a no-op
     /// pass-through. We still construct + use the wrapper so the
-    /// follower path is uniform regardless of Maestro
+    /// follower path is uniform regardless of fallback-provider
     /// configuration.
-    pub fn new(inner: Arc<P>, maestro: Option<Arc<MaestroClient>>) -> Self {
-        Self { inner, maestro }
+    pub fn new(inner: Arc<P>, fallback: Option<Arc<dyn FallbackProvider>>) -> Self {
+        Self { inner, fallback }
     }
 }
 
@@ -206,10 +206,10 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
         if let Some(out) = self.inner.read_utxo(oref, decode).await? {
             return Ok(Some(out));
         }
-        let Some(maestro) = &self.maestro else {
+        let Some(provider) = &self.fallback else {
             return Ok(None);
         };
-        Ok(fetch_dedup(maestro, oref, decode).await)
+        Ok(fetch_dedup(provider.as_ref(), oref, decode).await)
     }
 
     async fn read_utxos(
@@ -218,7 +218,7 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
         decode: DecodeLevel,
     ) -> DataPlaneResult<Vec<(OutputRef, TypedOutput)>> {
         let mut out = self.inner.read_utxos(orefs, decode).await?;
-        let Some(maestro) = &self.maestro else {
+        let Some(provider) = &self.fallback else {
             return Ok(out);
         };
 
@@ -231,7 +231,7 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
             if found.contains(&(oref.tx_hash, oref.index)) {
                 continue;
             }
-            if let Some(typed) = fetch_dedup(maestro, oref, decode).await {
+            if let Some(typed) = fetch_dedup(provider.as_ref(), oref, decode).await {
                 out.push((*oref, typed));
             }
         }
