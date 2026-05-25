@@ -45,6 +45,7 @@
 //! consumer needed v1 dispatch.
 
 pub mod admin;
+pub mod backfill_v2;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
 pub mod budget;
