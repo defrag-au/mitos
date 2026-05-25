@@ -64,6 +64,7 @@ pub mod host_v2;
 pub mod indexer_bridge;
 pub mod indexer_data_cache;
 pub mod inspect;
+pub mod koios;
 pub mod lag_tolerant;
 pub mod maestro;
 pub mod maestro_fallback_plane;

@@ -121,8 +121,9 @@ pub trait FallbackProvider: Send + Sync {
 /// - unset / `maestro` (default) → Maestro (`MAESTRO_API_KEY`);
 ///   `None` if no key, exactly as before this abstraction.
 /// - `none` → fallback disabled (planes pass through).
-/// - `koios` → Koios (phase 3; until wired, logs + uses Maestro so
-///   a misconfigured selector never silently loses coverage).
+/// - `koios` → Koios ([`crate::koios::KoiosProvider`]). Builds a
+///   working client even without `KOIOS_API_KEY` (free public tier),
+///   so this is `Some` unless the HTTP client fails to build.
 pub fn shared() -> Option<Arc<dyn FallbackProvider>> {
     let selected =
         std::env::var("MITOS_FALLBACK_PROVIDER").unwrap_or_else(|_| "maestro".to_owned());
@@ -132,10 +133,10 @@ pub fn shared() -> Option<Arc<dyn FallbackProvider>> {
             None
         }
         "koios" => {
-            // Phase 3 wires the Koios provider here. Until then, don't
-            // silently drop fallback coverage — fall back to Maestro.
-            tracing::warn!("MITOS_FALLBACK_PROVIDER=koios is not yet implemented; using Maestro");
-            maestro_provider()
+            // Koios builds a working client even without an API key
+            // (free public tier), so this is `Some` unless the HTTP
+            // client itself fails to build.
+            crate::koios::KoiosProvider::shared().map(|c| c as Arc<dyn FallbackProvider>)
         }
         other => {
             if other != "maestro" {
