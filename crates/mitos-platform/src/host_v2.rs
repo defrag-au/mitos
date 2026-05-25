@@ -356,7 +356,6 @@ where
         }
     }
 
-
     /// Start (or restart) the v2 module. Mirrors v1's
     /// `ModuleHost::start` shape: stop existing slot if any →
     /// instantiate → init (with refuel + trap-context capture)

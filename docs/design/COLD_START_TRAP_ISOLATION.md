@@ -227,14 +227,30 @@ turning trap-driven re-instantiation back into the rare safety net
 it was designed to be. (The live instance keeps the conservative
 default; this ceiling is a backfill-plane concern.)
 
-### Fix C — make the trap-retry budget progress-aware
+### Fix C — bound reactive trap-rebuilds with an absolute cap
 
-Reset the re-instantiation counter whenever a step makes forward
-progress (`ingested > 0` or the durable cursor advances). The cap
-then catches only a genuinely *stuck* module (no progress across
-consecutive retries), not a healthy large scan. With Fix B traps
-should be rare, but this is the correctness backstop so a
-periodic-OOM collection completes.
+Cap *reactive* (trap-driven) re-instantiations at a fixed ceiling
+(`MAX_TRAP_REBUILDS`, 64), **never reset**; proactive memory recycles
+(Fix B) are not counted. This guarantees the pump terminates: a
+pathological policy whose page is pinned at the `MIN_PAGE` floor
+(`budget.rs`) and still traps gives up the round with a partial
+refill — exactly the "if even `MIN_PAGE` traps, the module is
+pathological and the host gives up" intent the adaptive sizer already
+documents. Operator `recapture` resumes from the durable cursor.
+
+> **Revised after the post-deploy validation (2026-05-25).** The first
+> implementation made this cap *progress-aware* — reset on any page
+> that ingested > 0. That is unsound: in a real scan a light
+> ("sparse") page succeeds (resetting the cap) immediately before a
+> heavy ("dense") page traps, so the cap resets every cycle and a
+> sustained floor-trap **never terminates**. Hosky's recapture churned
+> at ~1.1 trap-rebuilds/sec indefinitely (`out-of-fuel` at
+> `retry_page=64`, `peak_memory=2.5 MB`) — the live instance stayed
+> healthy (Fix D held), but the backfill never completed and blocked
+> the follower's tip processing. The absolute, non-resetting cap is
+> the fix. The genuine large-collection case (periodic OOM in a
+> healthy scan) is served by Fix B's proactive recycle, which doesn't
+> count against this cap.
 
 ### Fix E — supervisor restart on live follower exit
 
@@ -306,6 +322,25 @@ class of failure cannot recur even if a future regression redresses
 
 ## Follow-ups / open questions
 
+- **Dense-UTxO throughput (the real Hosky bottleneck).** Hosky's
+  recapture traps `out-of-fuel` at the `MIN_PAGE=64` floor with
+  `peak_memory` ~2.5 MB — i.e. it's **fuel**-bound, not memory-bound:
+  a 64-ref page of asset-dense UTxOs (a treasury wallet holding many
+  NFTs per UTxO) overruns the per-call fuel budget, and the sizer
+  can't shrink below 64. The absolute cap (Fix C) now bounds this to a
+  partial refill, but to actually *ingest* such a collection we need
+  one of: (a) lower `MIN_PAGE` so the sizer can shrink to a fuel-safe
+  page (even 1 UTxO/call); (b) a higher rebootstrap `fuel_per_call`;
+  or (c) intra-UTxO chunking for pathologically dense outputs. Needs
+  offline `mitos-run --fixture` characterisation first. (The cursor
+  *does* advance across re-instantiation — the capped Hosky run
+  ingested `utxos=110400` over 1724 pages before the rebuild ceiling,
+  so this is genuine-but-slow progress bottlenecked on dense pages, not
+  a stuck cursor.) Note also that emit (`SnapshotChunk`) only fires
+  when a predicate's scan *completes*, so a partial-giveup builds the
+  shards in state-kv but emits nothing to the companion — a capped
+  large collection ends up with shards-but-no-snapshot until a
+  successful full pass.
 - **The synthetic-bootstrap onboard path still runs on the live
   instance.** Only the *chunked* cold-start (collection-holders/
   metadata) was moved to the backfill plane. Event-driven modules'

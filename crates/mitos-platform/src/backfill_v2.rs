@@ -143,11 +143,20 @@ const RECYCLE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// scan; this only guards a module that never returns `done`.
 const MAX_STEPS: u64 = 10_000_000;
 
-/// Consecutive re-instantiations *with no forward progress* before the
-/// pump gives up (the module traps even at the minimum page). Resets on
-/// any page that ingests > 0, so a large healthy scan that periodically
-/// OOMs completes — only a genuinely stuck module aborts.
-const MAX_NO_PROGRESS_REBUILDS: u32 = 6;
+/// Absolute ceiling on *reactive* (trap-driven) re-instantiations before
+/// the pump gives up the round with a partial refill. Proactive memory
+/// recycles (below) are NOT counted — only `OutOfFuel`/`OutOfMemory`
+/// traps. This guarantees termination: a module that keeps trapping —
+/// e.g. a policy whose UTxOs are so asset-dense that even a `MIN_PAGE`
+/// (64-ref) page overruns the per-call fuel budget, where the adaptive
+/// sizer is already pinned at the floor and cannot shrink further — is
+/// "pathological" (see `budget.rs` `MIN_PAGE`) and the host gives up
+/// rather than churning forever. Operator `recapture` resumes from the
+/// durable cursor, so a partial refill is recoverable. Sized generously
+/// so genuine adaptive-sizer convergence (256→128→64) and a large
+/// collection that legitimately re-instantiates a handful of times still
+/// complete; only sustained trapping aborts.
+const MAX_TRAP_REBUILDS: u32 = 64;
 
 /// Drive a module's chunked `rebootstrap` to completion on a
 /// **disposable** backfill instance owned by this function. Never
@@ -159,9 +168,14 @@ const MAX_NO_PROGRESS_REBUILDS: u32 = 6;
 ///   linear memory crosses [`RECYCLE_MEMORY_BYTES`].
 /// - **Reactive re-instantiate** — on an `OutOfFuel`/`OutOfMemory` trap,
 ///   rebuild carrying the shrunk adaptive page and retry.
-/// - **Progress-aware budget** — the no-progress rebuild cap resets on
-///   any page that ingests > 0, so periodic OOM in a large scan doesn't
-///   exhaust the budget.
+/// - **Bounded termination** — reactive trap-rebuilds are capped at
+///   [`MAX_TRAP_REBUILDS`] (proactive recycles are not counted), so a
+///   pathological policy whose page is pinned at the `MIN_PAGE` floor and
+///   keeps trapping gives up the round with a partial refill instead of
+///   churning forever. (An earlier progress-aware variant reset the cap
+///   on any page that ingested > 0; that was unsound — an interleaved
+///   light page resets it every cycle, so a sustained floor-trap never
+///   terminates. The absolute cap is the guarantee.)
 ///
 /// The disposable instance is dropped on return.
 pub(crate) async fn run_rebootstrap_pump(factory: &BackfillFactory) -> BackfillOutcome {
@@ -187,17 +201,17 @@ pub(crate) async fn run_rebootstrap_pump(factory: &BackfillFactory) -> BackfillO
     let mut ingested: u64 = 0;
     let mut steps: u64 = 0;
     let mut rebuilds: u32 = 0;
-    let mut no_progress_streak: u32 = 0;
+    // Reactive (trap-driven) re-instantiations only — proactive memory
+    // recycles are not counted. Never reset: an absolute bound that
+    // guarantees the pump terminates even when the page is pinned at the
+    // floor and keeps trapping (see `MAX_TRAP_REBUILDS`).
+    let mut trap_rebuilds: u32 = 0;
 
     let outcome = loop {
         match driver.call_rebootstrap().await {
             Ok(Ok(step)) => {
                 ingested += step.ingested;
                 steps += 1;
-                if step.ingested > 0 {
-                    // Forward progress resets the no-progress budget.
-                    no_progress_streak = 0;
-                }
                 if step.done {
                     break "completed";
                 }
@@ -254,15 +268,18 @@ pub(crate) async fn run_rebootstrap_pump(factory: &BackfillFactory) -> BackfillO
                         // the smaller page — the fresh instance re-inits
                         // its round from the durable cursor, a clean
                         // restart of the trapped predicate.
-                        no_progress_streak += 1;
+                        trap_rebuilds += 1;
                         rebuilds += 1;
-                        if no_progress_streak > MAX_NO_PROGRESS_REBUILDS {
+                        if trap_rebuilds > MAX_TRAP_REBUILDS {
                             tracing::error!(
                                 module = %module_id,
                                 trap = %trap,
+                                trap_rebuilds,
                                 peak_memory_bytes = driver.peak_memory_bytes(),
-                                "backfill: still trapping at the minimum page after repeated \
-                                 retries with no progress; refill may be partial",
+                                adaptive_page_limit = driver.adaptive_page_limit(),
+                                "backfill: exceeded trap-rebuild ceiling (pathological — page \
+                                 likely pinned at the floor and still trapping); giving up the \
+                                 round, refill is partial. Operator recapture resumes from cursor.",
                             );
                             break "partial";
                         }
@@ -272,7 +289,7 @@ pub(crate) async fn run_rebootstrap_pump(factory: &BackfillFactory) -> BackfillO
                             trap = %trap,
                             peak_memory_bytes = driver.peak_memory_bytes(),
                             retry_page,
-                            no_progress_streak,
+                            trap_rebuilds,
                             "backfill: page trapped; re-instantiating + retrying at a smaller page",
                         );
                         match factory.instantiate(Some(retry_page)).await {
