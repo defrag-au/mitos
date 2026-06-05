@@ -1,9 +1,22 @@
 # Watched-UTxO index (live interest set)
 
-Status: **implemented, shadow-ready — not yet deployed** (2026-06-05).
-Builds clean (`cargo check -p mitos`), 120 platform lib tests green,
-clippy clean. Ships defaulting to `MITOS_FALLBACK_GATE=off` (pre-index
-behaviour); operator enables `shadow` then `on`.
+Status: **deployed to mainnet in SHADOW** (2026-06-05). Built on box
+(`/opt/mitos/src`, commit `7fb28f5`), restarted into
+`MITOS_FALLBACK_GATE=shadow`. 16 modules up, 16 `watched.redb` created,
+cold-seed ran (e.g. 172054 / 2819 / 2062 refs), at tip, no traps.
+Early telemetry: `pct_skippable=100`, `index_gap=0` at steady state
+(small sample — `would_resolve` accrues as cold-seeded old watched
+UTxOs are spent). Env backup: `/etc/default/mitos-mainnet.bak.preshadow`.
+
+**Before `on`:** soak several days; require `index_gap == 0` over a
+full 7-day window and a stable `would_skip` %. Then set
+`MITOS_FALLBACK_GATE=on` + restart.
+
+Noted during deploy: `jpg-store-listing`/`jpg-store-sale` manifests
+carry malformed addresses (one 103 chars, one bad checksum) that fail
+cold-seed enumeration — harmless dead config (exact-string matching
+means they never matched a real output), but worth cleaning up.
+120 platform lib tests green, clippy clean.
 Owner: TBD
 Related: `crates/mitos-platform/src/maestro_fallback_plane.rs`,
 `crates/mitos-data-plane/src/dispatch.rs`,
