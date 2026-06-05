@@ -464,6 +464,14 @@ where
         // per-instance; the follower gets the one matching this driver.
         let (mut driver, trap_logger) = backfill.instantiate(None).await?;
 
+        // Watched-UTxO index for this module — shared between the
+        // driver (writer: insert matched produced / remove consumed)
+        // and the follower's fallback plane (reader: scope the Maestro
+        // prior-output fallback). One `Arc` per module, persisted to
+        // `watched.redb`. See `docs/design/WATCHED_UTXO_INDEX.md`.
+        let watched_index = self.storage.watched_index(id);
+        driver.set_watched(Some(watched_index.clone()));
+
         // Bootstrap: hydrate state at watched addresses
         // declared in the manifest's `[interest]` section.
         // Per-address state-kv flags make this a no-op for
@@ -523,6 +531,22 @@ where
                         "v2 bootstrap failed; continuing without full hydration",
                     );
                 }
+            }
+
+            // Migration cold-seed: when the watched index is empty
+            // but bootstrap was skipped (per-scope flags already set
+            // from a pre-index deploy), `dispatch_synthetic_batch`
+            // never fired, so the index has nothing. Seed it directly
+            // from current chain state (refs-only) so the gate has a
+            // populated set on first deploy. Subsequent restarts find
+            // a non-empty persisted index and skip this.
+            if watched_index.is_empty() {
+                crate::bootstrap_v2::seed_watched_index(
+                    &watched_index,
+                    &interest,
+                    bootstrap_chain.as_ref(),
+                )
+                .await;
             }
         }
 
@@ -594,6 +618,8 @@ where
             Arc::new(crate::maestro_fallback_plane::MaestroFallbackPlane::new(
                 self.chain_plane.clone(),
                 fallback_opt,
+                Some(watched_index.clone()),
+                crate::maestro_fallback_plane::GateMode::from_env(),
             ));
         let follower_storage = self.storage.clone();
         let follower_module_id = id.to_owned();
@@ -709,6 +735,7 @@ where
         // parity during the v1+v2 coexistence window.
         self.storage.close_cursor(id);
         self.storage.close_kv(id);
+        self.storage.close_watched(id);
         tracing::info!(
             module = %id,
             sha = %slot.sha,
@@ -1014,6 +1041,7 @@ where
         self.storage.close_kv(id);
         self.storage.close_emissions(id);
         self.storage.close_cursor(id);
+        self.storage.close_watched(id);
 
         tracing::info!(
             module = %id,

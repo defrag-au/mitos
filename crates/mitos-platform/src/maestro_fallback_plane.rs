@@ -34,6 +34,7 @@
 //! at once.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
@@ -45,6 +46,75 @@ use mitos_data_plane::{
 };
 
 use crate::fallback::FallbackProvider;
+use crate::watched_ref_index::WatchedRefIndex;
+
+/// How the watched-UTxO index scopes the Maestro prior-output
+/// fallback. Set process-wide via `MITOS_FALLBACK_GATE`. See
+/// `docs/design/WATCHED_UTXO_INDEX.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// Index ignored — resolve every archive-horizon gap via Maestro,
+    /// exactly as before the index existed. Default.
+    Off,
+    /// Resolve every gap (no behaviour change) but record whether the
+    /// gate *would* have skipped it — the measurement + safety pass
+    /// before flipping the gate on.
+    Shadow,
+    /// Only resolve gaps whose ref is in the watched index; skip the
+    /// rest (provably non-matching by the symmetry argument).
+    On,
+}
+
+impl GateMode {
+    /// Parse `MITOS_FALLBACK_GATE` once. Unset / unrecognised → `Off`.
+    pub fn from_env() -> Self {
+        static MODE: OnceLock<GateMode> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            match std::env::var("MITOS_FALLBACK_GATE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "shadow" => GateMode::Shadow,
+                "on" => GateMode::On,
+                _ => GateMode::Off,
+            }
+        })
+    }
+}
+
+/// Process-wide gate counters. Greppable summary lines stand in for a
+/// metrics exporter (none wired yet — see `infra/docs/mitos-operations.md`).
+static WOULD_RESOLVE: AtomicU64 = AtomicU64::new(0); // gap ref IS watched
+static WOULD_SKIP: AtomicU64 = AtomicU64::new(0); // gap ref is NOT watched
+
+/// Record one gate decision and periodically log a rolling summary
+/// (every 1000 decisions ≈ tens of lines/day at the observed rate).
+fn record_gate_decision(in_scope: bool, mode: GateMode) {
+    let resolve = if in_scope {
+        WOULD_RESOLVE.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        WOULD_RESOLVE.load(Ordering::Relaxed)
+    };
+    let skip = if in_scope {
+        WOULD_SKIP.load(Ordering::Relaxed)
+    } else {
+        WOULD_SKIP.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    let total = resolve + skip;
+    if total.is_multiple_of(1000) {
+        let pct_skip = skip.saturating_mul(100).checked_div(total).unwrap_or(0);
+        tracing::info!(
+            target: "fallback_gate",
+            mode = ?mode,
+            would_resolve = resolve,
+            would_skip = skip,
+            pct_skippable = pct_skip,
+            "watched-index gate rolling summary",
+        );
+    }
+}
 
 /// Cache key for Maestro-resolved outputs. Different `DecodeLevel`s
 /// populate different fields (e.g. datum payload only at
@@ -184,6 +254,11 @@ async fn fetch_dedup(
 pub struct MaestroFallbackPlane<P> {
     inner: Arc<P>,
     fallback: Option<Arc<dyn FallbackProvider>>,
+    /// Watched-UTxO index for this module — the gate's membership
+    /// test. `None` collapses the gate to fail-open (resolve all),
+    /// matching `GateMode::Off`.
+    watched: Option<Arc<WatchedRefIndex>>,
+    gate: GateMode,
 }
 
 impl<P> MaestroFallbackPlane<P> {
@@ -191,8 +266,49 @@ impl<P> MaestroFallbackPlane<P> {
     /// pass-through. We still construct + use the wrapper so the
     /// follower path is uniform regardless of fallback-provider
     /// configuration.
-    pub fn new(inner: Arc<P>, fallback: Option<Arc<dyn FallbackProvider>>) -> Self {
-        Self { inner, fallback }
+    ///
+    /// `watched` + `gate` drive interest-scoping of the prior-output
+    /// fallback (`docs/design/WATCHED_UTXO_INDEX.md`). Pass `gate =
+    /// GateMode::Off` (and/or `watched = None`) for the pre-index
+    /// behaviour.
+    pub fn new(
+        inner: Arc<P>,
+        fallback: Option<Arc<dyn FallbackProvider>>,
+        watched: Option<Arc<WatchedRefIndex>>,
+        gate: GateMode,
+    ) -> Self {
+        Self {
+            inner,
+            fallback,
+            watched,
+            gate,
+        }
+    }
+
+    /// Gate decision for one archive-horizon gap: returns `true` if
+    /// Maestro should be asked for this ref. In `Shadow` it always
+    /// returns `true` (resolve everything) but records what `On`
+    /// *would* have done; in `On` it returns index membership.
+    fn gate_allows(&self, oref: &OutputRef) -> bool {
+        gate_decision(self.gate, self.watched.as_deref(), oref)
+    }
+}
+
+/// Pure gate decision — extracted so the policy is unit-testable
+/// without a full `ChainDataPlane`. `Off` short-circuits (no
+/// counting); `Shadow` always resolves but records what `On` would
+/// do; `On` resolves only in-scope refs. A missing index under an
+/// active gate fails open — never silently drop resolution on a
+/// wiring gap.
+fn gate_decision(gate: GateMode, watched: Option<&WatchedRefIndex>, oref: &OutputRef) -> bool {
+    if gate == GateMode::Off {
+        return true;
+    }
+    let in_scope = watched.is_none_or(|w| w.contains(oref));
+    record_gate_decision(in_scope, gate);
+    match gate {
+        GateMode::Off | GateMode::Shadow => true,
+        GateMode::On => in_scope,
     }
 }
 
@@ -209,6 +325,9 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
         let Some(provider) = &self.fallback else {
             return Ok(None);
         };
+        if !self.gate_allows(oref) {
+            return Ok(None);
+        }
         Ok(fetch_dedup(provider.as_ref(), oref, decode).await)
     }
 
@@ -229,6 +348,9 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
 
         for oref in orefs {
             if found.contains(&(oref.tx_hash, oref.index)) {
+                continue;
+            }
+            if !self.gate_allows(oref) {
                 continue;
             }
             if let Some(typed) = fetch_dedup(provider.as_ref(), oref, decode).await {
@@ -345,5 +467,35 @@ impl<P: ChainDataPlane + Send + Sync + 'static> ChainDataPlane for MaestroFallba
 
     async fn protocol_params(&self) -> DataPlaneResult<ProtocolParameters> {
         self.inner.protocol_params().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::watched_ref_index::WatchedRefIndex;
+    use pallas_primitives::Hash;
+
+    fn oref(byte: u8) -> OutputRef {
+        OutputRef::new(Hash::new([byte; 32]), 0)
+    }
+
+    #[test]
+    fn gate_on_resolves_only_indexed_refs() {
+        let idx = WatchedRefIndex::in_memory();
+        let watched = oref(0x11);
+        let other = oref(0x22);
+        idx.seed([watched]);
+
+        // On: indexed → resolve; un-indexed → skip.
+        assert!(gate_decision(GateMode::On, Some(&idx), &watched));
+        assert!(!gate_decision(GateMode::On, Some(&idx), &other));
+
+        // Shadow + Off: always resolve regardless of membership.
+        assert!(gate_decision(GateMode::Shadow, Some(&idx), &other));
+        assert!(gate_decision(GateMode::Off, Some(&idx), &other));
+
+        // Active gate but no index wired → fail open (resolve).
+        assert!(gate_decision(GateMode::On, None, &other));
     }
 }

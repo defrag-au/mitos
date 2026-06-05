@@ -27,6 +27,7 @@ use pallas_primitives::Hash;
 use crate::driver_v2::DriverV2;
 use crate::host_fns::state_kv::ModuleKv;
 use crate::vendored::balius::kv::KvError;
+use crate::watched_ref_index::WatchedRefIndex;
 
 /// Result of one bootstrap pass over an interest set.
 #[derive(Debug, Default, Clone, Copy)]
@@ -203,6 +204,93 @@ pub async fn run_bootstrap<P: ChainDataPlane + Sync>(
     }
 
     Ok(stats)
+}
+
+/// One-time cold seed of the watched-UTxO index from current chain
+/// state, refs-only (no output decode for address/cred scans, no
+/// synthetic dispatch). Closes the migration gap on first deploy of
+/// the index against a module whose per-scope bootstrap flags are
+/// already set — `run_bootstrap` skips those scans, so the index
+/// would otherwise start empty. Going-forward seeding rides
+/// `DriverV2::dispatch_synthetic_batch`; this only handles cold start.
+///
+/// Best-effort: a per-predicate enumeration error is logged and
+/// skipped — the gate runs in shadow first, and `apply_block`'s
+/// `index_gap` safety net surfaces anything this misses.
+pub async fn seed_watched_index<P: ChainDataPlane + Sync>(
+    index: &WatchedRefIndex,
+    interest: &InterestSet,
+    plane: &P,
+) {
+    let mut total = 0usize;
+
+    // Addresses + payment creds: refs-only enumeration.
+    for address in interest.watched_addresses() {
+        match plane.utxos_by_address(address).await {
+            Ok(refs) => {
+                total += refs.len();
+                index.seed(refs);
+            }
+            Err(e) => tracing::warn!(
+                %address, error = %e,
+                "watched-index seed: utxos_by_address failed",
+            ),
+        }
+    }
+    for cred in interest.watched_payment_creds() {
+        match plane.utxos_by_payment_cred(cred.as_slice()).await {
+            Ok(refs) => {
+                total += refs.len();
+                index.seed(refs);
+            }
+            Err(e) => tracing::warn!(
+                cred = %hex::encode(cred), error = %e,
+                "watched-index seed: utxos_by_payment_cred failed",
+            ),
+        }
+    }
+
+    // Policies: page through the matching set (same paginated path as
+    // `scan_one_policy`), keeping refs only.
+    for policy in interest.watched_policies() {
+        let predicate = UtxoPredicate::matching(UtxoPattern {
+            asset: Some(AssetPattern::Policy(policy.clone())),
+            ..Default::default()
+        });
+        let mut page_token: Option<String> = None;
+        loop {
+            match plane
+                .search_utxos(
+                    &predicate,
+                    DecodeLevel::Lean,
+                    PageRequest {
+                        start_token: page_token.clone(),
+                        max_items: 1000,
+                    },
+                )
+                .await
+            {
+                Ok(page) => {
+                    let refs: Vec<OutputRef> = page.items.iter().map(|(o, _)| *o).collect();
+                    total += refs.len();
+                    index.seed(refs);
+                    match page.next_token {
+                        Some(t) => page_token = Some(t),
+                        None => break,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %policy, error = %e,
+                        "watched-index seed: search_utxos(holds_policy) failed",
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::info!(seeded = total, "watched-index cold seed complete");
 }
 
 /// Run bootstrap for a single newly-added predicate (address or

@@ -74,6 +74,7 @@ pub mod storage;
 pub mod supervisor;
 pub mod trap_context;
 pub mod vendored;
+pub mod watched_ref_index;
 
 pub use budget::{AdaptiveSizer, BudgetLimiter, TrapClass};
 /// Re-exported so bundle consumers can construct

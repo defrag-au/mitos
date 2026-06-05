@@ -68,6 +68,11 @@ pub struct ModuleStorage {
     cursor_stores: Arc<Mutex<HashMap<String, CursorStore>>>,
     emissions_stores: Arc<Mutex<HashMap<String, crate::emissions::EmissionsStore>>>,
     kv_stores: Arc<Mutex<HashMap<String, crate::vendored::balius::kv::RedbKv>>>,
+    /// Per-module watched-UTxO index handles (`watched.redb`). Shared
+    /// `Arc` per module so the follower's plane (reader) and driver
+    /// (writer) observe the same instance. See
+    /// `crate::watched_ref_index`.
+    watched_stores: Arc<Mutex<HashMap<String, Arc<crate::watched_ref_index::WatchedRefIndex>>>>,
     /// Platform-wide indexer-data cache (aux_data + datums). One
     /// handle shared across all module followers — `None` until
     /// first `indexer_data_cache()` call.
@@ -81,6 +86,7 @@ impl ModuleStorage {
             cursor_stores: Arc::new(Mutex::new(HashMap::new())),
             emissions_stores: Arc::new(Mutex::new(HashMap::new())),
             kv_stores: Arc::new(Mutex::new(HashMap::new())),
+            watched_stores: Arc::new(Mutex::new(HashMap::new())),
             indexer_data_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -119,6 +125,44 @@ impl ModuleStorage {
     /// `host::stop` so a follower restart re-opens redb cleanly.
     pub fn close_kv(&self, id: &str) {
         let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
+        cache.remove(id);
+    }
+
+    /// Get-or-open the per-module watched-UTxO index. Idempotent;
+    /// first call per module pays the redb open + mirror-load cost,
+    /// subsequent calls return the shared `Arc`. On open failure the
+    /// index degrades to in-memory (logs loudly; the set re-seeds at
+    /// the next bootstrap) rather than taking the follower down —
+    /// same posture as `kv_store`.
+    pub fn watched_index(&self, id: &str) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
+        let mut cache = self.watched_stores.lock().expect("watched_stores mutex");
+        if let Some(idx) = cache.get(id) {
+            return idx.clone();
+        }
+        let idx = match std::fs::create_dir_all(self.module_dir(id))
+            .map_err(|e| e.to_string())
+            .and_then(|_| {
+                crate::watched_ref_index::WatchedRefIndex::open(self.watched_path(id))
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(idx) => Arc::new(idx),
+            Err(e) => {
+                tracing::error!(
+                    module = %id,
+                    error = %e,
+                    "watched.redb open failed; falling back to in-memory watched index"
+                );
+                Arc::new(crate::watched_ref_index::WatchedRefIndex::in_memory())
+            }
+        };
+        cache.insert(id.to_owned(), idx.clone());
+        idx
+    }
+
+    /// Drop the cached watched-index handle for a module. Mirror of
+    /// `close_kv`; release the redb file lock before `remove_module_dir`.
+    pub fn close_watched(&self, id: &str) {
+        let mut cache = self.watched_stores.lock().expect("watched_stores mutex");
         cache.remove(id);
     }
 
@@ -477,6 +521,13 @@ impl ModuleStorage {
     /// See `emissions_path` for the rationale.
     pub(crate) fn kv_path(&self, id: &str) -> PathBuf {
         self.module_dir(id).join("kv.redb")
+    }
+
+    /// Per-module watched-UTxO index file (redb). Crate-private —
+    /// callers go through `watched_index(id)` so the cached
+    /// `Arc<Database>` handle is shared (single-writer lock).
+    pub(crate) fn watched_path(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("watched.redb")
     }
 
     /// Persist the driver's last-applied cursor atomically.
