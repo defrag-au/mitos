@@ -90,6 +90,13 @@ impl DriverV2 {
         self.watched = watched;
     }
 
+    /// Shared handle to this module's watched-UTxO index, if wired.
+    /// Cheap `Arc` clone — lets the bootstrap paths seed the same
+    /// index the plane reads without a borrow on the driver.
+    pub fn watched_index(&self) -> Option<Arc<WatchedRefIndex>> {
+        self.watched.clone()
+    }
+
     pub fn cursor(&self) -> Option<&ChainPoint> {
         self.cursor.as_ref()
     }

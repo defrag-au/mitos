@@ -532,22 +532,6 @@ where
                     );
                 }
             }
-
-            // Migration cold-seed: when the watched index is empty
-            // but bootstrap was skipped (per-scope flags already set
-            // from a pre-index deploy), `dispatch_synthetic_batch`
-            // never fired, so the index has nothing. Seed it directly
-            // from current chain state (refs-only) so the gate has a
-            // populated set on first deploy. Subsequent restarts find
-            // a non-empty persisted index and skip this.
-            if watched_index.is_empty() {
-                crate::bootstrap_v2::seed_watched_index(
-                    &watched_index,
-                    &interest,
-                    bootstrap_chain.as_ref(),
-                )
-                .await;
-            }
         }
 
         // Recapture re-bootstrap: after the host-side manifest

@@ -8,8 +8,27 @@ Early telemetry: `pct_skippable=100`, `index_gap=0` at steady state
 (small sample — `would_resolve` accrues as cold-seeded old watched
 UTxOs are spent). Env backup: `/etc/default/mitos-mainnet.bak.preshadow`.
 
-**Before `on`:** soak several days; require `index_gap == 0` over a
-full 7-day window and a stable `would_skip` %. Then set
+**Seeding fix (2026-06-06).** First soak (~26h) showed the win
+(`pct_skippable=99`) but ongoing `index_gap` (~62/2h) concentrated in
+**empty-manifest dynamic-interest modules** (asset-transfer,
+cip-25/68-mint, collection-holders/metadata, holder-distribution):
+the cold-seed was gated behind `if !manifest.interest.is_empty()` and
+the synthetic-dispatch bootstrap flag, so those modules' pre-existing
+live UTxOs were never indexed. Fix: a **separate per-scope
+`__platform/watched-seed/` flag** decouples index seeding from
+synthetic dispatch, and seeding now runs (refs-only, flag-gated) in
+`run_bootstrap` (manifest path) **and** `apply_interest_update`
+(dynamic path — before the chunked/non-chunked split, so it also
+covers chunked cold-start modules whose backfill instance never
+touches the live index). Redeployed in shadow: 161 scopes seeded,
+dynamic indexes grew 2.6M→4.6M, **`index_gap` → 0 at steady state**,
+`pct_skippable=99` with `would_resolve` now non-zero (index
+recognising watched refs). `seed_predicate_watched` /
+`seed_interest_watched` in `bootstrap_v2.rs`; `driver.watched_index()`
+accessor; obsolete `is_empty` host_v2 migration seed removed.
+
+**Before `on`:** soak; require `index_gap == 0` sustained over a full
+7-day horizon window and a stable `would_skip` %. Then set
 `MITOS_FALLBACK_GATE=on` + restart.
 
 Noted during deploy: `jpg-store-listing`/`jpg-store-sale` manifests

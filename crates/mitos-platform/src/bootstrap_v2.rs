@@ -99,6 +99,15 @@ pub async fn run_bootstrap<P: ChainDataPlane + Sync>(
 ) -> anyhow::Result<BootstrapStats> {
     let mut stats = BootstrapStats::default();
 
+    // Seed the watched-UTxO index for every interest scope first
+    // (refs-only, flag-gated, independent of the synthetic-dispatch
+    // bootstrap flags below). This is what records the current live
+    // set so the fallback gate recognises these UTxOs when they're
+    // later consumed. See `docs/design/WATCHED_UTXO_INDEX.md`.
+    if let Some(index) = driver.watched_index() {
+        seed_interest_watched(index.as_ref(), interest, kv, module_id, plane).await;
+    }
+
     // ----- address scans (current-state hydration via
     // `utxos_by_address`).
     let addresses: Vec<String> = interest.watched_addresses().map(|s| s.to_owned()).collect();
@@ -206,91 +215,141 @@ pub async fn run_bootstrap<P: ChainDataPlane + Sync>(
     Ok(stats)
 }
 
-/// One-time cold seed of the watched-UTxO index from current chain
-/// state, refs-only (no output decode for address/cred scans, no
-/// synthetic dispatch). Closes the migration gap on first deploy of
-/// the index against a module whose per-scope bootstrap flags are
-/// already set — `run_bootstrap` skips those scans, so the index
-/// would otherwise start empty. Going-forward seeding rides
-/// `DriverV2::dispatch_synthetic_batch`; this only handles cold start.
-///
-/// Best-effort: a per-predicate enumeration error is logged and
-/// skipped — the gate runs in shadow first, and `apply_block`'s
-/// `index_gap` safety net surfaces anything this misses.
-pub async fn seed_watched_index<P: ChainDataPlane + Sync>(
-    index: &WatchedRefIndex,
-    interest: &InterestSet,
+/// Per-scope completion flag for watched-index seeding. Distinct
+/// from the synthetic-dispatch bootstrap flag (`__platform/bootstrap/`)
+/// — seeding the index (recording a scope's live refs) and emitting
+/// synthetic `Produced` events to the module are independent concerns
+/// with independent idempotence. Keeping them separate lets the index
+/// be seeded once per scope even when the dispatch flag is already
+/// set (the case that left dynamic-interest modules unseeded on first
+/// deploy / restart). NOT cleared by `clear_bootstrap_flags` (the
+/// index is maintained by `apply_block` thereafter; recapture has no
+/// reason to re-seed).
+fn watched_seed_flag_key(predicate: &InterestPredicate) -> Option<String> {
+    match predicate {
+        InterestPredicate::AtAddress(a) => Some(format!("__platform/watched-seed/{a}")),
+        InterestPredicate::AtPaymentCred(c) => Some(format!(
+            "__platform/watched-seed/payment-cred/{}",
+            hex::encode(c)
+        )),
+        InterestPredicate::HoldsPolicy(p) => Some(format!("__platform/watched-seed/policy/{p}")),
+        // No current-state hydration for these (mirrors
+        // `bootstrap_one_predicate`): stake-cred needs a resolution
+        // step, single-asset seeding is uncommon, ticks have no state.
+        InterestPredicate::AtStakeCred(_)
+        | InterestPredicate::HoldsAsset { .. }
+        | InterestPredicate::TickEvery(_) => None,
+    }
+}
+
+/// Enumerate the current unspent refs matching one predicate,
+/// refs-only (no output decode, no synthetic dispatch). Errors are
+/// logged and yield an empty set — the gate runs in shadow first and
+/// `apply_block`'s `index_gap` safety net surfaces any miss.
+async fn enumerate_predicate_refs<P: ChainDataPlane + Sync>(
+    predicate: &InterestPredicate,
     plane: &P,
-) {
-    let mut total = 0usize;
-
-    // Addresses + payment creds: refs-only enumeration.
-    for address in interest.watched_addresses() {
-        match plane.utxos_by_address(address).await {
-            Ok(refs) => {
-                total += refs.len();
-                index.seed(refs);
+) -> Vec<OutputRef> {
+    match predicate {
+        InterestPredicate::AtAddress(address) => match plane.utxos_by_address(address).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::warn!(%address, error = %e, "watched-seed: utxos_by_address failed");
+                Vec::new()
             }
-            Err(e) => tracing::warn!(
-                %address, error = %e,
-                "watched-index seed: utxos_by_address failed",
-            ),
-        }
-    }
-    for cred in interest.watched_payment_creds() {
-        match plane.utxos_by_payment_cred(cred.as_slice()).await {
-            Ok(refs) => {
-                total += refs.len();
-                index.seed(refs);
+        },
+        InterestPredicate::AtPaymentCred(cred) => {
+            match plane.utxos_by_payment_cred(cred.as_slice()).await {
+                Ok(refs) => refs,
+                Err(e) => {
+                    tracing::warn!(cred = %hex::encode(cred), error = %e, "watched-seed: utxos_by_payment_cred failed");
+                    Vec::new()
+                }
             }
-            Err(e) => tracing::warn!(
-                cred = %hex::encode(cred), error = %e,
-                "watched-index seed: utxos_by_payment_cred failed",
-            ),
         }
-    }
-
-    // Policies: page through the matching set (same paginated path as
-    // `scan_one_policy`), keeping refs only.
-    for policy in interest.watched_policies() {
-        let predicate = UtxoPredicate::matching(UtxoPattern {
-            asset: Some(AssetPattern::Policy(policy.clone())),
-            ..Default::default()
-        });
-        let mut page_token: Option<String> = None;
-        loop {
-            match plane
-                .search_utxos(
-                    &predicate,
-                    DecodeLevel::Lean,
-                    PageRequest {
-                        start_token: page_token.clone(),
-                        max_items: 1000,
-                    },
-                )
-                .await
-            {
-                Ok(page) => {
-                    let refs: Vec<OutputRef> = page.items.iter().map(|(o, _)| *o).collect();
-                    total += refs.len();
-                    index.seed(refs);
-                    match page.next_token {
-                        Some(t) => page_token = Some(t),
-                        None => break,
+        InterestPredicate::HoldsPolicy(policy) => {
+            // Page through the matching set (same path as `scan_one_policy`).
+            let pred = UtxoPredicate::matching(UtxoPattern {
+                asset: Some(AssetPattern::Policy(policy.clone())),
+                ..Default::default()
+            });
+            let mut out = Vec::new();
+            let mut page_token: Option<String> = None;
+            loop {
+                match plane
+                    .search_utxos(
+                        &pred,
+                        DecodeLevel::Lean,
+                        PageRequest {
+                            start_token: page_token.clone(),
+                            max_items: 1000,
+                        },
+                    )
+                    .await
+                {
+                    Ok(page) => {
+                        out.extend(page.items.iter().map(|(o, _)| *o));
+                        match page.next_token {
+                            Some(t) => page_token = Some(t),
+                            None => break,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%policy, error = %e, "watched-seed: search_utxos(holds_policy) failed");
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        %policy, error = %e,
-                        "watched-index seed: search_utxos(holds_policy) failed",
-                    );
-                    break;
-                }
             }
+            out
         }
+        _ => Vec::new(),
     }
+}
 
-    tracing::info!(seeded = total, "watched-index cold seed complete");
+/// Seed the watched-UTxO index for one interest scope's current live
+/// set, once per scope (gated by [`watched_seed_flag_key`]). Refs-only
+/// and side-effect-free toward companions — unlike the synthetic
+/// bootstrap dispatch, this can run even when the dispatch flag is
+/// already set, which is exactly the path that backfills
+/// dynamic-interest modules on first deploy / restart.
+pub async fn seed_predicate_watched<P: ChainDataPlane + Sync>(
+    index: &WatchedRefIndex,
+    predicate: &InterestPredicate,
+    kv: &mut ModuleKv,
+    module_id: &str,
+    plane: &P,
+) {
+    let Some(key) = watched_seed_flag_key(predicate) else {
+        return;
+    };
+    match has_flag(kv, module_id, &key) {
+        Ok(true) => return, // already seeded this scope
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "watched-seed: flag read failed; seeding anyway"),
+    }
+    let refs = enumerate_predicate_refs(predicate, plane).await;
+    let seeded = refs.len();
+    index.seed(refs);
+    if let Err(e) = set_flag(kv, module_id, &key) {
+        tracing::warn!(error = %e, "watched-seed: flag set failed; may re-seed next run");
+    }
+    if seeded > 0 {
+        tracing::info!(module = %module_id, predicate = ?predicate, seeded, "watched-index scope seeded");
+    }
+}
+
+/// Seed every interest scope's watched-index entries (one pass over
+/// the set). Each scope is flag-gated, so this is cheap on warm runs.
+pub async fn seed_interest_watched<P: ChainDataPlane + Sync>(
+    index: &WatchedRefIndex,
+    interest: &InterestSet,
+    kv: &mut ModuleKv,
+    module_id: &str,
+    plane: &P,
+) {
+    for predicate in &interest.predicates {
+        seed_predicate_watched(index, predicate, kv, module_id, plane).await;
+    }
 }
 
 /// Run bootstrap for a single newly-added predicate (address or
