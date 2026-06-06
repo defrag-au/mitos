@@ -294,6 +294,51 @@ mitos_platform::dialer: dial loop started target=jpg-store-offer
   companion=jpg-store-offer
 ```
 
+## Rollbacks (chain reorgs)
+
+Cardano rolls back near the tip — routinely by a block or two, and
+more around a hard fork's era boundary. When the chain mitos is
+following reorgs, it walks your consumer **back** to the common
+ancestor and re-applies forward along the new chain:
+
+1. `ServerMessage::Undo { cursor: ChainPoint }`
+   (`crates/mitos-protocol/src/wire.rs`) — "rewind to this point."
+2. Fresh `Apply` frames along the new chain, advancing the cursor
+   forward again.
+
+The companion hook is `MitosChannel::undo(ctx, point)`. **Its default
+is a no-op + warning log** (`crates/mitos-companion/src/traits.rs`).
+Whether that default is safe depends entirely on the shape of your
+state:
+
+- **Re-derivable state → idempotent re-apply is enough; leave `undo`
+  as the default.** If `apply_event` reconverges your rows from
+  *current* chain state (e.g. ownership: "this asset's current owner is
+  X" — a later Apply just overwrites it), the re-applied frames after
+  the fork correct everything. This is why `collection-ownership` does
+  **not** override `undo`. Your `apply_event` MUST be idempotent
+  regardless (the dialer can re-deliver) — see
+  `docs/design/EVENT_DELIVERY_RESILIENCE.md`.
+
+- **Terminal / latching state → you MUST implement `undo`.** If an
+  event flips a one-way flag a re-apply won't un-flip — "confirmed",
+  "delivered", "paid", "settled" — then a rolled-back block leaves that
+  flag wrongly set, because the new chain simply won't re-emit the
+  event that set it. Re-apply can't help (there's nothing to re-apply).
+  Implement `undo(point)` to revert state at/after `point`. For this you
+  need the event to carry its `slot` so you know what to roll back
+  (several community events omit slot today — check the struct, and if
+  your latching logic needs it, that's a field to add to the module).
+
+The minting-engine's mint-confirmation is the canonical latching case:
+it sets a `delivered` status off a confirmation event, so it overrides
+`undo` to revert, and pairs the feed with a depth-buffered Maestro
+backstop for the fork window (see
+`cnft.dev-workers/docs/design/MINT_CONFIRMATION.md`).
+
+Rule of thumb: **if you can't recompute the row purely from the latest
+event for its key, you have latching state and need `undo`.**
+
 ## Recapture: resetting state for a fresh re-emission
 
 **Recapture** = drop the consumer's projected state, get the

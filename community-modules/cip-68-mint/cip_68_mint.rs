@@ -42,9 +42,20 @@ use pallas_primitives::PlutusData;
 use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
-use crate::mitos::platform_v2::types::{MintedEvent, ProducedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{ChainPoint, MintedEvent, ProducedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "cip-68-mint-module";
+
+/// Absolute slot of a chain cursor. `Origin` has no slot (0);
+/// `SlotOnly`/`Specific` carry one. Mirrors the helper in the
+/// `asset-transfer` module so both stamp `slot` identically.
+fn cursor_slot(cursor: &ChainPoint) -> u64 {
+    match cursor {
+        ChainPoint::Origin => 0,
+        ChainPoint::SlotOnly(s) => *s,
+        ChainPoint::Specific(p) => p.slot,
+    }
+}
 
 // CIP-67 label tags used by CIP-68.
 const CIP67_LABEL_REFERENCE: u32 = 100;
@@ -119,6 +130,9 @@ struct TxBuffer {
     /// events in one `handle-events` call belong to the same
     /// TX).
     tx_hash: Option<Vec<u8>>,
+    /// Absolute slot of the TX's block, captured from the first
+    /// event's cursor (all events in one batch share a block).
+    slot: u64,
 }
 
 #[derive(Clone)]
@@ -270,6 +284,7 @@ fn plutus_key_to_string(pd: &PlutusData) -> String {
 fn handle_minted(m: &MintedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(m.tx_hash.clone());
+        buf.slot = cursor_slot(&m.cursor);
     }
     if m.quantity_delta <= 0 {
         // Burns: handled by `standard-burn`. Ignored here.
@@ -315,6 +330,7 @@ fn handle_minted(m: &MintedEvent, buf: &mut TxBuffer) {
 fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(p.tx_hash.clone());
+        buf.slot = cursor_slot(&p.cursor);
     }
     // Look for a `_100`-prefixed asset in this output; capture
     // its datum bytes. Outputs commonly hold exactly one
@@ -342,6 +358,7 @@ fn flush_buffer(mut buf: TxBuffer) {
         None => return,
     };
     let tx_hash_hex = hex::encode(&tx_hash);
+    let slot = buf.slot;
 
     // Drain user-mints; for each, look for a paired ref-mint by
     // (policy, suffix). The user/ref maps are keyed by
@@ -384,6 +401,7 @@ fn flush_buffer(mut buf: TxBuffer) {
                 quantity: user.quantity,
                 cip67_label: user.label,
             },
+            slot,
         });
     }
 

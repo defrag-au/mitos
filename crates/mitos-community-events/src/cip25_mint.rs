@@ -39,6 +39,13 @@ pub struct Cip25Mint {
     /// own typed shape or pass to `cardano_assets::AssetMetadata`
     /// for the project-standard decode.
     pub metadata_json: Option<String>,
+    /// Absolute slot of the TX's block. Lets a consumer confirm
+    /// at a precise chain point and revert by slot on a rollback
+    /// (`ServerMessage::Undo`). `#[serde(default)]` keeps the
+    /// field additive — payloads emitted before this field was
+    /// introduced decode with `slot = 0`.
+    #[serde(default)]
+    pub slot: u64,
 }
 
 #[cfg(feature = "decode")]

@@ -37,6 +37,13 @@ pub struct Cip68Mint {
     /// User-token details — always present (the event exists
     /// because a user-token mint was observed).
     pub user: Cip68UserInfo,
+    /// Absolute slot of the TX's block. Lets a consumer confirm
+    /// at a precise chain point and revert by slot on a rollback
+    /// (`ServerMessage::Undo`). `#[serde(default)]` keeps the
+    /// field additive — payloads emitted before this field was
+    /// introduced decode with `slot = 0`.
+    #[serde(default)]
+    pub slot: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

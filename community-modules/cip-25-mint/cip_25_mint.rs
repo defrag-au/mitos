@@ -43,9 +43,20 @@ use mitos_community_events::cip25_mint::Cip25Mint;
 use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
-use crate::mitos::platform_v2::types::{MintedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{ChainPoint, MintedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "cip-25-mint-module";
+
+/// Absolute slot of a chain cursor. `Origin` has no slot (0);
+/// `SlotOnly`/`Specific` carry one. Mirrors the helper in the
+/// `asset-transfer` module so both stamp `slot` identically.
+fn cursor_slot(cursor: &ChainPoint) -> u64 {
+    match cursor {
+        ChainPoint::Origin => 0,
+        ChainPoint::SlotOnly(s) => *s,
+        ChainPoint::Specific(p) => p.slot,
+    }
+}
 
 // Per-handler aux-data cache: `Minted` events for one TX
 // arrive in one `handle-events` call, so caching by tx_hash
@@ -115,6 +126,7 @@ fn handle_minted(m: &MintedEvent) {
         tx_hash: hex::encode(&m.tx_hash),
         quantity,
         metadata_json,
+        slot: cursor_slot(&m.cursor),
     });
 }
 
