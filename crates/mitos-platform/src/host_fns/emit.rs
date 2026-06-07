@@ -37,6 +37,13 @@ pub struct EmittedEvent {
     /// drain in parallel across keys, serial within a key. See
     /// `docs/design/DIALER_CONCURRENCY.md`.
     pub partition_key: Vec<u8>,
+    /// Rollback marker. `false` for ordinary forward emissions
+    /// (the module produced this event). `true` for a synthetic
+    /// **undo** marker the follower injects on a chain rollback —
+    /// the drain task fans it out to every subscribed companion as
+    /// an undo emission (`is_undo` row → `POST /_internal/undo-…`),
+    /// carrying the rollback `ChainPoint` in `chain_point`.
+    pub is_undo: bool,
 }
 
 impl EventSink {

@@ -1160,7 +1160,14 @@ pub(crate) async fn run_emit_drain(
             _ = cancel.cancelled() => return,
             event = events_rx.recv() => {
                 let Some(event) = event else { return };
-                drain_one(&storage, &store, &module_id, event, &mut interest_cache);
+                if event.is_undo {
+                    // Chain rollback: broadcast an undo emission to every
+                    // subscribed companion (no interest filter — a reorg is
+                    // unconditional; each companion reverts its own state).
+                    fan_out_undo(&storage, &store, &module_id, event);
+                } else {
+                    drain_one(&storage, &store, &module_id, event, &mut interest_cache);
+                }
             }
         }
     }
@@ -1416,6 +1423,92 @@ fn drain_one(
             );
         }
     }
+}
+
+/// Fan a chain-rollback **undo** out to every companion subscribed to
+/// this module. Unlike [`drain_one`], there is no interest filter and
+/// no sentinel: a reorg is unconditional, so each subscribed companion
+/// gets one `is_undo` emission carrying the rollback `ChainPoint`
+/// (`event.chain_point`). The dialer delivers it via
+/// `POST /_internal/undo-<target>` and the companion's `undo()` hook
+/// reverts any latching state at or after that point. Re-derivable
+/// companions whose `undo` is the default no-op simply ignore it; the
+/// re-applied forward frames reconverge them.
+///
+/// No subscribers → nothing to undo (a sentinel undo would be
+/// meaningless — undo targets state a companion already applied).
+fn fan_out_undo(
+    storage: &ModuleStorage,
+    store: &crate::emissions::EmissionsStore,
+    module_id: &str,
+    event: emit::EmittedEvent,
+) {
+    let companions_dir = storage.module_dir_for_companions(module_id);
+    let now = format!(
+        "unix:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    // The undo row's channel = the module/target name (= the companion
+    // channel `NAME`). The dialer routes by the companion's pre-resolved
+    // per-target URL, but we stamp it here for log clarity + the
+    // companion's `/_internal/undo-<channel>` lookup.
+    let channel = module_id.to_string();
+
+    let Ok(read) = std::fs::read_dir(&companions_dir) else {
+        // No companions dir → no subscribers → nothing to revert.
+        return;
+    };
+    let mut delivered = 0u64;
+    for entry in read.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let dir_name = entry.file_name();
+        let Some(client_id) = dir_name.to_str() else {
+            continue;
+        };
+        if client_id.starts_with('.') {
+            continue; // metadata dirs (`.unreachable/` etc.)
+        }
+        let Ok(client_files) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for client_entry in client_files.flatten() {
+            let path = client_entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("cbor") {
+                continue;
+            }
+            let Some(companion_key) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match store.append_undo(
+                companion_key,
+                client_id,
+                &channel,
+                event.chain_point.clone(),
+                event.partition_key.clone(),
+                &now,
+            ) {
+                Ok(_) => delivered += 1,
+                Err(e) => tracing::warn!(
+                    module = %module_id,
+                    client_id = %client_id,
+                    companion_key = %companion_key,
+                    error = %e,
+                    "append undo emission failed"
+                ),
+            }
+        }
+    }
+    tracing::info!(
+        module = %module_id,
+        cursor = ?event.chain_point,
+        companions = delivered,
+        "rollback fanned out as undo emissions"
+    );
 }
 
 /// Interest-update router for v2 modules.

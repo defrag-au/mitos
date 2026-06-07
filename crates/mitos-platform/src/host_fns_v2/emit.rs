@@ -50,6 +50,29 @@ impl HostStateV2 {
             payload,
             chain_point,
             partition_key,
+            is_undo: false,
+        };
+        if self.emitter.sender.send(event).is_err() {
+            return Err(wasmtime::Error::msg("event sink closed"));
+        }
+        Ok(())
+    }
+
+    /// Inject a synthetic **undo** marker into the event sink on a chain
+    /// rollback. Modules don't emit on `DispatchEvent::Rollback`, so the
+    /// platform generates the undo: the drain task (`fan_out_undo`) turns
+    /// this one marker into an `is_undo` emission per subscribed companion,
+    /// carrying `point` (the rollback target) for the companion's `undo()`
+    /// hook. Channel/payload are unused for undo (the marker is
+    /// module-wide), so they're empty.
+    pub fn emit_undo_marker(&self, point: &ChainPoint) -> wasmtime::Result<()> {
+        let event = EmittedEvent {
+            module_id: self.module_id.clone(),
+            channel: 0,
+            payload: Vec::new(),
+            chain_point: to_wire(point),
+            partition_key: Vec::new(),
+            is_undo: true,
         };
         if self.emitter.sender.send(event).is_err() {
             return Err(wasmtime::Error::msg("event sink closed"));

@@ -22,9 +22,10 @@ mod interest_tests;
 
 pub use http::{
     ApplyBody, ApplyBulkRequest, ApplyBulkResponse, BulkEmission, BulkEmissionResult,
-    HTTP_DELIVERY_MIME, InterestMutationBody, RecaptureBody, decode_apply, decode_apply_bulk,
-    decode_apply_bulk_response, decode_interest_mutation, decode_recapture, encode_apply,
-    encode_apply_bulk, encode_apply_bulk_response, encode_interest_mutation, encode_recapture,
+    HTTP_DELIVERY_MIME, InterestMutationBody, RecaptureBody, UndoBody, decode_apply,
+    decode_apply_bulk, decode_apply_bulk_response, decode_interest_mutation, decode_recapture,
+    decode_undo, encode_apply, encode_apply_bulk, encode_apply_bulk_response,
+    encode_interest_mutation, encode_recapture, encode_undo,
 };
 pub use interest::{
     AssetMovementSelector, AssetSelector, BurnSelector, DexSelector, DomainSelector, Interest,

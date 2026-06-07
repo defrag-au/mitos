@@ -42,7 +42,8 @@ use crate::subscribe::SubscribeRequest;
 use crate::traits::{MitosChannel, MitosChannelDyn, MitosCompanion};
 use mitos_protocol::{
     ApplyBody, ApplyBulkResponse, BulkEmissionResult, ChainPoint, Interest, InterestOp,
-    RecaptureBody, decode_apply, decode_apply_bulk, decode_recapture, encode_apply_bulk_response,
+    RecaptureBody, UndoBody, decode_apply, decode_apply_bulk, decode_recapture, decode_undo,
+    encode_apply_bulk_response,
 };
 
 /// Companion runtime.
@@ -169,6 +170,10 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             (Method::Post, p) if p.starts_with("/_internal/recapture-") => {
                 let channel = p.trim_start_matches("/_internal/recapture-").to_string();
                 self.handle_recapture_post(req, channel).await
+            }
+            (Method::Post, p) if p.starts_with("/_internal/undo-") => {
+                let channel = p.trim_start_matches("/_internal/undo-").to_string();
+                self.handle_undo_post(req, channel).await
             }
             (Method::Post, "/_internal/wake") => self.handle_wake().await,
             (Method::Post, "/_internal/teardown") => self.handle_interest_teardown().await,
@@ -450,6 +455,66 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
                     "on_recapture failed; returning 500 so admin endpoint surfaces the error"
                 );
                 Response::error(format!("on_recapture failed: {e}"), 500)
+            }
+        }
+    }
+
+    /// Undo HTTP handler — signals a chain rollback (reorg).
+    ///
+    /// Decodes the [`UndoBody`], dispatches to the channel handler's
+    /// `undo` hook with the rollback `ChainPoint`, and translates the
+    /// result to an HTTP status:
+    /// - `Ok(())` → 200 OK (revert applied / no-op)
+    /// - `Err(e)` → 500 so the dialer retries (an undo that errored
+    ///   left latching state wrongly set — fail loud)
+    ///
+    /// Unlike apply, undo does **not** advance the persisted cursor:
+    /// the undo row is interleaved in the emission log before the new
+    /// chain's applies, which advance the cursor as they arrive. A
+    /// re-derivable companion's default no-op `undo` simply 200s.
+    async fn handle_undo_post(
+        &self,
+        mut req: Request,
+        channel: String,
+    ) -> worker::Result<Response> {
+        let bytes = req
+            .bytes()
+            .await
+            .map_err(|e| worker::Error::RustError(format!("read undo body: {e}")))?;
+        let body = match decode_undo(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "decode UndoBody failed");
+                return Response::error(format!("decode: {e}"), 400);
+            }
+        };
+
+        let UndoBody { cursor } = body;
+
+        let channel_handler = match self.lookup_channel(&channel) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(channel = %channel, error = %e, "no handler for channel");
+                return Response::error(format!("unknown channel: {e}"), 404);
+            }
+        };
+
+        let sql = self.state.storage().sql();
+        let ctx = Ctx::new(cursor.clone(), channel.clone(), sql.clone());
+
+        match channel_handler.undo(&ctx, cursor.clone()).await {
+            Ok(()) => {
+                tracing::info!(channel = %channel, cursor = ?cursor, "undo applied");
+                Response::empty()
+            }
+            Err(e) => {
+                tracing::error!(
+                    channel = %channel,
+                    cursor = ?cursor,
+                    error = %e,
+                    "undo hook failed; returning 500 so the dialer retries"
+                );
+                Response::error(format!("undo failed: {e}"), 500)
             }
         }
     }

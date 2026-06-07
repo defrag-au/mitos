@@ -214,6 +214,9 @@ struct CompanionDial {
     /// Bulk-apply URL (`apply_url` with `-bulk` before the query).
     bulk_url: String,
     recapture_url: String,
+    /// Undo URL (`{op}` = `undo`) — `POST /_internal/undo-<target>`,
+    /// used to deliver chain-rollback `is_undo` rows.
+    undo_url: String,
     header_name: Option<String>,
     header_value: Option<String>,
     /// Per-companion bulk-route capability cache
@@ -782,6 +785,7 @@ fn resolve_companion_dial(
         anyhow::bail!("apply URL is malformed: {apply_url}");
     }
     let recapture_url = resolve_op_url(req, target, "recapture")?;
+    let undo_url = resolve_op_url(req, target, "undo")?;
     // `bulk_url` is `apply_url` with `-bulk` spliced before the
     // query; the capability cache lazily resolves whether the
     // companion has the bulk route (404/415 → fall back to per-row
@@ -794,6 +798,7 @@ fn resolve_companion_dial(
         apply_url,
         bulk_url,
         recapture_url,
+        undo_url,
         header_name,
         header_value,
         bulk_capability: Arc::new(AtomicU8::new(pool::BULK_UNKNOWN)),
@@ -975,6 +980,7 @@ async fn run_module_tick(
                 client: client.clone(),
                 apply_url: dial.apply_url.clone(),
                 bulk_url: dial.bulk_url.clone(),
+                undo_url: dial.undo_url.clone(),
                 bulk_capability: dial.bulk_capability.clone(),
                 bulk_max: bulk_config.max,
                 channel: module_id.to_string(),
@@ -1297,6 +1303,7 @@ mod tests {
             status_at: "unix:0".into(),
             error: None,
             partition_key: partition_key.to_vec(),
+            is_undo: false,
         }
     }
 

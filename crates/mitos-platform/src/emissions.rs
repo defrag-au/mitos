@@ -124,6 +124,15 @@ pub struct EmissionRecord {
     /// dialer-concurrency) deserialise cleanly as empty.
     #[serde(default)]
     pub partition_key: Vec<u8>,
+    /// Rollback marker. `false` for ordinary forward emissions
+    /// (delivered as `POST /_internal/apply-<channel>`). `true` for
+    /// a host-synthesised **undo** row produced on a chain rollback;
+    /// the dialer delivers it as `POST /_internal/undo-<channel>`
+    /// with an `UndoBody` carrying `chain_point` (the rollback
+    /// target). `#[serde(default)]` so pre-undo rows deserialise as
+    /// `false`.
+    #[serde(default)]
+    pub is_undo: bool,
 }
 
 /// Per-module emissions log. Wraps a redb database file with
@@ -170,6 +179,9 @@ impl EmissionsStore {
     /// equivalent to legacy single-lane drain. Callers from the
     /// legacy `emit-event` path pass empty; `emit-event-keyed`
     /// callers pass the module-declared key.
+    ///
+    /// Records a forward (`is_undo = false`) emission. The rollback
+    /// fan-out uses [`Self::append_undo`].
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &self,
@@ -181,6 +193,59 @@ impl EmissionsStore {
         partition_key: Vec<u8>,
         initial_status: EmissionStatus,
         now_rfc3339: &str,
+    ) -> Result<u64, EmissionsError> {
+        self.append_inner(
+            companion_id,
+            client_id,
+            channel,
+            chain_point,
+            payload,
+            partition_key,
+            initial_status,
+            now_rfc3339,
+            false,
+        )
+    }
+
+    /// Append a host-synthesised **undo** row for a chain rollback.
+    /// Same shape as [`Self::append`] but flags the row `is_undo` so
+    /// the dialer delivers it via `POST /_internal/undo-<channel>`
+    /// (an `UndoBody` carrying `chain_point`, the rollback target).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_undo(
+        &self,
+        companion_id: &str,
+        client_id: &str,
+        channel: &str,
+        chain_point: ChainPoint,
+        partition_key: Vec<u8>,
+        now_rfc3339: &str,
+    ) -> Result<u64, EmissionsError> {
+        self.append_inner(
+            companion_id,
+            client_id,
+            channel,
+            chain_point,
+            Vec::new(),
+            partition_key,
+            EmissionStatus::Queued,
+            now_rfc3339,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_inner(
+        &self,
+        companion_id: &str,
+        client_id: &str,
+        channel: &str,
+        chain_point: ChainPoint,
+        payload: Vec<u8>,
+        partition_key: Vec<u8>,
+        initial_status: EmissionStatus,
+        now_rfc3339: &str,
+        is_undo: bool,
     ) -> Result<u64, EmissionsError> {
         let wx = self
             .db
@@ -218,6 +283,7 @@ impl EmissionsStore {
             status_at: now_rfc3339.to_string(),
             error: None,
             partition_key,
+            is_undo,
         };
 
         let mut buf = Vec::new();

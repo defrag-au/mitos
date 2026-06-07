@@ -393,6 +393,11 @@ impl DriverV2 {
             .bindings
             .call_handle_events(&mut self.instance.store, &[event])
             .await?;
+        // Modules don't emit on rollback; the platform synthesises the
+        // undo. Inject one marker into the event sink — the drain task
+        // fans it out to every subscribed companion as an undo emission
+        // (carrying `to_cursor`, the rollback target).
+        self.instance.store.data().emit_undo_marker(&to_cursor)?;
         self.cursor = Some(to_cursor);
         Ok(())
     }

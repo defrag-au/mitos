@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use mitos_protocol::{
-    ApplyBody, ApplyBulkRequest, BulkEmission, BulkEmissionResult, HTTP_DELIVERY_MIME,
-    encode_apply, encode_apply_bulk,
+    ApplyBody, ApplyBulkRequest, BulkEmission, BulkEmissionResult, HTTP_DELIVERY_MIME, UndoBody,
+    encode_apply, encode_apply_bulk, encode_undo,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -259,6 +259,9 @@ pub struct TickArgs {
     /// Bulk-apply URL (`apply_url` with `-bulk` before the query).
     /// Empty disables the bulk path.
     pub bulk_url: String,
+    /// Undo URL (`POST /_internal/undo-<target>`) — delivers
+    /// chain-rollback `is_undo` rows.
+    pub undo_url: String,
     /// Per-companion bulk capability cache, shared across this
     /// companion's lanes (and across ticks). See [`BULK_UNKNOWN`].
     pub bulk_capability: Arc<AtomicU8>,
@@ -317,6 +320,7 @@ pub async fn run_tick(args: TickArgs) -> anyhow::Result<()> {
         let client = args.client.clone();
         let apply_url = args.apply_url.clone();
         let bulk_url = args.bulk_url.clone();
+        let undo_url = args.undo_url.clone();
         let bulk_capability = args.bulk_capability.clone();
         let bulk_max = args.bulk_max;
         let channel = args.channel.clone();
@@ -334,6 +338,7 @@ pub async fn run_tick(args: TickArgs) -> anyhow::Result<()> {
                 client,
                 apply_url,
                 bulk_url,
+                undo_url,
                 bulk_capability,
                 bulk_max,
                 channel,
@@ -393,6 +398,7 @@ struct LaneArgs {
     client: reqwest::Client,
     apply_url: String,
     bulk_url: String,
+    undo_url: String,
     bulk_capability: Arc<AtomicU8>,
     bulk_max: usize,
     channel: String,
@@ -410,6 +416,7 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
         client,
         apply_url,
         bulk_url,
+        undo_url,
         bulk_capability,
         bulk_max,
         channel,
@@ -427,17 +434,22 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
         "lane drain start"
     );
 
-    // Bulk path is taken unless M<=1, no bulk URL, or the companion
-    // was already found not to support bulk (cached UNSUPPORTED).
+    // Bulk path is taken unless M<=1, no bulk URL, the companion was
+    // already found not to support bulk (cached UNSUPPORTED), or the
+    // lane carries any undo row (undo can't be bulk-batched and must
+    // keep strict id-order against the surrounding applies).
+    let has_undo = rows.iter().any(|r| r.is_undo);
     let bulk_enabled = bulk_max > 1
         && !bulk_url.is_empty()
-        && bulk_capability.load(Ordering::Relaxed) != BULK_UNSUPPORTED;
+        && bulk_capability.load(Ordering::Relaxed) != BULK_UNSUPPORTED
+        && !has_undo;
 
     if !bulk_enabled {
         return drain_rows_single(
             &rows,
             &client,
             &apply_url,
+            &undo_url,
             header_name.as_deref(),
             header_value.as_deref(),
             &companion_key,
@@ -485,6 +497,7 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
                     &rows[start..],
                     &client,
                     &apply_url,
+                    &undo_url,
                     header_name.as_deref(),
                     header_value.as_deref(),
                     &companion_key,
@@ -500,6 +513,62 @@ async fn drain_lane(args: LaneArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a per-row drain is delivering. Derived from
+/// [`EmissionRecord::is_undo`]; selects the destination URL, the wire
+/// body shape, and the log label. Forward (`Apply`) is the common path;
+/// `Undo` carries a chain-rollback to a companion's `undo` hook.
+///
+/// Only the bulk-incompatible per-row path uses this — `Undo` rows force
+/// a lane to drain per-row (see [`drain_lane`]) precisely because they
+/// can't be `ApplyBulkRequest`-batched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliveryKind {
+    Apply,
+    Undo,
+}
+
+impl DeliveryKind {
+    fn of(row: &EmissionRecord) -> Self {
+        if row.is_undo {
+            Self::Undo
+        } else {
+            Self::Apply
+        }
+    }
+
+    /// Lowercase label for log / error context.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Undo => "undo",
+        }
+    }
+
+    /// Destination URL for this delivery.
+    fn url<'a>(self, apply_url: &'a str, undo_url: &'a str) -> &'a str {
+        match self {
+            Self::Apply => apply_url,
+            Self::Undo => undo_url,
+        }
+    }
+
+    /// CBOR-encode `row` as the body for this delivery.
+    fn encode_body(self, row: &EmissionRecord) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Apply => encode_apply(&ApplyBody {
+                emission_id: row.id,
+                cursor: row.chain_point.clone(),
+                change: row.payload.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("encode ApplyBody: {e}")),
+            Self::Undo => encode_undo(&UndoBody {
+                cursor: row.chain_point.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("encode UndoBody: {e}")),
+        }
+    }
+}
+
 /// Per-row drain — one HTTP POST per emission. The pre-bulk path,
 /// retained as the fallback when a companion has no bulk route
 /// (404/415) and the `bulk_max <= 1` opt-out.
@@ -508,6 +577,7 @@ async fn drain_rows_single(
     rows: &[EmissionRecord],
     client: &reqwest::Client,
     apply_url: &str,
+    undo_url: &str,
     header_name: Option<&str>,
     header_value: Option<&str>,
     companion_key: &str,
@@ -519,15 +589,14 @@ async fn drain_rows_single(
         let now = (now_fn)();
         writer_tx.send(StatusUpdate::Pending(row.id, now));
 
-        let body = ApplyBody {
-            emission_id: row.id,
-            cursor: row.chain_point.clone(),
-            change: row.payload.clone(),
-        };
-        let body_bytes =
-            encode_apply(&body).map_err(|e| anyhow::anyhow!("encode ApplyBody: {e}"))?;
+        // Forward rows deliver as `ApplyBody` to the apply URL; rollback
+        // rows as `UndoBody` to the undo URL. A lane carrying any undo
+        // row drains here (per-row) so id-order is preserved across the
+        // apply→undo→apply boundary (bulk would reorder + can't mix).
+        let kind = DeliveryKind::of(row);
+        let body_bytes = kind.encode_body(row)?;
         let mut req_builder = client
-            .post(apply_url)
+            .post(kind.url(apply_url, undo_url))
             .header(reqwest::header::CONTENT_TYPE, HTTP_DELIVERY_MIME)
             .body(body_bytes);
         if let (Some(name), Some(value)) = (header_name, header_value) {
@@ -538,12 +607,27 @@ async fn drain_rows_single(
             Err(e) => {
                 let now = (now_fn)();
                 writer_tx.send(StatusUpdate::Queued(row.id, now));
-                return Err(anyhow::anyhow!("apply POST send: {e}"));
+                return Err(anyhow::anyhow!("{} POST send: {e}", kind.as_str()));
             }
         };
         let status = resp.status();
         let now = (now_fn)();
         if status.is_success() {
+            writer_tx.send(StatusUpdate::Acked(row.id, now));
+            continue;
+        }
+        // A companion with no `/_internal/undo-<channel>` route 404s undo
+        // POSTs. That's expected for re-derivable consumers (they never
+        // need undo — the re-applied forward frames reconverge them). Ack
+        // it so it doesn't wedge the lane retrying forever. Only latching
+        // consumers implement the route; for them a 200/422 comes back.
+        if kind == DeliveryKind::Undo && status == reqwest::StatusCode::NOT_FOUND {
+            debug!(
+                id = row.id,
+                slot_idx,
+                companion_key = %companion_key,
+                "companion has no undo route; skipping undo (re-derivable consumer)"
+            );
             writer_tx.send(StatusUpdate::Acked(row.id, now));
             continue;
         }
@@ -553,8 +637,9 @@ async fn drain_rows_single(
                 id = row.id,
                 slot_idx,
                 companion_key = %companion_key,
+                op = kind.as_str(),
                 error = %error,
-                "apply returned 422; marking emission as Nacked"
+                "delivery returned 422; marking emission as Nacked"
             );
             writer_tx.send(StatusUpdate::Nacked(row.id, now, error));
             continue;
@@ -562,7 +647,8 @@ async fn drain_rows_single(
         let body_text = resp.text().await.unwrap_or_default();
         writer_tx.send(StatusUpdate::Queued(row.id, now));
         return Err(anyhow::anyhow!(
-            "apply POST returned status {status}: {body_text}"
+            "{} POST returned status {status}: {body_text}",
+            kind.as_str()
         ));
     }
     Ok(())
