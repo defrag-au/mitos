@@ -33,9 +33,20 @@ use crate::mitos::platform_v2::logging::{self, LogLevel};
 // and the `Guest` trait come from the world-level `use ...`
 // clauses and are addressable at the top of this module's scope
 // without explicit imports.
-use crate::mitos::platform_v2::types::{MintedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{ChainPoint, MintedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "standard-burn-module";
+
+/// Absolute slot of a chain cursor. `Origin` has no slot (0);
+/// `SlotOnly`/`Specific` carry one. Mirrors the helper in the
+/// `asset-transfer` / mint modules so all stamp `slot` identically.
+fn cursor_slot(cursor: &ChainPoint) -> u64 {
+    match cursor {
+        ChainPoint::Origin => 0,
+        ChainPoint::SlotOnly(s) => *s,
+        ChainPoint::Specific(p) => p.slot,
+    }
+}
 
 /// Encode + emit a `Burn` event on channel 0 (single-channel
 /// module). Failure to encode the typed event is treated as a
@@ -84,6 +95,7 @@ fn handle_minted(m: &MintedEvent) {
         asset_name_hex: hex::encode(&m.asset_name),
         tx_hash: hex::encode(&m.tx_hash),
         quantity_burned,
+        slot: cursor_slot(&m.cursor),
     });
 }
 

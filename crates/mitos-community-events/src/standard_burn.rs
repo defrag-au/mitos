@@ -29,6 +29,12 @@ pub struct Burn {
     /// Quantity destroyed in this TX (positive — the absolute
     /// value of the `quantity_delta`).
     pub quantity_burned: u64,
+    /// Absolute slot of the TX's block. Lets a consumer order
+    /// burns and revert by slot on a rollback. `#[serde(default)]`
+    /// keeps the field additive — payloads emitted before this
+    /// field was introduced decode with `slot = 0`.
+    #[serde(default)]
+    pub slot: u64,
 }
 
 #[cfg(feature = "decode")]
