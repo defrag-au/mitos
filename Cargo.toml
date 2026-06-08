@@ -56,14 +56,25 @@ dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 # to build on a transitive update, re-pin with
 # `cargo update -p utxorpc-spec --precise 0.19.0`.
 
-# Cardano types + parsing. Same pallas version shared-crates uses
-# (bumped from alpha.3 → alpha.6 alongside the utxorpc-spec 0.18
-# upgrade in shared-crates rev 01ad0b70).
-pallas = "1.0.0-alpha.6"
-pallas-addresses = "1.0.0-alpha.6"
-pallas-codec = "1.0.0-alpha.6"
-pallas-primitives = "1.0.0-alpha.6"
-pallas-traverse = "1.0.0-alpha.6"
+# Cardano types + parsing. Pinned to 1.0.0 to match the pallas dolos v1.2.0
+# builds against (so the lockfile unifies a single pallas across mitos + the
+# embedded dolos — they share types at the follower boundary). `unstable`
+# mirrors dolos's own feature set (dolos uses ["hardano", "phase2", "unstable"]);
+# kept for parity, harmless otherwise.
+#
+# NOTE: this does NOT add a "van Rossem" block era. pallas-traverse's era probe
+# (`probe::block_era`) tops out at Conway (tag 7) in EVERY released version
+# incl. 1.1.0 / `main` — there is no era-8 variant in the `Era` enum anywhere.
+# So van Rossem / protocol v11 is an intra-Conway protocol bump, not a new
+# ledger era; a `MultiEraBlock decode: Unknown CBOR structure` on a follower
+# block means the probe went `Inconclusive` (the bytes aren't a complete block
+# wrapper, e.g. a divergent / reseed-only WAL tip), NOT an unknown era — chase
+# the chain/state, not the pallas version.
+pallas = { version = "1.0.0", features = ["unstable"] }
+pallas-addresses = "1.0.0"
+pallas-codec = "1.0.0"
+pallas-primitives = "1.0.0"
+pallas-traverse = { version = "1.0.0", features = ["unstable"] }
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
