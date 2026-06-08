@@ -14,18 +14,18 @@
 //! 5xx = host unavailable (transient → the engine's fallback may try Maestro).
 
 use axum::{
+    Router,
     body::Bytes,
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
-    Router,
 };
 use dolos::adapters::DomainAdapter;
 use dolos_core::{ChainError, Domain, DomainError, MempoolError, SubmitExt};
-use mitos_protocol::submit::{SubmitTxRequest, SubmitTxResponse, SUBMIT_MIME};
+use mitos_protocol::submit::{SUBMIT_MIME, SubmitTxRequest, SubmitTxResponse};
 
-use crate::auth::{require_auth, AuthToken};
+use crate::auth::{AuthToken, require_auth};
 
 /// Build the tx-submission router, gated by the shared-secret auth token. Merged
 /// into the host `app` in [`crate::bundle::Bundle::run`].
@@ -51,9 +51,7 @@ async fn submit_handler(State(domain): State<DomainAdapter>, body: Bytes) -> Res
                 tx_hash: hash.as_ref().to_vec(),
             };
             match resp.encode() {
-                Ok(bytes) => {
-                    ([(header::CONTENT_TYPE, SUBMIT_MIME)], bytes).into_response()
-                }
+                Ok(bytes) => ([(header::CONTENT_TYPE, SUBMIT_MIME)], bytes).into_response(),
                 Err(e) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response()
                 }

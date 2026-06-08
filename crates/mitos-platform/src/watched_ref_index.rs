@@ -137,10 +137,7 @@ impl WatchedRefIndex {
     /// Is this ref currently watched? Hot path — reads the mirror
     /// only, never redb.
     pub fn contains(&self, oref: &OutputRef) -> bool {
-        self.mem
-            .read()
-            .map(|m| m.contains(oref))
-            .unwrap_or(false)
+        self.mem.read().map(|m| m.contains(oref)).unwrap_or(false)
     }
 
     /// Number of refs currently watched (mirror size).
@@ -247,10 +244,8 @@ mod tests {
 
     #[test]
     fn redb_round_trips_across_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "watched_ref_index_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("watched_ref_index_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("watched.redb");
         let _ = std::fs::remove_file(&path);

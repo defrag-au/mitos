@@ -529,11 +529,7 @@ enum DeliveryKind {
 
 impl DeliveryKind {
     fn of(row: &EmissionRecord) -> Self {
-        if row.is_undo {
-            Self::Undo
-        } else {
-            Self::Apply
-        }
+        if row.is_undo { Self::Undo } else { Self::Apply }
     }
 
     /// Lowercase label for log / error context.
