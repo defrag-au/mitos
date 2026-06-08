@@ -14,6 +14,7 @@
 pub mod http;
 mod interest;
 pub mod protocol;
+pub mod submit;
 pub mod subscribe;
 pub mod wire;
 
@@ -39,6 +40,7 @@ pub use protocol::{
     OfferAcceptPayload, OfferCancelPayload, OfferCreatePayload, OfferUpdatePayload, OutputRef,
     PlutusBytes, ProtocolEvent, SalePayload, SwapPayload, UnlistingPayload,
 };
+pub use submit::{SUBMIT_MIME, SubmitTxRequest, SubmitTxResponse, SubmitWireError};
 pub use subscribe::{
     DialBackOverride, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeTarget,
     SubscribeWireError,

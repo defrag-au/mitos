@@ -19,6 +19,7 @@ mod indexer;
 mod indexer_bridge;
 mod replicate;
 mod transport;
+mod tx;
 
 #[cfg(test)]
 mod tests;
