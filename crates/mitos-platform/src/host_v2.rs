@@ -150,7 +150,13 @@ fn v1_interest_to_predicate(
     item: &mitos_protocol::Interest,
 ) -> Option<mitos_data_plane::InterestPredicate> {
     use mitos_data_plane::InterestPredicate;
-    use mitos_protocol::AssetSelector;
+    use mitos_protocol::{AssetSelector, DomainSelector};
+    // Raw output-address watch travels on the domain axis (it's a UTxO-output
+    // subscription, not a protocol-event filter). Take it first — an address
+    // interest carries `asset = Any`, which the asset match below would drop.
+    if let DomainSelector::AtAddress(addr) = &item.domain {
+        return Some(InterestPredicate::AtAddress(addr.clone()));
+    }
     match &item.asset {
         AssetSelector::Policy(p) => Some(InterestPredicate::HoldsPolicy(p.clone())),
         AssetSelector::Asset { policy, name_hex } => Some(InterestPredicate::HoldsAsset {

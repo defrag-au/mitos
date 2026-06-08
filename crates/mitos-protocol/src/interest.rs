@@ -62,6 +62,20 @@ impl Interest {
         }
     }
 
+    /// Watch a raw output address (bech32) — a UTxO-output subscription, NOT a
+    /// protocol-event filter. The host bridges this to the data-plane's
+    /// `InterestPredicate::AtAddress`; the decoded-event `matches` path returns
+    /// `false`. Used to dynamically watch a runtime-created receiving address (e.g.
+    /// the `credit-address` module's deposit-address watch).
+    pub fn at_address(address: impl Into<String>) -> Self {
+        Self {
+            asset: AssetSelector::Any,
+            roles: EnumSet::all(),
+            domain: DomainSelector::AtAddress(address.into()),
+            value: ValueFilter::Any,
+        }
+    }
+
     /// Per-event match. AND across the four axes.
     /// `roles` is bypassed for collection-wide events (no
     /// specific asset → no derivable role).
@@ -224,6 +238,16 @@ pub enum DomainSelector {
     Marketplace(MarketplaceSelector),
     Dex(DexSelector),
     Lending(LendingSelector),
+    /// Raw output-address watch (bech32) — NOT a protocol-event
+    /// filter. It exists only to carry an address subscription over
+    /// the wire to the host, which bridges it to the data-plane's
+    /// `InterestPredicate::AtAddress`. The decoded-event `matches`
+    /// path returns `false` for it (an address interest watches raw
+    /// UTxO outputs, not decoded protocol events — see the
+    /// `credit-address` module). Lets a consumer dynamically watch a
+    /// runtime-created receiving address (e.g. a per-tenant deposit
+    /// address) without a module rebuild.
+    AtAddress(String),
 }
 
 impl DomainSelector {
