@@ -39,12 +39,22 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Dolos as embedded data plane. Pinned to a tag for reproducibility;
 # bump deliberately and audit the diff (see docs/design/ROADMAP.md).
-dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
-dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
-dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
-dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.0.3" }
+# v1.2.0 brings the van Rossem fork / protocol-v11 support (#990) — fixes the
+# `roll/dreps.rs` sync panic that crash-looped older builds once preprod crossed
+# the governance fork. NOTE: it also versions the WAL on-disk schema and
+# force-resets on incompatibility (#984) — expect a dolos RESYNC on first run.
+dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
+dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
+dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
+dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
+dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
+# CARE: the transitive `utxorpc-spec` is pinned to 0.19.0 in Cargo.lock. dolos
+# v1.2.0's gRPC `v1beta/watch` builds against 0.19.0, but 0.19.2 made
+# `asset_name`/`policy_id` `Option<Bytes>` (a breaking change within the 0.19 line)
+# and won't compile dolos. A broad `cargo update` will re-bump it — if dolos fails
+# to build on a transitive update, re-pin with
+# `cargo update -p utxorpc-spec --precise 0.19.0`.
 
 # Cardano types + parsing. Same pallas version shared-crates uses
 # (bumped from alpha.3 → alpha.6 alongside the utxorpc-spec 0.18
