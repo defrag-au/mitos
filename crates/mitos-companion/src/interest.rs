@@ -28,6 +28,10 @@ use crate::error::{CompanionError, Result};
 /// kinds they don't understand on read.
 pub mod kinds {
     pub const POLICY: &str = "policy";
+    /// Raw output-address watch (bech32) → `Interest::at_address`,
+    /// bridged host-side to the data-plane `AtAddress` predicate.
+    /// For modules that watch addresses (e.g. `credit-address`).
+    pub const ADDRESS: &str = "address";
 }
 
 /// Empty-string channel marker — used when the dApp is single-
@@ -138,11 +142,21 @@ pub fn rows_to_interests(rows: &[InterestRow]) -> Vec<Interest> {
                     );
                 }
             },
+            kinds::ADDRESS => {
+                // A raw output-address watch — no parsing (the address is an opaque
+                // bech32 string the data-plane matches verbatim). Empty values are
+                // dropped so a malformed row can't widen the watch.
+                if row.value.is_empty() {
+                    tracing::warn!("skipping empty address interest row");
+                } else {
+                    out.push(Interest::at_address(row.value.clone()));
+                }
+            }
             other => {
                 tracing::warn!(
                     kind = %other,
                     value = %row.value,
-                    "unsupported interest kind; v1 supports only `policy`",
+                    "unsupported interest kind; supported: `policy`, `address`",
                 );
             }
         }
@@ -235,13 +249,29 @@ mod tests {
     #[test]
     fn rows_to_interests_skips_unknown_kinds() {
         let rows = vec![InterestRow {
-            kind: "address".into(), // v2 — currently unsupported
-            value: "addr1...".into(),
+            kind: "stake-key".into(), // genuinely unsupported kind
+            value: "stake1...".into(),
             channel: "".into(),
             added_at: "2026-05-05T00:00:00Z".into(),
         }];
         let interests = rows_to_interests(&rows);
         assert!(interests.is_empty());
+    }
+
+    #[test]
+    fn rows_to_interests_translates_address() {
+        let rows = vec![InterestRow {
+            kind: kinds::ADDRESS.into(),
+            value: "addr1watched".into(),
+            channel: "".into(),
+            added_at: "2026-05-05T00:00:00Z".into(),
+        }];
+        let interests = rows_to_interests(&rows);
+        assert_eq!(interests.len(), 1);
+        assert_eq!(
+            interests[0].domain,
+            mitos_protocol::DomainSelector::AtAddress("addr1watched".into())
+        );
     }
 
     #[test]

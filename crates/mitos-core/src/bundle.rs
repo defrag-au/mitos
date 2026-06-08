@@ -531,6 +531,12 @@ impl Bundle {
                 event_ring.clone(),
             ));
 
+            // Transaction submission: let a consumer (the minting engine) push a
+            // signed tx through mitos into dolos's mempool, which the sync
+            // submit-stage diffuses to the chain. Same `MITOS_AUTH_TOKEN` gate as
+            // the companion API. See `crate::tx`.
+            app = app.merge(crate::tx::tx_router(domain.clone(), auth.clone()));
+
             // Pass the reserved-names set so the upload handler
             // rejects modules whose id collides with an in-tree
             // indexer (see `docs/design/UNIFIED_SUBSCRIBE.md`

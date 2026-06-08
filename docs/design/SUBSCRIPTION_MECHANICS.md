@@ -13,10 +13,31 @@
 > design discussion; treat the wire-format sections as
 > historical sketches.
 >
+> **Two interest models — don't conflate them** (added 2026-06-07
+> after this tripped up a consumer-side reader):
+> - **`mitos_protocol::Interest`** (this doc) — what a **CF consumer**
+>   sends on subscribe. Asset-centric: `AssetSelector` is
+>   `Policy` / `Asset` / `Fingerprint` / `Any` + a domain selector.
+>   **There is no tx-hash or address axis here** — a consumer scopes
+>   by policy/asset, nothing finer-grained than the asset identity.
+> - **`mitos_data_plane::InterestPredicate`** (`crates/mitos-data-plane/
+>   src/types/interest.rs`) — the **platform's per-module dispatch
+>   filter** (`AtAddress` / `AtPaymentCred` / `AtStakeCred` /
+>   `HoldsPolicy` / `HoldsAsset` / `TickEvery`), mutated dynamically by
+>   a module's `update-interest`. This is NOT what a CF consumer sends;
+>   it's how the host decides which events a wasm module even sees.
+>
+> So "watch this address/credential" or "watch this tx hash" is a
+> *module-internal* concern, not something a CF consumer can express —
+> a consumer subscribes to a module (which does the address/cred
+> watching) and filters by policy.
+>
 > Authoritative current sources:
 > - `crates/mitos-protocol/src/interest.rs` — `Interest`,
 >   `AssetSelector`, `DomainSelector`, `ValueFilter` types +
 >   `match_event` implementation.
+> - `crates/mitos-data-plane/src/types/interest.rs` — the platform-side
+>   `InterestPredicate` / `InterestSet` (module dispatch filter).
 > - `crates/mitos-protocol/src/subscribe.rs` — `SubscribeRequest`
 >   / `SubscribeResponse` shapes. **Carries a required `client_id`
 >   field** for multi-client companion identity — see

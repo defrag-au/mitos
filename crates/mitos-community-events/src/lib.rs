@@ -14,6 +14,7 @@ pub mod cip25_mint;
 pub mod cip68_mint;
 pub mod collection_holders;
 pub mod collection_metadata;
+pub mod credit_address;
 pub mod dex;
 pub mod holder_distribution;
 pub mod jpg_store_listing;
@@ -45,6 +46,7 @@ pub fn decode_emit(module_id: &str, channel: u32, payload: &[u8]) -> Option<Stri
         "cip-68-mint" => cip68_mint::decode_emit(channel, payload),
         "collection-holders" => collection_holders::decode_emit(channel, payload),
         "collection-metadata" => collection_metadata::decode_emit(channel, payload),
+        "credit-address" => credit_address::decode_emit(channel, payload),
         "cswap-dex" => dex::decode_emit(channel, payload),
         "splash-dex" => dex::decode_emit(channel, payload),
         "holder-distribution" => holder_distribution::decode_emit(channel, payload),
@@ -69,6 +71,7 @@ mod decode_tests {
             asset_name_hex: "b".repeat(8),
             tx_hash: "c".repeat(64),
             quantity_burned: 42,
+            slot: 0,
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&burn, &mut buf).unwrap();
@@ -77,6 +80,29 @@ mod decode_tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["quantity_burned"], 42);
         assert_eq!(parsed["policy"], "a".repeat(56));
+    }
+
+    #[test]
+    fn round_trip_credit_address() {
+        let credit = credit_address::AddressCredit {
+            address: "addr_test1abc".into(),
+            tx_hash: "d".repeat(64),
+            output_index: 2,
+            lovelace: 600_000_000,
+            assets: vec![credit_address::CreditedAsset {
+                policy: "a".repeat(56),
+                asset_name_hex: "b".repeat(8),
+                quantity: 1,
+            }],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&credit, &mut buf).unwrap();
+
+        let json = decode_emit("credit-address", 0, &buf).expect("decoder registered");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["lovelace"], 600_000_000u64);
+        assert_eq!(parsed["output_index"], 2);
+        assert_eq!(parsed["assets"][0]["quantity"], 1);
     }
 
     #[test]
@@ -91,6 +117,7 @@ mod decode_tests {
             asset_name_hex: String::new(),
             tx_hash: String::new(),
             quantity_burned: 0,
+            slot: 0,
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&burn, &mut buf).unwrap();

@@ -1,0 +1,21 @@
+# credit-address fixture: an output landing at a watched address.
+# Reuses burn-address's real mainnet block (the same TX sends
+# 169,000 "The Elite Cats" tokens + its lovelace to a script
+# address). credit-address is address-agnostic — ANY consumer-
+# declared address fits (a deposit address, a sink, etc.).
+#
+# TX: d695425b745a3416d999ba2a8072786c917a138913ceb33e2f9e62067ff0ad1e
+# Watched address: addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4
+# Output index 0 lands at the watched address.
+#
+# Expected emission: one `AddressCredit` event for output index 0,
+# carrying the output's lovelace + its asset list (policy
+# 8e40ce04…/asset 54686520456c6974652043617473, qty 169000) and the
+# watched-address echo. (Unlike burn-address, credit-address emits
+# even for pure-ADA outputs and carries the lovelace.)
+
+version = 1
+
+[[interest]]
+kind = "at_address"
+address = "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4"

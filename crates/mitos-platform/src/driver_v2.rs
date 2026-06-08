@@ -27,11 +27,14 @@ use std::sync::Arc;
 
 use mitos_data_plane::block_events::decode_block_v2;
 use mitos_data_plane::dispatch::build_event_batches;
-use mitos_data_plane::{ChainDataPlane, ChainPoint, DispatchEvent, InterestSet, TxEventBatch};
+use mitos_data_plane::{
+    ChainDataPlane, ChainPoint, DispatchEvent, InterestSet, OutputRef, TxEventBatch, UtxoEvent,
+};
 
 use crate::bindings_v2::DispatchEvent as WitDispatchEvent;
 use crate::event_bindings;
 use crate::registry_v2::ModuleInstanceV2;
+use crate::watched_ref_index::WatchedRefIndex;
 use crate::{PlatformError, PlatformResult};
 
 /// Outcome of one block-dispatch attempt against a v2 module.
@@ -61,6 +64,12 @@ pub struct DriverV2 {
     /// driver doesn't differentiate; bootstrap orchestration
     /// will set this on a per-call basis.
     epoch_deadline_ticks: u64,
+    /// Watched-UTxO index for this module. Populated on the way in
+    /// (matched `Produced`) and pruned on the way out (`Consumed`)
+    /// during `apply_block`; read by the follower's fallback plane to
+    /// scope Maestro prior-output lookups. `None` until
+    /// `set_watched` wires it (tests / pre-index paths).
+    watched: Option<Arc<WatchedRefIndex>>,
 }
 
 impl DriverV2 {
@@ -70,7 +79,22 @@ impl DriverV2 {
             cursor: None,
             fuel_per_call: budget.fuel_per_call,
             epoch_deadline_ticks: budget.epoch_deadline_ticks,
+            watched: None,
         }
+    }
+
+    /// Attach the per-module watched-UTxO index. The host wires the
+    /// same `Arc` here and into the fallback plane so writes (here)
+    /// and reads (plane) share one instance.
+    pub fn set_watched(&mut self, watched: Option<Arc<WatchedRefIndex>>) {
+        self.watched = watched;
+    }
+
+    /// Shared handle to this module's watched-UTxO index, if wired.
+    /// Cheap `Arc` clone — lets the bootstrap paths seed the same
+    /// index the plane reads without a borrow on the driver.
+    pub fn watched_index(&self) -> Option<Arc<WatchedRefIndex>> {
+        self.watched.clone()
     }
 
     pub fn cursor(&self) -> Option<&ChainPoint> {
@@ -212,6 +236,12 @@ impl DriverV2 {
             .await
             .map_err(|e| PlatformError::Decode(format!("build_event_batches: {e}")))?;
 
+        // 2b. Maintain the watched-UTxO index from this block's events:
+        // insert every matched `Produced` ref (on the way in), remove
+        // every `Consumed` ref (on the way out). See
+        // `docs/design/WATCHED_UTXO_INDEX.md`.
+        self.update_watched(&batches, &interest);
+
         if batches.is_empty() {
             self.cursor = Some(cursor_after);
             return Ok(ApplyOutcomeV2::AppliedEmpty);
@@ -230,6 +260,64 @@ impl DriverV2 {
 
         self.cursor = Some(cursor_after);
         Ok(ApplyOutcomeV2::Applied)
+    }
+
+    /// Diff this block's matched batches into the watched-UTxO index:
+    /// insert every matched `Produced` ref, remove every `Consumed`
+    /// ref. No-op when no index is wired.
+    ///
+    /// Also runs the gate's correctness safety net: a `Consumed` whose
+    /// prior output matches interest but was neither already indexed
+    /// nor produced earlier in this same block is a seeding gap —
+    /// under `GateMode::On` its Maestro resolution would have been
+    /// wrongly skipped. Logged loudly so a shadow run surfaces any gap
+    /// before the gate is turned on. (Same-block produce→consume is
+    /// excluded: those resolve from the block body, never via the
+    /// gated fallback.)
+    fn update_watched(&self, batches: &[TxEventBatch], interest: &InterestSet) {
+        let Some(watched) = &self.watched else {
+            return;
+        };
+
+        // Pass 1: every output produced in this block (for the gap
+        // check) + the subset that matches interest (to insert).
+        let mut produced_this_block: std::collections::HashSet<OutputRef> =
+            std::collections::HashSet::new();
+        let mut insert: Vec<OutputRef> = Vec::new();
+        for batch in batches {
+            for event in &batch.events {
+                if let UtxoEvent::Produced(p) = event {
+                    produced_this_block.insert(p.oref);
+                    if interest.matches_output(&p.output) {
+                        insert.push(p.oref);
+                    }
+                }
+            }
+        }
+
+        // Pass 2: consumed refs to remove + the safety-net check.
+        let mut remove: Vec<OutputRef> = Vec::new();
+        for batch in batches {
+            for event in &batch.events {
+                if let UtxoEvent::Consumed(c) = event {
+                    if !c.prior_output.is_unresolved()
+                        && !produced_this_block.contains(&c.oref)
+                        && !watched.contains(&c.oref)
+                        && interest.matches_output(&c.prior_output)
+                    {
+                        tracing::error!(
+                            target: "fallback_gate",
+                            module = %self.instance.store.data().module_id(),
+                            oref = %c.oref,
+                            "watched-index gap: consumed output matches interest but was not indexed",
+                        );
+                    }
+                    remove.push(c.oref);
+                }
+            }
+        }
+
+        watched.apply(&insert, &remove);
     }
 
     /// Hand one TX's worth of events to the module via
@@ -264,6 +352,25 @@ impl DriverV2 {
         batch: TxEventBatch,
         cursor: ChainPoint,
     ) -> wasmtime::Result<()> {
+        // Bootstrap/recapture scans emit current-state `Produced`
+        // events for refs they enumerated under the module's interest
+        // — exactly the live watched set. Seed them into the index so
+        // the fallback gate recognises these (often >7-day-old) UTxOs
+        // when they're later consumed. The scan only enumerates
+        // matching refs, so every produced ref here is in-scope.
+        if let Some(watched) = &self.watched {
+            let refs: Vec<OutputRef> = batch
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    UtxoEvent::Produced(p) => Some(p.oref),
+                    _ => None,
+                })
+                .collect();
+            if !refs.is_empty() {
+                watched.seed(refs);
+            }
+        }
         self.instance.store.data_mut().current_cursor = Some(cursor);
         self.dispatch_batch(batch).await
     }
@@ -286,6 +393,11 @@ impl DriverV2 {
             .bindings
             .call_handle_events(&mut self.instance.store, &[event])
             .await?;
+        // Modules don't emit on rollback; the platform synthesises the
+        // undo. Inject one marker into the event sink — the drain task
+        // fans it out to every subscribed companion as an undo emission
+        // (carrying `to_cursor`, the rollback target).
+        self.instance.store.data().emit_undo_marker(&to_cursor)?;
         self.cursor = Some(to_cursor);
         Ok(())
     }

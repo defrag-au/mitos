@@ -78,6 +78,26 @@ pub struct RecaptureBody {
     pub reason: Option<String>,
 }
 
+/// Body of `POST /_internal/undo-<channel>?key=<companion_key>`.
+///
+/// Signals a chain rollback (reorg) at `cursor`. The host emits one
+/// undo per subscribed companion when the follower rolls a module back
+/// to a common ancestor; the consumer's `MitosChannel::undo(ctx, point)`
+/// hook should revert any **latching** state set by `apply_event` calls
+/// at or after `cursor` (re-derivable consumers can leave the default
+/// no-op — the re-applied forward frames reconverge them).
+///
+/// Unlike `recapture`, undo does NOT reset the consumer's persisted
+/// cursor: it's delivered as an ordinary emission row (interleaved
+/// after the pre-rollback applies, before the new chain's applies), so
+/// the cursor advances normally as those subsequent applies arrive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoBody {
+    /// Chain point the rollback reached (the common ancestor). The
+    /// consumer reverts state set by events at or after this point.
+    pub cursor: ChainPoint,
+}
+
 /// CBOR-encode an [`ApplyBody`].
 pub fn encode_apply(body: &ApplyBody) -> Result<Vec<u8>, String> {
     let mut buf = Vec::with_capacity(128);
@@ -184,6 +204,18 @@ pub fn encode_recapture(body: &RecaptureBody) -> Result<Vec<u8>, String> {
 /// CBOR-decode a [`RecaptureBody`].
 pub fn decode_recapture(bytes: &[u8]) -> Result<RecaptureBody, String> {
     ciborium::from_reader(bytes).map_err(|e| format!("decode_recapture: {e}"))
+}
+
+/// CBOR-encode an [`UndoBody`].
+pub fn encode_undo(body: &UndoBody) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(64);
+    ciborium::into_writer(body, &mut buf).map_err(|e| format!("encode_undo: {e}"))?;
+    Ok(buf)
+}
+
+/// CBOR-decode an [`UndoBody`].
+pub fn decode_undo(bytes: &[u8]) -> Result<UndoBody, String> {
+    ciborium::from_reader(bytes).map_err(|e| format!("decode_undo: {e}"))
 }
 
 /// Body of `POST /api/companions/{key}/interest`.
@@ -309,6 +341,16 @@ mod tests {
         let decoded = decode_recapture(&bytes).unwrap();
         assert_eq!(decoded.module, "jpg-store-offer");
         assert_eq!(decoded.reason.as_deref(), Some("operator triage"));
+    }
+
+    #[test]
+    fn undo_body_round_trip() {
+        let body = UndoBody {
+            cursor: ChainPoint::Specific(12345, "abcd1234".into()),
+        };
+        let bytes = encode_undo(&body).unwrap();
+        let decoded = decode_undo(&bytes).unwrap();
+        assert_eq!(decoded.cursor.slot(), Some(12345));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+# mitos.toml — module config for the credit-address indexer.
+#
+# Empty default interest set — the consumer declares the addresses
+# it wants to watch via the companion's
+# `/api/_interest/credit-address/subscribe` endpoint
+# (`kind = "address"`). Mirrors burn-address "Dynamic addresses".
+
+abi_version = 2
+
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+mitos-module-kit = { path = "../../crates/mitos-module-kit" }

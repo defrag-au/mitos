@@ -1,0 +1,15 @@
+[
+  {
+    "address": "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4",
+    "assets": [
+      {
+        "asset_name_hex": "54686520456c6974652043617473",
+        "policy": "8e40ce04191c1d584614d537d3adab4c082889bb8319c9aba8ffceb4",
+        "quantity": 169000
+      }
+    ],
+    "lovelace": 1198180,
+    "output_index": 0,
+    "tx_hash": "d695425b745a3416d999ba2a8072786c917a138913ceb33e2f9e62067ff0ad1e"
+  }
+]

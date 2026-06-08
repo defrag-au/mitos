@@ -208,6 +208,51 @@ bindings = [
 ]
 ```
 
+## Picking a mitos instance: dev ↔ preprod, prod ↔ mainnet
+
+There are **two** mitos instances (since 2026-06-06): mainnet at
+`https://mitos.defrag.cc` and preprod at
+`https://mitos-preprod.defrag.cc`. They host the **same** set of
+community modules but follow **different chains**.
+
+**The governing rule: the mitos instance must match the network your
+worker's data is on.** A worker exercising preprod txs MUST subscribe
+to mitos-preprod, or it will never see its own activity (those txs
+don't exist on mainnet). So the wiring is per-`[env.*]`, not global:
+
+```toml
+# Default / top-level vars = production (mainnet).
+[vars]
+MITOS_HOST_URL      = "https://mitos.defrag.cc"
+MITOS_REPLICATE_URL = "https://myworker.cnft.dev/_internal/{op}-{target}?key={key}"
+
+# Dev environment = preprod. Override the host + the dial-back host;
+# point MITOS_AUTH_TOKEN at the PREPROD token (a distinct secret value
+# from mainnet — each instance has its own).
+[env.dev.vars]
+MITOS_HOST_URL      = "https://mitos-preprod.defrag.cc"
+MITOS_REPLICATE_URL = "https://myworker.dev.cnft.dev/_internal/{op}-{target}?key={key}"
+```
+
+`MITOS_AUTH_TOKEN` is per-instance: push the **preprod** token to the
+dev environment and the **mainnet** token to production
+(`wrangler secret put MITOS_AUTH_TOKEN --env dev` etc.). The same value
+authenticates both the outbound subscribe POST and mitos's inbound
+dial-back, so a mismatch fails silently as "subscribed but no events".
+
+**Not every worker follows dev=preprod / prod=mainnet.** Some
+deliberately track mainnet data in a dev deployment (e.g.
+`collection-ownership` dev points at `mitos.defrag.cc` on purpose). The
+convention is a default, not a law — see the per-worker wiring registry
+in `infra/docs/mitos-operations.md` (§ Consumers & environment wiring).
+
+**Dial-back reachability:** mitos dials *out* to your worker's public
+URL, so mitos-preprod being internal-only (no inbound tunnel for
+`/_admin`) doesn't matter — it still reaches `*.dev.cnft.dev` over the
+internet. Nothing needs doing on the mitos box to onboard a worker;
+subscription is self-service once the worker has the right host URL +
+token.
+
 ## End-to-end boot sequence
 
 What happens when a fresh DO instance comes up:
@@ -248,6 +293,51 @@ mitos_platform::companions: subscribe accepted module=jpg-store-offer
 mitos_platform::dialer: dial loop started target=jpg-store-offer
   companion=jpg-store-offer
 ```
+
+## Rollbacks (chain reorgs)
+
+Cardano rolls back near the tip — routinely by a block or two, and
+more around a hard fork's era boundary. When the chain mitos is
+following reorgs, it walks your consumer **back** to the common
+ancestor and re-applies forward along the new chain:
+
+1. `ServerMessage::Undo { cursor: ChainPoint }`
+   (`crates/mitos-protocol/src/wire.rs`) — "rewind to this point."
+2. Fresh `Apply` frames along the new chain, advancing the cursor
+   forward again.
+
+The companion hook is `MitosChannel::undo(ctx, point)`. **Its default
+is a no-op + warning log** (`crates/mitos-companion/src/traits.rs`).
+Whether that default is safe depends entirely on the shape of your
+state:
+
+- **Re-derivable state → idempotent re-apply is enough; leave `undo`
+  as the default.** If `apply_event` reconverges your rows from
+  *current* chain state (e.g. ownership: "this asset's current owner is
+  X" — a later Apply just overwrites it), the re-applied frames after
+  the fork correct everything. This is why `collection-ownership` does
+  **not** override `undo`. Your `apply_event` MUST be idempotent
+  regardless (the dialer can re-deliver) — see
+  `docs/design/EVENT_DELIVERY_RESILIENCE.md`.
+
+- **Terminal / latching state → you MUST implement `undo`.** If an
+  event flips a one-way flag a re-apply won't un-flip — "confirmed",
+  "delivered", "paid", "settled" — then a rolled-back block leaves that
+  flag wrongly set, because the new chain simply won't re-emit the
+  event that set it. Re-apply can't help (there's nothing to re-apply).
+  Implement `undo(point)` to revert state at/after `point`. For this you
+  need the event to carry its `slot` so you know what to roll back
+  (several community events omit slot today — check the struct, and if
+  your latching logic needs it, that's a field to add to the module).
+
+The minting-engine's mint-confirmation is the canonical latching case:
+it sets a `delivered` status off a confirmation event, so it overrides
+`undo` to revert, and pairs the feed with a depth-buffered Maestro
+backstop for the fork window (see
+`cnft.dev-workers/docs/design/MINT_CONFIRMATION.md`).
+
+Rule of thumb: **if you can't recompute the row purely from the latest
+event for its key, you have latching state and need `undo`.**
 
 ## Recapture: resetting state for a fresh re-emission
 

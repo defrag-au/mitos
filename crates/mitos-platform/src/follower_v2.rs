@@ -332,6 +332,28 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     //    seeds nothing and the Onboard pump below is a no-op. Two
     //    paths, gated by `chunked_cold_start`:
     if matches!(update.op, WireOp::Add | WireOp::Replace) {
+        // Seed the watched-UTxO index for the added/asserted scopes
+        // (refs-only, flag-gated, once per scope). This MUST happen on
+        // the live `driver` here — the chunked cold-start below runs on
+        // a disposable backfill instance that never touches this index,
+        // and the per-scope bootstrap flag means the synthetic-dispatch
+        // path is skipped on restart re-subscribe. Without this, a
+        // dynamic-interest module's pre-existing live UTxOs stay
+        // unindexed and the gate would wrongly skip them. See
+        // `docs/design/WATCHED_UTXO_INDEX.md`.
+        if let Some(index) = driver.watched_index() {
+            let mut seed_kv = kv_factory(module_id);
+            for predicate in &update.predicates {
+                crate::bootstrap_v2::seed_predicate_watched(
+                    index.as_ref(),
+                    predicate,
+                    &mut seed_kv,
+                    module_id,
+                    plane,
+                )
+                .await;
+            }
+        }
         if chunked_cold_start {
             // Page-oriented modules (collection-holders/metadata)
             // seeded a scoped onboard set in update-interest above
