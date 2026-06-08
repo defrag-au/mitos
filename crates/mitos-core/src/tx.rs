@@ -68,15 +68,14 @@ async fn submit_handler(State(domain): State<DomainAdapter>, body: Bytes) -> Res
 /// duplicate → 409 (idempotent success), runtime/state faults → 500.
 fn map_submit_error(e: &DomainError) -> (StatusCode, String) {
     let status = match e {
-        DomainError::ChainError(x) => match x {
+        DomainError::ChainError(
             ChainError::BrokenInvariant(_)
             | ChainError::DecodingError(_)
             | ChainError::CborDecodingError(_)
             | ChainError::AddressDecoding(_)
             | ChainError::Phase1ValidationRejected(_)
-            | ChainError::Phase2ValidationRejected(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        },
+            | ChainError::Phase2ValidationRejected(_),
+        ) => StatusCode::BAD_REQUEST,
         DomainError::MempoolError(x) => match x {
             MempoolError::TraverseError(_)
             | MempoolError::InvalidTx(_)
