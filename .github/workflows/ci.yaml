@@ -15,11 +15,9 @@ env:
 
 jobs:
   # ----------------------------------------------------------------
-  # Workspace lint / format / test on the native target. Covers
-  # `mitos-platform`, `mitos-core`, `mitos-data-plane`, the in-tree
-  # indexers, and tooling (`mitos-build`, `mitos-run`, `mitos-admin`,
-  # `capture-block`, `mitos-tail`). Community-module wasm builds
-  # land in the separate `community-modules` job further down.
+  # Fast-fail gate. fmt is seconds; everything heavy hangs off it so
+  # a formatting miss short-circuits the run before we spend runner
+  # minutes on clippy / test / wasm builds.
   # ----------------------------------------------------------------
   fmt:
     name: Fmt
@@ -32,8 +30,14 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # ----------------------------------------------------------------
+  # Workspace lint / test on the native target. Run in parallel with
+  # `host-tools` (below) once `fmt` is green — covers `mitos-platform`,
+  # `mitos-core`, `mitos-data-plane`, the in-tree indexers, and tooling.
+  # ----------------------------------------------------------------
   clippy:
     name: Clippy
+    needs: [fmt]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +54,7 @@ jobs:
 
   test:
     name: Test
+    needs: [fmt]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,24 +70,57 @@ jobs:
       - run: cargo nextest run --workspace --all-features
 
   # ----------------------------------------------------------------
+  # Native host tools (mitos-build + mitos-run), published as
+  # artifacts. Split out of `community-modules` so it:
+  #   - runs in PARALLEL with clippy/test (was serial, behind
+  #     `needs: [test]`), and
+  #   - is compiled ONCE and reused — `community-modules` downloads
+  #     the binaries instead of recompiling them.
+  # Own cache scope so the native tool build doesn't churn the wasm
+  # job's cache (different target triple / deps).
+  # ----------------------------------------------------------------
+  host-tools:
+    name: Host Tools
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "host-tools"
+          cache-on-failure: true
+      - name: Build mitos-build + mitos-run
+        run: cargo build --release -p mitos-build -p mitos-run
+      - name: Upload host tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-tools
+          path: |
+            target/release/mitos-build
+            target/release/mitos-run
+          retention-days: 1
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
   # Community-module wasm artifacts + golden test suite.
   #
-  # Same flow as `scripts/deploy.sh` does on the box (build
-  # mitos-build, run it for each `community-modules/<name>/<name>.rs`,
-  # then assert via `scripts/run-golden-tests.sh`). Catches:
-  #   - wasm-target build failures
-  #   - module ABI / manifest drift
-  #   - emission-shape changes that would fail golden assertions
-  #   - non-deterministic emission order
+  # Depends ONLY on `host-tools` (which gates on `fmt`), NOT on `test`
+  # — so the slow per-module wasm builds start as soon as the tools
+  # are ready, overlapping clippy/test instead of waiting them out.
+  # Downloads the prebuilt mitos-build/mitos-run rather than
+  # recompiling. Catches: wasm-target build failures, module ABI /
+  # manifest drift, emission-shape changes that fail goldens, and
+  # non-deterministic emission order.
   #
-  # `wasm32-wasip2` is the canonical target for mitos platform-v2
-  # modules. `wasm32-unknown-unknown` (the typical CF-worker target)
-  # is NOT used here — that's a different ABI surface.
+  # `wasm32-wasip2` is the canonical platform-v2 module target.
   # ----------------------------------------------------------------
   community-modules:
     name: Community Modules + Golden Tests
+    needs: [host-tools]
     runs-on: ubuntu-latest
-    needs: [test]
     steps:
       - uses: actions/checkout@v4
 
@@ -96,49 +134,35 @@ jobs:
         with:
           shared-key: "community-modules"
           cache-on-failure: true
-          # Default rust-cache scope covers `~/.cargo/{registry,git}`
-          # and the top-level `target/`. Each community module
-          # materialises its wasm crate at
-          # `community-modules/<name>/target/mitos-build/<name>/`
-          # with its own private `target/` dir, none of which the
-          # default scope sees. Without explicit `cache-directories`
-          # entries every CI run rebuilds each module's wasm deps
-          # (pallas-*, serde, ciborium, …) from scratch.
+          # Each module materialises its wasm crate at
+          # `community-modules/<name>/target/mitos-build/<name>/` with
+          # its own private `target/` the default rust-cache scope
+          # doesn't see. The glob covers EVERY module (incl. new ones
+          # like credit-address) so the wasm deps (pallas-*, serde,
+          # ciborium, …) stay cached without hand-maintaining a list.
           cache-directories: |
-            community-modules/asset-metadata-update/target
-            community-modules/asset-transfer/target
-            community-modules/burn-address/target
-            community-modules/cip-25-mint/target
-            community-modules/cip-68-mint/target
-            community-modules/holder-distribution/target
-            community-modules/jpg-store-listing/target
-            community-modules/jpg-store-offer/target
-            community-modules/jpg-store-sale/target
-            community-modules/standard-burn/target
-            community-modules/vesting-tracker/target
+            community-modules/*/target
 
-      - name: Build host tools (mitos-build + mitos-run)
-        run: cargo build --release -p mitos-build -p mitos-run
+      - name: Download host tools
+        uses: actions/download-artifact@v4
+        with:
+          name: host-tools
+          path: target/release
+
+      - name: Restore exec bit
+        # upload-artifact zips files and drops the +x bit; restore it
+        # so the downloaded binaries are runnable.
+        run: chmod +x target/release/mitos-build target/release/mitos-run
 
       - name: Build community-module wasm artifacts
         # `MITOS_BUILD_FAST=1` switches every materialised module's
         # `[profile.release]` to a CI-friendly profile (no LTO,
-        # 16 codegen units, `opt-level = 1`). Default release
-        # profile (`lto = true`, `codegen-units = 1`,
-        # `opt-level = "z"`) is correct for prod deploys but
-        # dominates CI wall time; fast artifacts produce identical
-        # event emissions so goldens stay green.
+        # 16 codegen units, `opt-level = 1`) — identical event
+        # emissions, far less wall time than the prod profile.
         #
-        # `xargs -P "$(nproc)"` runs the per-module builds in
-        # parallel up to the runner's core count. Each module's
-        # target dir is independent so there's no write
-        # contention. On warm-cache incremental builds (the
-        # common case once caching is established) cross-module
-        # parallelism wins outright; on cold-cache full rebuilds
-        # cargo's internal codegen-unit parallelism would already
-        # saturate cores, so the cross-module dimension is
-        # net-neutral rather than a slowdown — Linux's scheduler
-        # handles the oversubscription.
+        # `xargs -P "$(nproc)"` runs the per-module builds in parallel
+        # up to the runner's core count; each module's target dir is
+        # independent so there's no write contention.
         env:
           MITOS_BUILD_FAST: "1"
         run: |
