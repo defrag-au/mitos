@@ -34,6 +34,24 @@ pub struct AddressCredit {
     pub output_index: u32,
     /// Lovelace (ADA) in the credited output.
     pub lovelace: u64,
+    /// The payer — resolved bech32 address of the tx's
+    /// largest-lovelace input. For a buyer payment this is the
+    /// sender: the consumer's NFT-delivery + refund counterparty.
+    /// The module resolves it from dolos alone (the tx's consumed
+    /// inputs on the live path, `read_tx` on the cold-start walk),
+    /// so the consumer needs no external indexer to act on a credit.
+    pub from_address: String,
+    /// Slot of the block carrying `tx_hash`. Lets the consumer order
+    /// credits and advance a scan cursor.
+    pub slot: u64,
+    /// Raw transaction-metadata CBOR (the CIP-20/674 label map), or
+    /// `None` when the tx carries no metadata — the common case for a
+    /// plain buyer payment. Forwarded so the consumer can classify
+    /// INTENT without an external indexer: e.g. a mint engine reads a
+    /// CIP-674 marker here to tell an operator wallet top-up from a
+    /// buyer payment (both land at the same watched address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Vec<u8>>,
     /// Native assets carried by the output, if any. Empty for a
     /// pure-ADA credit (the common payment case).
     pub assets: Vec<CreditedAsset>,

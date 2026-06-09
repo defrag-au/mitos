@@ -22,7 +22,7 @@
 //! asset): the output's `lovelace` plus its list of native assets.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use mitos_community_events::credit_address::{AddressCredit, CreditedAsset};
 use mitos_module_kit::ReentrantRound;
@@ -35,7 +35,7 @@ use crate::mitos::platform_v2::state_kv;
 // `DispatchEvent`, `TrapStrategy`, `RetryPolicy`, `InterestOp`,
 // and the `Guest` trait come from world-level `use ...` clauses.
 use crate::mitos::platform_v2::types::{
-    AssetEntry, OutputRef as WitOutputRef, ProducedEvent, UtxoEvent,
+    AssetEntry, ChainPoint, OutputRef as WitOutputRef, ProducedEvent, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "credit-address-module";
@@ -86,6 +86,29 @@ enum InterestPredicateWire {
     TickEvery(u32),
 }
 
+/// Slot carried by a dispatch cursor / tx record. `Origin` (genesis
+/// pre-state) has no slot — reported as 0.
+fn slot_of(cursor: &ChainPoint) -> u64 {
+    match cursor {
+        ChainPoint::SlotOnly(s) => *s,
+        ChainPoint::Specific(p) => p.slot,
+        ChainPoint::Origin => 0,
+    }
+}
+
+/// The payer of a tx: the resolved address of its largest-lovelace
+/// input. `prior_outputs` yields `(address, lovelace)` for each
+/// consumed input; unresolved inputs (empty address — a prior output
+/// pruned past the archive horizon) are skipped. `None` when no input
+/// is resolvable, so the caller can fall back or skip rather than emit
+/// a payer-less credit.
+fn payer_of<'a>(prior_outputs: impl Iterator<Item = (&'a str, u64)>) -> Option<String> {
+    prior_outputs
+        .filter(|(addr, _)| !addr.is_empty())
+        .max_by_key(|(_, lovelace)| *lovelace)
+        .map(|(addr, _)| addr.to_string())
+}
+
 fn emit_address_credit(event: &AddressCredit) {
     let mut buf = Vec::with_capacity(256);
     if let Err(e) = ciborium::ser::into_writer(event, &mut buf) {
@@ -103,11 +126,15 @@ fn emit_address_credit(event: &AddressCredit) {
 /// address — its total lovelace plus every native asset it carries.
 /// Shared by the live `Produced` path and the cold-start walk so
 /// both emit an identical wire shape.
+#[allow(clippy::too_many_arguments)]
 fn emit_output_credit(
     address: &str,
     tx_hash_hex: &str,
     output_index: u32,
     lovelace: u64,
+    from_address: &str,
+    slot: u64,
+    metadata: Option<Vec<u8>>,
     assets: &[AssetEntry],
 ) {
     let credited: Vec<CreditedAsset> = assets
@@ -123,11 +150,14 @@ fn emit_output_credit(
         tx_hash: tx_hash_hex.to_string(),
         output_index,
         lovelace,
+        from_address: from_address.to_string(),
+        slot,
+        metadata,
         assets: credited,
     });
 }
 
-fn handle_produced(p: &ProducedEvent) {
+fn handle_produced(p: &ProducedEvent, payer_by_tx: &HashMap<Vec<u8>, (u64, String)>) {
     // Per-output filter: the platform dispatches every Produced
     // event in any TX that touched a watched address, NOT just
     // outputs at the watched address. Bounce non-matching outputs
@@ -136,6 +166,40 @@ fn handle_produced(p: &ProducedEvent) {
     if !is_watched {
         return;
     }
+    // One `read_tx` for this tx — its source of the tx metadata (`aux_data`, read
+    // from the block via dolos; NO Maestro) and the payer fallback if the
+    // in-batch consumed inputs didn't resolve one. Prefer the dispatched consumed
+    // inputs for the payer (no extra work); only consult the record's inputs when
+    // they didn't resolve.
+    let record = chain_data::read_tx(&p.tx_hash);
+    let from_address = match payer_by_tx.get(&p.tx_hash) {
+        Some((_, addr)) if !addr.is_empty() => addr.clone(),
+        _ => {
+            let resolved = record.as_ref().and_then(|r| {
+                payer_of(
+                    r.inputs
+                        .iter()
+                        .map(|i| (i.prior_output.address.as_str(), i.prior_output.lovelace)),
+                )
+            });
+            match resolved {
+                Some(addr) => addr,
+                None => {
+                    logging::log(
+                        LogLevel::Warn,
+                        LOG_TARGET,
+                        &format!(
+                            "credit at {} in {}: unresolvable payer — skipping (backstop will catch it)",
+                            p.output.address,
+                            hex::encode(&p.tx_hash)
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    let metadata = record.and_then(|r| r.aux_data);
     // Emit EVERY credit, including pure-ADA — unlike burn-address we
     // do NOT skip asset-less outputs: a pure-ADA payment is the
     // common case here. The consumer classifies intent.
@@ -144,6 +208,9 @@ fn handle_produced(p: &ProducedEvent) {
         &hex::encode(&p.tx_hash),
         p.oref.index,
         p.output.lovelace,
+        &from_address,
+        slot_of(&p.cursor),
+        metadata,
         &p.output.assets,
     );
 }
@@ -162,11 +229,48 @@ fn process_address_page(addr: &str, refs: &[WitOutputRef]) -> Option<usize> {
     // `read_utxos` returns each output paired with its own ref — not
     // in `refs` order, so the ref comes from the tuple.
     for (oref, output) in chain_data::read_utxos(refs) {
+        // The payer + metadata come from the CREATING tx (`oref.tx_hash` produced
+        // this unspent deposit). No live block context here, so `read_tx` it from
+        // dolos (the block carries the inputs + aux_data — no Maestro). Skip —
+        // leaving it to the consumer's backstop — if the creating tx is unavailable
+        // (pruned past horizon) or has no resolvable input.
+        let Some(record) = chain_data::read_tx(&oref.tx_hash) else {
+            logging::log(
+                LogLevel::Warn,
+                LOG_TARGET,
+                &format!(
+                    "cold-start {addr}: no tx record for {} — skipping",
+                    hex::encode(&oref.tx_hash)
+                ),
+            );
+            continue;
+        };
+        let Some(from_address) = payer_of(
+            record
+                .inputs
+                .iter()
+                .map(|i| (i.prior_output.address.as_str(), i.prior_output.lovelace)),
+        ) else {
+            logging::log(
+                LogLevel::Warn,
+                LOG_TARGET,
+                &format!(
+                    "cold-start {addr}: unresolvable payer for {} — skipping",
+                    hex::encode(&oref.tx_hash)
+                ),
+            );
+            continue;
+        };
+        let slot = slot_of(&record.cursor);
+        let metadata = record.aux_data;
         emit_output_credit(
             addr,
             &hex::encode(&oref.tx_hash),
             oref.index,
             output.lovelace,
+            &from_address,
+            slot,
+            metadata,
             &output.assets,
         );
         credit_events += 1;
@@ -370,14 +474,32 @@ impl Guest for Module {
     }
 
     fn handle_events(events: Vec<DispatchEvent>) {
-        for event in events {
-            if let DispatchEvent::Utxo(UtxoEvent::Produced(p)) = event {
-                handle_produced(&p);
+        // Pass 1: per spending-TX, find the largest-lovelace consumed
+        // input — the payer. Keyed on `consuming_tx_hash` so a
+        // multi-TX batch resolves each TX's payer independently.
+        // Reading Consumed here is for payer attribution only; we
+        // still emit CREDITS for inbound outputs only (a bidirectional
+        // "movement" module would also emit on the spend side).
+        let mut payer_by_tx: HashMap<Vec<u8>, (u64, String)> = HashMap::new();
+        for event in &events {
+            if let DispatchEvent::Utxo(UtxoEvent::Consumed(c)) = event {
+                if c.prior_output.address.is_empty() {
+                    continue;
+                }
+                let best = payer_by_tx
+                    .entry(c.consuming_tx_hash.clone())
+                    .or_insert((0, String::new()));
+                if c.prior_output.lovelace > best.0 {
+                    *best = (c.prior_output.lovelace, c.prior_output.address.clone());
+                }
             }
-            // Consumed at a watched address (the address spending one
-            // of its own UTxOs) is an OUTBOUND movement — this module
-            // reports inbound CREDITS only, so we ignore it. A
-            // bidirectional "movement" module would be a superset.
+        }
+        // Pass 2: emit a credit for each watched produced output,
+        // tagged with its TX's payer + slot.
+        for event in &events {
+            if let DispatchEvent::Utxo(UtxoEvent::Produced(p)) = event {
+                handle_produced(p, &payer_by_tx);
+            }
         }
     }
 
