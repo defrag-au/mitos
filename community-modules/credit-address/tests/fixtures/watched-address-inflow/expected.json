@@ -8,8 +8,10 @@
         "quantity": 169000
       }
     ],
+    "from_address": "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yrycd2hfm9qpg7d0hf50s599tqx",
     "lovelace": 1198180,
     "output_index": 0,
+    "slot": 158943010,
     "tx_hash": "d695425b745a3416d999ba2a8072786c917a138913ceb33e2f9e62067ff0ad1e"
   }
 ]

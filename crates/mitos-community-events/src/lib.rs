@@ -89,6 +89,9 @@ mod decode_tests {
             tx_hash: "d".repeat(64),
             output_index: 2,
             lovelace: 600_000_000,
+            from_address: "addr_test1payer".into(),
+            slot: 125_000_000,
+            metadata: Some(vec![0xa1, 0x01, 0x02]),
             assets: vec![credit_address::CreditedAsset {
                 policy: "a".repeat(56),
                 asset_name_hex: "b".repeat(8),
@@ -102,6 +105,8 @@ mod decode_tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["lovelace"], 600_000_000u64);
         assert_eq!(parsed["output_index"], 2);
+        assert_eq!(parsed["from_address"], "addr_test1payer");
+        assert_eq!(parsed["slot"], 125_000_000u64);
         assert_eq!(parsed["assets"][0]["quantity"], 1);
     }
 

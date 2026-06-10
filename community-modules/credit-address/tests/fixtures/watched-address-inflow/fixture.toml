@@ -10,12 +10,33 @@
 #
 # Expected emission: one `AddressCredit` event for output index 0,
 # carrying the output's lovelace + its asset list (policy
-# 8e40ce04…/asset 54686520456c6974652043617473, qty 169000) and the
-# watched-address echo. (Unlike burn-address, credit-address emits
-# even for pure-ADA outputs and carries the lovelace.)
+# 8e40ce04…/asset 54686520456c6974652043617473, qty 169000), the
+# watched-address echo, the block `slot`, and the resolved payer
+# `from_address` (the largest-lovelace input's address — see the seeded
+# `[[utxo]]` inputs below). No `metadata` (this TX carries none; the
+# field is omitted when absent). (Unlike burn-address, credit-address
+# emits even for pure-ADA outputs and carries the lovelace.)
 
 version = 1
 
 [[interest]]
 kind = "at_address"
 address = "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4"
+
+# The TX's two inputs — both from the same payer wallet. Seeded so the
+# dispatcher can resolve the consumed prior-outputs, which is how the module
+# attributes the credit's `from_address` (the largest-lovelace input's address,
+# addr1qxvtxter…). Resolved via Koios mainnet `tx_info`. Without these the
+# prior-outputs are "pruned" from the harness's POV and the module skips the
+# credit (no resolvable payer → leaves it to the consumer's backstop).
+[[utxo]]
+tx_hash = "ef651a314034574b39837a13d9e0ebbd5b71b9173bfd6a5338e54b197d43ad77"
+index = 1
+address = "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yrycd2hfm9qpg7d0hf50s599tqx"
+lovelace = 851509739
+
+[[utxo]]
+tx_hash = "e604d5556be6369513cdc290477b93cb4b130ab8e3d455292010a2eff0d9bf00"
+index = 0
+address = "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yrycd2hfm9qpg7d0hf50s599tqx"
+lovelace = 2000000

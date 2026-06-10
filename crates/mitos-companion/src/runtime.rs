@@ -504,7 +504,12 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
 
         match channel_handler.undo(&ctx, cursor.clone()).await {
             Ok(()) => {
-                tracing::info!(channel = %channel, cursor = ?cursor, "undo applied");
+                // `debug`, not `info`: a chain rollback is fanned out to EVERY
+                // subscribed companion, but for most the `undo` hook is a no-op
+                // (nothing confirmed at/after the slot). A handler that actually
+                // reverts work logs that itself (with the affected rows), so this
+                // generic line is just per-rollback × per-companion noise at `info`.
+                tracing::debug!(channel = %channel, cursor = ?cursor, "undo applied");
                 Response::empty()
             }
             Err(e) => {
