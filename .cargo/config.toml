@@ -1,0 +1,20 @@
+# Shared build cache for every cargo invocation under this repo.
+#
+# Cargo config discovery walks up parent directories, so this also
+# applies to the synthetic per-module workspaces mitos-build
+# materialises under `community-modules/<name>/target/mitos-build/<id>/`
+# and to the sub-workspaces in `spikes/`. Without it, each of those
+# compiles the full dependency set into its own `target/` (~1GB each,
+# ~19GB across the community modules) and a root `cargo clean` never
+# touches them.
+#
+# With it, everything builds into the root `target/` — dependency
+# artifacts are shared across modules (same profile + target triple =
+# same fingerprint) and one `cargo clean` at the repo root reclaims
+# the lot.
+#
+# mitos-build resolves this redirect via `cargo metadata` when
+# locating the built wasm (see `cargo_target_dir` in
+# tools/mitos-build/src/main.rs).
+[build]
+target-dir = "target"

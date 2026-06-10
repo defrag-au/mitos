@@ -24,4 +24,5 @@ hex = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 toml = "0.8"
 serde = { workspace = true }
+serde_json = { workspace = true }
 ciborium = "0.2"

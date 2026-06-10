@@ -334,6 +334,33 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cargo's effective target directory for `workspace`, honouring
+/// `CARGO_TARGET_DIR` and any `.cargo/config.toml` on the discovery
+/// path — notably the repo-root shared `target-dir` that pools the
+/// per-module synthetic workspaces into one build cache. Hardcoding
+/// `<workspace>/target` would miss that redirect.
+fn cargo_target_dir(workspace: &Path) -> anyhow::Result<PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct Metadata {
+        target_directory: PathBuf,
+    }
+    let out = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| "running cargo metadata (is cargo on PATH?)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "cargo metadata failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let meta: Metadata =
+        serde_json::from_slice(&out.stdout).context("parsing cargo metadata output")?;
+    Ok(meta.target_directory)
+}
+
 fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::Result<PathBuf> {
     tracing::info!(crate_name = %crate_name, profile = %profile, "cargo build");
     let mut cmd = Command::new("cargo");
@@ -353,12 +380,11 @@ fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::
     }
 
     // Resolve the produced .wasm. Cargo writes to
-    // `<workspace>/target/wasm32-wasip2/<profile>/<crate>.wasm`
+    // `<target-dir>/wasm32-wasip2/<profile>/<crate>.wasm`
     // with hyphens in the crate name converted to underscores.
     let crate_underscore = crate_name.replace('-', "_");
     let profile_dir = if profile == "dev" { "debug" } else { profile };
-    let path = workspace
-        .join("target")
+    let path = cargo_target_dir(workspace)?
         .join("wasm32-wasip2")
         .join(profile_dir)
         .join(format!("{crate_underscore}.wasm"));
