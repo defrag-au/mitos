@@ -301,6 +301,12 @@ struct FixtureAssetState {
     /// Slot of the mint TX (cosmetic for the facade).
     #[serde(default)]
     initial_slot: Option<u64>,
+    /// 64-hex hash of the latest metadata-bearing mint TX, when it
+    /// differs from `initial_tx` (reveal collections: placeholder mint
+    /// → re-mint with final metadata). The CIP-25 facade prefers this.
+    /// Omit for mint-complete collections.
+    #[serde(default)]
+    metadata_tx: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -460,13 +466,18 @@ impl FixtureDataPlane {
                 .with_context(|| format!("asset_state asset_name_hex {}", a.asset_name_hex))?;
             let initial_tx = decode_32(&a.initial_tx)
                 .with_context(|| format!("asset_state initial_tx {}", a.initial_tx))?;
+            let metadata_tx = a
+                .metadata_tx
+                .as_deref()
+                .map(|h| decode_32(h).with_context(|| format!("asset_state metadata_tx {h}")))
+                .transpose()?;
             asset_state_by_key.insert(
                 (policy, asset_name),
                 mitos_data_plane::AssetMintState {
                     initial_tx: Some(initial_tx),
                     initial_slot: a.initial_slot,
                     mint_tx_count: 1,
-                    metadata_tx: None,
+                    metadata_tx,
                     quantity: 1,
                 },
             );
