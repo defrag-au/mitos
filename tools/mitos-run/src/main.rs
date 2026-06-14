@@ -469,9 +469,7 @@ impl FixtureDataPlane {
             let metadata_tx = a
                 .metadata_tx
                 .as_deref()
-                .map(|h| {
-                    decode_32(h).with_context(|| format!("asset_state metadata_tx {h}"))
-                })
+                .map(|h| decode_32(h).with_context(|| format!("asset_state metadata_tx {h}")))
                 .transpose()?;
             asset_state_by_key.insert(
                 (policy, asset_name),
