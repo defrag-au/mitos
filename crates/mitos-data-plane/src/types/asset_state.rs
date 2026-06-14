@@ -21,9 +21,13 @@ pub struct AssetMintState {
     /// Number of mint transactions observed for this asset.
     pub mint_tx_count: u64,
     /// Transaction the visitor flagged as carrying this asset's
-    /// metadata — the CIP-25 mint (label 721) or CIP-68 reference
-    /// token (label 100) tx. May be `None` for pre-bootstrap CIP-25
-    /// assets; prefer `initial_tx` for the CIP-25 facade.
+    /// metadata — the latest CIP-25 mint (label 721) or CIP-68
+    /// reference token (label 100) tx carrying this asset's metadata.
+    /// The CIP-25 facade prefers this over `initial_tx` so reveal
+    /// collections (placeholder mint → burn → re-mint with final
+    /// metadata) resolve the revealed traits, not the placeholder.
+    /// `None` for pre-bootstrap CIP-25 assets the visitor never saw
+    /// mint — the facade falls back to `initial_tx` there.
     pub metadata_tx: Option<[u8; 32]>,
     /// Net supply = total minted − total burned (`0` ⇒ fully burned).
     pub quantity: i128,

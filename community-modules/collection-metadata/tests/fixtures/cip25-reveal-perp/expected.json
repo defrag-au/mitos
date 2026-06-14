@@ -1,0 +1,27 @@
+[
+  {
+    "cursor_hash_hex": "",
+    "cursor_slot": 0,
+    "kind": "snapshot_begin",
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+  },
+  {
+    "entries": [
+      {
+        "asset_name_hex": "5065727035313538",
+        "immutable": true,
+        "metadata_json": "{\"Back Accessory\":\"Piano Guitar\",\"Background\":\"Sky Blue\",\"Body\":\"Purple\",\"Clothes\":\"White Coat\",\"Face Accessory\":\"None\",\"Facial Expression\":\"Angry Shaman\",\"Faction\":\"Genovault\",\"Hair or Head Accessory\":\"None\",\"Hands\":\"None\",\"Post It\":\"None\",\"Special\":\"None\",\"Special Accessory\":\"Astronaut Helmet\",\"description\":\"Pure Trouble\",\"files\":[{\"mediaType\":\"image/png\",\"src\":\"ipfs://QmbqyS7EeupdZr8Lchdgjt3y9pt8YbjVBrhgfx3Sa4o98z\"}],\"image\":\"ipfs://QmaT9pzYqeZdWViZPgkDz3ndBfcCskRwaZrtZKuhtvxtzQ\",\"mediaType\":\"image/png\",\"name\":\"Perp #5158\",\"website\":\"https://www.perpsquad.com/\",\"x\":\"https://x.com/perpsonx\"}",
+        "source_tx": "2222222222222222222222222222222222222222222222222222222222222222",
+        "standard": "cip25",
+        "version": 1
+      }
+    ],
+    "kind": "snapshot_chunk",
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+  },
+  {
+    "entry_count": 1,
+    "kind": "snapshot_end",
+    "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+  }
+]

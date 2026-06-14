@@ -9,6 +9,23 @@
 pub mod emit;
 pub mod state_kv;
 
+/// Pick the transaction whose label-721 aux-data should be decoded for
+/// a CIP-25 asset: the **latest metadata-bearing mint** (`metadata_tx`)
+/// when the dolos visitor flagged one, else the earliest mint
+/// (`initial_tx`).
+///
+/// Reveal collections mint a placeholder, then burn + re-mint with the
+/// final metadata (e.g. Funplastic: 6 mints / 5 burns for a supply-1
+/// NFT). `initial_tx` points at the placeholder mint; `metadata_tx` is
+/// overwritten to the most recent mint carrying this asset's 721 entry
+/// (dolos-cardano `roll/assets.rs`), i.e. the reveal. Mint-complete
+/// collections set `metadata_tx == initial_tx`, so this is a no-op for
+/// them; the `initial_tx` fallback preserves resolution for
+/// pre-bootstrap assets whose `metadata_tx` the visitor never recorded.
+fn cip25_source_tx(state: &mitos_data_plane::AssetMintState) -> Option<[u8; 32]> {
+    state.metadata_tx.or(state.initial_tx)
+}
+
 /// Trait the platform crate uses to talk to the data plane,
 /// kept narrow on purpose. `mitos-data-plane::ChainDataPlane`
 /// is the production impl (via the blanket impl below); tests
@@ -132,7 +149,7 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         let Some(state) = self.asset_state(policy, asset_name).await? else {
             return Ok(None);
         };
-        let Some(mint_tx) = state.initial_tx else {
+        let Some(mint_tx) = cip25_source_tx(&state) else {
             return Ok(None);
         };
         let Some(aux) = self.tx_metadata(&mint_tx).await? else {
@@ -178,11 +195,11 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
         policy: &[u8],
         asset_names: &[Vec<u8>],
     ) -> mitos_data_plane::DataPlaneResult<Vec<Option<mitos_data_plane::Cip25Resolution>>> {
-        // 1. Resolve each asset's mint tx (dolos-local, cheap).
+        // 1. Resolve each asset's metadata-bearing tx (dolos-local, cheap).
         let mut mint_txs: Vec<Option<[u8; 32]>> = Vec::with_capacity(asset_names.len());
         for name in asset_names {
             let tx = match self.asset_state(policy, name).await? {
-                Some(state) => state.initial_tx,
+                Some(state) => cip25_source_tx(&state),
                 None => None,
             };
             mint_txs.push(tx);
@@ -766,5 +783,46 @@ impl DataPlaneFacade for CachingDataPlane {
         asset_name: &[u8],
     ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::AssetMintState>> {
         self.inner.asset_state(policy, asset_name).await
+    }
+}
+
+#[cfg(test)]
+mod cip25_source_tx_tests {
+    use super::cip25_source_tx;
+    use mitos_data_plane::AssetMintState;
+
+    fn state(initial: Option<u8>, metadata: Option<u8>) -> AssetMintState {
+        AssetMintState {
+            initial_tx: initial.map(|b| [b; 32]),
+            initial_slot: Some(0),
+            mint_tx_count: 1,
+            metadata_tx: metadata.map(|b| [b; 32]),
+            quantity: 1,
+        }
+    }
+
+    #[test]
+    fn prefers_metadata_tx_when_present() {
+        // Reveal collection: initial_tx = placeholder mint, metadata_tx
+        // = the re-mint carrying the final metadata. Resolve the reveal.
+        assert_eq!(cip25_source_tx(&state(Some(1), Some(2))), Some([2; 32]));
+    }
+
+    #[test]
+    fn falls_back_to_initial_tx_when_metadata_tx_absent() {
+        // Pre-bootstrap asset the visitor never saw mint — only
+        // initial_tx is populated.
+        assert_eq!(cip25_source_tx(&state(Some(1), None)), Some([1; 32]));
+    }
+
+    #[test]
+    fn mint_complete_collection_is_a_no_op() {
+        // metadata_tx == initial_tx (single mint with full metadata).
+        assert_eq!(cip25_source_tx(&state(Some(7), Some(7))), Some([7; 32]));
+    }
+
+    #[test]
+    fn none_when_neither_known() {
+        assert_eq!(cip25_source_tx(&state(None, None)), None);
     }
 }
