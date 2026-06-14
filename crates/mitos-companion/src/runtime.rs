@@ -770,6 +770,18 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             }
             crate::interest::remove_interest(&sql, &row.kind, &row.value, &row.channel)?;
         }
+        // Invalidate the schema-ready cache. Teardown is the dApp's
+        // pre-wipe signal: the collection-ownership worker calls this
+        // immediately before `storage().delete_all()` (its DO reset),
+        // which drops our `mitos_companion_*` tables out from under the
+        // live isolate. Without clearing the flag, the next request's
+        // `ensure_runtime_ready()` short-circuits on the still-`true`
+        // cache and skips `ensure_schema()` → "no such table" on the
+        // re-onboard's subscribe/wake, stranding the DO empty until the
+        // isolate evicts. Resetting here makes reset→re-onboard work in
+        // the same isolate. Safe even when no wipe follows: the next
+        // `ensure_schema()` is `CREATE TABLE IF NOT EXISTS` (a no-op).
+        self.schema_ready.set(false);
         tracing::info!(removed = count, "companion teardown complete");
         Response::ok(format!("{{\"torn_down\":{count}}}"))
     }
