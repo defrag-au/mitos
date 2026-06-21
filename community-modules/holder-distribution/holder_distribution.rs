@@ -742,6 +742,48 @@ fn read_onboard_scope() -> Option<Vec<Vec<u8>>> {
     ciborium::de::from_reader(&bytes[..]).ok()
 }
 
+/// Scope for an `Onboard` rebootstrap pump: the subscribe-seeded scope
+/// PLUS any tracked policy that has no persisted ledger state yet (i.e.
+/// was never scanned).
+///
+/// The self-heal term makes onboarding *converge* even when the explicit
+/// seed was missed — e.g. a host-restart `Replace` re-asserts a policy
+/// into `TRACKED_POLICIES` without re-seeding the onboard scope (so the
+/// seed-on-`added` path is a no-op), or a first seed/pump that ingested
+/// nothing leaves a tracked-but-empty policy. Without it such a policy is
+/// stranded until the next *whole-module* recapture (the symptom that left
+/// freshly-onboarded ad-hoc tokens showing no holders).
+///
+/// Bounded: a fully-onboarded module has ledger state for every tracked
+/// policy, so the self-heal term is empty and an empty onboard scope stays
+/// a no-op — never a full re-scan of every policy (that remains
+/// recapture's job, `RebootstrapMode::Full`).
+fn onboard_scope_with_self_heal() -> Vec<Vec<u8>> {
+    let mut scope = read_onboard_scope().unwrap_or_default();
+    let seeded: HashSet<Vec<u8>> = scope.iter().cloned().collect();
+    let unscanned: Vec<Vec<u8>> = TRACKED_POLICIES.with(|set| {
+        set.borrow()
+            .iter()
+            .map(|p| p.to_vec())
+            .filter(|p| !seeded.contains(p))
+            .filter(|p| !policy_has_state(&hex::encode(p)))
+            .collect()
+    });
+    scope.extend(unscanned);
+    scope
+}
+
+/// True when the policy has at least one persisted `ledger:` shard — the
+/// reliable "has been scanned at least once" signal (the `meta:` shard is
+/// only written for pool/vesting policies, so it can't be used here).
+/// Cheap single-row prefix probe.
+fn policy_has_state(policy_hex: &str) -> bool {
+    state_kv::kv_scan(&ledger_prefix(policy_hex), None, 1)
+        .into_iter()
+        .next()
+        .is_some()
+}
+
 fn persist_tracked_policies() {
     let policies: Vec<String> =
         TRACKED_POLICIES.with(|set| set.borrow().iter().map(hex::encode).collect());
@@ -1033,7 +1075,7 @@ impl Guest for Module {
                 // Onboard scans only the seeded onboard scope; Full
                 // re-scans every tracked policy (recapture).
                 let mut predicates: Vec<Vec<u8>> = match mode {
-                    RebootstrapMode::Onboard => read_onboard_scope().unwrap_or_default(),
+                    RebootstrapMode::Onboard => onboard_scope_with_self_heal(),
                     RebootstrapMode::Full => {
                         TRACKED_POLICIES.with(|s| s.borrow().iter().map(|p| p.to_vec()).collect())
                     }
