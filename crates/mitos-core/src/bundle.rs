@@ -312,6 +312,7 @@ impl Bundle {
         // timeout.
         let mut module_host: Option<Arc<dyn mitos_platform::host_v2::ModuleHostHandle>> = None;
         let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut module_watchdog_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
@@ -554,9 +555,25 @@ impl Bundle {
                 reserved_names,
                 Some(chain_data),
                 started_at,
-                event_ring,
+                event_ring.clone(),
                 platform_auth,
             ));
+
+            // Module watchdog — revives any module that has
+            // registered companions but no live follower (dead
+            // follower task, or a failed/cancelled restart that
+            // left the slot empty), and re-asserts its
+            // scan-interest from the persisted companion set so
+            // subscribes that landed while it was down aren't
+            // stranded. First tick is delayed past this startup
+            // sequence. See `mitos_platform::watchdog`.
+            let watchdog_handle = mitos_platform::watchdog::spawn(
+                storage.clone(),
+                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>,
+                dialer.clone(),
+                event_ring.clone(),
+                exit.clone(),
+            );
 
             // Periodic emissions-log compaction. Hourly sweep
             // ages out Acked rows (7d) + flips stuck Pending
@@ -569,6 +586,7 @@ impl Bundle {
 
             module_host = Some(host);
             module_compaction_handle = Some(compaction_handle);
+            module_watchdog_handle = Some(watchdog_handle);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -621,6 +639,13 @@ impl Bundle {
         // handle to confirm cleanup before module followers
         // tear down redb handles.
         if let Some(handle) = module_compaction_handle {
+            let _ = handle.await;
+        }
+
+        // Watchdog observes the same `exit` token — cancelled by
+        // now. Await it so a mid-sweep restart can't race the
+        // follower teardown below.
+        if let Some(handle) = module_watchdog_handle {
             let _ = handle.await;
         }
 

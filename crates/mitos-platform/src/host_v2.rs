@@ -638,6 +638,7 @@ where
         // `manifest::is_chunked_cold_start_module` +
         // `follower_v2::apply_interest_update`.
         let follower_chunked_cold_start = crate::manifest::is_chunked_cold_start_module(id);
+        let exit_event_ring = self.event_ring.get().cloned();
         let task = tokio::spawn(async move {
             let result = run_chain_follower_v2(
                 driver,
@@ -655,11 +656,27 @@ where
             )
             .await;
             match &result {
-                Err(e) => tracing::error!(
-                    module = %id_for_log,
-                    error = %e,
-                    "v2 follower task exited with error",
-                ),
+                Err(e) => {
+                    tracing::error!(
+                        module = %id_for_log,
+                        error = %e,
+                        "v2 follower task exited with error",
+                    );
+                    // Surface the death on the event ring so
+                    // `/_admin/events` + alerting see it — a dead
+                    // follower otherwise looks like a quiet module
+                    // (queued=0). The watchdog restarts it on the
+                    // next tick; `list_running` reports truthfully
+                    // in the meantime via `is_finished()`.
+                    if let Some(ring) = &exit_event_ring {
+                        ring.record(
+                            id_for_log.as_str(),
+                            crate::events::EventKind::FollowerExited {
+                                error: e.to_string(),
+                            },
+                        );
+                    }
+                }
                 Ok(_) => tracing::info!(
                     module = %id_for_log,
                     "v2 follower task exited cleanly",
@@ -737,6 +754,21 @@ where
     pub async fn list(&self) -> Vec<String> {
         let slots = self.slots.lock().await;
         slots.keys().cloned().collect()
+    }
+
+    /// Module ids whose follower task is actually alive. Unlike
+    /// [`list`], a slot whose follower exited (dispatch error, trap
+    /// cascade) is excluded — the slot lingers in the map (nothing
+    /// polls the `JoinHandle`), so raw key listing over-reports
+    /// liveness. This is the signal `/_admin/status.running`, the
+    /// watchdog, and `mitos_module_running` are built on.
+    pub async fn list_running(&self) -> Vec<String> {
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .filter(|(_, slot)| !slot.task.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub async fn stop_all(&self) {
@@ -957,8 +989,32 @@ where
                 tracing::error!(
                     module = %id,
                     error = %e,
-                    "recapture: follower restart failed; refill is partial"
+                    "recapture: follower restart failed; attempting recovery start"
                 );
+                // `start` is stop-first: at this point the old
+                // follower is already gone, so returning the error
+                // as-is would leave the module STOPPED (silently
+                // dead until a restart — the 2026-06/07
+                // holder-distribution outage). Salvage with a plain
+                // start: the bootstrap-done flags were cleared in
+                // step 3, so a recovery start still performs the
+                // full refill through the normal bootstrap pass.
+                // The original error is still returned so the
+                // recapture reports failed and alerting fires.
+                match self.start(id, false).await {
+                    Ok(_) => tracing::warn!(
+                        module = %id,
+                        "recapture: recovery start succeeded — module is live and \
+                         the refill ran via bootstrap (flags were cleared); the \
+                         recapture itself is still reported failed"
+                    ),
+                    Err(re) => tracing::error!(
+                        module = %id,
+                        error = %re,
+                        "recapture: recovery start ALSO failed; module left \
+                         stopped — watchdog will retry on its next tick"
+                    ),
+                }
                 return Err(e);
             }
         };
@@ -1104,7 +1160,7 @@ where
         ModuleHostV2::stop_all(self).await
     }
     async fn list_running(&self) -> Vec<String> {
-        ModuleHostV2::list(self).await
+        ModuleHostV2::list_running(self).await
     }
     async fn recapture_module(
         &self,

@@ -377,6 +377,12 @@ pub struct StatusModule {
     pub queued: usize,
     /// Emissions dialed but not yet acked (in flight).
     pub pending: usize,
+    /// The module's follower task is alive (truthful liveness — a
+    /// follower that exited on error reports `false` even while its
+    /// slot lingers in the host map). `companions > 0` with
+    /// `running: false` means the module's consumers are getting
+    /// nothing — the watchdog restarts it; alerting should page on it.
+    pub running: bool,
     /// A recapture is currently in flight for this module (the
     /// per-module mutex is held). Answers "is a recapture still
     /// running?" without a journal grep.
@@ -520,13 +526,6 @@ enum HandlerError {
     #[error("recapture already in progress for module `{0}`")]
     RecaptureInProgress(String),
 
-    /// Recapture: companion failed to ACK `RecaptureReady` within
-    /// the per-companion timeout. Bootstrap-refill was NOT fired;
-    /// dApp state is whatever the companion partially produced.
-    /// Operator inspects companion logs and retries.
-    #[error("recapture timed out / coordination failed: {0}")]
-    RecaptureTimeout(String),
-
     /// Recapture: the host's dialer isn't wired in this bundle
     /// (e.g. an artifact-only deployment). Recapture is
     /// unavailable until the bundle calls `host.set_dialer`.
@@ -534,8 +533,8 @@ enum HandlerError {
     RecaptureUnavailable(String),
 
     /// Recapture: module not registered. Distinct from
-    /// "module exists but no subscribers" — that surfaces as
-    /// `RecaptureTimeout` from the platform layer.
+    /// "module exists but no subscribers" — that surfaces as a
+    /// `recapture_failed` event from the detached recapture task.
     #[error("module `{0}` not registered")]
     ModuleNotFound(String),
 }
@@ -561,7 +560,6 @@ impl HandlerError {
             Self::ReservedName(_) => "reserved_name",
             Self::RecaptureBadCompanion => "recapture_bad_companion",
             Self::RecaptureInProgress(_) => "recapture_in_progress",
-            Self::RecaptureTimeout(_) => "recapture_timeout",
             Self::RecaptureUnavailable(_) => "recapture_unavailable",
             Self::ModuleNotFound(_) => "not_found",
         }
@@ -574,7 +572,6 @@ impl HandlerError {
             Self::ChainData(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ReservedName(_) => StatusCode::CONFLICT,
             Self::RecaptureInProgress(_) => StatusCode::CONFLICT,
-            Self::RecaptureTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::RecaptureUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::ModuleNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
@@ -671,7 +668,7 @@ const ADMIN_ENDPOINTS: &[(&str, &str, &str, &str)] = &[
         "POST",
         "/_admin/modules/{id}/recapture",
         "full",
-        "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}.",
+        "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}. Async: returns 202 immediately; poll /_admin/events (recapture_completed/failed) or status.recapture_in_progress.",
     ),
     (
         "POST",
@@ -799,15 +796,17 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
     };
 
     // Snapshots of host-side state for the whole summary.
-    let (recapturing, bootstrapping, last_results): (
+    let (recapturing, bootstrapping, last_results, running_set): (
         std::collections::HashSet<String>,
         std::collections::HashSet<String>,
         std::collections::HashMap<String, crate::host_v2::LastResult>,
+        std::collections::HashSet<String>,
     ) = match &state.host {
         Some(host) => (
             host.recapture_in_flight().await.into_iter().collect(),
             host.bootstrap_in_flight().await.into_iter().collect(),
             host.last_results().await.into_iter().collect(),
+            host.list_running().await.into_iter().collect(),
         ),
         None => Default::default(),
     };
@@ -844,6 +843,7 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
             companions,
             queued,
             pending,
+            running: running_set.contains(&id),
             recapture_in_progress: recapturing.contains(&id),
             bootstrap_in_progress: bootstrapping.contains(&id),
             last_result,
@@ -951,15 +951,17 @@ async fn metrics(State(state): State<AdminState>) -> Response {
     }
 
     // ----- gather per-module + per-companion -----
-    let (recapturing, bootstrapping, last_results): (
+    let (recapturing, bootstrapping, last_results, running): (
         std::collections::HashSet<String>,
         std::collections::HashSet<String>,
         std::collections::HashMap<String, crate::host_v2::LastResult>,
+        std::collections::HashSet<String>,
     ) = match &state.host {
         Some(host) => (
             host.recapture_in_flight().await.into_iter().collect(),
             host.bootstrap_in_flight().await.into_iter().collect(),
             host.last_results().await.into_iter().collect(),
+            host.list_running().await.into_iter().collect(),
         ),
         None => Default::default(),
     };
@@ -972,6 +974,7 @@ async fn metrics(State(state): State<AdminState>) -> Response {
     struct ModMetrics {
         module: String,
         companions: usize,
+        running: bool,
         recapture: bool,
         bootstrap: bool,
         last_rebootstrap: Option<(u64, u64)>, // (utxos_ingested, secs_ago)
@@ -1019,6 +1022,7 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         mods.push(ModMetrics {
             module: id.clone(),
             companions: state.storage.count_companions(id),
+            running: running.contains(id),
             recapture: recapturing.contains(id),
             bootstrap: bootstrapping.contains(id),
             last_rebootstrap,
@@ -1043,6 +1047,23 @@ async fn metrics(State(state): State<AdminState>) -> Response {
             "mitos_module_companions{{module=\"{}\"}} {}",
             esc_label(&m.module),
             m.companions,
+        );
+    }
+
+    metric_header(
+        &mut out,
+        "mitos_module_running",
+        "1 if the module's follower task is alive (truthful liveness — a \
+         follower that exited on error reports 0 even while its slot \
+         lingers). companions>0 with running=0 is the page-worthy state.",
+        "gauge",
+    );
+    for m in &mods {
+        let _ = writeln!(
+            out,
+            "mitos_module_running{{module=\"{}\"}} {}",
+            esc_label(&m.module),
+            u8::from(m.running),
         );
     }
 
@@ -1844,19 +1865,16 @@ fn default_companion_filter() -> String {
     "*".to_owned()
 }
 
-/// Response body for a successful recapture.
+/// Response body for an accepted (dispatched) recapture. The
+/// recapture itself runs detached — completion/failure is observable
+/// via `GET /_admin/events` (`recapture_completed` /
+/// `recapture_failed`) and the `recapture_in_progress` field on
+/// `/_admin/status`.
 #[derive(Debug, Serialize)]
-struct RecaptureResponse {
+struct RecaptureAccepted {
     module: String,
-    companions_targeted: usize,
-    /// Best-effort counter; v1 always reports `0` (see
-    /// `RECAPTURE.md` open question 4). Companions MUST NOT
-    /// depend on the value for correctness.
-    events_emitted: u64,
-    /// Wall-clock time the admin endpoint spent driving the
-    /// recapture, in milliseconds. Includes the per-companion
-    /// `RecaptureReady` wait + the bootstrap re-walk.
-    duration_ms: u64,
+    /// Always `"started"` — the 202 contract marker.
+    status: &'static str,
 }
 
 /// Per-companion `RecaptureReady` ACK budget. Matches the design
@@ -1890,11 +1908,20 @@ async fn recapture_module(
         ));
     };
 
-    let started = std::time::Instant::now();
+    // Synchronous duplicate check so the caller gets an immediate
+    // 409. The authoritative guard is the mutex inside
+    // `recapture_module` (which the detached task still hits) — this
+    // pre-check just keeps the common repeat-POST path from spawning
+    // a task destined to 409, and keeps the event ring free of
+    // started/failed noise for duplicates.
+    if host.recapture_in_flight().await.iter().any(|m| m == &id) {
+        return Err(HandlerError::RecaptureInProgress(id));
+    }
+
     tracing::info!(
         module = %id,
         reason = ?req.reason,
-        "recapture: admin endpoint dispatching"
+        "recapture: admin endpoint dispatching (detached)"
     );
     state.events.record(
         id.as_str(),
@@ -1903,73 +1930,76 @@ async fn recapture_module(
         },
     );
 
-    match host
-        .recapture_module(&id, req.reason, RECAPTURE_COMPANION_TIMEOUT)
-        .await
-    {
-        Ok(outcome) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            tracing::info!(
-                module = %id,
-                companions_targeted = outcome.companion_count,
-                duration_ms,
-                "recapture: complete"
-            );
-            state.events.record(
-                id.as_str(),
-                crate::events::EventKind::RecaptureCompleted {
-                    companions_targeted: outcome.companion_count,
+    // Run the recapture DETACHED from this request. The old inline
+    // `.await` tied the whole coordinate→wipe→restart pipeline to the
+    // HTTP connection's lifetime; the CF tunnel kills idle responses
+    // at ~100s, dropping the handler future and cancelling the
+    // recapture mid-`start()` — which is stop-first, so the module
+    // was left STOPPED (the 2026-06/07 holder-distribution outage).
+    // A spawned task is owned by the runtime, not the connection, so
+    // client/tunnel behaviour can no longer corrupt module lifecycle.
+    // Completion/failure lands on the event ring exactly as before.
+    let task_host = host.clone();
+    let events = state.events.clone();
+    let module_id = id.clone();
+    let reason = req.reason.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        match task_host
+            .recapture_module(&module_id, reason, RECAPTURE_COMPANION_TIMEOUT)
+            .await
+        {
+            Ok(outcome) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                tracing::info!(
+                    module = %module_id,
+                    companions_targeted = outcome.companion_count,
                     duration_ms,
-                },
-            );
-            Ok(Json(RecaptureResponse {
-                module: outcome.module,
-                companions_targeted: outcome.companion_count,
-                events_emitted: outcome.events_emitted,
-                duration_ms,
-            })
-            .into_response())
-        }
-        Err(crate::PlatformError::RecaptureInProgress(m)) => {
-            Err(HandlerError::RecaptureInProgress(m))
-        }
-        Err(crate::PlatformError::RecaptureCoordination(detail)) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            state.events.record(
-                id.as_str(),
-                crate::events::EventKind::RecaptureFailed {
-                    error: detail.clone(),
+                    "recapture: complete"
+                );
+                events.record(
+                    module_id.as_str(),
+                    crate::events::EventKind::RecaptureCompleted {
+                        companions_targeted: outcome.companion_count,
+                        duration_ms,
+                    },
+                );
+            }
+            // Lost the pre-check race with a concurrent POST — the
+            // other flight is doing the work; nothing to record.
+            Err(crate::PlatformError::RecaptureInProgress(_)) => {
+                tracing::info!(
+                    module = %module_id,
+                    "recapture: duplicate dispatch lost the in-flight race; ignoring"
+                );
+            }
+            Err(other) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                tracing::error!(
+                    module = %module_id,
+                    error = %other,
                     duration_ms,
-                },
-            );
-            // Distinguish "dialer not wired" (operator
-            // misconfiguration; 503) from in-flight timeout /
-            // companion failure (504). The dialer-unwired path
-            // produces a detail string starting with "dialer
-            // not wired" — see host_v2.rs.
-            if detail.starts_with("dialer not wired") {
-                Err(HandlerError::RecaptureUnavailable(detail))
-            } else {
-                Err(HandlerError::RecaptureTimeout(detail))
+                    "recapture: failed"
+                );
+                events.record(
+                    module_id.as_str(),
+                    crate::events::EventKind::RecaptureFailed {
+                        error: other.to_string(),
+                        duration_ms,
+                    },
+                );
             }
         }
-        Err(other) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            tracing::error!(
-                module = %id,
-                error = %other,
-                "recapture: unexpected platform error"
-            );
-            state.events.record(
-                id.as_str(),
-                crate::events::EventKind::RecaptureFailed {
-                    error: other.to_string(),
-                    duration_ms,
-                },
-            );
-            Err(HandlerError::Wasmtime(format!("recapture: {other}")))
-        }
-    }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RecaptureAccepted {
+            module: id,
+            status: "started",
+        }),
+    )
+        .into_response())
 }
 
 /// Return the most recently captured trap fixture for a module.

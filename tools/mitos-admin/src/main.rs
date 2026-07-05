@@ -398,6 +398,10 @@ struct StatusModule {
     companions: usize,
     queued: usize,
     pending: usize,
+    /// Defaults to `true` when talking to a pre-`running`-field host
+    /// so an older server doesn't render every module as DOWN.
+    #[serde(default = "default_true")]
+    running: bool,
     #[serde(default)]
     recapture_in_progress: bool,
     #[serde(default)]
@@ -405,6 +409,10 @@ struct StatusModule {
     #[serde(default)]
     last_result: Option<StatusLastResult>,
     last_trap_secs_ago: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +454,14 @@ async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Resul
     println!("modules:        {}", s.modules.len());
     for m in &s.modules {
         let mut notes = Vec::new();
+        // Derived display phase — precedence: an in-flight
+        // recapture/bootstrap explains a not-running follower, so
+        // only flag DOWN when nothing is working on reviving it.
+        // (The API keeps the three independent flags; this word is
+        // presentation only.)
+        if !m.running && !m.recapture_in_progress && !m.bootstrap_in_progress && m.companions > 0 {
+            notes.push("DOWN".to_string());
+        }
         if m.queued + m.pending > 0 {
             notes.push(format!("BACKLOG {}q/{}p", m.queued, m.pending));
         }

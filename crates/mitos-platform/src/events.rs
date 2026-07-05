@@ -66,6 +66,14 @@ pub enum EventKind {
     /// or a module-side panic). `reason` is the host error text; the
     /// full replay fixture lands at `last-trap.toml` (see `last-trap`).
     Trap { reason: String },
+    /// The module's live follower task exited with an error (clean
+    /// stop/replace exits are not recorded). The module is no longer
+    /// applying blocks until something restarts it — the watchdog
+    /// picks it up on its next tick.
+    FollowerExited { error: String },
+    /// The watchdog found a module with registered companions but no
+    /// live follower and restarted it (see `watchdog.rs`).
+    WatchdogRestart { outcome: String },
 }
 
 impl EventKind {
@@ -81,6 +89,8 @@ impl EventKind {
             EventKind::CompanionSubscribed { .. } => "companion_subscribed",
             EventKind::CompanionEvicted { .. } => "companion_evicted",
             EventKind::Trap { .. } => "trap",
+            EventKind::FollowerExited { .. } => "follower_exited",
+            EventKind::WatchdogRestart { .. } => "watchdog_restart",
         }
     }
 }
