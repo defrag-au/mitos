@@ -1763,7 +1763,7 @@ crate_version = "0.0.0"
         apply_mutation_to_set(&mut current, InterestOp::Resync, std::slice::from_ref(&p1));
         assert_eq!(current, vec![p1.clone()]);
         // Re-asserting the same interest stays deduped.
-        apply_mutation_to_set(&mut current, InterestOp::Resync, &[p1.clone()]);
+        apply_mutation_to_set(&mut current, InterestOp::Resync, std::slice::from_ref(&p1));
         assert_eq!(current, vec![p1]);
     }
 
