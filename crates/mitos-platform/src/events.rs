@@ -57,6 +57,16 @@ pub enum EventKind {
         client_id: String,
         companion_key: String,
     },
+    /// A scoped `Resync` was routed into the module — either a
+    /// subscribe with `resume_from: None` (companion declaring it
+    /// holds no state) or a per-companion admin recapture. The
+    /// follower re-seeds the scope as new and the Onboard pump
+    /// re-emits its snapshot; pair with the following
+    /// `onboard_completed` to see the re-walk size.
+    ResyncRouted {
+        client_id: String,
+        companion_key: String,
+    },
     /// A companion record was removed (admin `delete-companion`).
     CompanionEvicted {
         client_id: String,
@@ -87,6 +97,7 @@ impl EventKind {
             EventKind::RebootstrapCompleted { .. } => "rebootstrap_completed",
             EventKind::OnboardCompleted { .. } => "onboard_completed",
             EventKind::CompanionSubscribed { .. } => "companion_subscribed",
+            EventKind::ResyncRouted { .. } => "resync_routed",
             EventKind::CompanionEvicted { .. } => "companion_evicted",
             EventKind::Trap { .. } => "trap",
             EventKind::FollowerExited { .. } => "follower_exited",

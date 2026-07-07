@@ -515,11 +515,10 @@ enum HandlerError {
     #[error("module id `{0}` shadows reserved in-tree indexer name")]
     ReservedName(String),
 
-    /// Recapture: `companion` filter not `"*"` (v1 only supports
-    /// targeting all subscribers — per-companion is deferred per
-    /// `docs/design/RECAPTURE.md`).
-    #[error("per-companion recapture not yet supported; use companion=*")]
-    RecaptureBadCompanion,
+    /// Per-companion recapture: the named companion has no
+    /// registration for this module, so there is nothing to resync.
+    #[error("companion `{0}` has no registration for this module")]
+    RecaptureCompanionUnknown(String),
 
     /// Recapture: per-module mutex held by another in-flight call.
     /// Operator can retry once the first completes.
@@ -558,7 +557,7 @@ impl HandlerError {
             Self::ChainData(_) => "chain_data",
             Self::BadTxHash(_) => "bad_tx_hash",
             Self::ReservedName(_) => "reserved_name",
-            Self::RecaptureBadCompanion => "recapture_bad_companion",
+            Self::RecaptureCompanionUnknown(_) => "recapture_companion_unknown",
             Self::RecaptureInProgress(_) => "recapture_in_progress",
             Self::RecaptureUnavailable(_) => "recapture_unavailable",
             Self::ModuleNotFound(_) => "not_found",
@@ -573,6 +572,7 @@ impl HandlerError {
             Self::ReservedName(_) => StatusCode::CONFLICT,
             Self::RecaptureInProgress(_) => StatusCode::CONFLICT,
             Self::RecaptureUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RecaptureCompanionUnknown(_) => StatusCode::NOT_FOUND,
             Self::ModuleNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
         }
@@ -668,7 +668,7 @@ const ADMIN_ENDPOINTS: &[(&str, &str, &str, &str)] = &[
         "POST",
         "/_admin/modules/{id}/recapture",
         "full",
-        "Coordinated state-rebuild for all companions. Body: {\"companion\":\"*\",\"reason\":...}. Async: returns 202 immediately; poll /_admin/events (recapture_completed/failed) or status.recapture_in_progress.",
+        "Coordinated state-rebuild. Body: {\"companion\":\"*\",\"reason\":...}. companion=* → full module rebuild (all subscribers); companion=<key> → scoped resync (re-emit that companion's scopes' snapshots, no module restart). Async: returns 202 immediately; poll /_admin/events (recapture_completed/failed | resync_routed + onboard_completed).",
     ),
     (
         "POST",
@@ -1890,13 +1890,6 @@ async fn recapture_module(
     // Empty body is treated as the default request.
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // v1 only supports `companion=*`. Reject anything else with
-    // a 400 + a clear "deferred" message so operators don't
-    // bother retrying with a specific key.
-    if req.companion != "*" {
-        return Err(HandlerError::RecaptureBadCompanion);
-    }
-
     // 404 when the module's never been activated.
     if state.storage.read_manifest(&id)?.is_none() {
         return Err(HandlerError::ModuleNotFound(id));
@@ -1907,6 +1900,58 @@ async fn recapture_module(
             "no host wired in this admin router".to_owned(),
         ));
     };
+
+    // `companion=<key>` — scoped resync, not the coordinated
+    // module-wide rebuild. Resolve the companion's persisted
+    // interests for THIS module and route `InterestOp::Resync` into
+    // the follower: the module drops + re-seeds those scopes as
+    // genuinely new, the Onboard pump re-walks them, and the
+    // re-emitted snapshots reach every subscriber (idempotent
+    // full-replace on consumers). No bootstrap-flag wipe, no
+    // follower restart, no `RecaptureReady` coordination — the big
+    // hammer stays `companion=*`.
+    if req.companion != "*" {
+        let interests: Vec<mitos_protocol::Interest> =
+            crate::companions::load_companion_registrations(&state.storage, &req.companion)
+                .map_err(|e| HandlerError::RecaptureUnavailable(e.to_string()))?
+                .into_iter()
+                .filter(|(module, _, _)| module == &id)
+                .flat_map(|(_, _, r)| r.interests)
+                .fold(Vec::new(), |mut acc, i| {
+                    if !acc.contains(&i) {
+                        acc.push(i);
+                    }
+                    acc
+                });
+        if interests.is_empty() {
+            return Err(HandlerError::RecaptureCompanionUnknown(req.companion));
+        }
+        tracing::info!(
+            module = %id,
+            companion_key = %req.companion,
+            scopes = interests.len(),
+            reason = ?req.reason,
+            "recapture: scoped resync dispatching"
+        );
+        state.events.record(
+            id.as_str(),
+            crate::events::EventKind::ResyncRouted {
+                client_id: "*".to_owned(),
+                companion_key: req.companion.clone(),
+            },
+        );
+        host.route_interest(&id, mitos_protocol::InterestOp::Resync, interests)
+            .await
+            .map_err(|e| HandlerError::RecaptureUnavailable(e.to_string()))?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(RecaptureAccepted {
+                module: id,
+                status: "resync_routed",
+            }),
+        )
+            .into_response());
+    }
 
     // Synchronous duplicate check so the caller gets an immediate
     // 409. The authoritative guard is the mutex inside

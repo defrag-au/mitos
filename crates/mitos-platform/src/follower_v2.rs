@@ -261,7 +261,10 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     //    block-dispatch filtering reflects the new predicates.
     let mut current = driver.interest();
     match update.op {
-        WireOp::Add => {
+        // Resync leaves the host filter net-identical to Add: the
+        // "treat as new" semantics live entirely in the module-export
+        // call sequence below.
+        WireOp::Add | WireOp::Resync => {
             for p in &update.predicates {
                 // Dedupe: a re-subscribe of an already-watched
                 // predicate is a no-op rather than a duplicate
@@ -287,39 +290,61 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     //    page-oriented module records the newly-added policies as a
     //    scoped cold-start (read back when we pump `rebootstrap`
     //    below). Runs for every op to keep the module's persisted
-    //    interest in sync. Map the wire op to the bindgen op (same
-    //    variants, different generated types).
-    let bindgen_op = match update.op {
-        WireOp::Add => crate::bindings_v2::InterestOp::Add,
-        WireOp::Remove => crate::bindings_v2::InterestOp::Remove,
-        WireOp::Replace => crate::bindings_v2::InterestOp::Replace,
+    //    interest in sync. Map the wire op to the bindgen call
+    //    sequence (same variants, different generated types).
+    //
+    //    `Resync` composes `Remove` ∘ `Add`: the Remove makes the
+    //    module drop the scope from its persisted tracked set, so the
+    //    immediately-following Add sees it as genuinely new and seeds
+    //    the scoped-onboard set — the Onboard pump below then re-walks
+    //    the scope and re-emits its snapshot to every subscriber
+    //    (snapshot apply is an idempotent full-replace on consumers).
+    //    Both calls happen inside this one InterestUpdate, which the
+    //    follower processes between blocks — no dispatch interleaves,
+    //    so there is no missed-event window. This is the same
+    //    sequence the manual per-policy resync dance exercised via
+    //    two HTTP round-trips, made atomic. No WIT change: the module
+    //    only ever sees the existing Add/Remove ops.
+    let call_ops: &[crate::bindings_v2::InterestOp] = match update.op {
+        WireOp::Add => &[crate::bindings_v2::InterestOp::Add],
+        WireOp::Remove => &[crate::bindings_v2::InterestOp::Remove],
+        WireOp::Replace => &[crate::bindings_v2::InterestOp::Replace],
+        WireOp::Resync => &[
+            crate::bindings_v2::InterestOp::Remove,
+            crate::bindings_v2::InterestOp::Add,
+        ],
     };
-    match driver
-        .call_update_interest(bindgen_op, &update.items_cbor)
-        .await
-    {
-        Ok(Ok(())) => {
-            tracing::debug!(
-                module = %module_id,
-                op = ?update.op,
-                "v2 interest update applied",
-            );
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(
-                module = %module_id,
-                op = ?update.op,
-                error = %e,
-                "module returned Err from update-interest; host filter still updated",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                module = %module_id,
-                op = ?update.op,
-                error = %e,
-                "update-interest trapped or fuel-exhausted; host filter still updated",
-            );
+    for bindgen_op in call_ops {
+        match driver
+            .call_update_interest(*bindgen_op, &update.items_cbor)
+            .await
+        {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    module = %module_id,
+                    op = ?update.op,
+                    call = ?bindgen_op,
+                    "v2 interest update applied",
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    module = %module_id,
+                    op = ?update.op,
+                    call = ?bindgen_op,
+                    error = %e,
+                    "module returned Err from update-interest; host filter still updated",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    module = %module_id,
+                    op = ?update.op,
+                    call = ?bindgen_op,
+                    error = %e,
+                    "update-interest trapped or fuel-exhausted; host filter still updated",
+                );
+            }
         }
     }
 
@@ -331,7 +356,7 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     //    onboard scope, so a re-assert of already-tracked policies
     //    seeds nothing and the Onboard pump below is a no-op. Two
     //    paths, gated by `chunked_cold_start`:
-    if matches!(update.op, WireOp::Add | WireOp::Replace) {
+    if matches!(update.op, WireOp::Add | WireOp::Replace | WireOp::Resync) {
         // Seed the watched-UTxO index for the added/asserted scopes
         // (refs-only, flag-gated, once per scope). This MUST happen on
         // the live `driver` here — the chunked cold-start below runs on
@@ -402,7 +427,15 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
                     },
                 );
             }
-        } else if matches!(update.op, WireOp::Add) {
+        } else if matches!(update.op, WireOp::Add | WireOp::Resync) {
+            // Resync included so a first-ever subscribe (which now
+            // routes Resync — `resume_from: None`) still fires the
+            // synthetic bootstrap for non-chunked modules. For an
+            // already-hydrated scope the per-scope state-kv flag
+            // makes this a no-op: non-chunked modules emit per-TX
+            // events, not snapshots, so there is no baseline to
+            // replay and re-firing history would duplicate
+            // change-log rows on consumers.
             // Every other module: the host's synthetic-event
             // bootstrap (unchanged). Pumping `rebootstrap` here would
             // double-fire a module that also cold-starts inline (e.g.

@@ -396,10 +396,44 @@ Body (optional):
   }
 ```
 
-Default body is `{ "companion": "*" }`. Anything other than
-`"*"` returns `400 Bad Request` with body
-`{"error": "per-companion recapture not yet supported; use companion=*"}`
-in v1.
+Default body is `{ "companion": "*" }` — the coordinated
+module-wide rebuild described above.
+
+`companion = "<key>"` (e.g. a policy id) is the **scoped
+resync**: the host resolves that companion's persisted
+interests for the module and routes `InterestOp::Resync` into
+the follower. The follower composes `Remove` ∘ `Add` against
+the module's `update-interest` export inside a single
+`InterestUpdate` (processed between blocks — no missed-event
+window), so the module drops + re-seeds those scopes as
+genuinely new, and the Onboard pump re-walks them and
+re-emits their snapshots to **every** subscriber (snapshot
+apply is an idempotent full-replace; other companions' policy
+guards skip scopes that aren't theirs). No bootstrap-flag
+wipe, no follower restart, no `RecaptureReady` coordination.
+CLI: `mitos-admin recapture <module> --companion <key>`.
+
+The same `Resync` fires automatically when a companion
+subscribes with `resume_from: None` to a scope the module
+already tracks — the companion is declaring it holds no state
+and needs a baseline. Without this, an `Add` for an
+already-hydrated scope deduped module-side and the new
+subscriber tailed live deltas over an empty ledger forever
+(the CO1 "added collection never captures" gap, hit on the
+2026-07-07 prod collection-ownership mitos cutover for every
+policy dev already watched). Debounced per
+(module, companion_key), 120s window, so wake storms can't
+trigger repeated re-walks. Observability: each routed resync
+records a `resync_routed` event; pair it with the following
+`onboard_completed` for the re-walk size.
+
+Related consistency fix in the same change: the incremental
+interest endpoint (`/api/companions/{key}/interest`) now
+routes `Remove` to the module **only for items no other
+persisted registration still holds** (union across all
+client_ids + companion_keys, read post-mutation). Previously
+one companion unsubscribing a policy silently dropped it from
+the module scan-set while other companions still tailed it.
 
 Successful response:
 

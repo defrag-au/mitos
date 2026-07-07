@@ -71,6 +71,18 @@ pub trait ModuleHostHandle: Send + Sync {
         companion_timeout: Duration,
     ) -> PlatformResult<RecaptureOutcome>;
 
+    /// Route a dynamic interest mutation into a running module's
+    /// follower — the same path a companion subscribe uses. The
+    /// admin router's per-companion recapture drives this with
+    /// `InterestOp::Resync` to re-emit a companion's scopes'
+    /// snapshots without the coordinated module-wide rebuild.
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError>;
+
     /// Full module retirement: stop the running slot, drop the
     /// dialer's in-memory companion connections for this module,
     /// and surrender the artifact directory back to the
@@ -1161,6 +1173,14 @@ where
     }
     async fn list_running(&self) -> Vec<String> {
         ModuleHostV2::list_running(self).await
+    }
+    async fn route_interest(
+        &self,
+        module_id: &str,
+        op: mitos_protocol::InterestOp,
+        items: Vec<mitos_protocol::Interest>,
+    ) -> Result<(), InterestRouteError> {
+        <Self as InterestRouter>::route_interest(self, module_id, op, items).await
     }
     async fn recapture_module(
         &self,

@@ -110,6 +110,19 @@ pub enum InterestOp {
     /// Full re-sync — host replaces its filter set with the supplied
     /// items. Used on reconnect to re-assert state.
     Replace,
+    /// Re-assert + re-hydrate: like `Add`, but the module must treat
+    /// the items as genuinely new even when it already tracks them.
+    /// The host's follower composes this as `Remove` ∘ `Add` against
+    /// the module's `update-interest` export (no WIT change), which
+    /// re-seeds the scoped-onboard set so the module re-walks the
+    /// scope and re-emits its snapshot to every subscriber. Routed by
+    /// the host when a companion subscribes with `resume_from: None`
+    /// to an already-hydrated scope (the companion is declaring it
+    /// has no state and needs a baseline — see
+    /// `docs/design/RECAPTURE.md`), and by the per-companion admin
+    /// recapture. Additive wire variant: companions never receive
+    /// this op, and pre-Resync senders simply never emit it.
+    Resync,
 }
 
 // ============================================================================
