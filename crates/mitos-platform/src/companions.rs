@@ -78,6 +78,7 @@ pub fn companion_router(
         dialer,
         indexer_bridge,
         events,
+        resync_recently: ResyncDebounce::default(),
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -101,6 +102,46 @@ struct CompanionState {
     indexer_bridge: Option<IndexerBridgeHandle>,
     /// Shared operational-events ring — records `companion_subscribed`.
     events: crate::events::EventRing,
+    /// Per-(module, companion_key) debounce for subscribe-time
+    /// auto-resync — see `subscribe_handler`.
+    resync_recently: ResyncDebounce,
+}
+
+/// Debounce guard for subscribe-time auto-resync. A companion that
+/// wakes repeatedly before consuming its first emission re-sends
+/// `resume_from: None` each time; without this, every wake would
+/// route another `Resync` and re-walk the scope. One resync per
+/// (module, companion_key) per window is plenty — the baseline only
+/// needs to stream once, and an operator who genuinely needs an
+/// immediate second pass has the per-companion admin recapture.
+#[derive(Clone, Default)]
+struct ResyncDebounce(
+    Arc<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>>,
+);
+
+impl ResyncDebounce {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// True when a resync may fire for this (module, companion_key).
+    /// Records the grant, so the next call inside the window is
+    /// refused. Degrades open (allow) on lock poisoning.
+    fn allow(&self, module: &str, companion_key: &str) -> bool {
+        let Ok(mut map) = self.0.lock() else {
+            return true;
+        };
+        let key = (module.to_owned(), companion_key.to_owned());
+        let now = std::time::Instant::now();
+        match map.get(&key) {
+            Some(last) if now.duration_since(*last) < Self::WINDOW => false,
+            _ => {
+                map.insert(key, now);
+                // Opportunistic sweep so the map can't grow unbounded
+                // across a long host lifetime (91 policies × restarts).
+                map.retain(|_, t| now.duration_since(*t) < Self::WINDOW);
+                true
+            }
+        }
+    }
 }
 
 // Local re-implementation of the admin auth middleware so the
@@ -328,10 +369,50 @@ async fn interest_mutation_handler(
     // restart. Best-effort: a follower that's not currently
     // running surfaces `InterestRouteError::NotRunning` which we
     // log + swallow (persisted CBOR will be picked up on restart).
+    //
+    // Module names dedupe first: `registrations` has one entry per
+    // (module, client) pair sharing the key, and routing the same
+    // mutation twice into one follower is wasted work.
     if let Some(dialer) = &state.dialer {
-        for (module, _, _) in &registrations {
+        let modules: std::collections::BTreeSet<&str> =
+            registrations.iter().map(|(m, _, _)| m.as_str()).collect();
+        for module in modules {
+            // Cross-companion underflow guard: an item is only
+            // removed from the module's scan-set when NO persisted
+            // registration still holds it. Without this, one
+            // companion unsubscribing a policy silently stopped the
+            // module watching it for every OTHER companion (e.g. a
+            // prod worker dropping a policy the dev worker still
+            // tails). The union is read back from disk after the
+            // mutation writes above, so it reflects the
+            // post-mutation world — including this companion's own
+            // surviving interests.
+            let items_to_route: Vec<mitos_protocol::Interest> =
+                if matches!(mutation.op, InterestOp::Remove) {
+                    let still_held = load_module_interest_union(&state.storage, module);
+                    let (route, kept): (Vec<_>, Vec<_>) = mutation
+                        .items
+                        .iter()
+                        .cloned()
+                        .partition(|item| !still_held.contains(item));
+                    if !kept.is_empty() {
+                        tracing::info!(
+                            module = %module,
+                            companion_key = %companion_key,
+                            kept = kept.len(),
+                            "interest remove: item(s) still held by another companion — \
+                             kept in module scan-set",
+                        );
+                    }
+                    route
+                } else {
+                    mutation.items.clone()
+                };
+            if items_to_route.is_empty() {
+                continue;
+            }
             match dialer
-                .route_interest_mutation(module, mutation.op, mutation.items.clone())
+                .route_interest_mutation(module, mutation.op, items_to_route)
                 .await
             {
                 Ok(_) => {}
@@ -371,7 +452,10 @@ fn apply_mutation_to_set(
     items: &[mitos_protocol::Interest],
 ) {
     match op {
-        InterestOp::Add => {
+        // Resync persists like Add — the "treat as new" semantics
+        // apply to the module's scan-set (follower-side), not to the
+        // registration record.
+        InterestOp::Add | InterestOp::Resync => {
             for item in items {
                 if !current.contains(item) {
                     current.push(item.clone());
@@ -387,10 +471,57 @@ fn apply_mutation_to_set(
     }
 }
 
+/// Union of every persisted registration's interests for one module —
+/// all client_ids, all companion_keys. Callers read this AFTER
+/// writing the current mutation's registrations so it reflects the
+/// post-mutation world. Un-decodable records are skipped (same
+/// tolerance as `load_companion_registrations`).
+fn load_module_interest_union(
+    storage: &ModuleStorage,
+    module_id: &str,
+) -> Vec<mitos_protocol::Interest> {
+    let mut union: Vec<mitos_protocol::Interest> = Vec::new();
+    let companions_root = storage.module_dir_for_companions(module_id);
+    let clients = match std::fs::read_dir(&companions_root) {
+        Ok(e) => e,
+        Err(_) => return union,
+    };
+    for client in clients.flatten() {
+        if !client.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if client.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let records = match std::fs::read_dir(client.path()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for record in records.flatten() {
+            if record.path().extension().and_then(|e| e.to_str()) != Some("cbor") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(record.path()) else {
+                continue;
+            };
+            let Ok(req) = ciborium::de::from_reader::<SubscribeRequest, _>(bytes.as_slice()) else {
+                continue;
+            };
+            for interest in req.interests {
+                if !union.contains(&interest) {
+                    union.push(interest);
+                }
+            }
+        }
+    }
+    union
+}
+
 /// Scan `<storage>/*/companions/<key>.cbor` and decode each
 /// matching registration. Returns one entry per module the
-/// companion is subscribed to.
-fn load_companion_registrations(
+/// companion is subscribed to. `pub(crate)` for the admin
+/// router's per-companion recapture (scoped resync).
+pub(crate) fn load_companion_registrations(
     storage: &ModuleStorage,
     companion_key: &str,
 ) -> std::io::Result<Vec<(String, PathBuf, SubscribeRequest)>> {
@@ -542,14 +673,43 @@ async fn subscribe_handler(
         // per-scope bootstrap flag suppresses re-cold-start, so this
         // only hydrates genuinely-new policies.
         if !request.interests.is_empty() {
+            // `resume_from: None` is the companion declaring it holds
+            // no state (fresh DO, or reset by a dApp-side recapture).
+            // For a scope the module ALREADY tracks, a plain `Add` is
+            // deduped module-side and no snapshot ever streams — the
+            // companion would tail live deltas over an empty ledger
+            // forever (the CO1 "added collection never captures"
+            // gap). Route `Resync` instead: the follower re-seeds the
+            // scope as genuinely new and the Onboard pump re-emits
+            // its snapshot. Idempotent for every other subscriber
+            // (snapshot apply is a full-replace), debounced per
+            // (module, companion_key) against wake storms.
+            let declares_no_state = request.resume_from.is_none();
             for target in &request.targets {
-                if let SubscribeTarget::Module { name } = target
-                    && let Err(e) = dialer
-                        .route_interest_mutation(name, InterestOp::Add, request.interests.clone())
-                        .await
+                let SubscribeTarget::Module { name } = target else {
+                    continue;
+                };
+                let op = if declares_no_state
+                    && state.resync_recently.allow(name, &request.companion_key)
+                {
+                    state.events.record(
+                        name.as_str(),
+                        crate::events::EventKind::ResyncRouted {
+                            client_id: request.client_id.clone(),
+                            companion_key: request.companion_key.clone(),
+                        },
+                    );
+                    InterestOp::Resync
+                } else {
+                    InterestOp::Add
+                };
+                if let Err(e) = dialer
+                    .route_interest_mutation(name, op, request.interests.clone())
+                    .await
                 {
                     tracing::warn!(
                         module = %name,
+                        op = ?op,
                         error = %e,
                         "subscribe: routing interest into module scan-set failed; \
                          companion fanout-interest still registered",
@@ -1582,5 +1742,89 @@ crate_version = "0.0.0"
                 .join("orphan.cbor")
                 .exists()
         );
+    }
+
+    #[test]
+    fn resync_debounce_one_grant_per_window() {
+        let debounce = ResyncDebounce::default();
+        assert!(debounce.allow("collection-holders", "policy_a"));
+        // Same (module, key) inside the window: refused.
+        assert!(!debounce.allow("collection-holders", "policy_a"));
+        // Different key / different module: independent grants.
+        assert!(debounce.allow("collection-holders", "policy_b"));
+        assert!(debounce.allow("collection-metadata", "policy_a"));
+    }
+
+    #[test]
+    fn apply_mutation_resync_persists_like_add() {
+        let p1 = mitos_protocol::Interest::any();
+        let mut current = vec![];
+        apply_mutation_to_set(&mut current, InterestOp::Resync, std::slice::from_ref(&p1));
+        assert_eq!(current, vec![p1.clone()]);
+        // Re-asserting the same interest stays deduped.
+        apply_mutation_to_set(&mut current, InterestOp::Resync, std::slice::from_ref(&p1));
+        assert_eq!(current, vec![p1]);
+    }
+
+    /// The union guard's input: `load_module_interest_union` must see
+    /// every persisted registration's interests — across client_ids
+    /// AND companion_keys — so a Remove only reaches the module for
+    /// items nobody else still holds.
+    #[tokio::test]
+    async fn module_interest_union_spans_clients_and_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let module_id = "ownership-indexer";
+
+        let shared = mitos_protocol::Interest::any();
+        let write_reg = |client: &str, key: &str, interests: Vec<mitos_protocol::Interest>| {
+            let dir = client_companions_dir(&storage, module_id, client);
+            std::fs::create_dir_all(&dir).unwrap();
+            let req = SubscribeRequest {
+                targets: vec![SubscribeTarget::Module {
+                    name: module_id.into(),
+                }],
+                companion_key: key.into(),
+                client_id: client.into(),
+                resume_from: None,
+                interests,
+                dial_back: None,
+            };
+            std::fs::write(dir.join(format!("{key}.cbor")), req.encode().unwrap()).unwrap();
+        };
+
+        // prod + dev clients sharing one key, plus a second key on a
+        // third record — all holding the same interest.
+        write_reg("ownership.cnft.dev", "policy_a", vec![shared.clone()]);
+        write_reg("ownership.dev.cnft.dev", "policy_a", vec![shared.clone()]);
+        write_reg("ownership.cnft.dev", "policy_b", vec![shared.clone()]);
+
+        let union = load_module_interest_union(&storage, module_id);
+        // Deduped: one interest held by three records.
+        assert_eq!(union, vec![shared.clone()]);
+
+        // Drop two of the three records; the union must still hold
+        // the interest via the survivor — this is exactly the state
+        // the Remove guard consults after the mutation writes.
+        std::fs::remove_file(
+            client_companions_dir(&storage, module_id, "ownership.cnft.dev").join("policy_a.cbor"),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            client_companions_dir(&storage, module_id, "ownership.dev.cnft.dev")
+                .join("policy_a.cbor"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_module_interest_union(&storage, module_id),
+            vec![shared]
+        );
+
+        // Last record gone → empty union → Remove may reach the module.
+        std::fs::remove_file(
+            client_companions_dir(&storage, module_id, "ownership.cnft.dev").join("policy_b.cbor"),
+        )
+        .unwrap();
+        assert!(load_module_interest_union(&storage, module_id).is_empty());
     }
 }

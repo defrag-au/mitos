@@ -57,6 +57,16 @@ pub enum EventKind {
         client_id: String,
         companion_key: String,
     },
+    /// A scoped `Resync` was routed into the module — either a
+    /// subscribe with `resume_from: None` (companion declaring it
+    /// holds no state) or a per-companion admin recapture. The
+    /// follower re-seeds the scope as new and the Onboard pump
+    /// re-emits its snapshot; pair with the following
+    /// `onboard_completed` to see the re-walk size.
+    ResyncRouted {
+        client_id: String,
+        companion_key: String,
+    },
     /// A companion record was removed (admin `delete-companion`).
     CompanionEvicted {
         client_id: String,
@@ -66,6 +76,14 @@ pub enum EventKind {
     /// or a module-side panic). `reason` is the host error text; the
     /// full replay fixture lands at `last-trap.toml` (see `last-trap`).
     Trap { reason: String },
+    /// The module's live follower task exited with an error (clean
+    /// stop/replace exits are not recorded). The module is no longer
+    /// applying blocks until something restarts it — the watchdog
+    /// picks it up on its next tick.
+    FollowerExited { error: String },
+    /// The watchdog found a module with registered companions but no
+    /// live follower and restarted it (see `watchdog.rs`).
+    WatchdogRestart { outcome: String },
 }
 
 impl EventKind {
@@ -79,8 +97,11 @@ impl EventKind {
             EventKind::RebootstrapCompleted { .. } => "rebootstrap_completed",
             EventKind::OnboardCompleted { .. } => "onboard_completed",
             EventKind::CompanionSubscribed { .. } => "companion_subscribed",
+            EventKind::ResyncRouted { .. } => "resync_routed",
             EventKind::CompanionEvicted { .. } => "companion_evicted",
             EventKind::Trap { .. } => "trap",
+            EventKind::FollowerExited { .. } => "follower_exited",
+            EventKind::WatchdogRestart { .. } => "watchdog_restart",
         }
     }
 }

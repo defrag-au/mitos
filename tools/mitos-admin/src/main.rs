@@ -131,6 +131,13 @@ enum Cmd {
         /// for tying ops events back to the trigger.
         #[arg(long)]
         reason: Option<String>,
+        /// Scope the recapture to one companion key (e.g. a policy
+        /// id): routes a `Resync` that re-emits just that
+        /// companion's scopes' snapshots — no module restart, no
+        /// coordinated rebuild. Omit for the full `companion=*`
+        /// module-wide recapture.
+        #[arg(long)]
+        companion: Option<String>,
     },
 
     /// Stop a running module's follower + drop the slot. Artifact
@@ -303,7 +310,11 @@ async fn main() -> anyhow::Result<()> {
         Cmd::GetModule { id } => cmd_get_module(&client, &cli, id).await,
         Cmd::UploadModule { artifact } => cmd_upload_module(&client, &cli, artifact).await,
         Cmd::RestartModule { id } => cmd_restart_module(&client, &cli, id).await,
-        Cmd::Recapture { id, reason } => cmd_recapture(&client, &cli, id, reason).await,
+        Cmd::Recapture {
+            id,
+            reason,
+            companion,
+        } => cmd_recapture(&client, &cli, id, reason, companion).await,
         Cmd::DeleteModule { id } => cmd_delete_module(&client, &cli, id).await,
         Cmd::EvictModule { id, force } => cmd_evict_module(&client, &cli, id, force).await,
         Cmd::DeleteCompanion {
@@ -398,6 +409,10 @@ struct StatusModule {
     companions: usize,
     queued: usize,
     pending: usize,
+    /// Defaults to `true` when talking to a pre-`running`-field host
+    /// so an older server doesn't render every module as DOWN.
+    #[serde(default = "default_true")]
+    running: bool,
     #[serde(default)]
     recapture_in_progress: bool,
     #[serde(default)]
@@ -405,6 +420,10 @@ struct StatusModule {
     #[serde(default)]
     last_result: Option<StatusLastResult>,
     last_trap_secs_ago: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +465,14 @@ async fn cmd_status(client: &Client, cli: &Cli, json_out: bool) -> anyhow::Resul
     println!("modules:        {}", s.modules.len());
     for m in &s.modules {
         let mut notes = Vec::new();
+        // Derived display phase — precedence: an in-flight
+        // recapture/bootstrap explains a not-running follower, so
+        // only flag DOWN when nothing is working on reviving it.
+        // (The API keeps the three independent flags; this word is
+        // presentation only.)
+        if !m.running && !m.recapture_in_progress && !m.bootstrap_in_progress && m.companions > 0 {
+            notes.push("DOWN".to_string());
+        }
         if m.queued + m.pending > 0 {
             notes.push(format!("BACKLOG {}q/{}p", m.queued, m.pending));
         }
@@ -828,20 +855,21 @@ async fn cmd_restart_module(client: &Client, cli: &Cli, id: String) -> anyhow::R
 /// reuse two field names.
 #[derive(Debug, Serialize)]
 struct RecaptureBody {
-    /// v1 always sends `"*"`. The server 400s anything else.
-    companion: &'static str,
+    /// `"*"` = module-wide coordinated rebuild; a companion key =
+    /// scoped resync (see the `--companion` flag).
+    companion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
 
-/// Response shape from a successful recapture. Surfaced in
-/// the typed CLI output for pretty-printing.
+/// Response shape from an accepted recapture / scoped resync —
+/// the endpoint dispatches detached and returns 202 with a
+/// status marker (`started` | `resync_routed`); completion lands
+/// on `/_admin/events`.
 #[derive(Debug, Deserialize)]
 struct RecaptureResp {
     module: String,
-    companions_targeted: usize,
-    events_emitted: u64,
-    duration_ms: u64,
+    status: String,
 }
 
 /// Error body the admin endpoint returns on non-2xx. Shape
@@ -857,10 +885,11 @@ async fn cmd_recapture(
     cli: &Cli,
     id: String,
     reason: Option<String>,
+    companion: Option<String>,
 ) -> anyhow::Result<()> {
     let url = format!("{}/_admin/modules/{id}/recapture", cli.mitos);
     let body = RecaptureBody {
-        companion: "*",
+        companion: companion.unwrap_or_else(|| "*".to_owned()),
         reason: reason.clone(),
     };
     let resp = auth(client.post(&url).json(&body), cli.token.as_deref())
@@ -872,14 +901,16 @@ async fn cmd_recapture(
     if status.is_success() {
         let parsed: RecaptureResp = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("decode response: {e}; body={text}"))?;
-        println!("recapture complete");
-        println!("  module:              {}", parsed.module);
-        println!("  companions targeted: {}", parsed.companions_targeted);
-        println!("  events emitted:      {}", parsed.events_emitted);
-        println!("  duration (ms):       {}", parsed.duration_ms);
+        println!("recapture dispatched ({})", parsed.status);
+        println!("  module:    {}", parsed.module);
+        println!("  companion: {}", body.companion);
         if let Some(r) = reason {
-            println!("  reason:              {r}");
+            println!("  reason:    {r}");
         }
+        println!(
+            "follow completion via: mitos-admin tail --module {}",
+            parsed.module
+        );
         return Ok(());
     }
 
