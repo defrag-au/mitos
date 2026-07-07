@@ -907,7 +907,10 @@ async fn cmd_recapture(
         if let Some(r) = reason {
             println!("  reason:    {r}");
         }
-        println!("follow completion via: mitos-admin tail --module {}", parsed.module);
+        println!(
+            "follow completion via: mitos-admin tail --module {}",
+            parsed.module
+        );
         return Ok(());
     }
 

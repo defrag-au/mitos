@@ -504,8 +504,7 @@ fn load_module_interest_union(
             let Ok(bytes) = std::fs::read(record.path()) else {
                 continue;
             };
-            let Ok(req) = ciborium::de::from_reader::<SubscribeRequest, _>(bytes.as_slice())
-            else {
+            let Ok(req) = ciborium::de::from_reader::<SubscribeRequest, _>(bytes.as_slice()) else {
                 continue;
             };
             for interest in req.interests {
@@ -1816,9 +1815,10 @@ crate_version = "0.0.0"
                 .join("policy_a.cbor"),
         )
         .unwrap();
-        assert_eq!(load_module_interest_union(&storage, module_id), vec![
-            shared
-        ]);
+        assert_eq!(
+            load_module_interest_union(&storage, module_id),
+            vec![shared]
+        );
 
         // Last record gone → empty union → Remove may reach the module.
         std::fs::remove_file(
