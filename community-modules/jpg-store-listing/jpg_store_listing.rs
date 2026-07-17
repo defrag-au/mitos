@@ -191,16 +191,28 @@ fn flush_buffer(buf: TxBuffer) {
         // subsequent Unlisting/Sale event or use an off-chain
         // source. Honest-about-unknowns is preferable to
         // skipping the create event entirely.
-        let decoded = resolve_datum_bytes(produced.datum.as_ref())
-            .and_then(|b| decode_listing_datum(&b))
-            .unwrap_or(DecodedListing {
-                payouts: Vec::new(),
-                seller_pkh: String::new(),
-            });
-        let new_price = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
+        // Payload-only decode first. Pure CREATES never fall back to
+        // `datum_by_hash` — jpg creates are hash-only by design, and the
+        // fallback provider turns every bootstrap re-scan of the
+        // (post-shutdown, stranded) jpg book into one sequential HTTP
+        // call per listing, stalling host startup for hours.
+        let decoded_payload =
+            payload_datum_bytes(produced.datum.as_ref()).and_then(|b| decode_listing_datum(&b));
 
         // Is there a matching Consumed for the same asset?
         if let Some(prior) = consumed.remove(&(policy.clone(), asset_name.clone())) {
+            // UPDATE: a rare single spend event — the fallback is worth
+            // it here so the new price stays populated.
+            let decoded = decoded_payload
+                .or_else(|| {
+                    resolve_datum_bytes(produced.datum.as_ref())
+                        .and_then(|b| decode_listing_datum(&b))
+                })
+                .unwrap_or(DecodedListing {
+                    payouts: Vec::new(),
+                    seller_pkh: String::new(),
+                });
+            let new_price = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
             // Listing update: extract previous price from the
             // prior datum (best-effort; if decode fails we emit
             // ListingUpdate with `previous_price_lovelace = 0`).
@@ -222,6 +234,11 @@ fn flush_buffer(buf: TxBuffer) {
             }));
             let _ = prior;
         } else {
+            let decoded = decoded_payload.unwrap_or(DecodedListing {
+                payouts: Vec::new(),
+                seller_pkh: String::new(),
+            });
+            let new_price = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
             emit_listing(&JpgStoreListing::Create(ListingCreate {
                 policy: policy_hex.clone(),
                 asset_name_hex: asset_name_hex.clone(),
@@ -273,9 +290,25 @@ fn emit_listing(event: &JpgStoreListing) {
     emit::emit_event(0, &buf);
 }
 
+/// Payload-only datum bytes — no `datum_by_hash` fallback. Used on
+/// the PRODUCED (create) path: jpg listing datums are hash-only and
+/// deliberately emitted with empty payouts when unrevealed; letting
+/// the create path fall back to `datum_by_hash` makes every bootstrap
+/// re-scan of the (post-shutdown, stranded) jpg book issue one
+/// fallback-provider HTTP call per listing, stalling host startup.
+fn payload_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
+    let d = d?;
+    if !d.payload.is_empty() {
+        return Some(d.payload.clone());
+    }
+    None
+}
+
 /// Resolve the on-chain datum bytes for an output. Inline
 /// datums carry `payload` directly; hash-only datums fall back
-/// to `chain_data::datum_by_hash`.
+/// to `chain_data::datum_by_hash`. Consumed (cancel/update/sale)
+/// paths keep the fallback — spends are rare single events and the
+/// spend TX's witness set usually resolves via payload anyway.
 fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     let d = d?;
     if !d.payload.is_empty() {

@@ -100,6 +100,13 @@ pub struct OfferAccept {
     /// `OfferAccept`.
     pub seller_address: String,
     pub co_version: WayupStoreOfferVersion,
+    /// True when the consumed offer was collection-wide (empty
+    /// target-asset list — the seller picked which asset to deliver);
+    /// false for an offer tied to a specific asset. Consumers use this
+    /// to split bid-side sales: asset-specific accepts are deliberate
+    /// purchases; CO fills generally aren't (e.g. not quest-worthy).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collection_offer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

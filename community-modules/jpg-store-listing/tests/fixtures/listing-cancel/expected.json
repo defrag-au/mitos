@@ -4,21 +4,10 @@
     "contract_version": "V2",
     "kind": "create",
     "output_index": 0,
-    "payouts": [
-      {
-        "lovelace": 11000000,
-        "payment_pkh": "f00407b340f62c8327c0c2737e41514d715b60664aca3b65bdce6c90",
-        "stake_pkh": "a234f55927f22416761471cb23a7d4faa0546c882c1f7570013dfce7"
-      },
-      {
-        "lovelace": 96250000,
-        "payment_pkh": "2e6e2e4401a82ebdb53ce7213ec491a0a9aaa08f75abca2fedf51b20",
-        "stake_pkh": "a42a0a6bfd3453390a9b0dda50c7df294bae6e8dbd6ad78f380a3353"
-      }
-    ],
+    "payouts": [],
     "policy": "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0",
-    "price_lovelace": 107250000,
-    "seller_pkh": "2e6e2e4401a82ebdb53ce7213ec491a0a9aaa08f75abca2fedf51b20",
+    "price_lovelace": 0,
+    "seller_pkh": "",
     "tx_hash": "34545914e26407ba0249e48a47182646437bbcfa010b10582d834d31480c4105"
   },
   {

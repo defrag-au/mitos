@@ -613,6 +613,7 @@ fn flush_buffer(mut buf: TxBuffer) {
                     price_lovelace: consume.prior_lovelace,
                     seller_address: out.address.clone(),
                     co_version: consume.co_version,
+                    collection_offer: consume.decoded.target_asset_names.is_empty(),
                 }));
                 emitted = true;
                 break;
@@ -663,6 +664,7 @@ fn emit_accept_partial(bidder_pkh: &str, tx_hash_hex: &str, consume: &ConsumedOf
         price_lovelace: consume.prior_lovelace,
         seller_address: String::new(),
         co_version: consume.co_version,
+        collection_offer: consume.decoded.target_asset_names.is_empty(),
     }));
     let _ = consume.prior_datum_bytes.len();
 }
