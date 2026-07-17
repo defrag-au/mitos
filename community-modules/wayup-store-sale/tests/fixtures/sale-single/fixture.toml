@@ -1,0 +1,27 @@
+# wayup-store-sale golden — Single fixed-price sale: buy redeemer Constr0[0], asset to third-party buyer.
+# Spend/create TX: 3b7862ee550b135f4146cadf890ac0b4c4d639d6f3205322877d78feb0c88cb4 (block slot 192679346).
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"
+
+# Consumed listings (prior outputs) — created before the spend
+# block, so supplied as fixture UTxOs with their datums.
+
+[[utxo]]
+tx_hash = "35ba743683a3d915a5df193601b3e25217f26c1d69456325909ecc411780cdbd"
+index = 0
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mtdjgmkkr7exzfgu0l02lvhvy8wrvvfnas9x7n75s9kmahdq9kvu0m"
+lovelace = 1327480
+datum_hash = "1ce48a2c7303f36884d2ac780ff86c0234f1754db54e98e469aeae29bbe8552d"
+
+[[utxo.assets]]
+policy = "bb3ce45d5272654e58ad076f114d8f683ae4553e3c9455b18facfea1"
+asset_name_hex = "4261627943726f63202331303637"
+quantity = 1
+
+[[datum]]
+hash = "1ce48a2c7303f36884d2ac780ff86c0234f1754db54e98e469aeae29bbe8552d"
+cbor_hex = "d8799f9fd8799fd8799fd8799f581c13803e7c4147ddca1f96a9a9aef7b292c35023ee2aa54eb2c803a405ffd8799fd8799fd8799f581cb246ed61fb261251c7fdeafb2ec21dc363133ec0a6f4fd4816dbeddaffffffff1a29e8c280ffd8799fd8799fd8799f581ca0adf3d71f77eef162098726fe9723a5b99b4a4e6a2a1b8001066098ffd8799fd8799fd8799f581c2a4d6ec982ac5dffbfa35ac40bf45ad84ea34857878fd08d5784ddc7ffffffff1a04c32d60ffff581cb246ed61fb261251c7fdeafb2ec21dc363133ec0a6f4fd4816dbeddaff"

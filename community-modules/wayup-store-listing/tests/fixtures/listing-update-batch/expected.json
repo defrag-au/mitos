@@ -1,0 +1,255 @@
+[
+  {
+    "asset_name_hex": "44503030353833",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 2,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503030363831",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 3,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503031323839",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 4,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503032303836",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 5,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503032323636",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 10,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503032333832",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 8,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503034343737",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 263620000,
+    "output_index": 0,
+    "payouts": [
+      {
+        "lovelace": 250170000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 13450000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 361620000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503035303733",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 7,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503037373134",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 6,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "44503039333630",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 38000000,
+    "output_index": 9,
+    "payouts": [
+      {
+        "lovelace": 36050000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 1950000,
+        "payment_pkh": "f459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23f",
+        "stake_pkh": "4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129"
+      }
+    ],
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "previous_price_lovelace": 43000000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  },
+  {
+    "asset_name_hex": "000de140534834353833",
+    "contract_version": "V1",
+    "kind": "update",
+    "new_price_lovelace": 847700000,
+    "output_index": 1,
+    "payouts": [
+      {
+        "lovelace": 761200000,
+        "payment_pkh": "56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495e",
+        "stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29"
+      },
+      {
+        "lovelace": 86500000,
+        "payment_pkh": "43c0cb39dccbca417507fc870f853fb7e462f1c8dd0a2aca1f34defc",
+        "stake_pkh": "a5b1f6420699c140427566d865d56aa4a6c550a434ef0226af71b468"
+      }
+    ],
+    "policy": "ecd0970cb2d599a8bdb61f6eb597e25eaf34d76bdf8ade17b6a8fa59",
+    "previous_price_lovelace": 851620000,
+    "seller_stake_pkh": "16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29",
+    "tx_hash": "383d83e24a2edada6e468840c6612b16fa61eefc95393503183b795909976c1a"
+  }
+]

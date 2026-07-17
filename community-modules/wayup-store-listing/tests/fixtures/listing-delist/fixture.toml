@@ -1,0 +1,27 @@
+# wayup-store-listing golden — Delist: cancel redeemer (d87a80), asset returns to the datum owner's stake.
+# Spend/create TX: d1e39e43a82f5dcbe2c5af321222ac8518243d8d91723efb72374490575a1c69 (block slot 192664494).
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"
+
+# Consumed listings (prior outputs) — created before the spend
+# block, so supplied as fixture UTxOs with their datums.
+
+[[utxo]]
+tx_hash = "b59b0fd4535464ca417b34c19485d7ac6186cb187875fc33a35a493a9c44b758"
+index = 0
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mt2axs5jy05js5e2e6rrkdy6hfgh2wpygh23ah5pe6el63qqggu07f"
+lovelace = 1297310
+datum_hash = "f65aeacfde550f667cfaf6707eb4ed6bf83abbe310514987650720d85a284a8a"
+
+[[utxo.assets]]
+policy = "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0"
+asset_name_hex = "44503032393136"
+quantity = 1
+
+[[datum]]
+hash = "f65aeacfde550f667cfaf6707eb4ed6bf83abbe310514987650720d85a284a8a"
+cbor_hex = "d8799f9fd8799fd8799fd8799f581c7cee1d9706dcd55cead15808e24e9ea64ce2904d5fa703007464c977ffd8799fd8799fd8799f581c5d3429223e928532ace863b349aba5175382445d51ede81ceb3fd440ffffffff1a2f9dc9f0ffd8799fd8799fd8799f581cf459466ef2f93af4ca2c9493b3e5db538d8879e24b2db41778dfc23fffd8799fd8799fd8799f581c4ec9449bf5a6afc1839dc310633f63c259ea78820b9e12c3e4093129ffffffff1a028f5d70ffff581c5d3429223e928532ace863b349aba5175382445d51ede81ceb3fd440ff"

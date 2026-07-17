@@ -23,7 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::jpg_store_listing::{JpgStoreContractVersion, ListingPayout};
+pub use crate::jpg_store_listing::JpgStoreContractVersion;
+pub use crate::marketplace::ListingPayout;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sale {

@@ -31,6 +31,10 @@
 
 use serde::{Deserialize, Serialize};
 
+// Re-export for existing consumers — the payout shape is shared
+// marketplace vocabulary and lives in `crate::marketplace` now.
+pub use crate::marketplace::ListingPayout;
+
 /// jpg.store sale contract version. Determined by the script
 /// address the listing UTxO lives at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,18 +43,6 @@ pub enum JpgStoreContractVersion {
     V2,
     V3,
     V4,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListingPayout {
-    /// Recipient payment-credential pkh, lowercase hex (28 bytes).
-    pub payment_pkh: String,
-    /// Optional stake credential, lowercase hex (28 bytes). Some
-    /// older listings encode enterprise-only recipients.
-    pub stake_pkh: Option<String>,
-    /// Lovelace this recipient will receive when the listing
-    /// is bought.
-    pub lovelace: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

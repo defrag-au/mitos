@@ -1,0 +1,107 @@
+# wayup-store-sale golden — Sweep: 7 listings (2 sellers) bought by one buyer in one TX.
+# Spend/create TX: 82dd69d5c79ef89a2546c946483dfc0d69dab38063e056deab7192ced68e65f9 (block slot 192651107).
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"
+
+# Consumed listings (prior outputs) — created before the spend
+# block, so supplied as fixture UTxOs with their datums.
+
+[[utxo]]
+tx_hash = "49c558f62efc122833a3841ca722aacee606bcb5eb1b43343cd87f0d4baf4a57"
+index = 0
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mt0w9rsvzy7yhnu7xqz6vz4lq967rj6q45h48ruv6aeak09smxdqz9"
+lovelace = 1336100
+datum_hash = "e2d0530ecf6a92114e019c68b579ce6c9fc4b5d3bce547723a4ddbff6595542e"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543037303730"
+quantity = 1
+
+[[utxo]]
+tx_hash = "761440e4562d12b9d2ede10c0789c4bb050a3ab231bbbc97bb3a469ca3da4378"
+index = 0
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mtgkk5r3vllwhuem45hdv620y0uc0pf024kyn2glny7wfg5sqgnjxw"
+lovelace = 1336100
+datum_hash = "02d01cd9f853e13f141c04adf27b43d4d5ce8a6e16d4f419cef8aadbc9a99a65"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543032323532"
+quantity = 1
+
+[[utxo]]
+tx_hash = "8ad4cd95883443c29d94250f81545badf5d587d5e6715c8129603bfec8f5c30b"
+index = 1
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mttan6rlcj8xt8l9hdrwdz6j92r84wgkmll7kzjajyvqk5nq2gln7a"
+lovelace = 1336100
+datum_hash = "c6a8aac33c9de2addceda8c617317f951598a8d7a3a7886264a68eedbf199f2a"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543033383632"
+quantity = 1
+
+[[utxo]]
+tx_hash = "8ad4cd95883443c29d94250f81545badf5d587d5e6715c8129603bfec8f5c30b"
+index = 4
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mttan6rlcj8xt8l9hdrwdz6j92r84wgkmll7kzjajyvqk5nq2gln7a"
+lovelace = 1336100
+datum_hash = "c6a8aac33c9de2addceda8c617317f951598a8d7a3a7886264a68eedbf199f2a"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543034323938"
+quantity = 1
+
+[[utxo]]
+tx_hash = "8ad4cd95883443c29d94250f81545badf5d587d5e6715c8129603bfec8f5c30b"
+index = 7
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mttan6rlcj8xt8l9hdrwdz6j92r84wgkmll7kzjajyvqk5nq2gln7a"
+lovelace = 1336100
+datum_hash = "c6a8aac33c9de2addceda8c617317f951598a8d7a3a7886264a68eedbf199f2a"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543036323033"
+quantity = 1
+
+[[utxo]]
+tx_hash = "8ad4cd95883443c29d94250f81545badf5d587d5e6715c8129603bfec8f5c30b"
+index = 8
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mttan6rlcj8xt8l9hdrwdz6j92r84wgkmll7kzjajyvqk5nq2gln7a"
+lovelace = 1336100
+datum_hash = "c6a8aac33c9de2addceda8c617317f951598a8d7a3a7886264a68eedbf199f2a"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543036343633"
+quantity = 1
+
+[[utxo]]
+tx_hash = "bef99ce4e6649694b7762aac9468b1b872b611e677c4045f612da136c3573562"
+index = 3
+address = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mttan6rlcj8xt8l9hdrwdz6j92r84wgkmll7kzjajyvqk5nq2gln7a"
+lovelace = 1336100
+datum_hash = "c6a8aac33c9de2addceda8c617317f951598a8d7a3a7886264a68eedbf199f2a"
+
+[[utxo.assets]]
+policy = "a2e719d70b9d71636aa825e71c11ca508ecf98eec87182b0e526d7c5"
+asset_name_hex = "000de1404f5554504f53543031393632"
+quantity = 1
+
+[[datum]]
+hash = "e2d0530ecf6a92114e019c68b579ce6c9fc4b5d3bce547723a4ddbff6595542e"
+cbor_hex = "d8799f9fd8799fd8799fd8799f581c144b22b126f223d424f746acf9318473a6f5a2fb67a730b3c19d1ad5ffd8799fd8799fd8799f581cee28e0c113c4bcf9e3005a60abf0175e1cb40ad2f538f8cd773db3cbffffffff1a0325aa00ffd8799fd8799fd8799f581c6f52cb0e5c2767859dc6afa9331700bd6fad888dcc140e66c101b943ffd8799fd8799fd8799f581ce3c9536e2947e33703d5793a02b593a8d32b49aaaef03ea0b2b03c87ffffffff1a005b8d80ffff581cee28e0c113c4bcf9e3005a60abf0175e1cb40ad2f538f8cd773db3cbff"
+
+[[datum]]
+hash = "02d01cd9f853e13f141c04adf27b43d4d5ce8a6e16d4f419cef8aadbc9a99a65"
+cbor_hex = "d8799f9fd8799fd8799fd8799f581c56e4d2d1b240120e75d8d17c602b474d93dc7d58cc9284167f61495effd8799fd8799fd8799f581c16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29ffffffff1a03911600ffd8799fd8799fd8799f581c6f52cb0e5c2767859dc6afa9331700bd6fad888dcc140e66c101b943ffd8799fd8799fd8799f581ce3c9536e2947e33703d5793a02b593a8d32b49aaaef03ea0b2b03c87ffffffff1a0067c280ffff581c16b507167feebf33bad2ed6694f23f987852f556c49a91f993ce4a29ff"
+
+[[datum]]
+hash = "c6a8aac33c9de2addceda8c617317f951598a8d7a3a7886264a68eedbf199f2a"
+cbor_hex = "d8799f9fd8799fd8799fd8799f581cedf87395bf24583d238a0b2d7d36b1930cdf37c2c7389e389ce55584ffd8799fd8799fd8799f581c7d9e87fc48e659fe5bb46e68b522a867ab916dfffeb0a5d91180b526ffffffff1a03ef1480ffd8799fd8799fd8799f581c6f52cb0e5c2767859dc6afa9331700bd6fad888dcc140e66c101b943ffd8799fd8799fd8799f581ce3c9536e2947e33703d5793a02b593a8d32b49aaaef03ea0b2b03c87ffffffff1a007270e0ffff581c7d9e87fc48e659fe5bb46e68b522a867ab916dfffeb0a5d91180b526ff"
