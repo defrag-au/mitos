@@ -82,6 +82,10 @@ struct PendingSale {
     seller_stake_pkh: String,
     payouts: Vec<ListingPayout>,
     price_lovelace: u64,
+    /// `Some(n)` when the consumed listing UTxO escrowed n > 1
+    /// assets (a bundle sold for one all-in price); `None` for
+    /// single-asset listings.
+    bundle_size: Option<u32>,
 }
 
 #[derive(Default)]
@@ -124,6 +128,8 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
         return;
     };
     let price_lovelace = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
+    let bundle_size =
+        (c.prior_output.assets.len() > 1).then(|| c.prior_output.assets.len() as u32);
     for entry in &c.prior_output.assets {
         buf.pending.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
@@ -131,6 +137,7 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
                 seller_stake_pkh: decoded.seller_stake_pkh.clone(),
                 payouts: decoded.payouts.clone(),
                 price_lovelace,
+                bundle_size,
             },
         );
     }
@@ -179,6 +186,7 @@ fn flush_buffer(buf: TxBuffer) {
                 payouts: sale.payouts,
                 price_lovelace: sale.price_lovelace,
                 contract_version: WayupStoreContractVersion::V1,
+                bundle_size: sale.bundle_size,
             }));
         }
     }

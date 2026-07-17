@@ -71,6 +71,9 @@ struct ProducedListing {
     output: TypedOutput,
     datum: Option<TypedDatum>,
     contract_version: JpgStoreContractVersion,
+    /// `Some(n)` when the listing UTxO escrows n > 1 assets (a
+    /// bundle); `None` for single-asset listings.
+    bundle_size: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -79,6 +82,9 @@ struct ConsumedListing {
     prior_datum: Option<TypedDatum>,
     redeemer: Option<Vec<u8>>,
     contract_version: JpgStoreContractVersion,
+    /// `Some(n)` when the consumed listing UTxO escrowed n > 1
+    /// assets (a bundle); `None` for single-asset listings.
+    bundle_size: Option<u32>,
 }
 
 #[derive(Default)]
@@ -103,7 +109,10 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     };
     // Index every native asset in the output. Real jpg.store
     // listings are usually single-asset but multi-asset bundles
-    // exist; emit one event per asset under the same listing UTxO.
+    // exist; emit one event per asset under the same listing UTxO,
+    // each stamped with the bundle size so consumers can partition
+    // bundle members out of single-asset price math.
+    let bundle_size = (p.output.assets.len() > 1).then(|| p.output.assets.len() as u32);
     for entry in &p.output.assets {
         buf.produced.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
@@ -112,6 +121,7 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
                 output: p.output.clone(),
                 datum: p.datum.clone(),
                 contract_version: version,
+                bundle_size,
             },
         );
     }
@@ -130,6 +140,8 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     if !is_cancel_redeemer(redeemer_bytes) {
         return;
     }
+    let bundle_size =
+        (c.prior_output.assets.len() > 1).then(|| c.prior_output.assets.len() as u32);
     for entry in &c.prior_output.assets {
         buf.consumed.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
@@ -138,6 +150,7 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
                 prior_datum: c.prior_datum.clone(),
                 redeemer: c.redeemer.clone(),
                 contract_version: version,
+                bundle_size,
             },
         );
     }
@@ -205,6 +218,7 @@ fn flush_buffer(buf: TxBuffer) {
                 seller_pkh: decoded.seller_pkh.clone(),
                 payouts: decoded.payouts.clone(),
                 contract_version: produced.contract_version,
+                bundle_size: produced.bundle_size,
             }));
             let _ = prior;
         } else {
@@ -217,6 +231,7 @@ fn flush_buffer(buf: TxBuffer) {
                 seller_pkh: decoded.seller_pkh.clone(),
                 payouts: decoded.payouts.clone(),
                 contract_version: produced.contract_version,
+                bundle_size: produced.bundle_size,
             }));
         }
         // `produced.output` consumed implicitly via the loop.
@@ -238,6 +253,7 @@ fn flush_buffer(buf: TxBuffer) {
             tx_hash: tx_hash_hex.clone(),
             seller_pkh,
             contract_version: prior.contract_version,
+            bundle_size: prior.bundle_size,
         }));
         let _ = prior.prior_output;
         let _ = prior.redeemer;

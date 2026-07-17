@@ -64,6 +64,14 @@ pub struct ListingCreate {
     /// royalty recipients.
     pub payouts: Vec<ListingPayout>,
     pub contract_version: WayupStoreContractVersion,
+    /// When this listing UTxO escrows multiple assets (a bundle sold
+    /// together for one all-in price), the number of assets in it.
+    /// `price_lovelace` is then the WHOLE-BUNDLE total, repeated on every
+    /// member's event — consumers must partition bundle members out of
+    /// single-asset floor/comparable math and count bundle sales once.
+    /// `None` for ordinary single-asset listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +90,14 @@ pub struct ListingUpdate {
     /// Payouts on the new listing.
     pub payouts: Vec<ListingPayout>,
     pub contract_version: WayupStoreContractVersion,
+    /// When this listing UTxO escrows multiple assets (a bundle sold
+    /// together for one all-in price), the number of assets in it.
+    /// `price_lovelace` is then the WHOLE-BUNDLE total, repeated on every
+    /// member's event — consumers must partition bundle members out of
+    /// single-asset floor/comparable math and count bundle sales once.
+    /// `None` for ordinary single-asset listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +111,14 @@ pub struct Unlisting {
     /// datum owner field).
     pub seller_stake_pkh: String,
     pub contract_version: WayupStoreContractVersion,
+    /// When this listing UTxO escrows multiple assets (a bundle sold
+    /// together for one all-in price), the number of assets in it.
+    /// `price_lovelace` is then the WHOLE-BUNDLE total, repeated on every
+    /// member's event — consumers must partition bundle members out of
+    /// single-asset floor/comparable math and count bundle sales once.
+    /// `None` for ordinary single-asset listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_size: Option<u32>,
 }
 
 /// Emit-channel discriminator (channel 0).

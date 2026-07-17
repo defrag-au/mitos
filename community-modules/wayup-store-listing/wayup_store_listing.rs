@@ -100,12 +100,18 @@ struct ProducedListing {
     output_index: u32,
     output: TypedOutput,
     datum: Option<TypedDatum>,
+    /// `Some(n)` when the listing UTxO escrows n > 1 assets (a
+    /// bundle); `None` for single-asset listings.
+    bundle_size: Option<u32>,
 }
 
 #[derive(Clone)]
 struct ConsumedListing {
     prior_output: TypedOutput,
     prior_datum: Option<TypedDatum>,
+    /// `Some(n)` when the consumed listing UTxO escrowed n > 1
+    /// assets (a bundle); `None` for single-asset listings.
+    bundle_size: Option<u32>,
 }
 
 #[derive(Default)]
@@ -124,6 +130,10 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if !is_listing_output(&p.output.address) {
         return;
     }
+    // One entry per escrowed asset; bundles (n > 1 assets in one
+    // listing UTxO) stamp every member with the bundle size so
+    // consumers can partition them out of single-asset price math.
+    let bundle_size = (p.output.assets.len() > 1).then(|| p.output.assets.len() as u32);
     for entry in &p.output.assets {
         buf.produced.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
@@ -131,6 +141,7 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
                 output_index: p.oref.index,
                 output: p.output.clone(),
                 datum: p.datum.clone(),
+                bundle_size,
             },
         );
     }
@@ -149,12 +160,15 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     if !is_cancel_redeemer(redeemer_bytes) {
         return;
     }
+    let bundle_size =
+        (c.prior_output.assets.len() > 1).then(|| c.prior_output.assets.len() as u32);
     for entry in &c.prior_output.assets {
         buf.consumed.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
             ConsumedListing {
                 prior_output: c.prior_output.clone(),
                 prior_datum: c.prior_datum.clone(),
+                bundle_size,
             },
         );
     }
@@ -208,6 +222,7 @@ fn flush_buffer(buf: TxBuffer) {
                 seller_stake_pkh: decoded.seller_stake_pkh.clone(),
                 payouts: decoded.payouts.clone(),
                 contract_version: WayupStoreContractVersion::V1,
+                bundle_size: produced.bundle_size,
             }));
             let _ = prior;
         } else {
@@ -220,6 +235,7 @@ fn flush_buffer(buf: TxBuffer) {
                 seller_stake_pkh: decoded.seller_stake_pkh.clone(),
                 payouts: decoded.payouts.clone(),
                 contract_version: WayupStoreContractVersion::V1,
+                bundle_size: produced.bundle_size,
             }));
         }
         let _ = produced.output;
@@ -239,6 +255,7 @@ fn flush_buffer(buf: TxBuffer) {
             tx_hash: tx_hash_hex.clone(),
             seller_stake_pkh,
             contract_version: WayupStoreContractVersion::V1,
+            bundle_size: prior.bundle_size,
         }));
         let _ = prior.prior_output;
     }

@@ -1,0 +1,12 @@
+# wayup-store-listing golden — BUNDLE listing create (in-block path):
+# TX 82c3bb035fe34a4882e6e68ee561a4f44f5c87a318a2dcec063a16bd95fe0cb4
+# (slot 192616455) produces ONE escrow UTxO (out #0) holding FIVE assets
+# under a single hash-only datum — one all-in price. Expect five
+# 'create' events, each with bundle_size = 5 and the identical
+# whole-bundle price.
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"
