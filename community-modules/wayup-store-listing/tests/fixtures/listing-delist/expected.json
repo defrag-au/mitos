@@ -1,0 +1,10 @@
+[
+  {
+    "asset_name_hex": "44503032393136",
+    "contract_version": "V1",
+    "kind": "unlisting",
+    "policy": "e74862a09d17a9cb03174a6bd5fa305b8684475c4c36021591c606e0",
+    "seller_stake_pkh": "5d3429223e928532ace863b349aba5175382445d51ede81ceb3fd440",
+    "tx_hash": "d1e39e43a82f5dcbe2c5af321222ac8518243d8d91723efb72374490575a1c69"
+  }
+]

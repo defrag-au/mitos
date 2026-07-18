@@ -1,0 +1,28 @@
+# mitos.toml — module config for the wayup-store-sale indexer.
+#
+# Completed fixed-price sales on the Wayup sale validator. Listing
+# lifecycle events live in the sibling wayup-store-listing module;
+# offer (bid) lifecycle in wayup-store-offer.
+
+abi_version = 2
+
+# Runtime config — CBOR-encoded by mitos-build, deserialised by
+# the module's `init`. The Wayup sale validator's payment-script
+# hash: listing UTxOs share this payment credential but embed the
+# seller's own stake key as the staking part.
+payment_cred = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"
+
+[interest]
+# Watch by payment credential (NOT a full address) — the staking
+# part varies per seller.
+payment_credentials = [
+    "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad",
+]
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+pallas-primitives = "1.0.0-alpha.6"
+pallas-codec = "1.0.0-alpha.6"
+# bech32 → payment-credential extraction (identify listing outputs;
+# the staking part varies per seller so a string compare won't do).
+pallas-addresses = "1.0.0-alpha.6"

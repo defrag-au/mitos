@@ -422,6 +422,7 @@ fn flush_buffer(mut buf: TxBuffer) {
                     price_lovelace: consume.prior_lovelace,
                     seller_address: String::new(),
                     co_version: WayupStoreOfferVersion::V1,
+                    collection_offer: consume.decoded.target_asset_names.is_empty(),
                 }));
             }
             None => {

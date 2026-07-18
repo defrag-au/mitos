@@ -23,7 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::jpg_store_listing::{JpgStoreContractVersion, ListingPayout};
+pub use crate::jpg_store_listing::JpgStoreContractVersion;
+pub use crate::marketplace::ListingPayout;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sale {
@@ -47,6 +48,14 @@ pub struct Sale {
     /// Total sale price in lovelace (sum of payouts).
     pub price_lovelace: u64,
     pub contract_version: JpgStoreContractVersion,
+    /// When this listing UTxO escrows multiple assets (a bundle sold
+    /// together for one all-in price), the number of assets in it.
+    /// `price_lovelace` is then the WHOLE-BUNDLE total, repeated on every
+    /// member's event — consumers must partition bundle members out of
+    /// single-asset floor/comparable math and count bundle sales once.
+    /// `None` for ordinary single-asset listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

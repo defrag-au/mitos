@@ -1,67 +1,87 @@
-//! jpg.store sales community module.
+//! Wayup fixed-price sale community module.
 //!
-//! Emits one `JpgStoreSale::Sale` per completed sale on the
-//! jpg.store sale contracts (V1/V2/V3/V4). Listing lifecycle
-//! events live in the sibling `jpg-store-listing` module.
+//! Emits `WayupStoreSale::Sale` when a Wayup listing is bought.
+//! Listing lifecycle events (create/update/unlisting) live in the
+//! sibling `wayup-store-listing` module; offer (bid) lifecycle in
+//! `wayup-store-offer`, whose `Accept` is the bid-side sale.
 //!
 //! ## Detection
 //!
-//! In each `handle_events` call (one TX's events):
+//! Wayup listing UTxOs sit at addresses sharing the sale
+//! validator's payment credential (`a76f0fb8…`) with a per-seller
+//! staking part, so classification is by payment credential.
 //!
-//! 1. Walk `Consumed` events. For each one at a jpg.store sale
-//!    script address whose redeemer is **constructor 0** (Buy /
-//!    Accept; on-wire CBOR starts with `d879…`):
-//!    - resolve the prior listing's datum (via the witness set
-//!      the sale TX itself reveals)
-//!    - extract payouts + seller_pkh from the datum
-//!    - record `(policy, asset_name)` in a "needs buyer" set
-//! 2. Walk `Produced` events. For each one that contains one of
-//!    the "needs buyer" assets at a non-jpg-script address,
-//!    record the recipient's address as the buyer.
-//! 3. Emit one `Sale` event per matched sale.
-//!
-//! Constructor 1 redeemers (Cancel/Unlisting) are skipped — that's
-//! jpg-store-listing's domain.
+//! - `Consumed` at the sale credential with a Buy redeemer —
+//!   constructor 0 with one uint field that varies per spend (an
+//!   input index: `d8799f00ff`, `d8799f09ff`, … observed in
+//!   mainnet sweep `4edc97fd…` buying 4 listings with fields
+//!   0/3/6/9). Matching is on the `d879` constructor prefix,
+//!   never the full bytes. Cancel spends (constructor 1,
+//!   `d87a80`) are the listing module's domain.
+//! - The consumed listing's datum
+//!   (`Constr 0 [ payouts, owner_stake_cred ]`, hash-only —
+//!   revealed in the sale TX's witness set) gives the agreed
+//!   payouts; price = their sum. Wayup's platform fee (2%,
+//!   1-10 ADA) is paid on top by the buyer and is NOT part of
+//!   the payouts.
+//! - The asset moves to a non-listing output — the buyer. Offer
+//!   outputs created in the same TX (mixed buy+bid TXs exist)
+//!   carry no assets and never match.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use mitos_community_events::jpg_store_sale::{
-    JpgStoreContractVersion, JpgStoreSale, ListingPayout, Sale,
+use mitos_community_events::wayup_store_sale::{
+    ListingPayout, Sale, WayupStoreContractVersion, WayupStoreSale,
 };
+use pallas_addresses::{Address, ShelleyPaymentPart};
 use pallas_primitives::PlutusData;
+use serde::Deserialize;
 
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
-use crate::mitos::platform_v2::types::{
-    ConsumedEvent, ProducedEvent, TypedDatum, UtxoEvent,
-};
+use crate::mitos::platform_v2::types::{ConsumedEvent, ProducedEvent, TypedDatum, UtxoEvent};
 
-const LOG_TARGET: &str = "jpg-store-sale-module";
+const LOG_TARGET: &str = "wayup-store-sale-module";
 
-const JPG_V1_ADDR: &str = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm";
-const JPG_V2_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V3_ADDR: &str = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V4_ADDR: &str = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp";
-
-fn classify_address(addr: &str) -> Option<JpgStoreContractVersion> {
-    match addr {
-        JPG_V1_ADDR => Some(JpgStoreContractVersion::V1),
-        JPG_V2_ADDR => Some(JpgStoreContractVersion::V2),
-        JPG_V3_ADDR => Some(JpgStoreContractVersion::V3),
-        JPG_V4_ADDR => Some(JpgStoreContractVersion::V4),
-        _ => None,
-    }
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    /// 56-char hex of the Wayup sale validator's payment
+    /// credential.
+    #[serde(default)]
+    payment_cred: String,
 }
 
-/// Sale-side state for one consumed listing UTxO. We carry
-/// enough to emit the event once we find the buyer in the
-/// produced outputs.
+thread_local! {
+    static SALE_PAYMENT_CRED: RefCell<Option<[u8; 28]>> = const { RefCell::new(None) };
+}
+
+/// Extract a Shelley address's 28-byte payment credential.
+fn address_payment_cred(addr: &str) -> Option<[u8; 28]> {
+    let Ok(Address::Shelley(s)) = Address::from_bech32(addr) else {
+        return None;
+    };
+    let cred: [u8; 28] = match s.payment() {
+        ShelleyPaymentPart::Key(h) => **h,
+        ShelleyPaymentPart::Script(h) => **h,
+    };
+    Some(cred)
+}
+
+/// Is this output at the watched Wayup sale payment credential?
+fn is_listing_output(addr: &str) -> bool {
+    SALE_PAYMENT_CRED.with(|c| match *c.borrow() {
+        Some(cred) => address_payment_cred(addr) == Some(cred),
+        None => false,
+    })
+}
+
+/// Sale-side state for one consumed listing UTxO.
 #[derive(Clone)]
 struct PendingSale {
-    seller_pkh: String,
+    seller_stake_pkh: String,
     payouts: Vec<ListingPayout>,
     price_lovelace: u64,
-    contract_version: JpgStoreContractVersion,
     /// `Some(n)` when the consumed listing UTxO escrowed n > 1
     /// assets (a bundle sold for one all-in price); `None` for
     /// single-asset listings.
@@ -70,16 +90,10 @@ struct PendingSale {
 
 #[derive(Default)]
 struct TxBuffer {
-    /// `(policy, asset_name)` → PendingSale, populated as we
-    /// process Consumed events at jpg-scripts with the Buy
-    /// redeemer. Cleared as we match Produced outputs to find
-    /// the buyer.
+    /// `(policy, asset_name)` → PendingSale, populated from
+    /// Buy-redeemer consumes at the sale credential.
     pending: BTreeMap<(Vec<u8>, Vec<u8>), PendingSale>,
-    /// Buffer Produced events so we can walk them at flush time
-    /// after all Consumed events have populated `pending`. (v2
-    /// dispatch order is referenced → consumed → produced, so
-    /// in principle we could match per-Produced live — buffering
-    /// keeps the matching logic simple and order-independent.)
+    /// Produced outputs buffered for buyer matching at flush.
     produced: Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>,
     tx_hash: Option<Vec<u8>>,
 }
@@ -88,9 +102,9 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(c.consuming_tx_hash.clone());
     }
-    let Some(version) = classify_address(&c.prior_output.address) else {
+    if !is_listing_output(&c.prior_output.address) {
         return;
-    };
+    }
     let Some(redeemer_bytes) = c.redeemer.as_ref() else {
         return;
     };
@@ -120,10 +134,9 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
         buf.pending.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
             PendingSale {
-                seller_pkh: decoded.seller_pkh.clone(),
+                seller_stake_pkh: decoded.seller_stake_pkh.clone(),
                 payouts: decoded.payouts.clone(),
                 price_lovelace,
-                contract_version: version,
                 bundle_size,
             },
         );
@@ -134,11 +147,10 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(p.tx_hash.clone());
     }
-    // Skip outputs back to any jpg-script — those are either
-    // listing updates (handled by jpg-store-listing) or
-    // accidental fee sinks. Sales send assets to a non-script
-    // address (the buyer).
-    if classify_address(&p.output.address).is_some() {
+    // Skip outputs back at the sale credential — those are listing
+    // updates (the listing module's domain). Sales deliver the
+    // asset to a non-listing address (the buyer).
+    if is_listing_output(&p.output.address) {
         return;
     }
     let assets: Vec<(Vec<u8>, Vec<u8>)> = p
@@ -165,22 +177,20 @@ fn flush_buffer(buf: TxBuffer) {
                 continue;
             };
             let (policy, asset_name) = asset_key;
-            emit_sale(&JpgStoreSale::Sale(Sale {
+            emit_sale(&WayupStoreSale::Sale(Sale {
                 policy: hex::encode(&policy),
                 asset_name_hex: hex::encode(&asset_name),
                 tx_hash: tx_hash_hex.clone(),
-                seller_pkh: sale.seller_pkh,
+                seller_stake_pkh: sale.seller_stake_pkh,
                 buyer_address: buyer_address.clone(),
                 payouts: sale.payouts,
                 price_lovelace: sale.price_lovelace,
-                contract_version: sale.contract_version,
+                contract_version: WayupStoreContractVersion::V1,
                 bundle_size: sale.bundle_size,
             }));
         }
     }
 
-    // Any pending sales we couldn't match to a buyer — log so
-    // operators see the gap.
     for ((policy, asset_name), _) in pending {
         logging::log(
             LogLevel::Warn,
@@ -194,25 +204,23 @@ fn flush_buffer(buf: TxBuffer) {
     }
 }
 
-fn emit_sale(event: &JpgStoreSale) {
+fn emit_sale(event: &WayupStoreSale) {
     let mut buf = Vec::with_capacity(512);
     if let Err(e) = ciborium::ser::into_writer(event, &mut buf) {
         logging::log(
             LogLevel::Error,
             LOG_TARGET,
-            &format!("encode JpgStoreSale failed: {e}"),
+            &format!("encode WayupStoreSale failed: {e}"),
         );
         return;
     }
     emit::emit_event(0, &buf);
 }
 
-/// jpg.store V1/V2/V3 Buy redeemer: constructor 0 with one
-/// uint field (typically zero). The on-wire CBOR is the
-/// indefinite-length form `d879 9f 00 ff`. We match
-/// permissively on "starts with d879" so future redeemer
-/// shapes that use the same constructor (e.g. richer fields)
-/// still classify as Buy.
+/// Wayup Buy redeemer: constructor 0 with one uint field whose
+/// value varies per spend (an input index — `d8799f00ff`,
+/// `d8799f03ff`, `d8799f09ff` all observed on mainnet). Match on
+/// the constructor prefix only.
 fn is_buy_redeemer(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xd8, 0x79])
 }
@@ -225,11 +233,15 @@ fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     crate::mitos::platform_v2::chain_data::datum_by_hash(&d.hash)
 }
 
+/// Result of decoding a Wayup listing (ask) datum.
 struct DecodedListing {
     payouts: Vec<ListingPayout>,
-    seller_pkh: String,
+    /// Hex of the seller's STAKE credential (28 bytes).
+    seller_stake_pkh: String,
 }
 
+/// Decode the Wayup listing datum:
+/// `Constr 0 [ List<Payout>, Bytes(owner_stake_cred) ]`.
 fn decode_listing_datum(cbor: &[u8]) -> Option<DecodedListing> {
     let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
     let outer = match pd {
@@ -247,16 +259,17 @@ fn decode_listing_datum(cbor: &[u8]) -> Option<DecodedListing> {
             .collect::<Vec<ListingPayout>>(),
         _ => return None,
     };
-    let seller_pkh = match &fields[1] {
+    let seller_stake_pkh = match &fields[1] {
         PlutusData::BoundedBytes(b) => hex::encode(&**b),
         _ => String::new(),
     };
     Some(DecodedListing {
         payouts,
-        seller_pkh,
+        seller_stake_pkh,
     })
 }
 
+/// One payout entry: `Constr 0 [ Address, Int ]`.
 fn decode_payout(pd: &PlutusData) -> Option<ListingPayout> {
     let constr = match pd {
         PlutusData::Constr(c) => c,
@@ -286,6 +299,7 @@ fn decode_payout(pd: &PlutusData) -> Option<ListingPayout> {
     })
 }
 
+/// Plutus address-credential extractor: `Constr 0 [ Bytes ]`.
 fn decode_credential_bytes(pd: Option<&PlutusData>) -> Option<Vec<u8>> {
     match pd? {
         PlutusData::Constr(c) => {
@@ -299,6 +313,7 @@ fn decode_credential_bytes(pd: Option<&PlutusData>) -> Option<Vec<u8>> {
     }
 }
 
+/// Optional stake credential (`Just (StakingHash (KeyHash b))`).
 fn decode_maybe_stake(pd: &PlutusData) -> Option<Vec<u8>> {
     let outer = match pd {
         PlutusData::Constr(c) => c,
@@ -322,11 +337,16 @@ fn decode_maybe_stake(pd: &PlutusData) -> Option<Vec<u8>> {
     None
 }
 
+/// Big-int → u64 (positive only).
 fn decode_bigint_u64(i: &pallas_primitives::BigInt) -> Option<u64> {
     match i {
         pallas_primitives::BigInt::Int(n) => {
             let v = i128::from(*n);
-            if v < 0 { None } else { u64::try_from(v).ok() }
+            if v < 0 {
+                None
+            } else {
+                u64::try_from(v).ok()
+            }
         }
         pallas_primitives::BigInt::BigUInt(b) => {
             let bytes: &[u8] = &**b;
@@ -368,14 +388,43 @@ impl Guest for Module {
             LOG_TARGET,
             &format!("init: enter (config_bytes={})", config.len()),
         );
+        if config.is_empty() {
+            return;
+        }
+        let cfg: Config = match ciborium::de::from_reader(config.as_slice()) {
+            Ok(c) => c,
+            Err(e) => {
+                logging::log(
+                    LogLevel::Error,
+                    LOG_TARGET,
+                    &format!("init: decode config failed: {e}"),
+                );
+                return;
+            }
+        };
+        match hex::decode(&cfg.payment_cred) {
+            Ok(bytes) if bytes.len() == 28 => {
+                let mut cred = [0u8; 28];
+                cred.copy_from_slice(&bytes);
+                SALE_PAYMENT_CRED.with(|c| *c.borrow_mut() = Some(cred));
+                logging::log(LogLevel::Info, LOG_TARGET, "init: payment cred stored");
+            }
+            _ => {
+                logging::log(
+                    LogLevel::Error,
+                    LOG_TARGET,
+                    &format!("init: invalid payment_cred `{}`", cfg.payment_cred),
+                );
+            }
+        }
     }
 
     fn handle_events(events: Vec<DispatchEvent>) {
         let mut buf = TxBuffer::default();
         for event in events {
             match event {
-                DispatchEvent::Utxo(UtxoEvent::Consumed(c)) => handle_consumed(&c, &mut buf),
                 DispatchEvent::Utxo(UtxoEvent::Produced(p)) => handle_produced(&p, &mut buf),
+                DispatchEvent::Utxo(UtxoEvent::Consumed(c)) => handle_consumed(&c, &mut buf),
                 _ => {}
             }
         }
@@ -383,13 +432,12 @@ impl Guest for Module {
     }
 
     fn update_interest(_op: InterestOp, _items_cbor: Vec<u8>) -> Result<(), String> {
+        // Interest is fully static (declared in <name>.toml).
         Ok(())
     }
 
     /// No-op: event-driven modules are refilled host-side by
-    /// `run_bootstrap` over the manifest `[interest]`. See the
-    /// `rebootstrap` export in `wit-v2/world.wit`. One call,
-    /// immediately `done`.
+    /// `run_bootstrap` over the manifest `[interest]`.
     fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,

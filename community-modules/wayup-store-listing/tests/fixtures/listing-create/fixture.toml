@@ -1,0 +1,8 @@
+# wayup-store-listing golden — Listing creates: tx 1ec380cd… produces listings at the sale cred.
+# Spend/create TX: see block (block slot 192663597).
+
+version = 1
+
+[[interest]]
+kind = "at_payment_cred"
+hash = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"

@@ -1,43 +1,56 @@
-//! jpg.store listing lifecycle community module.
+//! Wayup listing lifecycle community module.
 //!
-//! Emits `JpgStoreListing::{Create, Update, Unlisting}` for
-//! the jpg.store sale contracts (V1/V2/V3/V4). Sale events
-//! (asset moving to buyer + payment outputs to seller) live in
-//! the sibling `jpg-store-sale` module to keep concerns
-//! separable on the consumer side.
+//! Emits `WayupStoreListing::{Create, Update, Unlisting}` for the
+//! Wayup sale validator. Completed sales live in the sibling
+//! `wayup-store-sale` module; offers (bids) in `wayup-store-offer`.
 //!
 //! ## Detection
 //!
-//! Within one `handle_events` call (= one TX's events) we
-//! observe what touched the jpg.store sale scripts:
+//! Wayup listing UTxOs sit at addresses sharing the sale
+//! validator's payment credential with a per-seller staking part,
+//! so classification is by payment credential (like
+//! `wayup-store-offer`), not exact address match (unlike the jpg
+//! modules).
 //!
-//! - `Produced` at a jpg-script with a listing datum → record
-//!   it in `produced_listings` keyed by `(policy, asset_name)`.
-//! - `Consumed` at a jpg-script → record in `consumed_listings`
-//!   keyed the same way. Redeemer constructor distinguishes
-//!   action: 0 = Buy/Sale (skipped — jpg-store-sale's domain),
-//!   1 = Cancel (Unlisting if no paired Produced for same asset
-//!   in this TX; Update if paired).
+//! Within one `handle_events` call (= one TX's events):
+//!
+//! - `Produced` at the sale credential with a listing datum →
+//!   record in `produced` keyed by `(policy, asset_name)`.
+//! - `Consumed` at the sale credential with the cancel redeemer
+//!   (constructor 1, `d87a80`) → record in `consumed`. Buy spends
+//!   (constructor 0, `d8799f<idx>ff` — the field is an input
+//!   index) are the sale module's domain and are skipped here.
 //!
 //! At flush time:
 //!
-//! - `(consumed, produced)` for same asset → `ListingUpdate`
+//! - `(consumed, produced)` for the same asset → `ListingUpdate`
+//!   (Wayup price edits are cancel+recreate in a single TX,
+//!   observed as multi-asset batches, e.g. `383d83e2…` updated
+//!   11 listings in one TX)
 //! - `produced` alone → `ListingCreate`
-//! - `consumed` alone (cancel redeemer) → `Unlisting`
+//! - `consumed` alone → `Unlisting` (asset returns to the seller)
 //!
-//! ## Datum shape (V1/V2/V3 share the same payouts+owner_pkh
-//! structure; V4 is documented to use a different datum but
-//! production TXs to validate the shape against haven't been
-//! sampled yet — falls through to "unknown shape" emission
-//! with `payouts: []` until a V4 fixture confirms).
+//! ## Datum shape
+//!
+//! Identical structure to jpg.store V1-V3 listings:
+//! `Constr 0 [ List<Payout>, Bytes(owner) ]`, payout =
+//! `Constr 0 [ Address, Int ]`, price = sum of payout lovelace.
+//! **The owner field is the seller's STAKE credential** (jpg uses
+//! a payment pkh there). Datums are hash-only; resolution falls
+//! back to `chain_data::datum_by_hash` and, as with jpg, a create
+//! whose preimage isn't yet revealed emits with empty payouts
+//! rather than being dropped.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use mitos_community_events::jpg_store_listing::{
-    JpgStoreContractVersion, JpgStoreListing, ListingCreate, ListingPayout, ListingUpdate,
-    Unlisting,
+use mitos_community_events::wayup_store_listing::{
+    ListingCreate, ListingPayout, ListingUpdate, Unlisting, WayupStoreContractVersion,
+    WayupStoreListing,
 };
+use pallas_addresses::{Address, ShelleyPaymentPart};
 use pallas_primitives::PlutusData;
+use serde::Deserialize;
 
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
@@ -45,32 +58,48 @@ use crate::mitos::platform_v2::types::{
     ConsumedEvent, ProducedEvent, TypedDatum, TypedOutput, UtxoEvent,
 };
 
-const LOG_TARGET: &str = "jpg-store-listing-module";
+const LOG_TARGET: &str = "wayup-store-listing-module";
 
-const JPG_V1_ADDR: &str = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm";
-const JPG_V2_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V3_ADDR: &str = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V4_ADDR: &str = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp";
-
-fn classify_address(addr: &str) -> Option<JpgStoreContractVersion> {
-    match addr {
-        JPG_V1_ADDR => Some(JpgStoreContractVersion::V1),
-        JPG_V2_ADDR => Some(JpgStoreContractVersion::V2),
-        JPG_V3_ADDR => Some(JpgStoreContractVersion::V3),
-        JPG_V4_ADDR => Some(JpgStoreContractVersion::V4),
-        _ => None,
-    }
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    /// 56-char hex of the Wayup sale validator's payment
+    /// credential. Listing UTxOs share this payment cred but vary
+    /// in staking part per seller.
+    #[serde(default)]
+    payment_cred: String,
 }
 
-/// One Produced output at a jpg-script that we've recorded. We
-/// snapshot the bits the listing event shape needs — full TypedOutput
-/// is kept around for the asset-multiset walk during flush.
+// Configured at init from the manifest's colocated config.
+// RefCell since the wasm world is single-threaded.
+thread_local! {
+    static SALE_PAYMENT_CRED: RefCell<Option<[u8; 28]>> = const { RefCell::new(None) };
+}
+
+/// Extract a Shelley address's 28-byte payment credential.
+fn address_payment_cred(addr: &str) -> Option<[u8; 28]> {
+    let Ok(Address::Shelley(s)) = Address::from_bech32(addr) else {
+        return None;
+    };
+    let cred: [u8; 28] = match s.payment() {
+        ShelleyPaymentPart::Key(h) => **h,
+        ShelleyPaymentPart::Script(h) => **h,
+    };
+    Some(cred)
+}
+
+/// Is this output at the watched Wayup sale payment credential?
+fn is_listing_output(addr: &str) -> bool {
+    SALE_PAYMENT_CRED.with(|c| match *c.borrow() {
+        Some(cred) => address_payment_cred(addr) == Some(cred),
+        None => false,
+    })
+}
+
 #[derive(Clone)]
 struct ProducedListing {
     output_index: u32,
     output: TypedOutput,
     datum: Option<TypedDatum>,
-    contract_version: JpgStoreContractVersion,
     /// `Some(n)` when the listing UTxO escrows n > 1 assets (a
     /// bundle); `None` for single-asset listings.
     bundle_size: Option<u32>,
@@ -80,8 +109,6 @@ struct ProducedListing {
 struct ConsumedListing {
     prior_output: TypedOutput,
     prior_datum: Option<TypedDatum>,
-    redeemer: Option<Vec<u8>>,
-    contract_version: JpgStoreContractVersion,
     /// `Some(n)` when the consumed listing UTxO escrowed n > 1
     /// assets (a bundle); `None` for single-asset listings.
     bundle_size: Option<u32>,
@@ -89,14 +116,10 @@ struct ConsumedListing {
 
 #[derive(Default)]
 struct TxBuffer {
-    /// Produced listings keyed by `(policy, asset_name)`. Multi-
-    /// asset bundles get one entry per asset — most jpg.store
-    /// listings are single-asset, so this is typically 0 or 1
-    /// entries.
+    /// Produced listings keyed by `(policy, asset_name)`.
     produced: BTreeMap<(Vec<u8>, Vec<u8>), ProducedListing>,
-    /// Consumed listings keyed the same way.
+    /// Cancel-redeemer consumed listings keyed the same way.
     consumed: BTreeMap<(Vec<u8>, Vec<u8>), ConsumedListing>,
-    /// tx_hash from the first event seen in this batch.
     tx_hash: Option<Vec<u8>>,
 }
 
@@ -104,14 +127,12 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(p.tx_hash.clone());
     }
-    let Some(version) = classify_address(&p.output.address) else {
+    if !is_listing_output(&p.output.address) {
         return;
-    };
-    // Index every native asset in the output. Real jpg.store
-    // listings are usually single-asset but multi-asset bundles
-    // exist; emit one event per asset under the same listing UTxO,
-    // each stamped with the bundle size so consumers can partition
-    // bundle members out of single-asset price math.
+    }
+    // One entry per escrowed asset; bundles (n > 1 assets in one
+    // listing UTxO) stamp every member with the bundle size so
+    // consumers can partition them out of single-asset price math.
     let bundle_size = (p.output.assets.len() > 1).then(|| p.output.assets.len() as u32);
     for entry in &p.output.assets {
         buf.produced.insert(
@@ -120,7 +141,6 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
                 output_index: p.oref.index,
                 output: p.output.clone(),
                 datum: p.datum.clone(),
-                contract_version: version,
                 bundle_size,
             },
         );
@@ -131,9 +151,9 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(c.consuming_tx_hash.clone());
     }
-    let Some(version) = classify_address(&c.prior_output.address) else {
+    if !is_listing_output(&c.prior_output.address) {
         return;
-    };
+    }
     let Some(redeemer_bytes) = c.redeemer.as_ref() else {
         return;
     };
@@ -148,21 +168,18 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
             ConsumedListing {
                 prior_output: c.prior_output.clone(),
                 prior_datum: c.prior_datum.clone(),
-                redeemer: c.redeemer.clone(),
-                contract_version: version,
                 bundle_size,
             },
         );
     }
 }
 
-/// jpg.store V1/V2/V3 use a unit-constructor redeemer where
-/// Buy = constructor 0 and Cancel = constructor 1, both with
-/// empty fields. The on-wire CBOR for Cancel is `d87a80`
-/// (tag 122 = alternative 1 empty fields).
+/// Wayup cancel/delist redeemer: constructor 1 with empty fields
+/// (`d87a80`) — verified against mainnet delists (`d1e39e43…`,
+/// `81469028…`: asset returned to the datum owner's stake) and
+/// batch price-updates (`383d83e2…`: 11 cancel spends + 11
+/// re-produced listings in one TX). Buy spends use constructor 0.
 fn is_cancel_redeemer(bytes: &[u8]) -> bool {
-    // Minimal sniff: Cancel = `d87a80`. Anything else (Buy = `d87980`,
-    // or richer redeemers V4 might introduce) → not our concern.
     bytes == [0xd8, 0x7a, 0x80]
 }
 
@@ -172,143 +189,94 @@ fn flush_buffer(buf: TxBuffer) {
     };
     let tx_hash_hex = hex::encode(&tx_hash);
 
-    // Consume `consumed` into a working map so we can pop pairs
-    // out as we walk produced.
     let mut consumed = buf.consumed;
 
     for ((policy, asset_name), produced) in buf.produced {
         let policy_hex = hex::encode(&policy);
         let asset_name_hex = hex::encode(&asset_name);
 
-        // Decode the produced listing's datum into payouts +
-        // owner. jpg.store V1/V2/V3 listings use hash-only
-        // datums — the datum bytes don't exist on-chain until
-        // the listing is later consumed (cancel or sale), at
-        // which point they're revealed in that TX's witness set.
-        // So at listing time the resolution often returns None;
-        // we emit with empty payouts + empty seller_pkh, and
-        // downstream consumers either backfill from the
-        // subsequent Unlisting/Sale event or use an off-chain
-        // source. Honest-about-unknowns is preferable to
-        // skipping the create event entirely.
-        // Payload-only decode first. Pure CREATES never fall back to
-        // `datum_by_hash` — jpg creates are hash-only by design, and the
-        // fallback provider turns every bootstrap re-scan of the
-        // (post-shutdown, stranded) jpg book into one sequential HTTP
-        // call per listing, stalling host startup for hours.
-        let decoded_payload =
-            payload_datum_bytes(produced.datum.as_ref()).and_then(|b| decode_listing_datum(&b));
+        // Wayup listing datums are hash-only; at create time the
+        // preimage is usually revealed in the same TX's witness
+        // set (resolvable via datum_by_hash), but emit
+        // honest-about-unknowns like jpg when it isn't.
+        let decoded = resolve_datum_bytes(produced.datum.as_ref())
+            .and_then(|b| decode_listing_datum(&b))
+            .unwrap_or(DecodedListing {
+                payouts: Vec::new(),
+                seller_stake_pkh: String::new(),
+            });
+        let new_price = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
 
-        // Is there a matching Consumed for the same asset?
         if let Some(prior) = consumed.remove(&(policy.clone(), asset_name.clone())) {
-            // UPDATE: a rare single spend event — the fallback is worth
-            // it here so the new price stays populated.
-            let decoded = decoded_payload
-                .or_else(|| {
-                    resolve_datum_bytes(produced.datum.as_ref())
-                        .and_then(|b| decode_listing_datum(&b))
-                })
-                .unwrap_or(DecodedListing {
-                    payouts: Vec::new(),
-                    seller_pkh: String::new(),
-                });
-            let new_price = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
-            // Listing update: extract previous price from the
-            // prior datum (best-effort; if decode fails we emit
-            // ListingUpdate with `previous_price_lovelace = 0`).
             let previous_price = resolve_datum_bytes(prior.prior_datum.as_ref())
                 .and_then(|b| decode_listing_datum(&b))
                 .map(|d| d.payouts.iter().map(|p| p.lovelace).sum::<u64>())
                 .unwrap_or(0);
-            emit_listing(&JpgStoreListing::Update(ListingUpdate {
+            emit_listing(&WayupStoreListing::Update(ListingUpdate {
                 policy: policy_hex.clone(),
                 asset_name_hex: asset_name_hex.clone(),
                 tx_hash: tx_hash_hex.clone(),
                 output_index: produced.output_index,
                 previous_price_lovelace: previous_price,
                 new_price_lovelace: new_price,
-                seller_pkh: decoded.seller_pkh.clone(),
+                seller_stake_pkh: decoded.seller_stake_pkh.clone(),
                 payouts: decoded.payouts.clone(),
-                contract_version: produced.contract_version,
+                contract_version: WayupStoreContractVersion::V1,
                 bundle_size: produced.bundle_size,
             }));
             let _ = prior;
         } else {
-            let decoded = decoded_payload.unwrap_or(DecodedListing {
-                payouts: Vec::new(),
-                seller_pkh: String::new(),
-            });
-            let new_price = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
-            emit_listing(&JpgStoreListing::Create(ListingCreate {
+            emit_listing(&WayupStoreListing::Create(ListingCreate {
                 policy: policy_hex.clone(),
                 asset_name_hex: asset_name_hex.clone(),
                 tx_hash: tx_hash_hex.clone(),
                 output_index: produced.output_index,
                 price_lovelace: new_price,
-                seller_pkh: decoded.seller_pkh.clone(),
+                seller_stake_pkh: decoded.seller_stake_pkh.clone(),
                 payouts: decoded.payouts.clone(),
-                contract_version: produced.contract_version,
+                contract_version: WayupStoreContractVersion::V1,
                 bundle_size: produced.bundle_size,
             }));
         }
-        // `produced.output` consumed implicitly via the loop.
         let _ = produced.output;
     }
 
-    // Remaining consumed entries (no paired produced for the
-    // asset) are unlistings.
+    // Remaining consumed entries (no paired produced) are unlistings.
     for ((policy, asset_name), prior) in consumed {
         let policy_hex = hex::encode(&policy);
         let asset_name_hex = hex::encode(&asset_name);
-        let seller_pkh = resolve_datum_bytes(prior.prior_datum.as_ref())
+        let seller_stake_pkh = resolve_datum_bytes(prior.prior_datum.as_ref())
             .and_then(|b| decode_listing_datum(&b))
-            .map(|d| d.seller_pkh)
+            .map(|d| d.seller_stake_pkh)
             .unwrap_or_default();
-        emit_listing(&JpgStoreListing::Unlisting(Unlisting {
+        emit_listing(&WayupStoreListing::Unlisting(Unlisting {
             policy: policy_hex,
             asset_name_hex,
             tx_hash: tx_hash_hex.clone(),
-            seller_pkh,
-            contract_version: prior.contract_version,
+            seller_stake_pkh,
+            contract_version: WayupStoreContractVersion::V1,
             bundle_size: prior.bundle_size,
         }));
         let _ = prior.prior_output;
-        let _ = prior.redeemer;
     }
 }
 
-fn emit_listing(event: &JpgStoreListing) {
+fn emit_listing(event: &WayupStoreListing) {
     let mut buf = Vec::with_capacity(512);
     if let Err(e) = ciborium::ser::into_writer(event, &mut buf) {
         logging::log(
             LogLevel::Error,
             LOG_TARGET,
-            &format!("encode JpgStoreListing failed: {e}"),
+            &format!("encode WayupStoreListing failed: {e}"),
         );
         return;
     }
     emit::emit_event(0, &buf);
 }
 
-/// Payload-only datum bytes — no `datum_by_hash` fallback. Used on
-/// the PRODUCED (create) path: jpg listing datums are hash-only and
-/// deliberately emitted with empty payouts when unrevealed; letting
-/// the create path fall back to `datum_by_hash` makes every bootstrap
-/// re-scan of the (post-shutdown, stranded) jpg book issue one
-/// fallback-provider HTTP call per listing, stalling host startup.
-fn payload_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
-    let d = d?;
-    if !d.payload.is_empty() {
-        return Some(d.payload.clone());
-    }
-    None
-}
-
-/// Resolve the on-chain datum bytes for an output. Inline
-/// datums carry `payload` directly; hash-only datums fall back
-/// to `chain_data::datum_by_hash`. Consumed (cancel/update/sale)
-/// paths keep the fallback — spends are rare single events and the
-/// spend TX's witness set usually resolves via payload anyway.
+/// Resolve the on-chain datum bytes for an output. Inline datums
+/// carry `payload` directly; hash-only datums fall back to
+/// `chain_data::datum_by_hash`.
 fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     let d = d?;
     if !d.payload.is_empty() {
@@ -317,15 +285,17 @@ fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     crate::mitos::platform_v2::chain_data::datum_by_hash(&d.hash)
 }
 
-/// Result of decoding a jpg.store V1/V2/V3 listing datum.
+/// Result of decoding a Wayup listing (ask) datum.
 struct DecodedListing {
     payouts: Vec<ListingPayout>,
-    /// Hex of the seller's payment-credential pkh (28 bytes).
-    seller_pkh: String,
+    /// Hex of the seller's STAKE credential (28 bytes).
+    seller_stake_pkh: String,
 }
 
-/// Decode V1/V2/V3 listing datum:
-/// `Constr 0 [ List<Payout>, Bytes(owner_pkh) ]`.
+/// Decode the Wayup listing datum:
+/// `Constr 0 [ List<Payout>, Bytes(owner_stake_cred) ]` — the
+/// same shape as jpg.store V1-V3 asks, except the owner bytes are
+/// the seller's stake credential.
 fn decode_listing_datum(cbor: &[u8]) -> Option<DecodedListing> {
     let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
     let outer = match pd {
@@ -343,21 +313,19 @@ fn decode_listing_datum(cbor: &[u8]) -> Option<DecodedListing> {
             .collect::<Vec<ListingPayout>>(),
         _ => return None,
     };
-    let seller_pkh = match &fields[1] {
+    let seller_stake_pkh = match &fields[1] {
         PlutusData::BoundedBytes(b) => hex::encode(&**b),
         _ => String::new(),
     };
     Some(DecodedListing {
         payouts,
-        seller_pkh,
+        seller_stake_pkh,
     })
 }
 
-/// One payout entry: `Constr 0 [ Address, Int ]` where Address
-/// is `Constr 0 [ payment_cred, stake_cred ]` and payment_cred
-/// is `Constr 0 [ Bytes(pkh) ]`. Stake credential is a nested
-/// Maybe of the same shape; we extract bytes when present,
-/// fall through to `None` when not.
+/// One payout entry: `Constr 0 [ Address, Int ]` where Address is
+/// `Constr 0 [ payment_cred, stake_cred ]` and payment_cred is
+/// `Constr 0 [ Bytes(pkh) ]`.
 fn decode_payout(pd: &PlutusData) -> Option<ListingPayout> {
     let constr = match pd {
         PlutusData::Constr(c) => c,
@@ -367,7 +335,6 @@ fn decode_payout(pd: &PlutusData) -> Option<ListingPayout> {
     if fields.len() < 2 {
         return None;
     }
-    // Address constructor 0 [payment_cred, stake_cred]
     let (payment_pkh, stake_pkh) = match &fields[0] {
         PlutusData::Constr(addr) => {
             let addr_fields: Vec<PlutusData> = addr.fields.clone().into();
@@ -403,16 +370,12 @@ fn decode_credential_bytes(pd: Option<&PlutusData>) -> Option<Vec<u8>> {
 }
 
 /// Optional stake credential: `Constr 0 [ Constr 0 [ Constr 0 [ Bytes ] ] ]`
-/// for `Just (StakingHash (KeyHash bytes))`. Returns `None` for
-/// `Nothing` (constructor 1) or shape mismatch.
+/// for `Just (StakingHash (KeyHash bytes))`; `None` for `Nothing`.
 fn decode_maybe_stake(pd: &PlutusData) -> Option<Vec<u8>> {
     let outer = match pd {
         PlutusData::Constr(c) => c,
         _ => return None,
     };
-    // `Just` constructor (0) wraps `StakingHash (KeyHash bytes)`.
-    // We unwrap one constr level at a time, taking the first
-    // field each time, until we hit a BoundedBytes.
     if outer.any_constructor.unwrap_or(0) != 0 {
         return None;
     }
@@ -431,13 +394,16 @@ fn decode_maybe_stake(pd: &PlutusData) -> Option<Vec<u8>> {
     None
 }
 
-/// Big-int → u64 (positive only — payouts are always positive
-/// lovelace amounts; negative inputs return `None`).
+/// Big-int → u64 (positive only).
 fn decode_bigint_u64(i: &pallas_primitives::BigInt) -> Option<u64> {
     match i {
         pallas_primitives::BigInt::Int(n) => {
             let v = i128::from(*n);
-            if v < 0 { None } else { u64::try_from(v).ok() }
+            if v < 0 {
+                None
+            } else {
+                u64::try_from(v).ok()
+            }
         }
         pallas_primitives::BigInt::BigUInt(b) => {
             let bytes: &[u8] = &**b;
@@ -479,6 +445,35 @@ impl Guest for Module {
             LOG_TARGET,
             &format!("init: enter (config_bytes={})", config.len()),
         );
+        if config.is_empty() {
+            return;
+        }
+        let cfg: Config = match ciborium::de::from_reader(config.as_slice()) {
+            Ok(c) => c,
+            Err(e) => {
+                logging::log(
+                    LogLevel::Error,
+                    LOG_TARGET,
+                    &format!("init: decode config failed: {e}"),
+                );
+                return;
+            }
+        };
+        match hex::decode(&cfg.payment_cred) {
+            Ok(bytes) if bytes.len() == 28 => {
+                let mut cred = [0u8; 28];
+                cred.copy_from_slice(&bytes);
+                SALE_PAYMENT_CRED.with(|c| *c.borrow_mut() = Some(cred));
+                logging::log(LogLevel::Info, LOG_TARGET, "init: payment cred stored");
+            }
+            _ => {
+                logging::log(
+                    LogLevel::Error,
+                    LOG_TARGET,
+                    &format!("init: invalid payment_cred `{}`", cfg.payment_cred),
+                );
+            }
+        }
     }
 
     fn handle_events(events: Vec<DispatchEvent>) {
@@ -494,15 +489,13 @@ impl Guest for Module {
     }
 
     fn update_interest(_op: InterestOp, _items_cbor: Vec<u8>) -> Result<(), String> {
-        // Interest is fully static (declared in <name>.toml); no
-        // runtime updates needed.
+        // Interest is fully static (declared in <name>.toml).
         Ok(())
     }
 
     /// No-op: event-driven modules are refilled host-side by
-    /// `run_bootstrap` over the manifest `[interest]`. See the
-    /// `rebootstrap` export in `wit-v2/world.wit`. One call,
-    /// immediately `done`.
+    /// `run_bootstrap` over the manifest `[interest]`
+    /// (`payment_credentials` → `utxos_by_payment_cred`).
     fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,

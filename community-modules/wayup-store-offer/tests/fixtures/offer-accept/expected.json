@@ -3,6 +3,7 @@
     "asset_name_hex": "4d656b616e69736d32323132",
     "bidder_pkh": "cba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad",
     "co_version": "V1",
+    "collection_offer": true,
     "kind": "accept",
     "policy": "ffa56051fda3d106a96f09c3d209d4bf24a117406fb813fb8b4548e3",
     "price_lovelace": 55000000,
