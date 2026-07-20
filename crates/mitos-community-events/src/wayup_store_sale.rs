@@ -43,8 +43,9 @@ pub struct Sale {
     pub buyer_address: String,
     /// The agreed payouts from the listing datum — total sale
     /// price is the sum of these lovelace amounts. Note Wayup's
-    /// platform fee (2%, 1–10 ADA) is paid on top by the buyer and
-    /// is not part of the datum payouts.
+    /// platform fee (2% of the buyer's total, min 1 ADA, no cap —
+    /// the datum pays the seller 98%, so the fee is `sum/49`) is paid
+    /// on top by the buyer and is not part of the datum payouts.
     pub payouts: Vec<ListingPayout>,
     /// Total sale price in lovelace (sum of payouts).
     pub price_lovelace: u64,
@@ -57,6 +58,14 @@ pub struct Sale {
     /// `None` for ordinary single-asset listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_size: Option<u32>,
+    /// `true` when this sale paid NO platform fee — the buy TX carried no
+    /// output to Wayup's fee address. Wayup waives the fee (via an authority
+    /// co-signature) for sellers holding ≥5 FunPlastic, and the waiver leaves
+    /// no marker on the listing, so the sale TX is the only place it's
+    /// observable. Consumers computing the buyer-paid total add the fee
+    /// (`price_lovelace / 49`, min 1 ADA) only when this is `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fee_waived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
