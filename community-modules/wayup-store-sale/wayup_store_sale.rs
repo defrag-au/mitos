@@ -21,9 +21,10 @@
 //! - The consumed listing's datum
 //!   (`Constr 0 [ payouts, owner_stake_cred ]`, hash-only —
 //!   revealed in the sale TX's witness set) gives the agreed
-//!   payouts; price = their sum. Wayup's platform fee (2%,
-//!   1-10 ADA) is paid on top by the buyer and is NOT part of
-//!   the payouts.
+//!   payouts; price = their sum. Wayup's platform fee (2% of the
+//!   buyer's total, min 1 ADA, no cap) is paid on top by the buyer
+//!   and is NOT part of the payouts — an absent fee output means the
+//!   fee was waived (`fee_waived` on the emitted `Sale`).
 //! - The asset moves to a non-listing output — the buyer. Offer
 //!   outputs created in the same TX (mixed buy+bid TXs exist)
 //!   carry no assets and never match.
@@ -50,10 +51,17 @@ struct Config {
     /// credential.
     #[serde(default)]
     payment_cred: String,
+    /// 56-char hex of Wayup's fee address payment credential
+    /// (hardcoded in the sale validator). A buy that pays no
+    /// output here had its platform fee waived — see `fee_waived`
+    /// on the emitted `Sale`.
+    #[serde(default)]
+    fee_payment_cred: String,
 }
 
 thread_local! {
     static SALE_PAYMENT_CRED: RefCell<Option<[u8; 28]>> = const { RefCell::new(None) };
+    static FEE_PAYMENT_CRED: RefCell<Option<[u8; 28]>> = const { RefCell::new(None) };
 }
 
 /// Extract a Shelley address's 28-byte payment credential.
@@ -76,6 +84,22 @@ fn is_listing_output(addr: &str) -> bool {
     })
 }
 
+/// Is this output paying Wayup's platform-fee address? When a buy TX has
+/// no such output the fee was waived (FunPlastic seller). `false` when the
+/// fee cred wasn't configured — the safe default keeps the standard fee.
+fn is_fee_output(addr: &str) -> bool {
+    FEE_PAYMENT_CRED.with(|c| match *c.borrow() {
+        Some(cred) => address_payment_cred(addr) == Some(cred),
+        None => false,
+    })
+}
+
+/// Whether the fee payment credential was configured. Without it we can't
+/// distinguish a waiver from a missed output, so `fee_waived` stays `false`.
+fn fee_cred_configured() -> bool {
+    FEE_PAYMENT_CRED.with(|c| c.borrow().is_some())
+}
+
 /// Sale-side state for one consumed listing UTxO.
 #[derive(Clone)]
 struct PendingSale {
@@ -95,6 +119,11 @@ struct TxBuffer {
     pending: BTreeMap<(Vec<u8>, Vec<u8>), PendingSale>,
     /// Produced outputs buffered for buyer matching at flush.
     produced: Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>,
+    /// Did this TX pay an output to Wayup's fee address? When the fee
+    /// cred is configured and no such output exists, the fee was waived
+    /// (the co-signature mechanism is all-or-nothing per TX, so this
+    /// applies uniformly to every sale in the TX).
+    saw_fee_output: bool,
     tx_hash: Option<Vec<u8>>,
 }
 
@@ -128,8 +157,7 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
         return;
     };
     let price_lovelace = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
-    let bundle_size =
-        (c.prior_output.assets.len() > 1).then(|| c.prior_output.assets.len() as u32);
+    let bundle_size = (c.prior_output.assets.len() > 1).then(|| c.prior_output.assets.len() as u32);
     for entry in &c.prior_output.assets {
         buf.pending.insert(
             (entry.asset.policy.clone(), entry.asset.name.clone()),
@@ -146,6 +174,12 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
 fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
     if buf.tx_hash.is_none() {
         buf.tx_hash = Some(p.tx_hash.clone());
+    }
+    // Note any payment to Wayup's fee address (ADA-only) before the
+    // asset/listing filters drop it — its presence/absence is how we
+    // detect a fee waiver at flush.
+    if is_fee_output(&p.output.address) {
+        buf.saw_fee_output = true;
     }
     // Skip outputs back at the sale credential — those are listing
     // updates (the listing module's domain). Sales deliver the
@@ -171,6 +205,10 @@ fn flush_buffer(buf: TxBuffer) {
     let tx_hash_hex = hex::encode(&tx_hash);
     let mut pending = buf.pending;
 
+    // A waiver = fee cred configured AND no fee output seen this TX. If the
+    // cred isn't configured we can't tell, so assume the standard fee.
+    let fee_waived = fee_cred_configured() && !buf.saw_fee_output;
+
     for (buyer_address, assets) in buf.produced {
         for asset_key in assets {
             let Some(sale) = pending.remove(&asset_key) else {
@@ -187,6 +225,7 @@ fn flush_buffer(buf: TxBuffer) {
                 price_lovelace: sale.price_lovelace,
                 contract_version: WayupStoreContractVersion::V1,
                 bundle_size: sale.bundle_size,
+                fee_waived,
             }));
         }
     }
@@ -415,6 +454,25 @@ impl Guest for Module {
                     LOG_TARGET,
                     &format!("init: invalid payment_cred `{}`", cfg.payment_cred),
                 );
+            }
+        }
+        // Optional: fee address payment cred for waiver detection. Absent =
+        // waiver detection off (fee_waived stays false), not an error.
+        if !cfg.fee_payment_cred.is_empty() {
+            match hex::decode(&cfg.fee_payment_cred) {
+                Ok(bytes) if bytes.len() == 28 => {
+                    let mut cred = [0u8; 28];
+                    cred.copy_from_slice(&bytes);
+                    FEE_PAYMENT_CRED.with(|c| *c.borrow_mut() = Some(cred));
+                    logging::log(LogLevel::Info, LOG_TARGET, "init: fee cred stored");
+                }
+                _ => {
+                    logging::log(
+                        LogLevel::Error,
+                        LOG_TARGET,
+                        &format!("init: invalid fee_payment_cred `{}`", cfg.fee_payment_cred),
+                    );
+                }
             }
         }
     }

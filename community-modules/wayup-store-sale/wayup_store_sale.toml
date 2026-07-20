@@ -11,6 +11,10 @@ abi_version = 2
 # hash: listing UTxOs share this payment credential but embed the
 # seller's own stake key as the staking part.
 payment_cred = "a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"
+# Wayup's fee address payment credential (hardcoded in the sale
+# validator). A buy TX with no output here had its platform fee
+# waived (FunPlastic seller) → the emitted Sale sets `fee_waived`.
+fee_payment_cred = "5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283"
 
 [interest]
 # Watch by payment credential (NOT a full address) — the staking
