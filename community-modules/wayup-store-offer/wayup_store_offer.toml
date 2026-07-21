@@ -25,8 +25,10 @@ payment_credentials = [
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
-pallas-primitives = "1.0.0-alpha.6"
-pallas-codec = "1.0.0-alpha.6"
+# Offer datum decode + accept matching live in the shared marketplace crate (the
+# single source of truth also used by the cnft.dev-workers firehose); it pulls
+# pallas-primitives / pallas-codec transitively.
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
 # bech32 → payment-credential extraction (identify offer outputs;
 # the staking part varies per bidder so a string compare won't do).
 pallas-addresses = "1.0.0-alpha.6"

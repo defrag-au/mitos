@@ -41,8 +41,11 @@ use std::collections::HashMap;
 use mitos_community_events::wayup_store_offer::{
     OfferAccept, OfferCancel, OfferCreate, OfferUpdate, WayupStoreOffer, WayupStoreOfferVersion,
 };
+use mitos_marketplace_decode::{
+    decode_wayup_offer_accepts, decode_wayup_offer_datum, AssetId, DecodeTx, DecodedOffer, TxInput,
+    TxOutput, WayupOfferConfig,
+};
 use pallas_addresses::{Address, ShelleyPaymentPart};
-use pallas_primitives::{Constr, PlutusData};
 use serde::Deserialize;
 
 use crate::mitos::platform_v2::chain_data;
@@ -91,130 +94,11 @@ fn is_offer_output(addr: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone)]
-struct DecodedOfferDatum {
-    bidder_pkh: String,
-    target_policy: Option<String>,
-    target_asset_names: Vec<String>,
-    /// Payment credential of the NFT-payout recipient (the
-    /// bidder's wallet). An Accept must deliver the asset to
-    /// *this* address — distinguishing the genuine delivery from
-    /// other outputs that coincidentally carry the target policy
-    /// (the seller's change, or — in a batched TX — a listing of
-    /// another asset from the same collection to the sale script).
-    target_recipient: Option<[u8; 28]>,
-}
-
-/// Decode a Wayup offer datum: `Constr0[bidder_owner_key,
-/// [payout...]]`. Same shape as jpg.store's, except the target
-/// NFT payout is found by scanning for a non-ADA policy rather
-/// than taking the last payout.
-fn decode_offer_datum(cbor: &[u8]) -> Option<DecodedOfferDatum> {
-    let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
-    let PlutusData::Constr(constr) = pd else {
-        return None;
-    };
-    if !is_constructor_zero(&constr) {
-        return None;
-    }
-    let fields: Vec<PlutusData> = constr.fields.into();
-    if fields.len() != 2 {
-        return None;
-    }
-    let bidder_pkh = match &fields[0] {
-        PlutusData::BoundedBytes(b) if b.len() == 28 => hex::encode(&**b),
-        _ => return None,
-    };
-    // Scan all payouts for the one carrying a non-ADA (28-byte)
-    // policy key — the buyer payout (fee/royalty payouts carry
-    // the empty ADA policy and yield `None`).
-    let (target_policy, target_asset_names, target_recipient) = match &fields[1] {
-        PlutusData::Array(payouts) => payouts
-            .iter()
-            .find_map(extract_payout_target)
-            .map(|(p, n, r)| (Some(p), n, Some(r)))
-            .unwrap_or((None, Vec::new(), None)),
-        _ => (None, Vec::new(), None),
-    };
-    Some(DecodedOfferDatum {
-        bidder_pkh,
-        target_policy,
-        target_asset_names,
-        target_recipient,
-    })
-}
-
-fn is_constructor_zero(c: &Constr<PlutusData>) -> bool {
-    c.tag == 121 && c.any_constructor.is_none()
-}
-
-/// A payout is `Constr0[Address, Value]` where `Value` is
-/// `Map<PolicyId, Constr0[flag, Map<AssetName, qty>]>`. For the
-/// buyer payout (value map carries a 28-byte non-ADA policy key)
-/// returns `(policy_hex, asset_names, recipient_payment_cred)`;
-/// `None` for ADA fee/royalty payouts.
-fn extract_payout_target(payout: &PlutusData) -> Option<(String, Vec<String>, [u8; 28])> {
-    let PlutusData::Constr(constr) = payout else {
-        return None;
-    };
-    if !is_constructor_zero(constr) || constr.fields.len() != 2 {
-        return None;
-    }
-    let PlutusData::Map(pairs) = &constr.fields[1] else {
-        return None;
-    };
-    let (policy_hex, names) = pairs.iter().find_map(|(k, v)| match k {
-        PlutusData::BoundedBytes(b) if b.len() == 28 => {
-            Some((hex::encode(&**b), extract_asset_names(v)))
-        }
-        _ => None,
-    })?;
-    // Address is `constr.fields[0]` = Constr0[Credential, Maybe<Staking>].
-    let recipient = extract_address_payment_cred(&constr.fields[0])?;
-    Some((policy_hex, names, recipient))
-}
-
-/// Payment credential (28 bytes) from a Plutus `Address`
-/// (`Constr[Credential, ...]`, where `Credential` is
-/// `Constr0[pkh]` for a key or `Constr1[hash]` for a script).
-fn extract_address_payment_cred(addr: &PlutusData) -> Option<[u8; 28]> {
-    let PlutusData::Constr(c) = addr else {
-        return None;
-    };
-    let PlutusData::Constr(cred) = c.fields.first()? else {
-        return None;
-    };
-    let bytes = cred.fields.iter().find_map(|f| match f {
-        PlutusData::BoundedBytes(b) if b.len() == 28 => Some(b),
-        _ => None,
-    })?;
-    let mut out = [0u8; 28];
-    out.copy_from_slice(bytes);
-    Some(out)
-}
-
-/// Asset names from a value entry `Constr0[flag, Map<name, qty>]`.
-/// Empty map ⇒ collection-wide (flag=1); populated ⇒
-/// asset-specific (flag=0, the names listed).
-fn extract_asset_names(v: &PlutusData) -> Vec<String> {
-    let PlutusData::Constr(constr) = v else {
-        return Vec::new();
-    };
-    let inner_map = constr.fields.iter().find_map(|f| match f {
-        PlutusData::Map(m) => Some(m),
-        _ => None,
-    });
-    let Some(pairs) = inner_map else {
-        return Vec::new();
-    };
-    pairs
-        .iter()
-        .filter_map(|(k, _)| match k {
-            PlutusData::BoundedBytes(b) => Some(hex::encode(&**b)),
-            _ => None,
-        })
-        .collect()
-}
+/// The Wayup CO datum decode (`Constr0[bidder_key, [payout...]]`, scan-all-payouts
+/// target extraction + recipient credential) lives in the shared
+/// `mitos-marketplace-decode` crate — the single source of truth reused by the
+/// `cnft.dev-workers` firehose — as [`decode_wayup_offer_datum`], returning
+/// [`DecodedOffer`]. This module resolves the datum bytes and calls it.
 
 /// Resolve datum bytes: host payload first (inline / witness-set
 /// / `DATUM_NS`), else the `datum_by_hash` side-door. Wayup has
@@ -232,10 +116,14 @@ fn resolve_datum_bytes(datum: &TypedDatum) -> Option<Vec<u8>> {
 
 #[derive(Clone)]
 struct ConsumedOffer {
+    /// The consumed offer UTxO's address + raw datum — carried so `flush_buffer`
+    /// can rebuild the neutral `DecodeTx` the crate's accept decode consumes.
+    address: String,
+    prior_datum_bytes: Vec<u8>,
     prior_tx_hash: Vec<u8>,
     prior_output_index: u32,
     prior_lovelace: u64,
-    decoded: DecodedOfferDatum,
+    decoded: DecodedOffer,
 }
 
 #[derive(Clone)]
@@ -244,7 +132,7 @@ struct ProducedOffer {
     output_index: u32,
     lovelace: u64,
     datum_bytes: Vec<u8>,
-    decoded: DecodedOfferDatum,
+    decoded: DecodedOffer,
 }
 
 /// Produced output at a non-offer address — a potential
@@ -285,7 +173,7 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
         let Some(datum_bytes) = resolve_datum_bytes(datum) else {
             return;
         };
-        let Some(decoded) = decode_offer_datum(&datum_bytes) else {
+        let Some(decoded) = decode_wayup_offer_datum(&datum_bytes) else {
             return;
         };
         buf.produced_offers.push(ProducedOffer {
@@ -324,10 +212,12 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     let Some(datum_bytes) = resolve_datum_bytes(prior_datum) else {
         return;
     };
-    let Some(decoded) = decode_offer_datum(&datum_bytes) else {
+    let Some(decoded) = decode_wayup_offer_datum(&datum_bytes) else {
         return;
     };
     buf.consumed_offers.push(ConsumedOffer {
+        address: c.prior_output.address.clone(),
+        prior_datum_bytes: datum_bytes,
         prior_tx_hash: c.oref.tx_hash.clone(),
         prior_output_index: c.oref.index,
         prior_lovelace: c.prior_output.lovelace,
@@ -369,6 +259,56 @@ fn flush_buffer(mut buf: TxBuffer) {
             && produce_count.get(pkh).copied().unwrap_or(0) == 1
     };
 
+    // Decode the tx's offer-accepts with the shared crate — the single source of
+    // truth (also used by the `cnft.dev-workers` firehose) for the accept-vs-
+    // cancel discrimination (bidder-signed ⇒ cancel; else asset delivered to the
+    // bidder's own wallet ⇒ accept). We rebuild the neutral `DecodeTx` from the
+    // buffered consumes, the non-offer produced outputs, and the tx's required
+    // signers, then index the accepts by the consumed offer's oref. A consume
+    // with no crate accept (and not an Update) is a Cancel.
+    let offer_cfg = OFFER_PAYMENT_CRED.with(|c| {
+        c.borrow()
+            .map(|cred| WayupOfferConfig::from_hex(&hex::encode(cred)))
+            .unwrap_or_default()
+    });
+    let accept_tx = DecodeTx {
+        tx_hash: tx_hash.clone(),
+        inputs: consumed
+            .iter()
+            .map(|c| TxInput {
+                address: c.address.clone(),
+                lovelace: c.prior_lovelace,
+                assets: Vec::new(),
+                datum: Some(c.prior_datum_bytes.clone()),
+                redeemer: None,
+                oref_tx_hash: c.prior_tx_hash.clone(),
+                oref_index: c.prior_output_index,
+            })
+            .collect(),
+        outputs: buf
+            .produced_other
+            .iter()
+            .map(|o| TxOutput {
+                address: o.address.clone(),
+                lovelace: 0,
+                assets: o
+                    .assets
+                    .iter()
+                    .map(|(policy, name)| AssetId {
+                        policy: policy.clone(),
+                        name: name.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        required_signers: buf.required_signers.clone(),
+    };
+    let mut crate_accepts: HashMap<(String, u32), OfferAccept> =
+        decode_wayup_offer_accepts(&accept_tx, &offer_cfg)
+            .into_iter()
+            .map(|a| ((a.prior_tx_hash.clone(), a.prior_output_index), a))
+            .collect();
+
     // Step 1: each consumed offer → Update (paired), Accept
     // (asset delivered + bidder didn't sign), or Cancel.
     for consume in consumed {
@@ -396,45 +336,21 @@ fn flush_buffer(mut buf: TxBuffer) {
             continue;
         }
 
-        // Accept vs Cancel. Redeemer is identical (`d87a80`) for
-        // both, so discriminate on (a) whether the bidder's owner
-        // key signed — only a cancel needs the bidder's signature
-        // to reclaim — and (b) whether a target-policy asset was
-        // delivered to a non-offer output (only an accept moves
-        // an NFT). Accept requires both NOT-signed and delivered;
-        // everything else is a Cancel.
-        let bidder_signed = bidder_in_signers(&bidder_pkh, &buf.required_signers);
-        let delivered = if bidder_signed {
-            None
+        // Accept vs Cancel: the shared crate discriminated them (bidder-signed ⇒
+        // cancel; else delivery to the bidder's wallet ⇒ accept). A crate accept
+        // keyed on this consume's oref ⇒ emit it; otherwise it's a Cancel.
+        let key = (hex::encode(&consume.prior_tx_hash), consume.prior_output_index);
+        if let Some(accept) = crate_accepts.remove(&key) {
+            emit_offer(&WayupStoreOffer::Accept(accept));
         } else {
-            find_delivered_asset(&consume.decoded, &buf.produced_other)
-        };
-
-        match delivered {
-            Some((policy, asset_name_hex)) => {
-                emit_offer(&WayupStoreOffer::Accept(OfferAccept {
-                    bidder_pkh,
-                    tx_hash: tx_hash_hex.clone(),
-                    prior_tx_hash: hex::encode(&consume.prior_tx_hash),
-                    prior_output_index: consume.prior_output_index,
-                    policy,
-                    asset_name_hex,
-                    price_lovelace: consume.prior_lovelace,
-                    seller_address: String::new(),
-                    co_version: WayupStoreOfferVersion::V1,
-                    collection_offer: consume.decoded.target_asset_names.is_empty(),
-                }));
-            }
-            None => {
-                emit_offer(&WayupStoreOffer::Cancel(OfferCancel {
-                    bidder_pkh,
-                    tx_hash: tx_hash_hex.clone(),
-                    prior_tx_hash: hex::encode(&consume.prior_tx_hash),
-                    prior_output_index: consume.prior_output_index,
-                    target_policy: consume.decoded.target_policy,
-                    co_version: WayupStoreOfferVersion::V1,
-                }));
-            }
+            emit_offer(&WayupStoreOffer::Cancel(OfferCancel {
+                bidder_pkh,
+                tx_hash: tx_hash_hex.clone(),
+                prior_tx_hash: hex::encode(&consume.prior_tx_hash),
+                prior_output_index: consume.prior_output_index,
+                target_policy: consume.decoded.target_policy,
+                co_version: WayupStoreOfferVersion::V1,
+            }));
         }
     }
 
@@ -452,60 +368,6 @@ fn flush_buffer(mut buf: TxBuffer) {
             co_version: WayupStoreOfferVersion::V1,
         }));
     }
-}
-
-/// Is the bidder's owner key (hex) among the TX's required
-/// signers?
-fn bidder_in_signers(bidder_pkh: &str, signers: &[Vec<u8>]) -> bool {
-    let Ok(bidder) = hex::decode(bidder_pkh) else {
-        return false;
-    };
-    signers.iter().any(|s| s.as_slice() == bidder.as_slice())
-}
-
-/// Find the produced output that delivered the offer's target
-/// asset **to the bidder** (the datum's NFT-payout recipient).
-/// Matching on the recipient's payment credential — not just the
-/// policy — is what excludes the seller's change and, in a
-/// batched TX, a listing of another asset from the same
-/// collection. Collection-wide offers accept any asset under
-/// `target_policy`; asset-specific offers require the asset name
-/// to be in the allow-list. Returns `(policy_hex, asset_name_hex)`.
-fn find_delivered_asset(
-    decoded: &DecodedOfferDatum,
-    produced_other: &[ProducedNonScript],
-) -> Option<(String, String)> {
-    let target_policy = decoded.target_policy.as_deref()?;
-    let target_policy_bytes = hex::decode(target_policy).ok()?;
-    let target_recipient = decoded.target_recipient?;
-    let target_asset_set: Option<Vec<Vec<u8>>> = if decoded.target_asset_names.is_empty() {
-        None
-    } else {
-        Some(
-            decoded
-                .target_asset_names
-                .iter()
-                .filter_map(|n| hex::decode(n).ok())
-                .collect(),
-        )
-    };
-    for out in produced_other {
-        if address_payment_cred(&out.address) != Some(target_recipient) {
-            continue;
-        }
-        for (policy, name) in &out.assets {
-            if policy.as_slice() != target_policy_bytes.as_slice() {
-                continue;
-            }
-            if let Some(ref set) = target_asset_set
-                && !set.iter().any(|n| n.as_slice() == name.as_slice())
-            {
-                continue;
-            }
-            return Some((target_policy.to_owned(), hex::encode(name)));
-        }
-    }
-    None
 }
 
 fn emit_offer(event: &WayupStoreOffer) {

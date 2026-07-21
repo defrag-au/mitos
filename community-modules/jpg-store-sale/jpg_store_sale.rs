@@ -57,6 +57,8 @@ fn build_input(c: &ConsumedEvent) -> TxInput {
         assets: to_asset_ids(&c.prior_output.assets),
         datum,
         redeemer: c.redeemer.clone(),
+        // Sale decode ignores the spent UTxO's oref (offer-accepts use it).
+        ..Default::default()
     }
 }
 

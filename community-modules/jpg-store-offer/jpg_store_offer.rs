@@ -42,17 +42,18 @@ use std::collections::HashMap;
 use mitos_community_events::jpg_store_offer::{
     JpgStoreOffer, JpgStoreOfferVersion, OfferAccept, OfferCancel, OfferCreate, OfferUpdate,
 };
+use mitos_marketplace_decode::{
+    decode_jpg_offer_accepts, decode_jpg_offer_datum, AssetId, DecodeTx, DecodedOffer, TxInput,
+    TxOutput,
+};
 use pallas_codec::minicbor::data::Type;
 use pallas_crypto::hash::Hasher;
-use pallas_primitives::{Constr, PlutusData};
 use serde::Deserialize;
 
 use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
-use crate::mitos::platform_v2::types::{
-    ConsumedEvent, ProducedEvent, TypedDatum, UtxoEvent,
-};
+use crate::mitos::platform_v2::types::{ConsumedEvent, ProducedEvent, UtxoEvent};
 
 const LOG_TARGET: &str = "jpg-store-offer-module";
 
@@ -95,95 +96,11 @@ fn watched_version(addr: &str) -> Option<JpgStoreOfferVersion> {
     None
 }
 
-#[derive(Debug, Clone)]
-struct DecodedOfferDatum {
-    bidder_pkh: String,
-    target_policy: Option<String>,
-    target_asset_names: Vec<String>,
-}
-
-/// Decode a jpg.store CO datum (same wire shape as the
-/// existing `jpg-co` module).
-fn decode_offer_datum(cbor: &[u8]) -> Option<DecodedOfferDatum> {
-    let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
-    let constr = match pd {
-        PlutusData::Constr(c) => c,
-        _ => return None,
-    };
-    if !is_constructor_zero(&constr) {
-        return None;
-    }
-    let fields: Vec<PlutusData> = constr.fields.into();
-    if fields.len() != 2 {
-        return None;
-    }
-    let bidder_pkh = match &fields[0] {
-        PlutusData::BoundedBytes(b) if b.len() == 28 => hex::encode(&**b),
-        _ => return None,
-    };
-    let (target_policy, target_asset_names) = match &fields[1] {
-        PlutusData::Array(payouts) => payouts
-            .last()
-            .map(extract_target_policy_and_assets)
-            .unwrap_or_default(),
-        _ => Default::default(),
-    };
-    Some(DecodedOfferDatum {
-        bidder_pkh,
-        target_policy,
-        target_asset_names,
-    })
-}
-
-fn is_constructor_zero(c: &Constr<PlutusData>) -> bool {
-    c.tag == 121 && c.any_constructor.is_none()
-}
-
-fn extract_target_policy_and_assets(payout: &PlutusData) -> (Option<String>, Vec<String>) {
-    let constr = match payout {
-        PlutusData::Constr(c) => c,
-        _ => return Default::default(),
-    };
-    if !is_constructor_zero(constr) || constr.fields.len() != 2 {
-        return Default::default();
-    }
-    let pairs = match &constr.fields[1] {
-        PlutusData::Map(m) => m,
-        _ => return Default::default(),
-    };
-    for (k, v) in pairs.iter() {
-        let PlutusData::BoundedBytes(policy_bytes) = k else {
-            continue;
-        };
-        if policy_bytes.len() != 28 {
-            continue;
-        }
-        let policy_hex = hex::encode(&**policy_bytes);
-        let asset_names = extract_asset_names(v);
-        return (Some(policy_hex), asset_names);
-    }
-    Default::default()
-}
-
-fn extract_asset_names(v: &PlutusData) -> Vec<String> {
-    let PlutusData::Constr(constr) = v else {
-        return Vec::new();
-    };
-    let inner_map = constr.fields.iter().find_map(|f| match f {
-        PlutusData::Map(m) => Some(m),
-        _ => None,
-    });
-    let Some(pairs) = inner_map else {
-        return Vec::new();
-    };
-    pairs
-        .iter()
-        .filter_map(|(k, _)| match k {
-            PlutusData::BoundedBytes(b) => Some(hex::encode(&**b)),
-            _ => None,
-        })
-        .collect()
-}
+/// The CO datum decode (`Constr0[bidder_pkh, [payout...]]`, jpg's last-payout
+/// target extraction) lives in the shared `mitos-marketplace-decode` crate —
+/// the single source of truth reused by the `cnft.dev-workers` firehose — as
+/// [`decode_jpg_offer_datum`], returning [`DecodedOffer`]. This module resolves
+/// the datum bytes (labels-50+ recovery below) and calls it.
 
 /// Resolve datum bytes for an event. Host populates `payload`
 /// when it could resolve (inline / witness-set); when empty,
@@ -319,13 +236,16 @@ fn extract_metadata_entries(
 /// whether to emit Cancel or Accept.
 #[derive(Clone)]
 struct ConsumedOffer {
+    /// The consumed offer UTxO's on-chain address — carried so `flush_buffer`
+    /// can rebuild the neutral `DecodeTx` the crate's accept decode consumes.
+    address: String,
     prior_tx_hash: Vec<u8>,
     prior_output_index: u32,
     prior_datum_bytes: Vec<u8>,
     prior_lovelace: u64,
     redeemer: Option<Vec<u8>>,
     co_version: JpgStoreOfferVersion,
-    decoded: DecodedOfferDatum,
+    decoded: DecodedOffer,
 }
 
 /// One Produced event at a watched offer address. Used both
@@ -337,7 +257,7 @@ struct ProducedOffer {
     lovelace: u64,
     datum_bytes: Vec<u8>,
     co_version: JpgStoreOfferVersion,
-    decoded: DecodedOfferDatum,
+    decoded: DecodedOffer,
 }
 
 /// Captured Produced events at non-script addresses. Used at
@@ -390,7 +310,7 @@ fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
         else {
             return;
         };
-        let Some(decoded) = decode_offer_datum(&datum_bytes) else {
+        let Some(decoded) = decode_jpg_offer_datum(&datum_bytes) else {
             return;
         };
         buf.produced_offers.push(ProducedOffer {
@@ -437,10 +357,11 @@ fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
     ) else {
         return;
     };
-    let Some(decoded) = decode_offer_datum(&datum_bytes) else {
+    let Some(decoded) = decode_jpg_offer_datum(&datum_bytes) else {
         return;
     };
     buf.consumed_offers.push(ConsumedOffer {
+        address: c.prior_output.address.clone(),
         prior_tx_hash: c.oref.tx_hash.clone(),
         prior_output_index: c.oref.index,
         prior_datum_bytes: datum_bytes,
@@ -499,6 +420,51 @@ fn flush_buffer(mut buf: TxBuffer) {
             && produce_count.get(pkh).copied().unwrap_or(0) == 1
     };
 
+    // Decode the tx's offer-accepts with the shared crate — the single source of
+    // truth (also used by the `cnft.dev-workers` firehose) for the
+    // find-delivered-asset matching. We rebuild the neutral `DecodeTx` from the
+    // buffered consumes (the spent offers) and non-script produced outputs (the
+    // candidate deliveries), then index the results by the consumed offer's oref
+    // so the per-consume Accept branch below can look each one up. Updates are
+    // handled before the Accept branch and never deliver an NFT, so they produce
+    // no crate accept.
+    let accept_tx = DecodeTx {
+        tx_hash: tx_hash.clone(),
+        inputs: consumed
+            .iter()
+            .map(|c| TxInput {
+                address: c.address.clone(),
+                lovelace: c.prior_lovelace,
+                assets: Vec::new(),
+                datum: Some(c.prior_datum_bytes.clone()),
+                redeemer: c.redeemer.clone(),
+                oref_tx_hash: c.prior_tx_hash.clone(),
+                oref_index: c.prior_output_index,
+            })
+            .collect(),
+        outputs: buf
+            .produced_other
+            .iter()
+            .map(|o| TxOutput {
+                address: o.address.clone(),
+                lovelace: o.lovelace,
+                assets: o
+                    .assets
+                    .iter()
+                    .map(|(policy, name)| AssetId {
+                        policy: policy.clone(),
+                        name: name.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        required_signers: Vec::new(),
+    };
+    let mut crate_accepts: HashMap<(String, u32), OfferAccept> = decode_jpg_offer_accepts(&accept_tx)
+        .into_iter()
+        .map(|a| ((a.prior_tx_hash.clone(), a.prior_output_index), a))
+        .collect();
+
     // Step 1: walk consumed offers. Each one is either an
     // Update (paired 1:1 with a produced offer for the same
     // bidder), an Accept (target asset appears at a non-script
@@ -554,75 +520,14 @@ fn flush_buffer(mut buf: TxBuffer) {
             continue;
         }
 
-        // Accept: find the produced non-script output that
-        // received an asset matching the offer's target. For
-        // a collection-wide offer (no asset names), any asset
-        // under `target_policy` qualifies; for an asset-
-        // specific offer the asset_name must be in the allow-
-        // list.
-        let target_policy = match &consume.decoded.target_policy {
-            Some(p) => p.clone(),
-            None => {
-                // No target policy means the datum's payouts
-                // didn't yield one — fall through to a
-                // policy-less Accept emission so consumers
-                // see the lifecycle event even without the
-                // delivered asset details.
-                emit_accept_partial(&bidder_pkh, &tx_hash_hex, &consume);
-                continue;
-            }
-        };
-        let target_policy_bytes = match hex::decode(&target_policy) {
-            Ok(b) => b,
-            Err(_) => {
-                emit_accept_partial(&bidder_pkh, &tx_hash_hex, &consume);
-                continue;
-            }
-        };
-        let target_asset_set: Option<Vec<Vec<u8>>> =
-            if consume.decoded.target_asset_names.is_empty() {
-                None
-            } else {
-                Some(
-                    consume
-                        .decoded
-                        .target_asset_names
-                        .iter()
-                        .filter_map(|n| hex::decode(n).ok())
-                        .collect(),
-                )
-            };
-        let mut emitted = false;
-        for out in &buf.produced_other {
-            for (policy, name) in &out.assets {
-                if policy.as_slice() != target_policy_bytes.as_slice() {
-                    continue;
-                }
-                if let Some(ref set) = target_asset_set
-                    && !set.iter().any(|n| n.as_slice() == name.as_slice())
-                {
-                    continue;
-                }
-                emit_offer(&JpgStoreOffer::Accept(OfferAccept {
-                    bidder_pkh: bidder_pkh.clone(),
-                    tx_hash: tx_hash_hex.clone(),
-                    prior_tx_hash: hex::encode(&consume.prior_tx_hash),
-                    prior_output_index: consume.prior_output_index,
-                    policy: target_policy.clone(),
-                    asset_name_hex: hex::encode(name),
-                    price_lovelace: consume.prior_lovelace,
-                    seller_address: out.address.clone(),
-                    co_version: consume.co_version,
-                    collection_offer: consume.decoded.target_asset_names.is_empty(),
-                }));
-                emitted = true;
-                break;
-            }
-            if emitted {
-                break;
-            }
-        }
-        if !emitted {
+        // Accept: the shared crate found which delivered asset matches this
+        // offer's target (keyed by the consumed offer's oref). When it did, emit
+        // that Accept; when it couldn't identify the asset, fall back to a
+        // partial Accept so the lifecycle event isn't lost.
+        let key = (hex::encode(&consume.prior_tx_hash), consume.prior_output_index);
+        if let Some(accept) = crate_accepts.remove(&key) {
+            emit_offer(&JpgStoreOffer::Accept(accept));
+        } else {
             // Couldn't match the asset — emit a partial
             // Accept so the lifecycle event isn't lost.
             emit_accept_partial(&bidder_pkh, &tx_hash_hex, &consume);
