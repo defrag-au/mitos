@@ -25,8 +25,7 @@ payment_credentials = [
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
-pallas-primitives = "1.0.0-alpha.6"
-pallas-codec = "1.0.0-alpha.6"
-# bech32 → payment-credential extraction (identify listing outputs;
-# the staking part varies per seller so a string compare won't do).
-pallas-addresses = "1.0.0-alpha.6"
+# Redeemer + listing-datum decode, address-credential matching, and fee-waiver
+# detection all live in the shared marketplace crate; it pulls pallas-primitives
+# / pallas-codec / pallas-addresses transitively.
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }

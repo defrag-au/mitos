@@ -19,6 +19,7 @@ members = [
     "crates/mitos-module-kit",
     "crates/mitos-dex-decode",
     "crates/mitos-vesting-decode",
+    "crates/mitos-marketplace-decode",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",

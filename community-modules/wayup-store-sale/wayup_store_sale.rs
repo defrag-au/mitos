@@ -1,42 +1,22 @@
 //! Wayup fixed-price sale community module.
 //!
-//! Emits `WayupStoreSale::Sale` when a Wayup listing is bought.
-//! Listing lifecycle events (create/update/unlisting) live in the
-//! sibling `wayup-store-listing` module; offer (bid) lifecycle in
-//! `wayup-store-offer`, whose `Accept` is the bid-side sale.
+//! Emits `WayupStoreSale::Sale` when a Wayup listing is bought. All
+//! decode/matching logic (including fee-waiver detection) lives in the shared
+//! `mitos-marketplace-decode` crate — the single source of truth reused by the
+//! `cnft.dev-workers` historical backfill. This module is a thin adapter: it
+//! holds the sale/fee credentials from `init`, maps dispatch events into the
+//! crate's neutral `DecodeTx` (resolving datum hashes via the host), and emits
+//! what the crate returns.
 //!
-//! ## Detection
-//!
-//! Wayup listing UTxOs sit at addresses sharing the sale
-//! validator's payment credential (`a76f0fb8…`) with a per-seller
-//! staking part, so classification is by payment credential.
-//!
-//! - `Consumed` at the sale credential with a Buy redeemer —
-//!   constructor 0 with one uint field that varies per spend (an
-//!   input index: `d8799f00ff`, `d8799f09ff`, … observed in
-//!   mainnet sweep `4edc97fd…` buying 4 listings with fields
-//!   0/3/6/9). Matching is on the `d879` constructor prefix,
-//!   never the full bytes. Cancel spends (constructor 1,
-//!   `d87a80`) are the listing module's domain.
-//! - The consumed listing's datum
-//!   (`Constr 0 [ payouts, owner_stake_cred ]`, hash-only —
-//!   revealed in the sale TX's witness set) gives the agreed
-//!   payouts; price = their sum. Wayup's platform fee (2% of the
-//!   buyer's total, min 1 ADA, no cap) is paid on top by the buyer
-//!   and is NOT part of the payouts — an absent fee output means the
-//!   fee was waived (`fee_waived` on the emitted `Sale`).
-//! - The asset moves to a non-listing output — the buyer. Offer
-//!   outputs created in the same TX (mixed buy+bid TXs exist)
-//!   carry no assets and never match.
+//! Listing lifecycle events live in `wayup-store-listing`; offer (bid) lifecycle
+//! in `wayup-store-offer`, whose `Accept` is the bid-side sale.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 
-use mitos_community_events::wayup_store_sale::{
-    ListingPayout, Sale, WayupStoreContractVersion, WayupStoreSale,
+use mitos_community_events::wayup_store_sale::WayupStoreSale;
+use mitos_marketplace_decode::{
+    AssetId, DecodeTx, TxInput, TxOutput, WayupSaleConfig, decode_wayup_sales, is_buy_redeemer,
 };
-use pallas_addresses::{Address, ShelleyPaymentPart};
-use pallas_primitives::PlutusData;
 use serde::Deserialize;
 
 use crate::mitos::platform_v2::emit;
@@ -47,199 +27,56 @@ const LOG_TARGET: &str = "wayup-store-sale-module";
 
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
-    /// 56-char hex of the Wayup sale validator's payment
-    /// credential.
+    /// 56-char hex of the Wayup sale validator's payment credential.
     #[serde(default)]
     payment_cred: String,
-    /// 56-char hex of Wayup's fee address payment credential
-    /// (hardcoded in the sale validator). A buy that pays no
-    /// output here had its platform fee waived — see `fee_waived`
-    /// on the emitted `Sale`.
+    /// 56-char hex of Wayup's fee-address payment credential. A buy that pays
+    /// no output here had its platform fee waived (see `fee_waived`).
     #[serde(default)]
     fee_payment_cred: String,
 }
 
 thread_local! {
-    static SALE_PAYMENT_CRED: RefCell<Option<[u8; 28]>> = const { RefCell::new(None) };
-    static FEE_PAYMENT_CRED: RefCell<Option<[u8; 28]>> = const { RefCell::new(None) };
+    static SALE_CONFIG: RefCell<WayupSaleConfig> = RefCell::new(WayupSaleConfig::default());
 }
 
-/// Extract a Shelley address's 28-byte payment credential.
-fn address_payment_cred(addr: &str) -> Option<[u8; 28]> {
-    let Ok(Address::Shelley(s)) = Address::from_bech32(addr) else {
-        return None;
-    };
-    let cred: [u8; 28] = match s.payment() {
-        ShelleyPaymentPart::Key(h) => **h,
-        ShelleyPaymentPart::Script(h) => **h,
-    };
-    Some(cred)
-}
-
-/// Is this output at the watched Wayup sale payment credential?
-fn is_listing_output(addr: &str) -> bool {
-    SALE_PAYMENT_CRED.with(|c| match *c.borrow() {
-        Some(cred) => address_payment_cred(addr) == Some(cred),
-        None => false,
-    })
-}
-
-/// Is this output paying Wayup's platform-fee address? When a buy TX has
-/// no such output the fee was waived (FunPlastic seller). `false` when the
-/// fee cred wasn't configured — the safe default keeps the standard fee.
-fn is_fee_output(addr: &str) -> bool {
-    FEE_PAYMENT_CRED.with(|c| match *c.borrow() {
-        Some(cred) => address_payment_cred(addr) == Some(cred),
-        None => false,
-    })
-}
-
-/// Whether the fee payment credential was configured. Without it we can't
-/// distinguish a waiver from a missed output, so `fee_waived` stays `false`.
-fn fee_cred_configured() -> bool {
-    FEE_PAYMENT_CRED.with(|c| c.borrow().is_some())
-}
-
-/// Sale-side state for one consumed listing UTxO.
-#[derive(Clone)]
-struct PendingSale {
-    seller_stake_pkh: String,
-    payouts: Vec<ListingPayout>,
-    price_lovelace: u64,
-    /// `Some(n)` when the consumed listing UTxO escrowed n > 1
-    /// assets (a bundle sold for one all-in price); `None` for
-    /// single-asset listings.
-    bundle_size: Option<u32>,
-}
-
-#[derive(Default)]
-struct TxBuffer {
-    /// `(policy, asset_name)` → PendingSale, populated from
-    /// Buy-redeemer consumes at the sale credential.
-    pending: BTreeMap<(Vec<u8>, Vec<u8>), PendingSale>,
-    /// Produced outputs buffered for buyer matching at flush.
-    produced: Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>,
-    /// Did this TX pay an output to Wayup's fee address? When the fee
-    /// cred is configured and no such output exists, the fee was waived
-    /// (the co-signature mechanism is all-or-nothing per TX, so this
-    /// applies uniformly to every sale in the TX).
-    saw_fee_output: bool,
-    tx_hash: Option<Vec<u8>>,
-}
-
-fn handle_consumed(c: &ConsumedEvent, buf: &mut TxBuffer) {
-    if buf.tx_hash.is_none() {
-        buf.tx_hash = Some(c.consuming_tx_hash.clone());
+/// Resolve a datum to its CBOR bytes: inline/witness payload when present, else
+/// the host's hash lookup.
+fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
+    let d = d?;
+    if !d.payload.is_empty() {
+        return Some(d.payload.clone());
     }
-    if !is_listing_output(&c.prior_output.address) {
-        return;
-    }
-    let Some(redeemer_bytes) = c.redeemer.as_ref() else {
-        return;
-    };
-    if !is_buy_redeemer(redeemer_bytes) {
-        return;
-    }
-    let Some(datum_bytes) = resolve_datum_bytes(c.prior_datum.as_ref()) else {
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            "consumed listing has no resolvable datum; skipping sale emit",
-        );
-        return;
-    };
-    let Some(decoded) = decode_listing_datum(&datum_bytes) else {
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            "consumed listing datum didn't match expected shape; skipping",
-        );
-        return;
-    };
-    let price_lovelace = decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
-    let bundle_size = (c.prior_output.assets.len() > 1).then(|| c.prior_output.assets.len() as u32);
-    for entry in &c.prior_output.assets {
-        buf.pending.insert(
-            (entry.asset.policy.clone(), entry.asset.name.clone()),
-            PendingSale {
-                seller_stake_pkh: decoded.seller_stake_pkh.clone(),
-                payouts: decoded.payouts.clone(),
-                price_lovelace,
-                bundle_size,
-            },
-        );
-    }
+    crate::mitos::platform_v2::chain_data::datum_by_hash(&d.hash)
 }
 
-fn handle_produced(p: &ProducedEvent, buf: &mut TxBuffer) {
-    if buf.tx_hash.is_none() {
-        buf.tx_hash = Some(p.tx_hash.clone());
-    }
-    // Note any payment to Wayup's fee address (ADA-only) before the
-    // asset/listing filters drop it — its presence/absence is how we
-    // detect a fee waiver at flush.
-    if is_fee_output(&p.output.address) {
-        buf.saw_fee_output = true;
-    }
-    // Skip outputs back at the sale credential — those are listing
-    // updates (the listing module's domain). Sales deliver the
-    // asset to a non-listing address (the buyer).
-    if is_listing_output(&p.output.address) {
-        return;
-    }
-    let assets: Vec<(Vec<u8>, Vec<u8>)> = p
-        .output
-        .assets
+fn to_asset_ids(assets: &[crate::mitos::platform_v2::types::AssetEntry]) -> Vec<AssetId> {
+    assets
         .iter()
-        .map(|a| (a.asset.policy.clone(), a.asset.name.clone()))
-        .collect();
-    if !assets.is_empty() {
-        buf.produced.push((p.output.address.clone(), assets));
-    }
+        .map(|e| AssetId {
+            policy: e.asset.policy.clone(),
+            name: e.asset.name.clone(),
+        })
+        .collect()
 }
 
-fn flush_buffer(buf: TxBuffer) {
-    let Some(tx_hash) = buf.tx_hash else {
-        return;
+/// Build a neutral `TxInput` from a consumed event. Datum resolution (a host
+/// call) is lazy — only for sale-credential consumes with a Buy redeemer — to
+/// avoid the per-hash host lookups a blanket resolve would incur.
+fn build_input(c: &ConsumedEvent) -> TxInput {
+    let at_venue = SALE_CONFIG.with(|cfg| cfg.borrow().is_listing_address(&c.prior_output.address));
+    let is_buy = c.redeemer.as_deref().map(is_buy_redeemer).unwrap_or(false);
+    let datum = if at_venue && is_buy {
+        resolve_datum_bytes(c.prior_datum.as_ref())
+    } else {
+        None
     };
-    let tx_hash_hex = hex::encode(&tx_hash);
-    let mut pending = buf.pending;
-
-    // A waiver = fee cred configured AND no fee output seen this TX. If the
-    // cred isn't configured we can't tell, so assume the standard fee.
-    let fee_waived = fee_cred_configured() && !buf.saw_fee_output;
-
-    for (buyer_address, assets) in buf.produced {
-        for asset_key in assets {
-            let Some(sale) = pending.remove(&asset_key) else {
-                continue;
-            };
-            let (policy, asset_name) = asset_key;
-            emit_sale(&WayupStoreSale::Sale(Sale {
-                policy: hex::encode(&policy),
-                asset_name_hex: hex::encode(&asset_name),
-                tx_hash: tx_hash_hex.clone(),
-                seller_stake_pkh: sale.seller_stake_pkh,
-                buyer_address: buyer_address.clone(),
-                payouts: sale.payouts,
-                price_lovelace: sale.price_lovelace,
-                contract_version: WayupStoreContractVersion::V1,
-                bundle_size: sale.bundle_size,
-                fee_waived,
-            }));
-        }
-    }
-
-    for ((policy, asset_name), _) in pending {
-        logging::log(
-            LogLevel::Warn,
-            LOG_TARGET,
-            &format!(
-                "consumed listing {}/{} had Buy redeemer but no produced output matched as buyer",
-                hex::encode(&policy),
-                hex::encode(&asset_name)
-            ),
-        );
+    TxInput {
+        address: c.prior_output.address.clone(),
+        lovelace: c.prior_output.lovelace,
+        assets: to_asset_ids(&c.prior_output.assets),
+        datum,
+        redeemer: c.redeemer.clone(),
     }
 }
 
@@ -254,150 +91,6 @@ fn emit_sale(event: &WayupStoreSale) {
         return;
     }
     emit::emit_event(0, &buf);
-}
-
-/// Wayup Buy redeemer: constructor 0 with one uint field whose
-/// value varies per spend (an input index — `d8799f00ff`,
-/// `d8799f03ff`, `d8799f09ff` all observed on mainnet). Match on
-/// the constructor prefix only.
-fn is_buy_redeemer(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xd8, 0x79])
-}
-
-fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
-    let d = d?;
-    if !d.payload.is_empty() {
-        return Some(d.payload.clone());
-    }
-    crate::mitos::platform_v2::chain_data::datum_by_hash(&d.hash)
-}
-
-/// Result of decoding a Wayup listing (ask) datum.
-struct DecodedListing {
-    payouts: Vec<ListingPayout>,
-    /// Hex of the seller's STAKE credential (28 bytes).
-    seller_stake_pkh: String,
-}
-
-/// Decode the Wayup listing datum:
-/// `Constr 0 [ List<Payout>, Bytes(owner_stake_cred) ]`.
-fn decode_listing_datum(cbor: &[u8]) -> Option<DecodedListing> {
-    let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
-    let outer = match pd {
-        PlutusData::Constr(c) => c,
-        _ => return None,
-    };
-    let fields: Vec<PlutusData> = outer.fields.into();
-    if fields.len() < 2 {
-        return None;
-    }
-    let payouts = match &fields[0] {
-        PlutusData::Array(items) => items
-            .iter()
-            .filter_map(decode_payout)
-            .collect::<Vec<ListingPayout>>(),
-        _ => return None,
-    };
-    let seller_stake_pkh = match &fields[1] {
-        PlutusData::BoundedBytes(b) => hex::encode(&**b),
-        _ => String::new(),
-    };
-    Some(DecodedListing {
-        payouts,
-        seller_stake_pkh,
-    })
-}
-
-/// One payout entry: `Constr 0 [ Address, Int ]`.
-fn decode_payout(pd: &PlutusData) -> Option<ListingPayout> {
-    let constr = match pd {
-        PlutusData::Constr(c) => c,
-        _ => return None,
-    };
-    let fields: Vec<PlutusData> = constr.fields.clone().into();
-    if fields.len() < 2 {
-        return None;
-    }
-    let (payment_pkh, stake_pkh) = match &fields[0] {
-        PlutusData::Constr(addr) => {
-            let addr_fields: Vec<PlutusData> = addr.fields.clone().into();
-            let payment = decode_credential_bytes(addr_fields.first())?;
-            let stake = addr_fields.get(1).and_then(decode_maybe_stake);
-            (payment, stake)
-        }
-        _ => return None,
-    };
-    let lovelace = match &fields[1] {
-        PlutusData::BigInt(i) => decode_bigint_u64(i)?,
-        _ => return None,
-    };
-    Some(ListingPayout {
-        payment_pkh: hex::encode(payment_pkh),
-        stake_pkh: stake_pkh.map(hex::encode),
-        lovelace,
-    })
-}
-
-/// Plutus address-credential extractor: `Constr 0 [ Bytes ]`.
-fn decode_credential_bytes(pd: Option<&PlutusData>) -> Option<Vec<u8>> {
-    match pd? {
-        PlutusData::Constr(c) => {
-            let fields: Vec<PlutusData> = c.fields.clone().into();
-            match fields.first()? {
-                PlutusData::BoundedBytes(b) => Some((**b).to_vec()),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Optional stake credential (`Just (StakingHash (KeyHash b))`).
-fn decode_maybe_stake(pd: &PlutusData) -> Option<Vec<u8>> {
-    let outer = match pd {
-        PlutusData::Constr(c) => c,
-        _ => return None,
-    };
-    if outer.any_constructor.unwrap_or(0) != 0 {
-        return None;
-    }
-    let outer_fields: Vec<PlutusData> = outer.fields.clone().into();
-    let mut cur = outer_fields.into_iter().next()?;
-    for _ in 0..3 {
-        match cur {
-            PlutusData::Constr(c) => {
-                let f: Vec<PlutusData> = c.fields.into();
-                cur = f.into_iter().next()?;
-            }
-            PlutusData::BoundedBytes(b) => return Some((*b).to_vec()),
-            _ => return None,
-        }
-    }
-    None
-}
-
-/// Big-int → u64 (positive only).
-fn decode_bigint_u64(i: &pallas_primitives::BigInt) -> Option<u64> {
-    match i {
-        pallas_primitives::BigInt::Int(n) => {
-            let v = i128::from(*n);
-            if v < 0 {
-                None
-            } else {
-                u64::try_from(v).ok()
-            }
-        }
-        pallas_primitives::BigInt::BigUInt(b) => {
-            let bytes: &[u8] = &**b;
-            if bytes.len() > 8 {
-                return None;
-            }
-            let mut buf = [0u8; 8];
-            buf[8 - bytes.len()..].copy_from_slice(bytes);
-            Some(u64::from_be_bytes(buf))
-        }
-        pallas_primitives::BigInt::BigNInt(_) => None,
-    }
 }
 
 // ============================================================
@@ -441,52 +134,38 @@ impl Guest for Module {
                 return;
             }
         };
-        match hex::decode(&cfg.payment_cred) {
-            Ok(bytes) if bytes.len() == 28 => {
-                let mut cred = [0u8; 28];
-                cred.copy_from_slice(&bytes);
-                SALE_PAYMENT_CRED.with(|c| *c.borrow_mut() = Some(cred));
-                logging::log(LogLevel::Info, LOG_TARGET, "init: payment cred stored");
-            }
-            _ => {
-                logging::log(
-                    LogLevel::Error,
-                    LOG_TARGET,
-                    &format!("init: invalid payment_cred `{}`", cfg.payment_cred),
-                );
-            }
-        }
-        // Optional: fee address payment cred for waiver detection. Absent =
-        // waiver detection off (fee_waived stays false), not an error.
-        if !cfg.fee_payment_cred.is_empty() {
-            match hex::decode(&cfg.fee_payment_cred) {
-                Ok(bytes) if bytes.len() == 28 => {
-                    let mut cred = [0u8; 28];
-                    cred.copy_from_slice(&bytes);
-                    FEE_PAYMENT_CRED.with(|c| *c.borrow_mut() = Some(cred));
-                    logging::log(LogLevel::Info, LOG_TARGET, "init: fee cred stored");
-                }
-                _ => {
-                    logging::log(
-                        LogLevel::Error,
-                        LOG_TARGET,
-                        &format!("init: invalid fee_payment_cred `{}`", cfg.fee_payment_cred),
-                    );
-                }
-            }
-        }
+        let sale_config = WayupSaleConfig::from_hex(&cfg.payment_cred, &cfg.fee_payment_cred);
+        SALE_CONFIG.with(|c| *c.borrow_mut() = sale_config);
+        logging::log(LogLevel::Info, LOG_TARGET, "init: sale config stored");
     }
 
     fn handle_events(events: Vec<DispatchEvent>) {
-        let mut buf = TxBuffer::default();
+        let mut tx = DecodeTx::default();
         for event in events {
             match event {
-                DispatchEvent::Utxo(UtxoEvent::Produced(p)) => handle_produced(&p, &mut buf),
-                DispatchEvent::Utxo(UtxoEvent::Consumed(c)) => handle_consumed(&c, &mut buf),
+                DispatchEvent::Utxo(UtxoEvent::Consumed(c)) => {
+                    if tx.tx_hash.is_empty() {
+                        tx.tx_hash = c.consuming_tx_hash.clone();
+                    }
+                    tx.inputs.push(build_input(&c));
+                }
+                DispatchEvent::Utxo(UtxoEvent::Produced(p)) => {
+                    if tx.tx_hash.is_empty() {
+                        tx.tx_hash = p.tx_hash.clone();
+                    }
+                    tx.outputs.push(TxOutput {
+                        address: p.output.address.clone(),
+                        lovelace: p.output.lovelace,
+                        assets: to_asset_ids(&p.output.assets),
+                    });
+                }
                 _ => {}
             }
         }
-        flush_buffer(buf);
+        let sales = SALE_CONFIG.with(|cfg| decode_wayup_sales(&tx, &cfg.borrow()));
+        for sale in sales {
+            emit_sale(&sale);
+        }
     }
 
     fn update_interest(_op: InterestOp, _items_cbor: Vec<u8>) -> Result<(), String> {
@@ -494,8 +173,8 @@ impl Guest for Module {
         Ok(())
     }
 
-    /// No-op: event-driven modules are refilled host-side by
-    /// `run_bootstrap` over the manifest `[interest]`.
+    /// No-op: event-driven modules are refilled host-side by `run_bootstrap`
+    /// over the manifest `[interest]`.
     fn rebootstrap(_mode: RebootstrapMode) -> Result<RebootstrapStep, String> {
         Ok(RebootstrapStep {
             done: true,
