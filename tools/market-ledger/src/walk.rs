@@ -1,20 +1,18 @@
 //! `walk` — iterate certified immutable-DB history, decode each block, and drive
-//! the outref buffer + `DecodeTx` assembly into the marketplace decoders.
+//! the outref buffer + `DecodeTx` assembly into the marketplace decoders, then
+//! append the decoded events to the sqlite ledger.
 //!
 //! Per tx: buffer produced watched outputs (resolving their datum locally), take
 //! any spent watched outputs back out of the buffer to build resolved inputs,
-//! assemble one `DecodeTx`, and dispatch the crate decoders for each venue the
-//! tx touched. This slice counts the decoded events by venue + kind; the sqlite
-//! ingest + cursor/buffer persistence land next.
+//! assemble one `DecodeTx`, dispatch the crate decoders for each venue the tx
+//! touched, and map the events to `market_events` rows. Per checkpoint: persist
+//! the open-book buffer + per-venue cursor so a resume reloads the book and
+//! never re-walks.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use mitos_community_events::jpg_store_listing::JpgStoreListing;
-use mitos_community_events::jpg_store_offer::JpgStoreOffer;
-use mitos_community_events::wayup_store_listing::WayupStoreListing;
-use mitos_community_events::wayup_store_offer::WayupStoreOffer;
 use mitos_marketplace_decode::{
     AssetId, DecodeTx, OutputDatum, TxInput, TxOutput, decode_jpg_listings,
     decode_jpg_offer_lifecycle, decode_jpg_sales, decode_wayup_listings,
@@ -27,6 +25,8 @@ use pallas_traverse::MultiEraBlock;
 use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::decode::{Asset, DecodedOutput, DecodedTx, decode_tx};
 use crate::metadata;
+use crate::row::{self, BlockCtx, MarketEventRow};
+use crate::store::Ledger;
 use crate::venue::{Channel, VenueDecoder, VenueRegistry};
 
 #[derive(clap::Args, Debug)]
@@ -34,6 +34,10 @@ pub struct WalkArgs {
     /// Data dir holding the immutable DB (expects `<data-dir>/immutable`).
     #[arg(long)]
     data_dir: PathBuf,
+
+    /// Ledger sqlite path.
+    #[arg(long, default_value = "market-ledger.db")]
+    db: PathBuf,
 
     /// Venue registry TOML.
     #[arg(long, default_value = "venues.toml")]
@@ -43,9 +47,17 @@ pub struct WalkArgs {
     #[arg(long, value_delimiter = ',')]
     venue: Vec<String>,
 
-    /// Start slot (default: the lowest enabled venue's `earliest_slot`).
+    /// Start slot (default: the resume cursor, else the lowest venue floor).
     #[arg(long)]
     from_slot: Option<u64>,
+
+    /// Ignore any saved cursor/buffer and walk from the floor.
+    #[arg(long)]
+    fresh: bool,
+
+    /// Checkpoint (persist buffer + cursor) every N in-range blocks.
+    #[arg(long, default_value_t = 50_000)]
+    checkpoint_every: u64,
 
     /// Stop after this many in-range blocks (0 = no limit) — for smoke tests.
     #[arg(long, default_value_t = 0)]
@@ -54,9 +66,6 @@ pub struct WalkArgs {
 
 pub fn run(args: WalkArgs) -> Result<()> {
     let registry = VenueRegistry::load(&args.venues, &args.venue)?;
-    let floor = args
-        .from_slot
-        .unwrap_or_else(|| registry.min_earliest_slot());
     let immutable_dir = args.data_dir.join("immutable");
     if !immutable_dir.is_dir() {
         bail!(
@@ -65,18 +74,44 @@ pub fn run(args: WalkArgs) -> Result<()> {
         );
     }
 
-    let venues: Vec<&str> = registry.venue_names().collect();
-    tracing::info!(?venues, floor, dir = %immutable_dir.display(), "walk: starting");
+    let enabled: Vec<String> = registry.venue_names().map(str::to_owned).collect();
+    let enabled_refs: Vec<&str> = enabled.iter().map(String::as_str).collect();
+
+    let mut ledger = Ledger::open(&args.db)?;
+    let mut buffer = if args.fresh {
+        OutrefBuffer::default()
+    } else {
+        ledger.load_buffer()?
+    };
+    let resume = if args.fresh {
+        None
+    } else {
+        ledger.min_cursor_slot(&enabled_refs)?
+    };
+    let floor = args
+        .from_slot
+        .or(resume)
+        .unwrap_or_else(|| registry.min_earliest_slot());
+
+    tracing::info!(
+        venues = ?enabled,
+        floor,
+        resumed = resume.is_some(),
+        open_book = buffer.len(),
+        dir = %immutable_dir.display(),
+        db = %args.db.display(),
+        "walk: starting"
+    );
 
     let blocks = immutable::read_blocks(&immutable_dir).map_err(|e| {
         anyhow::anyhow!("opening immutable DB at {}: {e:?}", immutable_dir.display())
     })?;
 
-    let mut buffer = OutrefBuffer::default();
-    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut scanned: u64 = 0;
     let mut in_range: u64 = 0;
+    let mut inserted: u64 = 0;
     let mut last_slot: u64 = 0;
+    let mut rows: Vec<MarketEventRow> = Vec::new();
 
     for block in blocks {
         let bytes = block.map_err(|e| anyhow::anyhow!("reading block from chunk: {e:?}"))?;
@@ -94,17 +129,26 @@ pub fn run(args: WalkArgs) -> Result<()> {
         }
         in_range += 1;
 
+        let ctx = BlockCtx {
+            slot,
+            height: Some(blk.number()),
+            time: slot_to_unix(slot),
+        };
         for tx in blk.txs() {
-            process_tx(decode_tx(&tx), &registry, &mut buffer, &mut counts);
+            process_tx(decode_tx(&tx), &registry, &mut buffer, &ctx, &mut rows);
         }
+        inserted += ledger.insert_events(&rows)? as u64;
+        rows.clear();
 
-        if in_range.is_multiple_of(100_000) {
+        if in_range.is_multiple_of(args.checkpoint_every.max(1)) {
+            ledger.checkpoint(&buffer, &enabled_refs, slot, blk.hash().as_ref())?;
             tracing::info!(
                 scanned,
                 in_range,
                 slot,
+                inserted,
                 open_book = buffer.len(),
-                "walk: progress"
+                "walk: checkpoint"
             );
         }
         if args.max_blocks != 0 && in_range >= args.max_blocks {
@@ -113,12 +157,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
         }
     }
 
+    // Final flush + checkpoint.
+    if last_slot >= floor {
+        ledger.checkpoint(&buffer, &enabled_refs, last_slot, &[])?;
+    }
     tracing::info!(
         scanned,
         in_range,
         last_slot,
+        inserted,
         open_book = buffer.len(),
-        ?counts,
         "walk: complete"
     );
     Ok(())
@@ -128,7 +176,8 @@ fn process_tx(
     d: DecodedTx,
     registry: &VenueRegistry,
     buffer: &mut OutrefBuffer,
-    counts: &mut BTreeMap<String, u64>,
+    ctx: &BlockCtx,
+    rows: &mut Vec<MarketEventRow>,
 ) {
     let mut touched: BTreeSet<String> = BTreeSet::new();
 
@@ -200,29 +249,29 @@ fn process_tx(
         d.witness_datums.get(&Hash::from(arr)).cloned()
     };
 
-    // 4. Dispatch each touched venue's decoders.
+    // 4. Dispatch each touched venue's decoders → market_events rows.
     for venue in &touched {
         match registry.decoder(venue) {
             Some(VenueDecoder::Jpg) => {
-                for _ in decode_jpg_sales(&dtx) {
-                    bump(counts, venue, "sold");
+                for e in decode_jpg_sales(&dtx) {
+                    rows.push(row::from_jpg_sale(&e, ctx, venue));
                 }
                 for e in decode_jpg_listings(&dtx, resolve) {
-                    bump(counts, venue, jpg_listing_kind(&e));
+                    rows.push(row::from_jpg_listing(&e, ctx, venue));
                 }
                 for e in decode_jpg_offer_lifecycle(&dtx) {
-                    bump(counts, venue, jpg_offer_kind(&e));
+                    rows.push(row::from_jpg_offer(&e, ctx, venue));
                 }
             }
             Some(VenueDecoder::Wayup { sale, offer }) => {
-                for _ in decode_wayup_sales(&dtx, sale) {
-                    bump(counts, venue, "sold");
+                for e in decode_wayup_sales(&dtx, sale) {
+                    rows.push(row::from_wayup_sale(&e, ctx, venue));
                 }
                 for e in decode_wayup_listings(&dtx, sale, resolve) {
-                    bump(counts, venue, wayup_listing_kind(&e));
+                    rows.push(row::from_wayup_listing(&e, ctx, venue));
                 }
                 for e in decode_wayup_offer_lifecycle(&dtx, offer) {
-                    bump(counts, venue, wayup_offer_kind(&e));
+                    rows.push(row::from_wayup_offer(&e, ctx, venue));
                 }
             }
             None => {}
@@ -292,42 +341,16 @@ fn asset_id(a: &Asset) -> AssetId {
     }
 }
 
-fn bump(counts: &mut BTreeMap<String, u64>, venue: &str, kind: &str) {
-    *counts.entry(format!("{venue}:{kind}")).or_default() += 1;
-}
-
-fn jpg_listing_kind(e: &JpgStoreListing) -> &'static str {
-    match e {
-        JpgStoreListing::Create(_) => "listed",
-        JpgStoreListing::Update(_) => "price_change",
-        JpgStoreListing::Unlisting(_) => "delisted",
-    }
-}
-
-fn wayup_listing_kind(e: &WayupStoreListing) -> &'static str {
-    match e {
-        WayupStoreListing::Create(_) => "listed",
-        WayupStoreListing::Update(_) => "price_change",
-        WayupStoreListing::Unlisting(_) => "delisted",
-    }
-}
-
-fn jpg_offer_kind(e: &JpgStoreOffer) -> &'static str {
-    match e {
-        JpgStoreOffer::Create(_) => "offer_created",
-        JpgStoreOffer::Cancel(_) => "offer_cancelled",
-        JpgStoreOffer::Update(_) => "offer_updated",
-        JpgStoreOffer::Accept(a) if a.collection_offer => "collection_offer_accepted",
-        JpgStoreOffer::Accept(_) => "offer_accepted",
-    }
-}
-
-fn wayup_offer_kind(e: &WayupStoreOffer) -> &'static str {
-    match e {
-        WayupStoreOffer::Create(_) => "offer_created",
-        WayupStoreOffer::Cancel(_) => "offer_cancelled",
-        WayupStoreOffer::Update(_) => "offer_updated",
-        WayupStoreOffer::Accept(a) if a.collection_offer => "collection_offer_accepted",
-        WayupStoreOffer::Accept(_) => "offer_accepted",
+/// Mainnet slot → unix seconds. Shelley (slot ≥ 4_492_800) is 1s/slot from
+/// 1_596_059_091; Byron before that is 20s/slot (marketplace activity is all
+/// post-Shelley, so the Byron branch is only a floor sanity fallback).
+fn slot_to_unix(slot: u64) -> u64 {
+    const SHELLEY_START_SLOT: u64 = 4_492_800;
+    const SHELLEY_START_UNIX: u64 = 1_596_059_091;
+    const BYRON_START_UNIX: u64 = 1_506_203_091;
+    if slot >= SHELLEY_START_SLOT {
+        SHELLEY_START_UNIX + (slot - SHELLEY_START_SLOT)
+    } else {
+        BYRON_START_UNIX + slot * 20
     }
 }

@@ -15,6 +15,13 @@ path = "src/main.rs"
 mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
 # Wire event types the decoders return — matched to attribute a kind per event.
 mitos-community-events = { path = "../../crates/mitos-community-events" }
+# CIP-14 fingerprint (`asset1…`), computed per row like the D1 firehose does.
+cardano-assets = { workspace = true }
+
+# Operational ledger.
+rusqlite = { workspace = true }
+# Compact buffer-checkpoint serialisation (assets per buffered output).
+serde_json = { workspace = true }
 
 # Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/tx/address
 # decode. The tx decode (canonical redeemer ordering, witness-datum extraction)

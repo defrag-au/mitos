@@ -127,6 +127,10 @@ hex = "0.4"
 # state store — each indexer owns its own view).
 redb = "2"
 
+# Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
+# compiles sqlite from source (on-box build, no system dep).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Concurrent map for the dispatcher's per-Apply claim coordinator
 # (residual pass — see `docs/design/DOMAIN_REFACTOR.md`). Lock-free
 # insertion avoids contention when specific-domain indexers run in

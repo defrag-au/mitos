@@ -54,4 +54,9 @@ impl OutrefBuffer {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// Iterate the buffered outputs (for checkpoint persistence).
+    pub fn entries(&self) -> impl Iterator<Item = (&OutRef, &BufferedOutput)> {
+        self.map.iter()
+    }
 }

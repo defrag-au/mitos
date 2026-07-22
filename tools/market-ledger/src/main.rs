@@ -11,6 +11,8 @@ mod buffer;
 mod decode;
 mod metadata;
 mod mithril;
+mod row;
+mod store;
 mod venue;
 mod walk;
 
