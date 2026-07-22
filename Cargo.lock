@@ -3186,6 +3186,7 @@ dependencies = [
  "pallas-codec 1.0.0",
  "pallas-crypto 1.0.0",
  "pallas-hardano",
+ "pallas-network 1.0.0",
  "pallas-primitives 1.0.0",
  "pallas-traverse 1.0.0",
  "reqwest",

@@ -20,6 +20,7 @@ use crate::decode::{Asset, OutRef};
 
 /// A buffered watched output — everything a later spend needs to reconstruct a
 /// resolved input.
+#[derive(Clone)]
 pub struct BufferedOutput {
     pub address: String,
     pub lovelace: u64,
@@ -34,7 +35,9 @@ pub struct BufferedOutput {
     pub venue: String,
 }
 
-#[derive(Default)]
+// Clone: follow mode keeps two buffers — live (tip) and boundary (k-deep) —
+// and rebuilds live from a boundary clone on rollback.
+#[derive(Default, Clone)]
 pub struct OutrefBuffer {
     map: HashMap<OutRef, BufferedOutput>,
 }

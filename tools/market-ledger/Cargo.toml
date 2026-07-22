@@ -33,6 +33,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 # mirrors mitos-data-plane's `block_events::project_tx` — reimplemented here on
 # bare pallas to avoid dragging that crate's dolos deps into the walker.
 pallas-hardano = { workspace = true }
+pallas-network = { workspace = true }
 pallas-traverse = { workspace = true }
 pallas-addresses = { workspace = true }
 pallas-primitives = { workspace = true }

@@ -83,6 +83,9 @@ pallas-traverse = { version = "1.0.0", features = ["unstable"] }
 # (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
 # feature (mitos's pallas is `unstable`-only), so depend on it directly.
 pallas-hardano = "1.0.0"
+# N2N chainsync/blockfetch client for market-ledger's `follow` tip tail
+# (self-contained — see MARKET_LEDGER.md "Follow mode"). Same 1.0.0 pin.
+pallas-network = "1.0.0"
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.

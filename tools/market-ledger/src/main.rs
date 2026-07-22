@@ -11,6 +11,7 @@
 mod buffer;
 mod checkpoint;
 mod decode;
+mod follow;
 mod metadata;
 mod mithril;
 mod row;
@@ -51,8 +52,8 @@ enum Command {
     Reset(checkpoint::ResetArgs),
     /// Serve the ledger over HTTP (compact binary read surface).
     Serve(serve::ServeArgs),
-    /// Follow the chain tip via self-contained chainsync (phase 3 — not yet implemented).
-    Follow,
+    /// Follow the chain tip via self-contained chainsync (resumes from the walk cursor).
+    Follow(follow::FollowArgs),
 }
 
 fn main() -> Result<()> {
@@ -71,6 +72,6 @@ fn main() -> Result<()> {
         Command::Stats(args) => stats::run(args),
         Command::Reset(args) => checkpoint::run_reset(args),
         Command::Serve(args) => serve::run(args),
-        Command::Follow => anyhow::bail!("`follow` is phase 3 and not yet implemented"),
+        Command::Follow(args) => follow::run(args),
     }
 }

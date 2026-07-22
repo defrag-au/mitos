@@ -171,6 +171,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut in_range: u64 = 0;
     let mut inserted: u64 = 0;
     let mut last_slot: u64 = 0;
+    let mut last_hash: Option<Hash<32>> = None;
     let mut rows: Vec<MarketEventRow> = Vec::new();
 
     for block in blocks {
@@ -180,6 +181,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
         scanned += 1;
         let slot = blk.slot();
         last_slot = slot;
+        last_hash = Some(blk.hash());
 
         if slot < floor {
             if scanned.is_multiple_of(500_000) {
@@ -234,15 +236,18 @@ pub fn run(args: WalkArgs) -> Result<()> {
     }
 
     // Final flush + checkpoint (+ a `done` marker in the crash-visible file).
+    // The REAL last block hash is persisted so `follow` can chainsync-intersect
+    // at the cursor (an empty hash can't be intersected).
+    let final_hash = last_hash.map(|h| h.as_ref().to_vec()).unwrap_or_default();
     if last_slot >= floor {
-        ledger.checkpoint(&buffer, &enabled_refs, last_slot, &[])?;
+        ledger.checkpoint(&buffer, &enabled_refs, last_slot, &final_hash)?;
     }
     checkpoint::write(
         &checkpoint_path,
         &CheckpointFile {
             last_slot,
             last_block_height: None,
-            last_block_hash: String::new(),
+            last_block_hash: hex::encode(&final_hash),
             scanned_blocks: scanned,
             in_range_blocks: in_range,
             inserted_rows: inserted,
@@ -264,7 +269,9 @@ pub fn run(args: WalkArgs) -> Result<()> {
     Ok(())
 }
 
-fn process_tx(
+/// Shared with `follow` — the per-tx buffer/decode/row pipeline is identical
+/// whether the block came from an immutable chunk or the chainsync tail.
+pub(crate) fn process_tx(
     d: DecodedTx,
     registry: &VenueRegistry,
     buffer: &mut OutrefBuffer,
@@ -449,7 +456,7 @@ fn parse_point(s: &str) -> Result<(u64, Vec<u8>)> {
 /// Mainnet slot → unix seconds. Shelley (slot ≥ 4_492_800) is 1s/slot from
 /// 1_596_059_091; Byron before that is 20s/slot (marketplace activity is all
 /// post-Shelley, so the Byron branch is only a floor sanity fallback).
-fn slot_to_unix(slot: u64) -> u64 {
+pub(crate) fn slot_to_unix(slot: u64) -> u64 {
     const SHELLEY_START_SLOT: u64 = 4_492_800;
     const SHELLEY_START_UNIX: u64 = 1_596_059_091;
     const BYRON_START_UNIX: u64 = 1_506_203_091;

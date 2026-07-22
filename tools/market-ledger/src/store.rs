@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS outref_buffer (
     PRIMARY KEY (tx_hash, output_index)
 );
 
+CREATE TABLE IF NOT EXISTS volatile_blocks (
+    slot         INTEGER NOT NULL,
+    hash         BLOB    NOT NULL,
+    height       INTEGER,
+    cbor         BLOB    NOT NULL,
+    PRIMARY KEY (slot, hash)
+);
+
 CREATE TABLE IF NOT EXISTS partition_manifest (
     venue        TEXT    NOT NULL,
     year         INTEGER NOT NULL,
@@ -72,6 +80,14 @@ CREATE TABLE IF NOT EXISTS partition_manifest (
 
 pub struct Ledger {
     conn: Connection,
+}
+
+/// A raw block held in the volatile window (follow mode). The stored `height`
+/// column is observability-only — replay recomputes it from the block itself.
+pub struct VolatileBlock {
+    pub slot: u64,
+    pub hash: Vec<u8>,
+    pub cbor: Vec<u8>,
 }
 
 impl Ledger {
@@ -190,6 +206,117 @@ impl Ledger {
             }
         }
         Ok(min)
+    }
+
+    /// The persisted cursor as an intersect-able point: the (slot, block_hash)
+    /// of the LOWEST venue cursor over `venues`, skipping cursors persisted
+    /// with an empty hash. `None` if no venue has a usable cursor.
+    pub fn cursor_point(&self, venues: &[&str]) -> Result<Option<(u64, Vec<u8>)>> {
+        let mut min: Option<(u64, Vec<u8>)> = None;
+        for venue in venues {
+            let row: Option<(i64, Vec<u8>)> = self
+                .conn
+                .query_row(
+                    "SELECT slot, block_hash FROM walk_cursor WHERE venue = ?",
+                    [venue],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            if let Some((slot, hash)) = row
+                && hash.len() == 32
+                && min.as_ref().is_none_or(|(m, _)| (slot as u64) < *m)
+            {
+                min = Some((slot as u64, hash));
+            }
+        }
+        Ok(min)
+    }
+
+    // --- volatile window (follow mode) ---------------------------------------
+    //
+    // Raw block CBOR for the un-settled tail (≤ k blocks past the boundary
+    // checkpoint). On rollback: truncate events + volatile past the point,
+    // rebuild the live buffer from the boundary checkpoint + a replay of the
+    // surviving volatile blocks.
+
+    pub fn insert_volatile(
+        &mut self,
+        slot: u64,
+        hash: &[u8],
+        height: Option<u64>,
+        cbor: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO volatile_blocks (slot, hash, height, cbor) VALUES (?,?,?,?)",
+            params![u64_i64(slot), hash, height.map(u64_i64), cbor],
+        )?;
+        Ok(())
+    }
+
+    pub fn volatile_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM volatile_blocks", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Volatile blocks with `slot > after`, oldest first.
+    pub fn volatile_after(&self, after: u64) -> Result<Vec<VolatileBlock>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT slot, hash, cbor FROM volatile_blocks WHERE slot > ? ORDER BY slot")?;
+        let rows = stmt.query_map([u64_i64(after)], |r| {
+            Ok(VolatileBlock {
+                slot: r.get::<_, i64>(0)? as u64,
+                hash: r.get(1)?,
+                cbor: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Oldest volatile block (the next boundary-advance candidate).
+    pub fn oldest_volatile(&self) -> Result<Option<VolatileBlock>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT slot, hash, cbor FROM volatile_blocks ORDER BY slot LIMIT 1")?;
+        let mut rows = stmt.query_map([], |r| {
+            Ok(VolatileBlock {
+                slot: r.get::<_, i64>(0)? as u64,
+                hash: r.get(1)?,
+                cbor: r.get(2)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Drop volatile blocks with `slot <= upto` (after a boundary advance —
+    /// also the startup sweep for rows orphaned by a crash mid-advance).
+    pub fn delete_volatile_upto(&mut self, upto: u64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM volatile_blocks WHERE slot <= ?",
+            [u64_i64(upto)],
+        )?)
+    }
+
+    /// Drop volatile blocks past a rollback point.
+    pub fn delete_volatile_after(&mut self, after: u64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM volatile_blocks WHERE slot > ?",
+            [u64_i64(after)],
+        )?)
+    }
+
+    /// Drop events past a rollback point. Follow-mode only: every row with
+    /// `slot > point` necessarily came from a rolled-back volatile block.
+    pub fn delete_events_after(&mut self, after: u64) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM market_events WHERE slot > ?", [u64_i64(after)])?)
     }
 
     /// Reload the open-book buffer from the last checkpoint.

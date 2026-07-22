@@ -19,7 +19,7 @@ market-ledger stats --db ledger.db                    # corpus-sanity report
 market-ledger seal --db ledger.db --out-dir parquet   # completed months → Parquet (duckdb CLI)
 market-ledger upload --db ledger.db --endpoint <url>  # hot window → worker D1 ingest
 market-ledger serve --db ledger.db                    # HTTP read surface (compact binary)
-# follow (phase 3) — not yet implemented
+market-ledger follow --db ledger.db                   # chainsync tip tail (resumes from walk cursor)
 ```
 
 ## Where it runs
@@ -97,6 +97,28 @@ curl -s "localhost:8183/events?policy=<56hex>&kind=sold&limit=5&format=json" \
 curl -s --compressed "localhost:8183/events?policy=<56hex>&kind=sold" \
   -H "Authorization: Bearer $MARKET_LEDGER_TOKEN" -o page.bin && xxd page.bin | head  # byte 0 == 01
 ```
+
+## Follow
+
+`follow` keeps the ledger tip-current via a self-contained pallas-network
+chainsync + blockfetch tail — the same `process_tx` pipeline as walk, fed from
+a peer instead of chunk files. It intersects at the persisted walk cursor, so
+the flow is: walk a fresh snapshot to near-tip, then `follow` (the buffer is
+warm — the persisted outref buffer IS the inputs cache). Peer via `--peer` /
+`MARKET_LEDGER_PEER` (default: the IOG backbone relay; point it at a localhost
+dolos o7s listener if one exists).
+
+Rollback safety = a volatile window: raw CBOR for the last `--volatile-blocks`
+(k, default 2160) blocks is kept in sqlite; the boundary checkpoint (cursor +
+buffer, same tables walk uses) trails k blocks behind tip. `RollBackward` →
+truncate events/blocks past the point, rebuild the live buffer from boundary +
+replay. Kill it any time — restart resumes from the newest volatile block
+(validated: SIGTERM mid-run, clean resume, 0 rows lost). Rollbacks deeper than
+k abort with a re-walk instruction (beyond Ouroboros finality — shouldn't
+happen).
+
+Measured (2026-07-22, backbone relay): catch-up ~75 blocks/s including
+boundary checkpointing; a 28h gap (4.9k blocks) closed in ~66s.
 
 ## Validation (acceptance — run on-box after a bounded walk)
 
