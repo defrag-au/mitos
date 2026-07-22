@@ -8,6 +8,7 @@
 //! chunk files, never the live redb stores.
 
 mod buffer;
+mod checkpoint;
 mod decode;
 mod metadata;
 mod mithril;
@@ -44,6 +45,8 @@ enum Command {
     Upload(upload::UploadArgs),
     /// Corpus-sanity report over the ledger (venue/kind split, premiums, cursors).
     Stats(stats::StatsArgs),
+    /// Delete the ledger + checkpoint (+ optional Parquet) for a clean restart.
+    Reset(checkpoint::ResetArgs),
     /// Serve the ledger over HTTP (phase 2 — not yet implemented).
     Serve,
     /// Follow the chain tip via the mitos companion protocol (phase 3 — not yet implemented).
@@ -64,6 +67,7 @@ fn main() -> Result<()> {
         Command::Seal(args) => seal::run(args),
         Command::Upload(args) => upload::run(args),
         Command::Stats(args) => stats::run(args),
+        Command::Reset(args) => checkpoint::run_reset(args),
         Command::Serve => anyhow::bail!("`serve` is phase 2 and not yet implemented"),
         Command::Follow => anyhow::bail!("`follow` is phase 3 and not yet implemented"),
     }

@@ -35,6 +35,18 @@ every `--checkpoint-every` blocks. A re-run reloads the buffer and continues
 from the cursor — it never re-walks and never re-hits an indexer. `--fresh`
 ignores the saved state and restarts from the venue floor.
 
+**Crash-visible progress.** Each checkpoint also writes a small JSON mirror
+(`<db>.checkpoint.json`, atomic temp+rename) with the resumable slot/height/hash
++ counters, and a `done:true` marker on completion — so after a crash/kill,
+`cat <db>.checkpoint.json` shows exactly where the resumable point is (it never
+runs ahead of what a resume would use). Override with `--checkpoint-file`.
+
+**Clean restart.** `market-ledger reset --db … [--parquet <dir>] --yes` deletes
+the ledger (db + `-wal`/`-shm`) + checkpoint (+ optional Parquet); without
+`--yes` it dry-runs. For automation, `walk --reset-flag <path>`: if that file
+exists at startup, the walk wipes + restarts fresh and consumes the flag
+(`--reset-parquet` to also clear Parquet). `immutable/` is never touched.
+
 Input/datum resolution is **local-first**: the outref buffer + the spending tx's
 `plutus_data` witnesses resolve everything a normal walk needs with zero indexer
 calls (a datum_cache → Koios fallback for the rare unrevealed hash-only datum is

@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use mitos_marketplace_decode::{
     AssetId, DecodeTx, OutputDatum, TxInput, TxOutput, decode_jpg_listings,
     decode_jpg_offer_lifecycle, decode_jpg_sales, decode_wayup_listings,
@@ -23,6 +23,7 @@ use pallas_primitives::Hash;
 use pallas_traverse::MultiEraBlock;
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
+use crate::checkpoint::{self, CheckpointFile};
 use crate::decode::{Asset, DecodedOutput, DecodedTx, decode_tx};
 use crate::metadata;
 use crate::row::{self, BlockCtx, MarketEventRow};
@@ -62,6 +63,20 @@ pub struct WalkArgs {
     /// Stop after this many in-range blocks (0 = no limit) — for smoke tests.
     #[arg(long, default_value_t = 0)]
     max_blocks: u64,
+
+    /// Crash-visible progress mirror written at each checkpoint (default:
+    /// `<db>.checkpoint.json`).
+    #[arg(long)]
+    checkpoint_file: Option<PathBuf>,
+
+    /// If this file exists at startup, wipe the ledger + checkpoint and restart
+    /// fresh, then consume the flag — for automated clean restarts.
+    #[arg(long)]
+    reset_flag: Option<PathBuf>,
+
+    /// When resetting via `--reset-flag`, also delete this Parquet tree.
+    #[arg(long)]
+    reset_parquet: Option<PathBuf>,
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
@@ -76,6 +91,25 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
     let enabled: Vec<String> = registry.venue_names().map(str::to_owned).collect();
     let enabled_refs: Vec<&str> = enabled.iter().map(String::as_str).collect();
+
+    let checkpoint_path = args
+        .checkpoint_file
+        .clone()
+        .unwrap_or_else(|| checkpoint::default_path(&args.db));
+
+    // Reset flag: if present, wipe the ledger + checkpoint (+ optional Parquet)
+    // and consume the flag, so the walk below opens a fresh ledger.
+    if let Some(flag) = &args.reset_flag
+        && flag.exists()
+    {
+        tracing::warn!(flag = %flag.display(), "walk: reset flag present — wiping ledger");
+        let removed = checkpoint::wipe(&args.db, &checkpoint_path, args.reset_parquet.as_deref())?;
+        for f in &removed {
+            tracing::info!(path = %f.display(), "reset: removed");
+        }
+        std::fs::remove_file(flag)
+            .with_context(|| format!("consuming reset flag {}", flag.display()))?;
+    }
 
     let mut ledger = Ledger::open(&args.db)?;
     let mut buffer = if args.fresh {
@@ -141,7 +175,23 @@ pub fn run(args: WalkArgs) -> Result<()> {
         rows.clear();
 
         if in_range.is_multiple_of(args.checkpoint_every.max(1)) {
-            ledger.checkpoint(&buffer, &enabled_refs, slot, blk.hash().as_ref())?;
+            let hash = blk.hash();
+            ledger.checkpoint(&buffer, &enabled_refs, slot, hash.as_ref())?;
+            checkpoint::write(
+                &checkpoint_path,
+                &CheckpointFile {
+                    last_slot: slot,
+                    last_block_height: Some(blk.number()),
+                    last_block_hash: hex::encode(hash.as_ref()),
+                    scanned_blocks: scanned,
+                    in_range_blocks: in_range,
+                    inserted_rows: inserted,
+                    open_book: buffer.len(),
+                    venues: enabled.clone(),
+                    updated_unix: checkpoint::now_unix(),
+                    done: false,
+                },
+            )?;
             tracing::info!(
                 scanned,
                 in_range,
@@ -157,16 +207,32 @@ pub fn run(args: WalkArgs) -> Result<()> {
         }
     }
 
-    // Final flush + checkpoint.
+    // Final flush + checkpoint (+ a `done` marker in the crash-visible file).
     if last_slot >= floor {
         ledger.checkpoint(&buffer, &enabled_refs, last_slot, &[])?;
     }
+    checkpoint::write(
+        &checkpoint_path,
+        &CheckpointFile {
+            last_slot,
+            last_block_height: None,
+            last_block_hash: String::new(),
+            scanned_blocks: scanned,
+            in_range_blocks: in_range,
+            inserted_rows: inserted,
+            open_book: buffer.len(),
+            venues: enabled.clone(),
+            updated_unix: checkpoint::now_unix(),
+            done: true,
+        },
+    )?;
     tracing::info!(
         scanned,
         in_range,
         last_slot,
         inserted,
         open_book = buffer.len(),
+        checkpoint = %checkpoint_path.display(),
         "walk: complete"
     );
     Ok(())
