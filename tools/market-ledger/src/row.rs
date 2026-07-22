@@ -6,18 +6,20 @@
 //! `price/49` min 1 ADA unless waived; offers add no fee) — the same convention
 //! the firehose uses.
 //!
-//! Stake fields are best-effort here (the credential the event carries, or the
-//! delegation part of an address); exact parity with the firehose's stake
-//! extraction is a validation-slice concern.
+//! `seller_stake`/`buyer_stake` are bech32 stake addresses encoded exactly as the
+//! firehose does (`extract_stake_address` / `stake_keyhash_to_bech32` /
+//! `jpg_seller_stake`), so walk-uploaded rows match the live feed byte-for-byte
+//! (verified against dev D1, 2026-07-22).
 
 use cardano_assets::AssetId;
 use mitos_community_events::jpg_store_listing::JpgStoreListing;
 use mitos_community_events::jpg_store_offer::JpgStoreOffer;
 use mitos_community_events::jpg_store_sale::JpgStoreSale;
+use mitos_community_events::marketplace::ListingPayout;
 use mitos_community_events::wayup_store_listing::WayupStoreListing;
 use mitos_community_events::wayup_store_offer::WayupStoreOffer;
 use mitos_community_events::wayup_store_sale::WayupStoreSale;
-use pallas_addresses::{Address, ShelleyDelegationPart};
+use pallas_addresses::{Address, StakeAddress};
 
 /// Chain position for the tx being decoded.
 #[derive(Clone, Copy)]
@@ -63,20 +65,52 @@ fn fingerprint(policy_id: &str, asset_name_hex: &str) -> Option<String> {
         .and_then(|a| a.fingerprint().ok())
 }
 
-/// Delegation (stake) credential hex of a Shelley address, if it has one.
-fn stake_of(bech32: &str) -> Option<String> {
-    let Ok(Address::Shelley(s)) = Address::from_bech32(bech32) else {
+// Stake-address encoding mirrors the firehose exactly (so walk-uploaded rows are
+// byte-identical to the live feed's `seller_stake`/`buyer_stake`).
+
+/// Bech32 stake address from a full payment/base address's delegation part, or
+/// pass-through if already a `stake1…`. (`extract_stake_address`.)
+fn extract_stake_address(addr: &str) -> Option<String> {
+    if addr.is_empty() {
         return None;
-    };
-    match s.delegation() {
-        ShelleyDelegationPart::Key(h) => Some(hex::encode(h.as_ref())),
-        ShelleyDelegationPart::Script(h) => Some(hex::encode(h.as_ref())),
+    }
+    if addr.starts_with("stake1") {
+        return Some(addr.to_string());
+    }
+    match Address::from_bech32(addr).ok()? {
+        Address::Shelley(shelley) => {
+            let stake: StakeAddress = shelley.try_into().ok()?;
+            stake.to_bech32().ok()
+        }
         _ => None,
     }
 }
 
-fn some_nonempty(s: &str) -> Option<String> {
-    (!s.is_empty()).then(|| s.to_string())
+/// Bech32 stake address from a 28-byte credential hex (mainnet key/script
+/// header). (`stake_keyhash_to_bech32`.)
+fn stake_keyhash_to_bech32(keyhash_hex: &str, is_script: bool) -> Option<String> {
+    let hash = hex::decode(keyhash_hex).ok()?;
+    if hash.len() != 28 {
+        return None;
+    }
+    let header: u8 = if is_script { 0xf1 } else { 0xe1 };
+    let mut bytes = Vec::with_capacity(29);
+    bytes.push(header);
+    bytes.extend_from_slice(&hash);
+    match Address::from_bytes(&bytes).ok()? {
+        Address::Stake(stake) => stake.to_bech32().ok(),
+        _ => None,
+    }
+}
+
+/// jpg seller stake: the listing datum's owner is a PAYMENT credential, so the
+/// stake comes from the matching payout's stake part. (`jpg_seller_stake`.)
+fn jpg_seller_stake(seller_pkh: &str, payouts: &[ListingPayout]) -> Option<String> {
+    payouts
+        .iter()
+        .find(|p| p.payment_pkh == seller_pkh)
+        .and_then(|p| p.stake_pkh.as_deref())
+        .and_then(|kh| stake_keyhash_to_bech32(kh, false))
 }
 
 // ============================================================
@@ -93,8 +127,8 @@ pub fn from_jpg_sale(e: &JpgStoreSale, ctx: &BlockCtx, venue: &str) -> MarketEve
         kind: "sold".into(),
         price_lovelace: Some(s.price_lovelace),
         buyer_price_lovelace: Some(s.price_lovelace + s.on_top_fee_lovelace),
-        seller_stake: some_nonempty(&s.seller_pkh),
-        buyer_stake: stake_of(&s.buyer_address),
+        seller_stake: jpg_seller_stake(&s.seller_pkh, &s.payouts),
+        buyer_stake: extract_stake_address(&s.buyer_address),
         marketplace: JPG_MARKETPLACE.into(),
         bundle_size: s.bundle_size,
         output_index: None,
@@ -121,8 +155,8 @@ pub fn from_wayup_sale(e: &WayupStoreSale, ctx: &BlockCtx, venue: &str) -> Marke
         kind: "sold".into(),
         price_lovelace: Some(s.price_lovelace),
         buyer_price_lovelace: Some(buyer_price),
-        seller_stake: some_nonempty(&s.seller_stake_pkh),
-        buyer_stake: stake_of(&s.buyer_address),
+        seller_stake: stake_keyhash_to_bech32(&s.seller_stake_pkh, false),
+        buyer_stake: extract_stake_address(&s.buyer_address),
         marketplace: WAYUP_MARKETPLACE.into(),
         bundle_size: s.bundle_size,
         output_index: None,
@@ -162,7 +196,7 @@ pub fn from_jpg_listing(e: &JpgStoreListing, ctx: &BlockCtx, venue: &str) -> Mar
         JpgStoreListing::Create(c) => MarketEventRow {
             tx_hash: c.tx_hash.clone(),
             price_lovelace: Some(c.price_lovelace),
-            seller_stake: some_nonempty(&c.seller_pkh),
+            seller_stake: jpg_seller_stake(&c.seller_pkh, &c.payouts),
             bundle_size: c.bundle_size,
             output_index: Some(c.output_index),
             ..base(&c.policy, &c.asset_name_hex, "listed")
@@ -170,14 +204,14 @@ pub fn from_jpg_listing(e: &JpgStoreListing, ctx: &BlockCtx, venue: &str) -> Mar
         JpgStoreListing::Update(u) => MarketEventRow {
             tx_hash: u.tx_hash.clone(),
             price_lovelace: Some(u.new_price_lovelace),
-            seller_stake: some_nonempty(&u.seller_pkh),
+            seller_stake: jpg_seller_stake(&u.seller_pkh, &u.payouts),
             bundle_size: u.bundle_size,
             output_index: Some(u.output_index),
             ..base(&u.policy, &u.asset_name_hex, "price_change")
         },
         JpgStoreListing::Unlisting(d) => MarketEventRow {
             tx_hash: d.tx_hash.clone(),
-            seller_stake: some_nonempty(&d.seller_pkh),
+            seller_stake: None, // jpg delist carries no payouts to derive stake from
             bundle_size: d.bundle_size,
             ..base(&d.policy, &d.asset_name_hex, "delisted")
         },
@@ -208,7 +242,7 @@ pub fn from_wayup_listing(e: &WayupStoreListing, ctx: &BlockCtx, venue: &str) ->
         WayupStoreListing::Create(c) => MarketEventRow {
             tx_hash: c.tx_hash.clone(),
             price_lovelace: Some(c.price_lovelace),
-            seller_stake: some_nonempty(&c.seller_stake_pkh),
+            seller_stake: stake_keyhash_to_bech32(&c.seller_stake_pkh, false),
             bundle_size: c.bundle_size,
             output_index: Some(c.output_index),
             ..base(&c.policy, &c.asset_name_hex, "listed")
@@ -216,14 +250,14 @@ pub fn from_wayup_listing(e: &WayupStoreListing, ctx: &BlockCtx, venue: &str) ->
         WayupStoreListing::Update(u) => MarketEventRow {
             tx_hash: u.tx_hash.clone(),
             price_lovelace: Some(u.new_price_lovelace),
-            seller_stake: some_nonempty(&u.seller_stake_pkh),
+            seller_stake: stake_keyhash_to_bech32(&u.seller_stake_pkh, false),
             bundle_size: u.bundle_size,
             output_index: Some(u.output_index),
             ..base(&u.policy, &u.asset_name_hex, "price_change")
         },
         WayupStoreListing::Unlisting(d) => MarketEventRow {
             tx_hash: d.tx_hash.clone(),
-            seller_stake: some_nonempty(&d.seller_stake_pkh),
+            seller_stake: stake_keyhash_to_bech32(&d.seller_stake_pkh, false),
             bundle_size: d.bundle_size,
             ..base(&d.policy, &d.asset_name_hex, "delisted")
         },
@@ -244,8 +278,8 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             kind: accept_kind(a.collection_offer).into(),
             price_lovelace: Some(a.price_lovelace),
             buyer_price_lovelace: Some(a.price_lovelace),
-            seller_stake: stake_of(&a.seller_address),
-            buyer_stake: some_nonempty(&a.bidder_pkh),
+            seller_stake: extract_stake_address(&a.seller_address),
+            buyer_stake: stake_keyhash_to_bech32(&a.bidder_pkh, false),
             marketplace: JPG_MARKETPLACE.into(),
             bundle_size: None,
             output_index: Some(a.prior_output_index),
@@ -304,8 +338,8 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             kind: accept_kind(a.collection_offer).into(),
             price_lovelace: Some(a.price_lovelace),
             buyer_price_lovelace: Some(a.price_lovelace),
-            seller_stake: stake_of(&a.seller_address),
-            buyer_stake: some_nonempty(&a.bidder_pkh),
+            seller_stake: extract_stake_address(&a.seller_address),
+            buyer_stake: stake_keyhash_to_bech32(&a.bidder_pkh, false),
             marketplace: WAYUP_MARKETPLACE.into(),
             bundle_size: None,
             output_index: Some(a.prior_output_index),
@@ -388,7 +422,7 @@ fn offer_book_row(
         price_lovelace: lovelace,
         buyer_price_lovelace: None,
         seller_stake: None,
-        buyer_stake: some_nonempty(bidder_pkh),
+        buyer_stake: stake_keyhash_to_bech32(bidder_pkh, false),
         marketplace: marketplace.into(),
         bundle_size: None,
         output_index,
