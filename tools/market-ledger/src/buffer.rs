@@ -55,6 +55,10 @@ impl OutrefBuffer {
         self.map.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Iterate the buffered outputs (for checkpoint persistence).
     pub fn entries(&self) -> impl Iterator<Item = (&OutRef, &BufferedOutput)> {
         self.map.iter()

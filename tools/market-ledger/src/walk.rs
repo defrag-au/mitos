@@ -18,7 +18,7 @@ use mitos_marketplace_decode::{
     decode_jpg_offer_lifecycle, decode_jpg_sales, decode_wayup_listings,
     decode_wayup_offer_lifecycle, decode_wayup_sales,
 };
-use pallas_hardano::storage::immutable;
+use pallas_hardano::storage::immutable::{self, FallibleBlock, Point};
 use pallas_primitives::Hash;
 use pallas_traverse::MultiEraBlock;
 
@@ -51,6 +51,13 @@ pub struct WalkArgs {
     /// Start slot (default: the resume cursor, else the lowest venue floor).
     #[arg(long)]
     from_slot: Option<u64>,
+
+    /// Seek the immutable DB directly to `<slot>:<block_hash_hex>` instead of
+    /// streaming from genesis — skips the pre-floor decode for controlled tests.
+    /// The outref buffer starts cold, so sales/accepts of listings/offers created
+    /// BEFORE this point won't resolve; pick a point early enough to cover them.
+    #[arg(long)]
+    from_point: Option<String>,
 
     /// Ignore any saved cursor/buffer and walk from the floor.
     #[arg(long)]
@@ -122,14 +129,26 @@ pub fn run(args: WalkArgs) -> Result<()> {
     } else {
         ledger.min_cursor_slot(&enabled_refs)?
     };
-    let floor = args
-        .from_slot
+
+    // `--from-point <slot>:<hash>` seeks the reader; its slot is also the floor.
+    let from_point = args.from_point.as_deref().map(parse_point).transpose()?;
+    let point_slot = from_point.as_ref().map(|(slot, _)| *slot);
+    let floor = point_slot
+        .or(args.from_slot)
         .or(resume)
         .unwrap_or_else(|| registry.min_earliest_slot());
+
+    if from_point.is_some() && buffer.is_empty() {
+        tracing::warn!(
+            "walk: --from-point with a cold buffer — sales/accepts/delists of \
+             listings created before the point won't resolve"
+        );
+    }
 
     tracing::info!(
         venues = ?enabled,
         floor,
+        seek = from_point.is_some(),
         resumed = resume.is_some(),
         open_book = buffer.len(),
         dir = %immutable_dir.display(),
@@ -137,9 +156,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
         "walk: starting"
     );
 
-    let blocks = immutable::read_blocks(&immutable_dir).map_err(|e| {
-        anyhow::anyhow!("opening immutable DB at {}: {e:?}", immutable_dir.display())
-    })?;
+    // Seek to the point (efficient) or stream from genesis.
+    let blocks: Box<dyn Iterator<Item = FallibleBlock>> = match from_point {
+        Some((slot, hash)) => {
+            immutable::read_blocks_from_point(&immutable_dir, Point::Specific(slot, hash))
+                .map_err(|e| anyhow::anyhow!("seeking immutable DB to point: {e:?}"))?
+        }
+        None => Box::new(immutable::read_blocks(&immutable_dir).map_err(|e| {
+            anyhow::anyhow!("opening immutable DB at {}: {e:?}", immutable_dir.display())
+        })?),
+    };
 
     let mut scanned: u64 = 0;
     let mut in_range: u64 = 0;
@@ -405,6 +431,19 @@ fn asset_id(a: &Asset) -> AssetId {
         policy: a.policy.clone(),
         name: a.name.clone(),
     }
+}
+
+/// Parse `--from-point` as `<slot>:<block_hash_hex>` (32-byte hash).
+fn parse_point(s: &str) -> Result<(u64, Vec<u8>)> {
+    let (slot, hash) = s
+        .split_once(':')
+        .context("--from-point must be `<slot>:<block_hash_hex>`")?;
+    let slot: u64 = slot.trim().parse().context("--from-point slot")?;
+    let hash = hex::decode(hash.trim()).context("--from-point hash hex")?;
+    if hash.len() != 32 {
+        bail!("--from-point hash must be 32 bytes, got {}", hash.len());
+    }
+    Ok((slot, hash))
 }
 
 /// Mainnet slot → unix seconds. Shelley (slot ≥ 4_492_800) is 1s/slot from
