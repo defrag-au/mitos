@@ -13,12 +13,20 @@ path = "src/main.rs"
 # modules and the cnft.dev-workers firehose. The walker maps chain data into
 # its neutral `DecodeTx` and consumes the crate's outputs; no parallel decode.
 mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
+# Wire event types the decoders return — matched to attribute a kind per event.
+mitos-community-events = { path = "../../crates/mitos-community-events" }
 
-# Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/address
-# decode.
+# Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/tx/address
+# decode. The tx decode (canonical redeemer ordering, witness-datum extraction)
+# mirrors mitos-data-plane's `block_events::project_tx` — reimplemented here on
+# bare pallas to avoid dragging that crate's dolos deps into the walker.
 pallas-hardano = { workspace = true }
 pallas-traverse = { workspace = true }
 pallas-addresses = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-codec = { workspace = true }
+# blake2b for verifying jpg labels-50 offer-datum reconstructions at create time.
+pallas-crypto = "1.0.0"
 
 clap = { workspace = true }
 serde = { workspace = true }

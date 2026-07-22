@@ -31,5 +31,7 @@ decoder = "wayup"
 sale_creds = ["a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"]
 # Offer contract payment credential.
 offer_creds = ["27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"]
+# Fee-address payment credential — enables Wayup `fee_waived` detection.
+fee_cred = "5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283"
 # Wayup launched in 2023; ~slot 90.0M is a safe pre-activity floor.
 earliest_slot = 90_000_000

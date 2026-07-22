@@ -7,6 +7,9 @@
 //! returns. NOT a second chain follower — the walk reads Mithril immutable-DB
 //! chunk files, never the live redb stores.
 
+mod buffer;
+mod decode;
+mod metadata;
 mod mithril;
 mod venue;
 mod walk;
