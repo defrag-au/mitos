@@ -1,11 +1,12 @@
 //! market-ledger — deep marketplace-history walker + ledger for CNFT venues.
 //!
-//! One binary, three modes: `walk` (this + the next slices — snapshot walk into
-//! a local ledger), `serve` (phase 2, HTTP read surface), `follow` (phase 3,
-//! mitos companion tip-follow). Decode stays in `mitos-marketplace-decode`; this
-//! tool maps certified chain data into that crate's `DecodeTx` and stores what it
-//! returns. NOT a second chain follower — the walk reads Mithril immutable-DB
-//! chunk files, never the live redb stores.
+//! One binary, three modes: `walk` (snapshot walk into a local ledger), `serve`
+//! (HTTP read surface, compact binary), `follow` (phase 3, self-contained
+//! chainsync tip tail — see the design doc's "Follow mode"). Decode stays in
+//! `mitos-marketplace-decode`; this tool maps certified chain data into that
+//! crate's `DecodeTx` and stores what it returns. NOT a second follower STORE —
+//! the walk reads Mithril immutable-DB chunk files and follow keeps only a small
+//! volatile window; never the live redb stores.
 
 mod buffer;
 mod checkpoint;
@@ -50,7 +51,7 @@ enum Command {
     Reset(checkpoint::ResetArgs),
     /// Serve the ledger over HTTP (compact binary read surface).
     Serve(serve::ServeArgs),
-    /// Follow the chain tip via the mitos companion protocol (phase 3 — not yet implemented).
+    /// Follow the chain tip via self-contained chainsync (phase 3 — not yet implemented).
     Follow,
 }
 

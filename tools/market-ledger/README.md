@@ -5,8 +5,9 @@ immutable-DB history locally, decodes with the shared `mitos-marketplace-decode`
 crate (the same source of truth the live modules use), keeps the deep corpus
 on-box (sqlite → Parquet), and pushes the hot window to D1.
 
-**NOT a second chain follower** — it reads Mithril immutable-DB chunk files
-(plain files, no locks), never the live dolos/mitos redb. See
+**NOT a second follower store** — it reads Mithril immutable-DB chunk files
+(plain files, no locks), never the live dolos/mitos redb; phase-3 `follow` is
+a self-contained chainsync tail (not a mitos companion subscriber). See
 `docs/design/MARKET_LEDGER.md` for the full design.
 
 ## Modes

@@ -30,9 +30,18 @@ marketplace ledger**: full-depth, tip-current (phase 3), venue-pluggable.
 
 ## Non-goals / hard constraints
 
-- **NOT a second chain follower.** Mitos remains the only thing following
-  the chain tip. Tip-currency arrives via the mitos **companion protocol**
-  (phase 3), never via an own N2N/N2C sync.
+- **NOT a second follower *store*.** (REVISED 2026-07-22, user decision —
+  was "NOT a second chain follower".) The original constraint guarded
+  against a second dolos-style follower: its own state store, redb locks,
+  WAN churn. A raw chainsync *tail* is none of that and is now the plan:
+  phase-3 `follow` is a **self-contained pallas-network chainsync client**
+  (see "Follow mode"), NOT a mitos companion subscriber. Rationale: the
+  companion path would put the tip hot-path through the WASM module
+  pipeline and substitute module-emitted events for the tool's own
+  SoT-crate decode over raw blocks — the basis of its whole validation
+  story — buying only rollback handling, which is modest native work. The
+  tool keeps zero follower state beyond its existing sqlite (cursor,
+  buffer, small volatile window).
 - **Decode stays in `mitos-marketplace-decode`.** The walker maps chain
   data into `DecodeTx` and consumes the crate's outputs; no parallel decode
   logic. (Standing single-source-of-truth decision.)
@@ -65,7 +74,7 @@ One binary, three modes sharing one storage layout:
 ```
 market-ledger walk --venue jpg,wayup [--from-slot …]   # snapshot walk (resumable, per-venue)
 market-ledger serve                                     # HTTP read surface (long-running)
-market-ledger follow                                    # mitos companion subscriber (phase 3)
+market-ledger follow                                    # chainsync tip tail (phase 3)
 ```
 
 ### Venue registry (the pluggability seam)
@@ -223,14 +232,42 @@ re-runnable, no-op for rows the live feed already landed). This is the
 **prod backfill path**, replacing the sharded-Koios plan. Dev D1 is left
 as-is (decision 2).
 
-### Companion mode (phase 3)
+### Follow mode (phase 3) — self-contained chainsync
 
-Subscribe to the marketplace modules on localhost mitos-mainnet
-(`127.0.0.1:8181`) via the companion WS protocol — the same dial the CF
-companions use, terminating on-box. Events map through the identical wire
-types into the same sqlite ledger; PK dedup makes the walk/follow seam
-safe in both directions. Default topology: `follow` merges into `serve`
-(one process = the single writer).
+(REDESIGNED 2026-07-22, user decision — supersedes the companion-subscriber
+plan. The superseded shape: subscribe to the marketplace modules on
+localhost `:8181` via the companion WS protocol. Rejected because it routes
+the tip hot-path through the WASM module pipeline and replaces SoT-crate
+decode-at-source with module-emitted events; its only real win was
+rollback handling.)
+
+`follow` is a **pallas-network chainsync + blockfetch client** feeding the
+exact same `process_tx` path as `walk`:
+
+- **Intersect at the walk cursor.** Walk a fresh snapshot to near-tip,
+  then `follow` intersects chainsync at the persisted `(slot, hash)`
+  cursor — the outref buffer in sqlite is warm and exactly right. The
+  buffer IS the inputs cache; no external resolution needed (same
+  local-first rule as walk).
+- **Peer is configurable** (`--peer host:port`). Preferred: the box's own
+  dolos, if/when the mitos bundle exposes dolos's o7s (N2N serve)
+  listener — standard protocol against localhost, mitos stays a black
+  box, no second WAN connection. NOTE (checked 2026-07-22): the bundle
+  currently wires only the optional `minibf` HTTP bridge, NOT the o7s
+  serve stack — enabling it is a small config-gated bundle addition.
+  Until then: a public relay (IOG backbone) — one TCP connection at tip
+  rate, at most a few hundred MB/day.
+- **Rollback handling (the one new piece):** a volatile window. Keep raw
+  block CBOR for the last k (≤2160) blocks in a small sqlite table;
+  checkpoint the buffer at the immutable boundary as it advances. On
+  `RollBackward(point)`: delete `market_events` with `slot > point`,
+  reload the boundary buffer checkpoint, replay surviving volatile blocks
+  through `process_tx` (sub-second at the walk's measured ~10k blocks/s).
+  `INSERT OR IGNORE` makes replay idempotent. Practical rollbacks are 1-2
+  blocks; k is a safety ceiling, not a working size.
+- **Topology unchanged:** `follow` merges into `serve` (one process = the
+  single writer); PK dedup keeps the walk/follow seam safe in both
+  directions.
 
 ## Validation
 
@@ -295,7 +332,10 @@ this doc (Opus).**
 - [F] The union-view seam (Parquet + live sqlite months) and the aggregate
   endpoint contracts (incl. time-on-market derivation), once raw is proven.
 
-**Phase 3 — companion follow:**
-- [F] Companion protocol client + walk/follow cursor seam (single-writer
-  topology: follow merged into serve).
-- [O] Wire-type mapping (identical to the CF ingress mapping).
+**Phase 3 — chainsync follow (redesigned 2026-07-22, see "Follow mode"):**
+- [F] Rollback correctness: volatile window (raw block CBOR table),
+  boundary buffer checkpoint, RollBackward → truncate + replay.
+- [O] pallas-network chainsync/blockfetch client, `--peer` config,
+  intersect-at-cursor, merge into the serve process.
+- [O] (optional, separate) config-gated o7s serve listener in the mitos
+  bundle so follow can peer against localhost dolos.
