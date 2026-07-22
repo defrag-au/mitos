@@ -3118,6 +3118,7 @@ dependencies = [
  "pallas-hardano",
  "pallas-primitives 1.0.0",
  "pallas-traverse 1.0.0",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

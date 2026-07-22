@@ -12,7 +12,10 @@ mod decode;
 mod metadata;
 mod mithril;
 mod row;
+mod seal;
+mod stats;
 mod store;
+mod upload;
 mod venue;
 mod walk;
 
@@ -35,6 +38,12 @@ enum Command {
     Walk(walk::WalkArgs),
     /// Download + verify a Mithril snapshot's immutable DB into a data dir.
     Bootstrap(mithril::BootstrapArgs),
+    /// Seal completed months to per-venue Parquet partitions (via the duckdb CLI).
+    Seal(seal::SealArgs),
+    /// Upload the ledger's hot window to the worker's D1 ingest endpoint.
+    Upload(upload::UploadArgs),
+    /// Corpus-sanity report over the ledger (venue/kind split, premiums, cursors).
+    Stats(stats::StatsArgs),
     /// Serve the ledger over HTTP (phase 2 — not yet implemented).
     Serve,
     /// Follow the chain tip via the mitos companion protocol (phase 3 — not yet implemented).
@@ -52,6 +61,9 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Walk(args) => walk::run(args),
         Command::Bootstrap(args) => mithril::bootstrap(args),
+        Command::Seal(args) => seal::run(args),
+        Command::Upload(args) => upload::run(args),
+        Command::Stats(args) => stats::run(args),
         Command::Serve => anyhow::bail!("`serve` is phase 2 and not yet implemented"),
         Command::Follow => anyhow::bail!("`follow` is phase 3 and not yet implemented"),
     }

@@ -20,8 +20,10 @@ cardano-assets = { workspace = true }
 
 # Operational ledger.
 rusqlite = { workspace = true }
-# Compact buffer-checkpoint serialisation (assets per buffered output).
+# Compact buffer-checkpoint serialisation (assets per buffered output) + the
+# hot-window D1 upload (blocking HTTP — the walker's main loop is sync).
 serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 
 # Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/tx/address
 # decode. The tx decode (canonical redeemer ordering, witness-datum extraction)
