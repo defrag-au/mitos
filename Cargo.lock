@@ -3056,6 +3056,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "market-ledger"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "mitos-marketplace-decode",
+ "pallas-addresses 1.0.0",
+ "pallas-hardano",
+ "pallas-traverse 1.0.0",
+ "serde",
+ "toml 0.8.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matchers"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

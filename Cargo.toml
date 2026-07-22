@@ -28,6 +28,7 @@ members = [
     "tools/mitos-admin",
     "tools/mitos-build",
     "tools/mitos-run",
+    "tools/market-ledger",
 ]
 resolver = "2"
 
@@ -76,6 +77,11 @@ pallas-addresses = "1.0.0"
 pallas-codec = "1.0.0"
 pallas-primitives = "1.0.0"
 pallas-traverse = { version = "1.0.0", features = ["unstable"] }
+# Immutable-DB (cardano-node / Mithril snapshot) chunk reader — the
+# `market-ledger` walker iterates certified history from plain chunk files
+# (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
+# feature (mitos's pallas is `unstable`-only), so depend on it directly.
+pallas-hardano = "1.0.0"
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.

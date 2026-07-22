@@ -1,0 +1,32 @@
+[package]
+name = "market-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "market-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# Decode surface — the single source of truth shared with the live mitos
+# modules and the cnft.dev-workers firehose. The walker maps chain data into
+# its neutral `DecodeTx` and consumes the crate's outputs; no parallel decode.
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
+
+# Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/address
+# decode.
+pallas-hardano = { workspace = true }
+pallas-traverse = { workspace = true }
+pallas-addresses = { workspace = true }
+
+clap = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+
+# Venue registry is a small TOML file; parse it directly rather than pull the
+# whole `config` stack (same choice `capture-block` makes for `dolos.toml`).
+toml = "0.8"
