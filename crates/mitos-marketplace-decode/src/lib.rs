@@ -20,12 +20,14 @@
 pub mod datum;
 pub mod listings;
 pub mod offer_datum;
+pub mod offer_lifecycle;
 pub mod offers;
 pub mod sales;
 
 pub use datum::{DecodedListing, is_buy_redeemer, is_cancel_redeemer};
 pub use listings::{decode_jpg_listings, decode_wayup_listings};
 pub use offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
+pub use offer_lifecycle::{decode_jpg_offer_lifecycle, decode_wayup_offer_lifecycle};
 pub use offers::{
     WayupOfferConfig, classify_jpg_offer_address, decode_jpg_offer_accepts,
     decode_wayup_offer_accepts,

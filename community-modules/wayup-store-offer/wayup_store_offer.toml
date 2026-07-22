@@ -29,6 +29,3 @@ mitos-community-events = { path = "../../crates/mitos-community-events" }
 # single source of truth also used by the cnft.dev-workers firehose); it pulls
 # pallas-primitives / pallas-codec transitively.
 mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
-# bech32 → payment-credential extraction (identify offer outputs;
-# the staking part varies per bidder so a string compare won't do).
-pallas-addresses = "1.0.0-alpha.6"

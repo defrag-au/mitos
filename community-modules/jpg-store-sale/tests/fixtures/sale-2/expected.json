@@ -4,6 +4,7 @@
     "buyer_address": "addr1q8c6tr7zea729xj0fgqxxgkqhqt0az6gzg59cnyp5knwmp2mdz3a55rezmt6gfje85r86k082x9sgt0s6rw7p6ykvwdslkte5r",
     "contract_version": "V2",
     "kind": "sale",
+    "on_top_fee_lovelace": 5000000,
     "payouts": [
       {
         "lovelace": 25000000,
