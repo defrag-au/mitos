@@ -24,11 +24,21 @@ pub struct Db {
 pub struct HealthSnapshot {
     pub rows: i64,
     pub slot_min: Option<i64>,
+    /// Highest slot carrying a market EVENT (moves only on marketplace activity).
     pub slot_max: Option<i64>,
-    pub latest_block_time: Option<i64>,
-    /// `now - latest_block_time`. For a snapshot-walked corpus this is
-    /// "snapshot age" and is expected to be large.
+    /// The follower's live edge — the newest block it has processed (max slot
+    /// in the volatile window). `None` when nothing is following (a walk-only
+    /// ledger has an empty volatile window).
+    pub tip_slot: Option<i64>,
+    /// Follower lag: `now - block_time(tip_slot)`. This is the real liveness
+    /// signal — seconds-to-tens-of-seconds when following the tip, climbing if
+    /// the follower stalls. `None` when nothing is following.
     pub freshness_secs: Option<i64>,
+    /// Block time of the newest market event.
+    pub last_event_time: Option<i64>,
+    /// Market-activity recency: `now - last_event_time`. Naturally large during
+    /// quiet periods even when the follower is fully current — NOT a lag signal.
+    pub last_event_secs: Option<i64>,
     pub cursors: Vec<VenueCursor>,
     pub partitions: Vec<Partition>,
 }
@@ -69,12 +79,18 @@ impl Db {
         let conn = self.open_ro()?;
 
         let rows: i64 = conn.query_row("SELECT COUNT(*) FROM market_events", [], |r| r.get(0))?;
-        let (slot_min, slot_max, latest_block_time): (Option<i64>, Option<i64>, Option<i64>) = conn
+        let (slot_min, slot_max, last_event_time): (Option<i64>, Option<i64>, Option<i64>) = conn
             .query_row(
-                "SELECT MIN(slot), MAX(slot), MAX(block_time) FROM market_events",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
+            "SELECT MIN(slot), MAX(slot), MAX(block_time) FROM market_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+
+        // The follower's live edge = newest block in the volatile window. Its
+        // block_time is derived from the slot (mainnet post-Shelley = 1s/slot),
+        // so tip-follow freshness needs no extra bookkeeping.
+        let tip_slot: Option<i64> =
+            conn.query_row("SELECT MAX(slot) FROM volatile_blocks", [], |r| r.get(0))?;
 
         let mut cursors = Vec::new();
         let mut stmt =
@@ -112,14 +128,17 @@ impl Db {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let freshness_secs = latest_block_time.map(|t| now - t);
+        let freshness_secs = tip_slot.map(|s| now - crate::walk::slot_to_unix(s as u64) as i64);
+        let last_event_secs = last_event_time.map(|t| now - t);
 
         Ok(HealthSnapshot {
             rows,
             slot_min,
             slot_max,
-            latest_block_time,
+            tip_slot,
             freshness_secs,
+            last_event_time,
+            last_event_secs,
             cursors,
             partitions,
         })

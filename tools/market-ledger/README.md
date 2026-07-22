@@ -66,9 +66,12 @@ writing is fine (WAL, single writer).
 market-ledger serve --db ledger.db --listen 127.0.0.1:8183
 ```
 
-- **`GET /health`** (open): row count, slot extent, `latest_block_time` +
-  `freshness_secs` (= snapshot age for a walked corpus), per-venue walk
-  cursors, sealed partitions.
+- **`GET /health`** (open): row count, slot extent, per-venue walk cursors,
+  sealed partitions, and two freshness stats — `freshness_secs` = follower lag
+  (`now - block_time(tip_slot)`, where `tip_slot` is the newest block in the
+  volatile window; seconds when following, `null` on a walk-only ledger) vs
+  `last_event_secs` = time since the last marketplace event (naturally large in
+  quiet periods, NOT a lag signal).
 - **`GET /events`** (bearer-gated): filters `venue`, `policy` (56-hex),
   `asset` (CIP-14 fingerprint — exclusive with `policy`), `name`
   (asset_name_hex, requires `policy`), `kind` (comma-separated:

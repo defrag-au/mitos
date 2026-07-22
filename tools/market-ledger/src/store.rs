@@ -280,18 +280,23 @@ impl Ledger {
     }
 
     /// Oldest volatile block (the next boundary-advance candidate).
-    pub fn oldest_volatile(&self) -> Result<Option<VolatileBlock>> {
+    /// The oldest `limit` volatile blocks (slot ASC) — a boundary-advance batch.
+    pub fn volatile_oldest(&self, limit: u64) -> Result<Vec<VolatileBlock>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT slot, hash, cbor FROM volatile_blocks ORDER BY slot LIMIT 1")?;
-        let mut rows = stmt.query_map([], |r| {
+            .prepare("SELECT slot, hash, cbor FROM volatile_blocks ORDER BY slot LIMIT ?")?;
+        let rows = stmt.query_map([limit as i64], |r| {
             Ok(VolatileBlock {
                 slot: r.get::<_, i64>(0)? as u64,
                 hash: r.get(1)?,
                 cbor: r.get(2)?,
             })
         })?;
-        Ok(rows.next().transpose()?)
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Drop volatile blocks with `slot <= upto` (after a boundary advance —

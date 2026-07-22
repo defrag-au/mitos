@@ -13,11 +13,14 @@
 //!
 //! - **live** — at tip; every fetched block is processed into it and its
 //!   events inserted immediately (`INSERT OR IGNORE`, idempotent).
-//! - **boundary** — k blocks deep (`--volatile-blocks`). Raw block CBOR for
-//!   the boundary..tip window is kept in `volatile_blocks`; as the window
-//!   overflows k, the oldest block replays into the boundary buffer, which is
-//!   then checkpointed to sqlite (the same `walk_cursor`/`outref_buffer`
-//!   checkpoint walk uses) and the raw block dropped.
+//! - **boundary** — trails tip by k blocks (`--volatile-blocks`). Raw block
+//!   CBOR for the boundary..tip window is kept in `volatile_blocks`. The
+//!   boundary checkpoint rewrites the whole open book (tens of thousands of
+//!   rows on a deep ledger), so it's sealed in BATCHES (`--checkpoint-batch`):
+//!   the window grows to k + batch, then one checkpoint seals a batch of
+//!   blocks into the boundary buffer (same `walk_cursor`/`outref_buffer`
+//!   tables walk uses) and drops their CBOR. Amortizing the rewrite this way
+//!   is the difference between a crawling and a network-bound catch-up.
 //!
 //! On `RollBackward(point)`: events + volatile blocks past the point are
 //! deleted, live is rebuilt as boundary + replay of the surviving window.
@@ -77,6 +80,14 @@ pub struct FollowArgs {
     /// rollbacks deeper than this abort).
     #[arg(long, default_value_t = 2160)]
     volatile_blocks: u64,
+
+    /// Boundary-advance batch size. The boundary checkpoint rewrites the whole
+    /// open book (tens of thousands of rows on a deep ledger), so it's sealed
+    /// in batches: the window grows to k + this before one checkpoint seals a
+    /// batch of blocks. Bigger = cheaper catch-up, slightly more replay on
+    /// resume + a slightly larger retained window.
+    #[arg(long, default_value_t = 1000)]
+    checkpoint_batch: u64,
 
     /// Intersect override `<slot>:<block_hash_hex>` (default: the persisted
     /// walk cursor). The buffer is only warm at the CURSOR — an arbitrary
@@ -228,7 +239,14 @@ async fn follow_loop(
                 rows.clear();
                 ledger.insert_volatile(slot, hash.as_ref(), Some(height), &body)?;
 
-                advance_boundary(args.volatile_blocks, registry, venues, ledger, state)?;
+                advance_boundary(
+                    args.volatile_blocks,
+                    args.checkpoint_batch,
+                    registry,
+                    venues,
+                    ledger,
+                    state,
+                )?;
 
                 processed += 1;
                 let behind = tip.0.slot_or_default().saturating_sub(slot);
@@ -307,21 +325,40 @@ fn apply_block(
 /// only leaves `slot <= boundary` rows for the startup sweep.
 fn advance_boundary(
     k: u64,
+    batch: u64,
     registry: &VenueRegistry,
     venues: &[&str],
     ledger: &mut Ledger,
     state: &mut FollowState,
 ) -> Result<()> {
+    // Cheap gate: only touch the DB once the window has grown a full batch past
+    // k. Most blocks return here. `checkpoint` rewrites the entire open book
+    // (tens of thousands of rows on a deep ledger, ~1.5s), so we amortize ONE
+    // rewrite over `batch` sealed blocks instead of firing it per block — the
+    // difference between a ~0.6 blk/s and a network-bound catch-up.
+    let count = ledger.volatile_count()?;
+    if count <= k + batch {
+        return Ok(());
+    }
+
+    // Seal everything except the newest k blocks, replaying each into the
+    // boundary buffer. Order matters for crash-safety: replay + checkpoint
+    // (persist the new boundary) BEFORE deleting the sealed CBOR — a crash
+    // between checkpoint and delete only leaves already-sealed rows for the
+    // startup sweep; a crash before checkpoint replays them again (idempotent).
+    let to_seal = count - k;
+    let blocks = ledger.volatile_oldest(to_seal)?;
     let mut scratch: Vec<MarketEventRow> = Vec::new();
-    while ledger.volatile_count()? > k {
-        let oldest = ledger
-            .oldest_volatile()?
-            .context("volatile window count > k but no oldest block")?;
-        apply_block(&oldest.cbor, registry, &mut state.boundary, &mut scratch)?;
+    let mut sealed: Option<(u64, Vec<u8>)> = None;
+    for vb in &blocks {
+        apply_block(&vb.cbor, registry, &mut state.boundary, &mut scratch)?;
         scratch.clear(); // rows were inserted when the block was first seen
-        ledger.checkpoint(&state.boundary, venues, oldest.slot, &oldest.hash)?;
-        state.boundary_slot = oldest.slot;
-        ledger.delete_volatile_upto(oldest.slot)?;
+        sealed = Some((vb.slot, vb.hash.clone()));
+    }
+    if let Some((slot, hash)) = sealed {
+        ledger.checkpoint(&state.boundary, venues, slot, &hash)?;
+        ledger.delete_volatile_upto(slot)?;
+        state.boundary_slot = slot;
     }
     Ok(())
 }
@@ -416,14 +453,21 @@ mod tests {
         );
         assert_eq!(after[0].cbor, cbor);
 
-        let oldest = led.oldest_volatile().unwrap().unwrap();
-        assert_eq!((oldest.slot, oldest.hash[0]), (100, 1));
+        // volatile_oldest(limit) returns the seal batch, slot ASC.
+        let batch = led.volatile_oldest(2).unwrap();
+        assert_eq!(
+            batch
+                .iter()
+                .map(|v| (v.slot, v.hash[0]))
+                .collect::<Vec<_>>(),
+            vec![(100, 1), (110, 2)]
+        );
 
         // Boundary advance sweep (<=) and rollback truncate (>).
         assert_eq!(led.delete_volatile_upto(100).unwrap(), 1);
         assert_eq!(led.delete_volatile_after(110).unwrap(), 1);
         assert_eq!(led.volatile_count().unwrap(), 1);
-        assert_eq!(led.oldest_volatile().unwrap().unwrap().slot, 110);
+        assert_eq!(led.volatile_oldest(1).unwrap()[0].slot, 110);
     }
 
     #[test]
