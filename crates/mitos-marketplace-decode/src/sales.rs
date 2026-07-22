@@ -134,15 +134,75 @@ pub fn classify_jpg_address(addr: &str) -> Option<JpgStoreContractVersion> {
     }
 }
 
+/// Payment credential of jpg.store's fee-collection address. jpg-frontend-era
+/// listings carried the platform fee INSIDE the datum payouts (paid to this
+/// credential); WayUp, settling the surviving jpg book, charges its fee as an
+/// extra contract-enforced output to the SAME address that is NOT a datum
+/// payout. `outputs here − payouts here` is therefore the buyer-side on-top
+/// fee, correct for both generations. (Verified on-chain 2026-07-22, tx
+/// `1abb0f60…`: payouts 950+30=980 plus a 20 ADA fee output → buyer paid
+/// 1000, matching WayUp's displayed price.)
+const JPG_FEE_CRED_HEX: &str = "84cc25ea4c29951d40b443b95bbc5676bc425470f96376d1984af9ab";
+
 /// Decode every completed jpg.store sale in a transaction.
 ///
 /// Datum-authoritative (price = sum of the listing datum's payouts). jpg V4
 /// listings carry no payout datum, so they are skipped here — matching the
 /// live module's current behaviour; V4 ADA-flow decode is a separate concern.
+///
+/// Each sale also carries its `on_top_fee_lovelace` share (see
+/// [`JPG_FEE_CRED_HEX`]): the tx-level on-top fee attributed pro-rata by
+/// settlement across the tx's listings. Bundle members repeat their listing's
+/// whole share, mirroring how they repeat the whole-bundle price.
 pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
-    collect_sales(tx, classify_jpg_address)
+    let matched = collect_sales(tx, classify_jpg_address);
+    if matched.is_empty() {
+        return Vec::new();
+    }
+
+    let fee_cred = parse_cred(JPG_FEE_CRED_HEX);
+    let outputs_to_fees: u64 = tx
+        .outputs
+        .iter()
+        .filter(|o| address_payment_cred(&o.address) == fee_cred)
+        .map(|o| o.lovelace)
+        .sum();
+    // Listing-level totals. `matched` repeats a bundle listing per member, so
+    // re-derive from the listing inputs (same gate as `collect_sales`).
+    let mut listings_total: u64 = 0;
+    let mut payouts_to_fees: u64 = 0;
+    for input in &tx.inputs {
+        if classify_jpg_address(&input.address).is_none() {
+            continue;
+        }
+        let Some(redeemer) = input.redeemer.as_ref() else {
+            continue;
+        };
+        if !is_buy_redeemer(redeemer) {
+            continue;
+        }
+        let Some(decoded) = input.datum.as_deref().and_then(decode_listing_datum) else {
+            continue;
+        };
+        listings_total += decoded.payouts.iter().map(|p| p.lovelace).sum::<u64>();
+        payouts_to_fees += decoded
+            .payouts
+            .iter()
+            .filter(|p| p.payment_pkh == JPG_FEE_CRED_HEX)
+            .map(|p| p.lovelace)
+            .sum::<u64>();
+    }
+    let on_top_total = outputs_to_fees.saturating_sub(payouts_to_fees);
+
+    matched
         .into_iter()
         .map(|s| {
+            let on_top_fee_lovelace = if on_top_total == 0 || listings_total == 0 {
+                0
+            } else {
+                (u128::from(on_top_total) * u128::from(s.price_lovelace)
+                    / u128::from(listings_total)) as u64
+            };
             JpgStoreSale::Sale(JpgSale {
                 policy: hex::encode(&s.policy),
                 asset_name_hex: hex::encode(&s.asset_name),
@@ -153,6 +213,7 @@ pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
                 price_lovelace: s.price_lovelace,
                 contract_version: s.tag,
                 bundle_size: s.bundle_size,
+                on_top_fee_lovelace,
             })
         })
         .collect()
@@ -285,6 +346,113 @@ mod tests {
     fn empty_config_never_classifies() {
         let cfg = WayupSaleConfig::default();
         assert!(!cfg.is_listing_address(SHELLEY_ADDR));
+    }
+
+    use crate::{AssetId, TxInput, TxOutput};
+
+    /// jpg.store's real fee address — payment cred [`JPG_FEE_CRED_HEX`].
+    const JPG_FEE_ADDR: &str = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p";
+
+    /// Build a listing datum: `Constr 0 [ [payout…], Bytes(seller_pkh) ]`,
+    /// each payout `Constr 0 [ Addr(Constr0[Constr0[pkh]], no-stake), amount ]`.
+    /// Amounts are pre-encoded CBOR uints (e.g. `1a389fd980` = 950 ADA).
+    fn listing_datum(seller_pkh: &str, payouts: &[(&str, &str)]) -> Vec<u8> {
+        let mut s = String::from("d8799f9f");
+        for (pkh, amount_cbor) in payouts {
+            s.push_str(&format!(
+                "d8799fd8799fd8799f581c{pkh}ffd87a80ff{amount_cbor}ff"
+            ));
+        }
+        s.push_str(&format!("ff581c{seller_pkh}ff"));
+        hex::decode(s).expect("valid hex")
+    }
+
+    fn sale_tx(datum: Vec<u8>, extra_outputs: Vec<TxOutput>) -> DecodeTx {
+        let asset = AssetId {
+            policy: vec![1; 28],
+            name: b"Bud".to_vec(),
+        };
+        let mut outputs = vec![TxOutput {
+            address: "addr1buyer".into(),
+            lovelace: 1_315_000,
+            assets: vec![asset.clone()],
+            ..Default::default()
+        }];
+        outputs.extend(extra_outputs);
+        DecodeTx {
+            tx_hash: vec![0xab; 32],
+            inputs: vec![TxInput {
+                address: JPG_V2_ADDR.into(),
+                assets: vec![asset],
+                datum: Some(datum),
+                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                ..Default::default()
+            }],
+            outputs,
+            ..Default::default()
+        }
+    }
+
+    /// The observed WayUp-settled shape (tx `1abb0f60…`): payouts 950 + 30,
+    /// plus a 20 ADA fee output NOT in the payouts → on-top fee 20.
+    #[test]
+    fn wayup_settled_jpg_sale_carries_on_top_fee() {
+        let seller = "bb".repeat(28);
+        let royalty = "cc".repeat(28);
+        let tx = sale_tx(
+            listing_datum(
+                &seller,
+                &[(&seller, "1a389fd980"), (&royalty, "1a01c9c380")],
+            ),
+            vec![TxOutput {
+                address: JPG_FEE_ADDR.into(),
+                lovelace: 20_000_000,
+                assets: Vec::new(),
+                ..Default::default()
+            }],
+        );
+        let sales = decode_jpg_sales(&tx);
+        assert_eq!(sales.len(), 1);
+        let JpgStoreSale::Sale(s) = &sales[0];
+        assert_eq!(s.price_lovelace, 980_000_000);
+        assert_eq!(s.on_top_fee_lovelace, 20_000_000);
+    }
+
+    /// jpg-frontend-era shape: the fee is a datum payout to the fee cred, and
+    /// the matching fee output is NOT on-top — buyer pays the settlement.
+    #[test]
+    fn jpg_era_fee_in_payouts_yields_zero_on_top() {
+        let seller = "bb".repeat(28);
+        let tx = sale_tx(
+            listing_datum(
+                &seller,
+                &[(&seller, "1a389fd980"), (JPG_FEE_CRED_HEX, "1a01312d00")],
+            ),
+            vec![TxOutput {
+                address: JPG_FEE_ADDR.into(),
+                lovelace: 20_000_000,
+                assets: Vec::new(),
+                ..Default::default()
+            }],
+        );
+        let sales = decode_jpg_sales(&tx);
+        assert_eq!(sales.len(), 1);
+        let JpgStoreSale::Sale(s) = &sales[0];
+        assert_eq!(s.price_lovelace, 970_000_000); // 950 + 20 in-datum fee
+        assert_eq!(s.on_top_fee_lovelace, 0);
+    }
+
+    /// No fee output at all → no on-top fee.
+    #[test]
+    fn jpg_sale_without_fee_output_has_zero_on_top() {
+        let seller = "bb".repeat(28);
+        let tx = sale_tx(
+            listing_datum(&seller, &[(&seller, "1a389fd980")]),
+            Vec::new(),
+        );
+        let sales = decode_jpg_sales(&tx);
+        let JpgStoreSale::Sale(s) = &sales[0];
+        assert_eq!(s.on_top_fee_lovelace, 0);
     }
 
     #[test]

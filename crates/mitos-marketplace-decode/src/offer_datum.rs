@@ -90,10 +90,8 @@ fn extract_asset_names(v: &PlutusData) -> Vec<String> {
 /// payout (jpg's convention).
 pub fn decode_jpg_offer_datum(cbor: &[u8]) -> Option<DecodedOffer> {
     let (bidder_pkh, payouts) = decode_offer_outer(cbor)?;
-    let (target_policy, target_asset_names) = payouts
-        .last()
-        .map(jpg_extract_target)
-        .unwrap_or_default();
+    let (target_policy, target_asset_names) =
+        payouts.last().map(jpg_extract_target).unwrap_or_default();
     Some(DecodedOffer {
         bidder_pkh,
         target_policy,
@@ -159,7 +157,9 @@ fn wayup_extract_payout_target(payout: &PlutusData) -> Option<(String, Vec<Strin
         return None;
     };
     let (policy_hex, names) = pairs.iter().find_map(|(k, v)| match k {
-        PlutusData::BoundedBytes(b) if b.len() == 28 => Some((hex::encode(&**b), extract_asset_names(v))),
+        PlutusData::BoundedBytes(b) if b.len() == 28 => {
+            Some((hex::encode(&**b), extract_asset_names(v)))
+        }
         _ => None,
     })?;
     let recipient = extract_address_payment_cred(&constr.fields[0])?;

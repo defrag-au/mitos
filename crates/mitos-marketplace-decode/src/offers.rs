@@ -341,7 +341,12 @@ mod tests {
         assert!(d.target_asset_names.is_empty()); // collection-wide
         assert_eq!(
             d.target_recipient,
-            Some(hex::decode(WAYUP_RECIPIENT_CRED).unwrap().try_into().unwrap())
+            Some(
+                hex::decode(WAYUP_RECIPIENT_CRED)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            )
         );
     }
 
@@ -384,12 +389,14 @@ mod tests {
                     address: enterprise_addr(WAYUP_BIDDER),
                     lovelace: 2_000_000,
                     assets: vec![asset(MEKANISM_POLICY, "4d656b616e69736d39393939")],
+                    ..Default::default()
                 },
                 // Delivery to the bidder's own wallet.
                 TxOutput {
                     address: enterprise_addr(WAYUP_RECIPIENT_CRED),
                     lovelace: 2_000_000,
                     assets: vec![asset(MEKANISM_POLICY, MEKANISM_2212)],
+                    ..Default::default()
                 },
             ],
             required_signers: vec![],
@@ -415,6 +422,7 @@ mod tests {
                 address: enterprise_addr(WAYUP_RECIPIENT_CRED),
                 lovelace: 2_000_000,
                 assets: vec![asset(MEKANISM_POLICY, MEKANISM_2212)],
+                ..Default::default()
             }],
             // Bidder signed → reclaiming (cancel), never an accept.
             required_signers: vec![hex::decode(WAYUP_BIDDER).unwrap()],
@@ -445,6 +453,7 @@ mod tests {
                 address: JPG_SELLER_ADDR.to_string(),
                 lovelace: 2_000_000,
                 assets: vec![asset(TAPPY_POLICY, TAPPY_3589)],
+                ..Default::default()
             }],
             required_signers: vec![],
         }

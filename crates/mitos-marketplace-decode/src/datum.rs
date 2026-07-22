@@ -23,8 +23,10 @@ pub fn is_cancel_redeemer(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xd8, 0x7a])
 }
 
-/// A decoded listing (ask) datum.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A decoded listing (ask) datum. `Default` is the empty listing (no payouts,
+/// no owner credential) — the honest-about-unknowns value a create emits when
+/// its hash-only datum can't be resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecodedListing {
     /// The agreed payouts; the listing's total price is their lovelace sum.
     pub payouts: Vec<ListingPayout>,

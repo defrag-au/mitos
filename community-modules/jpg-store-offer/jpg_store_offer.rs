@@ -456,6 +456,7 @@ fn flush_buffer(mut buf: TxBuffer) {
                         name: name.clone(),
                     })
                     .collect(),
+                ..Default::default()
             })
             .collect(),
         required_signers: Vec::new(),

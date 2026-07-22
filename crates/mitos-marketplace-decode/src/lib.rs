@@ -18,11 +18,13 @@
 //! `pallas-addresses` — no host imports, no I/O.
 
 pub mod datum;
+pub mod listings;
 pub mod offer_datum;
 pub mod offers;
 pub mod sales;
 
 pub use datum::{DecodedListing, is_buy_redeemer, is_cancel_redeemer};
+pub use listings::{decode_jpg_listings, decode_wayup_listings};
 pub use offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 pub use offers::{
     WayupOfferConfig, classify_jpg_offer_address, decode_jpg_offer_accepts,
@@ -59,12 +61,36 @@ pub struct TxInput {
     pub oref_index: u32,
 }
 
+/// An output's datum, carrying whichever of the inline payload / datum hash the
+/// chain provides. Only listing (and offer) *lifecycle* decode reads it — to
+/// price a freshly produced ask/bid UTxO; sale/accept decode reads datums from
+/// spent inputs, so it leaves [`TxOutput::datum`] `None`.
+///
+/// The split matters because listing lifecycle resolution is asymmetric: a jpg
+/// *create* reads `payload` only and never resolves `hash` (the boot-stall
+/// fix), while updates/delists (and Wayup creates) fall back to the caller's
+/// hash resolver. Keeping both fields lets the decode apply that policy itself.
+#[derive(Debug, Clone, Default)]
+pub struct OutputDatum {
+    /// Inline datum CBOR. Empty when the output commits only a hash.
+    pub payload: Vec<u8>,
+    /// 32-byte datum hash. Empty when the output carries an inline datum or none.
+    pub hash: Vec<u8>,
+}
+
 /// A resolved transaction output.
 #[derive(Debug, Clone, Default)]
 pub struct TxOutput {
     pub address: String,
     pub lovelace: u64,
     pub assets: Vec<AssetId>,
+    /// On-chain output index within the producing tx. Listing/offer lifecycle
+    /// decode reports it as `output_index`; sale/accept decode ignores it
+    /// (default 0).
+    pub index: u32,
+    /// The output's datum (see [`OutputDatum`]). Only listing/offer lifecycle
+    /// decode reads it; sale/accept decode leaves it `None`.
+    pub datum: Option<OutputDatum>,
 }
 
 /// A whole transaction, in the neutral shape the decoders consume.

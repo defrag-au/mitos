@@ -122,6 +122,7 @@ impl Guest for Module {
                         address: p.output.address.clone(),
                         lovelace: p.output.lovelace,
                         assets: to_asset_ids(&p.output.assets),
+                        ..Default::default()
                     });
                 }
                 _ => {}
