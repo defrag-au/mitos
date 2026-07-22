@@ -17,7 +17,8 @@ market-ledger walk --data-dir <dir> --db ledger.db    # decode history → sqlit
 market-ledger stats --db ledger.db                    # corpus-sanity report
 market-ledger seal --db ledger.db --out-dir parquet   # completed months → Parquet (duckdb CLI)
 market-ledger upload --db ledger.db --endpoint <url>  # hot window → worker D1 ingest
-# serve (phase 2) / follow (phase 3) — not yet implemented
+market-ledger serve --db ledger.db                    # HTTP read surface (compact binary)
+# follow (phase 3) — not yet implemented
 ```
 
 ## Where it runs
@@ -52,6 +53,50 @@ Input/datum resolution is **local-first**: the outref buffer + the spending tx's
 calls (a datum_cache → Koios fallback for the rare unrevealed hash-only datum is
 a later addition).
 
+## Serve
+
+`serve` is the consumer path: a read microservice over the ledger answering
+market-history queries in the compact `market-ledger-wire` postcard format
+(consumers PULL from it; the D1 `upload` path is legacy/backfill). It opens the
+db read-only per request, so running it against a ledger a walk is actively
+writing is fine (WAL, single writer).
+
+```
+market-ledger serve --db ledger.db --listen 127.0.0.1:8183
+```
+
+- **`GET /health`** (open): row count, slot extent, `latest_block_time` +
+  `freshness_secs` (= snapshot age for a walked corpus), per-venue walk
+  cursors, sealed partitions.
+- **`GET /events`** (bearer-gated): filters `venue`, `policy` (56-hex),
+  `asset` (CIP-14 fingerprint — exclusive with `policy`), `name`
+  (asset_name_hex, requires `policy`), `kind` (comma-separated:
+  `kind=sold,offer_accepted`), `from_slot`/`to_slot` (inclusive), `limit`.
+  Response is `application/octet-stream`: a postcard `EventsPage`
+  (version byte first — see `crates/market-ledger-wire` for the format and
+  its append-only evolution contract). `?format=json` returns the text-form
+  rows instead — the curl/jq debug loop.
+- **Pagination** is keyset `(slot, rowid)`: follow `next_cursor` until it is
+  absent. Treat the cursor as opaque. A concurrent new-venue backfill can
+  insert rows at slots a paging client already passed — pagination is a
+  stream over the corpus as-of-passage; re-query for an authoritative read.
+- **Auth**: `MARKET_LEDGER_TOKEN` env (own secret, deliberately not
+  `MITOS_AUTH_TOKEN` so the two services rotate independently). Unset ⇒ open
+  mode with a startup warning — fine on loopback, set it before tunnelling.
+- Responses gzip when the client sends `Accept-Encoding` (use
+  `curl --compressed`); CORS is permissive so browser/WASM consumers can call
+  through a CF tunnel directly.
+
+Smoke:
+
+```
+curl -s localhost:8183/health | jq
+curl -s "localhost:8183/events?policy=<56hex>&kind=sold&limit=5&format=json" \
+  -H "Authorization: Bearer $MARKET_LEDGER_TOKEN" | jq
+curl -s --compressed "localhost:8183/events?policy=<56hex>&kind=sold" \
+  -H "Authorization: Bearer $MARKET_LEDGER_TOKEN" -o page.bin && xxd page.bin | head  # byte 0 == 01
+```
+
 ## Validation (acceptance — run on-box after a bounded walk)
 
 1. **D1 cross-check.** Walk the slot range the D1 firehose already covers
@@ -74,4 +119,5 @@ a later addition).
 
 Chunk-level fast-skip + `read_blocks_from_point` resume (avoid decoding pre-floor
 blocks), a persistent `datum_cache` fronting Koios, and in-process DuckDB for
-`serve` mode.
+`serve` mode (union view over sealed Parquet + live sqlite, behind the existing
+`serve/db.rs` seam; `--parquet-dir` is already plumbed).

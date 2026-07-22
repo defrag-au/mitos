@@ -18,6 +18,9 @@ mitos-community-events = { path = "../../crates/mitos-community-events" }
 # CIP-14 fingerprint (`asset1…`), computed per row like the D1 firehose does.
 cardano-assets = { workspace = true }
 
+# Wire format served by `serve` (shared with consumers — egui frontends etc).
+market-ledger-wire = { path = "../../crates/market-ledger-wire" }
+
 # Operational ledger.
 rusqlite = { workspace = true }
 # Compact buffer-checkpoint serialisation (assets per buffered output) + the
@@ -36,6 +39,12 @@ pallas-primitives = { workspace = true }
 pallas-codec = { workspace = true }
 # blake2b for verifying jpg labels-50 offer-datum reconstructions at create time.
 pallas-crypto = "1.0.0"
+
+# `serve` HTTP read surface. The tokio runtime is confined to the serve
+# subcommand — the walker's main loop stays sync.
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
 
 clap = { workspace = true }
 serde = { workspace = true }

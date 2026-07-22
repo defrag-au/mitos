@@ -14,6 +14,7 @@ mod metadata;
 mod mithril;
 mod row;
 mod seal;
+mod serve;
 mod stats;
 mod store;
 mod upload;
@@ -47,8 +48,8 @@ enum Command {
     Stats(stats::StatsArgs),
     /// Delete the ledger + checkpoint (+ optional Parquet) for a clean restart.
     Reset(checkpoint::ResetArgs),
-    /// Serve the ledger over HTTP (phase 2 — not yet implemented).
-    Serve,
+    /// Serve the ledger over HTTP (compact binary read surface).
+    Serve(serve::ServeArgs),
     /// Follow the chain tip via the mitos companion protocol (phase 3 — not yet implemented).
     Follow,
 }
@@ -68,7 +69,7 @@ fn main() -> Result<()> {
         Command::Upload(args) => upload::run(args),
         Command::Stats(args) => stats::run(args),
         Command::Reset(args) => checkpoint::run_reset(args),
-        Command::Serve => anyhow::bail!("`serve` is phase 2 and not yet implemented"),
+        Command::Serve(args) => serve::run(args),
         Command::Follow => anyhow::bail!("`follow` is phase 3 and not yet implemented"),
     }
 }

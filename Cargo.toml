@@ -20,6 +20,7 @@ members = [
     "crates/mitos-dex-decode",
     "crates/mitos-vesting-decode",
     "crates/mitos-marketplace-decode",
+    "crates/market-ledger-wire",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",
@@ -111,8 +112,15 @@ address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1", "ws"] }
 tower = "0.5"
+# Response layers for the market-ledger read surface (gzip + CORS for
+# browser/WASM consumers behind a CF tunnel).
+tower-http = { version = "0.6", default-features = false, features = ["compression-gzip", "cors"] }
+
+# Compact positional wire encoding for market-ledger-wire. Same pin as
+# cnft.dev-workers (registry-index blob) so the two trees agree on the format.
+postcard = { version = "1", features = ["use-std"] }
 
 # Serialization + logging + errors.
 serde = { version = "1", features = ["derive"] }

@@ -16,7 +16,7 @@ use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::decode::Asset;
 use crate::row::MarketEventRow;
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS market_events (
     tx_hash              TEXT    NOT NULL,
     policy_id            TEXT    NOT NULL,
