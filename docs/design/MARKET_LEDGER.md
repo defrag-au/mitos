@@ -340,6 +340,17 @@ this doc (Opus).**
 - [O] (optional, separate) config-gated o7s serve listener in the mitos
   bundle so follow can peer against localhost dolos.
 
+**Phase 5 — current-listings serving (see [`MARKET_LEDGER_LISTINGS.md`](./MARKET_LEDGER_LISTINGS.md)):**
+- market-ledger already holds the live book (the open book = un-spent listing
+  UTxOs; ~240k on the box). Add a materialized `listings` projection (decoded
+  price, maintained by `follow` from the lifecycle events it already emits,
+  seeded from the open book) and a SEPARATE `GET /listings` endpoint (distinct
+  from `/events` so consumers fetch history + listings in parallel), returning a
+  postcard `ListingsPage` with floor + count in the header. Reverses the
+  "listings stay on Anvil" call — validation-gated on an Anvil cross-check +
+  venue-coverage audit. Becomes the Anvil replacement in the S4 mitos live-book
+  removal.
+
 **Phase 4 — push / webhook delivery (see [`MARKET_LEDGER_PUSH.md`](./MARKET_LEDGER_PUSH.md)):**
 - Companion-like subscription + push for REACTIVE consumers (quests first;
   alerts/notifications later). Pull stays for analytical reads. `follow` (the
