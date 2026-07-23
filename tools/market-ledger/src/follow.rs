@@ -45,9 +45,9 @@ use pallas_traverse::{MultiEraBlock, MultiEraHeader};
 use crate::buffer::OutrefBuffer;
 use crate::decode::decode_tx;
 use crate::row::{BlockCtx, MarketEventRow};
-use crate::store::Ledger;
+use crate::store::{Ledger, ListingOp};
 use crate::venue::VenueRegistry;
-use crate::walk::{process_tx, slot_to_unix};
+use crate::walk::{process_tx, rebuild_listings, slot_to_unix};
 
 #[derive(clap::Args, Debug)]
 pub struct FollowArgs {
@@ -145,12 +145,30 @@ pub fn run(args: FollowArgs) -> Result<()> {
     let volatile = ledger.volatile_after(boundary_slot)?;
     let mut intersect = (boundary_slot, boundary_hash);
     let mut rows: Vec<MarketEventRow> = Vec::new();
+    let mut discard_ops: Vec<ListingOp> = Vec::new(); // replay ops are superseded by the seed below
     for vb in &volatile {
-        apply_block(&vb.cbor, &registry, &mut state.live, &mut rows)?;
+        apply_block(
+            &vb.cbor,
+            &registry,
+            &mut state.live,
+            &mut rows,
+            &mut discard_ops,
+        )?;
         ledger.insert_events(&rows)?; // idempotent — usually all no-ops
         rows.clear();
+        discard_ops.clear();
         intersect = (vb.slot, vb.hash.clone());
     }
+    // Seed / re-seed the listings projection authoritatively from the current
+    // open book (handles an already-walked ledger + any resume). Incremental
+    // maintenance keeps it current from here (the live edge in `follow_loop`).
+    rebuild_listings(
+        &mut ledger,
+        &registry,
+        &state.live,
+        intersect.0,
+        slot_to_unix(intersect.0) as i64,
+    )?;
 
     tracing::info!(
         venues = ?enabled,
@@ -212,6 +230,7 @@ async fn follow_loop(
     let mut inserted_total: u64 = 0;
     let mut at_tip_logged = false;
     let mut rows: Vec<MarketEventRow> = Vec::new();
+    let mut listing_ops: Vec<ListingOp> = Vec::new();
 
     loop {
         let next = next_or_await(peer.chainsync()).await?;
@@ -225,8 +244,15 @@ async fn follow_loop(
                     .with_context(|| format!("blockfetch at slot {slot}"))?;
 
                 // Events BEFORE volatile (crash between = idempotent re-apply).
-                let height = apply_block(&body, registry, &mut state.live, &mut rows)?;
+                let height = apply_block(
+                    &body,
+                    registry,
+                    &mut state.live,
+                    &mut rows,
+                    &mut listing_ops,
+                )?;
                 let inserted = ledger.insert_events(&rows)?;
+                ledger.apply_listing_ops(&listing_ops)?; // keep the listings projection current at tip
                 inserted_total += inserted as u64;
                 if inserted > 0 {
                     tracing::info!(
@@ -237,6 +263,7 @@ async fn follow_loop(
                     );
                 }
                 rows.clear();
+                listing_ops.clear();
                 ledger.insert_volatile(slot, hash.as_ref(), Some(height), &body)?;
 
                 advance_boundary(
@@ -306,6 +333,7 @@ fn apply_block(
     registry: &VenueRegistry,
     buffer: &mut OutrefBuffer,
     rows: &mut Vec<MarketEventRow>,
+    listing_ops: &mut Vec<ListingOp>,
 ) -> Result<u64> {
     let blk = MultiEraBlock::decode(bytes).map_err(|e| anyhow::anyhow!("decoding block: {e:?}"))?;
     let ctx = BlockCtx {
@@ -314,7 +342,7 @@ fn apply_block(
         time: slot_to_unix(blk.slot()),
     };
     for tx in blk.txs() {
-        process_tx(decode_tx(&tx), registry, buffer, &ctx, rows);
+        process_tx(decode_tx(&tx), registry, buffer, &ctx, rows, listing_ops);
     }
     Ok(blk.number())
 }
@@ -349,10 +377,18 @@ fn advance_boundary(
     let to_seal = count - k;
     let blocks = ledger.volatile_oldest(to_seal)?;
     let mut scratch: Vec<MarketEventRow> = Vec::new();
+    let mut scratch_ops: Vec<ListingOp> = Vec::new(); // boundary replay: listings already applied at tip
     let mut sealed: Option<(u64, Vec<u8>)> = None;
     for vb in &blocks {
-        apply_block(&vb.cbor, registry, &mut state.boundary, &mut scratch)?;
+        apply_block(
+            &vb.cbor,
+            registry,
+            &mut state.boundary,
+            &mut scratch,
+            &mut scratch_ops,
+        )?;
         scratch.clear(); // rows were inserted when the block was first seen
+        scratch_ops.clear();
         sealed = Some((vb.slot, vb.hash.clone()));
     }
     if let Some((slot, hash)) = sealed {
@@ -389,11 +425,28 @@ fn rollback(
     let dropped_blocks = ledger.delete_volatile_after(target)?;
     state.live = state.boundary.clone();
     let mut rows: Vec<MarketEventRow> = Vec::new();
+    let mut discard_ops: Vec<ListingOp> = Vec::new();
     let survivors = ledger.volatile_after(state.boundary_slot)?;
     for vb in &survivors {
-        apply_block(&vb.cbor, registry, &mut state.live, &mut rows)?;
+        apply_block(
+            &vb.cbor,
+            registry,
+            &mut state.live,
+            &mut rows,
+            &mut discard_ops,
+        )?;
         rows.clear();
+        discard_ops.clear();
     }
+    // Heal the listings projection: rebuild it from the corrected live buffer
+    // (rolled-back listings are gone; survivors are re-seeded).
+    rebuild_listings(
+        ledger,
+        registry,
+        &state.live,
+        target,
+        slot_to_unix(target) as i64,
+    )?;
     tracing::warn!(
         target,
         dropped_events,
@@ -522,11 +575,20 @@ mod tests {
         .unwrap();
         let mut buffer = OutrefBuffer::default();
         let mut rows = Vec::new();
-        let height = apply_block(&fixture_block(), &registry, &mut buffer, &mut rows).unwrap();
+        let mut ops = Vec::new();
+        let height = apply_block(
+            &fixture_block(),
+            &registry,
+            &mut buffer,
+            &mut rows,
+            &mut ops,
+        )
+        .unwrap();
         assert!(height > 0);
         // Fixture block touches no watched venue — no events, empty book.
         assert!(rows.is_empty());
         assert!(buffer.is_empty());
+        assert!(ops.is_empty());
     }
 
     #[test]

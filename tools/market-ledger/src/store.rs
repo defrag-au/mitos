@@ -112,9 +112,6 @@ pub struct VolatileBlock {
 /// A current live listing (the query-ready projection of the open book).
 /// `price_lovelace` is `None` only for the rare jpg listing whose datum isn't
 /// locally resolvable.
-// TODO(listings): the store helpers below are consumed by the buffer-driven
-// maintenance + `/listings` slices (next); allow dead_code until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
     pub policy_id: String,
@@ -126,6 +123,18 @@ pub struct Listing {
     pub output_index: u32,
     pub listed_slot: u64,
     pub listed_time: i64,
+}
+
+/// A buffer-driven mutation of the `listings` projection, produced by
+/// `process_tx` as watched Sale-channel outputs are buffered (`Upsert`) or
+/// spent (`Delete`). Deletes precede upserts within a tx, so a reprice
+/// (delete old UTxO + upsert new UTxO, same asset) nets to the new listing.
+pub(crate) enum ListingOp {
+    Upsert(Listing),
+    Delete {
+        policy_id: String,
+        asset_name_hex: String,
+    },
 }
 
 impl Ledger {
@@ -339,9 +348,29 @@ impl Ledger {
 
     // --- listings (current-listings projection) ---------------------------------
 
+    /// Wipe the listings projection — the first step of an authoritative
+    /// rebuild from the open book (seed / post-rollback).
+    pub fn clear_listings(&mut self) -> Result<()> {
+        self.conn.execute("DELETE FROM listings", [])?;
+        Ok(())
+    }
+
+    /// Apply buffer-driven listing ops in order (see [`ListingOp`]).
+    pub fn apply_listing_ops(&mut self, ops: &[ListingOp]) -> Result<()> {
+        for op in ops {
+            match op {
+                ListingOp::Upsert(l) => self.upsert_listing(l)?,
+                ListingOp::Delete {
+                    policy_id,
+                    asset_name_hex,
+                } => self.delete_listing(policy_id, asset_name_hex)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Upsert a listing (create or reprice) — in-place on the `(policy, asset)`
     /// PK, so a reprice replaces the row (new price + current UTxO).
-    #[allow(dead_code)] // wired in the maintenance + /listings slices
     pub fn upsert_listing(&mut self, l: &Listing) -> Result<()> {
         self.conn.execute(
             "INSERT INTO listings (policy_id, asset_name_hex, venue, price_lovelace,
@@ -367,7 +396,6 @@ impl Ledger {
         Ok(())
     }
 
-    #[allow(dead_code)]
     /// Remove a listing (delist / sale / buffer-evict).
     pub fn delete_listing(&mut self, policy_id: &str, asset_name_hex: &str) -> Result<()> {
         self.conn.execute(

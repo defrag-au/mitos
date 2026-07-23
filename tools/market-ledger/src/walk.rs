@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use mitos_marketplace_decode::{
     AssetId, DecodeTx, OutputDatum, TxInput, TxOutput, decode_jpg_listings,
-    decode_jpg_offer_lifecycle, decode_jpg_sales, decode_wayup_listings,
+    decode_jpg_offer_lifecycle, decode_jpg_sales, decode_listing_datum, decode_wayup_listings,
     decode_wayup_offer_lifecycle, decode_wayup_sales,
 };
 use pallas_hardano::storage::immutable::{self, FallibleBlock, Point};
@@ -27,7 +27,7 @@ use crate::checkpoint::{self, CheckpointFile};
 use crate::decode::{Asset, DecodedOutput, DecodedTx, decode_tx};
 use crate::metadata;
 use crate::row::{self, BlockCtx, MarketEventRow};
-use crate::store::Ledger;
+use crate::store::{Ledger, Listing, ListingOp};
 use crate::venue::{Channel, VenueDecoder, VenueRegistry};
 
 #[derive(clap::Args, Debug)]
@@ -173,6 +173,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut last_slot: u64 = 0;
     let mut last_hash: Option<Hash<32>> = None;
     let mut rows: Vec<MarketEventRow> = Vec::new();
+    let mut listing_ops: Vec<ListingOp> = Vec::new();
 
     for block in blocks {
         let bytes = block.map_err(|e| anyhow::anyhow!("reading block from chunk: {e:?}"))?;
@@ -197,10 +198,19 @@ pub fn run(args: WalkArgs) -> Result<()> {
             time: slot_to_unix(slot),
         };
         for tx in blk.txs() {
-            process_tx(decode_tx(&tx), &registry, &mut buffer, &ctx, &mut rows);
+            process_tx(
+                decode_tx(&tx),
+                &registry,
+                &mut buffer,
+                &ctx,
+                &mut rows,
+                &mut listing_ops,
+            );
         }
         inserted += ledger.insert_events(&rows)? as u64;
+        ledger.apply_listing_ops(&listing_ops)?;
         rows.clear();
+        listing_ops.clear();
 
         if in_range.is_multiple_of(args.checkpoint_every.max(1)) {
             let hash = blk.hash();
@@ -277,6 +287,7 @@ pub(crate) fn process_tx(
     buffer: &mut OutrefBuffer,
     ctx: &BlockCtx,
     rows: &mut Vec<MarketEventRow>,
+    listing_ops: &mut Vec<ListingOp>,
 ) {
     let mut touched: BTreeSet<String> = BTreeSet::new();
 
@@ -287,6 +298,17 @@ pub(crate) fn process_tx(
     for inp in &d.inputs {
         if let Some(b) = buffer.take(&inp.oref) {
             touched.insert(b.venue.clone());
+            // Listings maintenance: a spend of a Sale-channel (listing) UTxO
+            // removes its listing row(s). Deletes precede this tx's upserts, so
+            // a reprice (spend old + produce new) nets to the new listing.
+            if registry.watch_for(&b.address).map(|w| w.channel) == Some(Channel::Sale) {
+                for a in &b.assets {
+                    listing_ops.push(ListingOp::Delete {
+                        policy_id: hex::encode(&a.policy),
+                        asset_name_hex: hex::encode(&a.name),
+                    });
+                }
+            }
             let datum = b
                 .datum_bytes
                 .clone()
@@ -309,6 +331,21 @@ pub(crate) fn process_tx(
             touched.insert(w.venue.clone());
             let is_jpg = matches!(registry.decoder(&w.venue), Some(VenueDecoder::Jpg));
             let datum_bytes = resolve_produced_datum(out, &d, is_jpg);
+            // Listings maintenance: a produced Sale-channel output is a
+            // (re)listing — upsert one row per escrowed asset (bundles fan out),
+            // priced from the resolved datum (None for unresolvable hash-only jpg).
+            if w.channel == Channel::Sale {
+                push_listing_upserts(
+                    listing_ops,
+                    &w.venue,
+                    datum_bytes.as_deref(),
+                    &out.assets,
+                    &hex::encode(d.tx_hash.as_ref()),
+                    out.index,
+                    ctx.slot,
+                    ctx.time as i64,
+                );
+            }
             buffer.insert(
                 (d.tx_hash, out.index),
                 BufferedOutput {
@@ -376,6 +413,77 @@ pub(crate) fn process_tx(
             None => {}
         }
     }
+}
+
+/// Build the listing upsert(s) for a produced Sale-channel output: one row per
+/// escrowed asset (a bundle escrows several), priced by the payout sum (the
+/// ask; the fee-fold to buyer-price happens at serve time). Price/seller are
+/// `None` when the datum can't be decoded (unresolvable hash-only jpg).
+#[allow(clippy::too_many_arguments)]
+fn push_listing_upserts(
+    ops: &mut Vec<ListingOp>,
+    venue: &str,
+    datum_bytes: Option<&[u8]>,
+    assets: &[Asset],
+    tx_hash_hex: &str,
+    output_index: u32,
+    slot: u64,
+    time: i64,
+) {
+    let decoded = datum_bytes.and_then(decode_listing_datum);
+    let price = decoded
+        .as_ref()
+        .map(|dl| dl.payouts.iter().map(|p| p.lovelace).sum::<u64>())
+        .filter(|&p| p > 0);
+    let seller = decoded
+        .as_ref()
+        .map(|dl| dl.cred_hex.clone())
+        .filter(|s| !s.is_empty());
+    for a in assets {
+        ops.push(ListingOp::Upsert(Listing {
+            policy_id: hex::encode(&a.policy),
+            asset_name_hex: hex::encode(&a.name),
+            venue: venue.to_string(),
+            price_lovelace: price,
+            seller_stake: seller.clone(),
+            tx_hash: tx_hash_hex.to_string(),
+            output_index,
+            listed_slot: slot,
+            listed_time: time,
+        }));
+    }
+}
+
+/// Rebuild the `listings` projection from scratch off the open book — the
+/// authoritative source (evict-on-spend, no ghosts). Used to SEED an
+/// already-walked ledger and to heal after a rollback. `slot`/`time` stamp the
+/// rebuilt rows (the buffer doesn't retain per-listing creation slots;
+/// incremental maintenance restamps the real slot on the next reprice).
+pub(crate) fn rebuild_listings(
+    ledger: &mut Ledger,
+    registry: &VenueRegistry,
+    buffer: &OutrefBuffer,
+    slot: u64,
+    time: i64,
+) -> Result<()> {
+    let mut ops: Vec<ListingOp> = Vec::new();
+    for (oref, b) in buffer.entries() {
+        if registry.watch_for(&b.address).map(|w| w.channel) == Some(Channel::Sale) {
+            push_listing_upserts(
+                &mut ops,
+                &b.venue,
+                b.datum_bytes.as_deref(),
+                &b.assets,
+                &hex::encode(oref.0.as_ref()),
+                oref.1,
+                slot,
+                time,
+            );
+        }
+    }
+    ledger.clear_listings()?;
+    ledger.apply_listing_ops(&ops)?;
+    Ok(())
 }
 
 /// Resolve a produced output's datum locally: inline, else this tx's witnesses,
