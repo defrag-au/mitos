@@ -62,6 +62,7 @@ fn router(state: AppState, token: auth::AuthToken) -> Router {
     // stays open (the mitos-platform admin pattern).
     let gated = Router::new()
         .route("/events", get(handlers::events))
+        .route("/count", get(handlers::count))
         .route("/listings", get(handlers::listings))
         .layer(axum::middleware::from_fn_with_state(
             token,

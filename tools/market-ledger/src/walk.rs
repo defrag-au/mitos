@@ -436,7 +436,7 @@ pub(crate) fn process_tx(
                     rows.push(row::from_jpg_listing(&e, ctx, venue));
                 }
                 for e in decode_jpg_offer_lifecycle(&dtx) {
-                    rows.push(row::from_jpg_offer(&e, ctx, venue));
+                    push_offer_row(rows, row::from_jpg_offer(&e, ctx, venue));
                 }
             }
             Some(VenueDecoder::Wayup { sale, offer }) => {
@@ -447,12 +447,29 @@ pub(crate) fn process_tx(
                     rows.push(row::from_wayup_listing(&e, ctx, venue));
                 }
                 for e in decode_wayup_offer_lifecycle(&dtx, offer) {
-                    rows.push(row::from_wayup_offer(&e, ctx, venue));
+                    push_offer_row(rows, row::from_wayup_offer(&e, ctx, venue));
                 }
             }
             None => {}
         }
     }
+}
+
+/// Persist a decoded offer event unless it carries no policy.
+///
+/// An offer consume that resolved no delivered asset yields a policy-less row:
+/// the lifecycle decoders emit a **partial accept** (empty policy/asset) so a
+/// live offer buffer knows the UTxO was consumed, but that is NOT a realized
+/// trade. It happens when a bidder reclaims/withdraws an offer via the same
+/// non-cancel (constructor-1) redeemer jpg uses for accepts — no NFT is
+/// delivered, so no asset resolves. Such a row can't be attributed to a
+/// collection and can't be wire-encoded (an empty policy isn't 28 bytes), so
+/// the ledger drops it rather than record a phantom fill.
+fn push_offer_row(rows: &mut Vec<MarketEventRow>, row: MarketEventRow) {
+    if row.policy_id.is_empty() {
+        return;
+    }
+    rows.push(row);
 }
 
 /// Build the listing upsert(s) for a produced Sale-channel output: one row per

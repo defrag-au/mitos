@@ -31,6 +31,15 @@ pub fn build_page(rows: Vec<LedgerRow>, next: Option<Cursor>) -> Result<EventsPa
     let mut venue_index: HashMap<String, u32> = HashMap::new();
 
     for row in &rows {
+        // Policy-less rows are lifecycle-book artifacts (an offer consumed with
+        // no delivered asset), not realized trades. A current walk no longer
+        // persists them, but skip any legacy straggler rather than fail the
+        // whole page — an empty policy can't be encoded as a 28-byte slot, and
+        // one bad row must never 500 the public endpoint. (Genuinely malformed
+        // non-empty hex below still errors: that's corpus corruption.)
+        if row.policy_id.is_empty() {
+            continue;
+        }
         let policy = match policy_index.get(&row.policy_id) {
             Some(&i) => i,
             None => {
@@ -220,5 +229,20 @@ mod tests {
         let mut bad = row(1, 9, "stake1seller");
         bad.kind = "bogus".into();
         assert!(build_page(vec![bad], None).is_err());
+    }
+
+    #[test]
+    fn empty_policy_row_is_skipped_not_errored() {
+        // A policy-less lifecycle-book artifact (unresolved offer consume) must
+        // not fail the page — it's dropped, and clean rows still encode.
+        let mut blank = row(1, 9, "stake1seller");
+        blank.policy_id = String::new();
+        blank.asset_name_hex = String::new();
+        blank.kind = "offer_accepted".into();
+
+        let page = build_page(vec![blank, row(2, 9, "stake1seller")], None)
+            .expect("empty-policy row must be skipped, not error");
+        assert_eq!(page.events.len(), 1, "only the clean row survives");
+        assert_eq!(page.policies, vec![[9u8; 28]]);
     }
 }

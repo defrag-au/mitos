@@ -79,13 +79,11 @@ pub struct LedgerRow {
     pub venue: String,
 }
 
-fn events_sql(f: &EventFilter) -> (String, Vec<Value>) {
-    let mut sql = String::from(
-        "SELECT rowid, tx_hash, policy_id, asset_name_hex, kind, price_lovelace,
-                buyer_price_lovelace, seller_stake, buyer_stake, marketplace,
-                bundle_size, output_index, fee_waived, slot, block_height, block_time, venue
-         FROM market_events WHERE 1=1",
-    );
+/// The shared `WHERE` predicates (everything except the cursor keyset / order /
+/// limit) — reused by the events page and the count aggregate. Each clause is
+/// ` AND …`, appended after a `WHERE 1=1` anchor.
+fn where_sql(f: &EventFilter) -> (String, Vec<Value>) {
+    let mut sql = String::new();
     let mut params: Vec<Value> = Vec::new();
 
     if let Some(v) = &f.venue {
@@ -119,6 +117,18 @@ fn events_sql(f: &EventFilter) -> (String, Vec<Value>) {
         sql.push_str(" AND slot <= ?");
         params.push((s as i64).into());
     }
+    (sql, params)
+}
+
+fn events_sql(f: &EventFilter) -> (String, Vec<Value>) {
+    let (where_clause, mut params) = where_sql(f);
+    let mut sql = format!(
+        "SELECT rowid, tx_hash, policy_id, asset_name_hex, kind, price_lovelace,
+                buyer_price_lovelace, seller_stake, buyer_stake, marketplace,
+                bundle_size, output_index, fee_waived, slot, block_height, block_time, venue
+         FROM market_events WHERE 1=1{where_clause}"
+    );
+
     if let Some(c) = f.cursor {
         // Row-value keyset comparison (sqlite ≥ 3.15; the bundled build is
         // far newer).
@@ -131,6 +141,22 @@ fn events_sql(f: &EventFilter) -> (String, Vec<Value>) {
     // limit+1: the extra row detects whether a next page exists.
     params.push((i64::from(f.limit) + 1).into());
     (sql, params)
+}
+
+/// Count **single-asset** fills matching the filter — the market-activity
+/// measure used for period-over-period trends. Bundle members (one whole-bundle
+/// sale stored as N rows) are excluded, mirroring the consumer's per-window
+/// count, so a current-vs-prior comparison is like-for-like.
+pub fn count_events(conn: &Connection, f: &EventFilter) -> Result<u64> {
+    let (where_clause, params) = where_sql(f);
+    let sql = format!(
+        "SELECT COUNT(*) FROM market_events
+         WHERE 1=1{where_clause} AND (bundle_size IS NULL OR bundle_size <= 1)"
+    );
+    let count: i64 = conn
+        .query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))
+        .context("counting events")?;
+    Ok(count as u64)
 }
 
 /// Run the filter; returns one page plus the cursor for the next (`None` =
@@ -340,6 +366,34 @@ mod tests {
             ..base()
         };
         assert_eq!(all(f, &conn), ["t4/01/listed", "t5/01/sold"]);
+    }
+
+    #[test]
+    fn count_matches_filter_and_excludes_bundles() {
+        let conn = fixture_conn();
+        let sold_aaa = EventFilter {
+            policy: Some("aaa".into()),
+            kinds: vec!["sold"],
+            limit: 100,
+            ..Default::default()
+        };
+        // Two single-asset sold rows for policy aaa.
+        assert_eq!(count_events(&conn, &sold_aaa).unwrap(), 2);
+
+        // A bundle sale (bundle_size = 3) is one whole-bundle trade stored per
+        // member — it must NOT inflate the single-asset count.
+        conn.execute(
+            "INSERT INTO market_events (tx_hash, policy_id, asset_name_hex, kind,
+                marketplace, bundle_size, fee_waived, slot, block_time, source, venue)
+             VALUES ('tb', 'aaa', '09', 'sold', 'jpg.store', 3, 0, 101, 1010, 'walk', 'jpg')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            count_events(&conn, &sold_aaa).unwrap(),
+            2,
+            "bundle member excluded from the count"
+        );
     }
 
     #[test]

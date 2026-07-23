@@ -150,6 +150,32 @@ pub async fn events(
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
 
+/// `/count` response — the single-asset fill count for the filter.
+#[derive(Serialize)]
+struct CountJson {
+    count: u64,
+}
+
+/// `GET /count` — a lightweight aggregate (no rows) over the same filter as
+/// `/events`: how many single-asset fills match. Used for period-over-period
+/// trend baselines (e.g. this 30d vs the prior 30d) where fetching the rows
+/// would be wasteful.
+pub async fn count(
+    State(state): State<AppState>,
+    Query(params): Query<EventsParams>,
+) -> Result<Response, ApiError> {
+    let filter = parse_filter(&params, &state)?;
+    let db = state.db.clone();
+    let count = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.open_ro()?;
+        query::count_events(&conn, &filter)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))??;
+
+    Ok(Json(CountJson { count }).into_response())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListingsParams {
     policy: Option<String>,
