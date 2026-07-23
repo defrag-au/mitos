@@ -76,6 +76,25 @@ CREATE TABLE IF NOT EXISTS partition_manifest (
     rows         INTEGER NOT NULL,
     PRIMARY KEY (venue, year, month)
 );
+
+-- Current live listings — a query-ready projection of the open book's listing
+-- subset with the price DECODED (buffer-driven; see MARKET_LEDGER_LISTINGS.md).
+-- One active listing per (policy, asset): the asset is escrowed in the listing
+-- script, so it can be in at most one listing UTxO at a time. `price_lovelace`
+-- is NULL only for the rare jpg listing whose datum isn't locally resolvable.
+CREATE TABLE IF NOT EXISTS listings (
+    policy_id       TEXT    NOT NULL,
+    asset_name_hex  TEXT    NOT NULL,
+    venue           TEXT    NOT NULL,
+    price_lovelace  INTEGER,
+    seller_stake    TEXT,
+    tx_hash         TEXT    NOT NULL,
+    output_index    INTEGER NOT NULL,
+    listed_slot     INTEGER NOT NULL,
+    listed_time     INTEGER NOT NULL,
+    PRIMARY KEY (policy_id, asset_name_hex)
+);
+CREATE INDEX IF NOT EXISTS idx_listings_policy ON listings(policy_id, price_lovelace);
 ";
 
 pub struct Ledger {
@@ -88,6 +107,25 @@ pub struct VolatileBlock {
     pub slot: u64,
     pub hash: Vec<u8>,
     pub cbor: Vec<u8>,
+}
+
+/// A current live listing (the query-ready projection of the open book).
+/// `price_lovelace` is `None` only for the rare jpg listing whose datum isn't
+/// locally resolvable.
+// TODO(listings): the store helpers below are consumed by the buffer-driven
+// maintenance + `/listings` slices (next); allow dead_code until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub policy_id: String,
+    pub asset_name_hex: String,
+    pub venue: String,
+    pub price_lovelace: Option<u64>,
+    pub seller_stake: Option<String>,
+    pub tx_hash: String,
+    pub output_index: u32,
+    pub listed_slot: u64,
+    pub listed_time: i64,
 }
 
 impl Ledger {
@@ -299,6 +337,93 @@ impl Ledger {
         Ok(out)
     }
 
+    // --- listings (current-listings projection) ---------------------------------
+
+    /// Upsert a listing (create or reprice) — in-place on the `(policy, asset)`
+    /// PK, so a reprice replaces the row (new price + current UTxO).
+    #[allow(dead_code)] // wired in the maintenance + /listings slices
+    pub fn upsert_listing(&mut self, l: &Listing) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO listings (policy_id, asset_name_hex, venue, price_lovelace,
+                 seller_stake, tx_hash, output_index, listed_slot, listed_time)
+             VALUES (?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(policy_id, asset_name_hex) DO UPDATE SET
+                 venue=excluded.venue, price_lovelace=excluded.price_lovelace,
+                 seller_stake=excluded.seller_stake, tx_hash=excluded.tx_hash,
+                 output_index=excluded.output_index, listed_slot=excluded.listed_slot,
+                 listed_time=excluded.listed_time",
+            params![
+                l.policy_id,
+                l.asset_name_hex,
+                l.venue,
+                l.price_lovelace.map(u64_i64),
+                l.seller_stake,
+                l.tx_hash,
+                l.output_index,
+                u64_i64(l.listed_slot),
+                l.listed_time,
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    /// Remove a listing (delist / sale / buffer-evict).
+    pub fn delete_listing(&mut self, policy_id: &str, asset_name_hex: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM listings WHERE policy_id=? AND asset_name_hex=?",
+            params![policy_id, asset_name_hex],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    /// Current listings for a policy, cheapest-first (unpriced last), for
+    /// `/listings`. The `LIMIT` caps a page.
+    pub fn listings_for_policy(&self, policy_id: &str, limit: u32) -> Result<Vec<Listing>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT policy_id, asset_name_hex, venue, price_lovelace, seller_stake,
+                    tx_hash, output_index, listed_slot, listed_time
+             FROM listings WHERE policy_id=?
+             ORDER BY price_lovelace IS NULL, price_lovelace ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![policy_id, limit], |r| {
+            Ok(Listing {
+                policy_id: r.get(0)?,
+                asset_name_hex: r.get(1)?,
+                venue: r.get(2)?,
+                price_lovelace: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                seller_stake: r.get(4)?,
+                tx_hash: r.get(5)?,
+                output_index: r.get::<_, i64>(6)? as u32,
+                listed_slot: r.get::<_, i64>(7)? as u64,
+                listed_time: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    #[allow(dead_code)]
+    /// `(count, floor_lovelace)` for a policy — the `/listings` page header.
+    /// Floor is the min over priced listings; `None` if none are priced.
+    pub fn listing_summary(&self, policy_id: &str) -> Result<(u64, Option<u64>)> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), MIN(price_lovelace) FROM listings WHERE policy_id=?",
+                [policy_id],
+                |r| {
+                    let count: i64 = r.get(0)?;
+                    let floor: Option<i64> = r.get(1)?;
+                    Ok((count as u64, floor.map(|v| v as u64)))
+                },
+            )
+            .map_err(Into::into)
+    }
+
     /// Drop volatile blocks with `slot <= upto` (after a boundary advance —
     /// also the startup sweep for rows orphaned by a crash mid-advance).
     pub fn delete_volatile_upto(&mut self, upto: u64) -> Result<usize> {
@@ -467,5 +592,41 @@ mod tests {
         assert_eq!(got.datum_bytes.as_deref(), Some(&[0xd8, 0x79, 0x80][..]));
         assert_eq!(got.datum_hash, Some(Hash::from([2u8; 32])));
         assert_eq!(got.venue, "jpg");
+    }
+
+    #[test]
+    fn listings_upsert_reprice_delete_and_query() {
+        let mut led = Ledger::open(Path::new(":memory:")).unwrap();
+        let mk = |asset: &str, price: Option<u64>, slot: u64| Listing {
+            policy_id: "p".into(),
+            asset_name_hex: asset.into(),
+            venue: "wayup".into(),
+            price_lovelace: price,
+            seller_stake: Some("stake1x".into()),
+            tx_hash: "tx".into(),
+            output_index: 0,
+            listed_slot: slot,
+            listed_time: slot as i64,
+        };
+        led.upsert_listing(&mk("a", Some(30_000_000), 100)).unwrap();
+        led.upsert_listing(&mk("b", Some(10_000_000), 101)).unwrap();
+        led.upsert_listing(&mk("c", None, 102)).unwrap(); // unpriced jpg
+        // Reprice `a` in place (same PK) — still 3 rows, new price.
+        led.upsert_listing(&mk("a", Some(5_000_000), 200)).unwrap();
+
+        let rows = led.listings_for_policy("p", 100).unwrap();
+        assert_eq!(rows.len(), 3);
+        // Cheapest first, unpriced last.
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.asset_name_hex.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(rows[0].price_lovelace, Some(5_000_000)); // reprice applied
+        assert_eq!(led.listing_summary("p").unwrap(), (3, Some(5_000_000)));
+
+        led.delete_listing("p", "a").unwrap();
+        assert_eq!(led.listing_summary("p").unwrap(), (2, Some(10_000_000)));
     }
 }
