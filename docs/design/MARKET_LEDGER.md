@@ -339,3 +339,16 @@ this doc (Opus).**
   intersect-at-cursor, merge into the serve process.
 - [O] (optional, separate) config-gated o7s serve listener in the mitos
   bundle so follow can peer against localhost dolos.
+
+**Phase 4 — push / webhook delivery (see [`MARKET_LEDGER_PUSH.md`](./MARKET_LEDGER_PUSH.md)):**
+- Companion-like subscription + push for REACTIVE consumers (quests first;
+  alerts/notifications later). Pull stays for analytical reads. `follow` (the
+  writer) owns a `subscriptions` table + a delivery loop that reads new ledger
+  rows per subscription and POSTs postcard `EventsPage` batches with a
+  per-subscriber `(slot, rowid)` cursor + retry (at-least-once, idempotent
+  receiver). Delivered from the SETTLED boundary cursor, not the live tip, so a
+  volatile-window rollback never delivers a reversible event. This is the
+  vehicle for retiring the mitos marketplace subscriptions: quests repoint from
+  the mitos-fed DO feed to market-ledger push, then the live-book DO
+  (`MarketIngressDO` + DO market tables + market-stats/listings endpoints) is
+  removed (listings revert to Anvil).
