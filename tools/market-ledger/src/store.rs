@@ -95,6 +95,17 @@ CREATE TABLE IF NOT EXISTS listings (
     PRIMARY KEY (policy_id, asset_name_hex)
 );
 CREATE INDEX IF NOT EXISTS idx_listings_policy ON listings(policy_id, price_lovelace);
+
+-- Persistent datum retention: content-addressed hash → CBOR bytes. Written
+-- through at resolve time (produce) and when a spend finally reveals a
+-- previously hash-only preimage — retaining datums the moving `outref_buffer`
+-- evicts on spend, so history can be re-decoded without a re-walk and a hash is
+-- never re-resolved. Append-only (content-addressed ⇒ immutable), so writes use
+-- INSERT OR IGNORE and NEVER go through the checkpoint wipe/rewrite path.
+CREATE TABLE IF NOT EXISTS datum_cache (
+    datum_hash  BLOB PRIMARY KEY,
+    datum_bytes BLOB NOT NULL
+);
 ";
 
 pub struct Ledger {
@@ -190,6 +201,41 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Write resolved datums through to the persistent cache. Content-addressed
+    /// and immutable, so `INSERT OR IGNORE` is idempotent (replay-safe) and
+    /// never overwrites — a hash's bytes never change. Returns newly-inserted
+    /// count. Never called from `checkpoint` (which wipes+rewrites its tables).
+    pub fn insert_datums(&mut self, entries: &[(Hash<32>, Vec<u8>)]) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO datum_cache (datum_hash, datum_bytes) VALUES (?,?)",
+            )?;
+            for (hash, bytes) in entries {
+                inserted += stmt.execute(params![hash.as_ref(), bytes])?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Look up a datum's CBOR bytes by hash (the read side of the cache — the
+    /// final fallback in the LOCAL-FIRST resolution chain).
+    pub fn get_datum(&self, hash: &Hash<32>) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT datum_bytes FROM datum_cache WHERE datum_hash = ?",
+                [hash.as_ref()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .ok())
     }
 
     /// Persist the open-book snapshot + per-venue cursor in one transaction — a
@@ -656,5 +702,38 @@ mod tests {
 
         led.delete_listing("p", "a").unwrap();
         assert_eq!(led.listing_summary("p").unwrap(), (2, Some(10_000_000)));
+    }
+
+    #[test]
+    fn datum_cache_roundtrip_and_idempotent() {
+        let mut led = Ledger::open(Path::new(":memory:")).unwrap();
+        let h1 = Hash::from([1u8; 32]);
+        let h2 = Hash::from([2u8; 32]);
+        let bytes1 = vec![0xd8, 0x79, 0x80];
+
+        // First write of two distinct hashes inserts both.
+        assert_eq!(
+            led.insert_datums(&[(h1, bytes1.clone()), (h2, vec![0x01])])
+                .unwrap(),
+            2
+        );
+        // Read back by hash.
+        assert_eq!(led.get_datum(&h1).unwrap().as_deref(), Some(&bytes1[..]));
+        assert_eq!(led.get_datum(&h2).unwrap().as_deref(), Some(&[0x01][..]));
+        // A missing hash is None.
+        assert_eq!(led.get_datum(&Hash::from([9u8; 32])).unwrap(), None);
+
+        // Content-addressed + immutable: re-inserting the same hash writes
+        // nothing (INSERT OR IGNORE) and never overwrites the stored bytes,
+        // even if handed different bytes for the same key.
+        assert_eq!(
+            led.insert_datums(&[(h1, vec![0xff]), (h2, vec![0xff])])
+                .unwrap(),
+            0
+        );
+        assert_eq!(led.get_datum(&h1).unwrap().as_deref(), Some(&bytes1[..]));
+
+        // Empty batch is a no-op.
+        assert_eq!(led.insert_datums(&[]).unwrap(), 0);
     }
 }

@@ -174,6 +174,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut last_hash: Option<Hash<32>> = None;
     let mut rows: Vec<MarketEventRow> = Vec::new();
     let mut listing_ops: Vec<ListingOp> = Vec::new();
+    let mut datum_writes: Vec<(Hash<32>, Vec<u8>)> = Vec::new();
 
     for block in blocks {
         let bytes = block.map_err(|e| anyhow::anyhow!("reading block from chunk: {e:?}"))?;
@@ -197,20 +198,29 @@ pub fn run(args: WalkArgs) -> Result<()> {
             height: Some(blk.number()),
             time: slot_to_unix(slot),
         };
-        for tx in blk.txs() {
-            process_tx(
-                decode_tx(&tx),
-                &registry,
-                &mut buffer,
-                &ctx,
-                &mut rows,
-                &mut listing_ops,
-            );
+        // Scope the datum-cache read borrow of `ledger` to the tx loop so the
+        // per-block `&mut ledger` writes below are free.
+        {
+            let cache_get = |h: &Hash<32>| ledger.get_datum(h).unwrap_or(None);
+            for tx in blk.txs() {
+                process_tx(
+                    decode_tx(&tx),
+                    &registry,
+                    &mut buffer,
+                    &ctx,
+                    &mut rows,
+                    &mut listing_ops,
+                    &mut datum_writes,
+                    &cache_get,
+                );
+            }
         }
         inserted += ledger.insert_events(&rows)? as u64;
         ledger.apply_listing_ops(&listing_ops)?;
+        ledger.insert_datums(&datum_writes)?;
         rows.clear();
         listing_ops.clear();
+        datum_writes.clear();
 
         if in_range.is_multiple_of(args.checkpoint_every.max(1)) {
             let hash = blk.hash();
@@ -279,8 +289,19 @@ pub fn run(args: WalkArgs) -> Result<()> {
     Ok(())
 }
 
+/// The persistent datum-cache read side: hash → CBOR bytes, used as the final
+/// fallback in local-first resolution ("never re-resolve a hash"). `follow`
+/// boundary-replay passes a no-op (its decode output is discarded).
+pub(crate) type DatumCacheGet<'a> = &'a dyn Fn(&Hash<32>) -> Option<Vec<u8>>;
+
 /// Shared with `follow` — the per-tx buffer/decode/row pipeline is identical
 /// whether the block came from an immutable chunk or the chainsync tail.
+///
+/// `datum_writes` accumulates newly-materialized `(datum_hash, bytes)` pairs
+/// (resolved at produce time, or revealed by a spend just before the buffer
+/// evicts them) for the caller to flush to `datum_cache`. `cache_get` is the
+/// read side of that same cache.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_tx(
     d: DecodedTx,
     registry: &VenueRegistry,
@@ -288,6 +309,8 @@ pub(crate) fn process_tx(
     ctx: &BlockCtx,
     rows: &mut Vec<MarketEventRow>,
     listing_ops: &mut Vec<ListingOp>,
+    datum_writes: &mut Vec<(Hash<32>, Vec<u8>)>,
+    cache_get: DatumCacheGet<'_>,
 ) {
     let mut touched: BTreeSet<String> = BTreeSet::new();
 
@@ -309,10 +332,21 @@ pub(crate) fn process_tx(
                     });
                 }
             }
+            // Resolve the consumed listing's datum local-first: buffered bytes,
+            // else this SPENDING tx's witnesses (jpg hash-only datums reveal
+            // their preimage here), else the persistent cache.
+            let had_bytes = b.datum_bytes.is_some();
+            let bhash = b.datum_hash;
             let datum = b
                 .datum_bytes
                 .clone()
-                .or_else(|| b.datum_hash.and_then(|h| d.witness_datums.get(&h).cloned()));
+                .or_else(|| bhash.and_then(|h| d.witness_datums.get(&h).cloned()))
+                .or_else(|| bhash.and_then(|h| cache_get(&h)));
+            // Retention write-through: a preimage first revealed at spend time
+            // would otherwise be lost when the buffer evicts this output.
+            if !had_bytes && let (Some(h), Some(bytes)) = (bhash, datum.as_ref()) {
+                datum_writes.push((h, bytes.clone()));
+            }
             inputs.push(TxInput {
                 address: b.address,
                 lovelace: b.lovelace,
@@ -330,7 +364,12 @@ pub(crate) fn process_tx(
         if let Some(w) = registry.watch_for(&out.address) {
             touched.insert(w.venue.clone());
             let is_jpg = matches!(registry.decoder(&w.venue), Some(VenueDecoder::Jpg));
-            let datum_bytes = resolve_produced_datum(out, &d, is_jpg);
+            let datum_bytes = resolve_produced_datum(out, &d, is_jpg, cache_get);
+            // Retention write-through: cache a hash-only datum resolved locally
+            // (inline datums have no hash to key on, so are skipped).
+            if let (Some(h), Some(bytes)) = (out.datum_hash, datum_bytes.as_ref()) {
+                datum_writes.push((h, bytes.clone()));
+            }
             // Listings maintenance: a produced Sale-channel output is a
             // (re)listing — upsert one row per escrowed asset (bundles fan out),
             // priced from the resolved datum (None for unresolvable hash-only jpg).
@@ -369,7 +408,7 @@ pub(crate) fn process_tx(
     let outputs: Vec<TxOutput> = d
         .outputs
         .iter()
-        .map(|o| build_output(o, registry, &d))
+        .map(|o| build_output(o, registry, &d, cache_get))
         .collect();
     let dtx = DecodeTx {
         tx_hash: d.tx_hash.as_ref().to_vec(),
@@ -378,11 +417,12 @@ pub(crate) fn process_tx(
         required_signers: d.required_signers.clone(),
     };
 
-    // Listing decode resolves hash-only NEW-listing datums from this tx's
-    // witnesses (local-first; a datum_cache / Koios fallback layers in later).
+    // Listing decode resolves hash-only NEW-listing datums local-first: this
+    // tx's witnesses, then the persistent datum cache.
     let resolve = |hash: &[u8]| -> Option<Vec<u8>> {
         let arr: [u8; 32] = hash.try_into().ok()?;
-        d.witness_datums.get(&Hash::from(arr)).cloned()
+        let h = Hash::from(arr);
+        d.witness_datums.get(&h).cloned().or_else(|| cache_get(&h))
     };
 
     // 4. Dispatch each touched venue's decoders → market_events rows.
@@ -487,8 +527,14 @@ pub(crate) fn rebuild_listings(
 }
 
 /// Resolve a produced output's datum locally: inline, else this tx's witnesses,
-/// else (jpg) the labels-50 metadata reconstruction.
-fn resolve_produced_datum(out: &DecodedOutput, d: &DecodedTx, is_jpg: bool) -> Option<Vec<u8>> {
+/// else (jpg) the labels-50 metadata reconstruction, else the persistent datum
+/// cache.
+fn resolve_produced_datum(
+    out: &DecodedOutput,
+    d: &DecodedTx,
+    is_jpg: bool,
+    cache_get: DatumCacheGet<'_>,
+) -> Option<Vec<u8>> {
     out.inline_datum
         .clone()
         .or_else(|| {
@@ -505,13 +551,23 @@ fn resolve_produced_datum(out: &DecodedOutput, d: &DecodedTx, is_jpg: bool) -> O
                 None
             }
         })
+        .or_else(|| out.datum_hash.and_then(|h| cache_get(&h)))
 }
 
-/// Build a neutral `TxOutput`. Offer outputs carry their datum resolved into
-/// `payload` (offer decode has no resolver); sale/listing outputs carry the
-/// inline payload + hash so the listing decode applies its own resolution
-/// policy (create = payload-only; update = resolver).
-fn build_output(o: &DecodedOutput, registry: &VenueRegistry, d: &DecodedTx) -> TxOutput {
+/// Build a neutral `TxOutput`. Both offer and sale/listing outputs carry their
+/// datum resolved LOCAL-FIRST into `payload` (via `resolve_produced_datum`:
+/// inline → this-tx witnesses → jpg metadata) so the listing/offer decode can
+/// price hash-only jpg datums. The listing decode's own resolution policy still
+/// applies on top (create = payload-first; update = resolver fallback); feeding
+/// it the resolved payload is what makes jpg `listed`/`price_change` events
+/// carry a price instead of 0. `hash` is retained on sale outputs so the
+/// decoder's resolver fallback still has it for the rare unresolvable case.
+fn build_output(
+    o: &DecodedOutput,
+    registry: &VenueRegistry,
+    d: &DecodedTx,
+    cache_get: DatumCacheGet<'_>,
+) -> TxOutput {
     let datum = match registry
         .watch_for(&o.address)
         .map(|w| (w.venue.clone(), w.channel))
@@ -519,17 +575,20 @@ fn build_output(o: &DecodedOutput, registry: &VenueRegistry, d: &DecodedTx) -> T
         Some((venue, Channel::Offer)) => {
             let is_jpg = matches!(registry.decoder(&venue), Some(VenueDecoder::Jpg));
             Some(OutputDatum {
-                payload: resolve_produced_datum(o, d, is_jpg).unwrap_or_default(),
+                payload: resolve_produced_datum(o, d, is_jpg, cache_get).unwrap_or_default(),
                 hash: Vec::new(),
             })
         }
-        Some((_, Channel::Sale)) => Some(OutputDatum {
-            payload: o.inline_datum.clone().unwrap_or_default(),
-            hash: o
-                .datum_hash
-                .map(|h| h.as_ref().to_vec())
-                .unwrap_or_default(),
-        }),
+        Some((venue, Channel::Sale)) => {
+            let is_jpg = matches!(registry.decoder(&venue), Some(VenueDecoder::Jpg));
+            Some(OutputDatum {
+                payload: resolve_produced_datum(o, d, is_jpg, cache_get).unwrap_or_default(),
+                hash: o
+                    .datum_hash
+                    .map(|h| h.as_ref().to_vec())
+                    .unwrap_or_default(),
+            })
+        }
         None => None,
     };
     TxOutput {
@@ -572,5 +631,111 @@ pub(crate) fn slot_to_unix(slot: u64) -> u64 {
         SHELLEY_START_UNIX + (slot - SHELLEY_START_SLOT)
     } else {
         BYRON_START_UNIX + slot * 20
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    // A jpg.store V1 sale contract address (from venues.toml).
+    const JPG_SALE_ADDR: &str = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm";
+
+    fn registry() -> VenueRegistry {
+        VenueRegistry::load(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/venues.toml")),
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// A jpg listing tx with a single produced Sale-channel output.
+    fn jpg_listing_tx(
+        datum_hash: Option<Hash<32>>,
+        inline: Option<Vec<u8>>,
+        witness_datums: HashMap<Hash<32>, Vec<u8>>,
+    ) -> DecodedTx {
+        DecodedTx {
+            tx_hash: Hash::from([0u8; 32]),
+            inputs: Vec::new(),
+            outputs: vec![DecodedOutput {
+                address: JPG_SALE_ADDR.into(),
+                lovelace: 2_000_000,
+                assets: vec![Asset {
+                    policy: vec![9u8; 28],
+                    name: b"Bud1".to_vec(),
+                }],
+                index: 0,
+                datum_hash,
+                inline_datum: inline,
+            }],
+            required_signers: Vec::new(),
+            witness_datums,
+            aux_data: None,
+        }
+    }
+
+    fn no_cache(_: &Hash<32>) -> Option<Vec<u8>> {
+        None
+    }
+
+    // Thread 1: a jpg Sale-channel output whose datum is hash-only (empty
+    // inline) now carries the datum resolved from THIS tx's witnesses in the
+    // OutputDatum payload. The bug fed the empty inline payload to the decoder,
+    // so jpg `listed`/`price_change` decoded to price 0.
+    #[test]
+    fn sale_output_payload_resolved_from_witnesses() {
+        let reg = registry();
+        let h = Hash::from([7u8; 32]);
+        let preimage = vec![0xd8, 0x79, 0x80];
+        let mut wd = HashMap::new();
+        wd.insert(h, preimage.clone());
+        let d = jpg_listing_tx(Some(h), None, wd);
+
+        let built = build_output(&d.outputs[0], &reg, &d, &no_cache);
+        let datum = built.datum.expect("watched sale output carries a datum");
+        // Fixed: payload is the witness-resolved preimage, not empty.
+        assert_eq!(datum.payload, preimage);
+        // Hash retained for the decoder's resolver fallback / cache lookup.
+        assert_eq!(datum.hash, h.as_ref().to_vec());
+    }
+
+    // Thread 2: when local resolution (inline/witness/metadata) misses, the
+    // persistent datum cache is the final fallback ("never re-resolve a hash").
+    #[test]
+    fn sale_output_payload_resolved_from_cache() {
+        let reg = registry();
+        let h = Hash::from([5u8; 32]);
+        let cached = vec![0xd8, 0x79, 0x81];
+        let d = jpg_listing_tx(Some(h), None, HashMap::new()); // no witnesses
+
+        // Local miss without a cache; hit once the cache supplies the preimage.
+        assert_eq!(
+            resolve_produced_datum(&d.outputs[0], &d, true, &no_cache),
+            None
+        );
+        let hit = |q: &Hash<32>| (q == &h).then(|| cached.clone());
+        assert_eq!(
+            resolve_produced_datum(&d.outputs[0], &d, true, &hit),
+            Some(cached.clone())
+        );
+        // Through build_output: the Sale payload carries the cached datum.
+        let built = build_output(&d.outputs[0], &reg, &d, &hit);
+        assert_eq!(built.datum.unwrap().payload, cached);
+    }
+
+    // An inline datum (no hash) is used directly; with no datum_hash there is
+    // nothing for the produce-time write-through to key on (guards that path).
+    #[test]
+    fn inline_datum_used_directly() {
+        let inline = vec![0xd8, 0x79, 0x82];
+        let d = jpg_listing_tx(None, Some(inline.clone()), HashMap::new());
+        assert_eq!(
+            resolve_produced_datum(&d.outputs[0], &d, true, &no_cache),
+            Some(inline)
+        );
+        assert!(d.outputs[0].datum_hash.is_none());
     }
 }

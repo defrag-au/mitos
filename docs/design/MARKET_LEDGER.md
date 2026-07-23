@@ -205,6 +205,48 @@ ledger append-only and lets the derivation improve without migration.
 - **ClickHouse = documented graduation path, not a dependency.** Ingests
   the Parquet partitions natively if scale ever demands it (100M+ rows).
 
+### Write-path performance (measured 2026-07-23)
+
+Measured during a full genesis→tip re-walk on cardano-infra (netcup, 12
+vCPU, virtio disk). **The walk is CPU-bound, not IO-bound** — this is the
+right shape for a one-shot backfill, but the notes below matter if we ever
+want the re-walk faster (steady-state `follow` is ~1 block/2s and none of
+this registers there).
+
+- **System:** io-wait 0–3%, ~60% CPU idle, sustained ~137 MB/s writes with
+  headroom. The disk is not the bottleneck.
+- **Process:** single-threaded, ~0.8 of one core, oscillating running ↔
+  disk-sleep. Time goes to CBOR block decode, blake2b witness-datum
+  hashing, and marketplace decode — not to storage.
+- **Write amplification is real:** ~140 GB written to produce a ~5 GB db
+  (~28×), ~54M write syscalls. Most is inherent WAL double-write, but a
+  meaningful avoidable share is the un-batched listings path.
+
+**Potential improvements (none needed for correctness; ordered by payoff):**
+
+1. **Batch `apply_listing_ops` per block.** It currently does one
+   auto-commit *per op* (each `upsert_listing`/`delete_listing` is its own
+   implicit transaction). In the jpg era that's ~6.3M ops (4.4M listed +
+   1.48M delisted + 405k reprice), each a separate WAL commit — a large
+   fraction of the write-syscall count. Wrap it in a single per-block
+   transaction with cached statements, mirroring `insert_events` /
+   `insert_datums` (which already batch + early-return on empty). Small,
+   safe, biggest single win.
+2. **Split decode from storage across two threads.** A producer (read
+   chunk → `decode_tx` → marketplace decode) feeding a consumer (sqlite
+   writes) over a channel would overlap the ~0.8 CPU core with write IO
+   the disk has headroom for. Bigger change; only worth it if re-walks
+   become frequent.
+3. **Coalesce the three per-block flushes** (`insert_events`,
+   `apply_listing_ops`, `insert_datums`) into one transaction to cut
+   commit/WAL-frame overhead ~3×. Subsumed by (1) if that's done as a
+   shared per-block txn.
+
+The `datum_cache` write-through (2026-07-23) is already lean: batched
+`INSERT OR IGNORE`, early-return on empty, and the read fallback
+(`get_datum`) is an indexed PK lookup placed *last* in the resolution
+chain, so it only fires on the ~14% that inline/witness/metadata all miss.
+
 ### Serve mode (phase 2)
 
 Token-gated (own bearer, `MITOS_AUTH_TOKEN` shape), `127.0.0.1` first; CF

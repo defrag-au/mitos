@@ -47,7 +47,7 @@ use crate::decode::decode_tx;
 use crate::row::{BlockCtx, MarketEventRow};
 use crate::store::{Ledger, ListingOp};
 use crate::venue::VenueRegistry;
-use crate::walk::{process_tx, rebuild_listings, slot_to_unix};
+use crate::walk::{DatumCacheGet, process_tx, rebuild_listings, slot_to_unix};
 
 #[derive(clap::Args, Debug)]
 pub struct FollowArgs {
@@ -146,6 +146,8 @@ pub fn run(args: FollowArgs) -> Result<()> {
     let mut intersect = (boundary_slot, boundary_hash);
     let mut rows: Vec<MarketEventRow> = Vec::new();
     let mut discard_ops: Vec<ListingOp> = Vec::new(); // replay ops are superseded by the seed below
+    let mut discard_datums: Vec<(Hash<32>, Vec<u8>)> = Vec::new(); // already cached at tip
+    let no_cache = |_: &Hash<32>| -> Option<Vec<u8>> { None };
     for vb in &volatile {
         apply_block(
             &vb.cbor,
@@ -153,10 +155,13 @@ pub fn run(args: FollowArgs) -> Result<()> {
             &mut state.live,
             &mut rows,
             &mut discard_ops,
+            &mut discard_datums,
+            &no_cache,
         )?;
         ledger.insert_events(&rows)?; // idempotent — usually all no-ops
         rows.clear();
         discard_ops.clear();
+        discard_datums.clear();
         intersect = (vb.slot, vb.hash.clone());
     }
     // Seed / re-seed the listings projection authoritatively from the current
@@ -231,6 +236,7 @@ async fn follow_loop(
     let mut at_tip_logged = false;
     let mut rows: Vec<MarketEventRow> = Vec::new();
     let mut listing_ops: Vec<ListingOp> = Vec::new();
+    let mut datum_writes: Vec<(Hash<32>, Vec<u8>)> = Vec::new();
 
     loop {
         let next = next_or_await(peer.chainsync()).await?;
@@ -244,15 +250,23 @@ async fn follow_loop(
                     .with_context(|| format!("blockfetch at slot {slot}"))?;
 
                 // Events BEFORE volatile (crash between = idempotent re-apply).
-                let height = apply_block(
-                    &body,
-                    registry,
-                    &mut state.live,
-                    &mut rows,
-                    &mut listing_ops,
-                )?;
+                // Scope the datum-cache read borrow of `ledger` to the apply so
+                // the `&mut ledger` writes below are free.
+                let height = {
+                    let cache_get = |h: &Hash<32>| ledger.get_datum(h).unwrap_or(None);
+                    apply_block(
+                        &body,
+                        registry,
+                        &mut state.live,
+                        &mut rows,
+                        &mut listing_ops,
+                        &mut datum_writes,
+                        &cache_get,
+                    )?
+                };
                 let inserted = ledger.insert_events(&rows)?;
                 ledger.apply_listing_ops(&listing_ops)?; // keep the listings projection current at tip
+                ledger.insert_datums(&datum_writes)?; // retain datums revealed this block
                 inserted_total += inserted as u64;
                 if inserted > 0 {
                     tracing::info!(
@@ -264,6 +278,7 @@ async fn follow_loop(
                 }
                 rows.clear();
                 listing_ops.clear();
+                datum_writes.clear();
                 ledger.insert_volatile(slot, hash.as_ref(), Some(height), &body)?;
 
                 advance_boundary(
@@ -328,12 +343,15 @@ fn header_point(content: &HeaderContent) -> Result<(u64, Hash<32>)> {
 
 /// Decode a block and run every tx through the walk pipeline against `buffer`.
 /// Returns the block height.
+#[allow(clippy::too_many_arguments)]
 fn apply_block(
     bytes: &[u8],
     registry: &VenueRegistry,
     buffer: &mut OutrefBuffer,
     rows: &mut Vec<MarketEventRow>,
     listing_ops: &mut Vec<ListingOp>,
+    datum_writes: &mut Vec<(Hash<32>, Vec<u8>)>,
+    cache_get: DatumCacheGet<'_>,
 ) -> Result<u64> {
     let blk = MultiEraBlock::decode(bytes).map_err(|e| anyhow::anyhow!("decoding block: {e:?}"))?;
     let ctx = BlockCtx {
@@ -342,7 +360,16 @@ fn apply_block(
         time: slot_to_unix(blk.slot()),
     };
     for tx in blk.txs() {
-        process_tx(decode_tx(&tx), registry, buffer, &ctx, rows, listing_ops);
+        process_tx(
+            decode_tx(&tx),
+            registry,
+            buffer,
+            &ctx,
+            rows,
+            listing_ops,
+            datum_writes,
+            cache_get,
+        );
     }
     Ok(blk.number())
 }
@@ -378,6 +405,10 @@ fn advance_boundary(
     let blocks = ledger.volatile_oldest(to_seal)?;
     let mut scratch: Vec<MarketEventRow> = Vec::new();
     let mut scratch_ops: Vec<ListingOp> = Vec::new(); // boundary replay: listings already applied at tip
+    let mut scratch_datums: Vec<(Hash<32>, Vec<u8>)> = Vec::new(); // datums already cached at tip
+    // Replay's decode output is discarded (already applied/cached at the tip),
+    // so a no-op cache read is fine and avoids borrowing `ledger` here.
+    let no_cache = |_: &Hash<32>| -> Option<Vec<u8>> { None };
     let mut sealed: Option<(u64, Vec<u8>)> = None;
     for vb in &blocks {
         apply_block(
@@ -386,9 +417,12 @@ fn advance_boundary(
             &mut state.boundary,
             &mut scratch,
             &mut scratch_ops,
+            &mut scratch_datums,
+            &no_cache,
         )?;
         scratch.clear(); // rows were inserted when the block was first seen
         scratch_ops.clear();
+        scratch_datums.clear();
         sealed = Some((vb.slot, vb.hash.clone()));
     }
     if let Some((slot, hash)) = sealed {
@@ -426,6 +460,8 @@ fn rollback(
     state.live = state.boundary.clone();
     let mut rows: Vec<MarketEventRow> = Vec::new();
     let mut discard_ops: Vec<ListingOp> = Vec::new();
+    let mut discard_datums: Vec<(Hash<32>, Vec<u8>)> = Vec::new(); // already cached at tip; cache is rollback-immune
+    let no_cache = |_: &Hash<32>| -> Option<Vec<u8>> { None };
     let survivors = ledger.volatile_after(state.boundary_slot)?;
     for vb in &survivors {
         apply_block(
@@ -434,9 +470,12 @@ fn rollback(
             &mut state.live,
             &mut rows,
             &mut discard_ops,
+            &mut discard_datums,
+            &no_cache,
         )?;
         rows.clear();
         discard_ops.clear();
+        discard_datums.clear();
     }
     // Heal the listings projection: rebuild it from the corrected live buffer
     // (rolled-back listings are gone; survivors are re-seeded).
@@ -576,12 +615,16 @@ mod tests {
         let mut buffer = OutrefBuffer::default();
         let mut rows = Vec::new();
         let mut ops = Vec::new();
+        let mut datums = Vec::new();
+        let no_cache = |_: &Hash<32>| -> Option<Vec<u8>> { None };
         let height = apply_block(
             &fixture_block(),
             &registry,
             &mut buffer,
             &mut rows,
             &mut ops,
+            &mut datums,
+            &no_cache,
         )
         .unwrap();
         assert!(height > 0);
@@ -589,6 +632,7 @@ mod tests {
         assert!(rows.is_empty());
         assert!(buffer.is_empty());
         assert!(ops.is_empty());
+        assert!(datums.is_empty());
     }
 
     #[test]
