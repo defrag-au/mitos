@@ -148,6 +148,67 @@ impl EventsPage {
     }
 }
 
+/// One current live listing. Interned columns (`policy`, `seller`, `venue`)
+/// index the [`ListingsPage`] side tables. `price_lovelace` is the listing
+/// **ask** (the datum payout sum); consumers fold the venue fee for the
+/// buyer-price (wayup `+ask/49`). `None` only for the rare jpg listing whose
+/// datum isn't resolvable on-chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingRow {
+    /// Index into [`ListingsPage::policies`].
+    pub policy: u32,
+    /// Raw asset-name bytes.
+    pub asset_name: Vec<u8>,
+    pub price_lovelace: Option<u64>,
+    /// Index into [`ListingsPage::sellers`].
+    pub seller: Option<u32>,
+    /// Index into [`ListingsPage::venues`].
+    pub venue: u32,
+    /// The current listing UTxO.
+    pub tx_hash: [u8; 32],
+    pub output_index: u32,
+    pub listed_slot: u64,
+    /// Unix seconds.
+    pub listed_time: i64,
+}
+
+/// One page of current listings for a policy — interned side tables + rows +
+/// floor/count header + continuation cursor. Same versioning + append-only
+/// contract as [`EventsPage`] (byte 0 = [`WIRE_VERSION`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListingsPage {
+    /// MUST stay the first field — encodes as byte 0 (see module docs).
+    pub version: u8,
+    pub policies: Vec<[u8; 28]>,
+    /// Seller stake identifiers as stored, interned.
+    pub sellers: Vec<String>,
+    pub venues: Vec<String>,
+    /// Ordered price ASC (cheapest first; unpriced last) — floor is `[0]`.
+    pub listings: Vec<ListingRow>,
+    /// Collection-wide floor = min served price over all priced listings.
+    pub floor_lovelace: Option<u64>,
+    /// Total current listings for the policy (not just this page).
+    pub count: u32,
+    /// Opaque cursor for the next page; `None` = end.
+    pub next_cursor: Option<String>,
+}
+
+impl ListingsPage {
+    /// An empty page at the current wire version.
+    pub fn empty() -> Self {
+        ListingsPage {
+            version: WIRE_VERSION,
+            policies: Vec::new(),
+            sellers: Vec::new(),
+            venues: Vec::new(),
+            listings: Vec::new(),
+            floor_lovelace: None,
+            count: 0,
+            next_cursor: None,
+        }
+    }
+}
+
 /// Decode-side errors.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WireError {
@@ -184,6 +245,20 @@ pub fn encode_events_page(page: &EventsPage) -> Result<Vec<u8>, postcard::Error>
 
 /// Decode wire bytes, checking the version byte first.
 pub fn decode_events_page(bytes: &[u8]) -> Result<EventsPage, WireError> {
+    match bytes.first() {
+        None => Err(WireError::Empty),
+        Some(&v) if v != WIRE_VERSION => Err(WireError::VersionMismatch { got: v }),
+        Some(_) => postcard::from_bytes(bytes).map_err(WireError::Decode),
+    }
+}
+
+/// Encode a listings page to the wire bytes.
+pub fn encode_listings_page(page: &ListingsPage) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_allocvec(page)
+}
+
+/// Decode listings wire bytes, checking the version byte first.
+pub fn decode_listings_page(bytes: &[u8]) -> Result<ListingsPage, WireError> {
     match bytes.first() {
         None => Err(WireError::Empty),
         Some(&v) if v != WIRE_VERSION => Err(WireError::VersionMismatch { got: v }),
@@ -292,5 +367,46 @@ mod tests {
             assert_eq!(EventKind::from_db_str(kind.as_db_str()), Some(kind));
         }
         assert_eq!(EventKind::from_db_str("bogus"), None);
+    }
+
+    #[test]
+    fn listings_page_round_trip() {
+        let page = ListingsPage {
+            version: WIRE_VERSION,
+            policies: vec![[0x1f; 28]],
+            sellers: vec!["stake1uyyrtmamw".into()],
+            venues: vec!["wayup".into()],
+            listings: vec![
+                ListingRow {
+                    policy: 0,
+                    asset_name: b"Bud1".to_vec(),
+                    price_lovelace: Some(30_000_000),
+                    seller: Some(0),
+                    venue: 0,
+                    tx_hash: [0xab; 32],
+                    output_index: 0,
+                    listed_slot: 142_000_000,
+                    listed_time: 1_750_000_000,
+                },
+                ListingRow {
+                    policy: 0,
+                    asset_name: b"Bud2".to_vec(),
+                    price_lovelace: None, // unpriced jpg
+                    seller: None,
+                    venue: 0,
+                    tx_hash: [0x01; 32],
+                    output_index: 1,
+                    listed_slot: 142_000_100,
+                    listed_time: 1_750_000_100,
+                },
+            ],
+            floor_lovelace: Some(30_000_000),
+            count: 2,
+            next_cursor: Some("30000000:5".into()),
+        };
+        let bytes = encode_listings_page(&page).unwrap();
+        assert_eq!(bytes[0], WIRE_VERSION);
+        assert_eq!(decode_listings_page(&bytes).unwrap(), page);
+        assert_eq!(decode_listings_page(&[]), Err(WireError::Empty));
     }
 }

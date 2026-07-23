@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use market_ledger_wire::{EventKind, EventRow, EventsPage};
+use market_ledger_wire::{EventKind, EventRow, EventsPage, ListingRow, ListingsPage};
 
 use super::query::{Cursor, LedgerRow};
+use crate::store::Listing;
 
 fn intern(table: &mut Vec<String>, index: &mut HashMap<String, u32>, value: &str) -> u32 {
     if let Some(&i) = index.get(value) {
@@ -84,6 +85,62 @@ pub fn build_page(rows: Vec<LedgerRow>, next: Option<Cursor>) -> Result<EventsPa
     }
 
     page.next_cursor = next.map(|c| c.encode());
+    Ok(page)
+}
+
+/// Build a `ListingsPage` from the store rows: intern policy / seller / venue,
+/// hex-decode hashes, compute the floor over the priced rows. `count` is the
+/// true total (may exceed the page). Price stays the datum ask (fee-fold is a
+/// consumer concern); rows arrive cheapest-first.
+pub fn build_listings_page(rows: Vec<Listing>, count: u64) -> Result<ListingsPage> {
+    let mut page = ListingsPage::empty();
+    let mut policy_index: HashMap<String, u32> = HashMap::new();
+    let mut seller_index: HashMap<String, u32> = HashMap::new();
+    let mut venue_index: HashMap<String, u32> = HashMap::new();
+    let mut floor: Option<u64> = None;
+
+    for row in &rows {
+        let policy = match policy_index.get(&row.policy_id) {
+            Some(&i) => i,
+            None => {
+                let bytes: [u8; 28] = hex::decode(&row.policy_id)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .with_context(|| format!("policy_id not 28-byte hex: {}", row.policy_id))?;
+                let i = page.policies.len() as u32;
+                page.policies.push(bytes);
+                policy_index.insert(row.policy_id.clone(), i);
+                i
+            }
+        };
+        let tx_hash: [u8; 32] = hex::decode(&row.tx_hash)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .with_context(|| format!("tx_hash not 32-byte hex: {}", row.tx_hash))?;
+        let asset_name = hex::decode(&row.asset_name_hex)
+            .with_context(|| format!("asset_name_hex not hex: {}", row.asset_name_hex))?;
+
+        if let Some(p) = row.price_lovelace {
+            floor = Some(floor.map_or(p, |f| f.min(p)));
+        }
+        page.listings.push(ListingRow {
+            policy,
+            asset_name,
+            price_lovelace: row.price_lovelace,
+            seller: row
+                .seller_stake
+                .as_deref()
+                .map(|s| intern(&mut page.sellers, &mut seller_index, s)),
+            venue: intern(&mut page.venues, &mut venue_index, &row.venue),
+            tx_hash,
+            output_index: row.output_index,
+            listed_slot: row.listed_slot,
+            listed_time: row.listed_time,
+        });
+    }
+
+    page.floor_lovelace = floor;
+    page.count = count as u32;
     Ok(page)
 }
 

@@ -60,9 +60,13 @@ pub struct AppState {
 fn router(state: AppState, token: auth::AuthToken) -> Router {
     // Auth layers the gated sub-router only, BEFORE the merge, so /health
     // stays open (the mitos-platform admin pattern).
-    let gated = Router::new().route("/events", get(handlers::events)).layer(
-        axum::middleware::from_fn_with_state(token, auth::require_auth),
-    );
+    let gated = Router::new()
+        .route("/events", get(handlers::events))
+        .route("/listings", get(handlers::listings))
+        .layer(axum::middleware::from_fn_with_state(
+            token,
+            auth::require_auth,
+        ));
     Router::new()
         .route("/health", get(handlers::health))
         .merge(gated)
@@ -158,6 +162,25 @@ mod tests {
                 fixture_row(1, "Bud1", "listed", 100),
                 fixture_row(2, "Bud1", "sold", 200),
                 fixture_row(3, "Bud2", "sold", 300),
+            ])
+            .unwrap();
+        let policy_hex = hex::encode([0xaa; 28]);
+        let listing = |name: &str, price: Option<u64>| crate::store::Listing {
+            policy_id: policy_hex.clone(),
+            asset_name_hex: hex::encode(name.as_bytes()),
+            venue: "wayup".into(),
+            price_lovelace: price,
+            seller_stake: Some("stake1seller".into()),
+            tx_hash: hex::encode([0x11; 32]),
+            output_index: 0,
+            listed_slot: 400,
+            listed_time: 1_700_000_000,
+        };
+        ledger
+            .apply_listing_ops(&[
+                crate::store::ListingOp::Upsert(listing("Cheap", Some(20_000_000))),
+                crate::store::ListingOp::Upsert(listing("Pricey", Some(90_000_000))),
+                crate::store::ListingOp::Upsert(listing("Unpriced", None)),
             ])
             .unwrap();
         drop(ledger);
@@ -263,6 +286,35 @@ mod tests {
         assert_eq!(json["events"].as_array().unwrap().len(), 1);
         assert_eq!(json["events"][0]["kind"], "listed");
         assert_eq!(json["next_cursor"], serde_json::Value::Null);
+
+        // /listings — binary ListingsPage: cheapest-first, floor + count header.
+        let resp = client
+            .get(format!("{base}/listings?policy={policy_hex}"))
+            .bearer_auth(TOKEN)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let page = market_ledger_wire::decode_listings_page(&resp.bytes().unwrap()).unwrap();
+        assert_eq!(page.count, 3);
+        assert_eq!(page.floor_lovelace, Some(20_000_000));
+        assert_eq!(page.policies, vec![[0xaa; 28]]);
+        let names: Vec<String> = page
+            .listings
+            .iter()
+            .map(|l| String::from_utf8(l.asset_name.clone()).unwrap())
+            .collect();
+        assert_eq!(names, ["Cheap", "Pricey", "Unpriced"]); // priced ASC, unpriced last
+        assert_eq!(page.listings[2].price_lovelace, None);
+        // policy is required.
+        assert_eq!(
+            client
+                .get(format!("{base}/listings"))
+                .bearer_auth(TOKEN)
+                .send()
+                .unwrap()
+                .status(),
+            400
+        );
 
         drop(rt); // shuts the server down
         let _ = std::fs::remove_dir_all(&dir);

@@ -149,3 +149,59 @@ pub async fn events(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("wire encode failed: {e}")))?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ListingsParams {
+    policy: Option<String>,
+    venue: Option<String>,
+    limit: Option<u32>,
+    format: Option<String>,
+}
+
+/// `?format=json` debug body for `/listings`.
+#[derive(Serialize)]
+struct ListingsJson {
+    count: u64,
+    floor_lovelace: Option<u64>,
+    listings: Vec<crate::store::Listing>,
+}
+
+pub async fn listings(
+    State(state): State<AppState>,
+    Query(params): Query<ListingsParams>,
+) -> Result<Response, ApiError> {
+    let policy = params
+        .policy
+        .clone()
+        .ok_or_else(|| ApiError::BadRequest("policy is required".into()))?;
+    if policy.len() != 56 || !policy.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest("policy must be 56 hex chars".into()));
+    }
+    let venue = params.venue.clone();
+    // Default to the hard cap so all of a policy's listings come back in one
+    // page (per-policy counts sit well under it); no cursor pagination yet.
+    let limit = params.limit.unwrap_or(state.max_limit).min(state.max_limit);
+
+    let db = state.db.clone();
+    let (rows, count) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.open_ro()?;
+        query::fetch_listings(&conn, &policy, venue.as_deref(), limit)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))??;
+
+    if params.format.as_deref() == Some("json") {
+        let floor = rows.iter().filter_map(|r| r.price_lovelace).min();
+        return Ok(Json(ListingsJson {
+            count,
+            floor_lovelace: floor,
+            listings: rows,
+        })
+        .into_response());
+    }
+
+    let page = encode::build_listings_page(rows, count)?;
+    let bytes = market_ledger_wire::encode_listings_page(&page)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("wire encode failed: {e}")))?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+}

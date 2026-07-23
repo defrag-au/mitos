@@ -112,7 +112,7 @@ pub struct VolatileBlock {
 /// A current live listing (the query-ready projection of the open book).
 /// `price_lovelace` is `None` only for the rare jpg listing whose datum isn't
 /// locally resolvable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Listing {
     pub policy_id: String,
     pub asset_name_hex: String,

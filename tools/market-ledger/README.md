@@ -80,8 +80,17 @@ market-ledger serve --db ledger.db --listen 127.0.0.1:8183
   (version byte first — see `crates/market-ledger-wire` for the format and
   its append-only evolution contract). `?format=json` returns the text-form
   rows instead — the curl/jq debug loop.
-- **Pagination** is keyset `(slot, rowid)`: follow `next_cursor` until it is
-  absent. Treat the cursor as opaque. A concurrent new-venue backfill can
+- **`GET /listings`** (bearer-gated): current live listings for a policy —
+  `?policy=<56hex>[&venue=][&limit=]`. Response is a postcard `ListingsPage`
+  (cheapest-first, unpriced last; `floor_lovelace` + `count` in the header;
+  `?format=json` debug). `price_lovelace` is the datum **ask** (payout sum);
+  fold the venue fee for buyer-price (wayup `ask*50/49`, which matches Anvil to
+  the lovelace). The table is a buffer-driven projection of the open book (the
+  authoritative un-spent set), so it never carries ghosts; `follow` seeds it
+  from the open book at startup and maintains it at tip. ~86% of jpg + ~all
+  wayup listings are priced (the rest are hash-only jpg with no on-chain datum).
+- **Pagination** (on `/events`) is keyset `(slot, rowid)`: follow `next_cursor`
+  until it is absent. Treat the cursor as opaque. A concurrent new-venue backfill can
   insert rows at slots a paging client already passed — pagination is a
   stream over the corpus as-of-passage; re-query for an authoritative read.
 - **Auth**: `MARKET_LEDGER_TOKEN` env (own secret, deliberately not

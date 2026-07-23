@@ -180,6 +180,58 @@ pub fn fetch_events(
     Ok((rows, next))
 }
 
+/// Current listings for a policy (optional venue filter), cheapest-first
+/// (unpriced last), capped at `limit`. Returns the rows + the true total count
+/// (so a consumer can tell a page truncated). No cursor pagination yet —
+/// per-policy listing counts sit well under a generous limit.
+pub fn fetch_listings(
+    conn: &Connection,
+    policy: &str,
+    venue: Option<&str>,
+    limit: u32,
+) -> Result<(Vec<crate::store::Listing>, u64)> {
+    let mut filter = String::from("WHERE policy_id = ?");
+    let mut params: Vec<Value> = vec![policy.to_string().into()];
+    if let Some(v) = venue {
+        filter.push_str(" AND venue = ?");
+        params.push(v.to_string().into());
+    }
+
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM listings {filter}"),
+        rusqlite::params_from_iter(params.iter().cloned()),
+        |r| r.get(0),
+    )?;
+
+    let sql = format!(
+        "SELECT policy_id, asset_name_hex, venue, price_lovelace, seller_stake,
+                tx_hash, output_index, listed_slot, listed_time
+         FROM listings {filter}
+         ORDER BY price_lovelace IS NULL, price_lovelace ASC, asset_name_hex ASC
+         LIMIT ?"
+    );
+    params.push((limit as i64).into());
+    let mut stmt = conn.prepare(&sql).context("preparing listings query")?;
+    let mapped = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok(crate::store::Listing {
+            policy_id: r.get(0)?,
+            asset_name_hex: r.get(1)?,
+            venue: r.get(2)?,
+            price_lovelace: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+            seller_stake: r.get(4)?,
+            tx_hash: r.get(5)?,
+            output_index: r.get::<_, i64>(6)? as u32,
+            listed_slot: r.get::<_, i64>(7)? as u64,
+            listed_time: r.get(8)?,
+        })
+    })?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok((rows, count as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
