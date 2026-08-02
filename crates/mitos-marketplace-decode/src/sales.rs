@@ -46,13 +46,20 @@ struct Pending<T> {
 /// Match Buy-redeemer listing consumes to their buyer outputs.
 ///
 /// `classify` returns `Some(tag)` for an address that belongs to the venue's
-/// sale contract (and `None` otherwise); it gates both which inputs are
-/// listings and which outputs to skip (assets sent back to the venue are
-/// listing updates, not sales). A listing input is a sale iff it is at the
-/// venue, spent with a Buy redeemer, and its datum decodes to a payout list.
+/// sale contract (and `None` otherwise); it gates which inputs are listings and
+/// carries the venue tag. A listing input is a sale iff it is at the venue,
+/// spent with a Buy redeemer, and its datum decodes to a payout list.
+///
+/// `is_marketplace_escrow` returns `true` for *any* known marketplace sale
+/// escrow (not just this venue's). An asset produced back to such an address is
+/// a listing update (same venue) or a cross-venue migration (a different
+/// venue) — never a buyer delivery — so it is skipped. Without this,
+/// re-listing an NFT from one marketplace's escrow to another's is
+/// mis-booked as a sale to the receiving contract.
 pub fn collect_sales<T: Clone>(
     tx: &DecodeTx,
     classify: impl Fn(&str) -> Option<T>,
+    is_marketplace_escrow: impl Fn(&str) -> bool,
 ) -> Vec<MatchedSale<T>> {
     let mut pending: BTreeMap<(Vec<u8>, Vec<u8>), Pending<T>> = BTreeMap::new();
 
@@ -90,8 +97,10 @@ pub fn collect_sales<T: Clone>(
 
     let mut sales = Vec::new();
     for output in &tx.outputs {
-        // Assets sent back to the venue are listing updates, not a buyer.
-        if classify(&output.address).is_some() {
+        // Assets re-escrowed at a marketplace sale contract are not a buyer
+        // delivery — whether the same venue (a listing / price update) or a
+        // different one (a cross-venue migration, e.g. jpg → Wayup).
+        if classify(&output.address).is_some() || is_marketplace_escrow(&output.address) {
             continue;
         }
         for asset in &output.assets {
@@ -134,6 +143,26 @@ pub fn classify_jpg_address(addr: &str) -> Option<JpgStoreContractVersion> {
     }
 }
 
+/// Wayup's mainnet sale-validator payment credential. Wayup listings sit at
+/// addresses sharing this cred (the staking part varies per seller). Baked in —
+/// alongside the hardcoded jpg addresses above — so [`is_marketplace_escrow`]
+/// can recognise a re-listing onto Wayup without every caller threading Wayup's
+/// config through. (Confirmed on-chain 2026-08-02, tx `084bf145…`: a seller
+/// migrated two jpg V1 listings to this cred in one tx.)
+const WAYUP_SALE_CRED: [u8; 28] = [
+    0xa7, 0x6f, 0x0f, 0xb8, 0x01, 0xa2, 0x9f, 0x59, 0x1e, 0x98, 0x71, 0x57, 0x65, 0x08, 0xd8, 0x5b,
+    0x0b, 0x5f, 0x3c, 0x38, 0x77, 0x4f, 0x65, 0x03, 0x2f, 0x58, 0xfd, 0xad,
+];
+
+/// Whether `addr` is any known marketplace **sale** escrow — jpg V1–V4 (exact
+/// address) or Wayup (payment credential). The sale matcher uses this to tell a
+/// buyer delivery (asset leaves the marketplace to a wallet) from a re-listing
+/// (asset re-escrowed at some marketplace, same venue or another). See
+/// [`collect_sales`].
+pub fn is_marketplace_escrow(addr: &str) -> bool {
+    classify_jpg_address(addr).is_some() || address_payment_cred(addr) == Some(WAYUP_SALE_CRED)
+}
+
 /// Payment credential of jpg.store's fee-collection address. jpg-frontend-era
 /// listings carried the platform fee INSIDE the datum payouts (paid to this
 /// credential); WayUp, settling the surviving jpg book, charges its fee as an
@@ -155,7 +184,7 @@ const JPG_FEE_CRED_HEX: &str = "84cc25ea4c29951d40b443b95bbc5676bc425470f96376d1
 /// settlement across the tx's listings. Bundle members repeat their listing's
 /// whole share, mirroring how they repeat the whole-bundle price.
 pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
-    let matched = collect_sales(tx, classify_jpg_address);
+    let matched = collect_sales(tx, classify_jpg_address, is_marketplace_escrow);
     if matched.is_empty() {
         return Vec::new();
     }
@@ -272,8 +301,12 @@ pub fn decode_wayup_sales(tx: &DecodeTx, cfg: &WayupSaleConfig) -> Vec<WayupStor
     let fee_waived =
         cfg.fee_payment_cred.is_some() && !tx.outputs.iter().any(|o| cfg.is_fee_output(&o.address));
 
-    collect_sales(tx, |addr| cfg.is_listing_address(addr).then_some(()))
-        .into_iter()
+    collect_sales(
+        tx,
+        |addr| cfg.is_listing_address(addr).then_some(()),
+        is_marketplace_escrow,
+    )
+    .into_iter()
         .map(|s| {
             WayupStoreSale::Sale(WayupSale {
                 policy: hex::encode(&s.policy),
@@ -453,6 +486,70 @@ mod tests {
         let sales = decode_jpg_sales(&tx);
         let JpgStoreSale::Sale(s) = &sales[0];
         assert_eq!(s.on_top_fee_lovelace, 0);
+    }
+
+    /// The real re-list address from tx `084bf145…`: a Wayup sale escrow (its
+    /// payment cred is [`WAYUP_SALE_CRED`]), staking part per-seller.
+    const WAYUP_RELIST_ADDR: &str = "addr1zxnk7racqx3f7kg7npc4weggmpdskheu8pm57egr9av0mtfmstyj2cxlcts698uyn5zvqtsq9gryxwzavykdk62yetpqn2fucd";
+
+    /// Regression for tx `084bf145…`: a seller spends a jpg V1 listing (Buy-shaped
+    /// redeemer) and re-lists the NFT onto Wayup in one tx. The asset lands at a
+    /// Wayup sale escrow, not a buyer — so it must NOT be booked as a jpg sale.
+    #[test]
+    fn cross_venue_migration_is_not_a_sale() {
+        let seller = "aa".repeat(28);
+        let asset = AssetId {
+            policy: vec![7; 28],
+            name: b"Naru09878".to_vec(),
+        };
+        let tx = DecodeTx {
+            tx_hash: vec![0x08; 32],
+            inputs: vec![TxInput {
+                address: JPG_V1_ADDR.into(),
+                assets: vec![asset.clone()],
+                datum: Some(listing_datum(&seller, &[(&seller, "1a389fd980")])),
+                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                ..Default::default()
+            }],
+            // NFT re-escrowed at the Wayup sale contract (the migration), plus
+            // the seller's own change.
+            outputs: vec![
+                TxOutput {
+                    address: WAYUP_RELIST_ADDR.into(),
+                    lovelace: 1_305_930,
+                    assets: vec![asset],
+                    ..Default::default()
+                },
+                TxOutput {
+                    address: "addr1seller_change".into(),
+                    lovelace: 1_963_000_000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            decode_jpg_sales(&tx).is_empty(),
+            "re-listing a jpg NFT onto Wayup must not be booked as a jpg sale"
+        );
+    }
+
+    /// Control: a genuine sale (NFT delivered to a plain buyer wallet, not a
+    /// marketplace escrow) is still recorded after the migration guard.
+    #[test]
+    fn genuine_sale_to_wallet_still_records() {
+        let seller = "bb".repeat(28);
+        let tx = sale_tx(listing_datum(&seller, &[(&seller, "1a389fd980")]), Vec::new());
+        let sales = decode_jpg_sales(&tx);
+        assert_eq!(sales.len(), 1);
+    }
+
+    #[test]
+    fn is_marketplace_escrow_recognises_jpg_and_wayup() {
+        assert!(is_marketplace_escrow(JPG_V1_ADDR));
+        assert!(is_marketplace_escrow(JPG_V2_ADDR));
+        assert!(is_marketplace_escrow(WAYUP_RELIST_ADDR));
+        assert!(!is_marketplace_escrow("addr1buyer"));
     }
 
     #[test]

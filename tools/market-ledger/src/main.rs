@@ -14,6 +14,7 @@ mod decode;
 mod follow;
 mod metadata;
 mod mithril;
+mod prune;
 mod row;
 mod seal;
 mod serve;
@@ -50,6 +51,8 @@ enum Command {
     Stats(stats::StatsArgs),
     /// Delete the ledger + checkpoint (+ optional Parquet) for a clean restart.
     Reset(checkpoint::ResetArgs),
+    /// Delete phantom `sold` rows left by cross-venue migrations (dry-run unless --yes).
+    Prune(prune::PruneArgs),
     /// Serve the ledger over HTTP (compact binary read surface).
     Serve(serve::ServeArgs),
     /// Follow the chain tip via self-contained chainsync (resumes from the walk cursor).
@@ -71,6 +74,7 @@ fn main() -> Result<()> {
         Command::Upload(args) => upload::run(args),
         Command::Stats(args) => stats::run(args),
         Command::Reset(args) => checkpoint::run_reset(args),
+        Command::Prune(args) => prune::run(args),
         Command::Serve(args) => serve::run(args),
         Command::Follow(args) => follow::run(args),
     }
