@@ -12,7 +12,7 @@ use mitos_community_events::jpg_store_sale::{JpgStoreSale, Sale as JpgSale};
 use mitos_community_events::marketplace::ListingPayout;
 use mitos_community_events::wayup_store_listing::WayupStoreContractVersion;
 use mitos_community_events::wayup_store_sale::{Sale as WayupSale, WayupStoreSale};
-use pallas_addresses::{Address, ShelleyPaymentPart};
+use pallas_addresses::{Address, ShelleyDelegationPart, ShelleyPaymentPart};
 
 use crate::DecodeTx;
 use crate::datum::{decode_listing_datum, is_buy_redeemer};
@@ -56,6 +56,14 @@ struct Pending<T> {
 /// venue) — never a buyer delivery — so it is skipped. Without this,
 /// re-listing an NFT from one marketplace's escrow to another's is
 /// mis-booked as a sale to the receiving contract.
+///
+/// Two spend actions share the Buy redeemer's `d879` constructor prefix, so a
+/// consumed listing whose NFT goes *back to the lister* — a reclaim to their own
+/// wallet, or a self-directed move — is not a sale either. Such an output is
+/// dropped when its payment or stake credential matches the listing's owner
+/// credential ([`address_bears_cred`]). Without this, ~71% of jpg "sales" are
+/// phantom (the owner reclaiming/relisting their own NFT), because the receiving
+/// wallet is not a marketplace escrow and so escapes the check above.
 pub fn collect_sales<T: Clone>(
     tx: &DecodeTx,
     classify: impl Fn(&str) -> Option<T>,
@@ -107,6 +115,13 @@ pub fn collect_sales<T: Clone>(
             let Some(p) = pending.remove(&(asset.policy.clone(), asset.name.clone())) else {
                 continue;
             };
+            // The NFT returned to the lister's own credential (jpg: owner payment
+            // pkh; Wayup: owner stake cred) → a reclaim or self-directed move, not
+            // a buyer. (Re-lists onto a marketplace escrow are caught above; this
+            // catches a return to the owner's own wallet.)
+            if address_bears_cred(&output.address, &p.cred_hex) {
+                continue;
+            }
             sales.push(MatchedSale {
                 policy: asset.policy.clone(),
                 asset_name: asset.name.clone(),
@@ -335,6 +350,32 @@ pub fn address_payment_cred(addr: &str) -> Option<[u8; 28]> {
     })
 }
 
+/// Whether `addr`'s payment OR stake credential equals `cred_hex` (56-char hex).
+/// The listing owner credential is a payment pkh for jpg and a stake credential
+/// for Wayup, so checking both parts makes the "returned to the lister" test
+/// venue-agnostic. Empty/undecodable `cred_hex` never matches — leaving those
+/// rows to the escrow check alone, which is the safe (no-drop) default.
+fn address_bears_cred(addr: &str, cred_hex: &str) -> bool {
+    if cred_hex.is_empty() {
+        return false;
+    }
+    let Ok(Address::Shelley(s)) = Address::from_bech32(addr) else {
+        return false;
+    };
+    let payment = match s.payment() {
+        ShelleyPaymentPart::Key(h) | ShelleyPaymentPart::Script(h) => hex::encode(**h),
+    };
+    if payment == cred_hex {
+        return true;
+    }
+    match s.delegation() {
+        ShelleyDelegationPart::Key(h) | ShelleyDelegationPart::Script(h) => {
+            hex::encode(**h) == cred_hex
+        }
+        _ => false,
+    }
+}
+
 fn parse_cred(hex_str: &str) -> Option<[u8; 28]> {
     if hex_str.is_empty() {
         return None;
@@ -542,6 +583,54 @@ mod tests {
         let tx = sale_tx(listing_datum(&seller, &[(&seller, "1a389fd980")]), Vec::new());
         let sales = decode_jpg_sales(&tx);
         assert_eq!(sales.len(), 1);
+    }
+
+    /// The owner wallet + its listing owner pkh from tx `e00cbce7…` — the owner
+    /// reclaimed Wave1Flame129 from a jpg V1 listing back to this wallet (payment
+    /// cred == the listing datum's owner pkh) in the same tx that migrated other
+    /// assets to Wayup.
+    const RECLAIM_OWNER_ADDR: &str = "addr1q9hjep309lgmezdt9suwg666xc3xddmtfwjqd29rtxmm59sgl4kqa40pa07acf8rm4lpey7pnkp0vn0mfe63tyg5aagq8wz5th";
+    const RECLAIM_OWNER_PKH: &str = "6f2c862f2fd1bc89ab2c38e46b5a362266b76b4ba406a8a359b7ba16";
+
+    /// Regression for the ~71% buyer==seller phantom class: a jpg listing spent
+    /// with a Buy-shaped redeemer whose NFT is reclaimed to the owner's OWN wallet
+    /// (not a marketplace escrow) must NOT be booked as a sale.
+    #[test]
+    fn reclaim_to_owner_wallet_is_not_a_sale() {
+        let asset = AssetId {
+            policy: vec![9; 28],
+            name: b"Wave1Flame129".to_vec(),
+        };
+        let tx = DecodeTx {
+            tx_hash: vec![0xe0; 32],
+            inputs: vec![TxInput {
+                address: JPG_V1_ADDR.into(),
+                assets: vec![asset.clone()],
+                // owner-first listing datum: owner pkh == the reclaim wallet's pay cred.
+                datum: Some(listing_datum(RECLAIM_OWNER_PKH, &[(RECLAIM_OWNER_PKH, "1a0939c880")])),
+                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                ..Default::default()
+            }],
+            outputs: vec![TxOutput {
+                address: RECLAIM_OWNER_ADDR.into(),
+                lovelace: 1_323_170,
+                assets: vec![asset],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            decode_jpg_sales(&tx).is_empty(),
+            "an NFT reclaimed to the lister's own wallet must not be a sale"
+        );
+    }
+
+    #[test]
+    fn address_bears_cred_matches_payment_and_rejects_others() {
+        assert!(address_bears_cred(RECLAIM_OWNER_ADDR, RECLAIM_OWNER_PKH));
+        assert!(!address_bears_cred(RECLAIM_OWNER_ADDR, &"ab".repeat(28)));
+        assert!(!address_bears_cred(RECLAIM_OWNER_ADDR, "")); // empty never matches
+        assert!(!address_bears_cred("not-an-address", RECLAIM_OWNER_PKH));
     }
 
     #[test]
