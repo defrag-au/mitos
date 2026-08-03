@@ -72,9 +72,11 @@ pub fn run(args: PruneArgs) -> Result<()> {
 
 /// How many rows the pruning predicate matches.
 fn count_phantoms(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row(&format!("SELECT COUNT(*) FROM ({PHANTOM_ROWIDS})"), [], |r| {
-        r.get(0)
-    })?)
+    Ok(conn.query_row(
+        &format!("SELECT COUNT(*) FROM ({PHANTOM_ROWIDS})"),
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 /// Delete the matched rows; returns the number removed.

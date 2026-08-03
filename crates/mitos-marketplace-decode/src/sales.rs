@@ -322,21 +322,21 @@ pub fn decode_wayup_sales(tx: &DecodeTx, cfg: &WayupSaleConfig) -> Vec<WayupStor
         is_marketplace_escrow,
     )
     .into_iter()
-        .map(|s| {
-            WayupStoreSale::Sale(WayupSale {
-                policy: hex::encode(&s.policy),
-                asset_name_hex: hex::encode(&s.asset_name),
-                tx_hash: hex::encode(&s.tx_hash),
-                seller_stake_pkh: s.cred_hex,
-                buyer_address: s.buyer_address,
-                payouts: s.payouts,
-                price_lovelace: s.price_lovelace,
-                contract_version: WayupStoreContractVersion::V1,
-                bundle_size: s.bundle_size,
-                fee_waived,
-            })
+    .map(|s| {
+        WayupStoreSale::Sale(WayupSale {
+            policy: hex::encode(&s.policy),
+            asset_name_hex: hex::encode(&s.asset_name),
+            tx_hash: hex::encode(&s.tx_hash),
+            seller_stake_pkh: s.cred_hex,
+            buyer_address: s.buyer_address,
+            payouts: s.payouts,
+            price_lovelace: s.price_lovelace,
+            contract_version: WayupStoreContractVersion::V1,
+            bundle_size: s.bundle_size,
+            fee_waived,
         })
-        .collect()
+    })
+    .collect()
 }
 
 /// Extract a Shelley address's 28-byte payment credential.
@@ -580,7 +580,10 @@ mod tests {
     #[test]
     fn genuine_sale_to_wallet_still_records() {
         let seller = "bb".repeat(28);
-        let tx = sale_tx(listing_datum(&seller, &[(&seller, "1a389fd980")]), Vec::new());
+        let tx = sale_tx(
+            listing_datum(&seller, &[(&seller, "1a389fd980")]),
+            Vec::new(),
+        );
         let sales = decode_jpg_sales(&tx);
         assert_eq!(sales.len(), 1);
     }
@@ -607,7 +610,10 @@ mod tests {
                 address: JPG_V1_ADDR.into(),
                 assets: vec![asset.clone()],
                 // owner-first listing datum: owner pkh == the reclaim wallet's pay cred.
-                datum: Some(listing_datum(RECLAIM_OWNER_PKH, &[(RECLAIM_OWNER_PKH, "1a0939c880")])),
+                datum: Some(listing_datum(
+                    RECLAIM_OWNER_PKH,
+                    &[(RECLAIM_OWNER_PKH, "1a0939c880")],
+                )),
                 redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
