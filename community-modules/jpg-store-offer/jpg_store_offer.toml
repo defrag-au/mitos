@@ -44,7 +44,10 @@ policies = []
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
-pallas-primitives = "1.0.0-alpha.6"
+# Offer datum decode + accept matching live in the shared marketplace crate (the
+# single source of truth also used by the cnft.dev-workers firehose); it pulls
+# pallas-primitives / pallas-codec transitively.
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
 pallas-codec = "1.0.0-alpha.6"
 # blake2b for hash-matching candidate datum bytes recovered from
 # jpg.store's labels-50+ aux-data convention.

@@ -1,0 +1,15 @@
+# market-ledger-wire — the compact binary wire format served by
+# `market-ledger serve` and decoded by consumers (egui WASM frontends,
+# workers). Pure types + codec: serde + postcard only, no runtime deps,
+# safe for wasm32-unknown-unknown.
+
+[package]
+name = "market-ledger-wire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }

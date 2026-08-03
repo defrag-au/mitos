@@ -19,6 +19,8 @@ members = [
     "crates/mitos-module-kit",
     "crates/mitos-dex-decode",
     "crates/mitos-vesting-decode",
+    "crates/mitos-marketplace-decode",
+    "crates/market-ledger-wire",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",
@@ -27,6 +29,7 @@ members = [
     "tools/mitos-admin",
     "tools/mitos-build",
     "tools/mitos-run",
+    "tools/market-ledger",
 ]
 resolver = "2"
 
@@ -75,6 +78,14 @@ pallas-addresses = "1.0.0"
 pallas-codec = "1.0.0"
 pallas-primitives = "1.0.0"
 pallas-traverse = { version = "1.0.0", features = ["unstable"] }
+# Immutable-DB (cardano-node / Mithril snapshot) chunk reader — the
+# `market-ledger` walker iterates certified history from plain chunk files
+# (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
+# feature (mitos's pallas is `unstable`-only), so depend on it directly.
+pallas-hardano = "1.0.0"
+# N2N chainsync/blockfetch client for market-ledger's `follow` tip tail
+# (self-contained — see MARKET_LEDGER.md "Follow mode"). Same 1.0.0 pin.
+pallas-network = "1.0.0"
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
@@ -104,8 +115,15 @@ address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1", "ws"] }
 tower = "0.5"
+# Response layers for the market-ledger read surface (gzip + CORS for
+# browser/WASM consumers behind a CF tunnel).
+tower-http = { version = "0.6", default-features = false, features = ["compression-gzip", "cors"] }
+
+# Compact positional wire encoding for market-ledger-wire. Same pin as
+# cnft.dev-workers (registry-index blob) so the two trees agree on the format.
+postcard = { version = "1", features = ["use-std"] }
 
 # Serialization + logging + errors.
 serde = { version = "1", features = ["derive"] }
@@ -119,6 +137,10 @@ hex = "0.4"
 # Storage backend for indexer materialized views (separate from Dolos's
 # state store — each indexer owns its own view).
 redb = "2"
+
+# Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
+# compiles sqlite from source (on-box build, no system dep).
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Concurrent map for the dispatcher's per-Apply claim coordinator
 # (residual pass — see `docs/design/DOMAIN_REFACTOR.md`). Lock-free

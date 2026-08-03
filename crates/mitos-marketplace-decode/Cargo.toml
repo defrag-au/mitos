@@ -1,0 +1,17 @@
+[package]
+name = "mitos-marketplace-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared marketplace (jpg.store / Wayup) redeemer + listing-datum decode for mitos. The single source of truth used by the *-store-sale community modules (live) and by cnft.dev-workers' historical backfill (Maestro/Koios-resolved txs) — decode once, so realtime and backfill can never disagree."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+pallas-codec.workspace = true
+pallas-primitives.workspace = true
+pallas-addresses.workspace = true
+mitos-community-events = { path = "../mitos-community-events" }
+hex.workspace = true

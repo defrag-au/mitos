@@ -24,8 +24,8 @@ payment_credentials = [
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
-pallas-primitives = "1.0.0-alpha.6"
-pallas-codec = "1.0.0-alpha.6"
-# bech32 → payment-credential extraction (identify listing outputs;
-# the staking part varies per seller so a string compare won't do).
-pallas-addresses = "1.0.0-alpha.6"
+# Listing lifecycle decode (produced/consumed matching, datum decode, payment-
+# credential classification) lives in the shared marketplace crate — the single
+# source of truth the market-ledger walker shares. Pulls pallas transitively;
+# this module no longer walks PlutusData or addresses itself.
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }

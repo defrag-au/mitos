@@ -28,7 +28,8 @@ policies = []
 
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
-# PlutusData walking for listing datum decode (payouts list +
-# owner pkh extraction). Same path the cip-68-mint module uses.
-pallas-primitives = "1.0.0-alpha.6"
-pallas-codec = "1.0.0-alpha.6"
+# Listing lifecycle decode (produced/consumed matching, datum decode, price
+# math) lives in the shared marketplace crate — the single source of truth the
+# market-ledger walker shares. Pulls pallas-primitives / pallas-codec
+# transitively; this module no longer walks PlutusData itself.
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }

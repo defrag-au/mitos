@@ -1,0 +1,37 @@
+# market-ledger venue registry.
+#
+# Each `[venue.<name>]` declares the on-chain sites the walker watches and the
+# decoder that interprets its txs. jpg.store contracts are matched by exact
+# bech32 address; Wayup by payment credential (the per-seller/-bidder staking
+# part varies). `earliest_slot` is a fast-skip floor (first contract activity) —
+# an optimization, not a correctness bound; the walk is safe to run from genesis.
+#
+# Adding a marketplace: add a `[venue.<name>]` block here and (if genuinely new)
+# its decoder in `mitos-marketplace-decode`, then `walk --venue <name>`.
+
+[venue.jpg]
+decoder = "jpg"
+# Sale contracts V1–V4 (exact bech32).
+sale_addrs = [
+    "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm",
+    "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
+    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
+    "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp",
+]
+# Collection-offer (CO) V2 contract.
+offer_addrs = [
+    "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd",
+]
+# jpg.store opened mid-2021; ~slot 33.0M is a safe pre-activity floor.
+earliest_slot = 33_000_000
+
+[venue.wayup]
+decoder = "wayup"
+# Sale validator payment credential (staking part varies per seller).
+sale_creds = ["a76f0fb801a29f591e9871576508d85b0b5f3c38774f65032f58fdad"]
+# Offer contract payment credential.
+offer_creds = ["27d46ecbec94b052d8f875cf3beafd0e8ca40e8ad069f677e0a128ea"]
+# Fee-address payment credential — enables Wayup `fee_waived` detection.
+fee_cred = "5f08a64f580e581735070e1b1d2ce29ae6942ab45ccff5a1747d2283"
+# Wayup launched in 2023; ~slot 90.0M is a safe pre-activity floor.
+earliest_slot = 90_000_000

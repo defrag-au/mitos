@@ -56,6 +56,20 @@ pub struct Sale {
     /// `None` for ordinary single-asset listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_size: Option<u32>,
+    /// Buyer-side marketplace fee paid ON TOP of the datum payouts, in
+    /// lovelace — the buyer's true outlay is `price_lovelace + this`.
+    ///
+    /// jpg-frontend-era sales carried the platform fee INSIDE the payouts
+    /// (this is `0`); WayUp settling the surviving jpg book charges its fee
+    /// as an extra contract-enforced output to jpg's fee address instead.
+    /// Computed at decode as `outputs to fee collectors − payouts to fee
+    /// collectors`, attributed to a tx's sales pro-rata by settlement.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub on_top_fee_lovelace: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

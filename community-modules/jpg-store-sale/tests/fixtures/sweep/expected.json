@@ -4,6 +4,7 @@
     "buyer_address": "addr1q999ds5lu5wwmdk4930mzlh75dz3wkdpfd5nrmpp9th2qu950tqt0t0pswly8x86hr8q5gwfgcstrf76y7mpgfw8jmkqp3uwrn",
     "contract_version": "V2",
     "kind": "sale",
+    "on_top_fee_lovelace": 5000000,
     "payouts": [
       {
         "lovelace": 20000000,
@@ -26,6 +27,7 @@
     "buyer_address": "addr1q999ds5lu5wwmdk4930mzlh75dz3wkdpfd5nrmpp9th2qu950tqt0t0pswly8x86hr8q5gwfgcstrf76y7mpgfw8jmkqp3uwrn",
     "contract_version": "V2",
     "kind": "sale",
+    "on_top_fee_lovelace": 5000000,
     "payouts": [
       {
         "lovelace": 20000000,
