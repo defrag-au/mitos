@@ -29,6 +29,7 @@ members = [
     "tools/mitos-admin",
     "tools/mitos-build",
     "tools/mitos-run",
+    "tools/mitos-chain-walk",
     "tools/market-ledger",
 ]
 resolver = "2"
@@ -59,11 +60,23 @@ dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 # to build on a transitive update, re-pin with
 # `cargo update -p utxorpc-spec --precise 0.19.0`.
 
-# Cardano types + parsing. Pinned to 1.0.0 to match the pallas dolos v1.2.0
-# builds against (so the lockfile unifies a single pallas across mitos + the
-# embedded dolos — they share types at the follower boundary). `unstable`
-# mirrors dolos's own feature set (dolos uses ["hardano", "phase2", "unstable"]);
-# kept for parity, harmless otherwise.
+# Cardano types + parsing. ONE pallas across mitos + the embedded dolos — they
+# share types at the follower boundary, so the lockfile must unify a single
+# version. dolos v1.2.0 asks for `pallas = "1.0.0"` (a caret range), so 1.1.1
+# unifies and dolos compiles against it unchanged. `unstable` mirrors dolos's
+# own feature set (dolos uses ["hardano", "phase2", "unstable"]); kept for
+# parity, harmless otherwise.
+#
+# BUMPED 1.0.0 → 1.1.1 (2026-08-16) so shared-crates can be consumed from the
+# sibling tree via the [patch] block below: shared-crates moved to pallas 1.1.1,
+# and the `pallas` umbrella pins every sub-crate `=<its own version>`, so a
+# 1.0.0 umbrella here made `pallas-codec ^1.1.1` unresolvable.
+#
+# The bump is close to a no-op by construction: pallas 1.1.1's sources are
+# BYTE-IDENTICAL to 1.0.0 for every crate this tree uses (addresses, codec,
+# crypto, hardano, primitives, traverse). The sole difference in the whole
+# family is `pallas-network`'s `localmsgsubmission` mini-protocol — which
+# nothing here references, and whose public API is unchanged.
 #
 # NOTE: this does NOT add a "van Rossem" block era. pallas-traverse's era probe
 # (`probe::block_era`) tops out at Conway (tag 7) in EVERY released version
@@ -73,19 +86,21 @@ dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 # block means the probe went `Inconclusive` (the bytes aren't a complete block
 # wrapper, e.g. a divergent / reseed-only WAL tip), NOT an unknown era — chase
 # the chain/state, not the pallas version.
-pallas = { version = "1.0.0", features = ["unstable"] }
-pallas-addresses = "1.0.0"
-pallas-codec = "1.0.0"
-pallas-primitives = "1.0.0"
-pallas-traverse = { version = "1.0.0", features = ["unstable"] }
+pallas = { version = "1.1.1", features = ["unstable"] }
+pallas-addresses = "1.1.1"
+pallas-codec = "1.1.1"
+pallas-primitives = "1.1.1"
+pallas-traverse = { version = "1.1.1", features = ["unstable"] }
 # Immutable-DB (cardano-node / Mithril snapshot) chunk reader — the
 # `market-ledger` walker iterates certified history from plain chunk files
 # (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
 # feature (mitos's pallas is `unstable`-only), so depend on it directly.
-pallas-hardano = "1.0.0"
+pallas-hardano = "1.1.1"
 # N2N chainsync/blockfetch client for market-ledger's `follow` tip tail
-# (self-contained — see MARKET_LEDGER.md "Follow mode"). Same 1.0.0 pin.
-pallas-network = "1.0.0"
+# (self-contained — see MARKET_LEDGER.md "Follow mode"). Same pin as the rest
+# of the family; the only crate whose 1.1.1 sources differ from 1.0.0, and only
+# in `localmsgsubmission` (unused here).
+pallas-network = "1.1.1"
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
@@ -110,6 +125,18 @@ tx-classifier = { git = "https://github.com/defrag-au/shared-crates", rev = "d54
 # pinning here keeps the lockfile from picking up multiple
 # revisions of shared-crates.
 address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "d547c95c94a52bba618328ea7bf3b4474589abf1" }
+# Pure wallet-flow model + the project-walk frontier (consumed by
+# `tools/project-ledger`).
+#
+# ONE BLOCKER LEFT before `tools/project-ledger` can become a workspace member:
+# `chain_ledger::frontier` exists only in the local sibling tree, not in the rev
+# below. Adding the member now would build fine with the [patch] block ACTIVE
+# and fail the moment it is commented for commit — so it stays a standalone
+# package (own `[workspace]` root) until shared-crates pushes `frontier`.
+# THEN: bump this rev, add `tools/project-ledger` to members, switch its
+# chain-ledger dep to `{ workspace = true }`, delete its `[workspace]` table.
+# (The pallas half of that blocker is GONE as of the 1.1.1 bump above.)
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "9ac9db59a532f710cd53ee41527e4ee96d465e73" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -163,16 +190,25 @@ strip = "symbols"
 
 # --- Patch overrides ---
 #
-# All disabled now that the typed newtypes / pallas-adapter /
-# classify_raw work landed on shared-crates main (rev
-# 01ad0b70089fccdbb05c3905335fa2983848ee05, pinned above).
-# Uncomment a line during local shared-crates dev to point at the
-# sibling repo at `../shared-crates`. Re-comment before commit so
-# CI uses the git rev.
+# CURRENTLY ACTIVE (2026-08-16) — consuming the sibling tree at
+# `../shared-crates` for the chain-ledger / project-ledger work.
+# **RE-COMMENT THE WHOLE BLOCK BEFORE COMMIT** so CI uses the git revs.
+#
+# Toggle the block as a UNIT, never line by line: a selective edit either
+# duplicates a key (if a line ends up both active and commented) or breaks an
+# unrelated crate (if something transitively required is left commented).
+#
+# This block was un-usable until the pallas 1.1.1 bump above: shared-crates
+# moved to pallas 1.1.1 and the `pallas` umbrella pins its sub-crates `=`, so a
+# 1.0.0 umbrella here made the local `cardano-assets` unresolvable.
+#
+# Both states are verified to build: ACTIVE (local paths) and COMMENTED (the
+# pinned git revs). Keep it that way — the commented state is what CI sees.
 [patch."https://github.com/defrag-au/shared-crates"]
-# cardano-assets = { path = "../shared-crates/cardano-assets" }
-# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
-# transactions = { path = "../shared-crates/pipeline/transactions" }
-# tx-classifier = { path = "../shared-crates/pipeline/tx-classifier" }
-# address-registry = { path = "../shared-crates/address-registry" }
+cardano-assets = { path = "../shared-crates/cardano-assets" }
+pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+transactions = { path = "../shared-crates/pipeline/transactions" }
+tx-classifier = { path = "../shared-crates/pipeline/tx-classifier" }
+address-registry = { path = "../shared-crates/address-registry" }
+chain-ledger = { path = "../shared-crates/chain-ledger" }
 

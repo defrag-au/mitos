@@ -18,17 +18,17 @@ use mitos_marketplace_decode::{
     decode_jpg_offer_lifecycle, decode_jpg_sales, decode_listing_datum, decode_wayup_listings,
     decode_wayup_offer_lifecycle, decode_wayup_sales,
 };
-use pallas_hardano::storage::immutable::{self, FallibleBlock, Point};
 use pallas_primitives::Hash;
 use pallas_traverse::MultiEraBlock;
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::checkpoint::{self, CheckpointFile};
-use crate::decode::{Asset, DecodedOutput, DecodedTx, decode_tx};
 use crate::metadata;
 use crate::row::{self, BlockCtx, MarketEventRow};
 use crate::store::{Ledger, Listing, ListingOp};
 use crate::venue::{Channel, VenueDecoder, VenueRegistry};
+use mitos_chain_walk::decode::{Asset, DecodedOutput, DecodedTx, decode_tx};
+pub(crate) use mitos_chain_walk::{parse_point, slot_to_unix};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -157,15 +157,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     );
 
     // Seek to the point (efficient) or stream from genesis.
-    let blocks: Box<dyn Iterator<Item = FallibleBlock>> = match from_point {
-        Some((slot, hash)) => {
-            immutable::read_blocks_from_point(&immutable_dir, Point::Specific(slot, hash))
-                .map_err(|e| anyhow::anyhow!("seeking immutable DB to point: {e:?}"))?
-        }
-        None => Box::new(immutable::read_blocks(&immutable_dir).map_err(|e| {
-            anyhow::anyhow!("opening immutable DB at {}: {e:?}", immutable_dir.display())
-        })?),
-    };
+    let blocks = mitos_chain_walk::open_blocks(&immutable_dir, from_point)?;
 
     let mut scanned: u64 = 0;
     let mut in_range: u64 = 0;
@@ -235,7 +227,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     in_range_blocks: in_range,
                     inserted_rows: inserted,
                     open_book: buffer.len(),
-                    venues: enabled.clone(),
+                    scope: enabled.clone(),
                     updated_unix: checkpoint::now_unix(),
                     done: false,
                 },
@@ -272,7 +264,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             in_range_blocks: in_range,
             inserted_rows: inserted,
             open_book: buffer.len(),
-            venues: enabled.clone(),
+            scope: enabled.clone(),
             updated_unix: checkpoint::now_unix(),
             done: true,
         },
@@ -621,33 +613,6 @@ fn asset_id(a: &Asset) -> AssetId {
     AssetId {
         policy: a.policy.clone(),
         name: a.name.clone(),
-    }
-}
-
-/// Parse `--from-point` as `<slot>:<block_hash_hex>` (32-byte hash).
-fn parse_point(s: &str) -> Result<(u64, Vec<u8>)> {
-    let (slot, hash) = s
-        .split_once(':')
-        .context("--from-point must be `<slot>:<block_hash_hex>`")?;
-    let slot: u64 = slot.trim().parse().context("--from-point slot")?;
-    let hash = hex::decode(hash.trim()).context("--from-point hash hex")?;
-    if hash.len() != 32 {
-        bail!("--from-point hash must be 32 bytes, got {}", hash.len());
-    }
-    Ok((slot, hash))
-}
-
-/// Mainnet slot → unix seconds. Shelley (slot ≥ 4_492_800) is 1s/slot from
-/// 1_596_059_091; Byron before that is 20s/slot (marketplace activity is all
-/// post-Shelley, so the Byron branch is only a floor sanity fallback).
-pub(crate) fn slot_to_unix(slot: u64) -> u64 {
-    const SHELLEY_START_SLOT: u64 = 4_492_800;
-    const SHELLEY_START_UNIX: u64 = 1_596_059_091;
-    const BYRON_START_UNIX: u64 = 1_506_203_091;
-    if slot >= SHELLEY_START_SLOT {
-        SHELLEY_START_UNIX + (slot - SHELLEY_START_SLOT)
-    } else {
-        BYRON_START_UNIX + slot * 20
     }
 }
 

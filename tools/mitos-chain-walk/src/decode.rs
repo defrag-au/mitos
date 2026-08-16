@@ -1,9 +1,13 @@
-//! Pure block/tx decode → the pieces the outref buffer + `DecodeTx` assembly
+//! Pure block/tx decode → the pieces a walker's outref buffer + decode assembly
 //! need. Mirrors mitos-data-plane's `block_events::project_tx` on bare pallas
 //! (no dolos): canonical spend-redeemer ordering, witness-datum extraction, and
 //! per-output datum (hash + inline bytes). Keeping the exact pallas calls the
-//! live host uses is what makes the walker's `DecodeTx` byte-compatible with the
+//! live host uses is what makes a walker's `DecodeTx` byte-compatible with the
 //! modules' decode.
+//!
+//! Derives on the types are the minimum a downstream walker needs to persist a
+//! buffered output or key a map: `Asset` is `Clone + PartialEq + Eq + Hash`
+//! (market-ledger checkpoints it; project-ledger keys the policy filter on it).
 
 use std::collections::HashMap;
 
@@ -16,7 +20,7 @@ use pallas_traverse::{MultiEraOutput, MultiEraTx, OriginalHash};
 pub type OutRef = (Hash<32>, u32);
 
 /// A native asset (policy id + on-chain asset-name bytes).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Asset {
     pub policy: Vec<u8>,
     pub name: Vec<u8>,

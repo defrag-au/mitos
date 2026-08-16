@@ -1,0 +1,60 @@
+# project-ledger — pure ingestion of one NFT project's two-sided mint view.
+#
+# STANDALONE package for now (own `[workspace]` root, NOT a mitos member).
+#
+# ONE reason left: `chain_ledger::frontier` exists only in the sibling
+# shared-crates tree, not in any pushed rev. As a member it would build with
+# mitos's [patch] block ACTIVE and break the moment that block is commented for
+# commit — which is the state CI sees.
+#
+# (The other reason is GONE: mitos moved to pallas 1.1.1 on 2026-08-16, so the
+# shared-crates [patch] block now resolves. That was the blocker.)
+#
+# Build from this directory: `nix develop ../.. -c cargo build` — shares the
+# mitos flake + target dir. WHEN SHARED-CRATES PUSHES `frontier`: bump the
+# `chain-ledger` rev in mitos/Cargo.toml, add `tools/project-ledger` to its
+# members, switch the dep below to `{ workspace = true }`, delete `[workspace]`.
+[package]
+name = "project-ledger"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Mithril-snapshot walker for a project's mint window + royalties: capital in / holders forming / capital out, one slot-keyed ledger"
+
+[workspace]
+
+[[bin]]
+name = "project-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# Shared walker plumbing (bootstrap, immutable-DB iteration, tx decode,
+# checkpoint mirror). A mitos workspace member; path dep resolves through its
+# own workspace root.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+# Pure wallet-flow model + the frontier state machine. Sibling checkout.
+chain-ledger = { path = "../../../shared-crates/chain-ledger" }
+
+# Same pallas pin as mitos so `mitos-chain-walk` types unify.
+pallas-traverse = { version = "1.1.1", features = ["unstable"] }
+pallas-primitives = "1.1.1"
+pallas-addresses = "1.1.1"
+pallas-codec = "1.1.1"
+pallas-crypto = "1.1.1"
+
+# The write store (walk-time only; the artifact is Parquet via `export`).
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Frontier / activity blobs in the checkpoint; the wire precedent is postcard.
+postcard = { version = "1", features = ["use-std"] }
+# The input-resolution ladder's last rung (`/utxo_info`) + the floor seed
+# (`/policy_asset_info`). Blocking — the walk loop is sync.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"] }
+
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"

@@ -10,10 +10,8 @@
 
 mod buffer;
 mod checkpoint;
-mod decode;
 mod follow;
 mod metadata;
-mod mithril;
 mod prune;
 mod row;
 mod seal;
@@ -42,7 +40,7 @@ enum Command {
     /// Walk certified immutable-DB history and decode marketplace events.
     Walk(walk::WalkArgs),
     /// Download + verify a Mithril snapshot's immutable DB into a data dir.
-    Bootstrap(mithril::BootstrapArgs),
+    Bootstrap(mitos_chain_walk::mithril::BootstrapArgs),
     /// Seal completed months to per-venue Parquet partitions (via the duckdb CLI).
     Seal(seal::SealArgs),
     /// Upload the ledger's hot window to the worker's D1 ingest endpoint.
@@ -69,7 +67,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Walk(args) => walk::run(args),
-        Command::Bootstrap(args) => mithril::bootstrap(args),
+        Command::Bootstrap(args) => mitos_chain_walk::mithril::bootstrap(args),
         Command::Seal(args) => seal::run(args),
         Command::Upload(args) => upload::run(args),
         Command::Stats(args) => stats::run(args),

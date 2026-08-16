@@ -43,11 +43,11 @@ use pallas_primitives::Hash;
 use pallas_traverse::{MultiEraBlock, MultiEraHeader};
 
 use crate::buffer::OutrefBuffer;
-use crate::decode::decode_tx;
 use crate::row::{BlockCtx, MarketEventRow};
 use crate::store::{Ledger, ListingOp};
 use crate::venue::VenueRegistry;
-use crate::walk::{DatumCacheGet, process_tx, rebuild_listings, slot_to_unix};
+use crate::walk::{DatumCacheGet, parse_point, process_tx, rebuild_listings, slot_to_unix};
+use mitos_chain_walk::decode::decode_tx;
 
 #[derive(clap::Args, Debug)]
 pub struct FollowArgs {
@@ -497,19 +497,6 @@ fn rollback(
     Ok(())
 }
 
-/// Parse `<slot>:<block_hash_hex>` (same shape as walk's `--from-point`).
-fn parse_point(s: &str) -> Result<(u64, Vec<u8>)> {
-    let (slot, hash) = s
-        .split_once(':')
-        .context("--from-point must be `<slot>:<block_hash_hex>`")?;
-    let slot: u64 = slot.trim().parse().context("--from-point slot")?;
-    let hash = hex::decode(hash.trim()).context("--from-point hash hex")?;
-    if hash.len() != 32 {
-        bail!("--from-point hash must be 32 bytes, got {}", hash.len());
-    }
-    Ok((slot, hash))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,13 +620,5 @@ mod tests {
         assert!(buffer.is_empty());
         assert!(ops.is_empty());
         assert!(datums.is_empty());
-    }
-
-    #[test]
-    fn parse_point_shape() {
-        let (slot, hash) = parse_point(&format!("123:{}", hex::encode([9u8; 32]))).unwrap();
-        assert_eq!((slot, hash[0]), (123, 9));
-        assert!(parse_point("123").is_err());
-        assert!(parse_point("123:abcd").is_err());
     }
 }

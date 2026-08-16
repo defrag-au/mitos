@@ -1,0 +1,28 @@
+# project-ledger registry — what the chain cannot state, and nothing else.
+#
+# The royalty address is NOT here: it is derived from CIP-27 `777.addr` in the
+# policy's own on-mint metadata. The policy signer is NOT here: it is the `sig`
+# credential in the mint script. Declaring either by hand would reintroduce
+# assertion-as-fact.
+
+project = "Mekka"
+
+[[policy]]
+id    = "29728939434a25e57ef6a9b94ba3215508264fee665bbb35b16a2d56"
+label = "Mekka Dynasty (S1)"
+# floor = 0                       # optional slot override → floor_source = declared
+
+[[wallet]]                        # asserted — `source` is required
+stake  = "stake1u98f5mr0mn8tv2kqndk5cwen4uasc7cewlzdklz6y664zacl9lvjz"
+label  = "S1 treasury"
+role   = "treasury"
+source = "Mekka analysis 2026-08-11: named by the project as the mint payment wallet"
+
+[terminal]                        # custodial-scale proxies (see design doc Q3)
+receipts       = 1000
+counterparties = 300
+
+# [[terminal.party]]              # asserted custodial wallets, never expanded
+# stake  = "stake1u9…"
+# label  = "custodial hot wallet (32.6M ADA)"
+# source = "Mekka analysis 2026-08-13, balance observed via Koios"

@@ -13,8 +13,8 @@ use pallas_primitives::Hash;
 use rusqlite::{Connection, params};
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
-use crate::decode::Asset;
 use crate::row::MarketEventRow;
+use mitos_chain_walk::decode::Asset;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS market_events (

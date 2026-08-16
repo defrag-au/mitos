@@ -38,7 +38,7 @@ from the cursor — it never re-walks and never re-hits an indexer. `--fresh`
 ignores the saved state and restarts from the venue floor.
 
 **Crash-visible progress.** Each checkpoint also writes a small JSON mirror
-(`<db>.checkpoint.json`, atomic temp+rename) with the resumable slot/height/hash
+(`<db>.checkpoint.json`, atomic temp+rename; note the scope key is `scope`, not `venues`, since the mirror moved to the shared `mitos-chain-walk` crate) with the resumable slot/height/hash
 + counters, and a `done:true` marker on completion — so after a crash/kill,
 `cat <db>.checkpoint.json` shows exactly where the resumable point is (it never
 runs ahead of what a resume would use). Override with `--checkpoint-file`.
