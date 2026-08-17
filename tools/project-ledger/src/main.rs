@@ -13,6 +13,7 @@
 //! PROJECT_LEDGER_IMPORTER.md`.
 
 mod activity;
+mod asset_class;
 mod koios;
 mod mint;
 mod party;
@@ -101,6 +102,7 @@ fn stats(args: StatsArgs) -> Result<()> {
         seed::META_FLOOR_BASIS,
         seed::META_WALK_START,
         seed::META_EXPECTED_ASSETS,
+        seed::META_SUPPLY,
         seed::META_CEILING_SLOT,
         seed::META_LAST_MINT_SLOT,
         seed::META_ROYALTY_ADDR,

@@ -11,8 +11,15 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use pallas_hardano::storage::immutable::{self, FallibleBlock, Point};
 
-/// Open `<immutable_dir>` as a stream of raw block CBOR, either from genesis or
-/// seeked directly to `(slot, block_hash)`.
+/// Open `<immutable_dir>` as a stream of raw block CBOR: from genesis
+/// (`None`), or seeked to `(slot, block_hash)`.
+///
+/// **An EMPTY `block_hash` is a slot-only FUZZY seek** — pallas-hardano
+/// binary-searches the chunk list and yields the first block at
+/// `slot >= <slot>`. That is the cheap way to start a walk at a known floor
+/// when you do not have the block hash: it skips whole chunk files instead of
+/// decoding everything below the floor (which is over an hour of CPU on
+/// mainnet). A 32-byte hash seeks exactly and errors if that block is absent.
 pub fn open_blocks<'a>(
     immutable_dir: &'a Path,
     from_point: Option<(u64, Vec<u8>)>,

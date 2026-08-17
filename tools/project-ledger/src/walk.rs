@@ -19,7 +19,7 @@
 //! Resume replays `[cursor, crash)` idempotently — rows are keyed, promotion is
 //! a pure function of the stream.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -29,13 +29,14 @@ use mitos_chain_walk::decode::{DecodedTx, OutRef, decode_tx};
 use mitos_chain_walk::slot_to_unix;
 use pallas_traverse::{MultiEraBlock, MultiEraTx};
 
+use crate::asset_class::AssetClass;
 use crate::koios::Koios;
 use crate::mint::{cip27_royalty, policy_script};
 use crate::party::{Resolved, resolve_str};
 use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
 use crate::seed::*;
 use crate::state::{BufferedOutput, WalkState};
-use crate::store::{AssetEventRow, Ledger, TxDeltaRow, ValueEventRow};
+use crate::store::{AssetEventRow, Ledger, MintPaymentRow, TxDeltaRow, ValueEventRow};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -75,6 +76,24 @@ pub struct WalkArgs {
     /// Crash-visible progress mirror (default: `<db>.checkpoint.json`).
     #[arg(long)]
     checkpoint_file: Option<PathBuf>,
+
+    /// How many promotion hops from a seed the frontier may expand.
+    ///
+    /// Phase 1 (the thing to get right first) is **funds in + assets out**, with
+    /// the mint transactions as the distribution cue — that is hop 0, the
+    /// declared mint wallets themselves. Hop 1 adds the **direct** recipients of
+    /// distribution funds, which is the next thing that matters. Beyond that the
+    /// frontier starts inferring rather than observing, and the first real run
+    /// showed how fast that degrades (20,678 parties; see the
+    /// project-ledger-frontier-explosion note).
+    ///
+    ///   0 = seeds only — no expansion at all. Counterparties are still RECORDED
+    ///       on every row; they simply don't become watched parties themselves.
+    ///   1 = + direct recipients of treasury/mint outflows  (DEFAULT)
+    ///   2 = + their recipients (the design doc's "two hops")
+    ///  64 = effectively unbounded (the original, explosive behaviour)
+    #[arg(long, default_value_t = 1)]
+    max_hops: u32,
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
@@ -137,8 +156,14 @@ pub fn run(args: WalkArgs) -> Result<()> {
         "walk: starting"
     );
 
-    let from_point = resumed.then(|| (cursor_slot, cursor_hash.clone()));
-    let blocks = mitos_chain_walk::open_blocks(&immutable_dir, from_point)?;
+    // ALWAYS seek — never stream from genesis. A 32-byte cursor hash seeks
+    // precisely (resume); the EMPTY hash `seed` writes is pallas-hardano's
+    // FUZZY seek, which binary-searches the chunk list for the first block at
+    // slot >= walk_start. For a 2025 mint that skips ~7,400 of ~8,900 chunk
+    // files; decoding from genesis to reach the floor would cost over an hour
+    // of CPU before the first useful block.
+    let blocks =
+        mitos_chain_walk::open_blocks(&immutable_dir, Some((cursor_slot, cursor_hash.clone())))?;
 
     let mut scanned = 0u64;
     let mut in_range = 0u64;
@@ -162,6 +187,11 @@ pub fn run(args: WalkArgs) -> Result<()> {
         last_mint_slot: ledger
             .meta_get(META_LAST_MINT_SLOT)?
             .and_then(|s| s.parse().ok()),
+        max_hops: args.max_hops,
+        minted_holdings: ledger
+            .meta_get(META_MINTED_HOLDINGS)?
+            .map(|s| s.split(',').filter_map(|h| hex::decode(h).ok()).collect())
+            .unwrap_or_default(),
     };
 
     for block in blocks {
@@ -291,6 +321,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
         inserted,
         members = state.frontier.len(),
         minted = minted_n,
+        supply = ctx.minted_holdings.len(),
         expected = ?expected_assets,
         floor_basis = basis,
         ladder = ?stats,
@@ -350,6 +381,33 @@ fn reevaluate(state: &mut WalkState, slot: u64) -> Vec<(Party, chain_ledger::Ter
     })
 }
 
+/// Hops from the nearest seed to `party`, by following `promoted_by`.
+///
+/// Seeds are 0. `None` if the chain is broken or longer than a sane bound (a
+/// cycle cannot occur — promotion only ever adds a NEW member — but the guard
+/// keeps this total).
+fn hops_from_seed(frontier: &chain_ledger::Frontier, party: &Party) -> Option<u32> {
+    let mut cur = frontier.member(party)?;
+    let mut hops = 0u32;
+    while let Some(parent) = &cur.promoted_by {
+        hops += 1;
+        if hops > 64 {
+            return None;
+        }
+        cur = frontier.member(parent)?;
+    }
+    Some(hops)
+}
+
+/// Whether a movement to `to_key` may promote it into the frontier.
+///
+/// False only for a NON-member receiving a policy asset in the same tx — the
+/// buyer side of a sale. Already-watched parties are unaffected, so their
+/// receipt counters keep advancing whether or not they also bought something.
+fn may_promote(asset_receivers: &BTreeSet<&str>, to_key: &str, is_member: bool) -> bool {
+    is_member || !asset_receivers.contains(to_key)
+}
+
 /// The staking credential behind a stake-keyed party (decodes the bech32).
 fn stake_cred_of(p: &Party) -> Option<[u8; 28]> {
     if !p.has_stake_credential {
@@ -391,12 +449,19 @@ pub struct TxCtx<'a> {
     pub royalty: Option<String>,
     pub royalty_rate: Option<String>,
     pub last_mint_slot: Option<u64>,
+    /// Promotion-hop bound; 0 = unbounded.
+    pub max_hops: u32,
+    /// Distinct HOLDER-FACING assets minted (excludes CIP-68 reference tokens
+    /// and labelled fungibles). This is the collection's real supply — Mekka S1
+    /// mints 10,001 policy assets but is a 5,000-NFT collection.
+    pub minted_holdings: BTreeSet<Vec<u8>>,
 }
 
 /// Rows accumulated per block, flushed together.
 #[derive(Default)]
 pub struct Rows {
     pub assets: Vec<AssetEventRow>,
+    pub mint_payments: Vec<MintPaymentRow>,
     pub deltas: Vec<TxDeltaRow>,
     pub values: Vec<ValueEventRow>,
 }
@@ -404,9 +469,11 @@ pub struct Rows {
 impl Rows {
     pub fn flush(&mut self, ledger: &mut Ledger) -> Result<usize> {
         let n = ledger.insert_asset_events(&self.assets)?
+            + ledger.insert_mint_payments(&self.mint_payments)?
             + ledger.insert_tx_deltas(&self.deltas)?
             + ledger.insert_value_events(&self.values)?;
         self.assets.clear();
+        self.mint_payments.clear();
         self.deltas.clear();
         self.values.clear();
         Ok(n)
@@ -511,6 +578,9 @@ pub fn process_tx(
             if *amount > 0 {
                 minted_now.insert(name.clone());
                 ctx.minted.insert(name.clone());
+                if AssetClass::of(name).is_holding() {
+                    ctx.minted_holdings.insert(name.clone());
+                }
                 for o in outs
                     .iter()
                     .filter(|o| o.policy_assets.iter().any(|(n, _)| n == name))
@@ -526,6 +596,7 @@ pub fn process_tx(
                         tx_hash: tx_hex.clone(),
                         policy_id: ctx.policy_hex.clone(),
                         asset_name: hex::encode(name),
+                        asset_class: AssetClass::of(name).as_str(),
                         kind: "mint",
                         from_party: None,
                         to_party: Some(o.resolved.party.key.clone()),
@@ -540,6 +611,7 @@ pub fn process_tx(
                     tx_hash: tx_hex.clone(),
                     policy_id: ctx.policy_hex.clone(),
                     asset_name: hex::encode(name),
+                    asset_class: AssetClass::of(name).as_str(),
                     kind: "burn",
                     from_party: from,
                     to_party: None,
@@ -548,6 +620,58 @@ pub fn process_tx(
                     block_time: ctx.time,
                 });
             }
+        }
+    }
+
+    // ── the mint transaction's fund split ────────────────────────────────
+    //
+    // A mint bakes distribution INTO the mint tx: the buyer pays once, and the
+    // transaction splits it — most to a treasury, often a cut to an artist,
+    // sometimes a platform fee. Reading the mint as a single destination loses
+    // every one of those legs, and they are the distribution story.
+    //
+    // The test needs no input resolution: an output to a party that received NO
+    // policy asset in this tx is money going somewhere. That single rule also
+    // excludes the buyer's change and the minAda riding with each token (both
+    // land on the asset recipient) and the reference token's deposit (that
+    // output carries a policy asset).
+    if !mints.is_empty() {
+        let asset_parties: BTreeSet<&str> = outs
+            .iter()
+            .filter(|o| !o.policy_assets.is_empty())
+            .map(|o| o.resolved.party.key.as_str())
+            .collect();
+
+        let mut by_dest: BTreeMap<&str, u64> = BTreeMap::new();
+        for o in &outs {
+            if !asset_parties.contains(o.resolved.party.key.as_str()) {
+                *by_dest.entry(o.resolved.party.key.as_str()).or_insert(0) += o.lovelace;
+            }
+        }
+        for (dest, lovelace) in by_dest {
+            rows.mint_payments.push(MintPaymentRow {
+                tx_hash: tx_hex.clone(),
+                destination: dest.to_owned(),
+                lovelace: lovelace as i64,
+                slot: ctx.slot,
+                block_time: ctx.time,
+            });
+            // NOT seeded as a watched party — deliberately, for now.
+            //
+            // These destinations ARE the project's money, so watching their
+            // onward flows is the next phase. But a mint's payees include the
+            // minting platform's own fee wallet, which is custodial-scale: as a
+            // hop-0 seed it is exempt from the terminal rule and recruits every
+            // counterparty it touches. Measured: seeding them took the frontier
+            // from 64 parties to 2,826 and the ledger from 1.7GB to 2.2GB,
+            // while adding nothing to the fund split — `mint_payment` above
+            // already records every leg.
+            //
+            // Doing this properly needs a `Role::MintPayee` in `chain-ledger`
+            // that is NOT exempt from the terminal rule, so an artist wallet is
+            // watched and expands while a platform wallet is recorded and
+            // frozen. That is a shared-crates change, and it belongs with the
+            // phase that actually consumes the onward flows.
         }
     }
 
@@ -580,6 +704,7 @@ pub fn process_tx(
                 tx_hash: tx_hex.clone(),
                 policy_id: ctx.policy_hex.clone(),
                 asset_name: hex::encode(name),
+                asset_class: AssetClass::of(name).as_str(),
                 kind: "transfer",
                 from_party: prev,
                 to_party: Some(to.clone()),
@@ -664,8 +789,41 @@ pub fn process_tx(
     let deltas = chain_ledger::net_deltas(&view);
     let mvs: Vec<Movement> = chain_ledger::movements(&view);
 
+    // A movement that DELIVERS a policy asset to its receiver is a SALE, not a
+    // payment — so it must not promote. The receiver is a customer, already
+    // recorded in full on the assets-out side as an `asset_event`; treating the
+    // delivery leg as "the treasury paid this wallet" makes every one of a
+    // mint's thousands of buyers a watched ops wallet, and each of those then
+    // expands until the custodial threshold freezes it.
+    //
+    // The first real run surfaced exactly that: 527k `tx_delta` rows against
+    // 1.1k minted assets, 88 members frozen, before this guard existed. The
+    // terminal rule can't catch it — a customer is low-volume, so it looks
+    // nothing like a custodian.
+    //
+    // Only PROMOTION is suppressed. An already-watched party that happens to
+    // buy an asset still counts the receipt normally.
+    let asset_receivers: BTreeSet<&str> = outs
+        .iter()
+        .filter(|o| !o.policy_assets.is_empty())
+        .map(|o| o.resolved.party.key.as_str())
+        .collect();
+
     // Frontier: every movement, with the receiver's global activity count.
     for mv in &mvs {
+        let already = state.frontier.is_member(&mv.to);
+        if !may_promote(&asset_receivers, &mv.to.key, already) {
+            continue;
+        }
+        // Hop bound: only an EXPANDING member within the bound may promote. A
+        // party at the limit is still RECORDED — it appears as the counterparty
+        // on the payer's rows — it just never becomes a watch-set member whose
+        // own payments recruit further.
+        if !already
+            && hops_from_seed(&state.frontier, &mv.from).is_none_or(|h| h + 1 > ctx.max_hops)
+        {
+            continue;
+        }
         let global = creds
             .get(&mv.to.key)
             .copied()
@@ -751,6 +909,19 @@ mod tests {
     use chain_ledger::{Frontier, Thresholds};
     use std::path::PathBuf;
 
+    #[test]
+    fn asset_delivery_does_not_promote_a_stranger_but_members_still_count() {
+        let mut receivers = BTreeSet::new();
+        receivers.insert("stake1buyer");
+        // A stranger receiving a policy asset is a customer — never promoted.
+        assert!(!may_promote(&receivers, "stake1buyer", false));
+        // The same wallet, once watched, still counts its receipts.
+        assert!(may_promote(&receivers, "stake1buyer", true));
+        // A stranger paid WITHOUT receiving an asset is a genuine ops-wallet
+        // candidate — this is the case the expanding frontier exists for.
+        assert!(may_promote(&receivers, "stake1contractor", false));
+    }
+
     /// Drive `process_tx` over every tx of a captured mainnet block with a
     /// policy nobody minted and an empty frontier: nothing touches, activity is
     /// counted, no rows, no panics in the pallas paths.
@@ -784,6 +955,8 @@ mod tests {
             royalty: None,
             royalty_rate: None,
             last_mint_slot: None,
+            max_hops: 0,
+            minted_holdings: BTreeSet::new(),
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -857,6 +1030,8 @@ mod tests {
             royalty: None,
             royalty_rate: None,
             last_mint_slot: None,
+            max_hops: 0,
+            minted_holdings: BTreeSet::new(),
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();

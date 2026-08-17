@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS asset_event (
     tx_hash     TEXT    NOT NULL,
     policy_id   TEXT    NOT NULL,
     asset_name  TEXT    NOT NULL,          -- hex
+    -- CIP-67 label class: reference | nft | ft | rft | plain. A CIP-68
+    -- collection mints TWO tokens per NFT; only holder-facing classes count
+    -- as ownership (see `asset_class.rs`).
+    asset_class TEXT    NOT NULL DEFAULT 'plain',
     kind        TEXT    NOT NULL,          -- mint | transfer | burn
     from_party  TEXT,
     to_party    TEXT,
@@ -100,6 +104,28 @@ CREATE TABLE IF NOT EXISTS value_kind (
     kind         TEXT NOT NULL,
     PRIMARY KEY (tx_hash, party, counterparty)
 );
+
+-- Where the mint transaction sent the money.
+--
+-- Mints bake distribution INTO the mint tx: the buyer pays once and the tx
+-- splits it — most to a treasury, often a cut to artists, sometimes a platform
+-- fee. Modelling the mint as a single destination loses all of that.
+--
+-- The rule needs no input resolution: in a tx that mints the policy, a lovelace
+-- output to a party that received NO policy asset in that same tx is a payment
+-- destination. Outputs to the asset recipient are the buyer's own change and
+-- the minAda riding along with the token; outputs carrying the reference token
+-- are its deposit. Both are excluded by that one test.
+CREATE TABLE IF NOT EXISTS mint_payment (
+    tx_hash     TEXT    NOT NULL,
+    destination TEXT    NOT NULL,
+    lovelace    INTEGER NOT NULL,
+    slot        INTEGER NOT NULL,
+    block_time  INTEGER NOT NULL,
+    PRIMARY KEY (tx_hash, destination)
+);
+CREATE INDEX IF NOT EXISTS idx_mp_slot ON mint_payment(slot);
+CREATE INDEX IF NOT EXISTS idx_mp_dest ON mint_payment(destination);
 
 -- Copied in by `enrich` so the case exports self-contained.
 CREATE TABLE IF NOT EXISTS secondary_sale (
@@ -162,6 +188,7 @@ pub struct AssetEventRow {
     pub tx_hash: String,
     pub policy_id: String,
     pub asset_name: String,
+    pub asset_class: &'static str,
     pub kind: &'static str,
     pub from_party: Option<String>,
     pub to_party: Option<String>,
@@ -191,6 +218,16 @@ pub struct ValueEventRow {
     pub slot: u64,
     pub block_time: u64,
     pub unresolved_inputs: u32,
+}
+
+/// A row of `mint_payment` — where a mint tx sent money.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintPaymentRow {
+    pub tx_hash: String,
+    pub destination: String,
+    pub lovelace: i64,
+    pub slot: u64,
+    pub block_time: u64,
 }
 
 /// A resolved output from the cache/ladder (no party — resolve on read).
@@ -250,14 +287,16 @@ impl Ledger {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO asset_event
-                 (tx_hash, policy_id, asset_name, kind, from_party, to_party, quantity, slot, block_time)
-                 VALUES (?,?,?,?,?,?,?,?,?)",
+                 (tx_hash, policy_id, asset_name, asset_class, kind, from_party, to_party,
+                  quantity, slot, block_time)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
             )?;
             for r in rows {
                 n += stmt.execute(params![
                     r.tx_hash,
                     r.policy_id,
                     r.asset_name,
+                    r.asset_class,
                     r.kind,
                     r.from_party,
                     r.to_party,
@@ -291,6 +330,31 @@ impl Ledger {
                     u64_i64(r.slot),
                     u64_i64(r.block_time),
                     r.unresolved_inputs,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    pub fn insert_mint_payments(&mut self, rows: &[MintPaymentRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO mint_payment
+                 (tx_hash, destination, lovelace, slot, block_time) VALUES (?,?,?,?,?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.tx_hash,
+                    r.destination,
+                    r.lovelace,
+                    u64_i64(r.slot),
+                    u64_i64(r.block_time),
                 ])?;
             }
         }
@@ -680,6 +744,7 @@ mod tests {
             tx_hash: "aa".into(),
             policy_id: "pp".into(),
             asset_name: "4d".into(),
+            asset_class: "nft",
             kind: "mint",
             from_party: None,
             to_party: Some("stake1b".into()),

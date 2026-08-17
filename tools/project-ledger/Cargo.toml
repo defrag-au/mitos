@@ -1,27 +1,15 @@
-# project-ledger — pure ingestion of one NFT project's two-sided mint view.
+# project-ledger — pure ingestion of one NFT project's two-sided mint view:
+# capital in (mint payments + royalties), assets out (the holder base forming),
+# capital out (deployment) — from a certified Mithril snapshot into one
+# slot-keyed ledger. Never a follower.
 #
-# STANDALONE package for now (own `[workspace]` root, NOT a mitos member).
-#
-# ONE reason left: `chain_ledger::frontier` exists only in the sibling
-# shared-crates tree, not in any pushed rev. As a member it would build with
-# mitos's [patch] block ACTIVE and break the moment that block is commented for
-# commit — which is the state CI sees.
-#
-# (The other reason is GONE: mitos moved to pallas 1.1.1 on 2026-08-16, so the
-# shared-crates [patch] block now resolves. That was the blocker.)
-#
-# Build from this directory: `nix develop ../.. -c cargo build` — shares the
-# mitos flake + target dir. WHEN SHARED-CRATES PUSHES `frontier`: bump the
-# `chain-ledger` rev in mitos/Cargo.toml, add `tools/project-ledger` to its
-# members, switch the dep below to `{ workspace = true }`, delete `[workspace]`.
+# Design: `cnft.dev-workers/docs/design/PROJECT_LEDGER_IMPORTER.md`.
 [package]
 name = "project-ledger"
-version = "0.0.1"
-edition = "2024"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Mithril-snapshot walker for a project's mint window + royalties: capital in / holders forming / capital out, one slot-keyed ledger"
-
-[workspace]
 
 [[bin]]
 name = "project-ledger"
@@ -29,32 +17,31 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared walker plumbing (bootstrap, immutable-DB iteration, tx decode,
-# checkpoint mirror). A mitos workspace member; path dep resolves through its
-# own workspace root.
+# checkpoint mirror) — extracted from market-ledger, used by both walkers.
 mitos-chain-walk = { path = "../mitos-chain-walk" }
-# Pure wallet-flow model + the frontier state machine. Sibling checkout.
-chain-ledger = { path = "../../../shared-crates/chain-ledger" }
+# Pure wallet-flow model + the frontier state machine.
+chain-ledger = { workspace = true }
 
-# Same pallas pin as mitos so `mitos-chain-walk` types unify.
-pallas-traverse = { version = "1.1.1", features = ["unstable"] }
-pallas-primitives = "1.1.1"
-pallas-addresses = "1.1.1"
-pallas-codec = "1.1.1"
+pallas-traverse = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-addresses = { workspace = true }
+pallas-codec = { workspace = true }
+# blake2b-backed `Hash<N>` used for outrefs + policy/script hashes.
 pallas-crypto = "1.1.1"
 
 # The write store (walk-time only; the artifact is Parquet via `export`).
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { workspace = true }
 # Frontier / activity blobs in the checkpoint; the wire precedent is postcard.
-postcard = { version = "1", features = ["use-std"] }
+postcard = { workspace = true }
 # The input-resolution ladder's last rung (`/utxo_info`) + the floor seed
 # (`/policy_asset_info`). Blocking — the walk loop is sync.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"] }
+reqwest = { workspace = true, features = ["blocking"] }
 
-clap = { version = "4", features = ["derive", "env"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hex = "0.4"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }

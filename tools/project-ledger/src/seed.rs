@@ -41,6 +41,10 @@ pub const META_SIGNER_CREDS: &str = "signer_creds";
 pub const META_SEEDED_UNIX: &str = "seeded_unix";
 pub const META_LAST_MINT_SLOT: &str = "last_mint_slot";
 pub const META_MINTED_ASSETS: &str = "minted_assets";
+/// Holder-facing minted assets (CIP-68 reference tokens + labelled fungibles
+/// excluded) — the collection's real supply.
+pub const META_MINTED_HOLDINGS: &str = "minted_holdings";
+pub const META_SUPPLY: &str = "supply";
 
 #[derive(clap::Args, Debug)]
 pub struct SeedArgs {

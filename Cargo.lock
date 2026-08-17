@@ -672,6 +672,7 @@ dependencies = [
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc#d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
@@ -717,6 +718,14 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chain-ledger"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc#d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -4473,6 +4482,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pipeline-types"
 version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc#d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc"
 dependencies = [
  "cardano-assets",
  "hex",
@@ -4550,6 +4560,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "project-ledger"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chain-ledger",
+ "clap",
+ "hex",
+ "mitos-chain-walk",
+ "pallas-addresses 1.1.1",
+ "pallas-codec 1.1.1",
+ "pallas-crypto 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "postcard",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "toml 0.8.20",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6506,6 +6540,7 @@ dependencies = [
 [[package]]
 name = "tx_insights"
 version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc#d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc"
 dependencies = [
  "cardano-assets",
  "serde",
@@ -6938,6 +6973,7 @@ dependencies = [
 [[package]]
 name = "wasm_safe_serde"
 version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc#d7dbe4d21a2a63ebd3c0079f41066516ed2b27fc"
 dependencies = [
  "serde",
  "serde_json",
@@ -7989,19 +8025,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "address-registry"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "chain-ledger"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "transactions"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "tx-classifier"
-version = "0.1.0"
