@@ -38,7 +38,9 @@ use crate::party::{Resolved, resolve_str};
 use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
 use crate::seed::*;
 use crate::state::{BufferedOutput, WalkState};
-use crate::store::{AliasRow, AssetEventRow, Ledger, MintPaymentRow, TxDeltaRow, ValueEventRow};
+use crate::store::{
+    AliasRow, AssetEventRow, Ledger, MintPaymentRow, TxDeltaRow, UnitFlowRow, ValueEventRow,
+};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -479,6 +481,7 @@ pub struct Rows {
     pub aliases: Vec<AliasRow>,
     pub deltas: Vec<TxDeltaRow>,
     pub values: Vec<ValueEventRow>,
+    pub units: Vec<UnitFlowRow>,
 }
 
 impl Rows {
@@ -487,12 +490,14 @@ impl Rows {
             + ledger.insert_mint_payments(&self.mint_payments)?
             + ledger.insert_aliases(&self.aliases)?
             + ledger.insert_tx_deltas(&self.deltas)?
-            + ledger.insert_value_events(&self.values)?;
+            + ledger.insert_value_events(&self.values)?
+            + ledger.insert_unit_flows(&self.units)?;
         self.assets.clear();
         self.mint_payments.clear();
         self.aliases.clear();
         self.deltas.clear();
         self.values.clear();
+        self.units.clear();
         Ok(n)
     }
 }
@@ -505,6 +510,11 @@ struct Out<'a> {
     assets: &'a [mitos_chain_walk::decode::Asset],
     /// (asset name, quantity) for assets under THE policy.
     policy_assets: Vec<(Vec<u8>, u64)>,
+    /// EVERY native asset in this output, with its quantity: `(policy, name,
+    /// qty)`. `decode::Asset` carries identity only, so the quantities come
+    /// straight off the pallas output — no change to the shared walk crate and
+    /// none to the live market-ledger that also uses it.
+    bundle: Vec<(Vec<u8>, Vec<u8>, u64)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -546,12 +556,35 @@ pub fn process_tx(
                         .collect()
                 })
                 .unwrap_or_default();
+            let bundle = pallas_outs
+                .get(o.index as usize)
+                .map(|po| {
+                    po.value()
+                        .assets()
+                        .iter()
+                        .flat_map(|pa| {
+                            let policy = pa.policy().as_slice().to_vec();
+                            pa.assets()
+                                .iter()
+                                .map(|a| {
+                                    (
+                                        policy.clone(),
+                                        a.name().to_vec(),
+                                        a.output_coin().unwrap_or(0),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Out {
                 idx: o.index,
                 resolved,
                 lovelace: o.lovelace,
                 assets: &o.assets,
                 policy_assets,
+                bundle,
             }
         })
         .collect();
@@ -927,6 +960,15 @@ pub fn process_tx(
         }
     }
 
+    // Unit flows — what actually MOVED, ADA and every token, per output.
+    //
+    // The treasury does not only spend ADA: it off-ramps through a stable, pays
+    // suppliers in USDM, and gets paid in assets. None of that is lovelace, so
+    // none of it is in `value_event`. Attribution here is per OUTPUT rather than
+    // pro-rata: the recipient of an output is exact, and only the payer is a
+    // judgement when several parties funded the tx (recorded as `payers`).
+    book_unit_flows(&outs, &inputs, state, ctx, &tx_hex, unresolved, rows);
+
     // Buffer the outputs now held by members.
     for o in &outs {
         if state.frontier.is_member(&o.resolved.party) {
@@ -947,6 +989,114 @@ pub fn process_tx(
         }
     }
     Ok(())
+}
+
+/// Book one `unit_flow` row per (output, unit) where a watched party is on
+/// either end.
+///
+/// The payer is the input party that put in the most lovelace. That is a
+/// judgement, so `payers` carries how many distinct parties funded the tx: 1 is
+/// exact, more than 1 says "attributed" on the row itself rather than in a
+/// footnote nobody reads.
+fn book_unit_flows(
+    outs: &[Out<'_>],
+    inputs: &[(Party, u64, Option<[u8; 28]>)],
+    state: &WalkState,
+    ctx: &TxCtx<'_>,
+    tx_hex: &str,
+    unresolved: u32,
+    rows: &mut Rows,
+) {
+    // Funders, by lovelace contributed. A party can appear on several inputs.
+    let mut by_payer: BTreeMap<&str, (u64, &Party)> = BTreeMap::new();
+    for (p, lovelace, _) in inputs {
+        let e = by_payer.entry(p.key.as_str()).or_insert((0, p));
+        e.0 += lovelace;
+    }
+    // The dominant funder. Ties break on the key so a replay books identically.
+    // Every input unresolved (an offline walk, a stranger's UTxO): there is no
+    // payer to NAME, and inventing one is the failure this tool exists to
+    // prevent. But the receipt itself is still a fact — the recipient and the
+    // quantity are read straight off the output — so it is recorded with an
+    // EMPTY counterparty rather than dropped. Silently losing every inbound
+    // payment would be the worse lie: "the treasury was never paid in USDM"
+    // reads identically to "we could not tell who paid".
+    let payer = by_payer
+        .iter()
+        .max_by_key(|(k, (v, _))| (*v, std::cmp::Reverse(*k)))
+        .map(|(_, &(_, p))| p);
+    // A DOMINANT FUNDER IS ONLY KNOWABLE WHEN EVERY INPUT RESOLVED.
+    //
+    // `by_payer` sums the inputs we could resolve; the outputs are all of them.
+    // With even one input unresolved, a watched party holding a small resolved
+    // input becomes "the payer" of money that came from somewhere else entirely
+    // — and every output of the tx is then booked as the treasury spending.
+    //
+    // Measured on Mekka S1 before this guard: tx 92b2f6c0's true treasury delta
+    // is -2,374 ADA and it was booked as 1,893,881 ADA out, because the tx had
+    // two unresolved inputs. 96.4% of transactions in an offline walk have at
+    // least one, so the heuristic was wrong far more often than it was right.
+    //
+    // Receipts are NOT affected: an output to a watched party is exact no matter
+    // where the money came from. So an offline walk gives complete inbound and
+    // only fully-resolved outbound; `--remote koios` is what fills the rest in.
+    let attributable = unresolved == 0;
+    let payers = by_payer.len() as u32;
+    let payer_watched = attributable && payer.is_some_and(|p| state.frontier.is_member(p));
+    let payer_key = match attributable {
+        true => payer.map(|p| p.key.as_str()).unwrap_or(""),
+        false => "",
+    };
+
+    for o in outs {
+        let to = &o.resolved.party;
+        // An output back to a funder is CHANGE, not a payment.
+        if by_payer.contains_key(to.key.as_str()) {
+            continue;
+        }
+        let to_watched = state.frontier.is_member(to);
+        if !payer_watched && !to_watched {
+            continue;
+        }
+        let mut units: Vec<(String, u64)> = Vec::new();
+        if o.lovelace > 0 {
+            units.push(("lovelace".to_string(), o.lovelace));
+        }
+        for (policy, name, qty) in &o.bundle {
+            if *qty > 0 {
+                units.push((crate::store::unit_of(policy, name), *qty));
+            }
+        }
+        for (unit, qty) in units {
+            let q = qty.min(i64::MAX as u64) as i64;
+            if payer_watched {
+                rows.units.push(UnitFlowRow {
+                    tx_hash: tx_hex.to_string(),
+                    output_index: o.idx,
+                    party: payer_key.to_string(),
+                    counterparty: to.key.clone(),
+                    unit: unit.clone(),
+                    quantity: -q,
+                    payers,
+                    slot: ctx.slot,
+                    block_time: ctx.time,
+                });
+            }
+            if to_watched {
+                rows.units.push(UnitFlowRow {
+                    tx_hash: tx_hex.to_string(),
+                    output_index: o.idx,
+                    party: to.key.clone(),
+                    counterparty: payer_key.to_string(),
+                    unit,
+                    quantity: q,
+                    payers,
+                    slot: ctx.slot,
+                    block_time: ctx.time,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1112,5 +1262,253 @@ mod tests {
         assert!(buffered >= 1);
         // Nothing was promoted: no member paid anyone (inputs unresolved).
         assert_eq!(state.frontier.len(), 1);
+    }
+
+    // ── unit flows ────────────────────────────────────────────────────────
+
+    fn party(key: &str) -> Party {
+        Party {
+            key: key.to_string(),
+            chain: Chain::Cardano,
+            has_stake_credential: true,
+        }
+    }
+
+    fn out(
+        idx: u32,
+        to: &str,
+        lovelace: u64,
+        bundle: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    ) -> Out<'static> {
+        Out {
+            idx,
+            resolved: Resolved {
+                party: party(to),
+                stake_cred: None,
+                payment_cred: None,
+                payment_is_script: false,
+            },
+            lovelace,
+            assets: &[],
+            policy_assets: Vec::new(),
+            bundle,
+        }
+    }
+
+    fn seeded(watched: &[&str]) -> WalkState {
+        let mut frontier = Frontier::new(Thresholds::default(), []);
+        for k in watched {
+            frontier.seed(party(k), Role::Declared, 0).unwrap();
+        }
+        WalkState {
+            frontier,
+            buffer: Buffer::default(),
+            activity: Activity::default(),
+            holders: Holders::default(),
+        }
+    }
+
+    fn run_flows(
+        outs: &[Out<'_>],
+        inputs: &[(Party, u64, Option<[u8; 28]>)],
+        state: &WalkState,
+        unresolved: u32,
+    ) -> Vec<UnitFlowRow> {
+        let mut signer_creds = BTreeSet::new();
+        let mut minted = BTreeSet::new();
+        let ctx = TxCtx {
+            policy: [0xAB; 28],
+            policy_hex: hex::encode([0xAB; 28]),
+            slot: 7,
+            time: 1_700_000_000,
+            signer_creds: &mut signer_creds,
+            minted: &mut minted,
+            ceiling: None,
+            royalty: None,
+            royalty_rate: None,
+            last_mint_slot: None,
+            max_hops: 0,
+            minted_holdings: BTreeSet::new(),
+        };
+        let mut rows = Rows::default();
+        book_unit_flows(outs, inputs, state, &ctx, "txhash", unresolved, &mut rows);
+        rows.units
+    }
+
+    fn flows(
+        outs: &[Out<'_>],
+        inputs: &[(Party, u64, Option<[u8; 28]>)],
+        watched: &[&str],
+    ) -> Vec<UnitFlowRow> {
+        let state = seeded(watched);
+        let mut signer_creds = BTreeSet::new();
+        let mut minted = BTreeSet::new();
+        let ctx = TxCtx {
+            policy: [0xAB; 28],
+            policy_hex: hex::encode([0xAB; 28]),
+            slot: 7,
+            time: 1_700_000_000,
+            signer_creds: &mut signer_creds,
+            minted: &mut minted,
+            ceiling: None,
+            royalty: None,
+            royalty_rate: None,
+            last_mint_slot: None,
+            max_hops: 0,
+            minted_holdings: BTreeSet::new(),
+        };
+        let mut rows = Rows::default();
+        book_unit_flows(outs, inputs, &state, &ctx, "txhash", 0, &mut rows);
+        rows.units
+    }
+
+    const USDM: [u8; 4] = [0xc4, 0x8c, 0xbb, 0x3d];
+
+    /// The case the whole table exists for: the treasury pays a supplier in a
+    /// stable, not in ADA. Both legs of the bundle are booked, and the ADA
+    /// riding along with the token is not mistaken for the payment.
+    #[test]
+    fn a_token_payment_is_booked_per_unit() {
+        let rows = flows(
+            &[out(
+                0,
+                "stake1supplier",
+                1_400_000,
+                vec![(USDM.to_vec(), b"USDM".to_vec(), 1_500_000_000)],
+            )],
+            &[(party("stake1treasury"), 900_000_000, None)],
+            &["stake1treasury"],
+        );
+        assert_eq!(rows.len(), 2, "one row per unit in the output");
+        let usdm = rows
+            .iter()
+            .find(|r| {
+                r.unit.contains("55534d4d")
+                    || r.unit == format!("{}.{}", hex::encode(USDM), hex::encode(b"USDM"))
+            })
+            .expect("the USDM leg");
+        assert_eq!(usdm.quantity, -1_500_000_000, "out of the treasury");
+        assert_eq!(usdm.counterparty, "stake1supplier");
+        assert_eq!(usdm.payers, 1, "single funder — exact, not attributed");
+        let ada = rows.iter().find(|r| r.unit == "lovelace").unwrap();
+        assert_eq!(ada.quantity, -1_400_000);
+    }
+
+    /// Being PAID in assets — the other direction, same table. Mekka did this.
+    #[test]
+    fn the_treasury_being_paid_in_assets_is_the_same_table() {
+        let rows = flows(
+            &[out(
+                0,
+                "stake1treasury",
+                2_000_000,
+                vec![(vec![0x11; 28], b"SOMETOKEN".to_vec(), 42)],
+            )],
+            &[(party("stake1payer"), 500_000_000, None)],
+            &["stake1treasury"],
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.quantity > 0), "inbound is positive");
+        assert!(rows.iter().all(|r| r.counterparty == "stake1payer"));
+    }
+
+    /// Change is not a payment. Without this every tx reports the treasury
+    /// paying itself the balance of its own wallet.
+    #[test]
+    fn change_back_to_a_funder_is_not_a_flow() {
+        let rows = flows(
+            &[
+                out(0, "stake1supplier", 5_000_000, vec![]),
+                out(1, "stake1treasury", 900_000_000, vec![]), // change
+            ],
+            &[(party("stake1treasury"), 906_000_000, None)],
+            &["stake1treasury"],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].counterparty, "stake1supplier");
+        assert_eq!(rows[0].quantity, -5_000_000);
+    }
+
+    /// Several funders means the payer is a JUDGEMENT — the row says so, and
+    /// the dominant funder is the one named.
+    #[test]
+    fn multiple_funders_are_recorded_as_such() {
+        let rows = flows(
+            &[out(0, "stake1supplier", 5_000_000, vec![])],
+            &[
+                (party("stake1treasury"), 900_000_000, None),
+                (party("stake1cosigner"), 10_000_000, None),
+            ],
+            &["stake1treasury"],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].party, "stake1treasury", "the dominant funder");
+        assert_eq!(rows[0].payers, 2, "and the ambiguity is on the row");
+    }
+
+    /// An unresolvable payer must not delete the receipt. The recipient and
+    /// the quantity are read off the output and are exact; only the payer is
+    /// unknown, and an empty counterparty says so.
+    #[test]
+    fn an_unresolved_payer_still_records_the_receipt() {
+        let rows = flows(
+            &[out(
+                0,
+                "stake1treasury",
+                3_000_000,
+                vec![(USDM.to_vec(), b"USDM".to_vec(), 250)],
+            )],
+            &[],
+            &["stake1treasury"],
+        );
+        assert_eq!(rows.len(), 2, "the receipt survives an unknown payer");
+        assert!(rows.iter().all(|r| r.counterparty.is_empty()));
+        assert!(
+            rows.iter().all(|r| r.payers == 0),
+            "0 payers = nobody named"
+        );
+        assert!(rows.iter().all(|r| r.quantity > 0));
+    }
+
+    /// The guard that matters most: with ANY input unresolved there is no
+    /// knowable funder, so nothing outbound may be attributed — but the
+    /// receipt, which is read off the output, still stands.
+    #[test]
+    fn an_unresolved_input_forbids_outbound_attribution() {
+        let outs = [
+            out(0, "stake1stranger", 1_893_881_000_000, vec![]),
+            out(1, "stake1treasury", 5_000_000, vec![]),
+        ];
+        let inputs = [(party("stake1treasury"), 900_000_000, None)];
+        // Fully resolved: the treasury really is the funder.
+        let state = seeded(&["stake1treasury"]);
+        let clean = run_flows(&outs, &inputs, &state, 0);
+        assert!(
+            clean
+                .iter()
+                .any(|r| r.quantity < 0 && r.counterparty == "stake1stranger"),
+            "a fully-resolved tx still attributes outbound"
+        );
+        // One unresolved input: the 1.89M could have come from anywhere.
+        let dirty = run_flows(&outs, &inputs, &state, 1);
+        assert!(
+            dirty.iter().all(|r| r.quantity > 0),
+            "nothing outbound may be attributed: {dirty:?}"
+        );
+        assert!(
+            dirty.iter().all(|r| r.counterparty.is_empty()),
+            "and no payer is named"
+        );
+    }
+
+    /// A tx between two strangers writes nothing, even though it is decoded.
+    #[test]
+    fn a_tx_that_touches_nobody_watched_writes_nothing() {
+        let rows = flows(
+            &[out(0, "stake1bob", 5_000_000, vec![])],
+            &[(party("stake1alice"), 6_000_000, None)],
+            &["stake1treasury"],
+        );
+        assert!(rows.is_empty());
     }
 }

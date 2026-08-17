@@ -96,6 +96,41 @@ CREATE TABLE IF NOT EXISTS value_event (
 CREATE INDEX IF NOT EXISTS idx_ve_party_slot ON value_event(party, slot);
 CREATE INDEX IF NOT EXISTS idx_ve_slot ON value_event(slot);
 
+-- What the treasury actually MOVED, per unit — ADA and every native token.
+--
+-- `value_event` answers how much ADA moved between two parties, pro-rata
+-- across the tx. That model cannot carry tokens: a project pays for
+-- things in USDM, off-ramps through a stable, and gets paid in assets (Mekka
+-- did all three), and none of it is lovelace.
+--
+-- This table is deliberately a DIFFERENT attribution, not an extension of the
+-- same one, and says so: ONE ROW PER OUTPUT BUNDLE, from the tx dominant
+-- funder to that output's recipient. No pro-rata split is invented — an output
+-- is an indivisible fact, and its recipient is exact. What IS a judgement is
+-- the payer when a tx is funded by several parties; `payers` records how many
+-- there were, so a 1 is exact and anything above it is visibly an attribution.
+--
+-- Change is NOT a flow: an output back to a party that also funded the tx is
+-- skipped, or every transaction would report paying itself.
+--
+-- `unit` is `lovelace` or `<policy_hex>.<name_hex>` — the Cardano convention,
+-- so a unit string here is the same string every indexer uses.
+CREATE TABLE IF NOT EXISTS unit_flow (
+    tx_hash       TEXT    NOT NULL,
+    output_index  INTEGER NOT NULL,
+    party         TEXT    NOT NULL,        -- a watched party (either end)
+    counterparty  TEXT    NOT NULL,
+    unit          TEXT    NOT NULL,
+    -- Signed from `party`'s view: negative is out of the treasury.
+    quantity      INTEGER NOT NULL,
+    payers        INTEGER NOT NULL DEFAULT 1,
+    slot          INTEGER NOT NULL,
+    block_time    INTEGER NOT NULL,
+    PRIMARY KEY (tx_hash, output_index, party, unit)
+);
+CREATE INDEX IF NOT EXISTS idx_uf_party_slot ON unit_flow(party, slot);
+CREATE INDEX IF NOT EXISTS idx_uf_unit ON unit_flow(unit, slot);
+
 -- Interpretation, recomputable without a re-walk (`classify`).
 CREATE TABLE IF NOT EXISTS value_kind (
     tx_hash      TEXT NOT NULL,
@@ -238,6 +273,26 @@ pub struct ValueEventRow {
     pub unresolved_inputs: u32,
 }
 
+/// A row of `unit_flow` — one output's worth of one unit, moving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitFlowRow {
+    pub tx_hash: String,
+    pub output_index: u32,
+    pub party: String,
+    pub counterparty: String,
+    /// `lovelace`, or `<policy_hex>.<name_hex>`.
+    pub unit: String,
+    pub quantity: i64,
+    pub payers: u32,
+    pub slot: u64,
+    pub block_time: u64,
+}
+
+/// The Cardano unit string: `lovelace`, else `<policy_hex>.<name_hex>`.
+pub fn unit_of(policy: &[u8], name: &[u8]) -> String {
+    format!("{}.{}", hex::encode(policy), hex::encode(name))
+}
+
 /// A row of `mint_payment` — where a mint tx sent money.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintPaymentRow {
@@ -375,12 +430,7 @@ impl Ledger {
                 "INSERT OR IGNORE INTO party_alias (party, kind, value, slot) VALUES (?,?,?,?)",
             )?;
             for r in rows {
-                n += stmt.execute(params![
-                    r.party,
-                    r.kind.as_str(),
-                    r.value,
-                    u64_i64(r.slot)
-                ])?;
+                n += stmt.execute(params![r.party, r.kind.as_str(), r.value, u64_i64(r.slot)])?;
             }
         }
         tx.commit()?;
@@ -403,6 +453,37 @@ impl Ledger {
                     r.tx_hash,
                     r.destination,
                     r.lovelace,
+                    u64_i64(r.slot),
+                    u64_i64(r.block_time),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    pub fn insert_unit_flows(&mut self, rows: &[UnitFlowRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO unit_flow
+                 (tx_hash, output_index, party, counterparty, unit, quantity, payers,
+                  slot, block_time)
+                 VALUES (?,?,?,?,?,?,?,?,?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.tx_hash,
+                    r.output_index,
+                    r.party,
+                    r.counterparty,
+                    r.unit,
+                    r.quantity,
+                    r.payers,
                     u64_i64(r.slot),
                     u64_i64(r.block_time),
                 ])?;
