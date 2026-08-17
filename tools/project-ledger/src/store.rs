@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chain_ledger::Frontier;
+use chain_ledger::{AliasKind, Frontier};
 use mitos_chain_walk::decode::OutRef;
 use pallas_primitives::Hash;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -127,6 +127,24 @@ CREATE TABLE IF NOT EXISTS mint_payment (
 CREATE INDEX IF NOT EXISTS idx_mp_slot ON mint_payment(slot);
 CREATE INDEX IF NOT EXISTS idx_mp_dest ON mint_payment(destination);
 
+-- Every name a tracked wallet goes by, so a reader can FIND it by any of them.
+--
+-- A wallet is a stake key to us, but people hold an address or a $handle. Both
+-- are observable during the walk with no indexer: every output is already
+-- resolved to a party, so its payment address is free; and an ADA Handle is
+-- just an asset under one well-known policy, so an output carrying one names
+-- its receiver. Recorded only for wallets the ledger tracks (holders + watched
+-- parties) — the set anyone would search for — which keeps this bounded by
+-- the project, not the chain. `kind` ∈ address | handle.
+CREATE TABLE IF NOT EXISTS party_alias (
+    party  TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    value  TEXT NOT NULL,
+    slot   INTEGER NOT NULL,          -- first seen
+    PRIMARY KEY (party, kind, value)
+);
+CREATE INDEX IF NOT EXISTS idx_pa_value ON party_alias(value);
+
 -- Copied in by `enrich` so the case exports self-contained.
 CREATE TABLE IF NOT EXISTS secondary_sale (
     tx_hash        TEXT NOT NULL,
@@ -230,6 +248,15 @@ pub struct MintPaymentRow {
     pub block_time: u64,
 }
 
+/// A row of `party_alias` — one name a tracked wallet goes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasRow {
+    pub party: String,
+    pub kind: AliasKind,
+    pub value: String,
+    pub slot: u64,
+}
+
 /// A resolved output from the cache/ladder (no party — resolve on read).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedOutput {
@@ -330,6 +357,29 @@ impl Ledger {
                     u64_i64(r.slot),
                     u64_i64(r.block_time),
                     r.unresolved_inputs,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    pub fn insert_aliases(&mut self, rows: &[AliasRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO party_alias (party, kind, value, slot) VALUES (?,?,?,?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.party,
+                    r.kind.as_str(),
+                    r.value,
+                    u64_i64(r.slot)
                 ])?;
             }
         }

@@ -23,7 +23,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use chain_ledger::{Chain, FrontierOutcome, Movement, Party, Role, TxInput, TxOutput, TxView};
+use chain_ledger::{
+    AliasKind, Chain, FrontierOutcome, Movement, Party, Role, TxInput, TxOutput, TxView,
+};
 use mitos_chain_walk::checkpoint::{self, CheckpointFile};
 use mitos_chain_walk::decode::{DecodedTx, OutRef, decode_tx};
 use mitos_chain_walk::slot_to_unix;
@@ -36,7 +38,7 @@ use crate::party::{Resolved, resolve_str};
 use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
 use crate::seed::*;
 use crate::state::{BufferedOutput, WalkState};
-use crate::store::{AssetEventRow, Ledger, MintPaymentRow, TxDeltaRow, ValueEventRow};
+use crate::store::{AliasRow, AssetEventRow, Ledger, MintPaymentRow, TxDeltaRow, ValueEventRow};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -354,6 +356,18 @@ fn do_checkpoint(
             .collect::<Vec<_>>()
             .join(","),
     )?;
+    ledger.meta_set(
+        META_MINTED_HOLDINGS,
+        &ctx.minted_holdings
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    // The collection's REAL supply — what a holder chart scales to. Distinct
+    // from `expected_assets` (every asset minted under the policy), which is
+    // what proves floor coverage: a CIP-68 mint emits two per NFT.
+    ledger.meta_set(META_SUPPLY, &ctx.minted_holdings.len().to_string())?;
     if let Some(c) = ctx.ceiling {
         ledger.meta_set(META_CEILING_SLOT, &c.to_string())?;
         ledger.meta_set(META_CEILING_SOURCE, "native_script_before")?;
@@ -462,6 +476,7 @@ pub struct TxCtx<'a> {
 pub struct Rows {
     pub assets: Vec<AssetEventRow>,
     pub mint_payments: Vec<MintPaymentRow>,
+    pub aliases: Vec<AliasRow>,
     pub deltas: Vec<TxDeltaRow>,
     pub values: Vec<ValueEventRow>,
 }
@@ -470,10 +485,12 @@ impl Rows {
     pub fn flush(&mut self, ledger: &mut Ledger) -> Result<usize> {
         let n = ledger.insert_asset_events(&self.assets)?
             + ledger.insert_mint_payments(&self.mint_payments)?
+            + ledger.insert_aliases(&self.aliases)?
             + ledger.insert_tx_deltas(&self.deltas)?
             + ledger.insert_value_events(&self.values)?;
         self.assets.clear();
         self.mint_payments.clear();
+        self.aliases.clear();
         self.deltas.clear();
         self.values.clear();
         Ok(n)
@@ -711,6 +728,37 @@ pub fn process_tx(
                 quantity: *qty as i64,
                 slot: ctx.slot,
                 block_time: ctx.time,
+            });
+        }
+    }
+
+    // 3b. aliases — every name a TRACKED wallet goes by, so a reader can find
+    // it by whatever they have to hand. Tracked = watched party or a current
+    // holder (this tx's holdings are already applied above). Payment addresses
+    // are free (the output is already resolved); ADA Handles are assets under
+    // one policy, so an output carrying one names its receiver. Both without an
+    // indexer. `INSERT OR IGNORE` on (party, kind, value) makes re-seeing cheap.
+    for o in &outs {
+        let key = o.resolved.party.key.as_str();
+        let tracked = state.frontier.is_member(&o.resolved.party) || state.holders.holds(key);
+        if !tracked {
+            continue;
+        }
+        let address = &d.outputs[o.idx as usize].address;
+        if address != key {
+            rows.aliases.push(AliasRow {
+                party: key.to_owned(),
+                kind: AliasKind::Address,
+                value: address.clone(),
+                slot: ctx.slot,
+            });
+        }
+        for h in crate::alias::handles_in(o.assets) {
+            rows.aliases.push(AliasRow {
+                party: key.to_owned(),
+                kind: AliasKind::Handle,
+                value: h,
+                slot: ctx.slot,
             });
         }
     }

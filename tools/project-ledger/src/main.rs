@@ -13,6 +13,7 @@
 //! PROJECT_LEDGER_IMPORTER.md`.
 
 mod activity;
+mod alias;
 mod asset_class;
 mod koios;
 mod mint;
@@ -127,6 +128,8 @@ fn stats(args: StatsArgs) -> Result<()> {
         "tx_delta",
         "value_event",
         "value_kind",
+        "mint_payment",
+        "party_alias",
         "secondary_sale",
         "outref_buffer",
         "outref_cache",

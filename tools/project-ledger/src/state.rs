@@ -78,6 +78,10 @@ impl Buffer {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holders {
     map: HashMap<Vec<u8>, (String, u64)>,
+    /// How many policy assets each party currently holds — kept in step with
+    /// `map` so "does this party hold anything?" is O(1) per output, not a
+    /// scan over every asset.
+    per_party: HashMap<String, u32>,
 }
 
 #[allow(dead_code)]
@@ -85,9 +89,15 @@ impl Holders {
     /// Record `party` as the holder of `asset` from `slot`; returns the previous
     /// holder (if any) — the transfer's `from`.
     pub fn set(&mut self, asset: &[u8], party: &str, slot: u64) -> Option<String> {
-        self.map
+        let prev = self
+            .map
             .insert(asset.to_vec(), (party.to_owned(), slot))
-            .map(|(p, _)| p)
+            .map(|(p, _)| p);
+        if let Some(p) = &prev {
+            self.dec(p);
+        }
+        *self.per_party.entry(party.to_owned()).or_insert(0) += 1;
+        prev
     }
 
     pub fn get(&self, asset: &[u8]) -> Option<&str> {
@@ -95,7 +105,25 @@ impl Holders {
     }
 
     pub fn remove(&mut self, asset: &[u8]) -> Option<String> {
-        self.map.remove(asset).map(|(p, _)| p)
+        let prev = self.map.remove(asset).map(|(p, _)| p);
+        if let Some(p) = &prev {
+            self.dec(p);
+        }
+        prev
+    }
+
+    /// Whether `party` currently holds at least one policy asset.
+    pub fn holds(&self, party: &str) -> bool {
+        self.per_party.get(party).is_some_and(|n| *n > 0)
+    }
+
+    fn dec(&mut self, party: &str) {
+        if let Some(n) = self.per_party.get_mut(party) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_party.remove(party);
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
