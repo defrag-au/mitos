@@ -819,15 +819,28 @@ pub fn process_tx(
     }
     let found = resolve_missing(ledger, remote, &missing, stats)?;
     let mut unresolved = 0u32;
+    // WRITE DOWN WHAT WE COULD NOT RESOLVE.
+    //
+    // An unresolved input is not merely a missing number: it disables the
+    // change rule below, because a wallet's own output coming back can only be
+    // recognised as change if we know that wallet funded the tx. Every ref we
+    // fail on is therefore a receipt that may be nothing of the kind, and the
+    // only way to settle it later is to know which ref to go and fetch.
+    // `resolve-local` reads this list straight back out of the snapshot.
+    let mut wanted: Vec<(OutRef, u64)> = Vec::new();
     for oref in &missing {
         match found.get(oref) {
             Some(c) => {
                 let r = resolve_str(&c.address);
                 inputs.push((r.party, c.lovelace, r.stake_cred));
             }
-            None => unresolved += 1,
+            None => {
+                unresolved += 1;
+                wanted.push((*oref, ctx.slot));
+            }
         }
     }
+    ledger.wanted_put(&wanted)?;
 
     // TxView.
     let mut parties: Vec<Party> = Vec::new();

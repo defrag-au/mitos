@@ -107,15 +107,15 @@ pallas-network = "1.1.1"
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
 # Pinned to a specific shared-crates rev for reproducibility; bump
 # deliberately when shared-crates lands changes mitos needs.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "9ab2fccfb480bfc8725374bdb90b4825879dc036", features = ["cip14", "cip25"] }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "1f85aa1cc56c27ef913c9e0b933eff3bf6323890", features = ["cip14", "cip25"] }
 # Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
 # by the protocol-event taxonomy in `mitos-core::protocol`. Same
 # shape the existing classifier emits, so mitos events deserialize
 # identically on the CF side.
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "9ab2fccfb480bfc8725374bdb90b4825879dc036" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "1f85aa1cc56c27ef913c9e0b933eff3bf6323890" }
 # Pure, I/O-free wallet-flow model (`TxView`/`net_deltas`/`movements`) + the
 # project-walk `frontier` state machine. Consumed by `tools/project-ledger`.
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "9ab2fccfb480bfc8725374bdb90b4825879dc036" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "1f85aa1cc56c27ef913c9e0b933eff3bf6323890" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }

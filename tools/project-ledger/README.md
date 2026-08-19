@@ -40,6 +40,53 @@ Checkpoint (cursor + frontier + buffer + activity + holders, one transaction)
 every `--checkpoint-every` in-range blocks. The floor test at the end reconciles
 distinct minted assets against Koios's list: equal → `floor_basis = observed`.
 
+## Resolving inputs LOCALLY — do this, or receipts are unreliable
+
+**A walk that cannot resolve its inputs cannot tell an incoming payment from the
+wallet's own change.** Change is recognised in `book_unit_flows` by asking
+whether an output goes back to a wallet that FUNDED the tx; with no resolved
+inputs there are no known funders, so change is booked as a receipt from an
+unnamed payer. That turns gross throughput into apparent income — on the first
+Mekka walk, 415,508 outputs, and one script address reading 115M ₳ "received"
+against a net of 305k.
+
+The `outref_buffer` rung only holds **watched parties' own** outputs, so it
+resolves a tracked wallet spending something the walk already saw and nothing
+else. Every genuine inbound payment comes from a stranger and falls through it.
+
+**The snapshot already has every one of those outputs** — an input references an
+output in an earlier block of the same immutable DB. So the fix is local, and
+runs as three steps:
+
+```sh
+# 1. walk — records what it could not resolve into `wanted_outref`
+project-ledger walk --db mekka.db --data-dir /opt/market-ledger/snapshot-full …
+
+# 2. read those refs straight out of the snapshot into `outref_cache`
+#    (omit --from-slot to scan from genesis, which is the only setting that can
+#    close the list completely; set it to measure cost on a bounded range first)
+project-ledger resolve-local --db mekka.db \
+  --data-dir /opt/market-ledger/snapshot-full --from-slot 150000000
+
+# 3. re-walk — the ladder now finds them and the change rule works
+project-ledger reset --db mekka.db --yes && project-ledger seed … && walk …
+```
+
+Step 2 reports `closed = have/wanted` and WARNS when refs remain: those point at
+outputs created before the scanned range, and until they resolve a walk still
+cannot classify those receipts. `outref_cache` is append-only, so the cost is
+paid once and survives every later walk and rebootstrap — no indexer involved.
+
+**Step 3's `reset` keeps the ledger FILE and clears only what a walk derives**,
+because the cache lives in that same file: deleting it would discard the
+snapshot scan immediately before the walk that exists to spend it, and the only
+symptom would be change booked as income all over again. `--purge-cache` opts
+into the old delete-the-file behaviour for a genuinely clean start.
+
+Sizing: an input points at an output made earlier by an unknown margin (a wallet
+may hold a UTxO for years), so no start slot short of genesis is provably far
+enough back. `--from-slot` is a cost/coverage dial, not a correctness one.
+
 ## Not yet built
 
 `classify` (kind projection: mint_payment / royalty / internal / deployment),

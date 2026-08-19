@@ -16,6 +16,7 @@ mod activity;
 mod alias;
 mod asset_class;
 mod koios;
+mod local;
 mod mint;
 mod party;
 mod registry;
@@ -48,6 +49,12 @@ enum Command {
     Seed(seed::SeedArgs),
     /// Walk certified history from the floor.
     Walk(walk::WalkArgs),
+    /// Resolve a walk's unresolved inputs LOCALLY, out of the snapshot.
+    ///
+    /// Run between two walks: the first records what it could not resolve, this
+    /// fetches it from the immutable DB, the second books correctly. Without it
+    /// a walk cannot tell an incoming payment from the wallet's own change.
+    ResolveLocal(local::LocalArgs),
     /// Row counts + meta — a quick look at what a ledger holds.
     Stats(StatsArgs),
     /// Delete the ledger + checkpoint mirror for a clean restart (dry-run unless --yes).
@@ -70,6 +77,12 @@ struct ResetArgs {
     /// Also delete this export tree.
     #[arg(long)]
     export: Option<PathBuf>,
+    /// Also discard the resolved-input cache, deleting the ledger file outright.
+    ///
+    /// Off by default: `outref_cache` is paid for by a full snapshot scan and a
+    /// reset is normally a prelude to the re-walk that spends it.
+    #[arg(long)]
+    purge_cache: bool,
     /// Actually delete.
     #[arg(long)]
     yes: bool,
@@ -87,6 +100,7 @@ fn main() -> Result<()> {
         Command::Bootstrap(args) => mitos_chain_walk::mithril::bootstrap(args),
         Command::Seed(args) => seed::run(args),
         Command::Walk(args) => walk::run(args),
+        Command::ResolveLocal(args) => local::resolve_local(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }
@@ -147,9 +161,19 @@ fn reset(args: ResetArgs) -> Result<()> {
         .unwrap_or_else(|| default_path(&args.db));
     if !args.yes {
         println!("reset (dry-run; pass --yes to delete) would remove:");
-        for f in reset_files(&args.db, &checkpoint) {
-            if f.exists() {
-                println!("  {}", f.display());
+        if args.purge_cache {
+            for f in reset_files(&args.db, &checkpoint) {
+                if f.exists() {
+                    println!("  {}", f.display());
+                }
+            }
+        } else {
+            println!("  every walk-derived table in {}", args.db.display());
+            println!(
+                "  KEEPING outref_cache + wanted_outref (pass --purge-cache to drop them too)"
+            );
+            if checkpoint.exists() {
+                println!("  {}", checkpoint.display());
             }
         }
         if let Some(e) = &args.export
@@ -159,9 +183,42 @@ fn reset(args: ResetArgs) -> Result<()> {
         }
         return Ok(());
     }
-    let removed = wipe(&args.db, &checkpoint, args.export.as_deref())?;
-    for f in &removed {
-        tracing::info!(path = %f.display(), "reset: removed");
+
+    if args.purge_cache {
+        let removed = wipe(&args.db, &checkpoint, args.export.as_deref())?;
+        for f in &removed {
+            tracing::info!(path = %f.display(), "reset: removed");
+        }
+        return Ok(());
+    }
+
+    // Keep the file, clear only what the walk derives — see `reset_derived`.
+    if args.db.exists() {
+        let mut ledger = store::Ledger::open(&args.db)?;
+        let cleared = ledger.reset_derived()?;
+        let (wanted, have) = ledger.wanted_progress()?;
+        for (table, n) in &cleared {
+            tracing::debug!(table, rows = n, "reset: cleared");
+        }
+        tracing::info!(
+            db = %args.db.display(),
+            rows_cleared = cleared.iter().map(|(_, n)| n).sum::<u64>(),
+            resolution_cache_kept = format!("{have}/{wanted} refs closed"),
+            "reset: ledger cleared, resolution cache kept"
+        );
+    }
+    // `-wal`/`-shm` are deliberately left to sqlite: the ledger is still a live
+    // database here, and removing them by hand is only safe if the close was
+    // clean — a bad bet against a corrupted 2 GB file.
+    if checkpoint.exists() {
+        std::fs::remove_file(&checkpoint)?;
+        tracing::info!(path = %checkpoint.display(), "reset: removed");
+    }
+    if let Some(e) = &args.export
+        && e.exists()
+    {
+        std::fs::remove_dir_all(e)?;
+        tracing::info!(path = %e.display(), "reset: removed");
     }
     Ok(())
 }

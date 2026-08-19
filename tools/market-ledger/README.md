@@ -150,6 +150,49 @@ boundary checkpointing; a 28h gap (4.9k blocks) closed in ~66s.
    history, venue split, and the buyer-price premium (jpg-era ≈ 0%, Wayup and
    Wayup-settled-jpg ≈ +2%).
 
+## Notes from project-ledger (2026-08-19) — worth checking here
+
+`project-ledger` reuses this walker's resolution model and hit a class of bug in
+it. Neither item is known to be wrong here; both are worth confirming, because
+the failure is silent and the numbers look plausible either way.
+
+**1. The buffer only resolves WATCHED credentials, and the fallback rung may be
+off.** `project-ledger`'s ladder is the same shape — `outref_buffer` →
+`outref_cache` → Koios. The buffer holds only outputs the walk recognised as
+belonging to a tracked party, so it resolves a tracked wallet spending its own
+prior output and nothing else. Every input from a stranger falls through. When
+that walk was run `--remote offline`, 96.4% of transactions ended up with at
+least one unresolved input.
+
+The consequence is not just missing attribution. Change is recognised by asking
+whether an output returns to a wallet that FUNDED the transaction, so with no
+resolved inputs there are no known funders and a wallet's own change is
+indistinguishable from an incoming payment. **Gross throughput gets booked as
+income.** One script address showed 115M ₳ "received" against a net of 305k.
+
+Here, the venue set is static and the buffer covers venue outputs, so the
+exposure is narrower — but any figure derived by summing per-output rows rather
+than net deltas is worth auditing against the same question: *could this row be
+the wallet's own change?*
+
+**2. There is a LOCAL rung available, and it is better than Koios.** The
+snapshot already contains every one of these outputs — an input references an
+output in an earlier block of the same certified immutable DB. Going to an
+indexer for data on the local disk is slower per ref, rate-limited, and makes a
+rebootstrap re-fetch what it already had.
+
+`project-ledger` now implements this as `resolve-local` (see its `local.rs`):
+a walk records refs it could not resolve into `wanted_outref`, a scan matches
+those transaction hashes against the snapshot and writes their outputs into
+`outref_cache`, and a re-walk books correctly. It is directly portable — the
+tables and the ladder are the same — and it would let this walker drop its Koios
+dependency for inputs entirely, keeping it only for hash-only datums whose
+preimage never appears in the spending tx.
+
+Matching is by transaction hash rather than by ref, and caches ALL outputs of a
+found transaction: having paid to decode it, the marginal cost of the rest is a
+row each, and it spares a future pass.
+
 ## Deferred optimizations
 
 Chunk-level fast-skip + `read_blocks_from_point` resume (avoid decoding pre-floor

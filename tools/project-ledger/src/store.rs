@@ -233,7 +233,47 @@ CREATE TABLE IF NOT EXISTS outref_cache (
     assets        BLOB    NOT NULL,
     PRIMARY KEY (tx_hash, output_index)
 );
+
+-- Refs a walk NEEDED and could not resolve — the shopping list for
+-- `resolve-local`.
+--
+-- Without this the walk knows it failed but not what it failed ON, and the
+-- knowledge dies with the run: nothing downstream can tell a receipt from the
+-- wallet's own change coming back, and nothing can go and find out. Recording
+-- the ref costs one row and turns an unrecoverable gap into a fetch list.
+--
+-- Kept after resolution rather than deleted, so a second pass can report how
+-- much of the list it closed instead of silently shrinking it.
+CREATE TABLE IF NOT EXISTS wanted_outref (
+    tx_hash       BLOB    NOT NULL,
+    output_index  INTEGER NOT NULL,
+    first_slot    INTEGER NOT NULL,   -- slot of the tx that wanted it
+    PRIMARY KEY (tx_hash, output_index)
+);
 ";
+
+/// Tables a `reset` clears: everything a walk derives and would re-derive.
+pub const RESET_DERIVED_TABLES: [&str; 15] = [
+    "walk_meta",
+    "party",
+    "asset_event",
+    "tx_delta",
+    "value_event",
+    "unit_flow",
+    "value_kind",
+    "mint_payment",
+    "party_alias",
+    "secondary_sale",
+    "walk_cursor",
+    "frontier_blob",
+    "activity_counts",
+    "outref_buffer",
+    "asset_holder",
+];
+
+/// Tables a `reset` KEEPS: the input-resolution layer, which is bought with a
+/// snapshot scan rather than derived, and which the next walk is there to use.
+pub const RESET_KEPT_TABLES: [&str; 2] = ["outref_cache", "wanted_outref"];
 
 /// A row of `asset_event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,6 +614,115 @@ impl Ledger {
         Ok(n)
     }
 
+    // --- the wanted list ------------------------------------------------------
+
+    /// Note refs a walk needed and could not resolve.
+    pub fn wanted_put(&mut self, refs: &[(OutRef, u64)]) -> Result<usize> {
+        if refs.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO wanted_outref (tx_hash, output_index, first_slot)
+                 VALUES (?,?,?)",
+            )?;
+            for (oref, slot) in refs {
+                n += stmt.execute(params![oref.0.as_ref(), oref.1, u64_i64(*slot)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// The DISTINCT transaction hashes on the wanted list.
+    ///
+    /// Hashes, not refs: a local scan matches whole transactions, and one tx
+    /// commonly holds several wanted outputs. Handing back the deduped hash set
+    /// keeps the scan's hot-loop lookup to a single hash compare.
+    pub fn wanted_tx_hashes(&self) -> Result<std::collections::HashSet<[u8; 32]>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT tx_hash FROM wanted_outref")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for h in rows.filter_map(Result::ok) {
+            if h.len() == 32 {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&h);
+                out.insert(k);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(wanted, of which now in the cache)` — how much of the list is closed.
+    pub fn wanted_progress(&self) -> Result<(u64, u64)> {
+        let wanted: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM wanted_outref", [], |r| r.get(0))?;
+        let got: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM wanted_outref w
+             JOIN outref_cache c ON c.tx_hash = w.tx_hash AND c.output_index = w.output_index",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((wanted, got))
+    }
+
+    /// The earliest slot at which anything on the list was wanted.
+    ///
+    /// NOT where a local scan should start — the ref points at an output made
+    /// EARLIER than the tx that spent it, by an unknown margin. It is the upper
+    /// bound: scanning from here finds nothing, so it is the answer to "how far
+    /// back must I go?" being strictly further than this.
+    pub fn wanted_first_slot(&self) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MIN(first_slot) FROM wanted_outref", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?
+            .map(|v| v as u64))
+    }
+
+    /// Clear everything a walk DERIVES, keeping the resolution layer
+    /// (`outref_cache` + `wanted_outref`) so a re-walk starts clean but not
+    /// poor.
+    ///
+    /// This is what makes the three-step flow work at all. The cache is the
+    /// expensive thing — a full snapshot scan — and it lives in this same file,
+    /// so deleting the file between `resolve-local` and the re-walk would throw
+    /// away the very work the re-walk exists to use, silently: the walk would
+    /// simply find nothing cached and book change as income again.
+    ///
+    /// The wanted list is kept alongside it because the two are only meaningful
+    /// together — `closed = have/wanted` is how an operator knows whether the
+    /// next walk can be believed.
+    ///
+    /// Returns the rows cleared per table, for the operator to see.
+    pub fn reset_derived(&mut self) -> Result<Vec<(&'static str, u64)>> {
+        debug_assert!(
+            RESET_DERIVED_TABLES
+                .iter()
+                .all(|t| !RESET_KEPT_TABLES.contains(t)),
+            "a table cannot be both cleared and kept"
+        );
+        let tx = self.conn.transaction()?;
+        let mut cleared = Vec::new();
+        for t in RESET_DERIVED_TABLES {
+            let n: u64 = tx.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?;
+            tx.execute(&format!("DELETE FROM {t}"), [])?;
+            cleared.push((t, n));
+        }
+        tx.commit()?;
+        // Without this the file keeps the high-water mark of the walk it just
+        // discarded — gigabytes of free pages on a box that also holds a 215 GB
+        // snapshot.
+        self.conn.execute_batch("VACUUM")?;
+        Ok(cleared)
+    }
+
     // --- checkpoint / restore --------------------------------------------------
 
     /// Persist cursor + frontier + buffer + activity + holders in ONE
@@ -888,6 +1037,45 @@ mod tests {
         assert_eq!(l.count("asset_event").unwrap(), 1);
     }
 
+    /// The shopping list a walk leaves for `resolve-local`.
+    ///
+    /// An unresolved input disables the change rule — a wallet's own output
+    /// coming back can only be recognised as change if we know that wallet
+    /// funded the tx — so a ref we failed on is a receipt that may be nothing
+    /// of the kind. Recording WHICH ref is what makes that recoverable.
+    #[test]
+    fn the_wanted_list_records_misses_and_reports_how_many_are_closed() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let a = (Hash::new([7u8; 32]), 0u32);
+        let b = (Hash::new([7u8; 32]), 1u32); // same tx, second output
+        let c = (Hash::new([9u8; 32]), 0u32);
+        assert_eq!(l.wanted_put(&[(a, 500), (b, 500), (c, 700)]).unwrap(), 3);
+        // Idempotent: a re-walk must not grow the list.
+        assert_eq!(l.wanted_put(&[(a, 500)]).unwrap(), 0);
+
+        // Scanning matches whole TRANSACTIONS, so the list dedupes to hashes.
+        assert_eq!(
+            l.wanted_tx_hashes().unwrap().len(),
+            2,
+            "three refs across two transactions is two hashes to look for"
+        );
+        assert_eq!(l.wanted_progress().unwrap(), (3, 0));
+        assert_eq!(l.wanted_first_slot().unwrap(), Some(500));
+
+        // Resolving one closes part of the list; the list itself is kept, so a
+        // partial resolve reports as partial instead of silently shrinking.
+        l.cache_put(&[(
+            a,
+            CachedOutput {
+                address: "addr1x".into(),
+                lovelace: 5,
+                assets: vec![],
+            },
+        )])
+        .unwrap();
+        assert_eq!(l.wanted_progress().unwrap(), (3, 1));
+    }
+
     #[test]
     fn outref_cache_is_append_only_and_survives_checkpoint() {
         let mut l = Ledger::open_in_memory().unwrap();
@@ -904,5 +1092,62 @@ mod tests {
         assert_eq!(l.cache_get(&oref).unwrap(), Some(out));
         l.meta_set("floor_slot", "123").unwrap();
         assert_eq!(l.meta_get("floor_slot").unwrap().as_deref(), Some("123"));
+    }
+
+    /// A reset exists to prepare a RE-walk, and the whole point of the re-walk
+    /// is to spend the resolution cache. Losing it here would leave no visible
+    /// symptom — just change booked as income all over again.
+    #[test]
+    fn reset_derived_clears_the_walk_but_keeps_the_resolution_layer() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let oref = (Hash::new([7u8; 32]), 1);
+        let out = CachedOutput {
+            address: "addr1z".into(),
+            lovelace: 99,
+            assets: vec![],
+        };
+        l.cache_put(&[(oref, out.clone())]).unwrap();
+        l.wanted_put(&[(oref, 500)]).unwrap();
+        l.meta_set("floor_slot", "160419671").unwrap();
+        l.checkpoint(&state(), 42, &[9u8; 32]).unwrap();
+        assert_eq!(l.wanted_progress().unwrap(), (1, 1));
+
+        l.reset_derived().unwrap();
+
+        assert_eq!(l.cache_get(&oref).unwrap(), Some(out));
+        assert_eq!(l.wanted_progress().unwrap(), (1, 1));
+        assert_eq!(l.wanted_first_slot().unwrap(), Some(500));
+        // ...and the walk really is gone, so `seed` starts from nothing.
+        assert_eq!(l.meta_get("floor_slot").unwrap(), None);
+        assert_eq!(l.count("walk_cursor").unwrap(), 0);
+        assert_eq!(l.count("party").unwrap(), 0);
+    }
+
+    /// `reset_derived` names its tables in a list, so a table added to `SCHEMA`
+    /// later would silently survive a reset and poison the next walk with stale
+    /// rows. Ask sqlite what actually exists instead of trusting the list.
+    #[test]
+    fn reset_derived_covers_every_table_in_the_schema() {
+        let l = Ledger::open_in_memory().unwrap();
+        let mut stmt = l
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap();
+        let actual: std::collections::BTreeSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let accounted: std::collections::BTreeSet<String> = RESET_DERIVED_TABLES
+            .iter()
+            .chain(RESET_KEPT_TABLES.iter())
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            actual, accounted,
+            "a table exists that `reset_derived` neither clears nor deliberately keeps"
+        );
     }
 }
