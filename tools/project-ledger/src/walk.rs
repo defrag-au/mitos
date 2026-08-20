@@ -515,6 +515,10 @@ struct Out<'a> {
     /// straight off the pallas output — no change to the shared walk crate and
     /// none to the live market-ledger that also uses it.
     bundle: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    /// Protocol floor for this output; 0 when it carries no assets. Booked onto
+    /// the `lovelace` flow row so a reader can tell carrier ADA from payment —
+    /// see `DecodedOutput::min_utxo`.
+    min_utxo: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -585,6 +589,7 @@ pub fn process_tx(
                 assets: &o.assets,
                 policy_assets,
                 bundle,
+                min_utxo: o.min_utxo,
             }
         })
         .collect();
@@ -692,13 +697,19 @@ pub fn process_tx(
             .map(|o| o.resolved.party.key.as_str())
             .collect();
 
-        let mut by_dest: BTreeMap<&str, u64> = BTreeMap::new();
+        // Carries the `Party`, not just its key: the destination has to be
+        // seeded below, and re-deriving a party from a key string is not
+        // possible — the key IS the derived form.
+        let mut by_dest: BTreeMap<&str, (u64, &Party)> = BTreeMap::new();
         for o in &outs {
             if !asset_parties.contains(o.resolved.party.key.as_str()) {
-                *by_dest.entry(o.resolved.party.key.as_str()).or_insert(0) += o.lovelace;
+                let e = by_dest
+                    .entry(o.resolved.party.key.as_str())
+                    .or_insert((0, &o.resolved.party));
+                e.0 += o.lovelace;
             }
         }
-        for (dest, lovelace) in by_dest {
+        for (dest, (lovelace, dest_party)) in by_dest {
             rows.mint_payments.push(MintPaymentRow {
                 tx_hash: tx_hex.clone(),
                 destination: dest.to_owned(),
@@ -706,22 +717,34 @@ pub fn process_tx(
                 slot: ctx.slot,
                 block_time: ctx.time,
             });
-            // NOT seeded as a watched party — deliberately, for now.
+            // SEAT THE DESTINATION. Nothing else can.
             //
-            // These destinations ARE the project's money, so watching their
-            // onward flows is the next phase. But a mint's payees include the
-            // minting platform's own fee wallet, which is custodial-scale: as a
-            // hop-0 seed it is exempt from the terminal rule and recruits every
-            // counterparty it touches. Measured: seeding them took the frontier
-            // from 64 parties to 2,826 and the ledger from 1.7GB to 2.2GB,
-            // while adding nothing to the fund split — `mint_payment` above
-            // already records every leg.
+            // The frontier only grows along OUTBOUND edges from a member, and
+            // the payer here is the buyer — a stranger. So no promotion path
+            // ever reaches the wallets the mint money lands in: measured on
+            // Mekka, 2 of 3 mint destinations had no `party` row, one of them
+            // holding 23,092 ₳ across 126 payments. Unseated means undrawable,
+            // and what cannot be drawn is the project's capital coming IN.
             //
-            // Doing this properly needs a `Role::MintPayee` in `chain-ledger`
-            // that is NOT exempt from the terminal rule, so an artist wallet is
-            // watched and expands while a platform wallet is recorded and
-            // frozen. That is a shared-crates change, and it belongs with the
-            // phase that actually consumes the onward flows.
+            // An earlier attempt seeded these as an ordinary role and took the
+            // frontier from 64 parties to 2,826, because seeded roles are
+            // exempt from the terminal rule and a mint's payees include the
+            // platform's custodial fee wallet. `Role::MintPayee` exists for
+            // exactly this: seeded (so it has a row) but NOT exempt (so scale
+            // still freezes it). An artist wallet expands; a platform wallet is
+            // recorded and frozen.
+            //
+            // `seed` is idempotent and keeps the lowest slot, so re-seeing a
+            // destination across 700 mint txs costs a map lookup. A destination
+            // already watched keeps the role it has — this never demotes a
+            // declared treasury to a payee.
+            if !state.frontier.is_member(dest_party) {
+                tracing::info!(party = %dest, lovelace, slot = ctx.slot, "walk: mint payee seated");
+                state
+                    .frontier
+                    .seed((*dest_party).clone(), Role::MintPayee, ctx.slot)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
     }
 
@@ -1082,6 +1105,10 @@ fn book_unit_flows(
         }
         for (unit, qty) in units {
             let q = qty.min(i64::MAX as u64) as i64;
+            // The floor prices the OUTPUT, and it is its ADA that is pinned by
+            // it — a token row carrying the same number would read as though
+            // the token itself had a minimum, which is meaningless.
+            let min_utxo = if unit == "lovelace" { o.min_utxo } else { 0 };
             if payer_watched {
                 rows.units.push(UnitFlowRow {
                     tx_hash: tx_hex.to_string(),
@@ -1091,6 +1118,7 @@ fn book_unit_flows(
                     unit: unit.clone(),
                     quantity: -q,
                     payers,
+                    min_utxo,
                     slot: ctx.slot,
                     block_time: ctx.time,
                 });
@@ -1104,6 +1132,7 @@ fn book_unit_flows(
                     unit,
                     quantity: q,
                     payers,
+                    min_utxo,
                     slot: ctx.slot,
                     block_time: ctx.time,
                 });
@@ -1305,6 +1334,22 @@ mod tests {
             assets: &[],
             policy_assets: Vec::new(),
             bundle,
+            min_utxo: 0,
+        }
+    }
+
+    /// As `out`, but for an output pinned by the protocol floor — a token
+    /// riding with the ADA that pays for its bytes.
+    fn out_with_floor(
+        idx: u32,
+        to: &str,
+        lovelace: u64,
+        bundle: Vec<(Vec<u8>, Vec<u8>, u64)>,
+        min_utxo: u64,
+    ) -> Out<'static> {
+        Out {
+            min_utxo,
+            ..out(idx, to, lovelace, bundle)
         }
     }
 
@@ -1405,6 +1450,64 @@ mod tests {
         assert_eq!(usdm.payers, 1, "single funder — exact, not attributed");
         let ada = rows.iter().find(|r| r.unit == "lovelace").unwrap();
         assert_eq!(ada.quantity, -1_400_000);
+    }
+
+    /// A token cannot sit on chain without ADA to pay for its bytes, and that
+    /// ADA is a CARRIER, not a payment — booking it as value is how a mint's
+    /// asset distribution becomes tens of thousands of meaningless ADA flows.
+    ///
+    /// The floor is recorded, never deducted: an output can hold a token AND
+    /// real value, and only a reader can decide the threshold. So the ADA leg
+    /// keeps its full quantity and gains the floor beside it.
+    #[test]
+    fn the_protocol_floor_rides_on_the_ada_leg_only() {
+        let rows = flows(
+            &[out_with_floor(
+                0,
+                "stake1buyer",
+                1_262_830, // a bare NFT output: essentially all floor
+                vec![(USDM.to_vec(), b"NFT1".to_vec(), 1)],
+                1_262_830,
+            )],
+            &[(party("stake1treasury"), 900_000_000, None)],
+            &["stake1treasury"],
+        );
+        let ada = rows.iter().find(|r| r.unit == "lovelace").unwrap();
+        assert_eq!(ada.quantity, -1_262_830, "the quantity is NOT reduced");
+        assert_eq!(ada.min_utxo, 1_262_830, "and the floor sits beside it");
+        assert!(
+            ada.quantity.unsigned_abs() <= ada.min_utxo,
+            "at the floor = pure carrier, which is what a reader filters on"
+        );
+        let token = rows.iter().find(|r| r.unit != "lovelace").unwrap();
+        assert_eq!(
+            token.min_utxo, 0,
+            "a token has no floor of its own — only the output's ADA is pinned"
+        );
+    }
+
+    /// The case a blanket "ignore ADA on token outputs" rule gets wrong, and on
+    /// Mekka it would have got it wrong 93.6% of the time: real value moving in
+    /// the same output as a token.
+    #[test]
+    fn value_above_the_floor_survives() {
+        let rows = flows(
+            &[out_with_floor(
+                0,
+                "stake1artist",
+                500_000_000,
+                vec![(USDM.to_vec(), b"NFT1".to_vec(), 1)],
+                1_262_830,
+            )],
+            &[(party("stake1treasury"), 900_000_000, None)],
+            &["stake1treasury"],
+        );
+        let ada = rows.iter().find(|r| r.unit == "lovelace").unwrap();
+        assert_eq!(ada.quantity, -500_000_000);
+        assert!(
+            ada.quantity.unsigned_abs() > ada.min_utxo,
+            "500 ADA with an NFT attached is a payment, not dust"
+        );
     }
 
     /// Being PAID in assets — the other direction, same table. Mekka did this.

@@ -124,6 +124,13 @@ CREATE TABLE IF NOT EXISTS unit_flow (
     -- Signed from `party`'s view: negative is out of the treasury.
     quantity      INTEGER NOT NULL,
     payers        INTEGER NOT NULL DEFAULT 1,
+    -- The protocol floor this output had to hold, for `unit = 'lovelace'` rows
+    -- on an output that also carried a token; 0 otherwise. A token cannot sit
+    -- on chain without ADA to pay for its bytes, and that ADA is a carrier, not
+    -- a payment. Stored rather than deducted: an output can hold a token AND
+    -- real value, so `quantity - min_utxo` is the meaningful figure and only a
+    -- reader can decide the threshold. See `DecodedOutput::min_utxo`.
+    min_utxo      INTEGER NOT NULL DEFAULT 0,
     slot          INTEGER NOT NULL,
     block_time    INTEGER NOT NULL,
     PRIMARY KEY (tx_hash, output_index, party, unit)
@@ -252,6 +259,57 @@ CREATE TABLE IF NOT EXISTS wanted_outref (
 );
 ";
 
+/// Bring an EXISTING ledger's schema up to date.
+///
+/// **`CREATE TABLE IF NOT EXISTS` never adds a column.** A ledger created before
+/// a column existed keeps its old shape forever, the `IF NOT EXISTS` silently
+/// does nothing, and the first write fails with "no such column" — or worse,
+/// a read returns the old shape and looks like a UI bug. `reset` deliberately
+/// keeps the file (to preserve `outref_cache`), so a re-walk does NOT recreate
+/// the table and cannot be relied on to migrate it either.
+///
+/// Adds are idempotent by inspecting `PRAGMA table_info` rather than relying on
+/// the error text of a failed `ALTER`.
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, decl) in [(
+        "unit_flow",
+        "min_utxo",
+        "min_utxo INTEGER NOT NULL DEFAULT 0",
+    )] {
+        if !has_column(conn, table, column)? {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))
+                .with_context(|| format!("adding {table}.{column}"))?;
+            tracing::info!(table, column, "store: migrated schema");
+        }
+    }
+    Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if r.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A row of `secondary_sale` — a venue sale copied in by `enrich`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondarySaleRow {
+    pub tx_hash: String,
+    pub asset_name: String,
+    pub venue: String,
+    pub price_lovelace: Option<i64>,
+    /// `None` where the venue did not record one — common on collection
+    /// offers. Absence, never an empty party key.
+    pub seller: Option<String>,
+    pub buyer: Option<String>,
+    pub slot: i64,
+}
+
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
 pub const RESET_DERIVED_TABLES: [&str; 15] = [
     "walk_meta",
@@ -324,6 +382,9 @@ pub struct UnitFlowRow {
     pub unit: String,
     pub quantity: i64,
     pub payers: u32,
+    /// Protocol floor of the OUTPUT this row came from — see the column comment
+    /// in `SCHEMA`. Non-zero only on `lovelace` rows of asset-bearing outputs.
+    pub min_utxo: u64,
     pub slot: u64,
     pub block_time: u64,
 }
@@ -370,6 +431,7 @@ impl Ledger {
             Connection::open(path).with_context(|| format!("opening ledger {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -377,6 +439,7 @@ impl Ledger {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -512,8 +575,8 @@ impl Ledger {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO unit_flow
                  (tx_hash, output_index, party, counterparty, unit, quantity, payers,
-                  slot, block_time)
-                 VALUES (?,?,?,?,?,?,?,?,?)",
+                  min_utxo, slot, block_time)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)",
             )?;
             for r in rows {
                 n += stmt.execute(params![
@@ -524,6 +587,7 @@ impl Ledger {
                     r.unit,
                     r.quantity,
                     r.payers,
+                    u64_i64(r.min_utxo),
                     u64_i64(r.slot),
                     u64_i64(r.block_time),
                 ])?;
@@ -607,6 +671,38 @@ impl Ledger {
                     o.address,
                     u64_i64(o.lovelace),
                     encode_assets(&o.assets),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Write venue sales in. Idempotent on `(tx_hash, asset_name)`, so a
+    /// re-run after market-ledger has walked further merges rather than
+    /// duplicates — `REPLACE` not `IGNORE`, because a corrected price from a
+    /// later market walk should win over the one already here.
+    pub fn put_secondary_sales(&mut self, rows: &[SecondarySaleRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO secondary_sale
+                 (tx_hash, asset_name, venue, price_lovelace, seller, buyer, slot)
+                 VALUES (?,?,?,?,?,?,?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.tx_hash,
+                    r.asset_name,
+                    r.venue,
+                    r.price_lovelace,
+                    r.seller,
+                    r.buyer,
+                    r.slot,
                 ])?;
             }
         }
@@ -924,6 +1020,7 @@ pub fn role_str(r: chain_ledger::Role) -> &'static str {
         chain_ledger::Role::Signer => "signer",
         chain_ledger::Role::Royalty => "royalty",
         chain_ledger::Role::Promoted => "promoted",
+        chain_ledger::Role::MintPayee => "mint_payee",
     }
 }
 
@@ -1121,6 +1218,39 @@ mod tests {
         assert_eq!(l.meta_get("floor_slot").unwrap(), None);
         assert_eq!(l.count("walk_cursor").unwrap(), 0);
         assert_eq!(l.count("party").unwrap(), 0);
+    }
+
+    /// `CREATE TABLE IF NOT EXISTS` silently does NOTHING to an existing table,
+    /// so a column added to `SCHEMA` never reaches a ledger that already
+    /// exists — and `reset` deliberately keeps the file, so a re-walk does not
+    /// rescue it either. The first write then fails on "no such column".
+    #[test]
+    fn migrate_adds_a_column_to_a_ledger_created_before_it_existed() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The pre-min_utxo shape, as an old ledger on disk still has it.
+        conn.execute_batch(
+            "CREATE TABLE unit_flow (
+                 tx_hash TEXT NOT NULL, output_index INTEGER NOT NULL,
+                 party TEXT NOT NULL, counterparty TEXT NOT NULL, unit TEXT NOT NULL,
+                 quantity INTEGER NOT NULL, payers INTEGER NOT NULL DEFAULT 1,
+                 slot INTEGER NOT NULL, block_time INTEGER NOT NULL,
+                 PRIMARY KEY (tx_hash, output_index, party, unit));",
+        )
+        .unwrap();
+        assert!(!has_column(&conn, "unit_flow", "min_utxo").unwrap());
+
+        // What `open` does: the IF NOT EXISTS pass, then the migration.
+        conn.execute_batch(SCHEMA).unwrap();
+        assert!(
+            !has_column(&conn, "unit_flow", "min_utxo").unwrap(),
+            "SCHEMA alone must NOT be trusted to add it — that is the trap"
+        );
+        migrate(&conn).unwrap();
+        assert!(has_column(&conn, "unit_flow", "min_utxo").unwrap());
+
+        // Idempotent: opening again must not fail on a duplicate column.
+        migrate(&conn).unwrap();
+        assert!(has_column(&conn, "unit_flow", "min_utxo").unwrap());
     }
 
     /// `reset_derived` names its tables in a list, so a table added to `SCHEMA`

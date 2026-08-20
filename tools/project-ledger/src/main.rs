@@ -15,6 +15,7 @@
 mod activity;
 mod alias;
 mod asset_class;
+mod enrich;
 mod koios;
 mod local;
 mod mint;
@@ -55,6 +56,16 @@ enum Command {
     /// fetches it from the immutable DB, the second books correctly. Without it
     /// a walk cannot tell an incoming payment from the wallet's own change.
     ResolveLocal(local::LocalArgs),
+    /// Copy the policy's VENUE sales in from market-ledger.
+    ///
+    /// The walk sees an asset move and a net change; it cannot see that the
+    /// movement was a sale. Worse, a marketplace seller funds their own sale
+    /// transaction, so the change rule correctly skips the proceeds and the
+    /// trade reads as a give-away. This joins market-ledger in by tx_hash.
+    ///
+    /// Venue sales ONLY — a peer-to-peer trade leaves no marketplace event.
+    /// Cheap and recomputable: re-run after any walk.
+    Enrich(enrich::EnrichArgs),
     /// Row counts + meta — a quick look at what a ledger holds.
     Stats(StatsArgs),
     /// Delete the ledger + checkpoint mirror for a clean restart (dry-run unless --yes).
@@ -101,6 +112,7 @@ fn main() -> Result<()> {
         Command::Seed(args) => seed::run(args),
         Command::Walk(args) => walk::run(args),
         Command::ResolveLocal(args) => local::resolve_local(&args),
+        Command::Enrich(args) => enrich::run(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }
