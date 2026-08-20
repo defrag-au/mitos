@@ -31,7 +31,10 @@
 
 use std::path::PathBuf;
 
-use address_registry::{AddressCategory, ScriptCategory, lookup_address};
+use address_registry::{
+    AddressCategory, MatchKind, RegistryNetwork, ScriptCategory, lookup_address_match,
+    payment_credential_is_script,
+};
 use anyhow::Result;
 use chain_ledger::{Basis, ProviderCapability};
 
@@ -105,8 +108,36 @@ fn kind_of(cat: &AddressCategory) -> Option<(ProviderCapability, Option<String>)
     }
 }
 
+/// Whether a registry hit may NAME the party it was found on.
+///
+/// A prefix hit identified only the payment SCRIPT — order and listing
+/// contracts keep the CUSTOMER's staking credential on the script address, so
+/// for a stake-keyed party the hit may mean "this person once placed a Splash
+/// order", not "this is Splash". The discriminator is the party's other
+/// addresses: a venue's stake credential lives exclusively behind scripts,
+/// while a person also owns ordinary key-payment addresses. Getting this wrong
+/// named 168 Mekka customers "Splash" and fed their real marketplace purchases
+/// to the round-trip suppressor.
+///
+/// Known residue: a party seen ONLY via its order-script address still passes,
+/// but such a party has no key-payment footprint in this ledger, so every leg
+/// it touches is genuinely DEX-shaped anyway.
+fn hit_names_the_party(match_kind: MatchKind, addrs: &[String]) -> bool {
+    match match_kind {
+        MatchKind::Exact => true,
+        MatchKind::VariableStakePrefix => addrs.iter().all(|a| payment_credential_is_script(a)),
+    }
+}
+
 pub fn run(args: &ClassifyArgs) -> Result<()> {
     let mut ledger = Ledger::open(&args.db)?;
+
+    // Everything this pass writes is re-derived from the ledger and the
+    // registry, so start clean. Without this, a FIXED rule cannot retract what
+    // a broken one wrote — the 168 customers named "Splash" by the prefix bug
+    // survived every re-run because the writes are additive.
+    ledger.reset_counterparties()?;
+
     let candidates = ledger.counterparties_with_addresses()?;
     let total = candidates.len();
 
@@ -117,6 +148,7 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
         ledger.mint_payment_destinations()?.into_iter().collect();
 
     let mut rows: Vec<CounterpartyRow> = Vec::new();
+    let mut customers_spared = 0usize;
     for (key, addrs) in candidates {
         let mut caps: Vec<(ProviderCapability, Basis)> = Vec::new();
         let mut name = None;
@@ -125,13 +157,17 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
         // First address the registry recognises wins; a party's addresses all
         // belong to one wallet, so two answers would be a registry conflict
         // rather than something to average.
-        if let Some((addr, (cap, label))) = addrs
-            .iter()
-            .find_map(|a| lookup_address(a).and_then(|c| kind_of(c).map(|k| (a.clone(), k))))
-        {
-            caps.push((cap, Basis::Asserted));
-            name = label;
-            sources.push(format!("address-registry: {}", elide(&addr)));
+        if let Some((addr, match_kind, (cap, label))) = addrs.iter().find_map(|a| {
+            lookup_address_match(a, RegistryNetwork::Mainnet)
+                .and_then(|(c, mk)| kind_of(c).map(|k| (a.clone(), mk, k)))
+        }) {
+            if hit_names_the_party(match_kind, &addrs) {
+                caps.push((cap, Basis::Asserted));
+                name = label;
+                sources.push(format!("address-registry: {}", elide(&addr)));
+            } else {
+                customers_spared += 1;
+            }
         }
         // Minting is ADDITIVE, not an alternative. `bank.pillar` is both a
         // mint provider and (elsewhere) a payout service, and the old
@@ -155,7 +191,10 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
     tracing::info!(
         counterparties = total,
         named,
-        "classify: counterparties named from the address registry"
+        customers_spared,
+        "classify: counterparties named from the address registry \
+         (customers_spared = stake keys seen on an order/listing script but \
+         owning ordinary addresses too — people, not the venue)"
     );
 
     // INFERRED services, only when asked. Runs AFTER the registry write so the
@@ -276,7 +315,34 @@ fn elide(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use address_registry::lookup_address;
+
     use super::*;
+
+    /// A wallet that placed a Splash order carries the order SCRIPT among its
+    /// addresses — the registry hit identifies the script, not the person.
+    /// Their ordinary key-payment address is what proves personhood.
+    #[test]
+    fn a_splash_customer_keeps_their_own_name() {
+        let addrs = vec![
+            // their actual wallet
+            "addr1qy9mg28evkzcfghlrg8vjqvmmga4dmg2vwm4x2s9r2vmqtd7c9k425ezp5cw8a3ssg".to_string(),
+            // their order UTxO — Splash script, THEIR stake credential
+            "addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207qd7c9k425ezp5cw8a3ssg".to_string(),
+        ];
+        assert!(!hit_names_the_party(MatchKind::VariableStakePrefix, &addrs));
+    }
+
+    /// A pool's stake credential exists only behind script addresses, so the
+    /// all-script party still takes the venue's name — losing THIS is losing
+    /// round-trip suppression, and the 2.9M → 68k collapse depended on it.
+    #[test]
+    fn an_all_script_party_is_still_the_venue() {
+        let addrs = vec!["addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207qpoolcred".to_string()];
+        assert!(hit_names_the_party(MatchKind::VariableStakePrefix, &addrs));
+        // and a full-address registry entry vouches for its stake itself
+        assert!(hit_names_the_party(MatchKind::Exact, &addrs));
+    }
 
     /// The Minswap batcher — the contract that settles swaps, and the single
     /// address most responsible for swap returns reading as income.

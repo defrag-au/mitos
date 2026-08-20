@@ -66,6 +66,7 @@ struct Sale {
     seller: Option<String>,
     buyer: Option<String>,
     slot: i64,
+    policy_id: String,
 }
 
 pub fn run(args: &EnrichArgs) -> Result<()> {
@@ -85,27 +86,16 @@ pub fn run(args: &EnrichArgs) -> Result<()> {
 
     let placeholders = SALE_KINDS.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT tx_hash, asset_name_hex, venue, price_lovelace, seller_stake, buyer_stake, slot
+        "SELECT tx_hash, asset_name_hex, venue, price_lovelace, seller_stake, buyer_stake, slot,
+                policy_id
          FROM market_events
          WHERE policy_id = ? AND kind IN ({placeholders})"
     );
     let mut stmt = market.prepare(&sql).context("preparing the market query")?;
     let mut binds: Vec<&str> = vec![policy.as_str()];
     binds.extend(SALE_KINDS);
-    let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
-        Ok(Sale {
-            tx_hash: r.get(0)?,
-            asset_name: r.get(1)?,
-            venue: r.get(2)?,
-            price: r.get(3)?,
-            // The venue does not always record a seller — an empty string is
-            // absence, not a party whose key happens to be "".
-            seller: r.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
-            buyer: r.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
-            slot: r.get(6)?,
-        })
-    })?;
-    let sales: Vec<Sale> = rows.filter_map(Result::ok).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), read_sale)?;
+    let sales: Vec<Sale> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     if sales.is_empty() {
         tracing::warn!(
@@ -134,7 +124,70 @@ pub fn run(args: &EnrichArgs) -> Result<()> {
         "enrich: VENUE SALES ONLY. A peer-to-peer sale leaves no marketplace event and is \
          absent here — 'no sale row' does NOT mean 'not sold'."
     );
+
+    foreign_sales(&mut ledger, &market, &policy)?;
     Ok(())
+}
+
+/// The watched parties' venue trades in OTHER collections.
+///
+/// A watched wallet buying an unrelated NFT is ordinary shopping the app hides
+/// by default — but it is recorded rather than dropped, because a marketplace
+/// hop between two colluding wallets is also a serviceable way to move funds
+/// while looking like shopping, so the rows must stay surfaceable.
+///
+/// One full scan of the market ledger's sale rows with the party test done in
+/// Rust: the party set is a few hundred keys, and a scan beats teaching SQLite
+/// an `OR (buyer IN … OR seller IN …)` it cannot index anyway.
+fn foreign_sales(ledger: &mut Ledger, market: &Connection, case_policy: &str) -> Result<()> {
+    let parties: std::collections::HashSet<String> = ledger.party_keys()?.into_iter().collect();
+
+    let placeholders = SALE_KINDS.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT tx_hash, asset_name_hex, venue, price_lovelace, seller_stake, buyer_stake, slot,
+                policy_id
+         FROM market_events
+         WHERE policy_id <> ? AND kind IN ({placeholders})"
+    );
+    let mut stmt = market
+        .prepare(&sql)
+        .context("preparing the foreign-sale scan")?;
+    let mut binds: Vec<&str> = vec![case_policy];
+    binds.extend(SALE_KINDS);
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), read_sale)?;
+
+    let mut foreign: Vec<Sale> = Vec::new();
+    for row in rows {
+        let sale = row?;
+        let ours = |p: &Option<String>| p.as_deref().is_some_and(|p| parties.contains(p));
+        if ours(&sale.buyer) || ours(&sale.seller) {
+            foreign.push(sale);
+        }
+    }
+
+    let written = ledger.put_secondary_sales(&sales_rows(&foreign))?;
+    tracing::info!(
+        found = foreign.len(),
+        written,
+        "enrich: foreign-collection venue trades involving watched parties — the app \
+         hides these by default; toggle them on to check the marketplace-as-transfer angle"
+    );
+    Ok(())
+}
+
+fn read_sale(r: &rusqlite::Row<'_>) -> rusqlite::Result<Sale> {
+    Ok(Sale {
+        tx_hash: r.get(0)?,
+        asset_name: r.get(1)?,
+        venue: r.get(2)?,
+        price: r.get(3)?,
+        // The venue does not always record a seller — an empty string is
+        // absence, not a party whose key happens to be "".
+        seller: r.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+        buyer: r.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+        slot: r.get(6)?,
+        policy_id: r.get(7)?,
+    })
 }
 
 fn sales_rows(sales: &[Sale]) -> Vec<crate::store::SecondarySaleRow> {
@@ -148,6 +201,7 @@ fn sales_rows(sales: &[Sale]) -> Vec<crate::store::SecondarySaleRow> {
             seller: s.seller.clone(),
             buyer: s.buyer.clone(),
             slot: s.slot,
+            policy_id: Some(s.policy_id.clone()),
         })
         .collect()
 }
@@ -178,9 +232,13 @@ mod tests {
             seller: None,
             buyer: Some("stake1buyer".into()),
             slot: 1,
+            policy_id: "policyaaaa".into(),
         };
         let rows = sales_rows(&[s]);
         assert_eq!(rows[0].seller, None);
         assert_eq!(rows[0].price_lovelace, Some(68_000_000));
+        // The policy always rides along — "which collection sold" is what
+        // separates case evidence from a watched wallet's ordinary shopping.
+        assert_eq!(rows[0].policy_id.as_deref(), Some("policyaaaa"));
     }
 }

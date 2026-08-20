@@ -199,6 +199,9 @@ strip = "symbols"
 # Both states are verified to build: ACTIVE (local paths) and COMMENTED (the
 # pinned git revs). Keep it that way — the commented state is what CI sees.
 [patch."https://github.com/defrag-au/shared-crates"]
-# cardano-assets = { path = "../shared-crates/cardano-assets" }
-# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
-# chain-ledger = { path = "../shared-crates/chain-ledger" }
+cardano-assets = { path = "../shared-crates/cardano-assets" }
+pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+chain-ledger = { path = "../shared-crates/chain-ledger" }
+# address-registry re-added 2026-08-21: project-ledger's classify consumes it
+# again (workspace.dependencies entry above), so it belongs in the block.
+address-registry = { path = "../shared-crates/address-registry" }

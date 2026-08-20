@@ -188,6 +188,11 @@ CREATE TABLE IF NOT EXISTS party_alias (
 CREATE INDEX IF NOT EXISTS idx_pa_value ON party_alias(value);
 
 -- Copied in by `enrich` so the case exports self-contained.
+-- policy_id: which collection sold. NULL on rows written before the column
+-- existed, which were always the case's own policy. A row whose policy is NOT
+-- the case's marks a watched party trading OTHER collections — ordinary
+-- shopping the app hides by default, surfaceable because a marketplace hop is
+-- also a way to move funds between two colluding wallets.
 CREATE TABLE IF NOT EXISTS secondary_sale (
     tx_hash        TEXT NOT NULL,
     asset_name     TEXT NOT NULL,
@@ -196,6 +201,7 @@ CREATE TABLE IF NOT EXISTS secondary_sale (
     seller         TEXT,
     buyer          TEXT,
     slot           INTEGER NOT NULL,
+    policy_id      TEXT,
     PRIMARY KEY (tx_hash, asset_name)
 );
 
@@ -378,11 +384,15 @@ fn migrate(conn: &Connection) -> Result<()> {
             "store: migrated counterparty_kind to name + capabilities — re-run `classify`"
         );
     }
-    for (table, column, decl) in [(
-        "unit_flow",
-        "min_utxo",
-        "min_utxo INTEGER NOT NULL DEFAULT 0",
-    )] {
+    for (table, column, decl) in [
+        (
+            "unit_flow",
+            "min_utxo",
+            "min_utxo INTEGER NOT NULL DEFAULT 0",
+        ),
+        // NULL on pre-existing rows = the case's own policy (see SCHEMA).
+        ("secondary_sale", "policy_id", "policy_id TEXT"),
+    ] {
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))
                 .with_context(|| format!("adding {table}.{column}"))?;
@@ -427,6 +437,9 @@ pub struct SecondarySaleRow {
     pub seller: Option<String>,
     pub buyer: Option<String>,
     pub slot: i64,
+    /// Which collection sold. `None` only on rows predating the column —
+    /// those were always the case's own policy.
+    pub policy_id: Option<String>,
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
@@ -857,6 +870,23 @@ impl Ledger {
         Ok(n)
     }
 
+    /// Drop every counterparty identity and capability, for `classify` to
+    /// rebuild from scratch.
+    ///
+    /// Safe because classify is these tables' ONLY writer and everything it
+    /// writes is derived from the ledger plus the address registry. The
+    /// additive design of [`put_counterparty`](Self::put_counterparty) is for
+    /// passes WITHIN a run accruing different evidence; between runs it means
+    /// a fixed rule cannot retract a broken rule's rows, which is how 168
+    /// customers stayed named "Splash" until this existed.
+    pub fn reset_counterparties(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM counterparty_capability", [])?;
+        tx.execute("DELETE FROM counterparty_kind", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Every distinct counterparty in `unit_flow`, with the addresses it is
     /// known by — the registry keys on ADDRESSES, but a staked party's key is
     /// its stake credential, so the addresses come from `party_alias`.
@@ -1065,8 +1095,8 @@ impl Ledger {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO secondary_sale
-                 (tx_hash, asset_name, venue, price_lovelace, seller, buyer, slot)
-                 VALUES (?,?,?,?,?,?,?)",
+                 (tx_hash, asset_name, venue, price_lovelace, seller, buyer, slot, policy_id)
+                 VALUES (?,?,?,?,?,?,?,?)",
             )?;
             for r in rows {
                 n += stmt.execute(params![
@@ -1077,6 +1107,7 @@ impl Ledger {
                     r.seller,
                     r.buyer,
                     r.slot,
+                    r.policy_id,
                 ])?;
             }
         }

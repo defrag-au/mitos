@@ -66,7 +66,7 @@ pub fn run(args: &ScoreArgs) -> Result<()> {
     };
 
     let mut ledger = Ledger::open(&args.db)?;
-    let human = load_assertions(args, &args.db)?;
+    let human = load_assertions(args.annotations.as_deref(), &args.db)?;
     if human.is_empty() {
         tracing::warn!(
             "score: no annotations sidecar (or no classifications in it) — core_touch and \
@@ -262,14 +262,71 @@ pub fn run(args: &ScoreArgs) -> Result<()> {
 
 // ── assertions (the sidecar) ───────────────────────────────────────────────
 
+/// Export core/founder assertions as `[[wallet]]` registry fragments.
+///
+/// The bridge the loop was missing: a classification lives in the app's
+/// sidecar, which never leaves the operator's machine — so the walk, which
+/// reads `registry.toml` on the box, could not see it, and an assertion made
+/// once had to be made twice. This emits the registry's half, citing the
+/// sidecar as the source; the operator reviews and applies it — assertion
+/// stays a deliberate act, the file stays a human document.
+#[derive(clap::Args, Debug)]
+pub struct EmitRegistryArgs {
+    #[arg(long, default_value = "project-ledger.db")]
+    pub db: PathBuf,
+    /// Annotations sidecar; defaults to `<db>.annotations.db`.
+    #[arg(long)]
+    pub annotations: Option<PathBuf>,
+}
+
+pub fn emit_registry(args: &EmitRegistryArgs) -> Result<()> {
+    let human = load_assertions(args.annotations.as_deref(), &args.db)?;
+    let mut emitted = 0;
+    for (key, (class, conf)) in &human {
+        if !matches!(class.as_str(), "core" | "founder") {
+            continue;
+        }
+        // Tentative stays app-side: seeding the WALK from a hunch would let
+        // curiosity recruit a frontier.
+        if *conf == Confidence::Tentative {
+            tracing::warn!(party = %elide(key), "emit-registry: tentative — not exported");
+            continue;
+        }
+        // The registry declares stake-keyed wallets only (an enterprise
+        // address has no stake credential to key a party by).
+        if !key.starts_with("stake1") {
+            tracing::warn!(
+                party = %elide(key),
+                "emit-registry: not a stake key — declare its stake-keyed sibling instead"
+            );
+            continue;
+        }
+        println!("[[wallet]]");
+        println!("stake  = \"{key}\"");
+        println!("label  = \"{class}\"");
+        println!("role   = \"{class}\"");
+        println!(
+            "source = \"asserted {class} ({conf}) in the app annotations sidecar; \
+             exported by emit-registry\""
+        );
+        println!();
+        emitted += 1;
+    }
+    tracing::info!(
+        emitted,
+        of = human.len(),
+        "emit-registry: review the fragments above, append to the box registry, re-walk"
+    );
+    Ok(())
+}
+
 /// `key → (class, confidence)` from the app's annotations sidecar.
 fn load_assertions(
-    args: &ScoreArgs,
+    annotations: Option<&std::path::Path>,
     db: &std::path::Path,
 ) -> Result<BTreeMap<String, (String, Confidence)>> {
-    let path = args
-        .annotations
-        .clone()
+    let path = annotations
+        .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(format!("{}.annotations.db", db.display())));
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -517,8 +574,17 @@ fn signal_venue_sales(
     weights: &Weights,
     tx_sig: &mut HashMap<String, Fired>,
 ) -> Result<BTreeSet<String>> {
-    let mut stmt =
-        conn.prepare("SELECT tx_hash, MAX(venue) FROM secondary_sale GROUP BY tx_hash")?;
+    // CASE-policy sales only. `enrich` also copies in the watched parties'
+    // trades in OTHER collections (policy_id set, different policy) — those
+    // are ordinary shopping and must not fire VenueSale, which reads as "this
+    // project's asset changed hands for money". NULL policy_id predates the
+    // column and was always the case policy.
+    let mut stmt = conn.prepare(
+        "SELECT tx_hash, MAX(venue) FROM secondary_sale
+         WHERE policy_id IS NULL
+            OR policy_id = (SELECT v FROM walk_meta WHERE k = 'policy_id')
+         GROUP BY tx_hash",
+    )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut set = BTreeSet::new();
     for row in rows {
@@ -856,6 +922,9 @@ fn signal_unexplained_inbound(
          JOIN party p ON p.key = d.party AND p.role IN ('declared', 'signer', 'royalty')
          WHERE d.delta > 0
            AND NOT EXISTS (SELECT 1 FROM mint_payment m WHERE m.tx_hash = d.tx_hash)
+           -- ALL sales here, foreign included: a declared wallet's inbound is
+           -- explained just as well by selling an unrelated NFT on a venue as
+           -- by selling one of the project's own.
            AND NOT EXISTS (SELECT 1 FROM secondary_sale s WHERE s.tx_hash = d.tx_hash)",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -903,7 +972,15 @@ fn signal_core_assertions(
     // Registry-declared wallets are core by declaration; asserted-core join
     // them at their confidence. Pinning is an ordinary additive row, so the
     // evidence panel shows it like everything else.
-    let mut stmt = conn.prepare("SELECT key, label FROM party WHERE role = 'declared'")?;
+    //
+    // `terminal_reason IS NULL` is load-bearing: declared TERMINALS share the
+    // `declared` role but assert the OPPOSITE of core — "custodial-scale,
+    // never expand". On the first fresh-ledger run both CEX hot wallets
+    // arrived in the dig queue wearing +2.00 core_assertion because this
+    // filter was missing.
+    let mut stmt = conn.prepare(
+        "SELECT key, label FROM party WHERE role = 'declared' AND terminal_reason IS NULL",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
     })?;
@@ -918,13 +995,18 @@ fn signal_core_assertions(
         );
     }
     for (key, (class, conf)) in human {
-        if class == "core" {
+        // Founder counts WITH core here — a founder's personal wallet is the
+        // project's centre for attention purposes, and everything it touches
+        // is at least as interesting as what the treasury touches. The classes
+        // stay distinct everywhere else precisely so the core→founder boundary
+        // remains askable.
+        if matches!(class.as_str(), "core" | "founder") {
             add(
                 party_sig,
                 key,
                 Signal::CoreAssertion,
                 weights.core_assertion * conf.factor(),
-                format!("asserted core ({conf})"),
+                format!("asserted {class} ({conf})"),
             );
         }
     }
@@ -1048,7 +1130,7 @@ fn signal_core_touch(
          WHERE party = ?1 AND unit = 'lovelace' AND counterparty <> ''",
     )?;
     for (key, (class, conf)) in human {
-        if class != "core" {
+        if !matches!(class.as_str(), "core" | "founder") {
             continue;
         }
         let label = elide(key);
@@ -1067,7 +1149,7 @@ fn signal_core_touch(
                 &tx,
                 Signal::CoreTouch,
                 w,
-                format!("touches {label} (core, {conf})"),
+                format!("touches {label} ({class}, {conf})"),
             );
             if q < 0 {
                 *receipts.entry(cp).or_default() += 1;
@@ -1149,8 +1231,14 @@ fn propose(
     for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
         bought.insert(k?);
     }
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT buyer FROM secondary_sale WHERE buyer IS NOT NULL")?;
+    // Case-policy buyers only: buying an unrelated NFT on a venue does not
+    // make a wallet THIS project's customer.
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT buyer FROM secondary_sale
+         WHERE buyer IS NOT NULL
+           AND (policy_id IS NULL
+                OR policy_id = (SELECT v FROM walk_meta WHERE k = 'policy_id'))",
+    )?;
     for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
         bought.insert(k?);
     }
@@ -1204,9 +1292,32 @@ fn disagree(
     let mut out = Vec::new();
     for (key, (class, _)) in human {
         let score = score_of.get(key.as_str()).copied().unwrap_or(0.0);
+        // A founder assertion is exempt from CLASSIFICATION disagreement, and
+        // only that. The tool's vocabulary cannot propose "founder" — nothing
+        // on chain distinguishes a founder's personal wallet from a well-paid
+        // associate; that is exactly why the class exists as a human call —
+        // so comparing its proposal against one is a category error that
+        // would badge every founder wallet forever. Evidence-kind
+        // disagreements still apply in full.
+        // "Ignored" is a dismissal, and a dismissal is contestable — but only
+        // by STRONG evidence, or every waved-off customer would wear a badge
+        // and the ⚠ would stop meaning anything. A probable associate/core
+        // proposal against an ignore is exactly the resurface case: "you
+        // dismissed this; the ledger now thinks it works for the project."
+        let contest_ok = if class == "ignored" {
+            proposals.get(key).is_some_and(|p| {
+                p.class.as_ref().is_some_and(|(c, conf)| {
+                    matches!(c.as_str(), "associate" | "core") && *conf == Confidence::Probable
+                })
+            })
+        } else {
+            true
+        };
         if let Some(p) = proposals.get(key)
             && let Some((proposed, conf)) = &p.class
             && proposed != class
+            && class != "founder"
+            && contest_ok
         {
             out.push((
                 key.clone(),

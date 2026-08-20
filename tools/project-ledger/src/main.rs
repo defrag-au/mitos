@@ -82,6 +82,12 @@ enum Command {
     /// the ledger + the app's annotations sidecar — human classifications are
     /// the primary signal, and they never leave the operator's machine.
     Score(score::ScoreArgs),
+    /// Export core/founder assertions from the app's annotations sidecar as
+    /// `[[wallet]]` registry fragments.
+    ///
+    /// The bridge in the curation loop: assert once in the app, export, review,
+    /// append to the box registry, re-walk. Tentative assertions stay app-side.
+    EmitRegistry(score::EmitRegistryArgs),
     /// Row counts + meta — a quick look at what a ledger holds.
     Stats(StatsArgs),
     /// Delete the ledger + checkpoint mirror for a clean restart (dry-run unless --yes).
@@ -131,6 +137,7 @@ fn main() -> Result<()> {
         Command::Enrich(args) => enrich::run(&args),
         Command::Classify(args) => classify::run(&args),
         Command::Score(args) => score::run(&args),
+        Command::EmitRegistry(args) => score::emit_registry(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }
