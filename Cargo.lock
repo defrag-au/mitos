@@ -21,6 +21,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "address-registry"
+version = "0.1.0"
+source = "git+https://github.com/defrag-au/shared-crates?rev=96d24873eed90a84eb62447c31d711eabec62240#96d24873eed90a84eb62447c31d711eabec62240"
+dependencies = [
+ "phf",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -672,7 +683,7 @@ dependencies = [
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23#d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23"
+source = "git+https://github.com/defrag-au/shared-crates?rev=96d24873eed90a84eb62447c31d711eabec62240#96d24873eed90a84eb62447c31d711eabec62240"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
@@ -723,7 +734,7 @@ dependencies = [
 [[package]]
 name = "chain-ledger"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23#d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23"
+source = "git+https://github.com/defrag-au/shared-crates?rev=96d24873eed90a84eb62447c31d711eabec62240#96d24873eed90a84eb62447c31d711eabec62240"
 dependencies = [
  "serde",
 ]
@@ -4448,6 +4459,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_macros",
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared",
+ "rand 0.8.5",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4482,7 +4535,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pipeline-types"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23#d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23"
+source = "git+https://github.com/defrag-au/shared-crates?rev=96d24873eed90a84eb62447c31d711eabec62240#96d24873eed90a84eb62447c31d711eabec62240"
 dependencies = [
  "cardano-assets",
  "hex",
@@ -4566,6 +4619,7 @@ dependencies = [
 name = "project-ledger"
 version = "0.0.1"
 dependencies = [
+ "address-registry",
  "anyhow",
  "chain-ledger",
  "clap",
@@ -5617,6 +5671,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
 name = "slab"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6540,7 +6600,7 @@ dependencies = [
 [[package]]
 name = "tx_insights"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23#d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23"
+source = "git+https://github.com/defrag-au/shared-crates?rev=96d24873eed90a84eb62447c31d711eabec62240#96d24873eed90a84eb62447c31d711eabec62240"
 dependencies = [
  "cardano-assets",
  "serde",
@@ -6973,7 +7033,7 @@ dependencies = [
 [[package]]
 name = "wasm_safe_serde"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23#d94a7f22f4fadfcc9d153d8ee5be49665f0fbd23"
+source = "git+https://github.com/defrag-au/shared-crates?rev=96d24873eed90a84eb62447c31d711eabec62240#96d24873eed90a84eb62447c31d711eabec62240"
 dependencies = [
  "serde",
  "serde_json",

@@ -49,6 +49,14 @@ pub struct WalletDecl {
 pub struct TerminalDecl {
     pub receipts: Option<u32>,
     pub counterparties: Option<u32>,
+    /// New distinct wallets paid per window, above which the window is hot.
+    /// Omit to take the measured default — see `Thresholds`.
+    pub payees_per_window: Option<u32>,
+    /// Window length in slots (Cardano slot ≈ 1s, so 86,400 ≈ a day).
+    pub payee_window_slots: Option<u64>,
+    /// Hot windows required before freezing. Above 1 so a one-off airdrop
+    /// burst is not mistaken for a payout service.
+    pub payee_hot_windows: Option<u32>,
     #[serde(default, rename = "party")]
     pub parties: Vec<TerminalParty>,
 }
@@ -121,6 +129,20 @@ impl Registry {
         Thresholds {
             receipts: self.terminal.receipts.unwrap_or(d.receipts),
             counterparties: self.terminal.counterparties.unwrap_or(d.counterparties),
+            // Outbound fan-out RATE — the only measure that sees an exchange hot
+            // wallet, which receives from almost nobody while paying thousands.
+            payees_per_window: self
+                .terminal
+                .payees_per_window
+                .unwrap_or(d.payees_per_window),
+            payee_window_slots: self
+                .terminal
+                .payee_window_slots
+                .unwrap_or(d.payee_window_slots),
+            payee_hot_windows: self
+                .terminal
+                .payee_hot_windows
+                .unwrap_or(d.payee_hot_windows),
         }
     }
 

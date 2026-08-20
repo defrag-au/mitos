@@ -122,6 +122,20 @@ pub fn run(args: SeedArgs) -> Result<()> {
             .seed(stake_party(&w.stake), Role::Declared, walk_start)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    // Declared terminals are seated HERE, not left to be recorded on contact.
+    //
+    // `on_movement` records the receiver of a movement, so a wallet that only
+    // ever PAYS the watch set is never seated by contact — and its own funding,
+    // which is usually the reason it was declared, is never recorded at all. On
+    // Mekka, two wallets supplying the treasury with 38,870 ADA: one was seated
+    // only by accident a third of the way in, the other never.
+    //
+    // Terminal, so this cannot recruit: seeding those two as ordinary wallets
+    // instead took the frontier from 180 parties to 6,424 and unresolved inputs
+    // from 0.06% to 16.5%.
+    for t in &registry.terminal.parties {
+        frontier.seed_terminal(stake_party(&t.stake), walk_start);
+    }
 
     // --- persist ---------------------------------------------------------------
     let mut ledger = ledger;
@@ -136,6 +150,13 @@ pub fn run(args: SeedArgs) -> Result<()> {
     ledger.checkpoint(&state, walk_start, &[])?;
     for w in &registry.wallets {
         ledger.label_party(&w.stake, &w.label, &w.source)?;
+    }
+    // Terminals carry their label and source too — a declared terminal is an
+    // ASSERTION ("this wallet is custodial-scale, never expand it") and an
+    // unsourced one is exactly the laundering-of-guesses this tool refuses
+    // elsewhere.
+    for t in &registry.terminal.parties {
+        ledger.label_party(&t.stake, &t.label, &t.source)?;
     }
     ledger.meta_set(META_POLICY, &policy.id)?;
     ledger.meta_set(META_POLICY_LABEL, &policy.label)?;

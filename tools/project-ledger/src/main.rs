@@ -15,6 +15,7 @@
 mod activity;
 mod alias;
 mod asset_class;
+mod classify;
 mod enrich;
 mod koios;
 mod local;
@@ -22,6 +23,7 @@ mod mint;
 mod party;
 mod registry;
 mod resolve;
+mod score;
 mod seed;
 mod state;
 mod store;
@@ -66,6 +68,20 @@ enum Command {
     /// Venue sales ONLY — a peer-to-peer trade leaves no marketplace event.
     /// Cheap and recomputable: re-run after any walk.
     Enrich(enrich::EnrichArgs),
+    /// Name the counterparties the chain can identify — DEX pools, batchers,
+    /// marketplace contracts.
+    ///
+    /// Without it a swap's RETURN leg reads as project income: value the
+    /// treasury sent out, coming back after a conversion. Reports what it could
+    /// not name, because a registry fails silently.
+    Classify(classify::ClassifyArgs),
+    /// Score transactions and parties by investigative INTEREST.
+    ///
+    /// Attention, never fact: scores appear in no exported figure, and every
+    /// score decomposes into signal rows that sum to it. Runs LOCALLY against
+    /// the ledger + the app's annotations sidecar — human classifications are
+    /// the primary signal, and they never leave the operator's machine.
+    Score(score::ScoreArgs),
     /// Row counts + meta — a quick look at what a ledger holds.
     Stats(StatsArgs),
     /// Delete the ledger + checkpoint mirror for a clean restart (dry-run unless --yes).
@@ -113,6 +129,8 @@ fn main() -> Result<()> {
         Command::Walk(args) => walk::run(args),
         Command::ResolveLocal(args) => local::resolve_local(&args),
         Command::Enrich(args) => enrich::run(&args),
+        Command::Classify(args) => classify::run(&args),
+        Command::Score(args) => score::run(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }

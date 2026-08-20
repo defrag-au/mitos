@@ -420,6 +420,30 @@ fn hops_from_seed(frontier: &chain_ledger::Frontier, party: &Party) -> Option<u3
 /// False only for a NON-member receiving a policy asset in the same tx — the
 /// buyer side of a sale. Already-watched parties are unaffected, so their
 /// receipt counters keep advancing whether or not they also bought something.
+///
+/// ## The tempting fix that is WRONG, and why
+///
+/// This rule uses *received an asset* as a proxy for *is a customer*, and the
+/// proxy fails on the case the tool exists to find: **a project paying people
+/// in assets**. Mekka's founder did that for a period, and every recipient of
+/// the arrangement looked identical to a buyer and was refused forever.
+///
+/// The obvious repair is "a customer is someone who PAID — so refuse only an
+/// asset receiver who also FUNDED this transaction". **Do not do this.** Nearly
+/// all Cardano CNFT trades are NON-ATOMIC: two transactions a few minutes
+/// apart, one sending the asset and the other the ADA. So an ordinary buyer
+/// does not fund the transaction that delivers their asset, and that rule would
+/// promote essentially every customer — thousands of them — as though each had
+/// been paid in kind. It inverts the very judgement it was meant to sharpen.
+///
+/// Within-transaction funding only identifies a buyer in an ATOMIC swap, which
+/// is the rare shape here, not the common one.
+///
+/// Telling a purchase from payment-in-kind therefore needs the COUNTER-PAYMENT:
+/// a matching value transfer between the same two parties, in either direction,
+/// within a short window. That is not decidable while streaming forward — the
+/// counter-payment may not have happened yet — so it belongs in a post-pass
+/// over the finished ledger, whose findings can then seed the next walk.
 fn may_promote(asset_receivers: &BTreeSet<&str>, to_key: &str, is_member: bool) -> bool {
     is_member || !asset_receivers.contains(to_key)
 }

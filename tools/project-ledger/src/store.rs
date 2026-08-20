@@ -203,20 +203,94 @@ CREATE TABLE IF NOT EXISTS secondary_sale (
 -- a marketplace contract, an aggregator.
 --
 -- Without this, value returning from a swap reads as project income. On Mekka
--- that was 74,626 ₳ of a supposed 132,590 ₳ of "unexplained" inbound — money
--- the treasury had sent out moments earlier, coming back in a different unit.
--- It is the change-vs-receipt error one level up: a ROUND TRIP booked as
--- revenue.
+-- that was 74,626 of a supposed 132,590 ADA of unexplained inbound — money the
+-- treasury had sent out moments earlier, coming back in a different unit. It is
+-- the change-vs-receipt error one level up: a ROUND TRIP booked as revenue.
 --
 -- Interpretation, not observation, so it is recomputable without a re-walk and
--- `reset` clears it. `source` records WHERE the claim came from, because "this
--- address is Minswap" is an assertion inherited from a registry, not something
--- this walk observed.
+-- `reset` clears it. `source` records WHERE the claim came from: an address
+-- being Minswap is a claim inherited from a registry, not something this walk
+-- observed.
+-- WHO it is. `name` may be NULL: a wallet can be unmistakably an exchange hot
+-- wallet by shape while which exchange it belongs to is unknowable from chain
+-- data. Forcing a name would mean inventing one.
 CREATE TABLE IF NOT EXISTS counterparty_kind (
     key    TEXT PRIMARY KEY,       -- party key as it appears in unit_flow
-    kind   TEXT NOT NULL,          -- exchange | marketplace | aggregator | …
-    label  TEXT,                   -- "Minswap", "Splash", …
+    name   TEXT,                   -- Minswap, bank.pillar, … NULL when unknown
     source TEXT NOT NULL           -- how it was decided
+);
+
+-- WHAT it does. One row per capability, because an entity commonly has
+-- several: `bank.pillar` is a minting provider AND an airdrop payer, and the
+-- single-label version of this table had to discard one of those facts.
+--
+-- `basis` is per-capability, not per-entity, because they arrive from different
+-- evidence: `minting` is OBSERVED in a mint transaction's fund split, `dex` is
+-- ASSERTED by an address registry, `cex` is DERIVED from fan-out shape. A
+-- reader must be able to tell which claim is which.
+CREATE TABLE IF NOT EXISTS counterparty_capability (
+    key        TEXT NOT NULL,
+    capability TEXT NOT NULL,      -- cex | dex | minting | airdrop | …
+    basis      TEXT NOT NULL,      -- observed | derived | asserted
+    source     TEXT NOT NULL,
+    PRIMARY KEY (key, capability)
+);
+CREATE INDEX IF NOT EXISTS idx_cc_capability ON counterparty_capability(capability);
+
+-- Interest engine tables — see PROJECT_LEDGER_INTEREST.md. All of it is
+-- ATTENTION, never fact: recomputed wholesale by every `score` run, cleared by
+-- `reset`, never exported as a figure. The signal rows are the evidence and
+-- they SUM to the score — a hidden row would show up as arithmetic that
+-- doesn't.
+CREATE TABLE IF NOT EXISTS tx_signal (
+    tx_hash TEXT NOT NULL,
+    signal  TEXT NOT NULL,
+    weight  REAL NOT NULL,
+    basis   TEXT NOT NULL,          -- fixed per signal, stored for the reader
+    detail  TEXT,                   -- human-readable: the WHY, verbatim
+    PRIMARY KEY (tx_hash, signal)
+);
+CREATE TABLE IF NOT EXISTS tx_interest (
+    tx_hash TEXT PRIMARY KEY,
+    score   REAL NOT NULL,
+    round   INTEGER NOT NULL        -- which propagation round settled it
+);
+CREATE INDEX IF NOT EXISTS idx_ti_score ON tx_interest(score);
+CREATE TABLE IF NOT EXISTS party_signal (
+    key    TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    weight REAL NOT NULL,
+    basis  TEXT NOT NULL,
+    detail TEXT,
+    PRIMARY KEY (key, signal)
+);
+CREATE TABLE IF NOT EXISTS party_interest (
+    key                  TEXT PRIMARY KEY,
+    score                REAL NOT NULL,
+    -- The tool's PROPOSAL, never an assertion: class from the app vocabulary
+    -- (core|associate|customer), capability from the provider vocabulary.
+    -- Confidence is capped below `confirmed`, which is reserved for humans.
+    proposed_class       TEXT,
+    proposed_capability  TEXT,
+    proposed_confidence  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pi_score ON party_interest(score);
+-- Assertion never silences evidence; evidence never overrides assertion.
+-- When they conflict, BOTH sides go here and a human decides.
+CREATE TABLE IF NOT EXISTS disagreement (
+    key        TEXT NOT NULL,
+    kind       TEXT NOT NULL,       -- classification | evidence
+    human_says TEXT NOT NULL,
+    tool_says  TEXT NOT NULL,
+    severity   REAL NOT NULL,       -- interest x tool confidence
+    detail     TEXT,
+    PRIMARY KEY (key, kind)
+);
+-- Weights, window, rounds, and a fingerprint of the annotation state each run
+-- consumed — a re-tune must be visible, not a silent reinterpretation.
+CREATE TABLE IF NOT EXISTS score_meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
 );
 
 -- Checkpoint state (rewritten wholesale at each checkpoint).
@@ -291,6 +365,19 @@ CREATE TABLE IF NOT EXISTS wanted_outref (
 /// Adds are idempotent by inspecting `PRAGMA table_info` rather than relying on
 /// the error text of a failed `ALTER`.
 fn migrate(conn: &Connection) -> Result<()> {
+    // `counterparty_kind` carried a single `kind` string before capabilities
+    // existed. DROP rather than ALTER: the table is pure interpretation,
+    // rebuilt by `classify` in seconds, and its old shape cannot represent an
+    // entity with two functions — so there is nothing in it worth migrating.
+    // Dropping is also what makes the new `name` column appear at all, since
+    // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table.
+    if has_column(conn, "counterparty_kind", "kind")? {
+        conn.execute_batch("DROP TABLE counterparty_kind")?;
+        conn.execute_batch(SCHEMA)?;
+        tracing::info!(
+            "store: migrated counterparty_kind to name + capabilities — re-run `classify`"
+        );
+    }
     for (table, column, decl) in [(
         "unit_flow",
         "min_utxo",
@@ -316,6 +403,18 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// One counterparty's identity and capabilities, as `classify` establishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterpartyRow {
+    pub key: String,
+    /// `None` when the shape is unmistakable but the identity is not.
+    pub name: Option<String>,
+    /// `(capability, basis)` — basis is per-capability because they come from
+    /// different evidence. See the `counterparty_capability` schema comment.
+    pub capabilities: Vec<(chain_ledger::ProviderCapability, chain_ledger::Basis)>,
+    pub source: String,
+}
+
 /// A row of `secondary_sale` — a venue sale copied in by `enrich`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecondarySaleRow {
@@ -331,8 +430,15 @@ pub struct SecondarySaleRow {
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
-pub const RESET_DERIVED_TABLES: [&str; 16] = [
+pub const RESET_DERIVED_TABLES: [&str; 23] = [
     "counterparty_kind",
+    "counterparty_capability",
+    "tx_signal",
+    "tx_interest",
+    "party_signal",
+    "party_interest",
+    "disagreement",
+    "score_meta",
     "walk_meta",
     "party",
     "asset_event",
@@ -462,6 +568,16 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Raw connection, for the `score` post-pass.
+    ///
+    /// Scoring is ~fifteen read queries plus a bulk write, all of it
+    /// recomputed wholesale per run; giving each query a named method here
+    /// would bloat the walk-time store with display-adjacent concerns. The
+    /// walk's own writes stay behind the typed methods.
+    pub(crate) fn connection(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     // --- meta -----------------------------------------------------------------
@@ -699,23 +815,42 @@ impl Ledger {
         Ok(n)
     }
 
-    /// Record what counterparties ARE. Idempotent on the key.
-    pub fn put_counterparty_kinds(
-        &mut self,
-        rows: &[(String, &'static str, Option<String>, String)],
-    ) -> Result<usize> {
+    /// Record what counterparties ARE — identity and capabilities.
+    ///
+    /// Capabilities are written ADDITIVELY (`INSERT OR IGNORE`), never as a
+    /// replacement set. They arrive from different evidence in different
+    /// passes — `minting` from a mint's fund split, `dex` from a registry,
+    /// `cex` from fan-out shape — and a later pass that knows one fact must not
+    /// erase a fact an earlier one established. That erasure is precisely what
+    /// the single-label table did to a provider with two functions.
+    ///
+    /// The name IS replaced, because a better name supersedes a worse one and
+    /// there is only ever one.
+    pub fn put_counterparty(&mut self, rows: &[CounterpartyRow]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
         let tx = self.conn.transaction()?;
         let mut n = 0;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO counterparty_kind (key, kind, label, source)
-                 VALUES (?,?,?,?)",
+            let mut who = tx.prepare_cached(
+                "INSERT INTO counterparty_kind (key, name, source) VALUES (?,?,?)
+                 ON CONFLICT(key) DO UPDATE SET
+                   name = COALESCE(excluded.name, counterparty_kind.name),
+                   source = excluded.source",
             )?;
-            for (key, kind, label, source) in rows {
-                n += stmt.execute(params![key, kind, label, source])?;
+            let mut what = tx.prepare_cached(
+                "INSERT OR IGNORE INTO counterparty_capability
+                 (key, capability, basis, source) VALUES (?,?,?,?)",
+            )?;
+            for r in rows {
+                who.execute(params![r.key, r.name, r.source])?;
+                for (cap, basis) in &r.capabilities {
+                    n += what.execute(params![r.key, cap.as_str(), basis.as_str(), r.source])?;
+                }
+                if r.capabilities.is_empty() {
+                    n += 1;
+                }
             }
         }
         tx.commit()?;
@@ -726,9 +861,9 @@ impl Ledger {
     /// known by — the registry keys on ADDRESSES, but a staked party's key is
     /// its stake credential, so the addresses come from `party_alias`.
     pub fn counterparties_with_addresses(&self) -> Result<Vec<(String, Vec<String>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT counterparty FROM unit_flow WHERE counterparty <> ''",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT counterparty FROM unit_flow WHERE counterparty <> ''")?;
         let keys: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .filter_map(Result::ok)
@@ -751,6 +886,153 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Parties the project's own MINT transactions paid — mint providers.
+    ///
+    /// Derived, not asserted: a `mint_payment` row is read off the mint tx's
+    /// fund split. This is what separates a service the project USED from an
+    /// exchange it merely passed money through, and the difference is not
+    /// cosmetic — a mint provider's onward payments (airdrops, artist splits)
+    /// ARE project activity, while everything beyond an exchange is somebody
+    /// else's business.
+    pub fn mint_payment_destinations(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT destination FROM mint_payment WHERE destination <> ''")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading mint payment destinations")
+    }
+
+    /// What a counterparty is established to DO, with the basis of each claim.
+    ///
+    /// Read surface for consumers (the app charts by capability), so it is not
+    /// dead merely because this binary only writes.
+    #[allow(dead_code)]
+    pub fn capabilities_of(
+        &self,
+        key: &str,
+    ) -> Result<Vec<(chain_ledger::ProviderCapability, chain_ledger::Basis)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT capability, basis FROM counterparty_capability
+             WHERE key = ? ORDER BY capability",
+        )?;
+        let rows = stmt.query_map([key], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (cap, basis) = row?;
+            // An unparseable capability is an ERROR, not a skip: it means the
+            // vocabulary moved on and a reader is being shown less than the
+            // data holds. The basis degrades to `Asserted` instead, because
+            // there the cautious direction is downward.
+            let cap = cap
+                .parse::<chain_ledger::ProviderCapability>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            out.push((cap, chain_ledger::Basis::parse(&basis)));
+        }
+        Ok(out)
+    }
+
+    /// The name a counterparty is known by, if anything has established one.
+    ///
+    /// `None` is a real answer, not a gap: a wallet can be unmistakably a CEX
+    /// hot wallet by shape while which exchange it belongs to is unknowable.
+    #[allow(dead_code)]
+    pub fn counterparty_name(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name FROM counterparty_kind WHERE key = ?",
+                [key],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// `(distinct wallets paid, distinct wallets paid BY)` for a counterparty.
+    ///
+    /// The asymmetry is the whole signal. An exchange hot wallet pays thousands
+    /// and receives from a handful, because customer deposits land on per-user
+    /// addresses and the hot wallet is replenished from cold storage. A busy
+    /// project wallet, by contrast, has traffic in both directions.
+    ///
+    /// Every watched party's key — the set whose fan-out is measurable.
+    pub fn party_keys(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT key FROM party")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading party keys")
+    }
+
+    /// **Only measurable for a WATCHED PARTY.** Returns `None` otherwise, and
+    /// that distinction is the whole correctness of the rule.
+    ///
+    /// For a party, `unit_flow` holds every flow it had, so counting distinct
+    /// counterparties gives its true fan-out — 2,390 and 3,081 on the two real
+    /// hot wallets. For a mere counterparty we see ONLY its dealings with our
+    /// watch set, so the count is bounded by the number of watched parties
+    /// (178 here) and cannot be compared to a threshold in the hundreds.
+    ///
+    /// The first version of this counted distinct `party` for a given
+    /// counterparty, which is exactly that bounded quantity. It could never
+    /// reach the threshold, so the CEX rule silently matched nothing and the
+    /// empty result read as "no exchanges found" rather than "not measurable".
+    /// `None` now says which of those it is.
+    pub fn fan_shape(&self, key: &str) -> Result<Option<(u64, u64)>> {
+        let is_party: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM party WHERE key = ?)",
+            [key],
+            |r| r.get(0),
+        )?;
+        if !is_party {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT
+               COUNT(DISTINCT CASE WHEN quantity < 0 THEN counterparty END),
+               COUNT(DISTINCT CASE WHEN quantity > 0 THEN counterparty END)
+             FROM unit_flow WHERE party = ? AND unit = 'lovelace' AND counterparty <> ''",
+        )?;
+        let (paid, paid_by): (i64, i64) = stmt.query_row([key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(Some((paid.max(0) as u64, paid_by.max(0) as u64)))
+    }
+
+    /// Counterparties busy enough to be a service, that nothing has named yet.
+    ///
+    /// Ordered by volume so the report reads worst-first. Excludes anything
+    /// already in `counterparty_kind`: a registry claim is evidence about WHO,
+    /// and must not be overwritten by an inference about WHAT.
+    pub fn busy_unnamed_counterparties(&self, min_flows: u64) -> Result<Vec<(String, u64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            // Volume sums ONLY lovelace. A token's raw quantity can be
+            // astronomical (18 decimals is common), and summing ABS across all
+            // units over hundreds of thousands of rows overflows i64 — at which
+            // point sqlite quietly promotes the result to REAL and every row
+            // fails to decode as an integer. Activity is counted across all
+            // units; only the ADA figure is summed.
+            "SELECT f.counterparty, COUNT(*) AS n,
+                    SUM(CASE WHEN f.unit = 'lovelace' THEN ABS(f.quantity) ELSE 0 END) AS vol
+             FROM unit_flow f
+             WHERE f.counterparty <> ''
+               AND NOT EXISTS (SELECT 1 FROM counterparty_kind k WHERE k.key = f.counterparty)
+             GROUP BY f.counterparty HAVING n >= ? ORDER BY vol DESC",
+        )?;
+        let rows = stmt.query_map([min_flows as i64], |r| {
+            let key: String = r.get(0)?;
+            let flows: i64 = r.get(1)?;
+            let volume: i64 = r.get(2)?;
+            Ok((key, flows as u64, volume))
+        })?;
+        // Errors PROPAGATE. `filter_map(Result::ok)` here returned an empty set
+        // from a query that matched 102 rows, and reported success — a silent
+        // drop is indistinguishable from "nothing matched", which is exactly
+        // the failure this tool exists to avoid making elsewhere.
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading busy unnamed counterparties")
+    }
+
     /// Counterparties carrying real value that `classify` could NOT name,
     /// biggest first — the coverage report's teeth.
     pub fn unclassified_by_value(&self, limit: usize) -> Result<Vec<(String, u64, i64)>> {
@@ -762,7 +1044,10 @@ impl Ledger {
              GROUP BY f.counterparty ORDER BY vol DESC LIMIT ?",
         )?;
         let rows = stmt.query_map([limit as i64], |r| {
-            Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+            let key: String = r.get(0)?;
+            let flows: i64 = r.get(1)?;
+            let volume: i64 = r.get(2)?;
+            Ok((key, flows as u64, volume))
         })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
@@ -1119,6 +1404,7 @@ pub fn reason_str(r: chain_ledger::TerminalReason) -> &'static str {
         chain_ledger::TerminalReason::Receipts => "receipts",
         chain_ledger::TerminalReason::Counterparties => "counterparties",
         chain_ledger::TerminalReason::Declared => "declared",
+        chain_ledger::TerminalReason::Payees => "payees",
     }
 }
 
