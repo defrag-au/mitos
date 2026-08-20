@@ -199,6 +199,26 @@ CREATE TABLE IF NOT EXISTS secondary_sale (
     PRIMARY KEY (tx_hash, asset_name)
 );
 
+-- What a counterparty IS, where the chain can say so: a DEX pool, a batcher,
+-- a marketplace contract, an aggregator.
+--
+-- Without this, value returning from a swap reads as project income. On Mekka
+-- that was 74,626 ₳ of a supposed 132,590 ₳ of "unexplained" inbound — money
+-- the treasury had sent out moments earlier, coming back in a different unit.
+-- It is the change-vs-receipt error one level up: a ROUND TRIP booked as
+-- revenue.
+--
+-- Interpretation, not observation, so it is recomputable without a re-walk and
+-- `reset` clears it. `source` records WHERE the claim came from, because "this
+-- address is Minswap" is an assertion inherited from a registry, not something
+-- this walk observed.
+CREATE TABLE IF NOT EXISTS counterparty_kind (
+    key    TEXT PRIMARY KEY,       -- party key as it appears in unit_flow
+    kind   TEXT NOT NULL,          -- exchange | marketplace | aggregator | …
+    label  TEXT,                   -- "Minswap", "Splash", …
+    source TEXT NOT NULL           -- how it was decided
+);
+
 -- Checkpoint state (rewritten wholesale at each checkpoint).
 CREATE TABLE IF NOT EXISTS walk_cursor (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
@@ -311,7 +331,8 @@ pub struct SecondarySaleRow {
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
-pub const RESET_DERIVED_TABLES: [&str; 15] = [
+pub const RESET_DERIVED_TABLES: [&str; 16] = [
+    "counterparty_kind",
     "walk_meta",
     "party",
     "asset_event",
@@ -676,6 +697,74 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(n)
+    }
+
+    /// Record what counterparties ARE. Idempotent on the key.
+    pub fn put_counterparty_kinds(
+        &mut self,
+        rows: &[(String, &'static str, Option<String>, String)],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO counterparty_kind (key, kind, label, source)
+                 VALUES (?,?,?,?)",
+            )?;
+            for (key, kind, label, source) in rows {
+                n += stmt.execute(params![key, kind, label, source])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Every distinct counterparty in `unit_flow`, with the addresses it is
+    /// known by — the registry keys on ADDRESSES, but a staked party's key is
+    /// its stake credential, so the addresses come from `party_alias`.
+    pub fn counterparties_with_addresses(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT counterparty FROM unit_flow WHERE counterparty <> ''",
+        )?;
+        let keys: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .filter_map(Result::ok)
+            .collect();
+        let mut addr = self
+            .conn
+            .prepare("SELECT value FROM party_alias WHERE party = ? AND kind = 'address'")?;
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            let mut addrs: Vec<String> = addr
+                .query_map([&k], |r| r.get(0))?
+                .filter_map(Result::ok)
+                .collect();
+            // A stakeless party IS an address — the key itself is a candidate.
+            if k.starts_with("addr") {
+                addrs.push(k.clone());
+            }
+            out.push((k, addrs));
+        }
+        Ok(out)
+    }
+
+    /// Counterparties carrying real value that `classify` could NOT name,
+    /// biggest first — the coverage report's teeth.
+    pub fn unclassified_by_value(&self, limit: usize) -> Result<Vec<(String, u64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.counterparty, COUNT(*) AS n, SUM(ABS(f.quantity)) AS vol
+             FROM unit_flow f
+             WHERE f.unit = 'lovelace' AND f.counterparty <> ''
+               AND NOT EXISTS (SELECT 1 FROM counterparty_kind k WHERE k.key = f.counterparty)
+             GROUP BY f.counterparty ORDER BY vol DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// Write venue sales in. Idempotent on `(tx_hash, asset_name)`, so a
