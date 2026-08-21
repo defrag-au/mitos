@@ -358,6 +358,21 @@ CREATE TABLE IF NOT EXISTS wanted_outref (
     PRIMARY KEY (tx_hash, output_index)
 );
 
+-- Handles seen on TRACKED wallets during the genesis resolve scan.
+--
+-- KEPT through reset, like the rest of the resolution layer. The walk's own
+-- alias pass only sees handles that MOVE inside the walk window — a wallet
+-- holding its handle quietly since before the floor is never named (dwess
+-- held $dwess_art through the whole S2 window and stayed anonymous). The
+-- genesis scan reads every block anyway; harvesting handle sightings there
+-- costs no extra IO, and `seed` re-emits them as party aliases.
+CREATE TABLE IF NOT EXISTS discovered_handle (
+    party       TEXT    NOT NULL,
+    handle      TEXT    NOT NULL,
+    first_slot  INTEGER NOT NULL,
+    PRIMARY KEY (party, handle)
+);
+
 -- Stake keys seen RECEIVING a holder-facing asset of the tracked policy — the
 -- collection's holders, discovered by walking.
 --
@@ -482,10 +497,15 @@ pub const RESET_DERIVED_TABLES: [&str; 23] = [
     "asset_holder",
 ];
 
-/// Tables a `reset` KEEPS: the input-resolution layer and the discovered
-/// holder set — both bought by walking rather than derived, and both what the
-/// NEXT walk is there to use.
-pub const RESET_KEPT_TABLES: [&str; 3] = ["outref_cache", "wanted_outref", "discovered_holder"];
+/// Tables a `reset` KEEPS: the input-resolution layer plus the discovered
+/// holder and handle sets — all bought by scanning rather than derived, and
+/// all what the NEXT walk is there to use.
+pub const RESET_KEPT_TABLES: [&str; 4] = [
+    "outref_cache",
+    "wanted_outref",
+    "discovered_holder",
+    "discovered_handle",
+];
 
 /// A row of `asset_event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -938,6 +958,24 @@ impl Ledger {
     /// cosmetic — a mint provider's onward payments (airdrops, artist splits)
     /// ARE project activity, while everything beyond an exchange is somebody
     /// else's business.
+    /// Per-destination mint fund-split totals: `(key, lovelace, distinct
+    /// mint txs)` — the input to the dominant-destination rule.
+    pub fn mint_payment_totals(&self) -> Result<Vec<(String, i128, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT destination, SUM(lovelace), COUNT(DISTINCT tx_hash)
+             FROM mint_payment WHERE destination <> '' GROUP BY destination",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                i128::from(r.get::<_, i64>(1)?),
+                r.get::<_, i64>(2)? as u32,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading mint payment totals")
+    }
+
     pub fn mint_payment_destinations(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -1077,6 +1115,43 @@ impl Ledger {
             .context("reading busy unnamed counterparties")
     }
 
+    /// Stakeless counterparties with the OFF-RAMP candidate shape, one row
+    /// per address: how many watched wallets ever paid it, how many payment
+    /// legs, whether anything EVER came back, and the total that left.
+    ///
+    /// The verdict (few payers, nothing back, enough legs) belongs to
+    /// `classify`; this just measures. One-way-ness is measured over BOOKED
+    /// rows only — for an unwatched address that is exactly "no watched
+    /// wallet ever received from it", which is the strongest claim an
+    /// offline ledger can make.
+    pub fn stakeless_exit_shapes(
+        &self,
+        min_legs: u32,
+    ) -> Result<Vec<(String, u32, u32, u32, i128)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT counterparty,
+                    COUNT(DISTINCT CASE WHEN quantity < 0 THEN party END),
+                    SUM(CASE WHEN quantity < 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN quantity > 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN quantity < 0 THEN -quantity ELSE 0 END)
+             FROM unit_flow
+             WHERE counterparty LIKE 'addr1%' AND unit = 'lovelace'
+             GROUP BY counterparty
+             HAVING SUM(CASE WHEN quantity < 0 THEN 1 ELSE 0 END) >= ?1",
+        )?;
+        let rows = stmt.query_map([min_legs], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u32,
+                r.get::<_, i64>(2)? as u32,
+                r.get::<_, i64>(3)? as u32,
+                i128::from(r.get::<_, i64>(4)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading stakeless exit shapes")
+    }
+
     /// Counterparties carrying real value that `classify` could NOT name,
     /// biggest first — the coverage report's teeth.
     pub fn unclassified_by_value(&self, limit: usize) -> Result<Vec<(String, u64, i64)>> {
@@ -1161,6 +1236,43 @@ impl Ledger {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("reading discovered holders")
+    }
+
+    /// Record handle sightings from the genesis scan. First sighting's slot
+    /// wins — the alias is "this wallet has gone by this name".
+    pub fn put_discovered_handles(&mut self, rows: &[(String, String, u64)]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO discovered_handle (party, handle, first_slot)
+                 VALUES (?,?,?)",
+            )?;
+            for (party, handle, slot) in rows {
+                n += stmt.execute(params![party, handle, u64_i64(*slot)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Handle sightings for `seed` to re-emit as party aliases after a reset.
+    pub fn discovered_handles(&self) -> Result<Vec<(String, String, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT party, handle, first_slot FROM discovered_handle ORDER BY party")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading discovered handles")
     }
 
     // --- the wanted list ------------------------------------------------------

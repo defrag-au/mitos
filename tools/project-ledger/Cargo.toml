@@ -47,3 +47,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hex = { workspace = true }
+# resolve-local's per-block pre-filter for handle harvesting: a SIMD substring
+# search for the ADA Handle policy id over raw block bytes, so only blocks
+# that actually carry handles pay for output decoding.
+memchr = "2"

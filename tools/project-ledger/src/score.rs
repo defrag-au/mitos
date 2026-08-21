@@ -312,6 +312,27 @@ pub fn emit_registry(args: &EmitRegistryArgs) -> Result<()> {
         println!();
         emitted += 1;
     }
+    // The derived treasury pattern, offered — never exported as a fragment,
+    // because a registry [[wallet]] is an assertion and this is arithmetic.
+    // Printed commented-out so accepting it is a deliberate edit.
+    let ledger = crate::store::Ledger::open(&args.db)?;
+    if let Some(meta) = ledger.meta_get("mint_proceeds_dominant")?
+        && let Some((key, rest)) = meta.split_once(' ')
+        && !key.is_empty()
+        && !human.contains_key(key)
+    {
+        println!("# SUGGESTED by classify (derived, not asserted): this wallet took the");
+        println!("# majority of mint fund-split value ({rest} = share, mints). If you agree");
+        println!("# it is the treasury, uncomment and OWN the source line:");
+        println!("# [[wallet]]");
+        println!("# stake  = \"{key}\"");
+        println!("# label  = \"treasury\"");
+        println!("# role   = \"treasury\"");
+        println!(
+            "# source = \"<your grounds — the derived share alone is arithmetic, not identity>\""
+        );
+        println!();
+    }
     tracing::info!(
         emitted,
         of = human.len(),

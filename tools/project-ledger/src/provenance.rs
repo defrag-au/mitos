@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 
 use crate::store::Ledger;
 
@@ -67,6 +68,13 @@ pub struct ProvenanceArgs {
     #[arg(long, default_value_t = 0.5)]
     pub threshold: f64,
 
+    /// Also root coreness on the DERIVED dominant mint-proceeds destination
+    /// (`classify` records it in meta). For a cold collection with no human
+    /// assertions yet — clearly reported as derived, never silently mixed
+    /// with asserted roots.
+    #[arg(long)]
+    pub derived_roots: bool,
+
     /// How many flagged holders to print in full (all are counted).
     #[arg(long, default_value_t = 20)]
     pub report: usize,
@@ -78,13 +86,75 @@ struct HolderVerdict {
     assets: u64,
     /// Net spend across their mint txs (atomic mints) — context, not verdict.
     mint_spend: i128,
-    /// Funding-share from the core cluster, 0..1 over ATTRIBUTED inbound.
+    /// Funding-share from the core cluster, 0..1 over ATTRIBUTED inbound —
+    /// the MAXIMUM across payment units (see [`headline`]).
     core_share: f64,
-    /// Share of windowed inbound with no resolved payer — the fraction above
-    /// is a FLOOR and this is how far it could move.
+    /// Share of windowed inbound with no resolved payer, in the headline
+    /// unit — the fraction above is a FLOOR and this is how far it could move.
     unknown_share: f64,
-    /// Top funding legs: (source, lovelace, example tx).
-    legs: Vec<(String, i128, String)>,
+    /// Per-unit decomposition ("ada 12% · USDM 98%") when more than one
+    /// payment unit funded the wallet.
+    via: Option<String>,
+    /// Top funding legs: (display label, example tx).
+    legs: Vec<(String, String)>,
+}
+
+/// Whether a `unit_flow` unit participates in FUNDING analysis: lovelace, or
+/// a CIP-67 labelled fungible (333/444 — USDM is `0014df10` + "USDM").
+///
+/// Mint payments arrive in ADA or a stablecoin; NFTs riding through a wallet
+/// are custody, not funding, and counting them would let one airdropped
+/// token rewrite a wallet's money story.
+fn is_payment_unit(unit: &str) -> bool {
+    if unit == "lovelace" {
+        return true;
+    }
+    match unit.split_once('.') {
+        Some((_, name)) => name.starts_with("0014df10") || name.starts_with("001bc280"),
+        None => false,
+    }
+}
+
+/// A human ticker for a payment unit: "ada", or the label-stripped asset name
+/// when it decodes as ASCII ("USDM"), else the elided unit.
+fn unit_ticker(unit: &str) -> String {
+    if unit == "lovelace" {
+        return "ada".into();
+    }
+    let name = unit.split_once('.').map(|(_, n)| n).unwrap_or(unit);
+    let body = name.get(8..).unwrap_or("");
+    match hex::decode(body)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic()))
+    {
+        Some(t) => t,
+        None => format!("{}…", &unit[..unit.len().min(12)]),
+    }
+}
+
+/// The verdict across payment units: the MAXIMUM per-unit core share, with
+/// its unknown share, and a "via" breakdown when several units funded the
+/// wallet.
+///
+/// Max, not an average: units are incomparable without an invented exchange
+/// rate, and the anti-evasion reading is the honest one — a wallet loaded
+/// with core USDM is core-funded regardless of how clean its ADA history
+/// looks. The per-unit breakdown is printed so the max never hides its basis.
+fn headline(per_unit: &[(String, f64, f64)]) -> (f64, f64, Option<String>) {
+    let best = per_unit
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .cloned()
+        .unwrap_or(("ada".into(), 0.0, 0.0));
+    let via = (per_unit.len() > 1).then(|| {
+        per_unit
+            .iter()
+            .map(|(u, c, _)| format!("{u} {:.0}%", c * 100.0))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    });
+    (best.1, best.2, via)
 }
 
 const SLOTS_PER_DAY: u64 = 86_400;
@@ -157,12 +227,42 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
     for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
         coreness.insert(k?, 1.0);
     }
+    // The derived root, only when asked: the dominant mint-proceeds
+    // destination classify computed. A cold collection's first pass has
+    // nothing else to stand on — but a DERIVED root changes the figure's
+    // epistemic grade, so it is opt-in and loudly reported.
+    let dominant_meta: Option<String> = conn
+        .query_row(
+            "SELECT v FROM walk_meta WHERE k = 'mint_proceeds_dominant'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if args.derived_roots
+        && let Some(meta) = dominant_meta
+        && let Some((key, rest)) = meta.split_once(' ')
+        && !key.is_empty()
+    {
+        if coreness.contains_key(key) {
+            tracing::info!("provenance: derived root {key} already asserted — nothing added");
+        } else {
+            coreness.insert(key.to_string(), 1.0);
+            tracing::warn!(
+                key,
+                detail = rest,
+                "provenance: DERIVED root in use — the dominant mint-proceeds destination is \
+                 treated as core by arithmetic, not assertion. Figures below inherit that \
+                 basis; assert the wallet in the app to upgrade them."
+            );
+        }
+    }
     let roots = coreness.len();
     if roots == 0 {
         tracing::warn!(
             "provenance: NO core roots — no core/founder assertions in the sidecar and no \
              non-terminal seeds. Coreness cannot propagate from nothing; classify wallets in \
-             the app (or declare them in the registry) first."
+             the app (or declare them in the registry) first — or run with --derived-roots \
+             to stand on the dominant mint-proceeds destination."
         );
     }
 
@@ -262,6 +362,16 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
          WHERE party = ?1 AND delta > 0 AND slot >= ?2 AND slot <= ?3
          GROUP BY counterparty ORDER BY SUM(delta) DESC",
     )?;
+    // Token funding — mint payments arrive in USDM as well as ADA (the S2
+    // model), and a wallet loaded with core stablecoin is core-funded however
+    // clean its ADA history looks. Carrier rows are excluded by unit shape:
+    // only labelled fungibles participate (`is_payment_unit`).
+    let mut token_stmt = conn.prepare(
+        "SELECT unit, counterparty, SUM(quantity), MIN(tx_hash) FROM unit_flow
+         WHERE party = ?1 AND quantity > 0 AND unit <> 'lovelace'
+           AND slot >= ?2 AND slot <= ?3
+         GROUP BY unit, counterparty",
+    )?;
     let mut verdicts: Vec<HolderVerdict> = Vec::new();
     for (key, m) in &mints {
         if coreness.get(key).copied().unwrap_or(0.0) >= 1.0 {
@@ -275,8 +385,12 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
             }
         }
         let from_slot = m.first_slot.saturating_sub(window) as i64;
-        let mut sources: BTreeMap<String, i128> = BTreeMap::new();
-        let mut legs: Vec<(String, i128, String)> = Vec::new();
+
+        // Funding sources per payment unit: "ada" from the netted value
+        // events, each labelled fungible from its unit flows.
+        let mut by_unit: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
+        // `(ticker, source, raw quantity for sorting, display string, tx)`.
+        let mut raw_legs: Vec<(String, String, i128, String, String)> = Vec::new();
         let rows =
             fund_stmt.query_map(rusqlite::params![key, from_slot, m.last_slot as i64], |r| {
                 Ok((
@@ -287,19 +401,77 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
             })?;
         for row in rows {
             let (src, v, tx) = row?;
-            sources.insert(src.clone(), v);
-            legs.push((src, v, tx));
+            by_unit
+                .entry("ada".into())
+                .or_default()
+                .insert(src.clone(), v);
+            raw_legs.push((
+                "ada".into(),
+                src,
+                v,
+                chain_ledger::tokens::format_quantity("lovelace", v),
+                tx,
+            ));
         }
-        let (core_share, unknown_share) = weighted(&sources, &coreness);
+        let rows =
+            token_stmt.query_map(rusqlite::params![key, from_slot, m.last_slot as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as i128,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+        for row in rows {
+            let (unit, src, v, tx) = row?;
+            if !is_payment_unit(&unit) {
+                continue;
+            }
+            let ticker = unit_ticker(&unit);
+            *by_unit
+                .entry(ticker.clone())
+                .or_default()
+                .entry(src.clone())
+                .or_insert(0) += v;
+            // Rendered with the unit's own decimals where known — an
+            // unscaled stablecoin leg reads a million times too big, and
+            // this line is a FIGURE, not a hint.
+            let shown = chain_ledger::tokens::format_quantity(&unit, v);
+            raw_legs.push((ticker, src, v, shown, tx));
+        }
+
+        let per_unit: Vec<(String, f64, f64)> = by_unit
+            .iter()
+            .map(|(u, sources)| {
+                let (c, unk) = weighted(sources, &coreness);
+                (u.clone(), c, unk)
+            })
+            .collect();
+        let (core_share, unknown_share, via) = headline(&per_unit);
+
         // Keep only legs that carry actual coreness — the evidence trail.
-        legs.retain(|(src, _, _)| coreness.get(src).copied().unwrap_or(0.0) > 0.05);
-        legs.truncate(4);
+        raw_legs.retain(|(_, src, _, _, _)| coreness.get(src).copied().unwrap_or(0.0) > 0.05);
+        raw_legs.sort_by(|a, b| b.2.cmp(&a.2));
+        raw_legs.truncate(4);
+        let legs: Vec<(String, String)> = raw_legs
+            .into_iter()
+            .map(|(unit, src, _, shown, tx)| {
+                (
+                    format!(
+                        "{shown} {unit} from {src} (coreness {:.2})",
+                        coreness.get(&src).copied().unwrap_or(0.0)
+                    ),
+                    tx,
+                )
+            })
+            .collect();
         verdicts.push(HolderVerdict {
             key: key.clone(),
             assets: m.assets,
             mint_spend,
             core_share,
             unknown_share,
+            via,
             legs,
         });
     }
@@ -345,17 +517,12 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
             assets = h.assets,
             core_share = format!("{:.0}%", h.core_share * 100.0),
             unknown = format!("{:.0}%", h.unknown_share * 100.0),
+            via = h.via.as_deref().unwrap_or("ada"),
             spend = format!("{:.0} ada", h.mint_spend as f64 / 1e6),
             "provenance: core-funded holder"
         );
-        for (src, v, tx) in &h.legs {
-            tracing::info!(
-                "    ← {:.0} ada from {} (coreness {:.2}) e.g. tx {}",
-                *v as f64 / 1e6,
-                src,
-                coreness.get(src).copied().unwrap_or(0.0),
-                tx
-            );
+        for (label, tx) in &h.legs {
+            tracing::info!("    ← {label} e.g. tx {tx}");
         }
     }
     Ok(())
@@ -418,5 +585,51 @@ mod tests {
         let (core, unknown) = weighted(&m(&[("treasury", 600), ("", 400)]), &coreness);
         assert!((core - 0.6).abs() < 1e-9);
         assert!((unknown - 0.4).abs() < 1e-9);
+    }
+
+    /// Payment units: lovelace and labelled fungibles (USDM is 333). An NFT
+    /// riding through a wallet is custody, not funding.
+    #[test]
+    fn only_money_shaped_units_fund_a_mint() {
+        assert!(is_payment_unit("lovelace"));
+        // USDM: label 0014df10 + "USDM"
+        assert!(is_payment_unit(
+            "c48cbb3d5087d47e0193cb26b6cabbc655e3b06806f2543f9e56e10f.0014df105553444d"
+        ));
+        // an RFT (444)
+        assert!(is_payment_unit("aa.001bc28054657374"));
+        // a user NFT (222) and a plain-named NFT do NOT fund anyone
+        assert!(!is_payment_unit("aa.000de1404d4430303031"));
+        assert!(!is_payment_unit("aa.4d656b6b613031"));
+        assert_eq!(
+            unit_ticker(
+                "c48cbb3d5087d47e0193cb26b6cabbc655e3b06806f2543f9e56e10f.0014df105553444d"
+            ),
+            "USDM"
+        );
+        assert_eq!(unit_ticker("lovelace"), "ada");
+    }
+
+    /// The cross-unit verdict is the MAXIMUM per-unit core share — units are
+    /// incomparable without inventing a rate, and a wallet loaded with core
+    /// USDM is core-funded however clean its ADA history looks. The breakdown
+    /// rides along so the max never hides its basis.
+    #[test]
+    fn the_verdict_takes_the_most_incriminating_unit() {
+        let per_unit = vec![
+            ("ada".to_string(), 0.12, 0.05),
+            ("USDM".to_string(), 0.98, 0.0),
+        ];
+        let (core, unknown, via) = headline(&per_unit);
+        assert!((core - 0.98).abs() < 1e-9);
+        assert!(
+            unknown.abs() < 1e-9,
+            "unknown share follows the chosen unit"
+        );
+        assert_eq!(via.as_deref(), Some("ada 12% · USDM 98%"));
+        // One unit: no breakdown to print.
+        let (c, _, via) = headline(&[("ada".to_string(), 0.4, 0.1)]);
+        assert!((c - 0.4).abs() < 1e-9);
+        assert_eq!(via, None);
     }
 }

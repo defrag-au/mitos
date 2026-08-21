@@ -79,6 +79,18 @@ pub struct ClassifyArgs {
     /// both ways, which is why this bound is what stops the rule catching one.
     #[arg(long, default_value_t = 10)]
     pub service_max_fanin: u64,
+
+    /// Payment legs at or above which a stakeless one-way address is inferred
+    /// to be an OFF-RAMP (per-customer exchange deposit shape). Measured on a
+    /// real one: dwess's exit took 31 payments from exactly one wallet with
+    /// nothing ever back.
+    #[arg(long, default_value_t = 5)]
+    pub offramp_min_legs: u32,
+
+    /// Distinct payers above which the address is NOT a per-customer exit —
+    /// deposit addresses have one customer; a fee wallet has thousands.
+    #[arg(long, default_value_t = 2)]
+    pub offramp_max_payers: u32,
 }
 
 /// Map a registry category onto the kinds this ledger cares about.
@@ -138,6 +150,14 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
     // survived every re-run because the writes are additive.
     ledger.reset_counterparties()?;
 
+    // `fan_shape` probes unit_flow BY COUNTERPARTY per party; without this
+    // index that is a full scan per party — measured at ~1 HOUR for 448
+    // parties over a 2.6M-row table. `score` creates the same index, but
+    // classify runs first on a fresh ledger and must not depend on it.
+    ledger.connection().execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_uf_counterparty ON unit_flow(counterparty)",
+    )?;
+
     let candidates = ledger.counterparties_with_addresses()?;
     let total = candidates.len();
 
@@ -196,6 +216,30 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
          (customers_spared = stake keys seen on an order/listing script but \
          owning ordinary addresses too — people, not the venue)"
     );
+
+    // THE DOMINANT MINT-PROCEEDS DESTINATION — a derived fact with a stated
+    // rule, recorded in meta for the app, `emit-registry` and `provenance`.
+    //
+    // On S2 the mint-proceeds treasury took 99 of 100 fund-split legs (99.9%
+    // of split value); nothing in the ledger MARKED that dominance, so a cold
+    // reader had to rediscover it by query. The rule: majority of fund-split
+    // value across a non-trivial number of mints. The label "treasury" stays
+    // a human assertion — this records only the arithmetic.
+    match dominant_mint_destination(&ledger.mint_payment_totals()?) {
+        Some((key, share, mints)) => {
+            tracing::info!(
+                dest = %elide(&key),
+                share = format!("{:.1}%", share * 100.0),
+                mints,
+                "classify: dominant mint-proceeds destination (derived)"
+            );
+            ledger.meta_set(
+                "mint_proceeds_dominant",
+                &format!("{key} {share:.4} {mints}"),
+            )?;
+        }
+        None => ledger.meta_set("mint_proceeds_dominant", "")?,
+    }
 
     // INFERRED services, only when asked. Runs AFTER the registry write so the
     // exclusion in `busy_unnamed_counterparties` sees those rows — a registry
@@ -257,6 +301,46 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
             );
         }
 
+        // OFF-RAMPS from shape: a stakeless address that few wallets ever pay
+        // and that NEVER pays anything back is the per-customer exchange
+        // deposit pattern — a private door out of the chain. Derived, unnamed
+        // (which exchange is unknowable), and a BOUNDARY: money into it is
+        // gone, and its sole payer is the identification that matters.
+        let mut offramps = 0usize;
+        for (key, payers, legs, back, lovelace) in
+            ledger.stakeless_exit_shapes(args.offramp_min_legs)?
+        {
+            if payers == 0 || payers > args.offramp_max_payers || back > 0 {
+                continue;
+            }
+            // KEY-payment addresses only: a script taking one-way deposits is
+            // a CONTRACT (a lock, a vesting schedule), not somebody's
+            // exchange deposit address, and calling it an off-ramp would
+            // launder "we don't decode this contract" into "money left".
+            if payment_credential_is_script(&key) {
+                continue;
+            }
+            offramps += 1;
+            inferred.push(CounterpartyRow {
+                key,
+                name: None,
+                capabilities: vec![(ProviderCapability::Offramp, Basis::Derived)],
+                source: format!(
+                    "inferred offramp: {legs} payments from {payers} wallet(s), \
+                     {:.0} ada in, nothing ever back",
+                    lovelace as f64 / 1e6
+                ),
+            });
+        }
+        if offramps > 0 {
+            tracing::info!(
+                offramps,
+                min_legs = args.offramp_min_legs,
+                "classify: per-customer OFF-RAMPS inferred from shape — one-way stakeless \
+                 exits. Money into these has left the chain; the payer is the finding."
+            );
+        }
+
         let n = ledger.put_counterparty(&inferred)?;
         tracing::warn!(
             inferred = n,
@@ -297,6 +381,22 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
     Ok(())
 }
 
+/// The majority destination of the mint's own fund splits, if one exists:
+/// `(key, share_of_value, distinct_mints)`.
+///
+/// Majority of VALUE (not legs) across at least five mints — one big leg to a
+/// one-off wallet is a payment, not a treasury pattern. Returns `None` when
+/// nothing clears both bars, and the caller records that as absence.
+fn dominant_mint_destination(totals: &[(String, i128, u32)]) -> Option<(String, f64, u32)> {
+    let all: i128 = totals.iter().map(|(_, v, _)| *v).sum();
+    if all <= 0 {
+        return None;
+    }
+    let (key, v, mints) = totals.iter().max_by_key(|(_, v, _)| *v)?;
+    let share = *v as f64 / all as f64;
+    (share >= 0.5 && *mints >= 5).then(|| (key.clone(), share, *mints))
+}
+
 fn elide(s: &str) -> String {
     if s.chars().count() <= 24 {
         return s.to_string();
@@ -318,6 +418,39 @@ mod tests {
     use address_registry::lookup_address;
 
     use super::*;
+
+    /// The treasury pattern is MAJORITY OF VALUE across a real number of
+    /// mints — one big leg to a one-off wallet is a payment, and a platform's
+    /// per-mint fee legs never clear the value bar. Measured on S2: the
+    /// treasury took 99 of 100 legs (99.9% of value), Pillar's residual was
+    /// one 42 ₳ leg.
+    #[test]
+    fn the_dominant_mint_destination_needs_majority_value_and_recurrence() {
+        let rows = vec![
+            ("treasury".to_string(), 57_209_000_000_i128, 99_u32),
+            ("pillar".to_string(), 42_000_000, 1),
+        ];
+        let (key, share, mints) = dominant_mint_destination(&rows).expect("dominant");
+        assert_eq!(key, "treasury");
+        assert!(share > 0.99);
+        assert_eq!(mints, 99);
+
+        // Majority value in ONE mint: a payment, not a treasury.
+        let one_off = vec![
+            ("big-payee".to_string(), 900_000_000_000_i128, 1_u32),
+            ("rest".to_string(), 100_000_000_000, 40),
+        ];
+        assert_eq!(dominant_mint_destination(&one_off), None);
+
+        // No majority: nobody is dominant, and absence is recorded.
+        let split = vec![
+            ("a".to_string(), 400_i128, 20_u32),
+            ("b".to_string(), 350, 20),
+            ("c".to_string(), 250, 20),
+        ];
+        assert_eq!(dominant_mint_destination(&split), None);
+        assert_eq!(dominant_mint_destination(&[]), None);
+    }
 
     /// A wallet that placed a Splash order carries the order SCRIPT among its
     /// addresses — the registry hit identifies the script, not the person.
@@ -342,6 +475,41 @@ mod tests {
         assert!(hit_names_the_party(MatchKind::VariableStakePrefix, &addrs));
         // and a full-address registry entry vouches for its stake itself
         assert!(hit_names_the_party(MatchKind::Exact, &addrs));
+    }
+
+    /// The off-ramp verdict, on the measured shapes: dwess's real exit (one
+    /// payer, 31 legs, nothing back) qualifies; a fee wallet (thousands of
+    /// payers) and a rewards distributor (pays OUT) never do.
+    #[test]
+    fn an_offramp_needs_few_payers_and_strict_one_way() {
+        let qualifies = |addr: &str, payers: u32, legs: u32, back: u32| -> bool {
+            payers > 0
+                && payers <= 2
+                && back == 0
+                && legs >= 5
+                && !payment_credential_is_script(addr)
+        };
+        let person = "addr1v9hz2kw8csaqglxsu87m85c03pzzupefv0hxhjy6sfjt03gffa6dm";
+        assert!(qualifies(person, 1, 31, 0), "dwess's exit shape");
+        assert!(
+            !qualifies(person, 1, 31, 1),
+            "one payment back breaks one-way"
+        );
+        assert!(
+            !qualifies(person, 3000, 40, 0),
+            "a fee wallet has thousands of payers"
+        );
+        assert!(!qualifies(person, 1, 2, 0), "two payments is not a pattern");
+        assert!(
+            !qualifies(person, 0, 8, 0),
+            "no identified payer, no identification"
+        );
+        // A one-way SCRIPT is a contract (a lock, a vesting schedule), not
+        // somebody's exchange deposit address.
+        assert!(
+            !qualifies("addr1w8qmxkacjdffxah0l3qg8vesting", 1, 9, 0),
+            "scripts are contracts, not personal exits"
+        );
     }
 
     /// The Minswap batcher — the contract that settles swaps, and the single

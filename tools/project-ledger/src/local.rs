@@ -61,6 +61,8 @@ use anyhow::{Context, Result};
 use mitos_chain_walk::{decode_tx, open_blocks};
 use pallas_traverse::MultiEraBlock;
 
+use crate::alias::{ADA_HANDLE_POLICY, handle_name};
+use crate::party::resolve_str;
 use crate::store::{CachedOutput, Ledger};
 
 #[derive(clap::Args, Debug)]
@@ -88,6 +90,16 @@ pub struct LocalArgs {
     /// Write to the cache every N found transactions.
     #[arg(long, default_value_t = 2_000)]
     pub flush_every: u64,
+
+    /// Also harvest ADA Handle sightings for tracked wallets while scanning.
+    ///
+    /// The walk's own alias pass only sees handles that MOVE inside the walk
+    /// window; a wallet holding its handle since before the floor stays
+    /// anonymous. This scan reads every block anyway, so the sightings are
+    /// nearly free — blocks are pre-filtered with a byte search for the
+    /// handle policy before any transaction is decoded.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub harvest_handles: bool,
 }
 
 /// Scan the snapshot for wanted refs and cache what it finds.
@@ -134,10 +146,26 @@ pub fn resolve_local(args: &LocalArgs) -> Result<()> {
     let blocks = open_blocks(&immutable_dir, args.from_slot.map(|s| (s, Vec::new())))
         .context("opening the immutable DB for a local resolve")?;
 
+    // Tracked wallets for handle harvesting: watched parties from pass 1 plus
+    // every discovered holder — the set anyone would search for by name.
+    let tracked: std::collections::HashSet<String> = if args.harvest_handles {
+        ledger
+            .party_keys()?
+            .into_iter()
+            .chain(ledger.discovered_holders()?)
+            .collect()
+    } else {
+        Default::default()
+    };
+    let handle_finder = memchr::memmem::Finder::new(&ADA_HANDLE_POLICY);
+
     let mut scanned_blocks = 0u64;
     let mut found_txs = 0u64;
     let mut cached_rows = 0u64;
+    let mut handles_seen = 0u64;
+    let mut handle_rows = 0usize;
     let mut pending: Vec<(mitos_chain_walk::OutRef, CachedOutput)> = Vec::new();
+    let mut pending_handles: Vec<(String, String, u64)> = Vec::new();
     let mut last_slot = 0u64;
 
     for block in blocks {
@@ -151,6 +179,33 @@ pub fn resolve_local(args: &LocalArgs) -> Result<()> {
         {
             tracing::info!(to_slot = t, "resolve-local: reached --to-slot");
             break;
+        }
+
+        // Handle sightings: a raw byte search keeps the per-block cost near
+        // zero for the vast majority of blocks that carry no handles at all;
+        // only a match pays for output decoding.
+        if args.harvest_handles && handle_finder.find(&bytes).is_some() {
+            for tx in blk.txs() {
+                let d = decode_tx(&tx);
+                for o in &d.outputs {
+                    let mut named: Option<String> = None;
+                    for a in &o.assets {
+                        if a.policy.as_slice() != ADA_HANDLE_POLICY {
+                            continue;
+                        }
+                        let Some(h) = handle_name(&a.name) else {
+                            continue;
+                        };
+                        let key = named
+                            .get_or_insert_with(|| resolve_str(&o.address).party.key)
+                            .clone();
+                        if tracked.contains(&key) {
+                            handles_seen += 1;
+                            pending_handles.push((key, h, last_slot));
+                        }
+                    }
+                }
+            }
         }
 
         for tx in blk.txs() {
@@ -178,6 +233,8 @@ pub fn resolve_local(args: &LocalArgs) -> Result<()> {
             if found_txs.is_multiple_of(args.flush_every.max(1)) {
                 cached_rows += ledger.cache_put(&pending)? as u64;
                 pending.clear();
+                handle_rows += ledger.put_discovered_handles(&pending_handles)?;
+                pending_handles.clear();
                 let (w, g) = ledger.wanted_progress()?;
                 tracing::info!(
                     slot = last_slot,
@@ -199,6 +256,16 @@ pub fn resolve_local(args: &LocalArgs) -> Result<()> {
         }
     }
     cached_rows += ledger.cache_put(&pending)? as u64;
+    handle_rows += ledger.put_discovered_handles(&pending_handles)?;
+    if args.harvest_handles {
+        tracing::info!(
+            sightings = handles_seen,
+            new_rows = handle_rows,
+            tracked = tracked.len(),
+            "resolve-local: handle sightings harvested for tracked wallets — `seed` \
+             re-emits them as aliases on the next pass"
+        );
+    }
 
     let (wanted_n, have_n) = ledger.wanted_progress()?;
     let pct = if wanted_n == 0 {

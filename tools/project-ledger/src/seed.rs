@@ -80,7 +80,7 @@ pub struct SeedArgs {
 
 pub fn run(args: SeedArgs) -> Result<()> {
     let registry = Registry::load(&args.registry)?;
-    let ledger = Ledger::open(&args.db)?;
+    let mut ledger = Ledger::open(&args.db)?;
     if ledger.cursor()?.is_some() {
         bail!(
             "{} is already seeded/walked — `reset` first if you mean to start over",
@@ -154,8 +154,28 @@ pub fn run(args: SeedArgs) -> Result<()> {
         );
     }
 
+    // Handle sightings the genesis scan harvested — re-emitted as aliases,
+    // because `reset` cleared `party_alias` and the walk window alone cannot
+    // name a wallet whose handle never moves inside it.
+    let handles = ledger.discovered_handles()?;
+    if !handles.is_empty() {
+        let rows: Vec<crate::store::AliasRow> = handles
+            .into_iter()
+            .map(|(party, handle, slot)| crate::store::AliasRow {
+                party,
+                kind: chain_ledger::AliasKind::Handle,
+                value: handle,
+                slot,
+            })
+            .collect();
+        let n = ledger.insert_aliases(&rows)?;
+        tracing::info!(
+            aliases = n,
+            "seed: handle aliases re-emitted from the genesis scan's sightings"
+        );
+    }
+
     // --- persist ---------------------------------------------------------------
-    let mut ledger = ledger;
     let state = WalkState {
         frontier,
         buffer: Buffer::default(),
