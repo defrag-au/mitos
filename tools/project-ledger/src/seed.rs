@@ -137,6 +137,23 @@ pub fn run(args: SeedArgs) -> Result<()> {
         frontier.seed_terminal(stake_party(&t.stake), walk_start);
     }
 
+    // Holders a PREVIOUS walk discovered (the kept `discovered_holder` table)
+    // are seated FROM THE FLOOR. Discovered mid-walk they were seated too late
+    // to book their earlier transactions — and on a queued mint the payment
+    // precedes the fulfilment, so the purchase leg is precisely what the first
+    // pass missed. Watched-never-expanding, so this cannot recruit.
+    let holders = ledger.discovered_holders()?;
+    let holders_seated = holders.len();
+    for h in &holders {
+        frontier.seed_holder(stake_party(h), walk_start);
+    }
+    if holders_seated > 0 {
+        tracing::info!(
+            holders_seated,
+            "seed: collection holders from a previous walk seated from the floor"
+        );
+    }
+
     // --- persist ---------------------------------------------------------------
     let mut ledger = ledger;
     let state = WalkState {

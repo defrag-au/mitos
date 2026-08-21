@@ -98,6 +98,24 @@ pub struct WalkArgs {
     ///  64 = effectively unbounded (the original, explosive behaviour)
     #[arg(long, default_value_t = 1)]
     max_hops: u32,
+
+    /// Seat every wallet that RECEIVES a holder-facing asset of the policy as
+    /// a watched-but-never-expanding party (`Role::Holder`).
+    ///
+    /// The money frontier cannot reach these wallets: promotion follows
+    /// outbound VALUE edges, and on a queued mint the buyer never funds the
+    /// mint transaction — payment and fulfilment are separate txs. Without
+    /// this the collection's own customers are invisible and their purchase
+    /// legs unattributed. Bounded by the real holder base (they recruit
+    /// nobody), but on a large old collection it seats every historical
+    /// holder, which grows the walk — disable for a money-only pass.
+    ///
+    /// Discovery persists across `reset` (the `discovered_holder` table), so
+    /// the standard two-pass pipeline seats them FROM THE FLOOR on the second
+    /// walk and books the payment legs that PRECEDE each holder's first
+    /// receipt.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    watch_holders: bool,
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
@@ -196,6 +214,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             .meta_get(META_MINTED_HOLDINGS)?
             .map(|s| s.split(',').filter_map(|h| hex::decode(h).ok()).collect())
             .unwrap_or_default(),
+        watch_holders: args.watch_holders,
     };
 
     for block in blocks {
@@ -289,14 +308,32 @@ pub fn run(args: WalkArgs) -> Result<()> {
         do_checkpoint(&mut ledger, &state, &ctx, last_slot, hash)?;
     }
     let minted_n = ctx.minted.len() as u64;
+    // Per-class breakdown, so a CIP-68 collection's numbers read in the terms
+    // a person thinks in: "2,031 of 2,055" is really "1,015 of ~1,027 pairs",
+    // and half the raw count being reference tokens is the STANDARD, not a
+    // burn mystery. The floor test itself stays set-based over every asset
+    // name — the indexer counts names too, so that comparison is exact.
+    let mut by_class: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
+    for name in ctx.minted.iter() {
+        *by_class.entry(AssetClass::of(name).as_str()).or_insert(0) += 1;
+    }
+    let classes = by_class
+        .iter()
+        .map(|(k, v)| format!("{v} {k}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
     let basis = match expected_assets {
         Some(exp) if exp == minted_n => "observed",
         Some(exp) => {
             tracing::warn!(
                 expected = exp,
                 minted = minted_n,
+                classes,
                 "walk: FLOOR TEST FAILED — the walk did not see every asset the policy minted; \
-                 the floor is wrong or the walk stopped early"
+                 the floor is wrong, the walk stopped early, or the collection was STILL \
+                 MINTING at the snapshot tip (expected counts every asset name the indexer \
+                 knows, reference tokens included)"
             );
             "asserted"
         }
@@ -325,6 +362,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
         inserted,
         members = state.frontier.len(),
         minted = minted_n,
+        classes,
         supply = ctx.minted_holdings.len(),
         expected = ?expected_assets,
         floor_basis = basis,
@@ -495,6 +533,9 @@ pub struct TxCtx<'a> {
     /// and labelled fungibles). This is the collection's real supply — Mekka S1
     /// mints 10,001 policy assets but is a 5,000-NFT collection.
     pub minted_holdings: BTreeSet<Vec<u8>>,
+    /// Seat collection holders as watched-but-never-expanding parties
+    /// (`Role::Holder`). See `WalkArgs::watch_holders`.
+    pub watch_holders: bool,
 }
 
 /// Rows accumulated per block, flushed together.
@@ -506,6 +547,10 @@ pub struct Rows {
     pub deltas: Vec<TxDeltaRow>,
     pub values: Vec<ValueEventRow>,
     pub units: Vec<UnitFlowRow>,
+    /// `(stake key, first-seen slot)` of collection holders — persisted to the
+    /// KEPT `discovered_holder` table so the next pass can seat them from the
+    /// floor.
+    pub holders: Vec<(String, u64)>,
 }
 
 impl Rows {
@@ -515,13 +560,15 @@ impl Rows {
             + ledger.insert_aliases(&self.aliases)?
             + ledger.insert_tx_deltas(&self.deltas)?
             + ledger.insert_value_events(&self.values)?
-            + ledger.insert_unit_flows(&self.units)?;
+            + ledger.insert_unit_flows(&self.units)?
+            + ledger.put_discovered_holders(&self.holders)?;
         self.assets.clear();
         self.mint_payments.clear();
         self.aliases.clear();
         self.deltas.clear();
         self.values.clear();
         self.units.clear();
+        self.holders.clear();
         Ok(n)
     }
 }
@@ -543,6 +590,26 @@ struct Out<'a> {
     /// the `lovelace` flow row so a reader can tell carrier ADA from payment —
     /// see `DecodedOutput::min_utxo`.
     min_utxo: u64,
+}
+
+/// Seat the receiver of a holder-facing collection asset as a HOLDER —
+/// watched, never expanding — and record the discovery in the kept table.
+///
+/// Stake-keyed receivers only. A stakeless receiver is an off-ramp shape (and
+/// often a script); a marketplace escrow with the seller's staking credential
+/// resolves to the seller's stake key, which is the right wallet to watch
+/// anyway. Reference tokens and labelled fungibles never seat anyone.
+fn seat_holder(name: &[u8], o: &Out<'_>, state: &mut WalkState, ctx: &TxCtx<'_>, rows: &mut Rows) {
+    if !ctx.watch_holders
+        || !AssetClass::of(name).is_holding()
+        || !o.resolved.party.has_stake_credential
+    {
+        return;
+    }
+    state
+        .frontier
+        .seed_holder(o.resolved.party.clone(), ctx.slot);
+    rows.holders.push((o.resolved.party.key.clone(), ctx.slot));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -671,6 +738,7 @@ pub fn process_tx(
                         .map(|(_, q)| *q)
                         .unwrap_or(0);
                     state.holders.set(name, &o.resolved.party.key, ctx.slot);
+                    seat_holder(name, o, state, ctx, rows);
                     rows.assets.push(AssetEventRow {
                         tx_hash: tx_hex.clone(),
                         policy_id: ctx.policy_hex.clone(),
@@ -792,8 +860,9 @@ pub fn process_tx(
             if minted_now.contains(name) {
                 continue;
             }
-            let to = &o.resolved.party.key;
-            let prev = state.holders.set(name, to, ctx.slot);
+            let to = o.resolved.party.key.clone();
+            let prev = state.holders.set(name, &to, ctx.slot);
+            seat_holder(name, o, state, ctx, rows);
             if prev.as_deref() == Some(to.as_str()) {
                 continue; // self-transfer / consolidation
             }
@@ -1221,6 +1290,7 @@ mod tests {
             last_mint_slot: None,
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
+            watch_holders: true,
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -1296,6 +1366,7 @@ mod tests {
             last_mint_slot: None,
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
+            watch_holders: true,
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -1411,6 +1482,7 @@ mod tests {
             last_mint_slot: None,
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
+            watch_holders: true,
         };
         let mut rows = Rows::default();
         book_unit_flows(outs, inputs, state, &ctx, "txhash", unresolved, &mut rows);
@@ -1438,10 +1510,76 @@ mod tests {
             last_mint_slot: None,
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
+            watch_holders: true,
         };
         let mut rows = Rows::default();
         book_unit_flows(outs, inputs, &state, &ctx, "txhash", 0, &mut rows);
         rows.units
+    }
+
+    /// The queued-mint gap: on tx `ff4d4914…` the buyer received 10 S2 NFTs
+    /// without funding the mint tx at all (payment was an earlier tx), so no
+    /// money edge could ever seat them. Receiving a HOLDER-FACING asset now
+    /// seats the wallet — watched, never expanding — while reference-token
+    /// plumbing seats nobody and an expanding member is never downgraded.
+    #[test]
+    fn receiving_a_user_token_seats_a_holder_but_a_reference_seats_nobody() {
+        let mut state = seeded(&["treasury"]);
+        let mut signer_creds = BTreeSet::new();
+        let mut minted = BTreeSet::new();
+        let ctx = TxCtx {
+            policy: [0xAB; 28],
+            policy_hex: hex::encode([0xAB; 28]),
+            slot: 7,
+            time: 1_700_000_000,
+            signer_creds: &mut signer_creds,
+            minted: &mut minted,
+            ceiling: None,
+            royalty: None,
+            royalty_rate: None,
+            last_mint_slot: None,
+            max_hops: 0,
+            minted_holdings: BTreeSet::new(),
+            watch_holders: true,
+        };
+        let mut rows = Rows::default();
+        let user_token = hex::decode("000de1404d4430303031").unwrap();
+        let reference = hex::decode("000643b04d4430303031").unwrap();
+
+        // The buyer receives the user token: seated, watched, recruits nobody.
+        seat_holder(
+            &user_token,
+            &out(0, "buyer", 1_500_000, vec![]),
+            &mut state,
+            &ctx,
+            &mut rows,
+        );
+        let m = state.frontier.member(&party("buyer")).expect("seated");
+        assert_eq!(m.role, Role::Holder);
+        assert!(!state.frontier.expands(&party("buyer")));
+        assert_eq!(rows.holders, vec![("buyer".to_string(), 7)]);
+
+        // The metadata script receives the reference token: nobody is seated.
+        seat_holder(
+            &reference,
+            &out(1, "meta-script", 1_310_240, vec![]),
+            &mut state,
+            &ctx,
+            &mut rows,
+        );
+        assert!(!state.frontier.is_member(&party("meta-script")));
+
+        // The treasury buying its own asset stays Declared and expanding.
+        seat_holder(
+            &user_token,
+            &out(2, "treasury", 1_500_000, vec![]),
+            &mut state,
+            &ctx,
+            &mut rows,
+        );
+        let t = state.frontier.member(&party("treasury")).unwrap();
+        assert_eq!(t.role, Role::Declared);
+        assert!(state.frontier.expands(&party("treasury")));
     }
 
     const USDM: [u8; 4] = [0xc4, 0x8c, 0xbb, 0x3d];

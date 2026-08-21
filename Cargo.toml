@@ -107,22 +107,22 @@ pallas-network = "1.1.1"
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
 # Pinned to a specific shared-crates rev for reproducibility; bump
 # deliberately when shared-crates lands changes mitos needs.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "96d24873eed90a84eb62447c31d711eabec62240", features = ["cip14", "cip25"] }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "1fcdd854994168c88e0bd97b04120a131cb96385", features = ["cip14", "cip25"] }
 
 # Known script/contract addresses — DEX pools and batchers, marketplaces,
 # aggregators. Re-added 2026-08-20 for `project-ledger classify`: without it a
 # swap's return leg reads as project income, and on Mekka that was 74,626 ₳ of
 # a supposed 132,590 ₳ "unexplained" inbound. Same rev as every other
 # shared-crate here — a second rev would resolve a second copy of the crate.
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "96d24873eed90a84eb62447c31d711eabec62240" }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "1fcdd854994168c88e0bd97b04120a131cb96385" }
 # Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
 # by the protocol-event taxonomy in `mitos-core::protocol`. Same
 # shape the existing classifier emits, so mitos events deserialize
 # identically on the CF side.
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "96d24873eed90a84eb62447c31d711eabec62240" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "1fcdd854994168c88e0bd97b04120a131cb96385" }
 # Pure, I/O-free wallet-flow model (`TxView`/`net_deltas`/`movements`) + the
 # project-walk `frontier` state machine. Consumed by `tools/project-ledger`.
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "96d24873eed90a84eb62447c31d711eabec62240" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "1fcdd854994168c88e0bd97b04120a131cb96385" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -199,9 +199,9 @@ strip = "symbols"
 # Both states are verified to build: ACTIVE (local paths) and COMMENTED (the
 # pinned git revs). Keep it that way — the commented state is what CI sees.
 [patch."https://github.com/defrag-au/shared-crates"]
-cardano-assets = { path = "../shared-crates/cardano-assets" }
-pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
-chain-ledger = { path = "../shared-crates/chain-ledger" }
+# cardano-assets = { path = "../shared-crates/cardano-assets" }
+# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+# chain-ledger = { path = "../shared-crates/chain-ledger" }
 # address-registry re-added 2026-08-21: project-ledger's classify consumes it
 # again (workspace.dependencies entry above), so it belongs in the block.
-address-registry = { path = "../shared-crates/address-registry" }
+# address-registry = { path = "../shared-crates/address-registry" }

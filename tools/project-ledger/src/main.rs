@@ -21,6 +21,7 @@ mod koios;
 mod local;
 mod mint;
 mod party;
+mod provenance;
 mod registry;
 mod resolve;
 mod score;
@@ -82,6 +83,16 @@ enum Command {
     /// the ledger + the app's annotations sidecar — human classifications are
     /// the primary signal, and they never leave the operator's machine.
     Score(score::ScoreArgs),
+    /// Measure the EFFECTIVE team-funded mint supply: direct core mints plus
+    /// mints by wallets whose funding traces to the core cluster through up
+    /// to two intermediaries.
+    ///
+    /// The dark-wallet detector: compare the output against the project's
+    /// ADVERTISED allocation — the chain cannot know what was promised, but it
+    /// knows who paid for every mint. Every flagged holder prints its funding
+    /// legs with tx hashes. Needs a `--watch-holders` walk; runs locally with
+    /// the annotations sidecar, like `score`.
+    Provenance(provenance::ProvenanceArgs),
     /// Export core/founder assertions from the app's annotations sidecar as
     /// `[[wallet]]` registry fragments.
     ///
@@ -138,6 +149,7 @@ fn main() -> Result<()> {
         Command::Classify(args) => classify::run(&args),
         Command::Score(args) => score::run(&args),
         Command::EmitRegistry(args) => score::emit_registry(&args),
+        Command::Provenance(args) => provenance::run(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }

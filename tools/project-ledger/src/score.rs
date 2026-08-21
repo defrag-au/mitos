@@ -321,7 +321,7 @@ pub fn emit_registry(args: &EmitRegistryArgs) -> Result<()> {
 }
 
 /// `key → (class, confidence)` from the app's annotations sidecar.
-fn load_assertions(
+pub(crate) fn load_assertions(
     annotations: Option<&std::path::Path>,
     db: &std::path::Path,
 ) -> Result<BTreeMap<String, (String, Confidence)>> {
@@ -615,9 +615,14 @@ fn signal_counter_payment(
     weights: &Weights,
     tx_sig: &mut HashMap<String, Fired>,
 ) -> Result<(CounterMatches, CounterPayers)> {
+    // HOLDER-FACING assets only. A CIP-68 metadata update spends and recreates
+    // the label-100 reference token at its script — recorded as a transfer,
+    // but it is plumbing, not a person trading, and matching counter-payments
+    // against it would suppress interest on pure infrastructure churn.
     let mut transfers = conn.prepare(
         "SELECT tx_hash, from_party, to_party, block_time FROM asset_event
-         WHERE kind = 'transfer' AND from_party IS NOT NULL AND to_party IS NOT NULL",
+         WHERE kind = 'transfer' AND from_party IS NOT NULL AND to_party IS NOT NULL
+           AND asset_class IN ('nft', 'plain')",
     )?;
     // Value flowing receiver → sender, in either recording orientation
     // (whichever side the walk watched), in a DIFFERENT transaction. TWO
@@ -696,10 +701,14 @@ fn signal_asset_grants(
     tx_sig: &mut HashMap<String, Fired>,
     party_sig: &mut HashMap<String, Fired>,
 ) -> Result<BTreeMap<String, u32>> {
+    // Holder-facing only — a reference-token movement is a metadata update,
+    // and "the CIP-68 script received 1,015 assets without payment" is not a
+    // grant, it is how the standard works.
     let mut transfers = conn.prepare(
         "SELECT e.tx_hash, e.from_party, e.to_party, COUNT(*)
          FROM asset_event e
          WHERE e.kind = 'transfer' AND e.from_party IS NOT NULL AND e.to_party IS NOT NULL
+           AND e.asset_class IN ('nft', 'plain')
            AND EXISTS (SELECT 1 FROM party p WHERE p.key = e.from_party)
          GROUP BY e.tx_hash, e.from_party, e.to_party",
     )?;
@@ -1225,8 +1234,13 @@ fn propose(
     // Buyers: minted-to (the mint is atomic — they funded it), venue buyers,
     // and counter-payment payers.
     let mut bought: BTreeSet<String> = buyers_by_cp.clone();
+    // Holder-facing only: reference tokens are minted TO the CIP-68 metadata
+    // script, and without this filter that script proposes as a "customer" —
+    // the walk's biggest phantom holder becoming the tool's silliest claim.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT to_party FROM asset_event WHERE kind = 'mint' AND to_party IS NOT NULL",
+        "SELECT DISTINCT to_party FROM asset_event
+         WHERE kind = 'mint' AND to_party IS NOT NULL
+           AND asset_class IN ('nft', 'plain')",
     )?;
     for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
         bought.insert(k?);

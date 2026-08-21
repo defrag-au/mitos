@@ -357,6 +357,19 @@ CREATE TABLE IF NOT EXISTS wanted_outref (
     first_slot    INTEGER NOT NULL,   -- slot of the tx that wanted it
     PRIMARY KEY (tx_hash, output_index)
 );
+
+-- Stake keys seen RECEIVING a holder-facing asset of the tracked policy — the
+-- collection's holders, discovered by walking.
+--
+-- KEPT through reset, like the resolution layer, and for the same reason: it
+-- is what the next walk is for. A holder discovered mid-walk was seated too
+-- late to book their earlier transactions — on a queued mint the PAYMENT
+-- precedes the fulfilment, so the purchase leg is exactly what a first pass
+-- misses. The re-walk seeds these from the floor and books it.
+CREATE TABLE IF NOT EXISTS discovered_holder (
+    key         TEXT    NOT NULL PRIMARY KEY,
+    first_slot  INTEGER NOT NULL    -- slot of the first receipt seen
+);
 ";
 
 /// Bring an EXISTING ledger's schema up to date.
@@ -469,9 +482,10 @@ pub const RESET_DERIVED_TABLES: [&str; 23] = [
     "asset_holder",
 ];
 
-/// Tables a `reset` KEEPS: the input-resolution layer, which is bought with a
-/// snapshot scan rather than derived, and which the next walk is there to use.
-pub const RESET_KEPT_TABLES: [&str; 2] = ["outref_cache", "wanted_outref"];
+/// Tables a `reset` KEEPS: the input-resolution layer and the discovered
+/// holder set — both bought by walking rather than derived, and both what the
+/// NEXT walk is there to use.
+pub const RESET_KEPT_TABLES: [&str; 3] = ["outref_cache", "wanted_outref", "discovered_holder"];
 
 /// A row of `asset_event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1115,6 +1129,40 @@ impl Ledger {
         Ok(n)
     }
 
+    // --- discovered holders ---------------------------------------------------
+
+    /// Record holders seen receiving the collection's holder-facing assets.
+    /// `INSERT OR IGNORE` keeps the FIRST sighting's slot — coverage widens,
+    /// never narrows.
+    pub fn put_discovered_holders(&mut self, rows: &[(String, u64)]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO discovered_holder (key, first_slot) VALUES (?,?)",
+            )?;
+            for (key, slot) in rows {
+                n += stmt.execute(params![key, u64_i64(*slot)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Every holder a previous walk discovered — `seed` seats these from the
+    /// floor so the re-walk books their PRE-purchase legs too.
+    pub fn discovered_holders(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM discovered_holder ORDER BY key")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading discovered holders")
+    }
+
     // --- the wanted list ------------------------------------------------------
 
     /// Note refs a walk needed and could not resolve.
@@ -1426,6 +1474,7 @@ pub fn role_str(r: chain_ledger::Role) -> &'static str {
         chain_ledger::Role::Royalty => "royalty",
         chain_ledger::Role::Promoted => "promoted",
         chain_ledger::Role::MintPayee => "mint_payee",
+        chain_ledger::Role::Holder => "holder",
     }
 }
 
