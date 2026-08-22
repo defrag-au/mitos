@@ -451,7 +451,7 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
 
         // Keep only legs that carry actual coreness — the evidence trail.
         raw_legs.retain(|(_, src, _, _, _)| coreness.get(src).copied().unwrap_or(0.0) > 0.05);
-        raw_legs.sort_by(|a, b| b.2.cmp(&a.2));
+        raw_legs.sort_by_key(|l| std::cmp::Reverse(l.2));
         raw_legs.truncate(4);
         let legs: Vec<(String, String)> = raw_legs
             .into_iter()

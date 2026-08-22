@@ -22,7 +22,7 @@ use crate::activity::Activity;
 use crate::koios::Koios;
 use crate::party::stake_party;
 use crate::registry::Registry;
-use crate::state::{Buffer, Holders, WalkState};
+use crate::state::{Buffer, Holders, Relays, WalkState};
 use crate::store::Ledger;
 
 pub const META_POLICY: &str = "policy_id";
@@ -181,6 +181,7 @@ pub fn run(args: SeedArgs) -> Result<()> {
         buffer: Buffer::default(),
         activity: Activity::default(),
         holders: Holders::default(),
+        relays: Relays::default(),
     };
     // Cursor at the walk start with an EMPTY hash = "not started": the walk
     // streams from genesis and fast-skips to this slot.

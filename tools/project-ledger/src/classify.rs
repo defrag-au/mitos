@@ -91,6 +91,16 @@ pub struct ClassifyArgs {
     /// deposit addresses have one customer; a fee wallet has thousands.
     #[arg(long, default_value_t = 2)]
     pub offramp_max_payers: u32,
+
+    /// Distinct single-use relays landing on one address before it is inferred
+    /// to be a CUSTODIAL SWEEP TARGET.
+    ///
+    /// Two is deliberate, not timid. A throwaway address forwarding to a
+    /// wallet proves nothing on its own — that is just a payment. TWO
+    /// independent throwaways choosing the same destination is the sweep, and
+    /// on the Mekka compounding wallet four did.
+    #[arg(long, default_value_t = 2)]
+    pub sweep_min_relays: u32,
 }
 
 /// Map a registry category onto the kinds this ledger cares about.
@@ -306,11 +316,22 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
         // deposit pattern — a private door out of the chain. Derived, unnamed
         // (which exchange is unknowable), and a BOUNDARY: money into it is
         // gone, and its sole payer is the identification that matters.
+        // A CONFIRMED pass-through is not an exit. The walk watched these
+        // addresses spend, so we know the money kept going — calling them
+        // off-ramps would assert "left the chain here" about the one case
+        // where we can prove otherwise, and would bury the destination.
+        let relays = ledger.relay_addresses()?;
+
         let mut offramps = 0usize;
+        let mut demoted = 0usize;
         for (key, payers, legs, back, lovelace) in
             ledger.stakeless_exit_shapes(args.offramp_min_legs)?
         {
             if payers == 0 || payers > args.offramp_max_payers || back > 0 {
+                continue;
+            }
+            if relays.contains(&key) {
+                demoted += 1;
                 continue;
             }
             // KEY-payment addresses only: a script taking one-way deposits is
@@ -338,6 +359,52 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
                 min_legs = args.offramp_min_legs,
                 "classify: per-customer OFF-RAMPS inferred from shape — one-way stakeless \
                  exits. Money into these has left the chain; the payer is the finding."
+            );
+        }
+        if demoted > 0 {
+            tracing::info!(
+                demoted,
+                "classify: bare addresses that LOOK like off-ramps but were watched \
+                 sweeping onward — recorded as relays, not exits. Their destination is in \
+                 `relay_hop`."
+            );
+        }
+
+        // SWEEP TARGETS — where the relays actually delivered.
+        //
+        // Several single-use addresses feeding one wallet is the custodial
+        // deposit pattern seen from the outside: the exchange issues a fresh
+        // address per deposit and sweeps them into a hot wallet. This is the
+        // hop the trail used to lose, so it is the one worth naming.
+        //
+        // DERIVED and UNNAMED, for the same reason as the CEX rule: the shape
+        // says "a custodial service", never which one.
+        let mut targets = 0usize;
+        for (key, relay_count, from_parties, lovelace) in
+            ledger.relay_sweep_targets(args.sweep_min_relays)?
+        {
+            targets += 1;
+            inferred.push(CounterpartyRow {
+                key,
+                name: None,
+                capabilities: vec![
+                    (ProviderCapability::Cex, Basis::Derived),
+                    (ProviderCapability::Offramp, Basis::Derived),
+                ],
+                source: format!(
+                    "inferred sweep target: {relay_count} single-use relays from \
+                     {from_parties} watched wallet(s), {:.0} ada",
+                    lovelace as f64 / 1e6
+                ),
+            });
+        }
+        if targets > 0 {
+            tracing::warn!(
+                targets,
+                min_relays = args.sweep_min_relays,
+                "classify: CUSTODIAL SWEEP TARGETS found — money the watch set sent to \
+                 throwaway addresses was collected here. This is the chain exit the \
+                 single-use addresses were hiding."
             );
         }
 

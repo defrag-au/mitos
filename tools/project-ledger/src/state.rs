@@ -139,10 +139,79 @@ impl Holders {
     }
 }
 
+/// A payment from a watched party to a stakeless address that is not itself
+/// watched — a candidate RELAY, pending the sweep that would confirm it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCandidate {
+    /// The bare address that received.
+    pub address: String,
+    /// The watched party that funded it.
+    pub from_party: String,
+    pub lovelace: u64,
+    pub tx: String,
+    pub slot: u64,
+}
+
+/// Outputs sitting at stakeless non-member addresses, waiting to see whether
+/// they are swept onward.
+///
+/// ## Why this is not just the [`Buffer`]
+///
+/// The buffer holds the *watch set's* UTxOs, and its entries are permanent
+/// until spent. These are outputs at addresses we do NOT watch and have no
+/// intention of watching: we hold them only long enough to learn where the
+/// money went next, then drop them. An entry that is never swept within the
+/// window is evicted, because an address that simply *keeps* what it was sent
+/// is a destination, not a relay, and there is nothing to follow.
+///
+/// The eviction bound is what stops this becoming a second frontier. A relay
+/// is followed exactly one hop and never becomes a member, so this adds depth
+/// to the trail without adding breadth to the watch set — see the frontier
+/// explosion note in `walk.rs`.
+#[derive(Debug, Default, Clone)]
+pub struct Relays {
+    map: HashMap<OutRef, RelayCandidate>,
+}
+
+#[allow(dead_code)]
+impl Relays {
+    pub fn insert(&mut self, oref: OutRef, c: RelayCandidate) {
+        self.map.insert(oref, c);
+    }
+
+    pub fn take(&mut self, oref: &OutRef) -> Option<RelayCandidate> {
+        self.map.remove(oref)
+    }
+
+    pub fn contains(&self, oref: &OutRef) -> bool {
+        self.map.contains_key(oref)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Drop candidates older than `window` slots. An unswept output is a
+    /// holding, not a relay.
+    pub fn evict_before(&mut self, slot: u64, window: u64) {
+        let floor = slot.saturating_sub(window);
+        self.map.retain(|_, c| c.slot >= floor);
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&OutRef, &RelayCandidate)> {
+        self.map.iter()
+    }
+}
+
 /// Everything a checkpoint persists besides the rows and the cursor.
 pub struct WalkState {
     pub frontier: Frontier,
     pub buffer: Buffer,
     pub activity: Activity,
     pub holders: Holders,
+    pub relays: Relays,
 }

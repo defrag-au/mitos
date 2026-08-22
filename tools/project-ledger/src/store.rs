@@ -19,7 +19,7 @@ use pallas_primitives::Hash;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::activity::Activity;
-use crate::state::{Buffer, BufferedOutput, Holders, WalkState};
+use crate::state::{Buffer, BufferedOutput, Holders, Relays, WalkState};
 
 pub const SCHEMA: &str = "
 -- What the walk is, where it started, and what it was proven against.
@@ -385,6 +385,35 @@ CREATE TABLE IF NOT EXISTS discovered_holder (
     key         TEXT    NOT NULL PRIMARY KEY,
     first_slot  INTEGER NOT NULL    -- slot of the first receipt seen
 );
+
+-- A watched party paid a bare address that swept the money onward within
+-- minutes. The trail would otherwise STOP at that address.
+--
+-- This is the single-use exchange deposit pattern: a fresh stakeless address
+-- with exactly one receipt and one spend. Left unfollowed it reads as an
+-- off-ramp (`classify` infers exactly that from the one-way shape), which
+-- says 'money left the chain here' and quietly discards the one fact that
+-- matters -- WHERE it went. Following one hop turns four anonymous exits into
+-- four deposits at one identifiable service.
+--
+-- One hop only, and the relay is NEVER promoted: this adds depth to the trail
+-- without adding breadth to the watch set. `to_addr` is recorded, not
+-- watched -- a sweep target is typically a custodial hot wallet, and seating
+-- one would recruit thousands of unrelated wallets.
+CREATE TABLE IF NOT EXISTS relay_hop (
+    relay_addr  TEXT    NOT NULL,   -- the single-use address in the middle
+    from_party  TEXT    NOT NULL,   -- watched party that funded it
+    to_addr     TEXT    NOT NULL,   -- where the sweep actually landed
+    unit        TEXT    NOT NULL,
+    quantity    INTEGER NOT NULL,   -- as swept onward, not as received
+    in_tx       TEXT    NOT NULL,
+    out_tx      TEXT    NOT NULL,
+    in_slot     INTEGER NOT NULL,
+    out_slot    INTEGER NOT NULL,   -- out_slot - in_slot is the dwell time
+    PRIMARY KEY (relay_addr, unit, out_tx)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_from ON relay_hop(from_party);
+CREATE INDEX IF NOT EXISTS idx_relay_to   ON relay_hop(to_addr);
 ";
 
 /// Bring an EXISTING ledger's schema up to date.
@@ -471,7 +500,11 @@ pub struct SecondarySaleRow {
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
-pub const RESET_DERIVED_TABLES: [&str; 23] = [
+pub const RESET_DERIVED_TABLES: [&str; 24] = [
+    // Derived, not kept: a relay hop is reconstructed by the next walk from
+    // the same blocks. Keeping it would let a pass-through inferred under an
+    // old window survive a re-walk that would no longer draw it.
+    "relay_hop",
     "counterparty_kind",
     "counterparty_capability",
     "tx_signal",
@@ -543,6 +576,25 @@ pub struct ValueEventRow {
     pub slot: u64,
     pub block_time: u64,
     pub unresolved_inputs: u32,
+}
+
+/// `(address, distinct payers, legs out, legs back, lovelace in)` — the raw
+/// measurement behind the off-ramp verdict. See [`Ledger::stakeless_exit_shapes`].
+pub type ExitShape = (String, u32, u32, u32, i128);
+
+/// One confirmed pass-through: a watched party's money, seen leaving the bare
+/// address it was sent to. See the `relay_hop` table comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayHopRow {
+    pub relay_addr: String,
+    pub from_party: String,
+    pub to_addr: String,
+    pub unit: String,
+    pub quantity: i64,
+    pub in_tx: String,
+    pub out_tx: String,
+    pub in_slot: u64,
+    pub out_slot: u64,
 }
 
 /// A row of `unit_flow` — one output's worth of one unit, moving.
@@ -742,6 +794,37 @@ impl Ledger {
                     r.lovelace,
                     u64_i64(r.slot),
                     u64_i64(r.block_time),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    pub fn insert_relay_hops(&mut self, rows: &[RelayHopRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO relay_hop
+                 (relay_addr, from_party, to_addr, unit, quantity,
+                  in_tx, out_tx, in_slot, out_slot)
+                 VALUES (?,?,?,?,?,?,?,?,?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.relay_addr,
+                    r.from_party,
+                    r.to_addr,
+                    r.unit,
+                    r.quantity,
+                    r.in_tx,
+                    r.out_tx,
+                    u64_i64(r.in_slot),
+                    u64_i64(r.out_slot),
                 ])?;
             }
         }
@@ -1124,10 +1207,7 @@ impl Ledger {
     /// rows only — for an unwatched address that is exactly "no watched
     /// wallet ever received from it", which is the strongest claim an
     /// offline ledger can make.
-    pub fn stakeless_exit_shapes(
-        &self,
-        min_legs: u32,
-    ) -> Result<Vec<(String, u32, u32, u32, i128)>> {
+    pub fn stakeless_exit_shapes(&self, min_legs: u32) -> Result<Vec<ExitShape>> {
         let mut stmt = self.conn.prepare(
             "SELECT counterparty,
                     COUNT(DISTINCT CASE WHEN quantity < 0 THEN party END),
@@ -1150,6 +1230,48 @@ impl Ledger {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("reading stakeless exit shapes")
+    }
+
+    /// Addresses confirmed to be pass-throughs by the walk — the middle of a
+    /// `relay_hop`. These must never be read as destinations.
+    pub fn relay_addresses(&self) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT relay_addr FROM relay_hop")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()
+            .context("reading relay addresses")
+    }
+
+    /// Where the relays swept TO, ranked by how many distinct single-use
+    /// addresses fed each one.
+    ///
+    /// One address collecting from many fresh deposit addresses is the
+    /// custodial sweep pattern — it is the exchange, and the relays were its
+    /// per-customer doors. Two separate relays landing on the same wallet is
+    /// already more than coincidence; the threshold is the caller's.
+    pub fn relay_sweep_targets(&self, min_relays: u32) -> Result<Vec<(String, u32, u32, i128)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT to_addr,
+                    COUNT(DISTINCT relay_addr),
+                    COUNT(DISTINCT from_party),
+                    SUM(quantity)
+             FROM relay_hop
+             WHERE unit = 'lovelace'
+             GROUP BY to_addr
+             HAVING COUNT(DISTINCT relay_addr) >= ?1
+             ORDER BY SUM(quantity) DESC",
+        )?;
+        let rows = stmt.query_map([min_relays], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u32,
+                r.get::<_, i64>(2)? as u32,
+                i128::from(r.get::<_, i64>(3)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading relay sweep targets")
     }
 
     /// Counterparties carrying real value that `classify` could NOT name,
@@ -1570,11 +1692,16 @@ impl Ledger {
             }
         }
 
+        // Relay candidates are deliberately NOT checkpointed: an unswept
+        // candidate expires within the window anyway, so a resume that starts
+        // with none loses at most the relays straddling the checkpoint, and
+        // persisting them would let a stale pass-through survive a re-walk.
         Ok(Some(WalkState {
             frontier,
             buffer,
             activity,
             holders,
+            relays: Relays::default(),
         }))
     }
 }
@@ -1642,6 +1769,7 @@ mod tests {
             buffer,
             activity,
             holders,
+            relays: Relays::default(),
         }
     }
 
@@ -1665,6 +1793,64 @@ mod tests {
         assert_eq!(l.count("party").unwrap(), 1);
         l.label_party("stake1treasury", "S1 treasury", "registry")
             .unwrap();
+    }
+
+    /// The Mekka compounding shape, in miniature: four throwaway addresses,
+    /// one destination. One relay alone must NOT raise a sweep target — that
+    /// is just a payment — but the set of them must.
+    #[test]
+    fn relays_landing_on_one_wallet_surface_it_as_a_sweep_target() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let hop = |relay: &str, to: &str, q: i64| RelayHopRow {
+            relay_addr: relay.into(),
+            from_party: "stake1compounding".into(),
+            to_addr: to.into(),
+            unit: "lovelace".into(),
+            quantity: q,
+            in_tx: format!("in{relay}"),
+            out_tx: format!("out{relay}"),
+            in_slot: 100,
+            out_slot: 200,
+        };
+        l.insert_relay_hops(&[
+            hop("addr1vr1", "addr1vswap", 7_500_000_000),
+            hop("addr1vr2", "addr1vswap", 4_000_000_000),
+            hop("addr1vr3", "addr1vswap", 1_800_000_000),
+            hop("addr1vr4", "addr1vlonely", 800_000_000),
+        ])
+        .unwrap();
+
+        let targets = l.relay_sweep_targets(2).unwrap();
+        assert_eq!(targets.len(), 1, "one destination clears the bar, not two");
+        let (key, relays, parties, total) = &targets[0];
+        assert_eq!(key, "addr1vswap");
+        assert_eq!(*relays, 3);
+        assert_eq!(*parties, 1);
+        assert_eq!(*total, 13_300_000_000);
+
+        assert_eq!(
+            l.relay_addresses().unwrap().len(),
+            4,
+            "every confirmed pass-through is known, including the lonely one"
+        );
+    }
+
+    #[test]
+    fn a_relay_hop_is_idempotent_on_its_key() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        let row = RelayHopRow {
+            relay_addr: "addr1vr1".into(),
+            from_party: "stake1c".into(),
+            to_addr: "addr1vswap".into(),
+            unit: "lovelace".into(),
+            quantity: 7_500_000_000,
+            in_tx: "in".into(),
+            out_tx: "out".into(),
+            in_slot: 100,
+            out_slot: 200,
+        };
+        assert_eq!(l.insert_relay_hops(&[row.clone(), row.clone()]).unwrap(), 1);
+        assert_eq!(l.insert_relay_hops(&[row]).unwrap(), 0);
     }
 
     #[test]

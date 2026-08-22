@@ -37,9 +37,10 @@ use crate::mint::{cip27_royalty, policy_script};
 use crate::party::{Resolved, resolve_str};
 use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
 use crate::seed::*;
-use crate::state::{BufferedOutput, WalkState};
+use crate::state::{BufferedOutput, RelayCandidate, WalkState};
 use crate::store::{
-    AliasRow, AssetEventRow, Ledger, MintPaymentRow, TxDeltaRow, UnitFlowRow, ValueEventRow,
+    AliasRow, AssetEventRow, Ledger, MintPaymentRow, RelayHopRow, TxDeltaRow, UnitFlowRow,
+    ValueEventRow,
 };
 
 #[derive(clap::Args, Debug)]
@@ -116,6 +117,30 @@ pub struct WalkArgs {
     /// receipt.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     watch_holders: bool,
+
+    /// Follow money ONE HOP through single-use bare addresses.
+    ///
+    /// A watched wallet pays a fresh stakeless address; minutes later that
+    /// address forwards everything and is never used again. That is an
+    /// exchange deposit, and without this the trail simply stops there —
+    /// `classify` then reads the one-way shape as an off-ramp, which asserts
+    /// the money left the chain while discarding where it actually went.
+    ///
+    /// Cheap and bounded: candidates expire after `--relay-window-slots`, a
+    /// relay is followed exactly one hop, and NOTHING is promoted. It adds
+    /// depth to the trail, never breadth to the watch set.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    follow_relays: bool,
+
+    /// How long a bare address may hold the money and still read as a relay
+    /// (slots; 1 slot ≈ 1 second). Default 2 hours.
+    #[arg(long, default_value_t = 7200)]
+    relay_window_slots: u64,
+
+    /// Ignore bare outputs below this (lovelace). A relay carries a payment;
+    /// below the min-UTxO floor it is carrier ADA on an asset transfer.
+    #[arg(long, default_value_t = 5_000_000)]
+    relay_min_lovelace: u64,
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
@@ -215,6 +240,9 @@ pub fn run(args: WalkArgs) -> Result<()> {
             .map(|s| s.split(',').filter_map(|h| hex::decode(h).ok()).collect())
             .unwrap_or_default(),
         watch_holders: args.watch_holders,
+        follow_relays: args.follow_relays,
+        relay_window_slots: args.relay_window_slots,
+        relay_min_lovelace: args.relay_min_lovelace,
     };
 
     for block in blocks {
@@ -257,6 +285,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
             )?;
         }
         inserted += rows.flush(&mut ledger)? as u64;
+
+        // Expire relay candidates that were never swept. Without this the map
+        // grows for the length of the walk: every bare address a watched party
+        // ever paid would be held forever, which is the frontier explosion in
+        // a different container.
+        if ctx.follow_relays && in_range.is_multiple_of(2_000) {
+            state
+                .relays
+                .evict_before(slot, ctx.relay_window_slots.saturating_mul(2));
+        }
 
         if in_range.is_multiple_of(args.checkpoint_every.max(1)) {
             let hash = blk.hash();
@@ -536,6 +574,12 @@ pub struct TxCtx<'a> {
     /// Seat collection holders as watched-but-never-expanding parties
     /// (`Role::Holder`). See `WalkArgs::watch_holders`.
     pub watch_holders: bool,
+    /// Follow money one hop through single-use bare addresses. See `relay_hop`.
+    pub follow_relays: bool,
+    /// How long a bare address may hold the money and still read as a relay.
+    pub relay_window_slots: u64,
+    /// Ignore bare outputs below this — a relay carries a payment, not dust.
+    pub relay_min_lovelace: u64,
 }
 
 /// Rows accumulated per block, flushed together.
@@ -551,6 +595,9 @@ pub struct Rows {
     /// KEPT `discovered_holder` table so the next pass can seat them from the
     /// floor.
     pub holders: Vec<(String, u64)>,
+    /// Confirmed pass-throughs — a watched party's money seen leaving the bare
+    /// address it was paid into. See the `relay_hop` table.
+    pub relays: Vec<RelayHopRow>,
 }
 
 impl Rows {
@@ -561,6 +608,7 @@ impl Rows {
             + ledger.insert_tx_deltas(&self.deltas)?
             + ledger.insert_value_events(&self.values)?
             + ledger.insert_unit_flows(&self.units)?
+            + ledger.insert_relay_hops(&self.relays)?
             + ledger.put_discovered_holders(&self.holders)?;
         self.assets.clear();
         self.mint_payments.clear();
@@ -568,6 +616,7 @@ impl Rows {
         self.deltas.clear();
         self.values.clear();
         self.units.clear();
+        self.relays.clear();
         self.holders.clear();
         Ok(n)
     }
@@ -912,6 +961,20 @@ pub fn process_tx(
         }
     }
 
+    // 3b. RELAY SWEEP — a bare address we paid is spending what we sent it.
+    //
+    // Handled before the `touches` gate because a relay is by construction NOT
+    // a watched party: nothing here would otherwise make the walk look at this
+    // transaction, which is precisely why the trail used to stop one hop short.
+    let swept: Vec<RelayCandidate> = d
+        .inputs
+        .iter()
+        .filter_map(|i| state.relays.take(&i.oref))
+        .collect();
+    if !swept.is_empty() {
+        record_relay_hops(&swept, &outs, ctx, &tx_hex, rows);
+    }
+
     // 4. value flows — only if the tx touches a watched party.
     let touches = outs
         .iter()
@@ -1117,7 +1180,107 @@ pub fn process_tx(
             );
         }
     }
+
+    // Arm relay candidates: a member paid a STAKELESS address that is not
+    // itself watched. Stakeless is the discriminator — a wallet with a staking
+    // credential is somebody's actual wallet (they want their delegation), so
+    // its receipts are holdings to be reasoned about, not a conduit. The
+    // deposit addresses an exchange hands out are bare by construction.
+    if !ctx.follow_relays {
+        return Ok(());
+    }
+    let payer = dominant_member_payer(&inputs, state);
+    if let Some(from_party) = payer {
+        for o in &outs {
+            if o.resolved.party.has_stake_credential
+                || state.frontier.is_member(&o.resolved.party)
+                || o.lovelace < ctx.relay_min_lovelace
+            {
+                continue;
+            }
+            state.relays.insert(
+                (d.tx_hash, o.idx),
+                RelayCandidate {
+                    address: d.outputs[o.idx as usize].address.clone(),
+                    from_party: from_party.clone(),
+                    lovelace: o.lovelace,
+                    tx: tx_hex.clone(),
+                    slot: ctx.slot,
+                },
+            );
+        }
+    }
     Ok(())
+}
+
+/// The watched party that put the most lovelace into this transaction, if any.
+///
+/// A relay hop is only worth recording when we can name whose money it was.
+/// Where several members funded a tx the largest is attributed, matching the
+/// `payers` judgement `book_unit_flows` already makes.
+fn dominant_member_payer(
+    inputs: &[(Party, u64, Option<[u8; 28]>)],
+    state: &WalkState,
+) -> Option<String> {
+    let mut best: Option<(&str, u64)> = None;
+    for (p, lovelace, _) in inputs {
+        if !state.frontier.is_member(p) {
+            continue;
+        }
+        match best {
+            Some((_, v)) if v >= *lovelace => {}
+            _ => best = Some((p.key.as_str(), *lovelace)),
+        }
+    }
+    best.map(|(k, _)| k.to_owned())
+}
+
+/// Book where a swept relay's money actually went.
+///
+/// Change back to the relay itself is skipped: an address that keeps a slice
+/// is still passing the rest on, and the destination is the finding. Outputs
+/// are recorded individually rather than summed — a sweep that fans into two
+/// destinations is two facts, not an average.
+fn record_relay_hops(
+    swept: &[RelayCandidate],
+    outs: &[Out<'_>],
+    ctx: &TxCtx<'_>,
+    out_tx: &str,
+    rows: &mut Rows,
+) {
+    for c in swept {
+        // Dwell time is the whole signal. A bare address that sits on the
+        // money for days is somebody's wallet; one that forwards within
+        // minutes is plumbing.
+        let dwell = ctx.slot.saturating_sub(c.slot);
+        if dwell > ctx.relay_window_slots {
+            tracing::debug!(
+                relay = %c.address, dwell, "walk: bare address spent too late to read as a relay"
+            );
+            continue;
+        }
+        for o in outs {
+            if o.resolved.party.key == c.address || o.lovelace == 0 {
+                continue;
+            }
+            rows.relays.push(RelayHopRow {
+                relay_addr: c.address.clone(),
+                from_party: c.from_party.clone(),
+                to_addr: o.resolved.party.key.clone(),
+                unit: "lovelace".to_owned(),
+                quantity: o.lovelace as i64,
+                in_tx: c.tx.clone(),
+                out_tx: out_tx.to_owned(),
+                in_slot: c.slot,
+                out_slot: ctx.slot,
+            });
+        }
+        tracing::debug!(
+            relay = %c.address, from = %c.from_party, dwell,
+            ada = c.lovelace as f64 / 1e6,
+            "walk: followed a relay hop"
+        );
+    }
 }
 
 /// Book one `unit_flow` row per (output, unit) where a watched party is on
@@ -1238,8 +1401,9 @@ fn book_unit_flows(
 mod tests {
     use super::*;
     use crate::activity::Activity;
-    use crate::state::{Buffer, Holders};
+    use crate::state::{Buffer, Holders, Relays};
     use chain_ledger::{Frontier, Thresholds};
+    use pallas_primitives::Hash;
     use std::path::PathBuf;
 
     #[test]
@@ -1274,6 +1438,7 @@ mod tests {
             buffer: Buffer::default(),
             activity: Activity::default(),
             holders: Holders::default(),
+            relays: Relays::default(),
         };
         let mut signer_creds = BTreeSet::new();
         let mut minted = BTreeSet::new();
@@ -1291,6 +1456,9 @@ mod tests {
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
             watch_holders: true,
+            follow_relays: true,
+            relay_window_slots: 7200,
+            relay_min_lovelace: 5_000_000,
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -1350,6 +1518,7 @@ mod tests {
             buffer: Buffer::default(),
             activity: Activity::default(),
             holders: Holders::default(),
+            relays: Relays::default(),
         };
         let mut signer_creds = BTreeSet::new();
         let mut minted = BTreeSet::new();
@@ -1367,6 +1536,9 @@ mod tests {
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
             watch_holders: true,
+            follow_relays: true,
+            relay_window_slots: 7200,
+            relay_min_lovelace: 5_000_000,
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -1458,7 +1630,148 @@ mod tests {
             buffer: Buffer::default(),
             activity: Activity::default(),
             holders: Holders::default(),
+            relays: Relays::default(),
         }
+    }
+
+    // --- relay hops --------------------------------------------------------
+
+    fn relay_ctx<'a>(
+        slot: u64,
+        signer_creds: &'a mut BTreeSet<[u8; 28]>,
+        minted: &'a mut BTreeSet<Vec<u8>>,
+    ) -> TxCtx<'a> {
+        TxCtx {
+            policy: [0xAB; 28],
+            policy_hex: hex::encode([0xAB; 28]),
+            slot,
+            time: 1_700_000_000,
+            signer_creds,
+            minted,
+            ceiling: None,
+            royalty: None,
+            royalty_rate: None,
+            last_mint_slot: None,
+            max_hops: 0,
+            minted_holdings: BTreeSet::new(),
+            watch_holders: true,
+            follow_relays: true,
+            relay_window_slots: 7200,
+            relay_min_lovelace: 5_000_000,
+        }
+    }
+
+    fn candidate(slot: u64) -> RelayCandidate {
+        RelayCandidate {
+            address: "addr1vrelay".to_owned(),
+            from_party: "stake1compounding".to_owned(),
+            lovelace: 7_500_000_000,
+            tx: "intx".to_owned(),
+            slot,
+        }
+    }
+
+    /// The case this exists for: the trail must name the SWEEP TARGET, not
+    /// stop at the bare address in the middle.
+    #[test]
+    fn a_swept_relay_names_where_the_money_actually_went() {
+        let mut sc = BTreeSet::new();
+        let mut m = BTreeSet::new();
+        let ctx = relay_ctx(1_600, &mut sc, &mut m);
+        let outs = [out(0, "addr1vswaphotwallet", 7_499_300_000, vec![])];
+        let mut rows = Rows::default();
+        record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
+
+        assert_eq!(rows.relays.len(), 1);
+        let r = &rows.relays[0];
+        assert_eq!(r.to_addr, "addr1vswaphotwallet");
+        assert_eq!(r.from_party, "stake1compounding");
+        assert_eq!(r.relay_addr, "addr1vrelay");
+        assert_eq!(r.in_tx, "intx");
+        assert_eq!(r.out_tx, "outtx");
+        assert_eq!(
+            r.quantity, 7_499_300_000,
+            "the row carries what was SWEPT ONWARD, not what was received"
+        );
+    }
+
+    /// Dwell time is the discriminator. An address that sits on the money for
+    /// days is somebody's wallet, and calling it a conduit would put words in
+    /// the chain's mouth.
+    #[test]
+    fn a_bare_address_that_holds_the_money_too_long_is_not_a_relay() {
+        let mut sc = BTreeSet::new();
+        let mut m = BTreeSet::new();
+        let ctx = relay_ctx(1_000 + 7_201, &mut sc, &mut m);
+        let outs = [out(0, "addr1vswaphotwallet", 7_499_300_000, vec![])];
+        let mut rows = Rows::default();
+        record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
+        assert!(rows.relays.is_empty());
+    }
+
+    /// A relay that keeps a slice still passes the rest on; the change output
+    /// back to itself is not a destination.
+    #[test]
+    fn change_back_to_the_relay_is_not_a_destination() {
+        let mut sc = BTreeSet::new();
+        let mut m = BTreeSet::new();
+        let ctx = relay_ctx(1_100, &mut sc, &mut m);
+        let outs = [
+            out(0, "addr1vswaphotwallet", 7_000_000_000, vec![]),
+            out(1, "addr1vrelay", 499_300_000, vec![]),
+        ];
+        let mut rows = Rows::default();
+        record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
+        assert_eq!(rows.relays.len(), 1);
+        assert_eq!(rows.relays[0].to_addr, "addr1vswaphotwallet");
+    }
+
+    /// A sweep that fans out is several facts, not an average of them.
+    #[test]
+    fn a_fan_out_sweep_records_every_destination() {
+        let mut sc = BTreeSet::new();
+        let mut m = BTreeSet::new();
+        let ctx = relay_ctx(1_100, &mut sc, &mut m);
+        let outs = [
+            out(0, "addr1vfirst", 4_000_000_000, vec![]),
+            out(1, "addr1vsecond", 3_499_300_000, vec![]),
+        ];
+        let mut rows = Rows::default();
+        record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
+        assert_eq!(rows.relays.len(), 2);
+    }
+
+    #[test]
+    fn the_largest_watched_funder_is_the_one_attributed() {
+        let state = seeded(&["stake1treasury", "stake1compounding"]);
+        let inputs = [
+            (party("stake1treasury"), 10_000_000, None),
+            (party("stake1compounding"), 900_000_000, None),
+            (party("stake1stranger"), 5_000_000_000, None),
+        ];
+        assert_eq!(
+            dominant_member_payer(&inputs, &state).as_deref(),
+            Some("stake1compounding"),
+            "the biggest input is unwatched — attribution follows the biggest WATCHED one"
+        );
+    }
+
+    #[test]
+    fn a_tx_no_watched_party_funded_arms_no_relay() {
+        let state = seeded(&["stake1treasury"]);
+        let inputs = [(party("stake1stranger"), 5_000_000_000, None)];
+        assert!(dominant_member_payer(&inputs, &state).is_none());
+    }
+
+    /// The bound that stops this becoming a second frontier.
+    #[test]
+    fn unswept_candidates_are_evicted() {
+        let mut r = Relays::default();
+        r.insert((Hash::new([1u8; 32]), 0), candidate(1_000));
+        r.insert((Hash::new([2u8; 32]), 0), candidate(9_000));
+        r.evict_before(10_000, 7_200);
+        assert_eq!(r.len(), 1, "the stale candidate is dropped, the fresh kept");
+        assert!(r.contains(&(Hash::new([2u8; 32]), 0)));
     }
 
     fn run_flows(
@@ -1483,6 +1796,9 @@ mod tests {
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
             watch_holders: true,
+            follow_relays: true,
+            relay_window_slots: 7200,
+            relay_min_lovelace: 5_000_000,
         };
         let mut rows = Rows::default();
         book_unit_flows(outs, inputs, state, &ctx, "txhash", unresolved, &mut rows);
@@ -1511,6 +1827,9 @@ mod tests {
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
             watch_holders: true,
+            follow_relays: true,
+            relay_window_slots: 7200,
+            relay_min_lovelace: 5_000_000,
         };
         let mut rows = Rows::default();
         book_unit_flows(outs, inputs, &state, &ctx, "txhash", 0, &mut rows);
@@ -1541,6 +1860,9 @@ mod tests {
             max_hops: 0,
             minted_holdings: BTreeSet::new(),
             watch_holders: true,
+            follow_relays: true,
+            relay_window_slots: 7200,
+            relay_min_lovelace: 5_000_000,
         };
         let mut rows = Rows::default();
         let user_token = hex::decode("000de1404d4430303031").unwrap();
