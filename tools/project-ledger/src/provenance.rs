@@ -99,20 +99,31 @@ struct HolderVerdict {
     legs: Vec<(String, String)>,
 }
 
-/// Whether a `unit_flow` unit participates in FUNDING analysis: lovelace, or
-/// a CIP-67 labelled fungible (333/444 — USDM is `0014df10` + "USDM").
+/// Whether a `unit_flow` unit participates in FUNDING analysis.
 ///
 /// Mint payments arrive in ADA or a stablecoin; NFTs riding through a wallet
 /// are custody, not funding, and counting them would let one airdropped
 /// token rewrite a wallet's money story.
+///
+/// ## This was a CIP-67 LABEL TEST until 2026-08-23, and it was wrong twice
+///
+/// It asked whether the asset name began `0014df10` / `001bc280` — the
+/// fungible-token labels. But "fungible" is not "money":
+///
+/// - **Too permissive.** Any project can mint a labelled fungible. On the
+///   Mekka S1 ledger the test accepted WLK, ASCEND, ANGELS, ATLAS, SKULLY,
+///   TITAN, BETFI, FLDT, PBG, Shards and GENS as settlement — ~17,300 legs
+///   of meme and utility tokens counted as funding.
+/// - **Too restrictive.** Real stablecoins mostly carry PLAIN names: iUSD,
+///   USDA, DJED, USDC and USDCx have no label at all, so 139,157 legs of
+///   genuine payment were invisible. USDM qualified only by the accident of
+///   being CIP-68 minted.
+///
+/// Now delegated to [`chain_ledger::tokens::is_settlement_unit`] — an
+/// explicit, sourced list, on the same terms as the decimals table. A unit
+/// counts as money because we can say why.
 fn is_payment_unit(unit: &str) -> bool {
-    if unit == "lovelace" {
-        return true;
-    }
-    match unit.split_once('.') {
-        Some((_, name)) => name.starts_with("0014df10") || name.starts_with("001bc280"),
-        None => false,
-    }
+    chain_ledger::tokens::is_settlement_unit(unit)
 }
 
 /// A human ticker for a payment unit: "ada", or the label-stripped asset name
@@ -587,23 +598,43 @@ mod tests {
         assert!((unknown - 0.4).abs() < 1e-9);
     }
 
-    /// Payment units: lovelace and labelled fungibles (USDM is 333). An NFT
-    /// riding through a wallet is custody, not funding.
+    /// Payment units are an EXPLICIT LIST, not a CIP-67 label test.
+    ///
+    /// Rewritten 2026-08-23 with the rule it checks. The previous version
+    /// asserted the label behaviour, and its own fixture shows why that was
+    /// unsafe: it passed a "USDM" whose policy is
+    /// `c48cbb3d5087d47e…` when the real one is `c48cbb3d5e57ed56…`. The
+    /// label test accepted the impostor without complaint, because it only
+    /// ever looked at the asset NAME.
     #[test]
     fn only_money_shaped_units_fund_a_mint() {
         assert!(is_payment_unit("lovelace"));
-        // USDM: label 0014df10 + "USDM"
+        // The REAL USDM policy.
         assert!(is_payment_unit(
+            "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d"
+        ));
+        // A stablecoin with a PLAIN name — invisible to the old label test.
+        assert!(is_payment_unit(
+            "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344"
+        ));
+
+        // An impostor wearing USDM's name under another policy funds nobody.
+        assert!(!is_payment_unit(
             "c48cbb3d5087d47e0193cb26b6cabbc655e3b06806f2543f9e56e10f.0014df105553444d"
         ));
-        // an RFT (444)
-        assert!(is_payment_unit("aa.001bc28054657374"));
-        // a user NFT (222) and a plain-named NFT do NOT fund anyone
+        // A labelled fungible/RFT is NOT money just for being fungible —
+        // this is the change.
+        assert!(!is_payment_unit("aa.001bc28054657374"));
+        assert!(!is_payment_unit("aa.0014df10534b554c4c59")); // SKULLY
+        // NFTs remain custody, not funding.
         assert!(!is_payment_unit("aa.000de1404d4430303031"));
         assert!(!is_payment_unit("aa.4d656b6b613031"));
+
+        // `unit_ticker` is a DISPLAY helper and stays name-based — it is
+        // asked what to call a unit, never whether to trust it.
         assert_eq!(
             unit_ticker(
-                "c48cbb3d5087d47e0193cb26b6cabbc655e3b06806f2543f9e56e10f.0014df105553444d"
+                "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d"
             ),
             "USDM"
         );
