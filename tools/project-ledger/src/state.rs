@@ -171,12 +171,42 @@ pub struct RelayCandidate {
 #[derive(Debug, Default, Clone)]
 pub struct Relays {
     map: HashMap<OutRef, RelayCandidate>,
+    /// How many times each bare address has been armed. **The single-use
+    /// test.**
+    ///
+    /// Without this the whole idea collapses on real data. "Stakeless and
+    /// spent within the window" is not a throwaway deposit address — it is
+    /// also every DEX batcher, every hot wallet, every busy service on the
+    /// chain, all of which satisfy it thousands of times a day. A first pass
+    /// over Mekka S1 without this counter produced 160,589 hops across 1,338
+    /// "relays" totalling 70.7 BILLION ada — more than the entire supply,
+    /// because one hot wallet alone was armed 88,282 times.
+    ///
+    /// A relay is used ONCE. Armed twice, it is somebody's wallet.
+    seen: HashMap<String, u32>,
 }
 
 #[allow(dead_code)]
 impl Relays {
-    pub fn insert(&mut self, oref: OutRef, c: RelayCandidate) {
+    /// Arm a candidate, counting the address. Returns whether it is still a
+    /// plausible single-use relay.
+    pub fn arm(&mut self, oref: OutRef, c: RelayCandidate) -> bool {
+        let n = self.seen.entry(c.address.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            return false;
+        }
         self.map.insert(oref, c);
+        true
+    }
+
+    /// Has this address been armed exactly once in the whole walk?
+    pub fn is_single_use(&self, address: &str) -> bool {
+        self.seen.get(address) == Some(&1)
+    }
+
+    pub fn insert(&mut self, oref: OutRef, c: RelayCandidate) {
+        self.arm(oref, c);
     }
 
     pub fn take(&mut self, oref: &OutRef) -> Option<RelayCandidate> {

@@ -32,8 +32,8 @@
 use std::path::PathBuf;
 
 use address_registry::{
-    AddressCategory, MatchKind, RegistryNetwork, ScriptCategory, lookup_address_match,
-    payment_credential_is_script,
+    AddressCategory, MatchKind, RegistryNetwork, ScriptCategory, StakeServiceKind,
+    lookup_address_match, lookup_stake, payment_credential_is_script,
 };
 use anyhow::Result;
 use chain_ledger::{Basis, ProviderCapability};
@@ -198,6 +198,24 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
             } else {
                 customers_spared += 1;
             }
+        }
+        // A shared service named by its STAKE credential — a minting provider
+        // and the like. Keyed on the stake key rather than a payment address
+        // because such a service spends from many addresses under one
+        // credential, and the address table would need all of them.
+        //
+        // Asserted, and it may name the party: unlike a script-prefix hit,
+        // this credential belongs to the service itself, so there is no
+        // customer to mislabel.
+        if let Some(svc) = lookup_stake(&key) {
+            caps.push((
+                match svc.kind {
+                    StakeServiceKind::MintingProvider => ProviderCapability::Minting,
+                },
+                Basis::Asserted,
+            ));
+            name = Some(svc.label.to_string());
+            sources.push(format!("stake-registry: {}", svc.source));
         }
         // Minting is ADDITIVE, not an alternative. `bank.pillar` is both a
         // mint provider and (elsewhere) a payout service, and the old

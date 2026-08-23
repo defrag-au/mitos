@@ -116,7 +116,7 @@ pub fn run(args: SeedArgs) -> Result<()> {
     let walk_start = floor.saturating_sub(args.margin);
 
     // --- frontier --------------------------------------------------------------
-    let mut frontier = Frontier::new(registry.thresholds(), registry.declared_terminal());
+    let mut frontier = Frontier::new(registry.thresholds(), registry.terminal_parties());
     for w in &registry.wallets {
         frontier
             .seed(stake_party(&w.stake), Role::Declared, walk_start)
@@ -135,6 +135,14 @@ pub fn run(args: SeedArgs) -> Result<()> {
     // from 0.06% to 16.5%.
     for t in &registry.terminal.parties {
         frontier.seed_terminal(stake_party(&t.stake), walk_start);
+    }
+    // Shared services the address registry names — minting providers and the
+    // like. Seated terminal for every project automatically, so a new
+    // collection does not have to rediscover that its mint provider is not
+    // part of the project.
+    for (stake, label) in crate::registry::Registry::registry_services() {
+        frontier.seed_terminal(stake_party(&stake), walk_start);
+        tracing::info!(%stake, %label, "seed: shared service seated terminal from the address registry");
     }
 
     // Holders a PREVIOUS walk discovered (the kept `discovered_holder` table)

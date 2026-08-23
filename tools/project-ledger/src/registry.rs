@@ -146,11 +146,38 @@ impl Registry {
         }
     }
 
+    /// Stake keys the OPERATOR declared terminal in the TOML. Exactly that —
+    /// see [`Self::terminal_parties`] for the set the frontier is built with.
     pub fn declared_terminal(&self) -> impl Iterator<Item = Party> + '_ {
         self.terminal
             .parties
             .iter()
             .map(|t| Party::cardano_stake(t.stake.clone()))
+    }
+
+    /// Every party that must be recorded but never expanded: the operator's
+    /// declarations PLUS every shared service the address registry knows.
+    ///
+    /// The registry half is what stops this being per-project busywork. A
+    /// minting provider takes its fee inside the mint transaction of every
+    /// project it serves, so the mint decode seats it as a payee on every
+    /// ledger. Expanded, it drags in the provider's OTHER clients: Anvil's fee
+    /// wallet alone holds over a thousand unspent fee UTxOs from unrelated
+    /// collections. Knowing it once, centrally, means each new collection gets
+    /// the guard for free instead of waiting for someone to notice.
+    pub fn terminal_parties(&self) -> impl Iterator<Item = Party> + '_ {
+        self.declared_terminal().chain(
+            address_registry::STAKE_REGISTRY
+                .keys()
+                .map(|s| Party::cardano_stake((*s).to_string())),
+        )
+    }
+
+    /// Known shared services seated automatically, with their registry labels.
+    pub fn registry_services() -> impl Iterator<Item = (String, &'static str)> {
+        address_registry::STAKE_REGISTRY
+            .entries()
+            .map(|(k, v)| ((*k).to_string(), v.label))
     }
 }
 
@@ -169,6 +196,24 @@ mod tests {
         assert_eq!(r.thresholds().receipts, 1000);
         assert_eq!(r.thresholds().counterparties, 300);
         assert_eq!(r.declared_terminal().count(), 0);
+    }
+
+    /// A registry that declares nothing still guards against the shared
+    /// minting providers, or every new collection re-learns that its mint
+    /// provider is not part of the project.
+    #[test]
+    fn known_services_are_terminal_even_when_the_toml_declares_none() {
+        let r = Registry::parse(EXAMPLE).unwrap();
+        assert_eq!(r.declared_terminal().count(), 0, "the TOML declares none");
+        assert!(
+            r.terminal_parties().count() > 0,
+            "but the address registry's shared services are still seated terminal"
+        );
+        let anvil = "stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr";
+        assert!(
+            r.terminal_parties().any(|p| p.key == anvil),
+            "Anvil (the mint provider) must never be expandable"
+        );
     }
 
     #[test]

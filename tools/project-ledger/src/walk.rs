@@ -966,10 +966,17 @@ pub fn process_tx(
     // Handled before the `touches` gate because a relay is by construction NOT
     // a watched party: nothing here would otherwise make the walk look at this
     // transaction, which is precisely why the trail used to stop one hop short.
-    let swept: Vec<RelayCandidate> = d
+    let taken: Vec<RelayCandidate> = d
         .inputs
         .iter()
         .filter_map(|i| state.relays.take(&i.oref))
+        .collect();
+    // A relay is used ONCE. If this address has been paid more than once by
+    // the watch set it is a wallet or a service, and the sweep is just what
+    // wallets do — see `Relays::seen`.
+    let swept: Vec<RelayCandidate> = taken
+        .into_iter()
+        .filter(|c| state.relays.is_single_use(&c.address))
         .collect();
     if !swept.is_empty() {
         record_relay_hops(&swept, &outs, ctx, &tx_hex, rows);
@@ -1181,11 +1188,25 @@ pub fn process_tx(
         }
     }
 
-    // Arm relay candidates: a member paid a STAKELESS address that is not
-    // itself watched. Stakeless is the discriminator — a wallet with a staking
-    // credential is somebody's actual wallet (they want their delegation), so
-    // its receipts are holdings to be reasoned about, not a conduit. The
-    // deposit addresses an exchange hands out are bare by construction.
+    // Arm relay candidates: a member paid a bare KEY address that is not
+    // itself watched.
+    //
+    // Three exclusions, each of which a first run proved necessary:
+    //
+    // - STAKE-KEYED. A wallet with a staking credential is somebody's actual
+    //   wallet — they want their delegation — so its receipts are holdings to
+    //   reason about, not a conduit. Exchange deposit addresses are bare by
+    //   construction.
+    // - SCRIPT payment credentials. A script that takes money and passes it on
+    //   within minutes is a CONTRACT — a DEX batcher, an order, an escrow —
+    //   and following it as though it were a deposit address turns routine
+    //   swap plumbing into "the treasury's money went here". The Minswap
+    //   batcher alone drew 5,892 hops before this guard. `classify` refuses
+    //   scripts in the off-ramp rule for exactly this reason; the same trap
+    //   applies one hop further out.
+    // - BYRON addresses. Legacy addresses carry no staking credential AT ALL,
+    //   so "stakeless" says nothing about them — they are ordinary old
+    //   wallets, and 54 were caught before this guard.
     if !ctx.follow_relays {
         return Ok(());
     }
@@ -1193,12 +1214,14 @@ pub fn process_tx(
     if let Some(from_party) = payer {
         for o in &outs {
             if o.resolved.party.has_stake_credential
+                || o.resolved.payment_is_script
+                || !o.resolved.party.key.starts_with("addr")
                 || state.frontier.is_member(&o.resolved.party)
                 || o.lovelace < ctx.relay_min_lovelace
             {
                 continue;
             }
-            state.relays.insert(
+            state.relays.arm(
                 (d.tx_hash, o.idx),
                 RelayCandidate {
                     address: d.outputs[o.idx as usize].address.clone(),
@@ -1662,8 +1685,12 @@ mod tests {
     }
 
     fn candidate(slot: u64) -> RelayCandidate {
+        candidate_at("addr1vrelay", slot)
+    }
+
+    fn candidate_at(address: &str, slot: u64) -> RelayCandidate {
         RelayCandidate {
-            address: "addr1vrelay".to_owned(),
+            address: address.to_owned(),
             from_party: "stake1compounding".to_owned(),
             lovelace: 7_500_000_000,
             tx: "intx".to_owned(),
@@ -1763,12 +1790,44 @@ mod tests {
         assert!(dominant_member_payer(&inputs, &state).is_none());
     }
 
+    /// THE regression that matters. A first run over Mekka S1 without the
+    /// single-use test produced 160,589 hops across 1,338 "relays" totalling
+    /// 70.7 billion ada — more than the whole supply — because busy service
+    /// wallets satisfy "stakeless and spent quickly" all day long. One was
+    /// armed 88,282 times.
+    #[test]
+    fn an_address_armed_twice_is_a_wallet_not_a_relay() {
+        let mut r = Relays::default();
+        assert!(
+            r.arm((Hash::new([1u8; 32]), 0), candidate(1_000)),
+            "first sighting is a plausible throwaway"
+        );
+        assert!(r.is_single_use("addr1vrelay"));
+
+        assert!(
+            !r.arm((Hash::new([2u8; 32]), 0), candidate(2_000)),
+            "second sighting disqualifies it"
+        );
+        assert!(
+            !r.is_single_use("addr1vrelay"),
+            "and it stays disqualified — a hot wallet must never record a hop"
+        );
+    }
+
     /// The bound that stops this becoming a second frontier.
     #[test]
     fn unswept_candidates_are_evicted() {
         let mut r = Relays::default();
-        r.insert((Hash::new([1u8; 32]), 0), candidate(1_000));
-        r.insert((Hash::new([2u8; 32]), 0), candidate(9_000));
+        // Distinct addresses: two sightings of the SAME one would (correctly)
+        // be refused by the single-use rule, which is a different test.
+        r.insert(
+            (Hash::new([1u8; 32]), 0),
+            candidate_at("addr1vstale", 1_000),
+        );
+        r.insert(
+            (Hash::new([2u8; 32]), 0),
+            candidate_at("addr1vfresh", 9_000),
+        );
         r.evict_before(10_000, 7_200);
         assert_eq!(r.len(), 1, "the stale candidate is dropped, the fresh kept");
         assert!(r.contains(&(Hash::new([2u8; 32]), 0)));
