@@ -6872,6 +6872,7 @@ dependencies = [
  "mitos-chain-walk",
  "pallas-addresses 1.1.1",
  "pallas-crypto 1.1.1",
+ "pallas-primitives 1.1.1",
  "pallas-traverse 1.1.1",
  "rusqlite",
  "tracing",

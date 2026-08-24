@@ -19,6 +19,7 @@
 //!
 //! Design: `cnft.dev-workers/docs/design/WALLET_TRACE.md`.
 
+mod certs;
 mod creds;
 mod index;
 mod probe;

@@ -24,6 +24,8 @@ mitos-chain-walk = { path = "../mitos-chain-walk" }
 
 pallas-traverse = { workspace = true }
 pallas-addresses = { workspace = true }
+# Certificate + StakeCredential shapes, for the `stake_event` table.
+pallas-primitives = { workspace = true }
 # blake2b-224 over a vkey — which IS the payment key hash.
 pallas-crypto = "1.1.1"
 

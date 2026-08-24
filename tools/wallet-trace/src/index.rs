@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use mitos_chain_walk::open_blocks;
 use pallas_traverse::MultiEraBlock;
 
+use crate::certs::stake_events;
 use crate::creds::cred_pair;
 use crate::store::Index;
 use crate::witness::{KeyHash, signer_keys};
@@ -63,6 +64,18 @@ pub struct IndexArgs {
     /// unable to name a cluster's wallets — it would emit bare key hashes.
     #[arg(long)]
     pub no_cred_pairs: bool,
+
+    /// Backfill `stake_event` ONLY, into an index that already has its
+    /// co-signing graph.
+    ///
+    /// `stake_event` arrived after the first full-chain index was built, and
+    /// re-walking genesis→tip normally would mint fresh `group_id`s for
+    /// transactions already recorded — duplicating 71M rows and 12.8 GB rather
+    /// than adding to them. The walk costs the same either way (it is bound by
+    /// reading the snapshot), so this writes only what is missing and leaves
+    /// `cosign`, `cred_pair` and the cached `key_degree` census untouched.
+    #[arg(long, conflicts_with = "resume")]
+    pub only_stake_events: bool,
 }
 
 pub fn index(args: &IndexArgs) -> Result<()> {
@@ -97,6 +110,7 @@ pub fn index(args: &IndexArgs) -> Result<()> {
     let mut groups: Vec<(i64, [u8; 32], u64)> = Vec::new();
     let mut members: Vec<(i64, KeyHash)> = Vec::new();
     let mut pairs: Vec<(KeyHash, KeyHash, bool, u64)> = Vec::new();
+    let mut stakes: Vec<([u8; 32], KeyHash, &'static str, bool, u64)> = Vec::new();
     let mut pair_cache: HashSet<(KeyHash, KeyHash)> = HashSet::new();
 
     let mut blocks_seen = 0u64;
@@ -125,7 +139,7 @@ pub fn index(args: &IndexArgs) -> Result<()> {
             since_flush += 1;
 
             let signers = signer_keys(&tx);
-            if signers.is_group() && signers.len() <= args.max_group {
+            if !args.only_stake_events && signers.is_group() && signers.len() <= args.max_group {
                 group_id += 1;
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(tx.hash().as_ref());
@@ -135,7 +149,19 @@ pub fn index(args: &IndexArgs) -> Result<()> {
                 }
             }
 
-            if !args.no_cred_pairs {
+            // Certificates and withdrawals name stake credentials explicitly.
+            // Cheap: the vast majority of transactions carry neither, and the
+            // accessors return empty without allocating.
+            let events = stake_events(&tx);
+            if !events.is_empty() {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(tx.hash().as_ref());
+                for ev in events {
+                    stakes.push((hash, ev.cred, ev.kind, ev.is_script, slot));
+                }
+            }
+
+            if !args.no_cred_pairs && !args.only_stake_events {
                 for out in tx.outputs() {
                     let Ok(addr) = out.address() else { continue };
                     let Some(p) = cred_pair(&addr) else { continue };
@@ -150,11 +176,12 @@ pub fn index(args: &IndexArgs) -> Result<()> {
         }
 
         if since_flush >= args.flush_every {
-            ix.write_batch(&groups, &members, &pairs)?;
+            ix.write_batch(&groups, &members, &pairs, &stakes)?;
             ix.set_meta("last_slot", &last_slot.to_string())?;
             groups.clear();
             members.clear();
             pairs.clear();
+            stakes.clear();
             since_flush = 0;
             tracing::info!(
                 blocks = blocks_seen,
@@ -166,7 +193,7 @@ pub fn index(args: &IndexArgs) -> Result<()> {
         }
     }
 
-    ix.write_batch(&groups, &members, &pairs)?;
+    ix.write_batch(&groups, &members, &pairs, &stakes)?;
     ix.set_meta("last_slot", &last_slot.to_string())?;
     if let Some(f) = first_slot
         && ix.get_meta("first_slot")?.is_none()
@@ -176,6 +203,7 @@ pub fn index(args: &IndexArgs) -> Result<()> {
     ix.set_meta("max_group", &args.max_group.to_string())?;
 
     let (g, m, c, _) = ix.counts()?;
+    let se = ix.stake_event_count()?;
     tracing::info!(
         blocks = blocks_seen,
         txs,
@@ -183,15 +211,22 @@ pub fn index(args: &IndexArgs) -> Result<()> {
         groups = g,
         cosign_rows = m,
         cred_pairs = c,
+        stake_events = se,
         "index: done"
     );
     println!(
         "\nindexed {blocks_seen} blocks / {txs} txs  slots {}..{}\n  \
-         {g} groups, {m} cosign rows, {c} cred pairs\n  \
-         next: `wallet-trace suppress --db {}`",
+         {g} groups, {m} cosign rows, {c} cred pairs, {se} stake events",
         first_slot.unwrap_or(0),
         last_slot,
-        args.db.display()
     );
+    if args.only_stake_events {
+        println!(
+            "  (stake-events-only backfill — cosign/cred_pair and the cached\n  \
+             key_degree census were left untouched)"
+        );
+    } else {
+        println!("  next: `wallet-trace suppress --db {}`", args.db.display());
+    }
     Ok(())
 }

@@ -249,7 +249,21 @@ fn report(
     // beside — a stake key IS the wallet, so this is the shape a human reads.
     let mut wallets: BTreeMap<String, Vec<KeyHash>> = BTreeMap::new();
     let mut unnamed: Vec<KeyHash> = Vec::new();
+    // Cluster members that are themselves STAKE credentials, learned from
+    // certificates and withdrawals. Without this labelling every 28-byte hash
+    // in a cluster looks alike, and the first full-chain run reported 49 of 51
+    // co-signers as anonymous when some of them name a wallet outright.
+    let mut stake_members: Vec<(KeyHash, i64)> = Vec::new();
     for key in seen.keys() {
+        if let Some((n, is_script)) = ix.stake_cred_info(key)?
+            && !is_script
+        {
+            stake_members.push((*key, n));
+            wallets
+                .entry(stake_bech32(key, false))
+                .or_default()
+                .push(*key);
+        }
         let stakes = ix.stakes_for_payment(key)?;
         if stakes.is_empty() {
             unnamed.push(*key);
@@ -321,6 +335,40 @@ fn report(
                  of a SEPARATE wallet, not an absence of activity.",
                 groups_touched.len()
             );
+        }
+    }
+
+    if !stake_members.is_empty() {
+        println!(
+            "\n  {} cluster member(s) are STAKE credentials (certs / withdrawals)",
+            stake_members.len()
+        );
+        stake_members.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (cred, n) in stake_members.iter().take(12) {
+            println!("  {}  named by {n} tx(s)", stake_bech32(cred, false));
+        }
+    }
+
+    // Same-owner evidence that owes nothing to the co-signing graph: one
+    // transaction naming two distinct stake credentials. Nobody withdraws
+    // another person's rewards or registers their stake key.
+    let mut cooccur: BTreeMap<String, (String, [u8; 32])> = BTreeMap::new();
+    for (cred, _) in &stake_members {
+        for (other, tx, kind) in ix.stake_cooccurrences(cred)? {
+            cooccur
+                .entry(stake_bech32(&other, false))
+                .or_insert((kind, tx));
+        }
+    }
+    if !cooccur.is_empty() {
+        println!(
+            "\n  *** {} STAKE KEY(S) SHARE A TRANSACTION WITH THE CLUSTER ***\n  \
+             Independent of co-signing — a tx naming two stake credentials is\n  \
+             same-owner evidence in its own right.",
+            cooccur.len()
+        );
+        for (stake, (kind, tx)) in cooccur.iter().take(25) {
+            println!("  {stake}  via {kind} tx {}", hex::encode(tx));
         }
     }
 

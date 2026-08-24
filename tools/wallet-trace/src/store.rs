@@ -60,6 +60,19 @@ CREATE TABLE IF NOT EXISTS cred_pair (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS cred_pair_by_stake ON cred_pair (stake_cred);
 
+-- Stake credentials named EXPLICITLY by a tx (certificate or withdrawal).
+-- Supplies the labelling the witness set cannot: which 28-byte hashes in a
+-- cluster are stake credentials, so they render as `stake1…` wallets directly.
+CREATE TABLE IF NOT EXISTS stake_event (
+    tx_hash    BLOB NOT NULL,
+    stake_cred BLOB NOT NULL,
+    kind       TEXT NOT NULL,
+    is_script  INTEGER NOT NULL,
+    slot       INTEGER NOT NULL,
+    PRIMARY KEY (tx_hash, stake_cred, kind)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS stake_event_by_cred ON stake_event (stake_cred);
+
 -- Written by `suppress`. Operator keys excluded from union-find, WITH their
 -- measured degree, so the exclusion is auditable rather than a silent drop.
 CREATE TABLE IF NOT EXISTS suppressed_key (
@@ -114,12 +127,67 @@ impl Index {
         ))
     }
 
+    pub fn stake_event_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM stake_event", [], |r| r.get(0))?)
+    }
+
+    /// Is this credential known to be a STAKE credential?
+    ///
+    /// Returns the kinds seen and how many transactions named it, so a report
+    /// can distinguish "delegated once" from "withdrew rewards 362 times".
+    pub fn stake_cred_info(&self, cred: &KeyHash) -> Result<Option<(i64, bool)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT COUNT(*), MAX(is_script) FROM stake_event WHERE stake_cred = ?1",
+        )?;
+        let mut rows = st.query(params![&cred[..]])?;
+        Ok(match rows.next()? {
+            Some(r) => {
+                let n: i64 = r.get(0)?;
+                if n == 0 {
+                    None
+                } else {
+                    Some((n, r.get::<_, i64>(1)? != 0))
+                }
+            }
+            None => None,
+        })
+    }
+
+    /// Transactions that named two or more DISTINCT stake credentials, one of
+    /// them `cred`. Nobody withdraws another person's rewards or registers
+    /// their stake key, so a shared transaction here is same-owner evidence
+    /// independent of the co-signing graph.
+    pub fn stake_cooccurrences(&self, cred: &KeyHash) -> Result<Vec<(KeyHash, [u8; 32], String)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT b.stake_cred, b.tx_hash, b.kind
+               FROM stake_event a
+               JOIN stake_event b
+                 ON b.tx_hash = a.tx_hash AND b.stake_cred <> a.stake_cred
+              WHERE a.stake_cred = ?1 AND b.is_script = 0
+              GROUP BY b.stake_cred",
+        )?;
+        let mut rows = st.query(params![&cred[..]])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let raw: Vec<u8> = r.get(1)?;
+            let mut hash = [0u8; 32];
+            if raw.len() == 32 {
+                hash.copy_from_slice(&raw);
+            }
+            out.push((key_of(&r.get::<_, Vec<u8>>(0)?), hash, r.get(2)?));
+        }
+        Ok(out)
+    }
+
     /// Groups and credential pairs from one batch, in a single transaction.
     pub fn write_batch(
         &mut self,
         groups: &[(i64, [u8; 32], u64)],
         members: &[(i64, KeyHash)],
         pairs: &[(KeyHash, KeyHash, bool, u64)],
+        stake_events: &[([u8; 32], KeyHash, &'static str, bool, u64)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
@@ -144,6 +212,20 @@ impl Index {
                 p.execute(params![
                     &pay[..],
                     &stake[..],
+                    *is_script as i64,
+                    *slot as i64
+                ])?;
+            }
+            let mut s = tx.prepare_cached(
+                "INSERT OR IGNORE INTO stake_event
+                   (tx_hash, stake_cred, kind, is_script, slot)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (hash, cred, kind, is_script, slot) in stake_events {
+                s.execute(params![
+                    &hash[..],
+                    &cred[..],
+                    *kind,
                     *is_script as i64,
                     *slot as i64
                 ])?;
@@ -384,8 +466,15 @@ mod tests {
             &[(1, [7u8; 32], 100)],
             &[(1, k(1)), (1, k(2))],
             &[(k(1), k(9), false, 100)],
+            &[([7u8; 32], k(9), "withdraw", false, 100)],
         )
         .unwrap();
+
+        // A stake credential named by a cert/withdrawal must be recognisable as
+        // one, so a cluster member can render as a wallet without needing a
+        // cred_pair sighting.
+        assert_eq!(ix.stake_cred_info(&k(9)).unwrap(), Some((1, false)));
+        assert_eq!(ix.stake_cred_info(&k(1)).unwrap(), None);
 
         let gs = ix.groups_for_key(&k(1)).unwrap();
         assert_eq!(gs.len(), 1);
@@ -418,6 +507,7 @@ mod tests {
                 (4, k(1)),
                 (4, k(3)),
             ],
+            &[],
             &[],
         )
         .unwrap();
@@ -454,6 +544,7 @@ mod tests {
         ix.write_batch(
             &[(1, [0; 32], 1), (2, [0; 32], 2)],
             &[(1, k(1)), (1, k(2)), (2, k(1)), (2, k(3))],
+            &[],
             &[],
         )
         .unwrap();
