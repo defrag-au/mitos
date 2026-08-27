@@ -10,6 +10,7 @@
 //! that lives OUTSIDE the checkpoint wipe path (`outref_cache`), and per-block
 //! batched inserts.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -45,7 +46,13 @@ CREATE TABLE IF NOT EXISTS party (
     frozen_at_slot         INTEGER,
     promoted_via_terminal  INTEGER NOT NULL DEFAULT 0,
     receipts               INTEGER NOT NULL DEFAULT 0,
-    counterparties         INTEGER NOT NULL DEFAULT 0
+    counterparties         INTEGER NOT NULL DEFAULT 0,
+    -- Does the PROJECT own this wallet? Asserted by a human (registry
+    -- (registry role = treasury, or `seed --project-side`), never derived: the
+    -- chain cannot say who owns anything. It is the boundary every
+    -- returned/unreconciled verdict is measured against, so a wrong 1 here
+    -- launders an extraction into a deployment.
+    project_side           INTEGER NOT NULL DEFAULT 0
 );
 
 -- Edge tables, both slot-keyed so one playhead scrubs both.
@@ -414,6 +421,35 @@ CREATE TABLE IF NOT EXISTS relay_hop (
 );
 CREATE INDEX IF NOT EXISTS idx_relay_from ON relay_hop(from_party);
 CREATE INDEX IF NOT EXISTS idx_relay_to   ON relay_hop(to_addr);
+
+-- The BALANCE-SHEET side: assets of OTHER policies arriving at a wallet the
+-- project owns.
+--
+-- The walk records every unit of VALUE but only this policy's ASSETS, so a
+-- deployment paid in ADA and returned in someone else's NFTs has its
+-- departure captured and its arrival missing — and an honest allocation
+-- renders exactly like an extraction. Measured on Octaverse: 6,000 ADA out,
+-- 62 Mekka S2 back to the project's holding wallet inside 35 minutes, and the
+-- ledger held only the outflow.
+--
+-- Bounded to project-side parties ON PURPOSE. 'Every asset everywhere' is the
+-- frontier explosion in a new dimension — one wallet in that case touched 12
+-- policies and a busy one touches hundreds — but the wallets a project owns
+-- are a curated handful, so this costs almost nothing.
+CREATE TABLE IF NOT EXISTS asset_inflow (
+    party       TEXT    NOT NULL,   -- the project-side wallet that received
+    policy_id   TEXT    NOT NULL,   -- FOREIGN policy: never this project's
+    asset_name  TEXT    NOT NULL,   -- hex
+    quantity    INTEGER NOT NULL,
+    from_party  TEXT,               -- NULL when the inputs were unresolved
+    tx_hash     TEXT    NOT NULL,
+    slot        INTEGER NOT NULL,
+    block_time  INTEGER NOT NULL,
+    PRIMARY KEY (tx_hash, party, policy_id, asset_name)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_party  ON asset_inflow(party);
+CREATE INDEX IF NOT EXISTS idx_ai_policy ON asset_inflow(policy_id);
+CREATE INDEX IF NOT EXISTS idx_ai_slot   ON asset_inflow(slot);
 ";
 
 /// Bring an EXISTING ledger's schema up to date.
@@ -449,6 +485,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         ),
         // NULL on pre-existing rows = the case's own policy (see SCHEMA).
         ("secondary_sale", "policy_id", "policy_id TEXT"),
+        // 0 on pre-existing rows is the SAFE default: a ledger walked before
+        // project-side existed has never declared one, and defaulting to 1
+        // would silently claim every watched wallet is the project's.
+        (
+            "party",
+            "project_side",
+            "project_side INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))
@@ -500,7 +544,11 @@ pub struct SecondarySaleRow {
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
-pub const RESET_DERIVED_TABLES: [&str; 24] = [
+pub const RESET_DERIVED_TABLES: [&str; 25] = [
+    // Derived: the next walk reads the same blocks and re-records it. Keeping
+    // it would let an inflow captured under an OLD project-side set survive a
+    // re-walk that would no longer draw it.
+    "asset_inflow",
     // Derived, not kept: a relay hop is reconstructed by the next walk from
     // the same blocks. Keeping it would let a pass-through inferred under an
     // old window survive a re-walk that would no longer draw it.
@@ -595,6 +643,20 @@ pub struct RelayHopRow {
     pub out_tx: String,
     pub in_slot: u64,
     pub out_slot: u64,
+}
+
+/// A row of `asset_inflow` — a FOREIGN policy's asset arriving at a wallet
+/// the project owns. The return leg the walk could not otherwise see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetInflowRow {
+    pub party: String,
+    pub policy_id: String,
+    pub asset_name: String,
+    pub quantity: i64,
+    pub from_party: Option<String>,
+    pub tx_hash: String,
+    pub slot: u64,
+    pub block_time: i64,
 }
 
 /// A row of `unit_flow` — one output's worth of one unit, moving.
@@ -830,6 +892,61 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(n)
+    }
+
+    pub fn insert_asset_inflows(&mut self, rows: &[AssetInflowRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO asset_inflow
+                 (party, policy_id, asset_name, quantity, from_party,
+                  tx_hash, slot, block_time)
+                 VALUES (?,?,?,?,?,?,?,?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.party,
+                    r.policy_id,
+                    r.asset_name,
+                    r.quantity,
+                    r.from_party,
+                    r.tx_hash,
+                    u64_i64(r.slot),
+                    r.block_time,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Mark a party as owned by the project — the boundary every
+    /// returned/unreconciled verdict is measured against.
+    ///
+    /// An UPDATE, like [`Ledger::label_party`], and for the same reason: the
+    /// `party` table is a projection the checkpoint writes, so `seed` must
+    /// checkpoint FIRST and assert afterwards. The checkpoint's own upsert
+    /// deliberately does not list `project_side`, so a later walk cannot
+    /// clear an assertion a human made.
+    pub fn set_project_side(&self, key: &str, source: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE party SET project_side = 1, source = COALESCE(source, ?) WHERE key = ?",
+            params![source, key],
+        )?)
+    }
+
+    /// Every wallet the project owns. The walk reads this once at start-up to
+    /// decide whose incoming foreign assets are worth recording.
+    pub fn project_side_parties(&self) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM party WHERE project_side = 1")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn insert_unit_flows(&mut self, rows: &[UnitFlowRow]) -> Result<usize> {
@@ -2009,6 +2126,51 @@ mod tests {
     /// `reset_derived` names its tables in a list, so a table added to `SCHEMA`
     /// later would silently survive a reset and poison the next walk with stale
     /// rows. Ask sqlite what actually exists instead of trusting the list.
+    #[test]
+    /// `project_side` is a HUMAN assertion about who owns a wallet, and the
+    /// checkpoint's party upsert deliberately does not list it — so a walk
+    /// cannot clear what a curator declared. It must also survive `reset`,
+    /// which is a prelude to the re-walk that spends it.
+    #[test]
+    fn a_project_side_assertion_survives_the_walk_that_rewrites_the_party_row() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.conn
+            .execute(
+                "INSERT INTO party (key, has_stake, role, watched_from_slot, expand)
+                 VALUES ('stake1treasury', 1, 'declared', 100, 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(l.project_side_parties().unwrap().len(), 0, "0 by default");
+
+        assert_eq!(l.set_project_side("stake1treasury", "registry").unwrap(), 1);
+        assert!(l.project_side_parties().unwrap().contains("stake1treasury"));
+
+        // The checkpoint's own upsert: every frontier-derived column, and
+        // NOT project_side.
+        l.conn
+            .execute(
+                "INSERT INTO party (key, has_stake, role, watched_from_slot, expand)
+                 VALUES ('stake1treasury', 1, 'promoted', 200, 0)
+                 ON CONFLICT(key) DO UPDATE SET role = excluded.role, expand = excluded.expand",
+                [],
+            )
+            .unwrap();
+        assert!(
+            l.project_side_parties().unwrap().contains("stake1treasury"),
+            "a re-walk must not silently un-declare the project's own wallet"
+        );
+    }
+
+    /// Naming a party that has no row is a NO-OP, and the caller is told so —
+    /// `--project-side` on an unseated wallet must not look like it worked.
+    #[test]
+    fn marking_an_unseated_party_reports_zero_rather_than_inventing_one() {
+        let l = Ledger::open_in_memory().unwrap();
+        assert_eq!(l.set_project_side("stake1nobody", "cli").unwrap(), 0);
+        assert!(l.project_side_parties().unwrap().is_empty());
+    }
+
     #[test]
     fn reset_derived_covers_every_table_in_the_schema() {
         let l = Ledger::open_in_memory().unwrap();

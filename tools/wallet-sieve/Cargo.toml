@@ -1,0 +1,52 @@
+# wallet-sieve — on-demand wallet flow excavation with NO index.
+#
+# The other walkers (market-ledger, project-ledger, wallet-trace) decode the
+# whole chain because their target set is global. This tool's target is ONE
+# wallet, and a wallet's 28-byte credentials appear as raw bytes inside every
+# output address that pays it — so the query primitive is SIMD substring
+# search over raw chunk bytes, with CBOR decode only on hit. Scan cost is
+# chain-size-bound, not wallet-size-bound; measured 2026-08-25 on
+# cardano-infra the full 216GB sweep is ~2.5 min at 4 parallel readers.
+#
+# Design + measurements: cnft.dev-workers memory `project_wallet_flow_explorer`.
+[package]
+name = "wallet-sieve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "On-demand single-wallet flow excavation over a certified Mithril snapshot — no index"
+
+[[bin]]
+name = "wallet-sieve"
+path = "src/main.rs"
+
+[dependencies]
+# Shared walker plumbing: immutable-DB iteration (incl. the fuzzy slot seek)
+# and chunk arithmetic. Same substrate as the other three walkers.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+pallas-traverse = { workspace = true }
+pallas-addresses = { workspace = true }
+# The chain-tail spool follower (N2N chainsync + blockfetch to a relay).
+pallas-network = { workspace = true }
+
+# The sieve itself: SIMD memmem for the credential patterns (pass A), and a
+# multi-pattern automaton for the owned-tx-hash set (pass B sweeps).
+memchr = "2"
+aho-corasick = "1"
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# `serve` — the hosted read surface (market-ledger serve pattern): axum on
+# loopback, per-wallet sqlite cache, tokio confined to serve::run.
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

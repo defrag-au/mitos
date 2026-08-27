@@ -39,8 +39,8 @@ use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
 use crate::seed::*;
 use crate::state::{BufferedOutput, RelayCandidate, WalkState};
 use crate::store::{
-    AliasRow, AssetEventRow, Ledger, MintPaymentRow, RelayHopRow, TxDeltaRow, UnitFlowRow,
-    ValueEventRow,
+    AliasRow, AssetEventRow, AssetInflowRow, Ledger, MintPaymentRow, RelayHopRow, TxDeltaRow,
+    UnitFlowRow, ValueEventRow,
 };
 
 #[derive(clap::Args, Debug)]
@@ -219,6 +219,17 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut last_hash: Option<Vec<u8>> = None;
     let mut stats = LadderStats::default();
     let mut rows = Rows::default();
+    // Read ONCE, before the walk: the project boundary is asserted at seed and
+    // cannot change mid-walk. Empty is the normal case for an un-curated
+    // ledger and makes the whole capture a single `is_empty` check per tx.
+    let project_side = ledger.project_side_parties()?;
+    if !project_side.is_empty() {
+        tracing::info!(
+            wallets = project_side.len(),
+            "walk: project-side wallets declared — foreign assets arriving at them \
+             will be recorded as return legs (`asset_inflow`)"
+        );
+    }
     let mut ctx = TxCtx {
         policy,
         policy_hex: policy_hex.clone(),
@@ -243,6 +254,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
         follow_relays: args.follow_relays,
         relay_window_slots: args.relay_window_slots,
         relay_min_lovelace: args.relay_min_lovelace,
+        project_side: &project_side,
     };
 
     for block in blocks {
@@ -524,6 +536,35 @@ fn may_promote(asset_receivers: &BTreeSet<&str>, to_key: &str, is_member: bool) 
     is_member || !asset_receivers.contains(to_key)
 }
 
+/// The parties that took DELIVERY of the collection in this transaction — the
+/// buyers, whose outputs are therefore change and minAda rather than payment.
+///
+/// This is the exclusion the mint fund-split rests on, and it must ask for a
+/// HOLDING (`AssetClass::is_holding`) rather than for any policy asset. The
+/// thing being excluded is *the buyer*, and only a buyer takes delivery of a
+/// user token. A CIP-68 reference token goes to the PROJECT's own metadata
+/// address, so a party known only by that receipt is not a buyer, and lovelace
+/// landing on it is revenue.
+///
+/// **Measured on Octaverse (`6817db27…`)**: for the mint's first two days the
+/// treasury address and the reference-token address were different payment
+/// credentials under ONE stake key — and the stake key IS the party key. An
+/// any-policy-asset form therefore put **22,722.61 ₳ of mint proceeds behind the
+/// buyer-change exclusion** and reported the take as 24,081.47 ₳: 48.5% of the
+/// money gone, with no warning. Asking for a holding restores it, and cannot
+/// re-admit change — the reference token's own minAda does now book as a
+/// payment, but that carrier ADA is the project's, not the buyer's.
+fn delivery_parties<'a>(outs: &'a [Out<'a>]) -> BTreeSet<&'a str> {
+    outs.iter()
+        .filter(|o| {
+            o.policy_assets
+                .iter()
+                .any(|(n, _)| AssetClass::of(n).is_holding())
+        })
+        .map(|o| o.resolved.party.key.as_str())
+        .collect()
+}
+
 /// The staking credential behind a stake-keyed party (decodes the bech32).
 fn stake_cred_of(p: &Party) -> Option<[u8; 28]> {
     if !p.has_stake_credential {
@@ -580,6 +621,12 @@ pub struct TxCtx<'a> {
     pub relay_window_slots: u64,
     /// Ignore bare outputs below this — a relay carries a payment, not dust.
     pub relay_min_lovelace: u64,
+    /// Wallets the PROJECT OWNS (`party.project_side`), asserted at seed.
+    ///
+    /// Foreign-policy assets landing on one of these are the return leg of a
+    /// deployment and get recorded to `asset_inflow`. Empty is the normal
+    /// case and costs nothing — the whole block is skipped.
+    pub project_side: &'a BTreeSet<String>,
 }
 
 /// Rows accumulated per block, flushed together.
@@ -598,6 +645,9 @@ pub struct Rows {
     /// Confirmed pass-throughs — a watched party's money seen leaving the bare
     /// address it was paid into. See the `relay_hop` table.
     pub relays: Vec<RelayHopRow>,
+    /// Foreign-policy assets arriving at a project-owned wallet — the return
+    /// leg. See the `asset_inflow` table.
+    pub inflows: Vec<AssetInflowRow>,
 }
 
 impl Rows {
@@ -609,6 +659,7 @@ impl Rows {
             + ledger.insert_value_events(&self.values)?
             + ledger.insert_unit_flows(&self.units)?
             + ledger.insert_relay_hops(&self.relays)?
+            + ledger.insert_asset_inflows(&self.inflows)?
             + ledger.put_discovered_holders(&self.holders)?;
         self.assets.clear();
         self.mint_payments.clear();
@@ -617,6 +668,7 @@ impl Rows {
         self.values.clear();
         self.units.clear();
         self.relays.clear();
+        self.inflows.clear();
         self.holders.clear();
         Ok(n)
     }
@@ -819,6 +871,50 @@ pub fn process_tx(
         }
     }
 
+    // ── the balance-sheet side: what came BACK ───────────────────────────
+    //
+    // The walk records every unit of value but only THIS policy's assets, so
+    // a deployment paid in ADA and returned in another project's NFTs has its
+    // departure captured and its arrival nowhere. Read without the return
+    // leg, an honest allocation is indistinguishable from an extraction —
+    // measured on Octaverse, where 6,000 ₳ left the treasury and 62 Mekka S2
+    // came back to the project's holding wallet inside 35 minutes, and the
+    // ledger held only the outflow.
+    //
+    // Bounded to wallets the project OWNS. Recording every asset for every
+    // watched party would be the frontier explosion in a new dimension; a
+    // curated handful of project wallets costs nothing, and the empty case
+    // (no project_side declared) skips entirely.
+    if !ctx.project_side.is_empty() {
+        for o in &outs {
+            if !ctx.project_side.contains(o.resolved.party.key.as_str()) {
+                continue;
+            }
+            for (policy, name, qty) in &o.bundle {
+                // THIS policy's assets already have a home in `asset_event`;
+                // recording them here too would double-count the collection
+                // against its own supply.
+                if policy.as_slice() == ctx.policy.as_slice() {
+                    continue;
+                }
+                rows.inflows.push(AssetInflowRow {
+                    party: o.resolved.party.key.clone(),
+                    policy_id: hex::encode(policy),
+                    asset_name: hex::encode(name),
+                    quantity: *qty as i64,
+                    // The sender needs resolved inputs, which this point in
+                    // the walk does not have. The pairing rule is "assets
+                    // arrived inside the window after value left", and that
+                    // needs no payer — so leave it null rather than guess.
+                    from_party: None,
+                    tx_hash: tx_hex.clone(),
+                    slot: ctx.slot,
+                    block_time: ctx.time as i64,
+                });
+            }
+        }
+    }
+
     // ── the mint transaction's fund split ────────────────────────────────
     //
     // A mint bakes distribution INTO the mint tx: the buyer pays once, and the
@@ -826,17 +922,10 @@ pub fn process_tx(
     // sometimes a platform fee. Reading the mint as a single destination loses
     // every one of those legs, and they are the distribution story.
     //
-    // The test needs no input resolution: an output to a party that received NO
-    // policy asset in this tx is money going somewhere. That single rule also
-    // excludes the buyer's change and the minAda riding with each token (both
-    // land on the asset recipient) and the reference token's deposit (that
-    // output carries a policy asset).
+    // The test needs no input resolution: an output to a party that took no
+    // DELIVERY in this tx is money going somewhere. See `delivery_parties`.
     if !mints.is_empty() {
-        let asset_parties: BTreeSet<&str> = outs
-            .iter()
-            .filter(|o| !o.policy_assets.is_empty())
-            .map(|o| o.resolved.party.key.as_str())
-            .collect();
+        let asset_parties = delivery_parties(&outs);
 
         // Carries the `Party`, not just its key: the destination has to be
         // seeded below, and re-deriving a party from a key string is not
@@ -1423,6 +1512,12 @@ fn book_unit_flows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No project boundary declared — the default for every walk test, and the
+    /// state an un-curated ledger is in. The return-leg capture is skipped
+    /// entirely, so these tests exercise the walk unchanged.
+    static NO_PROJECT_SIDE: std::sync::LazyLock<BTreeSet<String>> =
+        std::sync::LazyLock::new(BTreeSet::new);
     use crate::activity::Activity;
     use crate::state::{Buffer, Holders, Relays};
     use chain_ledger::{Frontier, Thresholds};
@@ -1482,6 +1577,7 @@ mod tests {
             follow_relays: true,
             relay_window_slots: 7200,
             relay_min_lovelace: 5_000_000,
+            project_side: &NO_PROJECT_SIDE,
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -1562,6 +1658,7 @@ mod tests {
             follow_relays: true,
             relay_window_slots: 7200,
             relay_min_lovelace: 5_000_000,
+            project_side: &NO_PROJECT_SIDE,
         };
         let mut rows = Rows::default();
         let mut stats = LadderStats::default();
@@ -1681,6 +1778,7 @@ mod tests {
             follow_relays: true,
             relay_window_slots: 7200,
             relay_min_lovelace: 5_000_000,
+            project_side: &NO_PROJECT_SIDE,
         }
     }
 
@@ -1858,6 +1956,7 @@ mod tests {
             follow_relays: true,
             relay_window_slots: 7200,
             relay_min_lovelace: 5_000_000,
+            project_side: &NO_PROJECT_SIDE,
         };
         let mut rows = Rows::default();
         book_unit_flows(outs, inputs, state, &ctx, "txhash", unresolved, &mut rows);
@@ -1889,6 +1988,7 @@ mod tests {
             follow_relays: true,
             relay_window_slots: 7200,
             relay_min_lovelace: 5_000_000,
+            project_side: &NO_PROJECT_SIDE,
         };
         let mut rows = Rows::default();
         book_unit_flows(outs, inputs, &state, &ctx, "txhash", 0, &mut rows);
@@ -1922,6 +2022,7 @@ mod tests {
             follow_relays: true,
             relay_window_slots: 7200,
             relay_min_lovelace: 5_000_000,
+            project_side: &NO_PROJECT_SIDE,
         };
         let mut rows = Rows::default();
         let user_token = hex::decode("000de1404d4430303031").unwrap();
@@ -1961,6 +2062,38 @@ mod tests {
         let t = state.frontier.member(&party("treasury")).unwrap();
         assert_eq!(t.role, Role::Declared);
         assert!(state.frontier.expands(&party("treasury")));
+    }
+
+    /// The Octaverse regression: a CIP-68 project whose treasury address and
+    /// reference-token address share ONE stake key — which is the party key.
+    ///
+    /// Excluding every party that touched a policy asset hid 48.5% of that
+    /// mint's proceeds behind the buyer-change rule. Only DELIVERY of a
+    /// holder-facing token marks a buyer.
+    #[test]
+    fn a_reference_token_receipt_does_not_make_the_project_a_buyer() {
+        let user_token = hex::decode("000de1404d4430303031").unwrap();
+        let reference = hex::decode("000643b04d4430303031").unwrap();
+
+        let mut buyer = out(0, "buyer", 1_194_000, vec![]);
+        buyer.policy_assets = vec![(user_token, 1)];
+        // Same party as the treasury output below — one stake key, two payment
+        // credentials — holding only the metadata token.
+        let mut meta = out(1, "project", 1_340_000, vec![]);
+        meta.policy_assets = vec![(reference, 1)];
+        let treasury = out(2, "project", 147_196_000, vec![]);
+
+        let outs = [buyer, meta, treasury];
+        let delivered = delivery_parties(&outs);
+        assert!(
+            delivered.contains("buyer"),
+            "the user token marks its recipient as a buyer"
+        );
+        assert!(
+            !delivered.contains("project"),
+            "a reference token is metadata plumbing, not delivery — so the \
+             147.196 ₳ on the same party is revenue, not change"
+        );
     }
 
     const USDM: [u8; 4] = [0xc4, 0x8c, 0xbb, 0x3d];

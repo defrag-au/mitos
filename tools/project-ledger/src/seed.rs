@@ -76,6 +76,20 @@ pub struct SeedArgs {
     /// file). Cheap insurance against an indexer's `creation_time` being late.
     #[arg(long, default_value_t = CHUNK_SLOTS)]
     margin: u64,
+
+    /// Mark a `stake1…` as OWNED BY THE PROJECT, in addition to any registry
+    /// wallet whose role says so.
+    ///
+    /// This is the boundary the walk measures returns against: foreign assets
+    /// arriving at one of these wallets are recorded as `asset_inflow`, which
+    /// is what lets a deployment paid in ADA and returned in another
+    /// project's NFTs read as returned rather than as money walking out.
+    ///
+    /// For a wallet found mid-investigation. Prefer the registry — an entry
+    /// there carries a `source` explaining who says so, and this flag records
+    /// only that a command line asserted it.
+    #[arg(long = "project-side", value_name = "STAKE")]
+    project_side: Vec<String>,
 }
 
 pub fn run(args: SeedArgs) -> Result<()> {
@@ -194,8 +208,35 @@ pub fn run(args: SeedArgs) -> Result<()> {
     // Cursor at the walk start with an EMPTY hash = "not started": the walk
     // streams from genesis and fast-skips to this slot.
     ledger.checkpoint(&state, walk_start, &[])?;
+    let mut project_side = 0usize;
     for w in &registry.wallets {
         ledger.label_party(&w.stake, &w.label, &w.source)?;
+        if w.is_project_side() {
+            project_side += ledger.set_project_side(&w.stake, &w.source)?;
+        }
+        if let Some(r) = w.unknown_role() {
+            tracing::warn!(
+                stake = %w.stake, role = %r,
+                "seed: unrecognised wallet role — treated as OUTSIDE the project boundary, \
+                 so its receipts will not close a deployment. Use one of: treasury, mint, \
+                 holding, vault, ops, project"
+            );
+        }
+    }
+    // `--project-side` covers a wallet discovered mid-investigation, before
+    // anyone has edited the registry. Recorded with a source that names the
+    // command line, so it reads as WEAKER than a registry entry rather than
+    // indistinguishable from one.
+    for stake in &args.project_side {
+        let n = ledger.set_project_side(stake, "seed --project-side (command line)")?;
+        if n == 0 {
+            tracing::warn!(
+                stake = %stake,
+                "seed: --project-side named a party with no row — it is not in the frontier, \
+                 so nothing was marked. Declare it in the registry to seat it first."
+            );
+        }
+        project_side += n;
     }
     // Terminals carry their label and source too — a declared terminal is an
     // ASSERTION ("this wallet is custodial-scale, never expand it") and an
@@ -228,6 +269,7 @@ pub fn run(args: SeedArgs) -> Result<()> {
         expected_assets = ?expected,
         seeds = registry.wallets.len(),
         declared_terminal = registry.terminal.parties.len(),
+        project_side,
         db = %args.db.display(),
         "seed: complete"
     );

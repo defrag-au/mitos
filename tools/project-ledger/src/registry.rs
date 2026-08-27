@@ -34,7 +34,6 @@ pub struct PolicyDecl {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // `role` is surfaced by export
 pub struct WalletDecl {
     /// `stake1…` (the party key). Enterprise addresses are not declarable as
     /// project wallets — a stakeless address is terminal by shape.
@@ -43,6 +42,38 @@ pub struct WalletDecl {
     pub role: String,
     /// Required: who says so.
     pub source: String,
+}
+
+/// Roles that mean **the project owns this wallet**, so value arriving here
+/// has come back and value leaving here has crossed the boundary.
+///
+/// A closed set, deliberately. The alternative — treat anything that is not
+/// obviously external as the project's — gets the default wrong in the
+/// dangerous direction, because a mistaken `project_side` launders an
+/// extraction into a deployment.
+const PROJECT_SIDE_ROLES: [&str; 6] = ["treasury", "mint", "holding", "vault", "ops", "project"];
+
+impl WalletDecl {
+    /// Does this declaration place the wallet inside the project boundary?
+    ///
+    /// Case- and whitespace-insensitive, and an UNRECOGNISED role is reported
+    /// by [`WalletDecl::unknown_role`] rather than silently answering "no".
+    /// A registry typo that quietly means "not the project" is precisely the
+    /// silent failure this codebase keeps having to relearn.
+    pub fn is_project_side(&self) -> bool {
+        let r = self.role.trim().to_ascii_lowercase();
+        PROJECT_SIDE_ROLES.contains(&r.as_str())
+    }
+
+    /// The role string when it matches nothing known — for a startup warning.
+    /// `external` and `customer` are legitimate non-project roles and are not
+    /// reported.
+    pub fn unknown_role(&self) -> Option<&str> {
+        let r = self.role.trim().to_ascii_lowercase();
+        (!PROJECT_SIDE_ROLES.contains(&r.as_str())
+            && !matches!(r.as_str(), "external" | "customer" | "partner"))
+        .then_some(self.role.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -183,6 +214,40 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
+
+    /// The role string was DEAD CODE for weeks (`#[allow(dead_code)]`, "surfaced
+    /// by export"). Now it decides the project boundary, so a typo has to be
+    /// loud: an unrecognised role means NOT the project, which is the safe
+    /// answer, but silence about it is how a treasury goes unrecorded.
+    #[test]
+    fn a_wallet_role_decides_the_project_boundary_and_a_typo_is_reported() {
+        let w = |role: &str| WalletDecl {
+            stake: "stake1x".into(),
+            label: "l".into(),
+            role: role.into(),
+            source: "s".into(),
+        };
+        for r in [
+            "treasury",
+            "TREASURY",
+            "  Treasury ",
+            "mint",
+            "holding",
+            "vault",
+        ] {
+            assert!(w(r).is_project_side(), "{r} is the project's own wallet");
+            assert_eq!(w(r).unknown_role(), None);
+        }
+        // Legitimately outside, and not worth a warning.
+        for r in ["external", "customer", "partner"] {
+            assert!(!w(r).is_project_side());
+            assert_eq!(w(r).unknown_role(), None);
+        }
+        // A typo: outside the boundary (safe) AND reported (loud).
+        assert!(!w("tresury").is_project_side());
+        assert_eq!(w("tresury").unknown_role(), Some("tresury"));
+    }
+
     use super::*;
 
     const EXAMPLE: &str = include_str!("../registry.toml");
