@@ -90,6 +90,28 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
             return Err(e).context("adding wallet.deep_pending");
         }
     }
+    // An explicit ALTER, like every column above it: `CREATE TABLE IF NOT
+    // EXISTS` silently does nothing on an existing table, so a new column in
+    // the CREATE alone would be missing on every deployed cache.
+    if let Err(e) = conn.execute("ALTER TABLE flow ADD COLUMN asset_total INTEGER", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column") {
+            return Err(e).context("adding flow.asset_total");
+        }
+    }
+    for (table, col, ty) in [
+        ("flow", "locked", "INTEGER"),
+        ("flow", "unlocked", "INTEGER"),
+        ("owned", "script", "INTEGER"),
+        ("flow", "locked_assets", "TEXT"),
+    ] {
+        if let Err(e) = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(e).context(format!("adding {table}.{col}"));
+            }
+        }
+    }
     Ok(conn)
 }
 
@@ -175,7 +197,7 @@ pub fn load_wallet(conn: &Connection, canonical: &str) -> Result<Option<WalletMe
 
 pub fn load_owned(conn: &Connection, canonical: &str) -> Result<crate::classify::OwnedSet> {
     let mut stmt =
-        conn.prepare("SELECT tx_hash, idx, lovelace, units FROM owned WHERE target = ?1")?;
+        conn.prepare("SELECT tx_hash, idx, lovelace, units, script FROM owned WHERE target = ?1")?;
     let mut out = HashMap::new();
     let mut rows = stmt.query(params![canonical])?;
     while let Some(r) = rows.next()? {
@@ -188,7 +210,13 @@ pub fn load_owned(conn: &Connection, canonical: &str) -> Result<crate::classify:
             Some(j) => serde_json::from_str(&j).context("parsing owned units")?,
             None => Vec::new(),
         };
-        out.insert((h, r.get::<_, u32>(1)?), (r.get::<_, u64>(2)?, units));
+        // NULL on rows stored before the column existed — read as
+        // key-controlled, which is what the overwhelming majority are.
+        let script = r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0;
+        out.insert(
+            (h, r.get::<_, u32>(1)?),
+            (r.get::<_, u64>(2)?, units, script),
+        );
     }
     Ok(out)
 }
@@ -231,8 +259,9 @@ pub fn store_timeline(
         let mut ins = tx.prepare(&format!(
             "{verb} INTO flow
                  (target, slot, tx_idx, tx_hash, kind, lovelace_in, lovelace_out,
-                  assets_in, assets_out, senders, recipients, assets)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                  assets_in, assets_out, senders, recipients, assets, asset_total,
+                  locked, unlocked, locked_assets)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
         ))?;
         for (i, t) in timeline.txs.iter().enumerate() {
             let row = report::row_for(t, sources);
@@ -260,14 +289,21 @@ pub fn store_timeline(
                 senders,
                 recipients,
                 assets,
+                row.asset_total,
+                row.locked,
+                row.unlocked,
+                row.locked_assets
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ])?;
         }
         tx.execute("DELETE FROM owned WHERE target = ?1", params![canonical])?;
         let mut own = tx.prepare(
-            "INSERT INTO owned (target, tx_hash, idx, lovelace, assets, units)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO owned (target, tx_hash, idx, lovelace, assets, units, script)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        for ((hash, idx), (lovelace, units)) in &timeline.owned {
+        for ((hash, idx), (lovelace, units, script)) in &timeline.owned {
             own.execute(params![
                 canonical,
                 hash.as_slice(),
@@ -275,6 +311,7 @@ pub fn store_timeline(
                 lovelace,
                 units.len() as u32,
                 serde_json::to_string(units)?,
+                *script as i64,
             ])?;
         }
         let (new_first, new_last) = if timeline.txs.is_empty() {
@@ -365,7 +402,7 @@ pub fn query_rows(
 ) -> Result<Vec<report::Row>> {
     let mut stmt = conn.prepare(
         "SELECT slot, tx_hash, kind, lovelace_in, lovelace_out, assets_in, assets_out, senders,
-                recipients, assets, market
+                recipients, assets, market, asset_total, locked, unlocked, locked_assets
          FROM flow
          WHERE target = ?1 AND (?2 IS NULL OR slot < ?2)
          ORDER BY slot DESC, tx_idx DESC
@@ -410,6 +447,16 @@ pub fn query_rows(
             senders,
             recipients,
             assets,
+            // NULL on rows written before the column existed — read as 0,
+            // which the consumer treats as "unknown" and falls back to the
+            // list's own length.
+            asset_total: r.get::<_, Option<u32>>(11)?.unwrap_or(0),
+            locked: r.get::<_, Option<u64>>(12)?.unwrap_or(0),
+            unlocked: r.get::<_, Option<u64>>(13)?.unwrap_or(0),
+            locked_assets: match r.get::<_, Option<String>>(14)? {
+                Some(s) => Some(serde_json::from_str(&s).context("parsing locked_assets")?),
+                None => None,
+            },
             market,
         });
     }

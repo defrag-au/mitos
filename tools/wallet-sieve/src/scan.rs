@@ -65,6 +65,17 @@ pub struct OutHit {
     pub lovelace: u64,
     pub assets: u32,
     pub units: Vec<AssetUnit>,
+    /// The payment credential is a SCRIPT, so this output is not spendable
+    /// with the wallet's key even though its stake credential is the
+    /// wallet's.
+    ///
+    /// This is the gap between what a stake-keyed sieve sees and what a wallet
+    /// shows. An offer, a listing or an order parks funds at a contract
+    /// address that keeps the customer's delegation — so the money still earns
+    /// the wallet its rewards and still matches the credential scan, while
+    /// being completely beyond the reach of its spending key. Netting without
+    /// this reports a 147 ₳ offer as a 1.4 ₳ fee.
+    pub script: bool,
 }
 
 /// One transaction that touches the target credentials.
@@ -337,6 +348,16 @@ fn h32(h: impl AsRef<[u8]>) -> [u8; 32] {
     out
 }
 
+/// Does this address pay to a SCRIPT rather than a key?
+///
+/// Non-Shelley (Byron) addresses are always key-controlled, so `false`.
+fn addr_pays_to_script(addr: &Address) -> bool {
+    matches!(
+        addr,
+        Address::Shelley(sh) if matches!(sh.payment(), ShelleyPaymentPart::Script(_))
+    )
+}
+
 /// The two 28-byte credential slots of an output address, when Shelley.
 fn addr_creds(addr: &Address) -> (Option<[u8; 28]>, Option<[u8; 28]>) {
     match addr {
@@ -375,12 +396,14 @@ pub(crate) fn extract_cred_hits(
             assets: u32,
             units: Vec<AssetUnit>,
             matched: Vec<usize>,
+            script: bool,
         }
         let mut decoded: Vec<Decoded> = Vec::with_capacity(outputs.len());
         let mut any = false;
         for o in outputs.iter() {
             let Ok(addr) = o.address() else { continue };
             let (p, d) = addr_creds(&addr);
+            let script = addr_pays_to_script(&addr);
             let matched: Vec<usize> = targets
                 .iter()
                 .enumerate()
@@ -435,6 +458,7 @@ pub(crate) fn extract_cred_hits(
                 assets,
                 units,
                 matched,
+                script,
             });
         }
         if !any {
@@ -460,6 +484,7 @@ pub(crate) fn extract_cred_hits(
                         lovelace: d.lovelace,
                         assets: d.assets,
                         units: d.units.clone(),
+                        script: d.script,
                     });
                 } else {
                     other_outputs.push((d.address.clone(), d.lovelace));

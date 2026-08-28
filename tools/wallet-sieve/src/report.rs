@@ -27,6 +27,24 @@ pub struct Row {
     /// Which assets moved, netted (positive arrived, negative left).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets: Option<Vec<AssetEntry>>,
+    /// Distinct assets that moved, BEFORE the per-row cap. Equal to
+    /// `assets.len()` unless the row was capped — which is the only way a
+    /// consumer can tell the difference without guessing.
+    #[serde(default)]
+    pub asset_total: u32,
+    /// Lovelace parked at a script this wallet's stake credential owns but
+    /// its spending key cannot reach — an offer, a listing, an order.
+    #[serde(default)]
+    pub locked: u64,
+    /// Lovelace released back out of such a script.
+    #[serde(default)]
+    pub unlocked: u64,
+    /// Assets that crossed the spendable boundary: positive went into a
+    /// contract, negative came back. `assets` nets these away against the
+    /// change they return with, so without this a listing reports as having
+    /// moved nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_assets: Option<Vec<AssetEntry>>,
     /// What market-ledger says this transaction was, when it knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market: Option<crate::market::MarketEvent>,
@@ -88,6 +106,27 @@ pub fn row_for(tx: &TimelineTx, sources: &HashMap<([u8; 32], u32), (String, u64)
         // Enrichment is stitched in by the store layer, which is where the
         // market lookup happens; a bare row_for() call carries none.
         market: None,
+        // The true count, so a consumer never has to infer truncation from
+        // the length of the list it was handed.
+        asset_total: tx.asset_total,
+        locked: tx.locked,
+        unlocked: tx.unlocked,
+        locked_assets: if tx.locked_assets.is_empty() {
+            None
+        } else {
+            Some(
+                tx.locked_assets
+                    .iter()
+                    .map(|m| AssetEntry {
+                        policy: m.policy.clone(),
+                        name_hex: m.name_hex.clone(),
+                        quantity: m.quantity,
+                        minted: m.minted,
+                        burned: m.burned,
+                    })
+                    .collect(),
+            )
+        },
         assets: if tx.asset_moves.is_empty() {
             None
         } else {
