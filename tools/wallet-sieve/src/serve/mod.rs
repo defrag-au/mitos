@@ -74,6 +74,19 @@ pub struct ServeArgs {
     /// rows in a minute. `0` disables the split and sweeps everything once.
     #[arg(long, default_value_t = 365)]
     initial_window_days: u64,
+
+    /// Longest window still served by the SHALLOW lane.
+    ///
+    /// Scans run in two lanes so a newcomer wanting 30 days never queues
+    /// behind somebody's full-chain backfill. A sweep is chain-size-bound —
+    /// ~3 GB for 90 days against 219 GB for everything — so the deep lane can
+    /// hold a batch for minutes while the shallow one turns requests around in
+    /// seconds. Both lanes still coalesce, so concurrency costs sweeps, not
+    /// users.
+    ///
+    /// `0` puts every request in one lane (the old behaviour).
+    #[arg(long, default_value_t = 90)]
+    shallow_max_days: u64,
 }
 
 #[derive(Clone)]
@@ -121,6 +134,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         initial_window_slots: (args.initial_window_days > 0)
             .then(|| args.initial_window_days * 86_400),
         threads: args.scan_threads,
+        shallow_max_days: args.shallow_max_days,
     })?;
     crate::tail::spawn(
         args.immutable.clone(),

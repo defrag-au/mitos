@@ -19,6 +19,10 @@ use crate::report;
 pub fn open_rw(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Two scan lanes now write here. WAL serialises writers, so an overlap is
+    // ordinary rather than exceptional — wait for the lock instead of failing
+    // a sweep that has already read gigabytes of chain.
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS wallet (
              target TEXT PRIMARY KEY,
@@ -104,6 +108,16 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
         ("flow", "unlocked", "INTEGER"),
         ("owned", "script", "INTEGER"),
         ("flow", "locked_assets", "TEXT"),
+        // How far BACK this wallet has been scanned. See [`ScanTarget`] — the
+        // `deep_pending` boolean it supersedes could only say "shallow or
+        // not", which is why the only remedy it could express was a full
+        // 219 GB sweep.
+        //
+        // NULL on rows written before this column existed: depth unknown, so
+        // the next request that needs depth re-establishes it. Assuming
+        // "already deep" would permanently strand exactly the wallets this
+        // change exists to repair.
+        ("wallet", "scanned_from_slot", "INTEGER"),
     ] {
         if let Err(e) = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), []) {
             let msg = e.to_string();
@@ -164,33 +178,229 @@ pub fn open_ro(path: &Path) -> Result<Connection> {
         .with_context(|| format!("opening {} read-only", path.display()))
 }
 
+/// How far back a scan has gone, or is being asked to go.
+///
+/// Replaces a `deep_pending: bool`, which could only distinguish "shallow"
+/// from "not" — so the only backfill it could express was all the way to
+/// genesis. With tiers at 30/90/182/365 days a 90-day reader was made to pay
+/// for a 219 GB sweep because 3 GB and 219 GB were the only two options.
+///
+/// Depth is stored as the oldest slot covered, so "does what we hold satisfy
+/// what is being asked for?" is one comparison rather than a special case per
+/// tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanTarget {
+    /// Covered back to this slot, inclusive.
+    Since(u64),
+    /// Covered to the start of the chain — nothing older exists to fetch.
+    Genesis,
+}
+
+impl ScanTarget {
+    /// The oldest slot this target covers.
+    pub fn floor(self) -> u64 {
+        match self {
+            Self::Since(slot) => slot.max(crate::excavate::SHELLEY_START_SLOT),
+            Self::Genesis => crate::excavate::SHELLEY_START_SLOT,
+        }
+    }
+
+    /// Does what we already hold satisfy `wanted`?
+    ///
+    /// Deeper coverage is a LOWER floor, so this is `<=` — the direction is
+    /// easy to invert, and inverting it would make every request look already
+    /// satisfied and nothing would ever backfill.
+    pub fn covers(self, wanted: Self) -> bool {
+        self.floor() <= wanted.floor()
+    }
+
+    /// What a request is asking for. `None` days is the whole chain.
+    pub fn wanted(window_days: Option<u64>, now_slot: u64) -> Self {
+        match window_days.filter(|d| *d > 0) {
+            Some(days) => Self::Since(now_slot.saturating_sub(days * 86_400)),
+            None => Self::Genesis,
+        }
+    }
+
+    /// Read back from storage. `Genesis` is recorded as the Shelley start.
+    pub fn from_slot(slot: u64) -> Self {
+        if slot <= crate::excavate::SHELLEY_START_SLOT {
+            Self::Genesis
+        } else {
+            Self::Since(slot)
+        }
+    }
+}
+
 pub struct WalletMeta {
     pub scanned_to_chunk: u64,
     /// Slot-granular cursor (tail-aware). `None` on legacy rows.
     pub scanned_to_slot: Option<u64>,
-    /// The deep backfill below the initial window hasn't run yet.
-    pub deep_pending: bool,
+    /// How far BACK this wallet has been scanned. `None` = unknown (never
+    /// scanned, or written before the column existed).
+    pub scanned_from: Option<ScanTarget>,
     pub first_slot: Option<u64>,
     pub last_slot: Option<u64>,
     pub updated_unix: u64,
 }
 
+impl WalletMeta {
+    /// Is history still missing below what has been scanned, for a request
+    /// wanting `wanted`?
+    ///
+    /// Unknown depth counts as NOT covered: a wallet whose floor was never
+    /// recorded is exactly the one that needs re-establishing.
+    pub fn needs_backfill(&self, wanted: ScanTarget) -> bool {
+        !self.scanned_from.is_some_and(|held| held.covers(wanted))
+    }
+}
+
+#[cfg(test)]
+mod scan_target_tests {
+    use super::*;
+    use crate::excavate::SHELLEY_START_SLOT;
+
+    const NOW: u64 = SHELLEY_START_SLOT + 200_000_000;
+    const DAY: u64 = 86_400;
+
+    fn meta(scanned_from: Option<ScanTarget>) -> WalletMeta {
+        WalletMeta {
+            scanned_to_chunk: 0,
+            scanned_to_slot: Some(NOW),
+            scanned_from,
+            first_slot: None,
+            last_slot: None,
+            updated_unix: 0,
+        }
+    }
+
+    /// THE REGRESSION. A wallet first seen under a 30-day window, then asked
+    /// for the full chain, must backfill. The old code decided this from
+    /// whether the wallet had ever been scanned, so the answer was always
+    /// "no" and full-chain requests silently did nothing but a tail refresh.
+    #[test]
+    fn a_shallow_wallet_asked_for_everything_backfills() {
+        let held = ScanTarget::wanted(Some(30), NOW);
+        assert!(meta(Some(held)).needs_backfill(ScanTarget::Genesis));
+    }
+
+    /// The point of the type: a 90-day tier over a 90-day scan is COMPLETE and
+    /// must not be dragged through a 219 GB sweep just because the only other
+    /// option used to be "deep".
+    #[test]
+    fn a_window_already_covered_does_not_backfill() {
+        let held = ScanTarget::wanted(Some(90), NOW);
+        assert!(!meta(Some(held)).needs_backfill(ScanTarget::wanted(Some(90), NOW)));
+        assert!(
+            !meta(Some(held)).needs_backfill(ScanTarget::wanted(Some(30), NOW)),
+            "a shallower request over a deeper scan is already satisfied"
+        );
+    }
+
+    /// Each tier gets exactly its own depth — the reason a bool could not do
+    /// this job.
+    #[test]
+    fn a_deeper_window_over_a_shallower_scan_backfills() {
+        let held = ScanTarget::wanted(Some(30), NOW);
+        assert!(meta(Some(held)).needs_backfill(ScanTarget::wanted(Some(90), NOW)));
+        assert!(meta(Some(held)).needs_backfill(ScanTarget::wanted(Some(365), NOW)));
+    }
+
+    /// Genesis satisfies everything, including another genesis request — so a
+    /// fully-scanned wallet never re-sweeps the chain.
+    #[test]
+    fn genesis_covers_every_request() {
+        let m = meta(Some(ScanTarget::Genesis));
+        assert!(!m.needs_backfill(ScanTarget::Genesis));
+        assert!(!m.needs_backfill(ScanTarget::wanted(Some(365), NOW)));
+    }
+
+    /// Unknown depth must read as "not covered". Assuming the opposite would
+    /// permanently strand every wallet written before the column existed —
+    /// exactly the ones this change exists to repair.
+    ///
+    /// Not hypothetical: the first deploy trusted the old `deep_pending` flag
+    /// as a hint for legacy rows, and $boef came back claiming genesis
+    /// coverage while holding 898 rows of a nine-month history.
+    #[test]
+    fn unknown_depth_always_backfills() {
+        assert!(meta(None).needs_backfill(ScanTarget::wanted(Some(30), NOW)));
+        assert!(meta(None).needs_backfill(ScanTarget::Genesis));
+    }
+
+    /// Deeper coverage is a LOWER slot. Inverting this comparison would make
+    /// every request look satisfied and nothing would ever backfill again.
+    #[test]
+    fn coverage_compares_in_the_right_direction() {
+        let deep = ScanTarget::Since(SHELLEY_START_SLOT + 10);
+        let shallow = ScanTarget::Since(SHELLEY_START_SLOT + 10_000);
+        assert!(deep.covers(shallow));
+        assert!(!shallow.covers(deep));
+    }
+
+    /// A window reaching past the chain's start is genesis, not a negative
+    /// slot — `saturating_sub` plus the floor clamp.
+    #[test]
+    fn an_absurd_window_clamps_to_genesis() {
+        let t = ScanTarget::wanted(Some(100_000), NOW);
+        assert_eq!(t.floor(), SHELLEY_START_SLOT);
+        assert!(t.covers(ScanTarget::Genesis));
+    }
+
+    /// Round-tripping through storage: a floor at or below Shelley is genesis.
+    #[test]
+    fn storage_round_trips_through_the_floor() {
+        assert_eq!(
+            ScanTarget::from_slot(SHELLEY_START_SLOT),
+            ScanTarget::Genesis
+        );
+        assert_eq!(ScanTarget::from_slot(0), ScanTarget::Genesis);
+        let mid = SHELLEY_START_SLOT + 5 * DAY;
+        assert_eq!(ScanTarget::from_slot(mid), ScanTarget::Since(mid));
+        assert_eq!(ScanTarget::Since(mid).floor(), mid);
+    }
+
+    /// A zero-day window is not "zero history" — it is the absence of a
+    /// window, which the HTTP layer already treats as full chain.
+    #[test]
+    fn a_zero_window_means_the_whole_chain() {
+        assert_eq!(ScanTarget::wanted(Some(0), NOW), ScanTarget::Genesis);
+    }
+}
+
 pub fn load_wallet(conn: &Connection, canonical: &str) -> Result<Option<WalletMeta>> {
     let mut stmt = conn.prepare(
         "SELECT scanned_to_chunk, scanned_to_slot, first_slot, last_slot, updated_unix,
-                COALESCE(deep_pending, 0)
+                scanned_from_slot, COALESCE(deep_pending, 0)
          FROM wallet WHERE target = ?1",
     )?;
     let mut rows = stmt.query(params![canonical])?;
     match rows.next()? {
-        Some(r) => Ok(Some(WalletMeta {
-            scanned_to_chunk: r.get(0)?,
-            scanned_to_slot: r.get(1)?,
-            first_slot: r.get(2)?,
-            last_slot: r.get(3)?,
-            updated_unix: r.get(4)?,
-            deep_pending: r.get::<_, i64>(5)? != 0,
-        })),
+        Some(r) => {
+            let recorded: Option<u64> = r.get(5)?;
+            // A legacy row's depth is UNKNOWN, full stop — the old
+            // `deep_pending` flag cannot be salvaged as a hint.
+            //
+            // It looks like it should be: `0` reads as "no shallow window was
+            // applied". But the bug this change fixes meant every incremental
+            // refresh took the no-floor path and CLEARED the flag without ever
+            // running the backfill. So `deep_pending = 0` on a real cache says
+            // "some refresh happened", not "the chain was read to genesis".
+            //
+            // Verified on the box: $boef carried `deep_pending = 0` while
+            // holding 898 rows starting at slot 188,499,807 — three months of
+            // a nine-month wallet. Trusting the flag marked it fully scanned
+            // and stranded it exactly as before.
+            let scanned_from = recorded.map(ScanTarget::from_slot);
+            Ok(Some(WalletMeta {
+                scanned_to_chunk: r.get(0)?,
+                scanned_to_slot: r.get(1)?,
+                first_slot: r.get(2)?,
+                last_slot: r.get(3)?,
+                updated_unix: r.get(4)?,
+                scanned_from,
+            }))
+        }
         None => Ok(None),
     }
 }
@@ -226,8 +436,11 @@ pub fn load_owned(conn: &Connection, canonical: &str) -> Result<crate::classify:
 pub struct StoreOpts {
     /// Overwrite existing rows (the deep pass re-states what it now knows).
     pub replace: bool,
-    /// History below the scanned window is still missing.
-    pub deep_pending: bool,
+    /// How far back this write actually covers. `None` means the depth is
+    /// not being asserted by this write — an incremental tail refresh, which
+    /// must leave the recorded floor alone rather than claim the shallow
+    /// range it just scanned.
+    pub scanned_from: Option<ScanTarget>,
 }
 
 /// Persist one wallet's excavation result. Returns the number of NEW flow
@@ -321,12 +534,19 @@ pub fn store_timeline(
         };
         tx.execute(
             "INSERT INTO wallet (target, display, scanned_to_chunk, scanned_to_slot, first_slot,
-                                 last_slot, updated_unix, deep_pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                 last_slot, updated_unix, deep_pending, scanned_from_slot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(target) DO UPDATE SET
                  scanned_to_chunk = excluded.scanned_to_chunk,
                  scanned_to_slot = excluded.scanned_to_slot,
                  deep_pending = excluded.deep_pending,
+                 -- Depth only ever DEEPENS. A shallow refresh over a wallet
+                 -- already scanned to genesis must not raise the recorded
+                 -- floor and re-strand the history it already holds.
+                 scanned_from_slot = MIN(
+                     COALESCE(wallet.scanned_from_slot, excluded.scanned_from_slot),
+                     COALESCE(excluded.scanned_from_slot, wallet.scanned_from_slot)
+                 ),
                  first_slot = COALESCE(MIN(wallet.first_slot, excluded.first_slot),
                                         wallet.first_slot, excluded.first_slot),
                  last_slot = COALESCE(MAX(wallet.last_slot, excluded.last_slot),
@@ -340,7 +560,10 @@ pub fn store_timeline(
                 new_first,
                 new_last,
                 now_unix,
-                opts.deep_pending as i32,
+                // Kept for the HTTP surface and for one release of rollback
+                // headroom; `scanned_from_slot` is now the source of truth.
+                opts.scanned_from.is_none() as i32,
+                opts.scanned_from.map(|t: ScanTarget| t.floor()),
             ],
         )?;
     }

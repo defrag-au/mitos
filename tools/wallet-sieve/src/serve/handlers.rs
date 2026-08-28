@@ -55,6 +55,15 @@ pub async fn health(State(state): State<AppState>) -> Json<Health> {
 pub struct FlowsQuery {
     pub limit: Option<u32>,
     pub before_slot: Option<u64>,
+    /// The window the CALLER is entitled to, so `deep_pending` can answer
+    /// "is anything still missing *for you*" rather than "is this scanned to
+    /// genesis". Without it a 90-day reader over a complete 90-day scan is
+    /// told history is still coming, and goes chasing a backfill they neither
+    /// need nor can see.
+    ///
+    /// Absent means the whole chain — the conservative reading, since it can
+    /// only over-report missing history, never under-report it.
+    pub window_days: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -74,8 +83,21 @@ pub struct FlowsResponse {
     /// History older than the published window is still being excavated, so
     /// `first_slot` is a floor on what is known rather than the wallet's
     /// actual beginning.
+    ///
+    /// Derived from [`Self::scanned_from_slot`] against the window this
+    /// request asked for. Kept because consumers already read it; prefer the
+    /// slot, which says HOW deep rather than merely "not deep enough".
     #[serde(default)]
     pub deep_pending: bool,
+    /// The oldest slot actually scanned for this wallet.
+    ///
+    /// The counterpart to `scanned_to_slot`: that is the forward frontier,
+    /// this is the floor. Without it a consumer cannot tell "we looked and
+    /// the wallet starts here" from "we stopped looking here" — so a UI
+    /// timeline built on `first_slot` silently presents a partial scan as the
+    /// wallet's whole life.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_from_slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +136,7 @@ pub async fn flows(
                 scanned_to_chunk: None,
                 scanned_to_slot: None,
                 deep_pending: false,
+                scanned_from_slot: None,
                 updated_unix: None,
                 first_slot: None,
                 last_slot: None,
@@ -138,7 +161,18 @@ pub async fn flows(
         cached: meta.is_some(),
         scanned_to_chunk: meta.as_ref().map(|m| m.scanned_to_chunk),
         scanned_to_slot: meta.as_ref().and_then(|m| m.scanned_to_slot),
-        deep_pending: meta.as_ref().is_some_and(|m| m.deep_pending),
+        // "Still missing history" is now relative to WHAT WAS ASKED FOR: a
+        // 90-day reader over a 90-day scan is complete, and telling them
+        // otherwise sends them chasing a backfill they do not need.
+        deep_pending: meta.as_ref().is_some_and(|m| {
+            m.needs_backfill(db::ScanTarget::wanted(
+                q.window_days,
+                super::jobs::now_slot(),
+            ))
+        }),
+        scanned_from_slot: meta
+            .as_ref()
+            .and_then(|m| m.scanned_from.map(|t| t.floor())),
         updated_unix: meta.as_ref().map(|m| m.updated_unix),
         first_slot: meta.as_ref().and_then(|m| m.first_slot),
         last_slot: meta.as_ref().and_then(|m| m.last_slot),
