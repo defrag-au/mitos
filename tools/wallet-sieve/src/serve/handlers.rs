@@ -55,7 +55,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Health> {
 pub struct FlowsQuery {
     pub limit: Option<u32>,
     pub before_slot: Option<u64>,
-    /// The window the CALLER is entitled to, so `deep_pending` can answer
+    /// The window the CALLER is entitled to, so `history_pending` can answer
     /// "is anything still missing *for you*" rather than "is this scanned to
     /// genesis". Without it a 90-day reader over a complete 90-day scan is
     /// told history is still coming, and goes chasing a backfill they neither
@@ -80,15 +80,26 @@ pub struct FlowsResponse {
     /// figure for a freshness badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scanned_to_slot: Option<u64>,
-    /// History older than the published window is still being excavated, so
-    /// `first_slot` is a floor on what is known rather than the wallet's
+    /// History older than the published window is still missing, so
+    /// `first_slot` is a floor on what is KNOWN rather than the wallet's
     /// actual beginning.
     ///
-    /// Derived from [`Self::scanned_from_slot`] against the window this
-    /// request asked for. Kept because consumers already read it; prefer the
-    /// slot, which says HOW deep rather than merely "not deep enough".
+    /// DERIVED, every request, from [`Self::scanned_from_slot`] against the
+    /// window the caller asked for — it is never stored. It replaces a
+    /// persisted `deep_pending` column that went stale and reported wallets
+    /// as fully scanned when they held three months of a nine-month history;
+    /// the name went with the column so nothing can confuse the two.
     #[serde(default)]
-    pub deep_pending: bool,
+    pub history_pending: bool,
+    /// Rows held when the backfill ABANDONED this wallet, or absent if it
+    /// never did.
+    ///
+    /// Present means the history is deliberately incomplete and will not be
+    /// completed by retrying: the address is exchange-scale. Consumers must
+    /// surface this — a truncated feed that looks complete is a wrong answer
+    /// presented confidently, which is worse than the truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oversize_rows: Option<u64>,
     /// The oldest slot actually scanned for this wallet.
     ///
     /// The counterpart to `scanned_to_slot`: that is the forward frontier,
@@ -108,11 +119,28 @@ pub struct FlowsResponse {
     pub rows: Vec<report::Row>,
 }
 
+/// Refused for being a contract rather than a wallet. Distinct from a
+/// malformed target so a consumer can say something useful about it.
+pub const SCRIPT_TARGET_MESSAGE: &str = "this is a smart contract, not a wallet — marketplace, DEX and other \
+     script addresses carry every user's activity, not one holder's";
+
 fn parse_target(t: &str) -> Result<(Vec<target::Cred>, String), (StatusCode, String)> {
-    let creds =
+    let parsed =
         target::parse(t).map_err(|e| (StatusCode::BAD_REQUEST, format!("bad target: {e:#}")))?;
-    let canonical = target::canonical(&creds);
-    Ok((creds, canonical))
+    // REFUSED BEFORE ANY SCAN. The row cap stops a contract eventually, but
+    // only after a whole segment: jpg.store's marketplace cost 614,149 rows
+    // and 157 MB of cache before it tripped, and its true history is every
+    // trade on the platform. A script credential is knowable for free, from
+    // the address header, so the cheap check belongs in front of the
+    // expensive one.
+    if parsed.is_script {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SCRIPT_TARGET_MESSAGE.into(),
+        ));
+    }
+    let canonical = target::canonical(&parsed.creds);
+    Ok((parsed.creds, canonical))
 }
 
 pub async fn flows(
@@ -122,6 +150,10 @@ pub async fn flows(
 ) -> Result<Json<FlowsResponse>, Response> {
     let (_, canonical) = parse_target(&t).map_err(|e| e.into_response())?;
     let limit = q.limit.unwrap_or(500).min(5000);
+    // Somebody wants this wallet — the signal the cache janitor evicts by.
+    // Marked here rather than only on refresh, because a wallet that is merely
+    // READ a hundred times a day is exactly the one that must not be dropped.
+    state.seen.mark(&canonical, now_unix());
     let job = state.registry.snapshot(&canonical);
 
     let conn = match db::open_ro(&state.db_path) {
@@ -135,7 +167,8 @@ pub async fn flows(
                 cached: false,
                 scanned_to_chunk: None,
                 scanned_to_slot: None,
-                deep_pending: false,
+                history_pending: false,
+                oversize_rows: None,
                 scanned_from_slot: None,
                 updated_unix: None,
                 first_slot: None,
@@ -164,12 +197,17 @@ pub async fn flows(
         // "Still missing history" is now relative to WHAT WAS ASKED FOR: a
         // 90-day reader over a 90-day scan is complete, and telling them
         // otherwise sends them chasing a backfill they do not need.
-        deep_pending: meta.as_ref().is_some_and(|m| {
-            m.needs_backfill(db::ScanTarget::wanted(
-                q.window_days,
-                super::jobs::now_slot(),
-            ))
+        // A capped wallet is NOT "still scanning" — nothing more is coming,
+        // and saying otherwise leaves the reader waiting for a backfill that
+        // will never run. `oversize_rows` carries the real story.
+        history_pending: meta.as_ref().is_some_and(|m| {
+            m.oversize_rows.is_none()
+                && m.needs_backfill(db::ScanTarget::wanted(
+                    q.window_days,
+                    super::jobs::now_slot(),
+                ))
         }),
+        oversize_rows: meta.as_ref().and_then(|m| m.oversize_rows),
         scanned_from_slot: meta
             .as_ref()
             .and_then(|m| m.scanned_from.map(|t| t.floor())),
@@ -203,6 +241,7 @@ pub async fn refresh(
     Query(q): Query<RefreshQuery>,
 ) -> Result<Json<RefreshResponse>, Response> {
     let (_, canonical) = parse_target(&t).map_err(|e| e.into_response())?;
+    state.seen.mark(&canonical, now_unix());
     let job = state
         .registry
         .enqueue_windowed(&t, &canonical, q.window_days.filter(|d| *d > 0))
@@ -249,4 +288,11 @@ pub async fn events(
         }
     });
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

@@ -12,7 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use mitos_chain_walk::slot_to_unix;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::report;
 
@@ -23,6 +23,13 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
     // ordinary rather than exceptional — wait for the lock instead of failing
     // a sweep that has already read gigabytes of chain.
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Schema + every idempotent migration, split out from [`open_rw`] so tests
+/// can raise a real cache on an in-memory connection rather than a temp file.
+fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS wallet (
              target TEXT PRIMARY KEY,
@@ -88,10 +95,16 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
             return Err(e).context("adding flow.market");
         }
     }
-    if let Err(e) = conn.execute("ALTER TABLE wallet ADD COLUMN deep_pending INTEGER", []) {
+    // `deep_pending` is GONE, superseded by `scanned_from_slot`. Dropped
+    // rather than left in place: a deployed cache carries values written by
+    // the buggy incremental that never backfilled, so the column is not
+    // merely redundant — it is actively wrong, and the next reader to reach
+    // for it would repeat the misread that returned 898 rows instead of
+    // 3,235. "no such column" means it was already gone.
+    if let Err(e) = conn.execute("ALTER TABLE wallet DROP COLUMN deep_pending", []) {
         let msg = e.to_string();
-        if !msg.contains("duplicate column") {
-            return Err(e).context("adding wallet.deep_pending");
+        if !msg.contains("no such column") {
+            return Err(e).context("dropping wallet.deep_pending");
         }
     }
     // An explicit ALTER, like every column above it: `CREATE TABLE IF NOT
@@ -109,15 +122,33 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
         ("owned", "script", "INTEGER"),
         ("flow", "locked_assets", "TEXT"),
         // How far BACK this wallet has been scanned. See [`ScanTarget`] — the
-        // `deep_pending` boolean it supersedes could only say "shallow or
-        // not", which is why the only remedy it could express was a full
-        // 219 GB sweep.
+        // now-dropped `deep_pending` boolean it replaced could only say
+        // "shallow or not", which is why the only remedy it could express was
+        // a full 219 GB sweep.
         //
         // NULL on rows written before this column existed: depth unknown, so
         // the next request that needs depth re-establishes it. Assuming
         // "already deep" would permanently strand exactly the wallets this
         // change exists to repair.
         ("wallet", "scanned_from_slot", "INTEGER"),
+        // When a CLIENT last asked for this wallet — the eviction signal.
+        //
+        // Deliberately NOT `updated_unix`: the refresh watcher re-stores every
+        // cached wallet whenever chain coverage advances, roughly every twenty
+        // minutes, so `updated_unix` is near-identical across the whole table
+        // and orders nothing. It measures our own housekeeping, not anybody's
+        // interest. NULL means never asked for since the column existed, which
+        // sorts first and so is evicted first — correct, since a wallet nobody
+        // has requested is the cheapest thing to lose.
+        ("wallet", "last_seen_unix", "INTEGER"),
+        // Rows held when the backfill gave up on this wallet, or NULL if it
+        // never did. See `MAX_WALLET_ROWS` in `jobs`.
+        //
+        // Persisted so the verdict survives the scan that reached it. This is
+        // the "blacklist", except nothing is curated: it populates itself from
+        // measured row counts, so a rotated exchange address is caught on its
+        // own merits rather than needing to be recognised.
+        ("wallet", "oversize_rows", "INTEGER"),
     ] {
         if let Err(e) = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), []) {
             let msg = e.to_string();
@@ -126,7 +157,7 @@ pub fn open_rw(path: &Path) -> Result<Connection> {
             }
         }
     }
-    Ok(conn)
+    Ok(())
 }
 
 /// Stored rows that have never been market-checked, newest first.
@@ -242,6 +273,12 @@ pub struct WalletMeta {
     pub first_slot: Option<u64>,
     pub last_slot: Option<u64>,
     pub updated_unix: u64,
+    /// Rows held when the backfill gave up, or `None` if it never did.
+    ///
+    /// `Some` means this wallet's history is deliberately INCOMPLETE and no
+    /// further backfill will be attempted — the scan would cost a full-chain
+    /// read and hundreds of MB for an address nobody can scroll.
+    pub oversize_rows: Option<u64>,
 }
 
 impl WalletMeta {
@@ -271,6 +308,7 @@ mod scan_target_tests {
             first_slot: None,
             last_slot: None,
             updated_unix: 0,
+            oversize_rows: None,
         }
     }
 
@@ -371,26 +409,26 @@ mod scan_target_tests {
 pub fn load_wallet(conn: &Connection, canonical: &str) -> Result<Option<WalletMeta>> {
     let mut stmt = conn.prepare(
         "SELECT scanned_to_chunk, scanned_to_slot, first_slot, last_slot, updated_unix,
-                scanned_from_slot, COALESCE(deep_pending, 0)
+                scanned_from_slot, oversize_rows
          FROM wallet WHERE target = ?1",
     )?;
     let mut rows = stmt.query(params![canonical])?;
     match rows.next()? {
         Some(r) => {
+            // NULL depth is UNKNOWN, full stop.
+            //
+            // A row predating this column also carried a `deep_pending`
+            // boolean, and `0` there looked salvageable as "no shallow window
+            // was applied". It was not: the bug this column exists to fix
+            // meant every incremental refresh took the no-floor path and
+            // CLEARED that flag without ever running the backfill, so `0`
+            // said "some refresh happened", not "the chain was read to
+            // genesis". Verified on the box — $boef carried `deep_pending =
+            // 0` while holding 898 rows starting at slot 188,499,807, three
+            // months of a nine-month wallet. The column is dropped on open
+            // for exactly that reason: it cannot be trusted, so nothing
+            // should be able to reach for it.
             let recorded: Option<u64> = r.get(5)?;
-            // A legacy row's depth is UNKNOWN, full stop — the old
-            // `deep_pending` flag cannot be salvaged as a hint.
-            //
-            // It looks like it should be: `0` reads as "no shallow window was
-            // applied". But the bug this change fixes meant every incremental
-            // refresh took the no-floor path and CLEARED the flag without ever
-            // running the backfill. So `deep_pending = 0` on a real cache says
-            // "some refresh happened", not "the chain was read to genesis".
-            //
-            // Verified on the box: $boef carried `deep_pending = 0` while
-            // holding 898 rows starting at slot 188,499,807 — three months of
-            // a nine-month wallet. Trusting the flag marked it fully scanned
-            // and stranded it exactly as before.
             let scanned_from = recorded.map(ScanTarget::from_slot);
             Ok(Some(WalletMeta {
                 scanned_to_chunk: r.get(0)?,
@@ -399,6 +437,7 @@ pub fn load_wallet(conn: &Connection, canonical: &str) -> Result<Option<WalletMe
                 last_slot: r.get(3)?,
                 updated_unix: r.get(4)?,
                 scanned_from,
+                oversize_rows: r.get(6)?,
             }))
         }
         None => Ok(None),
@@ -441,6 +480,9 @@ pub struct StoreOpts {
     /// must leave the recorded floor alone rather than claim the shallow
     /// range it just scanned.
     pub scanned_from: Option<ScanTarget>,
+    /// Rows held when the backfill gave up on this wallet. `None` leaves any
+    /// existing verdict alone — an ordinary refresh must not clear a cap.
+    pub oversize_rows: Option<u64>,
 }
 
 /// Persist one wallet's excavation result. Returns the number of NEW flow
@@ -534,12 +576,15 @@ pub fn store_timeline(
         };
         tx.execute(
             "INSERT INTO wallet (target, display, scanned_to_chunk, scanned_to_slot, first_slot,
-                                 last_slot, updated_unix, deep_pending, scanned_from_slot)
+                                 last_slot, updated_unix, scanned_from_slot, oversize_rows)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(target) DO UPDATE SET
                  scanned_to_chunk = excluded.scanned_to_chunk,
                  scanned_to_slot = excluded.scanned_to_slot,
-                 deep_pending = excluded.deep_pending,
+                 -- COALESCE keeps a cap once set: an ordinary incremental
+                 -- passes NULL here, and must not read as \"no longer
+                 -- oversize\" and re-arm a full-chain sweep every refresh.
+                 oversize_rows = COALESCE(excluded.oversize_rows, wallet.oversize_rows),
                  -- Depth only ever DEEPENS. A shallow refresh over a wallet
                  -- already scanned to genesis must not raise the recorded
                  -- floor and re-strand the history it already holds.
@@ -560,10 +605,8 @@ pub fn store_timeline(
                 new_first,
                 new_last,
                 now_unix,
-                // Kept for the HTTP surface and for one release of rollback
-                // headroom; `scanned_from_slot` is now the source of truth.
-                opts.scanned_from.is_none() as i32,
                 opts.scanned_from.map(|t: ScanTarget| t.floor()),
+                opts.oversize_rows,
             ],
         )?;
     }
@@ -614,6 +657,153 @@ pub fn list_wallets(conn: &Connection) -> Result<Vec<(String, String)>> {
 
 pub fn wallet_count(conn: &Connection) -> Result<u64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM wallet", [], |r| r.get(0))?)
+}
+
+/// What the cache currently costs, for the budget decision and the gauge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Size of the database FILE, which is what fills the disk. Includes
+    /// pages freed by a delete but not yet reclaimed — see [`evict_to_budget`],
+    /// where that distinction is the whole problem.
+    pub bytes: u64,
+    /// Bytes holding live rows. `bytes - live_bytes` is reclaimable slack.
+    pub live_bytes: u64,
+    pub wallets: u64,
+    pub flows: u64,
+    /// Rows held by the single biggest wallet.
+    ///
+    /// Worth a gauge of its own because the distribution is savagely skewed:
+    /// one exchange address held 98.3% of the rows in this cache while every
+    /// ordinary wallet sat between one and four thousand. A total alone hides
+    /// that, and it is the shape that decides whether a budget is generous or
+    /// about to start thrashing.
+    pub largest_wallet_flows: u64,
+    /// Wallets the backfill gave up on. A rising count is the system-level
+    /// signal that people are pointing the tool at exchange-scale addresses.
+    pub capped_wallets: u64,
+}
+
+pub fn cache_stats(conn: &Connection) -> Result<CacheStats> {
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist: u64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    Ok(CacheStats {
+        bytes: page_count * page_size,
+        live_bytes: page_count.saturating_sub(freelist) * page_size,
+        wallets: wallet_count(conn)?,
+        flows: conn.query_row("SELECT COUNT(*) FROM flow", [], |r| r.get(0))?,
+        largest_wallet_flows: conn
+            .query_row(
+                "SELECT COUNT(*) AS n FROM flow GROUP BY target ORDER BY n DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0),
+        capped_wallets: conn.query_row(
+            "SELECT COUNT(*) FROM wallet WHERE oversize_rows IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?,
+    })
+}
+
+/// Outcome of one janitor pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Evicted {
+    pub wallets: usize,
+    pub flows: u64,
+    pub before: u64,
+    pub after: u64,
+    /// Over budget with nothing left that is safe to drop. The budget is too
+    /// small for the traffic, and the operator needs to hear about it rather
+    /// than have the cache start evicting wallets people are looking at.
+    pub stuck: bool,
+}
+
+/// Drop least-recently-REQUESTED wallets until the cache fits `budget`.
+///
+/// Two properties matter more than the eviction itself:
+///
+/// 1. **It reclaims.** `auto_vacuum` is off, so a DELETE returns pages to a
+///    freelist and the file never shrinks — row count would fall while disk
+///    usage sat exactly where it was, which is the opposite of the point. A
+///    VACUUM after the deletes is what makes this a disk bound at all.
+/// 2. **It refuses to thrash.** Anything requested within `protect` is off
+///    limits. Evicting a wallet somebody is watching buys a few hundred MB
+///    and spends a 219 GB re-read to get it back — strictly worse than being
+///    over budget, so the pass gives up and reports [`Evicted::stuck`].
+pub fn evict_to_budget(
+    conn: &mut Connection,
+    budget: u64,
+    protect: std::time::Duration,
+    now_unix: u64,
+) -> Result<Evicted> {
+    let before = cache_stats(conn)?.bytes;
+    let mut out = Evicted {
+        before,
+        after: before,
+        ..Default::default()
+    };
+    if before <= budget {
+        return Ok(out);
+    }
+    let cutoff = now_unix.saturating_sub(protect.as_secs());
+    loop {
+        // Live bytes, not file bytes: within a pass the deletes have not been
+        // reclaimed yet, so the file size cannot fall and the loop would
+        // evict the entire cache before noticing it was done.
+        let stats = cache_stats(conn)?;
+        if stats.live_bytes <= budget {
+            break;
+        }
+        // NULL sorts first under ASC in sqlite — never requested, so cheapest
+        // to lose.
+        let victim: Option<(String, String)> = conn
+            .query_row(
+                "SELECT target, display FROM wallet
+                 WHERE COALESCE(last_seen_unix, 0) < ?1
+                 ORDER BY last_seen_unix ASC LIMIT 1",
+                params![cutoff],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((target, label)) = victim else {
+            out.stuck = true;
+            break;
+        };
+        let tx = conn.transaction()?;
+        let flows: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM flow WHERE target = ?1",
+            params![&target],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM flow WHERE target = ?1", params![&target])?;
+        tx.execute("DELETE FROM owned WHERE target = ?1", params![&target])?;
+        tx.execute("DELETE FROM wallet WHERE target = ?1", params![&target])?;
+        tx.commit()?;
+        out.wallets += 1;
+        out.flows += flows;
+        tracing::info!(wallet = %label, flows, "cache evicted");
+    }
+    if out.wallets > 0 {
+        // Reclaim. Without this the deletes are invisible on disk.
+        conn.execute_batch("VACUUM")?;
+    }
+    out.after = cache_stats(conn)?.bytes;
+    Ok(out)
+}
+
+/// Record that a client asked for these wallets.
+pub fn touch_seen(conn: &Connection, seen: &[(String, u64)]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "UPDATE wallet SET last_seen_unix = MAX(COALESCE(last_seen_unix, 0), ?2)
+         WHERE target = ?1",
+    )?;
+    for (target, at) in seen {
+        stmt.execute(params![target, at])?;
+    }
+    Ok(())
 }
 
 /// Newest-first rows, optionally strictly below `before_slot` (pagination).
@@ -684,4 +874,246 @@ pub fn query_rows(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const HOUR: u64 = 3600;
+    const NOW: u64 = 1_800_000_000;
+
+    fn cache() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        migrate(&conn).expect("migrate");
+        conn
+    }
+
+    /// A wallet holding `rows` flows, last requested at `seen` (`None` = never).
+    fn add_wallet(conn: &Connection, target: &str, rows: u32, seen: Option<u64>) {
+        conn.execute(
+            "INSERT INTO wallet (target, display, scanned_to_chunk, updated_unix, last_seen_unix)
+             VALUES (?1, ?1, 0, ?2, ?3)",
+            params![target, NOW, seen],
+        )
+        .expect("insert wallet");
+        // Padded so the rows cost real PAGES — the budget is in bytes, and a
+        // handful of skinny rows would fit any budget and test nothing.
+        let pad = "x".repeat(512);
+        for i in 0..rows {
+            conn.execute(
+                "INSERT INTO flow (target, slot, tx_idx, tx_hash, kind, lovelace_in,
+                                   lovelace_out, assets_in, assets_out, senders)
+                 VALUES (?1, ?2, 0, ?3, 'transfer', 0, 0, 0, 0, ?4)",
+                params![target, i as u64, format!("{target}-{i}").as_bytes(), pad],
+            )
+            .expect("insert flow");
+        }
+    }
+
+    /// The core ordering rule: eviction follows REQUEST recency, so the wallet
+    /// nobody has asked for goes and the one in active use stays — even though
+    /// both were re-stored by the refresh watcher at the same moment.
+    #[test]
+    fn the_least_recently_requested_wallet_goes_first() {
+        let mut conn = cache();
+        add_wallet(&conn, "stale", 300, Some(NOW - 90 * HOUR));
+        add_wallet(&conn, "hot", 300, Some(NOW - HOUR));
+        let budget = cache_stats(&conn).unwrap().live_bytes * 2 / 3;
+
+        let out = evict_to_budget(&mut conn, budget, Duration::from_secs(48 * HOUR), NOW).unwrap();
+
+        assert_eq!(out.wallets, 1);
+        assert!(!out.stuck);
+        let left: Vec<String> = conn
+            .prepare("SELECT target FROM wallet")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec!["hot".to_string()]);
+        // The rows go with it, not just the wallet row.
+        let orphans: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow WHERE target = 'stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    /// The property the whole feature rests on. `auto_vacuum` is off, so a
+    /// DELETE alone returns pages to a freelist and the FILE never shrinks —
+    /// row count would fall while disk usage sat exactly where it was.
+    #[test]
+    fn eviction_actually_reclaims_disk() {
+        let mut conn = cache();
+        add_wallet(&conn, "stale", 800, None);
+        add_wallet(&conn, "hot", 100, Some(NOW));
+        let budget = cache_stats(&conn).unwrap().live_bytes / 4;
+
+        let out = evict_to_budget(&mut conn, budget, Duration::from_secs(48 * HOUR), NOW).unwrap();
+
+        assert!(out.wallets >= 1);
+        assert!(
+            out.after < out.before,
+            "file did not shrink: {} -> {} (missing VACUUM?)",
+            out.before,
+            out.after
+        );
+    }
+
+    /// A wallet nobody has ever asked for sorts FIRST — NULL under ASC in
+    /// sqlite — because it is the cheapest thing in the cache to lose.
+    #[test]
+    fn a_never_requested_wallet_is_the_first_to_go() {
+        let mut conn = cache();
+        add_wallet(&conn, "never", 300, None);
+        add_wallet(&conn, "ancient", 300, Some(NOW - 500 * HOUR));
+        let budget = cache_stats(&conn).unwrap().live_bytes * 2 / 3;
+
+        evict_to_budget(&mut conn, budget, Duration::from_secs(48 * HOUR), NOW).unwrap();
+
+        let left: Vec<String> = conn
+            .prepare("SELECT target FROM wallet")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, vec!["ancient".to_string()]);
+    }
+
+    /// Refusing to thrash. Everything over budget is in active use, so the
+    /// pass evicts NOTHING and says so: dropping a wallet somebody is watching
+    /// reclaims a few hundred MB and spends a full re-scan to get it back,
+    /// which is strictly worse than sitting over budget.
+    #[test]
+    fn wallets_in_active_use_are_never_evicted() {
+        let mut conn = cache();
+        add_wallet(&conn, "hot-a", 400, Some(NOW - HOUR));
+        add_wallet(&conn, "hot-b", 400, Some(NOW - 2 * HOUR));
+        let budget = cache_stats(&conn).unwrap().live_bytes / 4;
+
+        let out = evict_to_budget(&mut conn, budget, Duration::from_secs(48 * HOUR), NOW).unwrap();
+
+        assert_eq!(out.wallets, 0);
+        assert!(out.stuck, "the operator has to hear about this");
+        assert_eq!(wallet_count(&conn).unwrap(), 2);
+    }
+
+    /// Under budget is a no-op — no deletes, and no VACUUM rewriting the whole
+    /// file every five minutes for nothing.
+    #[test]
+    fn a_cache_within_budget_is_left_alone() {
+        let mut conn = cache();
+        add_wallet(&conn, "a", 100, None);
+        let before = cache_stats(&conn).unwrap();
+
+        let out =
+            evict_to_budget(&mut conn, before.bytes * 4, Duration::from_secs(HOUR), NOW).unwrap();
+
+        assert_eq!(out.wallets, 0);
+        assert!(!out.stuck);
+        assert_eq!(cache_stats(&conn).unwrap().wallets, before.wallets);
+    }
+
+    /// Interest only ever moves FORWARD. Marks are flushed in whatever order
+    /// the buffer drains, and an out-of-order write must not age a wallet
+    /// backwards into the eviction queue.
+    #[test]
+    fn recorded_interest_never_moves_backwards() {
+        let conn = cache();
+        add_wallet(&conn, "a", 1, Some(NOW));
+        touch_seen(&conn, &[("a".into(), NOW - 100 * HOUR)]).unwrap();
+        let seen: u64 = conn
+            .query_row(
+                "SELECT last_seen_unix FROM wallet WHERE target='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, NOW);
+
+        touch_seen(&conn, &[("a".into(), NOW + HOUR)]).unwrap();
+        let seen: u64 = conn
+            .query_row(
+                "SELECT last_seen_unix FROM wallet WHERE target='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, NOW + HOUR);
+    }
+
+    /// A cap must SURVIVE the ordinary refreshes that follow it.
+    ///
+    /// The refresh watcher re-stores every cached wallet every twenty minutes
+    /// and passes `oversize_rows: None`, meaning "no verdict from this write".
+    /// Were that stored literally it would clear the cap within the hour and
+    /// re-arm a 219 GB sweep the next time anyone opened the address — a loop
+    /// that would look exactly like the service being slow for no reason.
+    #[test]
+    fn an_ordinary_refresh_does_not_clear_a_cap() {
+        let conn = cache();
+        add_wallet(&conn, "whale", 1, None);
+        conn.execute(
+            "UPDATE wallet SET oversize_rows = 50000 WHERE target = 'whale'",
+            [],
+        )
+        .unwrap();
+
+        // What an incremental writes: a fresh cursor, no verdict.
+        conn.execute(
+            "INSERT INTO wallet (target, display, scanned_to_chunk, updated_unix, oversize_rows)
+             VALUES ('whale', 'whale', 9, 123, NULL)
+             ON CONFLICT(target) DO UPDATE SET
+                 oversize_rows = COALESCE(excluded.oversize_rows, wallet.oversize_rows),
+                 updated_unix = excluded.updated_unix",
+            [],
+        )
+        .unwrap();
+
+        let held: Option<u64> = conn
+            .query_row(
+                "SELECT oversize_rows FROM wallet WHERE target='whale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, Some(50_000), "the cap was cleared by a refresh");
+    }
+
+    /// The capped count is the system-level signal — a rising number means
+    /// people are pointing the tool at exchange-scale addresses.
+    #[test]
+    fn stats_count_capped_wallets() {
+        let conn = cache();
+        add_wallet(&conn, "whale", 2, None);
+        add_wallet(&conn, "ordinary", 2, None);
+        assert_eq!(cache_stats(&conn).unwrap().capped_wallets, 0);
+        conn.execute(
+            "UPDATE wallet SET oversize_rows = 50000 WHERE target = 'whale'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(cache_stats(&conn).unwrap().capped_wallets, 1);
+    }
+
+    /// The skew that makes a byte budget the right shape: one wallet held 98%
+    /// of a real cache, so the biggest-wallet gauge has to track the outlier
+    /// rather than an average that hides it.
+    #[test]
+    fn stats_report_the_biggest_wallet_not_the_average() {
+        let conn = cache();
+        add_wallet(&conn, "whale", 500, None);
+        add_wallet(&conn, "small", 5, None);
+        let s = cache_stats(&conn).unwrap();
+        assert_eq!(s.wallets, 2);
+        assert_eq!(s.flows, 505);
+        assert_eq!(s.largest_wallet_flows, 500);
+    }
 }

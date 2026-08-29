@@ -91,7 +91,11 @@ fn main() -> Result<()> {
 }
 
 fn run_scan(args: ScanArgs) -> Result<()> {
-    let creds = target::parse(&args.target)?;
+    // No script refusal here: the CLI is the OPERATOR's tool, and reading a
+    // contract deliberately — to investigate one — is a legitimate thing to
+    // do with it. The guard belongs on the hosted surface, where the cost
+    // lands on a shared box and the reader did not ask for a marketplace.
+    let creds = target::parse(&args.target)?.creds;
     let labels: Vec<String> = creds
         .iter()
         .map(|c| format!("{}:{}", c.label, hex::encode(c.bytes)))

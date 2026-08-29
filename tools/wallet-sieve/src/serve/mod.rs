@@ -14,6 +14,7 @@
 //! this service never sees end users.
 
 mod auth;
+mod cache;
 mod db;
 mod handlers;
 mod jobs;
@@ -87,6 +88,36 @@ pub struct ServeArgs {
     /// `0` puts every request in one lane (the old behaviour).
     #[arg(long, default_value_t = 90)]
     shallow_max_days: u64,
+
+    /// Ceiling for the row cache, in GiB. `0` disables eviction.
+    ///
+    /// Nothing else bounds it: every address ever looked up is kept forever,
+    /// and the distribution is savage — ordinary wallets cost 1–3 MB while a
+    /// single exchange address cost 780 MB and 98% of the cache. So the
+    /// ceiling has to be on BYTES, not on a wallet count.
+    #[arg(long, default_value_t = 8)]
+    cache_max_gib: u64,
+
+    /// Hours a wallet stays un-evictable after somebody last asked for it.
+    ///
+    /// Evicting something in active use spends a full re-scan to reclaim a
+    /// few hundred MB, so the janitor sits over budget and complains instead.
+    #[arg(long, default_value_t = 48)]
+    cache_protect_hours: u64,
+
+    /// Rows past which the backfill abandons a wallet. `0` disables the cap.
+    ///
+    /// Aimed at exchange and script addresses, whose deep history costs a
+    /// full-chain read and hundreds of MB for a feed nobody can scroll. The
+    /// margin is wide on purpose: the largest genuine wallet observed here
+    /// held 3,578 rows against an exchange's 1,129,026 — three orders of
+    /// magnitude, so this sits far above any real user.
+    #[arg(long, default_value_t = 50_000)]
+    max_wallet_rows: u64,
+
+    /// Prometheus textfile for the Alloy `textfile` collector. Empty disables.
+    #[arg(long, default_value = "/var/lib/alloy/textfile/wallet-sieve.prom")]
+    metrics_textfile: String,
 }
 
 #[derive(Clone)]
@@ -94,6 +125,8 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub registry: jobs::Registry,
     pub started: Instant,
+    /// Wallets asked for since the janitor's last pass — the eviction order.
+    pub seen: cache::Seen,
 }
 
 fn router(state: AppState, token: auth::AuthToken) -> Router {
@@ -135,6 +168,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .then(|| args.initial_window_days * 86_400),
         threads: args.scan_threads,
         shallow_max_days: args.shallow_max_days,
+        max_wallet_rows: match args.max_wallet_rows {
+            0 => u64::MAX,
+            n => n,
+        },
     })?;
     crate::tail::spawn(
         args.immutable.clone(),
@@ -187,7 +224,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
                                 "coverage advanced — queueing batch refresh"
                             );
                             for (canonical, display) in wallets {
-                                let _ = registry.enqueue(&display, &canonical);
+                                let _ = registry.enqueue_refresh(&display, &canonical);
                             }
                         }
                         _ => {}
@@ -197,10 +234,24 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .context("spawning refresh watcher")?;
     }
 
+    let seen = cache::Seen::default();
+    cache::spawn(
+        cache::Config {
+            db_path: args.db.clone(),
+            budget_bytes: args.cache_max_gib * 1024 * 1024 * 1024,
+            protect: std::time::Duration::from_secs(args.cache_protect_hours * 3600),
+            textfile: (!args.metrics_textfile.is_empty())
+                .then(|| PathBuf::from(&args.metrics_textfile)),
+            interval: std::time::Duration::from_secs(300),
+        },
+        seen.clone(),
+    )?;
+
     let state = AppState {
         db_path: args.db.clone(),
         registry,
         started: Instant::now(),
+        seen,
     };
     let rt = tokio::runtime::Runtime::new().context("building tokio runtime")?;
     rt.block_on(async move {

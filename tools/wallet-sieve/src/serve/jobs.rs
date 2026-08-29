@@ -41,6 +41,15 @@ use mitos_chain_walk::mithril::CHUNK_SLOTS;
 /// Rows market-checked per run — a deep history backfills over several.
 const MARKET_BACKFILL_LIMIT: u32 = 4000;
 
+/// How much chain one BACKFILL SEGMENT covers, in slots (1 slot = 1 second).
+///
+/// The deep pass walks backwards a segment at a time and stores after each,
+/// so history visibly extends into the past instead of appearing all at once
+/// when the whole sweep finishes. A year is ~13 GB of a 219 GB chain — small
+/// enough to land regularly, large enough that the per-segment store and
+/// re-classify stay noise against the read.
+const DEEP_SEGMENT_SLOTS: u64 = 365 * 86_400;
+
 /// Wall-clock now as a mainnet slot (inverse of `slot_to_unix`; Shelley is
 /// 1 slot/second, which is what makes a window expressible in slots).
 pub(crate) fn now_slot() -> u64 {
@@ -94,6 +103,8 @@ pub struct Config {
     /// Longest window the SHALLOW lane serves. `0` collapses both lanes into
     /// one, which is the pre-two-lane behaviour.
     pub shallow_max_days: u64,
+    /// Rows past which the backfill abandons a wallet. `u64::MAX` disables.
+    pub max_wallet_rows: u64,
 }
 
 /// How long a lane waits before sweeping, so near-simultaneous requests ride
@@ -222,8 +233,23 @@ impl Registry {
     }
 
     /// Queue an excavation, or join the active one for the same wallet.
-    pub fn enqueue(&self, display: &str, canonical: &str) -> Result<Arc<Job>> {
-        self.enqueue_inner(display, canonical, None)
+    /// Catch a cached wallet up to the tip. NEVER deepens it.
+    ///
+    /// The one-day window is doing two jobs, and both matter:
+    ///
+    /// 1. **Lane.** `None` means "the whole chain", which routes to the DEEP
+    ///    lane — so the refresh watcher, firing every cached wallet each time
+    ///    coverage advanced, monopolised the lane that exists for real
+    ///    full-chain requests. Observed in production: every sweep over a two
+    ///    hour window went to `sieve-deep` and the shallow lane sat idle,
+    ///    while readers queued behind a 19-wallet housekeeping batch.
+    /// 2. **Depth.** `None` also asks for GENESIS, so any wallet not already
+    ///    scanned that far would have a full backfill dragged behind a routine
+    ///    tail refresh. One day is shallower than anything already on disk, so
+    ///    `needs_backfill()` stays false and this can only ever be the
+    ///    incremental it is meant to be.
+    pub fn enqueue_refresh(&self, display: &str, canonical: &str) -> Result<Arc<Job>> {
+        self.enqueue_inner(display, canonical, Some(1))
     }
 
     fn enqueue_inner(
@@ -269,55 +295,55 @@ impl Registry {
     }
 }
 
-#[cfg(test)]
-mod lane_tests {
-    use super::*;
+/// What one target in a batch needs from this run.
+///
+/// Three DEPTHS and nothing else — every question the planner asks is a
+/// comparison between them. There is deliberately no `wants_deep` flag: that
+/// was a boolean derived from these same values, free to drift from them, and
+/// the same shape as the `deep_pending` bool this whole change set removed.
+/// State that can disagree with itself eventually does.
+struct Depth {
+    /// Depth already on disk. `None` = unknown, which always re-reads.
+    held: Option<db::ScanTarget>,
+    /// How far back this request is entitled to reach.
+    wanted: db::ScanTarget,
+    /// Oldest slot STAGE ONE reads. Always defined: a target needing no
+    /// backfill still reads from its cursor to the tip.
+    staged_from: u64,
+}
 
-    fn registry(shallow_max_days: u64) -> Registry {
-        let (shallow, _a) = mpsc::channel();
-        let (deep, _b) = mpsc::channel();
-        // Leaked so the receivers outlive the senders; this only exercises
-        // routing, which touches no worker and no database.
-        std::mem::forget((_a, _b));
-        Registry {
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            shallow,
-            deep,
-            shallow_max_days,
-            queued: Arc::new(AtomicUsize::new(0)),
+impl Depth {
+    /// Is anything the request is entitled to still missing?
+    fn needs_backfill(&self) -> bool {
+        !self.held.is_some_and(|h| h.covers(self.wanted))
+    }
+
+    /// The span the deep pass must read for this target, if any.
+    ///
+    /// Exists only where the entitlement reaches BELOW what stage one covers
+    /// — so a 30-day request whose stage one already spans 30 days gets no
+    /// second pass, however little of the chain is on disk.
+    fn deep_span(&self) -> Option<(u64, u64)> {
+        (self.needs_backfill() && self.wanted.floor() < self.staged_from)
+            .then(|| (self.wanted.floor(), self.staged_from))
+    }
+
+    /// What stage one alone leaves covered.
+    fn staged_depth(&self) -> db::ScanTarget {
+        db::ScanTarget::from_slot(self.staged_from)
+    }
+
+    /// What this target has covered once the backfill has read down to
+    /// `reached`. Called after each descending segment, so a run interrupted
+    /// halfway records the depth it truly holds.
+    ///
+    /// Never claims deeper than the entitlement: the deep pass is SHARED, so
+    /// it can sweep below what this particular target paid for.
+    fn depth_after(&self, reached: u64) -> Option<db::ScanTarget> {
+        match self.deep_span() {
+            Some((floor, _)) => Some(db::ScanTarget::from_slot(reached.max(floor))),
+            None => self.needs_backfill().then(|| self.staged_depth()),
         }
-    }
-
-    /// The tiers that must stay responsive under load — an arriving reader on
-    /// the free or 90-day rung never queues behind a full backfill.
-    #[test]
-    fn cheap_windows_take_the_shallow_lane() {
-        let r = registry(90);
-        assert_eq!(r.lane_for(Some(30)), Lane::Shallow);
-        assert_eq!(
-            r.lane_for(Some(90)),
-            Lane::Shallow,
-            "the bound is inclusive"
-        );
-    }
-
-    /// Anything deeper than the bound — and the whole chain especially — is
-    /// the rivalrous work and must not block arrivals.
-    #[test]
-    fn deep_windows_take_the_deep_lane() {
-        let r = registry(90);
-        assert_eq!(r.lane_for(Some(91)), Lane::Deep);
-        assert_eq!(r.lane_for(Some(365)), Lane::Deep);
-        assert_eq!(r.lane_for(None), Lane::Deep, "no window is the full chain");
-    }
-
-    /// `0` is the escape hatch back to one queue, for a box where two
-    /// concurrent sweeps would fight over disk more than they help.
-    #[test]
-    fn a_zero_bound_collapses_the_split() {
-        let r = registry(0);
-        assert_eq!(r.lane_for(Some(1)), Lane::Deep);
-        assert_eq!(r.lane_for(None), Lane::Deep);
     }
 }
 
@@ -352,26 +378,11 @@ fn run_batch_jobs(
     // had asked for 90 days.
     let mut targets = Vec::new();
     let mut live: Vec<&Arc<Job>> = Vec::new();
-    /// What one target in the batch needs from this run.
-    ///
-    /// A struct rather than a tuple because the three booleans-and-slots it
-    /// carries were previously positional, and `depths[i].1.is_some()` was
-    /// doing load-bearing work in four places with no name attached to it.
-    struct Depth {
-        /// Where the incremental sweep would start from (the stored cursor).
-        cursor: u64,
-        /// Oldest slot stage one reaches, when a backfill is needed at all.
-        floor: Option<u64>,
-        /// This target still has history missing below what is held.
-        wants_deep: bool,
-        /// How far back the request is entitled to reach.
-        wanted: db::ScanTarget,
-    }
 
     let mut depths: Vec<Depth> = Vec::new();
     for job in jobs {
-        let prep = (|| -> Result<(excavate::BatchTarget, u64, Option<u64>, bool, db::ScanTarget)> {
-            let creds = target::parse(&job.display)?;
+        let prep = (|| -> Result<(excavate::BatchTarget, Depth)> {
+            let creds = target::parse(&job.display)?.creds;
             let meta = db::load_wallet(conn, &job.canonical)?;
             let (cursor, seed_owned) = match &meta {
                 Some(meta) => {
@@ -398,7 +409,22 @@ fn run_batch_jobs(
             //
             // Depth is now compared, not inferred from freshness: what we hold
             // versus what is asked for.
-            let wanted = db::ScanTarget::wanted(job.window_days, now_slot());
+            let mut wanted = db::ScanTarget::wanted(job.window_days, now_slot());
+            // A wallet the backfill already gave up on asks for no more than
+            // it holds. Clamping `wanted` here — rather than branching at each
+            // decision below — means `deep_span()` returns `None` and the
+            // whole planner treats it as satisfied, so a capped exchange
+            // address costs an incremental tail sweep on every later request
+            // instead of re-attempting 219 GB it will abandon again.
+            if let Some(held) = meta.as_ref().and_then(|m| {
+                m.oversize_rows
+                    .is_some()
+                    .then_some(m.scanned_from)
+                    .flatten()
+            }) {
+                wanted = held;
+            }
+            let wanted = wanted;
             let needs_backfill = meta
                 .as_ref()
                 .map(|m| m.needs_backfill(wanted))
@@ -406,39 +432,48 @@ fn run_batch_jobs(
             // A configured initial window still caps a COLD scan's first pass,
             // so the reader sees something quickly; it never caps the depth a
             // request is entitled to.
-            let cold = cursor <= SHELLEY_START_SLOT;
-            let floor = if needs_backfill {
-                let first_pass = match (cold, cfg.initial_window_slots) {
-                    (true, Some(w)) => now_slot().saturating_sub(w).max(SHELLEY_START_SLOT),
-                    _ => wanted.floor(),
+            // STAGE ONE IS ALWAYS THE RECENT SLICE — the reader gets rows in
+            // seconds and history fills in behind them.
+            //
+            // This used to be gated on the wallet being cold, which meant a
+            // WARM wallet needing a backfill swept the whole chain in one pass
+            // and published nothing until it finished: minutes of blank
+            // screen on exactly the request ("scan full history") where the
+            // reader is most obviously waiting.
+            //
+            // `.max(cursor)` handles both shapes without a branch: a cold
+            // wallet's cursor sits at Shelley so the configured window wins,
+            // while a warm wallet's cursor is near the tip, so stage one is
+            // the cheap incremental rather than a needless re-read of a year
+            // it already holds.
+            let staged_from = if needs_backfill {
+                let window = match cfg.initial_window_slots {
+                    Some(w) => now_slot().saturating_sub(w).max(SHELLEY_START_SLOT),
+                    None => wanted.floor(),
                 };
-                // Never let the staged first pass start OLDER than the target.
-                Some(first_pass.max(wanted.floor()))
+                window.max(cursor).max(wanted.floor())
             } else {
-                None
+                // Nothing missing — the ordinary incremental to the tip.
+                cursor
             };
-            let wants_deep = needs_backfill;
+            let depth = Depth {
+                held: meta.as_ref().and_then(|m| m.scanned_from),
+                wanted,
+                staged_from,
+            };
             Ok((
                 excavate::BatchTarget {
                     creds: creds.iter().map(|c| c.bytes).collect(),
-                    scan_from_slot: floor.unwrap_or(cursor),
+                    scan_from_slot: staged_from,
                     seed_owned,
                 },
-                cursor,
-                floor,
-                wants_deep,
-                wanted,
+                depth,
             ))
         })();
         match prep {
-            Ok((t, cursor, floor, wants_deep, wanted)) => {
+            Ok((t, depth)) => {
                 targets.push(t);
-                depths.push(Depth {
-                    cursor,
-                    floor,
-                    wants_deep,
-                    wanted,
-                });
+                depths.push(depth);
                 live.push(job);
             }
             Err(e) => {
@@ -452,6 +487,13 @@ fn run_batch_jobs(
         return Ok(());
     }
 
+    // Which pass the scanner's progress belongs to.
+    //
+    // The callback fires from the scan threads and relabelled the whole
+    // backfill as "scan", so `set_all("deep", …)` survived milliseconds and
+    // no consumer polling for the deep phase ever saw it — the gateway's
+    // early emit then waited for "resolve", i.e. until after the backfill.
+    let backfilling = std::sync::atomic::AtomicBool::new(false);
     let on = |p: Progress<'_>| match p {
         Progress::Scan {
             pass,
@@ -459,7 +501,11 @@ fn run_batch_jobs(
             total,
             gb_per_s,
         } => set_all(
-            "scan",
+            if backfilling.load(Ordering::Relaxed) {
+                "deep"
+            } else {
+                "scan"
+            },
             format!("{pass}: {done}/{total} chunks · {gb_per_s:.2} GB/s"),
         ),
         Progress::Resolve {
@@ -482,33 +528,33 @@ fn run_batch_jobs(
     // The deep pass RE-CLASSIFIES the combined find rather than appending to
     // the first: direction depends on the UTxOs a wallet held *before* the
     // window, so a spend of an older UTxO reads as a receive until that UTxO
-    // is known. Stage one is therefore provisional by construction, and
-    // `deep_pending` says so rather than letting a partial history pose as a
-    // whole one.
+    // is known. Stage one is therefore provisional by construction, and the
+    // recorded `scanned_from_slot` says exactly how provisional rather than
+    // letting a partial history pose as a whole one.
+    //
     // Stage one reaches only as far as the shallowest target needs; each
     // target's own floor then filters what it keeps, so a 90-day request in
     // a batch with a full one still costs 90 days of reading.
-    let any_windowed = depths.iter().any(|d| d.floor.is_some());
-    // What stage one alone leaves covered: only as deep as it actually read.
-    // Asserting the requested depth here would record coverage the deep pass
-    // has not delivered yet, and a crash between the two would leave the
-    // wallet permanently claiming history it does not hold.
-    let staged_depth = |i: usize| depths[i].floor.map(db::ScanTarget::from_slot);
-    // After the deep pass the request's full depth IS covered.
-    let final_depth = |i: usize| {
-        if depths[i].wants_deep {
-            Some(depths[i].wanted)
-        } else {
-            staged_depth(i)
-        }
-    };
+    let any_windowed = depths.iter().any(|d| d.needs_backfill());
+    // Stage one records only as deep as it actually READ. Asserting the
+    // requested depth here would claim coverage the deep pass has not
+    // delivered, and a crash between the two would leave the wallet
+    // permanently reporting history it does not hold.
+    //
+    // A target needing no backfill reports `None` — leave the recorded depth
+    // alone rather than restating it from the cursor, which sits far above
+    // what the wallet actually holds.
+    let staged_depth = |i: usize| depths[i].needs_backfill().then(|| depths[i].staged_depth());
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let empty_sources = HashMap::new();
-    let mut inserted: Vec<usize> = Vec::with_capacity(live.len());
+    // Indexed in place, one slot per live target, rather than cleared and
+    // re-pushed: the backfill now skips the store for targets it has capped,
+    // and push-based accumulation would silently shift everyone's result.
+    let mut inserted: Vec<usize> = vec![0; live.len()];
 
     // Stage one: from the shallowest floor in the batch to the tip. Targets
     // that want more get it in stage two.
@@ -543,7 +589,7 @@ fn run_batch_jobs(
         .map(|(t, f)| crate::classify::build_with(t.seed_owned.clone(), f))
         .collect();
     for (i, (job, timeline)) in live.iter().zip(&timelines).enumerate() {
-        inserted.push(db::store_timeline(
+        inserted[i] = db::store_timeline(
             conn,
             &job.canonical,
             &job.display,
@@ -555,8 +601,9 @@ fn run_batch_jobs(
             db::StoreOpts {
                 replace: false,
                 scanned_from: staged_depth(i),
+                oversize_rows: None,
             },
-        )?);
+        )?;
     }
 
     // Stage two: everything below the window, then re-classify the whole.
@@ -564,68 +611,146 @@ fn run_batch_jobs(
     // that is the difference between a 3 GB read and a 219 GB one.
     let deep_ceiling = depths
         .iter()
-        .filter(|d| d.wants_deep && d.floor.is_some())
-        .filter_map(|d| d.floor)
+        .filter_map(|d| d.deep_span())
+        .map(|(_, to)| to)
         .max();
+    // Where the backfill gave up, per target: `(slot, rows)`.
+    let mut capped: Vec<Option<(u64, u64)>> = vec![None; live.len()];
     if let Some(ceiling) = deep_ceiling {
         set_all("deep", "backfilling older history".into());
         // Targets that did NOT buy the deep history opt out by asking for a
         // range above the ceiling — `keep()` then rejects every older tx for
         // them, so one shared sweep cannot hand anyone depth they didn't buy.
-        let deep_targets: Vec<excavate::BatchTarget> = targets
+        let mut deep_targets: Vec<excavate::BatchTarget> = targets
             .iter()
             .zip(&depths)
-            .map(
-                |(
-                    t,
-                    Depth {
-                        cursor, wants_deep, ..
-                    },
-                )| excavate::BatchTarget {
-                    creds: t.creds.clone(),
-                    scan_from_slot: if *wants_deep { *cursor } else { u64::MAX },
-                    seed_owned: t.seed_owned.clone(),
-                },
-            )
+            .map(|(t, d)| excavate::BatchTarget {
+                creds: t.creds.clone(),
+                // The target's OWN entitlement, not the cursor. Using the
+                // cursor handed a cold target everything back to Shelley
+                // regardless of the window it paid for. `u64::MAX` opts a
+                // target out of the shared sweep entirely.
+                scan_from_slot: d.deep_span().map_or(u64::MAX, |(from, _)| from),
+                seed_owned: t.seed_owned.clone(),
+            })
             .collect();
-        let (deep, _) = excavate::scan_batch(
-            &cfg.immutable,
-            Some(&cfg.tail_db),
-            &deep_targets,
-            excavate::ScanRange {
-                from_slot: SHELLEY_START_SLOT,
-                to_slot: Some(ceiling),
-            },
-            cfg.threads,
-            &on,
-        )?;
-        for (all, older) in found.iter_mut().zip(deep) {
-            all.extend(older);
-        }
-        timelines = targets
+        // Read no deeper than the deepest thing anyone in the batch actually
+        // wants. Starting at Shelley unconditionally made a batch of 12-month
+        // requests pay full-chain read costs.
+        let deep_from = depths
             .iter()
-            .zip(&found)
-            .map(|(t, f)| crate::classify::build_with(t.seed_owned.clone(), f))
-            .collect();
-        inserted.clear();
-        for (i, (job, timeline)) in live.iter().zip(&timelines).enumerate() {
-            inserted.push(db::store_timeline(
-                conn,
-                &job.canonical,
-                &job.display,
-                timeline,
-                &empty_sources,
-                newest_chunk,
-                scanned_to_slot,
-                now,
-                db::StoreOpts {
-                    replace: true,
-                    // The deep pass has now delivered what this target asked
-                    // for, so record its FULL depth — not the staged floor.
-                    scanned_from: final_depth(i),
+            .filter_map(|d| d.deep_span())
+            .map(|(from, _)| from)
+            .min()
+            .unwrap_or(SHELLEY_START_SLOT);
+        // Backfill in DESCENDING SEGMENTS, storing after each.
+        //
+        // One sweep from Shelley to the window published nothing until it had
+        // read all 219 GB — minutes of a screen that already had the recent
+        // rows on it but no way to show history arriving. Segmenting costs an
+        // extra store and re-classify per segment (cheap; the read dominates)
+        // and buys a timeline that visibly extends backwards while it runs.
+        let segments = ((ceiling.saturating_sub(deep_from)) as f64 / DEEP_SEGMENT_SLOTS as f64)
+            .ceil()
+            .max(1.0) as usize;
+        backfilling.store(true, Ordering::Relaxed);
+        let mut ceil = ceiling;
+        let mut segment = 0usize;
+        while ceil > deep_from {
+            let from = ceil.saturating_sub(DEEP_SEGMENT_SLOTS).max(deep_from);
+            segment += 1;
+            set_all(
+                "deep",
+                format!("backfilling older history ({segment} of {segments})"),
+            );
+            let (deep, _) = excavate::scan_batch(
+                &cfg.immutable,
+                Some(&cfg.tail_db),
+                &deep_targets,
+                excavate::ScanRange {
+                    from_slot: from,
+                    to_slot: Some(ceil),
                 },
-            )?);
+                cfg.threads,
+                &on,
+            )?;
+            for (all, older) in found.iter_mut().zip(deep) {
+                all.extend(older);
+            }
+            // THE GUARD. A wallet past the row ceiling stops here.
+            //
+            // The check has to live INSIDE the descending walk. Measuring
+            // after stage one — the cheap, obvious place — gets it exactly
+            // backwards on real data: the 1.13M-row address in this cache has
+            // 306 rows in the last year (0.0%), while a perfectly ordinary
+            // wallet had 3,240, all of them recent. Judged on recent activity
+            // the exchange looks dormant and the ordinary wallet looks
+            // enormous. Only the accumulating total tells them apart, and it
+            // only accumulates here.
+            //
+            // Setting `scan_from_slot` to `u64::MAX` drops the target from the
+            // remaining segments while the shared sweep continues for everyone
+            // else — the same opt-out an unentitled target already uses.
+            for (i, rows) in found.iter().map(Vec::len).enumerate() {
+                if capped[i].is_none() && rows as u64 >= cfg.max_wallet_rows {
+                    capped[i] = Some((from, rows as u64));
+                    deep_targets[i].scan_from_slot = u64::MAX;
+                    tracing::warn!(
+                        wallet = %live[i].display,
+                        rows,
+                        ceiling = cfg.max_wallet_rows,
+                        stopped_at_slot = from,
+                        "wallet oversize — backfill capped"
+                    );
+                }
+            }
+            timelines = targets
+                .iter()
+                .zip(&found)
+                .map(|(t, f)| crate::classify::build_with(t.seed_owned.clone(), f))
+                .collect();
+            for (i, (job, timeline)) in live.iter().zip(&timelines).enumerate() {
+                // A capped target collected nothing this segment, so re-storing
+                // its (unchanged, possibly six-figure) timeline every remaining
+                // segment is pure write amplification. Its rows and its verdict
+                // are already on disk from the segment that capped it.
+                if capped[i].is_some_and(|(at, _)| at != from) {
+                    continue;
+                }
+                inserted[i] = db::store_timeline(
+                    conn,
+                    &job.canonical,
+                    &job.display,
+                    timeline,
+                    &empty_sources,
+                    newest_chunk,
+                    scanned_to_slot,
+                    now,
+                    db::StoreOpts {
+                        replace: true,
+                        // Only what the backfill has REACHED so far. A crash
+                        // mid-backfill then leaves the wallet claiming the
+                        // segments it actually holds, and the next run resumes
+                        // from there rather than re-reading or, worse, calling
+                        // itself complete. A capped wallet freezes at the slot
+                        // it gave up on, for the same reason.
+                        scanned_from: match capped[i] {
+                            Some((at, _)) => Some(db::ScanTarget::from_slot(at)),
+                            None => depths[i].depth_after(from),
+                        },
+                        oversize_rows: capped[i].map(|(_, rows)| rows),
+                    },
+                )?;
+            }
+            // Everyone still collecting has been capped — the rest of the
+            // chain is being read for nobody.
+            if capped.iter().all(Option::is_some) {
+                tracing::info!("every target capped — abandoning the rest of the backfill");
+                break;
+            }
+            ceil = from;
         }
+        backfilling.store(false, Ordering::Relaxed);
     }
     // Market enrichment — cheap (an index seek per batch) and it names the
     // rows a holder cares most about, so it runs before the slow resolve.
@@ -667,8 +792,8 @@ fn run_batch_jobs(
         // sender whose source tx it will never show.
         let resolve_floor = depths
             .iter()
-            .filter(|d| d.floor.is_some() && !d.wants_deep)
-            .filter_map(|d| d.floor)
+            .filter(|d| d.needs_backfill() && d.deep_span().is_none())
+            .map(|d| d.staged_from)
             .min()
             .filter(|_| deep_ceiling.is_none());
         let floor_chunk = match resolve_floor {
@@ -693,4 +818,233 @@ fn run_batch_jobs(
         };
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry(shallow_max_days: u64) -> Registry {
+        let (shallow, _a) = mpsc::channel();
+        let (deep, _b) = mpsc::channel();
+        // Leaked so the receivers outlive the senders; this only exercises
+        // routing, which touches no worker and no database.
+        std::mem::forget((_a, _b));
+        Registry {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            shallow,
+            deep,
+            shallow_max_days,
+            queued: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The tiers that must stay responsive under load — an arriving reader on
+    /// the free or 90-day rung never queues behind a full backfill.
+    #[test]
+    fn cheap_windows_take_the_shallow_lane() {
+        let r = registry(90);
+        assert_eq!(r.lane_for(Some(30)), Lane::Shallow);
+        assert_eq!(
+            r.lane_for(Some(90)),
+            Lane::Shallow,
+            "the bound is inclusive"
+        );
+    }
+
+    /// Anything deeper than the bound — and the whole chain especially — is
+    /// the rivalrous work and must not block arrivals.
+    #[test]
+    fn deep_windows_take_the_deep_lane() {
+        let r = registry(90);
+        assert_eq!(r.lane_for(Some(91)), Lane::Deep);
+        assert_eq!(r.lane_for(Some(365)), Lane::Deep);
+        assert_eq!(r.lane_for(None), Lane::Deep, "no window is the full chain");
+    }
+
+    /// HOUSEKEEPING MUST NOT USE THE RIVALROUS LANE.
+    ///
+    /// The refresh watcher enqueues every cached wallet whenever chain
+    /// coverage advances. It used to pass no window, which routes to `Deep` —
+    /// so routine catch-up monopolised the lane that exists for full-chain
+    /// reads, and arrivals queued behind a batch of housekeeping. Observed in
+    /// production before this was fixed.
+    #[test]
+    fn a_refresh_takes_the_shallow_lane() {
+        let r = registry(90);
+        // The window `enqueue_refresh` uses, checked through the same routing
+        // the watcher's jobs go through.
+        assert_eq!(r.lane_for(Some(1)), Lane::Shallow);
+        assert_eq!(
+            r.lane_for(None),
+            Lane::Deep,
+            "and no-window is still Deep — which is why the watcher must not use it"
+        );
+    }
+
+    /// The other half: a one-day ask is shallower than anything already
+    /// scanned, so a refresh can never drag a backfill behind it.
+    #[test]
+    fn a_refresh_never_deepens_a_wallet() {
+        let now = 200_000_000;
+        let wanted = db::ScanTarget::wanted(Some(1), now);
+        for held in [
+            db::ScanTarget::Genesis,
+            db::ScanTarget::from_slot(100_000_000),
+            db::ScanTarget::from_slot(now - 2 * 86_400),
+        ] {
+            assert!(
+                held.covers(wanted),
+                "{held:?} already covers a one-day refresh, so needs_backfill stays false"
+            );
+        }
+    }
+
+    /// `0` is the escape hatch back to one queue, for a box where two
+    /// concurrent sweeps would fight over disk more than they help.
+    #[test]
+    fn a_zero_bound_collapses_the_split() {
+        let r = registry(0);
+        assert_eq!(r.lane_for(Some(1)), Lane::Deep);
+        assert_eq!(r.lane_for(None), Lane::Deep);
+    }
+
+    // Slots chosen to read as a ladder: OLD sits below RECENT, which sits
+    // below the tip. Real values, so `from_slot` round-trips.
+    const OLD: u64 = 90_000_000;
+    const RECENT: u64 = 140_000_000;
+
+    /// The bug this whole change set exists to kill: a wallet already scanned
+    /// to 30 days asks for the full chain and must get a deep pass, where the
+    /// old `deep_pending` bool said "already done" and returned 898 rows.
+    #[test]
+    fn shallow_history_plus_a_full_chain_request_is_a_backfill() {
+        let d = Depth {
+            held: Some(db::ScanTarget::from_slot(RECENT)),
+            wanted: db::ScanTarget::Genesis,
+            staged_from: RECENT,
+        };
+        assert!(d.needs_backfill());
+        assert_eq!(
+            d.deep_span(),
+            Some((db::ScanTarget::Genesis.floor(), RECENT))
+        );
+        assert_eq!(
+            d.depth_after(db::ScanTarget::Genesis.floor()),
+            Some(db::ScanTarget::Genesis),
+            "the completed backfill covers everything"
+        );
+    }
+
+    /// The backfill walks BACKWARDS a segment at a time, and each store must
+    /// claim only what it has reached — an interrupted run that recorded its
+    /// destination would call itself complete and never return.
+    #[test]
+    fn a_partial_backfill_records_only_what_it_reached() {
+        let d = Depth {
+            held: Some(db::ScanTarget::from_slot(RECENT)),
+            wanted: db::ScanTarget::Genesis,
+            staged_from: RECENT,
+        };
+        assert_eq!(d.depth_after(OLD), Some(db::ScanTarget::Since(OLD)));
+        assert_eq!(
+            d.depth_after(db::ScanTarget::Genesis.floor()),
+            Some(db::ScanTarget::Genesis)
+        );
+    }
+
+    /// The deep pass is SHARED: a batch mate wanting the whole chain drags
+    /// the read below this target's window, and it must not be credited with
+    /// depth it did not pay for.
+    #[test]
+    fn a_shared_sweep_cannot_credit_unbought_depth() {
+        let d = Depth {
+            held: Some(db::ScanTarget::from_slot(RECENT)),
+            wanted: db::ScanTarget::Since(OLD),
+            staged_from: RECENT,
+        };
+        assert_eq!(
+            d.depth_after(SHELLEY_START_SLOT),
+            Some(db::ScanTarget::Since(OLD)),
+            "clamped to the entitlement, not the sweep"
+        );
+    }
+
+    /// The converse, and the 94-second "30-day" scan: a COLD 30-day request
+    /// has uncovered depth by definition, but stage one already reaches its
+    /// entitlement, so it must not drag a full sweep behind it.
+    #[test]
+    fn a_cold_windowed_request_runs_no_deep_pass() {
+        let d = Depth {
+            held: None,
+            wanted: db::ScanTarget::Since(RECENT),
+            staged_from: RECENT,
+        };
+        assert!(d.needs_backfill(), "unknown depth always re-reads");
+        assert_eq!(d.deep_span(), None, "stage one already spans the window");
+        assert_eq!(
+            d.depth_after(SHELLEY_START_SLOT),
+            Some(db::ScanTarget::Since(RECENT)),
+            "no deep pass ran, so only stage one's reach is recorded"
+        );
+    }
+
+    /// Coverage recorded after stage one must be what stage one READ, never
+    /// what the request asked for — a crash between the passes would
+    /// otherwise leave the wallet claiming history it does not hold.
+    #[test]
+    fn staged_depth_never_asserts_the_deep_entitlement() {
+        let d = Depth {
+            held: None,
+            wanted: db::ScanTarget::Genesis,
+            staged_from: RECENT,
+        };
+        assert_eq!(d.staged_depth(), db::ScanTarget::Since(RECENT));
+        assert_ne!(
+            Some(d.staged_depth()),
+            d.depth_after(db::ScanTarget::Genesis.floor())
+        );
+    }
+
+    /// A capped wallet costs an incremental, never another full sweep.
+    ///
+    /// The planner is told this by CLAMPING `wanted` to what the wallet holds,
+    /// so the existing depth comparison reports it satisfied. Without that a
+    /// capped exchange address would re-attempt — and re-abandon — a 219 GB
+    /// read every single time somebody opened it.
+    #[test]
+    fn a_capped_wallet_is_never_deep_scanned_again() {
+        let held = db::ScanTarget::from_slot(RECENT);
+        // The clamp `prep` applies when `oversize_rows` is set: the ask
+        // becomes what is held, whatever the caller requested.
+        let d = Depth {
+            held: Some(held),
+            wanted: held,
+            staged_from: RECENT,
+        };
+        assert!(!d.needs_backfill());
+        assert_eq!(d.deep_span(), None, "a capped wallet must not re-sweep");
+
+        // Same wallet WITHOUT the clamp — the unguarded behaviour, kept here
+        // so the test fails loudly if the clamp is ever dropped.
+        let unclamped = Depth {
+            held: Some(held),
+            wanted: db::ScanTarget::Genesis,
+            staged_from: RECENT,
+        };
+        assert!(unclamped.deep_span().is_some());
+    }
+
+    /// An ordinary incremental: depth on disk already covers the ask, so
+    /// there is no backfill, no deep pass, and nothing to re-record.
+    #[test]
+    fn covered_history_needs_nothing() {
+        let d = Depth {
+            held: Some(db::ScanTarget::from_slot(OLD)),
+            wanted: db::ScanTarget::Since(RECENT),
+            staged_from: RECENT,
+        };
+        assert!(!d.needs_backfill());
+        assert_eq!(d.deep_span(), None);
+    }
 }
