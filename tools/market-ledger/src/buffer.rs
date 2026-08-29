@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use pallas_primitives::Hash;
 
-use crate::decode::{Asset, OutRef};
+use mitos_chain_walk::decode::{Asset, OutRef};
 
 /// A buffered watched output — everything a later spend needs to reconstruct a
 /// resolved input.

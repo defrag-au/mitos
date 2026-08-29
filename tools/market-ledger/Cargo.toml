@@ -28,10 +28,13 @@ rusqlite = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 
-# Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/tx/address
-# decode. The tx decode (canonical redeemer ordering, witness-datum extraction)
-# mirrors mitos-data-plane's `block_events::project_tx` — reimplemented here on
-# bare pallas to avoid dragging that crate's dolos deps into the walker.
+# Shared walker plumbing: Mithril bootstrap, immutable-DB iteration, bare-pallas
+# tx decode, crash-visible checkpoint mirror (extracted 2026-08-16; also used by
+# project-ledger).
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+# pallas is still needed directly for the buffer/decode assembly + follow's
+# chainsync client.
 pallas-hardano = { workspace = true }
 pallas-network = { workspace = true }
 pallas-traverse = { workspace = true }

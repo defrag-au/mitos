@@ -1,0 +1,39 @@
+# wallet-trace — identity clustering from the witness set.
+#
+# Unlike `project-ledger`, this walker resolves NO inputs. Cardano requires
+# every key-locked input to be authorised by a signature in the transaction's
+# own witness set, so the co-signing group is readable from block bytes alone.
+# That makes the walk stateless and forward-only — the cheapest shape there is.
+#
+# Design: `cnft.dev-workers/docs/design/WALLET_TRACE.md`.
+[package]
+name = "wallet-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wallet identity clustering from vkey witness sets, over a certified Mithril snapshot"
+
+[[bin]]
+name = "wallet-trace"
+path = "src/main.rs"
+
+[dependencies]
+# Shared walker plumbing: Mithril bootstrap, immutable-DB iteration (incl. the
+# fuzzy slot seek), chunk arithmetic. The same substrate both other walkers use.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+pallas-traverse = { workspace = true }
+pallas-addresses = { workspace = true }
+# Certificate + StakeCredential shapes, for the `stake_event` table.
+pallas-primitives = { workspace = true }
+# blake2b-224 over a vkey — which IS the payment key hash.
+pallas-crypto = "1.1.1"
+
+# The index. Query-time only for `trace`, so it runs on a laptop.
+rusqlite = { workspace = true }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }

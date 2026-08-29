@@ -1,0 +1,53 @@
+# project-ledger — pure ingestion of one NFT project's two-sided mint view:
+# capital in (mint payments + royalties), assets out (the holder base forming),
+# capital out (deployment) — from a certified Mithril snapshot into one
+# slot-keyed ledger. Never a follower.
+#
+# Design: `cnft.dev-workers/docs/design/PROJECT_LEDGER_IMPORTER.md`.
+[package]
+name = "project-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mithril-snapshot walker for a project's mint window + royalties: capital in / holders forming / capital out, one slot-keyed ledger"
+
+[[bin]]
+name = "project-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# Shared walker plumbing (bootstrap, immutable-DB iteration, tx decode,
+# checkpoint mirror) — extracted from market-ledger, used by both walkers.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+# Pure wallet-flow model + the frontier state machine.
+chain-ledger = { workspace = true }
+# Known DEX / marketplace / aggregator contract addresses, for `classify`.
+address-registry = { workspace = true }
+
+pallas-traverse = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-addresses = { workspace = true }
+pallas-codec = { workspace = true }
+# blake2b-backed `Hash<N>` used for outrefs + policy/script hashes.
+pallas-crypto = "1.1.1"
+
+# The write store (walk-time only; the artifact is Parquet via `export`).
+rusqlite = { workspace = true }
+# Frontier / activity blobs in the checkpoint; the wire precedent is postcard.
+postcard = { workspace = true }
+# The input-resolution ladder's last rung (`/utxo_info`) + the floor seed
+# (`/policy_asset_info`). Blocking — the walk loop is sync.
+reqwest = { workspace = true, features = ["blocking"] }
+
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+# resolve-local's per-block pre-filter for handle harvesting: a SIMD substring
+# search for the ADA Handle policy id over raw block bytes, so only blocks
+# that actually carry handles pay for output decoding.
+memchr = "2"

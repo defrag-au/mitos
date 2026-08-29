@@ -18,6 +18,18 @@
 //!
 //! The consumed offer's locked lovelace is the bid price (`price_lovelace`) —
 //! read from the input, never inferred from outputs.
+//!
+//! ## Batched fills
+//!
+//! A tx may spend several offers at once — notably one seller filling two of the
+//! *same* bidder's collection offers, where both offers carry the same target
+//! policy and (on Wayup) the same recipient credential, so the two are
+//! indistinguishable by matching rules alone. Each delivery is therefore
+//! **claimed**: an output/asset already reported for an earlier offer in the same
+//! tx is skipped by the next. Without that, first-match-wins reports the first
+//! delivery once per offer and loses every other asset in the tx.
+
+use std::collections::HashSet;
 
 use mitos_community_events::jpg_store_offer::{
     JpgStoreOfferVersion, OfferAccept as JpgOfferAccept,
@@ -28,7 +40,7 @@ use mitos_community_events::wayup_store_offer::{
 
 use crate::offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 use crate::sales::address_payment_cred;
-use crate::{DecodeTx, TxOutput};
+use crate::{AssetId, DecodeTx, TxOutput};
 
 // ============================================================
 // jpg.store
@@ -60,7 +72,8 @@ fn is_jpg_offer_cancel(redeemer: &[u8]) -> bool {
 /// carries a matching asset. Collection-wide offers (no asset names) accept any
 /// asset under the target policy; asset-specific offers require the delivered
 /// name to be in the allow-list. Accepts whose asset can't be identified are
-/// dropped (a partial accept carries no pricing signal).
+/// dropped (a partial accept carries no pricing signal). Deliveries are claimed
+/// across the tx, so a batched fill reports one asset per offer.
 ///
 /// Returns the bare [`JpgOfferAccept`] wire structs (this decode never produces
 /// the other lifecycle variants — Create/Cancel/Update stay with the live
@@ -68,6 +81,7 @@ fn is_jpg_offer_cancel(redeemer: &[u8]) -> bool {
 /// `JpgStoreOffer::Accept`.
 pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
     let mut out = Vec::new();
+    let mut claimed = ClaimedDeliveries::default();
     for input in &tx.inputs {
         let Some(version) = classify_jpg_offer_address(&input.address) else {
             continue;
@@ -88,7 +102,7 @@ pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
         // the seller's output holding the NFT (jpg does not credential-match the
         // recipient the way Wayup does).
         let Some((policy, asset_name_hex, seller_address)) =
-            jpg_find_delivered(&decoded, non_offer_outputs(tx))
+            jpg_find_delivered(&decoded, non_offer_outputs(tx), &mut claimed)
         else {
             continue;
         };
@@ -108,11 +122,12 @@ pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
     out
 }
 
-/// First non-offer output delivering a target-policy asset → `(policy_hex,
-/// asset_name_hex, seller_address)`.
+/// First unclaimed non-offer output delivering a target-policy asset →
+/// `(policy_hex, asset_name_hex, seller_address)`.
 fn jpg_find_delivered<'a>(
     decoded: &DecodedOffer,
     outputs: impl Iterator<Item = &'a TxOutput>,
+    claimed: &mut ClaimedDeliveries,
 ) -> Option<(String, String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
     let target_policy_bytes = hex::decode(target_policy).ok()?;
@@ -125,6 +140,9 @@ fn jpg_find_delivered<'a>(
             if let Some(ref set) = target_asset_set
                 && !set.iter().any(|n| n == &asset.name)
             {
+                continue;
+            }
+            if !claim(claimed, out, asset) {
                 continue;
             }
             return Some((
@@ -173,10 +191,13 @@ impl WayupOfferConfig {
 /// own wallet (`target_recipient`) AND whose bidder is not among the tx's
 /// required signers. Recipient-credential matching (not just policy) is what
 /// excludes the seller's change and, in a batched tx, a listing of another asset
-/// from the same collection. Returns the bare [`WayupOfferAccept`] structs (see
+/// from the same collection. Deliveries are claimed across the tx, so a seller
+/// filling two of one bidder's offers reports one asset per offer rather than
+/// the first asset twice. Returns the bare [`WayupOfferAccept`] structs (see
 /// [`decode_jpg_offer_accepts`] re the enum).
 pub fn decode_wayup_offer_accepts(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Vec<WayupOfferAccept> {
     let mut out = Vec::new();
+    let mut claimed = ClaimedDeliveries::default();
     for input in &tx.inputs {
         if !cfg.is_offer_address(&input.address) {
             continue;
@@ -192,7 +213,8 @@ pub fn decode_wayup_offer_accepts(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Vec<
         if bidder_in_signers(&decoded.bidder_pkh, &tx.required_signers) {
             continue;
         }
-        let Some((policy, asset_name_hex)) = wayup_find_delivered(&decoded, non_offer_outputs(tx))
+        let Some((policy, asset_name_hex)) =
+            wayup_find_delivered(&decoded, non_offer_outputs(tx), &mut claimed)
         else {
             continue;
         };
@@ -213,11 +235,12 @@ pub fn decode_wayup_offer_accepts(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Vec<
     out
 }
 
-/// Output delivering the target-policy asset to the bidder's own wallet →
-/// `(policy_hex, asset_name_hex)`.
+/// First unclaimed output delivering the target-policy asset to the bidder's own
+/// wallet → `(policy_hex, asset_name_hex)`.
 fn wayup_find_delivered<'a>(
     decoded: &DecodedOffer,
     outputs: impl Iterator<Item = &'a TxOutput>,
+    claimed: &mut ClaimedDeliveries,
 ) -> Option<(String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
     let target_policy_bytes = hex::decode(target_policy).ok()?;
@@ -234,6 +257,9 @@ fn wayup_find_delivered<'a>(
             if let Some(ref set) = target_asset_set
                 && !set.iter().any(|n| n == &asset.name)
             {
+                continue;
+            }
+            if !claim(claimed, out, asset) {
                 continue;
             }
             return Some((target_policy.to_owned(), hex::encode(&asset.name)));
@@ -253,6 +279,17 @@ fn bidder_in_signers(bidder_pkh: &str, signers: &[Vec<u8>]) -> bool {
 // ============================================================
 // shared helpers
 // ============================================================
+
+/// Deliveries already reported by an earlier offer in the same tx, keyed by
+/// `(output index, asset name)`. One physical asset settles exactly one offer,
+/// so a second offer matching the same output/asset must keep looking.
+type ClaimedDeliveries = HashSet<(u32, Vec<u8>)>;
+
+/// Claim a delivery for the offer currently being decoded. `false` when an
+/// earlier offer in this tx already took it.
+fn claim(claimed: &mut ClaimedDeliveries, out: &TxOutput, asset: &AssetId) -> bool {
+    claimed.insert((out.index, asset.name.clone()))
+}
 
 /// Tx outputs that are NOT at an offer address of *either* venue — the
 /// candidate accept-delivery outputs. (An accept's delivery never lands back at
@@ -304,6 +341,7 @@ mod tests {
     const WAYUP_BIDDER: &str = "cba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82ad";
     const MEKANISM_POLICY: &str = "ffa56051fda3d106a96f09c3d209d4bf24a117406fb813fb8b4548e3";
     const MEKANISM_2212: &str = "4d656b616e69736d32323132";
+    const MEKANISM_3131: &str = "4d656b616e69736d33313331";
     const WAYUP_RECIPIENT_CRED: &str = "4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922";
 
     // Real jpg.store offer-accept datum (collection-wide tappy bid, 153 ADA),
@@ -312,6 +350,7 @@ mod tests {
     const JPG_BIDDER: &str = "cd55cd8d31dd837222a878bda41bd1ef578eb9ec6d05778de039e6cf";
     const TAPPY_POLICY: &str = "e3ff4ab89245ede61b3e2beab0443dbcc7ea8ca2c017478e4e8990e2";
     const TAPPY_3589: &str = "746170707933353839";
+    const TAPPY_1234: &str = "746170707931323334";
     const JPG_SELLER_ADDR: &str = "addr1q8x4tnvdx8wcxu3z4putmfqm68h40r4ea3ks2auduqu7dnayvne0s5sjevqmh2uzxh8e42mvlqquz8qmae6ln45ys59q79cap8";
 
     /// Build a mainnet enterprise (no-stake) bech32 address for a payment cred —
@@ -374,6 +413,15 @@ mod tests {
         }
     }
 
+    /// The same bidder's offer, spent from a different oref — the batched-fill
+    /// shape, where the two offers are identical apart from where they sat.
+    fn wayup_offer_input_at(oref_index: u32) -> TxInput {
+        TxInput {
+            oref_index,
+            ..wayup_offer_input(Some(vec![0xd8, 0x7a, 0x80]))
+        }
+    }
+
     #[test]
     fn wayup_accept_picks_recipient_asset_not_change() {
         let tx = DecodeTx {
@@ -411,6 +459,74 @@ mod tests {
         assert_eq!(a.prior_output_index, 1);
         assert!(a.collection_offer);
         assert_eq!(a.seller_address, "");
+    }
+
+    #[test]
+    fn wayup_batched_fill_pairs_each_offer_with_its_own_asset() {
+        // Mainnet shape (b92da74b…): one seller filling two of the SAME
+        // bidder's collection offers in one tx. Both offers carry the same
+        // target policy and recipient credential, so nothing but claiming
+        // distinguishes them — first-match-wins reported the first delivery
+        // twice and dropped the second asset entirely.
+        let tx = DecodeTx {
+            tx_hash: hex::decode(
+                "b92da74ba21088a5d7537a23c2a526c8e5e0e3b4f3d6d2d98d8d7e406541f1b2",
+            )
+            .unwrap(),
+            inputs: vec![wayup_offer_input_at(0), wayup_offer_input_at(3)],
+            outputs: vec![
+                TxOutput {
+                    address: enterprise_addr(WAYUP_RECIPIENT_CRED),
+                    lovelace: 1_168_010,
+                    assets: vec![asset(MEKANISM_POLICY, MEKANISM_2212)],
+                    index: 1,
+                    ..Default::default()
+                },
+                TxOutput {
+                    address: enterprise_addr(WAYUP_RECIPIENT_CRED),
+                    lovelace: 1_163_700,
+                    assets: vec![asset(MEKANISM_POLICY, MEKANISM_3131)],
+                    index: 4,
+                    ..Default::default()
+                },
+            ],
+            required_signers: vec![],
+        };
+        let cfg = WayupOfferConfig::from_hex(WAYUP_OFFER_CRED);
+        let accepts = decode_wayup_offer_accepts(&tx, &cfg);
+
+        assert_eq!(accepts.len(), 2);
+        // Offers in input order, deliveries in output order.
+        assert_eq!(accepts[0].prior_output_index, 0);
+        assert_eq!(accepts[0].asset_name_hex, MEKANISM_2212);
+        assert_eq!(accepts[1].prior_output_index, 3);
+        assert_eq!(accepts[1].asset_name_hex, MEKANISM_3131);
+    }
+
+    #[test]
+    fn wayup_offer_with_no_asset_left_to_claim_is_not_an_accept() {
+        // Two offers spent but only one asset delivered: the second offer went
+        // somewhere else (a cancel batched alongside the fill). Reporting it as
+        // an accept would invent a sale — better to drop it than to double-count
+        // the one asset that did move.
+        let tx = DecodeTx {
+            tx_hash: vec![],
+            inputs: vec![wayup_offer_input_at(0), wayup_offer_input_at(3)],
+            outputs: vec![TxOutput {
+                address: enterprise_addr(WAYUP_RECIPIENT_CRED),
+                lovelace: 2_000_000,
+                assets: vec![asset(MEKANISM_POLICY, MEKANISM_2212)],
+                index: 1,
+                ..Default::default()
+            }],
+            required_signers: vec![],
+        };
+        let cfg = WayupOfferConfig::from_hex(WAYUP_OFFER_CRED);
+        let accepts = decode_wayup_offer_accepts(&tx, &cfg);
+
+        assert_eq!(accepts.len(), 1);
+        assert_eq!(accepts[0].prior_output_index, 0);
+        assert_eq!(accepts[0].asset_name_hex, MEKANISM_2212);
     }
 
     #[test]
@@ -472,6 +588,43 @@ mod tests {
         assert_eq!(a.seller_address, JPG_SELLER_ADDR);
         assert!(a.collection_offer);
         assert_eq!(a.prior_output_index, 0);
+    }
+
+    #[test]
+    fn jpg_batched_fill_pairs_each_offer_with_its_own_asset() {
+        // jpg matches on policy alone (no recipient credential in the datum),
+        // so two of one bidder's collection offers filled together are even
+        // less distinguishable than on Wayup. Same claiming rule.
+        let base = jpg_tx(vec![0xd8, 0x7a, 0x80]);
+        let second_offer = TxInput {
+            oref_index: 1,
+            ..base.inputs[0].clone()
+        };
+        let tx = DecodeTx {
+            inputs: vec![base.inputs[0].clone(), second_offer],
+            outputs: vec![
+                TxOutput {
+                    address: JPG_SELLER_ADDR.to_string(),
+                    lovelace: 2_000_000,
+                    assets: vec![asset(TAPPY_POLICY, TAPPY_3589)],
+                    index: 0,
+                    ..Default::default()
+                },
+                TxOutput {
+                    address: JPG_SELLER_ADDR.to_string(),
+                    lovelace: 2_000_000,
+                    assets: vec![asset(TAPPY_POLICY, TAPPY_1234)],
+                    index: 2,
+                    ..Default::default()
+                },
+            ],
+            ..base
+        };
+
+        let accepts = decode_jpg_offer_accepts(&tx);
+        assert_eq!(accepts.len(), 2);
+        assert_eq!(accepts[0].asset_name_hex, TAPPY_3589);
+        assert_eq!(accepts[1].asset_name_hex, TAPPY_1234);
     }
 
     #[test]
