@@ -1,0 +1,35 @@
+[package]
+name = "token-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "token-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# Shared walker plumbing: Mithril bootstrap, immutable-DB iteration, bare-pallas
+# tx decode, crash-visible checkpoint mirror. Same seam market-ledger and
+# project-ledger use — this tool adds no chain plumbing of its own.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+# The ledger. Full fidelity on the walk box; the export is what gets optimised.
+rusqlite = { workspace = true }
+
+# pallas directly for the buffer/mint assembly and stake-address derivation.
+pallas-traverse = { workspace = true }
+pallas-addresses = { workspace = true }
+pallas-primitives = { workspace = true }
+
+clap = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+
+# The watched-token registry is a small TOML file; parse it directly rather
+# than pull the whole `config` stack (same choice market-ledger makes for its
+# venue registry).
+toml = "0.8"

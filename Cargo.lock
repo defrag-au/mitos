@@ -6081,6 +6081,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "token-ledger"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "mitos-chain-walk",
+ "pallas-addresses 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "rusqlite",
+ "serde",
+ "toml 0.8.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tokio"
 version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

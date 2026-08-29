@@ -1,0 +1,24 @@
+# Watched tokens. One walked asset per ledger db — see registry.rs for why.
+#
+# floor_slot is the policy's FIRST mint. It is not a speed/correctness
+# trade-off the way a market-ledger floor is: before the first mint the asset
+# did not exist, so the outref buffer is complete from here by construction.
+# Derive it from Koios `asset_info.creation_time`:
+#     slot = 4_492_800 + (creation_time - 1_596_059_091)      # Shelley, 1s/slot
+# and the immutable file to fetch is slot / 21_600.
+
+[[token]]
+name = "aliens"
+policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"
+asset_name = "416c69656e73"            # "Aliens"
+floor_slot = 179_562_649               # minted 2026-02-15; immutable file 8313
+
+[[token]]
+name = "perp"
+policy = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64"
+asset_name = "5045525020434f494e"      # "PERP COIN"
+
+[[token]]
+name = "nikepig"
+policy = "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c"
+asset_name = "4e696b65"                # "Nike" — mints under a different name than it displays
