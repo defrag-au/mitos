@@ -109,22 +109,22 @@ pallas-network = "1.1.1"
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
 # Pinned to a specific shared-crates rev for reproducibility; bump
 # deliberately when shared-crates lands changes mitos needs.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "fd1808a528349da6526c13838faacc9a3df1c6a6", features = ["cip14", "cip25"] }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1", features = ["cip14", "cip25"] }
 
 # Known script/contract addresses — DEX pools and batchers, marketplaces,
 # aggregators. Re-added 2026-08-20 for `project-ledger classify`: without it a
 # swap's return leg reads as project income, and on Mekka that was 74,626 ₳ of
 # a supposed 132,590 ₳ "unexplained" inbound. Same rev as every other
 # shared-crate here — a second rev would resolve a second copy of the crate.
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "fd1808a528349da6526c13838faacc9a3df1c6a6" }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1" }
 # Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
 # by the protocol-event taxonomy in `mitos-core::protocol`. Same
 # shape the existing classifier emits, so mitos events deserialize
 # identically on the CF side.
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "fd1808a528349da6526c13838faacc9a3df1c6a6" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1" }
 # Pure, I/O-free wallet-flow model (`TxView`/`net_deltas`/`movements`) + the
 # project-walk `frontier` state machine. Consumed by `tools/project-ledger`.
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "fd1808a528349da6526c13838faacc9a3df1c6a6" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
