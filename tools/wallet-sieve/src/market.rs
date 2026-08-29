@@ -258,7 +258,11 @@ mod tests {
     ///
     /// A temp FILE rather than `:memory:` — `lookup` opens the database
     /// itself, read-only, which is the behaviour worth exercising.
-    fn events(tx: &str, rows: &[(&str, &str, Option<u64>, &str, &str, i64)]) -> MarketEvent {
+    /// One `market_events` row as a test writes it:
+    /// `(tx_hash, kind, price_lovelace, policy_id, asset_name_hex, bundle_size)`.
+    type Row<'a> = (&'a str, &'a str, Option<u64>, &'a str, &'a str, i64);
+
+    fn events(tx: &str, rows: &[Row<'_>]) -> MarketEvent {
         let path = std::env::temp_dir().join(format!("wallet-sieve-market-{tx}.db"));
         let _ = std::fs::remove_file(&path);
         {

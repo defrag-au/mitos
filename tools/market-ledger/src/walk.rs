@@ -652,6 +652,7 @@ mod tests {
                 index: 0,
                 datum_hash,
                 inline_datum: inline,
+                min_utxo: 0,
             }],
             required_signers: Vec::new(),
             witness_datums,

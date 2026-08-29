@@ -2123,10 +2123,6 @@ mod tests {
         assert!(has_column(&conn, "unit_flow", "min_utxo").unwrap());
     }
 
-    /// `reset_derived` names its tables in a list, so a table added to `SCHEMA`
-    /// later would silently survive a reset and poison the next walk with stale
-    /// rows. Ask sqlite what actually exists instead of trusting the list.
-    #[test]
     /// `project_side` is a HUMAN assertion about who owns a wallet, and the
     /// checkpoint's party upsert deliberately does not list it — so a walk
     /// cannot clear what a curator declared. It must also survive `reset`,
@@ -2171,6 +2167,9 @@ mod tests {
         assert!(l.project_side_parties().unwrap().is_empty());
     }
 
+    /// `reset_derived` names its tables in a list, so a table added to `SCHEMA`
+    /// later would silently survive a reset and poison the next walk with stale
+    /// rows. Ask sqlite what actually exists instead of trusting the list.
     #[test]
     fn reset_derived_covers_every_table_in_the_schema() {
         let l = Ledger::open_in_memory().unwrap();
