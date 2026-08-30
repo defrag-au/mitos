@@ -52,6 +52,16 @@ enum Command {
     },
     /// Write the spine + detail artifacts a frontend loads.
     Export(export::ExportArgs),
+    /// Read the artifacts back with no database — what a consumer sees.
+    Inspect {
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        token: String,
+        /// Evaluate at this slot instead of the end of the domain.
+        #[arg(long)]
+        at_slot: Option<u64>,
+    },
     /// Interrogate the unclassified band — do these contracts look like locks?
     Probe {
         #[arg(long)]
@@ -77,6 +87,11 @@ fn main() -> Result<()> {
         Command::Walk(args) => walk::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
+        Command::Inspect {
+            dir,
+            token,
+            at_slot,
+        } => export::inspect(&dir, &token, at_slot),
         Command::Probe { db } => walk::probe(&db),
         Command::Classify { db, tokens } => walk::classify(&db, &tokens),
     }

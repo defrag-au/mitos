@@ -16,6 +16,7 @@ mod activity;
 mod alias;
 mod asset_class;
 mod classify;
+mod distributions;
 mod enrich;
 mod koios;
 mod local;
@@ -93,6 +94,18 @@ enum Command {
     /// legs with tx hashes. Needs a `--watch-holders` walk; runs locally with
     /// the annotations sidecar, like `score`.
     Provenance(provenance::ProvenanceArgs),
+    /// Self-mints, contractor pay and founder pay — one base, three sections.
+    ///
+    /// Computes the EXTERNAL RAISE (mint proceeds minus the portion the
+    /// project paid itself) and reports every distribution against it. Shares
+    /// on gross proceeds understate: on Mekka S2 contractor pay read 21.7%
+    /// against gross and 27.9% against the honest base, either side of a 20%
+    /// pledge.
+    ///
+    /// Run `provenance` first — it identifies the fronts a project funded but
+    /// does not own, and without it self-mints see only wallets the project
+    /// holds outright.
+    Distributions(distributions::DistributionsArgs),
     /// Export core/founder assertions from the app's annotations sidecar as
     /// `[[wallet]]` registry fragments.
     ///
@@ -150,6 +163,7 @@ fn main() -> Result<()> {
         Command::Score(args) => score::run(&args),
         Command::EmitRegistry(args) => score::emit_registry(&args),
         Command::Provenance(args) => provenance::run(&args),
+        Command::Distributions(args) => distributions::run(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }

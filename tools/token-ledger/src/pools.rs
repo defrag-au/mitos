@@ -86,6 +86,19 @@ pub struct PoolObservation {
     pub key_policy: Vec<u8>,
     pub key_name: Vec<u8>,
     pub key_basis: KeyBasis,
+    /// Whether the pool's other side is ADA.
+    ///
+    /// **Only an ADA-paired pool can price the token**, and this is not an
+    /// edge case: of 15 live WingRiders V2 pools sampled 2026-08-30, only 4
+    /// paired with ADA — the rest are token/token (NIGHT/IAG, EDM/HKDG,
+    /// NIGHT/USDA, ßUSDM/iUSD…). A token/token pool's lovelace is its
+    /// min-UTxO carrier, so reading it as a quote reserve produces a spot
+    /// price wrong by orders of magnitude, silently.
+    ///
+    /// Such a pool still holds real supply and must still be counted in the
+    /// `pool` cohort — it just cannot contribute to the price. The two uses
+    /// are separated here rather than left for a caller to remember.
+    pub ada_paired: bool,
     /// Watched-asset reserve.
     pub base_reserve: i64,
     /// Lovelace reserve.
@@ -126,12 +139,17 @@ pub fn recognise(
         && let Some(bytes) = datum
         && let Some(d) = cswap::decode_pool_datum(bytes)
     {
+        // CSwap names its pair in the datum, so ADA-pairing is published
+        // rather than inferred: ADA is the empty policy and empty name.
+        let ada_paired = (d.quote_policy.is_empty() && d.quote_name.is_empty())
+            || (d.base_policy.is_empty() && d.base_name.is_empty());
         return Some(PoolObservation {
             dex,
             address: out.address.clone(),
             key_policy: d.lp_policy,
             key_name: d.lp_name,
             key_basis: KeyBasis::Datum,
+            ada_paired,
             base_reserve: qty,
             quote_reserve: out.lovelace as i64,
             fee_bps: Some(d.pool_fee_bps as i64),
@@ -155,6 +173,13 @@ pub fn recognise(
         key_policy,
         key_name,
         key_basis,
+        // Without a decoded datum the pair is unknown, so ADA-pairing is
+        // INFERRED from the value: a pool holding meaningful ADA beyond its
+        // min-UTxO carrier is ADA-paired. Conservative by design — a
+        // token/token pool wrongly treated as ADA-paired would publish a spot
+        // price off by orders of magnitude, whereas the reverse merely omits
+        // it from the price while still counting its supply.
+        ada_paired: out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING,
         base_reserve: qty,
         quote_reserve: out.lovelace as i64,
         fee_bps: None,
@@ -162,6 +187,14 @@ pub fn recognise(
         reserve_source: ReserveSource::Value,
     })
 }
+
+/// Above this much lovelace, a pool output is holding ADA as a *reserve*
+/// rather than as the carrier every token-bearing UTxO must pay.
+///
+/// Sampled token/token pools sit at 3 ADA; a real ADA reserve is orders of
+/// magnitude above that. 10 ADA leaves headroom for a fatter carrier without
+/// admitting a dead pool.
+const MIN_UTXO_CARRIER_CEILING: i64 = 10_000_000;
 
 enum ValueKey<'a> {
     One(&'a Asset),

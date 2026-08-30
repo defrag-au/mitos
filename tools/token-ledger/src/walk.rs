@@ -218,8 +218,15 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
             // Inputs: whatever this tx spent that we were holding.
             let mut deltas: HashMap<String, (Option<String>, i64)> = HashMap::new();
+            let mut locks_spent = Vec::new();
             for inp in &dtx.inputs {
                 if let Some(b) = buffer.take(&inp.oref) {
+                    // A spent lock closes here. Recorded so maturity can be
+                    // stated at any past instant, not just at tip — the live
+                    // set alone cannot say a lock existed and was claimed.
+                    if b.unlock_ts_ms.is_some() {
+                        locks_spent.push(inp.oref);
+                    }
                     let e = deltas.entry(b.address).or_insert((b.stake, 0));
                     e.1 -= b.qty;
                 }
@@ -227,6 +234,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
             // Outputs: whatever it produced that we now hold.
             let mut pool_obs = Vec::new();
+            let mut locks_created = Vec::new();
             for out in &dtx.outputs {
                 if !holds_watched(out, &policy, &asset_name) {
                     continue;
@@ -290,6 +298,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 let datum_cbor = worth_keeping.then(|| datum.map(<[u8]>::to_vec)).flatten();
                 let datum_hash = out.datum_hash.as_ref().map(|h| h.as_ref().to_vec());
 
+                if let Some(unlock) = unlock_ts_ms {
+                    locks_created.push(crate::store::LockCreated {
+                        oref: (dtx.tx_hash, out.index),
+                        address: out.address.clone(),
+                        qty,
+                        unlock_ts_ms: unlock,
+                        owner_pkh: owner_pkh.clone(),
+                    });
+                }
+
                 let stake = stake_of(&out.address);
                 buffer.insert(
                     (dtx.tx_hash, out.index),
@@ -307,7 +325,12 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 e.1 += qty;
             }
 
-            if deltas.is_empty() && net_mint == 0 && pool_obs.is_empty() {
+            if deltas.is_empty()
+                && net_mint == 0
+                && pool_obs.is_empty()
+                && locks_created.is_empty()
+                && locks_spent.is_empty()
+            {
                 continue;
             }
 
@@ -339,6 +362,8 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     .map(|(address, (stake, amount))| (address, stake, amount))
                     .collect(),
                 pools: pool_obs,
+                locks_created,
+                locks_spent,
             });
         }
 

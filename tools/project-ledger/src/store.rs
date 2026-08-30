@@ -473,6 +473,34 @@ CREATE INDEX IF NOT EXISTS idx_ai_slot   ON asset_inflow(slot);
 -- what was promised. Design: docs/design/DISTRIBUTIONS_REPORT.md
 -- ===========================================================================
 
+-- `provenance`'s per-holder result, persisted.
+--
+-- Until this existed the command only printed, so nothing downstream could use
+-- it and every consumer had to re-derive the funding trace -- the one piece of
+-- logic here least worth duplicating. `distributions` reads this to decide
+-- which mints were bought with the project's own money.
+--
+-- `core_share` is a FLOOR, not a verdict: `unknown_share` is the fraction of
+-- windowed inbound with no resolved payer, so a holder at 40% core and 50%
+-- unknown could be anywhere. Both are stored precisely so a reader can never
+-- take the first number without the second.
+CREATE TABLE IF NOT EXISTS provenance_verdict (
+    holder        TEXT PRIMARY KEY,
+    assets        INTEGER NOT NULL,   -- holder-facing units they minted
+    mint_spend    TEXT    NOT NULL,   -- i128 as TEXT: lovelace overflows i64 in aggregate
+    core_share    REAL    NOT NULL,   -- 0..1, funding traced to the core cluster
+    unknown_share REAL    NOT NULL,   -- 0..1, funding with no resolved payer
+    via           TEXT,               -- per-unit decomposition, e.g. 'ada 12% · USDM 98%'
+    flagged       INTEGER NOT NULL,   -- 1 when core_share >= the run's threshold
+    -- The run's parameters. A verdict read without them is uninterpretable:
+    -- the same wallet flags or does not depending on the threshold, and a
+    -- re-tune must be visible rather than a silent reinterpretation.
+    threshold     REAL    NOT NULL,
+    window_days   INTEGER NOT NULL,
+    roots_basis   TEXT    NOT NULL    -- asserted | derived — where coreness was anchored
+);
+CREATE INDEX IF NOT EXISTS idx_pv_flagged ON provenance_verdict(flagged);
+
 -- THE DENOMINATOR, computed once and cited by every section. Singleton.
 --
 -- Mint proceeds are NOT the raise. A project that funds its own wallets to
@@ -503,10 +531,10 @@ CREATE TABLE IF NOT EXISTS distribution_base (
 --
 -- There is deliberately no total-value column. Converting assets to ADA needs
 -- a price assumption the chain never made, and an ADA-only total is worse than
--- none: it systematically under-reports whoever was paid in kind. On S2
--- `$aesch` (moderation) received 0 ADA and 4 NFTs, so a lovelace sum reports
--- them as unpaid -- which is false, and false in a direction that always
--- flatters the project.
+-- none: it systematically under-reports whoever was paid in kind. On S2 the
+-- founder took 105 assets against 12 ADA of min-UTxO carrier, so a lovelace
+-- sum puts their share of the raise at 0.0% -- false, and false in the
+-- direction that always flatters the project.
 CREATE TABLE IF NOT EXISTS distribution_leg (
     party        TEXT    NOT NULL,
     role         TEXT    NOT NULL,   -- founder | contractor | ops | project | ...
@@ -660,7 +688,7 @@ pub struct SecondarySaleRow {
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
-pub const RESET_DERIVED_TABLES: [&str; 28] = [
+pub const RESET_DERIVED_TABLES: [&str; 29] = [
     // Derived from the walk + the CURRENT role set. Keeping them would let a
     // distribution computed under an old project boundary survive a re-walk
     // that would no longer draw it — and the boundary is exactly what gets
@@ -668,6 +696,9 @@ pub const RESET_DERIVED_TABLES: [&str; 28] = [
     "distribution_base",
     "distribution_leg",
     "distribution_evidence",
+    // Derived, and doubly so: it depends on both the walk and the core roots,
+    // and the roots are refined between runs by design.
+    "provenance_verdict",
     // Derived: the next walk reads the same blocks and re-records it. Keeping
     // it would let an inflow captured under an OLD project-side set survive a
     // re-walk that would no longer draw it.
@@ -786,6 +817,57 @@ pub struct AssetInflowRow {
     pub tx_hash: String,
     pub slot: u64,
     pub block_time: i64,
+}
+
+/// The `distribution_base` singleton — the denominator every share cites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionBase {
+    pub computed_unix: u64,
+    pub floor_slot: u64,
+    pub tip_slot: u64,
+    pub gross_proceeds: i64,
+    pub circular: i64,
+    pub external_raise: i64,
+    pub circular_txs: u64,
+    pub circular_assets: u64,
+}
+
+/// A row of `distribution_leg` — one party, one role, one UNIT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionLegRow {
+    pub party: String,
+    pub role: String,
+    pub function: Option<String>,
+    pub unit: String,
+    pub quantity: i64,
+    pub legs: u64,
+    pub unpaid_units: u64,
+    pub first_slot: Option<u64>,
+    pub last_slot: Option<u64>,
+    pub basis: String,
+}
+
+/// A row of `distribution_evidence` — the transaction behind a leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionEvidenceRow {
+    pub party: String,
+    pub unit: String,
+    pub tx_hash: String,
+    pub quantity: i64,
+    pub consideration: i64,
+    pub slot: u64,
+}
+
+/// A row of `provenance_verdict` — one holder's funding verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvenanceVerdictRow {
+    pub holder: String,
+    pub assets: u64,
+    pub mint_spend: i128,
+    pub core_share: f64,
+    pub unknown_share: f64,
+    pub via: Option<String>,
+    pub flagged: bool,
 }
 
 /// A row of `unit_flow` — one output's worth of one unit, moving.
@@ -1087,6 +1169,136 @@ impl Ledger {
             "UPDATE party SET declared_role = ?, declared_function = ? WHERE key = ?",
             params![role, function, key],
         )?)
+    }
+
+    /// Replace the provenance verdicts wholesale.
+    ///
+    /// Wholesale because a verdict only means anything alongside the run that
+    /// produced it: mixing rows from two thresholds would give a `flagged`
+    /// column that means different things on different rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_provenance_verdicts(
+        &mut self,
+        rows: &[ProvenanceVerdictRow],
+        threshold: f64,
+        window_days: u64,
+        roots_basis: &str,
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM provenance_verdict", [])?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO provenance_verdict
+                   (holder, assets, mint_spend, core_share, unknown_share, via,
+                    flagged, threshold, window_days, roots_basis)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.holder,
+                    u64_i64(r.assets),
+                    r.mint_spend.to_string(),
+                    r.core_share,
+                    r.unknown_share,
+                    r.via,
+                    i64::from(r.flagged),
+                    threshold,
+                    u64_i64(window_days),
+                    roots_basis,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Read-only connection, for the analysis passes that only query.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Replace the base, legs and evidence as ONE transaction.
+    ///
+    /// Wholesale and atomic together: a base written without its legs, or legs
+    /// carrying a stale base, is a report whose percentages cite a denominator
+    /// that is not the one they were computed against. Partial state here is
+    /// worse than none.
+    pub fn replace_distributions(
+        &mut self,
+        base: &DistributionBase,
+        legs: &[DistributionLegRow],
+        evidence: &[DistributionEvidenceRow],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM distribution_base", [])?;
+        tx.execute("DELETE FROM distribution_leg", [])?;
+        tx.execute("DELETE FROM distribution_evidence", [])?;
+        tx.execute(
+            "INSERT INTO distribution_base
+               (id, computed_unix, floor_slot, tip_slot, gross_proceeds, circular,
+                external_raise, circular_txs, circular_assets)
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                u64_i64(base.computed_unix),
+                u64_i64(base.floor_slot),
+                u64_i64(base.tip_slot),
+                base.gross_proceeds,
+                base.circular,
+                base.external_raise,
+                u64_i64(base.circular_txs),
+                u64_i64(base.circular_assets),
+            ],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO distribution_leg
+                   (party, role, function, unit, quantity, legs, unpaid_units,
+                    first_slot, last_slot, basis)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for l in legs {
+                stmt.execute(params![
+                    l.party,
+                    l.role,
+                    l.function,
+                    l.unit,
+                    l.quantity,
+                    u64_i64(l.legs),
+                    u64_i64(l.unpaid_units),
+                    l.first_slot.map(u64_i64),
+                    l.last_slot.map(u64_i64),
+                    l.basis,
+                ])?;
+            }
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO distribution_evidence
+                   (party, unit, tx_hash, quantity, consideration, slot)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )?;
+            for e in evidence {
+                stmt.execute(params![
+                    e.party,
+                    e.unit,
+                    e.tx_hash,
+                    e.quantity,
+                    e.consideration,
+                    u64_i64(e.slot),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Holders whose mint funding traced to the project — the wallets whose
+    /// mints were bought with the project's own money.
+    pub fn core_funded_holders(&self) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT holder FROM provenance_verdict WHERE flagged = 1")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Every wallet the project owns. The walk reads this once at start-up to

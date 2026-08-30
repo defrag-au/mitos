@@ -219,273 +219,297 @@ fn propagate(
 
 pub fn run(args: &ProvenanceArgs) -> Result<()> {
     let mut ledger = Ledger::open(&args.db)?;
-    let conn = ledger.connection();
+    // The read phase is SCOPED. It holds prepared statements, and a rusqlite
+    // `Statement` keeps its connection borrow alive until end of scope — so
+    // without this block the ledger is still borrowed when the verdicts are
+    // written back at the end, and nothing after here could touch it.
+    let (verdicts, total_minted, direct_core, roots, derived_root_used) = {
+        let conn = ledger.connection();
 
-    // ── who is CORE ────────────────────────────────────────────────────────
-    // Roots: human core/founder assertions + non-terminal project seeds.
-    // Declared terminals are exactly 0.0 — external money exonerates.
-    let human = crate::score::load_assertions(args.annotations.as_deref(), &args.db)?;
-    let mut coreness: BTreeMap<String, f64> = BTreeMap::new();
-    for (key, (class, _)) in &human {
-        if matches!(class.as_str(), "core" | "founder") {
-            coreness.insert(key.clone(), 1.0);
+        // ── who is CORE ────────────────────────────────────────────────────────
+        // Roots: human core/founder assertions + non-terminal project seeds.
+        // Declared terminals are exactly 0.0 — external money exonerates.
+        let human = crate::score::load_assertions(args.annotations.as_deref(), &args.db)?;
+        let mut coreness: BTreeMap<String, f64> = BTreeMap::new();
+        for (key, (class, _)) in &human {
+            if matches!(class.as_str(), "core" | "founder") {
+                coreness.insert(key.clone(), 1.0);
+            }
         }
-    }
-    let mut stmt = conn.prepare(
-        "SELECT key FROM party
+        let mut stmt = conn.prepare(
+            "SELECT key FROM party
          WHERE role IN ('declared', 'signer', 'royalty') AND terminal_reason IS NULL",
-    )?;
-    for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        coreness.insert(k?, 1.0);
-    }
-    // The derived root, only when asked: the dominant mint-proceeds
-    // destination classify computed. A cold collection's first pass has
-    // nothing else to stand on — but a DERIVED root changes the figure's
-    // epistemic grade, so it is opt-in and loudly reported.
-    let dominant_meta: Option<String> = conn
-        .query_row(
-            "SELECT v FROM walk_meta WHERE k = 'mint_proceeds_dominant'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if args.derived_roots
-        && let Some(meta) = dominant_meta
-        && let Some((key, rest)) = meta.split_once(' ')
-        && !key.is_empty()
-    {
-        if coreness.contains_key(key) {
-            tracing::info!("provenance: derived root {key} already asserted — nothing added");
-        } else {
-            coreness.insert(key.to_string(), 1.0);
-            tracing::warn!(
-                key,
-                detail = rest,
-                "provenance: DERIVED root in use — the dominant mint-proceeds destination is \
+        )?;
+        for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            coreness.insert(k?, 1.0);
+        }
+        // Whether a root was DERIVED rather than asserted. Persisted alongside the
+        // verdicts, because it grades every figure that follows: a wallet treated
+        // as core by arithmetic is a weaker foundation than one a human named, and
+        // a stored verdict that does not say which is uninterpretable later.
+        let mut derived_root_used = false;
+        // The derived root, only when asked: the dominant mint-proceeds
+        // destination classify computed. A cold collection's first pass has
+        // nothing else to stand on — but a DERIVED root changes the figure's
+        // epistemic grade, so it is opt-in and loudly reported.
+        let dominant_meta: Option<String> = conn
+            .query_row(
+                "SELECT v FROM walk_meta WHERE k = 'mint_proceeds_dominant'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if args.derived_roots
+            && let Some(meta) = dominant_meta
+            && let Some((key, rest)) = meta.split_once(' ')
+            && !key.is_empty()
+        {
+            if coreness.contains_key(key) {
+                tracing::info!("provenance: derived root {key} already asserted — nothing added");
+            } else {
+                derived_root_used = true;
+                coreness.insert(key.to_string(), 1.0);
+                tracing::warn!(
+                    key,
+                    detail = rest,
+                    "provenance: DERIVED root in use — the dominant mint-proceeds destination is \
                  treated as core by arithmetic, not assertion. Figures below inherit that \
                  basis; assert the wallet in the app to upgrade them."
-            );
+                );
+            }
         }
-    }
-    let roots = coreness.len();
-    if roots == 0 {
-        tracing::warn!(
-            "provenance: NO core roots — no core/founder assertions in the sidecar and no \
+        let roots = coreness.len();
+        if roots == 0 {
+            tracing::warn!(
+                "provenance: NO core roots — no core/founder assertions in the sidecar and no \
              non-terminal seeds. Coreness cannot propagate from nothing; classify wallets in \
              the app (or declare them in the registry) first — or run with --derived-roots \
              to stand on the dominant mint-proceeds destination."
-        );
-    }
+            );
+        }
 
-    // ── holders and their mints ────────────────────────────────────────────
-    let mut stmt = conn.prepare(
-        "SELECT to_party, tx_hash, slot FROM asset_event
+        // ── holders and their mints ────────────────────────────────────────────
+        let mut stmt = conn.prepare(
+            "SELECT to_party, tx_hash, slot FROM asset_event
          WHERE kind = 'mint' AND asset_class IN ('nft', 'plain') AND to_party IS NOT NULL",
-    )?;
-    struct Mints {
-        assets: u64,
-        txs: BTreeSet<String>,
-        first_slot: u64,
-        last_slot: u64,
-    }
-    let mut mints: BTreeMap<String, Mints> = BTreeMap::new();
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)? as u64,
-        ))
-    })?;
-    for row in rows {
-        let (to, tx, slot) = row?;
-        let e = mints.entry(to).or_insert(Mints {
-            assets: 0,
-            txs: BTreeSet::new(),
-            first_slot: u64::MAX,
-            last_slot: 0,
-        });
-        e.assets += 1;
-        e.txs.insert(tx);
-        e.first_slot = e.first_slot.min(slot);
-        e.last_slot = e.last_slot.max(slot);
-    }
-    let total_minted: u64 = mints.values().map(|m| m.assets).sum();
+        )?;
+        struct Mints {
+            assets: u64,
+            txs: BTreeSet<String>,
+            first_slot: u64,
+            last_slot: u64,
+        }
+        let mut mints: BTreeMap<String, Mints> = BTreeMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        for row in rows {
+            let (to, tx, slot) = row?;
+            let e = mints.entry(to).or_insert(Mints {
+                assets: 0,
+                txs: BTreeSet::new(),
+                first_slot: u64::MAX,
+                last_slot: 0,
+            });
+            e.assets += 1;
+            e.txs.insert(tx);
+            e.first_slot = e.first_slot.min(slot);
+            e.last_slot = e.last_slot.max(slot);
+        }
+        let total_minted: u64 = mints.values().map(|m| m.assets).sum();
 
-    // Mints straight into core wallets need no tracing — they ARE the direct
-    // team allocation, reported as their own line.
-    let direct_core: u64 = mints
-        .iter()
-        .filter(|(k, _)| coreness.get(*k).copied().unwrap_or(0.0) >= 1.0)
-        .map(|(_, m)| m.assets)
-        .sum();
+        // Mints straight into core wallets need no tracing — they ARE the direct
+        // team allocation, reported as their own line.
+        let direct_core: u64 = mints
+            .iter()
+            .filter(|(k, _)| coreness.get(*k).copied().unwrap_or(0.0) >= 1.0)
+            .map(|(_, m)| m.assets)
+            .sum();
 
-    // A ledger without seated holders has no inbound legs to attribute.
-    let holder_parties: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM party WHERE role = 'holder'",
-        [],
-        |r| r.get(0),
-    )?;
-    if holder_parties == 0 {
-        tracing::warn!(
-            "provenance: no `holder` parties in this ledger — it was walked before \
+        // A ledger without seated holders has no inbound legs to attribute.
+        let holder_parties: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM party WHERE role = 'holder'",
+            [],
+            |r| r.get(0),
+        )?;
+        if holder_parties == 0 {
+            tracing::warn!(
+                "provenance: no `holder` parties in this ledger — it was walked before \
              --watch-holders (or with it off), so buyers' funding legs are NOT booked and \
              attribution below covers only wallets the money frontier happened to seat. \
              Re-walk before trusting these numbers."
-        );
-    }
+            );
+        }
 
-    // ── whole-ledger inbound decomposition, for INTERMEDIARIES ────────────
-    // One pass over value_event; per party, inbound by source. Coreness then
-    // propagates over this map for two rounds, so treasury → ops → buyer is
-    // visible even when "ops" asserts nothing.
-    let mut inbound: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT party, counterparty, SUM(delta) FROM value_event
+        // ── whole-ledger inbound decomposition, for INTERMEDIARIES ────────────
+        // One pass over value_event; per party, inbound by source. Coreness then
+        // propagates over this map for two rounds, so treasury → ops → buyer is
+        // visible even when "ops" asserts nothing.
+        let mut inbound: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT party, counterparty, SUM(delta) FROM value_event
          WHERE delta > 0 GROUP BY party, counterparty",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)? as i128,
-        ))
-    })?;
-    for row in rows {
-        let (p, cp, v) = row?;
-        *inbound.entry(p).or_default().entry(cp).or_insert(0) += v;
-    }
-    // Roots stay pinned at 1.0 (an assertion outranks the arithmetic about
-    // it); declared terminals pinned at 0.0.
-    let mut pinned_zero: BTreeSet<String> = BTreeSet::new();
-    let mut stmt = conn.prepare("SELECT key FROM party WHERE terminal_reason = 'declared'")?;
-    for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        pinned_zero.insert(k?);
-    }
-    propagate(&mut coreness, &inbound, &pinned_zero);
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as i128,
+            ))
+        })?;
+        for row in rows {
+            let (p, cp, v) = row?;
+            *inbound.entry(p).or_default().entry(cp).or_insert(0) += v;
+        }
+        // Roots stay pinned at 1.0 (an assertion outranks the arithmetic about
+        // it); declared terminals pinned at 0.0.
+        let mut pinned_zero: BTreeSet<String> = BTreeSet::new();
+        let mut stmt = conn.prepare("SELECT key FROM party WHERE terminal_reason = 'declared'")?;
+        for k in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            pinned_zero.insert(k?);
+        }
+        propagate(&mut coreness, &inbound, &pinned_zero);
 
-    // ── per-holder verdicts, over the WINDOWED inbound ────────────────────
-    let window = args.window_days * SLOTS_PER_DAY;
-    let mut spend_stmt = conn.prepare(
-        "SELECT COALESCE(SUM(delta), 0) FROM tx_delta WHERE party = ?1 AND tx_hash = ?2",
-    )?;
-    let mut fund_stmt = conn.prepare(
-        "SELECT counterparty, SUM(delta), MIN(tx_hash) FROM value_event
+        // ── per-holder verdicts, over the WINDOWED inbound ────────────────────
+        let window = args.window_days * SLOTS_PER_DAY;
+        let mut spend_stmt = conn.prepare(
+            "SELECT COALESCE(SUM(delta), 0) FROM tx_delta WHERE party = ?1 AND tx_hash = ?2",
+        )?;
+        let mut fund_stmt = conn.prepare(
+            "SELECT counterparty, SUM(delta), MIN(tx_hash) FROM value_event
          WHERE party = ?1 AND delta > 0 AND slot >= ?2 AND slot <= ?3
          GROUP BY counterparty ORDER BY SUM(delta) DESC",
-    )?;
-    // Token funding — mint payments arrive in USDM as well as ADA (the S2
-    // model), and a wallet loaded with core stablecoin is core-funded however
-    // clean its ADA history looks. Carrier rows are excluded by unit shape:
-    // only labelled fungibles participate (`is_payment_unit`).
-    let mut token_stmt = conn.prepare(
-        "SELECT unit, counterparty, SUM(quantity), MIN(tx_hash) FROM unit_flow
+        )?;
+        // Token funding — mint payments arrive in USDM as well as ADA (the S2
+        // model), and a wallet loaded with core stablecoin is core-funded however
+        // clean its ADA history looks. Carrier rows are excluded by unit shape:
+        // only labelled fungibles participate (`is_payment_unit`).
+        let mut token_stmt = conn.prepare(
+            "SELECT unit, counterparty, SUM(quantity), MIN(tx_hash) FROM unit_flow
          WHERE party = ?1 AND quantity > 0 AND unit <> 'lovelace'
            AND slot >= ?2 AND slot <= ?3
          GROUP BY unit, counterparty",
-    )?;
-    let mut verdicts: Vec<HolderVerdict> = Vec::new();
-    for (key, m) in &mints {
-        if coreness.get(key).copied().unwrap_or(0.0) >= 1.0 {
-            continue; // direct core allocation, already counted
-        }
-        let mut mint_spend: i128 = 0;
-        for tx in &m.txs {
-            let d: i64 = spend_stmt.query_row(rusqlite::params![key, tx], |r| r.get(0))?;
-            if d < 0 {
-                mint_spend += i128::from(-d);
+        )?;
+        let mut verdicts: Vec<HolderVerdict> = Vec::new();
+        for (key, m) in &mints {
+            if coreness.get(key).copied().unwrap_or(0.0) >= 1.0 {
+                continue; // direct core allocation, already counted
             }
-        }
-        let from_slot = m.first_slot.saturating_sub(window) as i64;
-
-        // Funding sources per payment unit: "ada" from the netted value
-        // events, each labelled fungible from its unit flows.
-        let mut by_unit: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
-        // `(ticker, source, raw quantity for sorting, display string, tx)`.
-        let mut raw_legs: Vec<(String, String, i128, String, String)> = Vec::new();
-        let rows =
-            fund_stmt.query_map(rusqlite::params![key, from_slot, m.last_slot as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)? as i128,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-        for row in rows {
-            let (src, v, tx) = row?;
-            by_unit
-                .entry("ada".into())
-                .or_default()
-                .insert(src.clone(), v);
-            raw_legs.push((
-                "ada".into(),
-                src,
-                v,
-                chain_ledger::tokens::format_quantity("lovelace", v),
-                tx,
-            ));
-        }
-        let rows =
-            token_stmt.query_map(rusqlite::params![key, from_slot, m.last_slot as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)? as i128,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-        for row in rows {
-            let (unit, src, v, tx) = row?;
-            if !is_payment_unit(&unit) {
-                continue;
+            let mut mint_spend: i128 = 0;
+            for tx in &m.txs {
+                let d: i64 = spend_stmt.query_row(rusqlite::params![key, tx], |r| r.get(0))?;
+                if d < 0 {
+                    mint_spend += i128::from(-d);
+                }
             }
-            let ticker = unit_ticker(&unit);
-            *by_unit
-                .entry(ticker.clone())
-                .or_default()
-                .entry(src.clone())
-                .or_insert(0) += v;
-            // Rendered with the unit's own decimals where known — an
-            // unscaled stablecoin leg reads a million times too big, and
-            // this line is a FIGURE, not a hint.
-            let shown = chain_ledger::tokens::format_quantity(&unit, v);
-            raw_legs.push((ticker, src, v, shown, tx));
-        }
+            let from_slot = m.first_slot.saturating_sub(window) as i64;
 
-        let per_unit: Vec<(String, f64, f64)> = by_unit
-            .iter()
-            .map(|(u, sources)| {
-                let (c, unk) = weighted(sources, &coreness);
-                (u.clone(), c, unk)
-            })
-            .collect();
-        let (core_share, unknown_share, via) = headline(&per_unit);
-
-        // Keep only legs that carry actual coreness — the evidence trail.
-        raw_legs.retain(|(_, src, _, _, _)| coreness.get(src).copied().unwrap_or(0.0) > 0.05);
-        raw_legs.sort_by_key(|l| std::cmp::Reverse(l.2));
-        raw_legs.truncate(4);
-        let legs: Vec<(String, String)> = raw_legs
-            .into_iter()
-            .map(|(unit, src, _, shown, tx)| {
-                (
-                    format!(
-                        "{shown} {unit} from {src} (coreness {:.2})",
-                        coreness.get(&src).copied().unwrap_or(0.0)
-                    ),
+            // Funding sources per payment unit: "ada" from the netted value
+            // events, each labelled fungible from its unit flows.
+            let mut by_unit: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
+            // `(ticker, source, raw quantity for sorting, display string, tx)`.
+            let mut raw_legs: Vec<(String, String, i128, String, String)> = Vec::new();
+            let rows = fund_stmt.query_map(
+                rusqlite::params![key, from_slot, m.last_slot as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as i128,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (src, v, tx) = row?;
+                by_unit
+                    .entry("ada".into())
+                    .or_default()
+                    .insert(src.clone(), v);
+                raw_legs.push((
+                    "ada".into(),
+                    src,
+                    v,
+                    chain_ledger::tokens::format_quantity("lovelace", v),
                     tx,
-                )
-            })
-            .collect();
-        verdicts.push(HolderVerdict {
-            key: key.clone(),
-            assets: m.assets,
-            mint_spend,
-            core_share,
-            unknown_share,
-            via,
-            legs,
-        });
-    }
+                ));
+            }
+            let rows = token_stmt.query_map(
+                rusqlite::params![key, from_slot, m.last_slot as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? as i128,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (unit, src, v, tx) = row?;
+                if !is_payment_unit(&unit) {
+                    continue;
+                }
+                let ticker = unit_ticker(&unit);
+                *by_unit
+                    .entry(ticker.clone())
+                    .or_default()
+                    .entry(src.clone())
+                    .or_insert(0) += v;
+                // Rendered with the unit's own decimals where known — an
+                // unscaled stablecoin leg reads a million times too big, and
+                // this line is a FIGURE, not a hint.
+                let shown = chain_ledger::tokens::format_quantity(&unit, v);
+                raw_legs.push((ticker, src, v, shown, tx));
+            }
+
+            let per_unit: Vec<(String, f64, f64)> = by_unit
+                .iter()
+                .map(|(u, sources)| {
+                    let (c, unk) = weighted(sources, &coreness);
+                    (u.clone(), c, unk)
+                })
+                .collect();
+            let (core_share, unknown_share, via) = headline(&per_unit);
+
+            // Keep only legs that carry actual coreness — the evidence trail.
+            raw_legs.retain(|(_, src, _, _, _)| coreness.get(src).copied().unwrap_or(0.0) > 0.05);
+            raw_legs.sort_by_key(|l| std::cmp::Reverse(l.2));
+            raw_legs.truncate(4);
+            let legs: Vec<(String, String)> = raw_legs
+                .into_iter()
+                .map(|(unit, src, _, shown, tx)| {
+                    (
+                        format!(
+                            "{shown} {unit} from {src} (coreness {:.2})",
+                            coreness.get(&src).copied().unwrap_or(0.0)
+                        ),
+                        tx,
+                    )
+                })
+                .collect();
+            verdicts.push(HolderVerdict {
+                key: key.clone(),
+                assets: m.assets,
+                mint_spend,
+                core_share,
+                unknown_share,
+                via,
+                legs,
+            });
+        }
+
+        (
+            verdicts,
+            total_minted,
+            direct_core,
+            roots,
+            derived_root_used,
+        )
+    };
 
     // ── report ─────────────────────────────────────────────────────────────
     let flagged: Vec<&HolderVerdict> = {
@@ -536,6 +560,37 @@ pub fn run(args: &ProvenanceArgs) -> Result<()> {
             tracing::info!("    ← {label} e.g. tx {tx}");
         }
     }
+
+    // ── persist ────────────────────────────────────────────────────────────
+    // EVERY holder, not just the flagged ones. A verdict of "this wallet is
+    // 12% core-funded" is a finding in its own right, and storing only the
+    // flagged rows would leave a reader unable to tell an examined holder from
+    // one the pass never reached.
+    let threshold = args.threshold;
+    let rows: Vec<crate::store::ProvenanceVerdictRow> = verdicts
+        .iter()
+        .map(|h| crate::store::ProvenanceVerdictRow {
+            holder: h.key.clone(),
+            assets: h.assets,
+            mint_spend: h.mint_spend,
+            core_share: h.core_share,
+            unknown_share: h.unknown_share,
+            via: h.via.clone(),
+            flagged: h.core_share >= threshold,
+        })
+        .collect();
+    let basis = if derived_root_used {
+        "derived"
+    } else {
+        "asserted"
+    };
+    let n = ledger.replace_provenance_verdicts(&rows, threshold, args.window_days, basis)?;
+    tracing::info!(
+        verdicts = n,
+        roots_basis = basis,
+        "provenance: verdicts persisted — `distributions` reads these to decide which \
+         mints were bought with the project's own money"
+    );
     Ok(())
 }
 

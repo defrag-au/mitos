@@ -58,6 +58,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod projections;
+
 /// Version byte at offset 0 of every encoded page. Bump on ANY change to the
 /// types in this crate (see the module docs for what counts).
 pub const WIRE_VERSION: u8 = 1;
@@ -165,6 +167,19 @@ pub struct Spine {
     pub cp_holders: Vec<u32>,
     /// `cohorts.len()` totals per checkpoint, row-major.
     pub cp_totals: Vec<i64>,
+    /// Vesting supply past its unlock at each checkpoint — claimable, and so
+    /// part of the sellable floor.
+    ///
+    /// Carried here rather than derived by the consumer because maturity needs
+    /// decoded lock schedules *and* the lock's whole lifetime, neither of which
+    /// is in the movement columns. Without it a consumer must treat all vesting
+    /// as locked and understates what could hit the market.
+    pub cp_vest_matured: Vec<i64>,
+    /// Vesting supply still before its unlock at each checkpoint. Cannot move.
+    ///
+    /// A lock whose datum did not decode is counted **here**, never as matured:
+    /// a lock we cannot read is not an absent lock.
+    pub cp_vest_locked: Vec<i64>,
     pub pools: Vec<PoolMeta>,
     /// Reserve-curve slots, delta-encoded.
     pub rc_slots: Vec<u64>,
@@ -193,7 +208,11 @@ impl Spine {
 
     pub fn validate(&self) -> Result<(), WireError> {
         let cps = self.cp_slots.len();
-        if self.cp_tx_ord.len() != cps || self.cp_holders.len() != cps {
+        if self.cp_tx_ord.len() != cps
+            || self.cp_holders.len() != cps
+            || self.cp_vest_matured.len() != cps
+            || self.cp_vest_locked.len() != cps
+        {
             return Err(WireError::Inconsistent(
                 "checkpoint columns differ in length",
             ));
@@ -383,6 +402,8 @@ mod tests {
             cp_tx_ord: vec![0, 64, 128],
             cp_holders: vec![1, 5, 9],
             cp_totals: vec![0, 1000, 10, 990, 20, 980],
+            cp_vest_matured: vec![0, 0, 0],
+            cp_vest_locked: vec![0, 0, 0],
             pools: vec![PoolMeta {
                 dex: "cswap".into(),
                 key_policy: vec![1; 28],

@@ -153,6 +153,10 @@ pub fn run(args: ExportArgs) -> Result<()> {
     let mut cp_tx_ord = Vec::new();
     let mut cp_holders = Vec::new();
     let mut cp_totals = Vec::new();
+    let mut cp_vest_matured = Vec::new();
+    let mut cp_vest_locked = Vec::new();
+    let locks = ledger.lock_lifetimes()?;
+    let tx_times: Vec<u64> = txs.iter().map(|t| t.block_time).collect();
 
     let mut mv = 0usize;
     for (i, slot) in tx_slots_abs.iter().enumerate() {
@@ -172,6 +176,9 @@ pub fn run(args: ExportArgs) -> Result<()> {
             cp_tx_ord.push(i as u32);
             cp_holders.push(balances.values().filter(|b| **b != 0).count() as u32);
             cp_totals.extend_from_slice(&running);
+            let (matured, locked) = vesting_at(&locks, i as i64, tx_times[i]);
+            cp_vest_matured.push(matured);
+            cp_vest_locked.push(locked);
         }
     }
 
@@ -227,6 +234,8 @@ pub fn run(args: ExportArgs) -> Result<()> {
         cp_tx_ord,
         cp_holders,
         cp_totals,
+        cp_vest_matured,
+        cp_vest_locked,
         pools,
         rc_slots: wire::delta_encode(&rc_slots_abs),
         rc_pool,
@@ -277,6 +286,119 @@ pub fn run(args: ExportArgs) -> Result<()> {
         &[&spine_path, &detail_path, &txid_path],
     );
     Ok(())
+}
+
+/// Read the artifacts back with no database and print what a consumer sees.
+///
+/// This is the export's real test. `stats` answers from sqlite; `inspect`
+/// answers from the files alone, through the same `projections` a frontend
+/// will use. If the two disagree, the artifact is not a faithful carrier of
+/// the ledger — and that is a failure no amount of round-trip checking would
+/// catch, because the bytes would decode perfectly into the wrong numbers.
+pub fn inspect(dir: &Path, token: &str, at_slot: Option<u64>) -> Result<()> {
+    use token_ledger_wire::projections as proj;
+
+    let spine = wire::decode_spine(&std::fs::read(dir.join(format!("{token}.spine.bin")))?)?;
+    let detail = wire::decode_detail(&std::fs::read(dir.join(format!("{token}.detail.bin")))?)?;
+    let slot = at_slot.unwrap_or(spine.domain.1);
+
+    println!(
+        "domain {}..{}  ({} txs, {} movements, {} parties)",
+        spine.domain.0,
+        spine.domain.1,
+        detail.tx_count(),
+        detail.movement_count(),
+        detail.parties.len()
+    );
+
+    // Spine-only first, then with detail — the two tiers a frontend loads in
+    // sequence, so the difference between them is visible rather than assumed.
+    if let Some(c) = proj::cohorts_at_checkpoint(&spine, slot) {
+        println!(
+            "\nSPINE ONLY (checkpoint resolution, as of tx {})",
+            c.as_of_tx
+        );
+        print_cohorts(&spine, &c);
+    }
+    let Some(exact) = proj::cohorts_at(&spine, &detail, slot) else {
+        println!("no data at slot {slot}");
+        return Ok(());
+    };
+    println!("\n+ DETAIL (exact, as of tx {})", exact.as_of_tx);
+    print_cohorts(&spine, &exact);
+
+    match proj::cap_at(&spine, Some(&detail), slot) {
+        Some(cap) => {
+            let (lo, hi) = cap.honesty_ratio();
+            let (with_fee, pools) = proj::fee_coverage(&spine);
+            println!("\nspot          {:.8} ADA/token", cap.spot_lovelace / 1e6);
+            println!("notional cap  {:>12} ADA", cap.notional / 1_000_000);
+            println!(
+                "realisable    {:>12} .. {} ADA",
+                cap.realisable_low / 1_000_000,
+                cap.realisable_high / 1_000_000
+            );
+            println!("honesty ratio {lo:>12.1}% .. {hi:.1}%");
+            println!(
+                "uncertain     {:>12} tokens of unknown liquidity",
+                cap.uncertain
+            );
+            if with_fee < pools {
+                println!(
+                    "  note: {} of {pools} pools have no decoded fee — realisable is optimistic",
+                    pools - with_fee
+                );
+            }
+        }
+        None => println!("\nno price at this slot — no pool existed yet"),
+    }
+    println!(
+        "\nvesting at this instant: {} matured / {} still locked",
+        proj::vesting_matured_at(&spine, slot),
+        proj::vesting_locked_at(&spine, slot)
+    );
+    Ok(())
+}
+
+fn print_cohorts(spine: &wire::Spine, c: &token_ledger_wire::projections::CohortTotals) {
+    let total: i64 = c.totals.iter().sum();
+    for (name, amount) in spine.cohorts.iter().zip(&c.totals) {
+        if *amount == 0 {
+            continue;
+        }
+        let pct = if total > 0 {
+            100.0 * *amount as f64 / total as f64
+        } else {
+            0.0
+        };
+        println!("  {name:<8} {amount:>14}  {pct:5.2}%");
+    }
+    println!("  {:<8} {total:>14}  holders {}", "TOTAL", c.holders);
+}
+
+/// Vesting `(matured, locked)` as of transaction `tx_ord` at `block_time`.
+///
+/// A lock counts when it was open at that transaction — created at or before
+/// it, and either still live or spent afterwards. That is why lock *lifetimes*
+/// are recorded rather than the live set: a lock created and claimed inside the
+/// history leaves no trace at tip, and using tip's live set would silently
+/// backdate today's state onto every past checkpoint.
+fn vesting_at(locks: &[crate::store::LockLifetime], tx_ord: i64, block_time: u64) -> (i64, i64) {
+    let now_ms = block_time.saturating_mul(1_000);
+    let mut matured = 0i64;
+    let mut locked = 0i64;
+    for l in locks {
+        let open = l.created_tx_ord <= tx_ord && l.spent_tx_ord.is_none_or(|s| s > tx_ord);
+        if !open {
+            continue;
+        }
+        if l.unlock_ts_ms <= now_ms {
+            matured += l.qty;
+        } else {
+            locked += l.qty;
+        }
+    }
+    (matured, locked)
 }
 
 fn write(path: &Path, bytes: &[u8]) -> Result<()> {

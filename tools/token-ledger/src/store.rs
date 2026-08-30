@@ -73,6 +73,10 @@ pub struct TxRecord {
     pub tx_ord: i64,
     pub tx_hash: Vec<u8>,
     pub slot: u64,
+    /// Wall time of the containing block. Maturity is judged against this, so
+    /// a walk over an old snapshot dates itself honestly instead of borrowing
+    /// the operator's clock.
+    pub block_time: u64,
     pub net_mint: i64,
 }
 
@@ -95,6 +99,15 @@ pub struct CurvePoint {
     pub fee_bps: Option<i64>,
     pub base_reserve: i64,
     pub quote_reserve: i64,
+}
+
+/// One lock position across its whole life.
+pub struct LockLifetime {
+    pub created_tx_ord: i64,
+    /// `None` while still live at tip.
+    pub spent_tx_ord: Option<i64>,
+    pub qty: i64,
+    pub unlock_ts_ms: u64,
 }
 
 /// One live lock position.
@@ -132,6 +145,19 @@ pub struct TxRow {
     pub deltas: Vec<(String, Option<String>, i64)>,
     /// Pool reserves observed in this tx's outputs.
     pub pools: Vec<PoolObservation>,
+    /// Lock positions this tx opened.
+    pub locks_created: Vec<LockCreated>,
+    /// Lock positions this tx closed (outrefs it spent).
+    pub locks_spent: Vec<(Hash<32>, u32)>,
+}
+
+/// A lock position opened by a transaction.
+pub struct LockCreated {
+    pub oref: (Hash<32>, u32),
+    pub address: String,
+    pub qty: i64,
+    pub unlock_ts_ms: u64,
+    pub owner_pkh: Option<String>,
 }
 
 /// Add a column if the table doesn't already have it.
@@ -218,6 +244,11 @@ impl Ledger {
              -- reserves are unchanged between rows, so spot price is exact at
              -- every slot and piecewise-constant in between. Never interpolate
              -- across these — the price genuinely did not move.
+             -- `ada_paired` decides whether a pool may contribute to the
+             -- PRICE. Its supply counts either way — a token/token pool holds
+             -- real tokens — but its lovelace is a min-UTxO carrier, not a
+             -- quote reserve, and pricing from it is wrong by orders of
+             -- magnitude. Most WingRiders V2 pools are token/token.
              CREATE TABLE IF NOT EXISTS pool_state (
                  tx_ord         INTEGER NOT NULL,
                  pool_id        INTEGER NOT NULL,
@@ -226,8 +257,28 @@ impl Ledger {
                  fee_bps        INTEGER,
                  total_lp       INTEGER,
                  reserve_source TEXT NOT NULL,
+                 ada_paired     INTEGER NOT NULL DEFAULT 1,
                  PRIMARY KEY (tx_ord, pool_id)
              ) WITHOUT ROWID;
+
+             -- Lock LIFETIMES, not just live locks. `buffered` holds the open
+             -- set at tip, which answers what is locked NOW but cannot answer
+             -- what was locked THEN: a lock created and claimed mid-history
+             -- leaves no trace there. Recording both ends lets the export state
+             -- maturity at any past checkpoint, which is what makes the cap
+             -- band correct over the whole domain rather than only at the end.
+             CREATE TABLE IF NOT EXISTS lock (
+                 oref_hash      BLOB    NOT NULL,
+                 oref_idx       INTEGER NOT NULL,
+                 created_tx_ord INTEGER NOT NULL,
+                 spent_tx_ord   INTEGER,
+                 address        TEXT    NOT NULL,
+                 qty            INTEGER NOT NULL,
+                 unlock_ts_ms   INTEGER NOT NULL,
+                 owner_pkh      TEXT,
+                 PRIMARY KEY (oref_hash, oref_idx)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS lock_created ON lock(created_tx_ord);
 
              CREATE TABLE IF NOT EXISTS cursor (
                  k          TEXT PRIMARY KEY,
@@ -256,6 +307,16 @@ impl Ledger {
         // build the index that depends on them.
         ensure_column(&conn, "party", "cohort", "TEXT")?;
         ensure_column(&conn, "party", "basis", "TEXT")?;
+        // Defaults to 1 so a ledger written before the column keeps its
+        // existing behaviour — every pool it recorded was ADA-paired, because
+        // only CSwap and Splash were decoded and both of this token's pools
+        // pair with ADA.
+        ensure_column(
+            &conn,
+            "pool_state",
+            "ada_paired",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
         ensure_column(&conn, "buffered", "unlock_ts_ms", "INTEGER")?;
         ensure_column(&conn, "buffered", "owner_pkh", "TEXT")?;
         ensure_column(&conn, "buffered", "datum_cbor", "BLOB")?;
@@ -450,6 +511,31 @@ impl Ledger {
                 )?;
             }
 
+            for lock in &row.locks_created {
+                tx.execute(
+                    "INSERT OR IGNORE INTO lock
+                         (oref_hash, oref_idx, created_tx_ord, spent_tx_ord,
+                          address, qty, unlock_ts_ms, owner_pkh)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                    params![
+                        lock.oref.0.as_ref(),
+                        lock.oref.1 as i64,
+                        ord,
+                        lock.address,
+                        lock.qty,
+                        lock.unlock_ts_ms as i64,
+                        lock.owner_pkh
+                    ],
+                )?;
+            }
+            for (hash, idx) in &row.locks_spent {
+                tx.execute(
+                    "UPDATE lock SET spent_tx_ord = ?3
+                     WHERE oref_hash = ?1 AND oref_idx = ?2 AND spent_tx_ord IS NULL",
+                    params![hash.as_ref(), *idx as i64, ord],
+                )?;
+            }
+
             for obs in &row.pools {
                 let key = (
                     obs.dex.to_string(),
@@ -484,8 +570,8 @@ impl Ledger {
                 tx.execute(
                     "INSERT OR IGNORE INTO pool_state
                          (tx_ord, pool_id, base_reserve, quote_reserve,
-                          fee_bps, total_lp, reserve_source)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                          fee_bps, total_lp, reserve_source, ada_paired)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         ord,
                         pool_id,
@@ -493,7 +579,8 @@ impl Ledger {
                         obs.quote_reserve,
                         obs.fee_bps,
                         obs.total_lp,
-                        obs.reserve_source.as_str()
+                        obs.reserve_source.as_str(),
+                        obs.ada_paired as i64
                     ],
                 )?;
             }
@@ -612,8 +699,10 @@ impl Ledger {
             "SELECT p.dex, p.key_basis, s.base_reserve, s.quote_reserve, s.fee_bps
              FROM pool p
              JOIN pool_state s ON s.pool_id = p.pool_id
-             WHERE s.tx_ord = (
-                 SELECT MAX(tx_ord) FROM pool_state WHERE pool_id = p.pool_id
+             WHERE s.ada_paired = 1
+               AND s.tx_ord = (
+                 SELECT MAX(tx_ord) FROM pool_state
+                 WHERE pool_id = p.pool_id AND ada_paired = 1
              )
              ORDER BY s.quote_reserve DESC",
         )?;
@@ -657,17 +746,35 @@ impl Ledger {
         })
     }
 
+    /// Every lock ever opened, with when it opened and closed.
+    pub fn lock_lifetimes(&self) -> Result<Vec<LockLifetime>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT created_tx_ord, spent_tx_ord, qty, unlock_ts_ms
+             FROM lock ORDER BY created_tx_ord",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(LockLifetime {
+                created_tx_ord: r.get(0)?,
+                spent_tx_ord: r.get(1)?,
+                qty: r.get(2)?,
+                unlock_ts_ms: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Every transaction in chain order.
     pub fn all_txs(&self) -> Result<Vec<TxRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT tx_ord, tx_hash, slot, net_mint FROM tx ORDER BY tx_ord")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT tx_ord, tx_hash, slot, block_time, net_mint FROM tx ORDER BY tx_ord",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(TxRecord {
                 tx_ord: r.get(0)?,
                 tx_hash: r.get(1)?,
                 slot: r.get::<_, i64>(2)? as u64,
-                net_mint: r.get(3)?,
+                block_time: r.get::<_, i64>(3)? as u64,
+                net_mint: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -711,6 +818,7 @@ impl Ledger {
             "SELECT s.tx_ord, p.dex, p.key_policy, p.key_name, p.key_basis,
                     s.fee_bps, s.base_reserve, s.quote_reserve
              FROM pool_state s JOIN pool p USING (pool_id)
+             WHERE s.ada_paired = 1
              ORDER BY s.tx_ord, p.pool_id",
         )?;
         let rows = stmt.query_map([], |r| {
