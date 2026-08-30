@@ -159,6 +159,90 @@ pub fn decode_v2_pool_datum(cbor: &[u8]) -> Option<PoolV2> {
     })
 }
 
+/// Policy of the V1 pool NFT — one token per pool, so its NAME is the
+/// pool-instance key. Present in every sampled V1 pool UTxO.
+pub const V1_POOL_NFT_POLICY: [u8; 28] = [
+    0x0b, 0xe5, 0x5d, 0x26, 0x2b, 0x29, 0xf5, 0x64, 0x99, 0x8f, 0xf8, 0x1e, 0xfe, 0x21, 0xbd, 0xc0,
+    0x02, 0x26, 0x21, 0xc1, 0x2f, 0x15, 0xaf, 0x08, 0xd0, 0xf2, 0xdd, 0xb1,
+];
+
+/// Policy of the `MINSWAP` factory token every V1 pool also carries.
+///
+/// Both this and [`V1_POOL_NFT_POLICY`] sit in the pool UTxO's value and are
+/// **not reserves**. A V1 pool holds exactly: its NFT, this token, and the two
+/// sides — so netting these two out leaves the reserves.
+pub const V1_FACTORY_POLICY: [u8; 28] = [
+    0x13, 0xaa, 0x2a, 0xcc, 0xf2, 0xe1, 0x56, 0x17, 0x23, 0xaa, 0x26, 0x87, 0x1e, 0x07, 0x1f, 0xdf,
+    0x32, 0xc8, 0x67, 0xcf, 0xf7, 0xe7, 0xd5, 0x0a, 0xd4, 0x70, 0xd6, 0x2f,
+];
+
+/// Decoded Minswap **V1** pool datum (`Constr 0`, 5 fields):
+///
+/// ```text
+/// [0] assetA   [1] assetB   [2] totalLiquidity   [3] rootKLast
+/// [4] profitSharing (Option)
+/// ```
+///
+/// ## V1 publishes no reserves
+///
+/// Unlike V2, which carries `reserveA`/`reserveB` in the datum, V1 carries only
+/// the LP total. Reserves come from the UTxO's **value**, less the pool NFT and
+/// the factory token — see [`V1_POOL_NFT_POLICY`].
+///
+/// ## Whether a fixed ADA deposit should also come off is UNRESOLVED
+///
+/// It is widely said that V1 pools hold a fixed deposit. Testing it across the
+/// sampled ADA pools was **inconclusive**: the constant-product residual is
+/// flat from 0 to 4.5 ADA (median ~23% either way), because these pools are
+/// years old and LP value has drifted far more than a few ADA. So no deposit is
+/// subtracted here. That understates nothing on a real pool — a few ADA against
+/// hundreds — and the alternative is inventing a constant the data does not
+/// support. It matters only on a dead pool, where the depth is noise anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolV1 {
+    pub asset_a: AssetClass,
+    pub asset_b: AssetClass,
+    pub total_liquidity: u64,
+}
+
+impl PoolV1 {
+    /// `(ada_reserve, token_reserve)` given the two sides' holdings, or `None`
+    /// for a token/token pool — which holds real supply but cannot price it.
+    pub fn ada_pair(&self, value_a: u64, value_b: u64) -> Option<(u64, u64)> {
+        if self.asset_a.is_ada() {
+            Some((value_a, value_b))
+        } else if self.asset_b.is_ada() {
+            Some((value_b, value_a))
+        } else {
+            None
+        }
+    }
+
+    /// Is this policy one of the two the pool carries for its own bookkeeping
+    /// rather than as a reserve?
+    pub fn is_overhead_policy(policy: &[u8]) -> bool {
+        policy == V1_POOL_NFT_POLICY || policy == V1_FACTORY_POLICY
+    }
+}
+
+/// Decode a Minswap V1 pool datum.
+///
+/// V1 is PlutusV1, so this CBOR comes from the creating transaction's witness
+/// set rather than from an inline datum — see the crate docs on datum hashes.
+pub fn decode_v1_pool_datum(cbor: &[u8]) -> Option<PoolV1> {
+    let pd: PlutusData = minicbor::decode(cbor).ok()?;
+    let c = as_constr(&pd)?;
+    let fields: Vec<&PlutusData> = c.fields.iter().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    Some(PoolV1 {
+        asset_a: asset_class(fields.first().copied()?)?,
+        asset_b: asset_class(fields.get(1).copied()?)?,
+        total_liquidity: int_at(&fields, 2)?,
+    })
+}
+
 /// Total LP supply from the pool's own LP holding, for the mint-max pattern.
 ///
 /// Minswap mints `u64::MAX` LP up front and keeps the unissued remainder in
@@ -172,6 +256,66 @@ pub fn issued_lp(pool_held_lp: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real ADA/CHIMPY **V1** pool at `57e81fa7…#0`, captured 2026-08-30.
+    ///
+    /// The UTxO held 718,437,917 lovelace and 1,356,132,463,270 CHIMPY,
+    /// alongside its pool NFT and the `MINSWAP` factory token. The datum's
+    /// `totalLiquidity` of 30,955,673,379 sits within 0.8% of
+    /// `sqrt(718,437,917 × 1,356,132,463,270)`, which is the check that the
+    /// value — not some subset of it — is the reserve.
+    const V1_CHIMPY: &str = "d8799fd8799f4040ffd8799f581cff791cdf3857627970df7f7930bfb7c8eee3ce45df43860d68b9ef60464348494d5059ff1b00000007351a17231b0000000744785751d8799fd8799fd8799fd8799f581caafb1196434cb837fd6f21323ca37b302dff6387e8a84b3fa28faf56ffd8799fd8799fd8799f581c52563c5410bff6a0d43ccebb7c37e1f69f5eb260552521adff33b9c2ffffffffd87a80ffffff";
+
+    fn v1_chimpy() -> PoolV1 {
+        decode_v1_pool_datum(&hex::decode(V1_CHIMPY).unwrap()).expect("decode")
+    }
+
+    #[test]
+    fn decodes_a_real_v1_pool() {
+        let p = v1_chimpy();
+        assert!(p.asset_a.is_ada());
+        assert_eq!(p.asset_b.name, b"CHIMPY".to_vec());
+        assert_eq!(p.total_liquidity, 30_955_673_379);
+    }
+
+    #[test]
+    fn v1_reserves_come_from_the_value_and_satisfy_constant_product() {
+        // V1 publishes no reserves, so this is the evidence that the value is
+        // the right source: the pool's own totalLiquidity should be
+        // sqrt(a*b), and it is, to 0.8%.
+        let p = v1_chimpy();
+        let (ada, tok) = p.ada_pair(718_437_917, 1_356_132_463_270).unwrap();
+        let root = (ada as u128 * tok as u128).isqrt() as u64;
+        let err = root.abs_diff(p.total_liquidity) as f64 / p.total_liquidity as f64;
+        assert!(err < 0.02, "value-sourced reserves fit sqrt(a*b): {err}");
+    }
+
+    #[test]
+    fn the_v1_nft_and_factory_tokens_are_not_reserves() {
+        // A V1 pool holds exactly four things; two of them are bookkeeping.
+        // Counting either as a reserve would put a quantity of 1 on a side.
+        assert!(PoolV1::is_overhead_policy(&V1_POOL_NFT_POLICY));
+        assert!(PoolV1::is_overhead_policy(&V1_FACTORY_POLICY));
+        assert!(!PoolV1::is_overhead_policy(&V2_AUTHEN_POLICY));
+    }
+
+    #[test]
+    fn a_v1_token_token_pool_reports_no_ada_pair() {
+        let mut p = v1_chimpy();
+        p.asset_a.policy = vec![0xaa; 28];
+        p.asset_a.name = b"A".to_vec();
+        assert!(p.ada_pair(1, 2).is_none());
+    }
+
+    #[test]
+    fn the_v1_and_v2_datums_do_not_decode_as_each_other() {
+        // Both are `Constr 0`; only the arity separates them, so a decoder
+        // that tolerated arity would silently read V1 fields at V2 offsets.
+        let v1 = hex::decode(V1_CHIMPY).unwrap();
+        assert!(decode_v2_pool_datum(&v1).is_none());
+        let v2 = hex::decode(ADA_DOG).unwrap();
+        assert!(decode_v1_pool_datum(&v2).is_none());
+    }
 
     /// A real ADA/DOG V2 pool datum, captured from chain 2026-08-30.
     ///

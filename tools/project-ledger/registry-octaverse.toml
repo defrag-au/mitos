@@ -1,0 +1,50 @@
+# Octaverse — COLD START, the same shape as the Mekka S2 experiment: no
+# declared wallets, no asserted terminals. The frontier bootstraps from the
+# chain alone — mint payees, the policy signer credential, the CIP-27 royalty
+# address (label 777, rate 0.10, observed on the policy's own mint metadata).
+#
+# Anything asserted here would have to come from outside the chain, and nothing
+# about this project has been asserted yet. Curation happens in the app; if a
+# wallet earns a name, `emit-registry` writes it back here.
+
+project = "Octaverse"
+
+[[policy]]
+id    = "6817db27f1943c68113c8940ec675f3ee3bd2e30e7d9dec41ab95167"
+label = "Octaverse"
+
+# THE PROJECT BOUNDARY. `role` is what decides it (see registry.rs
+# PROJECT_SIDE_ROLES): value arriving at these wallets has come back, value
+# leaving them has crossed out. Get one of these wrong and an extraction reads
+# as a deployment — so each carries what it rests on.
+#
+# NOT declared here, deliberately:
+#   - bank.pillar (stake1uxf2xjg…) — the Yepple/BankFi MINTING PLATFORM. It
+#     collected phase-1 proceeds and remitted 26,052 ₳ over 96 legs to the
+#     treasury, and it serves other projects. Rails, not the project.
+#   - $vestself (stake1u8mg7xu…) — the founder's PERSONAL wallet, confirmed by
+#     the founder in writing. That is exactly the wallet whose boundary with
+#     the project is the question; declaring it project-side would answer the
+#     question by assumption.
+
+[[wallet]]
+stake  = "stake1uyk6rcqyvkxejzhcy5dghj9a5jf4egk38ak87ng9esl8jacu6hv03"
+label  = "Octaverse treasury"
+role   = "treasury"
+source = """Octaverse ledger 2026-08-25: sole recipient of mint proceeds from \
+2026-07-16 (95 legs, 23,787 ₳), and the payer of every treasury outflow in the \
+walk. Observed in `mint_payment`, not asserted by anyone."""
+
+[[wallet]]
+stake  = "stake1uxxcpjr50qzrxlaltqm2tn6zzjcw6e47zlt5wamh9rhlpsgr3mnmq"
+label  = "Octaverse holding wallet"
+role   = "holding"
+source = """Octaverse ledger 2026-08-25: holds EXACTLY 62 Mekka S2 + 1 Mekka S1 \
+and nothing else; 6 receipts, 2 counterparties. Received 6,002 ₳ from the \
+treasury on 2026-07-29 and took delivery of 62 of the 63 S2 minted with it the \
+same night. Corroborated by the founder in writing: 'I allocated 6k ADA to \
+MEKKA S2s ... I donated a S1 Mekka as well to the treasury.'"""
+
+[terminal]                        # custodial-scale proxies (see design doc Q3)
+receipts       = 1000
+counterparties = 300

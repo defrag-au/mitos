@@ -46,6 +46,15 @@ pub struct ExportArgs {
     /// and a finer spine-only chart; larger means the reverse.
     #[arg(long, default_value_t = 64)]
     pub stride: u32,
+
+    /// How far the reserve curve may deviate from true reserves, in basis
+    /// points. `0` keeps every observation and the curve is exact.
+    ///
+    /// This is the spine's real size lever. Checkpoints compress and the curve
+    /// does not: on WRT, raising the stride from 64 to 16,384 only moved the
+    /// spine 957 KB → 634 KB gzipped, because 51,318 reserve points dominate.
+    #[arg(long, default_value_t = 10)]
+    pub curve_eps_bps: u32,
 }
 
 pub fn run(args: ExportArgs) -> Result<()> {
@@ -88,17 +97,38 @@ pub fn run(args: ExportArgs) -> Result<()> {
         .map(|(i, t)| (t.tx_ord, i as u32))
         .collect();
 
-    let wire_parties: Vec<wire::PartyMeta> = parties
-        .iter()
-        .map(|p| wire::PartyMeta {
-            address: p.address.clone(),
-            stake: p.stake.clone(),
-            cohort: *cohort_ix
+    // Parties split hot from cold. The cohort and basis a scrub needs are two
+    // small integers; the address it does not need is 103 characters. Keeping
+    // them together made the dictionary 61.8% of the detail artifact.
+    let mut bases: Vec<String> = Vec::new();
+    let mut basis_ix: HashMap<String, u16> = HashMap::new();
+    let mut party_cohort = Vec::with_capacity(parties.len());
+    let mut party_basis = Vec::with_capacity(parties.len());
+    let mut addresses = Vec::with_capacity(parties.len());
+    let mut stakes = Vec::with_capacity(parties.len());
+    for p in &parties {
+        party_cohort.push(
+            *cohort_ix
                 .get(p.cohort.as_deref().unwrap_or("unclassified"))
                 .unwrap_or(&0),
-            basis: p.basis.clone().unwrap_or_else(|| "unknown".into()),
-        })
-        .collect();
+        );
+        // Four distinct strings across every party, so interning turns a
+        // repeated word into a byte.
+        let basis = p.basis.clone().unwrap_or_else(|| "unknown".into());
+        let next = bases.len() as u16;
+        let ix = *basis_ix.entry(basis.clone()).or_insert_with(|| {
+            bases.push(basis);
+            next
+        });
+        party_basis.push(ix);
+        addresses.push(p.address.clone());
+        stakes.push(p.stake.clone());
+    }
+    let party_ids = wire::PartyIds {
+        version: wire::WIRE_VERSION,
+        addresses,
+        stakes,
+    };
 
     // ---- Detail ---------------------------------------------------------
     let mut tx_hashes = Vec::with_capacity(txs.len());
@@ -135,7 +165,9 @@ pub fn run(args: ExportArgs) -> Result<()> {
 
     let detail = wire::Detail {
         version: wire::WIRE_VERSION,
-        parties: wire_parties,
+        bases,
+        party_cohort,
+        party_basis,
         tx_slots: wire::delta_encode(&tx_slots_abs),
         tx_net_mint,
         mv_tx,
@@ -163,7 +195,7 @@ pub fn run(args: ExportArgs) -> Result<()> {
         while mv < detail.mv_tx.len() && detail.mv_tx[mv] as usize == i {
             let p = detail.mv_party[mv];
             let amount = detail.mv_amount[mv];
-            let cohort = detail.parties[p as usize].cohort as usize;
+            let cohort = detail.party_cohort[p as usize] as usize;
             running[cohort] += amount;
             *balances.entry(p).or_insert(0) += amount;
             mv += 1;
@@ -210,6 +242,20 @@ pub fn run(args: ExportArgs) -> Result<()> {
         rc_quote.push(c.quote_reserve);
     }
 
+    // Reduce by price-change magnitude, never by time. A quiet pool that then
+    // moves sharply must keep the move; a busy pool trading flat need not keep
+    // every tick. The bound travels in the artifact so a consumer can render
+    // it rather than imply a precision the curve does not have.
+    let full_points = rc_slots_abs.len();
+    let keep = wire::reduce_curve(&rc_pool, &rc_base, &rc_quote, args.curve_eps_bps);
+    if keep.len() < full_points {
+        let take = |v: &Vec<i64>| keep.iter().map(|&i| v[i]).collect::<Vec<_>>();
+        rc_base = take(&rc_base);
+        rc_quote = take(&rc_quote);
+        rc_pool = keep.iter().map(|&i| rc_pool[i]).collect();
+        rc_slots_abs = keep.iter().map(|&i| rc_slots_abs[i]).collect();
+    }
+
     let policy: [u8; 28] = token
         .policy_bytes()?
         .try_into()
@@ -246,6 +292,7 @@ pub fn run(args: ExportArgs) -> Result<()> {
         rc_pool,
         rc_base,
         rc_quote,
+        rc_eps_bps: args.curve_eps_bps,
     };
 
     // The last checkpoint must equal the ledger's own totals, or the spine is
@@ -256,14 +303,17 @@ pub fn run(args: ExportArgs) -> Result<()> {
     let spine_bytes = wire::encode_spine(&spine)?;
     let detail_bytes = wire::encode_detail(&detail)?;
     let txid_bytes = wire::encode_tx_ids(&tx_ids)?;
+    let party_bytes = wire::encode_party_ids(&party_ids)?;
 
     std::fs::create_dir_all(&args.out_dir)?;
     let spine_path = args.out_dir.join(format!("{}.spine.bin", token.name));
     let detail_path = args.out_dir.join(format!("{}.detail.bin", token.name));
     let txid_path = args.out_dir.join(format!("{}.txids.bin", token.name));
+    let party_path = args.out_dir.join(format!("{}.parties.bin", token.name));
     write(&spine_path, &spine_bytes)?;
     write(&detail_path, &detail_bytes)?;
     write(&txid_path, &txid_bytes)?;
+    write(&party_path, &party_bytes)?;
 
     // Decode what was just written. An artifact that cannot be read back is
     // worse than no artifact, and the validators only run on shapes — this
@@ -271,15 +321,22 @@ pub fn run(args: ExportArgs) -> Result<()> {
     let round_spine = wire::decode_spine(&std::fs::read(&spine_path)?)?;
     let round_detail = wire::decode_detail(&std::fs::read(&detail_path)?)?;
     let round_ids = wire::decode_tx_ids(&std::fs::read(&txid_path)?)?;
+    let round_parties = wire::decode_party_ids(&std::fs::read(&party_path)?)?;
     anyhow::ensure!(round_spine == spine, "spine did not round-trip");
     anyhow::ensure!(round_detail == detail, "detail did not round-trip");
     anyhow::ensure!(round_ids == tx_ids, "tx ids did not round-trip");
-    // The two files are parallel only by construction — neither can enforce
-    // it alone, so check here rather than let a consumer discover it by
-    // opening the wrong transaction.
+    anyhow::ensure!(round_parties == party_ids, "party ids did not round-trip");
+    // These files are parallel only by construction — none can enforce it
+    // alone, so check here rather than let a consumer discover it by opening
+    // the wrong transaction or labelling a movement with another party's
+    // address. An index shift renders perfectly and is entirely wrong.
     anyhow::ensure!(
         tx_ids.hashes.len() == detail.tx_count(),
         "tx-id count does not match the detail page's transaction count"
+    );
+    anyhow::ensure!(
+        party_ids.agrees_with(&detail),
+        "party-id count does not match the detail page's party count"
     );
 
     report(
@@ -288,7 +345,8 @@ pub fn run(args: ExportArgs) -> Result<()> {
         &spine_bytes,
         &detail_bytes,
         &txid_bytes,
-        &[&spine_path, &detail_path, &txid_path],
+        &party_bytes,
+        &[&spine_path, &detail_path, &txid_path, &party_path],
     );
     Ok(())
 }
@@ -313,7 +371,7 @@ pub fn inspect(dir: &Path, token: &str, at_slot: Option<u64>) -> Result<()> {
         spine.domain.1,
         detail.tx_count(),
         detail.movement_count(),
-        detail.parties.len()
+        detail.party_count()
     );
 
     // Spine-only first, then with detail — the two tiers a frontend loads in
@@ -336,7 +394,16 @@ pub fn inspect(dir: &Path, token: &str, at_slot: Option<u64>) -> Result<()> {
         Some(cap) => {
             let (lo, hi) = cap.honesty_ratio();
             let (with_fee, pools) = proj::fee_coverage(&spine);
-            println!("\nspot          {:.8} ADA/token", cap.spot_lovelace / 1e6);
+            // Per WHOLE token. The artifact carries its own decimals, so
+            // `inspect` needs no registry — but it does have to apply them.
+            // `stats` was fixed for this and its twin here was not, which is
+            // how the same number came out right on one surface and a million
+            // times small on the other.
+            let scale = 10f64.powi(spine.asset.decimals as i32);
+            println!(
+                "\nspot          {:.8} ADA/token",
+                cap.spot_lovelace / 1e6 * scale
+            );
             println!("notional cap  {:>12} ADA", cap.notional / 1_000_000);
             println!(
                 "realisable    {:>12} .. {} ADA",
@@ -440,6 +507,7 @@ fn report(
     spine_bytes: &[u8],
     detail_bytes: &[u8],
     txid_bytes: &[u8],
+    party_bytes: &[u8],
     paths: &[&Path],
 ) {
     let kb = |n: usize| n as f64 / 1024.0;
@@ -452,18 +520,35 @@ fn report(
         spine.reserve_point_count(),
         spine.pools.len()
     );
+    if spine.rc_eps_bps > 0 {
+        println!(
+            "        curve reduced to ±{} bps — the only inexact part of the spine",
+            spine.rc_eps_bps
+        );
+    }
     println!(
         "detail  {:>9} bytes ({:>8.1} KB)  {} movements, {} txs, {} parties",
         detail_bytes.len(),
         kb(detail_bytes.len()),
         detail.movement_count(),
         detail.tx_count(),
-        detail.parties.len()
+        detail.party_count()
     );
     if detail.movement_count() > 0 {
+        let attrs = detail.party_attr_bytes();
         println!(
-            "        {:.1} bytes per movement (detail total / movements)",
-            detail_bytes.len() as f64 / detail.movement_count() as f64
+            "        {:.1} B/movement  ·  party attrs {} B (global — would be \
+             duplicated into every chunk)",
+            detail_bytes.len() as f64 / detail.movement_count() as f64,
+            attrs
+        );
+        // What an inline per-movement cohort byte would cost. If it is cheap,
+        // a chunk stops needing the global attr table at all and becomes
+        // self-contained — which is what chunking actually wants.
+        println!(
+            "        inline mv_cohort would be {} B raw over {} distinct values",
+            detail.inline_cohort_bytes(),
+            detail.cohort_span()
         );
     }
     println!(
@@ -471,6 +556,12 @@ fn report(
         txid_bytes.len(),
         kb(txid_bytes.len()),
         detail.tx_count()
+    );
+    println!(
+        "parties {:>9} bytes ({:>8.1} KB)  {} addresses — click-through only, never loaded to scrub",
+        party_bytes.len(),
+        kb(party_bytes.len()),
+        detail.party_count()
     );
     for p in paths {
         println!("wrote {}", p.display());

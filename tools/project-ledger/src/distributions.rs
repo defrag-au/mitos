@@ -131,7 +131,36 @@ pub fn run(args: &DistributionsArgs) -> Result<()> {
              project OWNS, missing any front it merely funded. Run `provenance` first."
         );
     }
-    let own_money: BTreeSet<String> = project_side.union(&core_funded).cloned().collect();
+    // A paid CONTRACTOR who mints is a customer, not a front.
+    //
+    // Compensation transfers ownership: once the project has paid someone for
+    // work, that ADA is theirs, and buying in with it is a purchase. Counting
+    // those units as team-funded supply books the same money twice — once as
+    // ops or marketing spend, and again as supply the team took.
+    //
+    // Measured on Mekka S1: `$showtime.ada` did marketing for the project, was
+    // paid 3,250 ₳ across 2025-09-02/07, and minted 12 NFTs on 09-06/08.
+    // `provenance` flags them at 61% core-funded — correctly, the money did come
+    // from the project — but the right reading is a former contractor spending
+    // their fee, not a front.
+    //
+    // The exclusion keys on `contractor` ONLY. A project OPERATING wallet
+    // (`ops`) is not a person being paid, so its mints stay counted even when
+    // it sits outside the value boundary — see `$pervsn`.
+    let paid_contractors = ledger.declared_contractors()?;
+    let own_money: BTreeSet<String> = project_side
+        .union(&core_funded)
+        .filter(|k| !paid_contractors.contains(*k))
+        .cloned()
+        .collect();
+    if !paid_contractors.is_empty() {
+        tracing::info!(
+            excluded = paid_contractors.len(),
+            "distributions: declared contractors are treated as CUSTOMERS when they mint — \
+             their funding is compensation they earned, and counting it as team supply would \
+             book the same ADA as both spend and supply"
+        );
+    }
 
     let (base, circular_txs) = compute_base(&ledger, &project_side, &own_money)?;
     let (legs, evidence) = compute_legs(&ledger, &project_side, &own_money, args)?;

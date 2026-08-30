@@ -1,22 +1,28 @@
 //! SundaeSwap DEX decode surface — pool credentials and the V3 pool datum.
 //!
-//! ## V3 is the version that can be read from an unspent output
+//! ## The two versions commit their state differently
 //!
-//! Sampling 1,000 live UTxOs at each pool credential on 2026-08-30 split the
-//! versions cleanly:
+//! Sampling 1,000 live UTxOs at each pool credential on 2026-08-30 split them
+//! cleanly:
 //!
 //! ```text
 //! SundaeSwap V3   996 inline datums,   0 hash-only
 //! SundaeSwap V1     0 inline datums, 937 hash-only
 //! ```
 //!
-//! V1 is PlutusV1, so its pool state is committed as a *hash* and the preimage
-//! only has to appear in the witness set of the transaction that **spends** the
-//! output — i.e. one interaction later than the state it describes. Decoding V1
-//! therefore needs a hash→datum cache in the walker, not just a decoder, and it
-//! is deliberately not attempted here. [`V1_PAYMENT_CRED`] is recorded so a
-//! consumer can still classify a V1 pool UTxO as a pool (which is enough to get
-//! the cohort right) without pretending it can price one.
+//! V1 is PlutusV1, which cannot spend an output carrying an inline datum, so it
+//! commits pool state as a *hash*.
+//!
+//! **That is not the obstacle it looks like.** The first reading here was that
+//! the preimage only has to appear when the output is *spent* — one interaction
+//! after the state it describes — and that decoding V1 would therefore need a
+//! deferred hash→datum cache in the walker. Testing it settled the question the
+//! other way: all six sampled hash-only datums resolve while their outputs are
+//! still **unspent**, and a preimage reaches the chain only through a witness
+//! set, so the *creating* transaction must carry it. A walker that reads the
+//! creating tx's own witness set — which `mitos-chain-walk` already does, via
+//! `tx.plutus_data()` — has the datum in hand at the moment it sees the output.
+//! No cache, no lag.
 //!
 //! ## Reserves are the VALUE MINUS `protocol_fees`, on the ADA side only
 //!
@@ -76,9 +82,6 @@ pub fn is_sundae_v3(payment_cred: &[u8; 28]) -> bool {
 }
 
 /// SundaeSwap **V1** pool payment credential (script hash, 28 bytes).
-///
-/// Recognition only. V1 datums are hash-committed (937 of 1,000 sampled live
-/// UTxOs), so there is no decoder here — see the module docs.
 pub const V1_PAYMENT_CRED: [u8; 28] = [
     0x40, 0x20, 0xe7, 0xfc, 0x2d, 0xe7, 0x5a, 0x07, 0x29, 0xc3, 0xcc, 0x3a, 0xf7, 0x15, 0xb3, 0x4d,
     0x98, 0x38, 0x1e, 0x0c, 0xdb, 0xcf, 0xa9, 0x9c, 0x95, 0x0b, 0xc3, 0xac,
@@ -86,6 +89,123 @@ pub const V1_PAYMENT_CRED: [u8; 28] = [
 
 pub fn is_sundae_v1(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &V1_PAYMENT_CRED
+}
+
+/// Policy of the V1 pool NFT.
+pub const V1_NFT_POLICY: [u8; 28] = [
+    0x00, 0x29, 0xcb, 0x7c, 0x88, 0xc7, 0x56, 0x7b, 0x63, 0xd1, 0xa5, 0x12, 0xc0, 0xed, 0x62, 0x6a,
+    0xa1, 0x69, 0x68, 0x8e, 0xc9, 0x80, 0x73, 0x0c, 0x04, 0x73, 0xb9, 0x13,
+];
+
+/// V1 pool NFT names are ASCII `p ` followed by the datum's `ident`.
+///
+/// Verified on every sampled V1 pool. The V3 equivalent is a CIP-68 label; V1
+/// predates that convention and just uses a two-byte tag.
+pub const V1_NFT_NAME_PREFIX: [u8; 2] = *b"p ";
+
+/// Decoded SundaeSwap **V1** pool datum (`Constr 0`, 4 fields):
+///
+/// ```text
+/// [0] Constr 0 [ assetA(Constr 0 [policy, name]),
+///                assetB(Constr 0 [policy, name]) ]
+/// [1] ident (bytes, short — 1-3 bytes in practice)
+/// [2] total_lp
+/// [3] Constr 0 [ fee_numerator, fee_denominator ]
+/// ```
+///
+/// Two differences from V3 worth holding onto: the pair is `Constr`-wrapped
+/// here rather than bare arrays, and the fee is an explicit **numerator over
+/// denominator** rather than a per-10,000 figure — `1/100`, `3/1000` and
+/// `1/2000` all occur, so a hard-coded basis would misprice most pools.
+///
+/// Reserves are the UTxO's value less the pool NFT; there is no `protocol_fees`
+/// field to net off. Checked across 10 live pools: `sqrt(reserve_a × reserve_b)`
+/// matches the pool's own `total_lp` to a **median 1.0%**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolV1 {
+    pub asset_a_policy: Vec<u8>,
+    pub asset_a_name: Vec<u8>,
+    pub asset_b_policy: Vec<u8>,
+    pub asset_b_name: Vec<u8>,
+    pub ident: Vec<u8>,
+    pub total_lp: u64,
+    pub fee_numerator: u64,
+    pub fee_denominator: u64,
+}
+
+impl PoolV1 {
+    pub fn a_is_ada(&self) -> bool {
+        self.asset_a_policy.is_empty() && self.asset_a_name.is_empty()
+    }
+
+    pub fn b_is_ada(&self) -> bool {
+        self.asset_b_policy.is_empty() && self.asset_b_name.is_empty()
+    }
+
+    /// The pool NFT's asset name: [`V1_NFT_NAME_PREFIX`] ++ `ident`.
+    pub fn nft_name(&self) -> Vec<u8> {
+        let mut n = V1_NFT_NAME_PREFIX.to_vec();
+        n.extend_from_slice(&self.ident);
+        n
+    }
+
+    /// `(ada_reserve, token_reserve)` from the pool's holdings, or `None` for a
+    /// token/token pool.
+    ///
+    /// No netting: unlike V3 there is no protocol-fee field, and unlike
+    /// WingRiders there is no treasury. The value less the NFT *is* the reserve.
+    pub fn ada_pair(&self, value_a: u64, value_b: u64) -> Option<(u64, u64)> {
+        if self.a_is_ada() {
+            Some((value_a, value_b))
+        } else if self.b_is_ada() {
+            Some((value_b, value_a))
+        } else {
+            None
+        }
+    }
+
+    /// The swap fee in basis points, from the datum's explicit fraction.
+    ///
+    /// `1/100` → 100 bps, `3/1000` → 30 bps, `1/2000` → 5 bps. All three occur
+    /// on chain, which is why this is computed rather than assumed. `None` on a
+    /// zero denominator rather than dividing by it.
+    pub fn fee_bps(&self) -> Option<u64> {
+        (self.fee_denominator != 0)
+            .then(|| self.fee_numerator.saturating_mul(10_000) / self.fee_denominator)
+    }
+}
+
+/// Decode a SundaeSwap V1 pool datum.
+///
+/// V1 is PlutusV1, so this CBOR comes from the creating transaction's witness
+/// set rather than an inline datum.
+pub fn decode_v1_pool_datum(cbor: &[u8]) -> Option<PoolV1> {
+    let pd: PlutusData = minicbor::decode(cbor).ok()?;
+    let c = as_constr(&pd)?;
+    let fields: Vec<&PlutusData> = c.fields.iter().collect();
+    if fields.len() != 4 {
+        return None;
+    }
+    let pair = as_constr(fields.first().copied()?)?;
+    let a = as_constr(pair.fields.first()?)?;
+    let b = as_constr(pair.fields.get(1)?)?;
+    let fee = as_constr(fields.get(3).copied()?)?;
+    let int_of = |pd: &PlutusData| -> Option<u64> {
+        match pd {
+            PlutusData::BigInt(bi) => bigint_to_u64(bi),
+            _ => None,
+        }
+    };
+    Some(PoolV1 {
+        asset_a_policy: bounded_bytes(a.fields.first()?)?,
+        asset_a_name: bounded_bytes(a.fields.get(1)?)?,
+        asset_b_policy: bounded_bytes(b.fields.first()?)?,
+        asset_b_name: bounded_bytes(b.fields.get(1)?)?,
+        ident: bounded_bytes(fields.get(1).copied()?)?,
+        total_lp: int_of(fields.get(2).copied()?)?,
+        fee_numerator: int_of(fee.fields.first()?)?,
+        fee_denominator: int_of(fee.fields.get(1)?)?,
+    })
 }
 
 /// Decoded SundaeSwap V3 pool datum. Field indices, verified on chain:
@@ -354,12 +474,76 @@ mod tests {
     }
 
     #[test]
-    fn v1_is_recognised_but_not_confused_with_v3() {
-        // V1 exists here for cohort classification only — its datums are
-        // hash-committed and there is no decoder.
+    fn v1_is_recognised_and_not_confused_with_v3() {
         assert!(is_sundae_v1(&V1_PAYMENT_CRED));
         assert!(!is_sundae_v3(&V1_PAYMENT_CRED));
         assert!(!is_sundae_v1(&POOL_PAYMENT_CRED));
+    }
+
+    /// A real ADA/ADAMARS **V1** pool at `16b4f233…#0`, captured 2026-08-30.
+    /// The UTxO held 632,695,954 lovelace and 85,688,442,537 ADAMARS beside
+    /// its pool NFT `7020af02`.
+    const V1_ADAMARS: &str = "d8799fd8799fd8799f4040ffd8799f581cdba8e004cdec2ac9d53b8aad67b1d6527dffe99a2efe3a1ea04a00d2474144414d415253ffff42af021b00000001b600bdecd8799f011864ffff";
+
+    fn v1_adamars() -> PoolV1 {
+        decode_v1_pool_datum(&hex::decode(V1_ADAMARS).unwrap()).expect("decode")
+    }
+
+    #[test]
+    fn decodes_a_real_v1_pool() {
+        let p = v1_adamars();
+        assert!(p.a_is_ada());
+        assert_eq!(p.asset_b_name, b"ADAMARS".to_vec());
+        assert_eq!(p.ident, hex::decode("af02").unwrap());
+        assert_eq!(p.total_lp, 7_348_469_228);
+    }
+
+    #[test]
+    fn v1_reserves_are_the_value_and_satisfy_constant_product() {
+        // V1 has neither a protocol-fee nor a treasury field, so the claim
+        // "the value IS the reserve" needs its own evidence. The pool's own
+        // total_lp should be sqrt(a*b), and lands within 0.2%.
+        let p = v1_adamars();
+        let (ada, tok) = p.ada_pair(632_695_954, 85_688_442_537).unwrap();
+        assert_eq!((ada, tok), (632_695_954, 85_688_442_537));
+        let root = (ada as u128 * tok as u128).isqrt() as u64;
+        let err = root.abs_diff(p.total_lp) as f64 / p.total_lp as f64;
+        assert!(err < 0.01, "value-sourced reserves fit sqrt(a*b): {err}");
+    }
+
+    #[test]
+    fn the_v1_fee_is_a_fraction_not_a_fixed_basis() {
+        // 1/100, 3/1000 and 1/2000 all occur on chain. Assuming any one basis
+        // misprices the other two.
+        let p = v1_adamars();
+        assert_eq!((p.fee_numerator, p.fee_denominator), (1, 100));
+        assert_eq!(p.fee_bps(), Some(100));
+
+        let mut q = v1_adamars();
+        q.fee_numerator = 3;
+        q.fee_denominator = 1_000;
+        assert_eq!(q.fee_bps(), Some(30));
+        q.fee_denominator = 0;
+        assert_eq!(q.fee_bps(), None, "a zero denominator must not divide");
+    }
+
+    #[test]
+    fn the_v1_nft_name_is_the_ascii_prefix_plus_the_ident() {
+        // V1 predates CIP-68, so its tag is `p ` rather than a label — a
+        // different prefix from V3's, on a different policy.
+        let p = v1_adamars();
+        assert_eq!(hex::encode(p.nft_name()), "7020af02");
+        assert_ne!(V1_NFT_POLICY, POOL_NFT_POLICY);
+    }
+
+    #[test]
+    fn the_v1_and_v3_datums_do_not_decode_as_each_other() {
+        // Both are `Constr 0`; arity is the whole guard, and V3's pair is bare
+        // arrays where V1's is Constr-wrapped.
+        let v1 = hex::decode(V1_ADAMARS).unwrap();
+        let v3 = hex::decode(SWANGO).unwrap();
+        assert!(decode_v3_pool_datum(&v1).is_none());
+        assert!(decode_v1_pool_datum(&v3).is_none());
     }
 
     #[test]

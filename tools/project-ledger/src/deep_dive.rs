@@ -48,7 +48,9 @@ use crate::store::{DistributionBase, DistributionLegRow, Ledger};
 /// figures and quoting either alone misleads.
 /// v6 — added `supply_onward`: where team-minted units went next, and whether
 /// that was a sale, compensation in kind, or a gift.
-pub const SCHEMA_VERSION: u32 = 6;
+/// v7 — `self_mint` funding is now WINDOWED to match `provenance` (lifetime
+/// sums badly misread a busy wallet), and carries `core_share_weighted`.
+pub const SCHEMA_VERSION: u32 = 7;
 
 fn tx_url(tx: &str) -> String {
     format!("https://cardanoscan.io/transaction/{tx}")
@@ -262,14 +264,27 @@ pub struct SelfMint {
     /// take as "raised".
     pub apparent_raise: i64,
     pub actual_raise: i64,
-    /// Money the project sent to the wallets that minted to themselves.
-    /// Excludes the project's OWN wallets minting directly, which needs no
-    /// funding leg and would double-count an internal transfer.
+    /// Money the project sent to the wallets that minted to themselves,
+    /// WITHIN the funding window before each wallet's first mint.
+    ///
+    /// Windowed, not lifetime. A first version summed all inbound ever and
+    /// produced a badly wrong answer on a busy wallet: Mekka S1's largest
+    /// self-minter also takes marketplace proceeds and sale income, so lifetime
+    /// inbound counted 71,614 ₳ of unrelated money as "their own funds" and put
+    /// the mint at 66% project-funded. `provenance`, measuring over the window,
+    /// put the same wallets at 94%. Two numbers on one page disagreeing about
+    /// the same thing is worse than either being slightly off.
     pub project_funding: i64,
-    /// What those wallets brought from anywhere else. The point of the whole
-    /// structure: when this is ~0, the team acquired supply without putting up
-    /// money of its own.
+    /// What those wallets brought from anywhere else in the same window. When
+    /// this is ~0, the team acquired supply without putting up money of its own.
     pub outside_funding: i64,
+    /// `provenance`'s asset-weighted core-funded share across the flagged
+    /// holders — the authoritative figure, since it propagates coreness through
+    /// intermediaries rather than looking only one hop back.
+    ///
+    /// Published alongside the raw ADA so a reader can see they agree. If they
+    /// ever diverge sharply, the windowing is wrong, not the trace.
+    pub core_share_weighted: Option<f64>,
 }
 
 /// Where team-minted supply went AFTER the team took it.
@@ -438,7 +453,15 @@ pub fn build(
             .iter()
             .filter(|l| l.unit == "lovelace")
             .filter(|l| match category {
-                "ops_team" => l.role == "contractor" && !is_marketing(l.function.as_deref()),
+                // `ops` counts here too. A project OPERATING wallet that sits
+                // outside the value boundary — `$pervsn`, which the project
+                // published as its Development wallet — produces distribution
+                // legs, and money sent to it is ops spend. Project-side wallets
+                // never reach this point: internal transfers generate no leg.
+                "ops_team" => {
+                    (l.role == "contractor" && !is_marketing(l.function.as_deref()))
+                        || l.role == "ops"
+                }
                 "marketing" => l.role == "contractor" && is_marketing(l.function.as_deref()),
                 "founder_pay" => l.role == "founder",
                 _ => false,
@@ -583,9 +606,13 @@ pub fn build(
 fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<OnwardLeg>> {
     let hf = crate::distributions::holder_facing_sql();
     let mut stmt = conn.prepare(&format!(
+        // EXCEPT declared contractors — a paid person minting with their fee is
+        // a customer, not a front. See `distributions::run` for why.
         "WITH own AS (
-             SELECT key AS k FROM party WHERE project_side = 1
-             UNION SELECT holder FROM provenance_verdict WHERE flagged = 1),
+             SELECT k FROM (
+                 SELECT key AS k FROM party WHERE project_side = 1
+                 UNION SELECT holder FROM provenance_verdict WHERE flagged = 1)
+             WHERE k NOT IN (SELECT key FROM party WHERE declared_role = 'contractor')),
          team_minted AS (
              SELECT asset_name FROM asset_event
              WHERE kind = 'mint' AND asset_class IN ({hf}) AND to_party IN (SELECT k FROM own)),
@@ -658,8 +685,10 @@ fn mint_timeline(conn: &rusqlite::Connection) -> Result<Vec<MintDay>> {
     let hf = crate::distributions::holder_facing_sql();
     let mut stmt = conn.prepare(&format!(
         "WITH own AS (
-             SELECT key AS k FROM party WHERE project_side = 1
-             UNION SELECT holder FROM provenance_verdict WHERE flagged = 1)
+             SELECT k FROM (
+                 SELECT key AS k FROM party WHERE project_side = 1
+                 UNION SELECT holder FROM provenance_verdict WHERE flagged = 1)
+             WHERE k NOT IN (SELECT key FROM party WHERE declared_role = 'contractor'))
          SELECT CAST(strftime('%s', date(block_time, 'unixepoch')) AS INTEGER) AS day,
                 SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 0 ELSE 1 END),
                 SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 1 ELSE 0 END)
@@ -692,6 +721,9 @@ fn self_mint(
     // project does not own. Its own wallets are excluded — a treasury minting
     // directly needs no funding leg, and counting the transfer that got the
     // money there would book an internal move as external funding.
+    let hf = crate::distributions::holder_facing_sql();
+    // Cardano slot ~= 1s, so a day is 86,400 slots — the same conversion
+    // `provenance` uses to turn `window_days` into a slot span.
     let funding = |from_project: bool| -> i64 {
         let op = match from_project {
             true => "IN",
@@ -699,17 +731,36 @@ fn self_mint(
         };
         conn.query_row(
             &format!(
-                "SELECT COALESCE(SUM(v.delta), 0) FROM value_event v
+                "WITH flagged AS (
+                     SELECT holder, window_days FROM provenance_verdict WHERE flagged = 1),
+                 first_mint AS (
+                     SELECT to_party AS holder, MIN(slot) AS slot
+                     FROM asset_event
+                     WHERE kind = 'mint' AND asset_class IN ({hf}) AND to_party IS NOT NULL
+                     GROUP BY to_party)
+                 SELECT COALESCE(SUM(v.delta), 0)
+                 FROM value_event v
+                 JOIN flagged f ON f.holder = v.party
+                 JOIN first_mint m ON m.holder = v.party
                  WHERE v.delta > 0
-                   AND v.party IN (SELECT holder FROM provenance_verdict WHERE flagged = 1)
                    AND v.party NOT IN (SELECT key FROM party WHERE project_side = 1)
-                   AND v.counterparty {op} (SELECT key FROM party WHERE project_side = 1)"
+                   AND v.counterparty {op} (SELECT key FROM party WHERE project_side = 1)
+                   AND v.slot BETWEEN m.slot - (f.window_days * 86400) AND m.slot"
             ),
             [],
             |r| r.get(0),
         )
         .unwrap_or(0)
     };
+    let core_share_weighted: Option<f64> = conn
+        .query_row(
+            "SELECT SUM(assets * core_share) / NULLIF(SUM(assets), 0)
+             FROM provenance_verdict WHERE flagged = 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
     let units = base.circular_assets as i64;
     Some(SelfMint {
         units,
@@ -722,6 +773,7 @@ fn self_mint(
         actual_raise: base.external_raise,
         project_funding: funding(true),
         outside_funding: funding(false),
+        core_share_weighted,
     })
 }
 
@@ -794,8 +846,10 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
     let own_money: BTreeSet<String> = {
         let mut s = BTreeSet::new();
         let mut q = conn.prepare(
-            "SELECT key FROM party WHERE project_side = 1
-             UNION SELECT holder FROM provenance_verdict WHERE flagged = 1",
+            "SELECT k FROM (
+                 SELECT key AS k FROM party WHERE project_side = 1
+                 UNION SELECT holder FROM provenance_verdict WHERE flagged = 1)
+             WHERE k NOT IN (SELECT key FROM party WHERE declared_role = 'contractor')",
         )?;
         for k in q.query_map([], |r| r.get::<_, String>(0))? {
             s.insert(k?);
@@ -851,12 +905,17 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
         // not a thing the project ever promised a share of.
         let label = match (role.as_str(), function.as_str()) {
             ("contractor", f) if is_marketing(Some(f)) => "marketing".to_string(),
-            ("contractor", _) => "ops · tools · team".to_string(),
-            ("", _) if own_money.contains(&counterparty) => {
-                // Money to a wallet that minted with it. Not unknown at all —
-                // it is the self-mint, reported in full in its own section.
-                "self-mint funding".to_string()
-            }
+            ("contractor", _) | ("ops", _) => "ops · tools · team".to_string(),
+            // Money to a wallet that minted with it. Not unknown at all — it is
+            // the self-mint, reported in full in its own section.
+            //
+            // Matched on own-money membership REGARDLESS of declared role. An
+            // earlier version required the role to be blank, so the moment a
+            // front was named in the registry its funding stopped reading as
+            // self-mint funding and fell through to the role's own name —
+            // identifying a wallet made the mechanism it served less visible,
+            // which is precisely backwards.
+            _ if own_money.contains(&counterparty) => "self-mint funding".to_string(),
             ("", _) if relay_target.contains_key(&counterparty) => {
                 // A pipe, not a destination. Named as such so the reader can
                 // follow it rather than reading a bare address as an endpoint.

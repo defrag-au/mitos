@@ -581,10 +581,17 @@ pub fn probe(db: &std::path::Path) -> Result<()> {
                 );
             }
             None if out.datum_cbor.is_some() => g.datum_present_undecoded += 1,
-            // A hash with no preimage is untestable, not negative: the datum
-            // is revealed by the SPENDING transaction, and these outputs are
-            // unspent. Counting it as "not a lock" would be a conclusion the
-            // chain has not offered.
+            // A hash with no preimage is untestable, not negative. Note what
+            // this bucket actually means: the walk already looked in the
+            // CREATING transaction's witness set, so landing here says the
+            // creator chose not to attach the datum — leaving the spend as the
+            // only thing that can reveal it, and these outputs are unspent.
+            //
+            // Attaching at creation is a choice, not a rule. Every sampled DEX
+            // pool does it (a batcher has to be able to read pool state), which
+            // is why the PlutusV1 pool decoders need no deferred cache. A lock
+            // contract has no such obligation. Counting this as "not a lock"
+            // would be a conclusion the chain has not offered.
             None if out.datum_hash.is_some() => g.hash_only += 1,
             None => g.no_datum += 1,
         }
@@ -940,15 +947,34 @@ fn cap_report(
     // the price per raw unit — wrong-looking rather than quietly wrong, and the
     // trailing note says which it is.
     let scale = meta.map_or(1.0, AssetMeta::scale);
+    let mut thin = 0usize;
     for t in &tips {
-        let spot = if t.base_reserve > 0 {
-            t.quote_reserve as f64 / t.base_reserve as f64 / 1e6 * scale
-        } else {
-            0.0
+        // A pool too shallow to quote still shows its reserves — they are real
+        // and they join the aggregate below. Only its own price is withheld,
+        // because a 1-ADA pool quoted WRT at 484 ADA against a real 0.0217.
+        let quotable = pools::is_quotable(t.quote_reserve);
+        if !quotable {
+            thin += 1;
+        }
+        let spot = match (t.base_reserve > 0, quotable) {
+            (true, true) => format!(
+                "{:.8} ADA",
+                t.quote_reserve as f64 / t.base_reserve as f64 / 1e6 * scale
+            ),
+            (true, false) => "  too thin to quote".to_string(),
+            (false, _) => "           no depth".to_string(),
         };
         println!(
-            "  {:<7} base {:>14}  quote {:>15} lovelace  spot {:.8} ADA  fee {:?}  key:{}",
+            "  {:<7} base {:>14}  quote {:>15} lovelace  spot {:>19}  fee {:?}  key:{}",
             t.dex, t.base_reserve, t.quote_reserve, spot, t.fee_bps, t.key_basis
+        );
+    }
+    if thin > 0 {
+        println!(
+            "  note: {thin} of {} pools hold under {} ADA — their reserves still count \
+             toward the aggregate, but a pool that thin cannot price anything",
+            tips.len(),
+            pools::MIN_QUOTABLE_LOVELACE / 1_000_000
         );
     }
     if base <= 0 {

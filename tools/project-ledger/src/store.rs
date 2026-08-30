@@ -1306,6 +1306,20 @@ impl Ledger {
         Ok(())
     }
 
+    /// Parties the operator declared as paid contractors.
+    ///
+    /// Excluded from the self-mint set: once someone has been paid for work,
+    /// the money is theirs and minting with it is a purchase. Keyed on
+    /// `contractor` alone — an `ops` wallet is a project wallet, not a person,
+    /// however it sits relative to the value boundary.
+    pub fn declared_contractors(&self) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM party WHERE declared_role = 'contractor'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Holders whose mint funding traced to the project — the wallets whose
     /// mints were bought with the project's own money.
     pub fn core_funded_holders(&self) -> Result<BTreeSet<String>> {

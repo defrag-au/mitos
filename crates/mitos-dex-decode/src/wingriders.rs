@@ -71,6 +71,118 @@ pub fn is_wingriders_v1(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &V1_PAYMENT_CRED
 }
 
+/// WingRiders **V1**'s LP policy. Like V2 it mints both the pool NFT and the LP
+/// token, but here the two are trivially separable by name: the pool NFT is
+/// [`V1_POOL_NFT_NAME`] on every pool, and the LP token carries a 32-byte
+/// per-pool name. So **the LP name is the pool-instance key**, recoverable from
+/// the value alone.
+pub const V1_LP_POLICY: [u8; 28] = [
+    0x02, 0x6a, 0x18, 0xd0, 0x4a, 0x0c, 0x64, 0x27, 0x59, 0xbb, 0x3d, 0x83, 0xb1, 0x2e, 0x33, 0x44,
+    0x89, 0x4e, 0x5c, 0x1c, 0x7b, 0x2a, 0xeb, 0x1a, 0x21, 0x13, 0xa5, 0x70,
+];
+
+/// The V1 pool NFT's asset name — ASCII `L`, the same on every pool.
+///
+/// Shared, so it marks a UTxO as a pool but does **not** say which pool. That
+/// is why the instance key is the *other* asset under [`V1_LP_POLICY`].
+pub const V1_POOL_NFT_NAME: [u8; 1] = *b"L";
+
+/// Decoded WingRiders **V1** pool datum.
+///
+/// The shape is `Constr 0`, 2 fields, with everything interesting one level
+/// down — unlike V2, which is flat:
+///
+/// ```text
+/// [0] requestScriptHash
+/// [1] Constr 0 [
+///       [0] Constr 0 [ assetA(Constr 0 [policy, name]),
+///                      assetB(Constr 0 [policy, name]) ]
+///       [1] lastInteracted (ms)
+///       [2] treasuryA   [3] treasuryB
+///     ]
+/// ```
+///
+/// The reserve rule is V2's — value minus treasury — which is what makes the
+/// nesting the only real difference between the two decoders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolV1 {
+    pub asset_a_policy: Vec<u8>,
+    pub asset_a_name: Vec<u8>,
+    pub asset_b_policy: Vec<u8>,
+    pub asset_b_name: Vec<u8>,
+    /// Accumulated fees on the A side — **not** part of the reserve.
+    pub treasury_a: u64,
+    pub treasury_b: u64,
+    /// Milliseconds. Useful for spotting a pool nobody has touched in years.
+    pub last_interacted_ms: u64,
+}
+
+impl PoolV1 {
+    pub fn a_is_ada(&self) -> bool {
+        self.asset_a_policy.is_empty() && self.asset_a_name.is_empty()
+    }
+
+    pub fn b_is_ada(&self) -> bool {
+        self.asset_b_policy.is_empty() && self.asset_b_name.is_empty()
+    }
+
+    /// Reserves from the UTxO's holdings, netting off the treasuries.
+    pub fn reserves(&self, value_a: u64, value_b: u64) -> (u64, u64) {
+        (
+            value_a.saturating_sub(self.treasury_a),
+            value_b.saturating_sub(self.treasury_b),
+        )
+    }
+
+    /// `(ada_reserve, token_reserve)` when one side is ADA, else `None`.
+    pub fn ada_pair(&self, value_a: u64, value_b: u64) -> Option<(u64, u64)> {
+        let (ra, rb) = self.reserves(value_a, value_b);
+        if self.a_is_ada() {
+            Some((ra, rb))
+        } else if self.b_is_ada() {
+            Some((rb, ra))
+        } else {
+            None
+        }
+    }
+}
+
+/// Decode a WingRiders V1 pool datum.
+///
+/// V1 is PlutusV1, so this CBOR comes from the creating transaction's witness
+/// set, not from an inline datum.
+pub fn decode_v1_pool_datum(cbor: &[u8]) -> Option<PoolV1> {
+    let pd: PlutusData = minicbor::decode(cbor).ok()?;
+    let outer = as_constr(&pd)?;
+    if outer.fields.len() != 2 {
+        return None;
+    }
+    let body = as_constr(outer.fields.get(1)?)?;
+    let body: Vec<&PlutusData> = body.fields.iter().collect();
+    if body.len() != 4 {
+        return None;
+    }
+    let pair = as_constr(body.first().copied()?)?;
+    let pair: Vec<&PlutusData> = pair.fields.iter().collect();
+    let a = as_constr(pair.first().copied()?)?;
+    let b = as_constr(pair.get(1).copied()?)?;
+    let int_at = |pd: &PlutusData| -> Option<u64> {
+        match pd {
+            PlutusData::BigInt(bi) => bigint_to_u64(bi),
+            _ => None,
+        }
+    };
+    Some(PoolV1 {
+        asset_a_policy: bounded_bytes(a.fields.first()?)?,
+        asset_a_name: bounded_bytes(a.fields.get(1)?)?,
+        asset_b_policy: bounded_bytes(b.fields.first()?)?,
+        asset_b_name: bounded_bytes(b.fields.get(1)?)?,
+        last_interacted_ms: int_at(body.get(1).copied()?)?,
+        treasury_a: int_at(body.get(2).copied()?)?,
+        treasury_b: int_at(body.get(3).copied()?)?,
+    })
+}
+
 /// Decoded WingRiders V2 pool datum. Field indices, verified on chain:
 ///
 /// ```text
@@ -183,6 +295,59 @@ pub fn decode_v2_pool_datum(cbor: &[u8]) -> Option<PoolV2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real ADA/WingRiders **V1** pool at `899c739a…#0`, captured
+    /// 2026-08-30. The UTxO held 42,924,008,929 lovelace and
+    /// 1,982,469,155,671 WRT, plus its `L` pool NFT and the unissued LP.
+    const V1_ADA_WRT: &str = "d8799f581c86ae9eebd8b97944a45201e4aec1330a72291af2d071644bba015959d8799fd8799fd8799f4040ffd8799f581cc0ee29a85b13209423b10447d3c2e6a50641a15c57770e27cb9d50734a57696e67526964657273ffff1b000001a0465ecc881a00316e071a0a1cce9effff";
+
+    fn v1_ada_wrt() -> PoolV1 {
+        decode_v1_pool_datum(&hex::decode(V1_ADA_WRT).unwrap()).expect("decode")
+    }
+
+    #[test]
+    fn decodes_a_real_v1_pool_through_its_nesting() {
+        // V1 buries the pair two levels down where V2 has it flat. Reading V1
+        // with V2's offsets yields the request-script hash as a policy id.
+        let p = v1_ada_wrt();
+        assert!(p.a_is_ada());
+        assert_eq!(p.asset_b_name, b"WingRiders".to_vec());
+        assert_eq!(p.treasury_a, 3_239_431);
+        assert_eq!(p.treasury_b, 169_660_062);
+    }
+
+    #[test]
+    fn v1_uses_the_same_value_minus_treasury_rule_as_v2() {
+        let p = v1_ada_wrt();
+        assert_eq!(
+            p.ada_pair(42_924_008_929, 1_982_469_155_671),
+            Some((42_920_769_498, 1_982_299_495_609))
+        );
+    }
+
+    #[test]
+    fn the_v1_pool_nft_marks_a_pool_but_the_lp_name_identifies_it() {
+        // Every V1 pool's NFT is named `L`, so the NFT alone cannot say WHICH
+        // pool — the per-pool 32-byte LP name under the same policy does.
+        assert_eq!(&V1_POOL_NFT_NAME, b"L");
+        assert_ne!(V1_LP_POLICY, V2_LP_POLICY);
+    }
+
+    #[test]
+    fn the_v1_and_v2_datums_do_not_decode_as_each_other() {
+        let v1 = hex::decode(V1_ADA_WRT).unwrap();
+        let v2 = hex::decode(NIGHT_IAG).unwrap();
+        // V2's decoder tolerates arity by design, so the guard that keeps V1
+        // out is its 2-field outer shape.
+        assert!(decode_v1_pool_datum(&v2).is_none());
+        // And V1 read as V2 would take the request-script hash for assetA's
+        // policy, which is exactly the silent-nonsense case.
+        let as_v2 = decode_v2_pool_datum(&v1);
+        assert!(
+            as_v2.is_none_or(|p| p.asset_a_name != b"WingRiders".to_vec()),
+            "V1 must not masquerade as a well-formed V2 pool"
+        );
+    }
 
     /// A real NIGHT/IAG V2 pool datum, captured from chain 2026-08-30.
     ///

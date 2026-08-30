@@ -75,6 +75,17 @@ floor_slot = 150_160_837                # minted 2025-03-11; immutable file 6951
 # `stats` printed its spot as `0.00000000` against a real 0.00231. Raw supply
 # 705,258,547,000,000 is 705,258,547 whole CSWAP.
 
+# Registered as the PlutusV1 test case. The three V1 DEX contracts commit pool
+# state as a datum HASH rather than inline, so nothing walked before this
+# exercised that path — $CSWAP is too recent to have V1 pools. WRT sits on
+# WingRiders V1 with real depth and predates every V2/V3 contract.
+[[token]]
+name = "wrt"
+policy = "c0ee29a85b13209423b10447d3c2e6a50641a15c57770e27cb9d5073"
+asset_name = "57696e67526964657273"  # "WingRiders"
+decimals = 6                           # registry: 6 dp
+floor_slot = 54_772_901                # minted 2022-05-27; immutable file 2535
+
 [[token]]
 name = "perp"
 policy = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64"

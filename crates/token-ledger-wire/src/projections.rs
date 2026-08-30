@@ -95,7 +95,7 @@ pub fn cohorts_at(spine: &Spine, detail: &Detail, slot: u64) -> Option<CohortTot
     let last_mv = detail.mv_tx.partition_point(|t| (*t as usize) < end);
     for i in first_mv..last_mv {
         let party = detail.mv_party[i] as usize;
-        let cohort = detail.parties[party].cohort as usize;
+        let cohort = detail.party_cohort[party] as usize;
         if let Some(t) = base.totals.get_mut(cohort) {
             *t += detail.mv_amount[i];
         }
@@ -281,7 +281,7 @@ pub fn fee_coverage(spine: &Spine) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssetId, PartyMeta, PoolMeta, WIRE_VERSION, delta_encode};
+    use crate::{AssetId, PoolMeta, WIRE_VERSION, delta_encode};
 
     /// Two cohorts, three checkpoints, one pool.
     fn spine() -> Spine {
@@ -315,26 +315,18 @@ mod tests {
             rc_pool: vec![0, 0],
             rc_base: vec![400, 400],
             rc_quote: vec![4_000_000, 8_000_000],
+            rc_eps_bps: 0,
         }
     }
 
     fn detail() -> Detail {
         Detail {
             version: WIRE_VERSION,
-            parties: vec![
-                PartyMeta {
-                    address: "pool".into(),
-                    stake: None,
-                    cohort: 0,
-                    basis: "decoded".into(),
-                },
-                PartyMeta {
-                    address: "w".into(),
-                    stake: None,
-                    cohort: 2,
-                    basis: "chain".into(),
-                },
-            ],
+            bases: vec!["decoded".into(), "chain".into()],
+            // Party 0 is the pool (cohort 0), party 1 a wallet (cohort 2).
+            // Addresses live in `PartyIds` and no projection needs them.
+            party_cohort: vec![0, 2],
+            party_basis: vec![0, 1],
             tx_slots: delta_encode(&[100, 150, 200, 250, 300]),
             tx_net_mint: vec![1000, 0, 0, 0, 0],
             // tx 3 moves 50 from wallet to pool; nothing else after cp@200.

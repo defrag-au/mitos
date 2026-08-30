@@ -1,0 +1,199 @@
+# Mekka S2 — SEEDED run (2026-08-30), successor to the cold-start
+# `registry-s2.toml`.
+#
+# The cold start proved the trail could bootstrap from the chain alone. This
+# run declares what the chain cannot state, so the project boundary is
+# explicit rather than left to frontier promotion.
+#
+# NOT declared here, deliberately:
+#   - The ROYALTY address. Derived from CIP-27 `777.addr` in the policy's own
+#     on-mint metadata (observed at slot 160,419,671 for S1; S2 resolves its
+#     own). S2's royalty wallet DIFFERS from S1's — declaring it by hand would
+#     reintroduce assertion-as-fact and would carry S1's answer into S2.
+#   - The policy SIGNER credential. It is the `sig` credential in the mint
+#     script and is read from chain.
+#   - $mekkacrow. The handle sits on TWO stakes 160 slots apart
+#     (stake1uxmaqke42j9… which also carries $btc-bank, and stake1ux9nk26sat…)
+#     and nothing observed disambiguates them. Declaring the wrong one would
+#     misplace the boundary, so the walk discovers it instead.
+
+project = "Mekka S2"
+
+[[policy]]
+id    = "a8056299a9fb1c3ab78bcc58e6c5d806bbe88413cff1766b17979a43"
+label = "Mekka (S2)"
+
+# ---------------------------------------------------------------------------
+# THE PROJECT BOUNDARY. `role` decides it (registry.rs PROJECT_SIDE_ROLES):
+# value arriving at these wallets has come back, value leaving them has
+# crossed out. Get one wrong and an extraction reads as a deployment — so
+# each carries what it rests on.
+# ---------------------------------------------------------------------------
+
+[[wallet]]
+stake  = "stake1u9xsvje8ewnzpts3tdj6mm89ystz0weeuqnsyglumv65y4sychxu2"
+label  = "S2 treasury"
+role   = "treasury"
+source = """project-ledger mekka-s2.db 2026-08-23 walk: sole non-platform \
+destination in `mint_payment` — 99 legs totalling 57,210 ADA between slots \
+193,809,319 and 195,592,727. Observed in the mint transactions themselves, \
+not asserted by anyone. DISTINCT from the S1 treasury \
+(stake1u98f5mr0mn8tv2kqndk5cwen4uasc7cewlzdklz6y664zacl9lvjz)."""
+
+[[wallet]]
+stake  = "stake1uytw7utsx3hs8rwdw4jquzza47qpp4azn5ln3qttjctvv3shdvc5d"
+label  = "$mekkalabs"
+role   = "ops"
+source = """ADA Handle `mekkalabs`, observed on this stake from slot \
+161,510,886 — i.e. throughout the S2 window (floor 192,544,877). The handle \
+previously sat on stake1u9af4pdv… ($jprigs33's wallet) until 161.5M; the \
+S2-era holder is this one. Team-side participant in the S2 mint: paid 3,845 \
+ADA for 33 NFTs (Mekka analysis 2026-08-11)."""
+
+[[wallet]]
+stake  = "stake1u9hechmv8sw45p4dnhhsujk8yl5hp7cvzyng9e94j3ew5fg7gpt5q"
+label  = "$mekkaops"
+role   = "ops"
+source = """ADA Handle `mekkaops`, observed on this stake from slot \
+162,451,606 and unmoved through the S2 window. The cold-start walk promoted \
+it to the frontier on its own (role `promoted`, 4 receipts, 1 counterparty); \
+declaring it makes the boundary explicit rather than promotion-dependent."""
+
+# ---------------------------------------------------------------------------
+# TERMINAL — recorded on contact, NEVER expanded.
+#
+# This is the distinction the S1 run learned the hard way: seeding a
+# wide-social-graph wallet as an ordinary `[[wallet]]` on 2026-08-20 let it
+# RECRUIT, and the frontier went 180 → 6,424 parties, the ledger 7.1M → 18.0M
+# rows, and unresolved inputs 0.059% → 16.5%. Terminal declaration gives the
+# full two-sided history — a member's flows are booked whether or not it
+# expands — without the recruitment.
+#
+# Numeric thresholds are deliberately LEFT AT DEFAULT. The cold-start run had
+# no [terminal] block at all; changing seeding and thresholds in the same run
+# would confound the two.
+# ---------------------------------------------------------------------------
+
+[[terminal.party]]
+stake  = "stake1uy0x3exj6jgh3nd3fk838qdqxjeq6vsx6lzdylk0vadvc2qwfl6ha"
+label  = "minting front"
+# `mint` — a wallet that mints on the project's behalf. Declared TERMINAL so it
+# is named without expanding: it holds hundreds of assets and a wide
+# counterparty set, and seating it as a `[[wallet]]` would recruit all of it.
+role   = "mint"
+source = """CONFIRMED a minting front by the operator, 2026-08-30, on \
+independent inspection. Carries no ADA Handle. The single largest self-minter \
+in BOTH seasons: 108 units in S2 on 16,084 ₳ from the S2 treasury, and 642 \
+units in S1 on 94,177 ₳ direct from the S1 treasury plus 3,865 ₳ from \
+$mekkaops — 87% of S1's team-funded supply and 73% of S2's.
+
+Declared rather than left to inference. `provenance` already flags it at 94% \
+(S1) and 100% (S2) core-funded, but a figure this load-bearing should not \
+depend on a wallet clearing a threshold: change `--threshold` and an inferred \
+classification moves, whereas an asserted one is on the record with its \
+source."""
+
+[[terminal.party]]
+stake  = "stake1u9af4pdvysr7ysqm3n0l2j2slkzlrvkz8ks8gn8mwy77rrsawvqey"
+label  = "$jprigs33"
+role   = "founder"
+source = """ADA Handle `jprigs33`, held on this stake since slot 118,208,143 \
+— long predating both mints. Founder (user confirmation 2026-08-30). \
+`founder` is an IDENTITY and does not place them inside the boundary: assets \
+arriving here are value LEAVING the project and must stay visible as such. \
+Measured on the 08-30 walk: 105 assets received across 11 transactions with \
+ADA paid in ZERO of them, all three senders being the treasury-funded \
+self-mint wallets. Terminal so its own funding history is booked in full \
+without recruiting its social graph."""
+
+# ---------------------------------------------------------------------------
+# CONTRACTORS — named, never expanded.
+#
+# Declared terminal rather than as `[[wallet]]`, because a `[[wallet]]` seeds
+# an EXPANDING member: naming $predlings that way would recruit ~1,883
+# transactions of unrelated personal activity to learn one retainer figure.
+# Identity and expansion are separate axes and this is what that buys.
+#
+# Roles are `contractor`, not `team` — these are paid for defined work, and the
+# advertised 15% ops·tools·team bucket covers them. Not `service_provider`:
+# "service" already means DEX/batcher/marketplace rails in `classify`.
+# ---------------------------------------------------------------------------
+
+[[terminal.party]]
+stake    = "stake1uydh8p0wazr0yayxl7wuv9ckvnwcg5htac085xerugfu2vsd5mugn"
+label    = "$dwess_art"
+role     = "contractor"
+function = "art"
+source   = """ADA Handle `dwess_art` from slot 95,272,651. Received 5,500 ₳ \
+across 2 legs from project-side wallets (2,880 from $mekkaops 2026-08-01, \
+2,620 from the S2 treasury 08-06) — observed in the 08-30 walk."""
+
+[[terminal.party]]
+stake    = "stake1uxsznxumwhdne3rr5rtueak6qn5tt8fxg2gq66yh8jf0mcsq7r947"
+label    = "$predlings / $buy.derp.birds"
+role     = "contractor"
+function = "marketing"
+source   = """ADA Handle `predlings` from slot 99,188,361; the same stake also \
+carries `buy.derp.birds`. Received 3,000 ₳ as 2 × 1,500 from $mekkalabs \
+(2026-07-30, 08-03), matching the retainer cadence recorded in the \
+$predlings/Mimi flow analysis of 2026-08-15."""
+
+[[terminal.party]]
+stake    = "stake1u9ry2698xdnhe93xr6q8yn49jm08ml4vt9q34zg948hg3lqwkqw54"
+label    = "$ariknfts"
+role     = "contractor"
+function = "dev"
+source   = """ADA Handle `ariknfts` from slot 112,383,083. Named as the dev by \
+the operator 2026-08-30. NOTE the dev PAYMENT channel is not this wallet: it \
+received 1.2 ₳ (min-UTxO carrier on an asset transfer, not a payment) plus 5 \
+asset transfers, while the publicly-announced Development wallet `pervsn` \
+(stake1ux52yas…) received 6,425 ₳ over the same window."""
+
+[[terminal.party]]
+stake    = "stake1uydx3n6mjgnf5rgjewcd50yuju9rc6dgnz8hdu89uztwc6q2nrty5"
+label    = "$aesch"
+role     = "contractor"
+function = "moderation"
+source   = """ADA Handles `aesch` (slot 58,781,475) and `vm.aesch`. Named as a \
+moderator by the operator 2026-08-30. NO PROJECT COMPENSATION IS VISIBLE in \
+the S2 window: 0 ₳ from any project-side wallet, and 0 assets originating \
+from the project. The 4 assets they did receive came from \
+stake1uxmc9var… (handles `genovault` / `rafflekwic`, a raffle service), \
+arriving alongside 1.2–1.7 ₳ — a raffle win, not payment. An earlier reading \
+of this wallet as "paid in kind" was WRONG and is retracted; it counted asset \
+receipts without checking the sender. Declared anyway, so that "the mods were \
+not paid from S2 funds" is a recorded measurement rather than a gap."""
+
+[[terminal.party]]
+stake  = "stake1ux52yas3q3m39mrsmjyxlahkq8yztugu4c9ewzlud4yvcyqpervsn"
+label  = "$pervsn — announced Development wallet"
+# `ops`, NOT `contractor` — a project operating wallet rather than a person
+# being paid, so its mints count as the project minting to itself. It stays
+# OUTSIDE the value boundary (terminal, never project_side), so the money sent
+# to it is still measured as ops spend against the 15% line. Operator's call,
+# 2026-08-30; the same entry appears in registry-s1-seeded.toml.
+role   = "ops"
+source = """Published BY THE PROJECT as its Development wallet (Discord, \
+JPRIGS/MEKKALABS; transcribed in docs/cases/MEKKA_DISTRIBUTIONS.md), so this \
+identity is DISCLOSED, not inferred. Received 6,425 ₳ over 5 legs from \
+project-side wallets 2026-07-30 → 08-22 on the 08-30 walk."""
+
+[[terminal.party]]
+stake  = "stake1uxf2xjgwe5drvzqa9paxhxalqekgecxh8flfppt3hc7pa9sz4k2cz"
+label  = "$bank.pillar — Yepple/BankFi mint hot wallet"
+source = """ADA Handle `bank.pillar` from slot 189,737,277. The MINTING \
+PLATFORM's hot wallet (Yepple/MintCity + BankFi Pillar rails), confirmed by \
+the user 2026-08-30 as the minter. Rails, not the project: 617 receipts \
+across 147 counterparties in the S2 walk alone, and it serves unrelated \
+client projects. Present in S2 `mint_payment` for 1 leg / 43 ADA."""
+
+[[terminal.party]]
+stake  = "stake1u94sq8k5rjax9vf5eyyzdnmh0d7nmhgf38f4tchdnspyy5qrlwfym"
+label  = "BankFi/Yepple pooled settlement wallet"
+source = """One stake carrying FIVE platform handles — `bankfi.pay` \
+(slot 153,164,914), `yepple.pay` (150,414,979), `bankfi.expenses` \
+(153,165,017), `pillar.pay` and `bankfi.pillar` (190,098,377/190,098,755). \
+Pooled settlement taking inflows from several unrelated projects; received \
+40,435 ADA swept from the 88 S2 phase-1 mint change UTxOs on 2026-07-30 \
+(62 inputs, UTxO-proven — Mekka analysis 2026-08-11). Platform revenue \
+share, not a Mekka wallet."""

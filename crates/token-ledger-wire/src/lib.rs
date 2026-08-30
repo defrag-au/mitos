@@ -62,7 +62,10 @@ pub mod projections;
 
 /// Version byte at offset 0 of every encoded page. Bump on ANY change to the
 /// types in this crate (see the module docs for what counts).
-pub const WIRE_VERSION: u8 = 1;
+/// v2 added [`Spine::rc_eps_bps`] — the reserve curve's declared error bound.
+/// Postcard is positional, so an added field is a breaking change and a v1
+/// reader must reject a v2 page rather than decode it shifted.
+pub const WIRE_VERSION: u8 = 2;
 
 /// What went wrong decoding a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,18 +124,23 @@ pub struct PoolMeta {
     pub fee_bps: Option<u32>,
 }
 
-/// A party in the detail dictionary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PartyMeta {
-    pub address: String,
-    pub stake: Option<String>,
+/// One party, assembled from the two tiers it is stored across.
+///
+/// **Not a wire type.** [`Detail`] holds the hot columns and [`PartyIds`] the
+/// addresses; this is what a consumer builds after loading both, for the one
+/// wallet it is actually rendering. Materialising every party into this shape
+/// is what the split exists to avoid — that is the 28.7 MB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Party<'a> {
+    pub address: &'a str,
+    pub stake: Option<&'a str>,
     /// Index into [`Spine::cohorts`].
     pub cohort: u16,
     /// How firmly the cohort is known: `proven` / `decoded` / `registered` /
     /// `chain`. The whole point of separating this from the cohort is that a
     /// provably-unspendable script and a wallet somebody named are not the
     /// same kind of claim.
-    pub basis: String,
+    pub basis: &'a str,
 }
 
 /// Cohort totals at a point in the log, computed offline over the complete
@@ -189,6 +197,106 @@ pub struct Spine {
     pub rc_base: Vec<i64>,
     /// Lovelace reserve at each point.
     pub rc_quote: Vec<i64>,
+    /// How far the reserve curve may deviate from the true reserves, in basis
+    /// points. `0` means every observation is present and the curve is exact.
+    ///
+    /// **This is the one part of the spine that is not exact**, and it is
+    /// declared rather than assumed so a consumer can render the bound instead
+    /// of implying a precision it does not have. Cohort checkpoints remain
+    /// exact at any stride; only the curve is reduced.
+    ///
+    /// The reduction drops a point when neither the pool's price nor either of
+    /// its reserves has moved by more than this since the last point KEPT FOR
+    /// THAT POOL — so the guarantee is per-pool and holds at every slot, not
+    /// just at retained points. First and last points of each pool are always
+    /// kept, so a pool's birth and its tip are exact regardless.
+    pub rc_eps_bps: u32,
+}
+
+/// Which reserve points to keep, so the curve stays within `eps_bps` of truth.
+///
+/// Returns indices into the input columns, ascending. `eps_bps == 0` keeps
+/// everything, which is the exact curve.
+///
+/// ## Why this exists
+///
+/// The reserve curve is the spine's size floor — checkpoints compress, the
+/// curve does not. Measured on WRT (1,174,382 transactions): raising the
+/// checkpoint stride from 64 to 16,384 moved the spine only 957 KB → 634 KB
+/// gzipped, because 51,318 reserve points dominate everything else. Reducing
+/// *by time* would misrepresent a quiet pool that then moves sharply; reducing
+/// by **price-change magnitude** keeps exactly the points that carry
+/// information.
+///
+/// ## The comparison is per pool, and against the last KEPT point
+///
+/// Both matter. Per pool, because [`projections::reserves_at`] reconstructs
+/// each pool's latest state and sums them — a global rule would drop a point
+/// that is the only record of some pool's state. Against the last kept point
+/// rather than the previous input point, because otherwise a long run of
+/// sub-threshold moves in the same direction accumulates without bound.
+pub fn reduce_curve(pool: &[u16], base: &[i64], quote: &[i64], eps_bps: u32) -> Vec<usize> {
+    let n = pool.len();
+    if eps_bps == 0 {
+        return (0..n).collect();
+    }
+    // Last point kept for each pool, so the error is measured against what a
+    // consumer will actually reconstruct.
+    let mut last_kept: std::collections::HashMap<u16, (i64, i64)> =
+        std::collections::HashMap::new();
+    // The final point of each pool is always kept — a pool's tip must be exact,
+    // and `stats` reads it directly.
+    let mut final_ix: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    for (i, p) in pool.iter().enumerate() {
+        final_ix.insert(*p, i);
+    }
+
+    let moved = |prev: i64, now: i64| -> bool {
+        if prev == now {
+            return false;
+        }
+        // A reserve arriving at or leaving zero is always material: it is a
+        // pool being created or drained, and a relative test cannot see it.
+        if prev == 0 || now == 0 {
+            return true;
+        }
+        let delta = (now - prev).unsigned_abs() as u128;
+        delta * 10_000 > prev.unsigned_abs() as u128 * eps_bps as u128
+    };
+
+    let mut keep = Vec::with_capacity(n / 4);
+    for i in 0..n {
+        let p = pool[i];
+        let (b, q) = (base[i], quote[i]);
+        let material = match last_kept.get(&p) {
+            // First sighting of a pool is always kept.
+            None => true,
+            Some(&(pb, pq)) => {
+                // Depth on either side, and price. Price is checked separately
+                // because both reserves can drift together — a proportional
+                // liquidity add moves depth without moving price at all, and a
+                // swap moves price while depth barely changes.
+                moved(pb, b) || moved(pq, q) || price_moved(pb, pq, b, q, eps_bps)
+            }
+        };
+        if material || final_ix.get(&p) == Some(&i) {
+            keep.push(i);
+            last_kept.insert(p, (b, q));
+        }
+    }
+    keep
+}
+
+/// Has `quote/base` moved by more than `eps_bps`? Compared as a cross-product
+/// so there is no division and no float.
+fn price_moved(pb: i64, pq: i64, b: i64, q: i64, eps_bps: u32) -> bool {
+    if pb <= 0 || b <= 0 {
+        return pb != b;
+    }
+    // prev = pq/pb, now = q/b. |now - prev| / prev  ==  |q*pb - pq*b| / (pq*b).
+    let lhs = (q as i128 * pb as i128 - pq as i128 * b as i128).unsigned_abs();
+    let rhs = (pq as i128).unsigned_abs() * b as u128;
+    lhs * 10_000 > rhs * eps_bps as u128
 }
 
 impl Spine {
@@ -238,10 +346,33 @@ impl Spine {
 }
 
 /// Movement columns plus the dictionaries they index into.
+///
+/// ## Parties are split hot from cold
+///
+/// A party used to be a [`PartyMeta`] record carrying its address. Measured on
+/// WRT (173,388 parties): that dictionary was **28,696,700 bytes — 61.8% of
+/// the whole detail artifact**, against 17,768,400 bytes of movement columns.
+/// The columns were never the problem; at 11.0 bytes per movement they are
+/// already lean. The *identifiers* were, exactly as with [`TxIds`], where
+/// hashes turned out to be 57% of a file everyone assumed was rows.
+///
+/// So what a scrub needs stays and what it does not leaves. Attributing a
+/// movement to a cohort needs `party_cohort` and `party_basis` — a few bytes
+/// each. Rendering an address needs 103 characters, and only when somebody
+/// drills into one wallet. The addresses live in [`PartyIds`], loaded on click.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Detail {
     pub version: u8,
-    pub parties: Vec<PartyMeta>,
+    /// Basis names, interned — `proven` / `decoded` / `registered` / `chain`.
+    /// Four distinct strings across every party, so storing the string per
+    /// party cost more than the cohort it qualifies.
+    pub bases: Vec<String>,
+    /// Cohort per party ordinal — index into [`Spine::cohorts`].
+    pub party_cohort: Vec<u16>,
+    /// Basis per party ordinal — index into `bases`. Kept beside the cohort
+    /// rather than folded into it: a provably-unspendable script and a wallet
+    /// somebody merely named are the same cohort and very different claims.
+    pub party_basis: Vec<u16>,
     /// Slot per transaction ordinal, delta-encoded.
     pub tx_slots: Vec<u64>,
     /// Net mint per transaction ordinal (0 / +mint / −burn).
@@ -254,6 +385,55 @@ pub struct Detail {
     /// cannot be derived from a multi-party transaction without a heuristic,
     /// and the obvious one is wrong exactly where the interesting activity is.
     pub mv_amount: Vec<i64>,
+}
+
+/// Party addresses, indexed by ordinal — the other click-through tier.
+///
+/// Parallel to [`Detail::party_cohort`]: party `i` in one is party `i` in the
+/// other. They are separate files and nothing but that convention binds them,
+/// so a consumer holding both must check the lengths agree — see
+/// [`PartyIds::agrees_with`].
+///
+/// Held apart from [`Detail`] for the same measured reason as [`TxIds`]: on
+/// WRT this is 28.7 MB against 17.8 MB of movement columns, and a time-scrub
+/// never renders an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartyIds {
+    pub version: u8,
+    /// Bech32 payment address per party ordinal.
+    pub addresses: Vec<String>,
+    /// Bech32 stake address, where the payment address has a delegation part.
+    pub stakes: Vec<Option<String>>,
+}
+
+impl PartyIds {
+    pub fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+
+    /// Do these addresses belong to that detail page?
+    ///
+    /// The check a consumer cannot skip: mismatched files index-shift every
+    /// address onto the wrong party, which renders perfectly and is entirely
+    /// wrong.
+    pub fn agrees_with(&self, detail: &Detail) -> bool {
+        self.addresses.len() == detail.party_count() && self.stakes.len() == detail.party_count()
+    }
+
+    /// Assemble one party across the two tiers. `None` if the ordinal is out of
+    /// range in either, which is the case a length check would have caught.
+    pub fn party<'a>(&'a self, detail: &'a Detail, ix: usize) -> Option<Party<'a>> {
+        Some(Party {
+            address: self.addresses.get(ix)?,
+            stake: self.stakes.get(ix)?.as_deref(),
+            cohort: *detail.party_cohort.get(ix)?,
+            basis: detail.bases.get(*detail.party_basis.get(ix)? as usize)?,
+        })
+    }
 }
 
 /// Transaction hashes, indexed by ordinal — the click-through tier.
@@ -279,6 +459,49 @@ impl Detail {
         self.tx_slots.len()
     }
 
+    pub fn party_count(&self) -> usize {
+        self.party_cohort.len()
+    }
+
+    /// How many distinct cohorts the parties actually span.
+    pub fn cohort_span(&self) -> usize {
+        let mut seen: Vec<u16> = self.party_cohort.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
+    }
+
+    /// What an inline per-movement cohort byte would cost.
+    ///
+    /// The alternative to a global `party -> cohort` table. Inline, a chunk
+    /// answers "which cohort did this movement touch" without reading anything
+    /// outside itself, which is the property chunking needs — a self-contained
+    /// chunk has no cross-file dependency to get wrong.
+    ///
+    /// Cheap because a cohort is one of a handful of values, so the column is
+    /// long runs of the same byte and compresses to near nothing.
+    pub fn inline_cohort_bytes(&self) -> usize {
+        let col: Vec<u8> = self
+            .mv_party
+            .iter()
+            .map(|p| self.party_cohort[*p as usize] as u8)
+            .collect();
+        postcard::to_allocvec(&col).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Encoded size of the party attribute columns (`bases`, `party_cohort`,
+    /// `party_basis`) alone.
+    ///
+    /// These are global — every movement in the log indexes into them — so if
+    /// the movement columns are ever chunked, this is the cost that would be
+    /// duplicated into each chunk. That makes it the number that decides
+    /// whether chunking needs a further tier split or can be done in place.
+    pub fn party_attr_bytes(&self) -> usize {
+        postcard::to_allocvec(&(&self.bases, &self.party_cohort, &self.party_basis))
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
     pub fn validate(&self) -> Result<(), WireError> {
         let txs = self.tx_slots.len();
         if self.tx_net_mint.len() != txs {
@@ -295,12 +518,22 @@ impl Detail {
                 "movement names an unknown transaction",
             ));
         }
+        if self.party_basis.len() != self.party_cohort.len() {
+            return Err(WireError::Inconsistent("party columns differ in length"));
+        }
         if self
             .mv_party
             .iter()
-            .any(|p| *p as usize >= self.parties.len())
+            .any(|p| *p as usize >= self.party_count())
         {
             return Err(WireError::Inconsistent("movement names an unknown party"));
+        }
+        if self
+            .party_basis
+            .iter()
+            .any(|b| *b as usize >= self.bases.len())
+        {
+            return Err(WireError::Inconsistent("party names an unknown basis"));
         }
         Ok(())
     }
@@ -381,6 +614,232 @@ pub fn decode_tx_ids(bytes: &[u8]) -> Result<TxIds, WireError> {
     postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)
 }
 
+pub fn encode_party_ids(ids: &PartyIds) -> Result<Vec<u8>, WireError> {
+    if ids.addresses.len() != ids.stakes.len() {
+        return Err(WireError::Inconsistent("party id columns differ in length"));
+    }
+    postcard::to_stdvec(ids).map_err(|_| WireError::Malformed)
+}
+
+pub fn decode_party_ids(bytes: &[u8]) -> Result<PartyIds, WireError> {
+    check_version(bytes)?;
+    let ids: PartyIds = postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)?;
+    if ids.addresses.len() != ids.stakes.len() {
+        return Err(WireError::Inconsistent("party id columns differ in length"));
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod party_tier_tests {
+    use super::*;
+
+    fn detail() -> Detail {
+        Detail {
+            version: WIRE_VERSION,
+            bases: vec!["chain".into(), "proven".into()],
+            party_cohort: vec![0, 1, 0],
+            party_basis: vec![0, 1, 0],
+            tx_slots: delta_encode(&[100]),
+            tx_net_mint: vec![10],
+            mv_tx: vec![0],
+            mv_party: vec![2],
+            mv_amount: vec![10],
+        }
+    }
+
+    fn ids() -> PartyIds {
+        PartyIds {
+            version: WIRE_VERSION,
+            addresses: vec!["addr_a".into(), "addr_b".into(), "addr_c".into()],
+            stakes: vec![Some("stake_a".into()), None, None],
+        }
+    }
+
+    #[test]
+    fn the_two_tiers_reassemble_one_party() {
+        let (d, i) = (detail(), ids());
+        let p = i.party(&d, 1).expect("party 1");
+        assert_eq!(p.address, "addr_b");
+        assert_eq!(p.stake, None);
+        assert_eq!(p.cohort, 1);
+        assert_eq!(p.basis, "proven");
+    }
+
+    #[test]
+    fn a_short_party_file_is_caught_rather_than_shifting_every_address() {
+        // The failure this check exists for: drop one address and every party
+        // after it silently wears its neighbour's identity. Nothing errors,
+        // nothing looks wrong, and every attribution past that point is a lie.
+        let d = detail();
+        let mut i = ids();
+        assert!(i.agrees_with(&d));
+        i.addresses.pop();
+        i.stakes.pop();
+        assert!(!i.agrees_with(&d));
+    }
+
+    #[test]
+    fn party_ids_round_trip_separately_from_detail() {
+        let bytes = encode_party_ids(&ids()).expect("encode");
+        assert_eq!(decode_party_ids(&bytes).expect("decode"), ids());
+    }
+
+    #[test]
+    fn mismatched_party_id_columns_are_rejected() {
+        let mut i = ids();
+        i.stakes.pop();
+        assert!(encode_party_ids(&i).is_err());
+    }
+
+    #[test]
+    fn a_basis_index_outside_the_dictionary_is_rejected() {
+        let mut d = detail();
+        d.party_basis[0] = 9;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn the_hot_tier_carries_no_addresses() {
+        // The whole point of the split, asserted so it cannot regress: on WRT
+        // the addresses were 28.7 MB against 17.8 MB of movement columns, and
+        // a time-scrub never renders one.
+        let encoded = encode_detail(&detail()).expect("encode");
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(
+            !text.contains("addr_"),
+            "detail must not carry addresses — they belong in PartyIds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod curve_reduction_tests {
+    use super::*;
+
+    /// Replay a reduced curve the way `reserves_at` does — each pool's latest
+    /// kept state — and report the worst relative price error against truth at
+    /// every input index.
+    fn worst_price_error(pool: &[u16], base: &[i64], quote: &[i64], eps: u32) -> f64 {
+        let keep = reduce_curve(pool, base, quote, eps);
+        let kept: std::collections::HashSet<usize> = keep.iter().copied().collect();
+        let mut latest: std::collections::HashMap<u16, (i64, i64)> =
+            std::collections::HashMap::new();
+        let mut worst = 0.0f64;
+        for i in 0..pool.len() {
+            if kept.contains(&i) {
+                latest.insert(pool[i], (base[i], quote[i]));
+            }
+            let (rb, rq) = latest[&pool[i]];
+            let seen = rq as f64 / rb as f64;
+            let truth = quote[i] as f64 / base[i] as f64;
+            worst = worst.max((seen - truth).abs() / truth);
+        }
+        worst
+    }
+
+    #[test]
+    fn zero_epsilon_keeps_every_point() {
+        let pool = vec![0u16; 5];
+        let base = vec![100, 101, 102, 103, 104];
+        let quote = vec![100, 100, 100, 100, 100];
+        assert_eq!(reduce_curve(&pool, &base, &quote, 0), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_flat_pool_collapses_to_its_endpoints() {
+        // 200 identical observations carry one bit of information.
+        let pool = vec![0u16; 200];
+        let base = vec![1_000_000i64; 200];
+        let quote = vec![2_000_000i64; 200];
+        let keep = reduce_curve(&pool, &base, &quote, 10);
+        assert_eq!(keep, vec![0, 199], "first and last only");
+    }
+
+    #[test]
+    fn the_error_never_exceeds_the_declared_bound() {
+        // The guarantee the artifact advertises. A drifting pool is the hard
+        // case: each step is sub-threshold, so a naive "compare to previous
+        // input" rule would let the error accumulate without limit.
+        let n = 500;
+        let pool = vec![0u16; n];
+        let base: Vec<i64> = (0..n).map(|_| 1_000_000i64).collect();
+        let quote: Vec<i64> = (0..n).map(|i| 1_000_000 + i as i64 * 400).collect();
+        for eps in [10u32, 50, 200] {
+            let worst = worst_price_error(&pool, &base, &quote, eps);
+            let bound = eps as f64 / 10_000.0;
+            assert!(
+                worst <= bound * 1.0001,
+                "eps {eps}: worst {worst} exceeded bound {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn drift_accumulating_below_the_threshold_is_still_caught() {
+        // 0.05% per step, 500 steps — 22% total. Comparing against the last
+        // KEPT point catches it; comparing against the previous input would
+        // keep only the endpoints and be 22% wrong in between.
+        let n = 500;
+        let pool = vec![0u16; n];
+        let base = vec![1_000_000i64; n];
+        let quote: Vec<i64> = (0..n).map(|i| 1_000_000 + i as i64 * 500).collect();
+        let keep = reduce_curve(&pool, &base, &quote, 100);
+        assert!(
+            keep.len() > 10,
+            "sub-threshold drift must still be sampled, kept {}",
+            keep.len()
+        );
+        assert!(worst_price_error(&pool, &base, &quote, 100) <= 0.0101);
+    }
+
+    #[test]
+    fn each_pool_is_reduced_against_its_own_history() {
+        // Interleaved pools. A global rule would compare pool 1's reserves
+        // against pool 0's and drop points that are the only record of a
+        // pool's state.
+        let pool = vec![0u16, 1, 0, 1, 0, 1];
+        let base = vec![100, 5_000_000, 100, 5_000_000, 100, 5_000_000];
+        let quote = vec![100, 9_000_000, 100, 9_000_000, 100, 9_000_000];
+        let keep = reduce_curve(&pool, &base, &quote, 10);
+        // Both pools are flat, so each keeps only its first and last.
+        assert_eq!(keep, vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn a_pool_draining_to_zero_is_always_kept() {
+        // A relative test cannot see a move to zero, and a drained pool is
+        // exactly the event a liquidity view exists to show.
+        let pool = vec![0u16, 0, 0, 0];
+        let base = vec![1_000_000, 1_000_000, 0, 0];
+        let quote = vec![2_000_000, 2_000_000, 0, 0];
+        let keep = reduce_curve(&pool, &base, &quote, 10);
+        assert!(keep.contains(&2), "the drain must survive reduction");
+    }
+
+    #[test]
+    fn a_proportional_liquidity_add_moves_depth_without_moving_price() {
+        // Both reserves double: price is unchanged, but depth is not, and the
+        // realisable band reads depth. Checking price alone would drop this.
+        let pool = vec![0u16, 0, 0];
+        let base = vec![1_000_000, 2_000_000, 2_000_000];
+        let quote = vec![2_000_000, 4_000_000, 4_000_000];
+        let keep = reduce_curve(&pool, &base, &quote, 10);
+        assert!(keep.contains(&1), "a depth change must survive reduction");
+    }
+
+    #[test]
+    fn a_pools_tip_is_exact_however_hard_the_curve_is_reduced() {
+        // `stats` reads the last point per pool directly, so reduction must
+        // never move it.
+        let pool = vec![0u16, 0, 0, 0];
+        let base = vec![1_000_000, 1_000_001, 1_000_002, 999_999];
+        let quote = vec![2_000_000, 2_000_001, 2_000_002, 1_999_998];
+        let keep = reduce_curve(&pool, &base, &quote, 10_000);
+        assert_eq!(*keep.last().unwrap(), 3);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,18 +874,18 @@ mod tests {
             rc_pool: vec![0, 0],
             rc_base: vec![10, 12],
             rc_quote: vec![100, 90],
+            // Exact — a fixture should not carry an error bound it does not
+            // need, or a test asserting reserves could pass on a reduced curve.
+            rc_eps_bps: 0,
         }
     }
 
     fn detail() -> Detail {
         Detail {
             version: WIRE_VERSION,
-            parties: vec![PartyMeta {
-                address: "addr1...".into(),
-                stake: None,
-                cohort: 1,
-                basis: "chain".into(),
-            }],
+            bases: vec!["chain".into()],
+            party_cohort: vec![1],
+            party_basis: vec![0],
             tx_slots: delta_encode(&[100, 300]),
             tx_net_mint: vec![1000, 0],
             mv_tx: vec![0, 1],
