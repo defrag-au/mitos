@@ -6095,9 +6095,18 @@ dependencies = [
  "pallas-traverse 1.1.1",
  "rusqlite",
  "serde",
+ "token-ledger-wire",
  "toml 0.8.20",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "token-ledger-wire"
+version = "0.0.1"
+dependencies = [
+ "postcard",
+ "serde",
 ]
 
 [[package]]

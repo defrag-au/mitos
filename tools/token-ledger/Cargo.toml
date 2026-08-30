@@ -24,6 +24,10 @@ mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
 # seam as the DEX crate.
 mitos-vesting-decode = { path = "../../crates/mitos-vesting-decode" }
 
+# The artifacts `export` writes — shared with the egui WASM frontend that
+# loads them, so the format lives in a crate rather than in this tool.
+token-ledger-wire = { path = "../../crates/token-ledger-wire" }
+
 # The ledger. Full fidelity on the walk box; the export is what gets optimised.
 rusqlite = { workspace = true }
 

@@ -21,6 +21,7 @@ members = [
     "crates/mitos-vesting-decode",
     "crates/mitos-marketplace-decode",
     "crates/market-ledger-wire",
+    "crates/token-ledger-wire",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",

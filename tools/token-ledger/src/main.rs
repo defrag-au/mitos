@@ -17,6 +17,7 @@
 
 mod buffer;
 mod cohort;
+mod export;
 mod pools;
 mod registry;
 mod store;
@@ -49,6 +50,8 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         top: usize,
     },
+    /// Write the spine + detail artifacts a frontend loads.
+    Export(export::ExportArgs),
     /// Interrogate the unclassified band — do these contracts look like locks?
     Probe {
         #[arg(long)]
@@ -73,6 +76,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Walk(args) => walk::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
+        Command::Export(args) => export::run(args),
         Command::Probe { db } => walk::probe(&db),
         Command::Classify { db, tokens } => walk::classify(&db, &tokens),
     }

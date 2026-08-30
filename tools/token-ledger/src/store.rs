@@ -68,6 +68,35 @@ pub struct UnnamedOutput {
     pub datum_hash: Option<Vec<u8>>,
 }
 
+/// One transaction, as `export` reads it back out.
+pub struct TxRecord {
+    pub tx_ord: i64,
+    pub tx_hash: Vec<u8>,
+    pub slot: u64,
+    pub net_mint: i64,
+}
+
+/// One party, as `export` reads it back out.
+pub struct PartyRecord {
+    pub party_id: i64,
+    pub address: String,
+    pub stake: Option<String>,
+    pub cohort: Option<String>,
+    pub basis: Option<String>,
+}
+
+/// One point on the reserve curve, joined to its pool.
+pub struct CurvePoint {
+    pub tx_ord: i64,
+    pub dex: String,
+    pub key_policy: Vec<u8>,
+    pub key_name: Vec<u8>,
+    pub key_basis: String,
+    pub fee_bps: Option<i64>,
+    pub base_reserve: i64,
+    pub quote_reserve: i64,
+}
+
 /// One live lock position.
 pub struct LockPosition {
     pub qty: i64,
@@ -626,6 +655,77 @@ impl Ledger {
             positions,
             tip_time: tip.map(|t| t as u64),
         })
+    }
+
+    /// Every transaction in chain order.
+    pub fn all_txs(&self) -> Result<Vec<TxRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tx_ord, tx_hash, slot, net_mint FROM tx ORDER BY tx_ord")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TxRecord {
+                tx_ord: r.get(0)?,
+                tx_hash: r.get(1)?,
+                slot: r.get::<_, i64>(2)? as u64,
+                net_mint: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every movement in chain order: `(tx_ord, party_id, amount)`.
+    pub fn all_movements(&self) -> Result<Vec<(i64, i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tx_ord, party_id, amount FROM delta ORDER BY tx_ord, party_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every party in `party_id` order.
+    pub fn all_parties(&self) -> Result<Vec<PartyRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT party_id, address, stake, cohort, basis FROM party ORDER BY party_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PartyRecord {
+                party_id: r.get(0)?,
+                address: r.get(1)?,
+                stake: r.get(2)?,
+                cohort: r.get(3)?,
+                basis: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The whole reserve curve in chain order.
+    pub fn reserve_curve(&self) -> Result<Vec<CurvePoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.tx_ord, p.dex, p.key_policy, p.key_name, p.key_basis,
+                    s.fee_bps, s.base_reserve, s.quote_reserve
+             FROM pool_state s JOIN pool p USING (pool_id)
+             ORDER BY s.tx_ord, p.pool_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CurvePoint {
+                tx_ord: r.get(0)?,
+                dex: r.get(1)?,
+                key_policy: r.get(2)?,
+                key_name: r.get(3)?,
+                key_basis: r.get(4)?,
+                fee_bps: r.get(5)?,
+                base_reserve: r.get(6)?,
+                quote_reserve: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Where supply went in the transactions that minted it.

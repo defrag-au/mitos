@@ -87,6 +87,11 @@ pub struct TokenEntry {
     /// empty-name assets, so it is required rather than optional — an omitted
     /// name and an empty name are different assets.
     pub asset_name: String,
+    /// Display decimals. Identity is the hex asset name; this is presentation
+    /// only, and the token registry — not the chain — is authoritative for it.
+    /// Defaults to 0, which is right for every token here so far.
+    #[serde(default)]
+    pub decimals: u8,
     /// Slot of the policy's FIRST mint. The walk's floor.
     ///
     /// This is not an optimisation with a correctness cost, which is the usual

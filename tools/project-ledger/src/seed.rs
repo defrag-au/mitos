@@ -214,12 +214,33 @@ pub fn run(args: SeedArgs) -> Result<()> {
         if w.is_project_side() {
             project_side += ledger.set_project_side(&w.stake, &w.source)?;
         }
+        ledger.set_declared_identity(&w.stake, &w.role_key(), w.function_key().as_deref())?;
         if let Some(r) = w.unknown_role() {
             tracing::warn!(
                 stake = %w.stake, role = %r,
                 "seed: unrecognised wallet role — treated as OUTSIDE the project boundary, \
-                 so its receipts will not close a deployment. Use one of: treasury, mint, \
-                 holding, vault, ops, project"
+                 so its receipts will not close a deployment. Project-side: treasury, mint, \
+                 holding, vault, ops, project. Outside: founder, contractor, external, \
+                 customer, partner"
+            );
+        }
+        if let Some(s) = w.unknown_side() {
+            tracing::warn!(
+                stake = %w.stake, side = %s, role = %w.role,
+                "seed: unrecognised `side` — IGNORED, and the role's default stands. \
+                 The boundary you tried to state was NOT applied. Use \"project\" or \
+                 \"external\""
+            );
+        }
+        // An explicit override moves a party across the boundary against the
+        // default its role implies. On a `founder` that is the single change
+        // most able to hide an extraction, so it is never applied quietly.
+        if w.side_is_explicit() {
+            tracing::info!(
+                stake = %w.stake, role = %w.role,
+                project_side = w.is_project_side(),
+                source = %w.source,
+                "seed: boundary STATED explicitly, overriding the role default"
             );
         }
     }
@@ -244,6 +265,18 @@ pub fn run(args: SeedArgs) -> Result<()> {
     // elsewhere.
     for t in &registry.terminal.parties {
         ledger.label_party(&t.stake, &t.label, &t.source)?;
+        // Identity is independent of expansion: a terminal party can be a
+        // named founder and still never recruit. See `TerminalParty::role`.
+        if let Some(r) = t.role_key() {
+            ledger.set_declared_identity(&t.stake, &r, t.function_key().as_deref())?;
+        }
+        if let Some(r) = t.unknown_role() {
+            tracing::warn!(
+                stake = %t.stake, role = %r,
+                "seed: unrecognised terminal role — the party is still seated terminal, \
+                 but it will not group under any identity in reports"
+            );
+        }
     }
     ledger.meta_set(META_POLICY, &policy.id)?;
     ledger.meta_set(META_POLICY_LABEL, &policy.label)?;
