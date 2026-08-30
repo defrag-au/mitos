@@ -12,3 +12,9 @@ disallowed_methods = "deny"
 [dependencies]
 pallas-codec.workspace = true
 pallas-primitives.workspace = true
+
+# Dev-only, deliberately. The crate's value is that a wasm community module
+# depending on it pulls in nothing transitive beyond pallas, so `hex` is
+# confined to the golden tests that carry real on-chain datums.
+[dev-dependencies]
+hex.workspace = true

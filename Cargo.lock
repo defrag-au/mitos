@@ -3646,6 +3646,7 @@ dependencies = [
 name = "mitos-dex-decode"
 version = "0.0.1"
 dependencies = [
+ "hex",
  "pallas-codec 1.1.1",
  "pallas-primitives 1.1.1",
 ]

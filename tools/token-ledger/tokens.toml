@@ -45,6 +45,12 @@ asset_name = "416c69656e73"            # "Aliens"
 floor_slot = 179_562_649               # minted 2026-02-15; immutable file 8313
 
 [[token]]
+name = "dong"
+policy = "141eea77e407aa35eec384dd6d863ca44aa338273222403c8f5549d9"
+asset_name = "446f6e67"                # "Dong"
+floor_slot = 133_983_726               # minted 2024-09-05; immutable file 6202
+
+[[token]]
 name = "perp"
 policy = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64"
 asset_name = "5045525020434f494e"      # "PERP COIN"

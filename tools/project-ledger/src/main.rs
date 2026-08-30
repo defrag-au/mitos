@@ -16,6 +16,7 @@ mod activity;
 mod alias;
 mod asset_class;
 mod classify;
+mod deep_dive;
 mod distributions;
 mod enrich;
 mod koios;

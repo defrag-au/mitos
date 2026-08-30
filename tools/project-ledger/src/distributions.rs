@@ -72,6 +72,15 @@ pub struct DistributionsArgs {
     /// How many legs to print per section.
     #[arg(long, default_value_t = 20)]
     pub report: usize,
+
+    /// Also write the project deep dive as a JSON fragment for a notebook.
+    ///
+    /// The publication surface. Self-describing — it carries the base, the
+    /// commitments, per-transaction evidence with explorer links, and the
+    /// caveats generated from this ledger's actual state — so a chart cannot
+    /// be built from it without the qualifications being available too.
+    #[arg(long)]
+    pub export: Option<PathBuf>,
 }
 
 /// Holder-facing CIP-67 classes — what a person can own. A CIP-68 collection
@@ -129,6 +138,31 @@ pub fn run(args: &DistributionsArgs) -> Result<()> {
 
     ledger.replace_distributions(&base, &legs, &evidence)?;
     report(&base, &legs, &circular_txs, args);
+
+    if let Some(path) = &args.export {
+        // Built AFTER the write, so the fragment is generated from what is
+        // actually in the ledger rather than from what we were about to put
+        // there. The two should agree; only one of them is what a reader can
+        // later re-derive.
+        let dive = crate::deep_dive::build(&ledger, &base, &legs)?;
+        crate::deep_dive::write(&dive, path)?;
+        let blocking = dive
+            .caveats
+            .iter()
+            .filter(|c| c.severity == "blocking")
+            .count();
+        tracing::info!(
+            path = %path.display(),
+            schema = crate::deep_dive::SCHEMA_VERSION,
+            legs = dive.distributions.len(),
+            caveats = dive.caveats.len(),
+            blocking,
+            "distributions: deep dive written"
+        );
+        for c in dive.caveats.iter().filter(|c| c.severity == "blocking") {
+            tracing::warn!(id = c.id, "deep dive: BLOCKING caveat — {}", c.text);
+        }
+    }
     Ok(())
 }
 
@@ -305,6 +339,72 @@ fn compute_legs(
                     unit: "lovelace".into(),
                     tx_hash: tx,
                     quantity: q,
+                    consideration: 0,
+                    slot: slot.max(0) as u64,
+                });
+            }
+        }
+
+        // ── Settlement TOKENS received from inside the boundary ────────────
+        //
+        // ADA is not the only money. A project pays in USDM, off-ramps through
+        // a stable, and settles in DJED — Mekka's own frontier moves 1.8M USDM
+        // across 25 parties — and a lovelace-only view reports every one of
+        // those payments as nothing at all.
+        //
+        // `unit_flow`, not `value_event`: the latter IS lovelace, by column
+        // type. What counts as money is delegated to
+        // `chain_ledger::tokens::is_settlement_unit`, the same sourced list
+        // `provenance` uses, so a token counts because we can say why rather
+        // than because it looked fungible.
+        //
+        // One leg PER UNIT, and no share is computed: converting USDM to ADA
+        // needs a rate the chain never quoted.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT unit, tx_hash, SUM(quantity), MIN(slot)
+             FROM unit_flow
+             WHERE counterparty = ?1 AND quantity > 0 AND unit != 'lovelace'
+               AND party IN ({ps})
+             GROUP BY unit, tx_hash"
+        ))?;
+        let token_rows: Vec<(String, String, i64, i64)> = stmt
+            .query_map([&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut by_unit: BTreeMap<String, Vec<(String, i64, i64)>> = BTreeMap::new();
+        for (unit, tx, qty, slot) in token_rows {
+            if !chain_ledger::tokens::is_settlement_unit(&unit) {
+                continue;
+            }
+            by_unit.entry(unit).or_default().push((tx, qty, slot));
+        }
+        for (unit, rows) in by_unit {
+            let total: i128 = rows.iter().map(|(_, q, _)| i128::from(*q)).sum();
+            legs.push(DistributionLegRow {
+                party: key.clone(),
+                role: role.clone(),
+                function: function.clone(),
+                unit: unit.clone(),
+                quantity: total.min(i128::from(i64::MAX)) as i64,
+                legs: rows.len() as u64,
+                unpaid_units: 0,
+                first_slot: rows
+                    .iter()
+                    .map(|(_, _, s)| *s)
+                    .min()
+                    .map(|s| s.max(0) as u64),
+                last_slot: rows
+                    .iter()
+                    .map(|(_, _, s)| *s)
+                    .max()
+                    .map(|s| s.max(0) as u64),
+                basis: "observed".into(),
+            });
+            for (tx, qty, slot) in rows {
+                evidence.push(DistributionEvidenceRow {
+                    party: key.clone(),
+                    unit: unit.clone(),
+                    tx_hash: tx,
+                    quantity: qty,
                     consideration: 0,
                     slot: slot.max(0) as u64,
                 });

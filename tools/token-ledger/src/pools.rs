@@ -1,21 +1,34 @@
 //! Pool recognition — the reserve curve's input.
 //!
 //! A pool output is recognised structurally: the watched asset sits at a known
-//! DEX pool script address. Both DEXes decoded here put *every* pool at one
-//! canonical address (CSwap's 82 pools share
-//! `cswap::POOL_SCRIPT_ADDR`; Splash V3 likewise), so recognition is an exact
-//! string match and costs nothing.
+//! DEX pool script. CSwap, Splash V3 and WingRiders V2 each put every pool at
+//! one canonical address, so those are exact string matches. Minswap derives a
+//! stake part per pool, so it is matched on the **payment credential** — a
+//! full-address set would need an entry per pool and miss every new one.
 //!
-//! ## Reserves come from the UTxO value here, and that does not generalise
+//! ## Reserves are sourced per DEX, and the difference is enormous
 //!
-//! For CSwap and Splash the pool UTxO holds reserves and nothing else, so the
-//! lovelace it carries *is* the quote reserve and the watched-asset quantity
-//! *is* the base reserve. **Minswap V2 carries `reserveA`/`reserveB` in its
-//! datum and holds accumulated fees and treasury in the same UTxO; WingRiders
-//! needs value minus treasury.** Reading value alone for those would overstate
-//! the reserve, silently and in the pool's favour. When a decoder for them
-//! lands, the reserve source becomes per-DEX — hence [`ReserveSource`], so the
-//! assumption is recorded per row rather than remembered.
+//! There is no single right answer, which is why [`ReserveSource`] is recorded
+//! on every row rather than assumed:
+//!
+//! | DEX | reserve is | why |
+//! |---|---|---|
+//! | CSwap, Splash | the UTxO value | the pool holds nothing else |
+//! | Minswap V2 | the datum's `reserveA`/`reserveB` | the UTxO also holds an ADA deposit, accrued fees, its NFT and unissued LP |
+//! | WingRiders V2 | value **minus** the declared treasuries | it publishes what it owes, not what it holds |
+//!
+//! Measured on chain 2026-08-30, reading value where the datum was
+//! authoritative overstated one Minswap pool's token side **314 million-fold**
+//! and one WingRiders pool's **156,000-fold**. A dead pool reads as deep
+//! liquidity and nothing errors.
+//!
+//! ## Not every pool can price the token
+//!
+//! Only an ADA-paired pool can. Of 15 live WingRiders V2 pools sampled, just 4
+//! were — the rest are token/token, whose lovelace is a min-UTxO carrier. Such
+//! a pool still holds real supply and still counts toward the `pool` cohort;
+//! it simply contributes nothing to the price. See
+//! [`PoolObservation::ada_paired`].
 //!
 //! ## Identity, and how firmly it is known
 //!
@@ -31,17 +44,30 @@ use mitos_chain_walk::decode::{Asset, DecodedOutput};
 use mitos_dex_decode::cswap;
 
 /// Where a row's reserves were read from.
+///
+/// Recorded per row rather than remembered, because the right answer differs
+/// per DEX and getting it wrong is silent and enormous — measured on chain:
+/// a Minswap V2 pool read from value overstated one side **314 million-fold**,
+/// and a WingRiders pool read from value overstated the other **156,000-fold**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReserveSource {
     /// The pool UTxO's own value. Correct only where the pool holds nothing
-    /// but reserves.
+    /// but reserves — CSwap and Splash.
     Value,
+    /// Published in the pool's own datum. Minswap V2, whose UTxO also carries
+    /// an ADA deposit, accrued fees, its NFT and unissued LP.
+    Datum,
+    /// The UTxO's value less the treasuries the datum declares. WingRiders,
+    /// which publishes what it owes rather than what it holds.
+    ValueMinusTreasury,
 }
 
 impl ReserveSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             ReserveSource::Value => "value",
+            ReserveSource::Datum => "datum",
+            ReserveSource::ValueMinusTreasury => "value-minus-treasury",
         }
     }
 }
@@ -124,15 +150,30 @@ pub fn recognise(
     watched_name: &[u8],
     witness_datum: Option<&[u8]>,
 ) -> Option<PoolObservation> {
+    let datum = out.inline_datum.as_deref().or(witness_datum);
+
+    // Minswap and WingRiders are matched on the PAYMENT credential — their
+    // stake part is contract-derived per pool, so a full-address set would
+    // need an entry each and miss every new one. CSwap and Splash genuinely
+    // are single addresses.
+    let cred = crate::cohort::payment_cred(&out.address);
+    if let Some(cred) = cred {
+        if mitos_dex_decode::minswap::is_minswap_v2(&cred) {
+            return minswap_v2(out, qty, datum);
+        }
+        if mitos_dex_decode::wingriders::is_wingriders_v2(&cred) {
+            return wingriders_v2(out, qty, datum, watched_policy, watched_name);
+        }
+        if mitos_dex_decode::splash::is_splash_pool(&cred) {
+            return splash(out, qty, datum);
+        }
+    }
+
     let dex = if out.address == cswap::POOL_SCRIPT_ADDR {
         "cswap"
-    } else if out.address == mitos_dex_decode::splash::POOL_SCRIPT_ADDR {
-        "splash"
     } else {
         return None;
     };
-
-    let datum = out.inline_datum.as_deref().or(witness_datum);
 
     // CSwap publishes its instance key, its fee and its LP supply. Take them.
     if dex == "cswap"
@@ -201,6 +242,129 @@ enum ValueKey<'a> {
     /// More than one candidate — reported rather than resolved by picking.
     Many,
     None,
+}
+
+/// Splash — reserves are the UTxO value; the datum names the pool.
+///
+/// Both known pool contracts decode the same way. The pool NFT is a genuine
+/// one-per-pool instance key, which upgrades Splash from the value-inferred
+/// `ambiguous` identity it had while only its address was known.
+fn splash(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<PoolObservation> {
+    let d = datum.and_then(mitos_dex_decode::splash::decode_pool_datum);
+    let (key_policy, key_name, key_basis, ada_paired) = match &d {
+        Some(p) => (
+            p.pool_nft.policy.clone(),
+            p.pool_nft.name.clone(),
+            KeyBasis::Datum,
+            p.is_ada_paired(),
+        ),
+        // A pool we recognise by credential but cannot read. Reserves are
+        // still the value — that part does not depend on the datum — so it is
+        // recorded rather than dropped, with its identity marked unknown.
+        None => (
+            Vec::new(),
+            Vec::new(),
+            KeyBasis::Unknown,
+            out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING,
+        ),
+    };
+    Some(PoolObservation {
+        dex: "splash",
+        address: out.address.clone(),
+        key_policy,
+        key_name,
+        key_basis,
+        ada_paired,
+        base_reserve: qty,
+        quote_reserve: out.lovelace as i64,
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: ReserveSource::Value,
+    })
+}
+
+/// Minswap V2 — reserves come from the datum, never the value.
+fn minswap_v2(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<PoolObservation> {
+    let d = datum.and_then(mitos_dex_decode::minswap::decode_v2_pool_datum)?;
+    // Without the datum there is nothing usable: the value would overstate
+    // reserves by the ADA deposit and every accrued fee, and on a dead pool by
+    // millions of times. Better to record no pool than a fictional one.
+    let (ada, token) = match d.ada_pair() {
+        Some(pair) => pair,
+        // Token/token: real supply, no ADA price. Reserves left at the
+        // watched-asset quantity so the supply still counts.
+        None => {
+            return Some(PoolObservation {
+                dex: "minswap-v2",
+                address: out.address.clone(),
+                key_policy: mitos_dex_decode::minswap::V2_AUTHEN_POLICY.to_vec(),
+                key_name: Vec::new(),
+                key_basis: KeyBasis::Datum,
+                ada_paired: false,
+                base_reserve: qty,
+                quote_reserve: 0,
+                fee_bps: Some(d.fee_a_bps as i64),
+                total_lp: Some(d.total_liquidity as i64),
+                reserve_source: ReserveSource::Datum,
+            });
+        }
+    };
+    Some(PoolObservation {
+        dex: "minswap-v2",
+        address: out.address.clone(),
+        // The authen policy is shared across every V2 pool, so the LP NAME is
+        // what distinguishes them. Left empty until the value-side lookup that
+        // recovers it lands; `key_basis` says the identity is partial.
+        key_policy: mitos_dex_decode::minswap::V2_AUTHEN_POLICY.to_vec(),
+        key_name: Vec::new(),
+        key_basis: KeyBasis::Ambiguous,
+        ada_paired: true,
+        base_reserve: i64::try_from(token).unwrap_or(i64::MAX),
+        quote_reserve: i64::try_from(ada).unwrap_or(i64::MAX),
+        fee_bps: Some(d.fee_a_bps as i64),
+        total_lp: Some(d.total_liquidity as i64),
+        reserve_source: ReserveSource::Datum,
+    })
+}
+
+/// WingRiders V2 — reserves are the value less the declared treasuries.
+fn wingriders_v2(
+    out: &DecodedOutput,
+    qty: i64,
+    datum: Option<&[u8]>,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Option<PoolObservation> {
+    let d = datum.and_then(mitos_dex_decode::wingriders::decode_v2_pool_datum)?;
+    let watched_is_a = d.asset_a_policy == watched_policy && d.asset_a_name == watched_name;
+    // The two sides' holdings: ADA from the output's lovelace, the watched
+    // token from the quantity the walk already extracted.
+    let (value_a, value_b) = if watched_is_a {
+        (qty as u64, out.lovelace)
+    } else {
+        (out.lovelace, qty as u64)
+    };
+    let ada_pair = d.ada_pair(value_a, value_b);
+    let (base, quote, ada_paired) = match ada_pair {
+        Some((ada, token)) => (token, ada, true),
+        None => (qty as u64, 0, false),
+    };
+    Some(PoolObservation {
+        dex: "wingriders-v2",
+        address: out.address.clone(),
+        key_policy: mitos_dex_decode::wingriders::V2_LP_POLICY.to_vec(),
+        key_name: Vec::new(),
+        key_basis: KeyBasis::Ambiguous,
+        ada_paired,
+        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
+        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        // WingRiders' fee is a numerator over the denominator at field 9;
+        // not surfaced by the decoder yet, so reported as unknown rather than
+        // guessed — an assumed fee makes the realisable figure quietly wrong.
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: ReserveSource::ValueMinusTreasury,
+    })
 }
 
 /// The single non-ADA, non-watched asset in a pool's value.
