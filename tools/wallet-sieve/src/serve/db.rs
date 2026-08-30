@@ -149,6 +149,23 @@ fn migrate(conn: &Connection) -> Result<()> {
         // measured row counts, so a rotated exchange address is caught on its
         // own merits rather than needing to be recognised.
         ("wallet", "oversize_rows", "INTEGER"),
+        // When this row was last offered to market-ledger, or NULL if never.
+        //
+        // THE ABSENCE OF A VERDICT IS A VERDICT. `market IS NULL` alone cannot
+        // tell "not yet asked" from "asked, and market-ledger has never heard
+        // of it" — and the second is the common case, because most rows are
+        // ordinary transfers that no marketplace was ever involved in.
+        // Without this column the enrichment pass re-asks the same permanently
+        // unanswerable question every refresh: measured on the live cache,
+        // 33,639 hashes re-probed every twenty minutes for a yield of ZERO,
+        // against 133,740 of 169,490 rows (79%) that are NULL and always will
+        // be.
+        //
+        // Not a plain boolean, because market-ledger is itself a follower and
+        // may simply not have reached this block yet. The timestamp lets
+        // `hashes_needing_market` re-ask only where the check plausibly RAN
+        // TOO EARLY — see `MARKET_SETTLE_SECS`.
+        ("flow", "market_checked_unix", "INTEGER"),
     ] {
         if let Err(e) = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), []) {
             let msg = e.to_string();
@@ -166,6 +183,26 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// an incremental run produces few (often zero) new txs, and a wallet's
 /// existing rows would otherwise never be labelled at all. Capped so a deep
 /// history backfills across runs instead of stalling one.
+/// How long after a block market-ledger is assumed to have caught up with it.
+///
+/// The follower is a few seconds behind the tip in normal operation; ten
+/// minutes is generous enough that a "no" recorded after it is a real no, and
+/// short enough that a row asked about too early gets exactly one more chance.
+const MARKET_SETTLE_SECS: i64 = 600;
+
+/// Rows still worth asking market-ledger about.
+///
+/// Two conditions, and the second is the one that matters. `market IS NULL`
+/// finds everything unlabelled — but most rows are ordinary transfers that no
+/// venue ever touched, so they are unlabelled PERMANENTLY and re-asking is
+/// pure waste. `market_checked_unix` distinguishes "not yet asked" from
+/// "asked, and the answer was no".
+///
+/// A recorded no is only final if the check ran after market-ledger had
+/// plausibly indexed that block. A row enriched seconds after it landed may
+/// have been asked about before the follower got there, so it stays eligible;
+/// one asked about ten minutes past its block time is settled and drops out
+/// for good.
 pub fn hashes_needing_market(
     conn: &Connection,
     canonical: &str,
@@ -173,15 +210,58 @@ pub fn hashes_needing_market(
 ) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT tx_hash FROM flow
-         WHERE target = ?1 AND market IS NULL
+         WHERE target = ?1
+           AND market IS NULL
+           AND (market_checked_unix IS NULL
+                OR market_checked_unix < slot + ?3 + ?4)
          ORDER BY slot DESC LIMIT ?2",
     )?;
-    let mut rows = stmt.query(params![canonical, limit])?;
+    let mut rows = stmt.query(params![
+        canonical,
+        limit,
+        slot_epoch_offset(),
+        MARKET_SETTLE_SECS
+    ])?;
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
         out.push(hex::encode(r.get::<_, Vec<u8>>(0)?));
     }
     Ok(out)
+}
+
+/// `unix = slot + offset` for the Shelley era, where one slot is one second.
+///
+/// Derived from the real conversion rather than restated as a literal, so the
+/// SQL above cannot drift from `slot_to_unix` if the era constants move.
+fn slot_epoch_offset() -> i64 {
+    let anchor = crate::excavate::SHELLEY_START_SLOT;
+    slot_to_unix(anchor) as i64 - anchor as i64
+}
+
+/// Record that market-ledger was asked about these rows, whatever it said.
+///
+/// Called with EVERY hash probed, not just the ones that came back with a
+/// verdict — the whole point is to remember the noes. Rows that did get a
+/// label are already excluded from the next pass by `market IS NOT NULL`;
+/// this is what retires the ones that never will be.
+pub fn mark_market_checked(
+    conn: &mut Connection,
+    canonical: &str,
+    hashes: &[String],
+    now_unix: u64,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE flow SET market_checked_unix = ?1 WHERE target = ?2 AND tx_hash = ?3",
+        )?;
+        for h in hashes {
+            let raw = hex::decode(h).with_context(|| format!("market hash {h}"))?;
+            stmt.execute(params![now_unix, canonical, raw])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Stitch market-ledger verdicts onto stored rows (the enrichment pass, like
@@ -483,6 +563,14 @@ pub struct StoreOpts {
     /// Rows held when the backfill gave up on this wallet. `None` leaves any
     /// existing verdict alone — an ordinary refresh must not clear a cap.
     pub oversize_rows: Option<u64>,
+    /// This write comes from the SHALLOW COMPANION of a deep request — a
+    /// windowed pass run purely to get rows on screen while the full sweep
+    /// runs in the other lane.
+    ///
+    /// It means the write is racing a deeper one for the same wallet, so it
+    /// must not overwrite the `owned` set with its narrower view. See the
+    /// guard in [`store_timeline`].
+    pub provisional: bool,
 }
 
 /// Persist one wallet's excavation result. Returns the number of NEW flow
@@ -553,21 +641,54 @@ pub fn store_timeline(
                     .transpose()?,
             ])?;
         }
-        tx.execute("DELETE FROM owned WHERE target = ?1", params![canonical])?;
-        let mut own = tx.prepare(
-            "INSERT INTO owned (target, tx_hash, idx, lovelace, assets, units, script)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        for ((hash, idx), (lovelace, units, script)) in &timeline.owned {
-            own.execute(params![
-                canonical,
-                hash.as_slice(),
-                idx,
-                lovelace,
-                units.len() as u32,
-                serde_json::to_string(units)?,
-                *script as i64,
-            ])?;
+        // THE OWNED SET IS REPLACED WHOLE, SO THE NARROWER WRITE MUST YIELD.
+        //
+        // `flow` rows and `scanned_from_slot` are already safe against a
+        // racing write — the first goes in with INSERT OR IGNORE, the second
+        // takes a MIN so depth only ever deepens. `owned` has no such
+        // arithmetic: it is a DELETE plus a re-insert, so whoever lands last
+        // wins outright.
+        //
+        // That matters because a deep request now runs a shallow companion
+        // alongside it. The companion's owned set is derived from its window
+        // only, so if it landed after the full sweep it would drop every UTxO
+        // created before the window and never spent — and `owned` is the seed
+        // every later incremental classifies from, so the loss would outlive
+        // the run that caused it, re-signing old spends as receives.
+        //
+        // Cheap to prevent, and the condition is exact: skip the rewrite when
+        // a strictly deeper scan is already recorded.
+        let outranked = opts.provisional
+            && match opts.scanned_from {
+                Some(mine) => tx
+                    .query_row(
+                        "SELECT scanned_from_slot FROM wallet WHERE target = ?1",
+                        params![canonical],
+                        |r| r.get::<_, Option<u64>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .is_some_and(|held| held < mine.floor()),
+                // Asserting no depth at all, so anything on disk outranks it.
+                None => true,
+            };
+        if !outranked {
+            tx.execute("DELETE FROM owned WHERE target = ?1", params![canonical])?;
+            let mut own = tx.prepare(
+                "INSERT INTO owned (target, tx_hash, idx, lovelace, assets, units, script)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for ((hash, idx), (lovelace, units, script)) in &timeline.owned {
+                own.execute(params![
+                    canonical,
+                    hash.as_slice(),
+                    idx,
+                    lovelace,
+                    units.len() as u32,
+                    serde_json::to_string(units)?,
+                    *script as i64,
+                ])?;
+            }
         }
         let (new_first, new_last) = if timeline.txs.is_empty() {
             (None, None)
@@ -910,6 +1031,82 @@ mod cache_tests {
             )
             .expect("insert flow");
         }
+    }
+
+    /// One flow row at `slot`, unlabelled and never offered to market-ledger.
+    fn add_row(conn: &Connection, target: &str, hash: &str, slot: u64) {
+        conn.execute(
+            "INSERT INTO flow (target, slot, tx_idx, tx_hash, kind, lovelace_in,
+                               lovelace_out, assets_in, assets_out)
+             VALUES (?1, ?2, 0, ?3, 'transfer', 0, 0, 0, 0)",
+            params![target, slot, hex::decode(hash).expect("hex")],
+        )
+        .expect("insert flow");
+    }
+
+    /// THE ENRICHMENT PASS MUST TERMINATE.
+    ///
+    /// Most rows are ordinary transfers no venue ever touched, so they are
+    /// unlabelled permanently. Measured on the live cache before this: 33,639
+    /// hashes re-probed every twenty minutes for a yield of zero. Once a row
+    /// has been asked about — after market-ledger had time to index its block
+    /// — the no is final and it drops out.
+    #[test]
+    fn a_settled_no_is_never_asked_again() {
+        let mut conn = cache();
+        let slot = 100_000_000;
+        add_row(&conn, "w", "aa", slot);
+        assert_eq!(
+            hashes_needing_market(&conn, "w", 10).expect("query").len(),
+            1,
+            "never asked, so eligible"
+        );
+        // Checked well after the block was indexable.
+        let long_after = slot_to_unix(slot) + MARKET_SETTLE_SECS as u64 + 1;
+        mark_market_checked(&mut conn, "w", &["aa".into()], long_after).expect("mark");
+        assert!(
+            hashes_needing_market(&conn, "w", 10)
+                .expect("query")
+                .is_empty(),
+            "asked and answered — re-asking is the bug this closes"
+        );
+    }
+
+    /// The other side of the rule. market-ledger is itself a follower, so a
+    /// row enriched moments after it landed may have been asked about before
+    /// the follower reached that block. That no is not trustworthy, and the
+    /// row stays eligible for exactly one more pass.
+    #[test]
+    fn a_no_recorded_too_early_is_asked_again() {
+        let mut conn = cache();
+        let slot = 100_000_000;
+        add_row(&conn, "w", "bb", slot);
+        // Checked while the follower could plausibly still have been behind.
+        let too_soon = slot_to_unix(slot) + 1;
+        mark_market_checked(&mut conn, "w", &["bb".into()], too_soon).expect("mark");
+        assert_eq!(
+            hashes_needing_market(&conn, "w", 10).expect("query").len(),
+            1,
+            "the follower may not have reached this block yet"
+        );
+    }
+
+    /// A row that DID get a label leaves by the other door — `market IS NULL`
+    /// — and must not depend on the checked stamp to stay gone.
+    #[test]
+    fn a_labelled_row_needs_no_further_asking() {
+        let conn = cache();
+        add_row(&conn, "w", "cc", 100_000_000);
+        conn.execute(
+            "UPDATE flow SET market = '{}' WHERE target = 'w'",
+            rusqlite::params![],
+        )
+        .expect("label");
+        assert!(
+            hashes_needing_market(&conn, "w", 10)
+                .expect("query")
+                .is_empty()
+        );
     }
 
     /// The core ordering rule: eviction follows REQUEST recency, so the wallet

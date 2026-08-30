@@ -32,6 +32,34 @@ pub struct BufferedOutput {
     pub stake: Option<String>,
     /// Quantity of the watched asset in this output.
     pub qty: i64,
+    /// From a decoded lock datum: when this position unlocks (ms since epoch).
+    ///
+    /// Carried on the live UTxO rather than in a side table because a vesting
+    /// position *is* a UTxO — it exists exactly as long as the output does, and
+    /// spending it is the claim. That makes "what is still locked at tip" a
+    /// read of the open set rather than a join against history.
+    pub unlock_ts_ms: Option<u64>,
+    /// The real owner behind the lock contract, from the same datum. The
+    /// contract address is the holder; this is the beneficiary.
+    pub owner_pkh: Option<String>,
+    /// Raw datum CBOR, kept only for outputs at *unidentified* script
+    /// addresses — not pools, not registered lock platforms, not wallets.
+    ///
+    /// This is the raw material for `probe`: the unclassified band is the
+    /// thing the surface most wants shrunk, and the cheapest way to shrink it
+    /// is to look at what those contracts actually say. Bounded by the live
+    /// script UTxO set, which is small precisely because these are the
+    /// addresses we could not name.
+    pub datum_cbor: Option<Vec<u8>>,
+    /// The output's datum *hash*, when it had one.
+    ///
+    /// Distinguishes the two ways [`Self::datum_cbor`] can be `None`, which
+    /// mean opposite things for a probe: no datum at all (this contract does
+    /// not carry state, so it is not a lock), versus a hash whose preimage the
+    /// chain has not revealed. A hash-only datum is disclosed by the
+    /// *spending* transaction, so for an output that is still unspent it is
+    /// genuinely unavailable — an untestable case, not a negative one.
+    pub datum_hash: Option<Vec<u8>>,
 }
 
 #[derive(Default, Clone)]

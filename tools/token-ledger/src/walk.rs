@@ -18,8 +18,10 @@ use mitos_chain_walk::decode::{DecodedOutput, decode_tx};
 use mitos_chain_walk::{open_blocks, slot_to_unix};
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
+use crate::cohort;
+use crate::pools;
 use crate::registry;
-use crate::store::{Ledger, TxRow};
+use crate::store::{Balance, Ledger, TxRow};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -94,6 +96,18 @@ pub fn run(args: WalkArgs) -> Result<()> {
         );
     }
 
+    // Loaded before the walk: the datum-capture decision needs to know which
+    // scripts are already-named lock platforms, so it only keeps datums for
+    // the genuinely unnamed ones.
+    let sinks: Vec<String> = registry::load_sinks(&args.tokens)?
+        .into_iter()
+        .map(|s| s.address)
+        .collect();
+    let lock_creds: Vec<[u8; 28]> = registry::load_lock_platforms(&args.tokens)?
+        .iter()
+        .map(registry::LockPlatform::cred_bytes)
+        .collect::<Result<_>>()?;
+
     let db_path = args
         .db
         .clone()
@@ -162,6 +176,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut in_range: u64 = 0;
     let mut touched: u64 = 0;
     let mut violations: u64 = 0;
+    let mut undecoded_locks: u64 = 0;
     let mut last_slot: u64 = 0;
 
     for block in blocks {
@@ -211,6 +226,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             }
 
             // Outputs: whatever it produced that we now hold.
+            let mut pool_obs = Vec::new();
             for out in &dtx.outputs {
                 if !holds_watched(out, &policy, &asset_name) {
                     continue;
@@ -219,6 +235,61 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 if qty == 0 {
                     continue;
                 }
+
+                // A pool output is still an ordinary holder for balance
+                // purposes — it just also contributes a point on the reserve
+                // curve. Both, not either.
+                let witness_datum: Option<&[u8]> = out
+                    .datum_hash
+                    .as_ref()
+                    .and_then(|h| dtx.witness_datums.get(h))
+                    .map(Vec::as_slice);
+                let mut pool_hit = false;
+                if let Some(obs) = pools::recognise(out, qty, &policy, &asset_name, witness_datum) {
+                    pool_obs.push(obs);
+                    pool_hit = true;
+                }
+
+                // A lock position carries its own schedule. Decode it here, on
+                // the output, so "what is still locked" is a read of the live
+                // UTxO set rather than a reconstruction from history.
+                let datum = witness_datum.or(out.inline_datum.as_deref());
+                let cred = cohort::payment_cred(&out.address);
+                let is_lock_platform = cred.as_ref().is_some_and(|c| {
+                    mitos_vesting_decode::crowd_lock::is_crowd_lock(c)
+                        || mitos_vesting_decode::snek_fun::is_snek_fun(c)
+                });
+
+                let (unlock_ts_ms, owner_pkh) = if is_lock_platform {
+                    match datum.and_then(mitos_vesting_decode::decode_vesting_datum) {
+                        Some(d) => (Some(d.unlock_ts_ms), Some(d.owner_pkh_hex)),
+                        None => {
+                            undecoded_locks += 1;
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+
+                // Keep the datum for script outputs we could not name, so the
+                // unclassified band can be interrogated offline rather than by
+                // re-walking. Pools and known platforms already decoded theirs;
+                // wallets have nothing to say.
+                // Keep the datum for any non-wallet, non-pool output whose
+                // schedule we failed to read — unnamed scripts AND registered
+                // lock platforms whose shape we cannot decode yet. The latter
+                // is the more valuable case: it is the raw material for writing
+                // the missing decoder, and keying capture on "unnamed" alone
+                // meant registering a platform silently stopped collecting the
+                // evidence needed to understand it.
+                let worth_keeping = !pool_hit
+                    && unlock_ts_ms.is_none()
+                    && cohort::classify(&out.address, &sinks, &[], &lock_creds).cohort
+                        != cohort::Cohort::Wallet;
+                let datum_cbor = worth_keeping.then(|| datum.map(<[u8]>::to_vec)).flatten();
+                let datum_hash = out.datum_hash.as_ref().map(|h| h.as_ref().to_vec());
+
                 let stake = stake_of(&out.address);
                 buffer.insert(
                     (dtx.tx_hash, out.index),
@@ -226,13 +297,17 @@ pub fn run(args: WalkArgs) -> Result<()> {
                         address: out.address.clone(),
                         stake: stake.clone(),
                         qty,
+                        unlock_ts_ms,
+                        owner_pkh,
+                        datum_cbor,
+                        datum_hash,
                     },
                 );
                 let e = deltas.entry(out.address.clone()).or_insert((stake, 0));
                 e.1 += qty;
             }
 
-            if deltas.is_empty() && net_mint == 0 {
+            if deltas.is_empty() && net_mint == 0 && pool_obs.is_empty() {
                 continue;
             }
 
@@ -263,6 +338,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     .filter(|(_, (_, amount))| *amount != 0)
                     .map(|(address, (stake, amount))| (address, stake, amount))
                     .collect(),
+                pools: pool_obs,
             });
         }
 
@@ -290,7 +366,10 @@ pub fn run(args: WalkArgs) -> Result<()> {
         }
     }
 
-    // Final buffer persist so a resume picks up the true open set.
+    // Final buffer persist so a resume picks up the true open set. The cursor
+    // slot is real; the hash is a placeholder because we no longer hold the
+    // last block. Nothing reads it yet — `follow`'s rollback path will, and
+    // will need the real one.
     ledger.commit_block(
         &[],
         last_slot,
@@ -298,6 +377,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
         &buffer,
         true,
     )?;
+
+    // Classify from the addresses just recorded. Derived, so it costs a pass
+    // over the party table and never a re-walk.
+    let classified = ledger.classify_parties(&sinks, &lock_creds)?;
+    tracing::info!(
+        classified,
+        sinks = sinks.len(),
+        lock_platforms = lock_creds.len(),
+        "walk: parties classified"
+    );
 
     let (txs, delta_rows, parties) = ledger.counts()?;
     let minted = ledger.net_mint_total()?;
@@ -330,6 +419,12 @@ pub fn run(args: WalkArgs) -> Result<()> {
     }
     if violations > 0 {
         println!("*** {violations} conservation violations — see logs ***");
+    }
+    if undecoded_locks > 0 {
+        // Reported, never assumed liquid: a lock we could not read is not the
+        // same as no lock, and the difference is supply the cascade would
+        // otherwise hand to the float.
+        println!("*** {undecoded_locks} lock outputs whose datum did not decode ***");
     }
 
     Ok(())
@@ -369,26 +464,495 @@ fn qty_from_output(
     i64::try_from(total).unwrap_or(i64::MAX)
 }
 
+/// Re-derive cohorts without touching the chain.
+///
+/// The point of the separation: registering a new sink or landing a new pool
+/// decoder reclassifies all of history in a second, because a cohort is a
+/// function of the stored address rather than something the walk decided.
+pub fn classify(db: &std::path::Path, tokens: &std::path::Path) -> Result<()> {
+    let mut ledger = Ledger::open(db).with_context(|| format!("opening {}", db.display()))?;
+    let sinks = registry::load_sinks(tokens)?;
+    for s in &sinks {
+        println!("sink {} — {}", s.address, s.evidence.trim());
+    }
+    let platforms = registry::load_lock_platforms(tokens)?;
+    for p in &platforms {
+        println!(
+            "lock platform {} ({}) — {}",
+            p.name,
+            p.payment_cred,
+            p.evidence.trim()
+        );
+    }
+    let addresses: Vec<String> = sinks.iter().map(|s| s.address.clone()).collect();
+    let creds: Vec<[u8; 28]> = platforms
+        .iter()
+        .map(registry::LockPlatform::cred_bytes)
+        .collect::<Result<_>>()?;
+    let n = ledger.classify_parties(&addresses, &creds)?;
+    println!(
+        "classified {n} parties against {} sink(s) and {} lock platform(s)",
+        addresses.len(),
+        creds.len()
+    );
+    Ok(())
+}
+
+/// Interrogate the unclassified band: do these contracts look like locks?
+///
+/// For every live output at a script address we could not name, try the shared
+/// lock-datum decode. A platform that copied a known implementation — which is
+/// common, these contracts get forked — will decode cleanly even though its
+/// payment credential is not in any registry.
+///
+/// **This reports; it does not classify.** A `Constr 0 [Int, List[Bytes28]]` is
+/// a shape, and shapes can coincide. What the probe produces is the evidence a
+/// human needs to register a credential deliberately, which keeps the
+/// classification ladder honest: registered credential is a decision, datum
+/// shape is a hint.
+pub fn probe(db: &std::path::Path) -> Result<()> {
+    let ledger = Ledger::open(db).with_context(|| format!("opening {}", db.display()))?;
+    let outputs = ledger.unnamed_script_outputs()?;
+    if outputs.is_empty() {
+        println!("no unnamed script outputs — nothing to probe");
+        return Ok(());
+    }
+
+    // Group by payment credential, not address: a lock platform that glues a
+    // per-locker stake part onto one shared script would otherwise look like
+    // many unrelated contracts.
+    let mut groups: HashMap<String, ProbeGroup> = HashMap::new();
+    for out in &outputs {
+        let cred = cohort::payment_cred(&out.address)
+            .map(hex::encode)
+            .unwrap_or_else(|| "?".into());
+        let g = groups.entry(cred).or_default();
+        g.utxos += 1;
+        g.qty += out.qty;
+        g.addresses.insert(out.address.clone());
+        match out
+            .datum_cbor
+            .as_deref()
+            .and_then(mitos_vesting_decode::decode_vesting_datum)
+        {
+            Some(d) => {
+                g.decoded += 1;
+                g.owners.insert(d.owner_pkh_hex);
+                g.unlock_min = Some(
+                    g.unlock_min
+                        .map_or(d.unlock_ts_ms, |m: u64| m.min(d.unlock_ts_ms)),
+                );
+                g.unlock_max = Some(
+                    g.unlock_max
+                        .map_or(d.unlock_ts_ms, |m: u64| m.max(d.unlock_ts_ms)),
+                );
+            }
+            None if out.datum_cbor.is_some() => g.datum_present_undecoded += 1,
+            // A hash with no preimage is untestable, not negative: the datum
+            // is revealed by the SPENDING transaction, and these outputs are
+            // unspent. Counting it as "not a lock" would be a conclusion the
+            // chain has not offered.
+            None if out.datum_hash.is_some() => g.hash_only += 1,
+            None => g.no_datum += 1,
+        }
+    }
+
+    let mut ordered: Vec<_> = groups.into_iter().collect();
+    ordered.sort_by_key(|(_, g)| -g.qty);
+
+    for (cred, g) in ordered {
+        println!("\npayment credential {cred}");
+        println!(
+            "  {} tokens across {} UTxOs / {} address(es)",
+            g.qty,
+            g.utxos,
+            g.addresses.len()
+        );
+        println!(
+            "  lock-datum decode: {}/{} ok · {} readable but a different shape · \
+             {} hash-only (UNTESTABLE — unspent) · {} no datum at all",
+            g.decoded, g.utxos, g.datum_present_undecoded, g.hash_only, g.no_datum
+        );
+        if g.decoded == 0 && g.hash_only == 0 && g.datum_present_undecoded == 0 {
+            println!("  ⇒ carries no datum — not a lock of any kind. Some other contract.");
+        } else if g.decoded == 0 && g.datum_present_undecoded > 0 {
+            println!("  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.");
+        } else if g.decoded == 0 {
+            println!(
+                "  ⇒ undetermined: the datum is hash-only and unspent, so the chain \
+                 has not revealed it. Not evidence either way."
+            );
+        }
+        if g.decoded > 0 {
+            println!(
+                "  ⇒ MATCHES the Shield/CrowdLock lock shape. {} distinct owner(s).",
+                g.owners.len()
+            );
+            if let (Some(lo), Some(hi)) = (g.unlock_min, g.unlock_max) {
+                println!("     unlock {} .. {} (unix ms)", lo, hi);
+            }
+            println!(
+                "     To count it as vesting, register this credential with evidence — \
+                 a shape match is a hint, not a decision."
+            );
+        }
+        for a in g.addresses.iter().take(3) {
+            println!("     {a}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ProbeGroup {
+    utxos: u64,
+    qty: i64,
+    decoded: u64,
+    datum_present_undecoded: u64,
+    hash_only: u64,
+    no_datum: u64,
+    addresses: std::collections::BTreeSet<String>,
+    owners: std::collections::BTreeSet<String>,
+    unlock_min: Option<u64>,
+    unlock_max: Option<u64>,
+}
+
 pub fn stats(db: &std::path::Path, top: usize) -> Result<()> {
     let ledger = Ledger::open(db).with_context(|| format!("opening {}", db.display()))?;
     let (txs, deltas, parties) = ledger.counts()?;
     let balances = ledger.balances()?;
-    let total: i128 = balances.iter().map(|(_, _, b)| *b as i128).sum();
+    let total: i128 = balances.iter().map(|b| b.amount as i128).sum();
 
     println!("txs {txs}  deltas {deltas}  parties seen {parties}");
     println!("holders with non-zero balance: {}", balances.len());
     println!("total held: {total}");
     println!();
-    for (addr, stake, bal) in balances.iter().take(top) {
+    for b in balances.iter().take(top) {
         let pct = if total > 0 {
-            100.0 * (*bal as f64) / (total as f64)
+            100.0 * (b.amount as f64) / (total as f64)
         } else {
             0.0
         };
-        let short = if addr.len() > 32 { &addr[..32] } else { addr };
-        let st = stake.as_deref().unwrap_or("-");
+        let short = if b.address.len() > 32 {
+            &b.address[..32]
+        } else {
+            &b.address
+        };
+        let cohort = b.cohort.as_deref().unwrap_or("?");
+        // Stake is shown for grouping, never as identity — CSwap collapses all
+        // of its pools onto one stake credential.
+        let st = b.stake.as_deref().unwrap_or("-");
         let st_short = if st.len() > 20 { &st[..20] } else { st };
-        println!("{bal:>16}  {pct:5.2}%  {short}…  {st_short}");
+        println!(
+            "{:>16}  {pct:5.2}%  {:<7}  {short}…  {st_short}",
+            b.amount, cohort
+        );
+    }
+
+    mint_report(&ledger, total)?;
+    cascade_report(&ledger, total)?;
+    cap_report(&ledger, &balances, total)?;
+    Ok(())
+}
+
+/// Where supply landed at mint — the first question of a launch forensic.
+fn mint_report(ledger: &Ledger, total: i128) -> Result<()> {
+    let dist = ledger.mint_distribution()?;
+    if dist.is_empty() {
+        return Ok(());
+    }
+    println!();
+    println!("AT MINT");
+    for (address, cohort, got) in dist.iter().take(6) {
+        let short = if address.len() > 40 {
+            &address[..40]
+        } else {
+            address
+        };
+        println!(
+            "  {:>16}  {:5.2}%  {:<7}  {short}…",
+            got,
+            100.0 * *got as f64 / total as f64,
+            cohort.as_deref().unwrap_or("?")
+        );
+    }
+    // A launchpad is the difference between "the team held the supply" and
+    // "a contract sold it", and the two read identically on a holder chart.
+    if let Some((_, cohort, got)) = dist.first()
+        && cohort.as_deref() != Some("wallet")
+        && *got as f64 / total as f64 > 0.5
+    {
+        println!(
+            "  ⇒ {:.1}% went straight to a CONTRACT at mint — launchpad-shaped, \
+             not a team allocation.",
+            100.0 * *got as f64 / total as f64
+        );
+    }
+    Ok(())
+}
+
+/// Split live lock positions into `(still_locked, matured, undated)`.
+///
+/// `undated` is vesting-cohort supply whose datum did not decode. It counts as
+/// **locked**, deliberately: a lock we cannot read is not an absent lock, and
+/// the failure mode of the opposite choice is handing supply to the float on
+/// the strength of our own decode gap.
+fn vesting_split(ledger: &Ledger) -> Result<(i64, i64, i64)> {
+    let snap = ledger.locked_positions()?;
+    let cohort_total: i64 = ledger
+        .cohort_totals()?
+        .iter()
+        .find(|(c, _, _)| c == "vesting")
+        .map(|(_, _, t)| *t)
+        .unwrap_or(0);
+
+    let Some(tip_secs) = snap.tip_time else {
+        return Ok((cohort_total, 0, cohort_total));
+    };
+    let tip_ms = tip_secs.saturating_mul(1_000);
+    let mut locked = 0i64;
+    let mut matured = 0i64;
+    for p in &snap.positions {
+        if p.unlock_ts_ms > tip_ms {
+            locked += p.qty;
+        } else {
+            matured += p.qty;
+        }
+    }
+    let dated: i64 = locked + matured;
+    let undated = (cohort_total - dated).max(0);
+    Ok((locked + undated, matured, undated))
+}
+
+/// The supply cascade — the reduction to reachable float, with the evidence
+/// quality of each step visible.
+///
+/// The reduction *is* the finding, so it is rendered rather than collapsed
+/// into one number. Only `burn` is subtracted: it is the one cohort that is
+/// provably gone. `script` stays in the float because we cannot show it is
+/// locked — but it is its own band, because the difference between "known
+/// liquid" and "not yet looked at" is what this view exists to make visible.
+fn cascade_report(ledger: &Ledger, total: i128) -> Result<()> {
+    let totals = ledger.cohort_totals()?;
+    if totals.iter().all(|(c, _, _)| c == "unclassified") {
+        println!("\n(parties unclassified — run `classify`)");
+        return Ok(());
+    }
+
+    let get = |name: &str| -> i64 {
+        totals
+            .iter()
+            .find(|(c, _, _)| c == name)
+            .map(|(_, _, t)| *t)
+            .unwrap_or(0)
+    };
+    let count = |name: &str| -> i64 {
+        totals
+            .iter()
+            .find(|(c, _, _)| c == name)
+            .map(|(_, n, _)| *n)
+            .unwrap_or(0)
+    };
+
+    let burn = get("burn");
+    let pool = get("pool");
+    let vesting = get("vesting");
+    let script = get("script");
+    let wallet = get("wallet");
+    let float = total as i64 - burn;
+    let pct = |v: i64| 100.0 * v as f64 / total as f64;
+    let (locked, matured, undated) = vesting_split(ledger)?;
+
+    println!();
+    println!("SUPPLY CASCADE");
+    println!("  nominal supply       {total:>16}");
+    println!(
+        "− provably unspendable {:>14}  {:5.2}%  ({} sink addr, basis: proven)",
+        burn,
+        pct(burn),
+        count("burn")
+    );
+    println!("= reachable float      {float:>14}  {:5.2}%", pct(float));
+    println!(
+        "    of which pooled    {:>14}  {:5.2}%  ({} pools, basis: decoded)",
+        pool,
+        pct(pool),
+        count("pool")
+    );
+    if vesting > 0 {
+        println!(
+            "    vesting            {:>14}  {:5.2}%  ({} addrs, basis: decoded)",
+            vesting,
+            pct(vesting),
+            count("vesting")
+        );
+        println!("      still locked   {:>14}  {:5.2}%", locked, pct(locked));
+        // Matured-but-unclaimed is the interesting half: supply that is free
+        // to move and has not, which is latent sell pressure rather than a
+        // lock. A single "vesting" number hides it completely.
+        println!(
+            "      matured        {:>14}  {:5.2}%  (claimable now, unclaimed)",
+            matured,
+            pct(matured)
+        );
+        if undated > 0 {
+            println!(
+                "      datum unread   {:>14}  {:5.2}%  (treated as LOCKED — a lock we \
+                 cannot read is not an absent lock)",
+                undated,
+                pct(undated)
+            );
+        }
+    }
+    println!(
+        "    script-held        {:>14}  {:5.2}%  ({} addrs, basis: chain — KIND UNKNOWN)",
+        script,
+        pct(script),
+        count("script")
+    );
+    println!(
+        "    key wallets        {:>14}  {:5.2}%  ({} addrs, basis: chain)",
+        wallet,
+        pct(wallet),
+        count("wallet")
+    );
+    if script > 0 {
+        println!(
+            "  note: script-held may be vesting, locked, or an open order — \
+             identifying it needs the declared layer, not the chain."
+        );
+    }
+    Ok(())
+}
+
+/// The cap band: notional against realisable, and the ratio between them.
+///
+/// Three deliberate choices, each argued in `TOKEN_LEDGER.md`:
+///
+/// - **Pooled supply counts as float.** It is the most reachable supply on
+///   chain — buying it needs no counterparty to agree. Excluding it would
+///   quietly pre-apply half the correction the realisable figure exists to
+///   make, and the honesty ratio would then understate the illiquidity.
+/// - **The realisable quantity excludes pooled supply.** Forced, not chosen:
+///   selling the pool into itself is incoherent. So the two figures have
+///   different denominators on purpose, which is why it is spelled out here
+///   rather than left for a reader to infer a bug.
+/// - **Reserves are summed across pools before the curve is walked.** For
+///   constant-product pools sitting at the same price, an optimal split across
+///   them yields exactly the merged-pool result, so this is exact rather than
+///   an approximation — but it stops being exact if the pools' prices diverge,
+///   which is worth revisiting when a third pool appears.
+fn cap_report(ledger: &Ledger, balances: &[Balance], total: i128) -> Result<()> {
+    let tips = ledger.pool_tips()?;
+    let (pool_count, curve_rows) = ledger.pool_counts()?;
+    println!();
+    println!("pools {pool_count}  reserve-curve rows {curve_rows}");
+    if tips.is_empty() {
+        println!("no pools decoded — no price, and therefore no cap. Not zero: undefined.");
+        return Ok(());
+    }
+
+    let by_cohort = |name: &str| -> i128 {
+        balances
+            .iter()
+            .filter(|b| b.cohort.as_deref() == Some(name))
+            .map(|b| b.amount as i128)
+            .sum()
+    };
+    let script_held = by_cohort("script");
+    let wallets = by_cohort("wallet");
+    let (_, matured, _) = vesting_split(ledger)?;
+    // Nothing provably-gone can be sold, and a pool cannot be sold into
+    // itself. Still-locked vesting is out of both bounds — it genuinely cannot
+    // move. **Matured vesting is in both**: it is claimable now, so excluding
+    // it would understate what could hit the market today. What remains
+    // uncertain is only the unidentified scripts, which is why the answer is a
+    // range and why identifying vesting narrowed it from both sides.
+    let sell_low = wallets + matured as i128;
+    let sell_high = sell_low + script_held;
+
+    let base: i128 = tips.iter().map(|t| t.base_reserve as i128).sum();
+    let quote: i128 = tips.iter().map(|t| t.quote_reserve as i128).sum();
+    for t in &tips {
+        let spot = if t.base_reserve > 0 {
+            t.quote_reserve as f64 / t.base_reserve as f64 / 1e6
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<7} base {:>14}  quote {:>15} lovelace  spot {:.8} ADA  fee {:?}  key:{}",
+            t.dex, t.base_reserve, t.quote_reserve, spot, t.fee_bps, t.key_basis
+        );
+    }
+    if base <= 0 {
+        println!("pools hold none of the asset — price undefined");
+        return Ok(());
+    }
+
+    // Lovelace per token. Kept in lovelace for the arithmetic below — the
+    // caps divide by 1e6 once, at the point of display, rather than carrying a
+    // scaled float through the curve.
+    let spot_lovelace = quote as f64 / base as f64;
+    let notional = (total as f64) * spot_lovelace / 1e6;
+
+    // Weighted-average fee across the pools, so a missing fee (Splash has no
+    // shared datum decoder yet) doesn't silently become zero.
+    let fee_known: Vec<i64> = tips.iter().filter_map(|t| t.fee_bps).collect();
+    let fee_bps = if fee_known.is_empty() {
+        0
+    } else {
+        fee_known.iter().sum::<i64>() / fee_known.len() as i64
+    };
+
+    let realise = |sell: i128| -> f64 {
+        crate::pools::constant_product_out(
+            i64::try_from(base).unwrap_or(i64::MAX),
+            i64::try_from(quote).unwrap_or(i64::MAX),
+            i64::try_from(sell).unwrap_or(i64::MAX),
+            fee_bps,
+        ) as f64
+            / 1e6
+    };
+    let (low, high) = (realise(sell_low), realise(sell_high));
+    let ratio = |v: f64| {
+        if notional > 0.0 {
+            100.0 * v / notional
+        } else {
+            0.0
+        }
+    };
+
+    println!();
+    println!(
+        "spot                  {:>16.8} ADA/token   (liquidity-weighted, piecewise-constant)",
+        spot_lovelace / 1e6
+    );
+    println!("notional cap          {notional:>16.0} ADA   (all supply x spot)");
+    if script_held > 0 {
+        // Two bounds because the middle is genuinely unknown, and a single
+        // number here would be a claim we cannot support either way: treating
+        // script-held as liquid flatters the ratio, treating it as locked
+        // understates it.
+        println!(
+            "realisable  {:>10.0} .. {:<10.0} ADA   (sell {} .. {} into the curve)",
+            low, high, sell_low, sell_high
+        );
+        println!("honesty ratio {:>14.1}% .. {:.1}%", ratio(low), ratio(high));
+        println!(
+            "  the spread is {} script-held tokens of unknown liquidity — \
+             not noise, an unanswered question",
+            script_held
+        );
+    } else {
+        println!("realisable            {high:>16.0} ADA   (sellable float into the curve)");
+        println!("honesty ratio         {:>16.1}%", ratio(high));
+    }
+    if fee_known.len() < tips.len() {
+        println!(
+            "  note: {} of {} pools have no decoded fee — realisable is optimistic by that pool's fee",
+            tips.len() - fee_known.len(),
+            tips.len()
+        );
     }
     Ok(())
 }

@@ -7,6 +7,37 @@
 #     slot = 4_492_800 + (creation_time - 1_596_059_091)      # Shelley, 1s/slot
 # and the immutable file to fetch is slot / 21_600.
 
+# Addresses tokens can reach but never leave. `evidence` is required: an
+# address that removes supply from the float is exactly where an unexamined
+# assumption gets expensive, so "provably unspendable" has to be distinguished
+# from "believed unspendable" at the point of registration.
+
+[[sink]]
+address = "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4"
+evidence = """
+Header byte 0x71 (type 7): script payment credential, no stake part — spending \
+requires satisfying the script and there is no key that can. The script is \
+Plutus V2, 46 bytes; its entire body is the trace string \
+"A cobra vai fumar!" (hex 4120636f627261207661692066756d617221, 18 bytes \
+matching the 0x12 length prefix) — an always-fails validator whose whole \
+content is an error message. 46 bytes leaves no room for conditional logic. \
+Consistent with observation: 19,692 UTxOs and 31,463 ADA accumulated, none \
+ever consumed. Checked 2026-08-29; see cnft.dev-workers docs/design/BURN_LEDGER.md. \
+CAVEAT: inferred from script size + embedded string, not from decompiling the \
+UPLC — strong inference, not yet proof.\
+"""
+
+# Lock/vesting platforms recognised by PAYMENT credential (the stake part
+# varies per locker). CrowdLock/Shield is built in via `mitos-vesting-decode`
+# and decodes its datum, so its positions carry a schedule. Anything listed
+# here is known to be a lock but its datum shape is not one we read, so its
+# supply counts as locked with no maturity date — the conservative reading.
+
+# (snek.fun now needs no entry here — its credential and datum live in
+# `mitos-vesting-decode::snek_fun`, so its locks decode with a real schedule
+# rather than counting as unreadable. This table remains the escape hatch for a
+# platform we can recognise but not yet decode.)
+
 [[token]]
 name = "aliens"
 policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"

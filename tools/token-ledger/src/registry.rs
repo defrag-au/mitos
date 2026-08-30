@@ -25,6 +25,56 @@ pub const CHUNK_SLOTS: u64 = 21_600;
 #[derive(Debug, Deserialize)]
 struct RegistryFile {
     token: Vec<TokenEntry>,
+    #[serde(default)]
+    sink: Vec<SinkEntry>,
+    #[serde(default)]
+    lock_platform: Vec<LockPlatform>,
+}
+
+/// A lock/vesting platform recognised by payment credential.
+///
+/// Separate from the built-in CrowdLock recognition because the two carry
+/// different evidence. CrowdLock's datum decodes, so its positions come with a
+/// schedule and an owner — `basis: decoded`. A platform registered here is
+/// known to be a lock (`basis: registered`) but its datum shape is not one we
+/// can read, so its supply counts as **locked** with no maturity date. That is
+/// deliberately the conservative reading; the alternative hands supply to the
+/// float on the strength of our own decode gap.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LockPlatform {
+    pub name: String,
+    /// 56-char hex of the 28-byte payment script hash. Matched on the payment
+    /// part only — lock platforms glue a per-locker stake credential onto one
+    /// shared script, so a full-address set would need an entry per locker.
+    pub payment_cred: String,
+    pub evidence: String,
+}
+
+impl LockPlatform {
+    pub fn cred_bytes(&self) -> Result<[u8; 28]> {
+        let b = hex::decode(&self.payment_cred)
+            .with_context(|| format!("lock platform `{}`: payment_cred is not hex", self.name))?;
+        <[u8; 28]>::try_from(b.as_slice()).map_err(|_| {
+            anyhow::anyhow!(
+                "lock platform `{}`: payment_cred must be 28 bytes",
+                self.name
+            )
+        })
+    }
+}
+
+/// An address tokens can reach but never leave.
+///
+/// **`evidence` is mandatory and is the point of the type.** "Provably
+/// unspendable" and "believed unspendable" are different claims, and an address
+/// that removes supply from the float — and, under `BURN_LEDGER.md`, buys paid
+/// access — is exactly where an unexamined assumption becomes expensive. So a
+/// sink cannot be registered without saying how it was established, mirroring
+/// the address-registry convention of storing a `source` string.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SinkEntry {
+    pub address: String,
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,22 +122,37 @@ impl TokenEntry {
     }
 }
 
-/// Load the registry and return the one requested token.
-pub fn load(path: &Path, name: &str) -> Result<TokenEntry> {
+fn read(path: &Path) -> Result<RegistryFile> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading token registry {}", path.display()))?;
-    let file: RegistryFile = toml::from_str(&text)
-        .with_context(|| format!("parsing token registry {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing token registry {}", path.display()))
+}
 
-    let entry = file
+/// Load the registry and return the one requested token.
+pub fn load(path: &Path, name: &str) -> Result<TokenEntry> {
+    let entry = read(path)?
         .token
         .into_iter()
         .find(|t| t.name == name)
         .with_context(|| format!("no token named `{name}` in {}", path.display()))?;
 
     // Validate eagerly so a malformed policy fails at startup rather than
-    // silently matching nothing for 23 minutes.
+    // silently matching nothing for the length of a walk.
     entry.policy_bytes()?;
     entry.asset_name_bytes()?;
     Ok(entry)
+}
+
+/// Every registered unspendable sink.
+pub fn load_sinks(path: &Path) -> Result<Vec<SinkEntry>> {
+    Ok(read(path)?.sink)
+}
+
+/// Every registered lock platform, validated.
+pub fn load_lock_platforms(path: &Path) -> Result<Vec<LockPlatform>> {
+    let platforms = read(path)?.lock_platform;
+    for p in &platforms {
+        p.cred_bytes()?;
+    }
+    Ok(platforms)
 }

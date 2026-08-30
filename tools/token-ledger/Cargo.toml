@@ -14,6 +14,16 @@ path = "src/main.rs"
 # project-ledger use — this tool adds no chain plumbing of its own.
 mitos-chain-walk = { path = "../mitos-chain-walk" }
 
+# Pool script addresses + the CSwap pool datum (LP policy/name = the pool
+# INSTANCE key, fee bps, LP supply). Pure decode, no WIT coupling — the shared
+# unit, per the crate's own "composition over coordination" note.
+mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
+
+# CrowdLock / Shield lock recognition (payment credential) + the lock datum
+# (unlock timestamp + the real owner behind the contract). Same pure-decode
+# seam as the DEX crate.
+mitos-vesting-decode = { path = "../../crates/mitos-vesting-decode" }
+
 # The ledger. Full fidelity on the walk box; the export is what gets optimised.
 rusqlite = { workspace = true }
 

@@ -40,12 +40,56 @@ use pallas_primitives::Hash;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
+use crate::pools::PoolObservation;
 
 pub struct Ledger {
     conn: Connection,
     /// address → party_id, so the hot path doesn't round-trip sqlite per row.
     parties: HashMap<String, i64>,
+    /// (dex, key_policy, key_name) → pool_id, same reason.
+    pools: HashMap<(String, Vec<u8>, Vec<u8>), i64>,
     next_tx_ord: i64,
+}
+
+/// One party's balance at tip.
+pub struct Balance {
+    pub address: String,
+    pub stake: Option<String>,
+    /// `None` until `classify_parties` has run.
+    pub cohort: Option<String>,
+    pub amount: i64,
+}
+
+/// A live output at a script address we could not name.
+pub struct UnnamedOutput {
+    pub address: String,
+    pub qty: i64,
+    pub datum_cbor: Option<Vec<u8>>,
+    pub datum_hash: Option<Vec<u8>>,
+}
+
+/// One live lock position.
+pub struct LockPosition {
+    pub qty: i64,
+    pub unlock_ts_ms: u64,
+}
+
+/// Live locks plus the ledger's own tip time — the two halves of "what is
+/// still locked", kept together so maturity is never judged against the wrong
+/// clock.
+pub struct LockSnapshot {
+    pub positions: Vec<LockPosition>,
+    /// Last block time in the ledger. `None` for an empty ledger.
+    pub tip_time: Option<u64>,
+}
+
+/// A pool's latest reserves — one row per pool, at the walk's end.
+pub struct PoolTip {
+    pub dex: String,
+    pub key_basis: String,
+    pub base_reserve: i64,
+    pub quote_reserve: i64,
+    pub fee_bps: Option<i64>,
 }
 
 /// One transaction that touched the watched asset.
@@ -57,6 +101,32 @@ pub struct TxRow {
     pub net_mint: i64,
     /// `(address, stake, signed amount)` for every party whose balance moved.
     pub deltas: Vec<(String, Option<String>, i64)>,
+    /// Pool reserves observed in this tx's outputs.
+    pub pools: Vec<PoolObservation>,
+}
+
+/// Add a column if the table doesn't already have it.
+///
+/// Idempotent, and the only safe way to widen a table that may predate the
+/// column — `CREATE TABLE IF NOT EXISTS` silently does nothing on an existing
+/// table, so a new column in the CREATE reaches fresh databases only.
+fn ensure_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+    let present: bool = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(r) = rows.next()? {
+            if r.get::<_, String>(1)? == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+    }
+    Ok(())
 }
 
 impl Ledger {
@@ -79,10 +149,17 @@ impl Ledger {
              );
              CREATE INDEX IF NOT EXISTS tx_slot ON tx(slot);
 
+             -- `cohort` + `basis` are DERIVED from the address, the pool set
+             -- and the sink registry — never from the walk. That is what makes
+             -- reclassification a re-derivation rather than a re-walk, and it
+             -- is why they are nullable: a party exists the moment it moves,
+             -- and is classified afterwards.
              CREATE TABLE IF NOT EXISTS party (
                  party_id INTEGER PRIMARY KEY,
                  address  TEXT NOT NULL UNIQUE,
-                 stake    TEXT
+                 stake    TEXT,
+                 cohort   TEXT,
+                 basis    TEXT
              );
              CREATE INDEX IF NOT EXISTS party_stake ON party(stake);
 
@@ -93,6 +170,35 @@ impl Ledger {
                  PRIMARY KEY (tx_ord, party_id)
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS delta_party ON delta(party_id);
+
+             -- One row per pool instance ever seen. `key_basis` records how
+             -- firmly the instance is identified (published in the datum vs
+             -- inferred from the value vs not at all) — a missing decoder must
+             -- show up as weak evidence, never as absence.
+             CREATE TABLE IF NOT EXISTS pool (
+                 pool_id    INTEGER PRIMARY KEY,
+                 dex        TEXT NOT NULL,
+                 address    TEXT NOT NULL,
+                 key_policy BLOB NOT NULL,
+                 key_name   BLOB NOT NULL,
+                 key_basis  TEXT NOT NULL,
+                 UNIQUE (dex, key_policy, key_name)
+             );
+
+             -- The reserve curve. One row per pool-touching transaction;
+             -- reserves are unchanged between rows, so spot price is exact at
+             -- every slot and piecewise-constant in between. Never interpolate
+             -- across these — the price genuinely did not move.
+             CREATE TABLE IF NOT EXISTS pool_state (
+                 tx_ord         INTEGER NOT NULL,
+                 pool_id        INTEGER NOT NULL,
+                 base_reserve   INTEGER NOT NULL,
+                 quote_reserve  INTEGER NOT NULL,
+                 fee_bps        INTEGER,
+                 total_lp       INTEGER,
+                 reserve_source TEXT NOT NULL,
+                 PRIMARY KEY (tx_ord, pool_id)
+             ) WITHOUT ROWID;
 
              CREATE TABLE IF NOT EXISTS cursor (
                  k          TEXT PRIMARY KEY,
@@ -114,6 +220,19 @@ impl Ledger {
              ) WITHOUT ROWID;",
         )?;
 
+        // `CREATE TABLE IF NOT EXISTS` is a NO-OP on an existing table — it
+        // will never add a column. A ledger written before `cohort`/`basis`
+        // existed keeps the old shape silently, and the first statement that
+        // names the new column fails at runtime. Add them explicitly, then
+        // build the index that depends on them.
+        ensure_column(&conn, "party", "cohort", "TEXT")?;
+        ensure_column(&conn, "party", "basis", "TEXT")?;
+        ensure_column(&conn, "buffered", "unlock_ts_ms", "INTEGER")?;
+        ensure_column(&conn, "buffered", "owner_pkh", "TEXT")?;
+        ensure_column(&conn, "buffered", "datum_cbor", "BLOB")?;
+        ensure_column(&conn, "buffered", "datum_hash", "BLOB")?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS party_cohort ON party(cohort);")?;
+
         let next_tx_ord: i64 = conn
             .query_row("SELECT COALESCE(MAX(tx_ord), -1) + 1 FROM tx", [], |r| {
                 r.get(0)
@@ -130,9 +249,29 @@ impl Ledger {
             }
         }
 
+        let mut pools = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT dex, key_policy, key_name, pool_id FROM pool")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    (
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ),
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (k, id) = row?;
+                pools.insert(k, id);
+            }
+        }
+
         Ok(Self {
             conn,
             parties,
+            pools,
             next_tx_ord,
         })
     }
@@ -145,9 +284,11 @@ impl Ledger {
     pub fn wipe(&mut self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM delta; DELETE FROM tx; DELETE FROM party;
+             DELETE FROM pool_state; DELETE FROM pool;
              DELETE FROM cursor; DELETE FROM buffered;",
         )?;
         self.parties.clear();
+        self.pools.clear();
         self.next_tx_ord = 0;
         Ok(())
     }
@@ -177,9 +318,11 @@ impl Ledger {
 
     pub fn load_buffer(&self) -> Result<OutrefBuffer> {
         let mut buf = OutrefBuffer::default();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT oref_hash, oref_idx, address, stake, qty FROM buffered")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT oref_hash, oref_idx, address, stake, qty, unlock_ts_ms, owner_pkh,
+                    datum_cbor, datum_hash
+             FROM buffered",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
@@ -187,10 +330,14 @@ impl Ledger {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<Vec<u8>>>(7)?,
+                r.get::<_, Option<Vec<u8>>>(8)?,
             ))
         })?;
         for row in rows {
-            let (hash, idx, address, stake, qty) = row?;
+            let (hash, idx, address, stake, qty, unlock, owner, datum, dhash) = row?;
             let h: [u8; 32] = hash
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("buffered oref hash is not 32 bytes"))?;
@@ -200,6 +347,10 @@ impl Ledger {
                     address,
                     stake,
                     qty,
+                    unlock_ts_ms: unlock.map(|v| v as u64),
+                    owner_pkh: owner,
+                    datum_cbor: datum,
+                    datum_hash: dhash,
                 },
             );
         }
@@ -269,6 +420,54 @@ impl Ledger {
                     params![ord, party_id, amount],
                 )?;
             }
+
+            for obs in &row.pools {
+                let key = (
+                    obs.dex.to_string(),
+                    obs.key_policy.clone(),
+                    obs.key_name.clone(),
+                );
+                let pool_id = match self.pools.get(&key) {
+                    Some(id) => *id,
+                    None => {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO pool
+                                 (dex, address, key_policy, key_name, key_basis)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                obs.dex,
+                                obs.address,
+                                obs.key_policy,
+                                obs.key_name,
+                                obs.key_basis.as_str()
+                            ],
+                        )?;
+                        let id: i64 = tx.query_row(
+                            "SELECT pool_id FROM pool
+                             WHERE dex = ?1 AND key_policy = ?2 AND key_name = ?3",
+                            params![obs.dex, obs.key_policy, obs.key_name],
+                            |r| r.get(0),
+                        )?;
+                        self.pools.insert(key, id);
+                        id
+                    }
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO pool_state
+                         (tx_ord, pool_id, base_reserve, quote_reserve,
+                          fee_bps, total_lp, reserve_source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        ord,
+                        pool_id,
+                        obs.base_reserve,
+                        obs.quote_reserve,
+                        obs.fee_bps,
+                        obs.total_lp,
+                        obs.reserve_source.as_str()
+                    ],
+                )?;
+            }
         }
 
         tx.execute(
@@ -281,8 +480,10 @@ impl Ledger {
             tx.execute("DELETE FROM buffered", [])?;
             {
                 let mut stmt = tx.prepare(
-                    "INSERT INTO buffered (oref_hash, oref_idx, address, stake, qty)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO buffered
+                         (oref_hash, oref_idx, address, stake, qty,
+                          unlock_ts_ms, owner_pkh, datum_cbor, datum_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )?;
                 for (oref, out) in buffer.entries() {
                     stmt.execute(params![
@@ -290,7 +491,11 @@ impl Ledger {
                         oref.1 as i64,
                         out.address,
                         out.stake,
-                        out.qty
+                        out.qty,
+                        out.unlock_ts_ms.map(|v| v as i64),
+                        out.owner_pkh,
+                        out.datum_cbor,
+                        out.datum_hash
                     ])?;
                 }
             }
@@ -300,14 +505,141 @@ impl Ledger {
         Ok(())
     }
 
-    /// Derived balances at tip: `(address, stake, balance)`, non-zero only,
-    /// descending. This is the projection the walk is verified against.
-    pub fn balances(&self) -> Result<Vec<(String, Option<String>, i64)>> {
+    /// Derived balances at tip, non-zero only, descending. This is the
+    /// projection the walk is verified against.
+    pub fn balances(&self) -> Result<Vec<Balance>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.address, p.stake, SUM(d.amount) AS bal
+            "SELECT p.address, p.stake, p.cohort, SUM(d.amount) AS bal
              FROM delta d JOIN party p USING (party_id)
              GROUP BY d.party_id HAVING bal <> 0
              ORDER BY bal DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Balance {
+                address: r.get(0)?,
+                stake: r.get(1)?,
+                cohort: r.get(2)?,
+                amount: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Re-derive every party's cohort from its address.
+    ///
+    /// Idempotent and cheap, so it runs at the end of each walk and is also
+    /// exposed as its own subcommand — registering a new sink or landing a new
+    /// pool decoder should reclassify history without touching the chain.
+    /// Returns the number of parties classified.
+    pub fn classify_parties(&mut self, sinks: &[String], lock_creds: &[[u8; 28]]) -> Result<usize> {
+        let pools = self.pool_addresses()?;
+        let addresses: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT party_id, address FROM party")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE party SET cohort = ?2, basis = ?3 WHERE party_id = ?1")?;
+            for (id, address) in &addresses {
+                let c = crate::cohort::classify(address, sinks, &pools, lock_creds);
+                stmt.execute(params![id, c.cohort.as_str(), c.basis])?;
+            }
+        }
+        tx.commit()?;
+        Ok(addresses.len())
+    }
+
+    /// Supply by cohort at tip — the cascade's input.
+    pub fn cohort_totals(&self) -> Result<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(p.cohort, 'unclassified') AS c,
+                    COUNT(*) AS n, SUM(bal) AS total
+             FROM (SELECT party_id, SUM(amount) AS bal FROM delta
+                   GROUP BY party_id HAVING bal <> 0) b
+             JOIN party p USING (party_id)
+             GROUP BY c ORDER BY total DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Each pool's most recent reserves — the tip of the reserve curve.
+    ///
+    /// "Most recent" is by `tx_ord`, which is walk order and therefore chain
+    /// order: `(slot, position in block)`. Ordering by slot alone would be
+    /// ambiguous for two pool touches in the same block, and on a launch that
+    /// is exactly when it matters.
+    pub fn pool_tips(&self) -> Result<Vec<PoolTip>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.dex, p.key_basis, s.base_reserve, s.quote_reserve, s.fee_bps
+             FROM pool p
+             JOIN pool_state s ON s.pool_id = p.pool_id
+             WHERE s.tx_ord = (
+                 SELECT MAX(tx_ord) FROM pool_state WHERE pool_id = p.pool_id
+             )
+             ORDER BY s.quote_reserve DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PoolTip {
+                dex: r.get(0)?,
+                key_basis: r.get(1)?,
+                base_reserve: r.get(2)?,
+                quote_reserve: r.get(3)?,
+                fee_bps: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Live lock positions at tip, and the tip's block time.
+    ///
+    /// Maturity is judged against the **ledger's** last block, not wall clock:
+    /// a walk over a snapshot is as-of that snapshot, and dating it from the
+    /// operator's laptop would silently mature positions the ledger has not
+    /// yet seen unlock.
+    pub fn locked_positions(&self) -> Result<LockSnapshot> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT qty, unlock_ts_ms FROM buffered WHERE unlock_ts_ms IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(LockPosition {
+                qty: r.get(0)?,
+                unlock_ts_ms: r.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        let positions = rows.collect::<Result<Vec<_>, _>>()?;
+        let tip: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(block_time) FROM tx", [], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(LockSnapshot {
+            positions,
+            tip_time: tip.map(|t| t as u64),
+        })
+    }
+
+    /// Where supply went in the transactions that minted it.
+    ///
+    /// "Received a positive delta in a minting transaction" is a chain fact,
+    /// not an inference, and it is the first question of any launch forensic:
+    /// a token whose supply went overwhelmingly to one contract at mint had a
+    /// launchpad, and one that went to a wallet did not.
+    pub fn mint_distribution(&self) -> Result<Vec<(String, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.address, p.cohort, SUM(d.amount) AS got
+             FROM tx t JOIN delta d USING (tx_ord) JOIN party p USING (party_id)
+             WHERE t.net_mint > 0 AND d.amount > 0
+             GROUP BY p.party_id ORDER BY got DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -316,6 +648,46 @@ impl Ledger {
                 r.get::<_, i64>(2)?,
             ))
         })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Live outputs at unnamed script addresses, with whatever datum they
+    /// carried — the input to `probe`.
+    pub fn unnamed_script_outputs(&self) -> Result<Vec<UnnamedOutput>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.address, b.qty, b.datum_cbor, b.datum_hash
+             FROM buffered b
+             LEFT JOIN party p ON p.address = b.address
+             WHERE COALESCE(p.cohort, '') = 'script'
+             ORDER BY b.qty DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(UnnamedOutput {
+                address: r.get(0)?,
+                qty: r.get(1)?,
+                datum_cbor: r.get(2)?,
+                datum_hash: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// `(pools, reserve-curve rows)`.
+    pub fn pool_counts(&self) -> Result<(i64, i64)> {
+        let pools: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pool", [], |r| r.get(0))?;
+        let states: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pool_state", [], |r| r.get(0))?;
+        Ok((pools, states))
+    }
+
+    /// Addresses that are pools, so a balance projection can separate pooled
+    /// supply from the rest without re-deriving the classification.
+    pub fn pool_addresses(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT address FROM pool")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 

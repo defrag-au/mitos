@@ -1,0 +1,279 @@
+//! Pool recognition — the reserve curve's input.
+//!
+//! A pool output is recognised structurally: the watched asset sits at a known
+//! DEX pool script address. Both DEXes decoded here put *every* pool at one
+//! canonical address (CSwap's 82 pools share
+//! `cswap::POOL_SCRIPT_ADDR`; Splash V3 likewise), so recognition is an exact
+//! string match and costs nothing.
+//!
+//! ## Reserves come from the UTxO value here, and that does not generalise
+//!
+//! For CSwap and Splash the pool UTxO holds reserves and nothing else, so the
+//! lovelace it carries *is* the quote reserve and the watched-asset quantity
+//! *is* the base reserve. **Minswap V2 carries `reserveA`/`reserveB` in its
+//! datum and holds accumulated fees and treasury in the same UTxO; WingRiders
+//! needs value minus treasury.** Reading value alone for those would overstate
+//! the reserve, silently and in the pool's favour. When a decoder for them
+//! lands, the reserve source becomes per-DEX — hence [`ReserveSource`], so the
+//! assumption is recorded per row rather than remembered.
+//!
+//! ## Identity, and how firmly it is known
+//!
+//! The pool *instance* key matters because one address holds many pools. CSwap
+//! publishes it: the pool datum carries `lpTokenPolicy` + `lpTokenName`, and an
+//! LP token is one-per-pool by construction. Splash has no datum decoder in
+//! `mitos-dex-decode` yet (it still lives inline in the community module), so
+//! its key is derived from the pool UTxO's own value — the single asset that is
+//! neither ADA nor the watched token. That is a weaker claim, and [`KeyBasis`]
+//! carries the difference rather than flattening it.
+
+use mitos_chain_walk::decode::{Asset, DecodedOutput};
+use mitos_dex_decode::cswap;
+
+/// Where a row's reserves were read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveSource {
+    /// The pool UTxO's own value. Correct only where the pool holds nothing
+    /// but reserves.
+    Value,
+}
+
+impl ReserveSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReserveSource::Value => "value",
+        }
+    }
+}
+
+/// How firmly the pool instance is identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyBasis {
+    /// The LP asset named by the pool's own datum. One-per-pool by
+    /// construction — the strong claim.
+    Datum,
+    /// The lone non-ADA, non-watched asset in the pool UTxO's value. Very
+    /// likely the LP token or pool NFT, but inferred rather than published.
+    Value,
+    /// Several candidate assets in the value and no decoder to choose between
+    /// them — a pool holding both an LP token and a pool NFT, typically. The
+    /// pool is real and its reserves are right; only its *identity* is
+    /// unresolved, which matters when one address holds several pools for the
+    /// same token.
+    Ambiguous,
+    /// No candidate at all. Distinguished from [`KeyBasis::Ambiguous`] because
+    /// the two want different fixes: this one says the pool shape is not what
+    /// was assumed, that one says a decoder is missing.
+    Unknown,
+}
+
+impl KeyBasis {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KeyBasis::Datum => "datum",
+            KeyBasis::Value => "value",
+            KeyBasis::Ambiguous => "ambiguous",
+            KeyBasis::Unknown => "unknown",
+        }
+    }
+}
+
+/// One pool observation at one transaction.
+pub struct PoolObservation {
+    pub dex: &'static str,
+    pub address: String,
+    /// The pool-instance key — LP policy + name where known.
+    pub key_policy: Vec<u8>,
+    pub key_name: Vec<u8>,
+    pub key_basis: KeyBasis,
+    /// Watched-asset reserve.
+    pub base_reserve: i64,
+    /// Lovelace reserve.
+    ///
+    /// Includes the output's min-UTxO carrier ADA, which is a couple of ADA
+    /// against pool reserves in the hundreds of thousands — under a
+    /// thousandth of a percent on spot. Recorded whole rather than netted:
+    /// deducting a carrier estimate from a real reserve is the kind of
+    /// correction that is wrong more often than the error it fixes.
+    pub quote_reserve: i64,
+    pub fee_bps: Option<i64>,
+    pub total_lp: Option<i64>,
+    pub reserve_source: ReserveSource,
+}
+
+/// Recognise a pool output, if this is one.
+///
+/// `qty` is the watched-asset quantity already extracted by the walk.
+pub fn recognise(
+    out: &DecodedOutput,
+    qty: i64,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+    witness_datum: Option<&[u8]>,
+) -> Option<PoolObservation> {
+    let dex = if out.address == cswap::POOL_SCRIPT_ADDR {
+        "cswap"
+    } else if out.address == mitos_dex_decode::splash::POOL_SCRIPT_ADDR {
+        "splash"
+    } else {
+        return None;
+    };
+
+    let datum = out.inline_datum.as_deref().or(witness_datum);
+
+    // CSwap publishes its instance key, its fee and its LP supply. Take them.
+    if dex == "cswap"
+        && let Some(bytes) = datum
+        && let Some(d) = cswap::decode_pool_datum(bytes)
+    {
+        return Some(PoolObservation {
+            dex,
+            address: out.address.clone(),
+            key_policy: d.lp_policy,
+            key_name: d.lp_name,
+            key_basis: KeyBasis::Datum,
+            base_reserve: qty,
+            quote_reserve: out.lovelace as i64,
+            fee_bps: Some(d.pool_fee_bps as i64),
+            total_lp: Some(d.total_lp_tokens as i64),
+            reserve_source: ReserveSource::Value,
+        });
+    }
+
+    // Otherwise fall back to the value: the lone asset that is neither ADA nor
+    // the token we are following.
+    let (key_policy, key_name, key_basis) =
+        match value_key(&out.assets, watched_policy, watched_name) {
+            ValueKey::One(a) => (a.policy.clone(), a.name.clone(), KeyBasis::Value),
+            ValueKey::Many => (Vec::new(), Vec::new(), KeyBasis::Ambiguous),
+            ValueKey::None => (Vec::new(), Vec::new(), KeyBasis::Unknown),
+        };
+
+    Some(PoolObservation {
+        dex,
+        address: out.address.clone(),
+        key_policy,
+        key_name,
+        key_basis,
+        base_reserve: qty,
+        quote_reserve: out.lovelace as i64,
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: ReserveSource::Value,
+    })
+}
+
+enum ValueKey<'a> {
+    One(&'a Asset),
+    /// More than one candidate — reported rather than resolved by picking.
+    Many,
+    None,
+}
+
+/// The single non-ADA, non-watched asset in a pool's value.
+///
+/// Ambiguity is returned as ambiguity. Picking the first, or the one with
+/// quantity 1, or the alphabetically-lowest policy would all "work" and would
+/// all be a guess dressed as an identity.
+fn value_key<'a>(assets: &'a [Asset], watched_policy: &[u8], watched_name: &[u8]) -> ValueKey<'a> {
+    let mut candidates = assets
+        .iter()
+        .filter(|a| !a.policy.is_empty())
+        .filter(|a| !(a.policy == watched_policy && a.name == watched_name));
+    let Some(first) = candidates.next() else {
+        return ValueKey::None;
+    };
+    match candidates.next() {
+        Some(_) => ValueKey::Many,
+        None => ValueKey::One(first),
+    }
+}
+
+/// Constant-product output for selling `sell` of the base asset into a pool.
+///
+/// `(quote * sell_after_fee) / (base + sell_after_fee)` — the standard
+/// `x*y=k` result with the fee taken off the input, which is how both of these
+/// DEXes charge it. Saturating rather than wrapping; a pool with a zero
+/// reserve yields nothing rather than dividing by zero.
+pub fn constant_product_out(base: i64, quote: i64, sell: i64, fee_bps: i64) -> i64 {
+    if base <= 0 || quote <= 0 || sell <= 0 {
+        return 0;
+    }
+    let fee_bps = fee_bps.clamp(0, 10_000) as i128;
+    let sell_after_fee = (sell as i128) * (10_000 - fee_bps) / 10_000;
+    if sell_after_fee <= 0 {
+        return 0;
+    }
+    let out = (quote as i128 * sell_after_fee) / (base as i128 + sell_after_fee);
+    i64::try_from(out).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_product_matches_hand_worked_case() {
+        // A pool of 1000 base / 1000 quote, selling 1000 base with no fee,
+        // returns half the quote reserve: 1000 * 1000 / 2000.
+        assert_eq!(constant_product_out(1_000, 1_000, 1_000, 0), 500);
+    }
+
+    #[test]
+    fn fee_reduces_the_effective_input() {
+        // 85 bps off the input leaves 991.5 -> 1000*991/1991.
+        let no_fee = constant_product_out(1_000, 1_000, 1_000, 0);
+        let with_fee = constant_product_out(1_000, 1_000, 1_000, 85);
+        assert!(with_fee < no_fee);
+    }
+
+    #[test]
+    fn selling_more_than_the_pool_cannot_drain_it() {
+        // The curve is asymptotic: no finite sale returns the whole reserve.
+        let out = constant_product_out(1_000, 1_000, i64::MAX / 4, 0);
+        assert!(
+            out < 1_000,
+            "constant product must never return the full quote reserve"
+        );
+    }
+
+    #[test]
+    fn degenerate_pools_yield_nothing() {
+        assert_eq!(constant_product_out(0, 1_000, 100, 0), 0);
+        assert_eq!(constant_product_out(1_000, 0, 100, 0), 0);
+        assert_eq!(constant_product_out(1_000, 1_000, 0, 0), 0);
+    }
+
+    #[test]
+    fn value_key_refuses_to_guess_between_two_candidates() {
+        let watched = Asset {
+            policy: vec![1; 28],
+            name: b"TOK".to_vec(),
+        };
+        let lp = Asset {
+            policy: vec![2; 28],
+            name: b"LP".to_vec(),
+        };
+        let nft = Asset {
+            policy: vec![3; 28],
+            name: b"NFT".to_vec(),
+        };
+        let one = vec![watched.clone(), lp.clone()];
+        assert!(matches!(
+            value_key(&one, &watched.policy, &watched.name),
+            ValueKey::One(a) if a.name == b"LP".to_vec()
+        ));
+        // Two candidates must report ambiguity, not pick one.
+        let two = vec![watched.clone(), lp, nft];
+        assert!(matches!(
+            value_key(&two, &watched.policy, &watched.name),
+            ValueKey::Many
+        ));
+        // No candidate is a different failure from too many.
+        let none = vec![watched.clone()];
+        assert!(matches!(
+            value_key(&none, &watched.policy, &watched.name),
+            ValueKey::None
+        ));
+    }
+}

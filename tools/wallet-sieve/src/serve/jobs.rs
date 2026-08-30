@@ -14,10 +14,28 @@
 //!    chain to `sieve-deep` — so arrivals are never held up by the rivalrous
 //!    tier. See [`Lane`].
 //!
-//! `enqueue` still joins the existing job when the same wallet is already
-//! queued or running, and terminal jobs stay in the registry (so a client
-//! polling just after completion still sees the outcome) until the next
-//! enqueue replaces them.
+//! 3. **The stage split.** Lanes fixed the SHALLOW reader and left the deep
+//!    one behind, because a deep request is not one piece of work. Stage one
+//!    — the recent slice anybody actually looks at first — is ~15 GB of a 219
+//!    GB sweep, but it ran inside the same `run_batch_jobs` call as the
+//!    backfill, on the same single-threaded lane. So a full-history request
+//!    arriving mid-sweep waited for a stranger's ENTIRE backfill before its
+//!    own cheap half could begin: measured in production at 6.4 minutes of
+//!    lane occupancy for ~15 seconds of work.
+//!
+//!    A deep request therefore also queues a shallow **companion** — the same
+//!    windowed job a 90-day rung would have queued, in the lane that stays
+//!    responsive. Rows land in seconds; the deep job then runs unchanged and
+//!    REPLACEs them with the re-classified full history. Deliberately not a
+//!    new scan path: the companion is production code already, which is why
+//!    the split costs no new classification logic.
+//!
+//! `enqueue` joins the existing job when the same wallet is already queued or
+//! running IN THAT LANE — the registry is keyed by `(wallet, lane)`, because
+//! joining by name alone would make a companion ride the deep job it exists
+//! to overtake. Terminal jobs stay in the registry (so a client polling just
+//! after completion still sees the outcome) until the next enqueue replaces
+//! them.
 //!
 //! Each lane owns its own sqlite connection — `Connection` is not `Sync`, and
 //! WAL serialises the writers with a busy timeout absorbing the overlap.
@@ -85,6 +103,10 @@ pub struct Job {
     /// `None` = everything. A shallow ask is cheap enough to hand out freely;
     /// the full sweep is the rivalrous one.
     pub window_days: Option<u64>,
+    /// This is the COMPANION, not the request — a windowed pass whose only
+    /// purpose is to put rows on screen while the real sweep runs elsewhere.
+    /// Its writes defer to the deep job's; see `StoreOpts::provisional`.
+    pub companion: bool,
 }
 
 #[derive(Clone)]
@@ -118,7 +140,7 @@ const GATHER: std::time::Duration = std::time::Duration::from_secs(2);
 /// 30 days could arrive ten seconds into somebody's full backfill and wait
 /// four minutes for a scan that takes eight seconds — head-of-line blocking
 /// by an unrelated request, which is exactly what makes a launch feel broken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lane {
     /// Windowed and cheap. Kept responsive for arrivals.
     Shallow,
@@ -128,7 +150,11 @@ pub enum Lane {
 
 #[derive(Clone)]
 pub struct Registry {
-    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
+    /// Keyed by lane as well as wallet: a deep request and its shallow
+    /// companion are two jobs for the same canonical target, and joining them
+    /// by name alone would make the second silently ride the first — which is
+    /// exactly the head-of-line wait the companion exists to avoid.
+    jobs: Arc<Mutex<HashMap<(String, Lane), Arc<Job>>>>,
     shallow: mpsc::Sender<Arc<Job>>,
     deep: mpsc::Sender<Arc<Job>>,
     shallow_max_days: u64,
@@ -258,8 +284,54 @@ impl Registry {
         canonical: &str,
         window_days: Option<u64>,
     ) -> Result<Arc<Job>> {
+        let lane = self.lane_for(window_days);
         let mut jobs = self.jobs.lock().expect("registry");
-        if let Some(existing) = jobs.get(canonical)
+        let job = self.place(&mut jobs, display, canonical, window_days, lane, false)?;
+        // THE STAGE SPLIT. A deep request also gets a shallow companion.
+        //
+        // Stage one — the recent slice a reader actually looks at first — is
+        // ~15 GB of a 219 GB sweep, but it lives inside the same
+        // `run_batch_jobs` call as the backfill, on the same single-threaded
+        // lane. So a wallet arriving while another full sweep is in flight
+        // waited for that sweep's ENTIRE backfill before its own cheap half
+        // could even start: measured in production at 6.4 minutes of
+        // "queued: waiting for the excavator" for ~15 seconds of work.
+        //
+        // The companion is that cheap half, run as an ordinary windowed job in
+        // the lane that stays responsive. It is not a new code path — it is
+        // exactly the job a 90-day rung would have queued, so its
+        // classification and its storage are the ones already in production.
+        // The deep job then runs unchanged and REPLACEs its rows with the
+        // re-classified full history.
+        //
+        // Skipped when the split is collapsed (`shallow_max_days == 0`), where
+        // a companion would route straight back into the deep lane and simply
+        // queue behind the request it was meant to overtake.
+        if lane == Lane::Deep && self.shallow_max_days > 0 {
+            self.place(
+                &mut jobs,
+                display,
+                canonical,
+                Some(self.shallow_max_days),
+                Lane::Shallow,
+                true,
+            )?;
+        }
+        Ok(job)
+    }
+
+    /// Queue one job into one lane, or join the live one already there.
+    fn place(
+        &self,
+        jobs: &mut HashMap<(String, Lane), Arc<Job>>,
+        display: &str,
+        canonical: &str,
+        window_days: Option<u64>,
+        lane: Lane,
+        companion: bool,
+    ) -> Result<Arc<Job>> {
+        let key = (canonical.to_string(), lane);
+        if let Some(existing) = jobs.get(&key)
             && !existing.state.lock().expect("job state").is_terminal()
         {
             return Ok(Arc::clone(existing));
@@ -269,25 +341,61 @@ impl Registry {
             canonical: canonical.to_string(),
             state: Mutex::new(JobState::Queued),
             window_days,
+            companion,
         });
-        jobs.insert(canonical.to_string(), Arc::clone(&job));
+        jobs.insert(key, Arc::clone(&job));
         self.queued.fetch_add(1, Ordering::Relaxed);
-        let lane = self.lane_for(window_days);
         let tx = match lane {
             Lane::Shallow => &self.shallow,
             Lane::Deep => &self.deep,
         };
-        tracing::debug!(?lane, window_days, canonical, "queued excavation");
+        tracing::debug!(
+            ?lane,
+            window_days,
+            companion,
+            canonical,
+            "queued excavation"
+        );
         tx.send(Arc::clone(&job)).context("sieve worker is gone")?;
         Ok(job)
     }
 
+    /// The state a reader should be shown for this wallet.
+    ///
+    /// A wallet can now have two jobs in flight, and the caller wants ONE
+    /// answer. The ranking is what keeps that answer honest: **unfinished
+    /// work outranks finished work**, so a completed companion can never
+    /// report `Done` over a backfill that is still running and still has
+    /// history to add. A failure outranks a success for the same reason —
+    /// it is the fact the reader needs.
     pub fn snapshot(&self, canonical: &str) -> Option<JobState> {
-        self.jobs
-            .lock()
-            .expect("registry")
-            .get(canonical)
+        fn rank(s: &JobState) -> u8 {
+            match s {
+                JobState::Running { .. } => 3,
+                JobState::Failed { .. } => 2,
+                JobState::Done { .. } => 1,
+                // LOWEST, and the ordering that matters most here. Once the
+                // companion has delivered the recent slice, the deep job
+                // typically sits queued behind somebody else's sweep for
+                // minutes. Ranking `Queued` above `Done` would put "waiting
+                // for the excavator" on a screen that already has rows on it
+                // — reproducing the exact complaint the split exists to fix.
+                //
+                // Nothing is hidden by this: how much history is actually
+                // held travels on `scanned_from_slot`, so the reader still
+                // gets "recent history — still excavating older".
+                JobState::Queued => 0,
+            }
+        }
+        let jobs = self.jobs.lock().expect("registry");
+        // Deep LAST, because `max_by_key` keeps the last of equal maxima: when
+        // both lanes are mid-scan it is the one whose completion the reader is
+        // actually waiting on.
+        [Lane::Shallow, Lane::Deep]
+            .into_iter()
+            .filter_map(|lane| jobs.get(&(canonical.to_string(), lane)))
             .map(|j| j.state.lock().expect("job state").clone())
+            .max_by_key(|s| rank(s))
     }
 
     pub fn queue_depth(&self) -> usize {
@@ -602,6 +710,7 @@ fn run_batch_jobs(
                 replace: false,
                 scanned_from: staged_depth(i),
                 oversize_rows: None,
+                provisional: job.companion,
             },
         )?;
     }
@@ -739,6 +848,9 @@ fn run_batch_jobs(
                             None => depths[i].depth_after(from),
                         },
                         oversize_rows: capped[i].map(|(_, rows)| rows),
+                        // The backfill only ever runs in the deep lane, so
+                        // this write is the authoritative one by construction.
+                        provisional: false,
                     },
                 )?;
             }
@@ -759,11 +871,21 @@ fn run_batch_jobs(
         // Off the cache, not this batch: an incremental run classifies few
         // rows, and the wallet's existing ones need naming too.
         let hashes = db::hashes_needing_market(conn, &job.canonical, MARKET_BACKFILL_LIMIT)?;
-        let found = crate::market::lookup(&cfg.market_db, &hashes);
+        if hashes.is_empty() {
+            continue;
+        }
+        // `None` is an outage, not an answer — leave every row eligible and
+        // try again next pass.
+        let Some(found) = crate::market::lookup(&cfg.market_db, &hashes) else {
+            continue;
+        };
         if !found.is_empty() {
             let n = db::update_market(conn, &job.canonical, &found)?;
             tracing::info!(target = %job.display, labelled = n, "market enrichment");
         }
+        // Record the NOES as well as the yeses, or this pass re-asks the same
+        // unanswerable question every twenty minutes forever.
+        db::mark_market_checked(conn, &job.canonical, &hashes, now)?;
     }
 
     set_all("resolve", "naming senders".into());
@@ -837,6 +959,189 @@ mod tests {
             shallow_max_days,
             queued: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// A registry whose lanes can be DRAINED, so a test can see what was
+    /// actually queued rather than only how it would have been routed.
+    type Lanes = (Registry, mpsc::Receiver<Arc<Job>>, mpsc::Receiver<Arc<Job>>);
+    fn lanes(shallow_max_days: u64) -> Lanes {
+        let (shallow, shallow_rx) = mpsc::channel();
+        let (deep, deep_rx) = mpsc::channel();
+        let r = Registry {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            shallow,
+            deep,
+            shallow_max_days,
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+        (r, shallow_rx, deep_rx)
+    }
+
+    fn drain(rx: &mpsc::Receiver<Arc<Job>>) -> Vec<Arc<Job>> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// THE STAGE SPLIT. A deep request must not have to finish somebody
+    /// else's backfill before its own recent slice can start.
+    ///
+    /// Stage one is ~15 GB of a 219 GB sweep but shares the deep lane with
+    /// the backfill, so a wallet arriving mid-sweep waited 6.4 minutes for 15
+    /// seconds of work. The companion is that recent slice, queued as an
+    /// ordinary windowed job in the lane that stays responsive.
+    #[test]
+    fn a_deep_request_also_queues_a_shallow_companion() {
+        let (r, shallow_rx, deep_rx) = lanes(90);
+        r.enqueue_windowed("addr1x", "stake:x", None)
+            .expect("queue");
+
+        let deep = drain(&deep_rx);
+        assert_eq!(deep.len(), 1, "the request itself");
+        assert_eq!(deep[0].window_days, None, "still the full chain");
+        assert!(!deep[0].companion);
+
+        let shallow = drain(&shallow_rx);
+        assert_eq!(shallow.len(), 1, "and its companion");
+        assert!(shallow[0].companion);
+        assert_eq!(
+            shallow[0].window_days,
+            Some(90),
+            "the companion buys exactly what the shallow lane serves"
+        );
+        assert_eq!(shallow[0].canonical, deep[0].canonical);
+    }
+
+    /// A cheap request is already in the responsive lane, so a companion
+    /// would be a second scan of the same window for nobody's benefit.
+    #[test]
+    fn a_shallow_request_queues_no_companion() {
+        let (r, shallow_rx, deep_rx) = lanes(90);
+        r.enqueue_windowed("addr1x", "stake:x", Some(30))
+            .expect("queue");
+        assert_eq!(drain(&shallow_rx).len(), 1);
+        assert!(drain(&deep_rx).is_empty());
+    }
+
+    /// Housekeeping is the highest-volume caller — every cached wallet, every
+    /// time coverage advances. It takes the shallow lane, so it must not
+    /// double its own queue with companions.
+    #[test]
+    fn a_refresh_queues_no_companion() {
+        let (r, shallow_rx, deep_rx) = lanes(90);
+        r.enqueue_refresh("addr1x", "stake:x").expect("queue");
+        assert_eq!(drain(&shallow_rx).len(), 1);
+        assert!(drain(&deep_rx).is_empty());
+    }
+
+    /// `0` collapses the split, and a companion would route straight back
+    /// into the deep lane — queueing behind the very job it exists to
+    /// overtake, at the cost of a second sweep.
+    #[test]
+    fn a_collapsed_split_queues_no_companion() {
+        let (r, shallow_rx, deep_rx) = lanes(0);
+        r.enqueue_windowed("addr1x", "stake:x", None)
+            .expect("queue");
+        assert_eq!(drain(&deep_rx).len(), 1);
+        assert!(drain(&shallow_rx).is_empty());
+    }
+
+    /// Two jobs, one wallet — so the registry must key by lane. Keyed by name
+    /// alone the companion would "join" the deep job and never run, which is
+    /// silently the old behaviour with extra code.
+    #[test]
+    fn a_companion_does_not_join_the_deep_job() {
+        let (r, shallow_rx, deep_rx) = lanes(90);
+        r.enqueue_windowed("addr1x", "stake:x", None)
+            .expect("queue");
+        assert_eq!(drain(&deep_rx).len(), 1);
+        assert_eq!(drain(&shallow_rx).len(), 1);
+    }
+
+    /// UNFINISHED WORK OUTRANKS FINISHED WORK.
+    ///
+    /// The companion completes in seconds; the backfill runs for minutes. If
+    /// the finished one won, the reader would be told the history is complete
+    /// while years of it were still arriving.
+    #[test]
+    fn a_done_companion_never_masks_a_running_backfill() {
+        let (r, _s, _d) = lanes(90);
+        r.enqueue_windowed("addr1x", "stake:x", None)
+            .expect("queue");
+        {
+            let jobs = r.jobs.lock().expect("registry");
+            *jobs[&("stake:x".to_string(), Lane::Shallow)]
+                .state
+                .lock()
+                .expect("state") = JobState::Done {
+                new_txs: 12,
+                secs: 3.0,
+            };
+            *jobs[&("stake:x".to_string(), Lane::Deep)]
+                .state
+                .lock()
+                .expect("state") = JobState::Running {
+                phase: "deep".into(),
+                detail: "backfilling older history (2 of 5)".into(),
+            };
+        }
+        assert!(
+            matches!(r.snapshot("stake:x"), Some(JobState::Running { phase, .. }) if phase == "deep"),
+            "the backfill is what the reader is still waiting on"
+        );
+    }
+
+    /// A failure must surface even when the other lane succeeded — the reader
+    /// has 90 days of rows and needs to know that is all they have.
+    #[test]
+    fn a_failure_outranks_a_success() {
+        let (r, _s, _d) = lanes(90);
+        r.enqueue_windowed("addr1x", "stake:x", None)
+            .expect("queue");
+        {
+            let jobs = r.jobs.lock().expect("registry");
+            *jobs[&("stake:x".to_string(), Lane::Shallow)]
+                .state
+                .lock()
+                .expect("state") = JobState::Done {
+                new_txs: 12,
+                secs: 3.0,
+            };
+            *jobs[&("stake:x".to_string(), Lane::Deep)]
+                .state
+                .lock()
+                .expect("state") = JobState::Failed {
+                error: "chunk store went away".into(),
+            };
+        }
+        assert!(matches!(
+            r.snapshot("stake:x"),
+            Some(JobState::Failed { .. })
+        ));
+    }
+
+    /// The companion has delivered and the backfill is still waiting its turn
+    /// — which is the NORMAL state for minutes at a time. Reporting `Queued`
+    /// here would print "waiting for the excavator" over a screen that
+    /// already has rows on it: the exact complaint this split exists to fix.
+    #[test]
+    fn a_queued_backfill_does_not_mask_delivered_rows() {
+        let (r, _s, _d) = lanes(90);
+        r.enqueue_windowed("addr1x", "stake:x", None)
+            .expect("queue");
+        {
+            let jobs = r.jobs.lock().expect("registry");
+            *jobs[&("stake:x".to_string(), Lane::Shallow)]
+                .state
+                .lock()
+                .expect("state") = JobState::Done {
+                new_txs: 12,
+                secs: 3.0,
+            };
+            // The deep job is left Queued, as it is in production.
+        }
+        assert!(
+            matches!(r.snapshot("stake:x"), Some(JobState::Done { new_txs, .. }) if new_txs == 12),
+            "the rows landed; depth is reported by scanned_from_slot, not by this"
+        );
     }
 
     /// The tiers that must stay responsive under load — an arriving reader on

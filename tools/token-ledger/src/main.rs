@@ -16,6 +16,8 @@
 //! - `export`/`serve` — later; see the design doc's three-tier artifact
 
 mod buffer;
+mod cohort;
+mod pools;
 mod registry;
 mod store;
 mod walk;
@@ -47,6 +49,18 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         top: usize,
     },
+    /// Interrogate the unclassified band — do these contracts look like locks?
+    Probe {
+        #[arg(long)]
+        db: PathBuf,
+    },
+    /// Re-derive party cohorts from their addresses. No chain access.
+    Classify {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long, default_value = "tokens.toml")]
+        tokens: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -59,5 +73,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Walk(args) => walk::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
+        Command::Probe { db } => walk::probe(&db),
+        Command::Classify { db, tokens } => walk::classify(&db, &tokens),
     }
 }

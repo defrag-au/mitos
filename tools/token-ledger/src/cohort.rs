@@ -1,0 +1,276 @@
+//! Cohort classification — chain-derivable only.
+//!
+//! Every party gets a cohort and, with it, **how firmly that cohort is known**.
+//! The whole point of separating the two is that a provably-unspendable script
+//! and a wallet somebody told us belongs to the team are not the same kind of
+//! claim, and rendering them identically launders a guess into a fact.
+//!
+//! This module deliberately stops at what the chain proves:
+//!
+//! | Cohort | Basis | What it rests on |
+//! |---|---|---|
+//! | `burn`    | `proven`  | a registered sink whose script provably cannot spend |
+//! | `pool`    | `decoded` | recognised at a DEX pool address, reserves decoded |
+//! | `vesting` | `decoded` | a lock platform whose datum we read — schedule and owner in hand |
+//! | `vesting` | `registered` | a lock platform registered with evidence, datum shape unreadable |
+//! | `script`  | `chain`   | payment credential is a script — header byte, nothing more |
+//! | `wallet`  | `chain`   | payment credential is a key |
+//!
+//! `script` is the honest residual: the address is a contract of *some* kind —
+//! an order book, something uncatalogued — and we do not yet know which. It is
+//! a first-class, visible cohort rather than a silent addition to ordinary
+//! float, because the difference between "we know this is liquid" and "we have
+//! not looked" is the difference this surface exists to show.
+//!
+//! **`vesting` is still chain-derivable**, which is why it belongs here: it is
+//! a payment-credential match against a platform contract whose shape
+//! `mitos-vesting-decode` establishes, not somebody's say-so. What remains
+//! *declared* — and deliberately absent — is "this wallet is the team" or "this
+//! script is Project X's treasury". Those need a source and an `as_of`, and the
+//! design requires them to stay mutable so history recomputes when they change.
+//! Baking them in here would put them in the one place they must not be.
+//!
+//! Because every cohort below is a pure function of the stored address (plus
+//! the pool and sink sets), reclassifying is a re-derivation, never a re-walk.
+
+use pallas_addresses::Address;
+
+/// A party's cohort. Ordered as the supply cascade renders them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cohort {
+    /// Provably unspendable. Removed from supply, permanently.
+    Burn,
+    /// A decoded DEX pool. In the float — see the LP-in-float decision — but
+    /// its own band, because a pool is not a holder.
+    Pool,
+    /// A known lock platform (CrowdLock / Shield). Recognised by payment
+    /// credential; the lock datum additionally yields an unlock timestamp and
+    /// the real owner behind the contract, which is what lets the cascade
+    /// separate *still locked* from *matured but unclaimed*.
+    Vesting,
+    /// Script-controlled, kind unknown. Might be locked, might be an open
+    /// order. The uncertainty is the finding.
+    Script,
+    /// Key-controlled. An ordinary holder.
+    Wallet,
+}
+
+impl Cohort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Cohort::Burn => "burn",
+            Cohort::Pool => "pool",
+            Cohort::Vesting => "vesting",
+            Cohort::Script => "script",
+            Cohort::Wallet => "wallet",
+        }
+    }
+
+    /// How firmly this cohort is known.
+    pub fn basis(&self) -> &'static str {
+        match self {
+            Cohort::Burn => "proven",
+            Cohort::Pool | Cohort::Vesting => "decoded",
+            Cohort::Script | Cohort::Wallet => "chain",
+        }
+    }
+}
+
+/// The 28-byte payment credential of a Shelley address, if it has one.
+pub fn payment_cred(address: &str) -> Option<[u8; 28]> {
+    match Address::from_bech32(address).ok()? {
+        Address::Shelley(sh) => match sh.payment() {
+            pallas_addresses::ShelleyPaymentPart::Key(h)
+            | pallas_addresses::ShelleyPaymentPart::Script(h) => Some(**h),
+        },
+        _ => None,
+    }
+}
+
+/// A cohort together with how firmly it is known.
+///
+/// Basis is per-classification rather than per-cohort because `vesting` can be
+/// reached two ways with genuinely different strength: a platform whose datum
+/// we decode (schedule and owner in hand) versus one we have merely registered
+/// as a lock. Collapsing them would present a guess and a reading identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Classification {
+    pub cohort: Cohort,
+    pub basis: &'static str,
+}
+
+/// Classify one address.
+///
+/// `sinks` and `pools` are exact address sets; `lock_creds` are 28-byte
+/// payment credentials. Everything else is decided by the payment credential's
+/// kind, read through pallas rather than by matching a bech32 prefix —
+/// `addr1z` covers two distinct address types and a prefix test would silently
+/// mis-sort one of them.
+pub fn classify(
+    address: &str,
+    sinks: &[String],
+    pools: &[String],
+    lock_creds: &[[u8; 28]],
+) -> Classification {
+    let c = |cohort: Cohort| Classification {
+        cohort,
+        basis: cohort.basis(),
+    };
+    if sinks.iter().any(|s| s == address) {
+        return c(Cohort::Burn);
+    }
+    if pools.iter().any(|p| p == address) {
+        return c(Cohort::Pool);
+    }
+    match Address::from_bech32(address) {
+        Ok(Address::Shelley(sh)) => {
+            let cred = match sh.payment() {
+                pallas_addresses::ShelleyPaymentPart::Key(h)
+                | pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
+            };
+            // Lock platforms glue a per-locker stake credential onto one shared
+            // payment script, so this must match the payment part only — a
+            // full-address set would need one entry per locker and would miss
+            // every new one.
+            if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred)
+                || mitos_vesting_decode::snek_fun::is_snek_fun(&cred)
+            {
+                c(Cohort::Vesting)
+            } else if lock_creds.contains(&cred) {
+                // Known to be a lock, but its datum is not one we read — so no
+                // schedule, and its supply stays locked rather than maturing.
+                Classification {
+                    cohort: Cohort::Vesting,
+                    basis: "registered",
+                }
+            } else if sh.payment().is_script() {
+                c(Cohort::Script)
+            } else {
+                c(Cohort::Wallet)
+            }
+        }
+        // Byron addresses have no script form; a stake address never holds an
+        // asset. Both are key-controlled for our purposes.
+        _ => c(Cohort::Wallet),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The verified always-fails sink from BURN_LEDGER.md.
+    const BURN: &str = "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4";
+    // CSwap pool (script payment + key stake, `addr1z`).
+    const CSWAP: &str = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
+    // An ordinary base address.
+    const WALLET: &str = "addr1qylnwp3lp2re0jtw9kf0dfvxf4mkvwt3jqzqhqzc5jvxjqrcfxvqcnf2v7xqcnqzsxsdxaewwqnyzcnrqhqhqhqhqhqcnfsz3";
+
+    #[test]
+    fn sink_beats_everything() {
+        let sinks = vec![BURN.to_string()];
+        assert_eq!(classify(BURN, &sinks, &[], &[]).cohort, Cohort::Burn);
+        assert_eq!(classify(BURN, &sinks, &[], &[]).cohort.basis(), "proven");
+    }
+
+    #[test]
+    fn pool_beats_the_generic_script_reading() {
+        // Without the pool set this is just "a script"; with it, it is a pool.
+        // Getting that precedence backwards would hide every pool inside the
+        // unclassified band.
+        assert_eq!(classify(CSWAP, &[], &[], &[]).cohort, Cohort::Script);
+        let pools = vec![CSWAP.to_string()];
+        assert_eq!(classify(CSWAP, &[], &pools, &[]).cohort, Cohort::Pool);
+    }
+
+    #[test]
+    fn script_payment_is_not_a_wallet() {
+        assert_eq!(classify(CSWAP, &[], &[], &[]).cohort, Cohort::Script);
+        assert_eq!(classify(CSWAP, &[], &[], &[]).cohort.basis(), "chain");
+    }
+
+    #[test]
+    fn unparseable_addresses_do_not_become_scripts() {
+        // Fall back to wallet rather than inflating the script band with
+        // decode failures — an unclassified band that grows because of our own
+        // bugs would be worse than useless.
+        assert_eq!(
+            classify("not-an-address", &[], &[], &[]).cohort,
+            Cohort::Wallet
+        );
+    }
+
+    #[test]
+    fn key_payment_is_a_wallet() {
+        assert_eq!(classify(WALLET, &[], &[], &[]).cohort, Cohort::Wallet);
+    }
+
+    // Two real $Aliens holders: same CrowdLock payment script, different
+    // per-locker stake credentials. Matching on the full address would need an
+    // entry per locker and would miss every new one, so this pins the
+    // payment-credential rule rather than the addresses.
+    const LOCK_A: &str = "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdkrxp0e2m4utglc7hmzkuta3e2td72cdjq9m9xlfn6rz8vq86l65l";
+    const LOCK_B: &str = "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w";
+
+    #[test]
+    fn crowdlock_is_vesting_across_differing_stake_parts() {
+        assert_eq!(classify(LOCK_A, &[], &[], &[]).cohort, Cohort::Vesting);
+        assert_eq!(classify(LOCK_B, &[], &[], &[]).cohort, Cohort::Vesting);
+        assert_eq!(classify(LOCK_A, &[], &[], &[]).cohort.basis(), "decoded");
+        assert_ne!(
+            payment_cred(LOCK_A),
+            None,
+            "payment credential must be extractable"
+        );
+        assert_eq!(payment_cred(LOCK_A), payment_cred(LOCK_B));
+    }
+
+    // A real $Aliens script holder that is NOT any known lock platform — the
+    // launchpad's bonding-curve contract. Stands in for "some contract we have
+    // registered as a lock but cannot decode".
+    //
+    // It used to be the snek.fun lock address, until snek.fun's credential and
+    // datum moved into `mitos-vesting-decode` and it stopped being an example
+    // of an unregistered platform. The assertion is unchanged; only the fixture
+    // had to be a contract that is still genuinely unknown.
+    const UNKNOWN_SCRIPT: &str = "addr1x9d238ne9evvyu8vrqpqdfz6ltpk4d9wc9mnlg9q4ursl889t0d6nktep03tacdtww0278hdyqp40pla5kf6h4pfwzzqa2av33";
+
+    #[test]
+    fn a_registered_platform_is_vesting_but_weaker_evidence() {
+        // Unregistered it is just an unnamed script; registered it is vesting,
+        // and the basis says we could not read its schedule.
+        assert_eq!(
+            classify(UNKNOWN_SCRIPT, &[], &[], &[]).cohort,
+            Cohort::Script
+        );
+        let creds = [payment_cred(UNKNOWN_SCRIPT).expect("payment cred")];
+        let got = classify(UNKNOWN_SCRIPT, &[], &[], &creds);
+        assert_eq!(got.cohort, Cohort::Vesting);
+        assert_eq!(
+            got.basis, "registered",
+            "a registered lock must not claim the same evidence as a decoded one"
+        );
+        // Built-in platforms keep the stronger basis even when registered
+        // ones exist alongside them.
+        assert_eq!(classify(LOCK_A, &[], &[], &creds).basis, "decoded");
+        assert_eq!(classify(SNEKFUN_LOCK, &[], &[], &[]).basis, "decoded");
+    }
+
+    /// snek.fun is recognised by the crate now, not by local config — so it
+    /// must classify as decoded vesting with no registry entry at all.
+    const SNEKFUN_LOCK: &str = "addr1w8wma0rzvdexhnqrty6t8dcur7c5ffu2rjau2ayec3d3azg5qp35x";
+
+    #[test]
+    fn snekfun_is_recognised_without_any_local_registration() {
+        let got = classify(SNEKFUN_LOCK, &[], &[], &[]);
+        assert_eq!(got.cohort, Cohort::Vesting);
+        assert_eq!(got.basis, "decoded");
+    }
+
+    #[test]
+    fn a_sink_still_wins_over_vesting() {
+        // Precedence matters: provably-gone outranks locked-for-now.
+        let sinks = vec![LOCK_A.to_string()];
+        assert_eq!(classify(LOCK_A, &sinks, &[], &[]).cohort, Cohort::Burn);
+    }
+}
