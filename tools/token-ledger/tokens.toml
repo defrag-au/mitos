@@ -38,24 +38,51 @@ UPLC — strong inference, not yet proof.\
 # rather than counting as unreadable. This table remains the escape hatch for a
 # platform we can recognise but not yet decode.)
 
+# `decimals` is a SOURCED CLAIM, and an omitted one is not the same as zero.
+# Omit it and the tool falls back to `chain-ledger`'s curated table, and if that
+# has never heard of the token either, `stats` says so and quotes the price per
+# RAW unit rather than inventing a scale. Every value below was read from the
+# token's own Cardano token registry record via Koios
+# `asset_info.token_registry_metadata`, not inferred from supply magnitude.
+
 [[token]]
 name = "aliens"
 policy = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7"
 asset_name = "416c69656e73"            # "Aliens"
+decimals = 0                           # registry: 0 dp
 floor_slot = 179_562_649               # minted 2026-02-15; immutable file 8313
 
 [[token]]
 name = "dong"
 policy = "141eea77e407aa35eec384dd6d863ca44aa338273222403c8f5549d9"
 asset_name = "446f6e67"                # "Dong"
+decimals = 0                           # registry: 0 dp
 floor_slot = 133_983_726               # minted 2024-09-05; immutable file 6202
+
+# Registered as the SundaeSwap V3 test case: $Aliens and $Dong have pools on
+# Minswap, WingRiders, Splash and CSwap but none on Sundae, so neither could
+# exercise the V3 decoder. CSWAP is on Sundae V3 *and* on its own DEX, which
+# makes the walk a cross-check rather than a single-venue reading.
+[[token]]
+name = "cswap"
+policy = "c863ceaa796d5429b526c336ab45016abd636859f331758e67204e5c"
+asset_name = "4353574150"               # "CSWAP"
+decimals = 6                            # token registry, via Koios `token_registry_metadata`
+floor_slot = 150_160_837                # minted 2025-03-11; immutable file 6951
+
+# The first non-zero-decimal token registered here. Every other token above is
+# 0 dp, which is why the scaling went unexercised until CSWAP arrived and
+# `stats` printed its spot as `0.00000000` against a real 0.00231. Raw supply
+# 705,258,547,000,000 is 705,258,547 whole CSWAP.
 
 [[token]]
 name = "perp"
 policy = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64"
 asset_name = "5045525020434f494e"      # "PERP COIN"
+decimals = 0                           # registry: 0 dp
 
 [[token]]
 name = "nikepig"
 policy = "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c"
 asset_name = "4e696b65"                # "Nike" — mints under a different name than it displays
+decimals = 0                           # registry: 0 dp, ticker NIKEPIG

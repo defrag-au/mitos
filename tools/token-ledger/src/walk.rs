@@ -21,7 +21,7 @@ use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::cohort;
 use crate::pools;
 use crate::registry;
-use crate::store::{Balance, Ledger, TxRow};
+use crate::store::{AssetMeta, Balance, Ledger, TxRow};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -148,9 +148,17 @@ pub fn run(args: WalkArgs) -> Result<()> {
         );
     }
 
+    // Stamp the ledger with what it is about, so every read command is
+    // self-describing instead of trusting a flag it could be given wrongly.
+    // Written on resume too, so a registry edit (a decimals value arriving)
+    // reaches an existing db without a re-walk.
+    let decimals = token.resolved_decimals();
+    ledger.put_meta(&token.name, &policy, &asset_name, decimals)?;
+
     tracing::info!(
         token = %token.name,
         policy = %token.policy,
+        decimals = ?decimals,
         floor,
         floor_file = ?token.floor_file(),
         resumed = resume.is_some(),
@@ -648,6 +656,25 @@ pub fn stats(db: &std::path::Path, top: usize) -> Result<()> {
     let balances = ledger.balances()?;
     let total: i128 = balances.iter().map(|b| b.amount as i128).sum();
 
+    // Say what this ledger is about before saying anything about it. `stats`
+    // takes only a path, so without this the output is a wall of numbers with
+    // no stated subject — and the reader has to trust the filename.
+    let meta = ledger.asset_meta()?;
+    match &meta {
+        Some(m) => println!(
+            "ledger: {}  {}.{}  {}",
+            m.name,
+            hex::encode(&m.policy),
+            hex::encode(&m.asset_name),
+            match m.decimals {
+                Some(d) => format!("{d} dp"),
+                None => "decimals unknown".to_string(),
+            }
+        ),
+        None => {
+            println!("ledger: (walked before the asset was recorded — re-run `walk` to stamp it)")
+        }
+    }
     println!("txs {txs}  deltas {deltas}  parties seen {parties}");
     println!("holders with non-zero balance: {}", balances.len());
     println!("total held: {total}");
@@ -676,7 +703,7 @@ pub fn stats(db: &std::path::Path, top: usize) -> Result<()> {
 
     mint_report(&ledger, total)?;
     cascade_report(&ledger, total)?;
-    cap_report(&ledger, &balances, total)?;
+    cap_report(&ledger, &balances, total, ledger.asset_meta()?.as_ref())?;
     Ok(())
 }
 
@@ -867,7 +894,18 @@ fn cascade_report(ledger: &Ledger, total: i128) -> Result<()> {
 ///   them yields exactly the merged-pool result, so this is exact rather than
 ///   an approximation — but it stops being exact if the pools' prices diverge,
 ///   which is worth revisiting when a third pool appears.
-fn cap_report(ledger: &Ledger, balances: &[Balance], total: i128) -> Result<()> {
+///
+/// `meta` supplies the token's decimals. Prices are quoted per WHOLE token, so
+/// without it a 6-dp token's spot renders a million times too small — CSWAP
+/// printed `0.00000000 ADA` at 8 decimal places against a real 0.00231. Only
+/// the *display* is affected: the caps multiply a raw supply by a raw-unit
+/// price, so the scale cancels and those figures were always right.
+fn cap_report(
+    ledger: &Ledger,
+    balances: &[Balance],
+    total: i128,
+    meta: Option<&AssetMeta>,
+) -> Result<()> {
     let tips = ledger.pool_tips()?;
     let (pool_count, curve_rows) = ledger.pool_counts()?;
     println!();
@@ -898,9 +936,13 @@ fn cap_report(ledger: &Ledger, balances: &[Balance], total: i128) -> Result<()> 
 
     let base: i128 = tips.iter().map(|t| t.base_reserve as i128).sum();
     let quote: i128 = tips.iter().map(|t| t.quote_reserve as i128).sum();
+    // ADA per WHOLE token. `scale` is 1 when decimals are unknown, which leaves
+    // the price per raw unit — wrong-looking rather than quietly wrong, and the
+    // trailing note says which it is.
+    let scale = meta.map_or(1.0, AssetMeta::scale);
     for t in &tips {
         let spot = if t.base_reserve > 0 {
-            t.quote_reserve as f64 / t.base_reserve as f64 / 1e6
+            t.quote_reserve as f64 / t.base_reserve as f64 / 1e6 * scale
         } else {
             0.0
         };
@@ -950,8 +992,19 @@ fn cap_report(ledger: &Ledger, balances: &[Balance], total: i128) -> Result<()> 
     println!();
     println!(
         "spot                  {:>16.8} ADA/token   (liquidity-weighted, piecewise-constant)",
-        spot_lovelace / 1e6
+        spot_lovelace / 1e6 * scale
     );
+    match meta.and_then(|m| m.decimals) {
+        Some(d) if d > 0 => println!("  quoted per whole token at {d} dp"),
+        // Explicit 0 dp and "nobody has told us" print the same number but are
+        // different claims, so they say different things. The second is a
+        // prompt to go and source the value, not a result.
+        Some(_) => {}
+        None => println!(
+            "  ⚠ decimals UNKNOWN — this is the price per RAW unit, not per token. \
+             Set `decimals` in tokens.toml and re-run the walk."
+        ),
+    }
     println!("notional cap          {notional:>16.0} ADA   (all supply x spot)");
     if script_held > 0 {
         // Two bounds because the middle is genuinely unknown, and a single

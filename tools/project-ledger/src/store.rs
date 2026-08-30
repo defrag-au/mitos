@@ -546,6 +546,14 @@ CREATE TABLE IF NOT EXISTS distribution_leg (
     -- extraction measure: `$jprigs33` took 105 assets across 11 transactions
     -- and paid ADA in zero of them. Meaningless on lovelace rows, left 0.
     unpaid_units INTEGER NOT NULL DEFAULT 0,
+    -- How many of those units the party STILL HOLDS.
+    --
+    -- Distinct from `quantity`, which is what they ACQUIRED, and the two must
+    -- not be used interchangeably: `$jprigs33` received 105 and holds 79,
+    -- having passed 26 on. Reporting the acquired figure on a chart labelled
+    -- as holdings overstates a current position by a third, and reporting only
+    -- holdings would hide a give-away that was subsequently sold.
+    held_now     INTEGER,
     first_slot   INTEGER,
     last_slot    INTEGER,
     -- observed | asserted | derived. A role resting on an operator assertion
@@ -637,6 +645,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         // assertion nobody made.
         ("party", "declared_role", "declared_role TEXT"),
         ("party", "declared_function", "declared_function TEXT"),
+        // NULL on rows written before this existed = "not measured", which is
+        // right: 0 would claim the party holds nothing.
+        ("distribution_leg", "held_now", "held_now INTEGER"),
     ] {
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))
@@ -842,6 +853,9 @@ pub struct DistributionLegRow {
     pub quantity: i64,
     pub legs: u64,
     pub unpaid_units: u64,
+    /// Units still held. `None` on lovelace legs, where it is meaningless.
+    /// NEVER interchangeable with `quantity` — see the column comment.
+    pub held_now: Option<i64>,
     pub first_slot: Option<u64>,
     pub last_slot: Option<u64>,
     pub basis: String,
@@ -1254,8 +1268,8 @@ impl Ledger {
             let mut stmt = tx.prepare(
                 "INSERT INTO distribution_leg
                    (party, role, function, unit, quantity, legs, unpaid_units,
-                    first_slot, last_slot, basis)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    held_now, first_slot, last_slot, basis)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             for l in legs {
                 stmt.execute(params![
@@ -1266,6 +1280,7 @@ impl Ledger {
                     l.quantity,
                     u64_i64(l.legs),
                     u64_i64(l.unpaid_units),
+                    l.held_now,
                     l.first_slot.map(u64_i64),
                     l.last_slot.map(u64_i64),
                     l.basis,

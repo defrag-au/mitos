@@ -89,6 +89,26 @@ pub struct PartyRecord {
     pub basis: Option<String>,
 }
 
+/// Which asset a ledger holds — recorded by the walk so readers are
+/// self-describing rather than trusting a flag.
+pub struct AssetMeta {
+    pub name: String,
+    pub policy: Vec<u8>,
+    pub asset_name: Vec<u8>,
+    /// `None` = unknown, render raw. Not the same as `Some(0)`.
+    pub decimals: Option<u8>,
+}
+
+impl AssetMeta {
+    /// Whole-token scale: `10^decimals`, or 1 when the scale is unknown.
+    ///
+    /// Returning 1 for unknown means quantities pass through unscaled, which is
+    /// the raw count — the honest reading when nobody has told us otherwise.
+    pub fn scale(&self) -> f64 {
+        10f64.powi(self.decimals.unwrap_or(0) as i32)
+    }
+}
+
 /// One point on the reserve curve, joined to its pool.
 pub struct CurvePoint {
     pub tx_ord: i64,
@@ -286,6 +306,26 @@ impl Ledger {
                  block_hash BLOB
              );
 
+             -- Which asset this ledger is ABOUT. One row, written by the walk.
+             --
+             -- The db is per-token precisely so no row needs a policy column,
+             -- but that left it unable to say what it held: `stats --db` had no
+             -- identity at all, so it could not scale a price by the token's
+             -- decimals and printed CSWAP spot as 0.00000000. Recording it here
+             -- rather than adding a --token flag to every read command means a
+             -- reader cannot be pointed at the wrong registry entry.
+             --
+             -- decimals is NULLABLE and null means UNKNOWN, not zero: render
+             -- raw. Decimals are not on chain, so an absent value is a real
+             -- state, not a missing default.
+             CREATE TABLE IF NOT EXISTS meta (
+                 k          TEXT PRIMARY KEY,
+                 name       TEXT NOT NULL,
+                 policy     BLOB NOT NULL,
+                 asset_name BLOB NOT NULL,
+                 decimals   INTEGER
+             );
+
              -- Live UTxOs holding the watched asset, so a resume reloads the
              -- open set instead of re-walking. Without this a resumed walk
              -- silently fails to resolve every input produced before the
@@ -404,6 +444,52 @@ impl Ledger {
             })
             .optional()?
             .map(|s| s as u64))
+    }
+
+    /// Record which asset this ledger is about. Idempotent; the walk calls it.
+    pub fn put_meta(
+        &self,
+        name: &str,
+        policy: &[u8],
+        asset_name: &[u8],
+        decimals: Option<u8>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (k, name, policy, asset_name, decimals)
+             VALUES ('asset', ?1, ?2, ?3, ?4)
+             ON CONFLICT(k) DO UPDATE SET
+                 name = excluded.name,
+                 policy = excluded.policy,
+                 asset_name = excluded.asset_name,
+                 decimals = excluded.decimals",
+            params![name, policy, asset_name, decimals],
+        )?;
+        Ok(())
+    }
+
+    /// What this ledger is about, if a walk has recorded it.
+    ///
+    /// `None` for a ledger written before the `meta` table existed — the read
+    /// commands degrade to unscaled output rather than failing, since an old db
+    /// is still perfectly valid, just silent about its own units.
+    pub fn asset_meta(&self) -> Result<Option<AssetMeta>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name, policy, asset_name, decimals FROM meta WHERE k = 'asset'",
+                [],
+                |r| {
+                    Ok(AssetMeta {
+                        name: r.get(0)?,
+                        policy: r.get(1)?,
+                        asset_name: r.get(2)?,
+                        decimals: r
+                            .get::<_, Option<i64>>(3)?
+                            .and_then(|d| u8::try_from(d).ok()),
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn load_buffer(&self) -> Result<OutrefBuffer> {

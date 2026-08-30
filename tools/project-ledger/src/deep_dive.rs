@@ -28,7 +28,7 @@
 //! Every figure that can be opened carries its transaction hashes and an
 //! explorer URL. A number a reader cannot check is not evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -43,10 +43,28 @@ use crate::store::{DistributionBase, DistributionLegRow, Ledger};
 /// destination, plus what is still held.
 /// v3 — added `units_seen` (every unit, so a non-ADA flow cannot be silently
 /// absent) and `self_mint` (the team allocation that appears in no table).
-pub const SCHEMA_VERSION: u32 = 3;
+/// v4 — added `mint_timeline`: mints per day split public vs project-funded.
+/// v5 — added `held_now` per leg: acquired and still-held are different
+/// figures and quoting either alone misleads.
+/// v6 — added `supply_onward`: where team-minted units went next, and whether
+/// that was a sale, compensation in kind, or a gift.
+pub const SCHEMA_VERSION: u32 = 6;
 
 fn tx_url(tx: &str) -> String {
     format!("https://cardanoscan.io/transaction/{tx}")
+}
+
+/// Which contractor functions are spending against the MARKETING commitment.
+///
+/// `sponsorship` belongs here, not in ops·tools·team. Paying an athlete to
+/// carry the brand is promotion, not work on the product — filing it under ops
+/// would overstate one published commitment and understate the other at the
+/// same time, which is the worst of both.
+///
+/// One definition, used by every consumer. Written out per call site, the two
+/// halves drift and a function ends up counted twice or not at all.
+pub(crate) fn is_marketing(function: Option<&str>) -> bool {
+    matches!(function, Some("marketing") | Some("sponsorship"))
 }
 
 fn stake_url(key: &str) -> Option<String> {
@@ -67,6 +85,11 @@ pub struct DeepDive {
     /// The team allocation that appears in no allocation table. See
     /// [`SelfMint`]. `None` when the project never minted to itself.
     pub self_mint: Option<SelfMint>,
+    /// Mints per day, split public vs project-funded. See [`MintDay`].
+    pub mint_timeline: Vec<MintDay>,
+    /// Where team-minted supply went after the team took it, and whether it
+    /// was paid for. See [`OnwardLeg`].
+    pub supply_onward: Vec<OnwardLeg>,
     /// Every unit seen moving through the project's wallets. See [`UnitSeen`].
     pub units_seen: Vec<UnitSeen>,
     pub distributions: Vec<Leg>,
@@ -145,6 +168,13 @@ pub struct Leg {
     /// Assets acquired for no consideration above the min-UTxO carrier floor.
     /// Zero on lovelace legs, where it is meaningless.
     pub unpaid_units: u64,
+    /// Units STILL HELD, against `quantity` which is what was ACQUIRED.
+    ///
+    /// Both are published because each alone misleads in a different
+    /// direction. `$jprigs33` acquired 105 and holds 79: quoting 105 as a
+    /// holding overstates the current position by a third, and quoting 79 as
+    /// the take hides that 26 were received free and then passed on.
+    pub held_now: Option<i64>,
     /// Precomputed so no consumer picks its own denominator. `null` on asset
     /// legs — there is no honest share of a money raise for a thing that is
     /// not money.
@@ -242,6 +272,69 @@ pub struct SelfMint {
     pub outside_funding: i64,
 }
 
+/// Where team-minted supply went AFTER the team took it.
+///
+/// The direct distribution legs stop at the first hop: supply leaving a
+/// project wallet. But a founder holding units acquired for nothing can spend
+/// them, and when the recipient is a declared contractor that is compensation —
+/// paid in units instead of ADA, and invisible to every ADA figure on the page.
+/// Measured on Mekka S2: `$ariknfts`, a declared dev, received 5 units from the
+/// founder and paid nothing for them.
+///
+/// Bounded to senders who are project-side, project-funded, or carry a declared
+/// identity. Once supply reaches an unnamed third party, what they do with it is
+/// theirs, and following further would attribute a stranger's trade to the
+/// project.
+#[derive(Debug, Serialize)]
+pub struct OnwardLeg {
+    pub recipient: String,
+    pub label: Option<String>,
+    /// The recipient's declared identity, when they have one. This is what
+    /// separates compensation from a giveaway.
+    pub declared_role: Option<String>,
+    pub units: i64,
+    /// Lovelace the recipient paid in the same transactions.
+    pub consideration: i64,
+    /// What these specific units cost to mint, summed per asset.
+    ///
+    /// Per ASSET, not a median: S2's mint ranged 2.7–158.6 ₳ per unit, so an
+    /// average would misvalue any individual transfer badly. Each unit is
+    /// costed at its own mint transaction's payment divided by the units that
+    /// transaction minted.
+    ///
+    /// This is an OBSERVED price for that unit — what was actually paid to
+    /// bring it into existence — not a market valuation. It says what the
+    /// project gave up, not what the recipient could sell it for.
+    pub value_at_mint: i64,
+    /// `sale` — they paid. `compensation` — no payment, and they hold a
+    /// declared role. `gift` — no payment, no declared role.
+    ///
+    /// `gift` deliberately does NOT distinguish a community prize from an
+    /// undisclosed payment: both look identical on chain, and guessing which
+    /// would be inventing a motive.
+    pub kind: &'static str,
+}
+
+/// Mints per day, split by who received them.
+///
+/// A mint is the one event in a collection's life that is unambiguously
+/// public: a counter goes up and everyone can see it. Splitting that counter by
+/// WHO minted is the difference between "the collection is selling" and "the
+/// collection's own wallets are minting", and no aggregator makes that
+/// distinction.
+///
+/// Days with no mints at all are omitted rather than zero-filled; a renderer
+/// should treat the axis as time, not as an index, or a two-week gap will
+/// render as a single step.
+#[derive(Debug, Serialize)]
+pub struct MintDay {
+    /// Midnight UTC of the day, unix seconds.
+    pub day_unix: i64,
+    pub public: i64,
+    /// Minted to a wallet the project owns or funded.
+    pub team: i64,
+}
+
 /// EVERY unit that moved through the project's own wallets, ADA included.
 ///
 /// Exists so a non-ADA flow can never be silently absent. The money sections
@@ -278,6 +371,7 @@ pub fn build(
     ledger: &Ledger,
     base: &DistributionBase,
     legs: &[DistributionLegRow],
+    carrier_floor: i64,
 ) -> Result<DeepDive> {
     let conn = ledger.conn();
     let meta = |k: &str| -> Option<String> {
@@ -327,6 +421,7 @@ pub fn build(
             quantity: l.quantity,
             transactions: l.legs,
             unpaid_units: l.unpaid_units,
+            held_now: l.held_now,
             basis: l.basis.clone(),
             evidence,
         });
@@ -343,8 +438,8 @@ pub fn build(
             .iter()
             .filter(|l| l.unit == "lovelace")
             .filter(|l| match category {
-                "ops_team" => l.role == "contractor" && l.function.as_deref() != Some("marketing"),
-                "marketing" => l.role == "contractor" && l.function.as_deref() == Some("marketing"),
+                "ops_team" => l.role == "contractor" && !is_marketing(l.function.as_deref()),
+                "marketing" => l.role == "contractor" && is_marketing(l.function.as_deref()),
                 "founder_pay" => l.role == "founder",
                 _ => false,
             })
@@ -426,6 +521,8 @@ pub fn build(
     let uses = uses(conn)?;
     let units_seen = units_seen(conn)?;
     let self_mint = self_mint(conn, base, minted_holder_facing);
+    let mint_timeline = mint_timeline(conn)?;
+    let supply_onward = supply_onward(conn, carrier_floor)?;
     let caveats = caveats(
         conn,
         base,
@@ -473,11 +570,113 @@ pub fn build(
         commitments,
         uses,
         self_mint,
+        mint_timeline,
+        supply_onward,
         units_seen,
         distributions,
         provenance,
         caveats,
     })
+}
+
+/// Team-minted supply that moved on, and whether it was paid for.
+fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<OnwardLeg>> {
+    let hf = crate::distributions::holder_facing_sql();
+    let mut stmt = conn.prepare(&format!(
+        "WITH own AS (
+             SELECT key AS k FROM party WHERE project_side = 1
+             UNION SELECT holder FROM provenance_verdict WHERE flagged = 1),
+         team_minted AS (
+             SELECT asset_name FROM asset_event
+             WHERE kind = 'mint' AND asset_class IN ({hf}) AND to_party IN (SELECT k FROM own)),
+         -- Per-ASSET mint cost: what that transaction paid, divided by the
+         -- units it minted. A bulk mint of 24 for 2,500 ADA costs ~104 each;
+         -- using a collection-wide average would price a cheap unit as a dear
+         -- one and vice versa, and the S2 range is 2.7–158.6.
+         mint_cost AS (
+             SELECT m.asset_name,
+                    COALESCE((SELECT SUM(p.lovelace) FROM mint_payment p
+                              WHERE p.tx_hash = m.tx_hash), 0) * 1.0
+                    / NULLIF((SELECT COUNT(*) FROM asset_event x
+                              WHERE x.tx_hash = m.tx_hash AND x.kind = 'mint'
+                                AND x.asset_class IN ({hf})), 0) AS cost
+             FROM asset_event m
+             WHERE m.kind = 'mint' AND m.asset_class IN ({hf})),
+         -- Senders still inside the project's orbit: its wallets, the fronts it
+         -- funded, and anyone it has named. Beyond that the supply is a third
+         -- party's to trade.
+         inside AS (
+             SELECT k FROM own
+             UNION SELECT key FROM party WHERE declared_role IS NOT NULL)
+         SELECT e.to_party,
+                (SELECT value FROM party_alias a
+                  WHERE a.party = e.to_party AND a.kind = 'handle' LIMIT 1),
+                (SELECT declared_role FROM party p WHERE p.key = e.to_party),
+                COUNT(*),
+                COALESCE((SELECT SUM(-d.delta) FROM tx_delta d
+                          WHERE d.party = e.to_party
+                            AND d.tx_hash IN (SELECT x.tx_hash FROM asset_event x
+                                              WHERE x.to_party = e.to_party
+                                                AND x.asset_name IN (SELECT asset_name FROM team_minted))), 0),
+                CAST(COALESCE(SUM((SELECT c.cost FROM mint_cost c
+                                   WHERE c.asset_name = e.asset_name)), 0) AS INTEGER)
+         FROM asset_event e
+         WHERE e.kind = 'transfer'
+           AND e.asset_name IN (SELECT asset_name FROM team_minted)
+           AND e.from_party IN (SELECT k FROM inside)
+           AND e.to_party NOT IN (SELECT k FROM own)
+           AND e.to_party IS NOT NULL
+         GROUP BY e.to_party
+         ORDER BY COUNT(*) DESC"
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            let declared_role: Option<String> = r.get(2)?;
+            let consideration: i64 = r.get(4)?;
+            Ok(OnwardLeg {
+                recipient: r.get(0)?,
+                label: r.get(1)?,
+                units: r.get(3)?,
+                // A payment above the carrier floor makes it a sale whoever the
+                // recipient is; only unpaid transfers are distributions.
+                kind: match (consideration > carrier_floor, declared_role.is_some()) {
+                    (true, _) => "sale",
+                    (false, true) => "compensation",
+                    (false, false) => "gift",
+                },
+                consideration: consideration.max(0),
+                value_at_mint: r.get(5)?,
+                declared_role,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Mints per day, split public vs project-funded.
+fn mint_timeline(conn: &rusqlite::Connection) -> Result<Vec<MintDay>> {
+    let hf = crate::distributions::holder_facing_sql();
+    let mut stmt = conn.prepare(&format!(
+        "WITH own AS (
+             SELECT key AS k FROM party WHERE project_side = 1
+             UNION SELECT holder FROM provenance_verdict WHERE flagged = 1)
+         SELECT CAST(strftime('%s', date(block_time, 'unixepoch')) AS INTEGER) AS day,
+                SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 0 ELSE 1 END),
+                SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 1 ELSE 0 END)
+         FROM asset_event
+         WHERE kind = 'mint' AND asset_class IN ({hf}) AND to_party IS NOT NULL
+         GROUP BY day ORDER BY day"
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(MintDay {
+                day_unix: r.get(0)?,
+                public: r.get(1)?,
+                team: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// How the self-mint was funded, and what the mint looks like with it removed.
@@ -584,13 +783,47 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
     // transfer invisible here — the treasury topping up an ops wallet has not
     // spent anything, and letting it count would make shuffling look like
     // deployment.
+    // "Undeclared" is NOT "unknown", and conflating them was a real error: on
+    // Mekka S2 the unattributed slice was 72.6% of outflow, of which 93% went
+    // somewhere the investigation had already identified — the self-mint
+    // wallets, the relays that carried money to a swap desk, and the minting
+    // platform. Charting all of that as unattributed reads as a black hole and
+    // overstates what is actually unaccounted for.
+    //
+    // So before falling back, ask two more questions the ledger can answer.
+    let own_money: BTreeSet<String> = {
+        let mut s = BTreeSet::new();
+        let mut q = conn.prepare(
+            "SELECT key FROM party WHERE project_side = 1
+             UNION SELECT holder FROM provenance_verdict WHERE flagged = 1",
+        )?;
+        for k in q.query_map([], |r| r.get::<_, String>(0))? {
+            s.insert(k?);
+        }
+        s
+    };
+    // Single-use addresses that swept onward, and where they landed. The relay
+    // hop is load-bearing: filtering on the immediate counterparty alone makes
+    // a fresh bare address look like a final destination, when it is a pipe.
+    let relay_target: BTreeMap<String, String> = {
+        let mut m = BTreeMap::new();
+        let mut q = conn.prepare("SELECT relay_addr, to_addr FROM relay_hop")?;
+        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (relay, to) = row?;
+            m.insert(relay, to);
+        }
+        m
+    };
+
     // GROUP BY the RAW expressions, never the aliases. Grouping on aliases here
     // silently failed to collapse: one destination class came back as three
     // partial rows, and the founder's outflow was bucketed as unattributed
     // instead of to the founder — a mislabel that moved money out of the
     // category the whole page is about.
+    let mut buckets: BTreeMap<String, i64> = BTreeMap::new();
     let mut stmt = conn.prepare(
-        "SELECT COALESCE(p.declared_role, ''),
+        "SELECT v.counterparty,
+                COALESCE(p.declared_role, ''),
                 COALESCE(p.declared_function, ''),
                 -SUM(v.delta)
          FROM value_event v
@@ -598,17 +831,18 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
          WHERE v.delta < 0
            AND v.party IN (SELECT key FROM party WHERE project_side = 1)
            AND v.counterparty NOT IN (SELECT key FROM party WHERE project_side = 1)
-         GROUP BY COALESCE(p.declared_role, ''), COALESCE(p.declared_function, '')",
+         GROUP BY v.counterparty, COALESCE(p.declared_role, ''),
+                  COALESCE(p.declared_function, '')",
     )?;
-    let mut buckets: BTreeMap<String, i64> = BTreeMap::new();
     for row in stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
         ))
     })? {
-        let (role, function, amount) = row?;
+        let (counterparty, role, function, amount) = row?;
         if amount <= 0 {
             continue;
         }
@@ -616,9 +850,19 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
         // these against the project's own breakdown, and "contractor/dev" is
         // not a thing the project ever promised a share of.
         let label = match (role.as_str(), function.as_str()) {
-            ("", _) => "unattributed".to_string(),
-            ("contractor", "marketing") => "marketing".to_string(),
+            ("contractor", f) if is_marketing(Some(f)) => "marketing".to_string(),
             ("contractor", _) => "ops · tools · team".to_string(),
+            ("", _) if own_money.contains(&counterparty) => {
+                // Money to a wallet that minted with it. Not unknown at all —
+                // it is the self-mint, reported in full in its own section.
+                "self-mint funding".to_string()
+            }
+            ("", _) if relay_target.contains_key(&counterparty) => {
+                // A pipe, not a destination. Named as such so the reader can
+                // follow it rather than reading a bare address as an endpoint.
+                "swept onward via single-use address".to_string()
+            }
+            ("", _) => "undeclared destination".to_string(),
             (r, _) => r.to_string(),
         };
         *buckets.entry(label).or_default() += amount;
@@ -644,7 +888,14 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
     let mut slices: Vec<UseSlice> = buckets
         .into_iter()
         .map(|(category, lovelace)| UseSlice {
-            attributed: category != "unattributed",
+            // `attributed` means "we can say what this money was for". A relay
+            // hop tells us where money WENT, not what it was for, so it is not
+            // attributed — but it is not a mystery either, and the category
+            // name says which.
+            attributed: !matches!(
+                category.as_str(),
+                "undeclared destination" | "swept onward via single-use address"
+            ),
             share: share(lovelace),
             category,
             lovelace,

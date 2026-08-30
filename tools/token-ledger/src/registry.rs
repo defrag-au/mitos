@@ -88,10 +88,25 @@ pub struct TokenEntry {
     /// name and an empty name are different assets.
     pub asset_name: String,
     /// Display decimals. Identity is the hex asset name; this is presentation
-    /// only, and the token registry — not the chain — is authoritative for it.
-    /// Defaults to 0, which is right for every token here so far.
-    #[serde(default)]
-    pub decimals: u8,
+    /// only, and the **token registry — not the chain — is authoritative** for
+    /// it. Read it from Koios `asset_info.token_registry_metadata.decimals`
+    /// rather than inferring it from supply magnitude.
+    ///
+    /// `None` when the entry says nothing, which is **not** the same as `0` —
+    /// hence `Option` rather than `#[serde(default)]`. An explicit `0` is a
+    /// sourced claim that the token has no fractional part; an absent one is an
+    /// invitation to ask [`chain_ledger::tokens`]. Collapsing the two would let
+    /// an unstated value silently override a curated one.
+    ///
+    /// Absent is right for $Aliens, $Dong, $PERP and $NIKEPIG — all genuinely
+    /// 0 dp, which is why the scaling went unexercised until $CSWAP (6 dp)
+    /// arrived and `stats` printed its spot as `0.00000000`. A default that is
+    /// right for every case you have is not the same as a default that is
+    /// right.
+    ///
+    /// Resolve through [`TokenEntry::resolved_decimals`], never by reading this
+    /// field directly.
+    pub decimals: Option<u8>,
     /// Slot of the policy's FIRST mint. The walk's floor.
     ///
     /// This is not an optimisation with a correctness cost, which is the usual
@@ -124,6 +139,30 @@ impl TokenEntry {
     /// The immutable file containing the floor — what `bootstrap --start` wants.
     pub fn floor_file(&self) -> Option<u64> {
         self.floor_slot.map(|s| s / CHUNK_SLOTS)
+    }
+
+    /// `policy_hex.asset_name_hex` — the key [`chain_ledger::tokens`] uses.
+    ///
+    /// Keyed by the full unit rather than by ticker on purpose: anyone can mint
+    /// a token called `USDM`, and matching on the name would let them borrow a
+    /// real stablecoin's scale.
+    pub fn unit(&self) -> String {
+        format!("{}.{}", self.policy, self.asset_name)
+    }
+
+    /// Display decimals: this entry's own value, else the curated shared table,
+    /// else unknown.
+    ///
+    /// The order matters. A local entry is a sourced decision about a token we
+    /// actually watch, so it wins; the shared table is the fallback that stops
+    /// every new token starting life silently mis-scaled. `None` means *render
+    /// raw*, which is what `chain-ledger` does for an unknown unit and the only
+    /// honest answer — decimals are not on chain, so there is no rule to apply,
+    /// only knowledge.
+    pub fn resolved_decimals(&self) -> Option<u8> {
+        self.decimals.or_else(|| {
+            chain_ledger::tokens::decimals(&self.unit()).and_then(|d| u8::try_from(d).ok())
+        })
     }
 }
 

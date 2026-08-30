@@ -18,6 +18,7 @@ pub mod cswap;
 pub mod minswap;
 pub mod originator;
 pub mod splash;
+pub mod sundae;
 pub mod wingriders;
 
 use pallas_primitives::{BigInt, PlutusData};

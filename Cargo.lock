@@ -6086,6 +6086,7 @@ name = "token-ledger"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chain-ledger",
  "clap",
  "hex",
  "mitos-chain-walk",

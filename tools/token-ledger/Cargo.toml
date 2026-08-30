@@ -28,6 +28,11 @@ mitos-vesting-decode = { path = "../../crates/mitos-vesting-decode" }
 # loads them, so the format lives in a crate rather than in this tool.
 token-ledger-wire = { path = "../../crates/token-ledger-wire" }
 
+# Curated token decimals, keyed by full unit. Decimals are NOT on chain, so a
+# walker cannot derive them — this is the shared table of the ones we can
+# vouch for, already used by project-ledger. Serde-only, no I/O.
+chain-ledger = { workspace = true }
+
 # The ledger. Full fidelity on the walk box; the export is what gets optimised.
 rusqlite = { workspace = true }
 

@@ -99,7 +99,7 @@ fn in_list(items: &BTreeSet<String>) -> String {
 /// `HOLDER_FACING` as a SQL list, so the classes are declared once. Written
 /// out twice, the reference token eventually creeps into one of them and
 /// supply silently doubles.
-fn holder_facing_sql() -> String {
+pub(crate) fn holder_facing_sql() -> String {
     HOLDER_FACING
         .iter()
         .map(|c| format!("'{c}'"))
@@ -144,7 +144,7 @@ pub fn run(args: &DistributionsArgs) -> Result<()> {
         // actually in the ledger rather than from what we were about to put
         // there. The two should agree; only one of them is what a reader can
         // later re-derive.
-        let dive = crate::deep_dive::build(&ledger, &base, &legs)?;
+        let dive = crate::deep_dive::build(&ledger, &base, &legs, args.carrier_floor as i64)?;
         crate::deep_dive::write(&dive, path)?;
         let blocking = dive
             .caveats
@@ -321,6 +321,8 @@ fn compute_legs(
                 quantity: total.min(i128::from(i64::MAX)) as i64,
                 legs: rows.len() as u64,
                 unpaid_units: 0,
+                // Money, not units — there is nothing to still be holding.
+                held_now: None,
                 first_slot: rows
                     .iter()
                     .map(|(_, _, s)| *s)
@@ -387,6 +389,8 @@ fn compute_legs(
                 quantity: total.min(i128::from(i64::MAX)) as i64,
                 legs: rows.len() as u64,
                 unpaid_units: 0,
+                // Money, not units — there is nothing to still be holding.
+                held_now: None,
                 first_slot: rows
                     .iter()
                     .map(|(_, _, s)| *s)
@@ -439,6 +443,17 @@ fn compute_legs(
                 .filter(|(_, _, _, paid)| *paid <= args.carrier_floor as i64)
                 .map(|(_, n, _, _)| *n)
                 .sum();
+            // What they still have, which is NOT what they took. `$jprigs33`
+            // received 105 and holds 79, having passed 26 on. Carrying only
+            // the acquired figure overstates a current position; carrying only
+            // holdings hides a give-away that was later sold. Both, always.
+            let held_now: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_holder WHERE party = ?1",
+                    [&key],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             legs.push(DistributionLegRow {
                 party: key.clone(),
                 role: role.clone(),
@@ -447,6 +462,7 @@ fn compute_legs(
                 quantity: total,
                 legs: rows.len() as u64,
                 unpaid_units: unpaid.max(0) as u64,
+                held_now: Some(held_now),
                 first_slot: rows
                     .iter()
                     .map(|(_, _, s, _)| *s)

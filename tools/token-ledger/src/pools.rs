@@ -57,8 +57,9 @@ pub enum ReserveSource {
     /// Published in the pool's own datum. Minswap V2, whose UTxO also carries
     /// an ADA deposit, accrued fees, its NFT and unissued LP.
     Datum,
-    /// The UTxO's value less the treasuries the datum declares. WingRiders,
-    /// which publishes what it owes rather than what it holds.
+    /// The UTxO's value less the non-tradeable balance the datum declares —
+    /// WingRiders' `treasuryA`/`treasuryB`, SundaeSwap V3's `protocol_fees`.
+    /// Both publish what they owe rather than what they hold.
     ValueMinusTreasury,
 }
 
@@ -166,6 +167,17 @@ pub fn recognise(
         }
         if mitos_dex_decode::splash::is_splash_pool(&cred) {
             return splash(out, qty, datum);
+        }
+        if mitos_dex_decode::sundae::is_sundae_v3(&cred) {
+            return sundae_v3(out, qty, datum, watched_policy, watched_name);
+        }
+        // SundaeSwap V1 is PlutusV1, so its pool state is committed as a datum
+        // HASH whose preimage only appears when the output is spent — one
+        // interaction after the state it describes. Recognised so its holdings
+        // land in the `pool` cohort rather than surfacing as an unnamed script;
+        // deliberately unpriced until the walker carries a hash→datum cache.
+        if mitos_dex_decode::sundae::is_sundae_v1(&cred) {
+            return Some(unpriced_pool("sundae-v1", out, qty));
         }
     }
 
@@ -281,6 +293,74 @@ fn splash(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<PoolObs
         total_lp: None,
         reserve_source: ReserveSource::Value,
     })
+}
+
+/// SundaeSwap V3 — reserves are the value less the declared `protocol_fees`.
+///
+/// The only remaining DEX whose pool state can be read straight off an unspent
+/// output: 996 of 1,000 sampled V3 pool UTxOs carry an inline datum. It is also
+/// the only one that hands over a usable **fee**, so its realisable figure is
+/// not flagged optimistic the way Splash's and WingRiders' are.
+fn sundae_v3(
+    out: &DecodedOutput,
+    qty: i64,
+    datum: Option<&[u8]>,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Option<PoolObservation> {
+    let d = datum.and_then(mitos_dex_decode::sundae::decode_v3_pool_datum)?;
+    let watched_is_a = d.asset_a_policy == watched_policy && d.asset_a_name == watched_name;
+    let (value_a, value_b) = if watched_is_a {
+        (qty as u64, out.lovelace)
+    } else {
+        (out.lovelace, qty as u64)
+    };
+    let (base, quote, ada_paired) = match d.ada_pair(value_a, value_b) {
+        Some((ada, token)) => (token, ada, true),
+        // Token/token: real supply, no ADA price.
+        None => (qty as u64, 0, false),
+    };
+    Some(PoolObservation {
+        dex: "sundae-v3",
+        address: out.address.clone(),
+        // The pool script mints its own NFT, and the NFT's name is the datum's
+        // `ident` behind a CIP-68 label — one per pool, so this is a genuine
+        // instance key rather than the shared-policy `ambiguous` that Minswap
+        // V2 and WingRiders V2 are still stuck on.
+        key_policy: mitos_dex_decode::sundae::POOL_NFT_POLICY.to_vec(),
+        key_name: d.nft_name(),
+        key_basis: KeyBasis::Datum,
+        ada_paired,
+        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
+        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        // Sundae's fee is already in ten-thousandths, which is basis points.
+        // The conservative side of bid/ask — they differ on 7 of 996 pools.
+        fee_bps: Some(d.max_fee_per_10_thousand() as i64),
+        total_lp: Some(i64::try_from(d.circulating_lp).unwrap_or(i64::MAX)),
+        reserve_source: ReserveSource::ValueMinusTreasury,
+    })
+}
+
+/// A pool recognised by credential whose reserves cannot be read.
+///
+/// Counts the supply — which is what the cohort needs — without contributing a
+/// price. `ada_paired: false` is the load-bearing part: it keeps the pool out
+/// of the reserve curve entirely, rather than letting an unnetted value stand
+/// in for a reserve and quietly move spot.
+fn unpriced_pool(dex: &'static str, out: &DecodedOutput, qty: i64) -> PoolObservation {
+    PoolObservation {
+        dex,
+        address: out.address.clone(),
+        key_policy: Vec::new(),
+        key_name: Vec::new(),
+        key_basis: KeyBasis::Unknown,
+        ada_paired: false,
+        base_reserve: qty,
+        quote_reserve: 0,
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: ReserveSource::Value,
+    }
 }
 
 /// Minswap V2 — reserves come from the datum, never the value.
@@ -408,6 +488,84 @@ pub fn constant_product_out(base: i64, quote: i64, sell: i64, fee_bps: i64) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real ADA/NIGHT SundaeSwap V3 pool at `590a3273…#0`, read from chain
+    /// 2026-08-30. The whole path — address → credential → decoder →
+    /// observation — is exercised on a live output rather than a fixture, so a
+    /// break anywhere in the chain fails here.
+    fn night_pool_output() -> DecodedOutput {
+        DecodedOutput {
+            address: mitos_dex_decode::sundae::POOL_ADDR.to_string(),
+            lovelace: 233_854_410_616,
+            assets: vec![
+                Asset {
+                    policy: mitos_dex_decode::sundae::POOL_NFT_POLICY.to_vec(),
+                    name: hex::decode(
+                        "000de1405b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b",
+                    )
+                    .unwrap(),
+                },
+                Asset {
+                    policy: NIGHT_POLICY.to_vec(),
+                    name: b"NIGHT".to_vec(),
+                },
+            ],
+            index: 0,
+            datum_hash: None,
+            inline_datum: Some(hex::decode(NIGHT_POOL_DATUM).unwrap()),
+            min_utxo: 0,
+        }
+    }
+
+    const NIGHT_POOL_DATUM: &str = "d8799f581c5b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b9f9f4040ff9f581c0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa454e49474854ffff1b0000008e9655d073181e181ed87a80001b00000001d2e8715fff";
+    const NIGHT_POLICY: [u8; 28] = [
+        0x06, 0x91, 0xb2, 0xfe, 0xcc, 0xa1, 0xac, 0x4f, 0x53, 0xcb, 0x6d, 0xfb, 0x00, 0xb7, 0x01,
+        0x3e, 0x56, 0x1d, 0x1f, 0x34, 0x40, 0x3b, 0x95, 0x7c, 0xbb, 0x5a, 0xf1, 0xfa,
+    ];
+    const NIGHT_HELD: i64 = 2_378_727_173_839;
+
+    #[test]
+    fn a_live_sundae_v3_pool_is_recognised_and_netted() {
+        let out = night_pool_output();
+        let obs = recognise(&out, NIGHT_HELD, &NIGHT_POLICY, b"NIGHT", None)
+            .expect("the V3 credential must be recognised");
+        assert_eq!(obs.dex, "sundae-v3");
+        assert!(obs.ada_paired);
+        assert_eq!(obs.base_reserve, NIGHT_HELD);
+        // 233,854,410,616 held less 7,833,416,031 of protocol fees. Reading
+        // the raw value would put spot 3.5% high on a pool this size.
+        assert_eq!(obs.quote_reserve, 226_020_994_585);
+        assert_eq!(obs.reserve_source, ReserveSource::ValueMinusTreasury);
+        assert_eq!(obs.fee_bps, Some(30));
+        assert_eq!(obs.total_lp, Some(612_407_562_355));
+    }
+
+    #[test]
+    fn a_v3_pool_is_keyed_by_its_own_nft() {
+        // The instance key must match the NFT actually sitting in the value —
+        // that equality is what makes it a key rather than a label. Minswap V2
+        // and WingRiders V2 are still `Ambiguous` precisely because they
+        // cannot do this.
+        let out = night_pool_output();
+        let obs = recognise(&out, NIGHT_HELD, &NIGHT_POLICY, b"NIGHT", None).unwrap();
+        assert_eq!(obs.key_basis, KeyBasis::Datum);
+        assert!(
+            out.assets
+                .iter()
+                .any(|a| a.policy == obs.key_policy && a.name == obs.key_name),
+            "the datum-derived key must name an asset the pool actually holds"
+        );
+    }
+
+    #[test]
+    fn a_v3_pool_with_no_datum_is_not_priced_from_its_raw_value() {
+        // Without the datum there is no protocol-fee figure, and the raw
+        // value overstates the ADA side. Dropping the observation is correct;
+        // recording it with unnetted reserves would move spot silently.
+        let mut out = night_pool_output();
+        out.inline_datum = None;
+        assert!(recognise(&out, NIGHT_HELD, &NIGHT_POLICY, b"NIGHT", None).is_none());
+    }
 
     #[test]
     fn constant_product_matches_hand_worked_case() {

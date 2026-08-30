@@ -220,7 +220,12 @@ pub fn run(args: ExportArgs) -> Result<()> {
         asset: wire::AssetId {
             policy,
             asset_name: token.asset_name_bytes()?,
-            decimals: token.decimals,
+            // The wire type carries a plain `u8`, where 0 and "unknown" both
+            // mean render raw — the same collapse `chain-ledger` makes, and
+            // harmless downstream because both format identically. The
+            // distinction only matters at registration time, which is where
+            // `Option` lives.
+            decimals: token.resolved_decimals().unwrap_or(0),
         },
         domain: (
             *tx_slots_abs.first().unwrap_or(&0),
