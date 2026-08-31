@@ -30,8 +30,11 @@ pallas-addresses = { workspace = true }
 # The chain-tail spool follower (N2N chainsync + blockfetch to a relay).
 pallas-network = { workspace = true }
 
-# The sieve itself: SIMD memmem for the credential patterns (pass A), and a
-# multi-pattern automaton for the owned-tx-hash set (pass B sweeps).
+# The scanning machine — parallel chunk memmem + decode-on-hit — extracted
+# to a shared crate so token-ledger's sieve walk uses the same core.
+chain-sieve = { path = "../../crates/chain-sieve" }
+
+# Still used directly by the tail spool's per-block gating.
 memchr = "2"
 aho-corasick = "1"
 

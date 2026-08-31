@@ -594,7 +594,44 @@ CREATE INDEX IF NOT EXISTS idx_devid_party ON distribution_evidence(party);
 CREATE TABLE IF NOT EXISTS commitment (
     category TEXT PRIMARY KEY,   -- hashpower | ops_team | marketing | supply
     share    REAL,               -- NULL = nothing was advertised. LOAD BEARING.
-    source   TEXT NOT NULL       -- e.g. 'docs/cases/MEKKA_COMMITMENTS.md'
+    source   TEXT NOT NULL,      -- e.g. 'docs/cases/MEKKA_COMMITMENTS.md'
+    -- Which published breakdown this line belongs to. A project publishes
+    -- SEVERAL: how mint funds are split, and separately how ongoing rewards
+    -- are split. They are different pools measured against different flows,
+    -- and mixing them breaks the exhaustiveness test that makes the
+    -- elimination argument work -- two breakdowns each summing to 100% look
+    -- like one breakdown summing to 200%.
+    grp      TEXT NOT NULL DEFAULT 'mint_funds',
+
+    -- An OFF-CHAIN counterpart: something claimed to have discharged this
+    -- line that the walk cannot see. Miners bought with the money exist in a
+    -- warehouse, not in a UTxO, so the largest commitment a mining project
+    -- makes is exactly the one the chain is worst at measuring.
+    --
+    -- Held SEPARATE from the measured share on purpose. Measured comes from
+    -- the walk and is reproducible; this comes from a person or a document
+    -- and is not. Folding them into one number would let an assertion inherit
+    -- the credibility of a measurement, which is the whole failure this tool
+    -- exists to avoid.
+    --
+    -- Denominated in lovelace like everything else here, so any conversion is
+    -- forced into `counterpart_source` where a reader can see the rate and
+    -- the date it came from.
+    counterpart_lovelace INTEGER,        -- NULL = nothing claimed against this line
+    counterpart_basis    TEXT,           -- asserted | document | observed
+    counterpart_source   TEXT,           -- who said so, and any rate applied
+
+    -- The event that must happen before this line can be spent against at all.
+    -- NULL = unconditional, so silence against it is a real gap.
+    --
+    -- A project can publish a breakdown for money it does not yet have — how
+    -- the proceeds of a sale WILL be split, before the sale happens. That line
+    -- is unmeasured for a completely different reason than a line whose
+    -- spending the walk simply cannot see, and flagging it as a coverage gap
+    -- would be wrong: there is nothing to cover yet. Recording the condition
+    -- keeps a future promise visible without letting it read as a failure to
+    -- deliver on a present one.
+    contingent_on        TEXT
 );
 ";
 
@@ -648,6 +685,30 @@ fn migrate(conn: &Connection) -> Result<()> {
         // NULL on rows written before this existed = "not measured", which is
         // right: 0 would claim the party holds nothing.
         ("distribution_leg", "held_now", "held_now INTEGER"),
+        // Existing rows are mint-fund lines — that is all the table held
+        // before rewards breakdowns could be recorded.
+        (
+            "commitment",
+            "grp",
+            "grp TEXT NOT NULL DEFAULT 'mint_funds'",
+        ),
+        // NULL on pre-existing rows = nobody has claimed anything against this
+        // line, which is the honest default. A zero would assert that someone
+        // claimed nothing was spent — a much stronger statement than silence.
+        (
+            "commitment",
+            "counterpart_lovelace",
+            "counterpart_lovelace INTEGER",
+        ),
+        ("commitment", "counterpart_basis", "counterpart_basis TEXT"),
+        (
+            "commitment",
+            "counterpart_source",
+            "counterpart_source TEXT",
+        ),
+        // NULL on pre-existing rows = unconditional, which is what every
+        // commitment recorded before this column existed was.
+        ("commitment", "contingent_on", "contingent_on TEXT"),
     ] {
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))

@@ -158,6 +158,110 @@ source = """Genuine customer (operator confirmation 2026-08-30), despite the \
 `mekka*` handle. S2's largest single minter. Named so a project-shaped handle \
 is not mistaken for a project wallet by the next reader."""
 
+# ── Identified by the operator, 2026-08-31 ──────────────────────────────────
+#
+# All from a walkthrough of where S1 funds and assets actually went. Each is an
+# ASSERTION with the operator as its source; the chain shows the movements, not
+# who anyone is.
+
+[[terminal.party]]
+stake  = "stake1uxgpvh4hyd45arlsql7q9p9e8s7wvjn3gh2pvzedydxjuccvw3gsm"
+label  = "ops wallet — precursor to $pervsn"
+role   = "ops"
+source = """Operator, 2026-08-31: a precursor to the $pervsn ops wallet. Also \
+published BY THE PROJECT as its "Compounding / New Machines" wallet (Discord, \
+JPRIGS/MEKKALABS; docs/cases/MEKKA_DISTRIBUTIONS.md). Received 99 S1 NFTs from \
+team wallets for no payment — the largest single asset destination in S1, and \
+internal movement rather than a distribution."""
+
+[[terminal.party]]
+stake  = "stake1u8zj623k2nvhyxsw48ap4vd35l7ftzkwazp2qvuqa9a8xfqvjf84n"
+label  = "$mekkaholds"
+role   = "ops"
+source = """ADA Handle `mekkaholds`; project operating wallet (operator, \
+2026-08-31). Received 53 NFTs and 11,788 ₳ from team wallets. Flagged by \
+`provenance` at 90.8% core-funded and minted 36 S1 NFTs itself."""
+
+# ── JP-associated wallets ───────────────────────────────────────────────────
+#
+# `founder`, and therefore OUTSIDE the value boundary: assets and ADA reaching
+# a principal personally have left the project, whatever wallet they land in.
+# Several of these also self-mint, which the founder role does not suppress —
+# only a `contractor` declaration excludes a wallet from team-funded supply.
+
+[[terminal.party]]
+stake  = "stake1ux4clcmywwdsdekwjv5gg6h056am4sas4ujn2fq5y8ld6gcjcthmy"
+label  = "JP wallet identity"
+role   = "founder"
+source = """Operator, 2026-08-31: another JP wallet identity. No ADA Handle. \
+Received 56 S1 NFTs and 6 S2 NFTs from team wallets, paying nothing in either \
+season."""
+
+[[terminal.party]]
+stake  = "stake1u82v4w7zgu5lg73d832es2l5gdxye2e55krayltwl0r04dg782l6m"
+label  = "JP wallet identity"
+role   = "founder"
+source = """Operator, 2026-08-31: JP-associated. Received 29 S1 NFTs and 3,858 ₳. \
+In S2 this wallet was a pure front — funded 1,100 ₳ by $mekkalabs, minted 7 \
+units, passed all 7 to $jprigs33 and retained nothing."""
+
+[[terminal.party]]
+stake  = "stake1uy9gr635kjqzach827pqljuxc9tntvg7kaj67vazwu28t4q23kpdp"
+label  = "JP wallet identity"
+role   = "founder"
+source = "Operator, 2026-08-31: JP-associated. Received 29 S1 NFTs from team wallets."
+
+[[terminal.party]]
+stake  = "stake1u9yfhm5la35av8te20s8ezprz568ap5d8zzfz2mnqmgrltgq6z7yj"
+label  = "$theseguysmine"
+role   = "founder"
+source = """ADA Handle `theseguysmine`. Operator, 2026-08-31: JP-associated — \
+inferred from its relationship with the precursor ops wallet rather than \
+directly attested, so weaker than the other JP entries here. Received 16,009 ₳ \
+across 23 legs, 2025-07-21 → 2026-04-02. It is also the wallet that paid the \
+three announced April 2026 distributions."""
+
+# ── Marketing, S1 ───────────────────────────────────────────────────────────
+
+[[terminal.party]]
+stake    = "stake1ux0w37ekc3ypew9vnzntvamn4pdx37ct85lx9t4uvfpmvdq430rqv"
+label    = "$bank.royalties — 'crash'"
+role     = "contractor"
+function = "marketing"
+source   = """Operator, 2026-08-31: 'crash', involved with S1 marketing, since \
+stepped away from the project. Received 42 S1 NFTs from team wallets for no \
+payment. NOTE the `bank.royalties` handle is misleading — this is a person, not \
+the platform's royalty infrastructure."""
+
+[[terminal.party]]
+stake    = "stake1u8jdpv73ej254dtlu8sqakew25s5nyhpkgsgkckjv4gfwnq6nfmq7"
+label    = "$7256 — 'bajoy'"
+role     = "contractor"
+function = "marketing"
+source   = """Operator, 2026-08-31: believed to be a marketer named bajoy. \
+Received 26 S1 NFTs and 5 S2 NFTs for no payment. Held with less confidence \
+than the other contractor entries — the operator's phrasing was 'I think'."""
+
+# ── Sales and marketplace surfaces — NOT distributions ──────────────────────
+
+[[terminal.party]]
+stake  = "stake17ykfvl6t62y5fvryvtsnch3lt406dcpls4n4d9pcekpnumg6v83tq"
+label  = "jpg.store — marketplace script"
+role   = "partner"
+source = """Operator, 2026-08-31: jpg.store. A SCRIPT credential (`stake17…`) \
+resolving to several `addr1x…` contract addresses, and the top payer of S1 \
+royalties — which only a marketplace does. The 80 NFTs sent here are LISTINGS, \
+not gifts, and `supply_onward` now excludes script credentials for that reason."""
+
+[[terminal.party]]
+stake  = "addr1v825u96vkgrr5lke2c36sgvxa72szq4d50wq3jdk4crylncgd0x55"
+label  = "Perps raffle platform"
+role   = "partner"
+source = """Operator, 2026-08-31: believed to be the Perps raffle platform, so \
+the 44 NFTs sent here are essentially SALES rather than gifts. A bare address, \
+so it carries no handle to confirm this from — the identification is the \
+operator's."""
+
 # ── Platform rails — recorded on contact, never expanded ─────────────────────
 
 [[terminal.party]]

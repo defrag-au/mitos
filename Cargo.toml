@@ -20,6 +20,7 @@ members = [
     "crates/mitos-dex-decode",
     "crates/mitos-vesting-decode",
     "crates/mitos-marketplace-decode",
+    "crates/chain-sieve",
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
     "crates/none-match-indexer",

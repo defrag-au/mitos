@@ -740,6 +740,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chain-sieve"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "memchr",
+ "mitos-chain-walk",
+ "pallas-traverse 1.1.1",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6087,6 +6098,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chain-ledger",
+ "chain-sieve",
  "clap",
  "hex",
  "mitos-chain-walk",
@@ -6900,6 +6912,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "axum 0.8.4",
+ "chain-sieve",
  "clap",
  "hex",
  "memchr",

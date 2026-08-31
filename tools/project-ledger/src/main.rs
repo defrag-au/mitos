@@ -30,6 +30,7 @@ mod score;
 mod seed;
 mod state;
 mod store;
+mod tainted;
 mod walk;
 
 use std::path::PathBuf;
@@ -107,6 +108,18 @@ enum Command {
     /// does not own, and without it self-mints see only wallets the project
     /// holds outright.
     Distributions(distributions::DistributionsArgs),
+    /// Per-ASSET provenance: which units the project minted to itself, and
+    /// where each one sits now.
+    ///
+    /// Every other report here is an aggregate — "the team minted 14.7%". This
+    /// answers the question an individual holder asks instead, which is
+    /// whether the one they own is part of it, and it is checkable against
+    /// their own wallet rather than taken on trust.
+    ///
+    /// Run `provenance` first: without it only wallets the project holds
+    /// outright are seen, and the funded fronts — the larger share — are
+    /// missed.
+    Tainted(tainted::TaintedArgs),
     /// Export core/founder assertions from the app's annotations sidecar as
     /// `[[wallet]]` registry fragments.
     ///
@@ -165,6 +178,7 @@ fn main() -> Result<()> {
         Command::EmitRegistry(args) => score::emit_registry(&args),
         Command::Provenance(args) => provenance::run(&args),
         Command::Distributions(args) => distributions::run(&args),
+        Command::Tainted(args) => tainted::run(&args),
         Command::Stats(args) => stats(args),
         Command::Reset(args) => reset(args),
     }

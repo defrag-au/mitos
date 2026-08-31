@@ -59,6 +59,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod projections;
+pub mod sample;
 
 /// Version byte at offset 0 of every encoded page. Bump on ANY change to the
 /// types in this crate (see the module docs for what counts).
@@ -106,6 +107,20 @@ pub struct AssetId {
     /// Display decimals. Identity is the hex name; this is presentation only,
     /// and the token registry — not the chain — is authoritative for it.
     pub decimals: u8,
+}
+
+impl AssetId {
+    /// ADA per WHOLE token, from the lovelace-per-RAW-unit that
+    /// [`projections::spot_at`] returns.
+    ///
+    /// Two conversions, and every surface that skipped either got a number
+    /// that looked plausible and was wrong by a factor of a million. This has
+    /// now been fixed three separate times — in `stats`, in `inspect`, and in
+    /// the frontend — because each held its own `/ 1e6`. It lives here, beside
+    /// the `decimals` that drives it, so there is one definition to be right.
+    pub fn spot_ada(&self, lovelace_per_raw_unit: f64) -> f64 {
+        lovelace_per_raw_unit / 1e6 * 10f64.powi(self.decimals as i32)
+    }
 }
 
 /// A pool on the reserve curve.

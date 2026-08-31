@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "allowed": {
+        "origins": [
+          "http://localhost:8088",
+          "http://127.0.0.1:8088",
+          "https://tokens.cnft.dev",
+          "https://dev.tokens.cnft.dev"
+        ],
+        "methods": ["GET", "HEAD"],
+        "headers": ["*"]
+      },
+      "exposeHeaders": ["Content-Length", "Content-Encoding", "ETag"],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}

@@ -50,7 +50,21 @@ use crate::store::{DistributionBase, DistributionLegRow, Ledger};
 /// that was a sale, compensation in kind, or a gift.
 /// v7 — `self_mint` funding is now WINDOWED to match `provenance` (lifetime
 /// sums badly misread a busy wallet), and carries `core_share_weighted`.
-pub const SCHEMA_VERSION: u32 = 7;
+/// v8 — commitments carry an optional off-chain `counterpart_*`: something
+/// claimed to discharge a line that the walk cannot reach. A mining project's
+/// largest promise buys machines, and machines are not a UTxO — so the line
+/// most worth checking is the one the chain is structurally blind to. Kept
+/// beside `measured_share`, never folded into it.
+/// v9 — commitments carry `contingent_on`: a promise over money the project
+/// does not have yet. Unmeasured then means NOT YET DUE, and reporting it as
+/// a coverage gap would accuse a project of missing a promise that has not
+/// come due — the mirror of the error v8 guards against.
+/// v10 — added `rewards`: what went BACK to holders, measured from the walk
+/// via declared `rewards_funding` → `rewards_distribution` parties. Until this
+/// existed the fragment measured only what left, and a page wanting the return
+/// figure had to cite another document. The same change stops a reward-funding
+/// wallet being counted as founder pay or ops spend.
+pub const SCHEMA_VERSION: u32 = 12;
 
 fn tx_url(tx: &str) -> String {
     format!("https://cardanoscan.io/transaction/{tx}")
@@ -67,6 +81,22 @@ fn tx_url(tx: &str) -> String {
 /// halves drift and a function ends up counted twice or not at all.
 pub(crate) fn is_marketing(function: Option<&str>) -> bool {
     matches!(function, Some("marketing") | Some("sponsorship"))
+}
+
+/// Wallets in the REWARD pipeline: the one that funds distributions and the
+/// one that pays them out.
+///
+/// Money reaching these is on its way BACK to holders, so it is neither a cost
+/// nor extraction, and counting it as either inverts the finding. On Mekka S1
+/// the funding wallet sat undeclared and fell through to `founder` — putting
+/// **15,217 ₳, 68% of measured "founder pay"**, on the founder. The wallet that
+/// paid holders every distribution was being reported as the founder taking
+/// money out.
+pub(crate) fn is_rewards(function: Option<&str>) -> bool {
+    matches!(
+        function,
+        Some("rewards_funding") | Some("rewards_distribution")
+    )
 }
 
 fn stake_url(key: &str) -> Option<String> {
@@ -95,11 +125,83 @@ pub struct DeepDive {
     /// Every unit seen moving through the project's wallets. See [`UnitSeen`].
     pub units_seen: Vec<UnitSeen>,
     pub distributions: Vec<Leg>,
+    /// What actually reached holders. `None` when no reward pipeline has been
+    /// declared — which means UNMEASURED, never zero. See [`Rewards`].
+    pub rewards: Option<Rewards>,
     pub provenance: Option<Provenance>,
     /// What must not be separated from the numbers above. Ordered most severe
     /// first so a renderer that shows only the top few still shows the ones
     /// that matter.
     pub caveats: Vec<Caveat>,
+}
+
+/// Money that went BACK to holders, measured from the walk.
+///
+/// Derived from two declared functions rather than from a wallet list:
+/// `rewards_funding` pays `rewards_distribution`, and the sum of those flows is
+/// what was distributed. Declaring the ROLE rather than the address means the
+/// measure survives the project changing provider, which is the same reason the
+/// original analysis found these by CIP-20 tag instead of by wallet.
+///
+/// This is the counterweight to every extraction figure in the fragment. A
+/// report that measures only what left and never what came back is not an
+/// accounting, and quoting a per-unit return from another document rather than
+/// from the walk invites exactly the "where did that come from" that the rest
+/// of this artifact exists to answer.
+#[derive(Debug, Serialize)]
+pub struct Rewards {
+    pub lovelace: i64,
+    /// One per distribution — these are batch payments, so this is the number
+    /// of DROPS, not the number of holders paid.
+    pub distributions: u64,
+    pub first_day_unix: Option<i64>,
+    pub last_day_unix: Option<i64>,
+    /// Divided across every holder-facing unit ever minted. A blunt average:
+    /// the project weighted its actual payouts by rarity, so no individual
+    /// holder received exactly this. It is the right figure for "what did the
+    /// collection return per NFT" and the wrong one for any single asset.
+    pub per_unit_lovelace: Option<i64>,
+    /// Funder → provider, so a reader can check the pipeline themselves.
+    pub funders: Vec<String>,
+    pub providers: Vec<String>,
+    /// Total seen arriving at named recipients in the payout transactions.
+    /// LOWER than `lovelace` — the walk only sees recipients inside its
+    /// frontier, so this is a floor on the fan-out, not a second total. The
+    /// gap between the two is the coverage.
+    pub observed_to_recipients: i64,
+    /// Rewards that landed on wallets the project declared. See
+    /// [`RewardRecipient`] — this is where a founder holding free-minted
+    /// supply shows up as being paid by it.
+    pub to_declared: Vec<RewardRecipient>,
+}
+
+/// A declared party that received holder rewards.
+///
+/// Rewards accrue PER ASSET, and the chain does not care what the asset cost.
+/// A unit the project minted to itself for nothing earns exactly as much as
+/// one a member of the public paid full price for — so a team wallet holding
+/// free-minted supply draws an income stream from the distribution it funds.
+/// That is a payment to the team by any reasonable reading, and it appears in
+/// no allocation table.
+#[derive(Debug, Serialize)]
+pub struct RewardRecipient {
+    pub party: String,
+    pub party_url: Option<String>,
+    pub label: Option<String>,
+    pub role: String,
+    /// What they did. Carried beside the role because the role alone loses the
+    /// distinction that decides which commitment the spend is measured
+    /// against — `sponsorship` and `moderation` are both `contractor`, but the
+    /// first is marketing and the second is ops.
+    pub function: Option<String>,
+    pub lovelace: i64,
+    /// How many of the distributions this wallet appeared in. Appearing in all
+    /// of them is the difference between holding through the run and having
+    /// bought in late.
+    pub drops: u64,
+    /// Units this wallet holds TODAY that were minted by the project's own
+    /// funded wallets — the free supply the income above accrues to.
+    pub free_minted_held: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +248,11 @@ pub struct Base {
 #[derive(Debug, Serialize)]
 pub struct Commitment {
     pub category: String,
+    /// `mint_funds` or `rewards` — which published breakdown this belongs to.
+    /// A consumer MUST filter by it before summing: two breakdowns each
+    /// summing to 100% look like one summing to 200%, which breaks the
+    /// exhaustiveness argument.
+    pub group: String,
     /// `null` means NOTHING WAS PUBLISHED — not a target of zero. A renderer
     /// must draw no marker; drawing one at zero asserts a promise nobody made.
     pub advertised_share: Option<f64>,
@@ -154,6 +261,23 @@ pub struct Commitment {
     /// `null` means nothing in this ledger measures it — which is itself worth
     /// showing, and is why the field exists rather than being omitted.
     pub measured_share: Option<f64>,
+    /// An off-chain claim against this line, in lovelace. NEVER merge this
+    /// into `measured_share`: that field is reproducible from the walk and
+    /// this one rests on someone's word. A renderer must show which is which.
+    pub counterpart_lovelace: Option<i64>,
+    /// Same value as a share of the external raise, so it sits on the same
+    /// axis as `advertised_share` and can be read against it directly.
+    pub counterpart_share: Option<f64>,
+    /// `asserted` | `document` | `observed`. Present whenever a counterpart
+    /// is, and the reason a reader can discount it appropriately.
+    pub counterpart_basis: Option<String>,
+    /// Includes any currency conversion, because a USD figure compared against
+    /// an ADA pledge is only as good as the rate and the date behind it.
+    pub counterpart_source: Option<String>,
+    /// The event that must occur before this line can be spent against. When
+    /// set, "unmeasured" means NOT YET DUE rather than not found, and a
+    /// renderer must not show it as a shortfall.
+    pub contingent_on: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -259,6 +383,19 @@ pub struct SelfMint {
     pub units: i64,
     pub share_of_supply: f64,
     /// Units that went to buyers outside the project.
+    ///
+    /// **Do NOT try to refine this by asking whether the MINT TRANSACTION paid
+    /// the project.** A batching provider settles to the treasury on its own
+    /// schedule, separately from the transactions that deliver the tokens, so
+    /// a paid buyer's units land in both a settling and a non-settling tx. That
+    /// test reported 472 of Mekka S2's 1,142 units as "given away" and moved
+    /// the price from 53.8 ₳ to 102.4 ₳ — both wrong. **1,139 of 1,142 units
+    /// were minted by wallets that paid the provider**; the other 3 went to the
+    /// provider's own settlement wallet.
+    ///
+    /// The same batching also inflates a naive per-tx price: a settling tx
+    /// carries ADA covering units minted in OTHER transactions, so
+    /// `treasury ÷ units in that tx` reads ~103 ₳ against a true ~60 ₳.
     pub public_units: i64,
     /// What the mint transactions total — the figure a reader would otherwise
     /// take as "raised".
@@ -458,12 +595,17 @@ pub fn build(
                 // published as its Development wallet — produces distribution
                 // legs, and money sent to it is ops spend. Project-side wallets
                 // never reach this point: internal transfers generate no leg.
+                // `is_rewards` is excluded from BOTH spending categories. A
+                // wallet that funds holder distributions is not ops spend and
+                // not marketing — the money is going back to the people who
+                // paid it in, which no mint-funds line describes.
                 "ops_team" => {
-                    (l.role == "contractor" && !is_marketing(l.function.as_deref()))
-                        || l.role == "ops"
+                    !is_rewards(l.function.as_deref())
+                        && ((l.role == "contractor" && !is_marketing(l.function.as_deref()))
+                            || l.role == "ops")
                 }
                 "marketing" => l.role == "contractor" && is_marketing(l.function.as_deref()),
-                "founder_pay" => l.role == "founder",
+                "founder_pay" => l.role == "founder" && !is_rewards(l.function.as_deref()),
                 _ => false,
             })
             .map(|l| l.quantity)
@@ -471,19 +613,47 @@ pub fn build(
         (sum > 0).then_some(sum)
     };
     let mut commitments = Vec::new();
-    let mut stmt =
-        conn.prepare("SELECT category, share, source FROM commitment ORDER BY category")?;
+    let mut stmt = conn.prepare(
+        "SELECT category, share, source, grp,
+                counterpart_lovelace, counterpart_basis, counterpart_source, contingent_on
+           FROM commitment ORDER BY grp, category",
+    )?;
     for row in stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Option<f64>>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
         ))
     })? {
-        let (category, advertised_share, source) = row?;
-        commitments.push(Commitment {
-            measured_share: measured_for(&category).and_then(share),
+        let (
             category,
+            advertised_share,
+            source,
+            group,
+            counterpart_lovelace,
+            counterpart_basis,
+            counterpart_source,
+            contingent_on,
+        ) = row?;
+        commitments.push(Commitment {
+            contingent_on,
+            counterpart_share: counterpart_lovelace.and_then(share),
+            counterpart_lovelace,
+            counterpart_basis,
+            counterpart_source,
+            // Only mint-fund lines have a spending counterpart in this ledger.
+            // A rewards line is measured against a distribution stream the walk
+            // does not model, so it stays null rather than reading as zero.
+            measured_share: (group == "mint_funds")
+                .then(|| measured_for(&category).and_then(share))
+                .flatten(),
+            category,
+            group,
             advertised_share,
             source,
         });
@@ -497,6 +667,123 @@ pub fn build(
             |r| r.get(0),
         )
         .unwrap_or(0);
+
+    // ── rewards: what went BACK to holders ─────────────────────────────────
+    //
+    // Measured funder → provider. Both ends must be declared: without the
+    // provider this would sum every outflow the funding wallet ever made,
+    // including its own off-ramps, and report them as money paid to holders.
+    let declared_keys = |function: &str| -> Result<Vec<String>> {
+        let mut s = conn.prepare("SELECT key FROM party WHERE declared_function = ?1")?;
+        let v = s
+            .query_map([function], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(v)
+    };
+    let funders = declared_keys("rewards_funding")?;
+    let providers = declared_keys("rewards_distribution")?;
+    let rewards = if funders.is_empty() || providers.is_empty() {
+        None
+    } else {
+        let list = |v: &[String]| {
+            v.iter()
+                .map(|k| format!("'{}'", k.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let sql = format!(
+            "SELECT COALESCE(SUM(quantity), 0), COUNT(DISTINCT tx_hash),
+                    MIN(block_time), MAX(block_time)
+               FROM unit_flow
+              WHERE unit = 'lovelace'
+                AND counterparty IN ({})
+                AND party IN ({})",
+            list(&funders),
+            list(&providers)
+        );
+        let (lovelace, distributions, first, last) = conn.query_row(&sql, [], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        // The PAYOUT transactions, identified by fan-out rather than by a hash
+        // list. A distribution pays every eligible holder at once; the same
+        // provider's other traffic — mint deliveries — pays exactly one party
+        // at a time. Twenty separates the two by an order of magnitude and
+        // needs no hard-coded hashes, so it survives the next distribution.
+        let drop_txs = format!(
+            "SELECT tx_hash FROM unit_flow
+              WHERE unit = 'lovelace' AND quantity > 0 AND counterparty IN ({})
+              GROUP BY tx_hash HAVING COUNT(DISTINCT party) >= 20",
+            list(&providers)
+        );
+        let observed_to_recipients: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM unit_flow
+                      WHERE unit = 'lovelace' AND quantity > 0 AND tx_hash IN ({drop_txs})"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let mut to_declared = Vec::new();
+        let recipients_sql = format!(
+            "SELECT u.party, p.declared_role, p.label, p.declared_function,
+                    SUM(u.quantity), COUNT(DISTINCT u.tx_hash),
+                    (SELECT COUNT(*) FROM asset_event e
+                       JOIN asset_holder h ON h.asset_name = e.asset_name
+                      WHERE e.kind = 'mint' AND e.asset_class = 'nft'
+                        AND h.party = u.party
+                        AND (e.to_party IN (SELECT key FROM party WHERE project_side = 1)
+                          OR e.to_party IN (SELECT holder FROM provenance_verdict WHERE flagged = 1)))
+               FROM unit_flow u JOIN party p ON p.key = u.party
+              WHERE u.unit = 'lovelace' AND u.quantity > 0
+                AND u.tx_hash IN ({drop_txs})
+                AND p.declared_role IS NOT NULL
+              GROUP BY u.party ORDER BY SUM(u.quantity) DESC"
+        );
+        let mut s = conn.prepare(&recipients_sql)?;
+        for row in s.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })? {
+            let (party, role, label, function, lovelace, drops, free_minted_held) = row?;
+            to_declared.push(RewardRecipient {
+                party_url: stake_url(&party),
+                party,
+                label,
+                role,
+                function,
+                lovelace,
+                drops: drops.max(0) as u64,
+                free_minted_held,
+            });
+        }
+
+        (lovelace > 0).then_some(Rewards {
+            lovelace,
+            distributions: distributions.max(0) as u64,
+            first_day_unix: first,
+            last_day_unix: last,
+            per_unit_lovelace: (minted_holder_facing > 0).then(|| lovelace / minted_holder_facing),
+            funders: funders.clone(),
+            providers: providers.clone(),
+            observed_to_recipients,
+            to_declared,
+        })
+    };
     let reference_tokens: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM asset_event WHERE kind='mint' AND asset_class='reference'",
@@ -597,6 +884,7 @@ pub fn build(
         supply_onward,
         units_seen,
         distributions,
+        rewards,
         provenance,
         caveats,
     })
@@ -653,6 +941,17 @@ fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<
            AND e.from_party IN (SELECT k FROM inside)
            AND e.to_party NOT IN (SELECT k FROM own)
            AND e.to_party IS NOT NULL
+           -- SCRIPTS ARE NOT RECIPIENTS. `stake17…` is a script stake
+           -- credential and `addr1w…` a script payment address, so a transfer
+           -- there is a LISTING or a contract interaction, not a gift to a
+           -- person. Mekka S1 sent 80 NFTs to jpg.store's script; counting
+           -- those as give-aways would turn ordinary listings into the largest
+           -- unexplained distribution on the page.
+           --
+           -- The asset usually comes straight back or is sold, and either way
+           -- the marketplace never owned it in any sense a reader means.
+           AND e.to_party NOT LIKE 'stake17%'
+           AND e.to_party NOT LIKE 'addr1w%'
          GROUP BY e.to_party
          ORDER BY COUNT(*) DESC"
     ))?;
@@ -904,6 +1203,19 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
         // these against the project's own breakdown, and "contractor/dev" is
         // not a thing the project ever promised a share of.
         let label = match (role.as_str(), function.as_str()) {
+            // FIRST, ahead of every role arm, because the funding wallet also
+            // looks like ops and whichever arm caught it would file money on
+            // its way back to holders as a cost — the one use of funds that is
+            // the opposite of a cost, and the only slice here that argues in
+            // the project's favour.
+            //
+            // FUNDING ONLY, never the distributor. On Mekka the airdrop
+            // provider is ALSO the minting provider, so money the project
+            // sends it is service fees; counting those as rewards inflated
+            // this slice by 7,813 ₳ — a third of it — by relabelling a cost as
+            // a payout. Rewards are the funder→provider leg, measured
+            // separately; this slice is only what the project put IN.
+            (_, "rewards_funding") => "returned to holders".to_string(),
             ("contractor", f) if is_marketing(Some(f)) => "marketing".to_string(),
             ("contractor", _) | ("ops", _) => "ops · tools · team".to_string(),
             // Money to a wallet that minted with it. Not unknown at all — it is
@@ -987,6 +1299,67 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
 /// the second read, and worse, it stays identical when the underlying state
 /// changes. These appear only when true, so their presence is information.
 #[allow(clippy::too_many_arguments)]
+/// What to say about a published commitment the walk cannot measure.
+///
+/// `None` when the line needs no caveat — either nothing was published, or
+/// something in the ledger measures it.
+///
+/// An off-chain counterpart changes what the silence MEANS, and only that. The
+/// line is still unmeasured; it is no longer *unanswered*, so calling it
+/// blocking would overstate the gap. It drops to `material` and names what the
+/// claim rests on — never presenting the claim as a measurement, which is the
+/// error the whole tool exists to avoid.
+fn commitment_caveat(c: &Commitment) -> Option<Caveat> {
+    let advertised = c.advertised_share?;
+    if c.measured_share.is_some() {
+        return None;
+    }
+    let pct = advertised * 100.0;
+    // A line whose triggering event has not happened is not a coverage gap —
+    // there is nothing yet to cover. Saying otherwise would report a project
+    // as having failed a promise that is not due, which is a real unfairness
+    // and not a conservative one.
+    if let Some(condition) = &c.contingent_on {
+        return Some(Caveat {
+            id: "commitment_not_yet_due",
+            severity: "context",
+            text: format!(
+                "'{}' was advertised at {pct:.0}% of a pool that DOES NOT EXIST YET — it is \
+                 contingent on {condition}. Nothing measures it because nothing has been spent \
+                 against it. Recorded so the promise is on file when the money arrives.",
+                c.category
+            ),
+        });
+    }
+    let (severity, text) = match (&c.counterpart_basis, c.counterpart_share) {
+        (Some(basis), Some(share)) => (
+            "material",
+            format!(
+                "'{}' was advertised at {pct:.0}% and NOTHING in this ledger measures it — the \
+                 spend leaves the chain before it becomes whatever was promised. A counterpart \
+                 worth {:.0}% of the raise is claimed against it — basis '{basis}' — which is not \
+                 a measurement and must not be read as one.",
+                c.category,
+                share * 100.0
+            ),
+        ),
+        _ => (
+            "blocking",
+            format!(
+                "'{}' was advertised at {pct:.0}% but NOTHING in this ledger measures it — no \
+                 declared wallet maps to that category. Its absence from the charts is a gap in \
+                 coverage, not a finding of zero.",
+                c.category
+            ),
+        ),
+    };
+    Some(Caveat {
+        id: "commitment_unmeasured",
+        severity,
+        text,
+    })
+}
+
 fn caveats(
     conn: &rusqlite::Connection,
     base: &DistributionBase,
@@ -1053,21 +1426,7 @@ fn caveats(
     // A published commitment with nothing measuring it is the most dangerous
     // silence in the whole fragment: the chart simply has no bar, and absence
     // reads as zero rather than as unmeasured.
-    for c in commitments {
-        if c.advertised_share.is_some() && c.measured_share.is_none() {
-            out.push(Caveat {
-                id: "commitment_unmeasured",
-                severity: "blocking",
-                text: format!(
-                    "'{}' was advertised at {:.0}% but NOTHING in this ledger measures it — no \
-                     declared wallet maps to that category. Its absence from the charts is a \
-                     gap in coverage, not a finding of zero.",
-                    c.category,
-                    c.advertised_share.unwrap_or(0.0) * 100.0
-                ),
-            });
-        }
-    }
+    out.extend(commitments.iter().filter_map(commitment_caveat));
 
     if legs.iter().any(|l| l.unit == "asset" && l.unpaid_units > 0) {
         out.push(Caveat {
@@ -1216,5 +1575,151 @@ mod tests {
         };
         v.sort_by_key(|c| rank(c.severity));
         assert_eq!(v.iter().map(|c| c.id).collect::<Vec<_>>(), ["b", "m", "c"]);
+    }
+
+    fn commitment(category: &str) -> Commitment {
+        Commitment {
+            category: category.into(),
+            group: "mint_funds".into(),
+            advertised_share: Some(0.8),
+            source: "infographic".into(),
+            measured_share: None,
+            counterpart_lovelace: None,
+            counterpart_share: None,
+            counterpart_basis: None,
+            counterpart_source: None,
+            contingent_on: None,
+        }
+    }
+
+    /// The reward pipeline must not be read as a cost. Money reaching the
+    /// wallet that funds holder distributions is on its way back OUT to
+    /// holders; counting it as founder pay or ops spend inverts the sign of
+    /// the finding, and on Mekka S1 it put 68% of "founder pay" on the founder.
+    #[test]
+    fn reward_pipeline_wallets_are_neither_ops_spend_nor_founder_pay() {
+        assert!(is_rewards(Some("rewards_funding")));
+        assert!(is_rewards(Some("rewards_distribution")));
+
+        // Everything else must be unaffected — an over-broad rule here would
+        // silently erase real spending from both published categories.
+        for f in [
+            Some("dev"),
+            Some("art"),
+            Some("moderation"),
+            Some("marketing"),
+            Some("sponsorship"),
+            None,
+        ] {
+            assert!(!is_rewards(f), "{f:?} must not read as reward plumbing");
+        }
+        // The two classifiers are disjoint: a function cannot be both promotion
+        // and a payout, and overlapping them would double-count.
+        assert!(!is_marketing(Some("rewards_funding")));
+    }
+
+    /// A project may publish how it will split money it does not yet have.
+    /// Reporting that as an unmet commitment accuses it of failing a promise
+    /// that is not due — the opposite error to the one this tool guards, and
+    /// just as bad.
+    #[test]
+    fn a_promise_over_money_that_does_not_exist_yet_is_not_a_coverage_gap() {
+        let c = commitment_caveat(&Commitment {
+            category: "machine_sale_hashpower".into(),
+            group: "machine_sale".into(),
+            advertised_share: Some(0.75),
+            contingent_on: Some("the sale of the 27 miners, not begun".into()),
+            ..commitment("machine_sale_hashpower")
+        })
+        .unwrap();
+
+        assert_eq!(
+            c.id, "commitment_not_yet_due",
+            "a contingent line is a different finding from an unmeasured one"
+        );
+        assert_eq!(
+            c.severity, "context",
+            "blocking would report a failure to deliver on a promise that is not due"
+        );
+        assert!(
+            c.text.contains("the sale of the 27 miners"),
+            "the condition is the whole point — it must be shown: {}",
+            c.text
+        );
+        // The contingency must win over the unmeasured path even when the line
+        // otherwise looks exactly like a gap.
+        assert!(!c.text.contains("gap in coverage"), "{}", c.text);
+    }
+
+    /// An off-chain counterpart ANSWERS a commitment without MEASURING it. The
+    /// distinction is the point of the field, so the caveat must keep saying
+    /// "unmeasured" even while reporting the claim — otherwise a reader takes
+    /// someone's recollection for a walk of the chain.
+    #[test]
+    fn a_counterpart_softens_the_caveat_without_ever_claiming_a_measurement() {
+        let bare = commitment_caveat(&commitment("mining_hardware")).unwrap();
+        assert_eq!(bare.severity, "blocking");
+
+        let claimed = commitment_caveat(&Commitment {
+            counterpart_lovelace: Some(201_568_000_000),
+            counterpart_share: Some(0.5515),
+            counterpart_basis: Some("asserted".into()),
+            counterpart_source: Some("operator recollection".into()),
+            ..commitment("mining_hardware")
+        })
+        .unwrap();
+
+        assert_eq!(
+            claimed.severity, "material",
+            "a claim against the line is not nothing, so blocking overstates the gap"
+        );
+        assert!(
+            claimed.text.contains("NOTHING in this ledger measures it"),
+            "the line is STILL unmeasured — softening severity must not soften that: {}",
+            claimed.text
+        );
+        assert!(
+            claimed.text.contains("must not be read as one"),
+            "the caveat has to say the counterpart is not a measurement: {}",
+            claimed.text
+        );
+        // 55% claimed against an 80% pledge. Reporting the pledge as answered
+        // would hide a quarter of the raise; the caveat must carry the figure
+        // so the shortfall is visible at the point the claim is made.
+        assert!(claimed.text.contains("55%"), "{}", claimed.text);
+    }
+
+    /// The counterpart must never suppress the caveat entirely, and a measured
+    /// line must never raise one. Both directions, because getting either
+    /// backwards silently changes what a published chart claims.
+    #[test]
+    fn measured_lines_are_silent_and_claimed_lines_are_not() {
+        assert!(
+            commitment_caveat(&Commitment {
+                measured_share: Some(0.42),
+                ..commitment("ops_team")
+            })
+            .is_none(),
+            "a measured commitment needs no caveat"
+        );
+        assert!(
+            commitment_caveat(&Commitment {
+                advertised_share: None,
+                ..commitment("supply")
+            })
+            .is_none(),
+            "nothing was published, so there is no promise to caveat"
+        );
+        // A basis with no figure is a half-filled row, not a claim. It must
+        // stay blocking rather than reading as answered.
+        assert_eq!(
+            commitment_caveat(&Commitment {
+                counterpart_basis: Some("asserted".into()),
+                ..commitment("mining_hardware")
+            })
+            .unwrap()
+            .severity,
+            "blocking"
+        );
     }
 }

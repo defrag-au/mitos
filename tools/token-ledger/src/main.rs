@@ -62,6 +62,21 @@ enum Command {
         #[arg(long)]
         at_slot: Option<u64>,
     },
+    /// Emit a real series as Rust source, for widget development.
+    ///
+    /// Widget work needs data with the awkward shapes real tokens have —
+    /// a 98.7% collapse, a band that swells and never releases, four years of
+    /// near-flat tail. Synthetic curves flatter a chart and hide exactly the
+    /// cases that decide whether a form works.
+    Fixture {
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        token: String,
+        /// Roughly how many points to emit. Sampled evenly across the domain.
+        #[arg(long, default_value_t = 240)]
+        points: usize,
+    },
     /// Interrogate the unclassified band — do these contracts look like locks?
     Probe {
         #[arg(long)]
@@ -92,6 +107,7 @@ fn main() -> Result<()> {
             token,
             at_slot,
         } => export::inspect(&dir, &token, at_slot),
+        Command::Fixture { dir, token, points } => export::fixture(&dir, &token, points),
         Command::Probe { db } => walk::probe(&db),
         Command::Classify { db, tokens } => walk::classify(&db, &tokens),
     }

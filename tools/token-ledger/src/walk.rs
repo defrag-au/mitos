@@ -58,6 +58,16 @@ pub struct WalkArgs {
     /// Stop after this many in-range blocks (smoke tests).
     #[arg(long)]
     pub max_blocks: Option<u64>,
+
+    /// Sieve mode: memmem each raw block for the policy id and only DECODE
+    /// on hit — the wallet-sieve technique applied to the walk. The gate is
+    /// COMPLETE, not heuristic: any tx moving the asset must carry the
+    /// policy id in an output's value or the mint field (the ledger's
+    /// balance rule leaves no third way), so a skipped block cannot hold
+    /// token history. The walk's CPU is almost entirely decode, so this is
+    /// the difference between ~30 minutes and ~1 minute on a 2-year token.
+    #[arg(long)]
+    pub sieve: bool,
 }
 
 /// Bech32 stake address from a payment address's delegation part.
@@ -180,15 +190,41 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let seek = (floor > 0).then(|| (floor, Vec::new()));
     let blocks = open_blocks(&immutable_dir, seek)?;
 
+    // Sieve gate: one 28-byte SIMD needle, shared machinery with
+    // wallet-sieve. Applied to the RAW block bytes before decode.
+    let sieve = args
+        .sieve
+        .then(|| chain_sieve::Needles::new(&[policy.clone()]))
+        .transpose()?;
+    let mut gated: u64 = 0;
+
     let mut scanned: u64 = 0;
     let mut in_range: u64 = 0;
     let mut touched: u64 = 0;
     let mut violations: u64 = 0;
     let mut undecoded_locks: u64 = 0;
-    let mut last_slot: u64 = 0;
+    // Seeded from the resume point, NOT 0. The final `commit_block` below
+    // writes this as the cursor, and it is only updated inside the block loop —
+    // so a resumed walk that finds NO new blocks (the snapshot has not advanced
+    // since last time, which is the common case when re-running) would otherwise
+    // write a cursor of 0 and destroy the resume point. The next walk then
+    // restarts from genesis: ~23 minutes instead of seconds, silently.
+    //
+    // Found via the R2 layout, which keys artifacts by this slot — $Aliens
+    // published under `…/0/` and the wrong version was visible in the key.
+    let mut last_slot: u64 = resume.unwrap_or(0);
 
     for block in blocks {
         let bytes = block.map_err(|e| anyhow::anyhow!("reading block from chunk: {e:?}"))?;
+        if let Some(needle) = &sieve {
+            if !needle.hit(&bytes) {
+                gated += 1;
+                if gated.is_multiple_of(1_000_000) {
+                    tracing::info!(gated, "walk: sieve skipping");
+                }
+                continue;
+            }
+        }
         let blk = MultiEraBlock::decode(&bytes)
             .map_err(|e| anyhow::anyhow!("decoding block at ~#{scanned}: {e:?}"))?;
         scanned += 1;
@@ -428,6 +464,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
     tracing::info!(
         scanned,
+        gated,
         in_range,
         touched,
         txs,

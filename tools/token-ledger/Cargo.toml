@@ -13,6 +13,9 @@ path = "src/main.rs"
 # tx decode, crash-visible checkpoint mirror. Same seam market-ledger and
 # project-ledger use — this tool adds no chain plumbing of its own.
 mitos-chain-walk = { path = "../mitos-chain-walk" }
+# The sieve gate — memmem raw blocks for the policy id, decode only on hit.
+# Shared machinery with wallet-sieve.
+chain-sieve = { path = "../../crates/chain-sieve" }
 
 # Pool script addresses + the CSwap pool datum (LP policy/name = the pool
 # INSTANCE key, fee bps, LP supply). Pure decode, no WIT coupling — the shared
