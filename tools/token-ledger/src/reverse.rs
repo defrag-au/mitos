@@ -270,11 +270,47 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<(u64, usiz
         on,
     )?;
 
+    // The top of what this ledger covers. A reverse pass starts at the ceiling
+    // and works down, so the ceiling IS the upper bound — and nothing else
+    // records it, since reverse never moves the forward cursor.
+    if contiguous {
+        ledger.set_walked_to(ceiling)?;
+    }
     ledger.put_pending(&pending.entries())?;
     // Target collapses onto the achieved floor: a finished pass is idle, not a
     // pass sitting at 100% forever. A poller reads the two being equal as
     // "nothing running".
     ledger.set_walk_target(outcome.floor)?;
+
+    // Has this ledger reached the policy's beginning?
+    //
+    // Only two things establish it: reaching genesis, or reaching a registered
+    // first-mint floor. A PROBE never does — it writes true rows into a
+    // detached window and claims no coverage, so it must not claim completeness
+    // either.
+    //
+    // A pass that stops short records PARTIAL, because it knows that for a
+    // fact: it just walked and did not get there. Leaving it unrecorded threw
+    // that away and made a ledger we had measured report "coverage unknown".
+    //
+    // The one thing never done is DEMOTING a `Complete` ledger: a later shallow
+    // pass over a fully-walked history has learned nothing that unmakes the
+    // earlier walk, and treating it as evidence would let routine refreshes
+    // erase a hard-won verdict.
+    use crate::store::Completeness;
+    let reached_beginning = contiguous
+        && (outcome.floor == 0 || token.floor_slot.is_some_and(|first| outcome.floor <= first));
+    let already = ledger.completeness()?;
+    let next = match (reached_beginning, already) {
+        (true, _) => Some(Completeness::Complete),
+        (false, Completeness::Complete) => None,
+        (false, _) if contiguous => Some(Completeness::Partial),
+        // A probe establishes nothing about coverage either way.
+        (false, _) => None,
+    };
+    if let Some(next) = next {
+        ledger.set_completeness(next)?;
+    }
 
     tracing::info!(
         floor = outcome.floor,
@@ -740,14 +776,8 @@ pub fn pass(
         }
         // WHICH transactions changed, not just how many. A consumer that was
         // handed these rows earlier has to re-read exactly these.
-        let mut updated: Vec<Hash<32>> = Vec::new();
-        for (spender, deltas) in by_tx {
-            let added = ledger.add_deltas(&spender, &deltas)?;
-            if added > 0 {
-                backfilled += added;
-                updated.push(spender);
-            }
-        }
+        let updated: Vec<Hash<32>> = by_tx.keys().copied().collect();
+        let backfills: Vec<(Hash<32>, Vec<DeltaRow>)> = by_tx.into_iter().collect();
 
         // EVERY chunk, including one that held nothing of ours.
         //
@@ -762,7 +792,12 @@ pub fn pass(
         // the recorded floor stop at the deepest chunk that happened to contain
         // a transaction, so every later pass re-read the quiet stretch below it.
         let (added, removed) = pending.take_changes();
-        ledger.commit_pending_changes(&added, &removed, contiguous.then(|| chunk * CHUNK_SLOTS))?;
+        backfilled += ledger.commit_chunk(
+            &backfills,
+            &added,
+            &removed,
+            contiguous.then(|| chunk * CHUNK_SLOTS),
+        )?;
 
         // AFTER the commit, so a consumer that reacts by reading the ledger
         // finds the rows this event is telling it about. Reported before the

@@ -27,7 +27,7 @@ use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::cohort;
 use crate::pools;
 use crate::registry;
-use crate::store::{AssetMeta, Balance, Ledger, TxRow};
+use crate::store::{AssetMeta, Balance, Completeness, Ledger, TxRow};
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -777,6 +777,17 @@ pub fn run(args: WalkArgs) -> Result<()> {
     // discovery when that ran — coverage from the policy's first appearance is
     // complete, because nothing below it holds the policy at all.
     ledger.set_walked_from(floor)?;
+    // And the top. A forward walk's frontier is where it stopped, which is the
+    // same slot the resume cursor names — recorded here too so `seal` reads ONE
+    // coverage pair regardless of which direction built the ledger.
+    ledger.set_walked_to(last_slot)?;
+    // Written by the only code that can decide it: this function holds the
+    // registry entry, and `buffer_complete` is the verdict every reader needs
+    // but none can re-derive from the ledger alone.
+    ledger.set_completeness(match buffer_complete {
+        true => Completeness::Complete,
+        false => Completeness::Partial,
+    })?;
 
     // Classify from the addresses just recorded. Derived, so it costs a pass
     // over the party table and never a re-walk.
@@ -1033,8 +1044,62 @@ pub fn stats(db: &std::path::Path, top: usize) -> Result<()> {
         }
     }
     println!("txs {txs}  deltas {deltas}  parties seen {parties}");
-    println!("holders with non-zero balance: {}", balances.len());
-    println!("total held: {total}");
+
+    // IS THIS A BALANCE TABLE, OR A WINDOW OF MOVEMENT?
+    //
+    // `balances` sums every delta on record. That IS the holder table when the
+    // walk reached the policy's first mint — every arrival has its matching
+    // departure. On a PARTIAL ledger it is not: a reverse pass records the
+    // arrival and leaves the departure below its floor, so the sums are net
+    // movement inside the covered window and nothing more.
+    //
+    // Presenting them the same way is how "23 holders, total held 86" gets
+    // printed for a 10,000-NFT collection with thousands of holders — measured,
+    // on SpaceBudz, before this check existed. The numbers were not wrong; the
+    // LABELS were, which is worse, because a wrong label is believed.
+    let coverage = ledger.coverage()?;
+    // THREE states, not two. "Not known to be complete" is its own answer: a
+    // ledger written before the flag existed may well be complete — $PERP's
+    // deltas sum to exactly its 1,000,000,000 supply with nothing unresolved —
+    // and calling that PARTIAL is as much a mislabel as the reverse. Say what
+    // is known, and say how to settle it.
+    let complete = ledger.completeness()?;
+    match complete {
+        Completeness::Complete => {
+            debug_assert!(complete.balances_are_holdings());
+            println!("holders with non-zero balance: {}", balances.len());
+            println!("total held: {total}");
+        }
+        Completeness::Partial => {
+            println!(
+                "PARTIAL LEDGER — coverage reaches back only to slot {}, so these are NET \
+                 MOVEMENTS in that window, NOT holdings.",
+                coverage
+                    .walked_from
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "(unrecorded)".into())
+            );
+            println!(
+                "parties that moved: {}  ·  net units moved: {total}  ·  \
+                 movements still missing a source: {}",
+                balances.len(),
+                coverage.unresolved
+            );
+            println!("  deepen with `reverse` until the unresolved count stops falling.");
+        }
+        Completeness::Unrecorded => {
+            println!(
+                "COVERAGE UNRECORDED — this ledger predates the completeness flag, so \
+                 whether these are holdings or a window of movement is not known."
+            );
+            println!(
+                "non-zero balances: {}  ·  net units: {total}  ·  unresolved sources: {}",
+                balances.len(),
+                coverage.unresolved
+            );
+            println!("  re-run `walk` to stamp it — an incremental resume is enough.");
+        }
+    }
     println!();
     for b in balances.iter().take(top) {
         let pct = if total > 0 {
@@ -1058,9 +1123,30 @@ pub fn stats(db: &std::path::Path, top: usize) -> Result<()> {
         );
     }
 
-    mint_report(&ledger, total)?;
-    cascade_report(&ledger, total)?;
-    cap_report(&ledger, &balances, total, ledger.asset_meta()?.as_ref())?;
+    // EVERY REPORT BELOW DIVIDES BY `total` AS IF IT WERE SUPPLY.
+    //
+    // "where supply landed at mint", "how concentrated is the float", "what is
+    // the market cap" — all three are statements about a whole history, and a
+    // partial ledger has not got one. Worse, they would still PRINT: a mint
+    // report over a window that never reached the mint shows the earliest
+    // arrivals it happens to have and calls them the launch.
+    //
+    // Skipped rather than caveated, because a caveat above a plausible-looking
+    // distribution table is not read.
+    //
+    // The asymmetry between this and `balances_are_holdings` is deliberate and
+    // argued on `Completeness` itself, so both call sites cannot drift apart.
+    if complete.supply_reports_defined() {
+        mint_report(&ledger, total)?;
+        cascade_report(&ledger, total)?;
+        cap_report(&ledger, &balances, total, ledger.asset_meta()?.as_ref())?;
+    } else {
+        println!();
+        println!(
+            "mint, cascade and cap reports SKIPPED — each divides by supply, and a \
+             partial ledger has no supply figure to divide by."
+        );
+    }
     Ok(())
 }
 

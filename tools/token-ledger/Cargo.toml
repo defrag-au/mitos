@@ -19,6 +19,16 @@ chain-sieve = { path = "../../crates/chain-sieve" }
 
 # `serve` — the hosted any-token-on-demand surface. Tokio is confined to
 # serve::run, per the wallet-sieve convention.
+# Sealed artifacts. `default-features = false` DELIBERATELY: the default set
+# pulls `arrow` (array/buffer/schema stack) and every compression codec, which
+# measured 16× larger than the low-level column API when compiled to wasm. The
+# frontend reads these files with the same lean feature set, so the writer and
+# the reader stay in step — see docs/design/TOKEN_LEDGER_PARQUET.md.
+#
+# NOT the `duckdb` crate: that embeds a query engine. This is the file format
+# alone, which is why it can live in-process instead of shelling a CLI that is
+# not installed on the box.
+parquet = { version = "55", default-features = false, features = ["snap"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 # SSE progress on the policy feed — the same streaming shape wallet-sieve's

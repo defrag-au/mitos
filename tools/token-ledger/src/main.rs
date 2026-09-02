@@ -22,6 +22,7 @@ mod policy_api;
 mod pools;
 mod registry;
 mod reverse;
+mod seal;
 mod serve;
 mod store;
 mod walk;
@@ -45,6 +46,13 @@ struct Cli {
 enum Command {
     /// Walk certified immutable-DB history into the ledger.
     Walk(walk::WalkArgs),
+    /// Write completed months to Parquet — the sealed, queryable archive.
+    ///
+    /// sqlite stays the working set (incremental walks, point lookups by tx
+    /// hash); Parquet is what goes to R2, where DuckDB's httpfs can query it in
+    /// place over range requests. Each partition is stamped with the ledger's
+    /// coverage, so an archive cannot be mistaken for a window.
+    Seal(seal::SealArgs),
     /// Walk BACKWARD from the ledger's floor, newest first.
     ///
     /// The progressive counterpart to `walk`. `walk` is complete-or-nothing:
@@ -133,6 +141,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Walk(args) => walk::run(args),
         Command::Reverse(args) => reverse::run(args),
+        Command::Seal(args) => seal::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),

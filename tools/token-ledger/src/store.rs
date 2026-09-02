@@ -48,6 +48,25 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::pools::PoolObservation;
 
+/// Cursor keys, named once.
+///
+/// These are `cursor.k` string literals, and every reader outside this module
+/// used to spell them itself. `seal` spelled `walked_from` where the writer says
+/// `walk_from`, read `None`, concluded the ledger covered nothing, and sealed
+/// zero partitions without an error — a typo that produced a plausible answer.
+pub mod cursor_key {
+    /// Lowest slot covered.
+    pub const WALK_FROM: &str = "walk_from";
+    /// Highest slot covered.
+    pub const WALK_TO: &str = "walk_to";
+    /// Where a running pass is heading.
+    pub const WALK_TARGET: &str = "walk_target";
+    /// Forward frontier — the resume point.
+    pub const WALK: &str = "walk";
+    /// `Completeness`, as a code.
+    pub const COVERAGE_COMPLETE: &str = "coverage_complete";
+}
+
 pub struct Ledger {
     conn: Connection,
     /// address → party_id, so the hot path doesn't round-trip sqlite per row.
@@ -218,6 +237,93 @@ pub struct PartyMove {
     pub address: String,
     pub stake: Option<String>,
     pub amount: i64,
+}
+
+/// How far a ledger's coverage reaches — and therefore what its delta sums
+/// actually mean.
+///
+/// **Three states, and an `Option<bool>` cannot hold them.** That was the first
+/// shape here and it collapsed the interesting distinction: `None` had to stand
+/// for "nobody recorded it", which is neither "complete" nor "partial" and is
+/// answered differently from both. A reader has to be able to tell "these are
+/// holdings" from "these are a window of movement" from "we do not know", and
+/// only the third is fixed by re-running a walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completeness {
+    /// Coverage reaches the policy's beginning. Delta sums ARE holdings, and
+    /// every supply-derived projection is defined.
+    Complete,
+    /// Coverage reaches a floor and stops. Sums are net movement inside that
+    /// window: an arrival whose source sits below the floor has no matching
+    /// departure, so they are not holdings and nothing may divide by them.
+    Partial,
+    /// Written before completeness was recorded. Genuinely unknown — and
+    /// settled by an incremental walk, which is what a reader should be told.
+    Unrecorded,
+}
+
+impl Completeness {
+    /// Every variant.
+    ///
+    /// Exercised by tests rather than by the binary — the production code
+    /// matches exhaustively, which the compiler already enforces. Kept because
+    /// the tests that assert every state has a wire spelling and a manifest
+    /// spelling are exactly what stops a fourth variant shipping half-wired.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const ALL: [Completeness; 3] = [
+        Completeness::Complete,
+        Completeness::Partial,
+        Completeness::Unrecorded,
+    ];
+
+    /// Stored form. `None` for [`Completeness::Unrecorded`], which is the
+    /// absence of a row rather than a value.
+    pub fn code(self) -> Option<i64> {
+        match self {
+            Completeness::Complete => Some(1),
+            Completeness::Partial => Some(0),
+            Completeness::Unrecorded => None,
+        }
+    }
+
+    pub fn from_code(code: Option<i64>) -> Self {
+        match code {
+            Some(1) => Completeness::Complete,
+            Some(_) => Completeness::Partial,
+            None => Completeness::Unrecorded,
+        }
+    }
+
+    /// The wire spelling. Matches `shared_types::policy_feed::Completeness`'s
+    /// serde representation — the two are one vocabulary across the tunnel, and
+    /// a mismatch here is a frontend that silently reads every ledger as
+    /// unrecorded.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Completeness::Complete => "complete",
+            Completeness::Partial => "partial",
+            Completeness::Unrecorded => "unrecorded",
+        }
+    }
+
+    /// May delta sums be presented as HOLDINGS?
+    ///
+    /// Only when known complete. `Unrecorded` is refused here even though it is
+    /// allowed to keep the supply reports — labelling movements as holdings is
+    /// a claim a reader believes, and it is the one mistake worth being
+    /// asymmetric about.
+    pub fn balances_are_holdings(self) -> bool {
+        matches!(self, Completeness::Complete)
+    }
+
+    /// May the mint / cascade / cap reports run? Each divides by supply.
+    ///
+    /// `Unrecorded` passes: withholding them from every pre-flag ledger would
+    /// break the tool for every token it already serves, and the header has
+    /// already said the coverage is unknown.
+    pub fn supply_reports_defined(self) -> bool {
+        !matches!(self, Completeness::Partial)
+    }
 }
 
 /// What a ledger covers, and how far a running pass has got.
@@ -771,6 +877,80 @@ impl Ledger {
             .map(|s| s as u64))
     }
 
+    /// Record how far this ledger's coverage reaches.
+    ///
+    /// A RECORDED FACT, not a re-derivation, because the ledger alone cannot
+    /// establish it. `walked_from <= first_slot` looks like the test and is
+    /// exactly backwards: on a shallow walk the floor sits below the earliest
+    /// transaction it happened to find, so every partial ledger would pass.
+    /// And `walked_from == 0` would call a complete walk from a registered
+    /// first-mint floor "partial", which is the opposite error.
+    ///
+    /// Only the walk knows — it holds the registry entry — so it writes the
+    /// answer down and every reader trusts it.
+    pub fn set_completeness(&self, state: Completeness) -> Result<()> {
+        let Some(code) = state.code() else {
+            // `Unrecorded` is the ABSENCE of a row, not a value. Writing it
+            // would claim we had decided "unknown", which is not a decision.
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT INTO cursor (k, slot) VALUES ('coverage_complete', ?1)
+             ON CONFLICT(k) DO UPDATE SET slot = ?1",
+            params![code],
+        )?;
+        Ok(())
+    }
+
+    /// How far this ledger's coverage reaches. Absent row ⇒
+    /// [`Completeness::Unrecorded`].
+    pub fn completeness(&self) -> Result<Completeness> {
+        let code: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT slot FROM cursor WHERE k = 'coverage_complete'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(Completeness::from_code(code))
+    }
+
+    /// The UPPER bound of coverage — the counterpart to [`Self::walked_from`].
+    ///
+    /// Recorded because the pair is the only honest statement of what a ledger
+    /// holds, and neither walk direction can supply it alone. A forward walk's
+    /// frontier is its resume cursor; a reverse walk deliberately never moves
+    /// that cursor, so a reverse-only ledger would have no upper bound at all
+    /// and `MAX(tx.slot)` is not one — that is the newest row found, not the
+    /// slot below which we stopped looking.
+    ///
+    /// `max` rather than assignment: coverage only ever grows upward, and a
+    /// deepening pass that starts lower must not retract the top.
+    pub fn set_walked_to(&self, slot: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cursor (k, slot) VALUES (?1, ?2)
+             ON CONFLICT(k) DO UPDATE SET slot = max(slot, excluded.slot)",
+            params![cursor_key::WALK_TO, slot as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn walked_to(&self) -> Result<Option<u64>> {
+        self.cursor(cursor_key::WALK_TO)
+    }
+
+    /// One cursor slot by key. The single place a `cursor` row is read.
+    pub fn cursor(&self, key: &str) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT slot FROM cursor WHERE k = ?1", params![key], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|s| s as u64))
+    }
+
     /// Where the running pass is HEADING, so a reader outside the process can
     /// compute progress.
     ///
@@ -1204,18 +1384,89 @@ impl Ledger {
     /// on reaching the transactions further back that created them, by which
     /// point the row is written. So the delta set grows after the fact.
     ///
-    /// `INSERT OR IGNORE` because the same source may be reached twice across a
-    /// resumed run, and a delta applied twice would double the party's balance.
-    /// The `(tx_ord, party_id, unit_id)` key makes that a no-op rather than a
-    /// correction anyone has to remember to make.
+    /// # Deltas ACCUMULATE; they do not replace, and they must not be ignored
     ///
-    /// Returns how many rows were genuinely new, so a caller can tell real
-    /// progress from a re-walk that resolved nothing.
-    pub fn add_deltas(&mut self, tx_hash: &Hash<32>, deltas: &[DeltaRow]) -> Result<usize> {
+    /// This was `INSERT OR IGNORE`, reasoning that the key made a
+    /// double-application a harmless no-op. That was wrong, and wrong in the
+    /// common case rather than an exotic one.
+    ///
+    /// A party routinely appears TWICE for the same unit in one transaction:
+    /// `+1` from the output loop when a token lands, `−1` from this backfill
+    /// when the walk later reaches the output it was spent from. Any transaction
+    /// touching a wallet that holds NFTs returns the untouched ones as change,
+    /// so sender and receiver are the same party. Under `OR IGNORE` the second
+    /// write collided with the first and the negative was silently dropped.
+    ///
+    /// Measured on a full-history SpaceBudz walk: `Σ delta` came to 440,971
+    /// against a net mint of 10,002 — roughly 431,000 arrivals with no matching
+    /// departure, and no error anywhere.
+    ///
+    /// The forward walk never hit it because it nets per `(party, unit)` in
+    /// memory and writes one row. The reverse walk cannot: the two halves are
+    /// discovered chunks apart.
+    ///
+    /// Returns rows genuinely CHANGED, so a caller can tell real progress from a
+    /// re-walk that resolved nothing.
+    /// Apply one chunk's backfills, pending changes and floor advance — ALL IN
+    /// ONE TRANSACTION.
+    ///
+    /// Atomic because the delta write and the pending removal are now a matched
+    /// pair. Deltas ACCUMULATE (see [`Self::add_deltas`]), so re-applying one is
+    /// no longer a harmless no-op — it doubles a balance. Committed separately,
+    /// a pass killed between the two would leave the source still pending, be
+    /// re-resolved on the next pass, and add the same movement twice.
+    ///
+    /// The floor rides along for the reason it always did: coverage must not
+    /// advance past work whose bookkeeping did not land.
+    pub fn commit_chunk(
+        &mut self,
+        backfills: &[(Hash<32>, Vec<DeltaRow>)],
+        added: &[((Hash<32>, u32), Hash<32>)],
+        removed: &[(Hash<32>, u32)],
+        floor: Option<u64>,
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut applied = 0usize;
+        for (spender, deltas) in backfills {
+            applied +=
+                Self::write_backfill(&tx, &mut self.parties, &mut self.units, spender, deltas)?;
+        }
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO pending_input (oref_hash, oref_idx, spender)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for ((hash, idx), spender) in added {
+                ins.execute(params![hash.as_ref(), *idx as i64, spender.as_ref()])?;
+            }
+            let mut del =
+                tx.prepare("DELETE FROM pending_input WHERE oref_hash = ?1 AND oref_idx = ?2")?;
+            for (hash, idx) in removed {
+                del.execute(params![hash.as_ref(), *idx as i64])?;
+            }
+        }
+        if let Some(floor) = floor {
+            tx.execute(
+                "INSERT INTO cursor (k, slot) VALUES ('walk_from', ?1)
+                 ON CONFLICT(k) DO UPDATE SET slot = min(slot, excluded.slot)",
+                params![floor as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    /// One spender's backfilled deltas, inside a caller-owned transaction.
+    fn write_backfill(
+        tx: &rusqlite::Transaction<'_>,
+        parties: &mut HashMap<String, i64>,
+        units: &mut HashMap<Vec<u8>, i64>,
+        tx_hash: &Hash<32>,
+        deltas: &[DeltaRow],
+    ) -> Result<usize> {
         if deltas.is_empty() {
             return Ok(0);
         }
-        let tx = self.conn.transaction()?;
         let ord: Option<i64> = tx
             .query_row(
                 "SELECT tx_ord FROM tx WHERE tx_hash = ?1",
@@ -1223,15 +1474,15 @@ impl Ledger {
                 |r| r.get(0),
             )
             .optional()?;
-        // The transaction is not on record. Reached when a source resolves for
-        // a tx that was filtered out — not an error, and silently inserting a
-        // parentless delta is exactly the orphan the reconciliation counts.
+        // Not on record — a source resolved for a transaction that was filtered
+        // out. Not an error, and inserting a parentless delta is exactly the
+        // orphan the reconciliation counts.
         let Some(ord) = ord else {
             return Ok(0);
         };
-        let mut added = 0;
+        let mut applied = 0;
         for d in deltas {
-            let party_id = match self.parties.get(&d.address) {
+            let party_id = match parties.get(&d.address) {
                 Some(id) => *id,
                 None => {
                     tx.execute(
@@ -1243,20 +1494,27 @@ impl Ledger {
                         params![d.address],
                         |r| r.get(0),
                     )?;
-                    self.parties.insert(d.address.clone(), id);
+                    parties.insert(d.address.clone(), id);
                     id
                 }
             };
-            let unit_id = Self::unit_id(&tx, &mut self.units, &d.name)?;
-            added += tx.execute(
-                "INSERT OR IGNORE INTO delta (tx_ord, party_id, unit_id, amount)
-                 VALUES (?1, ?2, ?3, ?4)",
+            let unit_id = Self::unit_id(tx, units, &d.name)?;
+            applied += tx.execute(
+                "INSERT INTO delta (tx_ord, party_id, unit_id, amount)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(tx_ord, party_id, unit_id)
+                 DO UPDATE SET amount = amount + excluded.amount",
                 params![ord, party_id, unit_id, d.amount],
             )?;
         }
-        tx.commit()?;
-        Ok(added)
+        Ok(applied)
     }
+
+    // NOTE: a standalone `add_deltas` used to live here, committing its own
+    // transaction. It is gone deliberately — a backfill must land in the SAME
+    // transaction as the pending removal that retires it, or a pass killed
+    // between the two re-resolves the source and, now that deltas accumulate,
+    // doubles the movement. `commit_chunk` is the only way in.
 
     /// One transaction as a FEED row: what moved, and who moved it.
     ///
@@ -1462,50 +1720,10 @@ impl Ledger {
         Ok(out)
     }
 
-    /// Apply one chunk's pending changes AND advance the floor, atomically.
-    ///
-    /// The atomicity is the point. `set_walked_from` advances every chunk; if
-    /// the pending set were saved only at the end of a pass, a run killed
-    /// midway would leave a ledger claiming coverage down to some slot with no
-    /// record of what it was still waiting for — and nothing would ever look
-    /// for those sources again, because the floor has already passed them.
-    /// Silent, permanent, and invisible to every reconciliation.
-    ///
-    /// Incremental rather than a wholesale rewrite because the set runs to tens
-    /// of thousands of rows while a chunk touches a handful.
-    /// `floor` is `None` for a PROBE — a detached window that writes real rows
-    /// but must not claim contiguous coverage down to where it happens to sit.
-    pub fn commit_pending_changes(
-        &mut self,
-        added: &[((Hash<32>, u32), Hash<32>)],
-        removed: &[(Hash<32>, u32)],
-        floor: Option<u64>,
-    ) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        {
-            let mut ins = tx.prepare(
-                "INSERT OR IGNORE INTO pending_input (oref_hash, oref_idx, spender)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for ((hash, idx), spender) in added {
-                ins.execute(params![hash.as_ref(), *idx as i64, spender.as_ref()])?;
-            }
-            let mut del =
-                tx.prepare("DELETE FROM pending_input WHERE oref_hash = ?1 AND oref_idx = ?2")?;
-            for (hash, idx) in removed {
-                del.execute(params![hash.as_ref(), *idx as i64])?;
-            }
-        }
-        if let Some(floor) = floor {
-            tx.execute(
-                "INSERT INTO cursor (k, slot) VALUES ('walk_from', ?1)
-                 ON CONFLICT(k) DO UPDATE SET slot = min(slot, excluded.slot)",
-                params![floor as i64],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
+    // NOTE: `commit_pending_changes` used to sit here, committing the pending
+    // set and the floor without the backfills. Folded into `commit_chunk` for
+    // the reason given there — the backfill has to be in the same transaction
+    // as the removal that retires it.
 
     /// Replace the pending set wholesale.
     ///

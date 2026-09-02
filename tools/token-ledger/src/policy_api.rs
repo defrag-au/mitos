@@ -291,6 +291,14 @@ pub struct CoverageDto {
     pub unresolved: u64,
     /// A pass is running and coverage is still moving.
     pub walking: bool,
+    /// `complete` | `partial` | `unrecorded` — whether these numbers are
+    /// holdings, a window of movement, or unknown.
+    ///
+    /// On the wire because the consumer cannot derive it: `walked_from` alone
+    /// looks sufficient and is not — on a shallow walk the floor sits below the
+    /// earliest transaction found, so every partial ledger would read as
+    /// complete. Only the walk knows, so only the walk says.
+    pub completeness: &'static str,
 }
 
 #[derive(Serialize)]
@@ -436,6 +444,9 @@ pub async fn feed(
                 units: 0,
                 unresolved: 0,
                 walking: false,
+                // No ledger, so nothing has been established about one. Not
+                // `partial`: that would claim a window exists.
+                completeness: crate::store::Completeness::Unrecorded.as_wire(),
             },
             job,
             rows: Vec::new(),
@@ -463,6 +474,7 @@ pub async fn feed(
                 (cov.walk_target, cov.walked_from),
                 (Some(t), Some(f)) if t < f
             ),
+            completeness: ledger.completeness().map_err(internal)?.as_wire(),
         },
         job,
         rows: rows.into_iter().map(to_dto).collect(),
@@ -647,6 +659,60 @@ mod tests {
     fn an_arrival_with_no_source_reads_as_below_the_floor() {
         let d = direction(&unit(0, vec![party("bob", 1)]));
         assert!(matches!(d, DirectionDto::SourceBelowFloor { ref to } if to == "bob"));
+    }
+
+    /// THE TWO SPELLINGS ARE ONE VOCABULARY.
+    ///
+    /// `store::Completeness::as_wire` and `shared_types::policy_feed::
+    /// Completeness`'s serde representation cross the tunnel as the same
+    /// strings. A drift is silent in the worst way: an unknown variant
+    /// deserialises to the `Unrecorded` default, so every ledger would quietly
+    /// read as "coverage unknown" and no error would ever be raised.
+    ///
+    /// Pinned here rather than in the consumer because this is the side that
+    /// writes them.
+    #[test]
+    fn the_wire_spellings_are_exhaustive_and_stable() {
+        use crate::store::Completeness;
+        let spellings: Vec<&str> = Completeness::ALL.iter().map(|c| c.as_wire()).collect();
+        assert_eq!(spellings, vec!["complete", "partial", "unrecorded"]);
+        // Distinct, or two states would collapse into one on the wire.
+        let mut sorted = spellings.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), Completeness::ALL.len());
+    }
+
+    /// The stored form round-trips, and an ABSENT row is `Unrecorded` — the
+    /// distinction the `Option<bool>` this replaced could not express.
+    #[test]
+    fn completeness_round_trips_through_its_stored_code() {
+        use crate::store::Completeness;
+        for state in Completeness::ALL {
+            assert_eq!(Completeness::from_code(state.code()), state, "{state:?}");
+        }
+        assert_eq!(Completeness::from_code(None), Completeness::Unrecorded);
+    }
+
+    /// The asymmetry is load-bearing: a partial ledger must not label its
+    /// movements as holdings, but an unrecorded one keeps its supply reports
+    /// rather than breaking every pre-flag token.
+    #[test]
+    fn only_a_complete_ledger_reports_holdings_but_only_partial_loses_supply_reports() {
+        use crate::store::Completeness;
+        assert!(Completeness::Complete.balances_are_holdings());
+        assert!(!Completeness::Partial.balances_are_holdings());
+        assert!(
+            !Completeness::Unrecorded.balances_are_holdings(),
+            "unknown must not be presented as holdings"
+        );
+
+        assert!(Completeness::Complete.supply_reports_defined());
+        assert!(!Completeness::Partial.supply_reports_defined());
+        assert!(
+            Completeness::Unrecorded.supply_reports_defined(),
+            "pre-flag ledgers keep working"
+        );
     }
 
     /// Zero-amount parties are filtered at write time, but a row assembled from
