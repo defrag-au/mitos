@@ -130,10 +130,26 @@ pub fn run(args: ServeArgs) -> Result<()> {
         });
     }
 
+    // The POLICY surface, mounted alongside rather than replacing the artifact
+    // path above. They answer different questions: that one builds an immutable
+    // snapshot for a finished token, this one serves a live, correcting feed.
+    // token-explorer depends on the first and is untouched.
+    let policy_hub = crate::policy_api::PolicyHub::new(
+        args.data_dir.clone(),
+        args.tokens.clone(),
+        args.db_dir.clone(),
+        std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
+    );
+
     let listen = args.listen.clone();
+    // Each half resolves its OWN state before the merge — the two hubs are
+    // different types, so they cannot share one `with_state`. CORS goes on
+    // last, over both.
     let app = axum::Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/token/{unit}", get(token))
+        .with_state(hub)
+        .merge(crate::policy_api::router(policy_hub))
         // Permissive CORS: the consumers are wasm frontends on other
         // origins, and everything here is public chain data behind the
         // bearer gate.
@@ -142,8 +158,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
-        )
-        .with_state(hub);
+        );
 
     tracing::info!(%listen, "serve: listening");
     tokio::runtime::Builder::new_multi_thread()

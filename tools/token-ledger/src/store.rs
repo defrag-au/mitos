@@ -189,6 +189,51 @@ pub struct TxRow {
     pub locks_spent: Vec<(Hash<32>, u32)>,
 }
 
+/// One transaction, as a feed reads it.
+pub struct FeedRow {
+    pub tx_hash: Vec<u8>,
+    pub slot: u64,
+    pub block_time: u64,
+    /// One entry per unit of the policy that this transaction touched.
+    pub units: Vec<UnitMove>,
+}
+
+/// One unit's movement within one transaction.
+pub struct UnitMove {
+    /// On-chain asset-name bytes.
+    pub name: Vec<u8>,
+    /// Net mint for this unit here: 0 transfer, positive mint, negative burn.
+    pub net_mint: i64,
+    /// Every party whose balance of this unit changed.
+    ///
+    /// The PRIMITIVE, carried as-is. Direction is derived from it rather than
+    /// stored, and the derivation has to be able to decline — a batched
+    /// marketplace fill has several losers and several gainers, and the obvious
+    /// "biggest is the sender" rule is wrong exactly there.
+    pub parties: Vec<PartyMove>,
+}
+
+/// One party's signed movement of one unit.
+pub struct PartyMove {
+    pub address: String,
+    pub stake: Option<String>,
+    pub amount: i64,
+}
+
+/// What a ledger covers, and how far a running pass has got.
+pub struct Coverage {
+    /// Lowest slot covered. `None` on a ledger no pass has recorded.
+    pub walked_from: Option<u64>,
+    /// Where a running pass is heading. Equal to `walked_from` when idle.
+    pub walk_target: Option<u64>,
+    pub first_slot: Option<u64>,
+    pub last_slot: Option<u64>,
+    pub total_txs: u64,
+    pub units: u64,
+    /// Movements whose source sits below the floor — the honest gap.
+    pub unresolved: u64,
+}
+
 /// The `Ledger`'s in-memory id caches, borrowed together.
 ///
 /// Bundled because `write_rows` needs all four while a `Transaction` holds a
@@ -726,6 +771,35 @@ impl Ledger {
             .map(|s| s as u64))
     }
 
+    /// Where the running pass is HEADING, so a reader outside the process can
+    /// compute progress.
+    ///
+    /// `walked_from` alone says where coverage reaches but not how far it
+    /// intends to go, and a poller cannot turn one number into a percentage. A
+    /// UI would be left showing a floor slot ticking down with no denominator —
+    /// which is a log line, not a progress bar.
+    ///
+    /// Cleared to the floor when a pass finishes, so "target == floor" reads as
+    /// idle rather than as a pass permanently stuck at 100%.
+    pub fn set_walk_target(&self, slot: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cursor (k, slot) VALUES ('walk_target', ?1)
+             ON CONFLICT(k) DO UPDATE SET slot = ?1",
+            params![slot as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn walk_target(&self) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT slot FROM cursor WHERE k = 'walk_target'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|s| s as u64))
+    }
+
     /// Lower the floor to `slot`, never raise it.
     ///
     /// `min` rather than assignment because coverage only ever grows downward:
@@ -1184,6 +1258,184 @@ impl Ledger {
         Ok(added)
     }
 
+    /// One transaction as a FEED row: what moved, and who moved it.
+    ///
+    /// Assembled from the stored primitive rather than stored in this shape.
+    /// `delta` is deliberately signed and undirected — see this module's header
+    /// — so direction is a READ-TIME derivation, which is what lets it be
+    /// improved later without a re-walk.
+    pub fn feed_rows(&self, limit: u32, before_slot: Option<u64>) -> Result<Vec<FeedRow>> {
+        let limit = limit.min(5_000);
+        let mut stmt = self.conn.prepare(
+            "SELECT tx_ord, tx_hash, slot, block_time FROM tx
+             WHERE (?1 IS NULL OR slot < ?1)
+             ORDER BY slot DESC, tx_ord DESC
+             LIMIT ?2",
+        )?;
+        let heads: Vec<(i64, Vec<u8>, u64, u64)> = stmt
+            .query_map(params![before_slot.map(|s| s as i64), limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        self.hydrate(heads)
+    }
+
+    /// ONE transaction by hash. Keyed off `tx.tx_hash`'s unique index, so a row
+    /// deep in history costs what the newest one costs — the property a shared
+    /// link needs, and the reason wallet-sieve grew the same endpoint.
+    pub fn feed_row_at(&self, tx_hash: &[u8]) -> Result<Option<FeedRow>> {
+        let head: Option<(i64, Vec<u8>, u64, u64)> = self
+            .conn
+            .query_row(
+                "SELECT tx_ord, tx_hash, slot, block_time FROM tx WHERE tx_hash = ?1",
+                params![tx_hash],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(self.hydrate(head.into_iter().collect())?.pop())
+    }
+
+    /// Attach per-unit movements and mint entries to a set of transaction heads.
+    fn hydrate(&self, heads: Vec<(i64, Vec<u8>, u64, u64)>) -> Result<Vec<FeedRow>> {
+        if heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ords: Vec<String> = heads.iter().map(|(o, ..)| o.to_string()).collect();
+        let list = ords.join(",");
+
+        // Interpolated rather than bound: the values are i64s this function
+        // just read out of its own primary key, and rusqlite has no variadic
+        // `IN` binding without the `rarray` feature. Nothing user-supplied
+        // reaches this string.
+        let mut moves: HashMap<i64, Vec<(Vec<u8>, String, Option<String>, i64)>> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT d.tx_ord, u.name, p.address, p.stake, d.amount
+                 FROM delta d JOIN party p USING(party_id) JOIN unit u USING(unit_id)
+                 WHERE d.tx_ord IN ({list})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (ord, name, address, stake, amount) = row?;
+                moves
+                    .entry(ord)
+                    .or_default()
+                    .push((name, address, stake, amount));
+            }
+        }
+
+        let mut mints: HashMap<i64, HashMap<Vec<u8>, i64>> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT m.tx_ord, u.name, m.amount
+                 FROM tx_mint m JOIN unit u USING(unit_id)
+                 WHERE m.tx_ord IN ({list})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (ord, name, amount) = row?;
+                mints.entry(ord).or_default().insert(name, amount);
+            }
+        }
+
+        Ok(heads
+            .into_iter()
+            .map(|(ord, tx_hash, slot, block_time)| {
+                let mut by_unit: HashMap<Vec<u8>, Vec<PartyMove>> = HashMap::new();
+                for (name, address, stake, amount) in moves.remove(&ord).unwrap_or_default() {
+                    by_unit.entry(name).or_default().push(PartyMove {
+                        address,
+                        stake,
+                        amount,
+                    });
+                }
+                let minted = mints.remove(&ord).unwrap_or_default();
+                // A unit can appear in the mint field having reached no party we
+                // recorded — the `Unattributed` case. It still belongs on the
+                // row, or a mint whose destination is below the floor vanishes.
+                for name in minted.keys() {
+                    by_unit.entry(name.clone()).or_default();
+                }
+                let units = by_unit
+                    .into_iter()
+                    .map(|(name, parties)| {
+                        let net_mint = minted.get(&name).copied().unwrap_or(0);
+                        UnitMove {
+                            name,
+                            net_mint,
+                            parties,
+                        }
+                    })
+                    .collect();
+                FeedRow {
+                    tx_hash,
+                    slot,
+                    block_time,
+                    units,
+                }
+            })
+            .collect())
+    }
+
+    /// What this ledger covers and how it is progressing.
+    pub fn coverage(&self) -> Result<Coverage> {
+        let one = |sql: &str| -> Result<Option<u64>> {
+            Ok(self
+                .conn
+                .query_row(sql, [], |r| r.get::<_, Option<i64>>(0))
+                .optional()?
+                .flatten()
+                .map(|v| v as u64))
+        };
+        Ok(Coverage {
+            walked_from: self.walked_from()?,
+            walk_target: self.walk_target()?,
+            first_slot: one("SELECT MIN(slot) FROM tx")?,
+            last_slot: one("SELECT MAX(slot) FROM tx")?,
+            total_txs: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM tx", [], |r| r.get::<_, i64>(0))?
+                as u64,
+            units: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM unit", [], |r| r.get::<_, i64>(0))?
+                as u64,
+            unresolved: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM pending_input", [], |r| {
+                    r.get::<_, i64>(0)
+                })? as u64,
+        })
+    }
+
     /// Every outref a previous reverse pass is still waiting on.
     pub fn load_pending(&self) -> Result<Vec<((Hash<32>, u32), Hash<32>)>> {
         let mut stmt = self
@@ -1208,6 +1460,51 @@ impl Ledger {
             out.push(((Hash::from(oref_hash), idx as u32), Hash::from(spender)));
         }
         Ok(out)
+    }
+
+    /// Apply one chunk's pending changes AND advance the floor, atomically.
+    ///
+    /// The atomicity is the point. `set_walked_from` advances every chunk; if
+    /// the pending set were saved only at the end of a pass, a run killed
+    /// midway would leave a ledger claiming coverage down to some slot with no
+    /// record of what it was still waiting for — and nothing would ever look
+    /// for those sources again, because the floor has already passed them.
+    /// Silent, permanent, and invisible to every reconciliation.
+    ///
+    /// Incremental rather than a wholesale rewrite because the set runs to tens
+    /// of thousands of rows while a chunk touches a handful.
+    /// `floor` is `None` for a PROBE — a detached window that writes real rows
+    /// but must not claim contiguous coverage down to where it happens to sit.
+    pub fn commit_pending_changes(
+        &mut self,
+        added: &[((Hash<32>, u32), Hash<32>)],
+        removed: &[(Hash<32>, u32)],
+        floor: Option<u64>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO pending_input (oref_hash, oref_idx, spender)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for ((hash, idx), spender) in added {
+                ins.execute(params![hash.as_ref(), *idx as i64, spender.as_ref()])?;
+            }
+            let mut del =
+                tx.prepare("DELETE FROM pending_input WHERE oref_hash = ?1 AND oref_idx = ?2")?;
+            for (hash, idx) in removed {
+                del.execute(params![hash.as_ref(), *idx as i64])?;
+            }
+        }
+        if let Some(floor) = floor {
+            tx.execute(
+                "INSERT INTO cursor (k, slot) VALUES ('walk_from', ?1)
+                 ON CONFLICT(k) DO UPDATE SET slot = min(slot, excluded.slot)",
+                params![floor as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Replace the pending set wholesale.

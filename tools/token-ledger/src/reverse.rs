@@ -96,15 +96,78 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub to_slot: Option<u64>,
 
+    /// Start the pass HERE instead of at the ledger's current floor — a probe
+    /// into an arbitrary moment in history.
+    ///
+    /// Seeking is cheap: the immutable DB is binary-searched to the chunk by a
+    /// slot-only fuzzy seek, and the chunk gate then reads only the files in
+    /// range. Reaching a window four years back costs what that window costs,
+    /// not what the intervening history costs.
+    ///
+    /// **A probe does NOT advance the ledger's recorded coverage.** Coverage is
+    /// a single contiguous range `[walked_from, tip]`, and a window detached
+    /// from it cannot be described by one floor — lowering it would claim
+    /// everything in between had been walked. Rows and resolutions are still
+    /// written and are still true; only the coverage claim is withheld.
+    #[arg(long)]
+    pub from_slot: Option<u64>,
+
     /// Skip the memmem gate and decode every block. Slower by roughly the ratio
     /// of hit blocks to all blocks; only useful for isolating a suspected gate
     /// bug, since the gate is complete by the ledger's balance rule.
     #[arg(long)]
     pub no_sieve: bool,
+
+    /// Log a progress line every N chunks. A chunk is ~6h of chain, so a
+    /// full-history pass covers thousands.
+    ///
+    /// Chunks that CORRECTED rows are always logged regardless — a backfill is
+    /// the event a consumer most needs and the rarest to happen.
+    #[arg(long, default_value_t = 250)]
+    pub report_every: u64,
 }
 
 /// Run one reverse pass, extending the ledger's coverage downward.
+///
+/// The CLI face: logs progress on `--report-every` and prints a summary.
 pub fn run(args: ReverseArgs) -> Result<()> {
+    let report_every = args.report_every.max(1);
+    let (written, backfilled, unresolved) = run_reporting(args, &|p| {
+        // Chunks are ~6h of chain, so a full-history pass emits thousands. Log
+        // every Nth, but ALWAYS log one that corrected rows: a backfill is the
+        // event a consumer most needs to see and the rarest to occur.
+        if p.chunks_done.is_multiple_of(report_every) || !p.updated.is_empty() {
+            tracing::info!(
+                pct = format!("{:.1}%", p.fraction() * 100.0),
+                floor = p.floor,
+                date = %slot_date(p.floor),
+                chunks = format!("{}/{}", p.chunks_done, p.chunks_total),
+                written = p.written,
+                updated = p.updated.len(),
+                pending = p.pending,
+                "reverse: progress"
+            );
+        }
+    })?;
+
+    println!("transactions written        = {written}");
+    println!("delta rows backfilled       = {backfilled}");
+    println!("sources still below floor   = {unresolved}");
+    if unresolved > 0 {
+        println!(
+            "  run again to reach deeper — each pass resolves sources for rows \
+             already written"
+        );
+    }
+    Ok(())
+}
+
+/// One reverse pass, reporting through `on` — the programmatic face.
+///
+/// Returns `(written, backfilled, unresolved)`. Separated from [`run`] so the
+/// hosted surface can drive a pass and turn its progress into job state without
+/// going through stdout, which is the only thing the CLI face adds.
+pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<(u64, usize, usize)> {
     let token = registry::load_or_unit(&args.tokens, &args.token)?;
     let policy = token.policy_bytes()?;
     let watched = match token.asset_name_bytes()? {
@@ -141,7 +204,23 @@ pub fn run(args: ReverseArgs) -> Result<()> {
     // A pass runs from the existing floor DOWNWARD, so coverage stays
     // contiguous. On a cold ledger there is no floor yet and the tip is the
     // ceiling — the first pass is the one that establishes it.
-    let ceiling = ledger.walked_from()?.unwrap_or(tip_slot);
+    let coverage_floor = ledger.walked_from()?;
+    let ceiling = args
+        .from_slot
+        .unwrap_or_else(|| coverage_floor.unwrap_or(tip_slot));
+    // A pass extends coverage only when it starts exactly where coverage
+    // currently ends. Anywhere else is a detached window, and a single
+    // `walked_from` cannot describe two ranges.
+    //
+    // A COLD ledger is not a free pass. Coverage means `[walked_from, tip]`, so
+    // a probe that starts below the tip is detached whether or not anything
+    // came before it — the first version read "no existing floor" as "anything
+    // is contiguous" and let a 2022 probe claim coverage it plainly did not
+    // have.
+    let contiguous = match args.from_slot {
+        None => true,
+        Some(from) => coverage_floor == Some(from),
+    };
     let floor = match args.to_slot {
         Some(s) => s,
         None => ceiling.saturating_sub(args.days * SLOTS_PER_DAY),
@@ -151,11 +230,12 @@ pub fn run(args: ReverseArgs) -> Result<()> {
     let floor = token.floor_slot.map_or(floor, |first| floor.max(first));
 
     if floor >= ceiling {
-        println!(
-            "nothing to do — coverage already reaches slot {ceiling} \
-             and the requested floor is {floor}"
+        tracing::info!(
+            ceiling,
+            floor,
+            "reverse: nothing to do — coverage already reaches the requested floor"
         );
-        return Ok(());
+        return Ok((0, 0, pending_count(&ledger)));
     }
 
     tracing::info!(
@@ -172,6 +252,10 @@ pub fn run(args: ReverseArgs) -> Result<()> {
     // an earlier one was waiting for, which made deepening useless.
     let mut pending = Pending::load(ledger.load_pending()?);
     let carried = pending.len();
+    // Published BEFORE the pass, so a poller that arrives mid-run has a
+    // denominator. Written after the fact it would be useless for exactly the
+    // window it exists to describe.
+    ledger.set_walk_target(floor)?;
     let outcome = pass(
         &mut ledger,
         &immutable,
@@ -182,26 +266,56 @@ pub fn run(args: ReverseArgs) -> Result<()> {
         ceiling,
         &mut pending,
         !args.no_sieve,
+        contiguous,
+        on,
     )?;
 
     ledger.put_pending(&pending.entries())?;
+    // Target collapses onto the achieved floor: a finished pass is idle, not a
+    // pass sitting at 100% forever. A poller reads the two being equal as
+    // "nothing running".
+    ledger.set_walk_target(outcome.floor)?;
 
-    println!("covered down to slot        = {}", outcome.floor);
-    println!("transactions written        = {}", outcome.written);
-    println!("sources carried in          = {carried}");
-    println!("delta rows backfilled       = {}", outcome.backfilled);
-    println!("sources still below floor   = {}", outcome.unresolved);
-    if outcome.unresolved > 0 {
-        println!(
-            "  run again to reach deeper — each pass resolves sources for rows \
-             already written"
-        );
-    }
-    Ok(())
+    tracing::info!(
+        floor = outcome.floor,
+        written = outcome.written,
+        carried,
+        backfilled = outcome.backfilled,
+        unresolved = outcome.unresolved,
+        "reverse: pass complete"
+    );
+    Ok((outcome.written, outcome.backfilled, outcome.unresolved))
 }
 
 fn watched_is_policy(w: &Watched) -> bool {
     matches!(w, Watched::Policy)
+}
+
+/// Pending count for an early return, where no pass ran to report one.
+fn pending_count(ledger: &Ledger) -> usize {
+    ledger.load_pending().map(|p| p.len()).unwrap_or(0)
+}
+
+/// A slot as `YYYY-MM-DD`, for saying how far back a pass has reached.
+///
+/// The slot number is the machine's answer and means nothing to a reader
+/// watching a progress bar: "reaching back to 2021-03-14" is the statement, and
+/// a UI should not have to carry a slot-to-date conversion to make it.
+///
+/// Civil-from-days (Hinnant), so this needs no date dependency.
+pub fn slot_date(slot: u64) -> String {
+    let days = (slot_to_unix(slot) / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// An outref spent by a transaction we have already written, whose creating
@@ -218,6 +332,16 @@ pub struct Pending {
     /// resumed run can legitimately re-record the same waiter, and collapsing
     /// that to a single slot would drop the second half of a re-walk.
     waiting: HashMap<(Hash<32>, u32), Vec<Hash<32>>>,
+    /// Changes since the last drain — the unit of PERSISTENCE.
+    ///
+    /// Kept as a changelog rather than rewriting the whole set per chunk
+    /// because the set runs to tens of thousands of entries while a chunk
+    /// touches a handful, and the floor cursor advances every chunk. Those two
+    /// have to move together: a pass killed with the floor advanced but its
+    /// pending unsaved leaves sources below that floor permanently
+    /// unresolvable, because nothing will ever look for them again.
+    added: Vec<((Hash<32>, u32), Hash<32>)>,
+    removed: Vec<(Hash<32>, u32)>,
 }
 
 impl Pending {
@@ -227,7 +351,14 @@ impl Pending {
         for (oref, spender) in entries {
             waiting.entry(oref).or_default().push(spender);
         }
-        Self { waiting }
+        // Loaded entries are already ON DISK, so the changelog starts empty.
+        // Seeding it with them would re-insert every row on the first chunk —
+        // harmless under `INSERT OR IGNORE`, but it would turn a handful of
+        // writes per chunk into tens of thousands.
+        Self {
+            waiting,
+            ..Default::default()
+        }
     }
 
     /// Flatten for persistence.
@@ -246,12 +377,25 @@ impl Pending {
         // guard to lean on, not a reason to create the condition.
         if !slot.contains(&spender) {
             slot.push(spender);
+            self.added.push((oref, spender));
         }
     }
 
     /// Transactions waiting on this outref, removing it from the open set.
     fn resolve(&mut self, oref: &(Hash<32>, u32)) -> Option<Vec<Hash<32>>> {
-        self.waiting.remove(oref)
+        let found = self.waiting.remove(oref);
+        if found.is_some() {
+            self.removed.push(*oref);
+        }
+        found
+    }
+
+    /// Drain the changelog for persistence.
+    fn take_changes(&mut self) -> (Vec<((Hash<32>, u32), Hash<32>)>, Vec<(Hash<32>, u32)>) {
+        (
+            std::mem::take(&mut self.added),
+            std::mem::take(&mut self.removed),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -263,6 +407,61 @@ impl Pending {
         self.waiting.is_empty()
     }
 }
+
+/// Where a pass has got to, emitted after every chunk it commits.
+///
+/// A reverse pass exists to feed a live surface, so it has to SAY where it is
+/// while it runs. Without this a consumer sees rows appear in the ledger with
+/// no way to tell whether more are coming, how far back the walk has reached,
+/// or which already-delivered rows just changed underneath it — measured on the
+/// SpaceBudz full-history run, which committed 49,591 transactions while
+/// emitting a single log line.
+///
+/// Emitted per CHUNK rather than per row: a chunk is the commit unit, so it is
+/// the only boundary at which the ledger is consistent for a reader, and it is
+/// ~6h of chain — frequent enough for a progress bar, rare enough not to flood
+/// a socket.
+pub struct Progress<'a> {
+    /// Lowest slot covered so far. Moves DOWN as the pass runs.
+    pub floor: u64,
+    /// Where this pass is heading — the requested floor.
+    pub target_floor: u64,
+    /// Where it started. `ceiling - floor` over `ceiling - target_floor` is the
+    /// fraction done.
+    pub ceiling: u64,
+    pub chunks_done: u64,
+    pub chunks_total: u64,
+    /// Transactions written so far by this pass.
+    pub written: u64,
+    /// Transactions whose deltas CHANGED in this chunk — a source resolved.
+    ///
+    /// The payload a `RowsUpdated` needs. A count cannot serve it: the consumer
+    /// has to know WHICH rows to re-read, and a reverse walk corrects rows it
+    /// delivered minutes earlier.
+    pub updated: &'a [Hash<32>],
+    /// Outrefs still waiting on a source below the floor.
+    pub pending: usize,
+}
+
+impl Progress<'_> {
+    /// How far through the requested range, 0.0–1.0.
+    ///
+    /// Saturating rather than panicking on a zero-width range: a pass with
+    /// nothing to do is a legitimate state and a progress bar should read it as
+    /// finished, not divide by zero.
+    pub fn fraction(&self) -> f64 {
+        let span = self.ceiling.saturating_sub(self.target_floor);
+        if span == 0 {
+            return 1.0;
+        }
+        let done = self.ceiling.saturating_sub(self.floor);
+        (done as f64 / span as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// The callback shape a pass reports through. Mirrors the forward walk's
+/// `Prog<'_>` so both walkers report the same way.
+pub type OnProgress<'x> = &'x dyn Fn(Progress<'_>);
 
 /// How far a reverse pass got, and what it cost.
 pub struct Outcome {
@@ -378,6 +577,10 @@ pub fn pass(
     ceiling: u64,
     pending: &mut Pending,
     sieve: bool,
+    // Does this pass extend the ledger's contiguous coverage, or is it a
+    // detached probe? See `ReverseArgs::from_slot`.
+    contiguous: bool,
+    on: OnProgress<'_>,
 ) -> Result<Outcome> {
     let needles = sieve
         .then(|| chain_sieve::Needles::new(std::slice::from_ref(&policy.to_vec())))
@@ -386,8 +589,11 @@ pub fn pass(
     let mut written = 0u64;
     let mut backfilled = 0usize;
     let mut lowest = ceiling;
+    let ordered = chunks_descending(chunks, floor, ceiling);
+    let chunks_total = ordered.len() as u64;
+    let mut chunks_done = 0u64;
 
-    for chunk in chunks_descending(chunks, floor, ceiling) {
+    for chunk in ordered {
         let blocks = chunk_txs_newest_first(immutable, chunk, needles.as_ref())?;
         let mut rows: Vec<TxRow> = Vec::new();
         // Backfills discovered in this chunk, applied after its rows are
@@ -518,27 +724,59 @@ pub fn pass(
             }
         }
 
-        if rows.is_empty() && resolved.is_empty() {
-            continue;
-        }
+        chunks_done += 1;
         written += rows.len() as u64;
-        // The buffer is not this mode's state, so nothing is persisted through
-        // it; the cursor written here is the forward frontier, which a reverse
-        // pass must not move. `commit_rows` exists for exactly that.
-        ledger.commit_rows(&rows)?;
+        if !rows.is_empty() {
+            // The buffer is not this mode's state, so nothing is persisted
+            // through it; the cursor `commit_block` would write is the FORWARD
+            // frontier, which a reverse pass must not move. `commit_rows`
+            // exists for exactly that.
+            ledger.commit_rows(&rows)?;
+        }
 
         let mut by_tx: HashMap<Hash<32>, Vec<DeltaRow>> = HashMap::new();
         for (spender, delta) in resolved {
             by_tx.entry(spender).or_default().push(delta);
         }
+        // WHICH transactions changed, not just how many. A consumer that was
+        // handed these rows earlier has to re-read exactly these.
+        let mut updated: Vec<Hash<32>> = Vec::new();
         for (spender, deltas) in by_tx {
-            backfilled += ledger.add_deltas(&spender, &deltas)?;
+            let added = ledger.add_deltas(&spender, &deltas)?;
+            if added > 0 {
+                backfilled += added;
+                updated.push(spender);
+            }
         }
 
+        // EVERY chunk, including one that held nothing of ours.
+        //
         // Coverage extends downward one chunk at a time, so the floor moves
         // with committed work rather than at the end of the pass. A pass killed
-        // halfway leaves a ledger that knows exactly how deep it got.
-        ledger.set_walked_from(chunk * CHUNK_SLOTS)?;
+        // halfway leaves a ledger that knows exactly how deep it got — and,
+        // because the pending changes ride the SAME transaction, exactly what
+        // it was still waiting for at that depth.
+        //
+        // An empty chunk still advances it: we READ that chunk and it held
+        // nothing, which is a fact worth keeping. Skipping the write here made
+        // the recorded floor stop at the deepest chunk that happened to contain
+        // a transaction, so every later pass re-read the quiet stretch below it.
+        let (added, removed) = pending.take_changes();
+        ledger.commit_pending_changes(&added, &removed, contiguous.then(|| chunk * CHUNK_SLOTS))?;
+
+        // AFTER the commit, so a consumer that reacts by reading the ledger
+        // finds the rows this event is telling it about. Reported before the
+        // commit, the read would race and come back short.
+        on(Progress {
+            floor: lowest,
+            target_floor: floor,
+            ceiling,
+            chunks_done,
+            chunks_total,
+            written,
+            updated: &updated,
+            pending: pending.len(),
+        });
     }
 
     Ok(Outcome {
@@ -609,5 +847,53 @@ mod tests {
     fn an_unwanted_outref_resolves_to_nothing() {
         let mut p = Pending::default();
         assert!(p.resolve(&(h(1), 0)).is_none());
+    }
+
+    // ── progress reporting ──────────────────────────────────────────────────
+
+    fn prog(floor: u64, target: u64, ceiling: u64) -> Progress<'static> {
+        Progress {
+            floor,
+            target_floor: target,
+            ceiling,
+            chunks_done: 0,
+            chunks_total: 0,
+            written: 0,
+            updated: &[],
+            pending: 0,
+        }
+    }
+
+    /// A reverse pass counts DOWN, so progress is how far the floor has fallen
+    /// from the ceiling toward the target — not how far it is above zero.
+    #[test]
+    fn progress_measures_the_floor_falling_toward_the_target() {
+        assert_eq!(prog(1_000, 0, 1_000).fraction(), 0.0, "nothing covered yet");
+        assert_eq!(prog(500, 0, 1_000).fraction(), 0.5);
+        assert_eq!(prog(0, 0, 1_000).fraction(), 1.0, "reached the target");
+    }
+
+    /// A pass with nothing to do reads as finished. Dividing by a zero-width
+    /// range would be the alternative, on a state that legitimately occurs the
+    /// moment coverage already reaches the requested floor.
+    #[test]
+    fn an_empty_range_reads_as_complete_rather_than_dividing_by_zero() {
+        assert_eq!(prog(500, 500, 500).fraction(), 1.0);
+    }
+
+    /// The floor can sit below the target when the last chunk overshoots — a
+    /// chunk is 21,600 slots and the target rarely lands on a boundary. That
+    /// must clamp, never report over 100%.
+    #[test]
+    fn overshooting_the_target_clamps_at_one() {
+        assert_eq!(prog(0, 100, 1_000).fraction(), 1.0);
+    }
+
+    /// The date is what a reader actually sees. Pinned against the Shelley
+    /// start slot, whose date is independently known.
+    #[test]
+    fn a_slot_renders_as_its_calendar_date() {
+        // Shelley began 2020-07-29.
+        assert_eq!(slot_date(4_492_800), "2020-07-29");
     }
 }

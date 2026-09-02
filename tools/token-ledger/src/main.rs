@@ -18,6 +18,7 @@
 mod buffer;
 mod cohort;
 mod export;
+mod policy_api;
 mod pools;
 mod registry;
 mod reverse;

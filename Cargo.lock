@@ -6113,6 +6113,7 @@ dependencies = [
  "serde_json",
  "token-ledger-wire",
  "tokio",
+ "tokio-stream",
  "toml 0.8.20",
  "tower-http 0.6.6",
  "tracing",

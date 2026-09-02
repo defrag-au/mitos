@@ -21,6 +21,9 @@ chain-sieve = { path = "../../crates/chain-sieve" }
 # serve::run, per the wallet-sieve convention.
 axum = { workspace = true }
 tokio = { workspace = true }
+# SSE progress on the policy feed — the same streaming shape wallet-sieve's
+# `/events` uses, so flow-explorer consumes both identically.
+tokio-stream = { workspace = true }
 tower-http = { workspace = true }
 
 # Pool script addresses + the CSwap pool datum (LP policy/name = the pool
