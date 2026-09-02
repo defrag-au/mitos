@@ -265,7 +265,13 @@ pub fn run(args: ExportArgs) -> Result<()> {
         version: wire::WIRE_VERSION,
         asset: wire::AssetId {
             policy,
-            asset_name: token.asset_name_bytes()?,
+            // The export artifacts describe ONE asset — the spine is a single
+            // supply curve and the detail tier a single holder set. A
+            // policy-wide ledger has no one asset to name here, so this refuses
+            // rather than picking one of its units to stand for the rest.
+            // Policy-wide export is a wire-format change; see
+            // `FLOW_EXPLORER_POLICY_VIEW.md`.
+            asset_name: token.require_asset_name()?,
             // The wire type carries a plain `u8`, where 0 and "unknown" both
             // mean render raw — the same collapse `chain-ledger` makes, and
             // harmless downstream because both format identically. The
@@ -342,7 +348,10 @@ pub fn run(args: ExportArgs) -> Result<()> {
     // The catalogue card. Written from the SPINE that was just verified, so
     // it cannot describe a token differently from the artifacts beside it.
     let card_path = args.out_dir.join(format!("{}.card.json", token.name));
-    write(&card_path, serde_json::to_vec_pretty(&card(&spine))?.as_slice())?;
+    write(
+        &card_path,
+        serde_json::to_vec_pretty(&card(&spine))?.as_slice(),
+    )?;
 
     report(
         &spine,

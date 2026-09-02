@@ -4,13 +4,21 @@
 //! `(policy, asset_name)` to follow and an optional `floor_slot`, and that is
 //! the whole contract.
 //!
-//! **One watched asset per ledger.** Not one policy — one asset. The delta
-//! primitive in `store` is `(tx, party) -> signed amount`, which is only
-//! unambiguous for a single fungible unit; a policy carrying several assets
-//! would need the asset on the key and would break the per-tx conservation
-//! check that makes this walk self-verifying. Every token this tool currently
-//! targets is a single-asset policy. Widening it is a schema change, so the
-//! restriction is enforced here rather than discovered later.
+//! **A ledger watches one asset, or one whole policy.** The delta primitive in
+//! `store` is `(tx, party, unit) -> signed amount`. It carried no unit until
+//! 2026-09, when watching a whole policy required one: summing a policy's
+//! assets into a single per-party scalar makes a tx that moves one unit out and
+//! another in net to zero, hiding both moves.
+//!
+//! The unit on the key is what PRESERVES the per-tx conservation check that
+//! makes this walk self-verifying — it becomes per unit rather than per tx.
+//! Without it the check could not have been kept at all, which is why the
+//! earlier restriction to a single asset was the honest position at the time.
+//!
+//! [`TokenEntry::asset_name`] is therefore `Option`: `None` watches the whole
+//! policy, `Some("")` watches the genuinely empty-named asset. Those are
+//! different requests and the type says so — the same distinction the field's
+//! own docs already drew between an omitted name and an empty one.
 
 use std::path::Path;
 
@@ -83,10 +91,19 @@ pub struct TokenEntry {
     pub name: String,
     /// 56-char lowercase hex policy id.
     pub policy: String,
-    /// Lowercase hex of the on-chain asset-name bytes. May be empty for
-    /// empty-name assets, so it is required rather than optional — an omitted
-    /// name and an empty name are different assets.
-    pub asset_name: String,
+    /// Lowercase hex of the on-chain asset-name bytes, or `None` to watch the
+    /// WHOLE POLICY.
+    ///
+    /// An omitted name and an empty name are different requests, which is why
+    /// this is `Option<String>` and not a `String` that happens to be empty:
+    /// `Some("")` is the asset whose on-chain name is zero bytes — a real and
+    /// common shape — while `None` is every asset under the policy.
+    ///
+    /// Policy mode is what an NFT collection needs: thousands of units, no one
+    /// of which is the token. It also serves a fungible policy that minted
+    /// under more than one name.
+    #[serde(default)]
+    pub asset_name: Option<String>,
     /// Display decimals. Identity is the hex asset name; this is presentation
     /// only, and the **token registry — not the chain — is authoritative** for
     /// it. Read it from Koios `asset_info.token_registry_metadata.decimals`
@@ -131,9 +148,33 @@ impl TokenEntry {
         Ok(b)
     }
 
-    pub fn asset_name_bytes(&self) -> Result<Vec<u8>> {
-        hex::decode(&self.asset_name)
-            .with_context(|| format!("token `{}`: asset_name is not hex", self.name))
+    /// The watched asset-name bytes, or `None` for a whole-policy watch.
+    ///
+    /// Returns `Ok(None)` rather than an error for policy mode: "no single
+    /// name" is a legitimate answer here, and callers that genuinely require
+    /// one should say so with [`Self::require_asset_name`].
+    pub fn asset_name_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.asset_name
+            .as_ref()
+            .map(|n| {
+                hex::decode(n)
+                    .with_context(|| format!("token `{}`: asset_name is not hex", self.name))
+            })
+            .transpose()
+    }
+
+    /// The asset name for a caller that cannot express a policy-wide watch.
+    ///
+    /// The export artifacts and the `stats` supply reconciliation are both
+    /// single-unit shapes today, so they refuse a policy entry loudly here
+    /// rather than silently picking one of its assets to describe.
+    pub fn require_asset_name(&self) -> Result<Vec<u8>> {
+        self.asset_name_bytes()?.with_context(|| {
+            format!(
+                "token `{}` watches a whole policy; this operation needs a single asset",
+                self.name
+            )
+        })
     }
 
     /// The immutable file containing the floor — what `bootstrap --start` wants.
@@ -141,13 +182,21 @@ impl TokenEntry {
         self.floor_slot.map(|s| s / CHUNK_SLOTS)
     }
 
-    /// `policy_hex.asset_name_hex` — the key [`chain_ledger::tokens`] uses.
+    /// `policy_hex.asset_name_hex` — the key [`chain_ledger::tokens`] uses —
+    /// or the bare `policy_hex` for a whole-policy watch.
     ///
     /// Keyed by the full unit rather than by ticker on purpose: anyone can mint
     /// a token called `USDM`, and matching on the name would let them borrow a
     /// real stablecoin's scale.
+    ///
+    /// The two forms are distinguishable by the dot, which is what lets a
+    /// ledger file, an artifact prefix and a serve route all key off this one
+    /// string without a second flag travelling beside it.
     pub fn unit(&self) -> String {
-        format!("{}.{}", self.policy, self.asset_name)
+        match &self.asset_name {
+            Some(name) => format!("{}.{name}", self.policy),
+            None => self.policy.clone(),
+        }
     }
 
     /// Display decimals: this entry's own value, else the curated shared table,
@@ -187,26 +236,39 @@ pub fn load(path: &Path, name: &str) -> Result<TokenEntry> {
     Ok(entry)
 }
 
-/// Load by registry name, or accept a raw `<policy_hex>.<asset_name_hex>`
-/// unit for a token nobody has registered — the serve path's "any token on
-/// demand". A synthetic entry carries no floor (the walk starts at genesis,
-/// which the sieve gate makes tolerable) and no curated decimals (the
-/// chain-ledger fallback still applies). Its `name` IS the unit, so ledger
-/// and artifact filenames are keyed by on-chain identity.
+/// Load by registry name, or accept a raw on-chain identity for something
+/// nobody has registered — the serve path's "any token on demand".
+///
+/// Two accepted raw shapes:
+/// - `<policy_hex>.<asset_name_hex>` — one unit
+/// - `<policy_hex>` (bare 56 hex) — the WHOLE POLICY
+///
+/// A synthetic entry carries no floor (the walk starts at genesis, which the
+/// sieve gate makes tolerable) and no curated decimals (the chain-ledger
+/// fallback still applies). Its `name` IS the unit, so ledger and artifact
+/// filenames are keyed by on-chain identity.
 pub fn load_or_unit(path: &Path, name_or_unit: &str) -> Result<TokenEntry> {
     if let Ok(entry) = load(path, name_or_unit) {
         return Ok(entry);
     }
     let unit = name_or_unit.to_lowercase();
-    let Some((policy, asset_name)) = unit.split_once('.') else {
-        bail!(
-            "`{name_or_unit}` is neither a registered token nor a `<policy_hex>.<name_hex>` unit"
-        );
+    // A bare policy is the whole-policy watch. Checked before the split so a
+    // 56-hex string is never read as a policy with an absent name — they are
+    // the same characters and only the dot tells them apart.
+    let (policy, asset_name) = match unit.split_once('.') {
+        Some((p, n)) => (p.to_string(), Some(n.to_string())),
+        None if unit.len() == 56 && unit.chars().all(|c| c.is_ascii_hexdigit()) => {
+            (unit.clone(), None)
+        }
+        None => bail!(
+            "`{name_or_unit}` is not a registered token, a `<policy_hex>.<name_hex>` unit, \
+             or a bare 56-hex policy id"
+        ),
     };
     let entry = TokenEntry {
         name: unit.clone(),
-        policy: policy.to_string(),
-        asset_name: asset_name.to_string(),
+        policy,
+        asset_name,
         decimals: None,
         floor_slot: None,
     };

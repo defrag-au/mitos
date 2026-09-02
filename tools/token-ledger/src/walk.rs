@@ -1,11 +1,17 @@
 //! `walk` — iterate certified immutable-DB history and record every movement
-//! of one watched asset as signed per-party deltas.
+//! of the watched asset, or of every asset under the watched policy, as signed
+//! per-party per-unit deltas.
 //!
 //! Per transaction: take the spent watched outputs back out of the buffer
 //! (that is the whole of input resolution — see `buffer`), buffer the produced
-//! ones, read the mint field, and net it all into one signed delta per party.
-//! A transaction that touches neither the buffer nor the mint field is skipped
-//! before any allocation, which is what keeps the walk at block-decode speed.
+//! ones, read the mint field, and net it all into one signed delta per party
+//! PER UNIT. A transaction that touches neither the buffer nor the mint field
+//! is skipped before any allocation, which is what keeps the walk at
+//! block-decode speed.
+//!
+//! [`Watched`] is the one place the unit-versus-policy decision is made; every
+//! output, mint entry and buffer row below asks it rather than re-deriving the
+//! answer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -71,7 +77,7 @@ pub struct WalkArgs {
 }
 
 /// Bech32 stake address from a payment address's delegation part.
-fn stake_of(addr: &str) -> Option<String> {
+pub(crate) fn stake_of(addr: &str) -> Option<String> {
     match Address::from_bech32(addr).ok()? {
         Address::Shelley(sh) => {
             let stake: StakeAddress = sh.try_into().ok()?;
@@ -81,22 +87,204 @@ fn stake_of(addr: &str) -> Option<String> {
     }
 }
 
-/// Does this output carry the watched asset?
+/// Which assets under the policy this ledger follows.
 ///
-/// `DecodedOutput.assets` carries asset *identity* only, so this answers
-/// presence and `qty_from_output` reads the quantity off the raw output. The
-/// cheap check runs first — the overwhelming majority of outputs on the chain
-/// are not ours.
-fn holds_watched(out: &DecodedOutput, policy: &[u8], name: &[u8]) -> bool {
-    out.assets
+/// An enum rather than an `Option<Vec<u8>>` threaded through six call sites: at
+/// each of them the question is "does this name count?", and a bare `Option`
+/// makes every one of them re-derive the answer — which is where a `None`
+/// silently comes to mean "no assets" instead of "all of them".
+pub(crate) enum Watched {
+    /// One asset. The original behaviour, and still what every registered
+    /// fungible token uses.
+    Unit(Vec<u8>),
+    /// Every asset under the policy — an NFT collection, or a policy that
+    /// minted under more than one name.
+    Policy,
+}
+
+impl Watched {
+    pub(crate) fn matches(&self, name: &[u8]) -> bool {
+        match self {
+            Watched::Unit(want) => name == want.as_slice(),
+            Watched::Policy => true,
+        }
+    }
+}
+
+/// Every watched unit in this output, with its quantity.
+///
+/// Replaces the old `holds_watched` + `qty_from_output` pair. They were split
+/// because `DecodedOutput.assets` carries asset *identity* only and the
+/// quantity had to be read off the raw output; that is still true, so the cheap
+/// identity scan still gates the raw read — the overwhelming majority of
+/// outputs on the chain are not ours and never touch the second half.
+///
+/// Zero-quantity entries are dropped: an asset named in the value with a
+/// quantity of nothing is not a holding, and letting it through would put a
+/// no-op delta on the row.
+pub(crate) fn units_in_output(
+    tx: &pallas_traverse::MultiEraTx<'_>,
+    out: &DecodedOutput,
+    policy: &[u8],
+    watched: &Watched,
+) -> Vec<(Vec<u8>, i64)> {
+    if !out
+        .assets
         .iter()
-        .any(|a| a.policy == policy && a.name == name)
+        .any(|a| a.policy == policy && watched.matches(&a.name))
+    {
+        return Vec::new();
+    }
+    let outputs = tx.outputs();
+    let Some(raw) = outputs.get(out.index as usize) else {
+        return Vec::new();
+    };
+    let mut units: HashMap<Vec<u8>, i64> = HashMap::new();
+    for pa in raw.value().assets().iter() {
+        if pa.policy().as_ref() != policy {
+            continue;
+        }
+        for a in pa.assets().iter() {
+            if !watched.matches(a.name()) {
+                continue;
+            }
+            // Output quantities are u64 on the wire but the delta arithmetic is
+            // signed. A token whose supply exceeds i64::MAX would saturate here
+            // rather than wrap — no such token exists on Cardano (SNEK, the
+            // largest, is 7.6e10), but saturating beats a silent negative
+            // balance.
+            let qty = i64::try_from(a.output_coin().unwrap_or(0)).unwrap_or(i64::MAX);
+            *units.entry(a.name().to_vec()).or_insert(0) += qty;
+        }
+    }
+    units.retain(|_, q| *q != 0);
+    units.into_iter().collect()
+}
+
+/// One unit whose deltas did not sum to its net mint.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Breach {
+    pub(crate) name: Vec<u8>,
+    pub(crate) delta_sum: i128,
+    pub(crate) net_mint: i64,
+    pub(crate) kind: BreachKind,
+}
+
+/// Why a unit failed to balance — and whether that is a bug or a known gap.
+///
+/// **This distinction is what makes a progressive (windowed or reverse) walk
+/// possible at all.** Such a walk starts with a cold buffer partway through
+/// history, so transactions spending outputs created below its floor are
+/// unresolvable *by construction*. Without separating the two, every one of
+/// them logs as a violation and the real signal drowns — which is also a latent
+/// trap in the existing `--from-slot`, where a cold buffer already produces
+/// exactly this noise.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum BreachKind {
+    /// `delta_sum > net_mint` — a MISSING NEGATIVE. Tokens arrived from a
+    /// holder we never buffered, which is precisely the shape of an input whose
+    /// creating output sits below the walk's floor.
+    ///
+    /// Expected while the buffer is incomplete, and the count of these is the
+    /// honest progress metric for a progressive walk: it converges to zero as
+    /// the floor is lowered toward the policy's first mint.
+    Unattributed,
+    /// `delta_sum < net_mint` — tokens left parties without arriving anywhere,
+    /// or were minted without landing.
+    ///
+    /// A cold buffer CANNOT cause this: outputs are read in full from the
+    /// transaction itself, so nothing we are owed can be missing on the
+    /// positive side. This is a real attribution bug at any floor, and stays an
+    /// error even on a deliberately partial walk.
+    Impossible,
+}
+
+/// Conservation, PER UNIT: within a transaction the deltas for each unit must
+/// sum to that unit's net mint — zero for a pure transfer, positive for a mint,
+/// negative for a burn. Anything else means an input we failed to resolve or an
+/// output we mis-read, which is the entire class of attribution bug this walker
+/// could have, caught for free.
+///
+/// **Per unit rather than per transaction is what keeps the check alive
+/// policy-wide.** Summed across units it would still balance while a gained
+/// unit silently cancelled a lost one — precisely the mis-attribution the check
+/// exists to catch, and the reason this ledger could only ever watch a single
+/// asset before the unit reached the delta key.
+///
+/// Pure, and separated from the walk for that reason: it is the invariant the
+/// whole walker rests on, and it needs no chain to exercise.
+pub(crate) fn conservation_breaches(
+    deltas: &HashMap<(String, Vec<u8>), (Option<String>, i64)>,
+    net_mint: &HashMap<Vec<u8>, i64>,
+) -> Vec<Breach> {
+    let mut sums: HashMap<&[u8], i128> = HashMap::new();
+    for ((_, name), (_, amount)) in deltas {
+        *sums.entry(name.as_slice()).or_insert(0) += *amount as i128;
+    }
+    // A unit that was minted but reached no party we track still has to be
+    // checked — that case IS a violation, so seeding from the mint side too is
+    // what stops it going unnoticed.
+    for name in net_mint.keys() {
+        sums.entry(name.as_slice()).or_insert(0);
+    }
+    let mut breaches: Vec<Breach> = sums
+        .into_iter()
+        .filter_map(|(name, delta_sum)| {
+            let minted = net_mint.get(name).copied().unwrap_or(0);
+            let kind = match delta_sum.cmp(&(minted as i128)) {
+                std::cmp::Ordering::Equal => return None,
+                std::cmp::Ordering::Greater => BreachKind::Unattributed,
+                std::cmp::Ordering::Less => BreachKind::Impossible,
+            };
+            Some(Breach {
+                name: name.to_vec(),
+                delta_sum,
+                net_mint: minted,
+                kind,
+            })
+        })
+        .collect();
+    // Deterministic order so a log line — and a test — reads the same way twice.
+    breaches.sort_by(|a, b| a.name.cmp(&b.name));
+    breaches
+}
+
+/// Can a walk covering from `coverage_from` have a complete outref buffer?
+///
+/// Complete means every input carrying the asset was seen as an output first,
+/// which holds when coverage begins at or below the policy's first mint. It is
+/// what decides whether an unbalanced unit is a bug or a known gap — see
+/// [`BreachKind`].
+///
+/// **Every unknown resolves to "not complete".** The two readings are not
+/// symmetric: calling a partial walk complete turns its expected gaps into a
+/// wall of logged violations and, worse, asserts a supply reconciliation it
+/// cannot satisfy. Calling a complete walk partial merely reports a zero.
+fn coverage_is_complete(coverage_from: Option<u64>, first_mint: Option<u64>) -> bool {
+    match (coverage_from, first_mint) {
+        // Genesis covers everything, whatever the registry says.
+        (Some(0), _) => true,
+        (Some(from), Some(first_mint)) => from <= first_mint,
+        // No registered first mint: only a genesis walk can be known-complete.
+        // Assuming otherwise would silently bless every shallow walk of an
+        // unregistered policy — which is every on-demand one.
+        (Some(_), None) => false,
+        // A ledger with rows but no recorded floor predates the `walk_from`
+        // cursor. Its coverage is genuinely unknown.
+        (None, _) => false,
+    }
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
     let token = registry::load_or_unit(&args.tokens, &args.token)?;
     let policy = token.policy_bytes()?;
     let asset_name = token.asset_name_bytes()?;
+    // ONE decision about what counts, made here and carried through every
+    // output, mint field and buffer entry below.
+    let watched = match asset_name.clone() {
+        Some(name) => Watched::Unit(name),
+        None => Watched::Policy,
+    };
 
     let immutable_dir = args.data_dir.join("immutable");
     if !immutable_dir.is_dir() {
@@ -158,12 +346,41 @@ pub fn run(args: WalkArgs) -> Result<()> {
         );
     }
 
+    // CAN this walk's buffer be complete?
+    //
+    // Complete means every input carrying the asset was seen as an output
+    // first, which holds when coverage begins at or below the policy's first
+    // mint. See [`BreachKind`] for why the distinction has to exist.
+    //
+    // Derived from the RECORDED floor, not from whether a cursor exists. A
+    // resume inherits the coverage of the walk that filled the buffer, and that
+    // walk may itself have been partial — assuming otherwise is how a
+    // deliberately shallow walk comes to report its own known gaps as
+    // conservation violations on the very next run.
+    let coverage_from = match resume {
+        // Continuing an existing ledger: the buffer on disk was built from
+        // wherever that ledger actually reaches.
+        Some(_) => ledger.walked_from()?,
+        // Starting fresh: this run's own floor is the coverage.
+        None => Some(floor),
+    };
+    let buffer_complete = coverage_is_complete(coverage_from, token.floor_slot);
+    if !buffer_complete {
+        tracing::warn!(
+            coverage_from = ?coverage_from,
+            floor_slot = ?token.floor_slot,
+            "walk: PARTIAL — coverage does not reach the policy's first mint. \
+             Movements whose source predates the floor are reported as \
+             unattributed rather than as conservation violations."
+        );
+    }
+
     // Stamp the ledger with what it is about, so every read command is
     // self-describing instead of trusting a flag it could be given wrongly.
     // Written on resume too, so a registry edit (a decimals value arriving)
     // reaches an existing db without a re-walk.
     let decimals = token.resolved_decimals();
-    ledger.put_meta(&token.name, &policy, &asset_name, decimals)?;
+    ledger.put_meta(&token.name, &policy, asset_name.as_deref(), decimals)?;
 
     tracing::info!(
         token = %token.name,
@@ -198,7 +415,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             &immutable_dir,
             &chunks,
             threads,
-            &[policy.clone()],
+            std::slice::from_ref(&policy),
             &|p| {
                 if p.done.is_multiple_of(1_000) {
                     tracing::info!(
@@ -235,7 +452,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     // wallet-sieve. Applied to the RAW block bytes before decode.
     let sieve = args
         .sieve
-        .then(|| chain_sieve::Needles::new(&[policy.clone()]))
+        .then(|| chain_sieve::Needles::new(std::slice::from_ref(&policy)))
         .transpose()?;
     let mut gated: u64 = 0;
 
@@ -243,6 +460,10 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut in_range: u64 = 0;
     let mut touched: u64 = 0;
     let mut violations: u64 = 0;
+    // Movements whose source output sits below this walk's floor. Zero on a
+    // complete walk by definition; on a progressive one it is the gap, and it
+    // shrinks as the floor is lowered.
+    let mut unattributed: u64 = 0;
     let mut undecoded_locks: u64 = 0;
     // Seeded from the resume point, NOT 0. The final `commit_block` below
     // writes this as the cursor, and it is only updated inside the block loop —
@@ -257,14 +478,14 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
     for block in blocks {
         let bytes = block.map_err(|e| anyhow::anyhow!("reading block from chunk: {e:?}"))?;
-        if let Some(needle) = &sieve {
-            if !needle.hit(&bytes) {
-                gated += 1;
-                if gated.is_multiple_of(1_000_000) {
-                    tracing::info!(gated, "walk: sieve skipping");
-                }
-                continue;
+        if let Some(needle) = &sieve
+            && !needle.hit(&bytes)
+        {
+            gated += 1;
+            if gated.is_multiple_of(1_000_000) {
+                tracing::info!(gated, "walk: sieve skipping");
             }
+            continue;
         }
         let blk = MultiEraBlock::decode(&bytes)
             .map_err(|e| anyhow::anyhow!("decoding block at ~#{scanned}: {e:?}"))?;
@@ -284,25 +505,30 @@ pub fn run(args: WalkArgs) -> Result<()> {
         let mut rows: Vec<TxRow> = Vec::new();
 
         for tx in blk.txs() {
-            // Net mint of the watched asset. Read from the raw tx — the
-            // shared decode surface doesn't carry the mint field.
-            let net_mint: i64 = tx
-                .mints()
-                .iter()
-                .filter(|pa| pa.policy().as_ref() == policy.as_slice())
-                .flat_map(|pa| {
-                    pa.assets()
-                        .iter()
-                        .filter(|a| a.name() == asset_name.as_slice())
-                        .map(|a| a.mint_coin().unwrap_or(0))
-                        .collect::<Vec<_>>()
-                })
-                .sum();
+            // Net mint per watched unit. Read from the raw tx — the shared
+            // decode surface doesn't carry the mint field.
+            let mut net_mint: HashMap<Vec<u8>, i64> = HashMap::new();
+            for pa in tx.mints().iter() {
+                if pa.policy().as_ref() != policy.as_slice() {
+                    continue;
+                }
+                for a in pa.assets().iter() {
+                    if !watched.matches(a.name()) {
+                        continue;
+                    }
+                    *net_mint.entry(a.name().to_vec()).or_insert(0) += a.mint_coin().unwrap_or(0);
+                }
+            }
 
             let dtx = decode_tx(&tx);
 
             // Inputs: whatever this tx spent that we were holding.
-            let mut deltas: HashMap<String, (Option<String>, i64)> = HashMap::new();
+            //
+            // Keyed by (address, unit) rather than by address alone. Summed
+            // across units, a tx moving one unit out and another in nets to
+            // zero and hides BOTH moves — which is also what would silently
+            // defeat the conservation check below.
+            let mut deltas: HashMap<(String, Vec<u8>), (Option<String>, i64)> = HashMap::new();
             let mut locks_spent = Vec::new();
             for inp in &dtx.inputs {
                 if let Some(b) = buffer.take(&inp.oref) {
@@ -312,8 +538,12 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     if b.unlock_ts_ms.is_some() {
                         locks_spent.push(inp.oref);
                     }
-                    let e = deltas.entry(b.address).or_insert((b.stake, 0));
-                    e.1 -= b.qty;
+                    for (name, qty) in &b.units {
+                        let e = deltas
+                            .entry((b.address.clone(), name.clone()))
+                            .or_insert((b.stake.clone(), 0));
+                        e.1 -= qty;
+                    }
                 }
             }
 
@@ -321,11 +551,8 @@ pub fn run(args: WalkArgs) -> Result<()> {
             let mut pool_obs = Vec::new();
             let mut locks_created = Vec::new();
             for out in &dtx.outputs {
-                if !holds_watched(out, &policy, &asset_name) {
-                    continue;
-                }
-                let qty = qty_from_output(&tx, out.index, &policy, &asset_name);
-                if qty == 0 {
+                let units = units_in_output(&tx, out, &policy, &watched);
+                if units.is_empty() {
                     continue;
                 }
 
@@ -337,10 +564,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     .as_ref()
                     .and_then(|h| dtx.witness_datums.get(h))
                     .map(Vec::as_slice);
+                // Recognised PER UNIT: a pool is keyed on the specific asset it
+                // quotes, so asking about the policy as a whole has no meaning.
+                // Policy-wide this simply never fires for an NFT collection,
+                // which has no pool keyed on any one of its items.
                 let mut pool_hit = false;
-                if let Some(obs) = pools::recognise(out, qty, &policy, &asset_name, witness_datum) {
-                    pool_obs.push(obs);
-                    pool_hit = true;
+                for (name, qty) in &units {
+                    if let Some(obs) = pools::recognise(out, *qty, &policy, name, witness_datum) {
+                        pool_obs.push(obs);
+                        pool_hit = true;
+                    }
                 }
 
                 // A lock position carries its own schedule. Decode it here, on
@@ -387,7 +620,12 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     locks_created.push(crate::store::LockCreated {
                         oref: (dtx.tx_hash, out.index),
                         address: out.address.clone(),
-                        qty,
+                        // A lock's size is its total across units. Lock
+                        // platforms are a fungible-token shape and no
+                        // registered one escrows a mixed bag; a policy-wide
+                        // walk over an NFT collection creates none of these at
+                        // all, because the recognition is by payment credential.
+                        qty: units.iter().map(|(_, q)| *q).sum(),
                         unlock_ts_ms: unlock,
                         owner_pkh: owner_pkh.clone(),
                     });
@@ -399,19 +637,23 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     BufferedOutput {
                         address: out.address.clone(),
                         stake: stake.clone(),
-                        qty,
+                        units: units.clone(),
                         unlock_ts_ms,
                         owner_pkh,
                         datum_cbor,
                         datum_hash,
                     },
                 );
-                let e = deltas.entry(out.address.clone()).or_insert((stake, 0));
-                e.1 += qty;
+                for (name, qty) in units {
+                    let e = deltas
+                        .entry((out.address.clone(), name))
+                        .or_insert((stake.clone(), 0));
+                    e.1 += qty;
+                }
             }
 
             if deltas.is_empty()
-                && net_mint == 0
+                && net_mint.is_empty()
                 && pool_obs.is_empty()
                 && locks_created.is_empty()
                 && locks_spent.is_empty()
@@ -419,20 +661,47 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 continue;
             }
 
-            // Conservation: within a tx the deltas must sum to the net mint.
-            // Anything else means an input we failed to resolve or an output
-            // we mis-read — the entire class of attribution bug this walker
-            // could have, caught for free.
-            let sum: i128 = deltas.values().map(|(_, a)| *a as i128).sum();
-            if sum != net_mint as i128 {
-                violations += 1;
-                tracing::error!(
-                    tx = %hex::encode(dtx.tx_hash.as_ref()),
-                    slot,
-                    delta_sum = %sum,
-                    net_mint,
-                    "walk: CONSERVATION VIOLATION — deltas do not sum to net mint"
-                );
+            for breach in conservation_breaches(&deltas, &net_mint) {
+                match breach.kind {
+                    // A real bug at any floor — a cold buffer cannot produce it.
+                    BreachKind::Impossible => {
+                        violations += 1;
+                        tracing::error!(
+                            tx = %hex::encode(dtx.tx_hash.as_ref()),
+                            slot,
+                            unit = %hex::encode(&breach.name),
+                            delta_sum = %breach.delta_sum,
+                            net_mint = breach.net_mint,
+                            "walk: CONSERVATION VIOLATION — deltas do not sum to net mint"
+                        );
+                    }
+                    // Tokens from a holder below the floor. On a complete walk
+                    // this is still a bug and still counted; on a deliberately
+                    // partial one it is the expected, converging gap — so it is
+                    // reported separately either way rather than drowning the
+                    // signal.
+                    BreachKind::Unattributed if buffer_complete => {
+                        violations += 1;
+                        tracing::error!(
+                            tx = %hex::encode(dtx.tx_hash.as_ref()),
+                            slot,
+                            unit = %hex::encode(&breach.name),
+                            delta_sum = %breach.delta_sum,
+                            net_mint = breach.net_mint,
+                            "walk: CONSERVATION VIOLATION — value from an unbuffered holder \
+                             on a walk whose buffer should be complete"
+                        );
+                    }
+                    BreachKind::Unattributed => {
+                        unattributed += 1;
+                        tracing::debug!(
+                            tx = %hex::encode(dtx.tx_hash.as_ref()),
+                            slot,
+                            unit = %hex::encode(&breach.name),
+                            "walk: source below floor — unattributed"
+                        );
+                    }
+                }
             }
 
             touched += 1;
@@ -440,11 +709,18 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 tx_hash: dtx.tx_hash,
                 slot,
                 block_time,
-                net_mint,
+                net_mint: net_mint.into_iter().collect(),
                 deltas: deltas
                     .into_iter()
                     .filter(|(_, (_, amount))| *amount != 0)
-                    .map(|(address, (stake, amount))| (address, stake, amount))
+                    .map(
+                        |((address, name), (stake, amount))| crate::store::DeltaRow {
+                            address,
+                            stake,
+                            name,
+                            amount,
+                        },
+                    )
                     .collect(),
                 pools: pool_obs,
                 locks_created,
@@ -488,6 +764,20 @@ pub fn run(args: WalkArgs) -> Result<()> {
         true,
     )?;
 
+    // Record the FLOOR this run covered, completing the coverage pair with the
+    // forward cursor `commit_block` just wrote.
+    //
+    // At the END rather than the start, and this is the subtle half: lowering
+    // the floor before the segment is walked would claim coverage of ground the
+    // run has not reached yet, and a crash there leaves a ledger asserting a
+    // contiguous range with a hole in it. Written here, `[walked_from, walk]`
+    // is only ever widened by work that actually completed.
+    //
+    // `floor` is the EFFECTIVE floor, so it carries the sieve's first-hit
+    // discovery when that ran — coverage from the policy's first appearance is
+    // complete, because nothing below it holds the policy at all.
+    ledger.set_walked_from(floor)?;
+
     // Classify from the addresses just recorded. Derived, so it costs a pass
     // over the party table and never a re-walk.
     let classified = ledger.classify_parties(&sinks, &lock_creds)?;
@@ -512,18 +802,32 @@ pub fn run(args: WalkArgs) -> Result<()> {
         delta_rows,
         parties,
         violations,
+        unattributed,
+        buffer_complete,
         "walk: done"
     );
 
     // End-to-end reconciliation. These three must agree; if they don't, every
     // number downstream is wrong and it is better to say so loudly here than
     // to ship a plausible chart.
+    //
+    // A PARTIAL walk cannot balance and must not claim to: its deltas are
+    // missing every source below the floor, so `Σ deltas` legitimately exceeds
+    // `Σ net_mint`. Asserting the identity anyway would print RECONCILIATION
+    // FAILED on a walk that is behaving exactly as designed, and the one number
+    // that means anything there is how much is still unattributed.
     let orphans = ledger.orphan_deltas()?;
     println!("net minted (Σ tx.net_mint)   = {minted}");
     println!("Σ all deltas                 = {delta_sum}");
     println!("live in buffer (circulating) = {live}");
     println!("orphan deltas                = {orphans}");
-    if minted as i128 != live || delta_sum != minted || orphans != 0 {
+    if !buffer_complete {
+        println!("unattributed movements       = {unattributed}");
+        println!(
+            "PARTIAL WALK — supply cannot balance from this floor; \
+             lower it toward the policy's first mint to close the gap"
+        );
+    } else if minted as i128 != live || delta_sum != minted || orphans != 0 {
         println!("*** RECONCILIATION FAILED — supply does not balance ***");
     } else {
         println!("reconciled: supply balances");
@@ -539,40 +843,6 @@ pub fn run(args: WalkArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Quantity of the watched asset in output `index` of `tx`.
-///
-/// Read off the raw output rather than the shared `DecodedOutput`, which
-/// carries asset identity but not quantity.
-fn qty_from_output(
-    tx: &pallas_traverse::MultiEraTx<'_>,
-    index: u32,
-    policy: &[u8],
-    name: &[u8],
-) -> i64 {
-    let outputs = tx.outputs();
-    let Some(out) = outputs.get(index as usize) else {
-        return 0;
-    };
-    let total: u64 = out
-        .value()
-        .assets()
-        .iter()
-        .filter(|pa| pa.policy().as_ref() == policy)
-        .flat_map(|pa| {
-            pa.assets()
-                .iter()
-                .filter(|a| a.name() == name)
-                .map(|a| a.output_coin().unwrap_or(0))
-                .collect::<Vec<_>>()
-        })
-        .sum();
-    // Output quantities are u64 on the wire but the delta arithmetic is
-    // signed. A token whose supply exceeds i64::MAX would saturate here rather
-    // than wrap — no such token exists on Cardano (SNEK, the largest, is
-    // 7.6e10), but saturating beats a silent negative balance.
-    i64::try_from(total).unwrap_or(i64::MAX)
 }
 
 /// Re-derive cohorts without touching the chain.
@@ -747,10 +1017,12 @@ pub fn stats(db: &std::path::Path, top: usize) -> Result<()> {
     let meta = ledger.asset_meta()?;
     match &meta {
         Some(m) => println!(
-            "ledger: {}  {}.{}  {}",
+            "ledger: {}  {}  {}",
             m.name,
-            hex::encode(&m.policy),
-            hex::encode(&m.asset_name),
+            match &m.asset_name {
+                Some(n) => format!("{}.{}", hex::encode(&m.policy), hex::encode(n)),
+                None => format!("{} (whole policy)", hex::encode(&m.policy)),
+            },
             match m.decimals {
                 Some(d) => format!("{d} dp"),
                 None => "decimals unknown".to_string(),
@@ -1137,4 +1409,208 @@ fn cap_report(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two assets under one policy — an NFT collection, or a policy that minted
+    /// under more than one name.
+    const A: &[u8] = b"AlienOne";
+    const B: &[u8] = b"AlienTwo";
+
+    fn deltas(entries: &[(&str, &[u8], i64)]) -> HashMap<(String, Vec<u8>), (Option<String>, i64)> {
+        entries
+            .iter()
+            .map(|(addr, name, amount)| ((addr.to_string(), name.to_vec()), (None, *amount)))
+            .collect()
+    }
+
+    fn mints(entries: &[(&[u8], i64)]) -> HashMap<Vec<u8>, i64> {
+        entries
+            .iter()
+            .map(|(name, amount)| (name.to_vec(), *amount))
+            .collect()
+    }
+
+    /// A pure transfer conserves: one party down, another up, nothing minted.
+    #[test]
+    fn a_transfer_conserves() {
+        let d = deltas(&[("alice", A, -5), ("bob", A, 5)]);
+        assert!(conservation_breaches(&d, &HashMap::new()).is_empty());
+    }
+
+    /// THE REASON THE UNIT IS ON THE KEY.
+    ///
+    /// Alice gives up one unit and receives a different one under the same
+    /// policy — an NFT trade, or a swap. Summed across units her deltas cancel
+    /// to zero, so the transaction looks perfectly conserved while BOTH moves
+    /// have been mis-attributed. Per unit, each one is a breach.
+    #[test]
+    fn a_cross_unit_swap_does_not_cancel_itself_out() {
+        let d = deltas(&[("alice", A, -1), ("alice", B, 1)]);
+        let breaches = conservation_breaches(&d, &HashMap::new());
+        assert_eq!(
+            breaches.len(),
+            2,
+            "both units must be reported: {breaches:?}"
+        );
+        assert_eq!(breaches[0].name, A.to_vec());
+        assert_eq!(breaches[0].delta_sum, -1);
+        assert_eq!(breaches[1].name, B.to_vec());
+        assert_eq!(breaches[1].delta_sum, 1);
+
+        // And the check this replaced — one scalar per party, summed over the
+        // whole tx — saw nothing at all. Stated here so the regression is
+        // unmistakable if anyone collapses the key again.
+        let summed: i128 = d.values().map(|(_, a)| *a as i128).sum();
+        assert_eq!(summed, 0, "the old per-tx check was blind to this");
+    }
+
+    /// A mint conserves when the minted quantity reaches somebody.
+    #[test]
+    fn a_mint_conserves_when_it_lands_somewhere() {
+        let d = deltas(&[("alice", A, 100)]);
+        assert!(conservation_breaches(&d, &mints(&[(A, 100)])).is_empty());
+    }
+
+    /// A burn is the same statement with the sign flipped.
+    #[test]
+    fn a_burn_conserves() {
+        let d = deltas(&[("alice", A, -100)]);
+        assert!(conservation_breaches(&d, &mints(&[(A, -100)])).is_empty());
+    }
+
+    /// A unit minted that reaches NO tracked party is a violation, and it is
+    /// visible only because the mint side seeds the comparison too. Reading the
+    /// deltas alone, this transaction has nothing to say.
+    #[test]
+    fn a_mint_that_reaches_nobody_is_a_breach() {
+        let breaches = conservation_breaches(&HashMap::new(), &mints(&[(A, 100)]));
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].delta_sum, 0);
+        assert_eq!(breaches[0].net_mint, 100);
+    }
+
+    /// Two units minted in one transaction — a collection's batch mint — each
+    /// conserve independently.
+    #[test]
+    fn units_conserve_independently_within_one_tx() {
+        let d = deltas(&[("alice", A, 1), ("bob", B, 1)]);
+        assert!(conservation_breaches(&d, &mints(&[(A, 1), (B, 1)])).is_empty());
+    }
+
+    // ── the progressive-walk distinction ────────────────────────────────────
+
+    /// THE PREREQUISITE FOR A REVERSE OR WINDOWED WALK.
+    ///
+    /// Alice's coins arrive at Bob, but Alice's output was created below the
+    /// walk's floor so it was never buffered — we see only `bob +5`. The sum
+    /// comes out ABOVE the net mint, because the negative half is the half
+    /// that went missing. That is a known gap, not a bug.
+    #[test]
+    fn a_source_below_the_floor_reads_as_unattributed() {
+        let d = deltas(&[("bob", A, 5)]);
+        let breaches = conservation_breaches(&d, &HashMap::new());
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].kind, BreachKind::Unattributed);
+        assert_eq!(breaches[0].delta_sum, 5);
+        assert_eq!(breaches[0].net_mint, 0);
+    }
+
+    /// The other direction can NEVER be caused by a cold buffer: outputs are
+    /// read in full from the transaction itself, so nothing owed to us can go
+    /// missing on the positive side. Tokens leaving without arriving is a real
+    /// attribution bug at any floor.
+    #[test]
+    fn value_leaving_without_arriving_is_always_a_bug() {
+        let d = deltas(&[("alice", A, -5)]);
+        let breaches = conservation_breaches(&d, &HashMap::new());
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].kind, BreachKind::Impossible);
+    }
+
+    /// A mint that lands nowhere is the same shape — minted, never received —
+    /// and must stay loud rather than hide among the floor gaps.
+    #[test]
+    fn a_mint_that_reaches_nobody_is_impossible_not_unattributed() {
+        let breaches = conservation_breaches(&HashMap::new(), &mints(&[(A, 100)]));
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].kind, BreachKind::Impossible);
+    }
+
+    /// A partial walk classifies per unit, not per transaction: one unit's
+    /// source can sit below the floor while another's is fully resolved in the
+    /// same transaction, and collapsing them would either hide the bug or
+    /// invent one.
+    #[test]
+    fn units_are_classified_independently_within_one_tx() {
+        let d = deltas(&[("bob", A, 5), ("alice", B, -1), ("carol", B, 1)]);
+        let breaches = conservation_breaches(&d, &HashMap::new());
+        assert_eq!(breaches.len(), 1, "only A is short: {breaches:?}");
+        assert_eq!(breaches[0].name, A.to_vec());
+        assert_eq!(breaches[0].kind, BreachKind::Unattributed);
+    }
+
+    // ── coverage completeness ───────────────────────────────────────────────
+
+    /// Reaching the policy's first mint is what completeness means.
+    #[test]
+    fn coverage_from_at_or_below_the_first_mint_is_complete() {
+        assert!(coverage_is_complete(Some(1_000), Some(1_000)));
+        assert!(coverage_is_complete(Some(999), Some(1_000)));
+        assert!(!coverage_is_complete(Some(1_001), Some(1_000)));
+    }
+
+    /// Genesis covers everything, whatever the registry does or does not say.
+    #[test]
+    fn a_genesis_walk_is_complete_without_a_registered_floor() {
+        assert!(coverage_is_complete(Some(0), None));
+        assert!(coverage_is_complete(Some(0), Some(5_000_000)));
+    }
+
+    /// THE CASE THAT MATTERS FOR ON-DEMAND POLICIES.
+    ///
+    /// An unregistered policy has no known first mint, so a walk starting part
+    /// way up cannot be shown to be complete — and must not be assumed so.
+    /// Every on-demand policy arrives in exactly this state.
+    #[test]
+    fn a_shallow_walk_of_an_unregistered_policy_is_not_complete() {
+        assert!(!coverage_is_complete(Some(90_000_000), None));
+    }
+
+    /// A ledger predating the `walk_from` cursor has genuinely unknown
+    /// coverage. The safe reading reports gaps as gaps rather than as bugs —
+    /// which is also what a resumed partial walk used to get wrong by assuming
+    /// that having a cursor implied having walked from the bottom.
+    #[test]
+    fn unknown_coverage_is_never_assumed_complete() {
+        assert!(!coverage_is_complete(None, Some(1_000)));
+        assert!(!coverage_is_complete(None, None));
+    }
+
+    /// Policy mode takes every name, including the empty one.
+    #[test]
+    fn a_policy_watch_matches_every_name() {
+        let w = Watched::Policy;
+        assert!(w.matches(A));
+        assert!(w.matches(B));
+        assert!(w.matches(b""));
+    }
+
+    /// A unit watch takes exactly its own name. The empty-named asset is a real
+    /// asset and must not be confused with "no name given" — which is the whole
+    /// reason `asset_name` is an `Option` rather than a `String`.
+    #[test]
+    fn a_unit_watch_matches_only_itself() {
+        let w = Watched::Unit(A.to_vec());
+        assert!(w.matches(A));
+        assert!(!w.matches(B));
+        assert!(!w.matches(b""));
+
+        let empty = Watched::Unit(Vec::new());
+        assert!(empty.matches(b""));
+        assert!(!empty.matches(A));
+    }
 }

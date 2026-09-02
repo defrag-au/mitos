@@ -30,8 +30,12 @@ pub struct BufferedOutput {
     /// alongside for grouping, never as identity.
     pub address: String,
     pub stake: Option<String>,
-    /// Quantity of the watched asset in this output.
-    pub qty: i64,
+    /// Quantity of each watched unit in this output, keyed by asset-name bytes.
+    ///
+    /// A `Vec` rather than a map: a single-asset watch has exactly one entry
+    /// and an NFT output typically one or two, so the linear scan beats hashing
+    /// and the ordering stays stable for the persisted encoding.
+    pub units: Vec<(Vec<u8>, i64)>,
     /// From a decoded lock datum: when this position unlocks (ms since epoch).
     ///
     /// Carried on the live UTxO rather than in a side table because a vesting
@@ -86,11 +90,26 @@ impl OutrefBuffer {
         self.map.iter()
     }
 
-    /// Total watched-asset quantity currently live.
+    /// Total watched quantity currently live, summed across units.
     ///
     /// At tip this must equal circulating supply, which is the walk's
-    /// end-to-end reconciliation check.
+    /// end-to-end reconciliation check. Summing across units is the right
+    /// aggregate for that check even policy-wide: every unit conserves
+    /// independently, so their total conserves too.
     pub fn total_qty(&self) -> i128 {
-        self.map.values().map(|b| b.qty as i128).sum()
+        self.map
+            .values()
+            .flat_map(|b| b.units.iter())
+            .map(|(_, q)| *q as i128)
+            .sum()
+    }
+}
+
+impl BufferedOutput {
+    /// This output's total across every watched unit — what the single-asset
+    /// `qty` field used to be, kept as a method so call sites that genuinely
+    /// want the aggregate read as though they asked for one.
+    pub fn total(&self) -> i64 {
+        self.units.iter().map(|(_, q)| *q).sum()
     }
 }

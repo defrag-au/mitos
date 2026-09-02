@@ -7,8 +7,8 @@
 //!
 //! ## The primitive is a signed delta, not a directed pair
 //!
-//! `delta(tx_ord, party_id) -> amount` — one row per party whose balance
-//! changed in a transaction. **Not** `(from, to, quantity)`.
+//! `delta(tx_ord, party_id, unit_id) -> amount` — one row per party per unit
+//! whose balance changed in a transaction. **Not** `(from, to, quantity)`.
 //!
 //! A directed pair cannot be derived from a multi-party transaction without a
 //! heuristic, and the obvious one ("largest absolute delta is the sender") is
@@ -26,16 +26,22 @@
 //!
 //! ## Conservation is the self-check
 //!
-//! Within one transaction the deltas must sum to the net mint of the watched
-//! asset — zero for a pure transfer, positive for a mint, negative for a burn.
+//! Within one transaction the deltas for EACH UNIT must sum to that unit's net
+//! mint — zero for a pure transfer, positive for a mint, negative for a burn.
 //! That invariant is free, exact, and catches the entire class of attribution
 //! bugs this walker could have. It is asserted per transaction and violations
 //! are counted and reported rather than swallowed.
+//!
+//! Per unit rather than per transaction is what keeps it alive when a ledger
+//! follows a whole policy: summed across units the check still balances while a
+//! gained unit silently cancels a lost one, which is exactly the mis-attribution
+//! it exists to catch. See `walk::conservation_breaches`, which is pure and
+//! tested against that case.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use pallas_primitives::Hash;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -48,6 +54,10 @@ pub struct Ledger {
     parties: HashMap<String, i64>,
     /// (dex, key_policy, key_name) → pool_id, same reason.
     pools: HashMap<(String, Vec<u8>, Vec<u8>), i64>,
+    /// asset-name bytes → unit_id. Same reason again, and it matters more here:
+    /// a policy-wide walk touches this on every delta of every transaction,
+    /// where the pool and party caches see far fewer distinct keys.
+    units: HashMap<Vec<u8>, i64>,
     next_tx_ord: i64,
 }
 
@@ -94,7 +104,10 @@ pub struct PartyRecord {
 pub struct AssetMeta {
     pub name: String,
     pub policy: Vec<u8>,
-    pub asset_name: Vec<u8>,
+    /// The single watched asset, or `None` when this ledger follows the WHOLE
+    /// policy. Distinct from `Some(vec![])`, which is the asset whose on-chain
+    /// name is genuinely zero bytes.
+    pub asset_name: Option<Vec<u8>>,
     /// `None` = unknown, render raw. Not the same as `Some(0)`.
     pub decimals: Option<u8>,
 }
@@ -159,16 +172,47 @@ pub struct TxRow {
     pub tx_hash: Hash<32>,
     pub slot: u64,
     pub block_time: u64,
-    /// Net mint of the watched asset in this tx (0 / +mint / −burn).
-    pub net_mint: i64,
-    /// `(address, stake, signed amount)` for every party whose balance moved.
-    pub deltas: Vec<(String, Option<String>, i64)>,
+    /// Net mint per unit in this tx (0 / +mint / −burn), keyed by asset-name
+    /// bytes. Empty for the overwhelming majority of transactions.
+    ///
+    /// The stored `tx.net_mint` is the SUM of these, which is what the global
+    /// reconciliation compares against `Σ delta.amount`. That total stays
+    /// correct policy-wide because every unit conserves independently.
+    pub net_mint: Vec<(Vec<u8>, i64)>,
+    /// Every party whose balance moved, per unit.
+    pub deltas: Vec<DeltaRow>,
     /// Pool reserves observed in this tx's outputs.
     pub pools: Vec<PoolObservation>,
     /// Lock positions this tx opened.
     pub locks_created: Vec<LockCreated>,
     /// Lock positions this tx closed (outrefs it spent).
     pub locks_spent: Vec<(Hash<32>, u32)>,
+}
+
+/// The `Ledger`'s in-memory id caches, borrowed together.
+///
+/// Bundled because `write_rows` needs all four while a `Transaction` holds a
+/// borrow of `conn`, and passing them as four parameters put the function over
+/// clippy's argument threshold for no gain in clarity.
+struct Caches<'a> {
+    parties: &'a mut HashMap<String, i64>,
+    units: &'a mut HashMap<Vec<u8>, i64>,
+    pools: &'a mut HashMap<(String, Vec<u8>, Vec<u8>), i64>,
+    next_tx_ord: &'a mut i64,
+}
+
+/// One party's signed movement of one unit, within one transaction.
+///
+/// A struct rather than a 4-tuple because the tuple it replaced was already at
+/// three fields and the unit makes four, at which point `.2` stops telling a
+/// reader anything and the stake and the name are both `Option`-ish strings
+/// waiting to be transposed.
+pub struct DeltaRow {
+    pub address: String,
+    pub stake: Option<String>,
+    /// On-chain asset-name bytes of the unit that moved.
+    pub name: Vec<u8>,
+    pub amount: i64,
 }
 
 /// A lock position opened by a transaction.
@@ -201,6 +245,114 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Resu
     if !present {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
     }
+    Ok(())
+}
+
+/// Per-unit quantities on a buffered output, as stored bytes.
+///
+/// A hand-rolled encoding rather than a serde format: this is written once per
+/// buffered UTxO on every buffer persist — tens of thousands of rows, every few
+/// hundred thousand blocks — and it never leaves this file, so there is no wire
+/// compatibility to honour. `u8` name length is sound because a Cardano asset
+/// name is capped at 32 bytes by the ledger rules.
+fn encode_units(units: &[(Vec<u8>, i64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(units.len() * 16);
+    for (name, qty) in units {
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
+        out.extend_from_slice(&qty.to_le_bytes());
+    }
+    out
+}
+
+fn decode_units(mut blob: &[u8]) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut units = Vec::new();
+    while !blob.is_empty() {
+        let len = blob[0] as usize;
+        // A truncated record means the row is unreadable, and a buffer silently
+        // short of entries is the one failure this walk cannot detect later —
+        // every input it fails to resolve becomes a conservation violation
+        // attributed to the wrong transaction. Refuse loudly instead.
+        if blob.len() < 1 + len + 8 {
+            bail!("buffered units blob is truncated");
+        }
+        let name = blob[1..1 + len].to_vec();
+        let qty = i64::from_le_bytes(
+            blob[1 + len..1 + len + 8]
+                .try_into()
+                .expect("8 bytes checked above"),
+        );
+        units.push((name, qty));
+        blob = &blob[1 + len + 8..];
+    }
+    Ok(units)
+}
+
+/// Give `delta` a unit dimension, rebuilding the table because its PRIMARY KEY
+/// changes.
+///
+/// `ALTER TABLE … ADD COLUMN` cannot widen a primary key, and the key is the
+/// whole point: under `PRIMARY KEY (tx_ord, party_id)` a transaction in which
+/// one party moves two different units of the same policy collides, and the
+/// `INSERT OR IGNORE` in `commit_block` silently drops the second. That is the
+/// exact bug policy-wide watching exists to avoid, so the rebuild is not
+/// optional tidying.
+///
+/// Existing rows are attributed to the ledger's single watched asset, read from
+/// `meta` — sound precisely because a ledger written under the old schema
+/// watched exactly one asset by construction.
+fn migrate_delta_to_units(conn: &Connection) -> Result<()> {
+    let has_unit_id: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(delta)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(r) = rows.next()? {
+            if r.get::<_, String>(1)? == "unit_id" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if has_unit_id {
+        return Ok(());
+    }
+
+    // The asset this ledger was watching. Absent only on a ledger with no
+    // `meta` row — i.e. one that has never walked — where there are no deltas
+    // to attribute either, so the empty name is harmless.
+    let existing_name: Vec<u8> = conn
+        .query_row("SELECT asset_name FROM meta WHERE k = 'asset'", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or_default();
+
+    conn.execute(
+        "INSERT OR IGNORE INTO unit (name) VALUES (?1)",
+        params![existing_name],
+    )?;
+    let unit_id: i64 = conn.query_row(
+        "SELECT unit_id FROM unit WHERE name = ?1",
+        params![existing_name],
+        |r| r.get(0),
+    )?;
+
+    conn.execute_batch(&format!(
+        "CREATE TABLE delta_new (
+             tx_ord   INTEGER NOT NULL,
+             party_id INTEGER NOT NULL,
+             unit_id  INTEGER NOT NULL,
+             amount   INTEGER NOT NULL,
+             PRIMARY KEY (tx_ord, party_id, unit_id)
+         ) WITHOUT ROWID;
+         INSERT INTO delta_new (tx_ord, party_id, unit_id, amount)
+             SELECT tx_ord, party_id, {unit_id}, amount FROM delta;
+         DROP TABLE delta;
+         ALTER TABLE delta_new RENAME TO delta;
+         CREATE INDEX IF NOT EXISTS delta_party ON delta(party_id);
+         CREATE INDEX IF NOT EXISTS delta_unit ON delta(unit_id);"
+    ))?;
+    tracing::info!("store: delta migrated to carry a unit dimension");
     Ok(())
 }
 
@@ -238,13 +390,18 @@ impl Ledger {
              );
              CREATE INDEX IF NOT EXISTS party_stake ON party(stake);
 
+             -- `unit_id` is in the KEY, not merely a column: without it a tx in
+             -- which one party moves two units of the same policy collides and
+             -- the second is silently dropped. See `migrate_delta_to_units`.
              CREATE TABLE IF NOT EXISTS delta (
                  tx_ord   INTEGER NOT NULL,
                  party_id INTEGER NOT NULL,
+                 unit_id  INTEGER NOT NULL,
                  amount   INTEGER NOT NULL,
-                 PRIMARY KEY (tx_ord, party_id)
+                 PRIMARY KEY (tx_ord, party_id, unit_id)
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS delta_party ON delta(party_id);
+             CREATE INDEX IF NOT EXISTS delta_unit ON delta(unit_id);
 
              -- One row per pool instance ever seen. `key_basis` records how
              -- firmly the instance is identified (published in the datum vs
@@ -337,6 +494,31 @@ impl Ledger {
                  stake     TEXT,
                  qty       INTEGER NOT NULL,
                  PRIMARY KEY (oref_hash, oref_idx)
+             ) WITHOUT ROWID;
+
+             -- Every asset name this ledger has seen under its policy.
+             --
+             -- A single-asset ledger holds exactly one row here and every
+             -- aggregate below reads identically to the way it did before this
+             -- table existed. A POLICY-WIDE ledger holds one row per unit, and
+             -- that is what keeps the per-tx conservation check meaningful:
+             -- summed across units, a tx moving one unit out and another in
+             -- nets to zero and hides both moves.
+             CREATE TABLE IF NOT EXISTS unit (
+                 unit_id INTEGER PRIMARY KEY,
+                 name    BLOB NOT NULL UNIQUE
+             );
+
+             -- Per-unit mint breakdown. `tx.net_mint` remains the total ACROSS
+             -- units, which is still exactly what the global reconciliation
+             -- wants — every unit conserves, so their sum conserves — while
+             -- this answers which unit actually moved. Empty for the
+             -- overwhelming majority of transactions, which mint nothing.
+             CREATE TABLE IF NOT EXISTS tx_mint (
+                 tx_ord  INTEGER NOT NULL,
+                 unit_id INTEGER NOT NULL,
+                 amount  INTEGER NOT NULL,
+                 PRIMARY KEY (tx_ord, unit_id)
              ) WITHOUT ROWID;",
         )?;
 
@@ -361,7 +543,15 @@ impl Ledger {
         ensure_column(&conn, "buffered", "owner_pkh", "TEXT")?;
         ensure_column(&conn, "buffered", "datum_cbor", "BLOB")?;
         ensure_column(&conn, "buffered", "datum_hash", "BLOB")?;
+        // Per-unit quantities on a buffered output. `qty` stays the total, so
+        // a ledger written before this column reloads its buffer with the same
+        // arithmetic it always had; the breakdown is synthesised from `meta`
+        // for those rows, which is correct precisely because such a ledger
+        // watched exactly one asset.
+        ensure_column(&conn, "buffered", "units", "BLOB")?;
+        ensure_column(&conn, "meta", "policy_wide", "INTEGER")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS party_cohort ON party(cohort);")?;
+        migrate_delta_to_units(&conn)?;
 
         let next_tx_ord: i64 = conn
             .query_row("SELECT COALESCE(MAX(tx_ord), -1) + 1 FROM tx", [], |r| {
@@ -398,12 +588,49 @@ impl Ledger {
             }
         }
 
+        let mut units = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT name, unit_id FROM unit")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (name, id) = row?;
+                units.insert(name, id);
+            }
+        }
+
         Ok(Self {
             conn,
             parties,
             pools,
+            units,
             next_tx_ord,
         })
+    }
+
+    /// `unit_id` for an asset name, inserting the unit on first sight.
+    ///
+    /// Takes the cache as a parameter rather than `&mut self` so it can be
+    /// called while a `Transaction` holds a borrow of `self.conn`.
+    fn unit_id(
+        tx: &rusqlite::Transaction<'_>,
+        cache: &mut HashMap<Vec<u8>, i64>,
+        name: &[u8],
+    ) -> Result<i64> {
+        if let Some(id) = cache.get(name) {
+            return Ok(*id);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO unit (name) VALUES (?1)",
+            params![name],
+        )?;
+        let id: i64 = tx.query_row(
+            "SELECT unit_id FROM unit WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        cache.insert(name.to_vec(), id);
+        Ok(id)
     }
 
     /// Drop every row — what `--fresh` means.
@@ -435,7 +662,8 @@ impl Ledger {
         )?)
     }
 
-    /// Resume point: the last slot committed by a previous walk.
+    /// Resume point: the last slot committed by a previous walk. The FORWARD
+    /// frontier — see [`Self::walked_from`] for its counterpart.
     pub fn resume_slot(&self) -> Result<Option<u64>> {
         Ok(self
             .conn
@@ -446,23 +674,80 @@ impl Ledger {
             .map(|s| s as u64))
     }
 
+    /// The FLOOR: the lowest slot this ledger has contiguous coverage from.
+    ///
+    /// The counterpart to [`Self::resume_slot`], and the pair is the whole
+    /// coverage statement — `[walked_from, resume_slot]`. Without this a reader
+    /// cannot tell "the policy starts here" from "we stopped looking here",
+    /// which is the same distinction wallet-sieve draws with
+    /// `scanned_from_slot` against `scanned_to_slot`, and for the same reason:
+    /// a timeline built on the first reading silently presents a partial walk
+    /// as a whole history.
+    ///
+    /// It is also what makes buffer completeness a recorded FACT rather than an
+    /// assumption — a resumed partial walk used to claim completeness simply
+    /// because it had a cursor.
+    ///
+    /// `None` means no walk has recorded a floor: either the ledger is empty,
+    /// or it predates this cursor. Callers must treat that as "unknown", never
+    /// as genesis.
+    pub fn walked_from(&self) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT slot FROM cursor WHERE k = 'walk_from'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|s| s as u64))
+    }
+
+    /// Lower the floor to `slot`, never raise it.
+    ///
+    /// `min` rather than assignment because coverage only ever grows downward:
+    /// a later shallow walk over a ledger that already reaches deeper must not
+    /// erase what it knows. That is exactly the shape of a refresh running after
+    /// a deep backfill, which is the common case rather than an edge one.
+    pub fn set_walked_from(&self, slot: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cursor (k, slot) VALUES ('walk_from', ?1)
+             ON CONFLICT(k) DO UPDATE SET slot = min(slot, excluded.slot)",
+            params![slot as i64],
+        )?;
+        Ok(())
+    }
+
     /// Record which asset this ledger is about. Idempotent; the walk calls it.
+    /// Stamp what this ledger is about. `asset_name` is `None` for a
+    /// whole-policy watch.
+    ///
+    /// Policy mode is recorded in a separate `policy_wide` flag rather than as
+    /// a NULL `asset_name`, because the column is `NOT NULL` on every deployed
+    /// ledger and sqlite cannot relax that without a table rebuild. The flag
+    /// also keeps the empty-name asset representable, which a NULL-or-empty
+    /// encoding would have quietly lost.
     pub fn put_meta(
         &self,
         name: &str,
         policy: &[u8],
-        asset_name: &[u8],
+        asset_name: Option<&[u8]>,
         decimals: Option<u8>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO meta (k, name, policy, asset_name, decimals)
-             VALUES ('asset', ?1, ?2, ?3, ?4)
+            "INSERT INTO meta (k, name, policy, asset_name, decimals, policy_wide)
+             VALUES ('asset', ?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(k) DO UPDATE SET
                  name = excluded.name,
                  policy = excluded.policy,
                  asset_name = excluded.asset_name,
-                 decimals = excluded.decimals",
-            params![name, policy, asset_name, decimals],
+                 decimals = excluded.decimals,
+                 policy_wide = excluded.policy_wide",
+            params![
+                name,
+                policy,
+                asset_name.unwrap_or(&[]),
+                decimals,
+                i64::from(asset_name.is_none())
+            ],
         )?;
         Ok(())
     }
@@ -476,13 +761,18 @@ impl Ledger {
         Ok(self
             .conn
             .query_row(
-                "SELECT name, policy, asset_name, decimals FROM meta WHERE k = 'asset'",
+                "SELECT name, policy, asset_name, decimals, policy_wide
+                 FROM meta WHERE k = 'asset'",
                 [],
                 |r| {
+                    let policy_wide = r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0;
                     Ok(AssetMeta {
                         name: r.get(0)?,
                         policy: r.get(1)?,
-                        asset_name: r.get(2)?,
+                        // A ledger written before the flag existed watched a
+                        // single asset by construction, so an absent flag reads
+                        // as `Some` — the pre-policy behaviour, unchanged.
+                        asset_name: (!policy_wide).then(|| r.get(2)).transpose()?,
                         decimals: r
                             .get::<_, Option<i64>>(3)?
                             .and_then(|d| u8::try_from(d).ok()),
@@ -494,9 +784,16 @@ impl Ledger {
 
     pub fn load_buffer(&self) -> Result<OutrefBuffer> {
         let mut buf = OutrefBuffer::default();
+        // What a row written before the `units` column was about. A ledger of
+        // that vintage watched exactly one asset by construction, so attributing
+        // its whole `qty` to that asset is exact, not a guess.
+        let legacy_unit: Vec<u8> = self
+            .asset_meta()?
+            .and_then(|m| m.asset_name)
+            .unwrap_or_default();
         let mut stmt = self.conn.prepare(
             "SELECT oref_hash, oref_idx, address, stake, qty, unlock_ts_ms, owner_pkh,
-                    datum_cbor, datum_hash
+                    datum_cbor, datum_hash, units
              FROM buffered",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -510,19 +807,24 @@ impl Ledger {
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, Option<Vec<u8>>>(7)?,
                 r.get::<_, Option<Vec<u8>>>(8)?,
+                r.get::<_, Option<Vec<u8>>>(9)?,
             ))
         })?;
         for row in rows {
-            let (hash, idx, address, stake, qty, unlock, owner, datum, dhash) = row?;
+            let (hash, idx, address, stake, qty, unlock, owner, datum, dhash, units) = row?;
             let h: [u8; 32] = hash
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("buffered oref hash is not 32 bytes"))?;
+            let units = match units.as_deref().filter(|b| !b.is_empty()) {
+                Some(blob) => decode_units(blob)?,
+                None => vec![(legacy_unit.clone(), qty)],
+            };
             buf.insert(
                 (Hash::from(h), idx as u32),
                 BufferedOutput {
                     address,
                     stake,
-                    qty,
+                    units,
                     unlock_ts_ms: unlock.map(|v| v as u64),
                     owner_pkh: owner,
                     datum_cbor: datum,
@@ -533,20 +835,38 @@ impl Ledger {
         Ok(buf)
     }
 
-    /// Commit one block's transactions plus the cursor, atomically.
+    /// Commit transactions WITHOUT touching the forward cursor — the reverse
+    /// pass's writer.
     ///
-    /// Rows and cursor move together — a crash mid-walk leaves a consistent
-    /// ledger whose cursor points at the last fully-written block.
-    pub fn commit_block(
-        &mut self,
-        txs: &[TxRow],
-        slot: u64,
-        block_hash: &Hash<32>,
-        buffer: &OutrefBuffer,
-        persist_buffer: bool,
-    ) -> Result<()> {
+    /// A reverse pass extends coverage DOWNWARD, so the forward frontier it
+    /// must not move: writing `slot` there would claim the walk had regressed
+    /// to somewhere it already passed, and the next forward resume would
+    /// re-walk everything above it. The floor is recorded separately, per
+    /// chunk, via [`Self::set_walked_from`].
+    ///
+    /// Nor is the outref buffer persisted: it is the forward walk's state and a
+    /// reverse pass does not maintain it. Overwriting it from here would erase
+    /// the open set a forward resume depends on.
+    pub fn commit_rows(&mut self, txs: &[TxRow]) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let mut caches = Caches {
+            parties: &mut self.parties,
+            units: &mut self.units,
+            pools: &mut self.pools,
+            next_tx_ord: &mut self.next_tx_ord,
+        };
+        Self::write_rows(&tx, &mut caches, txs)?;
+        tx.commit()?;
+        Ok(())
+    }
 
+    /// Write transaction rows and everything hanging off them. Shared by the
+    /// forward and reverse writers, which differ only in what they do to the
+    /// CURSORS around it.
+    ///
+    /// Takes the caches as a parameter rather than `&mut self` because a
+    /// `Transaction` already holds a borrow of `self.conn`.
+    fn write_rows(tx: &rusqlite::Transaction<'_>, c: &mut Caches<'_>, txs: &[TxRow]) -> Result<()> {
         for row in txs {
             // A transaction is recorded once, ever. If this hash is already
             // here — a resume that overlapped, a re-run — skip the whole row
@@ -556,44 +876,59 @@ impl Ledger {
             // deltas unconditionally under a fresh ordinal, so a re-walk left
             // deltas with no parent tx and double-counted every balance. The
             // supply reconciliation caught it; this makes it unrepresentable.
+            //
+            // The reverse pass leans on this too: it meets a transaction's
+            // outputs first and its sources later, and the later visit must not
+            // create a second row. Its backfill goes through `add_deltas`.
+            let net_mint_total: i64 = row.net_mint.iter().map(|(_, a)| *a).sum();
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO tx (tx_ord, tx_hash, slot, block_time, net_mint)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    self.next_tx_ord,
+                    *c.next_tx_ord,
                     row.tx_hash.as_ref(),
                     row.slot as i64,
                     row.block_time as i64,
-                    row.net_mint
+                    net_mint_total
                 ],
             )?;
             if inserted == 0 {
                 continue;
             }
-            let ord = self.next_tx_ord;
-            self.next_tx_ord += 1;
+            let ord = *c.next_tx_ord;
+            *c.next_tx_ord += 1;
 
-            for (address, stake, amount) in &row.deltas {
-                let party_id = match self.parties.get(address) {
+            for (name, amount) in &row.net_mint {
+                let unit_id = Self::unit_id(tx, c.units, name)?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO tx_mint (tx_ord, unit_id, amount)
+                     VALUES (?1, ?2, ?3)",
+                    params![ord, unit_id, amount],
+                )?;
+            }
+
+            for d in &row.deltas {
+                let party_id = match c.parties.get(&d.address) {
                     Some(id) => *id,
                     None => {
                         tx.execute(
                             "INSERT OR IGNORE INTO party (address, stake) VALUES (?1, ?2)",
-                            params![address, stake],
+                            params![d.address, d.stake],
                         )?;
                         let id: i64 = tx.query_row(
                             "SELECT party_id FROM party WHERE address = ?1",
-                            params![address],
+                            params![d.address],
                             |r| r.get(0),
                         )?;
-                        self.parties.insert(address.clone(), id);
+                        c.parties.insert(d.address.clone(), id);
                         id
                     }
                 };
+                let unit_id = Self::unit_id(tx, c.units, &d.name)?;
                 tx.execute(
-                    "INSERT OR IGNORE INTO delta (tx_ord, party_id, amount)
-                     VALUES (?1, ?2, ?3)",
-                    params![ord, party_id, amount],
+                    "INSERT OR IGNORE INTO delta (tx_ord, party_id, unit_id, amount)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![ord, party_id, unit_id, d.amount],
                 )?;
             }
 
@@ -628,7 +963,7 @@ impl Ledger {
                     obs.key_policy.clone(),
                     obs.key_name.clone(),
                 );
-                let pool_id = match self.pools.get(&key) {
+                let pool_id = match c.pools.get(&key) {
                     Some(id) => *id,
                     None => {
                         tx.execute(
@@ -649,7 +984,7 @@ impl Ledger {
                             params![obs.dex, obs.key_policy, obs.key_name],
                             |r| r.get(0),
                         )?;
-                        self.pools.insert(key, id);
+                        c.pools.insert(key, id);
                         id
                     }
                 };
@@ -671,6 +1006,29 @@ impl Ledger {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Commit one block's transactions plus the cursor, atomically.
+    ///
+    /// Rows and cursor move together — a crash mid-walk leaves a consistent
+    /// ledger whose cursor points at the last fully-written block.
+    pub fn commit_block(
+        &mut self,
+        txs: &[TxRow],
+        slot: u64,
+        block_hash: &Hash<32>,
+        buffer: &OutrefBuffer,
+        persist_buffer: bool,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let mut caches = Caches {
+            parties: &mut self.parties,
+            units: &mut self.units,
+            pools: &mut self.pools,
+            next_tx_ord: &mut self.next_tx_ord,
+        };
+        Self::write_rows(&tx, &mut caches, txs)?;
 
         tx.execute(
             "INSERT INTO cursor (k, slot, block_hash) VALUES ('walk', ?1, ?2)
@@ -683,9 +1041,9 @@ impl Ledger {
             {
                 let mut stmt = tx.prepare(
                     "INSERT INTO buffered
-                         (oref_hash, oref_idx, address, stake, qty,
+                         (oref_hash, oref_idx, address, stake, qty, units,
                           unlock_ts_ms, owner_pkh, datum_cbor, datum_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )?;
                 for (oref, out) in buffer.entries() {
                     stmt.execute(params![
@@ -693,7 +1051,12 @@ impl Ledger {
                         oref.1 as i64,
                         out.address,
                         out.stake,
-                        out.qty,
+                        // `qty` stays the TOTAL across units. Kept written so a
+                        // rollback to a build without `units` reloads a buffer
+                        // whose arithmetic is still right for a single-asset
+                        // ledger, which is every deployed one.
+                        out.total(),
+                        encode_units(&out.units),
                         out.unlock_ts_ms.map(|v| v as i64),
                         out.owner_pkh,
                         out.datum_cbor,
@@ -733,6 +1096,69 @@ impl Ledger {
     /// exposed as its own subcommand — registering a new sink or landing a new
     /// pool decoder should reclassify history without touching the chain.
     /// Returns the number of parties classified.
+    /// Add deltas to a transaction already on record — the REVERSE walk's
+    /// backfill.
+    ///
+    /// A forward walk knows a transaction's whole story when it writes it: the
+    /// buffer already holds every input it spends. A reverse walk does not. It
+    /// meets a transaction's *outputs* first and only learns its *sources* later,
+    /// on reaching the transactions further back that created them, by which
+    /// point the row is written. So the delta set grows after the fact.
+    ///
+    /// `INSERT OR IGNORE` because the same source may be reached twice across a
+    /// resumed run, and a delta applied twice would double the party's balance.
+    /// The `(tx_ord, party_id, unit_id)` key makes that a no-op rather than a
+    /// correction anyone has to remember to make.
+    ///
+    /// Returns how many rows were genuinely new, so a caller can tell real
+    /// progress from a re-walk that resolved nothing.
+    pub fn add_deltas(&mut self, tx_hash: &Hash<32>, deltas: &[DeltaRow]) -> Result<usize> {
+        if deltas.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let ord: Option<i64> = tx
+            .query_row(
+                "SELECT tx_ord FROM tx WHERE tx_hash = ?1",
+                params![tx_hash.as_ref()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // The transaction is not on record. Reached when a source resolves for
+        // a tx that was filtered out — not an error, and silently inserting a
+        // parentless delta is exactly the orphan the reconciliation counts.
+        let Some(ord) = ord else {
+            return Ok(0);
+        };
+        let mut added = 0;
+        for d in deltas {
+            let party_id = match self.parties.get(&d.address) {
+                Some(id) => *id,
+                None => {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO party (address, stake) VALUES (?1, ?2)",
+                        params![d.address, d.stake],
+                    )?;
+                    let id: i64 = tx.query_row(
+                        "SELECT party_id FROM party WHERE address = ?1",
+                        params![d.address],
+                        |r| r.get(0),
+                    )?;
+                    self.parties.insert(d.address.clone(), id);
+                    id
+                }
+            };
+            let unit_id = Self::unit_id(&tx, &mut self.units, &d.name)?;
+            added += tx.execute(
+                "INSERT OR IGNORE INTO delta (tx_ord, party_id, unit_id, amount)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![ord, party_id, unit_id, d.amount],
+            )?;
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
     pub fn classify_parties(&mut self, sinks: &[String], lock_creds: &[[u8; 28]]) -> Result<usize> {
         let pools = self.pool_addresses()?;
         let addresses: Vec<(i64, String)> = {

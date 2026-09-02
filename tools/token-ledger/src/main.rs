@@ -20,6 +20,7 @@ mod cohort;
 mod export;
 mod pools;
 mod registry;
+mod reverse;
 mod serve;
 mod store;
 mod walk;
@@ -43,6 +44,19 @@ struct Cli {
 enum Command {
     /// Walk certified immutable-DB history into the ledger.
     Walk(walk::WalkArgs),
+    /// Walk BACKWARD from the ledger's floor, newest first.
+    ///
+    /// The progressive counterpart to `walk`. `walk` is complete-or-nothing:
+    /// it starts at the policy's first mint so its buffer is complete and every
+    /// balance projection over it is exact, and it produces the newest row
+    /// LAST. This produces the newest row FIRST and deepens on demand, which is
+    /// what a feed needs and what makes a policy nobody has indexed viewable in
+    /// seconds rather than after a full history walk.
+    ///
+    /// Cost follows ACTIVITY in the window, not the policy's supply — so this
+    /// is also the only mode that can touch a collection too large for a
+    /// completeness-first walker.
+    Reverse(reverse::ReverseArgs),
     /// Derived balances at tip — the reconciliation surface.
     Stats {
         #[arg(long)]
@@ -117,6 +131,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Walk(args) => walk::run(args),
+        Command::Reverse(args) => reverse::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),
