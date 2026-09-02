@@ -757,6 +757,96 @@ pub fn update_senders(
     Ok(())
 }
 
+/// One row by transaction hash, with what surrounds it.
+///
+/// # Why this exists
+///
+/// `query_rows` is newest-first with a `before_slot` cursor, which is right
+/// for a feed and useless for "show me THIS transaction". A link shared out of
+/// a wallet is usually to something old — that is what makes it worth
+/// sharing — so resolving it by paging meant reading down to it, and anything
+/// past the first page simply could not be found. The consumer degraded to a
+/// wallet-level card and the shared row went unshown.
+///
+/// # Why the counts come back with it
+///
+/// The same question — "where does this row sit in the wallet?" — answers both
+/// callers. The reader's view needs the row; the interface around it needs to
+/// say how much lies either side, because a feed that stops without explaining
+/// itself reads as "there is nothing here". Two queries over the same index,
+/// one round trip.
+///
+/// `None` when the wallet holds no such transaction, which is an ordinary
+/// outcome: a mistyped hash, or a link to somebody else's wallet.
+pub fn query_row_at(conn: &Connection, canonical: &str, tx_hash: &[u8]) -> Result<Option<RowAt>> {
+    // The row's own slot first — everything else is positional against it.
+    let found: Option<(u64, i64)> = conn
+        .query_row(
+            "SELECT slot, tx_idx FROM flow WHERE target = ?1 AND tx_hash = ?2",
+            params![canonical, tx_hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((slot, tx_idx)) = found else {
+        return Ok(None);
+    };
+
+    // Strictly newer / strictly older, by the SAME ordering the feed pages in
+    // (`slot DESC, tx_idx DESC`). Using slot alone would miscount the rows
+    // sharing this row's slot — a batched submission puts several there, and
+    // they would land on both sides of the split or neither.
+    let newer: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM flow
+         WHERE target = ?1 AND (slot > ?2 OR (slot = ?2 AND tx_idx > ?3))",
+        params![canonical, slot, tx_idx],
+        |r| r.get(0),
+    )?;
+    let older: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM flow
+         WHERE target = ?1 AND (slot < ?2 OR (slot = ?2 AND tx_idx < ?3))",
+        params![canonical, slot, tx_idx],
+        |r| r.get(0),
+    )?;
+    let oldest_slot: Option<u64> = conn.query_row(
+        "SELECT MIN(slot) FROM flow WHERE target = ?1",
+        params![canonical],
+        |r| r.get(0),
+    )?;
+
+    // Reuses `query_rows` rather than repeating its column list and its JSON
+    // decoding — that decode has grown four columns since it was written, and
+    // a second copy would be a second thing to remember. `before_slot` is
+    // exclusive, so ask from just above this row and take the one we want.
+    let row = query_rows(conn, canonical, ROW_AT_WINDOW, Some(slot + 1))?
+        .into_iter()
+        .find(|r| r.tx == hex::encode(tx_hash));
+
+    Ok(row.map(|row| RowAt {
+        row,
+        newer,
+        older,
+        oldest_slot,
+    }))
+}
+
+/// How far `query_row_at` reads to re-decode the row it already located.
+///
+/// A slot holds a handful of a wallet's transactions at the very most, so this
+/// is generous by two orders of magnitude — it exists so a pathological slot
+/// cannot turn one lookup into a table scan.
+const ROW_AT_WINDOW: u32 = 64;
+
+/// One transaction and its position in the wallet.
+pub struct RowAt {
+    pub row: report::Row,
+    /// Transactions strictly newer than this one.
+    pub newer: u64,
+    /// Transactions strictly older.
+    pub older: u64,
+    /// The oldest slot cached for this wallet — how far back "older" reaches.
+    pub oldest_slot: Option<u64>,
+}
+
 pub fn count_flows(conn: &Connection, canonical: &str) -> Result<u64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM flow WHERE target = ?1",
@@ -1312,5 +1402,114 @@ mod cache_tests {
         assert_eq!(s.wallets, 2);
         assert_eq!(s.flows, 505);
         assert_eq!(s.largest_wallet_flows, 500);
+    }
+
+    // ── query_row_at ────────────────────────────────────────────────────────
+
+    /// A flow row at an explicit `(slot, tx_idx)`, so ordering within one slot
+    /// can be exercised — which is the part `query_row_at` can get wrong.
+    fn add_row_at(conn: &Connection, target: &str, hash: &str, slot: u64, tx_idx: i64) {
+        conn.execute(
+            "INSERT INTO flow (target, slot, tx_idx, tx_hash, kind, lovelace_in,
+                               lovelace_out, assets_in, assets_out)
+             VALUES (?1, ?2, ?3, ?4, 'transfer', 0, 0, 0, 0)",
+            params![target, slot, tx_idx, hex::decode(hash).expect("hex")],
+        )
+        .expect("insert flow");
+    }
+
+    fn hash(byte: &str) -> Vec<u8> {
+        hex::decode(byte.repeat(32)).expect("hex")
+    }
+
+    /// The whole point: a row deep in a wallet resolves directly, where paging
+    /// would have had to read past everything newer to reach it.
+    #[test]
+    fn a_row_is_found_by_hash_however_deep_it_sits() {
+        let conn = cache();
+        for i in 0..50u64 {
+            add_row_at(&conn, "w", &format!("{:02x}", i).repeat(32), 1_000 + i, 0);
+        }
+        let at = query_row_at(&conn, "w", &hash("07"))
+            .expect("query")
+            .expect("the row");
+        assert_eq!(at.row.slot, 1_007);
+        assert_eq!(at.newer, 42, "50 rows, 7 older, itself excluded");
+        assert_eq!(at.older, 7);
+        assert_eq!(at.oldest_slot, Some(1_000));
+    }
+
+    /// The newest row has nothing above it and the oldest nothing below —
+    /// the boundaries a count that is off by one gets wrong.
+    #[test]
+    fn the_ends_of_a_wallet_count_correctly() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 10, 0);
+        add_row_at(&conn, "w", &"bb".repeat(32), 20, 0);
+        add_row_at(&conn, "w", &"cc".repeat(32), 30, 0);
+
+        let newest = query_row_at(&conn, "w", &hash("cc")).unwrap().unwrap();
+        assert_eq!((newest.newer, newest.older), (0, 2));
+        let oldest = query_row_at(&conn, "w", &hash("aa")).unwrap().unwrap();
+        assert_eq!((oldest.newer, oldest.older), (2, 0));
+    }
+
+    /// SEVERAL ROWS IN ONE SLOT. A batched submission puts more than one of a
+    /// wallet's transactions in the same slot, and counting on `slot` alone
+    /// would put its siblings on both sides of the split — or neither.
+    /// The feed pages by `slot DESC, tx_idx DESC`, so this must too.
+    #[test]
+    fn rows_sharing_a_slot_are_split_by_their_index() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 500, 0);
+        add_row_at(&conn, "w", &"bb".repeat(32), 500, 1);
+        add_row_at(&conn, "w", &"cc".repeat(32), 500, 2);
+
+        let middle = query_row_at(&conn, "w", &hash("bb")).unwrap().unwrap();
+        assert_eq!(
+            (middle.newer, middle.older),
+            (1, 1),
+            "one sibling each side, not two or zero"
+        );
+        // And the totals reconcile: every other row is on exactly one side.
+        assert_eq!(middle.newer + middle.older, 2);
+    }
+
+    /// One wallet's transaction is not another's. The counts must come from
+    /// the named wallet alone, or a busy neighbour inflates them.
+    #[test]
+    fn another_wallets_rows_are_not_counted() {
+        let conn = cache();
+        add_row_at(&conn, "mine", &"aa".repeat(32), 10, 0);
+        add_row_at(&conn, "theirs", &"bb".repeat(32), 20, 0);
+        add_row_at(&conn, "theirs", &"cc".repeat(32), 30, 0);
+
+        let at = query_row_at(&conn, "mine", &hash("aa")).unwrap().unwrap();
+        assert_eq!((at.newer, at.older), (0, 0));
+        // …and a hash belonging to the other wallet is simply absent here.
+        assert!(query_row_at(&conn, "mine", &hash("bb")).unwrap().is_none());
+    }
+
+    /// An unknown hash is an ordinary outcome — a mistyped link — not an error.
+    #[test]
+    fn an_unknown_hash_is_none_rather_than_an_error() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 10, 0);
+        assert!(query_row_at(&conn, "w", &hash("ff")).unwrap().is_none());
+    }
+
+    /// The returned row is the DECODED one, carrying everything the feed's
+    /// rows carry — it is re-read through `query_rows` for exactly that
+    /// reason, rather than duplicating a column list that has grown four
+    /// times since it was written.
+    #[test]
+    fn the_returned_row_is_fully_decoded() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 12_345, 0);
+        let at = query_row_at(&conn, "w", &hash("aa")).unwrap().unwrap();
+        assert_eq!(at.row.tx, "aa".repeat(32));
+        assert_eq!(at.row.slot, 12_345);
+        assert_eq!(at.row.kind, "transfer");
+        assert!(!at.row.time.is_empty(), "the formatted time is populated");
     }
 }

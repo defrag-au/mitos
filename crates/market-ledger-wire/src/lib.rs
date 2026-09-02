@@ -79,6 +79,72 @@ impl EventKind {
     pub fn from_db_str(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.as_db_str() == s)
     }
+
+    /// How this kind reads with a count in front of it — `13 offers created`.
+    ///
+    /// # Why the enum owns this
+    ///
+    /// English puts the plural on the NOUN, and in these labels the noun is
+    /// not the last word: `offer_created` pluralises to `offers created`, not
+    /// `offer createds`. Nothing derivable from the slug gets that right, and
+    /// a caller de-slugging with a naive `+s` produced `13 offer created` on a
+    /// live card.
+    ///
+    /// Several kinds are invariant. `sold`, `listed` and `delisted` are past
+    /// participles standing in for "13 [items] sold" — they take no plural at
+    /// all, and adding one would be worse than the bug this fixes.
+    ///
+    /// Both forms are static, so counting costs no allocation.
+    pub fn counted_label(&self, count: u64) -> &'static str {
+        let one = count == 1;
+        match (self, one) {
+            // Participles: "13 sold" is already correct.
+            (EventKind::Sold, _) => "sold",
+            (EventKind::Listed, _) => "listed",
+            (EventKind::Delisted, _) => "delisted",
+
+            (EventKind::PriceChange, true) => "price change",
+            (EventKind::PriceChange, false) => "price changes",
+            (EventKind::OfferAccepted, true) => "offer accepted",
+            (EventKind::OfferAccepted, false) => "offers accepted",
+            (EventKind::CollectionOfferAccepted, true) => "collection offer accepted",
+            (EventKind::CollectionOfferAccepted, false) => "collection offers accepted",
+            (EventKind::OfferCreated, true) => "offer created",
+            (EventKind::OfferCreated, false) => "offers created",
+            (EventKind::OfferUpdated, true) => "offer updated",
+            (EventKind::OfferUpdated, false) => "offers updated",
+            (EventKind::OfferCancelled, true) => "offer cancelled",
+            (EventKind::OfferCancelled, false) => "offers cancelled",
+        }
+    }
+
+    /// Did an asset actually change hands, and money with it?
+    ///
+    /// # Why this distinction has a name
+    ///
+    /// Only three of these nine kinds are a trade. The other six are
+    /// INTENTIONS — an asking price posted, changed, or withdrawn; an offer
+    /// made or pulled — and their price is what somebody *wanted*, not what
+    /// anybody paid.
+    ///
+    /// Conflating them misreads badly in exactly one direction: a listing at
+    /// 813 ₳ presented like a settlement says a wallet received 813 ₳ when it
+    /// received nothing at all. Anything that headlines a price, colours a
+    /// figure as income, or totals a wallet's activity has to ask this first.
+    ///
+    /// A `PriceChange` is not a settlement even though it carries two prices;
+    /// a `Delisted` is not one even though it ends a listing that had one.
+    pub fn is_settlement(&self) -> bool {
+        match self {
+            EventKind::Sold | EventKind::OfferAccepted | EventKind::CollectionOfferAccepted => true,
+            EventKind::Listed
+            | EventKind::PriceChange
+            | EventKind::Delisted
+            | EventKind::OfferCreated
+            | EventKind::OfferUpdated
+            | EventKind::OfferCancelled => false,
+        }
+    }
 }
 
 /// One market event. String-ish columns are interned: `policy`,
@@ -367,6 +433,89 @@ mod tests {
             assert_eq!(EventKind::from_db_str(kind.as_db_str()), Some(kind));
         }
         assert_eq!(EventKind::from_db_str("bogus"), None);
+    }
+
+    /// `13 offer created` shipped on a live card. The plural goes on the
+    /// NOUN, which in these labels is not the last word.
+    #[test]
+    fn a_count_pluralises_the_noun_not_the_participle() {
+        use EventKind::*;
+        assert_eq!(OfferCreated.counted_label(13), "offers created");
+        assert_eq!(OfferCreated.counted_label(1), "offer created");
+        assert_eq!(OfferAccepted.counted_label(2), "offers accepted");
+        assert_eq!(
+            CollectionOfferAccepted.counted_label(3),
+            "collection offers accepted"
+        );
+        assert_eq!(PriceChange.counted_label(4), "price changes");
+    }
+
+    /// `13 sold` is already correct — these are participles standing in for
+    /// "13 [items] sold", and pluralising them would be worse than the bug.
+    #[test]
+    fn participle_kinds_take_no_plural() {
+        use EventKind::*;
+        for kind in [Sold, Listed, Delisted] {
+            assert_eq!(
+                kind.counted_label(1),
+                kind.counted_label(13),
+                "{kind:?} should read the same at any count"
+            );
+        }
+    }
+
+    /// Every kind has words at every count, and none is left as a raw slug —
+    /// an underscore reaching a card means a kind was added without being
+    /// given any.
+    #[test]
+    fn every_kind_reads_as_english_at_any_count() {
+        for kind in EventKind::ALL {
+            for n in [0u64, 1, 2, 13] {
+                let label = kind.counted_label(n);
+                assert!(!label.contains('_'), "{kind:?} at {n}: {label}");
+                assert!(!label.is_empty(), "{kind:?} at {n}");
+            }
+            // Zero reads like many; only ONE is special.
+            assert_eq!(kind.counted_label(0), kind.counted_label(2), "{kind:?}");
+        }
+    }
+
+    /// EXACTLY THREE KINDS ARE A TRADE. Written out in full rather than as a
+    /// count, so a kind added later has to be classified deliberately here
+    /// instead of falling into whichever arm the author reached for — and the
+    /// direction that matters is a non-settlement wrongly reading as one,
+    /// which is how an asking price becomes reported income.
+    #[test]
+    fn only_a_trade_is_a_settlement() {
+        use EventKind::*;
+        for kind in [Sold, OfferAccepted, CollectionOfferAccepted] {
+            assert!(kind.is_settlement(), "{kind:?} moves an asset for money");
+        }
+        for kind in [
+            Listed,
+            PriceChange,
+            Delisted,
+            OfferCreated,
+            OfferUpdated,
+            OfferCancelled,
+        ] {
+            assert!(
+                !kind.is_settlement(),
+                "{kind:?} is an intention, not a trade — its price is what \
+                 somebody wanted, not what anybody paid"
+            );
+        }
+        // And the two sets together are the whole enum, so nothing added later
+        // can go unclassified.
+        assert_eq!(
+            EventKind::ALL.iter().filter(|k| k.is_settlement()).count()
+                + EventKind::ALL.iter().filter(|k| !k.is_settlement()).count(),
+            EventKind::ALL.len()
+        );
+        assert_eq!(
+            EventKind::ALL.iter().filter(|k| k.is_settlement()).count(),
+            3
+        );
     }
 
     #[test]

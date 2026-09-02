@@ -157,4 +157,28 @@ rclone copyto "$STAGE/latest" "R2:${R2_BUCKET}/${UNIT}/latest" \
     --header-upload "Cache-Control: public, max-age=60" \
     --retries 5 -q
 
+# The catalogue card, LAST of all.
+#
+# R2 has no queryable index and a public bucket cannot be listed, so a
+# listing surface needs one small object per token it can fetch by key.
+# This is that object — and it sits at `<unit>/card.json`, NOT under the
+# slot, because a catalogue must not have to resolve `latest` before it can
+# show a row.
+#
+# Written after `latest` for the same reason `latest` is written after the
+# artifacts: the card names a slot, and advertising a slot whose files are
+# still uploading is exactly the failure the ordering exists to prevent.
+CARD="$EXPORT_DIR/$TOKEN.card.json"
+if [[ -r "$CARD" ]]; then
+    rclone copyto "$CARD" "R2:${R2_BUCKET}/${UNIT}/card.json" \
+        --header-upload "Content-Type: application/json" \
+        --header-upload "Cache-Control: public, max-age=60" \
+        --retries 5 -q
+    printf '  %-28s catalogue card\n' "card.json"
+else
+    # Not fatal: an older export predates the card and its artifacts are
+    # still perfectly usable by anything that knows the unit.
+    echo "  no card.json — token will not appear in the catalogue" >&2
+fi
+
 echo "pushed ${TOKEN} (${UNIT}) @ slot ${SLOT}"

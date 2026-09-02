@@ -20,6 +20,7 @@ mod cohort;
 mod export;
 mod pools;
 mod registry;
+mod serve;
 mod store;
 mod walk;
 
@@ -52,6 +53,9 @@ enum Command {
     },
     /// Write the spine + detail artifacts a frontend loads.
     Export(export::ExportArgs),
+    /// Hosted "any token on demand": sieve walk → export → push, behind a
+    /// poll endpoint. Flow-explorer's serve pattern applied to tokens.
+    Serve(serve::ServeArgs),
     /// Read the artifacts back with no database — what a consumer sees.
     Inspect {
         #[arg(long, default_value = ".")]
@@ -61,6 +65,19 @@ enum Command {
         /// Evaluate at this slot instead of the end of the domain.
         #[arg(long)]
         at_slot: Option<u64>,
+    },
+    /// Write the catalogue card from an already-exported spine.
+    ///
+    /// `export` writes this too, so the usual path needs nothing. This
+    /// exists for the tokens pushed BEFORE the card existed: their
+    /// artifacts are complete and a catalogue cannot see them, and
+    /// re-walking a token to regenerate a 300-byte JSON sidecar would be
+    /// absurd when the spine on disk already holds every field.
+    Card {
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        token: String,
     },
     /// Emit a real series as Rust source, for widget development.
     ///
@@ -102,11 +119,13 @@ fn main() -> Result<()> {
         Command::Walk(args) => walk::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
+        Command::Serve(args) => serve::run(args),
         Command::Inspect {
             dir,
             token,
             at_slot,
         } => export::inspect(&dir, &token, at_slot),
+        Command::Card { dir, token } => export::card_from_dir(&dir, &token),
         Command::Fixture { dir, token, points } => export::fixture(&dir, &token, points),
         Command::Probe { db } => walk::probe(&db),
         Command::Classify { db, tokens } => walk::classify(&db, &tokens),

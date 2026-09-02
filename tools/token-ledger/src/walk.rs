@@ -94,7 +94,7 @@ fn holds_watched(out: &DecodedOutput, policy: &[u8], name: &[u8]) -> bool {
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
-    let token = registry::load(&args.tokens, &args.token)?;
+    let token = registry::load_or_unit(&args.tokens, &args.token)?;
     let policy = token.policy_bytes()?;
     let asset_name = token.asset_name_bytes()?;
 
@@ -176,6 +176,47 @@ pub fn run(args: WalkArgs) -> Result<()> {
         db = %db_path.display(),
         "walk: starting"
     );
+
+    // An unregistered token has no floor_slot and nothing to resume from.
+    // Rather than reading the whole chain through the sequential block
+    // reader (~600 MB/s), discover the first policy-bearing chunk with the
+    // parallel sieve scan (~3 GB/s, early-cutoff) and floor there — before
+    // its first appearance the asset did not exist, so the floor is
+    // complete by construction, same argument as a registry floor.
+    let mut floor = floor;
+    if args.sieve && floor == 0 {
+        let chunks = chain_sieve::list_chunks(&immutable_dir, 0)?;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+        tracing::info!(
+            chunks = chunks.len(),
+            threads,
+            "walk: no floor — discovering first policy-bearing chunk"
+        );
+        match chain_sieve::first_hit_chunk(
+            &immutable_dir,
+            &chunks,
+            threads,
+            &[policy.clone()],
+            &|p| {
+                if p.done.is_multiple_of(1_000) {
+                    tracing::info!(
+                        done = p.done,
+                        total = p.total,
+                        gb_per_s = format!("{:.2}", p.gb_per_s),
+                        "walk: floor scan"
+                    );
+                }
+            },
+        )? {
+            Some(chunk) => {
+                floor = chunk * mitos_chain_walk::mithril::CHUNK_SLOTS;
+                tracing::info!(chunk, floor, "walk: floor discovered");
+            }
+            None => tracing::warn!("walk: policy never appears on chain — nothing to walk"),
+        }
+    }
 
     // Seek straight to the floor rather than decoding everything below it.
     // An EMPTY block hash is pallas-hardano's slot-only fuzzy seek: it

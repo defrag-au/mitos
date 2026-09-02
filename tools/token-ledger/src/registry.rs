@@ -187,6 +187,42 @@ pub fn load(path: &Path, name: &str) -> Result<TokenEntry> {
     Ok(entry)
 }
 
+/// Load by registry name, or accept a raw `<policy_hex>.<asset_name_hex>`
+/// unit for a token nobody has registered — the serve path's "any token on
+/// demand". A synthetic entry carries no floor (the walk starts at genesis,
+/// which the sieve gate makes tolerable) and no curated decimals (the
+/// chain-ledger fallback still applies). Its `name` IS the unit, so ledger
+/// and artifact filenames are keyed by on-chain identity.
+pub fn load_or_unit(path: &Path, name_or_unit: &str) -> Result<TokenEntry> {
+    if let Ok(entry) = load(path, name_or_unit) {
+        return Ok(entry);
+    }
+    let unit = name_or_unit.to_lowercase();
+    let Some((policy, asset_name)) = unit.split_once('.') else {
+        bail!(
+            "`{name_or_unit}` is neither a registered token nor a `<policy_hex>.<name_hex>` unit"
+        );
+    };
+    let entry = TokenEntry {
+        name: unit.clone(),
+        policy: policy.to_string(),
+        asset_name: asset_name.to_string(),
+        decimals: None,
+        floor_slot: None,
+    };
+    entry.policy_bytes()?;
+    entry.asset_name_bytes()?;
+    Ok(entry)
+}
+
+/// The registered token holding this on-chain unit, if any — so a request
+/// arriving by unit reuses the curated entry (floor, decimals, nickname-keyed
+/// ledger db) instead of a synthetic one.
+pub fn find_by_unit(path: &Path, unit: &str) -> Result<Option<TokenEntry>> {
+    let unit = unit.to_lowercase();
+    Ok(read(path)?.token.into_iter().find(|t| t.unit() == unit))
+}
+
 /// Every registered unspendable sink.
 pub fn load_sinks(path: &Path) -> Result<Vec<SinkEntry>> {
     Ok(read(path)?.sink)

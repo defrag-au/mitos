@@ -58,7 +58,7 @@ pub struct ExportArgs {
 }
 
 pub fn run(args: ExportArgs) -> Result<()> {
-    let token = registry::load(&args.tokens, &args.token)?;
+    let token = registry::load_or_unit(&args.tokens, &args.token)?;
     let ledger =
         Ledger::open(&args.db).with_context(|| format!("opening {}", args.db.display()))?;
 
@@ -339,6 +339,11 @@ pub fn run(args: ExportArgs) -> Result<()> {
         "party-id count does not match the detail page's party count"
     );
 
+    // The catalogue card. Written from the SPINE that was just verified, so
+    // it cannot describe a token differently from the artifacts beside it.
+    let card_path = args.out_dir.join(format!("{}.card.json", token.name));
+    write(&card_path, serde_json::to_vec_pretty(&card(&spine))?.as_slice())?;
+
     report(
         &spine,
         &detail,
@@ -349,6 +354,78 @@ pub fn run(args: ExportArgs) -> Result<()> {
         &[&spine_path, &detail_path, &txid_path, &party_path],
     );
     Ok(())
+}
+
+/// One row of the catalogue — enough to LIST a token without opening it.
+///
+/// 🔑 Exists because R2 has no queryable index and public buckets cannot be
+/// listed: without this a consumer can only fetch a token whose 90-character
+/// unit it already knows, which is why the explorer shipped with a
+/// hardcoded two-entry alias table.
+///
+/// Deliberately small and derived. Every field comes from the spine, so a
+/// catalogue can never claim a supply or a holder count the artifacts
+/// disagree with. Presentation the chain does not carry — ticker, logo —
+/// is NOT here: the token registry owns that and a consumer resolves it
+/// separately rather than us baking a second copy that can go stale.
+#[derive(serde::Serialize)]
+pub struct Card {
+    /// `<policy_hex>.<asset_name_hex>` — the key everything is stored under.
+    pub unit: String,
+    /// The on-chain asset name as text where it is valid UTF-8.
+    ///
+    /// ⚠️ NOT trimmed. `$TOONK` mints as `"Toonk "` with a trailing space,
+    /// and a catalogue that tidies that up produces a name which does not
+    /// round-trip to the unit it came from.
+    pub name: Option<String>,
+    pub decimals: u8,
+    pub supply: i64,
+    /// Holders at the last checkpoint.
+    pub holders: u32,
+    /// First and last block time covered, as unix seconds — what a
+    /// catalogue sorts and filters on.
+    pub first_unix: i64,
+    pub last_unix: i64,
+    /// Venues with a pool, in creation order. Empty means never graduated.
+    pub venues: Vec<String>,
+    /// Slot the walk reached. The same value `latest` points at.
+    pub slot: u64,
+}
+
+/// Rebuild a card from artifacts on disk, with no database.
+///
+/// Same function the export path uses, so a card written this way is
+/// byte-identical to one written at export time — which is what makes it
+/// safe to backfill the tokens that predate the card.
+pub fn card_from_dir(dir: &Path, token: &str) -> Result<()> {
+    let path = dir.join(format!("{token}.spine.bin"));
+    let spine = wire::decode_spine(&std::fs::read(&path)?)?;
+    let out = dir.join(format!("{token}.card.json"));
+    let bytes = serde_json::to_vec_pretty(&card(&spine))?;
+    write(&out, &bytes)?;
+    println!("{}", String::from_utf8_lossy(&bytes));
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+fn card(spine: &wire::Spine) -> Card {
+    let unit = format!(
+        "{}.{}",
+        hex::encode(spine.asset.policy),
+        hex::encode(&spine.asset.asset_name)
+    );
+    let cp_slots = wire::delta_decode(&spine.cp_slots);
+    Card {
+        unit,
+        name: String::from_utf8(spine.asset.asset_name.clone()).ok(),
+        decimals: spine.asset.decimals,
+        supply: spine.nominal_supply,
+        holders: spine.cp_holders.last().copied().unwrap_or(0),
+        first_unix: wire::sample::slot_to_unix(spine.domain.0),
+        last_unix: spine.last_block_time as i64,
+        venues: spine.pools.iter().map(|p| p.dex.clone()).collect(),
+        slot: cp_slots.last().copied().unwrap_or(spine.domain.1),
+    }
 }
 
 /// Read the artifacts back with no database and print what a consumer sees.
@@ -391,15 +468,17 @@ pub fn fixture(dir: &Path, token: &str, points: usize) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("/// `(unix_seconds, [cohort totals], holders, ada_depth, spot_lovelace)`.");
     println!(
-        "pub const SERIES: [(i64, [i64; {}], u32, i64, f64); {n}] = [",
+        "/// `(unix_seconds, [cohort totals], holders, ada_depth, spot_lovelace, vest_locked, vest_matured)`."
+    );
+    println!(
+        "pub const SERIES: [(i64, [i64; {}], u32, i64, f64, i64, i64); {n}] = [",
         s.cohorts.len()
     );
     for r in &s.rows {
         println!(
-            "    ({}, {:?}, {}, {}, {:.6}),",
-            r.unix, r.totals, r.holders, r.ada_depth, r.spot
+            "    ({}, {:?}, {}, {}, {:.6}, {}, {}),",
+            r.unix, r.totals, r.holders, r.ada_depth, r.spot, r.vest_locked, r.vest_matured
         );
     }
     println!("];");
@@ -424,6 +503,55 @@ pub fn fixture(dir: &Path, token: &str, points: usize) -> Result<()> {
         println!("    {row:?},");
     }
     println!("];");
+
+    // ---- named moments ---------------------------------------------------
+    // Derived in the wire crate so a chart annotation, a signpost in a 3-D
+    // view and a line in a report all agree on when a token graduated.
+    if !s.milestones.is_empty() {
+        println!();
+        println!("/// `(unix, kind, label)` — dated moments worth naming.");
+        println!(
+            "pub const MILESTONES: [(i64, &str, &str); {}] = [",
+            s.milestones.len()
+        );
+        for m in &s.milestones {
+            println!(
+                "    ({}, {:?}, {:?}),",
+                m.unix,
+                format!("{:?}", m.kind),
+                m.label
+            );
+        }
+        println!("];");
+    }
+
+    // ---- the event channel ---------------------------------------------
+    // What MOVED per window, beside what the token IS. A reactive surface
+    // needs both: state anchors the levels, events drive the motion.
+    if !s.events.is_empty() {
+        println!();
+        println!("/// Transactions in the window ending at each `SERIES` sample.");
+        println!("pub const EVENT_TXS: [u32; {n}] = [");
+        for e in &s.events {
+            println!("    {},", e.txs);
+        }
+        println!("];");
+        println!("/// Σ|delta| over the window — the \"beat\" a surface reacts to.");
+        println!("pub const EVENT_VOLUME: [i64; {n}] = [");
+        for e in &s.events {
+            println!("    {},", e.volume);
+        }
+        println!("];");
+        println!("/// Net per-cohort change across the window, parallel to `COHORTS`.");
+        println!(
+            "pub const EVENT_COHORT_DELTA: [[i64; {}]; {n}] = [",
+            s.cohorts.len()
+        );
+        for e in &s.events {
+            println!("    {:?},", e.cohort_delta);
+        }
+        println!("];");
+    }
 
     if !s.top_holders.is_empty() {
         println!();

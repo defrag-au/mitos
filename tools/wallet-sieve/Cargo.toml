@@ -34,6 +34,13 @@ pallas-network = { workspace = true }
 # to a shared crate so token-ledger's sieve walk uses the same core.
 chain-sieve = { path = "../../crates/chain-sieve" }
 
+# `EventKind` — the market ledger's own vocabulary, which is what lands in the
+# `market_events.kind` column this tool reads. Depended on rather than
+# re-spelled: the hand-written list it replaces had drifted, recognising three
+# kinds the ledger never writes and missing the two it does for accepted
+# offers.
+market-ledger-wire = { path = "../../crates/market-ledger-wire" }
+
 # Still used directly by the tail spool's per-block gating.
 memchr = "2"
 aho-corasick = "1"

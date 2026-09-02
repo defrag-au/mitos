@@ -17,6 +17,12 @@ mitos-chain-walk = { path = "../mitos-chain-walk" }
 # Shared machinery with wallet-sieve.
 chain-sieve = { path = "../../crates/chain-sieve" }
 
+# `serve` — the hosted any-token-on-demand surface. Tokio is confined to
+# serve::run, per the wallet-sieve convention.
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+
 # Pool script addresses + the CSwap pool datum (LP policy/name = the pool
 # INSTANCE key, fee bps, LP supply). Pure decode, no WIT coupling — the shared
 # unit, per the crate's own "composition over coordination" note.
@@ -46,6 +52,9 @@ pallas-primitives = { workspace = true }
 
 clap = { workspace = true }
 serde = { workspace = true }
+# The catalogue card — a small JSON sidecar per token so a listing surface
+# does not have to fetch and decode every spine.
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

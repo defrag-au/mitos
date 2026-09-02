@@ -160,6 +160,103 @@ fn parse_target(t: &str) -> Result<(Vec<target::Cred>, String), AppError> {
     Ok((parsed.creds, canonical))
 }
 
+/// One transaction on one wallet, and how much sits either side of it.
+///
+/// `cached` false means the wallet has never been scanned; `row` absent means
+/// it has, and this transaction is not in it.
+#[derive(Serialize)]
+pub struct FlowRowResponse {
+    pub target: String,
+    pub canonical: String,
+    pub cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<report::Row>,
+    /// Transactions strictly newer than this one.
+    #[serde(default)]
+    pub newer: u64,
+    /// Transactions strictly older.
+    #[serde(default)]
+    pub older: u64,
+    /// Oldest slot cached for this wallet — how far back `older` reaches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_slot: Option<u64>,
+    /// Every transaction this wallet has, cached.
+    #[serde(default)]
+    pub total_txs: u64,
+}
+
+/// `GET /flows/{target}/tx/{hash}` — resolve ONE transaction directly.
+///
+/// # Why this is not just `/flows` with a filter
+///
+/// `/flows` pages newest-first, so finding an old transaction means reading
+/// down to it — and a link worth sharing is usually to something old. A
+/// consumer looking for a specific hash either paged repeatedly or gave up at
+/// its first page and showed a wallet-level fallback, which is what the Open
+/// Graph card did. Keyed straight off `PRIMARY KEY (target, tx_hash)`, this is
+/// one index hit regardless of how far back the row sits.
+///
+/// # It never scans
+///
+/// A miss is a miss. This is reached by link previews, which are
+/// unauthenticated and trivially triggered by pasting a URL into a chat, so it
+/// must not be a way to queue work — see the cold-scan cap that exists for the
+/// same reason. `mark` is deliberately still called: a wallet whose links are
+/// being read is exactly one the janitor should not evict.
+pub async fn flow_tx(
+    State(state): State<AppState>,
+    Path((t, hash)): Path<(String, String)>,
+) -> Result<Json<FlowRowResponse>, AppError> {
+    let (_, canonical) = parse_target(&t)?;
+    let tx_hash = hex::decode(&hash)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "expected a 32-byte transaction hash in hex",
+            )
+        })?;
+    state.seen.mark(&canonical, now_unix());
+
+    let empty = |cached: bool| {
+        Ok(Json(FlowRowResponse {
+            target: t.clone(),
+            canonical: canonical.clone(),
+            cached,
+            row: None,
+            newer: 0,
+            older: 0,
+            oldest_slot: None,
+            total_txs: 0,
+        }))
+    };
+
+    let Ok(conn) = db::open_ro(&state.db_path) else {
+        // No cache file at all — nothing scanned by anyone.
+        return empty(false);
+    };
+    if db::load_wallet(&conn, &canonical)?.is_none() {
+        return empty(false);
+    }
+    let Some(at) = db::query_row_at(&conn, &canonical, &tx_hash)? else {
+        // The wallet IS cached; this transaction simply is not one of its own.
+        // Distinct from the case above, and the consumer renders them
+        // differently — "we have not looked" versus "we looked".
+        return empty(true);
+    };
+    Ok(Json(FlowRowResponse {
+        target: t,
+        canonical: canonical.clone(),
+        cached: true,
+        row: Some(at.row),
+        newer: at.newer,
+        older: at.older,
+        oldest_slot: at.oldest_slot,
+        total_txs: db::count_flows(&conn, &canonical)?,
+    }))
+}
+
 pub async fn flows(
     State(state): State<AppState>,
     Path(t): Path<String>,

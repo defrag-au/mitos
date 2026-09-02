@@ -64,7 +64,7 @@ use crate::store::{DistributionBase, DistributionLegRow, Ledger};
 /// existed the fragment measured only what left, and a page wanting the return
 /// figure had to cite another document. The same change stops a reward-funding
 /// wallet being counted as founder pay or ops spend.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 28;
 
 fn tx_url(tx: &str) -> String {
     format!("https://cardanoscan.io/transaction/{tx}")
@@ -128,11 +128,92 @@ pub struct DeepDive {
     /// What actually reached holders. `None` when no reward pipeline has been
     /// declared — which means UNMEASURED, never zero. See [`Rewards`].
     pub rewards: Option<Rewards>,
+    /// Everything that reached wallets declared `founder`, across every
+    /// channel. `None` when no founder is declared. See [`FounderPosition`].
+    pub founder: Option<FounderPosition>,
+    /// How the project's money reached the wallets that minted its supply, hop
+    /// by hop, with every transaction. The audit trail behind the "project
+    /// paying itself" figure. See [`SelfMintRoute`].
+    pub self_mint_routing: Vec<SelfMintRoute>,
     pub provenance: Option<Provenance>,
     /// What must not be separated from the numbers above. Ordered most severe
     /// first so a renderer that shows only the top few still shows the ones
     /// that matter.
     pub caveats: Vec<Caveat>,
+}
+
+/// Everything a founder took, gathered into one place.
+///
+/// ## Why this exists as its own block
+///
+/// A founder's take arrives through four different channels, and the natural
+/// reporting for each files it somewhere that does not read as "the founder".
+/// On Mekka S1 the page reported **founder pay at 2.0% of the raise** while the
+/// founder's wallets had in fact taken **490 units for nothing** — 9.8% of the
+/// collection, worth 54,274 ₳ at what they cost to mint — because:
+///
+/// 1. He barely minted anything himself (**2 units**). The project funded
+///    FRONTS, the fronts minted, and the units were transferred on for free.
+///    So the funding is booked as `self-mint funding` and the units as team
+///    supply; neither line says "founder".
+/// 2. Direct ADA payments are small and are the only thing `founder_pay`
+///    measures.
+/// 3. Reward income accrues per asset, out of the distribution pool, and is a
+///    different pool from mint funds — correctly excluded from `founder_pay`,
+///    and therefore invisible beside it.
+/// 4. Selling those units realises cash on a marketplace, which is a
+///    counterparty event and not a distribution at all.
+///
+/// Each of those decisions is defensible on its own. Together they mean no
+/// figure anywhere shows what one person received, which is the question a
+/// reader most wants answered.
+///
+/// ## There IS a combined total, and the basis is the project's own price
+///
+/// Elsewhere this tool refuses to add units to ADA, because converting an NFT
+/// to a number needs a price the chain never quoted. **That objection does not
+/// apply here.** These units are valued at `value_at_mint` — what the project
+/// charged the public for identical units in the same mint. It is not an
+/// outside estimate; it is the project's own price list, and it is what the
+/// project gave up by handing a unit over instead of selling it.
+///
+/// Declining to total it was the wrong call: it left the largest channel
+/// sitting beside the smallest with no statement of scale, which understates
+/// rather than protects.
+///
+/// **`lovelace_sales` is NOT in the total.** Selling a free unit converts value
+/// already counted in `units_free_value_at_mint` into cash; adding both counts
+/// the same unit twice. It is reported separately as *how much has been
+/// realised so far*, which is a different question from *how much was taken*.
+#[derive(Debug, Serialize)]
+pub struct FounderPosition {
+    pub wallets: usize,
+    /// Units that arrived from the project's own wallets for no consideration.
+    pub units_free: i64,
+    /// What those units cost to mint — a valuation, NOT cash received.
+    pub units_free_value_at_mint: i64,
+    pub units_free_share_of_supply: Option<f64>,
+    /// Still in founder wallets today. The difference between this and
+    /// `units_free` was sold on, and is the part that became cash.
+    pub units_held_now: i64,
+    /// Direct ADA distributions — the only channel `founder_pay` sees.
+    pub lovelace_direct: i64,
+    /// Holder-reward income. Accrues per asset, so free units earn exactly what
+    /// bought ones do.
+    pub lovelace_rewards: i64,
+    /// Realised by selling units on a marketplace. Reported, NOT added — see
+    /// the type docs; those units are already in `units_free_value_at_mint`.
+    pub lovelace_sales: i64,
+    /// The ADA channels summed, units excluded. Kept because "cash he received"
+    /// is a question someone will ask.
+    pub lovelace_total: i64,
+    pub lovelace_share_of_raise: Option<f64>,
+    /// **The headline.** Free units at the project's own mint price, plus every
+    /// ADA channel except sales. What the founder received, in one figure.
+    pub value_received: i64,
+    /// `value_received` against the external raise — what the public paid in,
+    /// measured against what one person took out.
+    pub value_received_share_of_raise: Option<f64>,
 }
 
 /// Money that went BACK to holders, measured from the walk.
@@ -173,6 +254,36 @@ pub struct Rewards {
     /// [`RewardRecipient`] — this is where a founder holding free-minted
     /// supply shows up as being paid by it.
     pub to_declared: Vec<RewardRecipient>,
+    /// Mint funds paid INTO the reward pool, with every payment.
+    ///
+    /// The reward wallet's income is not all mining income. On Mekka S1 the
+    /// project topped the pool up from the mint, and the early distributions
+    /// were paid almost entirely from it — so the yield holders saw at the
+    /// point they were deciding whether to buy was substantially their own
+    /// money returning.
+    pub subsidy_from_mint: i64,
+    pub subsidy_evidence: Vec<Evidence>,
+    /// How the funding wallet SPLIT the revenue, by destination and date.
+    ///
+    /// A project that publishes "75 / 20 / 5" is making a claim that can be
+    /// checked payment by payment, and this is the series that checks it. It
+    /// also exposes the shape of the arrangement: what the split adds up to,
+    /// and therefore what it leaves no room for.
+    pub allocations: Vec<RewardAllocation>,
+}
+
+/// One destination the reward funder paid, with every payment behind it.
+#[derive(Debug, Serialize)]
+pub struct RewardAllocation {
+    pub destination: String,
+    pub label: Option<String>,
+    /// The declared function or role — `rewards_distribution`, `compounding`,
+    /// `ops`. What the project said this leg was for.
+    pub purpose: Option<String>,
+    pub lovelace: i64,
+    pub share_of_allocated: f64,
+    pub transactions: u64,
+    pub evidence: Vec<Evidence>,
 }
 
 /// A declared party that received holder rewards.
@@ -261,6 +372,11 @@ pub struct Commitment {
     /// `null` means nothing in this ledger measures it — which is itself worth
     /// showing, and is why the field exists rather than being omitted.
     pub measured_share: Option<f64>,
+    /// The same spend against TOTAL MINT FUNDS — the base the project's own
+    /// percentages referred to. **This is the one to compare with
+    /// `advertised_share`;** `measured_share` is on a base the project never
+    /// promised anything about. See the comment on `share_of_total`.
+    pub measured_share_of_total: Option<f64>,
     /// An off-chain claim against this line, in lovelace. NEVER merge this
     /// into `measured_share`: that field is reproducible from the walk and
     /// this one rests on someone's word. A renderer must show which is which.
@@ -317,7 +433,44 @@ pub struct Evidence {
     /// What the receiving party paid in the same transaction, above the
     /// carrier floor. `0` on an asset leg is the finding, not a gap.
     pub consideration: i64,
+    /// What these units cost to mint, at their OWN mint transaction's price.
+    /// `None` on money legs. Present so a consumer can see the spread rather
+    /// than trusting an average — a collection minted in two batches at two
+    /// prices has no single per-unit figure.
+    pub value_at_mint: Option<i64>,
     pub slot: u64,
+}
+
+/// One funding hop into a self-minting wallet, with the transactions behind it.
+///
+/// The "project paying itself" headline is a single number standing in for a
+/// route: money leaves a project wallet, arrives at a wallet that then mints,
+/// and comes back as mint proceeds. Stated as one figure it is something a
+/// reader takes on trust. Stated as hops with transaction hashes it is
+/// something they can walk themselves — which is the only form in which a claim
+/// this serious should be published.
+///
+/// Hops are kept SEPARATE rather than collapsed to a total per front, because
+/// the shape is the evidence: a treasury paying a front directly reads
+/// differently from a treasury paying an ops wallet that pays the front, and
+/// flattening them hides the second step.
+#[derive(Debug, Serialize)]
+pub struct SelfMintRoute {
+    pub from: String,
+    pub from_label: Option<String>,
+    /// The declared role of the payer, so a renderer can order the flow by
+    /// distance from the treasury rather than by amount.
+    pub from_role: Option<String>,
+    pub to: String,
+    pub to_label: Option<String>,
+    /// Units this destination went on to mint. Attached to the DESTINATION, so
+    /// summing it across hops into the same wallet would double-count.
+    pub to_units_minted: i64,
+    pub lovelace: i64,
+    pub transactions: u64,
+    /// Every transaction in this hop. Not a sample — a reader checking a
+    /// disputed figure needs the whole set, and at this scale it is small.
+    pub evidence: Vec<Evidence>,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,6 +592,11 @@ pub struct SelfMint {
 /// project.
 #[derive(Debug, Serialize)]
 pub struct OnwardLeg {
+    /// The wallet that handed the units over. Without it the supply appears
+    /// from nowhere: a route diagram can show money reaching a front and units
+    /// reaching a founder, but not that they are the SAME units.
+    pub from: String,
+    pub from_label: Option<String>,
     pub recipient: String,
     pub label: Option<String>,
     /// The recipient's declared identity, when they have one. This is what
@@ -458,6 +616,11 @@ pub struct OnwardLeg {
     /// bring it into existence — not a market valuation. It says what the
     /// project gave up, not what the recipient could sell it for.
     pub value_at_mint: i64,
+    /// Every transfer behind this leg — hash, slot, and how many units moved.
+    /// A leg is an aggregate over months; the reader auditing whether an early
+    /// batch was a marketing payment rather than a founder taking supply needs
+    /// the individual dates, and cannot get them from a total.
+    pub evidence: Vec<Evidence>,
     /// `sale` — they paid. `compensation` — no payment, and they hold a
     /// declared role. `gift` — no payment, no declared role.
     ///
@@ -485,6 +648,13 @@ pub struct MintDay {
     pub public: i64,
     /// Minted to a wallet the project owns or funded.
     pub team: i64,
+    /// What the project received per unit minted that day, in lovelace.
+    ///
+    /// Carried per-day because a mint is not necessarily one price. Mekka S1
+    /// ran in **two batches** — ~65 ₳ through August and early September, then
+    /// a five-week pause, then ~120 ₳ from mid-October. A single average
+    /// (95 ₳) describes neither cohort and is what nobody paid.
+    pub price_per_unit: Option<i64>,
 }
 
 /// EVERY unit that moved through the project's own wallets, ADA included.
@@ -526,6 +696,48 @@ pub fn build(
     carrier_floor: i64,
 ) -> Result<DeepDive> {
     let conn = ledger.conn();
+    // ONE definition of what a unit cost, materialised once and joined by every
+    // consumer. It was previously computed twice — once in `supply_onward`'s
+    // aggregate and once inline in its evidence query — and the two drifted the
+    // moment the basis changed, so a leg total and the rows behind it were
+    // costed differently. A figure and its evidence disagreeing is the worst
+    // failure this artifact can have.
+    //
+    // Cost is per BATCH, not per transaction: see the note in `supply_onward`.
+    {
+        let hf = crate::distributions::holder_facing_sql();
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS temp.asset_cost;
+             CREATE TEMP TABLE asset_cost AS
+             WITH ordered AS (
+                 SELECT e.asset_name, e.tx_hash,
+                        ROW_NUMBER() OVER (ORDER BY e.slot, e.asset_name) rn
+                 FROM asset_event e
+                 WHERE e.kind = 'mint' AND e.asset_class IN ({hf})),
+             tx_units AS (SELECT tx_hash, COUNT(*) n FROM ordered GROUP BY tx_hash),
+             tx_paid AS (
+                 SELECT mp.tx_hash, SUM(mp.lovelace) paid FROM mint_payment mp
+                 JOIN party pp ON pp.key = mp.destination AND pp.project_side = 1
+                 GROUP BY mp.tx_hash),
+             half AS (SELECT (COUNT(*) + 1) / 2 h FROM ordered),
+             per_asset AS (
+                 SELECT o.asset_name, o.rn,
+                        COALESCE(p.paid, 0) * 1.0 / NULLIF(u.n, 0) v
+                 FROM ordered o JOIN tx_units u ON u.tx_hash = o.tx_hash
+                 LEFT JOIN tx_paid p ON p.tx_hash = o.tx_hash),
+             batch_price AS (
+                 SELECT CASE WHEN rn <= (SELECT h FROM half) THEN 1 ELSE 2 END b,
+                        SUM(v) / COUNT(*) price
+                 FROM per_asset GROUP BY b)
+             SELECT a.asset_name,
+                    CASE WHEN a.rn <= (SELECT h FROM half) THEN 1 ELSE 2 END AS batch,
+                    CAST((SELECT price FROM batch_price
+                           WHERE b = CASE WHEN a.rn <= (SELECT h FROM half) THEN 1 ELSE 2 END)
+                         AS INTEGER) AS cost
+               FROM per_asset a;
+             CREATE INDEX temp.idx_asset_cost ON asset_cost(asset_name);"
+        ))?;
+    }
     let meta = |k: &str| -> Option<String> {
         conn.query_row("SELECT v FROM walk_meta WHERE k = ?", [k], |r| r.get(0))
             .ok()
@@ -534,6 +746,23 @@ pub fn build(
     let policy_id = meta("policy_id").unwrap_or_default();
     let raise = base.external_raise;
     let share = |q: i64| (raise > 0).then(|| q as f64 / raise as f64);
+    // A SECOND base, for measuring published commitments only.
+    //
+    // `external_raise` is the right denominator for "what did the project have
+    // to spend", and the wrong one for "did it keep its promise". A project
+    // that pledges 80/15/5 is pledging shares of THE MINT FUNDS IT RECEIVES,
+    // not of a base an analyst later constructed by subtracting the circular
+    // portion. Measuring a promise against an adjusted base measures it against
+    // a target nobody made.
+    //
+    // It also removes the evidence from the frame: net the self-mint money out
+    // of the denominator and the self-mint problem can no longer be stated as a
+    // share of anything. On Mekka S1 the commitments table read 3.8% marketing
+    // against a 5% pledge and 7.4% ops against 15% — an UNDERSPEND — while
+    // 26.7% of the mint funds went into self-minting and 14.8% to the founder,
+    // neither of which had a target and neither of which appeared.
+    let gross = base.gross_proceeds;
+    let share_of_total = |q: i64| (gross > 0).then(|| q as f64 / gross as f64);
 
     // ── labels + evidence, looked up once ──────────────────────────────────
     let mut labels: BTreeMap<String, String> = BTreeMap::new();
@@ -541,6 +770,20 @@ pub fn build(
     for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
         let (k, l) = row?;
         labels.insert(k, l);
+    }
+    let mut functions: BTreeMap<String, String> = BTreeMap::new();
+    let mut fstmt = conn
+        .prepare("SELECT key, declared_function FROM party WHERE declared_function IS NOT NULL")?;
+    for row in fstmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (k, f) = row?;
+        functions.insert(k, f);
+    }
+    let mut declared_roles: BTreeMap<String, String> = BTreeMap::new();
+    let mut stmt =
+        conn.prepare("SELECT key, declared_role FROM party WHERE declared_role IS NOT NULL")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (k, r) = row?;
+        declared_roles.insert(k, r);
     }
 
     let mut ev_stmt = conn.prepare(
@@ -558,6 +801,8 @@ pub fn build(
                     tx_hash: tx,
                     quantity: r.get(1)?,
                     consideration: r.get(2)?,
+                    // A money leg has no unit cost.
+                    value_at_mint: None,
                     slot: r.get::<_, i64>(3)?.max(0) as u64,
                 })
             })?
@@ -651,6 +896,9 @@ pub fn build(
             // does not model, so it stays null rather than reading as zero.
             measured_share: (group == "mint_funds")
                 .then(|| measured_for(&category).and_then(share))
+                .flatten(),
+            measured_share_of_total: (group == "mint_funds")
+                .then(|| measured_for(&category).and_then(share_of_total))
                 .flatten(),
             category,
             group,
@@ -772,7 +1020,97 @@ pub fn build(
             });
         }
 
+        // How the funder split what it took in. Destinations above a floor, so
+        // dust and fee-change do not appear as an "allocation".
+        let mut allocations: Vec<RewardAllocation> = Vec::new();
+        {
+            let alloc_sql = format!(
+                "SELECT u.party, SUM(u.quantity), COUNT(DISTINCT u.tx_hash)
+                   FROM unit_flow u
+                  WHERE u.unit = 'lovelace' AND u.quantity > 0
+                    AND u.counterparty IN ({})
+                  GROUP BY u.party HAVING SUM(u.quantity) >= 100000000
+                  ORDER BY SUM(u.quantity) DESC",
+                list(&funders)
+            );
+            let mut a = conn.prepare(&alloc_sql)?;
+            let dests: Vec<(String, i64, i64)> = a
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            let allocated: i64 = dests.iter().map(|(_, v, _)| *v).sum();
+            let mut ev = conn.prepare(&format!(
+                "SELECT tx_hash, SUM(quantity), MIN(slot) FROM unit_flow
+                  WHERE unit = 'lovelace' AND quantity > 0
+                    AND counterparty IN ({}) AND party = ?1
+                  GROUP BY tx_hash ORDER BY MIN(slot)",
+                list(&funders)
+            ))?;
+            for (destination, lovelace, transactions) in dests {
+                let evidence = ev
+                    .query_map([&destination], |r| {
+                        let tx: String = r.get(0)?;
+                        Ok(Evidence {
+                            tx_url: tx_url(&tx),
+                            tx_hash: tx,
+                            quantity: r.get(1)?,
+                            consideration: 0,
+                            value_at_mint: None,
+                            slot: r.get::<_, i64>(2)?.max(0) as u64,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                allocations.push(RewardAllocation {
+                    label: labels.get(&destination).cloned(),
+                    purpose: functions
+                        .get(&destination)
+                        .cloned()
+                        .or_else(|| declared_roles.get(&destination).cloned()),
+                    share_of_allocated: match allocated > 0 {
+                        true => lovelace as f64 / allocated as f64,
+                        false => 0.0,
+                    },
+                    lovelace,
+                    transactions: transactions.max(0) as u64,
+                    evidence,
+                    destination,
+                });
+            }
+        }
+
+        // Mint funds INTO the pool — the mirror of `allocations`.
+        let subsidy_sql = format!(
+            "SELECT tx_hash, SUM(quantity), MIN(slot) FROM unit_flow
+              WHERE unit = 'lovelace' AND quantity > 0
+                AND party IN ({})
+                AND counterparty IN (SELECT key FROM party WHERE project_side = 1)
+              GROUP BY tx_hash ORDER BY MIN(slot)",
+            list(&funders)
+        );
+        let mut sub = conn.prepare(&subsidy_sql)?;
+        let subsidy_evidence: Vec<Evidence> = sub
+            .query_map([], |r| {
+                let tx: String = r.get(0)?;
+                Ok(Evidence {
+                    tx_url: tx_url(&tx),
+                    tx_hash: tx,
+                    quantity: r.get(1)?,
+                    consideration: 0,
+                    value_at_mint: None,
+                    slot: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         (lovelace > 0).then_some(Rewards {
+            subsidy_from_mint: subsidy_evidence.iter().map(|e| e.quantity).sum(),
+            subsidy_evidence,
+            allocations,
             lovelace,
             distributions: distributions.max(0) as u64,
             first_day_unix: first,
@@ -833,6 +1171,180 @@ pub fn build(
     let self_mint = self_mint(conn, base, minted_holder_facing);
     let mint_timeline = mint_timeline(conn)?;
     let supply_onward = supply_onward(conn, carrier_floor)?;
+
+    // ── how the project's money reached the minting wallets ────────────────
+    //
+    // Destinations are the self-mint set (project-side wallets plus the fronts
+    // provenance flagged); payers are project-side wallets. That deliberately
+    // includes project-side → project-side hops: an ops wallet relaying
+    // treasury money to a front IS the route, and dropping it would show the
+    // front funded from nowhere.
+    let mut self_mint_routing: Vec<SelfMintRoute> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT u.counterparty, u.party,
+                    SUM(u.quantity), COUNT(DISTINCT u.tx_hash)
+               FROM unit_flow u
+              WHERE u.unit = 'lovelace' AND u.quantity > 0
+                AND u.counterparty IN (SELECT key FROM party WHERE project_side = 1)
+                AND (u.party IN (SELECT key FROM party WHERE project_side = 1)
+                  OR u.party IN (SELECT holder FROM provenance_verdict WHERE flagged = 1))
+                AND u.counterparty <> u.party
+              GROUP BY u.counterparty, u.party
+              HAVING SUM(u.quantity) > 0
+              ORDER BY SUM(u.quantity) DESC",
+        )?;
+        let hops: Vec<(String, String, i64, i64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut ev = conn.prepare(
+            "SELECT tx_hash, SUM(quantity), MIN(slot) FROM unit_flow
+              WHERE unit = 'lovelace' AND quantity > 0
+                AND counterparty = ?1 AND party = ?2
+              GROUP BY tx_hash ORDER BY MIN(slot)",
+        )?;
+        let mut minted = conn.prepare(
+            "SELECT COUNT(*) FROM asset_event
+              WHERE kind = 'mint' AND asset_class = 'nft' AND to_party = ?1",
+        )?;
+        for (from, to, lovelace, transactions) in hops {
+            let evidence = ev
+                .query_map([&from, &to], |r| {
+                    let tx: String = r.get(0)?;
+                    Ok(Evidence {
+                        tx_url: tx_url(&tx),
+                        tx_hash: tx,
+                        quantity: r.get(1)?,
+                        consideration: 0,
+                        value_at_mint: None,
+                        slot: r.get::<_, i64>(2)?.max(0) as u64,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            self_mint_routing.push(SelfMintRoute {
+                from_label: labels.get(&from).cloned(),
+                from_role: declared_roles.get(&from).cloned(),
+                to_label: labels.get(&to).cloned(),
+                to_units_minted: minted.query_row([&to], |r| r.get(0)).unwrap_or(0),
+                lovelace,
+                transactions: transactions.max(0) as u64,
+                evidence,
+                from,
+                to,
+            });
+        }
+    }
+
+    // ── the founder's position, gathered across every channel ──────────────
+    //
+    // Keyed on `declared_role = 'founder'` in the PARTY table, not on the legs,
+    // so a founder wallet that never appears as a distribution leg — which is
+    // the usual case when the project funds fronts instead — is still counted.
+    let founder_wallets: BTreeSet<String> = {
+        let mut s = conn.prepare("SELECT key FROM party WHERE declared_role = 'founder'")?;
+        s.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    // EXCLUDE ADA sent to a founder wallet that is ALSO a minting front.
+    //
+    // That money does not stay with anyone: it goes out, the wallet mints
+    // with it, and it returns as mint proceeds. It is already measured as
+    // `self-mint funding`, and what it BOUGHT is already measured as units
+    // — counted here as well, the same value appears twice and the units
+    // are attributed to the founder even when they went to the public.
+    //
+    // On Mekka S1 one wallet accounted for **11,424 ₳ of 18,733**, and the
+    // 36 units it minted went overwhelmingly to public buyers (11, 4, 3, 2…)
+    // with 2 to the founder. Including it put the founder's total at 21.1%
+    // of the raise against a true 18.0%.
+    let minting_fronts: BTreeSet<String> = {
+        let mut s = conn.prepare(
+            "SELECT key FROM party WHERE project_side = 1
+         UNION SELECT holder FROM provenance_verdict WHERE flagged = 1",
+        )?;
+        s.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+
+    let founder = (!founder_wallets.is_empty()).then(|| {
+        // EXCLUDE founder → founder. Moving units between wallets the same
+        // person controls is not receiving them; counting it inflates the
+        // total by the size of the internal shuffle. On Mekka S1 that was
+        // **61 of 490 units** — `$jprigs33` alone sent 38 to other founder
+        // wallets, and each arrival was being counted as a fresh acquisition.
+        let free: Vec<&OnwardLeg> = supply_onward
+            .iter()
+            .filter(|o| o.declared_role.as_deref() == Some("founder"))
+            .filter(|o| o.consideration == 0)
+            .filter(|o| !founder_wallets.contains(&o.from))
+            .collect();
+        let units_free: i64 = free.iter().map(|o| o.units).sum();
+        let lovelace_direct: i64 = legs
+            .iter()
+            .filter(|l| l.role == "founder" && l.unit == "lovelace")
+            .filter(|l| !minting_fronts.contains(&l.party))
+            .map(|l| l.quantity)
+            .sum();
+        let lovelace_rewards: i64 = rewards
+            .as_ref()
+            .map(|r| {
+                r.to_declared
+                    .iter()
+                    .filter(|x| x.role == "founder")
+                    .map(|x| x.lovelace)
+                    .sum()
+            })
+            .unwrap_or(0);
+        let list = founder_wallets
+            .iter()
+            .map(|k| format!("'{}'", k.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let lovelace_sales: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(price_lovelace), 0) FROM secondary_sale
+                      WHERE seller IN ({list})"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let units_held_now: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM asset_holder WHERE party IN ({list})"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let lovelace_total = lovelace_direct + lovelace_rewards + lovelace_sales;
+        let units_value: i64 = free.iter().map(|o| o.value_at_mint).sum();
+        // Sales EXCLUDED: they convert units already counted above.
+        let value_received = units_value + lovelace_direct + lovelace_rewards;
+        FounderPosition {
+            value_received,
+            value_received_share_of_raise: share(value_received),
+            wallets: founder_wallets.len(),
+            units_free,
+            units_free_value_at_mint: units_value,
+            units_free_share_of_supply: (minted_holder_facing > 0)
+                .then(|| units_free as f64 / minted_holder_facing as f64),
+            units_held_now,
+            lovelace_direct,
+            lovelace_rewards,
+            lovelace_sales,
+            lovelace_total,
+            lovelace_share_of_raise: share(lovelace_total),
+        }
+    });
+
     let caveats = caveats(
         conn,
         base,
@@ -885,6 +1397,8 @@ pub fn build(
         units_seen,
         distributions,
         rewards,
+        founder,
+        self_mint_routing,
         provenance,
         caveats,
     })
@@ -893,6 +1407,28 @@ pub fn build(
 /// Team-minted supply that moved on, and whether it was paid for.
 fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<OnwardLeg>> {
     let hf = crate::distributions::holder_facing_sql();
+    // Per-transfer detail for each (sender, recipient) pair, looked up after
+    // the aggregate so the grouping stays one query.
+    let mut ev_stmt = conn.prepare(&format!(
+        // MUST restrict to team-minted assets, exactly as the aggregate does.
+        // Without it the evidence counts every transfer between the same two
+        // wallets — including units the project never minted — and the log
+        // sums to more than the figure it is evidence for. It read 437 against
+        // a 427 total, which is the one discrepancy an evidence table cannot
+        // have.
+        "SELECT e.tx_hash, COUNT(*), MIN(e.slot),
+                CAST(COALESCE(SUM((SELECT c.cost FROM asset_cost c
+                                    WHERE c.asset_name = e.asset_name)), 0) AS INTEGER)
+           FROM asset_event e
+          WHERE e.kind = 'transfer' AND e.asset_class IN ({hf})
+            AND e.from_party = ?1 AND e.to_party = ?2
+            AND e.asset_name IN (
+                  SELECT m.asset_name FROM asset_event m
+                   WHERE m.kind = 'mint' AND m.asset_class IN ({hf})
+                     AND (m.to_party IN (SELECT key FROM party WHERE project_side = 1)
+                       OR m.to_party IN (SELECT holder FROM provenance_verdict WHERE flagged = 1)))
+          GROUP BY e.tx_hash ORDER BY MIN(e.slot)"
+    ))?;
     let mut stmt = conn.prepare(&format!(
         // EXCEPT declared contractors — a paid person minting with their fee is
         // a customer, not a front. See `distributions::run` for why.
@@ -908,15 +1444,10 @@ fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<
          -- units it minted. A bulk mint of 24 for 2,500 ADA costs ~104 each;
          -- using a collection-wide average would price a cheap unit as a dear
          -- one and vice versa, and the S2 range is 2.7–158.6.
-         mint_cost AS (
-             SELECT m.asset_name,
-                    COALESCE((SELECT SUM(p.lovelace) FROM mint_payment p
-                              WHERE p.tx_hash = m.tx_hash), 0) * 1.0
-                    / NULLIF((SELECT COUNT(*) FROM asset_event x
-                              WHERE x.tx_hash = m.tx_hash AND x.kind = 'mint'
-                                AND x.asset_class IN ({hf})), 0) AS cost
-             FROM asset_event m
-             WHERE m.kind = 'mint' AND m.asset_class IN ({hf})),
+         -- Unit cost comes from `temp.asset_cost`, built once in `build()`:
+         -- per BATCH, because per-transaction costing is distorted by batched
+         -- settlement. One definition, joined here and by the evidence query
+         -- below, so a total and its rows can never disagree.
          -- Senders still inside the project's orbit: its wallets, the fronts it
          -- funded, and anyone it has named. Beyond that the supply is a third
          -- party's to trade.
@@ -924,6 +1455,11 @@ fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<
              SELECT k FROM own
              UNION SELECT key FROM party WHERE declared_role IS NOT NULL)
          SELECT e.to_party,
+                e.from_party,
+                (SELECT COALESCE(
+                    (SELECT p.label FROM party p WHERE p.key = e.from_party),
+                    (SELECT value FROM party_alias a
+                      WHERE a.party = e.from_party AND a.kind = 'handle' LIMIT 1))),
                 (SELECT value FROM party_alias a
                   WHERE a.party = e.to_party AND a.kind = 'handle' LIMIT 1),
                 (SELECT declared_role FROM party p WHERE p.key = e.to_party),
@@ -933,7 +1469,7 @@ fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<
                             AND d.tx_hash IN (SELECT x.tx_hash FROM asset_event x
                                               WHERE x.to_party = e.to_party
                                                 AND x.asset_name IN (SELECT asset_name FROM team_minted))), 0),
-                CAST(COALESCE(SUM((SELECT c.cost FROM mint_cost c
+                CAST(COALESCE(SUM((SELECT c.cost FROM asset_cost c
                                    WHERE c.asset_name = e.asset_name)), 0) AS INTEGER)
          FROM asset_event e
          WHERE e.kind = 'transfer'
@@ -952,17 +1488,19 @@ fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<
            -- the marketplace never owned it in any sense a reader means.
            AND e.to_party NOT LIKE 'stake17%'
            AND e.to_party NOT LIKE 'addr1w%'
-         GROUP BY e.to_party
+         GROUP BY e.to_party, e.from_party
          ORDER BY COUNT(*) DESC"
     ))?;
     let rows = stmt
         .query_map([], |r| {
-            let declared_role: Option<String> = r.get(2)?;
-            let consideration: i64 = r.get(4)?;
+            let declared_role: Option<String> = r.get(4)?;
+            let consideration: i64 = r.get(6)?;
             Ok(OnwardLeg {
                 recipient: r.get(0)?,
-                label: r.get(1)?,
-                units: r.get(3)?,
+                from: r.get(1)?,
+                from_label: r.get(2)?,
+                label: r.get(3)?,
+                units: r.get(5)?,
                 // A payment above the carrier floor makes it a sale whoever the
                 // recipient is; only unpaid transfers are distributions.
                 kind: match (consideration > carrier_floor, declared_role.is_some()) {
@@ -971,11 +1509,30 @@ fn supply_onward(conn: &rusqlite::Connection, carrier_floor: i64) -> Result<Vec<
                     (false, false) => "gift",
                 },
                 consideration: consideration.max(0),
-                value_at_mint: r.get(5)?,
+                value_at_mint: r.get(7)?,
                 declared_role,
+                evidence: Vec::new(),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Fill the per-transfer detail. Done after the aggregate rather than in it
+    // so the grouping stays a single query and the evidence is a lookup.
+    let mut rows = rows;
+    for leg in &mut rows {
+        leg.evidence = ev_stmt
+            .query_map([&leg.from, &leg.recipient], |r| {
+                let tx: String = r.get(0)?;
+                Ok(Evidence {
+                    tx_url: tx_url(&tx),
+                    tx_hash: tx,
+                    quantity: r.get(1)?,
+                    consideration: 0,
+                    slot: r.get::<_, i64>(2)?.max(0) as u64,
+                    value_at_mint: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
     Ok(rows)
 }
 
@@ -990,7 +1547,18 @@ fn mint_timeline(conn: &rusqlite::Connection) -> Result<Vec<MintDay>> {
              WHERE k NOT IN (SELECT key FROM party WHERE declared_role = 'contractor'))
          SELECT CAST(strftime('%s', date(block_time, 'unixepoch')) AS INTEGER) AS day,
                 SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 0 ELSE 1 END),
-                SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 1 ELSE 0 END)
+                SUM(CASE WHEN to_party IN (SELECT k FROM own) THEN 1 ELSE 0 END),
+                -- Price per unit that day: what the project's own wallets were
+                -- paid across the day's mint transactions, over the units they
+                -- minted. NULL on a day whose mints carried no payment.
+                CAST(
+                  (SELECT SUM(mp.lovelace) FROM mint_payment mp
+                    JOIN party pp ON pp.key = mp.destination AND pp.project_side = 1
+                   WHERE mp.tx_hash IN (
+                     SELECT x.tx_hash FROM asset_event x
+                      WHERE x.kind = 'mint' AND x.asset_class IN ({hf})
+                        AND date(x.block_time, 'unixepoch') = date(asset_event.block_time, 'unixepoch')))
+                  / NULLIF(COUNT(*), 0) AS INTEGER)
          FROM asset_event
          WHERE kind = 'mint' AND asset_class IN ({hf}) AND to_party IS NOT NULL
          GROUP BY day ORDER BY day"
@@ -1001,6 +1569,7 @@ fn mint_timeline(conn: &rusqlite::Connection) -> Result<Vec<MintDay>> {
                 day_unix: r.get(0)?,
                 public: r.get(1)?,
                 team: r.get(2)?,
+                price_per_unit: r.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1215,7 +1784,14 @@ fn uses(conn: &rusqlite::Connection) -> Result<Uses> {
             // this slice by 7,813 ₳ — a third of it — by relabelling a cost as
             // a payout. Rewards are the funder→provider leg, measured
             // separately; this slice is only what the project put IN.
-            (_, "rewards_funding") => "returned to holders".to_string(),
+            // NOT "returned to holders". This is mint money going INTO the
+            // reward pool, which is the opposite direction from what that
+            // label implies — and on Mekka S1 it paid for the early
+            // distributions outright: September's pool took 4,718 A of mint
+            // funds against 816 A of mining income, and the first drop was
+            // 5,000 A. Calling that "returned to holders" would present the
+            // mint subsidising an appearance of yield as though it were yield.
+            (_, "rewards_funding") => "topped up the reward pool".to_string(),
             ("contractor", f) if is_marketing(Some(f)) => "marketing".to_string(),
             ("contractor", _) | ("ops", _) => "ops · tools · team".to_string(),
             // Money to a wallet that minted with it. Not unknown at all — it is
@@ -1584,6 +2160,7 @@ mod tests {
             advertised_share: Some(0.8),
             source: "infographic".into(),
             measured_share: None,
+            measured_share_of_total: None,
             counterpart_lovelace: None,
             counterpart_share: None,
             counterpart_basis: None,

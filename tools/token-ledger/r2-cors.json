@@ -5,6 +5,8 @@
         "origins": [
           "http://localhost:8088",
           "http://127.0.0.1:8088",
+          "http://localhost:8090",
+          "http://127.0.0.1:8090",
           "https://tokens.cnft.dev",
           "https://dev.tokens.cnft.dev"
         ],

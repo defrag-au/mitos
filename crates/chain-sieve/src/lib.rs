@@ -112,6 +112,78 @@ impl Needles<'_> {
     }
 }
 
+/// Find the EARLIEST chunk containing any needle — floor discovery for a
+/// target nobody has registered a floor slot for.
+///
+/// Parallel workers pull chunks in ascending order and share an
+/// earliest-hit cutoff, so chunks past a known hit are skipped without
+/// being read. The scan runs at parallel `fs::read` speed (~3 GB/s
+/// measured) versus the sequential block reader's ~600 MB/s — which turns
+/// a genesis-floor cold start from ~15 minutes of reading into ~1–2
+/// minutes of scanning plus a walk over only the target's actual lifetime.
+pub fn first_hit_chunk(
+    immutable: &Path,
+    chunks: &[u64],
+    threads: usize,
+    patterns: &[Vec<u8>],
+    on: OnProgress<'_>,
+) -> Result<Option<u64>> {
+    let started = Instant::now();
+    let queue: Mutex<VecDeque<u64>> = Mutex::new(chunks.iter().copied().collect());
+    let earliest = AtomicU64::new(u64::MAX);
+    let done_chunks = AtomicU64::new(0);
+    let done_bytes = AtomicU64::new(0);
+    let total = chunks.len() as u64;
+
+    std::thread::scope(|s| -> Result<()> {
+        let handles: Vec<_> = (0..threads.max(1))
+            .map(|_| {
+                let queue = &queue;
+                let earliest = &earliest;
+                let done_chunks = &done_chunks;
+                let done_bytes = &done_bytes;
+                s.spawn(move || -> Result<()> {
+                    let needles = Needles::new(patterns)?;
+                    loop {
+                        let chunk = { queue.lock().expect("queue").pop_front() };
+                        let Some(chunk) = chunk else { break };
+                        // A hit at or before this chunk already exists —
+                        // nothing later can be the FIRST.
+                        if chunk >= earliest.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let path: PathBuf = immutable.join(format!("{chunk:05}.chunk"));
+                        let bytes = std::fs::read(&path)
+                            .with_context(|| format!("reading {}", path.display()))?;
+                        let dc = done_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+                        let db = done_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        if dc.is_multiple_of(200) {
+                            let secs = started.elapsed().as_secs_f64();
+                            on(ScanProgress {
+                                pass: "floor",
+                                done: dc,
+                                total,
+                                gb_per_s: db as f64 / 1e9 / secs,
+                            });
+                        }
+                        if needles.hit(&bytes) {
+                            earliest.fetch_min(chunk, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker panicked")?;
+        }
+        Ok(())
+    })?;
+
+    let hit = earliest.load(Ordering::Relaxed);
+    Ok((hit != u64::MAX).then_some(hit))
+}
+
 /// The parallel scan-and-extract harness: chunk queue → raw memmem → block
 /// pass on hit → `extract` into `T`s. Hit order is NOT slot order — workers
 /// own whole chunks. Stateful consumers should gate their own ordered pass

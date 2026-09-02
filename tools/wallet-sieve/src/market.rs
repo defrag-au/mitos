@@ -245,8 +245,24 @@ fn venue_of(conn: &Connection, tx: &str) -> anyhow::Result<String> {
 }
 
 /// Kinds where money actually moved.
+///
+/// # Why this defers rather than matching strings
+///
+/// It WAS `matches!(kind, "sold" | "offer_filled" | "bought" | "sale")`, and
+/// it had drifted badly: `offer_filled`, `bought` and `sale` are not kinds the
+/// ledger has ever written, while `offer_accepted` and
+/// `collection_offer_accepted` — which it writes for every accepted offer —
+/// were both missing.
+///
+/// The consequence was not cosmetic. [`MarketEvent::kind`] is chosen by
+/// ranking settlements first, so a transaction carrying an accepted offer AND
+/// a listing was headlined as the LISTING — the exact mislabelling the
+/// per-leg split was introduced to prevent.
+///
+/// `EventKind` owns this question because it owns the vocabulary; a kind it
+/// does not recognise reads as NOT a settlement, which is the safe direction.
 fn is_settlement(kind: &str) -> bool {
-    matches!(kind, "sold" | "offer_filled" | "bought" | "sale")
+    market_ledger_wire::EventKind::from_db_str(kind).is_some_and(|k| k.is_settlement())
 }
 
 #[cfg(test)]
@@ -256,9 +272,36 @@ mod tests {
     #[test]
     fn settlement_outranks_listing() {
         assert!(is_settlement("sold"));
-        assert!(is_settlement("offer_filled"));
         assert!(!is_settlement("listed"));
         assert!(!is_settlement("delisted"));
+    }
+
+    /// THE DRIFT THIS REPLACED. The old hand-written list recognised three
+    /// kinds the ledger never writes and missed the two it writes for every
+    /// accepted offer — so an accepted offer lost the headline to a listing
+    /// in the same transaction.
+    #[test]
+    fn an_accepted_offer_is_a_settlement() {
+        assert!(is_settlement("offer_accepted"));
+        assert!(is_settlement("collection_offer_accepted"));
+    }
+
+    /// Every kind the ledger can write is classified, and nothing else is.
+    /// Walking `EventKind::ALL` is what stops this going stale again.
+    #[test]
+    fn the_vocabulary_is_the_ledgers_own() {
+        use market_ledger_wire::EventKind;
+        for kind in EventKind::ALL {
+            assert_eq!(
+                is_settlement(kind.as_db_str()),
+                kind.is_settlement(),
+                "{kind:?} classified differently from the ledger"
+            );
+        }
+        // Kinds the old list carried that no ledger row has ever used.
+        for dead in ["offer_filled", "bought", "sale"] {
+            assert!(!is_settlement(dead), "{dead} is not a ledger kind");
+        }
     }
 
     /// Still not an error — but no longer an empty ANSWER either.

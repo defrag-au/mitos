@@ -4,6 +4,10 @@
 //!
 //! Surface:
 //! - `GET  /health` — open.
+//! - `GET  /flows/{target}/tx/{hash}` — ONE row by hash, plus how many sit
+//!   either side of it. Keyed off the primary key, so a transaction deep in a
+//!   wallet's history costs the same as its newest one — which paging could
+//!   not offer, and which is what a shared link needs.
 //! - `GET  /flows/{target}` — cached rows newest-first (`?limit`,
 //!   `?before_slot` pagination) + wallet meta + any job state.
 //! - `POST /flows/{target}/refresh` — start (or join) an excavation.
@@ -132,6 +136,7 @@ pub struct AppState {
 fn router(state: AppState, token: auth::AuthToken) -> Router {
     let gated = Router::new()
         .route("/flows/{target}", get(handlers::flows))
+        .route("/flows/{target}/tx/{hash}", get(handlers::flow_tx))
         .route("/flows/{target}/refresh", post(handlers::refresh))
         .route("/flows/{target}/events", get(handlers::events))
         .layer(axum::middleware::from_fn_with_state(
