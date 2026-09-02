@@ -314,7 +314,11 @@ fn migrate_delta_to_units(conn: &Connection) -> Result<()> {
         }
         found
     };
+    // The index lives here rather than in the schema batch, so it is only ever
+    // created once `delta` is known to carry the column — on a fresh ledger
+    // that is immediately, on an existing one only after the rebuild below.
     if has_unit_id {
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS delta_unit ON delta(unit_id);")?;
         return Ok(());
     }
 
@@ -401,7 +405,12 @@ impl Ledger {
                  PRIMARY KEY (tx_ord, party_id, unit_id)
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS delta_party ON delta(party_id);
-             CREATE INDEX IF NOT EXISTS delta_unit ON delta(unit_id);
+             -- NOTE: the `delta_unit` index is created by
+             -- `migrate_delta_to_units`, NOT here. On an existing ledger the
+             -- CREATE TABLE above is a no-op, so `delta` still has no
+             -- `unit_id` when this batch runs and an index naming that column
+             -- fails outright — taking the whole `open` with it. Caught on a
+             -- real ledger the first time this ran off the laptop.
 
              -- One row per pool instance ever seen. `key_basis` records how
              -- firmly the instance is identified (published in the datum vs
@@ -519,6 +528,22 @@ impl Ledger {
                  unit_id INTEGER NOT NULL,
                  amount  INTEGER NOT NULL,
                  PRIMARY KEY (tx_ord, unit_id)
+             ) WITHOUT ROWID;
+
+             -- Outrefs a reverse pass is still waiting on: spent by a
+             -- transaction already written, source not yet reached.
+             --
+             -- PERSISTED, because a reverse walk's whole point is to deepen
+             -- across separate runs. Held only in memory, a second pass starts
+             -- with no record of what the first was waiting for and can never
+             -- resolve it — measured on SpaceBudz, pass 2 backfilled nothing
+             -- into pass 1's rows. The forward walk's buffer is persisted for
+             -- exactly the same reason.
+             CREATE TABLE IF NOT EXISTS pending_input (
+                 oref_hash BLOB    NOT NULL,
+                 oref_idx  INTEGER NOT NULL,
+                 spender   BLOB    NOT NULL,
+                 PRIMARY KEY (oref_hash, oref_idx, spender)
              ) WITHOUT ROWID;",
         )?;
 
@@ -1157,6 +1182,55 @@ impl Ledger {
         }
         tx.commit()?;
         Ok(added)
+    }
+
+    /// Every outref a previous reverse pass is still waiting on.
+    pub fn load_pending(&self) -> Result<Vec<((Hash<32>, u32), Hash<32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT oref_hash, oref_idx, spender FROM pending_input")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (oref_hash, idx, spender) = row?;
+            let oref_hash: [u8; 32] = oref_hash
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("pending oref hash is not 32 bytes"))?;
+            let spender: [u8; 32] = spender
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("pending spender hash is not 32 bytes"))?;
+            out.push(((Hash::from(oref_hash), idx as u32), Hash::from(spender)));
+        }
+        Ok(out)
+    }
+
+    /// Replace the pending set wholesale.
+    ///
+    /// Wholesale rather than incremental because the in-memory set IS the
+    /// answer at the end of a pass: entries resolved during it are gone from
+    /// the map, and a differential update would have to reconstruct which those
+    /// were. Cardinality is the transactions still missing a source, which stays
+    /// small precisely because only unbalanced transactions register at all.
+    pub fn put_pending(&mut self, entries: &[((Hash<32>, u32), Hash<32>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM pending_input", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO pending_input (oref_hash, oref_idx, spender)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for ((hash, idx), spender) in entries {
+                stmt.execute(params![hash.as_ref(), *idx as i64, spender.as_ref()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn classify_parties(&mut self, sinks: &[String], lock_creds: &[[u8; 28]]) -> Result<usize> {

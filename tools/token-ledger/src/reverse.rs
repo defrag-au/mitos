@@ -168,7 +168,10 @@ pub fn run(args: ReverseArgs) -> Result<()> {
         "reverse: pass starting"
     );
 
-    let mut pending = Pending::default();
+    // Carried across runs: a pass that started empty could never resolve what
+    // an earlier one was waiting for, which made deepening useless.
+    let mut pending = Pending::load(ledger.load_pending()?);
+    let carried = pending.len();
     let outcome = pass(
         &mut ledger,
         &immutable,
@@ -181,8 +184,11 @@ pub fn run(args: ReverseArgs) -> Result<()> {
         !args.no_sieve,
     )?;
 
+    ledger.put_pending(&pending.entries())?;
+
     println!("covered down to slot        = {}", outcome.floor);
     println!("transactions written        = {}", outcome.written);
+    println!("sources carried in          = {carried}");
     println!("delta rows backfilled       = {}", outcome.backfilled);
     println!("sources still below floor   = {}", outcome.unresolved);
     if outcome.unresolved > 0 {
@@ -215,8 +221,32 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// Rebuild from what a previous pass left behind.
+    pub fn load(entries: Vec<((Hash<32>, u32), Hash<32>)>) -> Self {
+        let mut waiting: HashMap<(Hash<32>, u32), Vec<Hash<32>>> = HashMap::new();
+        for (oref, spender) in entries {
+            waiting.entry(oref).or_default().push(spender);
+        }
+        Self { waiting }
+    }
+
+    /// Flatten for persistence.
+    pub fn entries(&self) -> Vec<((Hash<32>, u32), Hash<32>)> {
+        self.waiting
+            .iter()
+            .flat_map(|(oref, spenders)| spenders.iter().map(move |s| (*oref, *s)))
+            .collect()
+    }
+
     fn want(&mut self, oref: (Hash<32>, u32), spender: Hash<32>) {
-        self.waiting.entry(oref).or_default().push(spender);
+        let slot = self.waiting.entry(oref).or_default();
+        // A resumed pass reloads what it already recorded, so the same waiter
+        // can arrive twice. Duplicates would emit the same backfill twice —
+        // harmless only because `add_deltas` ignores conflicts, which is a
+        // guard to lean on, not a reason to create the condition.
+        if !slot.contains(&spender) {
+            slot.push(spender);
+        }
     }
 
     /// Transactions waiting on this outref, removing it from the open set.
@@ -280,6 +310,28 @@ fn chunk_txs_newest_first(
 ) -> Result<Vec<(u64, Vec<u8>)>> {
     let start = chunk * CHUNK_SLOTS;
     let end = (chunk + 1) * CHUNK_SLOTS;
+
+    // CHUNK-LEVEL GATE FIRST — the cheap half, and the one that decides whether
+    // a deep pass is minutes or an hour.
+    //
+    // A per-BLOCK gate still pays the sequential reader for every block in the
+    // file (~600 MB/s) even when nothing in it is ours. Reading the raw chunk
+    // with one `fs::read` and one memmem runs at parallel-read speed and skips
+    // the whole file on a miss — which is almost every file, since a policy's
+    // activity is a thin slice of the chain. Same trick, same reason, as
+    // `chain_sieve::scan_extract`.
+    //
+    // Sound for the same reason the block gate is: a transaction touching the
+    // policy carries its id in an output value or the mint field, so a chunk
+    // whose bytes lack it cannot hold one.
+    if let Some(n) = needles {
+        let path = immutable.join(format!("{chunk:05}.chunk"));
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if !n.hit(&bytes) {
+            return Ok(Vec::new());
+        }
+    }
+
     let blocks = open_blocks(immutable, Some((start, Vec::new())))
         .with_context(|| format!("seeking chunk {chunk}"))?;
     let mut out = Vec::new();
@@ -410,18 +462,42 @@ pub fn pass(
                     }
                 }
 
-                // A transaction with nothing of ours in its outputs and nothing
-                // in its mint field is only interesting if it SPENT something
-                // of ours — which we cannot know yet. Recording its inputs as
-                // pending is how that is discovered later.
+                // Any transaction that MOVES a watched asset necessarily has it
+                // in an output — or, for a burn, in the mint field. So this is
+                // complete: a transaction with neither touches nothing of ours.
                 let touches_us = !deltas.is_empty() || !net_mint.is_empty();
                 if !touches_us {
                     continue;
                 }
 
-                // INPUTS: unknown now. Register interest and move on.
-                for inp in &dtx.inputs {
-                    pending.want(inp.oref, dtx.tx_hash);
+                // INPUTS: register interest ONLY where a source is actually
+                // missing.
+                //
+                // Conservation says exactly that. A transaction whose deltas
+                // already balance has every party accounted for, so none of its
+                // inputs held a watched asset and waiting on them is waiting
+                // forever. Registering them all instead put every ADA input of
+                // every watched transaction into the pending set — unbounded
+                // growth, on entries that can never resolve.
+                //
+                // `Unattributed` is the missing-negative case; see
+                // `walk::BreachKind`.
+                let as_map: HashMap<(String, Vec<u8>), (Option<String>, i64)> = deltas
+                    .iter()
+                    .map(|d| {
+                        (
+                            (d.address.clone(), d.name.clone()),
+                            (d.stake.clone(), d.amount),
+                        )
+                    })
+                    .collect();
+                let missing_source = crate::walk::conservation_breaches(&as_map, &net_mint)
+                    .iter()
+                    .any(|b| b.kind == crate::walk::BreachKind::Unattributed);
+                if missing_source {
+                    for inp in &dtx.inputs {
+                        pending.want(inp.oref, dtx.tx_hash);
+                    }
                 }
 
                 rows.push(TxRow {
