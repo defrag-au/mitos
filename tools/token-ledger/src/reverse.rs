@@ -1,65 +1,73 @@
-//! `reverse` — walk history BACKWARD from the tip, emitting newest first.
+//! `reverse` — walk history BACKWARD from the tip, newest first, into the
+//! policy archive. No database.
 //!
 //! The forward walk in [`crate::walk`] is the complete one: it starts at or
 //! below the policy's first mint, so its outref buffer is complete by
 //! construction and every projection over it — float, holder count,
 //! concentration, market cap — is exact. It is also the wrong shape for a feed.
-//! A feed wants the newest row FIRST, and a forward walk produces the newest row
-//! LAST, so nothing can be shown until the whole window is done.
+//! A feed wants the newest row FIRST, and a forward walk produces the newest
+//! row LAST, so nothing can be shown until the whole window is done.
 //!
-//! This mode inverts that: chunk-descending, newest first, rows available in
-//! seconds and improving as it goes.
+//! This mode inverts that: chunk-descending, newest first, one pass at a time,
+//! each pass reaching further back than the last.
 //!
-//! # The buffer inverts too
+//! # The model is in memory; the archive is the state
 //!
-//! Forward, the buffer holds outputs awaiting their spender: a tx spends outref
-//! X, `buffer.take(X)` says who held it, and the negative delta is known
-//! immediately.
+//! A pass holds every transaction it finds in memory, resolves what it can
+//! while it runs, and writes the result ONCE as a stamped Parquet file
+//! ([`crate::archive`]). Nothing on the box outlives the pass except the
+//! Mithril snapshot it read and the artifacts it wrote — which is what lets
+//! the same walk run on a satellite that owns nothing but a snapshot and
+//! publishes into R2.
 //!
-//! Backward, that is impossible — the output that created X sits at a LOWER
-//! slot, which is ground this walk has not covered yet. So the state inverts:
-//! [`Pending`] holds outrefs already spent by transactions we have already
-//! written, waiting for their creating output to come into view. Every
-//! transaction is therefore written in two stages:
+//! # The buffer inverts
 //!
-//! - its **positive** deltas immediately, from its own outputs
-//! - its **negative** deltas later, on reaching the transactions further back
-//!   that created what it spent — via [`crate::store::Ledger::add_deltas`]
+//! Forward, the buffer holds outputs awaiting their spender. Backward, the
+//! output that created an input sits at a LOWER slot — ground not covered
+//! yet — so the state is [`Pending`]: transactions already found, waiting for
+//! their sources to come into view. When a source appears, the spender gains
+//! its missing negative delta:
 //!
-//! That is the same progressive-enrichment shape the wallet view already speaks
-//! over its socket (`FlowDelta::RowsUpdated`): a row lands readable and is
-//! corrected in place rather than withheld until perfect.
+//! - in THIS pass's model, if the spender was found in this pass;
+//! - as a row in `corrections.parquet`, if an earlier pass published it.
+//!
+//! Readers sum both by `(transaction, unit, party)` — the same rule the sqlite
+//! ledger's `ON CONFLICT … amount + excluded.amount` enforced, now applied at
+//! read time over immutable files. A row lands readable and is corrected
+//! later rather than withheld until perfect.
 //!
 //! # What bounds it
 //!
-//! `Pending` grows with unresolved inputs and shrinks as they resolve, so it is
-//! bounded by the transactions still missing a source rather than by the
-//! policy's supply. That is the property that makes this safe on a collection a
-//! completeness-first walker cannot touch at all: cost follows ACTIVITY in the
-//! window, never the size of the holder set.
+//! `Pending` grows with unresolved inputs and shrinks as they resolve, so it
+//! is bounded by the transactions still missing a source, never by supply.
+//! Two rules keep it honest: inputs are registered ONLY for a transaction
+//! whose deltas do not balance (conservation says exactly which are missing a
+//! source), and a spender is RETIRED — its remaining inputs forgotten — the
+//! moment its units balance, because a balanced transaction's other inputs
+//! were carrying ADA, not the asset, and would never resolve.
 //!
 //! # The sieve gate stays complete
 //!
-//! A watched input's creating output necessarily carried the policy id, so its
-//! block — and its chunk — is a sieve hit. Skipping non-hit chunks therefore
-//! cannot lose a resolution. Non-watched inputs (the ADA that funds a fee) may
-//! never be visited at all, which costs nothing: they were never owed a delta.
-//! Conservation is what distinguishes the two, and it needs no help from here —
-//! see [`crate::walk::BreachKind`].
+//! A watched input's creating output necessarily carried the policy id, so
+//! its block — and its chunk — is a sieve hit. Skipping non-hit chunks cannot
+//! lose a resolution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use mitos_chain_walk::decode::decode_tx;
+use mitos_chain_walk::decode::{OutRef, decode_tx};
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
 use mitos_chain_walk::{open_blocks, slot_to_unix};
 use pallas_primitives::Hash;
 use pallas_traverse::MultiEraBlock;
+use policy_archive::{ArchiveWriter, Completeness, GroupPolicy, Movement, Stamp};
 
+use crate::archive::{self, FileEntry, Manifest, PassEntry, PendingFile, PendingSpender};
 use crate::registry;
-use crate::store::{DeltaRow, Ledger, TxRow};
-use crate::walk::{Watched, stake_of, units_in_output};
+use crate::walk::{Watched, units_in_output};
 
 /// Slots per day on Cardano — one slot per second.
 const SLOTS_PER_DAY: u64 = 86_400;
@@ -78,61 +86,57 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub token: String,
 
-    /// Ledger sqlite path (default: `<token>.db`).
-    #[arg(long)]
-    pub db: Option<PathBuf>,
+    /// Archive root. The pass writes `<archive-dir>/<policy_hex>/pass-NNNN/`
+    /// and replaces `<archive-dir>/<policy_hex>/manifest.json`.
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
 
-    /// How much further back to reach, in days, measured from the ledger's
-    /// current floor (or from the tip on a cold ledger).
+    /// How much further back to reach, in days, measured from the archive's
+    /// current floor (or from the tip on a cold policy).
     ///
-    /// This is the WINDOW, and it is the whole cost control: a pass reads the
-    /// chain in that window and nothing else, whatever the policy's supply. Run
-    /// it again to go deeper — each pass extends coverage downward and resolves
-    /// sources for rows already written.
-    #[arg(long, default_value_t = 30)]
-    pub days: u64,
+    /// Absent — the hosted surface's shape — means ALL THE WAY: to the
+    /// policy's first mint when the registry or `--to-slot` names it, else to
+    /// genesis. A pass reads the chain in its window and nothing else,
+    /// whatever the policy's supply; run it again to extend coverage downward
+    /// and resolve sources for rows already published.
+    #[arg(long)]
+    pub days: Option<u64>,
 
-    /// Absolute floor to stop at, overriding `--days`.
+    /// Absolute floor to stop at, overriding `--days`. The hosted surface
+    /// passes the policy's first mint here.
     #[arg(long)]
     pub to_slot: Option<u64>,
 
-    /// Start the pass HERE instead of at the ledger's current floor — a probe
-    /// into an arbitrary moment in history.
-    ///
-    /// Seeking is cheap: the immutable DB is binary-searched to the chunk by a
-    /// slot-only fuzzy seek, and the chunk gate then reads only the files in
-    /// range. Reaching a window four years back costs what that window costs,
-    /// not what the intervening history costs.
-    ///
-    /// **A probe does NOT advance the ledger's recorded coverage.** Coverage is
-    /// a single contiguous range `[walked_from, tip]`, and a window detached
-    /// from it cannot be described by one floor — lowering it would claim
-    /// everything in between had been walked. Rows and resolutions are still
-    /// written and are still true; only the coverage claim is withheld.
-    #[arg(long)]
-    pub from_slot: Option<u64>,
-
-    /// Skip the memmem gate and decode every block. Slower by roughly the ratio
-    /// of hit blocks to all blocks; only useful for isolating a suspected gate
-    /// bug, since the gate is complete by the ledger's balance rule.
+    /// Skip the memmem gate and decode every block. Only useful for isolating
+    /// a suspected gate bug, since the gate is complete by the balance rule.
     #[arg(long)]
     pub no_sieve: bool,
 
-    /// Log a progress line every N chunks. A chunk is ~6h of chain, so a
-    /// full-history pass covers thousands.
-    ///
-    /// Chunks that CORRECTED rows are always logged regardless — a backfill is
-    /// the event a consumer most needs and the rarest to happen.
+    /// Log a progress line every N chunks.
     #[arg(long, default_value_t = 250)]
     pub report_every: u64,
 }
 
-/// Run one reverse pass, extending the ledger's coverage downward.
-///
-/// The CLI face: logs progress on `--report-every` and prints a summary.
+/// What a pass produced.
+pub struct Outcome {
+    /// Lowest slot now covered — the archive's new floor.
+    pub floor: u64,
+    /// Transactions the archive now holds from this pass. Fewer than the
+    /// walk found: a transaction the asset only passed through as change
+    /// moved nothing and has no rows.
+    pub written: u64,
+    /// Delta rows resolved onto transactions — this pass's, or earlier ones'.
+    pub backfilled: u64,
+    /// Spenders still waiting on a source. The honest gap.
+    pub unresolved: u64,
+    /// Bytes of `pending.bin` — the carried state, measured.
+    pub pending_bytes: u64,
+}
+
+/// Run one reverse pass. The CLI face: logs progress and prints a summary.
 pub fn run(args: ReverseArgs) -> Result<()> {
     let report_every = args.report_every.max(1);
-    let (written, backfilled, unresolved) = run_reporting(args, &|p| {
+    let out = run_reporting(args, &|p| {
         // Chunks are ~6h of chain, so a full-history pass emits thousands. Log
         // every Nth, but ALWAYS log one that corrected rows: a backfill is the
         // event a consumer most needs to see and the rarest to occur.
@@ -150,26 +154,25 @@ pub fn run(args: ReverseArgs) -> Result<()> {
         }
     })?;
 
-    println!("transactions written        = {written}");
-    println!("delta rows backfilled       = {backfilled}");
-    println!("sources still below floor   = {unresolved}");
-    if unresolved > 0 {
+    println!("transactions written        = {}", out.written);
+    println!("delta rows backfilled       = {}", out.backfilled);
+    println!("sources still below floor   = {}", out.unresolved);
+    println!("pending sidecar             = {} bytes", out.pending_bytes);
+    if out.unresolved > 0 {
         println!(
             "  run again to reach deeper — each pass resolves sources for rows \
-             already written"
+             already published"
         );
     }
     Ok(())
 }
 
 /// One reverse pass, reporting through `on` — the programmatic face.
-///
-/// Returns `(written, backfilled, unresolved)`. Separated from [`run`] so the
-/// hosted surface can drive a pass and turn its progress into job state without
-/// going through stdout, which is the only thing the CLI face adds.
-pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<(u64, usize, usize)> {
+pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
+    let started = Instant::now();
     let token = registry::load_or_unit(&args.tokens, &args.token)?;
     let policy = token.policy_bytes()?;
+    let policy_hex = hex::encode(&policy);
     let watched = match token.asset_name_bytes()? {
         Some(name) => Watched::Unit(name),
         None => Watched::Policy,
@@ -183,17 +186,8 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<(u64, usiz
         );
     }
 
-    let db_path = args
-        .db
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{}.db", token.name)));
-    let mut ledger = Ledger::open(&db_path)?;
-    ledger.put_meta(
-        &token.name,
-        &policy,
-        token.asset_name_bytes()?.as_deref(),
-        token.resolved_decimals(),
-    )?;
+    let dir = archive::policy_dir(&args.archive_dir, &policy_hex);
+    let mut manifest = archive::load_manifest(&dir)?.unwrap_or_else(|| Manifest::new(&policy_hex));
 
     let all_chunks = chain_sieve::list_chunks(&immutable, 0)?;
     let tip_slot = all_chunks
@@ -202,32 +196,36 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<(u64, usiz
         .unwrap_or(0);
 
     // A pass runs from the existing floor DOWNWARD, so coverage stays
-    // contiguous. On a cold ledger there is no floor yet and the tip is the
-    // ceiling — the first pass is the one that establishes it.
-    let coverage_floor = ledger.walked_from()?;
-    let ceiling = args
-        .from_slot
-        .unwrap_or_else(|| coverage_floor.unwrap_or(tip_slot));
-    // A pass extends coverage only when it starts exactly where coverage
-    // currently ends. Anywhere else is a detached window, and a single
-    // `walked_from` cannot describe two ranges.
-    //
-    // A COLD ledger is not a free pass. Coverage means `[walked_from, tip]`, so
-    // a probe that starts below the tip is detached whether or not anything
-    // came before it — the first version read "no existing floor" as "anything
-    // is contiguous" and let a 2022 probe claim coverage it plainly did not
-    // have.
-    let contiguous = match args.from_slot {
-        None => true,
-        Some(from) => coverage_floor == Some(from),
-    };
-    let floor = match args.to_slot {
-        Some(s) => s,
-        None => ceiling.saturating_sub(args.days * SLOTS_PER_DAY),
+    // contiguous. On a cold policy there is no floor yet and the tip is the
+    // ceiling — the first pass establishes it.
+    let ceiling = manifest.walk_from.unwrap_or(tip_slot);
+    let floor = match (args.to_slot, args.days) {
+        (Some(s), _) => s,
+        (None, Some(days)) => ceiling.saturating_sub(days * SLOTS_PER_DAY),
+        // Everything. Clamped to the first mint below when one is known.
+        (None, None) => 0,
     };
     // Never dig below the policy's own first mint when we know it: there is
-    // nothing there, and reading it is pure cost.
-    let floor = token.floor_slot.map_or(floor, |first| floor.max(first));
+    // nothing there, and reading it is pure cost. The registry's floor is
+    // recorded in the manifest so a later pass on a box without the registry
+    // entry still stops there.
+    // `--to-slot` IS the first mint when the hosted surface passes it (from
+    // Koios); counting it here is what lets a pass that reaches it record
+    // COMPLETE. The first full ClayNation walk reached its mint exactly and
+    // was stamped partial for want of this.
+    let first_mint = token
+        .floor_slot
+        .or(manifest.first_mint_slot)
+        .or(args.to_slot);
+    let floor = first_mint.map_or(floor, |first| floor.max(first));
+
+    // The carried state: what the previous pass was still waiting for.
+    let prior_pending = match manifest.latest_pass() {
+        Some(p) => archive::load_pending(&dir.join(&p.dir).join(archive::PENDING))?,
+        None => PendingFile::default(),
+    };
+    let mut pending = Pending::load(prior_pending.spenders);
+    let carried = pending.len();
 
     if floor >= ceiling {
         tracing::info!(
@@ -235,116 +233,229 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<(u64, usiz
             floor,
             "reverse: nothing to do — coverage already reaches the requested floor"
         );
-        return Ok((0, 0, pending_count(&ledger)));
+        return Ok(Outcome {
+            floor: ceiling,
+            written: 0,
+            backfilled: 0,
+            unresolved: carried as u64,
+            pending_bytes: 0,
+        });
     }
 
     tracing::info!(
         token = %token.name,
-        policy = %token.policy,
-        policy_wide = watched_is_policy(&watched),
+        policy = %policy_hex,
+        policy_wide = matches!(watched, Watched::Policy),
         floor,
         ceiling,
-        days = args.days,
+        days = ?args.days,
+        carried,
         "reverse: pass starting"
     );
 
-    // Carried across runs: a pass that started empty could never resolve what
-    // an earlier one was waiting for, which made deepening useless.
-    let mut pending = Pending::load(ledger.load_pending()?);
-    let carried = pending.len();
-    // Published BEFORE the pass, so a poller that arrives mid-run has a
-    // denominator. Written after the fact it would be useless for exactly the
-    // window it exists to describe.
-    ledger.set_walk_target(floor)?;
-    let outcome = pass(
-        &mut ledger,
+    let mut model = Model::default();
+    let mut corrections: Vec<Movement> = Vec::new();
+    let walked = pass(
         &immutable,
         &all_chunks,
         &policy,
         &watched,
         floor,
         ceiling,
+        &mut model,
         &mut pending,
+        &mut corrections,
         !args.no_sieve,
-        contiguous,
         on,
     )?;
 
-    // The top of what this ledger covers. A reverse pass starts at the ceiling
-    // and works down, so the ceiling IS the upper bound — and nothing else
-    // records it, since reverse never moves the forward cursor.
-    if contiguous {
-        ledger.set_walked_to(ceiling)?;
-    }
-    ledger.put_pending(&pending.entries())?;
-    // Target collapses onto the achieved floor: a finished pass is idle, not a
-    // pass sitting at 100% forever. A poller reads the two being equal as
-    // "nothing running".
-    ledger.set_walk_target(outcome.floor)?;
-
-    // Has this ledger reached the policy's beginning?
-    //
-    // Only two things establish it: reaching genesis, or reaching a registered
-    // first-mint floor. A PROBE never does — it writes true rows into a
-    // detached window and claims no coverage, so it must not claim completeness
-    // either.
-    //
-    // A pass that stops short records PARTIAL, because it knows that for a
-    // fact: it just walked and did not get there. Leaving it unrecorded threw
-    // that away and made a ledger we had measured report "coverage unknown".
-    //
-    // The one thing never done is DEMOTING a `Complete` ledger: a later shallow
-    // pass over a fully-walked history has learned nothing that unmakes the
-    // earlier walk, and treating it as evidence would let routine refreshes
-    // erase a hard-won verdict.
-    use crate::store::Completeness;
-    let reached_beginning = contiguous
-        && (outcome.floor == 0 || token.floor_slot.is_some_and(|first| outcome.floor <= first));
-    let already = ledger.completeness()?;
-    let next = match (reached_beginning, already) {
-        (true, _) => Some(Completeness::Complete),
-        (false, Completeness::Complete) => None,
-        (false, _) if contiguous => Some(Completeness::Partial),
-        // A probe establishes nothing about coverage either way.
-        (false, _) => None,
-    };
-    if let Some(next) = next {
-        ledger.set_completeness(next)?;
-    }
+    let out = write_pass(PassWrite {
+        dir: &dir,
+        manifest: &mut manifest,
+        policy_hex: &policy_hex,
+        first_mint,
+        ceiling,
+        walked,
+        model,
+        corrections,
+        pending: &pending,
+        secs: started.elapsed().as_secs_f64(),
+    })?;
 
     tracing::info!(
-        floor = outcome.floor,
-        written = outcome.written,
+        floor = out.floor,
+        written = out.written,
         carried,
-        backfilled = outcome.backfilled,
-        unresolved = outcome.unresolved,
+        backfilled = out.backfilled,
+        unresolved = out.unresolved,
+        pending_bytes = out.pending_bytes,
+        secs = format!("{:.1}", started.elapsed().as_secs_f64()),
         "reverse: pass complete"
     );
-    Ok((outcome.written, outcome.backfilled, outcome.unresolved))
+    Ok(out)
 }
 
-fn watched_is_policy(w: &Watched) -> bool {
-    matches!(w, Watched::Policy)
+/// Everything a finished walk hands to the writer.
+struct PassWrite<'a> {
+    dir: &'a Path,
+    manifest: &'a mut Manifest,
+    policy_hex: &'a str,
+    first_mint: Option<u64>,
+    ceiling: u64,
+    walked: Walked,
+    model: Model,
+    corrections: Vec<Movement>,
+    pending: &'a Pending,
+    secs: f64,
 }
 
-/// Pending count for an early return, where no pass ran to report one.
-fn pending_count(ledger: &Ledger) -> usize {
-    ledger.load_pending().map(|p| p.len()).unwrap_or(0)
+/// Write one pass: its files, its pending sidecar, and LAST the manifest.
+///
+/// Separate from the chunk walk so the archive's write path can be exercised
+/// against a synthetic model — the walk needs Mithril chunks, the archive
+/// does not.
+fn write_pass(w: PassWrite<'_>) -> Result<Outcome> {
+    let PassWrite {
+        dir,
+        manifest,
+        policy_hex,
+        first_mint,
+        ceiling,
+        walked,
+        model,
+        corrections,
+        pending,
+        secs,
+    } = w;
+    let seq = manifest.next_seq();
+    let pass_dir = dir.join(PassEntry::dir_name(seq));
+    std::fs::create_dir_all(&pass_dir)?;
+    let new_walk_from = Some(
+        manifest
+            .walk_from
+            .map_or(walked.floor, |f| f.min(walked.floor)),
+    );
+    let new_walk_to = Some(manifest.walk_to.map_or(ceiling, |t| t.max(ceiling)));
+
+    // Has the archive reached the policy's beginning? Only two things
+    // establish it: reaching genesis, or reaching the registered first mint.
+    // A pass that stops short records PARTIAL — it just walked and did not
+    // get there. A `Complete` archive is never demoted by a later pass.
+    let reached_beginning = walked.floor == 0 || first_mint.is_some_and(|f| walked.floor <= f);
+    let completeness = match (reached_beginning, manifest.completeness()) {
+        (true, _) | (_, Completeness::Complete) => Completeness::Complete,
+        (false, _) => Completeness::Partial,
+    };
+    let sealed_unix = now_unix();
+    let stamp = |covered_from: u64, covered_to: u64| Stamp {
+        policy_hex: policy_hex.to_string(),
+        completeness,
+        walk_from: new_walk_from,
+        walk_to: new_walk_to,
+        covered_from,
+        covered_to,
+        sealed_unix,
+    };
+
+    let Rows {
+        rows: movement_rows,
+        units,
+        txs: written,
+    } = model.into_rows();
+    let movements = write_file(
+        &pass_dir.join(archive::MOVEMENTS),
+        &stamp(walked.floor, ceiling.saturating_sub(1)),
+        movement_rows,
+    )?;
+    let corrections_entry = match corrections.is_empty() {
+        true => None,
+        false => {
+            let lo = corrections.iter().map(|m| m.slot).min().unwrap_or(0);
+            let hi = corrections.iter().map(|m| m.slot).max().unwrap_or(0);
+            Some(write_file(
+                &pass_dir.join(archive::CORRECTIONS),
+                &stamp(lo, hi),
+                corrections,
+            )?)
+        }
+    };
+    let pending_file = pending.to_file();
+    let pending_bytes = archive::store_pending(&pass_dir.join(archive::PENDING), &pending_file)?;
+
+    manifest.first_mint_slot = first_mint;
+    manifest.completeness = completeness.as_wire().to_string();
+    manifest.walk_from = new_walk_from;
+    manifest.walk_to = new_walk_to;
+    manifest.updated_unix = sealed_unix;
+    manifest.passes.push(PassEntry {
+        seq,
+        dir: PassEntry::dir_name(seq),
+        ceiling,
+        floor: walked.floor,
+        movements: Some(movements),
+        corrections: corrections_entry,
+        pending: pending_file.spenders.len() as u64,
+        found: walked.written,
+        written,
+        backfilled: walked.backfilled as u64,
+        units,
+        secs,
+        written_unix: sealed_unix,
+    });
+    // LAST. A reader that opens the manifest sees a pass whose files exist.
+    archive::store_manifest(dir, manifest)?;
+
+    Ok(Outcome {
+        floor: walked.floor,
+        written,
+        backfilled: walked.backfilled as u64,
+        unresolved: pending_file.spenders.len() as u64,
+        pending_bytes,
+    })
+}
+
+/// Rows → one stamped file, via a temp path so a crash never leaves a
+/// half-written artifact under its final name.
+fn write_file(path: &Path, stamp: &Stamp, rows: Vec<Movement>) -> Result<FileEntry> {
+    let tmp = path.with_extension("parquet.tmp");
+    let sink = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let mut w = ArchiveWriter::new(sink, stamp, GroupPolicy::DAILY)?;
+    for row in rows {
+        w.push(row)?;
+    }
+    let written = w.finish()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(FileEntry {
+        file: path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        rows: written.rows,
+        min_slot: written.min_slot,
+        max_slot: written.max_slot,
+    })
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// A slot as `YYYY-MM-DD`, for saying how far back a pass has reached.
-///
-/// The slot number is the machine's answer and means nothing to a reader
-/// watching a progress bar: "reaching back to 2021-03-14" is the statement, and
-/// a UI should not have to carry a slot-to-date conversion to make it.
-///
-/// Civil-from-days (Hinnant), so this needs no date dependency.
 pub fn slot_date(slot: u64) -> String {
-    let days = (slot_to_unix(slot) / 86_400) as i64;
+    unix_date(slot_to_unix(slot))
+}
+
+/// Unix seconds as `YYYY-MM-DD`. Civil-from-days (Hinnant), so this needs no
+/// date dependency.
+pub fn unix_date(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -354,137 +465,404 @@ pub fn slot_date(slot: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// An outref spent by a transaction we have already written, whose creating
-/// output we have not reached yet.
-///
-/// The reverse counterpart of a buffered output. Keyed by outref because that
-/// is what a later (earlier-in-slot) transaction will present when it creates
-/// the thing — the same join the forward buffer makes, in the other direction.
+// ─── the in-memory model ─────────────────────────────────────────────────────
+
+/// One transaction found by this pass.
+struct PassTx {
+    hash: Hash<32>,
+    slot: u64,
+    block_time: u64,
+    /// Per unit: 0 / +mint / −burn.
+    net_mint: Vec<(Vec<u8>, i64)>,
+    /// `(unit, address, amount)` — outputs as found, negatives as resolved.
+    deltas: Vec<(Vec<u8>, String, i64)>,
+}
+
+impl PassTx {
+    /// This transaction's rows as first found — its outputs, plus a
+    /// placeholder for a minted-or-burned unit that reached nobody. What the
+    /// live view is handed before any source is resolved; resolutions arrive
+    /// as further signed rows and fold on top.
+    fn live_rows(&self) -> Vec<Movement> {
+        let hash = self.hash.as_ref().to_vec();
+        let mut rows: Vec<Movement> = self
+            .deltas
+            .iter()
+            .map(|(unit, address, amount)| Movement {
+                slot: self.slot,
+                block_time: self.block_time,
+                tx_hash: hash.clone(),
+                unit_name: unit.clone(),
+                address: address.clone(),
+                amount: *amount,
+                net_mint: self
+                    .net_mint
+                    .iter()
+                    .find(|(n, _)| n == unit)
+                    .map_or(0, |(_, a)| *a),
+            })
+            .collect();
+        for (unit, amount) in &self.net_mint {
+            if !self.deltas.iter().any(|(u, _, _)| u == unit) {
+                rows.push(Movement {
+                    slot: self.slot,
+                    block_time: self.block_time,
+                    tx_hash: hash.clone(),
+                    unit_name: unit.clone(),
+                    address: String::new(),
+                    amount: 0,
+                    net_mint: *amount,
+                });
+            }
+        }
+        rows
+    }
+}
+
+/// Everything this pass found, indexed by hash for backfills.
+#[derive(Default)]
+struct Model {
+    txs: Vec<PassTx>,
+    by_hash: HashMap<Hash<32>, usize>,
+}
+
+impl Model {
+    fn push(&mut self, tx: PassTx) {
+        self.by_hash.insert(tx.hash, self.txs.len());
+        self.txs.push(tx);
+    }
+
+    fn backfill(
+        &mut self,
+        spender: &Hash<32>,
+        unit: Vec<u8>,
+        address: String,
+        amount: i64,
+    ) -> bool {
+        match self.by_hash.get(spender) {
+            Some(&i) => {
+                self.txs[i].deltas.push((unit, address, amount));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Archive rows, in writer order, summed per `(tx, unit, party)`, with a
+    /// placeholder for every minted-or-burned unit that reached no party.
+    ///
+    /// A transaction whose every delta nets to zero and that minted nothing
+    /// produces NO rows and is not in the archive: the asset rode through it
+    /// as change and nothing moved. Measured on SpaceBudz, 89 of the 160
+    /// transactions touching the policy in a 120-day window were of that
+    /// kind — which is why [`Rows::txs`] is reported separately from what the
+    /// walk found.
+    fn into_rows(self) -> Rows {
+        let mut units: HashSet<Vec<u8>> = HashSet::new();
+        let mut txs = 0u64;
+        let mut rows: Vec<Movement> = Vec::new();
+        for tx in self.txs {
+            let before = rows.len();
+            let net: HashMap<&[u8], i64> = tx
+                .net_mint
+                .iter()
+                .map(|(n, a)| (n.as_slice(), *a))
+                .collect();
+            let mut summed: HashMap<(Vec<u8>, String), i64> = HashMap::new();
+            for (unit, address, amount) in &tx.deltas {
+                units.insert(unit.clone());
+                *summed.entry((unit.clone(), address.clone())).or_insert(0) += amount;
+            }
+            let mut seen_units: HashSet<Vec<u8>> = HashSet::new();
+            for ((unit, address), amount) in summed {
+                if amount == 0 {
+                    continue;
+                }
+                seen_units.insert(unit.clone());
+                rows.push(Movement {
+                    slot: tx.slot,
+                    block_time: tx.block_time,
+                    tx_hash: tx.hash.as_ref().to_vec(),
+                    net_mint: net.get(unit.as_slice()).copied().unwrap_or(0),
+                    unit_name: unit,
+                    address,
+                    amount,
+                });
+            }
+            for (unit, amount) in &tx.net_mint {
+                units.insert(unit.clone());
+                if !seen_units.contains(unit) {
+                    rows.push(Movement {
+                        slot: tx.slot,
+                        block_time: tx.block_time,
+                        tx_hash: tx.hash.as_ref().to_vec(),
+                        unit_name: unit.clone(),
+                        address: String::new(),
+                        amount: 0,
+                        net_mint: *amount,
+                    });
+                }
+            }
+            if rows.len() > before {
+                txs += 1;
+            }
+        }
+        sort_for_writer(&mut rows);
+        Rows {
+            rows,
+            units: units.len() as u64,
+            txs,
+        }
+    }
+}
+
+/// What a model became on disk.
+struct Rows {
+    rows: Vec<Movement>,
+    /// Distinct units with a row.
+    units: u64,
+    /// Transactions with at least one row — what the archive HOLDS, as
+    /// against what the walk found.
+    txs: u64,
+}
+
+/// The writer's order: block time, then transaction, then unit, then party.
+fn sort_for_writer(rows: &mut [Movement]) {
+    rows.sort_by(|a, b| {
+        a.block_time
+            .cmp(&b.block_time)
+            .then_with(|| a.tx_hash.cmp(&b.tx_hash))
+            .then_with(|| a.unit_name.cmp(&b.unit_name))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+}
+
+// ─── pending ─────────────────────────────────────────────────────────────────
+
+/// A transaction waiting on its sources.
+struct Spender {
+    hash: Hash<32>,
+    slot: u64,
+    block_time: u64,
+    /// Per unit, the amount still unattributed. A unit at zero is settled.
+    missing: HashMap<Vec<u8>, i64>,
+    net_mint: Vec<(Vec<u8>, i64)>,
+    outrefs: Vec<OutRef>,
+    /// Found by THIS pass (backfill the model) or an earlier one (write a
+    /// correction)?
+    origin: Origin,
+    retired: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    ThisPass,
+    EarlierPass,
+}
+
+impl Spender {
+    fn settled(&self) -> bool {
+        self.missing.values().all(|m| *m <= 0)
+    }
+}
+
+/// One resolved negative delta.
+struct Resolution {
+    spender: Hash<32>,
+    origin: Origin,
+    slot: u64,
+    block_time: u64,
+    unit: Vec<u8>,
+    address: String,
+    amount: i64,
+    net_mint: i64,
+}
+
+/// Outrefs spent by transactions already found, whose creating outputs are
+/// still below the walk.
 #[derive(Default)]
 pub struct Pending {
-    /// outref → the transactions that spent it.
-    ///
-    /// A `Vec` because a single outref can only be spent once on chain, but a
-    /// resumed run can legitimately re-record the same waiter, and collapsing
-    /// that to a single slot would drop the second half of a re-walk.
-    waiting: HashMap<(Hash<32>, u32), Vec<Hash<32>>>,
-    /// Changes since the last drain — the unit of PERSISTENCE.
-    ///
-    /// Kept as a changelog rather than rewriting the whole set per chunk
-    /// because the set runs to tens of thousands of entries while a chunk
-    /// touches a handful, and the floor cursor advances every chunk. Those two
-    /// have to move together: a pass killed with the floor advanced but its
-    /// pending unsaved leaves sources below that floor permanently
-    /// unresolvable, because nothing will ever look for them again.
-    added: Vec<((Hash<32>, u32), Hash<32>)>,
-    removed: Vec<(Hash<32>, u32)>,
+    spenders: Vec<Spender>,
+    /// outref → spenders waiting on it. An outref is spent once on chain, but
+    /// the same spender can be re-registered across passes, so it is a list
+    /// with duplicates refused.
+    wants: HashMap<OutRef, Vec<usize>>,
 }
 
 impl Pending {
-    /// Rebuild from what a previous pass left behind.
-    pub fn load(entries: Vec<((Hash<32>, u32), Hash<32>)>) -> Self {
-        let mut waiting: HashMap<(Hash<32>, u32), Vec<Hash<32>>> = HashMap::new();
-        for (oref, spender) in entries {
-            waiting.entry(oref).or_default().push(spender);
+    /// Rebuild from what the previous pass left behind.
+    pub fn load(spenders: Vec<PendingSpender>) -> Self {
+        let mut p = Pending::default();
+        for s in spenders {
+            let idx = p.spenders.len();
+            let outrefs: Vec<OutRef> = s
+                .outrefs
+                .iter()
+                .map(|(h, i)| (Hash::from(*h), *i))
+                .collect();
+            for oref in &outrefs {
+                p.wants.entry(*oref).or_default().push(idx);
+            }
+            p.spenders.push(Spender {
+                hash: Hash::from(s.tx_hash),
+                slot: s.slot,
+                block_time: s.block_time,
+                missing: s.missing.into_iter().collect(),
+                net_mint: s.net_mint,
+                outrefs,
+                origin: Origin::EarlierPass,
+                retired: false,
+            });
         }
-        // Loaded entries are already ON DISK, so the changelog starts empty.
-        // Seeding it with them would re-insert every row on the first chunk —
-        // harmless under `INSERT OR IGNORE`, but it would turn a handful of
-        // writes per chunk into tens of thousands.
-        Self {
-            waiting,
-            ..Default::default()
+        p
+    }
+
+    /// Register a transaction found in this pass whose deltas do not balance.
+    fn want(&mut self, tx: &PassTx, missing: HashMap<Vec<u8>, i64>, inputs: &[OutRef]) {
+        let idx = self.spenders.len();
+        for oref in inputs {
+            let slot = self.wants.entry(*oref).or_default();
+            if !slot.contains(&idx) {
+                slot.push(idx);
+            }
         }
+        self.spenders.push(Spender {
+            hash: tx.hash,
+            slot: tx.slot,
+            block_time: tx.block_time,
+            missing,
+            net_mint: tx.net_mint.clone(),
+            outrefs: inputs.to_vec(),
+            origin: Origin::ThisPass,
+            retired: false,
+        });
     }
 
-    /// Flatten for persistence.
-    pub fn entries(&self) -> Vec<((Hash<32>, u32), Hash<32>)> {
-        self.waiting
-            .iter()
-            .flat_map(|(oref, spenders)| spenders.iter().map(move |s| (*oref, *s)))
-            .collect()
-    }
-
-    fn want(&mut self, oref: (Hash<32>, u32), spender: Hash<32>) {
-        let slot = self.waiting.entry(oref).or_default();
-        // A resumed pass reloads what it already recorded, so the same waiter
-        // can arrive twice. Duplicates would emit the same backfill twice —
-        // harmless only because `add_deltas` ignores conflicts, which is a
-        // guard to lean on, not a reason to create the condition.
-        if !slot.contains(&spender) {
-            slot.push(spender);
-            self.added.push((oref, spender));
+    /// An output has come into view. Everyone waiting on it learns who held
+    /// it and how much — their missing negatives — and a spender whose units
+    /// now balance is retired along with its remaining wants.
+    fn resolve(
+        &mut self,
+        oref: &OutRef,
+        units: &[(Vec<u8>, i64)],
+        address: &str,
+    ) -> Vec<Resolution> {
+        let Some(waiting) = self.wants.remove(oref) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for idx in waiting {
+            let s = &mut self.spenders[idx];
+            if s.retired {
+                continue;
+            }
+            for (unit, qty) in units {
+                if let Some(m) = s.missing.get_mut(unit) {
+                    *m -= qty;
+                }
+                let net_mint = s
+                    .net_mint
+                    .iter()
+                    .find(|(n, _)| n == unit)
+                    .map_or(0, |(_, a)| *a);
+                out.push(Resolution {
+                    spender: s.hash,
+                    origin: s.origin,
+                    slot: s.slot,
+                    block_time: s.block_time,
+                    unit: unit.clone(),
+                    address: address.to_string(),
+                    amount: -qty,
+                    net_mint,
+                });
+            }
+            s.outrefs.retain(|o| o != oref);
+            if s.settled() {
+                // Its other inputs were carrying ADA. Forget them, or they
+                // sit in the pending set forever — measured at 1,062,528
+                // entries on a ledger that was provably complete.
+                s.retired = true;
+                let leftovers = std::mem::take(&mut s.outrefs);
+                for o in leftovers {
+                    if let Some(list) = self.wants.get_mut(&o) {
+                        list.retain(|i| *i != idx);
+                        if list.is_empty() {
+                            self.wants.remove(&o);
+                        }
+                    }
+                }
+            }
         }
+        out
     }
 
-    /// Transactions waiting on this outref, removing it from the open set.
-    fn resolve(&mut self, oref: &(Hash<32>, u32)) -> Option<Vec<Hash<32>>> {
-        let found = self.waiting.remove(oref);
-        if found.is_some() {
-            self.removed.push(*oref);
-        }
-        found
-    }
-
-    /// Drain the changelog for persistence.
-    fn take_changes(&mut self) -> (Vec<((Hash<32>, u32), Hash<32>)>, Vec<(Hash<32>, u32)>) {
-        (
-            std::mem::take(&mut self.added),
-            std::mem::take(&mut self.removed),
-        )
-    }
-
+    /// Spenders still waiting.
     pub fn len(&self) -> usize {
-        self.waiting.len()
+        self.spenders
+            .iter()
+            .filter(|s| !s.retired && !s.outrefs.is_empty())
+            .count()
     }
 
     #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.waiting.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The carried state, as the next pass will load it.
+    fn to_file(&self) -> PendingFile {
+        PendingFile {
+            spenders: self
+                .spenders
+                .iter()
+                .filter(|s| !s.retired && !s.outrefs.is_empty())
+                .map(|s| PendingSpender {
+                    tx_hash: *s.hash.as_ref().first_chunk::<32>().expect("32-byte hash"),
+                    slot: s.slot,
+                    block_time: s.block_time,
+                    missing: s.missing.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                    net_mint: s.net_mint.clone(),
+                    outrefs: s
+                        .outrefs
+                        .iter()
+                        .map(|(h, i)| (*h.as_ref().first_chunk::<32>().expect("32-byte hash"), *i))
+                        .collect(),
+                })
+                .collect(),
+        }
     }
 }
 
-/// Where a pass has got to, emitted after every chunk it commits.
-///
-/// A reverse pass exists to feed a live surface, so it has to SAY where it is
-/// while it runs. Without this a consumer sees rows appear in the ledger with
-/// no way to tell whether more are coming, how far back the walk has reached,
-/// or which already-delivered rows just changed underneath it — measured on the
-/// SpaceBudz full-history run, which committed 49,591 transactions while
-/// emitting a single log line.
-///
-/// Emitted per CHUNK rather than per row: a chunk is the commit unit, so it is
-/// the only boundary at which the ledger is consistent for a reader, and it is
-/// ~6h of chain — frequent enough for a progress bar, rare enough not to flood
-/// a socket.
+// ─── the pass ────────────────────────────────────────────────────────────────
+
+/// Where a pass has got to, emitted after every chunk.
 pub struct Progress<'a> {
     /// Lowest slot covered so far. Moves DOWN as the pass runs.
     pub floor: u64,
     /// Where this pass is heading — the requested floor.
     pub target_floor: u64,
-    /// Where it started. `ceiling - floor` over `ceiling - target_floor` is the
-    /// fraction done.
+    /// Where it started.
     pub ceiling: u64,
     pub chunks_done: u64,
     pub chunks_total: u64,
-    /// Transactions written so far by this pass.
+    /// Transactions found so far by this pass.
     pub written: u64,
     /// Transactions whose deltas CHANGED in this chunk — a source resolved.
-    ///
-    /// The payload a `RowsUpdated` needs. A count cannot serve it: the consumer
-    /// has to know WHICH rows to re-read, and a reverse walk corrects rows it
-    /// delivered minutes earlier.
     pub updated: &'a [Hash<32>],
-    /// Outrefs still waiting on a source below the floor.
+    /// Spenders still waiting on a source below the floor.
     pub pending: usize,
+    /// THE LOWER LOD: every archive row this chunk produced — new
+    /// transactions' rows and every resolution as a signed row — in the same
+    /// shape the Parquet will hold. A hosted surface keeps these in memory
+    /// and serves them, folded, until the pass lands and the archive takes
+    /// over; a reader scrubbing into the in-progress stretch sees what has
+    /// been walked so far rather than nothing.
+    pub rows: &'a [Movement],
 }
 
 impl Progress<'_> {
-    /// How far through the requested range, 0.0–1.0.
-    ///
-    /// Saturating rather than panicking on a zero-width range: a pass with
-    /// nothing to do is a legitimate state and a progress bar should read it as
-    /// finished, not divide by zero.
+    /// How far through the requested range, 0.0–1.0. Saturating: a pass with
+    /// nothing to do reads as finished, not as a division by zero.
     pub fn fraction(&self) -> f64 {
         let span = self.ceiling.saturating_sub(self.target_floor);
         if span == 0 {
@@ -495,30 +873,20 @@ impl Progress<'_> {
     }
 }
 
-/// The callback shape a pass reports through. Mirrors the forward walk's
-/// `Prog<'_>` so both walkers report the same way.
 pub type OnProgress<'x> = &'x dyn Fn(Progress<'_>);
 
-/// How far a reverse pass got, and what it cost.
-pub struct Outcome {
-    /// Lowest slot now covered — the ledger's new floor.
-    pub floor: u64,
-    /// Transactions written by this pass.
-    pub written: u64,
-    /// Delta rows backfilled onto transactions written earlier, here or by a
-    /// previous pass. The measure of the walk resolving its own history.
-    pub backfilled: usize,
-    /// Outrefs still waiting on a source below the floor. The honest gap, and
-    /// what a deeper pass would close.
-    pub unresolved: usize,
+/// What the chunk walk itself produced, before anything is written.
+struct Walked {
+    floor: u64,
+    written: u64,
+    backfilled: usize,
 }
 
 /// Chunk numbers to visit, highest first, covering `[floor, ceiling)`.
 ///
-/// Descending is the whole point, but the chunk LIST still has to come from the
-/// directory rather than from arithmetic: chunk files are dense in practice and
-/// sparse in principle, and inventing numbers that are not on disk turns a gap
-/// into a read error halfway through a pass.
+/// The chunk LIST comes from the directory rather than from arithmetic: chunk
+/// files are dense in practice and sparse in principle, and inventing numbers
+/// that are not on disk turns a gap into a read error mid-pass.
 pub fn chunks_descending(chunks: &[u64], floor: u64, ceiling: u64) -> Vec<u64> {
     let lo = floor / CHUNK_SLOTS;
     let hi = ceiling.div_ceil(CHUNK_SLOTS);
@@ -531,14 +899,13 @@ pub fn chunks_descending(chunks: &[u64], floor: u64, ceiling: u64) -> Vec<u64> {
     wanted
 }
 
-/// One chunk's transactions, newest first.
+/// One chunk's blocks, newest first, gated at the chunk AND the block.
 ///
-/// The immutable DB only reads FORWARD — `open_blocks` seeks to a point and
-/// streams upward — so "reverse" is chunk-descending with each chunk read
-/// forward and flipped. A chunk is 21,600 slots (~6h), which is fine grain for a
-/// feed and a trivial amount to hold: only blocks that pass the sieve gate are
-/// decoded, and only their watched transactions are kept.
-fn chunk_txs_newest_first(
+/// The immutable DB only reads FORWARD, so "reverse" is chunk-descending with
+/// each chunk read forward and flipped. The chunk-level gate — one `fs::read`
+/// plus one memmem — skips the whole file on a miss, which is almost every
+/// file, since a policy's activity is a thin slice of the chain.
+fn chunk_blocks_newest_first(
     immutable: &Path,
     chunk: u64,
     needles: Option<&chain_sieve::Needles<'_>>,
@@ -546,19 +913,6 @@ fn chunk_txs_newest_first(
     let start = chunk * CHUNK_SLOTS;
     let end = (chunk + 1) * CHUNK_SLOTS;
 
-    // CHUNK-LEVEL GATE FIRST — the cheap half, and the one that decides whether
-    // a deep pass is minutes or an hour.
-    //
-    // A per-BLOCK gate still pays the sequential reader for every block in the
-    // file (~600 MB/s) even when nothing in it is ours. Reading the raw chunk
-    // with one `fs::read` and one memmem runs at parallel-read speed and skips
-    // the whole file on a miss — which is almost every file, since a policy's
-    // activity is a thin slice of the chain. Same trick, same reason, as
-    // `chain_sieve::scan_extract`.
-    //
-    // Sound for the same reason the block gate is: a transaction touching the
-    // policy carries its id in an output value or the mint field, so a chunk
-    // whose bytes lack it cannot hold one.
     if let Some(n) = needles {
         let path = immutable.join(format!("{chunk:05}.chunk"));
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -572,9 +926,6 @@ fn chunk_txs_newest_first(
     let mut out = Vec::new();
     for raw in blocks {
         let raw = raw.map_err(|e| anyhow::anyhow!("reading block in chunk {chunk}: {e:?}"))?;
-        // Cheap slot peek before any gate: decoding is the cost this whole
-        // design exists to avoid, but we must decode to learn the slot. The
-        // sieve check first is therefore strictly cheaper on a miss.
         if let Some(n) = needles
             && !n.hit(&raw)
         {
@@ -596,28 +947,22 @@ fn chunk_txs_newest_first(
     Ok(out)
 }
 
-/// Walk `[floor, ceiling)` backward, writing rows newest-first and resolving
-/// sources as they come into view.
-///
-/// `ceiling` is exclusive and is normally the ledger's existing floor, so a
-/// pass extends coverage downward contiguously — which is what lets the caller
-/// lower `walked_from` for every chunk that commits.
+/// Walk `[floor, ceiling)` backward into the model, resolving sources as they
+/// come into view.
 #[allow(clippy::too_many_arguments)]
-pub fn pass(
-    ledger: &mut Ledger,
+fn pass(
     immutable: &Path,
     chunks: &[u64],
     policy: &[u8],
     watched: &Watched,
     floor: u64,
     ceiling: u64,
+    model: &mut Model,
     pending: &mut Pending,
+    corrections: &mut Vec<Movement>,
     sieve: bool,
-    // Does this pass extend the ledger's contiguous coverage, or is it a
-    // detached probe? See `ReverseArgs::from_slot`.
-    contiguous: bool,
     on: OnProgress<'_>,
-) -> Result<Outcome> {
+) -> Result<Walked> {
     let needles = sieve
         .then(|| chain_sieve::Needles::new(std::slice::from_ref(&policy.to_vec())))
         .transpose()?;
@@ -630,12 +975,13 @@ pub fn pass(
     let mut chunks_done = 0u64;
 
     for chunk in ordered {
-        let blocks = chunk_txs_newest_first(immutable, chunk, needles.as_ref())?;
-        let mut rows: Vec<TxRow> = Vec::new();
-        // Backfills discovered in this chunk, applied after its rows are
-        // written: a source and its spender can sit in the SAME chunk, and
-        // applying the backfill first would find no parent transaction.
-        let mut resolved: Vec<(Hash<32>, DeltaRow)> = Vec::new();
+        let blocks = chunk_blocks_newest_first(immutable, chunk, needles.as_ref())?;
+        // Resolutions found in this chunk, applied after its rows are in the
+        // model: a source and its spender can sit in the SAME chunk, and the
+        // spender must exist before its backfill lands.
+        let mut resolved: Vec<Resolution> = Vec::new();
+        // What this chunk adds, as archive rows, for the live view.
+        let mut chunk_rows: Vec<Movement> = Vec::new();
 
         for (slot, raw) in blocks {
             if slot < floor || slot >= ceiling {
@@ -646,9 +992,6 @@ pub fn pass(
                 .map_err(|e| anyhow::anyhow!("decoding block at slot {slot}: {e:?}"))?;
             let block_time = slot_to_unix(slot);
 
-            // Transactions within a block are reversed too, so the emitted
-            // order is a strict newest-first total order rather than one that
-            // is newest-first between blocks and oldest-first inside them.
             let txs: Vec<_> = blk.txs();
             for tx in txs.iter().rev() {
                 let dtx = decode_tx(tx);
@@ -667,141 +1010,96 @@ pub fn pass(
                     }
                 }
 
-                // OUTPUTS: known now, and they are two things at once — this
-                // transaction's own positive deltas, AND the resolution of
-                // whatever spent them later.
-                let mut deltas: Vec<DeltaRow> = Vec::new();
+                // OUTPUTS: this transaction's own positive deltas, AND the
+                // resolution of whatever spent them later.
+                let mut deltas: Vec<(Vec<u8>, String, i64)> = Vec::new();
                 for out in &dtx.outputs {
                     let units = units_in_output(tx, out, policy, watched);
                     if units.is_empty() {
                         continue;
                     }
-                    let stake = stake_of(&out.address);
                     for (name, qty) in &units {
-                        deltas.push(DeltaRow {
-                            address: out.address.clone(),
-                            stake: stake.clone(),
-                            name: name.clone(),
-                            amount: *qty,
-                        });
+                        deltas.push((name.clone(), out.address.clone(), *qty));
                     }
-                    // Anyone waiting on this outref now learns who held it and
-                    // how much — their MISSING NEGATIVE.
-                    if let Some(spenders) = pending.resolve(&(dtx.tx_hash, out.index)) {
-                        for spender in spenders {
-                            for (name, qty) in &units {
-                                resolved.push((
-                                    spender,
-                                    DeltaRow {
-                                        address: out.address.clone(),
-                                        stake: stake.clone(),
-                                        name: name.clone(),
-                                        amount: -qty,
-                                    },
-                                ));
-                            }
-                        }
-                    }
+                    resolved.extend(pending.resolve(
+                        &(dtx.tx_hash, out.index),
+                        &units,
+                        &out.address,
+                    ));
                 }
 
-                // Any transaction that MOVES a watched asset necessarily has it
-                // in an output — or, for a burn, in the mint field. So this is
-                // complete: a transaction with neither touches nothing of ours.
                 let touches_us = !deltas.is_empty() || !net_mint.is_empty();
                 if !touches_us {
                     continue;
                 }
 
-                // INPUTS: register interest ONLY where a source is actually
-                // missing.
-                //
-                // Conservation says exactly that. A transaction whose deltas
-                // already balance has every party accounted for, so none of its
-                // inputs held a watched asset and waiting on them is waiting
-                // forever. Registering them all instead put every ADA input of
-                // every watched transaction into the pending set — unbounded
-                // growth, on entries that can never resolve.
-                //
-                // `Unattributed` is the missing-negative case; see
-                // `walk::BreachKind`.
-                let as_map: HashMap<(String, Vec<u8>), (Option<String>, i64)> = deltas
-                    .iter()
-                    .map(|d| {
-                        (
-                            (d.address.clone(), d.name.clone()),
-                            (d.stake.clone(), d.amount),
-                        )
+                // INPUTS: register interest ONLY where a source is missing —
+                // per unit, by how much. Conservation says exactly that.
+                let mut sums: HashMap<Vec<u8>, i64> = HashMap::new();
+                for (unit, _, amount) in &deltas {
+                    *sums.entry(unit.clone()).or_insert(0) += amount;
+                }
+                for unit in net_mint.keys() {
+                    sums.entry(unit.clone()).or_insert(0);
+                }
+                let missing: HashMap<Vec<u8>, i64> = sums
+                    .into_iter()
+                    .filter_map(|(unit, sum)| {
+                        let minted = net_mint.get(&unit).copied().unwrap_or(0);
+                        (sum > minted).then_some((unit, sum - minted))
                     })
                     .collect();
-                let missing_source = crate::walk::conservation_breaches(&as_map, &net_mint)
-                    .iter()
-                    .any(|b| b.kind == crate::walk::BreachKind::Unattributed);
-                if missing_source {
-                    for inp in &dtx.inputs {
-                        pending.want(inp.oref, dtx.tx_hash);
-                    }
-                }
 
-                rows.push(TxRow {
-                    tx_hash: dtx.tx_hash,
+                let row = PassTx {
+                    hash: dtx.tx_hash,
                     slot,
                     block_time,
                     net_mint: net_mint.into_iter().collect(),
                     deltas,
-                    // Pool reserves and lock lifetimes are COMPLETENESS-shaped
-                    // projections: both are read off the live open set, which a
-                    // reverse pass does not have. They stay the forward walk's
-                    // job, and leaving them empty here is what stops a partial
-                    // pass publishing a half-populated curve.
-                    pools: Vec::new(),
-                    locks_created: Vec::new(),
-                    locks_spent: Vec::new(),
-                });
+                };
+                if !missing.is_empty() {
+                    let inputs: Vec<OutRef> = dtx.inputs.iter().map(|i| i.oref).collect();
+                    pending.want(&row, missing, &inputs);
+                }
+                chunk_rows.extend(row.live_rows());
+                model.push(row);
+                written += 1;
             }
         }
 
+        // Apply this chunk's resolutions: into the model for this pass's
+        // rows, into the corrections file for earlier passes'. Both are ALSO
+        // live rows — a fold sums them onto whatever the reader already has.
+        let mut updated: Vec<Hash<32>> = Vec::new();
+        for r in resolved {
+            backfilled += 1;
+            if !updated.contains(&r.spender) {
+                updated.push(r.spender);
+            }
+            let as_row = Movement {
+                slot: r.slot,
+                block_time: r.block_time,
+                tx_hash: r.spender.as_ref().to_vec(),
+                unit_name: r.unit.clone(),
+                address: r.address.clone(),
+                amount: r.amount,
+                net_mint: r.net_mint,
+            };
+            match r.origin {
+                Origin::ThisPass => {
+                    if !model.backfill(&r.spender, r.unit, r.address, r.amount) {
+                        bail!(
+                            "resolution for {} which this pass never recorded",
+                            hex::encode(r.spender.as_ref())
+                        );
+                    }
+                }
+                Origin::EarlierPass => corrections.push(as_row.clone()),
+            }
+            chunk_rows.push(as_row);
+        }
+
         chunks_done += 1;
-        written += rows.len() as u64;
-        if !rows.is_empty() {
-            // The buffer is not this mode's state, so nothing is persisted
-            // through it; the cursor `commit_block` would write is the FORWARD
-            // frontier, which a reverse pass must not move. `commit_rows`
-            // exists for exactly that.
-            ledger.commit_rows(&rows)?;
-        }
-
-        let mut by_tx: HashMap<Hash<32>, Vec<DeltaRow>> = HashMap::new();
-        for (spender, delta) in resolved {
-            by_tx.entry(spender).or_default().push(delta);
-        }
-        // WHICH transactions changed, not just how many. A consumer that was
-        // handed these rows earlier has to re-read exactly these.
-        let updated: Vec<Hash<32>> = by_tx.keys().copied().collect();
-        let backfills: Vec<(Hash<32>, Vec<DeltaRow>)> = by_tx.into_iter().collect();
-
-        // EVERY chunk, including one that held nothing of ours.
-        //
-        // Coverage extends downward one chunk at a time, so the floor moves
-        // with committed work rather than at the end of the pass. A pass killed
-        // halfway leaves a ledger that knows exactly how deep it got — and,
-        // because the pending changes ride the SAME transaction, exactly what
-        // it was still waiting for at that depth.
-        //
-        // An empty chunk still advances it: we READ that chunk and it held
-        // nothing, which is a fact worth keeping. Skipping the write here made
-        // the recorded floor stop at the deepest chunk that happened to contain
-        // a transaction, so every later pass re-read the quiet stretch below it.
-        let (added, removed) = pending.take_changes();
-        backfilled += ledger.commit_chunk(
-            &backfills,
-            &added,
-            &removed,
-            contiguous.then(|| chunk * CHUNK_SLOTS),
-        )?;
-
-        // AFTER the commit, so a consumer that reacts by reading the ledger
-        // finds the rows this event is telling it about. Reported before the
-        // commit, the read would race and come back short.
         on(Progress {
             floor: lowest,
             target_floor: floor,
@@ -811,14 +1109,19 @@ pub fn pass(
             written,
             updated: &updated,
             pending: pending.len(),
+            rows: &chunk_rows,
         });
     }
 
-    Ok(Outcome {
-        floor: lowest,
+    // Coverage is where the pass STOPPED LOOKING, not the deepest row it
+    // found: a quiet stretch below the last hit was read and held nothing,
+    // which is a fact worth keeping. Only a range with no chunks on disk at
+    // all extends nothing.
+    sort_for_writer(corrections);
+    Ok(Walked {
+        floor: if chunks_total == 0 { ceiling } else { floor },
         written,
         backfilled,
-        unresolved: pending.len(),
     })
 }
 
@@ -830,8 +1133,243 @@ mod tests {
         Hash::from([b; 32])
     }
 
-    /// Descending, and only chunks that exist on disk. Inventing a number that
-    /// is not there turns a sparse range into a read error mid-pass.
+    fn tx(b: u8, deltas: Vec<(&str, &str, i64)>) -> PassTx {
+        PassTx {
+            hash: h(b),
+            slot: 1_000 + b as u64,
+            block_time: 1_700_000_000 + b as u64,
+            net_mint: Vec::new(),
+            deltas: deltas
+                .into_iter()
+                .map(|(u, a, n)| (u.as_bytes().to_vec(), a.to_string(), n))
+                .collect(),
+        }
+    }
+
+    fn missing(unit: &str, n: i64) -> HashMap<Vec<u8>, i64> {
+        HashMap::from([(unit.as_bytes().to_vec(), n)])
+    }
+
+    /// Resolving an outref hands its holder to the spender and removes it
+    /// from the open set — a second sighting resolves nothing.
+    #[test]
+    fn resolving_an_outref_removes_it_from_the_open_set() {
+        let mut p = Pending::default();
+        let spender = tx(1, vec![("A", "bob", 1)]);
+        p.want(&spender, missing("A", 1), &[(h(9), 0), (h(9), 1)]);
+        let got = p.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].amount, got[0].address.as_str()), (-1, "alice"));
+        assert!(
+            p.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice")
+                .is_empty()
+        );
+    }
+
+    /// THE RETIREMENT RULE. Once the spender's units balance, its OTHER
+    /// inputs are forgotten — they were carrying ADA and would wait forever.
+    #[test]
+    fn a_balanced_spender_forgets_its_other_inputs() {
+        let mut p = Pending::default();
+        let spender = tx(1, vec![("A", "bob", 1)]);
+        p.want(&spender, missing("A", 1), &[(h(9), 0), (h(8), 3)]);
+        assert_eq!(p.len(), 1);
+        p.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
+        assert!(p.is_empty(), "settled, so nothing is pending");
+        assert!(
+            p.resolve(&(h(8), 3), &[(b"A".to_vec(), 1)], "carol")
+                .is_empty()
+        );
+        assert!(p.to_file().spenders.is_empty());
+    }
+
+    /// A batched fill missing two sources stays pending after one arrives.
+    #[test]
+    fn a_partly_resolved_spender_stays_pending() {
+        let mut p = Pending::default();
+        let spender = tx(1, vec![("A", "bob", 2)]);
+        p.want(&spender, missing("A", 2), &[(h(9), 0), (h(8), 0)]);
+        p.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
+        assert_eq!(p.len(), 1);
+        let file = p.to_file();
+        assert_eq!(file.spenders[0].missing, vec![(b"A".to_vec(), 1)]);
+        assert_eq!(file.spenders[0].outrefs, vec![([8; 32], 0)]);
+    }
+
+    /// The carried state round-trips: what the next pass loads resolves
+    /// exactly what this one was waiting for, and as an EARLIER-pass spender.
+    #[test]
+    fn pending_survives_a_pass_boundary_as_an_earlier_spender() {
+        let mut p = Pending::default();
+        let spender = tx(1, vec![("A", "bob", 1)]);
+        p.want(&spender, missing("A", 1), &[(h(9), 0)]);
+        let mut next = Pending::load(p.to_file().spenders);
+        assert_eq!(next.len(), 1);
+        let got = next.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
+        assert_eq!(got[0].origin, Origin::EarlierPass);
+        assert_eq!(got[0].slot, 1_001);
+    }
+
+    /// The model's rows: a party on both sides nets out, and a burned unit
+    /// that reached nobody becomes a placeholder rather than vanishing.
+    #[test]
+    fn the_model_sums_and_placeholders_its_rows() {
+        let mut m = Model::default();
+        let mut t = tx(1, vec![("A", "alice", 1), ("B", "bob", 1)]);
+        t.net_mint = vec![(b"C".to_vec(), -1)];
+        m.push(t);
+        assert!(m.backfill(&h(1), b"A".to_vec(), "alice".into(), -1));
+        assert!(m.backfill(&h(1), b"B".to_vec(), "carol".into(), -1));
+        assert!(!m.backfill(&h(2), b"B".to_vec(), "carol".into(), -1));
+        let Rows { rows, units, txs } = m.into_rows();
+        assert_eq!(units, 3);
+        assert_eq!(txs, 1);
+        let a: Vec<&Movement> = rows.iter().filter(|r| r.unit_name == b"A").collect();
+        assert!(a.is_empty(), "alice's change nets to nothing");
+        let b: Vec<&Movement> = rows.iter().filter(|r| r.unit_name == b"B").collect();
+        assert_eq!(b.len(), 2);
+        let c: Vec<&Movement> = rows.iter().filter(|r| r.unit_name == b"C").collect();
+        assert_eq!(c.len(), 1);
+        assert!(c[0].is_placeholder());
+        assert_eq!(c[0].net_mint, -1);
+    }
+
+    /// THE ARCHIVE END TO END, without a chain: two passes, the second
+    /// resolving a source for a row the first published, read back through
+    /// the same range reader the API uses.
+    #[test]
+    fn two_passes_write_an_archive_the_reader_folds_correctly() {
+        use crate::archive::PolicyArchive;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ab".repeat(28));
+        let mut manifest = Manifest::new(&"ab".repeat(28));
+
+        // PASS 1: newest window. tx 5 received unit A from a source below the
+        // floor (missing 1), tx 6 minted unit B.
+        let mut model = Model::default();
+        model.push(tx(5, vec![("A", "bob", 1)]));
+        let mut minted = tx(6, vec![("B", "carol", 1)]);
+        minted.net_mint = vec![(b"B".to_vec(), 1)];
+        model.push(minted);
+        let mut pending = Pending::default();
+        pending.want(&model.txs[0], missing("A", 1), &[(h(9), 0), (h(8), 0)]);
+        let out = write_pass(PassWrite {
+            dir: &dir,
+            manifest: &mut manifest,
+            policy_hex: &"ab".repeat(28),
+            first_mint: Some(500),
+            ceiling: 2_000,
+            walked: Walked {
+                floor: 1_004,
+                written: 2,
+                backfilled: 0,
+            },
+            model,
+            corrections: Vec::new(),
+            pending: &pending,
+            secs: 0.0,
+        })
+        .unwrap();
+        assert_eq!(out.unresolved, 1);
+        assert!(out.pending_bytes > 0);
+
+        let mut a = PolicyArchive::open(&dir).unwrap().expect("manifest");
+        assert_eq!(a.manifest.completeness, "partial");
+        let cov = a.coverage();
+        assert_eq!((cov.walked_from, cov.walked_to), (Some(1_004), Some(2_000)));
+        assert_eq!(cov.total_txs, 2);
+        assert_eq!(cov.unresolved, 1);
+        let page = a.feed_rows(10, None).unwrap();
+        assert_eq!(page.len(), 2);
+        let five = page.iter().find(|r| r.tx_hash == h(5).as_ref()).unwrap();
+        assert_eq!(five.units[0].parties.len(), 1, "only the arrival is known");
+        let density = a.density(86_400);
+        assert_eq!(density.iter().map(|b| b.txs).sum::<u64>(), 2);
+        assert_eq!(density.iter().map(|b| b.mints).sum::<u64>(), 1);
+
+        // PASS 2: deeper. The source of tx 5's input comes into view — held
+        // by alice — which is a CORRECTION to a row pass 1 published, and
+        // the walk reaches the registered first mint.
+        let mut pending = Pending::load(
+            archive::load_pending(&dir.join(PassEntry::dir_name(0)).join(archive::PENDING))
+                .unwrap()
+                .spenders,
+        );
+        let resolved = pending.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].origin, Origin::EarlierPass);
+        let corrections: Vec<Movement> = resolved
+            .into_iter()
+            .map(|r| Movement {
+                slot: r.slot,
+                block_time: r.block_time,
+                tx_hash: r.spender.as_ref().to_vec(),
+                unit_name: r.unit,
+                address: r.address,
+                amount: r.amount,
+                net_mint: r.net_mint,
+            })
+            .collect();
+        let mut model = Model::default();
+        model.push(tx(3, vec![("A", "alice", 1)]));
+        let out = write_pass(PassWrite {
+            dir: &dir,
+            manifest: &mut manifest,
+            policy_hex: &"ab".repeat(28),
+            first_mint: Some(500),
+            ceiling: 1_004,
+            walked: Walked {
+                floor: 500,
+                written: 1,
+                backfilled: 1,
+            },
+            model,
+            corrections,
+            pending: &pending,
+            secs: 0.0,
+        })
+        .unwrap();
+        assert_eq!(out.unresolved, 0, "settled, and its ADA input forgotten");
+
+        let mut a = PolicyArchive::open(&dir).unwrap().expect("manifest");
+        assert_eq!(a.manifest.completeness, "complete", "reached the mint");
+        assert_eq!(a.manifest.passes.len(), 2);
+        let cov = a.coverage();
+        assert_eq!((cov.walked_from, cov.walked_to), (Some(500), Some(2_000)));
+        assert_eq!(cov.total_txs, 3);
+        assert_eq!(cov.unresolved, 0);
+
+        // The feed folds the correction in: tx 5 is now alice → bob.
+        let page = a.feed_rows(10, None).unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].tx_hash, h(6).as_ref(), "newest first");
+        let five = page.iter().find(|r| r.tx_hash == h(5).as_ref()).unwrap();
+        let mut parties: Vec<(String, i64)> = five.units[0]
+            .parties
+            .iter()
+            .map(|p| (p.address.clone(), p.amount))
+            .collect();
+        parties.sort();
+        assert_eq!(parties, vec![("alice".into(), -1), ("bob".into(), 1)]);
+
+        // Point lookup through the bloom filters agrees, and a page BEFORE
+        // tx 5 excludes it.
+        let at = a.feed_row_at(h(5).as_ref()).unwrap().expect("found");
+        assert_eq!(at.units[0].parties.len(), 2);
+        assert!(a.feed_row_at(h(77).as_ref()).unwrap().is_none());
+        let older = a.feed_rows(10, Some(1_005)).unwrap();
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].tx_hash, h(3).as_ref());
+
+        // Density counts the correction as a movement of an existing tx,
+        // never as a new one.
+        let density = a.density(86_400);
+        assert_eq!(density.iter().map(|b| b.txs).sum::<u64>(), 3);
+        assert_eq!(density.iter().map(|b| b.movements).sum::<u64>(), 4);
+        let (requests, bytes) = a.fetched();
+        assert!(requests > 0 && bytes > 0);
+    }
+
     #[test]
     fn chunks_come_back_highest_first_and_only_if_present() {
         let on_disk = [10u64, 11, 12, 14, 15];
@@ -839,52 +1377,12 @@ mod tests {
         assert_eq!(got, vec![15, 14, 12, 11]);
     }
 
-    /// The range is inclusive of the chunk holding the floor — a floor mid-chunk
-    /// still needs that chunk read, because the slots above it inside the chunk
-    /// are in range.
     #[test]
     fn the_chunk_holding_the_floor_is_included() {
         let on_disk = [10u64, 11, 12];
         let got = chunks_descending(&on_disk, 11 * CHUNK_SLOTS + 5, 12 * CHUNK_SLOTS);
         assert!(got.contains(&11), "{got:?}");
     }
-
-    /// An outref is resolved once and then gone: leaving it in the open set
-    /// would re-apply its negative delta on the next pass that saw the same
-    /// source, which the `INSERT OR IGNORE` in `add_deltas` would mask rather
-    /// than fix.
-    #[test]
-    fn resolving_an_outref_removes_it_from_the_open_set() {
-        let mut p = Pending::default();
-        p.want((h(1), 0), h(9));
-        assert_eq!(p.len(), 1);
-
-        let waiters = p.resolve(&(h(1), 0)).expect("a waiter");
-        assert_eq!(waiters, vec![h(9)]);
-        assert!(p.is_empty());
-        assert!(p.resolve(&(h(1), 0)).is_none(), "resolved only once");
-    }
-
-    /// Two transactions can wait on different outputs of the same transaction,
-    /// and both must be served when it comes into view.
-    #[test]
-    fn separate_outputs_of_one_source_serve_separate_spenders() {
-        let mut p = Pending::default();
-        p.want((h(1), 0), h(8));
-        p.want((h(1), 1), h(9));
-        assert_eq!(p.resolve(&(h(1), 0)).unwrap(), vec![h(8)]);
-        assert_eq!(p.resolve(&(h(1), 1)).unwrap(), vec![h(9)]);
-    }
-
-    /// Nothing waiting means nothing to serve — the common case, since most
-    /// inputs of a watched transaction never carried the asset.
-    #[test]
-    fn an_unwanted_outref_resolves_to_nothing() {
-        let mut p = Pending::default();
-        assert!(p.resolve(&(h(1), 0)).is_none());
-    }
-
-    // ── progress reporting ──────────────────────────────────────────────────
 
     fn prog(floor: u64, target: u64, ceiling: u64) -> Progress<'static> {
         Progress {
@@ -896,39 +1394,49 @@ mod tests {
             written: 0,
             updated: &[],
             pending: 0,
+            rows: &[],
         }
     }
 
-    /// A reverse pass counts DOWN, so progress is how far the floor has fallen
-    /// from the ceiling toward the target — not how far it is above zero.
+    /// The live rows of a transaction fold to the same feed row the archive
+    /// gives — outputs first, a placeholder for an unattributed burn.
+    #[test]
+    fn live_rows_match_the_archives_shape() {
+        let mut t = tx(1, vec![("A", "alice", 1)]);
+        t.net_mint = vec![(b"A".to_vec(), 0), (b"C".to_vec(), -1)];
+        let rows = t.live_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].unit_name.as_slice(), rows[0].amount),
+            (b"A".as_slice(), 1)
+        );
+        assert!(rows[1].is_placeholder());
+        assert_eq!(rows[1].net_mint, -1);
+        let folded = crate::archive::fold_rows(rows);
+        assert_eq!(folded[0].units.len(), 2);
+    }
+
     #[test]
     fn progress_measures_the_floor_falling_toward_the_target() {
-        assert_eq!(prog(1_000, 0, 1_000).fraction(), 0.0, "nothing covered yet");
-        assert_eq!(prog(500, 0, 1_000).fraction(), 0.5);
-        assert_eq!(prog(0, 0, 1_000).fraction(), 1.0, "reached the target");
+        assert!((prog(75, 50, 100).fraction() - 0.5).abs() < 1e-9);
+        assert!((prog(100, 50, 100).fraction()).abs() < 1e-9);
+        assert!((prog(50, 50, 100).fraction() - 1.0).abs() < 1e-9);
     }
 
-    /// A pass with nothing to do reads as finished. Dividing by a zero-width
-    /// range would be the alternative, on a state that legitimately occurs the
-    /// moment coverage already reaches the requested floor.
     #[test]
     fn an_empty_range_reads_as_complete_rather_than_dividing_by_zero() {
-        assert_eq!(prog(500, 500, 500).fraction(), 1.0);
+        assert!((prog(10, 10, 10).fraction() - 1.0).abs() < 1e-9);
     }
 
-    /// The floor can sit below the target when the last chunk overshoots — a
-    /// chunk is 21,600 slots and the target rarely lands on a boundary. That
-    /// must clamp, never report over 100%.
     #[test]
     fn overshooting_the_target_clamps_at_one() {
-        assert_eq!(prog(0, 100, 1_000).fraction(), 1.0);
+        assert!((prog(10, 50, 100).fraction() - 1.0).abs() < 1e-9);
     }
 
-    /// The date is what a reader actually sees. Pinned against the Shelley
-    /// start slot, whose date is independently known.
     #[test]
     fn a_slot_renders_as_its_calendar_date() {
-        // Shelley began 2020-07-29.
+        // Shelley start, 2020-07-29.
         assert_eq!(slot_date(4_492_800), "2020-07-29");
+        assert_eq!(unix_date(0), "1970-01-01");
     }
 }

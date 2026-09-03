@@ -4634,6 +4634,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "policy-archive"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "parquet",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6199,10 +6208,12 @@ dependencies = [
  "pallas-addresses 1.1.1",
  "pallas-primitives 1.1.1",
  "pallas-traverse 1.1.1",
- "parquet",
+ "policy-archive",
+ "postcard",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "token-ledger-wire",
  "tokio",
  "tokio-stream",

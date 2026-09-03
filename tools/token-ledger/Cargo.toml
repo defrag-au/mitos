@@ -19,16 +19,15 @@ chain-sieve = { path = "../../crates/chain-sieve" }
 
 # `serve` — the hosted any-token-on-demand surface. Tokio is confined to
 # serve::run, per the wallet-sieve convention.
-# Sealed artifacts. `default-features = false` DELIBERATELY: the default set
-# pulls `arrow` (array/buffer/schema stack) and every compression codec, which
-# measured 16× larger than the low-level column API when compiled to wasm. The
-# frontend reads these files with the same lean feature set, so the writer and
-# the reader stay in step — see docs/design/TOKEN_LEDGER_PARQUET.md.
-#
-# NOT the `duckdb` crate: that embeds a query engine. This is the file format
-# alone, which is why it can live in-process instead of shelling a CLI that is
-# not installed on the box.
-parquet = { version = "55", default-features = false, features = ["snap"] }
+# The sealed Parquet archive — writer AND reader in one crate, so `seal` and
+# `archive` here, a Worker over R2, and a wasm frontend all speak one format.
+# It pins `parquet` with `default-features = false` (no `arrow`, which
+# measured 16× larger in wasm) and SNAPPY only, because every reader has to
+# link whatever the writer chose. See docs/design/POLICY_ARCHIVE_AND_SCALE.md.
+policy-archive = { path = "../../crates/policy-archive" }
+# The pending-input sidecar a reverse pass carries between passes — the same
+# codec the wire artifacts use, for the same reason (compact, no schema file).
+postcard = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 # SSE progress on the policy feed — the same streaming shape wallet-sieve's
@@ -77,3 +76,7 @@ hex = { workspace = true }
 # than pull the whole `config` stack (same choice market-ledger makes for its
 # venue registry).
 toml = "0.8"
+
+[dev-dependencies]
+# A throwaway ledger + archive on disk for the seal round-trip test.
+tempfile = "3"

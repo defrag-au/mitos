@@ -48,23 +48,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::buffer::{BufferedOutput, OutrefBuffer};
 use crate::pools::PoolObservation;
 
-/// Cursor keys, named once.
-///
-/// These are `cursor.k` string literals, and every reader outside this module
-/// used to spell them itself. `seal` spelled `walked_from` where the writer says
-/// `walk_from`, read `None`, concluded the ledger covered nothing, and sealed
-/// zero partitions without an error — a typo that produced a plausible answer.
+/// Cursor keys, named once. A reader that spelled `walked_from` where the
+/// writer says `walk_from` once read `None`, concluded the ledger covered
+/// nothing, and quietly did nothing — a typo that produced a plausible answer.
 pub mod cursor_key {
-    /// Lowest slot covered.
-    pub const WALK_FROM: &str = "walk_from";
     /// Highest slot covered.
     pub const WALK_TO: &str = "walk_to";
-    /// Where a running pass is heading.
-    pub const WALK_TARGET: &str = "walk_target";
-    /// Forward frontier — the resume point.
-    pub const WALK: &str = "walk";
-    /// `Completeness`, as a code.
-    pub const COVERAGE_COMPLETE: &str = "coverage_complete";
 }
 
 pub struct Ledger {
@@ -208,37 +197,6 @@ pub struct TxRow {
     pub locks_spent: Vec<(Hash<32>, u32)>,
 }
 
-/// One transaction, as a feed reads it.
-pub struct FeedRow {
-    pub tx_hash: Vec<u8>,
-    pub slot: u64,
-    pub block_time: u64,
-    /// One entry per unit of the policy that this transaction touched.
-    pub units: Vec<UnitMove>,
-}
-
-/// One unit's movement within one transaction.
-pub struct UnitMove {
-    /// On-chain asset-name bytes.
-    pub name: Vec<u8>,
-    /// Net mint for this unit here: 0 transfer, positive mint, negative burn.
-    pub net_mint: i64,
-    /// Every party whose balance of this unit changed.
-    ///
-    /// The PRIMITIVE, carried as-is. Direction is derived from it rather than
-    /// stored, and the derivation has to be able to decline — a batched
-    /// marketplace fill has several losers and several gainers, and the obvious
-    /// "biggest is the sender" rule is wrong exactly there.
-    pub parties: Vec<PartyMove>,
-}
-
-/// One party's signed movement of one unit.
-pub struct PartyMove {
-    pub address: String,
-    pub stake: Option<String>,
-    pub amount: i64,
-}
-
 /// How far a ledger's coverage reaches — and therefore what its delta sums
 /// actually mean.
 ///
@@ -295,9 +253,11 @@ impl Completeness {
     }
 
     /// The wire spelling. Matches `shared_types::policy_feed::Completeness`'s
-    /// serde representation — the two are one vocabulary across the tunnel, and
-    /// a mismatch here is a frontend that silently reads every ledger as
-    /// unrecorded.
+    /// serde representation and `policy_archive::Completeness::as_wire` — one
+    /// vocabulary across the tunnel, and a mismatch is a frontend that
+    /// silently reads every ledger as unrecorded. Pinned by a test in
+    /// `policy_api`; the binary itself now speaks through the archive's copy.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn as_wire(self) -> &'static str {
         match self {
             Completeness::Complete => "complete",
@@ -326,17 +286,12 @@ impl Completeness {
     }
 }
 
-/// What a ledger covers, and how far a running pass has got.
+/// What a ledger covers — what `stats` reports alongside the balances.
 pub struct Coverage {
-    /// Lowest slot covered. `None` on a ledger no pass has recorded.
+    /// Lowest slot covered. `None` on a ledger no walk has recorded.
     pub walked_from: Option<u64>,
-    /// Where a running pass is heading. Equal to `walked_from` when idle.
-    pub walk_target: Option<u64>,
-    pub first_slot: Option<u64>,
-    pub last_slot: Option<u64>,
-    pub total_txs: u64,
-    pub units: u64,
-    /// Movements whose source sits below the floor — the honest gap.
+    /// Inputs a walk registered as wanting a source and never resolved — the
+    /// honest gap on a ledger written before its first mint was known.
     pub unresolved: u64,
 }
 
@@ -936,50 +891,6 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn walked_to(&self) -> Result<Option<u64>> {
-        self.cursor(cursor_key::WALK_TO)
-    }
-
-    /// One cursor slot by key. The single place a `cursor` row is read.
-    pub fn cursor(&self, key: &str) -> Result<Option<u64>> {
-        Ok(self
-            .conn
-            .query_row("SELECT slot FROM cursor WHERE k = ?1", params![key], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?
-            .map(|s| s as u64))
-    }
-
-    /// Where the running pass is HEADING, so a reader outside the process can
-    /// compute progress.
-    ///
-    /// `walked_from` alone says where coverage reaches but not how far it
-    /// intends to go, and a poller cannot turn one number into a percentage. A
-    /// UI would be left showing a floor slot ticking down with no denominator —
-    /// which is a log line, not a progress bar.
-    ///
-    /// Cleared to the floor when a pass finishes, so "target == floor" reads as
-    /// idle rather than as a pass permanently stuck at 100%.
-    pub fn set_walk_target(&self, slot: u64) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO cursor (k, slot) VALUES ('walk_target', ?1)
-             ON CONFLICT(k) DO UPDATE SET slot = ?1",
-            params![slot as i64],
-        )?;
-        Ok(())
-    }
-
-    pub fn walk_target(&self) -> Result<Option<u64>> {
-        Ok(self
-            .conn
-            .query_row("SELECT slot FROM cursor WHERE k = 'walk_target'", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?
-            .map(|s| s as u64))
-    }
-
     /// Lower the floor to `slot`, never raise it.
     ///
     /// `min` rather than assignment because coverage only ever grows downward:
@@ -1114,34 +1025,7 @@ impl Ledger {
         Ok(buf)
     }
 
-    /// Commit transactions WITHOUT touching the forward cursor — the reverse
-    /// pass's writer.
-    ///
-    /// A reverse pass extends coverage DOWNWARD, so the forward frontier it
-    /// must not move: writing `slot` there would claim the walk had regressed
-    /// to somewhere it already passed, and the next forward resume would
-    /// re-walk everything above it. The floor is recorded separately, per
-    /// chunk, via [`Self::set_walked_from`].
-    ///
-    /// Nor is the outref buffer persisted: it is the forward walk's state and a
-    /// reverse pass does not maintain it. Overwriting it from here would erase
-    /// the open set a forward resume depends on.
-    pub fn commit_rows(&mut self, txs: &[TxRow]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let mut caches = Caches {
-            parties: &mut self.parties,
-            units: &mut self.units,
-            pools: &mut self.pools,
-            next_tx_ord: &mut self.next_tx_ord,
-        };
-        Self::write_rows(&tx, &mut caches, txs)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Write transaction rows and everything hanging off them. Shared by the
-    /// forward and reverse writers, which differ only in what they do to the
-    /// CURSORS around it.
+    /// Write transaction rows and everything hanging off them.
     ///
     /// Takes the caches as a parameter rather than `&mut self` because a
     /// `Transaction` already holds a borrow of `self.conn`.
@@ -1369,323 +1253,16 @@ impl Ledger {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Re-derive every party's cohort from its address.
-    ///
-    /// Idempotent and cheap, so it runs at the end of each walk and is also
-    /// exposed as its own subcommand — registering a new sink or landing a new
-    /// pool decoder should reclassify history without touching the chain.
-    /// Returns the number of parties classified.
-    /// Add deltas to a transaction already on record — the REVERSE walk's
-    /// backfill.
-    ///
-    /// A forward walk knows a transaction's whole story when it writes it: the
-    /// buffer already holds every input it spends. A reverse walk does not. It
-    /// meets a transaction's *outputs* first and only learns its *sources* later,
-    /// on reaching the transactions further back that created them, by which
-    /// point the row is written. So the delta set grows after the fact.
-    ///
-    /// # Deltas ACCUMULATE; they do not replace, and they must not be ignored
-    ///
-    /// This was `INSERT OR IGNORE`, reasoning that the key made a
-    /// double-application a harmless no-op. That was wrong, and wrong in the
-    /// common case rather than an exotic one.
-    ///
-    /// A party routinely appears TWICE for the same unit in one transaction:
-    /// `+1` from the output loop when a token lands, `−1` from this backfill
-    /// when the walk later reaches the output it was spent from. Any transaction
-    /// touching a wallet that holds NFTs returns the untouched ones as change,
-    /// so sender and receiver are the same party. Under `OR IGNORE` the second
-    /// write collided with the first and the negative was silently dropped.
-    ///
-    /// Measured on a full-history SpaceBudz walk: `Σ delta` came to 440,971
-    /// against a net mint of 10,002 — roughly 431,000 arrivals with no matching
-    /// departure, and no error anywhere.
-    ///
-    /// The forward walk never hit it because it nets per `(party, unit)` in
-    /// memory and writes one row. The reverse walk cannot: the two halves are
-    /// discovered chunks apart.
-    ///
-    /// Returns rows genuinely CHANGED, so a caller can tell real progress from a
-    /// re-walk that resolved nothing.
-    /// Apply one chunk's backfills, pending changes and floor advance — ALL IN
-    /// ONE TRANSACTION.
-    ///
-    /// Atomic because the delta write and the pending removal are now a matched
-    /// pair. Deltas ACCUMULATE (see [`Self::add_deltas`]), so re-applying one is
-    /// no longer a harmless no-op — it doubles a balance. Committed separately,
-    /// a pass killed between the two would leave the source still pending, be
-    /// re-resolved on the next pass, and add the same movement twice.
-    ///
-    /// The floor rides along for the reason it always did: coverage must not
-    /// advance past work whose bookkeeping did not land.
-    pub fn commit_chunk(
-        &mut self,
-        backfills: &[(Hash<32>, Vec<DeltaRow>)],
-        added: &[((Hash<32>, u32), Hash<32>)],
-        removed: &[(Hash<32>, u32)],
-        floor: Option<u64>,
-    ) -> Result<usize> {
-        let tx = self.conn.transaction()?;
-        let mut applied = 0usize;
-        for (spender, deltas) in backfills {
-            applied +=
-                Self::write_backfill(&tx, &mut self.parties, &mut self.units, spender, deltas)?;
-        }
-        {
-            let mut ins = tx.prepare(
-                "INSERT OR IGNORE INTO pending_input (oref_hash, oref_idx, spender)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for ((hash, idx), spender) in added {
-                ins.execute(params![hash.as_ref(), *idx as i64, spender.as_ref()])?;
-            }
-            let mut del =
-                tx.prepare("DELETE FROM pending_input WHERE oref_hash = ?1 AND oref_idx = ?2")?;
-            for (hash, idx) in removed {
-                del.execute(params![hash.as_ref(), *idx as i64])?;
-            }
-        }
-        if let Some(floor) = floor {
-            tx.execute(
-                "INSERT INTO cursor (k, slot) VALUES ('walk_from', ?1)
-                 ON CONFLICT(k) DO UPDATE SET slot = min(slot, excluded.slot)",
-                params![floor as i64],
-            )?;
-        }
-        tx.commit()?;
-        Ok(applied)
-    }
+    // NOTE: the reverse walk's backfill (`commit_chunk`, `add_deltas`) and
+    // its `pending_input` bookkeeping used to live here. The reverse walk no
+    // longer touches sqlite at all — see `reverse.rs` and `archive.rs`; the
+    // `pending_input` table is created for compatibility with ledgers that
+    // already have it and is otherwise unused.
 
-    /// One spender's backfilled deltas, inside a caller-owned transaction.
-    fn write_backfill(
-        tx: &rusqlite::Transaction<'_>,
-        parties: &mut HashMap<String, i64>,
-        units: &mut HashMap<Vec<u8>, i64>,
-        tx_hash: &Hash<32>,
-        deltas: &[DeltaRow],
-    ) -> Result<usize> {
-        if deltas.is_empty() {
-            return Ok(0);
-        }
-        let ord: Option<i64> = tx
-            .query_row(
-                "SELECT tx_ord FROM tx WHERE tx_hash = ?1",
-                params![tx_hash.as_ref()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        // Not on record — a source resolved for a transaction that was filtered
-        // out. Not an error, and inserting a parentless delta is exactly the
-        // orphan the reconciliation counts.
-        let Some(ord) = ord else {
-            return Ok(0);
-        };
-        let mut applied = 0;
-        for d in deltas {
-            let party_id = match parties.get(&d.address) {
-                Some(id) => *id,
-                None => {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO party (address, stake) VALUES (?1, ?2)",
-                        params![d.address, d.stake],
-                    )?;
-                    let id: i64 = tx.query_row(
-                        "SELECT party_id FROM party WHERE address = ?1",
-                        params![d.address],
-                        |r| r.get(0),
-                    )?;
-                    parties.insert(d.address.clone(), id);
-                    id
-                }
-            };
-            let unit_id = Self::unit_id(tx, units, &d.name)?;
-            applied += tx.execute(
-                "INSERT INTO delta (tx_ord, party_id, unit_id, amount)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(tx_ord, party_id, unit_id)
-                 DO UPDATE SET amount = amount + excluded.amount",
-                params![ord, party_id, unit_id, d.amount],
-            )?;
-        }
-        Ok(applied)
-    }
-
-    // NOTE: a standalone `add_deltas` used to live here, committing its own
-    // transaction. It is gone deliberately — a backfill must land in the SAME
-    // transaction as the pending removal that retires it, or a pass killed
-    // between the two re-resolves the source and, now that deltas accumulate,
-    // doubles the movement. `commit_chunk` is the only way in.
-
-    /// One transaction as a FEED row: what moved, and who moved it.
-    ///
-    /// Assembled from the stored primitive rather than stored in this shape.
-    /// `delta` is deliberately signed and undirected — see this module's header
-    /// — so direction is a READ-TIME derivation, which is what lets it be
-    /// improved later without a re-walk.
-    pub fn feed_rows(&self, limit: u32, before_slot: Option<u64>) -> Result<Vec<FeedRow>> {
-        let limit = limit.min(5_000);
-        let mut stmt = self.conn.prepare(
-            "SELECT tx_ord, tx_hash, slot, block_time FROM tx
-             WHERE (?1 IS NULL OR slot < ?1)
-             ORDER BY slot DESC, tx_ord DESC
-             LIMIT ?2",
-        )?;
-        let heads: Vec<(i64, Vec<u8>, u64, u64)> = stmt
-            .query_map(params![before_slot.map(|s| s as i64), limit], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get::<_, i64>(2)? as u64,
-                    r.get::<_, i64>(3)? as u64,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        self.hydrate(heads)
-    }
-
-    /// ONE transaction by hash. Keyed off `tx.tx_hash`'s unique index, so a row
-    /// deep in history costs what the newest one costs — the property a shared
-    /// link needs, and the reason wallet-sieve grew the same endpoint.
-    pub fn feed_row_at(&self, tx_hash: &[u8]) -> Result<Option<FeedRow>> {
-        let head: Option<(i64, Vec<u8>, u64, u64)> = self
-            .conn
-            .query_row(
-                "SELECT tx_ord, tx_hash, slot, block_time FROM tx WHERE tx_hash = ?1",
-                params![tx_hash],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get::<_, i64>(2)? as u64,
-                        r.get::<_, i64>(3)? as u64,
-                    ))
-                },
-            )
-            .optional()?;
-        Ok(self.hydrate(head.into_iter().collect())?.pop())
-    }
-
-    /// Attach per-unit movements and mint entries to a set of transaction heads.
-    fn hydrate(&self, heads: Vec<(i64, Vec<u8>, u64, u64)>) -> Result<Vec<FeedRow>> {
-        if heads.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ords: Vec<String> = heads.iter().map(|(o, ..)| o.to_string()).collect();
-        let list = ords.join(",");
-
-        // Interpolated rather than bound: the values are i64s this function
-        // just read out of its own primary key, and rusqlite has no variadic
-        // `IN` binding without the `rarray` feature. Nothing user-supplied
-        // reaches this string.
-        let mut moves: HashMap<i64, Vec<(Vec<u8>, String, Option<String>, i64)>> = HashMap::new();
-        {
-            let sql = format!(
-                "SELECT d.tx_ord, u.name, p.address, p.stake, d.amount
-                 FROM delta d JOIN party p USING(party_id) JOIN unit u USING(unit_id)
-                 WHERE d.tx_ord IN ({list})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })?;
-            for row in rows {
-                let (ord, name, address, stake, amount) = row?;
-                moves
-                    .entry(ord)
-                    .or_default()
-                    .push((name, address, stake, amount));
-            }
-        }
-
-        let mut mints: HashMap<i64, HashMap<Vec<u8>, i64>> = HashMap::new();
-        {
-            let sql = format!(
-                "SELECT m.tx_ord, u.name, m.amount
-                 FROM tx_mint m JOIN unit u USING(unit_id)
-                 WHERE m.tx_ord IN ({list})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (ord, name, amount) = row?;
-                mints.entry(ord).or_default().insert(name, amount);
-            }
-        }
-
-        Ok(heads
-            .into_iter()
-            .map(|(ord, tx_hash, slot, block_time)| {
-                let mut by_unit: HashMap<Vec<u8>, Vec<PartyMove>> = HashMap::new();
-                for (name, address, stake, amount) in moves.remove(&ord).unwrap_or_default() {
-                    by_unit.entry(name).or_default().push(PartyMove {
-                        address,
-                        stake,
-                        amount,
-                    });
-                }
-                let minted = mints.remove(&ord).unwrap_or_default();
-                // A unit can appear in the mint field having reached no party we
-                // recorded — the `Unattributed` case. It still belongs on the
-                // row, or a mint whose destination is below the floor vanishes.
-                for name in minted.keys() {
-                    by_unit.entry(name.clone()).or_default();
-                }
-                let units = by_unit
-                    .into_iter()
-                    .map(|(name, parties)| {
-                        let net_mint = minted.get(&name).copied().unwrap_or(0);
-                        UnitMove {
-                            name,
-                            net_mint,
-                            parties,
-                        }
-                    })
-                    .collect();
-                FeedRow {
-                    tx_hash,
-                    slot,
-                    block_time,
-                    units,
-                }
-            })
-            .collect())
-    }
-
-    /// What this ledger covers and how it is progressing.
+    /// What this ledger covers.
     pub fn coverage(&self) -> Result<Coverage> {
-        let one = |sql: &str| -> Result<Option<u64>> {
-            Ok(self
-                .conn
-                .query_row(sql, [], |r| r.get::<_, Option<i64>>(0))
-                .optional()?
-                .flatten()
-                .map(|v| v as u64))
-        };
         Ok(Coverage {
             walked_from: self.walked_from()?,
-            walk_target: self.walk_target()?,
-            first_slot: one("SELECT MIN(slot) FROM tx")?,
-            last_slot: one("SELECT MAX(slot) FROM tx")?,
-            total_txs: self
-                .conn
-                .query_row("SELECT COUNT(*) FROM tx", [], |r| r.get::<_, i64>(0))?
-                as u64,
-            units: self
-                .conn
-                .query_row("SELECT COUNT(*) FROM unit", [], |r| r.get::<_, i64>(0))?
-                as u64,
             unresolved: self
                 .conn
                 .query_row("SELECT COUNT(*) FROM pending_input", [], |r| {
@@ -1694,60 +1271,12 @@ impl Ledger {
         })
     }
 
-    /// Every outref a previous reverse pass is still waiting on.
-    pub fn load_pending(&self) -> Result<Vec<((Hash<32>, u32), Hash<32>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT oref_hash, oref_idx, spender FROM pending_input")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (oref_hash, idx, spender) = row?;
-            let oref_hash: [u8; 32] = oref_hash
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("pending oref hash is not 32 bytes"))?;
-            let spender: [u8; 32] = spender
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("pending spender hash is not 32 bytes"))?;
-            out.push(((Hash::from(oref_hash), idx as u32), Hash::from(spender)));
-        }
-        Ok(out)
-    }
-
-    // NOTE: `commit_pending_changes` used to sit here, committing the pending
-    // set and the floor without the backfills. Folded into `commit_chunk` for
-    // the reason given there — the backfill has to be in the same transaction
-    // as the removal that retires it.
-
-    /// Replace the pending set wholesale.
+    /// Re-derive every party's cohort from its address.
     ///
-    /// Wholesale rather than incremental because the in-memory set IS the
-    /// answer at the end of a pass: entries resolved during it are gone from
-    /// the map, and a differential update would have to reconstruct which those
-    /// were. Cardinality is the transactions still missing a source, which stays
-    /// small precisely because only unbalanced transactions register at all.
-    pub fn put_pending(&mut self, entries: &[((Hash<32>, u32), Hash<32>)]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM pending_input", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO pending_input (oref_hash, oref_idx, spender)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for ((hash, idx), spender) in entries {
-                stmt.execute(params![hash.as_ref(), *idx as i64, spender.as_ref()])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
+    /// Idempotent and cheap, so it runs at the end of each walk and is also
+    /// exposed as its own subcommand — registering a new sink or landing a new
+    /// pool decoder should reclassify history without touching the chain.
+    /// Returns the number of parties classified.
     pub fn classify_parties(&mut self, sinks: &[String], lock_creds: &[[u8; 28]]) -> Result<usize> {
         let pools = self.pool_addresses()?;
         let addresses: Vec<(i64, String)> = {

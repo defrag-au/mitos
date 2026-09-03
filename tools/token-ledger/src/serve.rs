@@ -49,6 +49,12 @@ pub struct ServeArgs {
     #[arg(long)]
     pub export_dir: PathBuf,
 
+    /// Root of the POLICY archives the reverse passes write and the
+    /// `/policy/*` routes read (`<archive-dir>/<policy_hex>/manifest.json`).
+    /// Parquet and a manifest, no database — see `archive.rs`.
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+
     /// `push-artifacts.sh`. Omit to skip pushing (artifacts stay local).
     #[arg(long)]
     pub push_script: Option<PathBuf>,
@@ -93,6 +99,7 @@ struct Hub {
 pub fn run(args: ServeArgs) -> Result<()> {
     std::fs::create_dir_all(&args.db_dir)?;
     std::fs::create_dir_all(&args.export_dir)?;
+    std::fs::create_dir_all(&args.archive_dir)?;
 
     let (tx, rx) = mpsc::channel::<String>();
     let bearer = std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok();
@@ -137,7 +144,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let policy_hub = crate::policy_api::PolicyHub::new(
         args.data_dir.clone(),
         args.tokens.clone(),
-        args.db_dir.clone(),
+        args.archive_dir.clone(),
         std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
     );
 

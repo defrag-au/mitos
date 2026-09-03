@@ -23,6 +23,7 @@ members = [
     "crates/chain-sieve",
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
+    "crates/policy-archive",
     "crates/none-match-indexer",
     "bundles/default",
     "tools/capture-block",

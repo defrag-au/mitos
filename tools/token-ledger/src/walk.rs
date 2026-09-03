@@ -161,6 +161,10 @@ pub(crate) fn units_in_output(
     units.into_iter().collect()
 }
 
+/// `(address, unit) → (stake, amount)`: one transaction's deltas, keyed the way
+/// the conservation check reads them.
+pub(crate) type PartyUnitDeltas = HashMap<(String, Vec<u8>), (Option<String>, i64)>;
+
 /// One unit whose deltas did not sum to its net mint.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Breach {
@@ -214,7 +218,7 @@ pub(crate) enum BreachKind {
 /// Pure, and separated from the walk for that reason: it is the invariant the
 /// whole walker rests on, and it needs no chain to exercise.
 pub(crate) fn conservation_breaches(
-    deltas: &HashMap<(String, Vec<u8>), (Option<String>, i64)>,
+    deltas: &PartyUnitDeltas,
     net_mint: &HashMap<Vec<u8>, i64>,
 ) -> Vec<Breach> {
     let mut sums: HashMap<&[u8], i128> = HashMap::new();
