@@ -48,6 +48,9 @@ pub fn outputs(era: Era, body: &[u8]) -> Result<Vec<ResolvedOutput>> {
                 .map(|(i, o)| convert(i, &MultiEraOutput::from_conway(o)))
                 .collect())
         }
+        // `Era` is `#[non_exhaustive]` upstream. A new era means a new body
+        // type this build does not know; say so rather than mis-decode.
+        other => Err(anyhow!("era {other} is newer than this build of tx-index")),
     }
 }
 
@@ -58,7 +61,7 @@ fn convert(index: usize, o: &MultiEraOutput<'_>) -> ResolvedOutput {
         .unwrap_or_else(|_| "<unparsable>".into());
 
     let mut assets = Vec::new();
-    for bundle in o.non_ada_assets() {
+    for bundle in o.value().assets() {
         for a in bundle.assets() {
             if let Some(quantity) = a.output_coin() {
                 assets.push(OutputAsset {

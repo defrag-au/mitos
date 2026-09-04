@@ -113,6 +113,8 @@ pub struct Job {
 pub struct Config {
     pub db_path: PathBuf,
     pub immutable: PathBuf,
+    /// tx-index dir for sender resolution (see `resolve`).
+    pub index_dir: PathBuf,
     /// Chain-tail spool db (scanned when present; freshness = minutes).
     pub tail_db: PathBuf,
     /// market-ledger sqlite, read-only, for venue/sale labels. Absent file =
@@ -148,13 +150,16 @@ pub enum Lane {
     Deep,
 }
 
+/// Live jobs keyed by (canonical target, lane).
+type JobMap = Arc<Mutex<HashMap<(String, Lane), Arc<Job>>>>;
+
 #[derive(Clone)]
 pub struct Registry {
     /// Keyed by lane as well as wallet: a deep request and its shallow
     /// companion are two jobs for the same canonical target, and joining them
     /// by name alone would make the second silently ride the first — which is
     /// exactly the head-of-line wait the companion exists to avoid.
-    jobs: Arc<Mutex<HashMap<(String, Lane), Arc<Job>>>>,
+    jobs: JobMap,
     shallow: mpsc::Sender<Arc<Job>>,
     deep: mpsc::Sender<Arc<Job>>,
     shallow_max_days: u64,
@@ -395,7 +400,7 @@ impl Registry {
             .into_iter()
             .filter_map(|lane| jobs.get(&(canonical.to_string(), lane)))
             .map(|j| j.state.lock().expect("job state").clone())
-            .max_by_key(|s| rank(s))
+            .max_by_key(rank)
     }
 
     pub fn queue_depth(&self) -> usize {
@@ -616,13 +621,16 @@ fn run_batch_jobs(
             },
             format!("{pass}: {done}/{total} chunks · {gb_per_s:.2} GB/s"),
         ),
+        Progress::Lookup { done, total } => {
+            set_all("resolve", format!("{done}/{total} hashes looked up"))
+        }
         Progress::Resolve {
             done,
             total,
             wanted_left,
         } => set_all(
             "resolve",
-            format!("{done}/{total} bands · {wanted_left} sources wanted"),
+            format!("sweep {done}/{total} bands · {wanted_left} sources wanted"),
         ),
         Progress::Phase { label, detail } => set_all(label, detail.to_string()),
     };
@@ -904,14 +912,14 @@ fn run_batch_jobs(
         }
     }
     if !wanted.is_empty() && max_last > 0 {
-        // A windowed job pays for a windowed resolve. Naming a sender means
+        // The tx index names a sender at any age for the price of one point
+        // lookup, so with it every foreign input gets named. The window
+        // below bounds only the SWEEP fallback (index absent, or chunks it
+        // has not been rebuilt over yet): naming a sender by sweep means
         // finding the source tx, which can sit years before the rows on
-        // screen — so an unbounded resolve would hand a 90-day request the
-        // cost of a full-chain read. Sources older than the window stay
-        // unnamed; the rows still carry their venue and recipients.
-        // Resolve reaches no deeper than the shallowest floor still in force
-        // — otherwise a 90-day request pays full-chain read costs to name a
-        // sender whose source tx it will never show.
+        // screen, and an unbounded sweep would hand a 90-day request the
+        // cost of a full-chain read. Under the fallback, sources older than
+        // the window stay unnamed; the rows still carry venue + recipients.
         let resolve_floor = depths
             .iter()
             .filter(|d| d.needs_backfill() && d.deep_span().is_none())
@@ -927,7 +935,21 @@ fn run_batch_jobs(
             .into_iter()
             .filter(|c| *c <= last)
             .collect();
-        let resolved = crate::resolve::senders(&cfg.immutable, &chunks, &wanted, cfg.threads, &on)?;
+        let resolved = crate::resolve::senders(
+            &cfg.immutable,
+            Some(&cfg.index_dir),
+            &chunks,
+            &wanted,
+            cfg.threads,
+            &on,
+        )?;
+        tracing::info!(
+            via_index = resolved.via_index,
+            via_sweep = resolved.via_sweep,
+            unresolved = resolved.unresolved,
+            secs = format!("{:.1}", resolved.wall_secs),
+            "senders resolved"
+        );
         for (job, timeline) in live.iter().zip(&timelines) {
             db::update_senders(conn, &job.canonical, timeline, &resolved.sources)?;
         }

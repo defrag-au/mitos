@@ -41,14 +41,22 @@
 //! browser bundle — and what keeps the wasm cost at the 0.15 MB the format
 //! doc measured rather than the 2.5 MB the convenient API costs.
 
+pub mod bundle;
 pub mod density;
+pub mod feed;
 pub mod groups;
+pub mod manifest;
+pub mod multi;
 pub mod reader;
 pub mod schema;
 pub mod writer;
 
+pub use bundle::{BUNDLE, BUNDLE_FORMAT, Bundle, BundledFooter};
 pub use density::DensityBucket;
+pub use feed::{FeedRow, PartyMove, UnitMove, fold_rows};
 pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
+pub use manifest::{FileEntry, FileKind, Manifest, PassEntry};
+pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
 pub use writer::{ArchiveWriter, Written};
@@ -70,6 +78,13 @@ pub enum Error {
     NotFetched { start: u64, end: u64 },
     #[error("the file is shorter than a parquet footer ({0} bytes)")]
     TooShort(u64),
+    /// The caller's transport failed. Wrapped as a string so this crate
+    /// stays free of any transport's error type.
+    #[error("fetch: {0}")]
+    Fetch(String),
+    /// A bundle that does not decode, or carries a manifest that does not.
+    #[error("bundle: {0}")]
+    Bundle(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -23,3 +23,14 @@ license.workspace = true
 parquet = { version = "55", default-features = false, features = ["snap"] }
 bytes = "1"
 thiserror = { workspace = true }
+# The manifest is JSON on disk and in R2; the same struct on both sides of
+# the wire is the point of it living here.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The per-policy bundle (manifest + footers) for a key-value store, in the
+# same encoding as the pending sidecar.
+postcard = { workspace = true }
+
+[dev-dependencies]
+# Drives the runtime-free async reader in tests.
+futures-executor = "0.3"

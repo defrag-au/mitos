@@ -153,10 +153,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "tx-index-compact-{name}-{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("tx-index-compact-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

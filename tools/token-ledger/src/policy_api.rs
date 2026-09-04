@@ -284,6 +284,8 @@ pub struct PolicyHub {
     /// Root of the per-policy archives — Parquet plus a manifest, no
     /// database. See `archive.rs`.
     pub archive_dir: PathBuf,
+    /// Run after a pass lands, to publish the archive — see `serve`.
+    push_script: Option<PathBuf>,
     jobs: Mutex<HashMap<String, PolicyJob>>,
     /// The in-progress pass per policy, if one is running.
     live: Mutex<HashMap<String, Arc<Mutex<Live>>>>,
@@ -296,6 +298,7 @@ impl PolicyHub {
         data_dir: PathBuf,
         tokens: PathBuf,
         archive_dir: PathBuf,
+        push_script: Option<PathBuf>,
         bearer: Option<String>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<PassRequest>();
@@ -303,6 +306,7 @@ impl PolicyHub {
             data_dir,
             tokens,
             archive_dir,
+            push_script,
             jobs: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             queue: tx,
@@ -337,7 +341,30 @@ impl PolicyHub {
                     };
                     // The archive holds it now — or, on failure, nobody does.
                     hub.live.lock().expect("live").remove(&req.policy);
+                    let landed = matches!(state, PolicyJob::Done { .. });
                     hub.set(&req.policy, state);
+                    // PUBLISH. Synchronous on this thread, deliberately: the
+                    // next pass would otherwise rewrite the directory under
+                    // a push still reading it. A failed push is logged and
+                    // never fails the pass — the archive is on disk either
+                    // way and the next landing pushes again.
+                    if landed && let Some(script) = &hub.push_script {
+                        match std::process::Command::new(script)
+                            .arg(&req.policy)
+                            .arg(&hub.archive_dir)
+                            .status()
+                        {
+                            Ok(s) if s.success() => {
+                                tracing::info!(policy = req.policy, "policy: archive pushed")
+                            }
+                            Ok(s) => {
+                                tracing::warn!(policy = req.policy, status = %s, "policy: push failed")
+                            }
+                            Err(e) => {
+                                tracing::warn!(policy = req.policy, error = %e, "policy: push failed")
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -647,27 +674,15 @@ pub struct PolicyDensityResponse {
 /// and the failure mode — confidently naming the wrong sender on a batched fill
 /// — is invisible in the output.
 pub fn direction(unit: &archive::UnitMove) -> DirectionDto {
-    let losers: Vec<&archive::PartyMove> = unit.parties.iter().filter(|p| p.amount < 0).collect();
-    let gainers: Vec<&archive::PartyMove> = unit.parties.iter().filter(|p| p.amount > 0).collect();
-    match (losers.as_slice(), gainers.as_slice(), unit.net_mint) {
-        // Created here and landed in one place.
-        ([], [to], m) if m > 0 => DirectionDto::Mint {
-            to: to.address.clone(),
-        },
-        // Destroyed here, out of one place.
-        ([from], [], m) if m < 0 => DirectionDto::Burn {
-            from: from.address.clone(),
-        },
-        ([from], [to], 0) => DirectionDto::Transfer {
-            from: from.address.clone(),
-            to: to.address.clone(),
-        },
-        // Arrived from nobody we know, and nothing was minted: the source is
-        // below the floor. A deeper pass resolves this into a Transfer.
-        ([], [to], 0) => DirectionDto::SourceBelowFloor {
-            to: to.address.clone(),
-        },
-        _ => DirectionDto::Ambiguous,
+    use policy_archive::feed::Direction;
+    // The rule lives in the crate, so a Worker reading R2 derives the same
+    // direction from the same rows. This is only the spelling.
+    match policy_archive::feed::direction(unit) {
+        Direction::Mint { to } => DirectionDto::Mint { to },
+        Direction::Burn { from } => DirectionDto::Burn { from },
+        Direction::Transfer { from, to } => DirectionDto::Transfer { from, to },
+        Direction::SourceBelowFloor { to } => DirectionDto::SourceBelowFloor { to },
+        Direction::Ambiguous => DirectionDto::Ambiguous,
     }
 }
 
@@ -687,8 +702,8 @@ fn to_dto(row: archive::FeedRow) -> FeedRowDto {
                     .parties
                     .iter()
                     .map(|p| PartyMoveDto {
+                        stake: crate::walk::stake_of(&p.address),
                         address: p.address.clone(),
-                        stake: p.stake.clone(),
                         amount: p.amount,
                     })
                     .collect(),
@@ -944,7 +959,6 @@ mod tests {
     fn party(addr: &str, amount: i64) -> archive::PartyMove {
         archive::PartyMove {
             address: addr.into(),
-            stake: None,
             amount,
         }
     }
@@ -1131,6 +1145,7 @@ mod tests {
                 rows: 6,
                 min_slot: Some(700),
                 max_slot: Some(1_500),
+                units: 0,
             }],
         );
         assert!(live.buffer.is_empty());

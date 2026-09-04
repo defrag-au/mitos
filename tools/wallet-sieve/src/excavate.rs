@@ -20,6 +20,9 @@ pub const SHELLEY_START_SLOT: u64 = 4_492_800;
 
 pub struct Params<'a> {
     pub immutable: &'a Path,
+    /// tx-index dir (base.idx + segments/) for sender resolution. `None`,
+    /// or an unusable dir, means the decode+hash sweep.
+    pub index_dir: Option<&'a Path>,
     pub creds: Vec<[u8; 28]>,
     /// First chunk pass A scans (Shelley chunk for cold, cursor+1 for
     /// incremental).
@@ -37,7 +40,8 @@ pub struct Outcome {
     pub sources: HashMap<([u8; 32], u32), (String, u64)>,
     pub pass_a: scan::ScanStats,
     pub pass_b: Option<scan::ScanStats>,
-    pub resolve_secs: Option<f64>,
+    /// Pass C's own accounting (`sources` is its output), when it ran.
+    pub resolve: Option<resolve::Resolved>,
 }
 
 /// One wallet in a shared sweep.
@@ -197,7 +201,7 @@ pub fn run(p: Params<'_>, on: Prog<'_>) -> Result<Outcome> {
     }
 
     let mut sources = HashMap::new();
-    let mut resolve_secs = None;
+    let mut resolved = None;
     if p.resolve && !timeline.txs.is_empty() {
         let mut wanted: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
         for tx in &timeline.txs {
@@ -216,9 +220,10 @@ pub fn run(p: Params<'_>, on: Prog<'_>) -> Result<Outcome> {
                 .copied()
                 .filter(|c| *c <= last_chunk)
                 .collect();
-            let r = resolve::senders(p.immutable, &c_chunks, &wanted, p.threads, on)?;
-            sources = r.sources;
-            resolve_secs = Some(r.wall_secs);
+            let mut r =
+                resolve::senders(p.immutable, p.index_dir, &c_chunks, &wanted, p.threads, on)?;
+            sources = std::mem::take(&mut r.sources);
+            resolved = Some(r);
         }
     }
 
@@ -227,6 +232,6 @@ pub fn run(p: Params<'_>, on: Prog<'_>) -> Result<Outcome> {
         sources,
         pass_a,
         pass_b,
-        resolve_secs,
+        resolve: resolved,
     })
 }

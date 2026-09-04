@@ -228,9 +228,10 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         .or(args.to_slot);
     let floor = first_mint.map_or(floor, |first| floor.max(first));
 
-    // The carried state: what the previous pass was still waiting for.
-    let prior_pending = match manifest.latest_pass() {
-        Some(p) => archive::load_pending(&dir.join(&p.dir).join(archive::PENDING))?,
+    // The carried state: what the previous pass was still waiting for —
+    // wherever the manifest says it is, which after a rollup is the root.
+    let prior_pending = match manifest.pending_file() {
+        Some(rel) => archive::load_pending(&dir.join(rel))?,
         None => PendingFile::default(),
     };
     let mut pending = Pending::load(prior_pending.spenders);
@@ -425,6 +426,29 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     });
     // LAST. A reader that opens the manifest sees a pass whose files exist.
     archive::store_manifest(dir, manifest)?;
+    // And the bundle the push puts in KV, from the files that manifest names.
+    archive::store_bundle(dir, manifest)?;
+
+    // ROLLUP, once enough passes have piled up: every reader pays a footer
+    // per file, and a satellite publishing to R2 wants one object per
+    // policy. Its own manifest write, after this one, so a failure here
+    // leaves a landed pass rather than a lost one.
+    if compact {
+        let loose = manifest
+            .passes
+            .iter()
+            .filter(|p| !manifest.rolled_up_through.is_some_and(|t| p.seq <= t))
+            .count();
+        if loose >= segments::ROLLUP_AFTER_PASSES {
+            let t = Instant::now();
+            segments::rollup(dir, manifest, now_unix())?;
+            tracing::info!(
+                passes = loose,
+                secs = format!("{:.1}", t.elapsed().as_secs_f64()),
+                "reverse: rolled up"
+            );
+        }
+    }
 
     Ok(Outcome {
         floor: walked.floor,

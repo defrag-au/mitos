@@ -46,147 +46,15 @@ use anyhow::{Context, Result, bail};
 use policy_archive::{Archive, Completeness, DensityBucket, Movement, SparseBytes};
 use serde::{Deserialize, Serialize};
 
-use crate::walk::stake_of;
-
-/// One transaction, as a feed reads it.
-pub struct FeedRow {
-    pub tx_hash: Vec<u8>,
-    pub slot: u64,
-    pub block_time: u64,
-    /// One entry per unit of the policy that this transaction touched.
-    pub units: Vec<UnitMove>,
-}
-
-/// One unit's movement within one transaction.
-pub struct UnitMove {
-    /// On-chain asset-name bytes.
-    pub name: Vec<u8>,
-    /// Net mint for this unit here: 0 transfer, positive mint, negative burn.
-    pub net_mint: i64,
-    /// Every party whose balance of this unit changed.
-    ///
-    /// The PRIMITIVE, carried as-is. Direction is derived from it rather than
-    /// stored, and the derivation has to be able to decline — a batched
-    /// marketplace fill has several losers and several gainers, and the obvious
-    /// "biggest is the sender" rule is wrong exactly there.
-    pub parties: Vec<PartyMove>,
-}
-
-/// One party's signed movement of one unit.
-pub struct PartyMove {
-    pub address: String,
-    pub stake: Option<String>,
-    pub amount: i64,
-}
-
-pub const MANIFEST: &str = "manifest.json";
-pub const MOVEMENTS: &str = "movements.parquet";
-pub const CORRECTIONS: &str = "corrections.parquet";
-pub const PENDING: &str = "pending.bin";
-pub const MANIFEST_FORMAT: u32 = 1;
-
-/// The archive's own record of itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Manifest {
-    pub format: u32,
-    pub policy: String,
-    /// The registered first-mint floor, if the registry knew one when a pass
-    /// ran. The bound below which no pass will look.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_mint_slot: Option<u64>,
-    /// `complete` | `partial` | `unrecorded` — the feed's own words.
-    pub completeness: String,
-    /// Lowest slot covered, across passes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub walk_from: Option<u64>,
-    /// Highest slot covered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub walk_to: Option<u64>,
-    pub passes: Vec<PassEntry>,
-    pub updated_unix: u64,
-}
-
-impl Manifest {
-    pub fn new(policy_hex: &str) -> Self {
-        Manifest {
-            format: MANIFEST_FORMAT,
-            policy: policy_hex.to_string(),
-            first_mint_slot: None,
-            completeness: Completeness::Unrecorded.as_wire().to_string(),
-            walk_from: None,
-            walk_to: None,
-            passes: Vec::new(),
-            updated_unix: 0,
-        }
-    }
-
-    pub fn completeness(&self) -> Completeness {
-        Completeness::from_wire(&self.completeness).unwrap_or(Completeness::Unrecorded)
-    }
-
-    /// The newest pass — the one whose pending set is current.
-    pub fn latest_pass(&self) -> Option<&PassEntry> {
-        self.passes.iter().max_by_key(|p| p.seq)
-    }
-
-    pub fn next_seq(&self) -> u32 {
-        self.latest_pass().map_or(0, |p| p.seq + 1)
-    }
-}
-
-/// One pass, as the manifest records it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PassEntry {
-    pub seq: u32,
-    /// Directory under the policy's, e.g. `pass-0003`.
-    pub dir: String,
-    /// The range this pass walked: `[floor, ceiling)`.
-    pub ceiling: u64,
-    pub floor: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub movements: Option<FileEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrections: Option<FileEntry>,
-    /// A pass left UNCOMPACTED: the segments it spilled while walking, in
-    /// order, kind by filename (`seg-`/`corr-`). Empty once compacted into
-    /// `movements`/`corrections`. Readers merge either shape the same way.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub segments: Vec<FileEntry>,
-    /// Spenders still waiting on a source after this pass.
-    pub pending: u64,
-    /// Transactions the walk FOUND touching the policy in the pass's range.
-    #[serde(default)]
-    pub found: u64,
-    /// Transactions with rows in `movements` — fewer than `found`, because
-    /// a transaction the asset only rode through as change moved nothing.
-    pub written: u64,
-    /// Delta rows resolved for rows written earlier — here or by an earlier
-    /// pass.
-    pub backfilled: u64,
-    /// Distinct units seen in this pass. A lower bound on the policy's, since
-    /// a window sees only what moved in it.
-    pub units: u64,
-    pub secs: f64,
-    pub written_unix: u64,
-}
-
-impl PassEntry {
-    pub fn dir_name(seq: u32) -> String {
-        format!("pass-{seq:04}")
-    }
-}
-
-/// One Parquet file, as the manifest records it — enough to decide whether
-/// to open it without opening it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileEntry {
-    pub file: String,
-    pub rows: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_slot: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_slot: Option<u64>,
-}
+// The manifest, the file kinds and the feed shapes live in the crate, so a
+// Worker reading R2 parses exactly what the box wrote.
+#[cfg(test)]
+pub use policy_archive::feed::PartyMove;
+pub use policy_archive::feed::{FeedRow, UnitMove, fold_rows};
+pub use policy_archive::manifest::{
+    CORRECTIONS, FileEntry, FileKind, MANIFEST, MANIFEST_FORMAT, MOVEMENTS, Manifest, PENDING,
+    PassEntry, kind_of,
+};
 
 /// A transaction still waiting on inputs — the carried state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,8 +87,7 @@ pub fn load_manifest(dir: &Path) -> Result<Option<Manifest>> {
         return Ok(None);
     }
     let raw = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let m: Manifest =
-        serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let m = Manifest::from_json(&raw).with_context(|| format!("parsing {}", path.display()))?;
     if m.format > MANIFEST_FORMAT {
         bail!(
             "{} is manifest format {} — newer than this binary ({MANIFEST_FORMAT})",
@@ -236,8 +103,81 @@ pub fn load_manifest(dir: &Path) -> Result<Option<Manifest>> {
 pub fn store_manifest(dir: &Path, m: &Manifest) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!("{MANIFEST}.tmp"));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
+    std::fs::write(&tmp, m.to_json()?)?;
     std::fs::rename(&tmp, dir.join(MANIFEST))?;
+    Ok(())
+}
+
+/// The manifest plus every file's footer, as one blob beside the manifest —
+/// what the push script puts in KV so a Worker opens the archive in ONE read
+/// instead of a manifest and two tails per file. Written AFTER the manifest,
+/// from the files it names, and replaced whole.
+pub fn store_bundle(dir: &Path, m: &Manifest) -> Result<PathBuf> {
+    use policy_archive::reader::{FOOTER_HINT, footer_length, footer_request};
+    let mut files = Vec::new();
+    for (rel, _) in m.files() {
+        let path = dir.join(&rel);
+        let mut f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let total = f.metadata()?.len();
+        let (start, len) = footer_request(total, FOOTER_HINT);
+        let mut tail = vec![0u8; len as usize];
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut tail)?;
+        let need = footer_length(&tail)?;
+        let (footer_start, footer) = if need > len {
+            let (start, len) = footer_request(total, need);
+            let mut whole = vec![0u8; len as usize];
+            f.seek(SeekFrom::Start(start))?;
+            f.read_exact(&mut whole)?;
+            (start, whole)
+        } else {
+            // Exactly the footer, not the whole tail request.
+            (total - need, tail.split_off((len - need) as usize))
+        };
+        files.push(policy_archive::BundledFooter {
+            file: rel,
+            total_len: total,
+            footer_start,
+            footer,
+        });
+    }
+    let bundle = policy_archive::Bundle {
+        format: policy_archive::BUNDLE_FORMAT,
+        manifest: m.to_json()?,
+        files,
+    };
+    let path = dir.join(policy_archive::BUNDLE);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::BUNDLE));
+    std::fs::write(&tmp, bundle.encode()?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// `token-ledger bundle` — (re)write a policy's bundle from its manifest.
+/// The landing path writes one itself; this is for archives from before the
+/// bundle existed.
+#[derive(clap::Args, Debug)]
+pub struct BundleArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+}
+
+pub fn bundle(args: BundleArgs) -> Result<()> {
+    let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let Some(m) = load_manifest(&dir)? else {
+        bail!("no archive at {}", dir.display());
+    };
+    let path = store_bundle(&dir, &m)?;
+    let len = std::fs::metadata(&path)?.len();
+    println!(
+        "wrote {} — {} files, {len} bytes",
+        path.display(),
+        m.files().len()
+    );
     Ok(())
 }
 
@@ -292,15 +232,6 @@ impl RangeFile {
         into.insert(start, buf.into());
         Ok(())
     }
-}
-
-/// Which stream a file belongs to. Movements files count transactions in
-/// their footers; corrections files only ever add movements to transactions
-/// counted elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    Movements,
-    Corrections,
 }
 
 /// The footer protocol against a local file: the tail, then the exact footer
@@ -409,23 +340,16 @@ impl PolicyArchive {
             )
         });
         let mut files = Vec::new();
-        for pass in &manifest.passes {
-            let base = dir.join(&pass.dir);
-            if let Some(f) = &pass.movements {
-                files.push(OpenFile::open(&base.join(&f.file), FileKind::Movements)?);
-            }
-            if let Some(f) = &pass.corrections {
-                files.push(OpenFile::open(&base.join(&f.file), FileKind::Corrections)?);
-            }
-            for f in &pass.segments {
-                files.push(OpenFile::open(
-                    &base.join(&f.file),
-                    crate::segments::kind_of(&f.file),
-                )?);
-            }
+        for (rel, kind) in manifest.files() {
+            files.push(OpenFile::open(&dir.join(rel), kind)?);
         }
+        // A running pass's segments can vanish under us when it lands and
+        // compacts them; one request seeing the archive without them is
+        // better than one request failing.
         for (path, kind) in extra {
-            files.push(OpenFile::open(path, *kind)?);
+            if path.exists() {
+                files.push(OpenFile::open(path, *kind)?);
+            }
         }
         Ok(Some(Self { manifest, files }))
     }
@@ -676,70 +600,6 @@ pub fn merge_density(a: Vec<DensityBucket>, b: Vec<DensityBucket>) -> Vec<Densit
     by.into_values().collect()
 }
 
-/// Rows → feed rows. Sums per `(transaction, unit, party)` — the rule the
-/// sqlite `ON CONFLICT … amount + excluded.amount` used to enforce — drops
-/// parties that net to nothing, keeps a unit with no parties when a
-/// placeholder said the transaction minted or burned it, and orders
-/// newest-first.
-pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
-    struct Acc {
-        slot: u64,
-        block_time: u64,
-        units: BTreeMap<Vec<u8>, (i64, BTreeMap<String, i64>)>,
-    }
-    let mut by_tx: HashMap<Vec<u8>, Acc> = HashMap::new();
-    for m in rows {
-        let acc = by_tx.entry(m.tx_hash.clone()).or_insert_with(|| Acc {
-            slot: m.slot,
-            block_time: m.block_time,
-            units: BTreeMap::new(),
-        });
-        let unit = acc.units.entry(m.unit_name.clone()).or_default();
-        if m.net_mint != 0 {
-            unit.0 = m.net_mint;
-        }
-        if !m.is_placeholder() {
-            *unit.1.entry(m.address.clone()).or_insert(0) += m.amount;
-        }
-    }
-    let mut out: Vec<FeedRow> = by_tx
-        .into_iter()
-        .filter_map(|(tx_hash, acc)| {
-            let units: Vec<UnitMove> = acc
-                .units
-                .into_iter()
-                .map(|(name, (net_mint, parties))| UnitMove {
-                    name,
-                    net_mint,
-                    parties: parties
-                        .into_iter()
-                        .filter(|(_, amount)| *amount != 0)
-                        .map(|(address, amount)| PartyMove {
-                            stake: stake_of(&address),
-                            address,
-                            amount,
-                        })
-                        .collect(),
-                })
-                // A unit whose parties all netted to nothing and that was
-                // neither minted nor burned did not MOVE — the asset rode
-                // through the transaction as change. Measured on SpaceBudz:
-                // 89 of 160 transactions in a 120-day window. Shown, it would
-                // read as "ambiguous", which it is not; it is nothing.
-                .filter(|u| !u.parties.is_empty() || u.net_mint != 0)
-                .collect();
-            (!units.is_empty()).then_some(FeedRow {
-                tx_hash,
-                slot: acc.slot,
-                block_time: acc.block_time,
-                units,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| b.slot.cmp(&a.slot).then_with(|| b.tx_hash.cmp(&a.tx_hash)));
-    out
-}
-
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(clap::Args, Debug)]
@@ -778,6 +638,12 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
         m.walk_to,
         m.passes.len()
     );
+    if let Some(r) = &m.rollup {
+        println!(
+            "rollup      {} rows={} units={} through pass {:?}",
+            r.file, r.rows, r.units, m.rolled_up_through
+        );
+    }
     for p in &m.passes {
         println!(
             "  {} [{}, {}) found={} written={} backfilled={} pending={} units={} {:.1}s{}",

@@ -1,4 +1,5 @@
-# wallet-sieve — on-demand wallet flow excavation with NO index.
+# wallet-sieve — on-demand wallet flow excavation. The sieve passes need no
+# index; sender resolution rides the tx index.
 #
 # The other walkers (market-ledger, project-ledger, wallet-trace) decode the
 # whole chain because their target set is global. This tool's target is ONE
@@ -8,13 +9,16 @@
 # chain-size-bound, not wallet-size-bound; measured 2026-08-25 on
 # cardano-infra the full 216GB sweep is ~2.5 min at 4 parallel readers.
 #
+# The one thing bytes cannot find is a SENDER (a tx hash is computed, never
+# stored), which is why pass C uses `tx-index` (crates/tx-index) instead.
+#
 # Design + measurements: cnft.dev-workers memory `project_wallet_flow_explorer`.
 [package]
 name = "wallet-sieve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "On-demand single-wallet flow excavation over a certified Mithril snapshot — no index"
+description = "On-demand single-wallet flow excavation over a certified Mithril snapshot — byte sieve for flows, tx-index for senders"
 
 [[bin]]
 name = "wallet-sieve"
@@ -33,6 +37,12 @@ pallas-network = { workspace = true }
 # The scanning machine — parallel chunk memmem + decode-on-hit — extracted
 # to a shared crate so token-ledger's sieve walk uses the same core.
 chain-sieve = { path = "../../crates/chain-sieve" }
+
+# Sender resolution — tx hash → body offset over the same chunk store, so
+# pass C is a point lookup per foreign input instead of a decode+hash sweep
+# over bands of chunks. The sweep survives only as the fallback for chunks
+# the index has not been rebuilt over yet (or an absent index).
+tx-index = { path = "../../crates/tx-index" }
 
 # `EventKind` — the market ledger's own vocabulary, which is what lands in the
 # `market_events.kind` column this tool reads. Depended on rather than

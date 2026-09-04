@@ -59,6 +59,12 @@ pub struct ServeArgs {
     #[arg(long)]
     pub push_script: Option<PathBuf>,
 
+    /// Script run after every policy pass lands, with the policy hex and
+    /// the archive root as arguments — `push-archive.sh`, which puts the
+    /// archive in R2 so the Worker can read it without this box.
+    #[arg(long)]
+    pub archive_push_script: Option<PathBuf>,
+
     /// Public base clients should fetch artifacts from.
     #[arg(long, default_value = "https://tokendata.hodlcroft.com")]
     pub public_base: String,
@@ -145,6 +151,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.data_dir.clone(),
         args.tokens.clone(),
         args.archive_dir.clone(),
+        args.archive_push_script.clone(),
         std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
     );
 

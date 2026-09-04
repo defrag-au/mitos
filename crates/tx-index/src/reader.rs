@@ -52,9 +52,15 @@ impl TxBody {
 /// What an outref lookup came back with.
 #[derive(Clone, Debug)]
 pub enum Resolution {
-    Found { body: TxBody, output: ResolvedOutput },
+    Found {
+        body: TxBody,
+        output: ResolvedOutput,
+    },
     /// The tx exists with `outputs` outputs; the index asked for is past them.
-    NoSuchOutput { body: TxBody, outputs: usize },
+    NoSuchOutput {
+        body: TxBody,
+        outputs: usize,
+    },
     UnknownTx,
 }
 

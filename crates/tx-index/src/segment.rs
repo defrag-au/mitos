@@ -87,7 +87,8 @@ impl SegmentFile {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: the file is written once via rename and never modified in
         // place; a concurrent unlink keeps the mapping valid until dropped.
-        let mmap = unsafe { Mmap::map(&f) }.with_context(|| format!("mapping {}", path.display()))?;
+        let mmap =
+            unsafe { Mmap::map(&f) }.with_context(|| format!("mapping {}", path.display()))?;
         let header = SegmentHeader::read(&mmap)?;
         let want = SEGMENT_HEADER_BYTES + header.count as usize * ENTRY_BYTES;
         if mmap.len() != want {

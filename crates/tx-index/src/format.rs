@@ -127,7 +127,10 @@ impl SegmentHeader {
             bail!("not a tx-index segment (bad magic)");
         }
         if b[4] != FORMAT_VERSION {
-            bail!("segment format version {} (this build reads {FORMAT_VERSION})", b[4]);
+            bail!(
+                "segment format version {} (this build reads {FORMAT_VERSION})",
+                b[4]
+            );
         }
         Ok(SegmentHeader {
             era: b[5],
@@ -173,7 +176,10 @@ impl BaseHeader {
             bail!("not a tx-index base (bad magic)");
         }
         if b[4] != FORMAT_VERSION {
-            bail!("base format version {} (this build reads {FORMAT_VERSION})", b[4]);
+            bail!(
+                "base format version {} (this build reads {FORMAT_VERSION})",
+                b[4]
+            );
         }
         let hdr = BaseHeader {
             dir_bits: b[5],
@@ -238,8 +244,9 @@ pub fn chunk_number(name: &str, ext: &str) -> Option<u64> {
     name.strip_suffix(ext)?.parse::<u64>().ok()
 }
 
-/// Chunk numbers must fit the entry's u16. Mainnet is ~3,000 in 2026 and
-/// gains ~28 a week; this trips in the 2060s.
+/// Chunk numbers must fit the entry's u16. A chunk is 21,600 slots — six
+/// hours since Shelley — so mainnet sits at ~9,100 in 2026 and gains 28 a
+/// week; the field overflows in the early 2060s.
 pub fn chunk_u16(n: u64) -> Result<u16> {
     u16::try_from(n).with_context(|| format!("chunk {n} exceeds the u16 entry field"))
 }

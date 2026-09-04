@@ -29,7 +29,8 @@ impl BaseFile {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: the base is produced whole under a temp name and swapped in
         // by rename; nothing writes to a published base in place.
-        let mmap = unsafe { Mmap::map(&f) }.with_context(|| format!("mapping {}", path.display()))?;
+        let mmap =
+            unsafe { Mmap::map(&f) }.with_context(|| format!("mapping {}", path.display()))?;
         let header = BaseHeader::read(&mmap)?;
         if mmap.len() as u64 != header.file_len() {
             bail!(

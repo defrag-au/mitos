@@ -47,6 +47,12 @@ pub struct ServeArgs {
     #[arg(long)]
     immutable: PathBuf,
 
+    /// tx-index dir (base.idx + segments/) for sender resolution — the
+    /// index `tx-index-refresh` maintains beside the chunk store. Unusable
+    /// = the decode+hash sweep, with a warning per resolve.
+    #[arg(long, default_value = "/opt/tx-index/mainnet")]
+    index_dir: PathBuf,
+
     /// Threads per excavation (one excavation runs at a time).
     #[arg(long, default_value_t = 10)]
     scan_threads: usize,
@@ -166,6 +172,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let registry = jobs::Registry::start(jobs::Config {
         db_path: args.db.clone(),
         immutable: args.immutable.clone(),
+        index_dir: args.index_dir.clone(),
         tail_db: args.tail_db.clone(),
         market_db: args.market_db.clone(),
         // Slots are seconds on Shelley, so a day is 86,400 of them.

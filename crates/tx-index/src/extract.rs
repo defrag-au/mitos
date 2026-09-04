@@ -90,11 +90,13 @@ pub fn extract_chunk(immutable: &Path, chunk: u16) -> Result<Extracted> {
             Some(_) => {}
         }
 
-        for body in bodies(&block) {
+        for body in bodies(&block)? {
             let start = body.as_ptr() as usize;
             let end = start + body.len();
             if start < base_ptr || end > base_ptr + bytes.len() {
-                bail!("chunk {chunk}: tx body at block byte {pos} is not borrowed from the chunk buffer");
+                bail!(
+                    "chunk {chunk}: tx body at block byte {pos} is not borrowed from the chunk buffer"
+                );
             }
             let offset = start - base_ptr;
             let hash = Hasher::<256>::hash(body);
@@ -102,8 +104,9 @@ pub fn extract_chunk(immutable: &Path, chunk: u16) -> Result<Extracted> {
                 prefix: prefix_of(&hash),
                 loc: Location {
                     chunk,
-                    offset: u32::try_from(offset)
-                        .with_context(|| format!("chunk {chunk}: body offset {offset} exceeds u32"))?,
+                    offset: u32::try_from(offset).with_context(|| {
+                        format!("chunk {chunk}: body offset {offset} exceeds u32")
+                    })?,
                     len: u16::try_from(body.len()).with_context(|| {
                         format!("chunk {chunk}: body of {} bytes exceeds u16", body.len())
                     })?,
@@ -143,8 +146,8 @@ pub fn extract_to_segment(immutable: &Path, index_dir: &Path, chunk: u16) -> Res
 /// The raw body slice of every transaction in the block, in block order.
 /// Byron's hashed item is the inner `Tx` of each `[tx, witnesses]` payload;
 /// Shelley onward it is each element of the body array.
-fn bodies<'a>(block: &'a MultiEraBlock<'_>) -> Vec<&'a [u8]> {
-    match block {
+fn bodies<'a>(block: &'a MultiEraBlock<'_>) -> Result<Vec<&'a [u8]>> {
+    Ok(match block {
         MultiEraBlock::EpochBoundary(_) => Vec::new(),
         MultiEraBlock::Byron(b) => b
             .body
@@ -152,20 +155,16 @@ fn bodies<'a>(block: &'a MultiEraBlock<'_>) -> Vec<&'a [u8]> {
             .iter()
             .map(|p| p.transaction.raw_cbor())
             .collect(),
-        MultiEraBlock::AlonzoCompatible(b, _) => b
-            .transaction_bodies
-            .iter()
-            .map(|k| k.raw_cbor())
-            .collect(),
-        MultiEraBlock::Babbage(b) => b
-            .transaction_bodies
-            .iter()
-            .map(|k| k.raw_cbor())
-            .collect(),
-        MultiEraBlock::Conway(b) => b
-            .transaction_bodies
-            .iter()
-            .map(|k| k.raw_cbor())
-            .collect(),
-    }
+        MultiEraBlock::AlonzoCompatible(b, _) => {
+            b.transaction_bodies.iter().map(|k| k.raw_cbor()).collect()
+        }
+        MultiEraBlock::Babbage(b) => b.transaction_bodies.iter().map(|k| k.raw_cbor()).collect(),
+        MultiEraBlock::Conway(b) => b.transaction_bodies.iter().map(|k| k.raw_cbor()).collect(),
+        // `MultiEraBlock` is `#[non_exhaustive]` upstream. A block shape this
+        // build cannot name must fail the chunk, not silently index nothing.
+        other => bail!(
+            "block era {} is newer than this build of tx-index",
+            other.era()
+        ),
+    })
 }

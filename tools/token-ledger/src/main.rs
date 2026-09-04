@@ -65,6 +65,13 @@ enum Command {
     /// then only the row groups a page or a lookup needs — and report what it
     /// cost in requests and bytes.
     Archive(archive::InspectArgs),
+    /// Fold a policy's passes into ONE file at its root — fewer footers per
+    /// read, one object per policy for R2. Runs on its own after every few
+    /// passes; this forces it.
+    Rollup(segments::RollupArgs),
+    /// Write a policy's bundle — manifest plus every footer, one blob for
+    /// KV — from its manifest. Landing writes one; this backfills.
+    Bundle(archive::BundleArgs),
     /// Derived balances at tip — the reconciliation surface.
     Stats {
         #[arg(long)]
@@ -141,6 +148,8 @@ fn main() -> Result<()> {
         Command::Walk(args) => walk::run(args),
         Command::Reverse(args) => reverse::run(args),
         Command::Archive(args) => archive::inspect(args),
+        Command::Rollup(args) => segments::run_rollup(args),
+        Command::Bundle(args) => archive::bundle(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),

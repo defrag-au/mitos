@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use policy_archive::{Archive, ArchiveWriter, GroupPolicy, Movement, SparseBytes, Stamp};
 
-use crate::archive::{FileEntry, FileKind, RangeFile};
+use crate::archive::{FileEntry, RangeFile};
 
 /// Flush a segment once either buffer holds this many rows…
 pub const SEGMENT_ROWS: usize = 50_000;
@@ -57,15 +57,7 @@ pub const SEGMENT_ROWS: usize = 50_000;
 /// still publishes and a reader watching the pass sees the floor move.
 pub const SEGMENT_CHUNKS: u64 = 200;
 
-/// Which stream a file belongs to, by name. `FileEntry` carries no kind
-/// because the name already says it and a manifest edit cannot disagree
-/// with the file it names.
-pub fn kind_of(file: &str) -> FileKind {
-    match file.starts_with("corr-") || file == crate::archive::CORRECTIONS {
-        true => FileKind::Corrections,
-        false => FileKind::Movements,
-    }
-}
+pub use crate::archive::kind_of;
 
 /// The writer's order: block time, then transaction, then unit, then party —
 /// the order the merge in [`compact`] relies on.
@@ -98,6 +90,7 @@ pub fn write_file(path: &Path, stamp: &Stamp, rows: Vec<Movement>) -> Result<Fil
         rows: written.rows,
         min_slot: written.min_slot,
         max_slot: written.max_slot,
+        units: 0,
     })
 }
 
@@ -272,25 +265,149 @@ pub fn compact(
     ceiling: u64,
     stamp: &Stamp,
 ) -> Result<Compacted> {
-    // Files by their lowest slot, so a file is opened only when the merge
-    // frontier reaches it — the k-way merge never holds more open groups
-    // than the files overlapping the current moment.
-    let mut files: Vec<&FileEntry> = segments.iter().collect();
-    files.sort_by_key(|f| f.min_slot.unwrap_or(0));
+    let inputs: Vec<PathBuf> = segments.iter().map(|f| dir.join(&f.file)).collect();
+    let out = merge_files(&inputs, dir, crate::archive::MOVEMENTS, ceiling, stamp)?;
+    for p in &inputs {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(out)
+}
+
+/// How many uncompacted passes an archive carries before it is rolled up on
+/// landing. Every extra pass is a footer per read for every reader.
+pub const ROLLUP_AFTER_PASSES: usize = 3;
+
+/// Fold EVERYTHING the manifest names — rollup, passes, corrections — into
+/// one file at the policy's root, and rewrite the manifest to point at it.
+///
+/// The merge is the one [`compact`] uses with the ceiling at infinity: every
+/// row is "own", so a correction lands on the row it corrects and the
+/// output has no corrections file. Sequence numbers keep counting, so a
+/// reader mid-flight on the old manifest still finds old files until the
+/// prune; the manifest is written BEFORE the old files are removed.
+pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: u64) -> Result<()> {
+    let old_files = manifest.files();
+    if old_files.len() < 2 {
+        return Ok(());
+    }
+    let inputs: Vec<PathBuf> = old_files.iter().map(|(rel, _)| dir.join(rel)).collect();
+    let seq =
+        manifest.rolled_up_through.map_or(0, |t| t + 1) + manifest.rollup.as_ref().map_or(0, |_| 0);
+    let name = format!("archive-{:04}.parquet", manifest.next_seq());
+    let stamp = Stamp {
+        policy_hex: manifest.policy.clone(),
+        completeness: manifest.completeness(),
+        walk_from: manifest.walk_from,
+        walk_to: manifest.walk_to,
+        covered_from: manifest.walk_from.unwrap_or(0),
+        covered_to: manifest.walk_to.unwrap_or(u64::MAX),
+        sealed_unix,
+    };
+    let _ = seq;
+    let out = merge_files(&inputs, dir, &name, u64::MAX, &stamp)?;
+
+    // The carried state moves to the root before the pass directory that
+    // held it goes.
+    if let Some(rel) = manifest.pending_file() {
+        let from = dir.join(&rel);
+        if from.exists() && rel != crate::archive::PENDING {
+            std::fs::copy(&from, dir.join(crate::archive::PENDING))?;
+        }
+    }
+    let through = manifest.latest_pass().map(|p| p.seq);
+    let previous_rollup = manifest.rollup.take();
+    manifest.rollup = Some(FileEntry {
+        units: out.units,
+        ..out.movements
+    });
+    manifest.rolled_up_through = through;
+    manifest.pending = Some(crate::archive::PENDING.to_string());
+    manifest.updated_unix = sealed_unix;
+    crate::archive::store_manifest(dir, manifest)?;
+    crate::archive::store_bundle(dir, manifest)?;
+
+    // Prune: the files the new manifest no longer names.
+    for p in &inputs {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Some(prev) = previous_rollup {
+        let _ = std::fs::remove_file(dir.join(prev.file));
+    }
+    for pass in &manifest.passes {
+        if through.is_some_and(|t| pass.seq <= t) {
+            let _ = std::fs::remove_dir_all(dir.join(&pass.dir));
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RollupArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+}
+
+/// `token-ledger rollup` — fold a policy's passes into one file now.
+pub fn run_rollup(args: RollupArgs) -> Result<()> {
+    let dir = crate::archive::policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let Some(mut manifest) = crate::archive::load_manifest(&dir)? else {
+        anyhow::bail!("no archive at {}", dir.display());
+    };
+    let before = manifest.files().len();
+    let t = std::time::Instant::now();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    rollup(&dir, &mut manifest, now)?;
+    let r = manifest.rollup.as_ref();
+    println!(
+        "rolled {before} files into {} ({} rows, {} units) in {:.1}s",
+        r.map_or("nothing", |r| r.file.as_str()),
+        r.map_or(0, |r| r.rows),
+        r.map_or(0, |r| r.units),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// The streaming k-way merge behind [`compact`] and [`rollup`]: `inputs`
+/// (any mix of movement and correction files, each in writer order) → one
+/// movements file named `movements_name` in `out_dir`, plus
+/// `corrections.parquet` beside it for rows at or above `ceiling`.
+fn merge_files(
+    inputs: &[PathBuf],
+    out_dir: &Path,
+    movements_name: &str,
+    ceiling: u64,
+    stamp: &Stamp,
+) -> Result<Compacted> {
+    // Footers first, to order the files by their lowest slot: a file is then
+    // opened for rows only when the merge frontier reaches it, so the k-way
+    // merge never holds more open groups than the files overlapping the
+    // current moment.
+    let mut files: Vec<(u64, &PathBuf)> = Vec::with_capacity(inputs.len());
+    for p in inputs {
+        let (_, _, archive) = crate::archive::open_footer(p)?;
+        files.push((archive.stamp().covered_from, p));
+    }
+    files.sort_by_key(|(from, _)| *from);
+    let lowest = files.first().map_or(0, |(from, _)| *from);
     let mut next_file = 0usize;
     let mut cursors: Vec<Cursor> = Vec::new();
     // Min-heap on the writer key.
     let mut heap: BinaryHeap<Reverse<(Key, usize)>> = BinaryHeap::new();
 
+    let mv_tmp = out_dir.join(format!("{movements_name}.tmp"));
     let mut movements = ArchiveWriter::new(
-        File::create(dir.join(format!("{}.tmp", crate::archive::MOVEMENTS)))?,
+        File::create(&mv_tmp)?,
         &Stamp {
-            covered_from: segments
-                .iter()
-                .filter_map(|f| f.min_slot)
-                .min()
-                .unwrap_or(0),
-            covered_to: ceiling.saturating_sub(1),
+            covered_from: lowest.min(stamp.covered_from),
+            covered_to: stamp.covered_to.min(ceiling.saturating_sub(1)),
             ..stamp.clone()
         },
         GroupPolicy::DAILY,
@@ -304,16 +421,17 @@ pub fn compact(
 
     // The open (tx, unit) group.
     let mut group: Option<Group> = None;
+    let dir = out_dir;
 
     loop {
         // Open every file whose lowest slot is at or below the frontier.
-        while let Some(f) = files.get(next_file) {
+        while let Some((from, path)) = files.get(next_file) {
             let frontier = heap.peek().map(|Reverse(((bt, _, _, _), _))| *bt);
-            let file_bt = mitos_chain_walk::slot_to_unix(f.min_slot.unwrap_or(0));
+            let file_bt = mitos_chain_walk::slot_to_unix(*from);
             if frontier.is_some_and(|bt| file_bt > bt) {
                 break;
             }
-            let mut c = Cursor::open(&dir.join(&f.file))?;
+            let mut c = Cursor::open(path)?;
             if let Some(k) = c.peek_key()? {
                 heap.push(Reverse((k, cursors.len())));
                 cursors.push(c);
@@ -368,16 +486,13 @@ pub fn compact(
     written += written_txs.len() as u64;
 
     let mv = movements.finish()?;
-    let mv_path = dir.join(crate::archive::MOVEMENTS);
-    std::fs::rename(
-        dir.join(format!("{}.tmp", crate::archive::MOVEMENTS)),
-        &mv_path,
-    )?;
+    std::fs::rename(&mv_tmp, dir.join(movements_name))?;
     let movements_entry = FileEntry {
-        file: crate::archive::MOVEMENTS.to_string(),
+        file: movements_name.to_string(),
         rows: mv.rows,
         min_slot: mv.min_slot,
         max_slot: mv.max_slot,
+        units: units.len() as u64,
     };
     let corrections_entry = match corrections {
         Some(w) => {
@@ -392,13 +507,11 @@ pub fn compact(
                 rows: c.rows,
                 min_slot: c.min_slot,
                 max_slot: c.max_slot,
+                units: 0,
             })
         }
         None => None,
     };
-    for f in segments {
-        let _ = std::fs::remove_file(dir.join(&f.file));
-    }
     Ok(Compacted {
         movements: movements_entry,
         corrections: corrections_entry,
@@ -538,6 +651,7 @@ fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::FileKind;
     use policy_archive::Completeness;
 
     fn mv(slot: u64, tx: u8, unit: &str, addr: &str, amount: i64, net_mint: i64) -> Movement {
@@ -625,5 +739,91 @@ mod tests {
         let dave = a.movements_of(&[9; 32]).unwrap();
         assert_eq!(dave.len(), 1);
         assert_eq!(dave[0].amount, -1);
+    }
+
+    /// A rollup folds every file the manifest names into one at the root,
+    /// takes over the pending set, and leaves the manifest pointing at only
+    /// that — with the same rows the separate files gave.
+    #[test]
+    fn a_rollup_folds_the_passes_into_one_file() {
+        use crate::archive::{Manifest, PassEntry, PolicyArchive, store_manifest, store_pending};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut manifest = Manifest::new(&"ab".repeat(28));
+        // Pass 0: two transactions, one waiting on a source.
+        let p0 = dir.join(PassEntry::dir_name(0));
+        std::fs::create_dir_all(&p0).unwrap();
+        let mv0 = write_file(
+            &p0.join(crate::archive::MOVEMENTS),
+            &stamp(),
+            vec![mv(900, 1, "A", "bob", 1, 0), mv(950, 2, "B", "carol", 1, 1)],
+        )
+        .unwrap();
+        store_pending(
+            &p0.join(crate::archive::PENDING),
+            &crate::archive::PendingFile::default(),
+        )
+        .unwrap();
+        // Pass 1: one older transaction and the correction for tx 1.
+        let p1 = dir.join(PassEntry::dir_name(1));
+        std::fs::create_dir_all(&p1).unwrap();
+        let mv1 = write_file(
+            &p1.join(crate::archive::MOVEMENTS),
+            &stamp(),
+            vec![mv(500, 3, "A", "alice", 1, 0)],
+        )
+        .unwrap();
+        let corr1 = write_file(
+            &p1.join(crate::archive::CORRECTIONS),
+            &stamp(),
+            vec![mv(900, 1, "A", "alice", -1, 0)],
+        )
+        .unwrap();
+        store_pending(
+            &p1.join(crate::archive::PENDING),
+            &crate::archive::PendingFile::default(),
+        )
+        .unwrap();
+        for (seq, mvs, corr) in [(0, mv0, None), (1, mv1, Some(corr1))] {
+            manifest.passes.push(PassEntry {
+                seq,
+                dir: PassEntry::dir_name(seq),
+                ceiling: 1_000,
+                floor: 400,
+                movements: Some(mvs),
+                corrections: corr,
+                segments: Vec::new(),
+                pending: 0,
+                found: 0,
+                written: 0,
+                backfilled: 0,
+                units: 0,
+                secs: 0.0,
+                written_unix: 0,
+            });
+        }
+        manifest.walk_from = Some(400);
+        manifest.walk_to = Some(1_000);
+        store_manifest(dir, &manifest).unwrap();
+
+        let before = PolicyArchive::open(dir)
+            .unwrap()
+            .unwrap()
+            .feed_rows(10, None)
+            .unwrap();
+        rollup(dir, &mut manifest, 7).unwrap();
+        assert_eq!(manifest.files().len(), 1, "one file, at the root");
+        assert_eq!(manifest.rolled_up_through, Some(1));
+        assert!(dir.join(crate::archive::PENDING).exists());
+        assert!(!p0.exists() && !p1.exists(), "pass directories are gone");
+        let r = manifest.rollup.as_ref().unwrap();
+        assert_eq!(r.units, 2);
+
+        let mut a = PolicyArchive::open(dir).unwrap().unwrap();
+        let after = a.feed_rows(10, None).unwrap();
+        assert_eq!(after, before, "the rollup reads exactly as the passes did");
+        let one = after.iter().find(|r| r.tx_hash == vec![1; 32]).unwrap();
+        assert_eq!(one.units[0].parties.len(), 2, "the correction is folded in");
+        assert_eq!(a.coverage().total_txs, 3);
     }
 }

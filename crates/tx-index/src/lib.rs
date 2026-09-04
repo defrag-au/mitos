@@ -49,3 +49,12 @@ pub mod wire;
 
 pub use format::{Entry, Location, prefix_of};
 pub use reader::{Coverage, Index, IndexHandle, Located, Resolution, TxBody};
+
+/// The tx hash of a body: blake2b-256 over its bytes. The one computation
+/// extraction, verification and the read side must all agree on.
+pub fn tx_hash(body: &[u8]) -> [u8; 32] {
+    let h = pallas_crypto::hash::Hasher::<256>::hash(body);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_ref());
+    out
+}

@@ -1,4 +1,5 @@
-//! wallet-sieve — one wallet's flow story from raw chain bytes, NO index.
+//! wallet-sieve — one wallet's flow story from raw chain bytes. The sieve
+//! passes need no index; sender resolution uses the tx index.
 //!
 //! Three passes over a certified Mithril immutable DB:
 //!
@@ -8,8 +9,9 @@
 //! - **B. sweeps** (`--sweeps`) — memmem the wallet's own tx hashes to catch
 //!   change-less spends (a spending tx names its source hash in raw bytes).
 //!   Measured near-useless on a real wallet (2 of 870 txs) — off by default.
-//! - **C. resolve** (`--resolve`) — decode+hash txs newest-first to name the
-//!   senders behind receipts; early-exits once every wanted source is found.
+//! - **C. resolve** (`--resolve`) — name the senders behind receipts: one
+//!   tx-index point lookup per foreign input (`--index-dir`), with the old
+//!   decode+hash sweep kept only for chunks the index has not covered yet.
 //!
 //! Two faces: `scan` (one-shot CLI, JSONL out) and `serve` (hosted read
 //! surface with a per-wallet cache, incremental refresh from a chunk cursor,
@@ -44,7 +46,9 @@ use crate::excavate::SHELLEY_START_SLOT;
 use crate::progress::Progress;
 
 #[derive(Parser, Debug)]
-#[command(about = "Single-wallet flow excavation over a Mithril immutable DB — no index")]
+#[command(
+    about = "Single-wallet flow excavation over a Mithril immutable DB — byte sieve for flows, tx-index for senders"
+)]
 enum Cmd {
     /// One-shot excavation: JSONL rows to stdout/file, timings to stderr.
     Scan(ScanArgs),
@@ -74,9 +78,14 @@ struct ScanArgs {
     #[arg(long)]
     sweeps: bool,
 
-    /// Pass C: resolve sender addresses behind receipts (decode+hash pass).
+    /// Pass C: resolve sender addresses behind receipts.
     #[arg(long)]
     resolve: bool,
+
+    /// tx-index dir (base.idx + segments/) for pass C. Omitted or unusable
+    /// = the full decode+hash sweep.
+    #[arg(long)]
+    index_dir: Option<PathBuf>,
 
     /// JSONL output path (default: stdout).
     #[arg(long)]
@@ -113,13 +122,20 @@ fn run_scan(args: ScanArgs) -> Result<()> {
                 eprintln!("  … {pass}: {done}/{total} chunks, {gb_per_s:.2} GB/s");
             }
         }
+        Progress::Lookup { done, total } => {
+            if done.is_multiple_of(10_000) || done == total {
+                eprintln!("  … resolve: {done}/{total} hashes looked up");
+            }
+        }
         Progress::Resolve {
             done,
             total,
             wanted_left,
         } => {
             if done.is_multiple_of(20) {
-                eprintln!("  … resolve: {done}/{total} bands, {wanted_left} sources still wanted");
+                eprintln!(
+                    "  … resolve sweep: {done}/{total} bands, {wanted_left} sources still wanted"
+                );
             }
         }
         Progress::Phase { label, detail } => eprintln!("phase {label}: {detail}"),
@@ -128,6 +144,7 @@ fn run_scan(args: ScanArgs) -> Result<()> {
     let outcome = excavate::run(
         excavate::Params {
             immutable: &args.immutable,
+            index_dir: args.index_dir.as_deref(),
             creds: creds.iter().map(|c| c.bytes).collect(),
             scan_from_chunk: immutable_file_for_slot(args.floor_slot),
             seed_owned: HashMap::new(),
@@ -157,10 +174,14 @@ fn run_scan(args: ScanArgs) -> Result<()> {
             b.hit_chunks
         );
     }
-    if let Some(secs) = outcome.resolve_secs {
+    if let Some(r) = &outcome.resolve {
         eprintln!(
-            "pass C (resolve): {secs:.1}s — {} sources named",
-            outcome.sources.len()
+            "pass C (resolve): {:.1}s — {} sources named ({} via index, {} via sweep), {} unresolved",
+            r.wall_secs,
+            outcome.sources.len(),
+            r.via_index,
+            r.via_sweep,
+            r.unresolved
         );
     }
 
