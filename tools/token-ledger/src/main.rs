@@ -23,6 +23,7 @@ mod policy_api;
 mod pools;
 mod registry;
 mod reverse;
+mod segments;
 mod serve;
 mod store;
 mod walk;

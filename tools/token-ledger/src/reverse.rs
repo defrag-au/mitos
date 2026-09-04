@@ -1,5 +1,5 @@
 //! `reverse` — walk history BACKWARD from the tip, newest first, into the
-//! policy archive. No database.
+//! policy archive. No database, and no model in memory.
 //!
 //! The forward walk in [`crate::walk`] is the complete one: it starts at or
 //! below the policy's first mint, so its outref buffer is complete by
@@ -11,30 +11,27 @@
 //! This mode inverts that: chunk-descending, newest first, one pass at a time,
 //! each pass reaching further back than the last.
 //!
-//! # The model is in memory; the archive is the state
+//! # The pass spills; the archive is the state
 //!
-//! A pass holds every transaction it finds in memory, resolves what it can
-//! while it runs, and writes the result ONCE as a stamped Parquet file
-//! ([`crate::archive`]). Nothing on the box outlives the pass except the
-//! Mithril snapshot it read and the artifacts it wrote — which is what lets
-//! the same walk run on a satellite that owns nothing but a snapshot and
-//! publishes into R2.
+//! A pass holds a bounded buffer of rows and flushes it to disk as a
+//! **segment** as it walks ([`crate::segments`]). Nothing on the box outlives
+//! the pass except the Mithril snapshot it read and the artifacts it wrote —
+//! which is what lets the same walk run on a satellite that owns nothing but
+//! a snapshot, publishes into R2 while it walks, and runs beside other
+//! policies without the memory of each being the limit.
 //!
 //! # The buffer inverts
 //!
 //! Forward, the buffer holds outputs awaiting their spender. Backward, the
 //! output that created an input sits at a LOWER slot — ground not covered
 //! yet — so the state is [`Pending`]: transactions already found, waiting for
-//! their sources to come into view. When a source appears, the spender gains
-//! its missing negative delta:
-//!
-//! - in THIS pass's model, if the spender was found in this pass;
-//! - as a row in `corrections.parquet`, if an earlier pass published it.
-//!
-//! Readers sum both by `(transaction, unit, party)` — the same rule the sqlite
-//! ledger's `ON CONFLICT … amount + excluded.amount` enforced, now applied at
-//! read time over immutable files. A row lands readable and is corrected
-//! later rather than withheld until perfect.
+//! their sources to come into view. When a source appears, the spender's
+//! missing negative delta is written as ONE MORE SIGNED ROW — a correction —
+//! whichever pass found the spender. Readers sum by `(transaction, unit,
+//! party)`, the same rule the sqlite ledger's `ON CONFLICT … amount +
+//! excluded.amount` enforced, now applied at read time over immutable files;
+//! compaction applies it once when the pass lands. A row lands readable and
+//! is corrected later rather than withheld until perfect.
 //!
 //! # What bounds it
 //!
@@ -44,7 +41,9 @@
 //! whose deltas do not balance (conservation says exactly which are missing a
 //! source), and a spender is RETIRED — its remaining inputs forgotten — the
 //! moment its units balance, because a balanced transaction's other inputs
-//! were carrying ADA, not the asset, and would never resolve.
+//! were carrying ADA, not the asset, and would never resolve. Measured on a
+//! full ClayNation walk: 745,400 transactions found, 1,659,023 resolutions,
+//! and nothing pending at the end.
 //!
 //! # The sieve gate stays complete
 //!
@@ -52,8 +51,7 @@
 //! its block — and its chunk — is a sieve hit. Skipping non-hit chunks cannot
 //! lose a resolution.
 
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -63,10 +61,11 @@ use mitos_chain_walk::mithril::CHUNK_SLOTS;
 use mitos_chain_walk::{open_blocks, slot_to_unix};
 use pallas_primitives::Hash;
 use pallas_traverse::MultiEraBlock;
-use policy_archive::{ArchiveWriter, Completeness, GroupPolicy, Movement, Stamp};
+use policy_archive::{Completeness, Movement, Stamp};
 
 use crate::archive::{self, FileEntry, Manifest, PassEntry, PendingFile, PendingSpender};
 use crate::registry;
+use crate::segments::{self, SegmentWriter};
 use crate::walk::{Watched, units_in_output};
 
 /// Slots per day on Cardano — one slot per second.
@@ -107,6 +106,12 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub to_slot: Option<u64>,
 
+    /// Leave the pass as its segments rather than compacting them into one
+    /// file at the end. For measuring, and for a box that would rather hand
+    /// compaction to something else.
+    #[arg(long)]
+    pub no_compact: bool,
+
     /// Skip the memmem gate and decode every block. Only useful for isolating
     /// a suspected gate bug, since the gate is complete by the balance rule.
     #[arg(long)]
@@ -123,7 +128,8 @@ pub struct Outcome {
     pub floor: u64,
     /// Transactions the archive now holds from this pass. Fewer than the
     /// walk found: a transaction the asset only passed through as change
-    /// moved nothing and has no rows.
+    /// moved nothing and has no rows. Equal to `found` when left
+    /// uncompacted, since only compaction drops them.
     pub written: u64,
     /// Delta rows resolved onto transactions — this pass's, or earlier ones'.
     pub backfilled: u64,
@@ -138,9 +144,12 @@ pub fn run(args: ReverseArgs) -> Result<()> {
     let report_every = args.report_every.max(1);
     let out = run_reporting(args, &|p| {
         // Chunks are ~6h of chain, so a full-history pass emits thousands. Log
-        // every Nth, but ALWAYS log one that corrected rows: a backfill is the
-        // event a consumer most needs to see and the rarest to occur.
-        if p.chunks_done.is_multiple_of(report_every) || !p.updated.is_empty() {
+        // every Nth, but ALWAYS log one that corrected rows or flushed a
+        // segment: those are the events a consumer most needs to see.
+        if p.chunks_done.is_multiple_of(report_every)
+            || !p.updated.is_empty()
+            || !p.flushed.is_empty()
+        {
             tracing::info!(
                 pct = format!("{:.1}%", p.fraction() * 100.0),
                 floor = p.floor,
@@ -149,6 +158,7 @@ pub fn run(args: ReverseArgs) -> Result<()> {
                 written = p.written,
                 updated = p.updated.len(),
                 pending = p.pending,
+                flushed = p.flushed.len(),
                 "reverse: progress"
             );
         }
@@ -206,13 +216,12 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         (None, None) => 0,
     };
     // Never dig below the policy's own first mint when we know it: there is
-    // nothing there, and reading it is pure cost. The registry's floor is
-    // recorded in the manifest so a later pass on a box without the registry
-    // entry still stops there.
-    // `--to-slot` IS the first mint when the hosted surface passes it (from
-    // Koios); counting it here is what lets a pass that reaches it record
-    // COMPLETE. The first full ClayNation walk reached its mint exactly and
-    // was stamped partial for want of this.
+    // nothing there, and reading it is pure cost. `--to-slot` IS the first
+    // mint when the hosted surface passes it (from Koios); counting it here
+    // is what lets a pass that reaches it record COMPLETE — the first full
+    // ClayNation walk reached its mint exactly and was stamped partial for
+    // want of this. Recorded in the manifest so a later pass on a box
+    // without the registry entry still stops there.
     let first_mint = token
         .floor_slot
         .or(manifest.first_mint_slot)
@@ -253,8 +262,27 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         "reverse: pass starting"
     );
 
-    let mut model = Model::default();
-    let mut corrections: Vec<Movement> = Vec::new();
+    // The pass directory, fresh. A pass that died mid-walk left segments
+    // here that no manifest names; they are not this pass's and would only
+    // waste disk.
+    let seq = manifest.next_seq();
+    let pass_dir = dir.join(PassEntry::dir_name(seq));
+    if pass_dir.exists() {
+        std::fs::remove_dir_all(&pass_dir)?;
+    }
+    let mut writer = SegmentWriter::new(
+        &pass_dir,
+        Stamp {
+            policy_hex: policy_hex.clone(),
+            completeness: manifest.completeness(),
+            walk_from: manifest.walk_from,
+            walk_to: manifest.walk_to,
+            covered_from: 0,
+            covered_to: 0,
+            sealed_unix: now_unix(),
+        },
+    )?;
+
     let walked = pass(
         &immutable,
         &all_chunks,
@@ -262,23 +290,23 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         &watched,
         floor,
         ceiling,
-        &mut model,
+        &mut writer,
         &mut pending,
-        &mut corrections,
         !args.no_sieve,
         on,
     )?;
+    let segments = writer.finish()?;
 
-    let out = write_pass(PassWrite {
+    let out = land(Landing {
         dir: &dir,
         manifest: &mut manifest,
         policy_hex: &policy_hex,
         first_mint,
         ceiling,
         walked,
-        model,
-        corrections,
+        segments,
         pending: &pending,
+        compact: !args.no_compact,
         secs: started.elapsed().as_secs_f64(),
     })?;
 
@@ -295,38 +323,39 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
     Ok(out)
 }
 
-/// Everything a finished walk hands to the writer.
-struct PassWrite<'a> {
+/// Everything a finished walk hands to the landing.
+struct Landing<'a> {
     dir: &'a Path,
     manifest: &'a mut Manifest,
     policy_hex: &'a str,
     first_mint: Option<u64>,
     ceiling: u64,
     walked: Walked,
-    model: Model,
-    corrections: Vec<Movement>,
+    segments: Vec<FileEntry>,
     pending: &'a Pending,
+    compact: bool,
     secs: f64,
 }
 
-/// Write one pass: its files, its pending sidecar, and LAST the manifest.
+/// Land one pass: compact its segments (or keep them), write the pending
+/// sidecar, and LAST the manifest.
 ///
 /// Separate from the chunk walk so the archive's write path can be exercised
-/// against a synthetic model — the walk needs Mithril chunks, the archive
+/// against synthetic segments — the walk needs Mithril chunks, the archive
 /// does not.
-fn write_pass(w: PassWrite<'_>) -> Result<Outcome> {
-    let PassWrite {
+fn land(l: Landing<'_>) -> Result<Outcome> {
+    let Landing {
         dir,
         manifest,
         policy_hex,
         first_mint,
         ceiling,
         walked,
-        model,
-        corrections,
+        segments,
         pending,
+        compact,
         secs,
-    } = w;
+    } = l;
     let seq = manifest.next_seq();
     let pass_dir = dir.join(PassEntry::dir_name(seq));
     std::fs::create_dir_all(&pass_dir)?;
@@ -347,37 +376,28 @@ fn write_pass(w: PassWrite<'_>) -> Result<Outcome> {
         (false, _) => Completeness::Partial,
     };
     let sealed_unix = now_unix();
-    let stamp = |covered_from: u64, covered_to: u64| Stamp {
+    let stamp = Stamp {
         policy_hex: policy_hex.to_string(),
         completeness,
         walk_from: new_walk_from,
         walk_to: new_walk_to,
-        covered_from,
-        covered_to,
+        covered_from: walked.floor,
+        covered_to: ceiling.saturating_sub(1),
         sealed_unix,
     };
 
-    let Rows {
-        rows: movement_rows,
-        units,
-        txs: written,
-    } = model.into_rows();
-    let movements = write_file(
-        &pass_dir.join(archive::MOVEMENTS),
-        &stamp(walked.floor, ceiling.saturating_sub(1)),
-        movement_rows,
-    )?;
-    let corrections_entry = match corrections.is_empty() {
-        true => None,
-        false => {
-            let lo = corrections.iter().map(|m| m.slot).min().unwrap_or(0);
-            let hi = corrections.iter().map(|m| m.slot).max().unwrap_or(0);
-            Some(write_file(
-                &pass_dir.join(archive::CORRECTIONS),
-                &stamp(lo, hi),
-                corrections,
-            )?)
+    let (movements, corrections, kept, written, units) = match compact {
+        true => {
+            let c = segments::compact(&pass_dir, &segments, ceiling, &stamp)?;
+            (
+                Some(c.movements),
+                c.corrections,
+                Vec::new(),
+                c.written,
+                c.units,
+            )
         }
+        false => (None, None, segments, walked.written, 0),
     };
     let pending_file = pending.to_file();
     let pending_bytes = archive::store_pending(&pass_dir.join(archive::PENDING), &pending_file)?;
@@ -392,8 +412,9 @@ fn write_pass(w: PassWrite<'_>) -> Result<Outcome> {
         dir: PassEntry::dir_name(seq),
         ceiling,
         floor: walked.floor,
-        movements: Some(movements),
-        corrections: corrections_entry,
+        movements,
+        corrections,
+        segments: kept,
         pending: pending_file.spenders.len() as u64,
         found: walked.written,
         written,
@@ -411,28 +432,6 @@ fn write_pass(w: PassWrite<'_>) -> Result<Outcome> {
         backfilled: walked.backfilled as u64,
         unresolved: pending_file.spenders.len() as u64,
         pending_bytes,
-    })
-}
-
-/// Rows → one stamped file, via a temp path so a crash never leaves a
-/// half-written artifact under its final name.
-fn write_file(path: &Path, stamp: &Stamp, rows: Vec<Movement>) -> Result<FileEntry> {
-    let tmp = path.with_extension("parquet.tmp");
-    let sink = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let mut w = ArchiveWriter::new(sink, stamp, GroupPolicy::DAILY)?;
-    for row in rows {
-        w.push(row)?;
-    }
-    let written = w.finish()?;
-    std::fs::rename(&tmp, path)?;
-    Ok(FileEntry {
-        file: path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        rows: written.rows,
-        min_slot: written.min_slot,
-        max_slot: written.max_slot,
     })
 }
 
@@ -465,25 +464,24 @@ pub fn unix_date(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-// ─── the in-memory model ─────────────────────────────────────────────────────
+// ─── one transaction, as found ───────────────────────────────────────────────
 
-/// One transaction found by this pass.
+/// One transaction as the walk first meets it.
 struct PassTx {
     hash: Hash<32>,
     slot: u64,
     block_time: u64,
     /// Per unit: 0 / +mint / −burn.
     net_mint: Vec<(Vec<u8>, i64)>,
-    /// `(unit, address, amount)` — outputs as found, negatives as resolved.
+    /// `(unit, address, amount)` — its outputs.
     deltas: Vec<(Vec<u8>, String, i64)>,
 }
 
 impl PassTx {
     /// This transaction's rows as first found — its outputs, plus a
-    /// placeholder for a minted-or-burned unit that reached nobody. What the
-    /// live view is handed before any source is resolved; resolutions arrive
-    /// as further signed rows and fold on top.
-    fn live_rows(&self) -> Vec<Movement> {
+    /// placeholder for a minted-or-burned unit that reached nobody.
+    /// Resolutions arrive later as further signed rows and fold on top.
+    fn rows(&self) -> Vec<Movement> {
         let hash = self.hash.as_ref().to_vec();
         let mut rows: Vec<Movement> = self
             .deltas
@@ -519,124 +517,6 @@ impl PassTx {
     }
 }
 
-/// Everything this pass found, indexed by hash for backfills.
-#[derive(Default)]
-struct Model {
-    txs: Vec<PassTx>,
-    by_hash: HashMap<Hash<32>, usize>,
-}
-
-impl Model {
-    fn push(&mut self, tx: PassTx) {
-        self.by_hash.insert(tx.hash, self.txs.len());
-        self.txs.push(tx);
-    }
-
-    fn backfill(
-        &mut self,
-        spender: &Hash<32>,
-        unit: Vec<u8>,
-        address: String,
-        amount: i64,
-    ) -> bool {
-        match self.by_hash.get(spender) {
-            Some(&i) => {
-                self.txs[i].deltas.push((unit, address, amount));
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Archive rows, in writer order, summed per `(tx, unit, party)`, with a
-    /// placeholder for every minted-or-burned unit that reached no party.
-    ///
-    /// A transaction whose every delta nets to zero and that minted nothing
-    /// produces NO rows and is not in the archive: the asset rode through it
-    /// as change and nothing moved. Measured on SpaceBudz, 89 of the 160
-    /// transactions touching the policy in a 120-day window were of that
-    /// kind — which is why [`Rows::txs`] is reported separately from what the
-    /// walk found.
-    fn into_rows(self) -> Rows {
-        let mut units: HashSet<Vec<u8>> = HashSet::new();
-        let mut txs = 0u64;
-        let mut rows: Vec<Movement> = Vec::new();
-        for tx in self.txs {
-            let before = rows.len();
-            let net: HashMap<&[u8], i64> = tx
-                .net_mint
-                .iter()
-                .map(|(n, a)| (n.as_slice(), *a))
-                .collect();
-            let mut summed: HashMap<(Vec<u8>, String), i64> = HashMap::new();
-            for (unit, address, amount) in &tx.deltas {
-                units.insert(unit.clone());
-                *summed.entry((unit.clone(), address.clone())).or_insert(0) += amount;
-            }
-            let mut seen_units: HashSet<Vec<u8>> = HashSet::new();
-            for ((unit, address), amount) in summed {
-                if amount == 0 {
-                    continue;
-                }
-                seen_units.insert(unit.clone());
-                rows.push(Movement {
-                    slot: tx.slot,
-                    block_time: tx.block_time,
-                    tx_hash: tx.hash.as_ref().to_vec(),
-                    net_mint: net.get(unit.as_slice()).copied().unwrap_or(0),
-                    unit_name: unit,
-                    address,
-                    amount,
-                });
-            }
-            for (unit, amount) in &tx.net_mint {
-                units.insert(unit.clone());
-                if !seen_units.contains(unit) {
-                    rows.push(Movement {
-                        slot: tx.slot,
-                        block_time: tx.block_time,
-                        tx_hash: tx.hash.as_ref().to_vec(),
-                        unit_name: unit.clone(),
-                        address: String::new(),
-                        amount: 0,
-                        net_mint: *amount,
-                    });
-                }
-            }
-            if rows.len() > before {
-                txs += 1;
-            }
-        }
-        sort_for_writer(&mut rows);
-        Rows {
-            rows,
-            units: units.len() as u64,
-            txs,
-        }
-    }
-}
-
-/// What a model became on disk.
-struct Rows {
-    rows: Vec<Movement>,
-    /// Distinct units with a row.
-    units: u64,
-    /// Transactions with at least one row — what the archive HOLDS, as
-    /// against what the walk found.
-    txs: u64,
-}
-
-/// The writer's order: block time, then transaction, then unit, then party.
-fn sort_for_writer(rows: &mut [Movement]) {
-    rows.sort_by(|a, b| {
-        a.block_time
-            .cmp(&b.block_time)
-            .then_with(|| a.tx_hash.cmp(&b.tx_hash))
-            .then_with(|| a.unit_name.cmp(&b.unit_name))
-            .then_with(|| a.address.cmp(&b.address))
-    });
-}
-
 // ─── pending ─────────────────────────────────────────────────────────────────
 
 /// A transaction waiting on its sources.
@@ -648,16 +528,7 @@ struct Spender {
     missing: HashMap<Vec<u8>, i64>,
     net_mint: Vec<(Vec<u8>, i64)>,
     outrefs: Vec<OutRef>,
-    /// Found by THIS pass (backfill the model) or an earlier one (write a
-    /// correction)?
-    origin: Origin,
     retired: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Origin {
-    ThisPass,
-    EarlierPass,
 }
 
 impl Spender {
@@ -666,16 +537,10 @@ impl Spender {
     }
 }
 
-/// One resolved negative delta.
+/// One resolved negative delta, as the row it becomes.
 struct Resolution {
     spender: Hash<32>,
-    origin: Origin,
-    slot: u64,
-    block_time: u64,
-    unit: Vec<u8>,
-    address: String,
-    amount: i64,
-    net_mint: i64,
+    row: Movement,
 }
 
 /// Outrefs spent by transactions already found, whose creating outputs are
@@ -710,7 +575,6 @@ impl Pending {
                 missing: s.missing.into_iter().collect(),
                 net_mint: s.net_mint,
                 outrefs,
-                origin: Origin::EarlierPass,
                 retired: false,
             });
         }
@@ -733,7 +597,6 @@ impl Pending {
             missing,
             net_mint: tx.net_mint.clone(),
             outrefs: inputs.to_vec(),
-            origin: Origin::ThisPass,
             retired: false,
         });
     }
@@ -767,13 +630,15 @@ impl Pending {
                     .map_or(0, |(_, a)| *a);
                 out.push(Resolution {
                     spender: s.hash,
-                    origin: s.origin,
-                    slot: s.slot,
-                    block_time: s.block_time,
-                    unit: unit.clone(),
-                    address: address.to_string(),
-                    amount: -qty,
-                    net_mint,
+                    row: Movement {
+                        slot: s.slot,
+                        block_time: s.block_time,
+                        tx_hash: s.hash.as_ref().to_vec(),
+                        unit_name: unit.clone(),
+                        address: address.to_string(),
+                        amount: -qty,
+                        net_mint,
+                    },
                 });
             }
             s.outrefs.retain(|o| o != oref);
@@ -853,11 +718,13 @@ pub struct Progress<'a> {
     pub pending: usize,
     /// THE LOWER LOD: every archive row this chunk produced — new
     /// transactions' rows and every resolution as a signed row — in the same
-    /// shape the Parquet will hold. A hosted surface keeps these in memory
-    /// and serves them, folded, until the pass lands and the archive takes
-    /// over; a reader scrubbing into the in-progress stretch sees what has
-    /// been walked so far rather than nothing.
+    /// shape the Parquet will hold. A hosted surface mirrors these into a
+    /// small buffer until `flushed` says they are on disk.
     pub rows: &'a [Movement],
+    /// Segments written at the end of this chunk, if the buffer was flushed.
+    /// They hold everything buffered so far INCLUDING `rows`, so a mirror
+    /// clears its buffer on this rather than appending.
+    pub flushed: &'a [FileEntry],
 }
 
 impl Progress<'_> {
@@ -875,7 +742,7 @@ impl Progress<'_> {
 
 pub type OnProgress<'x> = &'x dyn Fn(Progress<'_>);
 
-/// What the chunk walk itself produced, before anything is written.
+/// What the chunk walk itself produced, before anything lands.
 struct Walked {
     floor: u64,
     written: u64,
@@ -947,7 +814,7 @@ fn chunk_blocks_newest_first(
     Ok(out)
 }
 
-/// Walk `[floor, ceiling)` backward into the model, resolving sources as they
+/// Walk `[floor, ceiling)` backward into segments, resolving sources as they
 /// come into view.
 #[allow(clippy::too_many_arguments)]
 fn pass(
@@ -957,9 +824,8 @@ fn pass(
     watched: &Watched,
     floor: u64,
     ceiling: u64,
-    model: &mut Model,
+    writer: &mut SegmentWriter,
     pending: &mut Pending,
-    corrections: &mut Vec<Movement>,
     sieve: bool,
     on: OnProgress<'_>,
 ) -> Result<Walked> {
@@ -976,9 +842,8 @@ fn pass(
 
     for chunk in ordered {
         let blocks = chunk_blocks_newest_first(immutable, chunk, needles.as_ref())?;
-        // Resolutions found in this chunk, applied after its rows are in the
-        // model: a source and its spender can sit in the SAME chunk, and the
-        // spender must exist before its backfill lands.
+        // Resolutions found in this chunk. A source and its spender can sit
+        // in the SAME chunk; as rows they simply sum, so order is free.
         let mut resolved: Vec<Resolution> = Vec::new();
         // What this chunk adds, as archive rows, for the live view.
         let mut chunk_rows: Vec<Movement> = Vec::new();
@@ -1061,45 +926,28 @@ fn pass(
                     let inputs: Vec<OutRef> = dtx.inputs.iter().map(|i| i.oref).collect();
                     pending.want(&row, missing, &inputs);
                 }
-                chunk_rows.extend(row.live_rows());
-                model.push(row);
+                let rows = row.rows();
+                chunk_rows.extend(rows.iter().cloned());
+                writer.push_own(rows);
                 written += 1;
             }
         }
 
-        // Apply this chunk's resolutions: into the model for this pass's
-        // rows, into the corrections file for earlier passes'. Both are ALSO
-        // live rows — a fold sums them onto whatever the reader already has.
+        // This chunk's resolutions, as correction rows — whichever pass the
+        // spender came from. Compaction folds this pass's own onto their
+        // transactions; the reader sums the rest.
         let mut updated: Vec<Hash<32>> = Vec::new();
         for r in resolved {
             backfilled += 1;
             if !updated.contains(&r.spender) {
                 updated.push(r.spender);
             }
-            let as_row = Movement {
-                slot: r.slot,
-                block_time: r.block_time,
-                tx_hash: r.spender.as_ref().to_vec(),
-                unit_name: r.unit.clone(),
-                address: r.address.clone(),
-                amount: r.amount,
-                net_mint: r.net_mint,
-            };
-            match r.origin {
-                Origin::ThisPass => {
-                    if !model.backfill(&r.spender, r.unit, r.address, r.amount) {
-                        bail!(
-                            "resolution for {} which this pass never recorded",
-                            hex::encode(r.spender.as_ref())
-                        );
-                    }
-                }
-                Origin::EarlierPass => corrections.push(as_row.clone()),
-            }
-            chunk_rows.push(as_row);
+            chunk_rows.push(r.row.clone());
+            writer.push_corr(r.row);
         }
 
         chunks_done += 1;
+        let flushed = writer.end_chunk()?;
         on(Progress {
             floor: lowest,
             target_floor: floor,
@@ -1110,6 +958,7 @@ fn pass(
             updated: &updated,
             pending: pending.len(),
             rows: &chunk_rows,
+            flushed: &flushed,
         });
     }
 
@@ -1117,7 +966,6 @@ fn pass(
     // found: a quiet stretch below the last hit was read and held nothing,
     // which is a fact worth keeping. Only a range with no chunks on disk at
     // all extends nothing.
-    sort_for_writer(corrections);
     Ok(Walked {
         floor: if chunks_total == 0 { ceiling } else { floor },
         written,
@@ -1128,6 +976,7 @@ fn pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::PolicyArchive;
 
     fn h(b: u8) -> Hash<32> {
         Hash::from([b; 32])
@@ -1159,7 +1008,11 @@ mod tests {
         p.want(&spender, missing("A", 1), &[(h(9), 0), (h(9), 1)]);
         let got = p.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
         assert_eq!(got.len(), 1);
-        assert_eq!((got[0].amount, got[0].address.as_str()), (-1, "alice"));
+        assert_eq!(
+            (got[0].row.amount, got[0].row.address.as_str()),
+            (-1, "alice")
+        );
+        assert_eq!(got[0].row.slot, 1_001, "the row sits at the SPENDER's slot");
         assert!(
             p.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice")
                 .is_empty()
@@ -1197,66 +1050,74 @@ mod tests {
     }
 
     /// The carried state round-trips: what the next pass loads resolves
-    /// exactly what this one was waiting for, and as an EARLIER-pass spender.
+    /// exactly what this one was waiting for.
     #[test]
-    fn pending_survives_a_pass_boundary_as_an_earlier_spender() {
+    fn pending_survives_a_pass_boundary() {
         let mut p = Pending::default();
         let spender = tx(1, vec![("A", "bob", 1)]);
         p.want(&spender, missing("A", 1), &[(h(9), 0)]);
         let mut next = Pending::load(p.to_file().spenders);
         assert_eq!(next.len(), 1);
         let got = next.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
-        assert_eq!(got[0].origin, Origin::EarlierPass);
-        assert_eq!(got[0].slot, 1_001);
+        assert_eq!(got[0].row.slot, 1_001);
     }
 
-    /// The model's rows: a party on both sides nets out, and a burned unit
-    /// that reached nobody becomes a placeholder rather than vanishing.
+    /// A transaction's rows as found: outputs first, a placeholder for an
+    /// unattributed burn.
     #[test]
-    fn the_model_sums_and_placeholders_its_rows() {
-        let mut m = Model::default();
-        let mut t = tx(1, vec![("A", "alice", 1), ("B", "bob", 1)]);
-        t.net_mint = vec![(b"C".to_vec(), -1)];
-        m.push(t);
-        assert!(m.backfill(&h(1), b"A".to_vec(), "alice".into(), -1));
-        assert!(m.backfill(&h(1), b"B".to_vec(), "carol".into(), -1));
-        assert!(!m.backfill(&h(2), b"B".to_vec(), "carol".into(), -1));
-        let Rows { rows, units, txs } = m.into_rows();
-        assert_eq!(units, 3);
-        assert_eq!(txs, 1);
-        let a: Vec<&Movement> = rows.iter().filter(|r| r.unit_name == b"A").collect();
-        assert!(a.is_empty(), "alice's change nets to nothing");
-        let b: Vec<&Movement> = rows.iter().filter(|r| r.unit_name == b"B").collect();
-        assert_eq!(b.len(), 2);
-        let c: Vec<&Movement> = rows.iter().filter(|r| r.unit_name == b"C").collect();
-        assert_eq!(c.len(), 1);
-        assert!(c[0].is_placeholder());
-        assert_eq!(c[0].net_mint, -1);
+    fn a_transactions_rows_match_the_archives_shape() {
+        let mut t = tx(1, vec![("A", "alice", 1)]);
+        t.net_mint = vec![(b"A".to_vec(), 0), (b"C".to_vec(), -1)];
+        let rows = t.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].unit_name.as_slice(), rows[0].amount),
+            (b"A".as_slice(), 1)
+        );
+        assert!(rows[1].is_placeholder());
+        assert_eq!(rows[1].net_mint, -1);
+        let folded = crate::archive::fold_rows(rows);
+        assert_eq!(folded[0].units.len(), 2);
     }
 
-    /// THE ARCHIVE END TO END, without a chain: two passes, the second
-    /// resolving a source for a row the first published, read back through
-    /// the same range reader the API uses.
+    fn stamp(policy_hex: &str) -> Stamp {
+        Stamp {
+            policy_hex: policy_hex.to_string(),
+            completeness: Completeness::Unrecorded,
+            walk_from: None,
+            walk_to: None,
+            covered_from: 0,
+            covered_to: 0,
+            sealed_unix: 0,
+        }
+    }
+
+    /// THE ARCHIVE END TO END, without a chain: two passes, spilled as
+    /// segments and compacted on landing, the second resolving a source for
+    /// a row the first published, read back through the same reader the API
+    /// uses.
     #[test]
-    fn two_passes_write_an_archive_the_reader_folds_correctly() {
-        use crate::archive::PolicyArchive;
+    fn two_passes_land_an_archive_the_reader_folds_correctly() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("ab".repeat(28));
-        let mut manifest = Manifest::new(&"ab".repeat(28));
+        let policy_hex = "ab".repeat(28);
+        let dir = tmp.path().join(&policy_hex);
+        let mut manifest = Manifest::new(&policy_hex);
 
         // PASS 1: newest window. tx 5 received unit A from a source below the
         // floor (missing 1), tx 6 minted unit B.
-        let mut model = Model::default();
-        model.push(tx(5, vec![("A", "bob", 1)]));
-        let mut minted = tx(6, vec![("B", "carol", 1)]);
-        minted.net_mint = vec![(b"B".to_vec(), 1)];
-        model.push(minted);
+        let mut w =
+            SegmentWriter::new(&dir.join(PassEntry::dir_name(0)), stamp(&policy_hex)).unwrap();
+        let five = tx(5, vec![("A", "bob", 1)]);
+        let mut six = tx(6, vec![("B", "carol", 1)]);
+        six.net_mint = vec![(b"B".to_vec(), 1)];
+        w.push_own(five.rows());
+        w.push_own(six.rows());
         let mut pending = Pending::default();
-        pending.want(&model.txs[0], missing("A", 1), &[(h(9), 0), (h(8), 0)]);
-        let out = write_pass(PassWrite {
+        pending.want(&five, missing("A", 1), &[(h(9), 0), (h(8), 0)]);
+        let out = land(Landing {
             dir: &dir,
             manifest: &mut manifest,
-            policy_hex: &"ab".repeat(28),
+            policy_hex: &policy_hex,
             first_mint: Some(500),
             ceiling: 2_000,
             walked: Walked {
@@ -1264,58 +1125,41 @@ mod tests {
                 written: 2,
                 backfilled: 0,
             },
-            model,
-            corrections: Vec::new(),
+            segments: w.finish().unwrap(),
             pending: &pending,
+            compact: true,
             secs: 0.0,
         })
         .unwrap();
-        assert_eq!(out.unresolved, 1);
-        assert!(out.pending_bytes > 0);
+        assert_eq!((out.unresolved, out.written), (1, 2));
 
         let mut a = PolicyArchive::open(&dir).unwrap().expect("manifest");
         assert_eq!(a.manifest.completeness, "partial");
         let cov = a.coverage();
         assert_eq!((cov.walked_from, cov.walked_to), (Some(1_004), Some(2_000)));
         assert_eq!(cov.total_txs, 2);
-        assert_eq!(cov.unresolved, 1);
         let page = a.feed_rows(10, None).unwrap();
-        assert_eq!(page.len(), 2);
-        let five = page.iter().find(|r| r.tx_hash == h(5).as_ref()).unwrap();
-        assert_eq!(five.units[0].parties.len(), 1, "only the arrival is known");
-        let density = a.density(86_400);
-        assert_eq!(density.iter().map(|b| b.txs).sum::<u64>(), 2);
-        assert_eq!(density.iter().map(|b| b.mints).sum::<u64>(), 1);
+        let f = page.iter().find(|r| r.tx_hash == h(5).as_ref()).unwrap();
+        assert_eq!(f.units[0].parties.len(), 1, "only the arrival is known");
 
-        // PASS 2: deeper. The source of tx 5's input comes into view — held
-        // by alice — which is a CORRECTION to a row pass 1 published, and
-        // the walk reaches the registered first mint.
+        // PASS 2: deeper, and left UNCOMPACTED. The source of tx 5's input
+        // comes into view — held by alice — a correction to a row pass 1
+        // published; and the walk reaches the registered first mint.
         let mut pending = Pending::load(
             archive::load_pending(&dir.join(PassEntry::dir_name(0)).join(archive::PENDING))
                 .unwrap()
                 .spenders,
         );
-        let resolved = pending.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].origin, Origin::EarlierPass);
-        let corrections: Vec<Movement> = resolved
-            .into_iter()
-            .map(|r| Movement {
-                slot: r.slot,
-                block_time: r.block_time,
-                tx_hash: r.spender.as_ref().to_vec(),
-                unit_name: r.unit,
-                address: r.address,
-                amount: r.amount,
-                net_mint: r.net_mint,
-            })
-            .collect();
-        let mut model = Model::default();
-        model.push(tx(3, vec![("A", "alice", 1)]));
-        let out = write_pass(PassWrite {
+        let mut w =
+            SegmentWriter::new(&dir.join(PassEntry::dir_name(1)), stamp(&policy_hex)).unwrap();
+        for r in pending.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice") {
+            w.push_corr(r.row);
+        }
+        w.push_own(tx(3, vec![("A", "alice", 1)]).rows());
+        let out = land(Landing {
             dir: &dir,
             manifest: &mut manifest,
-            policy_hex: &"ab".repeat(28),
+            policy_hex: &policy_hex,
             first_mint: Some(500),
             ceiling: 1_004,
             walked: Walked {
@@ -1323,9 +1167,9 @@ mod tests {
                 written: 1,
                 backfilled: 1,
             },
-            model,
-            corrections,
+            segments: w.finish().unwrap(),
             pending: &pending,
+            compact: false,
             secs: 0.0,
         })
         .unwrap();
@@ -1333,11 +1177,14 @@ mod tests {
 
         let mut a = PolicyArchive::open(&dir).unwrap().expect("manifest");
         assert_eq!(a.manifest.completeness, "complete", "reached the mint");
-        assert_eq!(a.manifest.passes.len(), 2);
+        assert_eq!(
+            a.manifest.passes[1].segments.len(),
+            2,
+            "seg + corr, uncompacted"
+        );
         let cov = a.coverage();
         assert_eq!((cov.walked_from, cov.walked_to), (Some(500), Some(2_000)));
         assert_eq!(cov.total_txs, 3);
-        assert_eq!(cov.unresolved, 0);
 
         // The feed folds the correction in: tx 5 is now alice → bob.
         let page = a.feed_rows(10, None).unwrap();
@@ -1352,8 +1199,7 @@ mod tests {
         parties.sort();
         assert_eq!(parties, vec![("alice".into(), -1), ("bob".into(), 1)]);
 
-        // Point lookup through the bloom filters agrees, and a page BEFORE
-        // tx 5 excludes it.
+        // Point lookup and paging agree.
         let at = a.feed_row_at(h(5).as_ref()).unwrap().expect("found");
         assert_eq!(at.units[0].parties.len(), 2);
         assert!(a.feed_row_at(h(77).as_ref()).unwrap().is_none());
@@ -1361,13 +1207,10 @@ mod tests {
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].tx_hash, h(3).as_ref());
 
-        // Density counts the correction as a movement of an existing tx,
-        // never as a new one.
+        // Density counts the correction as a movement, never a transaction.
         let density = a.density(86_400);
         assert_eq!(density.iter().map(|b| b.txs).sum::<u64>(), 3);
         assert_eq!(density.iter().map(|b| b.movements).sum::<u64>(), 4);
-        let (requests, bytes) = a.fetched();
-        assert!(requests > 0 && bytes > 0);
     }
 
     #[test]
@@ -1395,25 +1238,8 @@ mod tests {
             updated: &[],
             pending: 0,
             rows: &[],
+            flushed: &[],
         }
-    }
-
-    /// The live rows of a transaction fold to the same feed row the archive
-    /// gives — outputs first, a placeholder for an unattributed burn.
-    #[test]
-    fn live_rows_match_the_archives_shape() {
-        let mut t = tx(1, vec![("A", "alice", 1)]);
-        t.net_mint = vec![(b"A".to_vec(), 0), (b"C".to_vec(), -1)];
-        let rows = t.live_rows();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            (rows[0].unit_name.as_slice(), rows[0].amount),
-            (b"A".as_slice(), 1)
-        );
-        assert!(rows[1].is_placeholder());
-        assert_eq!(rows[1].net_mint, -1);
-        let folded = crate::archive::fold_rows(rows);
-        assert_eq!(folded[0].units.len(), 2);
     }
 
     #[test]

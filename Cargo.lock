@@ -3311,6 +3311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6702,6 +6711,38 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
+name = "tx-index"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "memmap2",
+ "pallas-codec 1.1.1",
+ "pallas-crypto 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "tx-index-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum 0.8.4",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http 0.6.6",
+ "tracing",
+ "tracing-subscriber",
+ "tx-index",
+]
 
 [[package]]
 name = "tx3-cardano"

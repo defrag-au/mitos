@@ -40,9 +40,9 @@
 //! undirected on purpose (see [`crate::store`]'s header); this layer turns it
 //! into a feed row and is allowed to answer "ambiguous".
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -108,45 +108,32 @@ struct PassRequest {
     to_slot: Option<u64>,
 }
 
-/// THE LOWER LOD — what a running pass has walked so far, in memory.
+/// THE LOWER LOD — what a running pass has walked so far.
 ///
-/// A pass writes its Parquet ONCE, at the end, so without this a reader
-/// scrubbing into the stretch being walked would see nothing for minutes.
-/// The pass hands over every chunk's rows as it goes (`Progress::rows`) and
-/// they are served, folded, exactly as the archive's rows are — the same
-/// shape at a lower level of durability. When the pass lands the archive
-/// holds the same rows and this is dropped.
+/// A pass spills its rows to disk as SEGMENTS while it walks
+/// (`crate::segments`), in the archive's own format, so most of what it has
+/// found is already servable through the same reader as the archive. What
+/// is not on disk yet — at most one segment's worth — is mirrored here from
+/// `Progress::rows` and cleared on `Progress::flushed`. Reads open the
+/// archive WITH the pass's segments and fold the buffer on top: the same
+/// shape at a lower level of durability, and a reader scrubbing into the
+/// stretch being walked sees what has been walked so far.
 ///
 /// `seq` is the manifest sequence the pass will write. A reader checks the
-/// manifest for it: present means the pass landed and these rows are now
-/// duplicates of the archive's, so they are ignored — which closes the race
-/// between the manifest rename and this being cleared, without a lock across
-/// two structures.
+/// manifest for it: present means the pass landed, its segments have been
+/// compacted into the archive's files, and this is stale — which closes the
+/// race between the manifest rename and this being cleared, without a lock
+/// across two structures.
 pub struct Live {
     pub seq: u32,
     pub floor: u64,
     pub ceiling: u64,
-    pub rows: Vec<Movement>,
     pub pending: usize,
-    pub min_slot: Option<u64>,
-    pub max_slot: Option<u64>,
-    /// The histogram, kept as rows arrive — per DAY, with the transaction
-    /// sets that make "distinct transactions" and "transactions that minted"
-    /// answerable without re-reading the rows. A full-history ClayNation
-    /// pass holds 360k transactions; recomputing this per poll cost 1.5 s.
-    density: BTreeMap<u64, LiveBucket>,
+    /// Segments flushed so far, in order, servable now.
+    pub segments: Vec<(PathBuf, archive::FileKind)>,
+    /// Rows not yet in a segment.
+    pub buffer: Vec<Movement>,
 }
-
-/// One day of a running pass.
-#[derive(Default)]
-struct LiveBucket {
-    txs: HashSet<Vec<u8>>,
-    mints: HashSet<Vec<u8>>,
-    burns: HashSet<Vec<u8>>,
-    movements: u64,
-}
-
-const LIVE_BUCKET_SECS: u64 = 86_400;
 
 impl Live {
     fn new(seq: u32) -> Self {
@@ -154,61 +141,79 @@ impl Live {
             seq,
             floor: u64::MAX,
             ceiling: 0,
-            rows: Vec::new(),
             pending: 0,
-            min_slot: None,
-            max_slot: None,
-            density: BTreeMap::new(),
+            segments: Vec::new(),
+            buffer: Vec::new(),
         }
     }
 
-    /// Take a chunk's rows.
-    fn publish(&mut self, rows: &[Movement]) {
-        for m in rows {
-            self.min_slot = Some(self.min_slot.map_or(m.slot, |s| s.min(m.slot)));
-            self.max_slot = Some(self.max_slot.map_or(m.slot, |s| s.max(m.slot)));
-            let day = m.block_time / LIVE_BUCKET_SECS * LIVE_BUCKET_SECS;
-            let b = self.density.entry(day).or_default();
-            // A correction to an EARLIER pass's transaction sits above this
-            // pass's ceiling; its transaction is the archive's to count.
-            if m.slot < self.ceiling || self.ceiling == 0 {
-                b.txs.insert(m.tx_hash.clone());
-                if m.net_mint > 0 {
-                    b.mints.insert(m.tx_hash.clone());
-                }
-                if m.net_mint < 0 {
-                    b.burns.insert(m.tx_hash.clone());
-                }
+    /// Take a chunk's rows — or, if the pass flushed at the end of it, the
+    /// segments that now hold everything buffered so far.
+    fn publish(&mut self, pass_dir: &Path, rows: &[Movement], flushed: &[archive::FileEntry]) {
+        if flushed.is_empty() {
+            self.buffer.extend_from_slice(rows);
+            return;
+        }
+        for f in flushed {
+            self.segments
+                .push((pass_dir.join(&f.file), crate::segments::kind_of(&f.file)));
+        }
+        self.buffer.clear();
+    }
+
+    /// Is this row one of the pass's OWN transactions, as against a
+    /// correction to one an earlier pass archived?
+    fn own(&self, m: &Movement) -> bool {
+        m.slot < self.ceiling || self.ceiling == 0
+    }
+
+    /// Transactions in the buffer this pass FOUND — the segments' are counted
+    /// by their footers.
+    fn buffered_txs(&self) -> u64 {
+        self.buffer
+            .iter()
+            .filter(|m| self.own(m))
+            .map(|m| m.tx_hash.as_slice())
+            .collect::<HashSet<_>>()
+            .len() as u64
+    }
+
+    fn buffered_slots(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.buffer.iter().map(|m| m.slot).min(),
+            self.buffer.iter().map(|m| m.slot).max(),
+        )
+    }
+
+    /// The buffer's histogram: transactions from the pass's own rows,
+    /// movements from all of them.
+    fn buffered_density(&self, bucket_secs: u64) -> Vec<policy_archive::DensityBucket> {
+        let own: Vec<Movement> = self
+            .buffer
+            .iter()
+            .filter(|m| self.own(m))
+            .cloned()
+            .collect();
+        let mut out = crate::archive::density_of(&own, bucket_secs);
+        let width = bucket_secs.max(1);
+        for m in self
+            .buffer
+            .iter()
+            .filter(|m| !self.own(m) && !m.is_placeholder())
+        {
+            let from = m.block_time / width * width;
+            match out.iter_mut().find(|b| b.from_unix == from) {
+                Some(b) => b.movements += 1,
+                None => out.push(policy_archive::DensityBucket {
+                    from_unix: from,
+                    to_unix: from + width,
+                    movements: 1,
+                    ..policy_archive::DensityBucket::default()
+                }),
             }
-            if !m.is_placeholder() {
-                b.movements += 1;
-            }
         }
-        self.rows.extend_from_slice(rows);
-    }
-
-    /// Transactions this pass has FOUND.
-    fn found_txs(&self) -> u64 {
-        self.density.values().map(|b| b.txs.len() as u64).sum()
-    }
-
-    /// The histogram at `bucket_secs` — a day at the finest.
-    fn density(&self, bucket_secs: u64) -> Vec<policy_archive::DensityBucket> {
-        let width = bucket_secs.max(LIVE_BUCKET_SECS);
-        let mut out: BTreeMap<u64, policy_archive::DensityBucket> = BTreeMap::new();
-        for (day, b) in &self.density {
-            let from = day / width * width;
-            let slot = out.entry(from).or_insert(policy_archive::DensityBucket {
-                from_unix: from,
-                to_unix: from + width,
-                ..policy_archive::DensityBucket::default()
-            });
-            slot.movements += b.movements;
-            slot.txs += b.txs.len() as u64;
-            slot.mints += b.mints.len() as u64;
-            slot.burns += b.burns.len() as u64;
-        }
-        out.into_values().collect()
+        out.sort_by_key(|b| b.from_unix);
+        out
     }
 
     /// The rows behind a page: the newest `limit` transactions below
@@ -223,9 +228,12 @@ impl Live {
     /// pass found lands on the archived row it corrects.
     fn page(&self, limit: usize, before: u64, archived: &HashSet<Vec<u8>>) -> Vec<Movement> {
         use std::collections::BTreeSet;
-        let own = |m: &Movement| m.slot < self.ceiling || self.ceiling == 0;
         let mut top: BTreeSet<(u64, &[u8])> = BTreeSet::new();
-        for m in self.rows.iter().filter(|m| own(m) && m.slot < before) {
+        for m in self
+            .buffer
+            .iter()
+            .filter(|m| self.own(m) && m.slot < before)
+        {
             let key = (m.slot, m.tx_hash.as_slice());
             if top.len() < limit {
                 top.insert(key);
@@ -235,12 +243,39 @@ impl Live {
             }
         }
         let wanted: HashSet<&[u8]> = top.iter().map(|(_, h)| *h).collect();
-        self.rows
+        self.buffer
             .iter()
             .filter(|m| wanted.contains(m.tx_hash.as_slice()) || archived.contains(&m.tx_hash))
             .cloned()
             .collect()
     }
+}
+
+/// What a read sees: the archive — opened WITH a running pass's segments —
+/// and the pass's buffer, or neither for a policy nobody has touched.
+struct View<'a> {
+    archive: Option<PolicyArchive>,
+    live: Option<std::sync::MutexGuard<'a, Live>>,
+}
+
+fn view<'a>(hub: &PolicyHub, policy: &str, live: &'a Option<Arc<Mutex<Live>>>) -> Result<View<'a>> {
+    let dir = hub.policy_dir(policy);
+    let guard = live.as_ref().map(|l| l.lock().expect("live"));
+    // Landed? Then the segments are compacted away and the buffer is stale;
+    // the archive alone is the truth.
+    let manifest = archive::load_manifest(&dir)?;
+    let active = guard
+        .as_deref()
+        .is_some_and(|l| !manifest.is_some_and(|m| m.passes.iter().any(|p| p.seq == l.seq)));
+    let segments: Vec<(PathBuf, archive::FileKind)> = match (active, guard.as_deref()) {
+        (true, Some(l)) => l.segments.clone(),
+        _ => Vec::new(),
+    };
+    let archive = PolicyArchive::open_with(&dir, &segments)?;
+    Ok(View {
+        archive,
+        live: if active { guard } else { None },
+    })
 }
 
 pub struct PolicyHub {
@@ -357,6 +392,7 @@ fn run_pass(hub: &PolicyHub, req: &PassRequest) -> Result<reverse::Outcome> {
         // walk goes — one walk per policy, shared by everyone.
         days: None,
         to_slot: req.to_slot,
+        no_compact: false,
         no_sieve: false,
         report_every: u64::MAX,
     };
@@ -371,6 +407,9 @@ fn run_pass(hub: &PolicyHub, req: &PassRequest) -> Result<reverse::Outcome> {
         .insert(req.policy.clone(), Arc::clone(&live));
 
     let policy = req.policy.clone();
+    let pass_dir = hub
+        .policy_dir(&req.policy)
+        .join(archive::PassEntry::dir_name(seq));
     let hub_ref = hub;
     reverse::run_reporting(args, &|p| {
         {
@@ -378,7 +417,7 @@ fn run_pass(hub: &PolicyHub, req: &PassRequest) -> Result<reverse::Outcome> {
             l.floor = p.floor;
             l.ceiling = p.ceiling;
             l.pending = p.pending;
-            l.publish(p.rows);
+            l.publish(&pass_dir, p.rows, p.flushed);
         }
         hub_ref.set(
             &policy,
@@ -420,13 +459,13 @@ fn merged_coverage(
         walked_to: max(cov.as_ref().and_then(|c| c.walked_to), live_ceiling),
         first_slot: min(
             cov.as_ref().and_then(|c| c.first_slot),
-            live.and_then(|l| l.min_slot),
+            live.and_then(|l| l.buffered_slots().0),
         ),
         last_slot: max(
             cov.as_ref().and_then(|c| c.last_slot),
-            live.and_then(|l| l.max_slot),
+            live.and_then(|l| l.buffered_slots().1),
         ),
-        total_txs: cov.as_ref().map_or(0, |c| c.total_txs) + live.map_or(0, Live::found_txs),
+        total_txs: cov.as_ref().map_or(0, |c| c.total_txs) + live.map_or(0, Live::buffered_txs),
         units: cov.as_ref().map_or(0, |c| c.units),
         unresolved: live.map_or_else(
             || cov.as_ref().map_or(0, |c| c.unresolved),
@@ -440,12 +479,6 @@ fn merged_coverage(
             .map_or(policy_archive::Completeness::Unrecorded, |c| c.completeness)
             .as_wire(),
     }
-}
-
-/// Has the pass that produced `live` landed in the archive? If so its rows
-/// are the archive's rows and must not be counted twice.
-fn landed(archive: Option<&PolicyArchive>, live: &Live) -> bool {
-    archive.is_some_and(|a| a.manifest.passes.iter().any(|p| p.seq == live.seq))
 }
 
 // ─── wire types ──────────────────────────────────────────────────────────────
@@ -708,26 +741,26 @@ pub async fn feed(
     let limit = q.limit.unwrap_or(200).clamp(0, 5_000);
     let before = q.before_slot.unwrap_or(u64::MAX);
 
-    // TWO TIERS OF THE SAME ROWS: the archive's, and the running pass's.
-    // Both are unfolded movements, appended and folded once, so a correction
-    // the live pass found for an archived transaction lands on it.
-    let mut archive = PolicyArchive::open(&hub.policy_dir(&policy)).map_err(internal)?;
+    // TWO TIERS OF THE SAME ROWS: the archive's (segments included), and the
+    // running pass's buffer. Both are unfolded movements, appended and
+    // folded once, so a correction the live pass found for an archived
+    // transaction lands on it.
+    let live = hub.live_for(&policy);
+    let View {
+        mut archive,
+        live: live_view,
+    } = view(&hub, &policy, &live).map_err(internal)?;
     let mut rows: Vec<Movement> = match archive.as_mut() {
         Some(a) if limit > 0 => a.movements_page(limit, q.before_slot).map_err(internal)?,
         _ => Vec::new(),
     };
-    let live = hub.live_for(&policy);
-    let live_guard = live.as_ref().map(|l| l.lock().expect("live"));
-    let live_view = live_guard
-        .as_deref()
-        .filter(|l| !landed(archive.as_ref(), l));
-    if let Some(l) = live_view
+    if let Some(l) = live_view.as_deref()
         && limit > 0
     {
         let archived: HashSet<Vec<u8>> = rows.iter().map(|m| m.tx_hash.clone()).collect();
         rows.extend(l.page(limit as usize, before, &archived));
     }
-    let coverage = merged_coverage(archive.as_ref(), live_view, walking);
+    let coverage = merged_coverage(archive.as_ref(), live_view.as_deref(), walking);
     let mut folded = crate::archive::fold_rows(rows);
     folded.truncate(limit as usize);
     Ok(Json(PolicyFeedResponse {
@@ -750,18 +783,19 @@ pub async fn density(
     // An hour at the finest, a month at the coarsest — anything else is a
     // request for the raw rows, which is the feed's job.
     let bucket_secs = q.bucket.unwrap_or(86_400).clamp(3_600, 31 * 86_400);
-    let archive = PolicyArchive::open(&hub.policy_dir(&policy)).map_err(internal)?;
     let live = hub.live_for(&policy);
-    let live_guard = live.as_ref().map(|l| l.lock().expect("live"));
-    let live_view = live_guard
-        .as_deref()
-        .filter(|l| !landed(archive.as_ref(), l));
-    // The footers' histogram plus the running pass's, bucket for bucket.
+    let View {
+        archive,
+        live: live_view,
+    } = view(&hub, &policy, &live).map_err(internal)?;
+    // The footers' histogram — segments included — plus the buffer's.
     let from_archive = archive
         .as_ref()
         .map_or_else(Vec::new, |a| a.density(bucket_secs));
-    let from_live = live_view.map_or_else(Vec::new, |l| l.density(bucket_secs));
-    let coverage = merged_coverage(archive.as_ref(), live_view, hub.walking(&policy));
+    let from_live = live_view
+        .as_deref()
+        .map_or_else(Vec::new, |l| l.buffered_density(bucket_secs));
+    let coverage = merged_coverage(archive.as_ref(), live_view.as_deref(), hub.walking(&policy));
     let buckets = crate::archive::merge_density(from_archive, from_live)
         .into_iter()
         .map(|b| DensityBucketDto {
@@ -801,18 +835,17 @@ pub async fn row_at(
                 "expected a 32-byte transaction hash in hex".into(),
             )
         })?;
-    let mut archive = PolicyArchive::open(&hub.policy_dir(&policy)).map_err(internal)?;
+    let live = hub.live_for(&policy);
+    let View {
+        mut archive,
+        live: live_view,
+    } = view(&hub, &policy, &live).map_err(internal)?;
     let mut rows = match archive.as_mut() {
         Some(a) => a.movements_of(&raw).map_err(internal)?,
         None => Vec::new(),
     };
-    let live = hub.live_for(&policy);
-    let live_guard = live.as_ref().map(|l| l.lock().expect("live"));
-    let live_view = live_guard
-        .as_deref()
-        .filter(|l| !landed(archive.as_ref(), l));
-    if let Some(l) = live_view {
-        rows.extend(l.rows.iter().filter(|m| m.tx_hash == raw).cloned());
+    if let Some(l) = live_view.as_deref() {
+        rows.extend(l.buffer.iter().filter(|m| m.tx_hash == raw).cloned());
     }
     let cached = archive.is_some() || live_view.is_some();
     Ok(Json(PolicyRowAtResponse {
@@ -1046,25 +1079,31 @@ mod tests {
         }
     }
 
-    /// The live tier: its histogram counts transactions once however many
+    /// The live buffer: its histogram counts transactions once however many
     /// rows they have, a correction to an ARCHIVED transaction (above the
-    /// ceiling) adds a movement but never a transaction, and a page takes
-    /// the newest transactions with every row of theirs.
+    /// ceiling) adds a movement but never a transaction, a page takes the
+    /// newest transactions with every row of theirs, and a flush replaces
+    /// the buffer with the segments that now hold it.
     #[test]
     fn the_live_tier_counts_and_pages_like_the_archive() {
         let mut live = Live::new(3);
         live.ceiling = 1_000;
-        live.publish(&[
-            live_row(900, 1, "A", "alice", 1, 1),
-            live_row(900, 1, "B", "alice", 1, 1),
-            live_row(800, 2, "A", "bob", 1, 0),
-            live_row(800, 2, "A", "carol", -1, 0),
-            // A correction for a transaction an earlier pass published.
-            live_row(1_500, 9, "A", "dave", -1, 0),
-        ]);
-        assert_eq!(live.found_txs(), 2);
-        assert_eq!((live.min_slot, live.max_slot), (Some(800), Some(1_500)));
-        let d = live.density(86_400);
+        let dir = std::path::Path::new("/tmp/pass");
+        live.publish(
+            dir,
+            &[
+                live_row(900, 1, "A", "alice", 1, 1),
+                live_row(900, 1, "B", "alice", 1, 1),
+                live_row(800, 2, "A", "bob", 1, 0),
+                live_row(800, 2, "A", "carol", -1, 0),
+                // A correction for a transaction an earlier pass published.
+                live_row(1_500, 9, "A", "dave", -1, 0),
+            ],
+            &[],
+        );
+        assert_eq!(live.buffered_txs(), 2);
+        assert_eq!(live.buffered_slots(), (Some(800), Some(1_500)));
+        let d = live.buffered_density(86_400);
         assert_eq!(d.iter().map(|b| b.txs).sum::<u64>(), 2);
         assert_eq!(d.iter().map(|b| b.mints).sum::<u64>(), 1);
         assert_eq!(d.iter().map(|b| b.movements).sum::<u64>(), 5);
@@ -1082,6 +1121,22 @@ mod tests {
         assert_eq!(with.len(), 3);
         assert!(with.iter().any(|m| m.tx_hash == vec![9; 32]));
         assert_eq!(older.len(), 2, "both rows of the transaction come along");
+
+        // A flush: the segments take over, the buffer empties.
+        live.publish(
+            dir,
+            &[live_row(700, 3, "A", "erin", 1, 0)],
+            &[archive::FileEntry {
+                file: "seg-0000.parquet".into(),
+                rows: 6,
+                min_slot: Some(700),
+                max_slot: Some(1_500),
+            }],
+        );
+        assert!(live.buffer.is_empty());
+        assert_eq!(live.segments.len(), 1);
+        assert_eq!(live.segments[0].1, archive::FileKind::Movements);
+        assert_eq!(live.buffered_txs(), 0);
     }
 
     /// Zero-amount parties are filtered at write time, but a row assembled from

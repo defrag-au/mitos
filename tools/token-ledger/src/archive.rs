@@ -147,6 +147,11 @@ pub struct PassEntry {
     pub movements: Option<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corrections: Option<FileEntry>,
+    /// A pass left UNCOMPACTED: the segments it spilled while walking, in
+    /// order, kind by filename (`seg-`/`corr-`). Empty once compacted into
+    /// `movements`/`corrections`. Readers merge either shape the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<FileEntry>,
     /// Spenders still waiting on a source after this pass.
     pub pending: u64,
     /// Transactions the walk FOUND touching the policy in the pass's range.
@@ -289,10 +294,37 @@ impl RangeFile {
     }
 }
 
+/// Which stream a file belongs to. Movements files count transactions in
+/// their footers; corrections files only ever add movements to transactions
+/// counted elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileKind {
+pub enum FileKind {
     Movements,
     Corrections,
+}
+
+/// The footer protocol against a local file: the tail, then the exact footer
+/// if the tail fell short. What every reader here starts from.
+pub fn open_footer(path: &Path) -> Result<(RangeFile, SparseBytes, Archive)> {
+    let mut source = RangeFile::open(path)?;
+    let mut bytes = SparseBytes::new(source.size());
+    let (start, len) =
+        policy_archive::reader::footer_request(source.size(), policy_archive::reader::FOOTER_HINT);
+    source.fetch(&mut bytes, start, len)?;
+    let tail_start = source.size().saturating_sub(8);
+    // `SparseBytes` has no public byte accessor by design; re-read the eight
+    // bytes through the file rather than widen the crate's API.
+    let mut last8 = vec![0u8; (source.size() - tail_start) as usize];
+    source.file.seek(SeekFrom::Start(tail_start))?;
+    source.file.read_exact(&mut last8)?;
+    let need = policy_archive::reader::footer_length(&last8)?;
+    if need > len {
+        let (start, len) = policy_archive::reader::footer_request(source.size(), need);
+        source.fetch(&mut bytes, start, len)?;
+    }
+    let archive =
+        Archive::open(&bytes).with_context(|| format!("opening footer of {}", path.display()))?;
+    Ok((source, bytes, archive))
 }
 
 struct OpenFile {
@@ -305,31 +337,8 @@ struct OpenFile {
 }
 
 impl OpenFile {
-    /// The footer protocol: the tail, then the exact footer if the tail fell
-    /// short.
     fn open(path: &Path, kind: FileKind) -> Result<Self> {
-        let mut source = RangeFile::open(path)?;
-        let mut bytes = SparseBytes::new(source.size());
-        let (start, len) = policy_archive::reader::footer_request(
-            source.size(),
-            policy_archive::reader::FOOTER_HINT,
-        );
-        source.fetch(&mut bytes, start, len)?;
-        let tail_start = source.size().saturating_sub(8);
-        let mut tail = SparseBytes::new(source.size());
-        source.fetch(&mut tail, tail_start, source.size() - tail_start)?;
-        // `SparseBytes` has no public byte accessor by design; re-read the
-        // eight bytes through the file rather than widen the crate's API.
-        let mut last8 = vec![0u8; (source.size() - tail_start) as usize];
-        source.file.seek(SeekFrom::Start(tail_start))?;
-        source.file.read_exact(&mut last8)?;
-        let need = policy_archive::reader::footer_length(&last8)?;
-        if need > len {
-            let (start, len) = policy_archive::reader::footer_request(source.size(), need);
-            source.fetch(&mut bytes, start, len)?;
-        }
-        let archive = Archive::open(&bytes)
-            .with_context(|| format!("opening footer of {}", path.display()))?;
+        let (source, bytes, archive) = open_footer(path)?;
         Ok(Self {
             kind,
             source,
@@ -381,9 +390,24 @@ pub struct PolicyArchive {
 impl PolicyArchive {
     /// `None` when no pass has ever run for this policy.
     pub fn open(dir: &Path) -> Result<Option<Self>> {
-        let Some(manifest) = load_manifest(dir)? else {
+        Self::open_with(dir, &[])
+    }
+
+    /// The archive plus `extra` files that are not in the manifest yet — a
+    /// running pass's segments, which the hub knows about before they land.
+    /// `None` when there is neither a manifest nor anything extra.
+    pub fn open_with(dir: &Path, extra: &[(PathBuf, FileKind)]) -> Result<Option<Self>> {
+        let manifest = load_manifest(dir)?;
+        if manifest.is_none() && extra.is_empty() {
             return Ok(None);
-        };
+        }
+        let manifest = manifest.unwrap_or_else(|| {
+            Manifest::new(
+                &dir.file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+        });
         let mut files = Vec::new();
         for pass in &manifest.passes {
             let base = dir.join(&pass.dir);
@@ -393,8 +417,30 @@ impl PolicyArchive {
             if let Some(f) = &pass.corrections {
                 files.push(OpenFile::open(&base.join(&f.file), FileKind::Corrections)?);
             }
+            for f in &pass.segments {
+                files.push(OpenFile::open(
+                    &base.join(&f.file),
+                    crate::segments::kind_of(&f.file),
+                )?);
+            }
+        }
+        for (path, kind) in extra {
+            files.push(OpenFile::open(path, *kind)?);
         }
         Ok(Some(Self { manifest, files }))
+    }
+
+    /// Files alone, no manifest — for reading a compaction's output back.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_files(files: &[(PathBuf, FileKind)]) -> Result<Self> {
+        let mut opened = Vec::new();
+        for (path, kind) in files {
+            opened.push(OpenFile::open(path, *kind)?);
+        }
+        Ok(Self {
+            manifest: Manifest::new(""),
+            files: opened,
+        })
     }
 
     /// Bytes and requests so far, across every file — what a Worker would
@@ -406,13 +452,15 @@ impl PolicyArchive {
     }
 
     pub fn coverage(&self) -> Coverage {
-        let movement_entries = self
-            .manifest
-            .passes
+        // From the FOOTERS, so a running pass's segments count the moment
+        // they are opened, before any manifest names them.
+        let ranges = self
+            .files
             .iter()
-            .filter_map(|p| p.movements.as_ref());
-        let first_slot = movement_entries.clone().filter_map(|f| f.min_slot).min();
-        let last_slot = movement_entries.filter_map(|f| f.max_slot).max();
+            .filter(|f| f.kind == FileKind::Movements)
+            .flat_map(|f| (0..f.archive.num_groups()).filter_map(|g| f.archive.slot_range(g)));
+        let first_slot = ranges.clone().map(|(lo, _)| lo).min();
+        let last_slot = ranges.map(|(_, hi)| hi).max();
         let total_txs = self
             .files
             .iter()
@@ -747,6 +795,13 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
                 .map(|c| format!(" corrections={}", c.rows))
                 .unwrap_or_default()
         );
+        if !p.segments.is_empty() {
+            println!(
+                "    uncompacted: {} segments, {} rows",
+                p.segments.len(),
+                p.segments.iter().map(|s| s.rows).sum::<u64>()
+            );
+        }
     }
     let cov = a.coverage();
     println!(
@@ -937,6 +992,7 @@ mod tests {
             floor: 5,
             movements: None,
             corrections: None,
+            segments: Vec::new(),
             pending: 0,
             found: 0,
             written: 0,
