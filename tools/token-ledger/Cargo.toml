@@ -33,6 +33,10 @@ tokio = { workspace = true }
 # SSE progress on the policy feed — the same streaming shape wallet-sieve's
 # `/events` uses, so flow-explorer consumes both identically.
 tokio-stream = { workspace = true }
+# The in-process archive publisher: R2 through an S3 client (conditional
+# manifest put, list, delete), the KV bundle through the Cloudflare API.
+object_store = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true }
 
 # Pool script addresses + the CSwap pool datum (LP policy/name = the pool

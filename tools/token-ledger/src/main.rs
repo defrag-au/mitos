@@ -21,6 +21,7 @@ mod cohort;
 mod export;
 mod policy_api;
 mod pools;
+mod publish;
 mod registry;
 mod reverse;
 mod segments;
@@ -72,6 +73,10 @@ enum Command {
     /// Write a policy's bundle — manifest plus every footer, one blob for
     /// KV — from its manifest. Landing writes one; this backfills.
     Bundle(archive::BundleArgs),
+    /// Publish one policy's archive — R2 and the KV bundle — by hand, from
+    /// the same environment `serve --publish-archive` uses, and print the
+    /// per-step record.
+    Publish(publish::PublishArgs),
     /// Derived balances at tip — the reconciliation surface.
     Stats {
         #[arg(long)]
@@ -150,6 +155,7 @@ fn main() -> Result<()> {
         Command::Archive(args) => archive::inspect(args),
         Command::Rollup(args) => segments::run_rollup(args),
         Command::Bundle(args) => archive::bundle(args),
+        Command::Publish(args) => publish::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),

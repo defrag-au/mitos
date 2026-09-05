@@ -59,11 +59,12 @@ pub struct ServeArgs {
     #[arg(long)]
     pub push_script: Option<PathBuf>,
 
-    /// Script run after every policy pass lands, with the policy hex and
-    /// the archive root as arguments — `push-archive.sh`, which puts the
-    /// archive in R2 so the Worker can read it without this box.
+    /// Publish every landed policy archive — Parquet and manifest to R2,
+    /// the bundle to Workers KV — from the environment the unit loads
+    /// (`R2_*`, `CF_KV_TOKEN`, `KV_NAMESPACE_IDS`). In process, with a
+    /// per-step record; see `publish.rs`. Omit to keep archives local.
     #[arg(long)]
-    pub archive_push_script: Option<PathBuf>,
+    pub publish_archive: bool,
 
     /// Public base clients should fetch artifacts from.
     #[arg(long, default_value = "https://tokendata.hodlcroft.com")]
@@ -151,7 +152,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.data_dir.clone(),
         args.tokens.clone(),
         args.archive_dir.clone(),
-        args.archive_push_script.clone(),
+        args.publish_archive.then(crate::publish::Targets::from_env),
         std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
     );
 

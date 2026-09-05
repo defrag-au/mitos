@@ -183,6 +183,9 @@ config = { version = "0.14", default-features = false, features = ["toml"] }
 
 # HTTP client for the diff harness (polls both workers' read APIs).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+# S3-compatible client for R2 — the policy archive publisher (token-ledger).
+# `aws` only; no cloud SDK, no arrow.
+object_store = { version = "0.12", default-features = false, features = ["aws"] }
 
 [profile.release]
 opt-level = 3

@@ -284,8 +284,6 @@ pub struct PolicyHub {
     /// Root of the per-policy archives — Parquet plus a manifest, no
     /// database. See `archive.rs`.
     pub archive_dir: PathBuf,
-    /// Run after a pass lands, to publish the archive — see `serve`.
-    push_script: Option<PathBuf>,
     jobs: Mutex<HashMap<String, PolicyJob>>,
     /// The in-progress pass per policy, if one is running.
     live: Mutex<HashMap<String, Arc<Mutex<Live>>>>,
@@ -294,11 +292,13 @@ pub struct PolicyHub {
 }
 
 impl PolicyHub {
+    /// `publish`: where a landed archive goes — R2 and the KV bundle — or
+    /// `None` to leave it on disk. See `publish.rs`.
     pub fn new(
         data_dir: PathBuf,
         tokens: PathBuf,
         archive_dir: PathBuf,
-        push_script: Option<PathBuf>,
+        publish: Option<crate::publish::Targets>,
         bearer: Option<String>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<PassRequest>();
@@ -306,7 +306,6 @@ impl PolicyHub {
             data_dir,
             tokens,
             archive_dir,
-            push_script,
             jobs: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             queue: tx,
@@ -318,6 +317,23 @@ impl PolicyHub {
         {
             let hub = Arc::clone(&hub);
             std::thread::spawn(move || {
+                // The publisher and its runtime live on THIS thread for the
+                // life of the loop: its HTTP clients are used from the one
+                // runtime that created their connections.
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("publish runtime");
+                let publisher = publish.and_then(|targets| {
+                    tracing::info!(targets = %targets.describe(), "policy: publishing landed archives");
+                    match crate::publish::Publisher::new(targets) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"), "policy: publisher not built — archives stay local");
+                            None
+                        }
+                    }
+                });
                 for req in rx {
                     let started = Instant::now();
                     let outcome = run_pass(&hub, &req);
@@ -345,23 +361,21 @@ impl PolicyHub {
                     hub.set(&req.policy, state);
                     // PUBLISH. Synchronous on this thread, deliberately: the
                     // next pass would otherwise rewrite the directory under
-                    // a push still reading it. A failed push is logged and
-                    // never fails the pass — the archive is on disk either
-                    // way and the next landing pushes again.
-                    if landed && let Some(script) = &hub.push_script {
-                        match std::process::Command::new(script)
-                            .arg(&req.policy)
-                            .arg(&hub.archive_dir)
-                            .status()
-                        {
-                            Ok(s) if s.success() => {
-                                tracing::info!(policy = req.policy, "policy: archive pushed")
+                    // a publish still reading it. A failed publish is
+                    // recorded (`published.json`) and logged, and never
+                    // fails the pass — the archive is on disk either way
+                    // and the next landing publishes again.
+                    if landed && let Some(p) = &publisher {
+                        let dir = hub.policy_dir(&req.policy);
+                        match runtime.block_on(p.publish(&dir, &req.policy)) {
+                            Ok(rec) if rec.all_done() => {
+                                tracing::info!(policy = req.policy, outcome = %rec.summary(), "policy: archive published")
                             }
-                            Ok(s) => {
-                                tracing::warn!(policy = req.policy, status = %s, "policy: push failed")
+                            Ok(rec) => {
+                                tracing::warn!(policy = req.policy, outcome = %rec.summary(), "policy: publish INCOMPLETE")
                             }
                             Err(e) => {
-                                tracing::warn!(policy = req.policy, error = %e, "policy: push failed")
+                                tracing::warn!(policy = req.policy, error = %format!("{e:#}"), "policy: publish failed")
                             }
                         }
                     }
