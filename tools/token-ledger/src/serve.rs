@@ -66,6 +66,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub publish_archive: bool,
 
+    /// A tx-index over the same snapshot (`base.idx` + `segments/`). With
+    /// it, a DETOUR — the window a running pass reads for a seek below its
+    /// floor — resolves its inputs on the spot; without it those rows arrive
+    /// as arrivals and the descent corrects them later.
+    #[arg(long)]
+    pub tx_index_dir: Option<PathBuf>,
+
     /// Public base clients should fetch artifacts from.
     #[arg(long, default_value = "https://tokendata.hodlcroft.com")]
     pub public_base: String,
@@ -153,6 +160,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.tokens.clone(),
         args.archive_dir.clone(),
         args.publish_archive.then(crate::publish::Targets::from_env),
+        args.tx_index_dir.clone(),
         std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
     );
 

@@ -51,7 +51,7 @@
 //! its block — and its chunk — is a sieve hit. Skipping non-hit chunks cannot
 //! lose a resolution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -101,7 +101,8 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub days: Option<u64>,
 
-    /// Absolute floor to stop at, overriding `--days`. The hosted surface
+    /// Absolute floor to stop at. With `--days` too, the NEARER bound wins —
+    /// a preview is ten days with the mint as its floor. The hosted surface
     /// passes the policy's first mint here.
     #[arg(long)]
     pub to_slot: Option<u64>,
@@ -142,7 +143,7 @@ pub struct Outcome {
 /// Run one reverse pass. The CLI face: logs progress and prints a summary.
 pub fn run(args: ReverseArgs) -> Result<()> {
     let report_every = args.report_every.max(1);
-    let out = run_reporting(args, &|p| {
+    let on: OnProgress<'_> = &|p| {
         // Chunks are ~6h of chain, so a full-history pass emits thousands. Log
         // every Nth, but ALWAYS log one that corrected rows or flushed a
         // segment: those are the events a consumer most needs to see.
@@ -162,7 +163,19 @@ pub fn run(args: ReverseArgs) -> Result<()> {
                 "reverse: progress"
             );
         }
-    })?;
+    };
+    // The CLI walks straight down: nobody is scrubbing, so no detours, and
+    // its inputs resolve the way they always have — as the descent reaches
+    // them.
+    let out = run_reporting(
+        args,
+        Hooks {
+            on,
+            take_detour: &|| None,
+            between_chunks: &|| {},
+            resolver: None,
+        },
+    )?;
 
     println!("transactions written        = {}", out.written);
     println!("delta rows backfilled       = {}", out.backfilled);
@@ -177,8 +190,9 @@ pub fn run(args: ReverseArgs) -> Result<()> {
     Ok(())
 }
 
-/// One reverse pass, reporting through `on` — the programmatic face.
-pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
+/// One reverse pass, reporting and interruptible through `hooks` — the
+/// programmatic face.
+pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
     let started = Instant::now();
     let token = registry::load_or_unit(&args.tokens, &args.token)?;
     let policy = token.policy_bytes()?;
@@ -209,12 +223,6 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
     // contiguous. On a cold policy there is no floor yet and the tip is the
     // ceiling — the first pass establishes it.
     let ceiling = manifest.walk_from.unwrap_or(tip_slot);
-    let floor = match (args.to_slot, args.days) {
-        (Some(s), _) => s,
-        (None, Some(days)) => ceiling.saturating_sub(days * SLOTS_PER_DAY),
-        // Everything. Clamped to the first mint below when one is known.
-        (None, None) => 0,
-    };
     // Never dig below the policy's own first mint when we know it: there is
     // nothing there, and reading it is pure cost. `--to-slot` IS the first
     // mint when the hosted surface passes it (from Koios); counting it here
@@ -226,7 +234,7 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         .floor_slot
         .or(manifest.first_mint_slot)
         .or(args.to_slot);
-    let floor = first_mint.map_or(floor, |first| floor.max(first));
+    let floor = pass_floor(ceiling, args.to_slot, args.days, first_mint);
 
     // The carried state: what the previous pass was still waiting for —
     // wherever the manifest says it is, which after a rollup is the root.
@@ -294,7 +302,7 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         &mut writer,
         &mut pending,
         !args.no_sieve,
-        on,
+        &hooks,
     )?;
     let segments = writer.finish()?;
 
@@ -322,6 +330,29 @@ pub fn run_reporting(args: ReverseArgs, on: OnProgress<'_>) -> Result<Outcome> {
         "reverse: pass complete"
     );
     Ok(out)
+}
+
+/// Where a pass stops: the NEARER of an absolute floor and a day limit,
+/// never below the first mint.
+///
+/// The first version let `to_slot` win outright, so a PREVIEW — ten days
+/// with the mint as its floor — walked to the mint: a full pass running
+/// inside the chunk hook of another full pass. Both bounds apply.
+pub fn pass_floor(
+    ceiling: u64,
+    to_slot: Option<u64>,
+    days: Option<u64>,
+    first_mint: Option<u64>,
+) -> u64 {
+    let by_days = days.map(|d| ceiling.saturating_sub(d * SLOTS_PER_DAY));
+    let asked = match (to_slot, by_days) {
+        (Some(s), Some(d)) => s.max(d),
+        (Some(s), None) => s,
+        (None, Some(d)) => d,
+        // Everything. Clamped to the first mint below when one is known.
+        (None, None) => 0,
+    };
+    first_mint.map_or(asked, |first| asked.max(first))
 }
 
 /// Everything a finished walk hands to the landing.
@@ -749,6 +780,11 @@ pub struct Progress<'a> {
     /// They hold everything buffered so far INCLUDING `rows`, so a mirror
     /// clears its buffer on this rather than appending.
     pub flushed: &'a [FileEntry],
+    /// A DETOUR produced this chunk: the seek it is reaching for. `floor`
+    /// is still the descent's.
+    pub reaching: Option<u64>,
+    /// Windows detours have read so far, `(from, to)`, in the order asked.
+    pub detours: &'a [(u64, u64)],
 }
 
 impl Progress<'_> {
@@ -765,6 +801,33 @@ impl Progress<'_> {
 }
 
 pub type OnProgress<'x> = &'x dyn Fn(Progress<'_>);
+
+/// What the hosted surface hooks into a pass. A CLI run reports and
+/// nothing else.
+pub struct Hooks<'a> {
+    pub on: OnProgress<'a>,
+    /// The newest seek below the descent's floor, taken once. Asked after
+    /// every chunk; a `Some` sends the pass on a DETOUR — a bounded window
+    /// ending at that slot, read next, ahead of the descent — so a reader
+    /// scrubbing to 2024 on a policy whose walk is at 2025 sees rows in
+    /// seconds rather than when the descent gets there.
+    pub take_detour: &'a dyn Fn() -> Option<u64>,
+    /// Called after every descent chunk, before the detour check. The
+    /// hosted surface uses it to give a policy QUEUED behind this pass a
+    /// short pass of its own — its newest days — so its page shows rows
+    /// while it waits, rather than skeletons for half an hour.
+    pub between_chunks: &'a dyn Fn(),
+    /// tx hash → body over the same snapshot. With it a detour resolves its
+    /// spenders' inputs on the spot and its rows arrive attributed; without
+    /// it they arrive as arrivals and the descent corrects them later.
+    pub resolver: Option<&'a tx_index::Index>,
+}
+
+/// How much a detour reads: at most this many chunks below the seek, and
+/// it stops early once it has a page of transactions. Chunks are ~6 h of
+/// chain, so the cap is about ten days; a page is the feed's page size.
+const DETOUR_MAX_CHUNKS: u64 = 40;
+const DETOUR_PAGE_TXS: u64 = 500;
 
 /// What the chunk walk itself produced, before anything lands.
 struct Walked {
@@ -838,45 +901,64 @@ fn chunk_blocks_newest_first(
     Ok(out)
 }
 
-/// Walk `[floor, ceiling)` backward into segments, resolving sources as they
-/// come into view.
-#[allow(clippy::too_many_arguments)]
-fn pass(
-    immutable: &Path,
-    chunks: &[u64],
-    policy: &[u8],
-    watched: &Watched,
-    floor: u64,
-    ceiling: u64,
-    writer: &mut SegmentWriter,
-    pending: &mut Pending,
-    sieve: bool,
-    on: OnProgress<'_>,
-) -> Result<Walked> {
-    let needles = sieve
-        .then(|| chain_sieve::Needles::new(std::slice::from_ref(&policy.to_vec())))
-        .transpose()?;
+/// Which walk a chunk is read for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The descent: contiguous, newest first, the thing that makes the
+    /// archive complete.
+    Descent,
+    /// A window ahead of the descent, for a seek. Its transactions are
+    /// remembered so the descent passes them by when it gets there.
+    Detour,
+}
 
-    let mut written = 0u64;
-    let mut backfilled = 0usize;
-    let mut lowest = ceiling;
-    let ordered = chunks_descending(chunks, floor, ceiling);
-    let chunks_total = ordered.len() as u64;
-    let mut chunks_done = 0u64;
+/// What one chunk produced.
+struct ChunkOut {
+    /// Every archive row — own rows and resolutions — for the live view.
+    rows: Vec<Movement>,
+    /// Spenders whose deltas changed.
+    updated: Vec<Hash<32>>,
+    /// Lowest block slot read, if any block was in range.
+    lowest: Option<u64>,
+    /// Transactions found.
+    found: u64,
+}
 
-    for chunk in ordered {
-        let blocks = chunk_blocks_newest_first(immutable, chunk, needles.as_ref())?;
+/// The per-chunk machinery, shared by the descent and its detours.
+struct Scan<'a> {
+    immutable: &'a Path,
+    policy: &'a [u8],
+    policy_hex: String,
+    watched: &'a Watched,
+    needles: Option<&'a chain_sieve::Needles<'a>>,
+    writer: &'a mut SegmentWriter,
+    pending: &'a mut Pending,
+    resolver: Option<&'a tx_index::Index>,
+    /// Transactions a detour already wrote. The descent resolves their
+    /// outputs for spenders above and otherwise passes them by, so each
+    /// transaction has exactly one set of own rows.
+    detoured: HashSet<Hash<32>>,
+    written: u64,
+    backfilled: usize,
+    /// Inputs a detour resolved through the index rather than the descent.
+    resolved_by_index: u64,
+}
+
+impl Scan<'_> {
+    fn chunk(&mut self, chunk: u64, lo: u64, hi: u64, mode: Mode) -> Result<ChunkOut> {
+        let blocks = chunk_blocks_newest_first(self.immutable, chunk, self.needles)?;
         // Resolutions found in this chunk. A source and its spender can sit
         // in the SAME chunk; as rows they simply sum, so order is free.
         let mut resolved: Vec<Resolution> = Vec::new();
-        // What this chunk adds, as archive rows, for the live view.
-        let mut chunk_rows: Vec<Movement> = Vec::new();
+        let mut rows: Vec<Movement> = Vec::new();
+        let mut lowest: Option<u64> = None;
+        let mut found = 0u64;
 
         for (slot, raw) in blocks {
-            if slot < floor || slot >= ceiling {
+            if slot < lo || slot >= hi {
                 continue;
             }
-            lowest = lowest.min(slot);
+            lowest = Some(lowest.map_or(slot, |l| l.min(slot)));
             let blk = MultiEraBlock::decode(&raw)
                 .map_err(|e| anyhow::anyhow!("decoding block at slot {slot}: {e:?}"))?;
             let block_time = slot_to_unix(slot);
@@ -887,11 +969,11 @@ fn pass(
 
                 let mut net_mint: HashMap<Vec<u8>, i64> = HashMap::new();
                 for pa in tx.mints().iter() {
-                    if pa.policy().as_ref() != policy {
+                    if pa.policy().as_ref() != self.policy {
                         continue;
                     }
                     for a in pa.assets().iter() {
-                        if !watched.matches(a.name()) {
+                        if !self.watched.matches(a.name()) {
                             continue;
                         }
                         *net_mint.entry(a.name().to_vec()).or_insert(0) +=
@@ -903,14 +985,14 @@ fn pass(
                 // resolution of whatever spent them later.
                 let mut deltas: Vec<(Vec<u8>, String, i64)> = Vec::new();
                 for out in &dtx.outputs {
-                    let units = units_in_output(tx, out, policy, watched);
+                    let units = units_in_output(tx, out, self.policy, self.watched);
                     if units.is_empty() {
                         continue;
                     }
                     for (name, qty) in &units {
                         deltas.push((name.clone(), out.address.clone(), *qty));
                     }
-                    resolved.extend(pending.resolve(
+                    resolved.extend(self.pending.resolve(
                         &(dtx.tx_hash, out.index),
                         &units,
                         &out.address,
@@ -919,6 +1001,14 @@ fn pass(
 
                 let touches_us = !deltas.is_empty() || !net_mint.is_empty();
                 if !touches_us {
+                    continue;
+                }
+                // A detour wrote this one already. Its outputs have just
+                // resolved whatever was waiting on them; its rows exist.
+                // Either mode: a second detour over the same stretch must
+                // not write them again, or the sum-merge doubles them —
+                // seen on 901ba6e9 when one window was read four times.
+                if self.detoured.contains(&dtx.tx_hash) {
                     continue;
                 }
 
@@ -948,12 +1038,33 @@ fn pass(
                 };
                 if !missing.is_empty() {
                     let inputs: Vec<OutRef> = dtx.inputs.iter().map(|i| i.oref).collect();
-                    pending.want(&row, missing, &inputs);
+                    // A detour with an index resolves NOW: its sources are
+                    // below a floor the descent may not reach for minutes.
+                    let (missing, inputs) = match (mode, self.resolver) {
+                        (Mode::Detour, Some(index)) => Self::resolve_now(
+                            index,
+                            &self.policy_hex,
+                            self.watched,
+                            &row,
+                            missing,
+                            &inputs,
+                            &mut resolved,
+                            &mut self.resolved_by_index,
+                        ),
+                        _ => (missing, inputs),
+                    };
+                    if !missing.is_empty() {
+                        self.pending.want(&row, missing, &inputs);
+                    }
                 }
-                let rows = row.rows();
-                chunk_rows.extend(rows.iter().cloned());
-                writer.push_own(rows);
-                written += 1;
+                if mode == Mode::Detour {
+                    self.detoured.insert(dtx.tx_hash);
+                }
+                let own = row.rows();
+                rows.extend(own.iter().cloned());
+                self.writer.push_own(own);
+                self.written += 1;
+                found += 1;
             }
         }
 
@@ -962,28 +1073,196 @@ fn pass(
         // transactions; the reader sums the rest.
         let mut updated: Vec<Hash<32>> = Vec::new();
         for r in resolved {
-            backfilled += 1;
+            self.backfilled += 1;
             if !updated.contains(&r.spender) {
                 updated.push(r.spender);
             }
-            chunk_rows.push(r.row.clone());
-            writer.push_corr(r.row);
+            rows.push(r.row.clone());
+            self.writer.push_corr(r.row);
         }
+        Ok(ChunkOut {
+            rows,
+            updated,
+            lowest,
+            found,
+        })
+    }
 
-        chunks_done += 1;
-        let flushed = writer.end_chunk()?;
-        on(Progress {
+    /// Resolve a spender's inputs through the index: each outref that the
+    /// index knows and that carried a watched unit becomes a signed row
+    /// here and now. What is left — units still missing, inputs the index
+    /// does not hold — goes to the pending set for the descent, exactly as
+    /// it would have without an index. Stops looking once the units balance:
+    /// the remaining inputs carried ADA (the retirement rule).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_now(
+        index: &tx_index::Index,
+        policy_hex: &str,
+        watched: &Watched,
+        tx: &PassTx,
+        mut missing: HashMap<Vec<u8>, i64>,
+        inputs: &[OutRef],
+        resolved: &mut Vec<Resolution>,
+        counted: &mut u64,
+    ) -> (HashMap<Vec<u8>, i64>, Vec<OutRef>) {
+        let mut leftover = Vec::new();
+        for oref in inputs {
+            if missing.values().all(|m| *m <= 0) {
+                break;
+            }
+            let Some(hash) = oref.0.as_ref().first_chunk::<32>() else {
+                leftover.push(*oref);
+                continue;
+            };
+            match index.resolve(hash, oref.1) {
+                Ok(tx_index::Resolution::Found { output, .. }) => {
+                    let units: Vec<(Vec<u8>, i64)> = output
+                        .assets
+                        .iter()
+                        .filter(|a| a.policy == policy_hex)
+                        .filter_map(|a| {
+                            let name = hex::decode(&a.name).ok()?;
+                            watched
+                                .matches(&name)
+                                .then_some((name, i64::try_from(a.quantity).unwrap_or(i64::MAX)))
+                        })
+                        .collect();
+                    for (unit, qty) in &units {
+                        if let Some(m) = missing.get_mut(unit) {
+                            *m -= qty;
+                        }
+                        let net_mint = tx
+                            .net_mint
+                            .iter()
+                            .find(|(n, _)| n == unit)
+                            .map_or(0, |(_, a)| *a);
+                        resolved.push(Resolution {
+                            spender: tx.hash,
+                            row: Movement {
+                                slot: tx.slot,
+                                block_time: tx.block_time,
+                                tx_hash: tx.hash.as_ref().to_vec(),
+                                unit_name: unit.clone(),
+                                address: output.address.clone(),
+                                amount: -qty,
+                                net_mint,
+                            },
+                        });
+                    }
+                    *counted += 1;
+                }
+                // Not indexed (a chunk newer than the base, an unknown era):
+                // the descent will meet it.
+                Ok(_) => leftover.push(*oref),
+                Err(e) => {
+                    tracing::debug!(error = %e, "detour: index lookup failed; leaving to the descent");
+                    leftover.push(*oref);
+                }
+            }
+        }
+        missing.retain(|_, m| *m > 0);
+        (missing, leftover)
+    }
+}
+
+/// Walk `[floor, ceiling)` backward into segments, resolving sources as they
+/// come into view — and, between chunks, any DETOUR a seek asks for.
+#[allow(clippy::too_many_arguments)]
+fn pass(
+    immutable: &Path,
+    chunks: &[u64],
+    policy: &[u8],
+    watched: &Watched,
+    floor: u64,
+    ceiling: u64,
+    writer: &mut SegmentWriter,
+    pending: &mut Pending,
+    sieve: bool,
+    hooks: &Hooks<'_>,
+) -> Result<Walked> {
+    let policy_vec = policy.to_vec();
+    let needles = sieve
+        .then(|| chain_sieve::Needles::new(std::slice::from_ref(&policy_vec)))
+        .transpose()?;
+    let mut scan = Scan {
+        immutable,
+        policy,
+        policy_hex: hex::encode(policy),
+        watched,
+        needles: needles.as_ref(),
+        writer,
+        pending,
+        resolver: hooks.resolver,
+        detoured: HashSet::new(),
+        written: 0,
+        backfilled: 0,
+        resolved_by_index: 0,
+    };
+
+    let mut lowest = ceiling;
+    let ordered = chunks_descending(chunks, floor, ceiling);
+    let chunks_total = ordered.len() as u64;
+    let mut detours: Vec<(u64, u64)> = Vec::new();
+
+    for (done, chunk) in ordered.into_iter().enumerate() {
+        let chunks_done = done as u64 + 1;
+        let out = scan.chunk(chunk, floor, ceiling, Mode::Descent)?;
+        if let Some(l) = out.lowest {
+            lowest = lowest.min(l);
+        }
+        let flushed = scan.writer.end_chunk()?;
+        (hooks.on)(Progress {
             floor: lowest,
             target_floor: floor,
             ceiling,
             chunks_done,
             chunks_total,
-            written,
-            updated: &updated,
-            pending: pending.len(),
-            rows: &chunk_rows,
+            written: scan.written,
+            updated: &out.updated,
+            pending: scan.pending.len(),
+            rows: &out.rows,
             flushed: &flushed,
+            reaching: None,
+            detours: &detours,
         });
+        (hooks.between_chunks)();
+
+        // A seek below the floor? Read that window next. Only below what
+        // the descent has reached and above where it is heading; and not
+        // where a detour has already been.
+        if let Some(at) = (hooks.take_detour)()
+            && at < lowest
+            && at > floor
+            // `to` INCLUSIVE: a window read up to `at` answers a seek AT
+            // `at` — the seek asks for rows below it — and it is exactly
+            // the slot the next poll asks for again.
+            && !detours.iter().any(|(from, to)| at > *from && at <= *to)
+        {
+            let window = detour(&mut scan, chunks, at, floor, |progress| {
+                (hooks.on)(Progress {
+                    floor: lowest,
+                    target_floor: floor,
+                    ceiling,
+                    chunks_done,
+                    chunks_total,
+                    written: progress.written,
+                    updated: progress.updated,
+                    pending: progress.pending,
+                    rows: progress.rows,
+                    flushed: progress.flushed,
+                    reaching: Some(at),
+                    detours: &detours,
+                })
+            })?;
+            tracing::info!(
+                at,
+                from = window.0,
+                to = window.1,
+                by_index = scan.resolved_by_index,
+                "reverse: detour read"
+            );
+            detours.push(window);
+        }
     }
 
     // Coverage is where the pass STOPPED LOOKING, not the deepest row it
@@ -992,9 +1271,52 @@ fn pass(
     // all extends nothing.
     Ok(Walked {
         floor: if chunks_total == 0 { ceiling } else { floor },
-        written,
-        backfilled,
+        written: scan.written,
+        backfilled: scan.backfilled,
     })
+}
+
+/// What a detour reports per chunk, before the descent's frame is put
+/// around it.
+struct DetourProgress<'a> {
+    written: u64,
+    updated: &'a [Hash<32>],
+    pending: usize,
+    rows: &'a [Movement],
+    flushed: &'a [FileEntry],
+}
+
+/// Read the window ending at `at`: at most [`DETOUR_MAX_CHUNKS`] chunks
+/// down, stopping early at a page of transactions. Returns the stretch
+/// actually read, `(from, to)`.
+fn detour(
+    scan: &mut Scan<'_>,
+    chunks: &[u64],
+    at: u64,
+    floor: u64,
+    on: impl Fn(DetourProgress<'_>),
+) -> Result<(u64, u64)> {
+    let lo = floor.max(at.saturating_sub(DETOUR_MAX_CHUNKS * CHUNK_SLOTS));
+    let mut found = 0u64;
+    let mut reached = at;
+    for chunk in chunks_descending(chunks, lo, at) {
+        let out = scan.chunk(chunk, lo, at, Mode::Detour)?;
+        found += out.found;
+        // Read down to the bottom of this chunk, or the window's floor.
+        reached = reached.min((chunk * CHUNK_SLOTS).max(lo));
+        let flushed = scan.writer.end_chunk()?;
+        on(DetourProgress {
+            written: scan.written,
+            updated: &out.updated,
+            pending: scan.pending.len(),
+            rows: &out.rows,
+            flushed: &flushed,
+        });
+        if found >= DETOUR_PAGE_TXS {
+            break;
+        }
+    }
+    Ok((reached, at))
 }
 
 #[cfg(test)]
@@ -1244,6 +1566,35 @@ mod tests {
         assert_eq!(got, vec![15, 14, 12, 11]);
     }
 
+    /// A preview is ten days WITH the mint as its floor; the nearer bound
+    /// wins, and a policy minted last week previews to completion.
+    #[test]
+    fn a_pass_stops_at_the_nearer_of_its_bounds() {
+        let ceiling = 1_000 * SLOTS_PER_DAY;
+        let mint = 500 * SLOTS_PER_DAY;
+        assert_eq!(
+            pass_floor(ceiling, Some(mint), Some(10), Some(mint)),
+            990 * SLOTS_PER_DAY,
+            "ten days, not five hundred"
+        );
+        assert_eq!(pass_floor(ceiling, Some(mint), None, Some(mint)), mint);
+        assert_eq!(
+            pass_floor(
+                ceiling,
+                Some(997 * SLOTS_PER_DAY),
+                Some(10),
+                Some(997 * SLOTS_PER_DAY)
+            ),
+            997 * SLOTS_PER_DAY,
+            "a policy minted three days ago previews to its mint"
+        );
+        assert_eq!(pass_floor(ceiling, None, None, None), 0);
+        assert_eq!(
+            pass_floor(ceiling, None, Some(10), Some(995 * SLOTS_PER_DAY)),
+            995 * SLOTS_PER_DAY
+        );
+    }
+
     #[test]
     fn the_chunk_holding_the_floor_is_included() {
         let on_disk = [10u64, 11, 12];
@@ -1263,6 +1614,8 @@ mod tests {
             pending: 0,
             rows: &[],
             flushed: &[],
+            reaching: None,
+            detours: &[],
         }
     }
 

@@ -16,6 +16,10 @@ mitos-chain-walk = { path = "../mitos-chain-walk" }
 # The sieve gate — memmem raw blocks for the policy id, decode only on hit.
 # Shared machinery with wallet-sieve.
 chain-sieve = { path = "../../crates/chain-sieve" }
+# tx hash → body over the same snapshot: a DETOUR — a window read ahead of
+# the descent for a seek below the floor — resolves its inputs on the spot
+# instead of waiting for the descent to reach them.
+tx-index = { path = "../../crates/tx-index" }
 
 # `serve` — the hosted any-token-on-demand surface. Tokio is confined to
 # serve::run, per the wallet-sieve convention.

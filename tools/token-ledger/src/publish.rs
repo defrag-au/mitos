@@ -45,7 +45,7 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
-use crate::archive::{MANIFEST, Manifest};
+use crate::archive::MANIFEST;
 
 /// Key prefix in the bucket: `policy-archive/<policy_hex>/<relative path>`,
 /// the same relative paths the manifest carries.
@@ -586,6 +586,14 @@ pub fn run(args: PublishArgs) -> Result<()> {
     let dir = crate::archive::policy_dir(&args.archive_dir, &policy);
     let targets = Targets::from_env();
     println!("targets: {}", targets.describe());
+    if let Some(prev) = load_record(&dir)? {
+        println!(
+            "last publish: {} (manifest {}, at {})",
+            prev.summary(),
+            prev.manifest_updated_unix,
+            prev.published_unix
+        );
+    }
     let Some(publisher) = Publisher::new(targets)? else {
         bail!(
             "R2 is not configured (R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET)"
