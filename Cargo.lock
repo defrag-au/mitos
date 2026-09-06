@@ -6277,6 +6277,7 @@ dependencies = [
  "chain-ledger",
  "chain-sieve",
  "clap",
+ "flate2",
  "hex",
  "libc",
  "mitos-chain-walk",

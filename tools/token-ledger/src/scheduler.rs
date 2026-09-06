@@ -59,6 +59,14 @@ use crate::archive::{self, SlotRange};
 use crate::policy_api::{Live, PolicyHub, PolicyJob};
 use crate::reverse;
 
+/// The movement graph keys parties by STAKE — the wallet — which is worth
+/// about ten times on the wire (ClayNation: 2.20 MB against 16.94 MB) and is
+/// the right node for "who traded with whom". It merges addresses sharing a
+/// staking credential, which is wrong for forensic work; that case rebuilds
+/// with `token-ledger graph` and no `--by-stake`. See
+/// `policy_archive::graph`.
+const GRAPH_BY_STAKE: bool = true;
+
 /// A job's reach: forty chunks, about ten days of chain, seconds through
 /// the sieve gate. The unit of fairness between policies and of a seek's
 /// window.
@@ -719,6 +727,20 @@ fn worker(hub: Arc<PolicyHub>, publish: Option<crate::publish::Targets>, kind: J
                         "policy: walk complete"
                     );
                     if !hub.sched.busy(&policy) {
+                        // THE MOVEMENT GRAPH, before the publish that would
+                        // carry it. Here rather than on every landing: it is
+                        // a full read of the archive (5.9 s on ClayNation),
+                        // and a walk completes once — including once per
+                        // daily top-up, which is exactly the cadence the
+                        // artifact wants. A failure is logged and never
+                        // blocks the archive itself.
+                        if let Err(e) = crate::archive::write_graph(
+                            &hub.policy_dir(&policy),
+                            &policy,
+                            GRAPH_BY_STAKE,
+                        ) {
+                            tracing::warn!(policy, error = %format!("{e:#}"), "policy: movement graph not built");
+                        }
                         publishing.publish(hub.policy_dir(&policy), &policy);
                     }
                     continue;

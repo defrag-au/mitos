@@ -68,6 +68,10 @@ enum Command {
     /// then only the row groups a page or a lookup needs — and report what it
     /// cost in requests and bytes.
     Archive(archive::InspectArgs),
+    /// What a party-to-party movement graph over a whole policy weighs —
+    /// distinct edges, not rows. The measurement that decides whether the
+    /// graph is one fetch or six hundred paged requests.
+    Graph(archive::GraphArgs),
     /// Fold a policy's passes into ONE file at its root — fewer footers per
     /// read, one object per policy for R2. Runs on its own after every few
     /// passes; this forces it.
@@ -155,6 +159,7 @@ fn main() -> Result<()> {
         Command::Walk(args) => walk::run(args),
         Command::Reverse(args) => reverse::run(args),
         Command::Archive(args) => archive::inspect(args),
+        Command::Graph(args) => archive::graph(args),
         Command::Rollup(args) => segments::run_rollup(args),
         Command::Bundle(args) => archive::bundle(args),
         Command::Publish(args) => publish::run(args),

@@ -75,6 +75,11 @@ pallas-primitives = { workspace = true }
 # through the snapshot. See `reverse::drop_chunk_pages`.
 libc = { workspace = true }
 
+# gzip for the published artifacts, IN PROCESS. `push-artifacts.sh` shells
+# out to `gzip -9`; the archive publisher replaced that shape for a reason and
+# the graph artifact does not reintroduce it.
+flate2 = "1"
+
 clap = { workspace = true }
 serde = { workspace = true }
 # The catalogue card — a small JSON sidecar per token so a listing surface

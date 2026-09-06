@@ -156,6 +156,12 @@ impl Outcome {
     pub fn is_done(&self) -> bool {
         matches!(self, Outcome::Done | Outcome::NotConfigured)
     }
+
+    /// A record written before a step existed says nothing about it, which
+    /// is `NotAttempted` — not a failure and not a success.
+    fn not_attempted() -> Self {
+        Outcome::NotAttempted
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +184,12 @@ pub struct Record {
     pub uploaded_bytes: u64,
     pub manifest: Outcome,
     pub bundle: Outcome,
+    /// The MOVEMENT GRAPH artifact, when one has been generated.
+    #[serde(default = "Outcome::not_attempted")]
+    pub graph: Outcome,
+    /// What it weighed on the wire — gzipped when that measurably paid.
+    #[serde(default)]
+    pub graph_bytes: u64,
     #[serde(default)]
     pub kv: Vec<KvOutcome>,
     pub prune: Outcome,
@@ -201,13 +213,15 @@ impl Record {
             Outcome::Failed { error } => format!("{name} FAILED: {error}"),
         };
         format!(
-            "{} ({} up, {} same, {} B); {}; {}; {} ({} pruned); {:.1}s",
+            "{} ({} up, {} same, {} B); {}; {}; {} ({} B); {} ({} pruned); {:.1}s",
             step("files", &self.files),
             self.uploaded,
             self.skipped,
             self.uploaded_bytes,
             step("manifest", &self.manifest),
             step("bundle", &self.bundle),
+            step("graph", &self.graph),
+            self.graph_bytes,
             step("prune", &self.prune),
             self.pruned,
             self.secs
@@ -326,6 +340,8 @@ impl Publisher {
             uploaded_bytes: 0,
             manifest: Outcome::NotAttempted,
             bundle: Outcome::NotAttempted,
+            graph: Outcome::NotAttempted,
+            graph_bytes: 0,
             kv: Vec::new(),
             prune: Outcome::NotAttempted,
             pruned: 0,
@@ -401,7 +417,19 @@ impl Publisher {
             }
         }
 
-        // 3. The bundle, to every namespace.
+        // 3. The MOVEMENT GRAPH, if one has been generated. After the flip
+        // on purpose: it is a DERIVED convenience, and a failure here must
+        // not stop the archive from being published.
+        match self.put_graph(policy, dir).await {
+            Ok(None) => record.graph = Outcome::NotAttempted,
+            Ok(Some(n)) => {
+                record.graph = Outcome::Done;
+                record.graph_bytes = n;
+            }
+            Err(e) => record.graph = Outcome::failed(e),
+        }
+
+        // 4. The bundle, to every namespace.
         match &self.kv {
             None => record.bundle = Outcome::NotConfigured,
             Some(kv) => {
@@ -430,11 +458,25 @@ impl Publisher {
             }
         }
 
-        // 4. Prune. The flip succeeded, so nothing live names what goes.
+        // 5. Prune. The flip succeeded, so nothing live names what goes.
+        //
+        // DERIVED artifacts are kept too, and this is the whole reason the
+        // list is explicit: the prune deletes everything under the policy's
+        // prefix that the manifest does not name, and the movement graph is
+        // by design not named by the manifest. Without these two entries the
+        // publish wrote the graph and then deleted it seconds later, and
+        // recorded `graph: done` for a put that genuinely succeeded — the
+        // object simply did not survive to the end of the same function.
+        // Both names, because whether it is stored gzipped is decided from
+        // the measured result and either one may be the live object.
         let keep: BTreeSet<ObjPath> = wanted
             .iter()
             .map(|(rel, _)| Self::key(policy, rel))
             .chain(std::iter::once(manifest_key))
+            .chain([
+                Self::key(policy, policy_archive::GRAPH),
+                Self::key(policy, &format!("{}.gz", policy_archive::GRAPH)),
+            ])
             .collect();
         match self.prune(policy, &keep).await {
             Ok(n) => {
@@ -452,6 +494,56 @@ impl Publisher {
         record.secs = started.elapsed().as_secs_f64();
         store_record(dir, &record)?;
         Ok(record)
+    }
+
+    /// The movement graph — a DERIVED artifact, not a file the manifest
+    /// names, and not immutable: it is regenerated as the archive grows, so
+    /// it gets the manifest's cache posture rather than the files'.
+    ///
+    /// Compressed only when that MEASURABLY pays. R2 does not compress for
+    /// you — a body is stored pre-compressed with `Content-Encoding: gzip`
+    /// and the browser decompresses it transparently — and whether a body
+    /// compresses depends on what is in it: the token path's `txids`, a wall
+    /// of 32-byte hashes, came out 6 KB LARGER gzipped. Measured on
+    /// ClayNation, this one goes 3.45 MB → 2.20 MB, so it pays; the
+    /// comparison is made every time regardless.
+    ///
+    /// `Ok(None)` when no graph has been generated for this policy.
+    async fn put_graph(&self, policy: &str, dir: &Path) -> Result<Option<u64>> {
+        let path = dir.join(policy_archive::GRAPH);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let gz = crate::archive::gzip(&raw)?;
+        let mut attrs = Attributes::new();
+        // It changes; a year-long immutable cache would pin a stale graph.
+        attrs.insert(Attribute::CacheControl, "public, max-age=300".into());
+        attrs.insert(Attribute::ContentType, "application/octet-stream".into());
+        // An ABSENT Content-Encoding is the identity encoding, so the raw
+        // case sets no header — and the key's suffix already tells a reader
+        // which case it is looking at.
+        let (rel, body) = match gz.len() < raw.len() {
+            true => {
+                attrs.insert(Attribute::ContentEncoding, "gzip".into());
+                (format!("{}.gz", policy_archive::GRAPH), gz)
+            }
+            false => (policy_archive::GRAPH.to_string(), raw),
+        };
+        let n = body.len() as u64;
+        let key = Self::key(policy, &rel);
+        self.store
+            .put_opts(
+                &key,
+                PutPayload::from(body),
+                PutOptions {
+                    attributes: attrs,
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("put {key}"))?;
+        Ok(Some(n))
     }
 
     async fn upload_files(&self, policy: &str, wanted: &[(String, PathBuf)]) -> Result<Uploaded> {
@@ -630,6 +722,9 @@ mod tests {
             uploaded_bytes: 3,
             manifest: Outcome::Done,
             bundle: Outcome::NotConfigured,
+            // No graph generated for this policy — a step that never ran.
+            graph: Outcome::NotAttempted,
+            graph_bytes: 0,
             kv: Vec::new(),
             prune: Outcome::Done,
             pruned: 0,

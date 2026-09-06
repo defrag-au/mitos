@@ -688,6 +688,522 @@ pub struct InspectArgs {
     pub density: bool,
 }
 
+/// `token-ledger graph` — what a party-to-party movement graph over a whole
+/// policy would actually weigh.
+///
+/// The feed is rows and a graph is EDGES, which is a reduction: 1.6M
+/// movements on ClayNation collapse to however many distinct
+/// `(from, to)` pairs there are, and that number — not the row count — is
+/// what decides whether the graph can be one fetch the browser holds
+/// locally rather than six hundred paged requests. Measured here rather
+/// than estimated, because the archive is on disk and guessing at it is
+/// how the footer-size question went wrong the first time.
+///
+/// Reads through [`PolicyArchive`], the same reader the Worker uses.
+#[derive(clap::Args, Debug)]
+pub struct GraphArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+    /// Print the heaviest edges.
+    #[arg(long, default_value_t = 10)]
+    pub top: usize,
+    /// Key parties by STAKE address rather than payment address.
+    ///
+    /// The archive stores payment addresses deliberately — CSwap collapses
+    /// every pool onto one stake credential, so keying by stake would merge
+    /// distinct pools into one holder. A movement GRAPH usually wants the
+    /// opposite: a wallet, not a UTxO address. This measures what that
+    /// costs and what it saves.
+    #[arg(long)]
+    pub by_stake: bool,
+    /// Print the party dictionary, one per line, and nothing else — so its
+    /// real compressed size can be measured rather than guessed at.
+    #[arg(long)]
+    pub dump_parties: bool,
+    /// WRITE the artifact to `<policy>/graph.bin` (postcard, raw), and report
+    /// what it weighs raw and gzipped. Without this the command only
+    /// measures.
+    #[arg(long)]
+    pub write: bool,
+    /// Break the stake-keyed SELF-LOOPS down by what the underlying payment
+    /// addresses are, so "these are just UTxO shuffles" can be checked
+    /// rather than assumed. See [`SelfLoops`].
+    #[arg(long)]
+    pub self_loops: bool,
+}
+
+/// Why a stake-keyed edge points at its own node.
+///
+/// The reason this is a MEASUREMENT and not an assumption: a self-loop is
+/// usually a wallet moving units between its own payment addresses, which is
+/// noise in a movement graph. But protocols share staking credentials —
+/// Splash and DexHunter run fourteen scripts on one — so a trade between two
+/// distinct CONTRACT addresses collapses to a self-loop too, and that is real
+/// flow. Dropping both because they look alike would hide the second.
+#[derive(Default)]
+struct SelfLoops {
+    /// Both sides are key-credential addresses: one wallet's own addresses.
+    /// A genuine shuffle.
+    wallet: u64,
+    /// Either side is a SCRIPT address. Distinct contracts merged by a
+    /// shared staking credential — real movement, not a shuffle.
+    script: u64,
+    /// Identical payment address on both sides. Should not survive the fold
+    /// (it nets to zero), so a non-zero count here is worth knowing about.
+    same_address: u64,
+}
+
+/// What the archive's rows reduce to.
+#[derive(Default)]
+struct Graph {
+    by_stake: bool,
+    txs: u64,
+    unit_moves: u64,
+    /// One loser, one gainer — an edge.
+    transfers: u64,
+    mints: u64,
+    burns: u64,
+    /// A gainer whose source is below the floor. On a COMPLETE archive this
+    /// should be zero; anything else is an honest hole in the graph.
+    source_below_floor: u64,
+    /// Several parties on a side — a batched fill. NOT an edge: the
+    /// pairing is genuinely unknown and the archive refuses to guess it.
+    ambiguous: u64,
+    /// Parties interned to ids, so an edge is 8 bytes rather than two
+    /// bech32 strings.
+    parties: HashMap<String, u32>,
+    /// `(from, to)` → how it accumulated.
+    edges: HashMap<(u32, u32), EdgeAcc>,
+    /// party → (transactions, units)
+    minted: HashMap<u32, (u32, u64)>,
+    burned: HashMap<u32, (u32, u64)>,
+    first_slot: Option<u64>,
+    last_slot: Option<u64>,
+    /// Only meaningful when keyed by stake.
+    loops: SelfLoops,
+    /// Transfers dropped as wallet self-shuffles.
+    self_shuffles: u64,
+}
+
+/// One edge while it is still being summed.
+struct EdgeAcc {
+    count: u32,
+    units: u64,
+    first_slot: u64,
+    last_slot: u64,
+}
+
+impl Graph {
+    /// The artifact: the dictionary, the edges ascending by `(from, to)`,
+    /// and the mints and burns that are not edges.
+    fn finish(self, policy: &str, complete: bool) -> policy_archive::MovementGraph {
+        let mut all = vec![String::new(); self.parties.len()];
+        for (addr, id) in &self.parties {
+            all[*id as usize] = addr.clone();
+        }
+        // PRUNE the dictionary. Dropping wallet self-shuffles leaves parties
+        // that nothing references — a wallet whose only activity was
+        // reorganising its own UTxOs. The dictionary is the artifact's whole
+        // cost (27.3 MB against 3.7 MB of edges on ClayNation), so carrying
+        // addresses no edge names would be paying for silence.
+        let mut keep = vec![false; all.len()];
+        for (from, to) in self.edges.keys() {
+            keep[*from as usize] = true;
+            keep[*to as usize] = true;
+        }
+        for p in self.minted.keys().chain(self.burned.keys()) {
+            keep[*p as usize] = true;
+        }
+        let mut remap = vec![u32::MAX; all.len()];
+        let mut parties = Vec::new();
+        for (old, addr) in all.into_iter().enumerate() {
+            if keep[old] {
+                remap[old] = parties.len() as u32;
+                parties.push(addr);
+            }
+        }
+        let id = |old: &u32| remap[*old as usize];
+        let mut edges: Vec<policy_archive::Edge> = self
+            .edges
+            .iter()
+            .map(|((from, to), e)| policy_archive::Edge {
+                from: id(from),
+                to: id(to),
+                count: e.count,
+                units: e.units,
+                first_slot: e.first_slot,
+                last_slot: e.last_slot,
+            })
+            .collect();
+        // Deterministic, and it compresses better than hash order.
+        edges.sort_unstable_by_key(|e| (e.from, e.to));
+        let counts = |m: &HashMap<u32, (u32, u64)>| {
+            let mut v: Vec<policy_archive::PartyCount> = m
+                .iter()
+                .map(|(party, (count, units))| policy_archive::PartyCount {
+                    party: id(party),
+                    count: *count,
+                    units: *units,
+                })
+                .collect();
+            v.sort_unstable_by_key(|p| p.party);
+            v
+        };
+        policy_archive::MovementGraph {
+            format: policy_archive::GRAPH_FORMAT,
+            policy: policy.to_string(),
+            keyed_by: match self.by_stake {
+                true => policy_archive::PartyKey::Stake,
+                false => policy_archive::PartyKey::Payment,
+            },
+            from_slot: self.first_slot.unwrap_or(0),
+            to_slot: self.last_slot.unwrap_or(0),
+            complete,
+            built_unix: crate::reverse::now_unix(),
+            txs: self.txs,
+            transfers: self.transfers,
+            ambiguous: self.ambiguous,
+            source_below_floor: self.source_below_floor,
+            self_shuffles: self.self_shuffles,
+            parties,
+            edges,
+            mints: counts(&self.minted),
+            burns: counts(&self.burned),
+        }
+    }
+}
+
+impl Graph {
+    fn party(&mut self, addr: &str) -> u32 {
+        if let Some(id) = self.parties.get(addr) {
+            return *id;
+        }
+        let id = self.parties.len() as u32;
+        self.parties.insert(addr.to_string(), id);
+        id
+    }
+
+    /// The graph's key for an address: the wallet behind it, or the address
+    /// itself when there is no stake part (an enterprise or script address).
+    fn key(&self, addr: &str) -> String {
+        match self.by_stake {
+            true => crate::walk::stake_of(addr).unwrap_or_else(|| addr.to_string()),
+            false => addr.to_string(),
+        }
+    }
+
+    /// Units moved on one side of a transfer — the magnitude, taken from the
+    /// gainer so it is positive whichever way the row was written.
+    fn moved(unit: &UnitMove) -> u64 {
+        unit.parties
+            .iter()
+            .filter(|p| p.amount > 0)
+            .map(|p| p.amount as u64)
+            .sum()
+    }
+
+    fn add(&mut self, row: &FeedRow) {
+        self.txs += 1;
+        self.first_slot = Some(self.first_slot.map_or(row.slot, |s: u64| s.min(row.slot)));
+        self.last_slot = Some(self.last_slot.map_or(row.slot, |s: u64| s.max(row.slot)));
+        for unit in &row.units {
+            self.unit_moves += 1;
+            let units = Self::moved(unit);
+            match policy_archive::feed::direction(unit) {
+                policy_archive::feed::Direction::Transfer { from, to } => {
+                    self.transfers += 1;
+                    // A stake-keyed self-loop is one of two different things,
+                    // and only one of them is noise. Decided by what the
+                    // ADDRESS IS, never by the shape of the edge.
+                    if self.by_stake && self.key(&from) == self.key(&to) {
+                        let script = |a: &str| {
+                            matches!(
+                                pallas_addresses::Address::from_bech32(a),
+                                Ok(pallas_addresses::Address::Shelley(sh)) if sh.payment().is_script()
+                            )
+                        };
+                        match (from == to, script(&from) || script(&to)) {
+                            // Nets out in the fold; should never reach here.
+                            (true, _) => self.loops.same_address += 1,
+                            // Distinct CONTRACTS sharing a staking credential
+                            // — real flow, and it stays an edge.
+                            (false, true) => self.loops.script += 1,
+                            // A wallet reorganising its own UTxOs. Not a
+                            // relationship between parties: counted, dropped.
+                            (false, false) => {
+                                self.loops.wallet += 1;
+                                self.self_shuffles += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    let (f, t) = (self.party(&self.key(&from)), self.party(&self.key(&to)));
+                    let e = self.edges.entry((f, t)).or_insert(EdgeAcc {
+                        count: 0,
+                        units: 0,
+                        first_slot: row.slot,
+                        last_slot: row.slot,
+                    });
+                    e.count += 1;
+                    e.units += units;
+                    e.first_slot = e.first_slot.min(row.slot);
+                    e.last_slot = e.last_slot.max(row.slot);
+                }
+                policy_archive::feed::Direction::Mint { to } => {
+                    self.mints += 1;
+                    let p = self.party(&self.key(&to));
+                    let m = self.minted.entry(p).or_insert((0, 0));
+                    m.0 += 1;
+                    m.1 += units;
+                }
+                policy_archive::feed::Direction::Burn { from } => {
+                    self.burns += 1;
+                    // A burn's magnitude is the LOSER's side; `moved` reads
+                    // gainers, so take it from the negative parties.
+                    let qty: u64 = unit
+                        .parties
+                        .iter()
+                        .filter(|p| p.amount < 0)
+                        .map(|p| p.amount.unsigned_abs())
+                        .sum();
+                    let p = self.party(&self.key(&from));
+                    let b = self.burned.entry(p).or_insert((0, 0));
+                    b.0 += 1;
+                    b.1 += qty;
+                }
+                policy_archive::feed::Direction::SourceBelowFloor { to } => {
+                    self.source_below_floor += 1;
+                    self.party(&self.key(&to));
+                }
+                policy_archive::feed::Direction::Ambiguous => self.ambiguous += 1,
+            }
+        }
+    }
+}
+
+/// A graph, and what reading the archive to build it cost.
+pub struct BuiltGraph {
+    pub graph: policy_archive::MovementGraph,
+    pub requests: usize,
+    pub bytes: u64,
+    pub secs: f64,
+    loops: SelfLoops,
+}
+
+/// Reduce a policy's whole archive to a movement graph.
+///
+/// The shared path: the scheduler builds one when a walk completes — which
+/// is also after every daily top-up, so the artifact keeps up with the
+/// chain — and the CLI builds one on demand. `None` when the policy has no
+/// archive.
+pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<BuiltGraph>> {
+    let Some(mut a) = PolicyArchive::open(dir)? else {
+        return Ok(None);
+    };
+    let complete = a.manifest.completeness() == Completeness::Complete;
+    let started = std::time::Instant::now();
+
+    // Page the whole archive newest-first through the reader a Worker uses.
+    // `before` walks down by slot; a page that returns nothing new ends it,
+    // which also guards the pathological case of one slot holding more
+    // transactions than a page.
+    let mut g = Graph {
+        by_stake,
+        ..Graph::default()
+    };
+    let mut before: Option<u64> = None;
+    const PAGE: u32 = 5_000;
+    loop {
+        let page = a.feed_rows(PAGE, before)?;
+        let Some(oldest) = page.iter().map(|r| r.slot).min() else {
+            break;
+        };
+        for row in &page {
+            g.add(row);
+        }
+        let next = Some(oldest);
+        if next == before {
+            break;
+        }
+        before = next;
+    }
+    let (requests, bytes) = a.fetched();
+    let loops = std::mem::take(&mut g.loops);
+    Ok(Some(BuiltGraph {
+        graph: g.finish(policy, complete),
+        requests,
+        bytes,
+        secs: started.elapsed().as_secs_f64(),
+        loops,
+    }))
+}
+
+/// Build the graph and write it beside the manifest, RAW. Returns its size,
+/// or `None` when the policy has no archive. The publisher compresses at
+/// upload time and decides then whether that pays.
+pub fn write_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<usize>> {
+    let Some(built) = build_graph(dir, policy, by_stake)? else {
+        return Ok(None);
+    };
+    let raw = built.graph.encode()?;
+    std::fs::write(dir.join(policy_archive::GRAPH), &raw)?;
+    tracing::info!(
+        policy,
+        parties = built.graph.parties.len(),
+        edges = built.graph.edges.len(),
+        bytes = raw.len(),
+        secs = format!("{:.1}", built.secs),
+        "policy: movement graph written"
+    );
+    Ok(Some(raw.len()))
+}
+
+pub fn graph(args: GraphArgs) -> Result<()> {
+    let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let policy = args.policy.to_lowercase();
+    let Some(built) = build_graph(&dir, &policy, args.by_stake)? else {
+        println!("no archive at {}", dir.display());
+        return Ok(());
+    };
+    let g = &built.graph;
+
+    if args.dump_parties {
+        for addr in &g.parties {
+            println!("{addr}");
+        }
+        return Ok(());
+    }
+    let mints: u64 = g.mints.iter().map(|m| m.count as u64).sum();
+    let burns: u64 = g.burns.iter().map(|b| b.count as u64).sum();
+    println!("policy         {}", g.policy);
+    println!(
+        "keyed by       {}",
+        match g.keyed_by {
+            policy_archive::PartyKey::Stake => "stake address (the wallet)",
+            policy_archive::PartyKey::Payment => "payment address (the UTxO)",
+        }
+    );
+    println!(
+        "completeness   {}",
+        match g.complete {
+            true => "complete",
+            false => "partial",
+        }
+    );
+    println!(
+        "read           {} requests, {:.1} MB, {:.1}s",
+        built.requests,
+        built.bytes as f64 / 1e6,
+        built.secs
+    );
+    println!("transactions   {}", g.txs);
+    println!(
+        "unit moves     {}",
+        g.transfers + mints + burns + g.ambiguous + g.source_below_floor
+    );
+    println!("  transfers    {}  (an edge each)", g.transfers);
+    println!("  mints        {mints}");
+    println!("  burns        {burns}");
+    println!("  below floor  {}", g.source_below_floor);
+    println!(
+        "  ambiguous    {}  (batched — no edge, never guessed)",
+        g.ambiguous
+    );
+    println!(
+        "  self-shuffle {}  (a wallet's own UTxOs — DROPPED, see below)",
+        g.self_shuffles
+    );
+    println!(
+        "parties        {}  (after pruning any nothing references)",
+        g.parties.len()
+    );
+    println!("DISTINCT EDGES {}", g.edges.len());
+
+    if args.self_loops {
+        let l = &built.loops;
+        let total = l.wallet + l.script + l.same_address;
+        println!("SELF-LOOPS     {total} transfers land on their own node");
+        println!(
+            "  wallet       {}  (both sides key-credential — a genuine UTxO shuffle)",
+            l.wallet
+        );
+        println!(
+            "  script       {}  (a SCRIPT address either side — distinct contracts sharing a staking credential, NOT a shuffle)",
+            l.script
+        );
+        println!(
+            "  same address {}  (should be zero: it nets out in the fold)",
+            l.same_address
+        );
+    }
+
+    if args.top > 0 && !g.edges.is_empty() {
+        let mut top: Vec<&policy_archive::Edge> = g.edges.iter().collect();
+        top.sort_by_key(|e| std::cmp::Reverse(e.count));
+        println!("heaviest edges");
+        let short = |id: u32| {
+            g.parties
+                .get(id as usize)
+                .map(|a| match a.len() > 20 {
+                    true => format!("{}…{}", &a[..12], &a[a.len() - 6..]),
+                    false => a.clone(),
+                })
+                .unwrap_or_default()
+        };
+        for e in top.iter().take(args.top) {
+            println!("  {:>6}×  {} → {}", e.count, short(e.from), short(e.to));
+        }
+    }
+
+    if args.write {
+        let raw = g.encode()?;
+        let path = dir.join(policy_archive::GRAPH);
+        std::fs::write(&path, &raw)?;
+        // MEASURE the compression rather than assume it: the token path's
+        // `txids` artifact came out 6 KB larger gzipped, and whether a body
+        // compresses depends on what is in it. The publisher makes the same
+        // comparison at upload time; this is the number that decides.
+        let gz = gzip(&raw)?;
+        println!(
+            "wrote          {} — {:.2} MB raw, {:.2} MB gzipped ({:.1}×)",
+            path.display(),
+            raw.len() as f64 / 1e6,
+            gz.len() as f64 / 1e6,
+            raw.len() as f64 / gz.len().max(1) as f64
+        );
+        if gz.len() >= raw.len() {
+            println!("               gzip made it BIGGER — the publisher will store it raw");
+        }
+        // Read it back through the decoder a frontend would use. An artifact
+        // nothing can parse is the failure this catches, and the reason the
+        // reader landed with the writer everywhere else in this tool.
+        let back = policy_archive::MovementGraph::decode(&raw)?;
+        println!(
+            "verified       {} parties, {} edges, keyed by {}",
+            back.parties.len(),
+            back.edges.len(),
+            back.keyed_by.as_wire()
+        );
+    }
+    Ok(())
+}
+
+/// gzip, in process. The token path shells out to `gzip -9` from a script the
+/// user called "an incredibly brittle surface"; this is the same compression
+/// without the shell.
+pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut e = GzEncoder::new(Vec::new(), Compression::best());
+    e.write_all(bytes)?;
+    Ok(e.finish()?)
+}
+
 /// `token-ledger archive` — read an archive back the way a Worker would,
 /// and say what it cost.
 pub fn inspect(args: InspectArgs) -> Result<()> {
