@@ -22,10 +22,72 @@
 //! A reader merges EVERY file the manifest names by summing rows per
 //! `(transaction, unit, party)`; rollup and compaction are the same sum
 //! applied ahead of time so readers open fewer files.
+//!
+//! # Coverage is a SET OF RANGES
+//!
+//! Each pass records the stretch it read — `[floor, ceiling)` plus any
+//! `windows` it read outside that (a seek's detour) — and everything about
+//! coverage is DERIVED from those: [`Manifest::ranges`] merges them,
+//! [`Manifest::walk_from`]/[`Manifest::walk_to`] are their extremes,
+//! [`Manifest::completeness`] is whether they form one stretch from the
+//! first mint up. The `walk_from`/`walk_to`/`completeness` FIELDS are a
+//! cache of those derivations, refreshed by [`Manifest::to_json`] so a
+//! reader of the JSON sees the same answer the methods give. Nothing
+//! requires passes to be contiguous or in order; the walker keeps its
+//! descent contiguous because resolution is cheaper that way, not because
+//! the manifest needs it. See `docs/design/POLICY_WALK_SCHEDULER.md`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::schema::Completeness;
+
+/// A stretch of slots, `[from, to)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SlotRange {
+    pub from: u64,
+    pub to: u64,
+}
+
+impl SlotRange {
+    pub fn new(from: u64, to: u64) -> Self {
+        Self { from, to }
+    }
+
+    pub fn contains(&self, slot: u64) -> bool {
+        slot >= self.from && slot < self.to
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.to <= self.from
+    }
+}
+
+/// Merge overlapping and touching ranges, ascending.
+pub fn merge_ranges(mut ranges: Vec<SlotRange>) -> Vec<SlotRange> {
+    ranges.retain(|r| !r.is_empty());
+    ranges.sort();
+    let mut out: Vec<SlotRange> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if r.from <= last.to => last.to = last.to.max(r.to),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// What kind of chain a range was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeKind {
+    /// The Mithril immutable directory: settled, never rolls back, summed
+    /// with everything else.
+    #[default]
+    Immutable,
+    /// The stretch between the immutable tip and the live tip: may roll
+    /// back, so its file is REPLACED on each refresh rather than summed.
+    Volatile,
+}
 
 pub const MANIFEST: &str = "manifest.json";
 pub const MOVEMENTS: &str = "movements.parquet";
@@ -59,12 +121,13 @@ pub struct Manifest {
     /// pass will look.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_mint_slot: Option<u64>,
-    /// `complete` | `partial` | `unrecorded` — the feed's own words.
+    /// `complete` | `partial` | `unrecorded` — a CACHE of
+    /// [`Manifest::completeness`], refreshed on write. Read the method.
     pub completeness: String,
-    /// Lowest slot covered, across passes.
+    /// A cache of [`Manifest::walk_from`], refreshed on write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_from: Option<u64>,
-    /// Highest slot covered.
+    /// A cache of [`Manifest::walk_to`], refreshed on write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_to: Option<u64>,
     /// THE ROLLUP: every pass up to `rolled_up_through`, in one file at the
@@ -99,13 +162,107 @@ impl Manifest {
         }
     }
 
+    /// Every stretch any pass has read, merged, ascending. THE coverage;
+    /// everything else here is a view of it.
+    pub fn ranges(&self) -> Vec<SlotRange> {
+        let mut all = Vec::new();
+        for p in &self.passes {
+            all.push(SlotRange::new(p.floor, p.ceiling));
+            all.extend(p.windows.iter().copied());
+        }
+        merge_ranges(all)
+    }
+
+    /// Lowest slot any pass has read.
+    pub fn walk_from(&self) -> Option<u64> {
+        self.ranges().first().map(|r| r.from)
+    }
+
+    /// Highest slot any pass has read.
+    pub fn walk_to(&self) -> Option<u64> {
+        self.ranges().last().map(|r| r.to)
+    }
+
+    /// Has any pass read `slot`?
+    pub fn covers(&self, slot: u64) -> bool {
+        self.ranges().iter().any(|r| r.contains(slot))
+    }
+
+    /// The parts of `[from, to)` no pass has read, ascending.
+    pub fn uncovered(&self, from: u64, to: u64) -> Vec<SlotRange> {
+        let mut out = Vec::new();
+        let mut cursor = from;
+        for r in self.ranges() {
+            if r.to <= cursor {
+                continue;
+            }
+            if r.from >= to {
+                break;
+            }
+            if r.from > cursor {
+                out.push(SlotRange::new(cursor, r.from.min(to)));
+            }
+            cursor = cursor.max(r.to);
+            if cursor >= to {
+                break;
+            }
+        }
+        if cursor < to {
+            out.push(SlotRange::new(cursor, to));
+        }
+        out
+    }
+
+    /// DERIVED: does the coverage form ONE stretch that reaches the
+    /// policy's beginning? Reaching is genesis, or the first mint when it
+    /// is known. A stretch that stops short, or a second stretch below the
+    /// first — a seek window the descent has not joined up with yet — is
+    /// `Partial`. No ranges at all is `Unrecorded`.
+    ///
+    /// Never demoted by a later pass in practice: a pass on a complete
+    /// archive can only extend the one stretch upward. It CAN be demoted
+    /// by a window read below a hole, which is the truthful answer.
     pub fn completeness(&self) -> Completeness {
-        Completeness::from_wire(&self.completeness).unwrap_or(Completeness::Unrecorded)
+        let ranges = self.ranges();
+        let Some(lowest) = ranges.first() else {
+            return Completeness::Unrecorded;
+        };
+        let reached = lowest.from == 0 || self.first_mint_slot.is_some_and(|m| lowest.from <= m);
+        match reached && ranges.len() == 1 {
+            true => Completeness::Complete,
+            false => Completeness::Partial,
+        }
+    }
+
+    /// Bring the cached fields in line with the derivations. Called by
+    /// [`Manifest::to_json`]; call it after editing passes if the fields
+    /// are read directly before a write.
+    pub fn refresh_derived(&mut self) {
+        self.walk_from = self.walk_from();
+        self.walk_to = self.walk_to();
+        self.completeness = self.completeness().as_wire().to_string();
     }
 
     /// The newest pass — the one whose pending set is current.
     pub fn latest_pass(&self) -> Option<&PassEntry> {
         self.passes.iter().max_by_key(|p| p.seq)
+    }
+
+    /// Every pending sidecar still on disk, relative to the policy's
+    /// directory: one per un-rolled-up pass, plus the root's after a
+    /// rollup. A job loads the UNION; a spender resolved by one pass is
+    /// harmless to load again, since its outref is spent once on chain.
+    pub fn pending_files(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .passes
+            .iter()
+            .filter(|p| !self.rolled_up_through.is_some_and(|t| p.seq <= t))
+            .map(|p| format!("{}/{}", p.dir, PENDING))
+            .collect();
+        if let Some(root) = &self.pending {
+            out.push(root.clone());
+        }
+        out
     }
 
     pub fn next_seq(&self) -> u32 {
@@ -157,8 +314,12 @@ impl Manifest {
             .unwrap_or(0)
     }
 
+    /// With the cached fields refreshed, so the JSON says what the methods
+    /// say.
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(self)
+        let mut fresh = self.clone();
+        fresh.refresh_derived();
+        serde_json::to_vec_pretty(&fresh)
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
@@ -175,6 +336,15 @@ pub struct PassEntry {
     /// The range this pass walked: `[floor, ceiling)`.
     pub ceiling: u64,
     pub floor: u64,
+    /// Stretches this pass ALSO read, outside `[floor, ceiling)` — the
+    /// windows its detours took for seeks below the floor. Their rows are
+    /// in this pass's files like any other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<SlotRange>,
+    /// Which chain the range came from. Everything so far is immutable;
+    /// the volatile tail is the design's next step.
+    #[serde(default)]
+    pub kind: RangeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub movements: Option<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +411,8 @@ mod tests {
             dir: PassEntry::dir_name(seq),
             ceiling: 10,
             floor: 5,
+            windows: Vec::new(),
+            kind: RangeKind::Immutable,
             movements: Some(entry(MOVEMENTS)),
             corrections: (seq > 0).then(|| entry(CORRECTIONS)),
             segments: Vec::new(),
@@ -287,8 +459,86 @@ mod tests {
         m.passes.push(pass(0));
         m.rollup = Some(entry("archive-0000.parquet"));
         let back = Manifest::from_json(&m.to_json().unwrap()).unwrap();
+        // The JSON carries the derivations, so the round trip refreshes
+        // the cache: compare after refreshing the original too.
+        m.refresh_derived();
         assert_eq!(back, m);
-        assert_eq!(back.completeness(), Completeness::Unrecorded);
+        assert_eq!(back.walk_from, Some(5));
+        assert_eq!(back.walk_to, Some(10));
+        assert_eq!(
+            back.completeness(),
+            Completeness::Partial,
+            "5 is not the mint"
+        );
+    }
+
+    /// COVERAGE IS A SET OF RANGES. Passes need not be contiguous or in
+    /// order; a detour's window counts; the derivations say what has been
+    /// read, what has not, and whether it reaches the beginning.
+    #[test]
+    fn coverage_is_derived_from_the_ranges_read() {
+        let mut m = Manifest::new("ab");
+        assert_eq!(m.completeness(), Completeness::Unrecorded);
+        assert!(m.ranges().is_empty());
+
+        // The descent read [500, 1000), and a seek read [100, 150) below it.
+        let mut p0 = pass(0);
+        p0.floor = 500;
+        p0.ceiling = 1_000;
+        p0.windows = vec![SlotRange::new(100, 150)];
+        m.passes.push(p0);
+        assert_eq!(
+            m.ranges(),
+            vec![SlotRange::new(100, 150), SlotRange::new(500, 1_000)]
+        );
+        assert_eq!(m.walk_from(), Some(100));
+        assert_eq!(m.walk_to(), Some(1_000));
+        assert!(m.covers(120) && m.covers(999) && !m.covers(150) && !m.covers(300));
+        assert_eq!(
+            m.uncovered(0, 1_200),
+            vec![
+                SlotRange::new(0, 100),
+                SlotRange::new(150, 500),
+                SlotRange::new(1_000, 1_200)
+            ]
+        );
+        assert_eq!(m.uncovered(600, 900), Vec::new(), "inside a range");
+        m.first_mint_slot = Some(100);
+        assert_eq!(
+            m.completeness(),
+            Completeness::Partial,
+            "two stretches: the hole between them is not read"
+        );
+
+        // The descent joins them up: [100, 500) as pass 1. One stretch,
+        // from the mint: complete.
+        let mut p1 = pass(1);
+        p1.floor = 100;
+        p1.ceiling = 500;
+        m.passes.push(p1);
+        assert_eq!(m.ranges(), vec![SlotRange::new(100, 1_000)]);
+        assert_eq!(m.completeness(), Completeness::Complete);
+        assert!(m.uncovered(100, 1_000).is_empty());
+        // A later top-up above extends the one stretch.
+        let mut p2 = pass(2);
+        p2.floor = 1_000;
+        p2.ceiling = 1_300;
+        m.passes.push(p2);
+        assert_eq!(m.completeness(), Completeness::Complete);
+        assert_eq!(m.walk_to(), Some(1_300));
+        assert_eq!(m.pending_files().len(), 3);
+    }
+
+    #[test]
+    fn ranges_merge_when_they_touch() {
+        let merged = merge_ranges(vec![
+            SlotRange::new(10, 20),
+            SlotRange::new(20, 30),
+            SlotRange::new(5, 12),
+            SlotRange::new(40, 40),
+            SlotRange::new(50, 60),
+        ]);
+        assert_eq!(merged, vec![SlotRange::new(5, 30), SlotRange::new(50, 60)]);
     }
 
     #[test]

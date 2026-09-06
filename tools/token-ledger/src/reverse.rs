@@ -51,7 +51,7 @@
 //! its block — and its chunk — is a sieve hit. Skipping non-hit chunks cannot
 //! lose a resolution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -63,7 +63,9 @@ use pallas_primitives::Hash;
 use pallas_traverse::MultiEraBlock;
 use policy_archive::{Completeness, Movement, Stamp};
 
-use crate::archive::{self, FileEntry, Manifest, PassEntry, PendingFile, PendingSpender};
+use crate::archive::{
+    self, FileEntry, Manifest, PassEntry, PendingFile, PendingSpender, RangeKind, SlotRange,
+};
 use crate::registry;
 use crate::segments::{self, SegmentWriter};
 use crate::walk::{Watched, units_in_output};
@@ -106,6 +108,12 @@ pub struct ReverseArgs {
     /// passes the policy's first mint here.
     #[arg(long)]
     pub to_slot: Option<u64>,
+
+    /// Start here rather than at the bottom of what is already read. A
+    /// stretch inside the pass that an earlier pass read is scanned for
+    /// resolution only, never written twice.
+    #[arg(long)]
+    pub from_slot: Option<u64>,
 
     /// Leave the pass as its segments rather than compacting them into one
     /// file at the end. For measuring, and for a box that would rather hand
@@ -219,10 +227,14 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         .map(|c| (c + 1) * CHUNK_SLOTS)
         .unwrap_or(0);
 
-    // A pass runs from the existing floor DOWNWARD, so coverage stays
-    // contiguous. On a cold policy there is no floor yet and the tip is the
-    // ceiling — the first pass establishes it.
-    let ceiling = manifest.walk_from.unwrap_or(tip_slot);
+    // The descent continues DOWNWARD from the bottom of the TOP stretch —
+    // not from the lowest slot ever read, which after a seek window may sit
+    // far below with a hole above it. The hole is what the descent is for.
+    // On a cold policy there is no stretch yet and the tip is the ceiling.
+    let covered = manifest.ranges();
+    let ceiling = args
+        .from_slot
+        .unwrap_or_else(|| covered.last().map_or(tip_slot, |top| top.from));
     // Never dig below the policy's own first mint when we know it: there is
     // nothing there, and reading it is pure cost. `--to-slot` IS the first
     // mint when the hosted surface passes it (from Koios); counting it here
@@ -236,20 +248,27 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         .or(args.to_slot);
     let floor = pass_floor(ceiling, args.to_slot, args.days, first_mint);
 
-    // The carried state: what the previous pass was still waiting for —
-    // wherever the manifest says it is, which after a rollup is the root.
-    let prior_pending = match manifest.pending_file() {
-        Some(rel) => archive::load_pending(&dir.join(rel))?,
-        None => PendingFile::default(),
-    };
-    let mut pending = Pending::load(prior_pending.spenders);
+    // The carried state: everything any earlier pass was still waiting
+    // for, wherever its sidecar is. The UNION, because passes need not be
+    // contiguous any more; a spender already settled is harmless to load
+    // again, since its outref is spent once on chain and resolves once.
+    let mut prior = PendingFile::default();
+    for rel in manifest.pending_files() {
+        let path = dir.join(&rel);
+        if path.exists() {
+            prior
+                .spenders
+                .extend(archive::load_pending(&path)?.spenders);
+        }
+    }
+    let mut pending = Pending::load(prior.spenders);
     let carried = pending.len();
 
-    if floor >= ceiling {
+    if floor >= ceiling || manifest.uncovered(floor, ceiling).is_empty() {
         tracing::info!(
             ceiling,
             floor,
-            "reverse: nothing to do — coverage already reaches the requested floor"
+            "reverse: nothing to do — everything between floor and ceiling is read"
         );
         return Ok(Outcome {
             floor: ceiling,
@@ -284,8 +303,8 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         Stamp {
             policy_hex: policy_hex.clone(),
             completeness: manifest.completeness(),
-            walk_from: manifest.walk_from,
-            walk_to: manifest.walk_to,
+            walk_from: manifest.walk_from(),
+            walk_to: manifest.walk_to(),
             covered_from: 0,
             covered_to: 0,
             sealed_unix: now_unix(),
@@ -299,6 +318,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         &watched,
         floor,
         ceiling,
+        covered,
         &mut writer,
         &mut pending,
         !args.no_sieve,
@@ -391,12 +411,14 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     let seq = manifest.next_seq();
     let pass_dir = dir.join(PassEntry::dir_name(seq));
     std::fs::create_dir_all(&pass_dir)?;
+    // What the ledger will cover once this pass is in: for the file
+    // stamp, which is written before the pass entry exists.
     let new_walk_from = Some(
         manifest
-            .walk_from
+            .walk_from()
             .map_or(walked.floor, |f| f.min(walked.floor)),
     );
-    let new_walk_to = Some(manifest.walk_to.map_or(ceiling, |t| t.max(ceiling)));
+    let new_walk_to = Some(manifest.walk_to().map_or(ceiling, |t| t.max(ceiling)));
 
     // Has the archive reached the policy's beginning? Only two things
     // establish it: reaching genesis, or reaching the registered first mint.
@@ -434,16 +456,17 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     let pending_file = pending.to_file();
     let pending_bytes = archive::store_pending(&pass_dir.join(archive::PENDING), &pending_file)?;
 
+    // Coverage and completeness are DERIVED from the passes now; the
+    // manifest's cached fields are refreshed on write.
     manifest.first_mint_slot = first_mint;
-    manifest.completeness = completeness.as_wire().to_string();
-    manifest.walk_from = new_walk_from;
-    manifest.walk_to = new_walk_to;
     manifest.updated_unix = sealed_unix;
     manifest.passes.push(PassEntry {
         seq,
         dir: PassEntry::dir_name(seq),
         ceiling,
         floor: walked.floor,
+        windows: walked.windows,
+        kind: RangeKind::Immutable,
         movements,
         corrections,
         segments: kept,
@@ -834,6 +857,8 @@ struct Walked {
     floor: u64,
     written: u64,
     backfilled: usize,
+    /// Stretches read outside `[floor, ceiling)` — the detours' windows.
+    windows: Vec<SlotRange>,
 }
 
 /// Chunk numbers to visit, highest first, covering `[floor, ceiling)`.
@@ -934,10 +959,12 @@ struct Scan<'a> {
     writer: &'a mut SegmentWriter,
     pending: &'a mut Pending,
     resolver: Option<&'a tx_index::Index>,
-    /// Transactions a detour already wrote. The descent resolves their
-    /// outputs for spenders above and otherwise passes them by, so each
-    /// transaction has exactly one set of own rows.
-    detoured: HashSet<Hash<32>>,
+    /// Stretches ALREADY READ — by an earlier pass, or by a detour of this
+    /// one. A block inside one is scanned for RESOLUTION ONLY: its outputs
+    /// settle spenders found above it, and its transactions are not
+    /// written again, so each transaction has exactly one set of own rows
+    /// however many jobs pass over it.
+    covered: Vec<SlotRange>,
     written: u64,
     backfilled: usize,
     /// Inputs a detour resolved through the index rather than the descent.
@@ -959,6 +986,7 @@ impl Scan<'_> {
                 continue;
             }
             lowest = Some(lowest.map_or(slot, |l| l.min(slot)));
+            let read_before = self.covered.iter().any(|r| r.contains(slot));
             let blk = MultiEraBlock::decode(&raw)
                 .map_err(|e| anyhow::anyhow!("decoding block at slot {slot}: {e:?}"))?;
             let block_time = slot_to_unix(slot);
@@ -1003,12 +1031,12 @@ impl Scan<'_> {
                 if !touches_us {
                     continue;
                 }
-                // A detour wrote this one already. Its outputs have just
-                // resolved whatever was waiting on them; its rows exist.
-                // Either mode: a second detour over the same stretch must
-                // not write them again, or the sum-merge doubles them —
-                // seen on 901ba6e9 when one window was read four times.
-                if self.detoured.contains(&dtx.tx_hash) {
+                // READ BEFORE — by an earlier pass or a detour. Its outputs
+                // have just resolved whatever was waiting on them; its rows
+                // exist. Writing them again would double them in the
+                // sum-merge, which is what happened on 901ba6e9 when one
+                // window was read four times.
+                if read_before {
                     continue;
                 }
 
@@ -1056,9 +1084,6 @@ impl Scan<'_> {
                     if !missing.is_empty() {
                         self.pending.want(&row, missing, &inputs);
                     }
-                }
-                if mode == Mode::Detour {
-                    self.detoured.insert(dtx.tx_hash);
                 }
                 let own = row.rows();
                 rows.extend(own.iter().cloned());
@@ -1175,6 +1200,7 @@ fn pass(
     watched: &Watched,
     floor: u64,
     ceiling: u64,
+    covered: Vec<SlotRange>,
     writer: &mut SegmentWriter,
     pending: &mut Pending,
     sieve: bool,
@@ -1193,7 +1219,7 @@ fn pass(
         writer,
         pending,
         resolver: hooks.resolver,
-        detoured: HashSet::new(),
+        covered,
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
@@ -1262,6 +1288,9 @@ fn pass(
                 "reverse: detour read"
             );
             detours.push(window);
+            // The descent, when it gets there, resolves against this
+            // stretch and writes nothing.
+            scan.covered.push(SlotRange::new(window.0, window.1));
         }
     }
 
@@ -1273,6 +1302,10 @@ fn pass(
         floor: if chunks_total == 0 { ceiling } else { floor },
         written: scan.written,
         backfilled: scan.backfilled,
+        windows: detours
+            .iter()
+            .map(|(from, to)| SlotRange::new(*from, *to))
+            .collect(),
     })
 }
 
@@ -1470,6 +1503,7 @@ mod tests {
                 floor: 1_004,
                 written: 2,
                 backfilled: 0,
+                windows: Vec::new(),
             },
             segments: w.finish().unwrap(),
             pending: &pending,
@@ -1512,6 +1546,7 @@ mod tests {
                 floor: 500,
                 written: 1,
                 backfilled: 1,
+                windows: Vec::new(),
             },
             segments: w.finish().unwrap(),
             pending: &pending,

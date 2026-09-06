@@ -55,7 +55,7 @@ pub use bundle::{BUNDLE, BUNDLE_FORMAT, Bundle, BundledFooter};
 pub use density::DensityBucket;
 pub use feed::{FeedRow, PartyMove, UnitMove, fold_rows};
 pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
-pub use manifest::{FileEntry, FileKind, Manifest, PassEntry};
+pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};

@@ -605,6 +605,8 @@ fn run_pass(hub: &PolicyHub, req: &PassRequest, depth: Depth) -> Result<reverse:
         // The mint floor holds for a preview too: a policy minted last
         // week previews to completion and the full pass finds nothing left.
         to_slot: req.to_slot,
+        // From the bottom of the top stretch, as the descent always has.
+        from_slot: None,
         no_compact: false,
         no_sieve: false,
         report_every: u64::MAX,
@@ -730,6 +732,34 @@ fn merged_coverage(
                 })
                 .collect()
         }),
+        // THE RANGES: what the archive has read, plus what the running pass
+        // has reached so far and the windows its detours took — merged, so
+        // a reader asks one question of one list.
+        ranges: {
+            let mut all: Vec<archive::SlotRange> =
+                cov.as_ref().map_or_else(Vec::new, |c| c.ranges.clone());
+            if let Some(l) = live {
+                if let (Some(from), Some(to)) = (live_floor, live_ceiling) {
+                    all.push(archive::SlotRange::new(from, to));
+                }
+                all.extend(
+                    l.detours
+                        .iter()
+                        .map(|(from, to)| archive::SlotRange::new(*from, *to)),
+                );
+            }
+            policy_archive::merge_ranges(all)
+                .into_iter()
+                .map(|r| SlotSpanDto {
+                    from: r.from,
+                    to: r.to,
+                })
+                .collect()
+        },
+        reading: match (live_floor, live_ceiling) {
+            (Some(from), Some(to)) if walking => Some(SlotSpanDto { from, to }),
+            _ => None,
+        },
     }
 }
 
@@ -821,6 +851,14 @@ pub struct CoverageDto {
     /// Stretches below `walked_from` that detours have read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub detours: Vec<SlotSpanDto>,
+    /// Every stretch READ — the archive's ranges, the running pass's reach
+    /// and its detours — merged, ascending. `walked_from`/`walked_to` are
+    /// its extremes; `detours` its members below the descent.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<SlotSpanDto>,
+    /// The stretch the running pass is reading right now, if one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reading: Option<SlotSpanDto>,
 }
 
 #[derive(Serialize)]

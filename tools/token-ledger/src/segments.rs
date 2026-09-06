@@ -297,10 +297,10 @@ pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: 
     let stamp = Stamp {
         policy_hex: manifest.policy.clone(),
         completeness: manifest.completeness(),
-        walk_from: manifest.walk_from,
-        walk_to: manifest.walk_to,
-        covered_from: manifest.walk_from.unwrap_or(0),
-        covered_to: manifest.walk_to.unwrap_or(u64::MAX),
+        walk_from: manifest.walk_from(),
+        walk_to: manifest.walk_to(),
+        covered_from: manifest.walk_from().unwrap_or(0),
+        covered_to: manifest.walk_to().unwrap_or(u64::MAX),
         sealed_unix,
     };
     let _ = seq;
@@ -790,6 +790,8 @@ mod tests {
                 dir: PassEntry::dir_name(seq),
                 ceiling: 1_000,
                 floor: 400,
+                windows: Vec::new(),
+                kind: crate::archive::RangeKind::Immutable,
                 movements: Some(mvs),
                 corrections: corr,
                 segments: Vec::new(),
@@ -802,8 +804,6 @@ mod tests {
                 written_unix: 0,
             });
         }
-        manifest.walk_from = Some(400);
-        manifest.walk_to = Some(1_000);
         store_manifest(dir, &manifest).unwrap();
 
         let before = PolicyArchive::open(dir)

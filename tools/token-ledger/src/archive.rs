@@ -53,7 +53,7 @@ pub use policy_archive::feed::PartyMove;
 pub use policy_archive::feed::{FeedRow, UnitMove, fold_rows};
 pub use policy_archive::manifest::{
     CORRECTIONS, FileEntry, FileKind, MANIFEST, MANIFEST_FORMAT, MOVEMENTS, Manifest, PENDING,
-    PassEntry, kind_of,
+    PassEntry, RangeKind, SlotRange, kind_of,
 };
 
 /// A transaction still waiting on inputs — the carried state.
@@ -301,6 +301,9 @@ impl OpenFile {
 /// What the archive covers — the same statement the sqlite ledger used to
 /// make, derived from the manifest and the footers.
 pub struct Coverage {
+    /// Every stretch read, merged, ascending — THE coverage. The two
+    /// extremes below are views of it kept for the wire.
+    pub ranges: Vec<SlotRange>,
     pub walked_from: Option<u64>,
     pub walked_to: Option<u64>,
     pub first_slot: Option<u64>,
@@ -392,8 +395,9 @@ impl PolicyArchive {
             .flat_map(|f| f.archive.groups().iter().map(|g| g.txs))
             .sum();
         Coverage {
-            walked_from: self.manifest.walk_from,
-            walked_to: self.manifest.walk_to,
+            ranges: self.manifest.ranges(),
+            walked_from: self.manifest.walk_from(),
+            walked_to: self.manifest.walk_to(),
             first_slot,
             last_slot,
             total_txs,
@@ -856,6 +860,8 @@ mod tests {
             dir: PassEntry::dir_name(0),
             ceiling: 10,
             floor: 5,
+            windows: Vec::new(),
+            kind: RangeKind::Immutable,
             movements: None,
             corrections: None,
             segments: Vec::new(),
@@ -871,7 +877,11 @@ mod tests {
         assert_eq!(m.passes[0].dir, "pass-0000");
         let back: Manifest = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert_eq!(back, m);
-        assert_eq!(back.completeness(), Completeness::Unrecorded);
+        // DERIVED now: a pass over [5, 10) is a record, so this is a partial
+        // ledger rather than an unrecorded one. `Unrecorded` is what a
+        // manifest with no ranges at all says.
+        assert_eq!(back.completeness(), Completeness::Partial);
+        assert_eq!(back.ranges(), vec![SlotRange::new(5, 10)]);
     }
 
     #[test]
