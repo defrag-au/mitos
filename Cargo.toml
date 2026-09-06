@@ -166,6 +166,11 @@ redb = "2"
 # whole caching story, a rebuilt base is swapped by rename and old mappings
 # keep the old inode alive until dropped.
 memmap2 = "0.9"
+# `posix_fadvise(DONTNEED)`: a full-history policy walk streams 216 GB of
+# Mithril chunks past the sieve gate and reads almost none of them twice, so
+# it hands each chunk's pages back rather than evict the other services that
+# share the box's cache. Linux only, behind a cfg.
+libc = "0.2"
 
 # Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
 # compiles sqlite from source (on-box build, no system dep).

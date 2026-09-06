@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use policy_archive::{Archive, ArchiveWriter, GroupPolicy, Movement, SparseBytes, Stamp};
 
 use crate::archive::{FileEntry, RangeFile};
@@ -286,14 +286,29 @@ pub const ROLLUP_AFTER_PASSES: usize = 3;
 /// reader mid-flight on the old manifest still finds old files until the
 /// prune; the manifest is written BEFORE the old files are removed.
 pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: u64) -> Result<()> {
-    let old_files = manifest.files();
+    // IMMUTABLE only: the volatile tail is replaced whole on its next
+    // refresh, so folding it into a file nothing rewrites would freeze a
+    // stretch that can still roll back.
+    let old_files = manifest.immutable_files();
     if old_files.len() < 2 {
         return Ok(());
     }
     let inputs: Vec<PathBuf> = old_files.iter().map(|(rel, _)| dir.join(rel)).collect();
-    let seq =
-        manifest.rolled_up_through.map_or(0, |t| t + 1) + manifest.rollup.as_ref().map_or(0, |_| 0);
-    let name = format!("archive-{:04}.parquet", manifest.next_seq());
+    // The ROLLUP's own sequence, not the pass sequence — see
+    // `Manifest::next_rollup_seq` for the archive this distinction cost.
+    let rollup_seq = manifest.next_rollup_seq();
+    let name = format!("archive-{rollup_seq:04}.parquet");
+    // The invariant that would have made that a loud failure instead of a
+    // silent deletion: the merge must never write over one of its inputs,
+    // because the prune below removes every input.
+    let out_path = dir.join(&name);
+    if inputs.contains(&out_path) {
+        bail!(
+            "rollup would write {} over one of its own inputs — refusing; \
+             the rollup sequence is not unique",
+            out_path.display()
+        );
+    }
     let stamp = Stamp {
         policy_hex: manifest.policy.clone(),
         completeness: manifest.completeness(),
@@ -303,7 +318,6 @@ pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: 
         covered_to: manifest.walk_to().unwrap_or(u64::MAX),
         sealed_unix,
     };
-    let _ = seq;
     let out = merge_files(&inputs, dir, &name, u64::MAX, &stamp)?;
 
     // The carried state moves to the root before the pass directory that
@@ -314,13 +328,25 @@ pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: 
             std::fs::copy(&from, dir.join(crate::archive::PENDING))?;
         }
     }
-    let through = manifest.latest_pass().map(|p| p.seq);
     let previous_rollup = manifest.rollup.take();
     manifest.rollup = Some(FileEntry {
         units: out.units,
         ..out.movements
     });
-    manifest.rolled_up_through = through;
+    // EXACTLY the passes whose files went into the merge — every pass the
+    // manifest named when `old_files` was taken. A pass with a lower `seq`
+    // that lands later is a LOOSE pass, not a folded one: it was still in
+    // flight, its rows are not in this file, and marking it by a threshold
+    // over `seq` is how 72 days of ClayNation were deleted.
+    for pass in manifest
+        .passes
+        .iter_mut()
+        .filter(|p| p.kind == crate::archive::RangeKind::Immutable)
+    {
+        pass.rolled_up = true;
+    }
+    manifest.rolled_up_through = manifest.latest_pass().map(|p| p.seq);
+    manifest.rollup_seq = rollup_seq;
     manifest.pending = Some(crate::archive::PENDING.to_string());
     manifest.updated_unix = sealed_unix;
     crate::archive::store_manifest(dir, manifest)?;
@@ -333,10 +359,8 @@ pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: 
     if let Some(prev) = previous_rollup {
         let _ = std::fs::remove_file(dir.join(prev.file));
     }
-    for pass in &manifest.passes {
-        if through.is_some_and(|t| pass.seq <= t) {
-            let _ = std::fs::remove_dir_all(dir.join(&pass.dir));
-        }
+    for pass in manifest.passes.iter().filter(|p| p.rolled_up) {
+        let _ = std::fs::remove_dir_all(dir.join(&pass.dir));
     }
     Ok(())
 }
@@ -792,6 +816,7 @@ mod tests {
                 floor: 400,
                 windows: Vec::new(),
                 kind: crate::archive::RangeKind::Immutable,
+                rolled_up: false,
                 movements: Some(mvs),
                 corrections: corr,
                 segments: Vec::new(),

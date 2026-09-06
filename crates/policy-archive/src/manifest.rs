@@ -62,6 +62,10 @@ impl SlotRange {
     }
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 /// Merge overlapping and touching ranges, ascending.
 pub fn merge_ranges(mut ranges: Vec<SlotRange>) -> Vec<SlotRange> {
     ranges.retain(|r| !r.is_empty());
@@ -74,6 +78,17 @@ pub fn merge_ranges(mut ranges: Vec<SlotRange>) -> Vec<SlotRange> {
         }
     }
     out
+}
+
+/// A stretch read, and which chain it came from. The two never merge with
+/// each other: an immutable file is SUMMED with everything else, a volatile
+/// one is REPLACED whole on every refresh, so "read" means a different thing
+/// on each side of the immutable tip and a reader has to be told which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub from: u64,
+    pub to: u64,
+    pub kind: RangeKind,
 }
 
 /// What kind of chain a range was read from.
@@ -130,13 +145,27 @@ pub struct Manifest {
     /// A cache of [`Manifest::walk_to`], refreshed on write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_to: Option<u64>,
-    /// THE ROLLUP: every pass up to `rolled_up_through`, in one file at the
-    /// policy's root. Passes with a `seq` at or below that hold no files of
-    /// their own any more; their entries stay for the record.
+    /// THE ROLLUP: the passes marked [`PassEntry::rolled_up`], folded into
+    /// one file at the policy's root. Those passes hold no files of their
+    /// own any more; their entries stay for the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollup: Option<FileEntry>,
+    /// The highest `seq` the rollup folded — a RECORD, not the test.
+    ///
+    /// It used to be the test, and that was a defect the moment jobs began
+    /// landing out of order: four walk workers on one policy land seq 10
+    /// before seq 8, a rollup at seq 10 wrote `rolled_up_through: 10`, and
+    /// seq 8 then landed into a manifest that no longer named its files —
+    /// which the next prune deleted. Measured on a ClayNation re-walk: 13
+    /// out-of-order landings, 6,641 transactions and 72 whole days gone from
+    /// an archive that called itself complete. The test is the per-pass flag;
+    /// this is read only to migrate a manifest written before it existed
+    /// (see [`Manifest::from_json`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolled_up_through: Option<u32>,
+    /// The rollup file's OWN sequence — see [`Manifest::next_rollup_seq`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rollup_seq: u32,
     /// The carried pending set at the policy's root, once a rollup has
     /// removed the pass directory that held it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +185,7 @@ impl Manifest {
             walk_to: None,
             rollup: None,
             rolled_up_through: None,
+            rollup_seq: 0,
             pending: None,
             passes: Vec::new(),
             updated_unix: 0,
@@ -165,12 +195,62 @@ impl Manifest {
     /// Every stretch any pass has read, merged, ascending. THE coverage;
     /// everything else here is a view of it.
     pub fn ranges(&self) -> Vec<SlotRange> {
+        merge_ranges(
+            self.spans()
+                .into_iter()
+                .map(|s| SlotRange::new(s.from, s.to))
+                .collect(),
+        )
+    }
+
+    /// The stretches read from the IMMUTABLE chain alone — the settled ones.
+    ///
+    /// This, not [`Self::ranges`], is what completeness and the descent are
+    /// about: the volatile tail sits above the immutable tip, can roll back,
+    /// and is replaced rather than extended. A walk that treated it as
+    /// coverage would think it had already read to the live tip and stop
+    /// generating the top-ups that make the tail shrink.
+    pub fn immutable_ranges(&self) -> Vec<SlotRange> {
+        merge_ranges(self.ranges_of(RangeKind::Immutable))
+    }
+
+    /// Every stretch read, merged WITHIN each kind and tagged with it.
+    pub fn spans(&self) -> Vec<Span> {
+        let mut out: Vec<Span> = Vec::new();
+        for kind in [RangeKind::Immutable, RangeKind::Volatile] {
+            out.extend(
+                merge_ranges(self.ranges_of(kind))
+                    .into_iter()
+                    .map(|r| Span {
+                        from: r.from,
+                        to: r.to,
+                        kind,
+                    }),
+            );
+        }
+        out.sort_by_key(|s| (s.from, s.to));
+        out
+    }
+
+    fn ranges_of(&self, kind: RangeKind) -> Vec<SlotRange> {
         let mut all = Vec::new();
-        for p in &self.passes {
+        for p in self.passes.iter().filter(|p| p.kind == kind) {
             all.push(SlotRange::new(p.floor, p.ceiling));
             all.extend(p.windows.iter().copied());
         }
-        merge_ranges(all)
+        all
+    }
+
+    /// The one volatile pass, if the tail has been read. At most one by
+    /// construction: each refresh replaces it.
+    pub fn volatile(&self) -> Option<&PassEntry> {
+        self.passes.iter().find(|p| p.kind == RangeKind::Volatile)
+    }
+
+    /// The top of the settled coverage — what "complete to" means. The
+    /// volatile tail rides above it.
+    pub fn immutable_walk_to(&self) -> Option<u64> {
+        self.immutable_ranges().last().map(|r| r.to)
     }
 
     /// Lowest slot any pass has read.
@@ -188,11 +268,17 @@ impl Manifest {
         self.ranges().iter().any(|r| r.contains(slot))
     }
 
-    /// The parts of `[from, to)` no pass has read, ascending.
+    /// The parts of `[from, to)` no IMMUTABLE pass has read, ascending —
+    /// what is left for a job to do.
+    ///
+    /// Immutable only, because this is what a job asks before deciding to
+    /// skip a range. The volatile tail is replaced on its next refresh, so
+    /// a top-up that read the stretch it covers is not doing work twice —
+    /// it is the only thing making that stretch settled.
     pub fn uncovered(&self, from: u64, to: u64) -> Vec<SlotRange> {
         let mut out = Vec::new();
         let mut cursor = from;
-        for r in self.ranges() {
+        for r in self.immutable_ranges() {
             if r.to <= cursor {
                 continue;
             }
@@ -223,7 +309,10 @@ impl Manifest {
     /// archive can only extend the one stretch upward. It CAN be demoted
     /// by a window read below a hole, which is the truthful answer.
     pub fn completeness(&self) -> Completeness {
-        let ranges = self.ranges();
+        // IMMUTABLE only. A volatile tail is a live tail, not settled
+        // history: an archive whose immutable stretch stops short is
+        // partial however far above the tip it can also see.
+        let ranges = self.immutable_ranges();
         let Some(lowest) = ranges.first() else {
             return Completeness::Unrecorded;
         };
@@ -248,19 +337,19 @@ impl Manifest {
         self.passes.iter().max_by_key(|p| p.seq)
     }
 
-    /// Every pending sidecar still on disk, relative to the policy's
-    /// directory: one per un-rolled-up pass, plus the root's after a
-    /// rollup. A job loads the UNION; a spender resolved by one pass is
-    /// harmless to load again, since its outref is spent once on chain.
-    pub fn pending_files(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
+    /// Every pending sidecar still on disk, as `(landed_unix, path)`
+    /// relative to the policy's directory: one per un-rolled-up pass, plus
+    /// the root's after a rollup (the oldest, at time zero). A job merges
+    /// them latest-first; see the walker's `load_pending_union`.
+    pub fn pending_files(&self) -> Vec<(u64, String)> {
+        let mut out: Vec<(u64, String)> = self
             .passes
             .iter()
-            .filter(|p| !self.rolled_up_through.is_some_and(|t| p.seq <= t))
-            .map(|p| format!("{}/{}", p.dir, PENDING))
+            .filter(|p| !p.rolled_up && p.kind == RangeKind::Immutable)
+            .map(|p| (p.written_unix, format!("{}/{}", p.dir, PENDING)))
             .collect();
         if let Some(root) = &self.pending {
-            out.push(root.clone());
+            out.push((0, root.clone()));
         }
         out
     }
@@ -269,15 +358,62 @@ impl Manifest {
         self.latest_pass().map_or(0, |p| p.seq + 1)
     }
 
+    /// The next ROLLUP file's sequence — its own counter, never the pass
+    /// sequence.
+    ///
+    /// It used to be `next_seq()`, and that was a silent data-loss bug the
+    /// moment jobs began landing out of order. `next_seq()` is `max(seq)+1`,
+    /// so two rollups at the same high-water mark computed the SAME name:
+    /// seq 104 lands → rollup writes `archive-0105`; seq 103 lands later →
+    /// rollup again, max seq still 104 → `archive-0105` again. The second
+    /// merge read that file as an INPUT, wrote its output over the same
+    /// name, and then the prune — which deletes every input — removed the
+    /// file the manifest had just been pointed at. Policy `f7f5a12b…` lost
+    /// its whole rolled-up history that way on 2026-09-06, and every read
+    /// 500'd on the missing file.
+    ///
+    /// Monotonic across the migration: a manifest written before this field
+    /// existed carries the number in its rollup's FILENAME, so that is read
+    /// as the floor and no name is ever reused.
+    pub fn next_rollup_seq(&self) -> u32 {
+        let from_name = self
+            .rollup
+            .as_ref()
+            .and_then(|r| r.file.strip_prefix("archive-"))
+            .and_then(|s| s.strip_suffix(".parquet"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        self.rollup_seq.max(from_name).saturating_add(1)
+    }
+
     /// Every Parquet file a reader must merge, as `(relative path, kind)`,
     /// relative to the policy's directory or key prefix.
     pub fn files(&self) -> Vec<(String, FileKind)> {
+        self.files_from(&self.passes.iter().collect::<Vec<_>>())
+    }
+
+    /// The files a ROLLUP may fold: the immutable ones only.
+    ///
+    /// A volatile file is replaced whole on the next refresh, so folding it
+    /// into the rollup would bake a stretch that can roll back into a file
+    /// that nothing ever rewrites.
+    pub fn immutable_files(&self) -> Vec<(String, FileKind)> {
+        self.files_from(
+            &self
+                .passes
+                .iter()
+                .filter(|p| p.kind == RangeKind::Immutable)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn files_from(&self, passes: &[&PassEntry]) -> Vec<(String, FileKind)> {
         let mut out = Vec::new();
         if let Some(r) = &self.rollup {
             out.push((r.file.clone(), FileKind::Movements));
         }
-        for p in &self.passes {
-            if self.rolled_up_through.is_some_and(|t| p.seq <= t) {
+        for p in passes {
+            if p.rolled_up {
                 continue;
             }
             if let Some(f) = &p.movements {
@@ -294,13 +430,26 @@ impl Manifest {
     }
 
     /// Where the current pending set is, relative to the policy's directory.
+    ///
+    /// IMMUTABLE passes only. The volatile tail is re-derived whole on every
+    /// refresh, so it carries nothing forward and writes no sidecar — and a
+    /// manifest that named one sent the publisher to `stat` a file that has
+    /// never existed, which failed the whole publish before it reached the
+    /// manifest flip and quietly froze R2 and KV at the last good tick.
     pub fn pending_file(&self) -> Option<String> {
-        match self.latest_pass() {
-            Some(p) if !self.rolled_up_through.is_some_and(|t| p.seq <= t) => {
-                Some(format!("{}/{}", p.dir, PENDING))
-            }
+        match self.latest_immutable_pass() {
+            Some(p) if !p.rolled_up => Some(format!("{}/{}", p.dir, PENDING)),
             _ => self.pending.clone(),
         }
+    }
+
+    /// The newest pass read from the settled chain — whose pending set is
+    /// the one a later job carries.
+    pub fn latest_immutable_pass(&self) -> Option<&PassEntry> {
+        self.passes
+            .iter()
+            .filter(|p| p.kind == RangeKind::Immutable)
+            .max_by_key(|p| p.seq)
     }
 
     /// A LOWER BOUND on the policy's distinct units: the most any one pass
@@ -323,7 +472,20 @@ impl Manifest {
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        let mut m: Manifest = serde_json::from_slice(bytes)?;
+        // A manifest written before [`PassEntry::rolled_up`] existed says
+        // which passes were folded only as a threshold. Read it once, here,
+        // so nothing downstream has to know the field ever meant that. A
+        // manifest this code wrote always flags at least one pass, so this
+        // never fires on one of ours.
+        if let Some(through) = m.rolled_up_through
+            && !m.passes.iter().any(|p| p.rolled_up)
+        {
+            for p in m.passes.iter_mut().filter(|p| p.seq <= through) {
+                p.rolled_up = true;
+            }
+        }
+        Ok(m)
     }
 }
 
@@ -345,6 +507,12 @@ pub struct PassEntry {
     /// the volatile tail is the design's next step.
     #[serde(default)]
     pub kind: RangeKind,
+    /// A rollup has folded this pass's files into the policy's rollup file
+    /// and pruned them. Per pass, never a threshold over `seq`: jobs land
+    /// out of order, so "every pass up to N" is not a statement anyone can
+    /// make — see [`Manifest::rolled_up_through`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rolled_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub movements: Option<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -373,6 +541,16 @@ pub struct PassEntry {
 impl PassEntry {
     pub fn dir_name(seq: u32) -> String {
         format!("pass-{seq:04}")
+    }
+
+    /// The VOLATILE tail's directory. Its own name, because it is the one
+    /// entry in the archive that is replaced rather than added to, and an
+    /// operator looking at the directory should be able to see that. A
+    /// sequence still, so no name is ever reused — the publisher skips an
+    /// R2 object it already holds at the same size, which is only safe
+    /// while names are unique.
+    pub fn tip_dir_name(seq: u32) -> String {
+        format!("tip-{seq:04}")
     }
 }
 
@@ -413,6 +591,7 @@ mod tests {
             floor: 5,
             windows: Vec::new(),
             kind: RangeKind::Immutable,
+            rolled_up: false,
             movements: Some(entry(MOVEMENTS)),
             corrections: (seq > 0).then(|| entry(CORRECTIONS)),
             segments: Vec::new(),
@@ -437,7 +616,9 @@ mod tests {
         assert_eq!(m.pending_file().as_deref(), Some("pass-0002/pending.bin"));
 
         m.rollup = Some(entry("archive-0001.parquet"));
-        m.rolled_up_through = Some(1);
+        for p in m.passes.iter_mut().filter(|p| p.seq <= 1) {
+            p.rolled_up = true;
+        }
         m.pending = Some(PENDING.into());
         let after = m.files();
         assert_eq!(after.len(), 3, "rollup + pass 2's two files");
@@ -447,10 +628,139 @@ mod tests {
         );
         assert_eq!(m.pending_file().as_deref(), Some("pass-0002/pending.bin"));
 
-        m.rolled_up_through = Some(2);
+        m.passes[2].rolled_up = true;
         assert_eq!(m.files().len(), 1);
         assert_eq!(m.pending_file().as_deref(), Some(PENDING));
         assert_eq!(m.next_seq(), 3, "sequence numbers never reuse");
+    }
+
+    /// A PASS THAT LANDS AFTER A ROLLUP WITH A LOWER `seq` IS STILL LOOSE.
+    ///
+    /// Four walk workers on one policy land out of order — seq 10 before
+    /// seq 8 — and the rollup at seq 10 folded only what the manifest named
+    /// at the time. Marking "everything up to 10" instead deleted 6,641
+    /// transactions and 72 whole days from a ClayNation archive that went
+    /// on calling itself complete.
+    #[test]
+    fn a_pass_that_lands_after_a_rollup_is_not_folded_by_its_sequence() {
+        let mut m = Manifest::new("ab");
+        m.passes = vec![pass(0), pass(2)];
+        for p in m.passes.iter_mut() {
+            p.rolled_up = true;
+        }
+        m.rollup = Some(entry("archive-0003.parquet"));
+        m.rolled_up_through = Some(2);
+        m.pending = Some(PENDING.into());
+        assert_eq!(m.files().len(), 1, "only the rollup, so far");
+
+        // Seq 1 was in flight while that rollup ran, and lands now.
+        m.passes.push(pass(1));
+        m.passes.sort_by_key(|p| p.seq);
+        let files = m.files();
+        assert_eq!(files.len(), 3, "the rollup AND the late pass's two files");
+        assert!(
+            files
+                .iter()
+                .any(|(f, _)| f == "pass-0001/movements.parquet")
+        );
+        assert_eq!(
+            m.pending_files().len(),
+            2,
+            "the late pass's sidecar and the root's"
+        );
+    }
+
+    /// THE ROLLUP FILE'S NAME MUST NEVER REPEAT, and the pass sequence
+    /// cannot promise that.
+    ///
+    /// `next_seq()` is `max(seq)+1`, so two rollups at the same high-water
+    /// mark — ordinary once jobs land out of order — computed the same name.
+    /// The second read that file as an input, wrote its output over it, and
+    /// the prune then deleted every input, taking the file the manifest had
+    /// just been pointed at. Policy `f7f5a12b…` lost its entire rolled-up
+    /// history to this on 2026-09-06 and every read 500'd.
+    #[test]
+    fn the_rollup_sequence_never_repeats_when_passes_land_out_of_order() {
+        let mut m = Manifest::new("ab");
+        m.passes = vec![pass(0), pass(1), pass(2)];
+        // Three passes landed, seq 2 highest: the old rule said "0003".
+        assert_eq!(m.next_seq(), 3);
+        let first = m.next_rollup_seq();
+        m.rollup = Some(entry(&format!("archive-{first:04}.parquet")));
+        m.rollup_seq = first;
+
+        // Seq 1 was in flight and lands now: the high-water mark has NOT
+        // moved, so `next_seq()` is unchanged — and the rollup name must be
+        // anyway.
+        assert_eq!(m.next_seq(), 3, "the pass sequence really does repeat");
+        let second = m.next_rollup_seq();
+        assert!(second > first, "{second} must be past {first}");
+        assert_ne!(
+            format!("archive-{second:04}.parquet"),
+            m.rollup.as_ref().unwrap().file,
+            "a rollup must never write over its own input"
+        );
+    }
+
+    /// A manifest written before `rollup_seq` existed carries the number in
+    /// its rollup's FILENAME. Read it as the floor, or the first rollup
+    /// after the upgrade reuses a name R2 may still hold.
+    #[test]
+    fn the_rollup_sequence_migrates_from_the_filename() {
+        let mut m = Manifest::new("ab");
+        m.rollup = Some(entry("archive-0105.parquet"));
+        assert_eq!(m.rollup_seq, 0, "the field is absent in the old shape");
+        assert_eq!(m.next_rollup_seq(), 106);
+    }
+
+    /// THE VOLATILE TAIL CARRIES NOTHING FORWARD, so it names no sidecar.
+    ///
+    /// It is re-derived whole on every refresh, so there is no pending set
+    /// to hand to a later job. A manifest that named one sent the publisher
+    /// to `stat` a file that has never existed; that failed the publish
+    /// before it reached the manifest flip, and R2 and KV silently froze at
+    /// the last tick before the tail started running.
+    #[test]
+    fn the_volatile_tail_names_no_pending_sidecar() {
+        let mut m = Manifest::new("ab");
+        m.passes = vec![pass(0), pass(1)];
+        let mut tail = pass(2);
+        tail.kind = RangeKind::Volatile;
+        tail.dir = PassEntry::tip_dir_name(2);
+        m.passes.push(tail);
+
+        let sidecars = m.pending_files();
+        assert_eq!(sidecars.len(), 2, "the two immutable passes only");
+        assert!(
+            !sidecars.iter().any(|(_, f)| f.starts_with("tip-")),
+            "{sidecars:?}"
+        );
+        // And the CURRENT one is the newest immutable pass, not the tail,
+        // even though the tail has the highest sequence.
+        assert_eq!(
+            m.latest_pass().map(|p| p.seq),
+            Some(2),
+            "the tail is newest"
+        );
+        assert_eq!(m.pending_file().as_deref(), Some("pass-0001/pending.bin"));
+    }
+
+    /// A manifest written before the per-pass flag says which passes were
+    /// folded only as a threshold. It is read once, on load, and never
+    /// meant again.
+    #[test]
+    fn a_manifest_from_before_the_flag_migrates_on_load() {
+        let mut m = Manifest::new("ab");
+        m.passes = vec![pass(0), pass(1), pass(2)];
+        m.rollup = Some(entry("archive-0002.parquet"));
+        m.rolled_up_through = Some(1);
+        let raw = serde_json::to_vec(&m).unwrap();
+        let back = Manifest::from_json(&raw).unwrap();
+        assert_eq!(
+            back.passes.iter().map(|p| p.rolled_up).collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
+        assert_eq!(back.files().len(), 3, "rollup + pass 2's two files");
     }
 
     #[test]

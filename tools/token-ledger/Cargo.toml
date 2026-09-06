@@ -70,6 +70,11 @@ pallas-traverse = { workspace = true }
 pallas-addresses = { workspace = true }
 pallas-primitives = { workspace = true }
 
+# `posix_fadvise` — a walk hands each chunk's pages back to the page cache
+# so it does not evict market-ledger's and mitos's working sets on its way
+# through the snapshot. See `reverse::drop_chunk_pages`.
+libc = { workspace = true }
+
 clap = { workspace = true }
 serde = { workspace = true }
 # The catalogue card — a small JSON sidecar per token so a listing surface

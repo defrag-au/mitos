@@ -67,11 +67,23 @@ pub struct ServeArgs {
     pub publish_archive: bool,
 
     /// A tx-index over the same snapshot (`base.idx` + `segments/`). With
-    /// it, a DETOUR — the window a running pass reads for a seek below its
-    /// floor — resolves its inputs on the spot; without it those rows arrive
-    /// as arrivals and the descent corrects them later.
+    /// it, a SEEK — the window a reader asked for — resolves its inputs on
+    /// the spot; without it those rows arrive as arrivals and the descent
+    /// corrects them later.
     #[arg(long)]
     pub tx_index_dir: Option<PathBuf>,
+
+    /// Walk workers: how many policies descend at once. Measured on
+    /// cardano-infra: eight concurrent 60-day walks cost what one costs
+    /// (the sieve gate is CPU-bound, twelve cores); four is the co-tenant's
+    /// number. See `docs/design/POLICY_WALK_SCHEDULER.md`.
+    #[arg(long, default_value_t = 4)]
+    pub walk_workers: usize,
+
+    /// Seek workers: bounded windows readers asked for, seconds each,
+    /// mostly idle.
+    #[arg(long, default_value_t = 20)]
+    pub seek_workers: usize,
 
     /// Public base clients should fetch artifacts from.
     #[arg(long, default_value = "https://tokendata.hodlcroft.com")]
@@ -79,6 +91,12 @@ pub struct ServeArgs {
 
     #[arg(long, default_value = "127.0.0.1:8185")]
     pub listen: String,
+
+    /// The volatile tail: one chainsync follower for the box, keeping the
+    /// stretch above the immutable tip that no snapshot can hold. See
+    /// `crate::tip`.
+    #[command(flatten)]
+    pub tip: crate::tip::TipArgs,
 }
 
 /// One unit's place in the pipeline. Serialized as the poll response body.
@@ -161,7 +179,19 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.archive_dir.clone(),
         args.publish_archive.then(crate::publish::Targets::from_env),
         args.tx_index_dir.clone(),
+        crate::scheduler::Pool {
+            walk_workers: args.walk_workers.max(1),
+            seek_workers: args.seek_workers.max(1),
+        },
         std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
+    );
+
+    // THE VOLATILE TAIL, from the box's chain-tail spool. No-op without
+    // `--tail-db`; token-ledger follows nothing itself.
+    crate::tip::spawn(
+        Arc::clone(&policy_hub),
+        args.tip.clone(),
+        args.publish_archive.then(crate::publish::Targets::from_env),
     );
 
     let listen = args.listen.clone();

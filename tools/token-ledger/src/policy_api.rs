@@ -43,8 +43,8 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::{Path as AxPath, Query, State};
@@ -58,7 +58,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use policy_archive::Movement;
 
 use crate::archive::{self, PolicyArchive};
-use crate::reverse;
 
 /// How a reverse pass for one policy is going.
 ///
@@ -100,15 +99,8 @@ impl PolicyJob {
     }
 }
 
-/// A queued reverse pass.
-struct PassRequest {
-    policy: String,
-    /// Stop here — the policy's first mint, when the caller knows it. `None`
-    /// walks to the registry's floor, or genesis.
-    to_slot: Option<u64>,
-}
-
-/// THE LOWER LOD — what a running pass has walked so far.
+/// THE LOWER LOD — what a running JOB has walked so far. One per job in
+/// flight; a policy with a walk job and two seek jobs running has three.
 ///
 /// A pass spills its rows to disk as SEGMENTS while it walks
 /// (`crate::segments`), in the archive's own format, so most of what it has
@@ -133,14 +125,10 @@ pub struct Live {
     pub segments: Vec<(PathBuf, archive::FileKind)>,
     /// Rows not yet in a segment.
     pub buffer: Vec<Movement>,
-    /// A detour in progress — the seek it is reaching for.
-    pub reaching: Option<u64>,
-    /// Windows below `floor` that detours have read, `(from, to)`.
-    pub detours: Vec<(u64, u64)>,
 }
 
 impl Live {
-    fn new(seq: u32) -> Self {
+    pub fn new(seq: u32) -> Self {
         Self {
             seq,
             floor: u64::MAX,
@@ -148,23 +136,12 @@ impl Live {
             pending: 0,
             segments: Vec::new(),
             buffer: Vec::new(),
-            reaching: None,
-            detours: Vec::new(),
         }
-    }
-
-    /// Would a detour ending at `at` re-read a stretch already read? `to`
-    /// inclusive: a seek asks for rows BELOW its slot, and a window read
-    /// up to that slot has them.
-    fn detoured(&self, at: u64) -> bool {
-        self.detours
-            .iter()
-            .any(|(from, to)| at > *from && at <= *to)
     }
 
     /// Take a chunk's rows — or, if the pass flushed at the end of it, the
     /// segments that now hold everything buffered so far.
-    fn publish(&mut self, pass_dir: &Path, rows: &[Movement], flushed: &[archive::FileEntry]) {
+    pub fn publish(&mut self, pass_dir: &Path, rows: &[Movement], flushed: &[archive::FileEntry]) {
         if flushed.is_empty() {
             self.buffer.extend_from_slice(rows);
             return;
@@ -266,31 +243,33 @@ impl Live {
     }
 }
 
-/// What a read sees: the archive — opened WITH a running pass's segments —
-/// and the pass's buffer, or neither for a policy nobody has touched.
+/// What a read sees: the archive — opened WITH every running job's segments
+/// — and the jobs' buffers, or neither for a policy nobody has touched.
 struct View<'a> {
     archive: Option<PolicyArchive>,
-    live: Option<std::sync::MutexGuard<'a, Live>>,
+    lives: Vec<std::sync::MutexGuard<'a, Live>>,
 }
 
-fn view<'a>(hub: &PolicyHub, policy: &str, live: &'a Option<Arc<Mutex<Live>>>) -> Result<View<'a>> {
+fn view<'a>(hub: &PolicyHub, policy: &str, jobs: &'a [Arc<Mutex<Live>>]) -> Result<View<'a>> {
     let dir = hub.policy_dir(policy);
-    let guard = live.as_ref().map(|l| l.lock().expect("live"));
-    // Landed? Then the segments are compacted away and the buffer is stale;
-    // the archive alone is the truth.
     let manifest = archive::load_manifest(&dir)?;
-    let active = guard
-        .as_deref()
-        .is_some_and(|l| !manifest.is_some_and(|m| m.passes.iter().any(|p| p.seq == l.seq)));
-    let segments: Vec<(PathBuf, archive::FileKind)> = match (active, guard.as_deref()) {
-        (true, Some(l)) => l.segments.clone(),
-        _ => Vec::new(),
-    };
+    // A job that has LANDED has its segments compacted away and its buffer
+    // stale; the manifest names its sequence and the archive alone is the
+    // truth for it. The guards are taken in one order everywhere — the
+    // scheduler's list order — so two reads cannot deadlock.
+    let lives: Vec<std::sync::MutexGuard<'a, Live>> = jobs
+        .iter()
+        .map(|l| l.lock().expect("live"))
+        .filter(|l| {
+            !manifest
+                .as_ref()
+                .is_some_and(|m| m.passes.iter().any(|p| p.seq == l.seq))
+        })
+        .collect();
+    let segments: Vec<(PathBuf, archive::FileKind)> =
+        lives.iter().flat_map(|l| l.segments.clone()).collect();
     let archive = PolicyArchive::open_with(&dir, &segments)?;
-    Ok(View {
-        archive,
-        live: if active { guard } else { None },
-    })
+    Ok(View { archive, lives })
 }
 
 pub struct PolicyHub {
@@ -300,39 +279,29 @@ pub struct PolicyHub {
     /// database. See `archive.rs`.
     pub archive_dir: PathBuf,
     jobs: Mutex<HashMap<String, PolicyJob>>,
-    /// The in-progress pass per policy, if one is running.
-    live: Mutex<HashMap<String, Arc<Mutex<Live>>>>,
-    /// The newest seek below the floor per policy, waiting for the running
-    /// pass to take it between chunks. Newest wins: a reader dragging the
-    /// spine sends several and only the last one matters.
-    detours: Mutex<HashMap<String, u64>>,
-    /// tx hash → body over the snapshot, for resolving a detour's inputs on
+    /// tx hash → body over the snapshot, for resolving a seek's inputs on
     /// the spot. `None` without `--tx-index-dir`.
-    index: Option<tx_index::IndexHandle>,
-    /// Passes queued and not yet started, with their floors — what the
-    /// running pass looks at between chunks to give a waiting policy a
-    /// PREVIEW. Removed when the pass starts.
-    queued: Mutex<HashMap<String, Option<u64>>>,
-    /// Policies that have had their preview this time round, so a long
-    /// queue does not preview the same one on every chunk.
-    previewed: Mutex<HashSet<String>>,
-    queue: mpsc::Sender<PassRequest>,
+    pub(crate) index: Option<tx_index::IndexHandle>,
+    /// The pool: walk jobs, seek jobs, what is in flight. See
+    /// `scheduler.rs`.
+    pub(crate) sched: crate::scheduler::Scheduler,
     bearer: Option<String>,
 }
 
 impl PolicyHub {
     /// `publish`: where a landed archive goes — R2 and the KV bundle — or
     /// `None` to leave it on disk. See `publish.rs`. `tx_index_dir`: a
-    /// tx-index over the same snapshot, for detours.
+    /// tx-index over the same snapshot, for seeks. `pool`: how many
+    /// workers of each kind.
     pub fn new(
         data_dir: PathBuf,
         tokens: PathBuf,
         archive_dir: PathBuf,
         publish: Option<crate::publish::Targets>,
         tx_index_dir: Option<PathBuf>,
+        pool: crate::scheduler::Pool,
         bearer: Option<String>,
     ) -> Arc<Self> {
-        let (tx, rx) = mpsc::channel::<PassRequest>();
         let index = tx_index_dir.and_then(|dir| {
             match tx_index::IndexHandle::open(&dir, &data_dir.join("immutable")) {
                 Ok(h) => {
@@ -341,113 +310,33 @@ impl PolicyHub {
                         dir = %dir.display(),
                         base_entries = cov.base_entries,
                         newest_chunk = ?cov.newest_chunk,
-                        "policy: tx-index open — detours resolve inputs on the spot"
+                        "policy: tx-index open — seeks resolve inputs on the spot"
                     );
                     Some(h)
                 }
                 Err(e) => {
-                    tracing::warn!(dir = %dir.display(), error = %format!("{e:#}"), "policy: tx-index NOT open — detours leave inputs to the descent");
+                    tracing::warn!(dir = %dir.display(), error = %format!("{e:#}"), "policy: tx-index NOT open — seeks leave inputs to the descent");
                     None
                 }
             }
         });
+        if let Some(t) = &publish {
+            tracing::info!(targets = %t.describe(), "policy: publishing landed archives");
+        }
         let hub = Arc::new(Self {
             data_dir,
             tokens,
             archive_dir,
             jobs: Mutex::new(HashMap::new()),
-            live: Mutex::new(HashMap::new()),
-            detours: Mutex::new(HashMap::new()),
             index,
-            queued: Mutex::new(HashMap::new()),
-            previewed: Mutex::new(HashSet::new()),
-            queue: tx,
+            sched: crate::scheduler::Scheduler::new(),
             bearer,
         });
-        // ONE worker, for the reason the artifact builder next door has one:
-        // passes are disk-bound against a shared snapshot and two interleaving
-        // would slow both. A queued request says so rather than starting.
-        {
-            let hub = Arc::clone(&hub);
-            std::thread::spawn(move || {
-                // The publisher and its runtime live on THIS thread for the
-                // life of the loop: its HTTP clients are used from the one
-                // runtime that created their connections.
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("publish runtime");
-                let publisher = publish.and_then(|targets| {
-                    tracing::info!(targets = %targets.describe(), "policy: publishing landed archives");
-                    match crate::publish::Publisher::new(targets) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!(error = %format!("{e:#}"), "policy: publisher not built — archives stay local");
-                            None
-                        }
-                    }
-                });
-                for req in rx {
-                    let started = Instant::now();
-                    hub.queued.lock().expect("queued").remove(&req.policy);
-                    let outcome = run_pass(&hub, &req, Depth::Full);
-                    // The next time this policy queues, it may be previewed
-                    // again — its archive will say whether that is needed.
-                    hub.previewed.lock().expect("previewed").remove(&req.policy);
-                    let state = match outcome {
-                        Ok(out) => PolicyJob::Done {
-                            written: out.written,
-                            backfilled: out.backfilled as usize,
-                            unresolved: out.unresolved as usize,
-                            secs: started.elapsed().as_secs_f64(),
-                        },
-                        Err(e) => {
-                            tracing::error!(
-                                policy = req.policy,
-                                error = %format!("{e:#}"),
-                                "policy: pass failed"
-                            );
-                            PolicyJob::Failed {
-                                error: format!("{e:#}"),
-                            }
-                        }
-                    };
-                    // The archive holds it now — or, on failure, nobody does.
-                    hub.live.lock().expect("live").remove(&req.policy);
-                    let landed = matches!(state, PolicyJob::Done { .. });
-                    hub.set(&req.policy, state);
-                    // PUBLISH. Synchronous on this thread, deliberately: the
-                    // next pass would otherwise rewrite the directory under
-                    // a publish still reading it. A failed publish is
-                    // recorded (`published.json`) and logged, and never
-                    // fails the pass — the archive is on disk either way
-                    // and the next landing publishes again.
-                    if landed && let Some(p) = &publisher {
-                        let dir = hub.policy_dir(&req.policy);
-                        match runtime.block_on(p.publish(&dir, &req.policy)) {
-                            Ok(rec) if rec.all_done() => {
-                                tracing::info!(policy = req.policy, outcome = %rec.summary(), "policy: archive published")
-                            }
-                            Ok(rec) => {
-                                tracing::warn!(policy = req.policy, outcome = %rec.summary(), "policy: publish INCOMPLETE")
-                            }
-                            Err(e) => {
-                                tracing::warn!(policy = req.policy, error = %format!("{e:#}"), "policy: publish failed")
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        crate::scheduler::spawn(Arc::clone(&hub), pool, publish);
         hub
     }
 
-    /// The running pass's in-memory rows for a policy, if any.
-    fn live_for(&self, policy: &str) -> Option<Arc<Mutex<Live>>> {
-        self.live.lock().expect("live").get(policy).cloned()
-    }
-
-    fn set(&self, policy: &str, state: PolicyJob) {
+    pub(crate) fn set(&self, policy: &str, state: PolicyJob) {
         self.jobs
             .lock()
             .expect("jobs")
@@ -459,109 +348,60 @@ impl PolicyHub {
     }
 
     /// The policy's archive directory.
-    fn policy_dir(&self, policy: &str) -> PathBuf {
+    pub(crate) fn policy_dir(&self, policy: &str) -> PathBuf {
         crate::archive::policy_dir(&self.archive_dir, policy)
     }
 
-    /// Is a pass queued or running for this policy?
+    /// Every policy with an archive on disk, sorted — what the volatile
+    /// tail follower keeps a tail for. From the DIRECTORY rather than a
+    /// registry: an archive is the only thing that makes a tail useful, and
+    /// it is also the only thing a tail can be recorded against.
+    pub(crate) fn archived_policies(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.archive_dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().join(crate::archive::MANIFEST).exists())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.len() == 56 && n.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A sequence for a new pass on this policy, from the SAME allocator
+    /// the scheduler's jobs draw from.
+    ///
+    /// The volatile tail used to take `manifest.next_seq()` of its own,
+    /// which collides: the scheduler counts up in memory from the sequence
+    /// it read once, so a tail that guessed the same number would put two
+    /// passes with one `seq` in the manifest and leave `latest_pass()`
+    /// ambiguous.
+    pub(crate) fn next_pass_seq(&self, policy: &str) -> u32 {
+        self.sched.next_seq(self, policy)
+    }
+
+    /// The lock held across a manifest read-modify-write for one policy.
+    /// Shared with the scheduler's landings — the volatile tail is one more
+    /// writer of the same file.
+    pub(crate) fn landing_lock(&self, policy: &str) -> Arc<Mutex<()>> {
+        self.sched.lock_for(policy)
+    }
+
+    /// The snapshot's tip: the first slot of the chunk after the newest on
+    /// disk. Read from the directory each time — a refresh can land while
+    /// the service runs, and listing nine thousand names is milliseconds.
+    pub(crate) fn tip_slot(&self) -> u64 {
+        chain_sieve::list_chunks(&self.data_dir.join("immutable"), 0)
+            .ok()
+            .and_then(|c| c.last().copied())
+            .map_or(0, |c| (c + 1) * mitos_chain_walk::mithril::CHUNK_SLOTS)
+    }
+
+    /// Is a walk wanted or running for this policy?
     fn walking(&self, policy: &str) -> bool {
-        self.get(policy).is_some_and(|j| !j.is_terminal())
-    }
-
-    /// Ask the running pass to read the stretch ending at `at` next.
-    /// Newest wins; a stretch already read, or one the descent has already
-    /// passed, is declined with the reason.
-    fn request_detour(&self, policy: &str, at: u64) -> DetourResponse {
-        let Some(live) = self.live_for(policy) else {
-            return DetourResponse {
-                accepted: false,
-                because: Some("not_walking"),
-                reaching: None,
-            };
-        };
-        let (floor, reaching, read) = {
-            let l = live.lock().expect("live");
-            (l.floor, l.reaching, l.detoured(at))
-        };
-        if read {
-            return DetourResponse {
-                accepted: false,
-                because: Some("already_read"),
-                reaching,
-            };
-        }
-        if at >= floor {
-            return DetourResponse {
-                accepted: false,
-                because: Some("above_floor"),
-                reaching,
-            };
-        }
-        self.detours
-            .lock()
-            .expect("detours")
-            .insert(policy.to_string(), at);
-        DetourResponse {
-            accepted: true,
-            because: None,
-            reaching: Some(at),
-        }
-    }
-
-    /// The pass's side: the newest seek for this policy, taken once.
-    fn take_detour(&self, policy: &str) -> Option<u64> {
-        self.detours.lock().expect("detours").remove(policy)
-    }
-
-    /// Between chunks of `running`: give ONE policy waiting behind it a
-    /// preview — a short pass over its newest days, landed as its first
-    /// pass — so its page shows rows and a spine while it waits. Only a
-    /// policy nobody has walked; one that already has an archive has rows
-    /// to show. The full pass, when its turn comes, continues downward from
-    /// the preview's floor, so nothing is read twice.
-    fn preview_queued(&self, running: &str) {
-        let next = {
-            let queued = self.queued.lock().expect("queued");
-            let previewed = self.previewed.lock().expect("previewed");
-            queued
-                .iter()
-                .find(|(p, _)| p.as_str() != running && !previewed.contains(*p))
-                .map(|(p, floor)| (p.clone(), *floor))
-        };
-        let Some((policy, to_slot)) = next else {
-            return;
-        };
-        self.previewed
-            .lock()
-            .expect("previewed")
-            .insert(policy.clone());
-        let cold = match crate::archive::load_manifest(&self.policy_dir(&policy)) {
-            Ok(m) => m.is_none(),
-            Err(e) => {
-                tracing::warn!(policy, error = %format!("{e:#}"), "policy: preview skipped — manifest unreadable");
-                return;
-            }
-        };
-        if !cold {
-            return;
-        }
-        let started = Instant::now();
-        let req = PassRequest { policy, to_slot };
-        match run_pass(self, &req, Depth::Preview) {
-            Ok(out) => tracing::info!(
-                policy = req.policy,
-                written = out.written,
-                secs = format!("{:.1}", started.elapsed().as_secs_f64()),
-                "policy: preview landed — the full pass is still queued"
-            ),
-            Err(e) => {
-                tracing::warn!(policy = req.policy, error = %format!("{e:#}"), "policy: preview failed")
-            }
-        }
-        self.live.lock().expect("live").remove(&req.policy);
-        // Still waiting for its full pass: the preview did not change that,
-        // and the page must keep saying so.
-        self.set(&req.policy, PolicyJob::Queued);
+        self.sched.walking(policy)
     }
 
     fn authorised(&self, headers: &HeaderMap) -> bool {
@@ -576,119 +416,17 @@ impl PolicyHub {
     }
 }
 
-/// How far a pass goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Depth {
-    /// ALL THE WAY. Tiers gate what a reader SEES, never how far the walk
-    /// goes — one walk per policy, shared by everyone.
-    Full,
-    /// The newest [`PREVIEW_DAYS`], for a policy waiting behind another
-    /// pass. Lands as an ordinary first pass; the full one continues from
-    /// its floor.
-    Preview,
-}
-
-/// A preview's reach. About forty chunks — seconds of reading through the
-/// sieve gate — and enough of a spine to scrub.
-const PREVIEW_DAYS: u64 = 10;
-
-fn run_pass(hub: &PolicyHub, req: &PassRequest, depth: Depth) -> Result<reverse::Outcome> {
-    let args = reverse::ReverseArgs {
-        data_dir: hub.data_dir.clone(),
-        tokens: hub.tokens.clone(),
-        token: req.policy.clone(),
-        archive_dir: hub.archive_dir.clone(),
-        days: match depth {
-            Depth::Full => None,
-            Depth::Preview => Some(PREVIEW_DAYS),
-        },
-        // The mint floor holds for a preview too: a policy minted last
-        // week previews to completion and the full pass finds nothing left.
-        to_slot: req.to_slot,
-        // From the bottom of the top stretch, as the descent always has.
-        from_slot: None,
-        no_compact: false,
-        no_sieve: false,
-        report_every: u64::MAX,
-    };
-    // The sequence this pass will write, read before it starts, so a reader
-    // can tell "landed" from "still in memory" by looking at the manifest.
-    let seq =
-        crate::archive::load_manifest(&hub.policy_dir(&req.policy))?.map_or(0, |m| m.next_seq());
-    let live = Arc::new(Mutex::new(Live::new(seq)));
-    hub.live
-        .lock()
-        .expect("live")
-        .insert(req.policy.clone(), Arc::clone(&live));
-
-    let policy = req.policy.clone();
-    let pass_dir = hub
-        .policy_dir(&req.policy)
-        .join(archive::PassEntry::dir_name(seq));
-    let hub_ref = hub;
-    // The index, as it stands when the pass starts. A refresh that lands
-    // mid-pass is picked up by the next one; a lookup that misses falls to
-    // the descent either way.
-    let index = hub.index.as_ref().map(|h| {
-        if let Err(e) = h.reload_if_changed() {
-            tracing::warn!(error = %format!("{e:#}"), "policy: tx-index reload failed; using the mapping in hand");
-        }
-        h.get()
-    });
-    let on: reverse::OnProgress<'_> = &|p| {
-        {
-            let mut l = live.lock().expect("live");
-            l.floor = p.floor;
-            l.ceiling = p.ceiling;
-            l.pending = p.pending;
-            l.reaching = p.reaching;
-            l.detours = p.detours.to_vec();
-            l.publish(&pass_dir, p.rows, p.flushed);
-        }
-        hub_ref.set(
-            &policy,
-            PolicyJob::Running {
-                fraction: p.fraction(),
-                floor: p.floor,
-                date: reverse::slot_date(p.floor),
-                chunks_done: p.chunks_done,
-                chunks_total: p.chunks_total,
-                written: p.written,
-                updated: p.updated.iter().map(|h| hex::encode(h.as_ref())).collect(),
-                unresolved: p.pending,
-            },
-        );
-    };
-    let take_detour = || hub_ref.take_detour(&req.policy);
-    // Only a FULL pass previews the queue behind it; a preview is itself
-    // the interruption and does not nest.
-    let preview_queued = || hub_ref.preview_queued(&req.policy);
-    let nothing = || {};
-    let between_chunks: &dyn Fn() = match depth {
-        Depth::Full => &preview_queued,
-        Depth::Preview => &nothing,
-    };
-    reverse::run_reporting(
-        args,
-        reverse::Hooks {
-            on,
-            take_detour: &take_detour,
-            between_chunks,
-            resolver: index.as_deref(),
-        },
-    )
-}
-
-/// Coverage as a reader sees it: the archive's, widened by whatever a running
-/// pass has reached. `None` for both is a policy nobody has touched.
-fn merged_coverage(
-    archive: Option<&PolicyArchive>,
-    live: Option<&Live>,
-    walking: bool,
-) -> CoverageDto {
+/// Coverage as a reader sees it: the archive's, widened by whatever the
+/// running jobs have reached. Nothing for either is a policy nobody has
+/// touched.
+fn merged_coverage(archive: Option<&PolicyArchive>, lives: &[&Live], walking: bool) -> CoverageDto {
     let cov = archive.map(|a| a.coverage());
-    let live_floor = live.map(|l| l.floor).filter(|f| *f != u64::MAX);
-    let live_ceiling = live.map(|l| l.ceiling).filter(|c| *c != 0);
+    let live_floor = lives
+        .iter()
+        .map(|l| l.floor)
+        .filter(|f| *f != u64::MAX)
+        .min();
+    let live_ceiling = lives.iter().map(|l| l.ceiling).filter(|c| *c != 0).max();
     let min = |a: Option<u64>, b: Option<u64>| match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -698,68 +436,69 @@ fn merged_coverage(
         (a, b) => a.or(b),
     };
     CoverageDto {
-        cached: cov.is_some() || live.is_some(),
+        cached: cov.is_some() || !lives.is_empty(),
         walked_from: min(cov.as_ref().and_then(|c| c.walked_from), live_floor),
         walked_to: max(cov.as_ref().and_then(|c| c.walked_to), live_ceiling),
         first_slot: min(
             cov.as_ref().and_then(|c| c.first_slot),
-            live.and_then(|l| l.buffered_slots().0),
+            lives.iter().filter_map(|l| l.buffered_slots().0).min(),
         ),
         last_slot: max(
             cov.as_ref().and_then(|c| c.last_slot),
-            live.and_then(|l| l.buffered_slots().1),
+            lives.iter().filter_map(|l| l.buffered_slots().1).max(),
         ),
-        total_txs: cov.as_ref().map_or(0, |c| c.total_txs) + live.map_or(0, Live::buffered_txs),
+        total_txs: cov.as_ref().map_or(0, |c| c.total_txs)
+            + lives.iter().map(|l| l.buffered_txs()).sum::<u64>(),
         units: cov.as_ref().map_or(0, |c| c.units),
-        unresolved: live.map_or_else(
-            || cov.as_ref().map_or(0, |c| c.unresolved),
-            |l| l.pending as u64,
-        ),
+        unresolved: lives
+            .iter()
+            .map(|l| l.pending as u64)
+            .max()
+            .unwrap_or_else(|| cov.as_ref().map_or(0, |c| c.unresolved)),
         walking,
-        // While a pass runs the verdict is not in yet; the archive's stands
-        // until the pass lands and rewrites it.
+        // While a job runs the verdict is not in yet; the archive's stands
+        // until the job lands and the manifest is rederived.
         completeness: cov
             .as_ref()
             .map_or(policy_archive::Completeness::Unrecorded, |c| c.completeness)
             .as_wire(),
-        reaching: live.and_then(|l| l.reaching),
-        detours: live.map_or_else(Vec::new, |l| {
-            l.detours
-                .iter()
-                .map(|(from, to)| SlotSpanDto {
-                    from: *from,
-                    to: *to,
-                })
-                .collect()
-        }),
-        // THE RANGES: what the archive has read, plus what the running pass
-        // has reached so far and the windows its detours took — merged, so
-        // a reader asks one question of one list.
+        // THE RANGES: what the archive has read, tagged by which chain it
+        // came from, plus what the running jobs have reached so far. The
+        // immutable stretches merge with each other and the volatile tail
+        // stands apart — they are summed differently, so a reader has to be
+        // able to tell them apart.
         ranges: {
-            let mut all: Vec<archive::SlotRange> =
-                cov.as_ref().map_or_else(Vec::new, |c| c.ranges.clone());
-            if let Some(l) = live {
-                if let (Some(from), Some(to)) = (live_floor, live_ceiling) {
-                    all.push(archive::SlotRange::new(from, to));
-                }
-                all.extend(
-                    l.detours
-                        .iter()
-                        .map(|(from, to)| archive::SlotRange::new(*from, *to)),
-                );
-            }
-            policy_archive::merge_ranges(all)
+            let mut immutable: Vec<archive::SlotRange> = cov
+                .as_ref()
+                .map_or_else(Vec::new, |c| c.immutable_ranges.clone());
+            immutable.extend(lives.iter().filter_map(|l| reached(l)));
+            let mut out: Vec<SlotSpanDto> = policy_archive::merge_ranges(immutable)
                 .into_iter()
-                .map(|r| SlotSpanDto {
-                    from: r.from,
-                    to: r.to,
-                })
-                .collect()
+                .map(SlotSpanDto::reading)
+                .collect();
+            out.extend(
+                cov.as_ref()
+                    .into_iter()
+                    .flat_map(|c| c.volatile.iter().copied())
+                    .map(SlotSpanDto::of),
+            );
+            out.sort_by_key(|s| (s.from, s.to));
+            out
         },
-        reading: match (live_floor, live_ceiling) {
-            (Some(from), Some(to)) if walking => Some(SlotSpanDto { from, to }),
-            _ => None,
-        },
+        reading: lives
+            .iter()
+            .filter_map(|l| reached(l))
+            .map(SlotSpanDto::reading)
+            .collect(),
+    }
+}
+
+/// The stretch a running job has read so far: from where it has got to,
+/// up to its ceiling. `None` before its first chunk.
+fn reached(l: &Live) -> Option<archive::SlotRange> {
+    match (l.floor, l.ceiling) {
+        (u64::MAX, _) | (_, 0) => None,
+        (from, to) => Some(archive::SlotRange::new(from.min(to), to)),
     }
 }
 
@@ -845,44 +584,50 @@ pub struct CoverageDto {
     /// earliest transaction found, so every partial ledger would read as
     /// complete. Only the walk knows, so only the walk says.
     pub completeness: &'static str,
-    /// A detour is reading the stretch around this slot right now.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reaching: Option<u64>,
-    /// Stretches below `walked_from` that detours have read.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub detours: Vec<SlotSpanDto>,
-    /// Every stretch READ — the archive's ranges, the running pass's reach
-    /// and its detours — merged, ascending. `walked_from`/`walked_to` are
-    /// its extremes; `detours` its members below the descent.
+    /// Every stretch READ — the archive's ranges and what every running
+    /// job has reached so far — merged, ascending. `walked_from` /
+    /// `walked_to` are its extremes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ranges: Vec<SlotSpanDto>,
-    /// The stretch the running pass is reading right now, if one is.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reading: Option<SlotSpanDto>,
+    /// The stretches jobs are reading right now.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reading: Vec<SlotSpanDto>,
 }
 
 #[derive(Serialize)]
 pub struct SlotSpanDto {
     pub from: u64,
     pub to: u64,
+    /// `immutable` | `volatile`. A consumer that predates the volatile tail
+    /// defaults it to immutable, which is what every span used to be.
+    pub kind: &'static str,
 }
 
-/// `POST /policy/{policy}/detour?at=S` — what the origin did with it.
-#[derive(Serialize)]
-pub struct DetourResponse {
-    /// Queued for the running pass to read next.
-    pub accepted: bool,
-    /// Why not, when not: `not_walking` | `already_read` | `above_floor`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub because: Option<&'static str>,
-    /// The seek the pass is reaching for now — this one, or a newer one
-    /// that superseded it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reaching: Option<u64>,
+impl SlotSpanDto {
+    fn of(span: policy_archive::manifest::Span) -> Self {
+        Self {
+            from: span.from,
+            to: span.to,
+            kind: match span.kind {
+                archive::RangeKind::Immutable => "immutable",
+                archive::RangeKind::Volatile => "volatile",
+            },
+        }
+    }
+
+    /// A stretch a job is reading right now. Always settled: a job only
+    /// reads the immutable chain.
+    fn reading(r: archive::SlotRange) -> Self {
+        Self {
+            from: r.from,
+            to: r.to,
+            kind: "immutable",
+        }
+    }
 }
 
 #[derive(Deserialize)]
-pub struct DetourQuery {
+pub struct SeekQuery {
     pub at: u64,
 }
 
@@ -1051,25 +796,23 @@ pub async fn feed(
     let before = q.before_slot.unwrap_or(u64::MAX);
 
     // TWO TIERS OF THE SAME ROWS: the archive's (segments included), and the
-    // running pass's buffer. Both are unfolded movements, appended and
-    // folded once, so a correction the live pass found for an archived
+    // running jobs' buffers. Both are unfolded movements, appended and
+    // folded once, so a correction a live job found for an archived
     // transaction lands on it.
-    let live = hub.live_for(&policy);
-    let View {
-        mut archive,
-        live: live_view,
-    } = view(&hub, &policy, &live).map_err(internal)?;
+    let jobs = hub.sched.inflight_for(&policy);
+    let View { mut archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
     let mut rows: Vec<Movement> = match archive.as_mut() {
         Some(a) if limit > 0 => a.movements_page(limit, q.before_slot).map_err(internal)?,
         _ => Vec::new(),
     };
-    if let Some(l) = live_view.as_deref()
-        && limit > 0
-    {
+    if limit > 0 {
         let archived: HashSet<Vec<u8>> = rows.iter().map(|m| m.tx_hash.clone()).collect();
-        rows.extend(l.page(limit as usize, before, &archived));
+        for l in &lives {
+            rows.extend(l.page(limit as usize, before, &archived));
+        }
     }
-    let coverage = merged_coverage(archive.as_ref(), live_view.as_deref(), walking);
+    let live_refs: Vec<&Live> = lives.iter().map(|g| &**g).collect();
+    let coverage = merged_coverage(archive.as_ref(), &live_refs, walking);
     let mut folded = crate::archive::fold_rows(rows);
     folded.truncate(limit as usize);
     Ok(Json(PolicyFeedResponse {
@@ -1092,19 +835,17 @@ pub async fn density(
     // An hour at the finest, a month at the coarsest — anything else is a
     // request for the raw rows, which is the feed's job.
     let bucket_secs = q.bucket.unwrap_or(86_400).clamp(3_600, 31 * 86_400);
-    let live = hub.live_for(&policy);
-    let View {
-        archive,
-        live: live_view,
-    } = view(&hub, &policy, &live).map_err(internal)?;
-    // The footers' histogram — segments included — plus the buffer's.
+    let jobs = hub.sched.inflight_for(&policy);
+    let View { archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    // The footers' histogram — segments included — plus every buffer's.
     let from_archive = archive
         .as_ref()
         .map_or_else(Vec::new, |a| a.density(bucket_secs));
-    let from_live = live_view
-        .as_deref()
-        .map_or_else(Vec::new, |l| l.buffered_density(bucket_secs));
-    let coverage = merged_coverage(archive.as_ref(), live_view.as_deref(), hub.walking(&policy));
+    let from_live = lives.iter().fold(Vec::new(), |acc, l| {
+        crate::archive::merge_density(acc, l.buffered_density(bucket_secs))
+    });
+    let live_refs: Vec<&Live> = lives.iter().map(|g| &**g).collect();
+    let coverage = merged_coverage(archive.as_ref(), &live_refs, hub.walking(&policy));
     let buckets = crate::archive::merge_density(from_archive, from_live)
         .into_iter()
         .map(|b| DensityBucketDto {
@@ -1144,19 +885,16 @@ pub async fn row_at(
                 "expected a 32-byte transaction hash in hex".into(),
             )
         })?;
-    let live = hub.live_for(&policy);
-    let View {
-        mut archive,
-        live: live_view,
-    } = view(&hub, &policy, &live).map_err(internal)?;
+    let jobs = hub.sched.inflight_for(&policy);
+    let View { mut archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
     let mut rows = match archive.as_mut() {
         Some(a) => a.movements_of(&raw).map_err(internal)?,
         None => Vec::new(),
     };
-    if let Some(l) = live_view.as_deref() {
+    for l in &lives {
         rows.extend(l.buffer.iter().filter(|m| m.tx_hash == raw).cloned());
     }
-    let cached = archive.is_some() || live_view.is_some();
+    let cached = archive.is_some() || !lives.is_empty();
     Ok(Json(PolicyRowAtResponse {
         policy,
         cached,
@@ -1164,15 +902,14 @@ pub async fn row_at(
     }))
 }
 
-/// `POST /policy/{policy}/refresh?to_slot=S` — queue THE reverse pass.
+/// `POST /policy/{policy}/refresh?to_slot=S` — walk this policy to its
+/// mint.
 ///
-/// One walk per policy, all the way to `to_slot` (the first mint, as the
-/// caller learned it) or to the registry's floor or genesis. Tiers gate what
-/// a reader sees, never how far this goes.
-///
-/// The ONLY route that starts work. Joining an existing pass rather than
-/// stacking a second is deliberate: passes are serialised anyway, and a queue
-/// of duplicates for one policy would starve every other caller.
+/// `to_slot` is the first mint as the caller learned it (the query keeps
+/// its old name). One walk per policy, whoever asked: joining a walk
+/// already wanted is a no-op. Tiers gate what a reader sees, never how far
+/// this goes. With the pool, the walk's first job — the newest ten days —
+/// starts within one job of whatever is running.
 pub async fn refresh(
     State(hub): State<Arc<PolicyHub>>,
     headers: HeaderMap,
@@ -1183,40 +920,30 @@ pub async fn refresh(
     let policy = parse_policy(&policy)?;
     if let Some(state) = hub.get(&policy)
         && !state.is_terminal()
+        && hub.walking(&policy)
     {
         return Ok(Json(state));
     }
     hub.set(&policy, PolicyJob::Queued);
-    hub.queued
-        .lock()
-        .expect("queued")
-        .insert(policy.clone(), q.to_slot);
-    let _ = hub.queue.send(PassRequest {
-        policy: policy.clone(),
-        to_slot: q.to_slot,
-    });
+    hub.sched.want_walk(&policy, q.to_slot);
     Ok(Json(PolicyJob::Queued))
 }
 
-/// `POST /policy/{policy}/detour?at=S` — ask the running pass to read the
-/// stretch ending at `S` next, ahead of its descent.
+/// `POST /policy/{policy}/seek?at=S` — read the window ending at `S`.
 ///
-/// The seek-below-the-floor path. A reader scrubbing to 2024 on a policy
-/// whose walk is at 2025 would otherwise wait for the descent to get there;
-/// this reads a bounded window at the playhead within seconds. Newest
-/// request wins — a reader dragging the spine sends several and only the
-/// last matters — and a stretch a detour has already read is not read
-/// twice. Only meaningful while a pass runs: a landed archive has no floor
-/// to be below.
-pub async fn detour(
+/// The reader asked for a stretch nothing has read; its job goes to the
+/// seek workers, never behind a walk, and its inputs resolve through the
+/// tx-index on the spot. Declined when the stretch is read, when a job
+/// over it is already queued or running, or when it lies below the mint.
+pub async fn seek(
     State(hub): State<Arc<PolicyHub>>,
     headers: HeaderMap,
     AxPath(policy): AxPath<String>,
-    Query(q): Query<DetourQuery>,
-) -> Result<Json<DetourResponse>, ApiError> {
+    Query(q): Query<SeekQuery>,
+) -> Result<Json<crate::scheduler::SeekResponse>, ApiError> {
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
-    Ok(Json(hub.request_detour(&policy, q.at)))
+    Ok(Json(hub.sched.seek(&hub, &policy, q.at)))
 }
 
 /// `GET /policy/{policy}/events` — job progress until terminal.
@@ -1267,7 +994,7 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         .route("/policy/{policy}/tx/{hash}", get(row_at))
         .route("/policy/{policy}/density", get(density))
         .route("/policy/{policy}/refresh", post(refresh))
-        .route("/policy/{policy}/detour", post(detour))
+        .route("/policy/{policy}/seek", post(seek))
         .route("/policy/{policy}/events", get(events))
         .with_state(hub)
 }

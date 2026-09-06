@@ -75,6 +75,20 @@ pub struct PendingSpender {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PendingFile {
     pub spenders: Vec<PendingSpender>,
+    /// Spenders this job LOADED from an earlier sidecar and settled. A
+    /// later job merging every sidecar it can find — jobs land out of
+    /// order now — drops these rather than carrying a settled spender
+    /// forever because an older file still lists it. Only carried ones:
+    /// a job's own settled spenders were never in any file.
+    #[serde(default)]
+    pub settled: Vec<[u8; 32]>,
+}
+
+/// The sidecar before `settled` existed. postcard is not self-describing,
+/// so an old file has to be read as the old shape.
+#[derive(Debug, Default, Deserialize)]
+struct PendingFileV1 {
+    spenders: Vec<PendingSpender>,
 }
 
 pub fn policy_dir(root: &Path, policy_hex: &str) -> PathBuf {
@@ -186,7 +200,46 @@ pub fn load_pending(path: &Path) -> Result<PendingFile> {
         return Ok(PendingFile::default());
     }
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    postcard::from_bytes(&raw).with_context(|| format!("decoding {}", path.display()))
+    match postcard::from_bytes::<PendingFile>(&raw) {
+        Ok(f) => Ok(f),
+        Err(_) => {
+            let v1: PendingFileV1 = postcard::from_bytes(&raw)
+                .with_context(|| format!("decoding {}", path.display()))?;
+            Ok(PendingFile {
+                spenders: v1.spenders,
+                settled: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Every sidecar's state, merged: the copy from the LATEST-landed file
+/// wins per spender, and a spender any file says was settled is dropped.
+/// Exact when jobs land in sequence; when they race, a spender the latest
+/// job never loaded is picked up from the older file that has it.
+pub fn load_pending_union(dir: &Path, manifest: &Manifest) -> Result<PendingFile> {
+    let mut files = manifest.pending_files();
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    let mut by_hash: HashMap<[u8; 32], PendingSpender> = HashMap::new();
+    let mut settled: HashSet<[u8; 32]> = HashSet::new();
+    for (_, rel) in files {
+        let path = dir.join(&rel);
+        if !path.exists() {
+            continue;
+        }
+        let f = load_pending(&path)?;
+        settled.extend(f.settled.iter().copied());
+        for s in f.spenders {
+            by_hash.entry(s.tx_hash).or_insert(s);
+        }
+    }
+    Ok(PendingFile {
+        spenders: by_hash
+            .into_values()
+            .filter(|s| !settled.contains(&s.tx_hash))
+            .collect(),
+        settled: Vec::new(),
+    })
 }
 
 pub fn store_pending(path: &Path, p: &PendingFile) -> Result<u64> {
@@ -301,9 +354,13 @@ impl OpenFile {
 /// What the archive covers — the same statement the sqlite ledger used to
 /// make, derived from the manifest and the footers.
 pub struct Coverage {
-    /// Every stretch read, merged, ascending — THE coverage. The two
-    /// extremes below are views of it kept for the wire.
-    pub ranges: Vec<SlotRange>,
+    /// The SETTLED stretches, merged, ascending — the coverage a reader
+    /// can rely on. `walked_from`/`walked_to` below are the extremes of
+    /// these AND the tail together.
+    pub immutable_ranges: Vec<SlotRange>,
+    /// The live tail above the immutable tip, if the box is following it.
+    /// At most one, and replaced whole on every refresh.
+    pub volatile: Vec<policy_archive::manifest::Span>,
     pub walked_from: Option<u64>,
     pub walked_to: Option<u64>,
     pub first_slot: Option<u64>,
@@ -395,7 +452,13 @@ impl PolicyArchive {
             .flat_map(|f| f.archive.groups().iter().map(|g| g.txs))
             .sum();
         Coverage {
-            ranges: self.manifest.ranges(),
+            immutable_ranges: self.manifest.immutable_ranges(),
+            volatile: self
+                .manifest
+                .spans()
+                .into_iter()
+                .filter(|s| s.kind == RangeKind::Volatile)
+                .collect(),
             walked_from: self.manifest.walk_from(),
             walked_to: self.manifest.walk_to(),
             first_slot,
@@ -862,6 +925,7 @@ mod tests {
             floor: 5,
             windows: Vec::new(),
             kind: RangeKind::Immutable,
+            rolled_up: false,
             movements: None,
             corrections: None,
             segments: Vec::new(),
@@ -884,6 +948,87 @@ mod tests {
         assert_eq!(back.ranges(), vec![SlotRange::new(5, 10)]);
     }
 
+    /// A sidecar from before `settled` existed still loads — postcard is
+    /// not self-describing, so the old shape is tried second.
+    #[test]
+    fn an_old_pending_file_still_loads() {
+        let dir = std::env::temp_dir().join(format!("tl-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PENDING);
+        // The 1-byte file every complete archive on the box carries: an
+        // empty spender list, nothing after it.
+        std::fs::write(&path, [0u8]).unwrap();
+        let f = load_pending(&path).unwrap();
+        assert!(f.spenders.is_empty() && f.settled.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Jobs land out of order, so the carried state is the MERGE of every
+    /// sidecar: the latest-landed copy per spender, minus anything a job
+    /// reported settled.
+    #[test]
+    fn the_pending_union_takes_the_latest_copy_and_drops_the_settled() {
+        let dir = std::env::temp_dir().join(format!("tl-union-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spender = |h: u8, outrefs: usize| PendingSpender {
+            tx_hash: [h; 32],
+            slot: 1,
+            block_time: 2,
+            missing: vec![(b"A".to_vec(), 1)],
+            net_mint: vec![],
+            outrefs: (0..outrefs as u32).map(|i| ([h; 32], i)).collect(),
+        };
+        let mut m = Manifest::new("ab");
+        for (seq, unix) in [(0u32, 100u64), (1, 200)] {
+            let pass_dir = dir.join(PassEntry::dir_name(seq));
+            std::fs::create_dir_all(&pass_dir).unwrap();
+            m.passes.push(PassEntry {
+                seq,
+                dir: PassEntry::dir_name(seq),
+                ceiling: 10,
+                floor: 5,
+                windows: Vec::new(),
+                kind: RangeKind::Immutable,
+                rolled_up: false,
+                movements: None,
+                corrections: None,
+                segments: Vec::new(),
+                pending: 0,
+                found: 0,
+                written: 0,
+                backfilled: 0,
+                units: 0,
+                secs: 0.0,
+                written_unix: unix,
+            });
+        }
+        // Pass 0 (older): spenders 1 (three outrefs) and 2. Pass 1 (newer):
+        // spender 1 with one outref left, and it settled spender 2.
+        store_pending(
+            &dir.join("pass-0000").join(PENDING),
+            &PendingFile {
+                spenders: vec![spender(1, 3), spender(2, 2)],
+                settled: Vec::new(),
+            },
+        )
+        .unwrap();
+        store_pending(
+            &dir.join("pass-0001").join(PENDING),
+            &PendingFile {
+                spenders: vec![spender(1, 1), spender(3, 1)],
+                settled: vec![[2; 32]],
+            },
+        )
+        .unwrap();
+        let union = load_pending_union(&dir, &m).unwrap();
+        let mut hashes: Vec<u8> = union.spenders.iter().map(|s| s.tx_hash[0]).collect();
+        hashes.sort_unstable();
+        assert_eq!(hashes, vec![1, 3], "2 was settled; 1 and 3 remain");
+        let one = union.spenders.iter().find(|s| s.tx_hash[0] == 1).unwrap();
+        assert_eq!(one.outrefs.len(), 1, "the newer copy of spender 1 wins");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_pending_file_round_trips() {
         let p = PendingFile {
@@ -895,6 +1040,7 @@ mod tests {
                 net_mint: vec![],
                 outrefs: vec![([1; 32], 0), ([2; 32], 5)],
             }],
+            settled: vec![[9; 32]],
         };
         let bytes = postcard::to_stdvec(&p).unwrap();
         let back: PendingFile = postcard::from_bytes(&bytes).unwrap();

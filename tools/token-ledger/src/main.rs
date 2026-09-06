@@ -24,9 +24,11 @@ mod pools;
 mod publish;
 mod registry;
 mod reverse;
+mod scheduler;
 mod segments;
 mod serve;
 mod store;
+mod tip;
 mod walk;
 
 use std::path::PathBuf;

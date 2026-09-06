@@ -33,6 +33,18 @@
 //! compaction applies it once when the pass lands. A row lands readable and
 //! is corrected later rather than withheld until perfect.
 //!
+//! # Resolution does not depend on contiguity
+//!
+//! With a **tx-index** over the same snapshot ([`Hooks::resolver`]) a job
+//! looks each unbalanced spender's inputs up by hash and writes the source
+//! rows inside the job. Nothing then ties one range to the range below it,
+//! which is what lets several jobs walk one policy at once
+//! (`crate::scheduler`, and step four of
+//! `docs/design/POLICY_WALK_SCHEDULER.md`). What the index cannot answer —
+//! a chunk newer than its base, an era it does not decode — still falls to
+//! [`Pending`], and the descent's own resolution against the outputs it
+//! passes is the fast path that settles it.
+//!
 //! # What bounds it
 //!
 //! `Pending` grows with unresolved inputs and shrinks as they resolve, so it
@@ -52,6 +64,8 @@
 //! lose a resolution.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -115,6 +129,28 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub from_slot: Option<u64>,
 
+    /// The policy's first mint, when the caller knows it (the hosted
+    /// surface learns it from Koios). Recorded in the manifest; the bound
+    /// below which nothing will ever look. Distinct from `--to-slot`, which
+    /// is where THIS pass stops.
+    #[arg(long)]
+    pub first_mint: Option<u64>,
+
+    /// Read this window as a SEEK: a reader asked for it, so it is a
+    /// bounded window rather than a step of a descent. Only the summary
+    /// line differs now that every job resolves through the index.
+    #[arg(long)]
+    pub seek: bool,
+
+    /// A tx-index over the SAME snapshot (`tx-index build --index-dir`).
+    /// With it, a job resolves its spenders' inputs by hash inside the job
+    /// instead of waiting for the descent to reach them — which is what
+    /// makes ranges independent, and so what lets several jobs walk one
+    /// policy at once. The hosted surface passes the serve's index; this
+    /// is how the CLI runs the same walk.
+    #[arg(long)]
+    pub tx_index_dir: Option<PathBuf>,
+
     /// Leave the pass as its segments rather than compacting them into one
     /// file at the end. For measuring, and for a box that would rather hand
     /// compaction to something else.
@@ -142,6 +178,10 @@ pub struct Outcome {
     pub written: u64,
     /// Delta rows resolved onto transactions — this pass's, or earlier ones'.
     pub backfilled: u64,
+    /// Inputs the tx-index answered INSIDE this job, rather than leaving
+    /// for a descent that would have to reach them. What makes ranges
+    /// independent; the figure step four of the scheduler design gates on.
+    pub by_index: u64,
     /// Spenders still waiting on a source. The honest gap.
     pub unresolved: u64,
     /// Bytes of `pending.bin` — the carried state, measured.
@@ -172,21 +212,37 @@ pub fn run(args: ReverseArgs) -> Result<()> {
             );
         }
     };
-    // The CLI walks straight down: nobody is scrubbing, so no detours, and
-    // its inputs resolve the way they always have — as the descent reaches
-    // them.
+    // The CLI walks alone: no lock, its own sequence. It resolves through
+    // the index only when pointed at one — without it, the descent's own
+    // resolution is the whole story, as it always was.
+    let index = match &args.tx_index_dir {
+        Some(dir) => {
+            let index = tx_index::Index::open(dir, &args.data_dir.join("immutable"))
+                .with_context(|| format!("opening tx-index at {}", dir.display()))?;
+            let cov = index.coverage();
+            tracing::info!(
+                dir = %dir.display(),
+                base_entries = cov.base_entries,
+                newest_chunk = ?cov.newest_chunk,
+                "reverse: tx-index open — inputs resolve inside the job"
+            );
+            Some(index)
+        }
+        None => None,
+    };
     let out = run_reporting(
         args,
         Hooks {
             on,
-            take_detour: &|| None,
-            between_chunks: &|| {},
-            resolver: None,
+            resolver: index.as_ref(),
+            land_lock: None,
+            seq: None,
         },
     )?;
 
     println!("transactions written        = {}", out.written);
     println!("delta rows backfilled       = {}", out.backfilled);
+    println!("  of those, by the index    = {}", out.by_index);
     println!("sources still below floor   = {}", out.unresolved);
     println!("pending sidecar             = {} bytes", out.pending_bytes);
     if out.unresolved > 0 {
@@ -231,7 +287,12 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
     // not from the lowest slot ever read, which after a seek window may sit
     // far below with a hole above it. The hole is what the descent is for.
     // On a cold policy there is no stretch yet and the tip is the ceiling.
-    let covered = manifest.ranges();
+    //
+    // IMMUTABLE stretches only. The volatile tail's rows are replaced on
+    // every refresh, so a stretch it covers is not read: a top-up that
+    // walks up into it must still write its own rows, or the next refresh
+    // shrinks the tail out from under them.
+    let covered = manifest.immutable_ranges();
     let ceiling = args
         .from_slot
         .unwrap_or_else(|| covered.last().map_or(tip_slot, |top| top.from));
@@ -245,22 +306,18 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
     let first_mint = token
         .floor_slot
         .or(manifest.first_mint_slot)
-        .or(args.to_slot);
+        .or(args.first_mint);
     let floor = pass_floor(ceiling, args.to_slot, args.days, first_mint);
+    let mode = match args.seek {
+        true => Mode::Seek,
+        false => Mode::Descent,
+    };
 
     // The carried state: everything any earlier pass was still waiting
     // for, wherever its sidecar is. The UNION, because passes need not be
     // contiguous any more; a spender already settled is harmless to load
     // again, since its outref is spent once on chain and resolves once.
-    let mut prior = PendingFile::default();
-    for rel in manifest.pending_files() {
-        let path = dir.join(&rel);
-        if path.exists() {
-            prior
-                .spenders
-                .extend(archive::load_pending(&path)?.spenders);
-        }
-    }
+    let prior = archive::load_pending_union(&dir, &manifest)?;
     let mut pending = Pending::load(prior.spenders);
     let carried = pending.len();
 
@@ -274,6 +331,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
             floor: ceiling,
             written: 0,
             backfilled: 0,
+            by_index: 0,
             unresolved: carried as u64,
             pending_bytes: 0,
         });
@@ -292,8 +350,9 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
 
     // The pass directory, fresh. A pass that died mid-walk left segments
     // here that no manifest names; they are not this pass's and would only
-    // waste disk.
-    let seq = manifest.next_seq();
+    // waste disk. The sequence comes from the caller when jobs run
+    // concurrently on one policy — two jobs reading `next_seq` would agree.
+    let seq = hooks.seq.unwrap_or_else(|| manifest.next_seq());
     let pass_dir = dir.join(PassEntry::dir_name(seq));
     if pass_dir.exists() {
         std::fs::remove_dir_all(&pass_dir)?;
@@ -319,6 +378,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         floor,
         ceiling,
         covered,
+        mode,
         &mut writer,
         &mut pending,
         !args.no_sieve,
@@ -328,6 +388,8 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
 
     let out = land(Landing {
         dir: &dir,
+        seq,
+        lock: hooks.land_lock,
         manifest: &mut manifest,
         policy_hex: &policy_hex,
         first_mint,
@@ -344,6 +406,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         written = out.written,
         carried,
         backfilled = out.backfilled,
+        by_index = out.by_index,
         unresolved = out.unresolved,
         pending_bytes = out.pending_bytes,
         secs = format!("{:.1}", started.elapsed().as_secs_f64()),
@@ -378,6 +441,11 @@ pub fn pass_floor(
 /// Everything a finished walk hands to the landing.
 struct Landing<'a> {
     dir: &'a Path,
+    /// The pass's sequence — the directory its files are already in.
+    seq: u32,
+    /// Held across the manifest read-modify-write when jobs land
+    /// concurrently on one policy. `None` for a lone CLI pass.
+    lock: Option<&'a std::sync::Mutex<()>>,
     manifest: &'a mut Manifest,
     policy_hex: &'a str,
     first_mint: Option<u64>,
@@ -398,6 +466,8 @@ struct Landing<'a> {
 fn land(l: Landing<'_>) -> Result<Outcome> {
     let Landing {
         dir,
+        seq,
+        lock,
         manifest,
         policy_hex,
         first_mint,
@@ -408,7 +478,13 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         compact,
         secs,
     } = l;
-    let seq = manifest.next_seq();
+    // UNDER THE POLICY'S LOCK from here: another job may have landed since
+    // this one loaded the manifest, so what is on disk is the truth and
+    // this pass is appended to it.
+    let _held = lock.map(|l| l.lock().expect("landing lock"));
+    if let Some(fresh) = archive::load_manifest(dir)? {
+        *manifest = fresh;
+    }
     let pass_dir = dir.join(PassEntry::dir_name(seq));
     std::fs::create_dir_all(&pass_dir)?;
     // What the ledger will cover once this pass is in: for the file
@@ -465,8 +541,9 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         dir: PassEntry::dir_name(seq),
         ceiling,
         floor: walked.floor,
-        windows: walked.windows,
+        windows: Vec::new(),
         kind: RangeKind::Immutable,
+        rolled_up: false,
         movements,
         corrections,
         segments: kept,
@@ -488,10 +565,14 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     // policy. Its own manifest write, after this one, so a failure here
     // leaves a landed pass rather than a lost one.
     if compact {
+        // IMMUTABLE passes only. The volatile tail is one file a reader
+        // always opens and a rollup can never fold, so counting it toward
+        // the threshold just fires the rollup a pass early — it does not
+        // reduce anything.
         let loose = manifest
             .passes
             .iter()
-            .filter(|p| !manifest.rolled_up_through.is_some_and(|t| p.seq <= t))
+            .filter(|p| !p.rolled_up && p.kind == RangeKind::Immutable)
             .count();
         if loose >= segments::ROLLUP_AFTER_PASSES {
             let t = Instant::now();
@@ -508,12 +589,13 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         floor: walked.floor,
         written,
         backfilled: walked.backfilled as u64,
+        by_index: walked.by_index,
         unresolved: pending_file.spenders.len() as u64,
         pending_bytes,
     })
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -544,22 +626,24 @@ pub fn unix_date(unix: u64) -> String {
 
 // ─── one transaction, as found ───────────────────────────────────────────────
 
-/// One transaction as the walk first meets it.
-struct PassTx {
-    hash: Hash<32>,
-    slot: u64,
-    block_time: u64,
+/// One transaction as the walk first meets it. Shared with the volatile
+/// tail's forward follower ([`crate::tip`]) so there is ONE definition of
+/// what rows a transaction produces.
+pub struct PassTx {
+    pub hash: Hash<32>,
+    pub slot: u64,
+    pub block_time: u64,
     /// Per unit: 0 / +mint / −burn.
-    net_mint: Vec<(Vec<u8>, i64)>,
+    pub net_mint: Vec<(Vec<u8>, i64)>,
     /// `(unit, address, amount)` — its outputs.
-    deltas: Vec<(Vec<u8>, String, i64)>,
+    pub deltas: Vec<(Vec<u8>, String, i64)>,
 }
 
 impl PassTx {
     /// This transaction's rows as first found — its outputs, plus a
     /// placeholder for a minted-or-burned unit that reached nobody.
     /// Resolutions arrive later as further signed rows and fold on top.
-    fn rows(&self) -> Vec<Movement> {
+    pub fn rows(&self) -> Vec<Movement> {
         let hash = self.hash.as_ref().to_vec();
         let mut rows: Vec<Movement> = self
             .deltas
@@ -607,6 +691,10 @@ struct Spender {
     net_mint: Vec<(Vec<u8>, i64)>,
     outrefs: Vec<OutRef>,
     retired: bool,
+    /// Loaded from an earlier sidecar rather than found by this job. When
+    /// it settles here, the sidecar says so, or the next job to merge the
+    /// older file would carry it forever.
+    carried: bool,
 }
 
 impl Spender {
@@ -619,6 +707,22 @@ impl Spender {
 struct Resolution {
     spender: Hash<32>,
     row: Movement,
+}
+
+/// What an out-of-band lookup of an outref can say about it — the three
+/// answers [`Pending::settle_with`] acts on differently.
+enum Lookup {
+    /// The output existed and carried watched units: a source, resolved.
+    Held {
+        units: Vec<(Vec<u8>, i64)>,
+        address: String,
+    },
+    /// The output existed and carried none of them, so it is not the source
+    /// of anything missing. Forgotten, not carried.
+    NotOurs,
+    /// No answer — a chunk the index does not cover, an era it does not
+    /// decode, a read that failed. Left pending, exactly as with no index.
+    Unknown,
 }
 
 /// Outrefs spent by transactions already found, whose creating outputs are
@@ -654,6 +758,7 @@ impl Pending {
                 net_mint: s.net_mint,
                 outrefs,
                 retired: false,
+                carried: true,
             });
         }
         p
@@ -676,6 +781,7 @@ impl Pending {
             net_mint: tx.net_mint.clone(),
             outrefs: inputs.to_vec(),
             retired: false,
+            carried: false,
         });
     }
 
@@ -739,6 +845,105 @@ impl Pending {
         out
     }
 
+    /// Drop an outref nobody can be waiting on any more: the index answered
+    /// it and the output carried none of the watched units, so it is not the
+    /// source of anything missing. Without this the spender carries a dead
+    /// ADA input in its sidecar for ever.
+    fn forget(&mut self, oref: &OutRef) {
+        for idx in self.wants.remove(oref).unwrap_or_default() {
+            self.spenders[idx].outrefs.retain(|o| o != oref);
+        }
+    }
+
+    /// Settle what the walk itself did not meet, through the tx-index.
+    ///
+    /// **Run once, at the END of a job.** A source inside the job's own
+    /// range costs nothing to resolve because the descent walks past it and
+    /// [`Pending::resolve`] fires for free; only sources BELOW the range are
+    /// worth a lookup. Measured on a 60-day ClayNation window: resolving
+    /// eagerly, per transaction, cost 617 µs per input cold — a quarter of
+    /// an hour added to a full walk — against a few hundred lookups per job
+    /// deferred, for the same archive.
+    ///
+    /// Only this job's OWN spenders. A carried one — loaded from an earlier
+    /// job's sidecar — may be waiting on a source that another job running
+    /// right now will walk past, and two jobs both writing that correction
+    /// would double it under the sum rule. Carried spenders settle the way
+    /// they always have: the descent reaches their source.
+    ///
+    /// What the index cannot answer (a chunk newer than its base, an era it
+    /// does not decode) stays pending, exactly as without an index.
+    fn settle_through_index(
+        &mut self,
+        index: &tx_index::Index,
+        policy_hex: &str,
+        watched: &Watched,
+        counted: &mut u64,
+    ) -> Vec<Resolution> {
+        self.settle_with(|oref| {
+            let Some(hash) = oref.0.as_ref().first_chunk::<32>() else {
+                return Lookup::Unknown;
+            };
+            match index.resolve(hash, oref.1) {
+                Ok(tx_index::Resolution::Found { output, .. }) => {
+                    *counted += 1;
+                    let units: Vec<(Vec<u8>, i64)> = output
+                        .assets
+                        .iter()
+                        .filter(|a| a.policy == policy_hex)
+                        .filter_map(|a| {
+                            let name = hex::decode(&a.name).ok()?;
+                            watched
+                                .matches(&name)
+                                .then_some((name, i64::try_from(a.quantity).unwrap_or(i64::MAX)))
+                        })
+                        .collect();
+                    match units.is_empty() {
+                        true => Lookup::NotOurs,
+                        false => Lookup::Held {
+                            units,
+                            address: output.address.clone(),
+                        },
+                    }
+                }
+                // Not indexed: the descent will meet it, or a lower job will.
+                Ok(_) => Lookup::Unknown,
+                Err(e) => {
+                    tracing::debug!(error = %e, "reverse: index lookup failed; leaving it pending");
+                    Lookup::Unknown
+                }
+            }
+        })
+    }
+
+    /// [`Pending::settle_through_index`] with the lookup as an argument, so
+    /// the rule that decides WHICH spenders are offered to it can be tested
+    /// without a 123-million-entry index on disk.
+    fn settle_with(&mut self, mut lookup: impl FnMut(&OutRef) -> Lookup) -> Vec<Resolution> {
+        // A snapshot: `resolve` removes outrefs as it goes, and retiring a
+        // settled spender takes its siblings' wants with it.
+        let open: Vec<OutRef> = self
+            .spenders
+            .iter()
+            .filter(|s| !s.carried && !s.retired)
+            .flat_map(|s| s.outrefs.clone())
+            .collect();
+        let mut out = Vec::new();
+        for oref in open {
+            if !self.wants.contains_key(&oref) {
+                continue;
+            }
+            match lookup(&oref) {
+                Lookup::Held { units, address } => {
+                    out.extend(self.resolve(&oref, &units, &address))
+                }
+                Lookup::NotOurs => self.forget(&oref),
+                Lookup::Unknown => {}
+            }
+        }
+        out
+    }
+
     /// Spenders still waiting.
     pub fn len(&self) -> usize {
         self.spenders
@@ -752,7 +957,8 @@ impl Pending {
         self.len() == 0
     }
 
-    /// The carried state, as the next pass will load it.
+    /// The carried state, as the next pass will load it — plus which of the
+    /// spenders it loaded are settled now.
     fn to_file(&self) -> PendingFile {
         PendingFile {
             spenders: self
@@ -771,6 +977,12 @@ impl Pending {
                         .map(|(h, i)| (*h.as_ref().first_chunk::<32>().expect("32-byte hash"), *i))
                         .collect(),
                 })
+                .collect(),
+            settled: self
+                .spenders
+                .iter()
+                .filter(|s| s.carried && (s.retired || s.outrefs.is_empty()))
+                .map(|s| *s.hash.as_ref().first_chunk::<32>().expect("32-byte hash"))
                 .collect(),
         }
     }
@@ -803,11 +1015,6 @@ pub struct Progress<'a> {
     /// They hold everything buffered so far INCLUDING `rows`, so a mirror
     /// clears its buffer on this rather than appending.
     pub flushed: &'a [FileEntry],
-    /// A DETOUR produced this chunk: the seek it is reaching for. `floor`
-    /// is still the descent's.
-    pub reaching: Option<u64>,
-    /// Windows detours have read so far, `(from, to)`, in the order asked.
-    pub detours: &'a [(u64, u64)],
 }
 
 impl Progress<'_> {
@@ -827,38 +1034,32 @@ pub type OnProgress<'x> = &'x dyn Fn(Progress<'_>);
 
 /// What the hosted surface hooks into a pass. A CLI run reports and
 /// nothing else.
+///
+/// A pass is ONE JOB over one range now — the scheduler decides which
+/// ranges, in what order, on which thread (`crate::scheduler`). Nothing
+/// here interrupts a pass or nests one inside another.
 pub struct Hooks<'a> {
     pub on: OnProgress<'a>,
-    /// The newest seek below the descent's floor, taken once. Asked after
-    /// every chunk; a `Some` sends the pass on a DETOUR — a bounded window
-    /// ending at that slot, read next, ahead of the descent — so a reader
-    /// scrubbing to 2024 on a policy whose walk is at 2025 sees rows in
-    /// seconds rather than when the descent gets there.
-    pub take_detour: &'a dyn Fn() -> Option<u64>,
-    /// Called after every descent chunk, before the detour check. The
-    /// hosted surface uses it to give a policy QUEUED behind this pass a
-    /// short pass of its own — its newest days — so its page shows rows
-    /// while it waits, rather than skeletons for half an hour.
-    pub between_chunks: &'a dyn Fn(),
-    /// tx hash → body over the same snapshot. With it a detour resolves its
-    /// spenders' inputs on the spot and its rows arrive attributed; without
-    /// it they arrive as arrivals and the descent corrects them later.
+    /// tx hash → body over the same snapshot. With it, EVERY job resolves
+    /// its spenders' inputs inside the job, so no job depends on the range
+    /// below it having been read; without it, a spender waits in the
+    /// pending set for a descent to reach its source.
     pub resolver: Option<&'a tx_index::Index>,
+    /// Held across the manifest read-modify-write at landing, when jobs on
+    /// one policy run concurrently.
+    pub land_lock: Option<&'a std::sync::Mutex<()>>,
+    /// The pass's sequence, allocated by the caller for the same reason.
+    /// `None` reads the manifest's next.
+    pub seq: Option<u32>,
 }
-
-/// How much a detour reads: at most this many chunks below the seek, and
-/// it stops early once it has a page of transactions. Chunks are ~6 h of
-/// chain, so the cap is about ten days; a page is the feed's page size.
-const DETOUR_MAX_CHUNKS: u64 = 40;
-const DETOUR_PAGE_TXS: u64 = 500;
 
 /// What the chunk walk itself produced, before anything lands.
 struct Walked {
     floor: u64,
     written: u64,
     backfilled: usize,
-    /// Stretches read outside `[floor, ceiling)` — the detours' windows.
-    windows: Vec<SlotRange>,
+    /// Inputs the index answered inside the job — see [`Outcome::by_index`].
+    by_index: u64,
 }
 
 /// Chunk numbers to visit, highest first, covering `[floor, ceiling)`.
@@ -878,6 +1079,40 @@ pub fn chunks_descending(chunks: &[u64], floor: u64, ceiling: u64) -> Vec<u64> {
     wanted
 }
 
+fn chunk_path(immutable: &Path, chunk: u64) -> PathBuf {
+    immutable.join(format!("{chunk:05}.chunk"))
+}
+
+/// Drop one chunk's pages from the page cache, once this job is finished
+/// with it.
+///
+/// cardano-infra runs market-ledger, two mitos nodes and a tx-index serve
+/// against the same 216 GB snapshot and the same 31 GB of RAM. A full walk
+/// streams every chunk through the sieve gate and reads almost none of them
+/// twice, so without this it evicts every other service's working set on the
+/// way past — the co-tenancy condition in
+/// `docs/design/POLICY_WALK_SCHEDULER.md`.
+///
+/// Called at the END of a chunk, not at the end of the sieve read: the
+/// blocks are decoded and the index resolutions taken after the gate, and a
+/// spender's source is very often an output in the same chunk.
+///
+/// Best effort. `POSIX_FADV_DONTNEED` drops clean pages only, which is every
+/// page of a file nothing writes; a failure costs cache, never correctness.
+/// Linux only — a dev Mac has no `posix_fadvise` and nothing to protect.
+fn drop_chunk_pages(immutable: &Path, chunk: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(f) = File::open(chunk_path(immutable, chunk)) {
+            // SAFETY: a live fd, and the advice takes no buffer.
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (immutable, chunk);
+}
+
 /// One chunk's blocks, newest first, gated at the chunk AND the block.
 ///
 /// The immutable DB only reads FORWARD, so "reverse" is chunk-descending with
@@ -893,8 +1128,11 @@ fn chunk_blocks_newest_first(
     let end = (chunk + 1) * CHUNK_SLOTS;
 
     if let Some(n) = needles {
-        let path = immutable.join(format!("{chunk:05}.chunk"));
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let path = chunk_path(immutable, chunk);
+        let mut file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let mut bytes = Vec::with_capacity(file.metadata()?.len() as usize);
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", path.display()))?;
         if !n.hit(&bytes) {
             return Ok(Vec::new());
         }
@@ -926,15 +1164,15 @@ fn chunk_blocks_newest_first(
     Ok(out)
 }
 
-/// Which walk a chunk is read for.
+/// Which walk a range is read for. Both resolve their inputs through the
+/// index and both scan an already-read stretch for resolution only — the
+/// difference is who asked and how the job is reported, not what it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// The descent: contiguous, newest first, the thing that makes the
-    /// archive complete.
+    /// A step of a descent: the next stretch below what a policy has read.
     Descent,
-    /// A window ahead of the descent, for a seek. Its transactions are
-    /// remembered so the descent passes them by when it gets there.
-    Detour,
+    /// A bounded window a reader asked for, out of the descent's order.
+    Seek,
 }
 
 /// What one chunk produced.
@@ -945,8 +1183,6 @@ struct ChunkOut {
     updated: Vec<Hash<32>>,
     /// Lowest block slot read, if any block was in range.
     lowest: Option<u64>,
-    /// Transactions found.
-    found: u64,
 }
 
 /// The per-chunk machinery, shared by the descent and its detours.
@@ -967,19 +1203,36 @@ struct Scan<'a> {
     covered: Vec<SlotRange>,
     written: u64,
     backfilled: usize,
-    /// Inputs a detour resolved through the index rather than the descent.
+    /// Inputs the index answered inside this job rather than the descent.
     resolved_by_index: u64,
 }
 
 impl Scan<'_> {
-    fn chunk(&mut self, chunk: u64, lo: u64, hi: u64, mode: Mode) -> Result<ChunkOut> {
+    /// One chunk of the immutable directory.
+    fn chunk(&mut self, chunk: u64, lo: u64, hi: u64) -> Result<ChunkOut> {
         let blocks = chunk_blocks_newest_first(self.immutable, chunk, self.needles)?;
+        let out = self.blocks(blocks, lo, hi)?;
+        // Done with this chunk: hand its pages back rather than evict the
+        // other services on the box.
+        drop_chunk_pages(self.immutable, chunk);
+        Ok(out)
+    }
+
+    /// Blocks ALREADY IN HAND, newest first — the seam the volatile tail
+    /// comes in through ([`crate::tip`]). Blocks arrive gated: the chunk
+    /// path gates in `chunk_blocks_newest_first`, the spool path gates once
+    /// for every watched policy at load.
+    ///
+    /// This is the ONE definition of what rows a transaction produces. The
+    /// tail used to have its own, forward, with its own outref buffer — two
+    /// implementations of the same derivation, which is the drift the
+    /// manifest was moved into the crate to avoid.
+    fn blocks(&mut self, blocks: Vec<(u64, Vec<u8>)>, lo: u64, hi: u64) -> Result<ChunkOut> {
         // Resolutions found in this chunk. A source and its spender can sit
         // in the SAME chunk; as rows they simply sum, so order is free.
         let mut resolved: Vec<Resolution> = Vec::new();
         let mut rows: Vec<Movement> = Vec::new();
         let mut lowest: Option<u64> = None;
-        let mut found = 0u64;
 
         for (slot, raw) in blocks {
             if slot < lo || slot >= hi {
@@ -1065,31 +1318,17 @@ impl Scan<'_> {
                     deltas,
                 };
                 if !missing.is_empty() {
+                    // Interest, not a lookup: the descent is about to walk
+                    // past most of these sources for nothing. Whatever it
+                    // does not meet is settled through the index at the end
+                    // of the job — see [`Pending::settle_through_index`].
                     let inputs: Vec<OutRef> = dtx.inputs.iter().map(|i| i.oref).collect();
-                    // A detour with an index resolves NOW: its sources are
-                    // below a floor the descent may not reach for minutes.
-                    let (missing, inputs) = match (mode, self.resolver) {
-                        (Mode::Detour, Some(index)) => Self::resolve_now(
-                            index,
-                            &self.policy_hex,
-                            self.watched,
-                            &row,
-                            missing,
-                            &inputs,
-                            &mut resolved,
-                            &mut self.resolved_by_index,
-                        ),
-                        _ => (missing, inputs),
-                    };
-                    if !missing.is_empty() {
-                        self.pending.want(&row, missing, &inputs);
-                    }
+                    self.pending.want(&row, missing, &inputs);
                 }
                 let own = row.rows();
                 rows.extend(own.iter().cloned());
                 self.writer.push_own(own);
                 self.written += 1;
-                found += 1;
             }
         }
 
@@ -1109,89 +1348,96 @@ impl Scan<'_> {
             rows,
             updated,
             lowest,
-            found,
         })
     }
 
-    /// Resolve a spender's inputs through the index: each outref that the
-    /// index knows and that carried a watched unit becomes a signed row
-    /// here and now. What is left — units still missing, inputs the index
-    /// does not hold — goes to the pending set for the descent, exactly as
-    /// it would have without an index. Stops looking once the units balance:
-    /// the remaining inputs carried ADA (the retirement rule).
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_now(
-        index: &tx_index::Index,
-        policy_hex: &str,
-        watched: &Watched,
-        tx: &PassTx,
-        mut missing: HashMap<Vec<u8>, i64>,
-        inputs: &[OutRef],
-        resolved: &mut Vec<Resolution>,
-        counted: &mut u64,
-    ) -> (HashMap<Vec<u8>, i64>, Vec<OutRef>) {
-        let mut leftover = Vec::new();
-        for oref in inputs {
-            if missing.values().all(|m| *m <= 0) {
-                break;
+    /// After the last chunk: settle what the walk did not meet, through the
+    /// index, and write those resolutions as correction rows like any other.
+    /// The rows come back so the live tier sees them before the job lands.
+    ///
+    /// This is what makes a range independent of the range below it, and so
+    /// what lets several jobs walk one policy at once. Nothing without an
+    /// index: the spenders stay in the sidecar for a lower job to meet.
+    fn settle(&mut self) -> (Vec<Movement>, Vec<Hash<32>>) {
+        let Some(index) = self.resolver else {
+            return (Vec::new(), Vec::new());
+        };
+        let settled = self.pending.settle_through_index(
+            index,
+            &self.policy_hex,
+            self.watched,
+            &mut self.resolved_by_index,
+        );
+        let mut rows = Vec::with_capacity(settled.len());
+        let mut updated: Vec<Hash<32>> = Vec::new();
+        for r in settled {
+            self.backfilled += 1;
+            if !updated.contains(&r.spender) {
+                updated.push(r.spender);
             }
-            let Some(hash) = oref.0.as_ref().first_chunk::<32>() else {
-                leftover.push(*oref);
-                continue;
-            };
-            match index.resolve(hash, oref.1) {
-                Ok(tx_index::Resolution::Found { output, .. }) => {
-                    let units: Vec<(Vec<u8>, i64)> = output
-                        .assets
-                        .iter()
-                        .filter(|a| a.policy == policy_hex)
-                        .filter_map(|a| {
-                            let name = hex::decode(&a.name).ok()?;
-                            watched
-                                .matches(&name)
-                                .then_some((name, i64::try_from(a.quantity).unwrap_or(i64::MAX)))
-                        })
-                        .collect();
-                    for (unit, qty) in &units {
-                        if let Some(m) = missing.get_mut(unit) {
-                            *m -= qty;
-                        }
-                        let net_mint = tx
-                            .net_mint
-                            .iter()
-                            .find(|(n, _)| n == unit)
-                            .map_or(0, |(_, a)| *a);
-                        resolved.push(Resolution {
-                            spender: tx.hash,
-                            row: Movement {
-                                slot: tx.slot,
-                                block_time: tx.block_time,
-                                tx_hash: tx.hash.as_ref().to_vec(),
-                                unit_name: unit.clone(),
-                                address: output.address.clone(),
-                                amount: -qty,
-                                net_mint,
-                            },
-                        });
-                    }
-                    *counted += 1;
-                }
-                // Not indexed (a chunk newer than the base, an unknown era):
-                // the descent will meet it.
-                Ok(_) => leftover.push(*oref),
-                Err(e) => {
-                    tracing::debug!(error = %e, "detour: index lookup failed; leaving to the descent");
-                    leftover.push(*oref);
-                }
-            }
+            rows.push(r.row.clone());
+            self.writer.push_corr(r.row);
         }
-        missing.retain(|_, m| *m > 0);
-        (missing, leftover)
+        (rows, updated)
     }
 }
 
+/// Read blocks ALREADY IN HAND as one range — the volatile tail's entry
+/// point ([`crate::tip`]).
+///
+/// The stretch above the immutable tip is not in any chunk file, so its
+/// blocks come from wallet-sieve's chain-tail spool. Everything after that
+/// is identical to a descent over chunks: the same [`Scan`], the same
+/// `(tx, unit, party)` rows, the same [`Pending`] for sources inside the
+/// range, and the same end-of-range settle through the index for sources
+/// below it — which here means below the immutable tip, exactly where the
+/// index's coverage ends.
+///
+/// `blocks` must be NEWEST FIRST and already gated.
+pub fn scan_blocks(
+    blocks: Vec<(u64, Vec<u8>)>,
+    policy: &[u8],
+    watched: &Watched,
+    floor: u64,
+    ceiling: u64,
+    writer: &mut SegmentWriter,
+    resolver: Option<&tx_index::Index>,
+) -> Result<Outcome> {
+    // The tail carries NO state between refreshes: it is re-derived whole
+    // every time, because it is replaced whole every time. So a fresh
+    // pending set, and whatever it cannot settle is an honest gap rather
+    // than something to hand to the next pass.
+    let mut pending = Pending::default();
+    let mut scan = Scan {
+        immutable: Path::new(""),
+        policy,
+        policy_hex: hex::encode(policy),
+        watched,
+        needles: None,
+        writer,
+        pending: &mut pending,
+        resolver,
+        covered: Vec::new(),
+        written: 0,
+        backfilled: 0,
+        resolved_by_index: 0,
+    };
+    // The rows went to the writer; nothing here needs them a second time.
+    scan.blocks(blocks, floor, ceiling)?;
+    scan.settle();
+    Ok(Outcome {
+        floor,
+        written: scan.written,
+        // `settle` counts its own resolutions into `backfilled` too.
+        backfilled: scan.backfilled as u64,
+        by_index: scan.resolved_by_index,
+        unresolved: scan.pending.len() as u64,
+        pending_bytes: 0,
+    })
+}
+
 /// Walk `[floor, ceiling)` backward into segments, resolving sources as they
-/// come into view — and, between chunks, any DETOUR a seek asks for.
+/// come into view.
 #[allow(clippy::too_many_arguments)]
 fn pass(
     immutable: &Path,
@@ -1201,6 +1447,7 @@ fn pass(
     floor: u64,
     ceiling: u64,
     covered: Vec<SlotRange>,
+    mode: Mode,
     writer: &mut SegmentWriter,
     pending: &mut Pending,
     sieve: bool,
@@ -1228,11 +1475,10 @@ fn pass(
     let mut lowest = ceiling;
     let ordered = chunks_descending(chunks, floor, ceiling);
     let chunks_total = ordered.len() as u64;
-    let mut detours: Vec<(u64, u64)> = Vec::new();
 
     for (done, chunk) in ordered.into_iter().enumerate() {
         let chunks_done = done as u64 + 1;
-        let out = scan.chunk(chunk, floor, ceiling, Mode::Descent)?;
+        let out = scan.chunk(chunk, floor, ceiling)?;
         if let Some(l) = out.lowest {
             lowest = lowest.min(l);
         }
@@ -1248,51 +1494,35 @@ fn pass(
             pending: scan.pending.len(),
             rows: &out.rows,
             flushed: &flushed,
-            reaching: None,
-            detours: &detours,
         });
-        (hooks.between_chunks)();
-
-        // A seek below the floor? Read that window next. Only below what
-        // the descent has reached and above where it is heading; and not
-        // where a detour has already been.
-        if let Some(at) = (hooks.take_detour)()
-            && at < lowest
-            && at > floor
-            // `to` INCLUSIVE: a window read up to `at` answers a seek AT
-            // `at` — the seek asks for rows below it — and it is exactly
-            // the slot the next poll asks for again.
-            && !detours.iter().any(|(from, to)| at > *from && at <= *to)
-        {
-            let window = detour(&mut scan, chunks, at, floor, |progress| {
-                (hooks.on)(Progress {
-                    floor: lowest,
-                    target_floor: floor,
-                    ceiling,
-                    chunks_done,
-                    chunks_total,
-                    written: progress.written,
-                    updated: progress.updated,
-                    pending: progress.pending,
-                    rows: progress.rows,
-                    flushed: progress.flushed,
-                    reaching: Some(at),
-                    detours: &detours,
-                })
-            })?;
-            tracing::info!(
-                at,
-                from = window.0,
-                to = window.1,
-                by_index = scan.resolved_by_index,
-                "reverse: detour read"
-            );
-            detours.push(window);
-            // The descent, when it gets there, resolves against this
-            // stretch and writes nothing.
-            scan.covered.push(SlotRange::new(window.0, window.1));
-        }
     }
+    // THE LEFTOVERS, once and at the end: everything the descent walked
+    // past has already resolved itself for nothing.
+    let waiting_before = scan.pending.len();
+    let (settled, updated) = scan.settle();
+    let flushed = scan.writer.end_chunk()?;
+    (hooks.on)(Progress {
+        floor: lowest,
+        target_floor: floor,
+        ceiling,
+        chunks_done: chunks_total,
+        chunks_total,
+        written: scan.written,
+        updated: &updated,
+        pending: scan.pending.len(),
+        rows: &settled,
+        flushed: &flushed,
+    });
+    tracing::info!(
+        floor,
+        ceiling,
+        ?mode,
+        waiting_before,
+        by_index = scan.resolved_by_index,
+        still_waiting = scan.pending.len(),
+        written = scan.written,
+        "reverse: range read"
+    );
 
     // Coverage is where the pass STOPPED LOOKING, not the deepest row it
     // found: a quiet stretch below the last hit was read and held nothing,
@@ -1302,54 +1532,8 @@ fn pass(
         floor: if chunks_total == 0 { ceiling } else { floor },
         written: scan.written,
         backfilled: scan.backfilled,
-        windows: detours
-            .iter()
-            .map(|(from, to)| SlotRange::new(*from, *to))
-            .collect(),
+        by_index: scan.resolved_by_index,
     })
-}
-
-/// What a detour reports per chunk, before the descent's frame is put
-/// around it.
-struct DetourProgress<'a> {
-    written: u64,
-    updated: &'a [Hash<32>],
-    pending: usize,
-    rows: &'a [Movement],
-    flushed: &'a [FileEntry],
-}
-
-/// Read the window ending at `at`: at most [`DETOUR_MAX_CHUNKS`] chunks
-/// down, stopping early at a page of transactions. Returns the stretch
-/// actually read, `(from, to)`.
-fn detour(
-    scan: &mut Scan<'_>,
-    chunks: &[u64],
-    at: u64,
-    floor: u64,
-    on: impl Fn(DetourProgress<'_>),
-) -> Result<(u64, u64)> {
-    let lo = floor.max(at.saturating_sub(DETOUR_MAX_CHUNKS * CHUNK_SLOTS));
-    let mut found = 0u64;
-    let mut reached = at;
-    for chunk in chunks_descending(chunks, lo, at) {
-        let out = scan.chunk(chunk, lo, at, Mode::Detour)?;
-        found += out.found;
-        // Read down to the bottom of this chunk, or the window's floor.
-        reached = reached.min((chunk * CHUNK_SLOTS).max(lo));
-        let flushed = scan.writer.end_chunk()?;
-        on(DetourProgress {
-            written: scan.written,
-            updated: &out.updated,
-            pending: scan.pending.len(),
-            rows: &out.rows,
-            flushed: &flushed,
-        });
-        if found >= DETOUR_PAGE_TXS {
-            break;
-        }
-    }
-    Ok((reached, at))
 }
 
 #[cfg(test)]
@@ -1428,6 +1612,104 @@ mod tests {
         assert_eq!(file.spenders[0].outrefs, vec![([8; 32], 0)]);
     }
 
+    /// A CARRIED spender that settles is named in the sidecar, so a later
+    /// job merging an older file — jobs land out of order in the pool —
+    /// drops it instead of carrying it forever. A spender found and
+    /// settled in the same job is nobody's business.
+    #[test]
+    fn a_carried_spender_that_settles_is_reported_settled() {
+        let mut first = Pending::default();
+        first.want(&tx(1, vec![("A", "bob", 1)]), missing("A", 1), &[(h(9), 0)]);
+        first.want(&tx(2, vec![("A", "cat", 1)]), missing("A", 1), &[(h(8), 0)]);
+        let file = first.to_file();
+        assert!(file.settled.is_empty(), "nothing was carried into this job");
+
+        let mut next = Pending::load(file.spenders);
+        next.resolve(&(h(9), 0), &[(b"A".to_vec(), 1)], "alice");
+        next.want(&tx(3, vec![("A", "dan", 1)]), missing("A", 1), &[(h(7), 0)]);
+        next.resolve(&(h(7), 0), &[(b"A".to_vec(), 1)], "erin");
+        let file = next.to_file();
+        assert_eq!(
+            file.settled,
+            vec![[1u8; 32]],
+            "the carried one, settled here"
+        );
+        assert_eq!(file.spenders.len(), 1, "tx 2 is still waiting");
+        assert_eq!(file.spenders[0].tx_hash, [2u8; 32]);
+    }
+
+    /// THE END-OF-JOB SETTLE, and the rule that keeps it from doubling
+    /// rows: only spenders this job FOUND go to the index. A carried one
+    /// may be waiting on a source that another job running right now walks
+    /// past, and both writing that correction would double it under the
+    /// sum rule.
+    #[test]
+    fn only_this_jobs_own_spenders_are_settled_through_the_index() {
+        let mut p = Pending::default();
+        // Carried from an earlier job's sidecar.
+        p.spenders.push(Spender {
+            hash: h(1),
+            slot: 900,
+            block_time: 1,
+            missing: missing("A", 1),
+            net_mint: Vec::new(),
+            outrefs: vec![(h(9), 0)],
+            retired: false,
+            carried: true,
+        });
+        p.wants.insert((h(9), 0), vec![0]);
+        // Found here.
+        p.want(&tx(2, vec![("A", "bob", 1)]), missing("A", 1), &[(h(8), 0)]);
+
+        let mut asked: Vec<OutRef> = Vec::new();
+        let got = p.settle_with(|oref| {
+            asked.push(*oref);
+            Lookup::Held {
+                units: vec![(b"A".to_vec(), 1)],
+                address: "alice".into(),
+            }
+        });
+        assert_eq!(asked, vec![(h(8), 0)], "the carried spender is not offered");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].spender, h(2));
+        assert_eq!((got[0].row.amount, got[0].row.slot), (-1, 1_002));
+        assert_eq!(p.len(), 1, "the carried one is still waiting");
+    }
+
+    /// An input the index knows and that carried none of our units is not
+    /// the source of anything: FORGET it, or the spender hauls a dead ADA
+    /// input through every sidecar from here down.
+    #[test]
+    fn an_input_that_carried_none_of_our_units_is_forgotten() {
+        let mut p = Pending::default();
+        p.want(
+            &tx(1, vec![("A", "bob", 1)]),
+            missing("A", 1),
+            &[(h(9), 0), (h(8), 0)],
+        );
+        let got = p.settle_with(|oref| match *oref == (h(9), 0) {
+            true => Lookup::NotOurs,
+            false => Lookup::Held {
+                units: vec![(b"A".to_vec(), 1)],
+                address: "alice".into(),
+            },
+        });
+        assert_eq!(got.len(), 1, "only the real source produced a row");
+        assert!(p.is_empty());
+        assert!(p.to_file().spenders.is_empty(), "nothing carried onward");
+    }
+
+    /// What the index cannot answer stays pending, exactly as with no index
+    /// at all — the descent, or a lower job, will meet it.
+    #[test]
+    fn an_input_the_index_cannot_answer_stays_pending() {
+        let mut p = Pending::default();
+        p.want(&tx(1, vec![("A", "bob", 1)]), missing("A", 1), &[(h(9), 0)]);
+        assert!(p.settle_with(|_| Lookup::Unknown).is_empty());
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.to_file().spenders[0].outrefs, vec![([9; 32], 0)]);
+    }
+
     /// The carried state round-trips: what the next pass loads resolves
     /// exactly what this one was waiting for.
     #[test]
@@ -1495,6 +1777,8 @@ mod tests {
         pending.want(&five, missing("A", 1), &[(h(9), 0), (h(8), 0)]);
         let out = land(Landing {
             dir: &dir,
+            seq: manifest.next_seq(),
+            lock: None,
             manifest: &mut manifest,
             policy_hex: &policy_hex,
             first_mint: Some(500),
@@ -1503,7 +1787,7 @@ mod tests {
                 floor: 1_004,
                 written: 2,
                 backfilled: 0,
-                windows: Vec::new(),
+                by_index: 0,
             },
             segments: w.finish().unwrap(),
             pending: &pending,
@@ -1538,6 +1822,8 @@ mod tests {
         w.push_own(tx(3, vec![("A", "alice", 1)]).rows());
         let out = land(Landing {
             dir: &dir,
+            seq: manifest.next_seq(),
+            lock: None,
             manifest: &mut manifest,
             policy_hex: &policy_hex,
             first_mint: Some(500),
@@ -1546,7 +1832,7 @@ mod tests {
                 floor: 500,
                 written: 1,
                 backfilled: 1,
-                windows: Vec::new(),
+                by_index: 0,
             },
             segments: w.finish().unwrap(),
             pending: &pending,
@@ -1649,8 +1935,6 @@ mod tests {
             pending: 0,
             rows: &[],
             flushed: &[],
-            reaching: None,
-            detours: &[],
         }
     }
 
