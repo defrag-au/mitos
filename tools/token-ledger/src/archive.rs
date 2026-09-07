@@ -734,6 +734,30 @@ pub struct GraphArgs {
     /// rather than assumed. See [`SelfLoops`].
     #[arg(long)]
     pub self_loops: bool,
+    /// Everything that moved into or out of ONE party, and which contract
+    /// credential each movement carried.
+    ///
+    /// The question this answers: a pile the frontend should have suppressed
+    /// is on screen — did its inbound movements carry a script credential at
+    /// all? A marketplace that settles through an ordinary wallet for some
+    /// flows is indistinguishable from a holder without asking.
+    #[arg(long)]
+    pub party: Option<String>,
+}
+
+/// Where a transfer's two ends sit: an ordinary wallet, or a script.
+///
+/// A marketplace listing is a real transfer to a CONTRACT, so the archive
+/// records `seller → venue` and later `venue → buyer` — two edges through a
+/// party that is not a counterparty. Counting them is how we find out
+/// whether the movement graph is mostly people trading, or mostly everyone
+/// touching jpg.store.
+#[derive(Default)]
+struct Ends {
+    wallet_to_wallet: u64,
+    wallet_to_script: u64,
+    script_to_wallet: u64,
+    script_to_script: u64,
 }
 
 /// Why a stake-keyed edge points at its own node.
@@ -755,6 +779,13 @@ struct SelfLoops {
     /// Identical payment address on both sides. Should not survive the fold
     /// (it nets to zero), so a non-zero count here is worth knowing about.
     same_address: u64,
+    /// The SCRIPT addresses that appeared in a self-loop, and how often.
+    ///
+    /// Which contract it is decides what the movement MEANS: a marketplace
+    /// whose validator keeps the seller's staking part turns a listing into
+    /// a self-loop, and that is a listing to be marked rather than a move to
+    /// be drawn. Naming them is how that stops being a guess.
+    scripts: HashMap<String, u64>,
 }
 
 /// What the archive's rows reduce to.
@@ -776,49 +807,59 @@ struct Graph {
     /// Parties interned to ids, so an edge is 8 bytes rather than two
     /// bech32 strings.
     parties: HashMap<String, u32>,
-    /// `(from, to)` → how it accumulated.
-    edges: HashMap<(u32, u32), EdgeAcc>,
-    /// party → (transactions, units)
-    minted: HashMap<u32, (u32, u64)>,
-    burned: HashMap<u32, (u32, u64)>,
+    /// THE STREAM, unsorted — one entry per movement. Sorted by slot at
+    /// `finish`, because the archive is paged newest-first.
+    moves: Vec<RawMove>,
+    /// Unit name hex → index into the asset dictionary.
+    units: HashMap<String, u32>,
+    /// Script PAYMENT CREDENTIAL hex → index. Tiny: a validator issues one
+    /// address per seller but they all share this.
+    scripts: HashMap<String, u32>,
     first_slot: Option<u64>,
     last_slot: Option<u64>,
     /// Only meaningful when keyed by stake.
     loops: SelfLoops,
     /// Transfers dropped as wallet self-shuffles.
     self_shuffles: u64,
+    /// Where transfers' ends sit — see [`Ends`].
+    ends: Ends,
 }
 
-/// One edge while it is still being summed.
-struct EdgeAcc {
-    count: u32,
-    units: u64,
-    first_slot: u64,
-    last_slot: u64,
+/// One movement as found, before the stream is ordered and delta-encoded.
+struct RawMove {
+    slot: u64,
+    asset: u32,
+    /// `NOBODY` for a mint.
+    from: u32,
+    /// `NOBODY` for a burn.
+    to: u32,
+    quantity: u64,
+    /// `1 + index` into the script dictionary, or 0 for an ordinary wallet.
+    from_script: u32,
+    to_script: u32,
 }
 
 impl Graph {
-    /// The artifact: the dictionary, the edges ascending by `(from, to)`,
-    /// and the mints and burns that are not edges.
+    /// The artifact: dictionaries, and the movement stream ordered and
+    /// delta-encoded.
     fn finish(self, policy: &str, complete: bool) -> policy_archive::MovementGraph {
         let mut all = vec![String::new(); self.parties.len()];
         for (addr, id) in &self.parties {
             all[*id as usize] = addr.clone();
         }
-        // PRUNE the dictionary. Dropping wallet self-shuffles leaves parties
-        // that nothing references — a wallet whose only activity was
-        // reorganising its own UTxOs. The dictionary is the artifact's whole
-        // cost (27.3 MB against 3.7 MB of edges on ClayNation), so carrying
-        // addresses no edge names would be paying for silence.
+        // PRUNE the dictionary. Dropping wallet self-shuffles can leave
+        // parties nothing references. The dictionary is the artifact's
+        // dominant cost — 2.33 MB of ClayNation's 3.34 MB — so carrying
+        // addresses no movement names would be paying for silence.
         let mut keep = vec![false; all.len()];
-        for (from, to) in self.edges.keys() {
-            keep[*from as usize] = true;
-            keep[*to as usize] = true;
+        for m in &self.moves {
+            for p in [m.from, m.to] {
+                if p != policy_archive::NOBODY {
+                    keep[p as usize] = true;
+                }
+            }
         }
-        for p in self.minted.keys().chain(self.burned.keys()) {
-            keep[*p as usize] = true;
-        }
-        let mut remap = vec![u32::MAX; all.len()];
+        let mut remap = vec![policy_archive::NOBODY; all.len()];
         let mut parties = Vec::new();
         for (old, addr) in all.into_iter().enumerate() {
             if keep[old] {
@@ -826,33 +867,38 @@ impl Graph {
                 parties.push(addr);
             }
         }
-        let id = |old: &u32| remap[*old as usize];
-        let mut edges: Vec<policy_archive::Edge> = self
-            .edges
-            .iter()
-            .map(|((from, to), e)| policy_archive::Edge {
-                from: id(from),
-                to: id(to),
-                count: e.count,
-                units: e.units,
-                first_slot: e.first_slot,
-                last_slot: e.last_slot,
-            })
-            .collect();
-        // Deterministic, and it compresses better than hash order.
-        edges.sort_unstable_by_key(|e| (e.from, e.to));
-        let counts = |m: &HashMap<u32, (u32, u64)>| {
-            let mut v: Vec<policy_archive::PartyCount> = m
-                .iter()
-                .map(|(party, (count, units))| policy_archive::PartyCount {
-                    party: id(party),
-                    count: *count,
-                    units: *units,
-                })
-                .collect();
-            v.sort_unstable_by_key(|p| p.party);
-            v
+        let id = |p: u32| match p == policy_archive::NOBODY {
+            true => policy_archive::NOBODY,
+            false => remap[p as usize],
         };
+
+        let mut units = vec![String::new(); self.units.len()];
+        for (name, i) in &self.units {
+            units[*i as usize] = name.clone();
+        }
+        let mut scripts = vec![String::new(); self.scripts.len()];
+        for (cred, i) in &self.scripts {
+            scripts[*i as usize] = cred.clone();
+        }
+
+        // SLOT-ASCENDING: the archive pages newest-first, and a stream a
+        // frontend plays has to run forwards. Deltas are only small if the
+        // order is right.
+        let mut moves = self.moves;
+        moves.sort_unstable_by_key(|m| (m.slot, m.asset));
+        let mut out = policy_archive::Moves::default();
+        let mut prev = 0u64;
+        for m in &moves {
+            out.slot_deltas.push(m.slot - prev);
+            prev = m.slot;
+            out.assets.push(m.asset);
+            out.from.push(id(m.from));
+            out.to.push(id(m.to));
+            out.quantities.push(m.quantity);
+            out.from_script.push(m.from_script);
+            out.to_script.push(m.to_script);
+        }
+
         policy_archive::MovementGraph {
             format: policy_archive::GRAPH_FORMAT,
             policy: policy.to_string(),
@@ -870,14 +916,33 @@ impl Graph {
             source_below_floor: self.source_below_floor,
             self_shuffles: self.self_shuffles,
             parties,
-            edges,
-            mints: counts(&self.minted),
-            burns: counts(&self.burned),
+            units,
+            scripts,
+            moves: out,
         }
     }
 }
 
+/// A log, and what reading the archive to build it cost.
+pub struct BuiltGraph {
+    pub graph: policy_archive::MovementGraph,
+    pub requests: usize,
+    pub bytes: u64,
+    pub secs: f64,
+    loops: SelfLoops,
+    ends: Ends,
+}
+
 impl Graph {
+    /// The graph's key for an address: the wallet behind it, or the address
+    /// itself when there is no stake part (an enterprise or script address).
+    fn key(&self, addr: &str) -> String {
+        match self.by_stake {
+            true => crate::walk::stake_of(addr).unwrap_or_else(|| addr.to_string()),
+            false => addr.to_string(),
+        }
+    }
+
     fn party(&mut self, addr: &str) -> u32 {
         if let Some(id) = self.parties.get(addr) {
             return *id;
@@ -887,13 +952,15 @@ impl Graph {
         id
     }
 
-    /// The graph's key for an address: the wallet behind it, or the address
-    /// itself when there is no stake part (an enterprise or script address).
-    fn key(&self, addr: &str) -> String {
-        match self.by_stake {
-            true => crate::walk::stake_of(addr).unwrap_or_else(|| addr.to_string()),
-            false => addr.to_string(),
+    /// The asset's stable identity — the dot's key in a holder field.
+    fn asset(&mut self, name: &[u8]) -> u32 {
+        let hex = hex::encode(name);
+        if let Some(id) = self.units.get(&hex) {
+            return *id;
         }
+        let id = self.units.len() as u32;
+        self.units.insert(hex, id);
+        id
     }
 
     /// Units moved on one side of a transfer — the magnitude, taken from the
@@ -906,6 +973,40 @@ impl Graph {
             .sum()
     }
 
+    /// Is this a SCRIPT address? A marketplace listing is a transfer to one.
+    fn is_script(addr: &str) -> bool {
+        matches!(
+            pallas_addresses::Address::from_bech32(addr),
+            Ok(pallas_addresses::Address::Shelley(sh)) if sh.payment().is_script()
+        )
+    }
+
+    /// `1 + index` of this address's script payment credential, or 0 when it
+    /// is an ordinary wallet.
+    ///
+    /// The CREDENTIAL, not the address: Wayup's validator issues a different
+    /// address per seller — the staking part varies — but every one of them
+    /// carries `a76f0fb8…`, so interning the credential turns thousands of
+    /// listings into one dictionary entry and gives a reader something the
+    /// venue registry can actually match.
+    fn script_cred(&mut self, addr: &str) -> u32 {
+        let Ok(pallas_addresses::Address::Shelley(sh)) =
+            pallas_addresses::Address::from_bech32(addr)
+        else {
+            return 0;
+        };
+        let hex = match sh.payment() {
+            pallas_addresses::ShelleyPaymentPart::Script(h) => hex::encode(h.as_ref()),
+            pallas_addresses::ShelleyPaymentPart::Key(_) => return 0,
+        };
+        if let Some(id) = self.scripts.get(&hex) {
+            return id + 1;
+        }
+        let id = self.scripts.len() as u32;
+        self.scripts.insert(hex, id);
+        id + 1
+    }
+
     fn add(&mut self, row: &FeedRow) {
         self.txs += 1;
         self.first_slot = Some(self.first_slot.map_or(row.slot, |s: u64| s.min(row.slot)));
@@ -916,24 +1017,31 @@ impl Graph {
             match policy_archive::feed::direction(unit) {
                 policy_archive::feed::Direction::Transfer { from, to } => {
                     self.transfers += 1;
+                    match (Self::is_script(&from), Self::is_script(&to)) {
+                        (false, false) => self.ends.wallet_to_wallet += 1,
+                        (false, true) => self.ends.wallet_to_script += 1,
+                        (true, false) => self.ends.script_to_wallet += 1,
+                        (true, true) => self.ends.script_to_script += 1,
+                    }
                     // A stake-keyed self-loop is one of two different things,
                     // and only one of them is noise. Decided by what the
-                    // ADDRESS IS, never by the shape of the edge.
+                    // ADDRESS IS, never by the shape of the movement.
                     if self.by_stake && self.key(&from) == self.key(&to) {
-                        let script = |a: &str| {
-                            matches!(
-                                pallas_addresses::Address::from_bech32(a),
-                                Ok(pallas_addresses::Address::Shelley(sh)) if sh.payment().is_script()
-                            )
-                        };
-                        match (from == to, script(&from) || script(&to)) {
+                        match (from == to, Self::is_script(&from) || Self::is_script(&to)) {
                             // Nets out in the fold; should never reach here.
                             (true, _) => self.loops.same_address += 1,
                             // Distinct CONTRACTS sharing a staking credential
-                            // — real flow, and it stays an edge.
-                            (false, true) => self.loops.script += 1,
+                            // — real flow, and it stays a movement.
+                            (false, true) => {
+                                self.loops.script += 1;
+                                for a in [&from, &to] {
+                                    if Self::is_script(a) {
+                                        *self.loops.scripts.entry(a.clone()).or_insert(0) += 1;
+                                    }
+                                }
+                            }
                             // A wallet reorganising its own UTxOs. Not a
-                            // relationship between parties: counted, dropped.
+                            // movement between parties: counted, dropped.
                             (false, false) => {
                                 self.loops.wallet += 1;
                                 self.self_shuffles += 1;
@@ -941,24 +1049,38 @@ impl Graph {
                             }
                         }
                     }
+                    let asset = self.asset(&unit.name);
+                    // WHICH contract, when there was one. Recorded before
+                    // the party keys, because stake-keying is what throws
+                    // this away: a Wayup listing keeps the seller's stake on
+                    // both sides and is indistinguishable from a reshuffle
+                    // without it.
+                    let (fs, ts) = (self.script_cred(&from), self.script_cred(&to));
                     let (f, t) = (self.party(&self.key(&from)), self.party(&self.key(&to)));
-                    let e = self.edges.entry((f, t)).or_insert(EdgeAcc {
-                        count: 0,
-                        units: 0,
-                        first_slot: row.slot,
-                        last_slot: row.slot,
+                    self.moves.push(RawMove {
+                        slot: row.slot,
+                        asset,
+                        from: f,
+                        to: t,
+                        quantity: units,
+                        from_script: fs,
+                        to_script: ts,
                     });
-                    e.count += 1;
-                    e.units += units;
-                    e.first_slot = e.first_slot.min(row.slot);
-                    e.last_slot = e.last_slot.max(row.slot);
                 }
                 policy_archive::feed::Direction::Mint { to } => {
                     self.mints += 1;
-                    let p = self.party(&self.key(&to));
-                    let m = self.minted.entry(p).or_insert((0, 0));
-                    m.0 += 1;
-                    m.1 += units;
+                    let asset = self.asset(&unit.name);
+                    let ts = self.script_cred(&to);
+                    let t = self.party(&self.key(&to));
+                    self.moves.push(RawMove {
+                        slot: row.slot,
+                        asset,
+                        from: policy_archive::NOBODY,
+                        to: t,
+                        quantity: units,
+                        from_script: 0,
+                        to_script: ts,
+                    });
                 }
                 policy_archive::feed::Direction::Burn { from } => {
                     self.burns += 1;
@@ -970,14 +1092,24 @@ impl Graph {
                         .filter(|p| p.amount < 0)
                         .map(|p| p.amount.unsigned_abs())
                         .sum();
-                    let p = self.party(&self.key(&from));
-                    let b = self.burned.entry(p).or_insert((0, 0));
-                    b.0 += 1;
-                    b.1 += qty;
+                    let asset = self.asset(&unit.name);
+                    let fs = self.script_cred(&from);
+                    let f = self.party(&self.key(&from));
+                    self.moves.push(RawMove {
+                        slot: row.slot,
+                        asset,
+                        from: f,
+                        to: policy_archive::NOBODY,
+                        quantity: qty,
+                        from_script: fs,
+                        to_script: 0,
+                    });
                 }
-                policy_archive::feed::Direction::SourceBelowFloor { to } => {
-                    self.source_below_floor += 1;
-                    self.party(&self.key(&to));
+                // We know it arrived but not from where. Emitting it as a
+                // mint would be a lie; it is counted and left out, which on
+                // a COMPLETE archive is zero movements.
+                policy_archive::feed::Direction::SourceBelowFloor { .. } => {
+                    self.source_below_floor += 1
                 }
                 policy_archive::feed::Direction::Ambiguous => self.ambiguous += 1,
             }
@@ -985,21 +1117,6 @@ impl Graph {
     }
 }
 
-/// A graph, and what reading the archive to build it cost.
-pub struct BuiltGraph {
-    pub graph: policy_archive::MovementGraph,
-    pub requests: usize,
-    pub bytes: u64,
-    pub secs: f64,
-    loops: SelfLoops,
-}
-
-/// Reduce a policy's whole archive to a movement graph.
-///
-/// The shared path: the scheduler builds one when a walk completes — which
-/// is also after every daily top-up, so the artifact keeps up with the
-/// chain — and the CLI builds one on demand. `None` when the policy has no
-/// archive.
 pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<BuiltGraph>> {
     let Some(mut a) = PolicyArchive::open(dir)? else {
         return Ok(None);
@@ -1033,12 +1150,14 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
     }
     let (requests, bytes) = a.fetched();
     let loops = std::mem::take(&mut g.loops);
+    let ends = std::mem::take(&mut g.ends);
     Ok(Some(BuiltGraph {
         graph: g.finish(policy, complete),
         requests,
         bytes,
         secs: started.elapsed().as_secs_f64(),
         loops,
+        ends,
     }))
 }
 
@@ -1054,7 +1173,7 @@ pub fn write_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<us
     tracing::info!(
         policy,
         parties = built.graph.parties.len(),
-        edges = built.graph.edges.len(),
+        movements = built.graph.moves.len(),
         bytes = raw.len(),
         secs = format!("{:.1}", built.secs),
         "policy: movement graph written"
@@ -1077,8 +1196,9 @@ pub fn graph(args: GraphArgs) -> Result<()> {
         }
         return Ok(());
     }
-    let mints: u64 = g.mints.iter().map(|m| m.count as u64).sum();
-    let burns: u64 = g.burns.iter().map(|b| b.count as u64).sum();
+    let edges = g.edges();
+    let mints = g.moves.iter().filter(|m| m.from.is_none()).count();
+    let burns = g.moves.iter().filter(|m| m.to.is_none()).count();
     println!("policy         {}", g.policy);
     println!(
         "keyed by       {}",
@@ -1103,7 +1223,7 @@ pub fn graph(args: GraphArgs) -> Result<()> {
     println!("transactions   {}", g.txs);
     println!(
         "unit moves     {}",
-        g.transfers + mints + burns + g.ambiguous + g.source_below_floor
+        g.transfers + mints as u64 + burns as u64 + g.ambiguous + g.source_below_floor
     );
     println!("  transfers    {}  (an edge each)", g.transfers);
     println!("  mints        {mints}");
@@ -1121,9 +1241,81 @@ pub fn graph(args: GraphArgs) -> Result<()> {
         "parties        {}  (after pruning any nothing references)",
         g.parties.len()
     );
-    println!("DISTINCT EDGES {}", g.edges.len());
+    println!(
+        "movements     {}  (the stream a frontend plays)",
+        g.moves.len()
+    );
+    println!("assets         {}", g.units.len());
+    // The contracts the stream touched, by payment credential. A handful by
+    // construction — a validator issues an address per seller and they all
+    // share one credential — so printing them whole is the point: this is
+    // what a reader matches against the venue registry.
+    println!("contracts      {}", g.scripts.len());
+    for (i, cred) in g.scripts.iter().enumerate() {
+        let touched = g
+            .moves
+            .iter()
+            .filter(|m| m.from_script == Some(i as u32) || m.to_script == Some(i as u32))
+            .count();
+        println!("  {touched:>7}×  {cred}");
+    }
+
+    // ONE PARTY, and what its movements actually carried.
+    if let Some(want) = args.party.as_deref() {
+        let id = g.parties.iter().position(|p| p == want);
+        match id {
+            None => println!("party          {want} — not in this log"),
+            Some(id) => {
+                let id = id as u32;
+                let cred = |i: Option<u32>| match i.and_then(|i| g.scripts.get(i as usize)) {
+                    Some(c) => c.as_str(),
+                    None => "(a wallet — no script credential)",
+                };
+                let mut inbound: BTreeMap<&str, u64> = BTreeMap::new();
+                let mut outbound: BTreeMap<&str, u64> = BTreeMap::new();
+                for m in g.moves.iter() {
+                    if m.to == Some(id) {
+                        *inbound.entry(cred(m.to_script)).or_insert(0) += 1;
+                    }
+                    if m.from == Some(id) {
+                        *outbound.entry(cred(m.from_script)).or_insert(0) += 1;
+                    }
+                }
+                println!("party          {want}");
+                println!("  INBOUND — what the destination address was:");
+                for (c, n) in &inbound {
+                    println!("    {n:>7}×  {c}");
+                }
+                println!("  OUTBOUND — what the source address was:");
+                for (c, n) in &outbound {
+                    println!("    {n:>7}×  {c}");
+                }
+            }
+        }
+    }
+    println!(
+        "DISTINCT EDGES {}  (derived: the stream folded)",
+        edges.len()
+    );
 
     if args.self_loops {
+        let e = &built.ends;
+        let via_script = e.wallet_to_script + e.script_to_wallet + e.script_to_script;
+        println!("WHERE ENDS SIT (every transfer, before the self-shuffle drop)");
+        println!("  wallet → wallet {}", e.wallet_to_wallet);
+        println!(
+            "  wallet → script {}  (a listing, or any contract deposit)",
+            e.wallet_to_script
+        );
+        println!(
+            "  script → wallet {}  (a sale settling, or a delist)",
+            e.script_to_wallet
+        );
+        println!("  script → script {}", e.script_to_script);
+        println!(
+            "  VIA A CONTRACT  {via_script}  = {:.1}% of transfers",
+            100.0 * via_script as f64 / built.graph.transfers.max(1) as f64
+        );
         let l = &built.loops;
         let total = l.wallet + l.script + l.same_address;
         println!("SELF-LOOPS     {total} transfers land on their own node");
@@ -1139,10 +1331,18 @@ pub fn graph(args: GraphArgs) -> Result<()> {
             "  same address {}  (should be zero: it nets out in the fold)",
             l.same_address
         );
+        // WHICH CONTRACTS. A self-loop through a marketplace validator that
+        // keeps the seller's staking part is a LISTING, not a move — and
+        // that can only be told apart by naming the address.
+        let mut scripts: Vec<(&String, &u64)> = l.scripts.iter().collect();
+        scripts.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (addr, n) in scripts.iter().take(args.top.max(5)) {
+            println!("    {n:>7}×  {addr}");
+        }
     }
 
-    if args.top > 0 && !g.edges.is_empty() {
-        let mut top: Vec<&policy_archive::Edge> = g.edges.iter().collect();
+    if args.top > 0 && !edges.is_empty() {
+        let mut top: Vec<&policy_archive::Edge> = edges.iter().collect();
         top.sort_by_key(|e| std::cmp::Reverse(e.count));
         println!("heaviest edges");
         let short = |id: u32| {
@@ -1185,7 +1385,7 @@ pub fn graph(args: GraphArgs) -> Result<()> {
         println!(
             "verified       {} parties, {} edges, keyed by {}",
             back.parties.len(),
-            back.edges.len(),
+            back.edges().len(),
             back.keyed_by.as_wire()
         );
     }

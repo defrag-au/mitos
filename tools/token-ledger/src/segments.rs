@@ -638,7 +638,20 @@ fn emit(
     if rows.is_empty() {
         return Ok(());
     }
-    units.insert(unit);
+    // COUNTED, not recorded. The rows are written either way — the archive is
+    // a record of what happened on chain and a metadata update is something
+    // that happened — but `units` is the number a reader is shown as the size
+    // of the collection, and a policy's asset list is not its supply.
+    //
+    // A CIP-68 mint creates a reference twin per collectible, so counting the
+    // raw set doubled Mekka S1: 5,000 NFTs reported as 9,690 units. CIP-27
+    // adds one empty-named royalty token with a supply of zero, which is the
+    // `+1` on every "6,001 units" for a 6,000-piece drop. The same rule is
+    // applied to the holder field in the frontend, from the same crate, so
+    // the header and the picture cannot state different sizes.
+    if cardano_assets::AssetRole::of_bytes(&unit).standing() == cardano_assets::UnitStanding::Unit {
+        units.insert(unit);
+    }
     if slot >= ceiling {
         // An earlier pass's transaction: only the correction rows, and never
         // a placeholder — the archived row already says what was minted.
@@ -763,6 +776,77 @@ mod tests {
         let dave = a.movements_of(&[9; 32]).unwrap();
         assert_eq!(dave.len(), 1);
         assert_eq!(dave[0].amount, -1);
+    }
+
+    /// The same, for a unit name that is not valid UTF-8 — every CIP-68
+    /// asset, whose `000643b0` label ends in a byte no `&str` can hold.
+    fn mv_raw(slot: u64, tx: u8, unit: Vec<u8>, addr: &str, amount: i64) -> Movement {
+        Movement {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![tx; 32],
+            unit_name: unit,
+            address: addr.to_string(),
+            amount,
+            net_mint: 0,
+        }
+    }
+
+    /// A POLICY'S ASSET LIST IS NOT ITS SUPPLY.
+    ///
+    /// `units` is the number a reader is shown as the size of the collection,
+    /// and three kinds of token live under a collection's policy. Counting
+    /// them all reported Mekka S1 — 5,000 NFTs — as 9,690 units, and put a
+    /// `+1` on every CIP-25 drop for its royalty token.
+    ///
+    /// The ROWS are unaffected and that is the point: the archive records
+    /// what happened on chain, including the metadata update, and only the
+    /// count is a judgement about what a collection is.
+    #[test]
+    fn plumbing_is_recorded_but_not_counted_as_a_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut w = SegmentWriter::new(dir, stamp()).unwrap();
+        let labelled = |label: [u8; 4]| {
+            let mut name = label.to_vec();
+            name.extend_from_slice(b"MD0001");
+            name
+        };
+        w.push_own(vec![
+            // The collectible, and its metadata twin in the same transaction.
+            mv_raw(900, 1, labelled([0x00, 0x0d, 0xe1, 0x40]), "alice", 1),
+            mv_raw(900, 1, labelled([0x00, 0x06, 0x43, 0xb0]), "vault", 1),
+            // A plain CIP-25 asset, and the CIP-27 royalty token: no name.
+            mv(900, 1, "Perp2214", "bob", 1, 0),
+            mv_raw(900, 1, Vec::new(), "vault", 1),
+        ]);
+        for _ in 0..=SEGMENT_CHUNKS {
+            let _ = w.end_chunk().unwrap();
+        }
+        let segments = w.finish().unwrap();
+        let out = compact(dir, &segments, 1_000, &stamp()).unwrap();
+
+        assert_eq!(
+            out.units, 2,
+            "one CIP-68 collectible and one CIP-25 asset — the reference twin \
+             and the royalty token are not units of the collection"
+        );
+
+        // …and all four movements are still in the archive.
+        let mut a = crate::archive::PolicyArchive::open_files(&[(
+            dir.join(&out.movements.file),
+            FileKind::Movements,
+        )])
+        .unwrap();
+        let rows = a.movements_page(10, None).unwrap();
+        let names: std::collections::HashSet<Vec<u8>> =
+            rows.iter().map(|r| r.unit_name.clone()).collect();
+        assert_eq!(
+            names.len(),
+            4,
+            "the reference twin and the royalty token are RECORDED, just not \
+             counted — the archive is a record, the count is a judgement"
+        );
     }
 
     /// A rollup folds every file the manifest names into one at the root,

@@ -29,6 +29,14 @@ tx-index = { path = "../../crates/tx-index" }
 # measured 16× larger in wasm) and SNAPPY only, because every reader has to
 # link whatever the writer chose. See docs/design/POLICY_ARCHIVE_AND_SCALE.md.
 policy-archive = { path = "../../crates/policy-archive" }
+# WHAT COUNTS AS A UNIT of a collection — `AssetRole::of_bytes`. A policy's
+# on-chain asset list is not its supply: CIP-68 mints a reference twin per
+# collectible and CIP-27 adds a royalty token, so counting the raw list
+# doubled Mekka S1 (5,000 NFTs, 9,690 "units") and added a phantom +1 to
+# every CIP-25 drop. The vocabulary is shared with the frontends that draw
+# the same numbers, because two implementations of "is this a unit" is two
+# answers.
+cardano-assets = { workspace = true }
 # The pending-input sidecar a reverse pass carries between passes — the same
 # codec the wire artifacts use, for the same reason (compact, no schema file).
 postcard = { workspace = true }

@@ -55,7 +55,9 @@ pub mod writer;
 pub use bundle::{BUNDLE, BUNDLE_FORMAT, Bundle, BundledFooter};
 pub use density::DensityBucket;
 pub use feed::{FeedRow, PartyMove, UnitMove, fold_rows};
-pub use graph::{Edge, GRAPH, GRAPH_FORMAT, MovementGraph, PartyCount, PartyKey};
+pub use graph::{
+    Edge, GRAPH, GRAPH_FORMAT, Movement as PartyMovement, MovementGraph, Moves, NOBODY, PartyKey,
+};
 pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
 pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
