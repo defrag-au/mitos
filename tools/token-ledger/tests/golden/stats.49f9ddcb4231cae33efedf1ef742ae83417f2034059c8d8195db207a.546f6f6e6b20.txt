@@ -1,0 +1,57 @@
+ledger: 49f9ddcb4231cae33efedf1ef742ae83417f2034059c8d8195db207a.546f6f6e6b20  49f9ddcb4231cae33efedf1ef742ae83417f2034059c8d8195db207a.546f6f6e6b20  decimals unknown
+txs 11797  deltas 4826  parties seen 614
+COVERAGE UNRECORDED — this ledger predates the completeness flag, so whether these are holdings or a window of movement is not known.
+non-zero balances: 99  ·  net units: 1000000000  ·  unresolved sources: 0
+  re-run `walk` to stamp it — an incremental resume is enough.
+
+       326931750  32.69%  pool     addr1x89ksjnfu7ys02tedvslc9g2wk9…  stake17xe0d2lkpnx7jt
+       164464604  16.45%  vesting  addr1w8wma0rzvdexhnqrty6t8dcur7c…  -
+        73121506   7.31%  wallet   addr1qxrypzs8xswny2wy7drvj29tg8h…  stake1u96cw9enh0s36p
+        71937638   7.19%  wallet   addr1qyt3mwrles2y9k2j4tghm0ag9ga…  stake1uy60t8v33jj2ef
+        51392198   5.14%  wallet   addr1qyp7jdpmylh6fl3d088w3ehgndl…  stake1u9pnzqcrvnt6nj
+        44692170   4.47%  burn     addr1w8qmxkacjdffxah0l3qg8hq2pmv…  -
+        43311369   4.33%  wallet   addr1q8kk6tzxxhh8d5s2qlm04d7vwmt…  stake1u8u7jukc5z8ush
+        32172188   3.22%  wallet   addr1q8kcag09juwtg6r2g8l8gw6rta0…  stake1uy8enhrmuj3fnv
+        12710298   1.27%  wallet   addr1qy3xhwk2d75kz9s7axvpr9f53we…  stake1u9w2xkc8s7qf4e
+        12157912   1.22%  wallet   addr1qy7e82ns988dgwer8lyxr2jm4ga…  stake1uxs05ejnp3e6r6
+        11716309   1.17%  wallet   addr1q92mm4gxa8estd6qxx4ad28hel9…  stake1u9a7ywtuwpxrxa
+        10060428   1.01%  wallet   addr1qyds7aedqu87ql8xvpz0gayj8jn…  stake1u9sdd8clkmnry9
+        10000000   1.00%  wallet   addr1q9jxx0zle0ktnye4td4e6d2a56m…  stake1uytg7kp24lqu4r
+         7911586   0.79%  wallet   addr1qx57fjgm57r44cds8tvrsk9xxj0…  stake1ux7mqgx9ykrz64
+         7802286   0.78%  vesting  addr1zyupekdkyr8f6lrnm4zulcs8juw…  stake1u8pnqhu4d67950
+         7000000   0.70%  wallet   addr1qxme5hsd26s7qr3vlph4yv7w5ua…  stake1uy5tgztwaqt70q
+         6606250   0.66%  wallet   addr1q8f9pgpv6cec7w6ls7u2njr50ep…  stake1u8mg7xu6ans4h2
+         6308029   0.63%  wallet   addr1q8wdxpejmgtmut3rhqrra652za8…  stake1uylu74g0f466kj
+         5671967   0.57%  wallet   addr1qx5eqvkm4es2xjx3e9v067x8qex…  stake1u88dzdqh4v3cdd
+         5567560   0.56%  wallet   addr1qy0smd9kuv65am9smyar5awjzcq…  stake1u9z27wteewejh5
+         5371120   0.54%  wallet   addr1q8znclgczarq0whkdkcddzxh2ku…  stake1u8dqx0j6990xgm
+         5044126   0.50%  wallet   addr1qx7st5shu4ypw60xdg36t0p0kqd…  stake1u8f4r7d7fxd62u
+         4918988   0.49%  wallet   addr1q85n6c2d6djhaaluzg22zgq600k…  stake1u9l4cxwf6t76su
+         4575465   0.46%  wallet   addr1q9f9dngey6ynyg7erhv020f7396…  stake1u8xf5tlewp794w
+         4506713   0.45%  wallet   addr1q9g3p5ek74p7003rvjt30syrwf8…  stake1uxuhlxnq246ttm
+
+AT MINT
+         961617458  96.16%  script   addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28…
+          38382542   3.84%  wallet   addr1qyds7aedqu87ql8xvpz0gayj8jn3c2xa2qm…
+  ⇒ 96.2% went straight to a CONTRACT at mint — launchpad-shaped, not a team allocation.
+
+SUPPLY CASCADE
+  nominal supply             1000000000
+− provably unspendable       44692170   4.47%  (1 sink addr, basis: proven)
+= reachable float           955307830  95.53%
+    of which pooled         326931750  32.69%  (1 pools, basis: decoded)
+    vesting                 172266890  17.23%  (2 addrs, basis: decoded)
+      still locked        154464604  15.45%
+      matured              17802286   1.78%  (claimable now, unclaimed)
+    script-held                     0   0.00%  (0 addrs, basis: chain — KIND UNKNOWN)
+    key wallets             456109190  45.61%  (95 addrs, basis: chain)
+
+pools 1  reserve-curve rows 195
+  splash  base      326931750  quote     14763842294 lovelace  spot      0.00004516 ADA  fee None  key:datum
+
+spot                        0.00004516 ADA/token   (liquidity-weighted, piecewise-constant)
+  ⚠ decimals UNKNOWN — this is the price per RAW unit, not per token. Set `decimals` in tokens.toml and re-run the walk.
+notional cap                     45159 ADA   (all supply x spot)
+realisable                        8737 ADA   (sellable float into the curve)
+honesty ratio                     19.3%
+  note: 1 of 1 pools have no decoded fee — realisable is optimistic by that pool's fee

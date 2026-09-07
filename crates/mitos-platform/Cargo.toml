@@ -99,3 +99,7 @@ serde_json = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 # Companion-router tests need a temp ModuleStorage root.
 tempfile = "3"
+# Validates the bech32 addresses declared in community-module configs — see
+# tests/community_module_interest.rs. Dev-only: the platform itself treats
+# interest addresses as opaque strings.
+pallas-addresses = { workspace = true }

@@ -7,10 +7,17 @@ abi_version = 2
 
 [interest]
 addresses = [
+    # V1 — script hash 9068a7a3…, delegated form.
     "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm",
+    # V2/V3 — one validator, script hash c727443d…, in both of its
+    # bech32 forms: addr1x (script payment + script stake) and
+    # addr1w (script payment, no stake). Both must be listed; they
+    # are distinct addresses on chain and sales settle from either.
     "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
-    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
-    "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp",
+    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7eg0fcr8k",
+    # V4 — intentionally absent; see the note in the sibling
+    # jpg-store-listing module. No V4 address that passes its bech32
+    # checksum is known.
 ]
 policies = []
 

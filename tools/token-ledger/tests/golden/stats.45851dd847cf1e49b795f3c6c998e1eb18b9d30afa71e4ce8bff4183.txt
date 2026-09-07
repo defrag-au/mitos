@@ -1,0 +1,33 @@
+ledger: 45851dd847cf1e49b795f3c6c998e1eb18b9d30afa71e4ce8bff4183  45851dd847cf1e49b795f3c6c998e1eb18b9d30afa71e4ce8bff4183 (whole policy)  decimals unknown
+txs 14324  deltas 116254  parties seen 609
+PARTIAL LEDGER — coverage reaches back only to slot 154245600, so these are NET MOVEMENTS in that window, NOT holdings.
+parties that moved: 383  ·  net units moved: 104932  ·  movements still missing a source: 40321
+  deepen with `reverse` until the unresolved count stops falling.
+
+           12800  12.20%  ?        addr1qye5zfn4sk0lmwcqxg5kz7wypf9…  stake1uy8dclfrw7tj8t
+           11185  10.66%  ?        addr1qyjym4hwkc3yrgksje2mpamd4m2…  stake1ux8p7evjnzsm76
+            8842   8.43%  ?        addr1qxzn9t2gmap66nnxqg89zvh7yke…  stake1u8vnp6w3x26jhn
+            5806   5.53%  ?        addr1q9dl94auumrxp5vxtlxq3e24tfu…  stake1u92xnu8t8q9l39
+            4545   4.33%  ?        addr1qylmpv35p0z64z7rdaqrhwvd9lc…  stake1u9qgqryajpp6wk
+            4236   4.04%  ?        addr1qyh8dxecjyaca3rvkerp7z3w22w…  stake1uytdswgnwtp5wg
+            3676   3.50%  ?        addr1qx0yzk4nttyp9wm7m7njywa36m5…  stake1uxtv0srjrna92a
+            3564   3.40%  ?        addr1q9acnp2nxss62erg09eewcfswlw…  stake1ux8tk9fzw0r8ug
+            3265   3.11%  ?        addr1qyhr3kczkscg6ugvhhgjfdlkslw…  stake1uxf394sx835lq4
+            3163   3.01%  ?        addr1q9fm62fxmcurj39lvyfz58sehdv…  stake1u989vs45gend8m
+            3154   3.01%  ?        addr1q9u4897q29r2dgad9x50ek0dwae…  stake1uxlhp7nymkd9px
+            2184   2.08%  ?        addr1qyt7t3hpr9xgfjmvgk6akp9t3re…  stake1u8hy2zruapnefc
+            1977   1.88%  ?        addr1qx9vlr5tnce2n90yny0pag32kae…  stake1uyztgv539ygwa8
+            1883   1.79%  ?        addr1q9jccaymfzrzkse0erxfpq2y2t0…  stake1u84lprzh2dewrw
+            1844   1.76%  ?        addr1q8wdxpejmgtmut3rhqrra652za8…  stake1uylu74g0f466kj
+            1569   1.50%  ?        addr1qxttxzhg8lyyzmkgnf838mkmukk…  stake1uy983fs4ukl6p9
+            1342   1.28%  ?        addr1q9x88ythnz70ga753jmvs4s8xtl…  stake1uykfyecdypvhe4
+            1163   1.11%  ?        addr1q9edpkaktak5qggw4hrax747mk9…  stake1uyf0ga6ja0cq32
+            1114   1.06%  ?        addr1q9vzwamswe9d73lpszzhu4p0vam…  stake1u9pwcl05nuz42f
+            1055   1.01%  ?        addr1qxlhw9d5uhy2c2nhsj6802u6cty…  stake1uy8w5j887d45t3
+            1054   1.00%  ?        addr1q8c6tr7zea729xj0fgqxxgkqhqt…  stake1u9dk3g762pu3d4
+            1040   0.99%  ?        addr1qygqnmh82r99yp0kjphtxqy69we…  stake1ux4mjjh5ar22af
+            1009   0.96%  ?        addr1qxqajagufj9apaafp79lzzrgc6t…  stake1uxspezsusnjhj6
+             962   0.92%  ?        addr1q9rqjgtezzcnj5w8w765pq83u0a…  stake1uyxcvq57sxtupl
+             840   0.80%  ?        addr1qy6c82gsnp535pdr4mwyt42e9nz…  stake1uxxhlf46v57nfj
+
+mint, cascade and cap reports SKIPPED — each divides by supply, and a partial ledger has no supply figure to divide by.

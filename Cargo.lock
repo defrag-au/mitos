@@ -3747,6 +3747,7 @@ dependencies = [
  "mitos-data-plane",
  "mitos-protocol",
  "pallas",
+ "pallas-addresses 1.1.1",
  "pallas-primitives 1.1.1",
  "pallas-traverse 1.1.1",
  "redb 2.6.3",

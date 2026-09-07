@@ -960,8 +960,14 @@ pub fn probe(db: &std::path::Path) -> Result<()> {
         }
     }
 
+    // Descending balance, then by CREDENTIAL — the tiebreak is load-bearing.
+    // Groups come out of a `HashMap`, whose iteration order is randomised per
+    // process, so two credentials holding the SAME amount swapped places
+    // between runs of an otherwise identical command. Found by
+    // `golden-capture.sh` on its first check: $CSWAP has two contracts holding
+    // exactly 2,500,000,000 each, and they alternated.
     let mut ordered: Vec<_> = groups.into_iter().collect();
-    ordered.sort_by_key(|(_, g)| -g.qty);
+    ordered.sort_by(|(a_cred, a), (b_cred, b)| b.qty.cmp(&a.qty).then(a_cred.cmp(b_cred)));
 
     for (cred, g) in ordered {
         println!("\npayment credential {cred}");

@@ -1,0 +1,61 @@
+ledger: wrt  c0ee29a85b13209423b10447d3c2e6a50641a15c57770e27cb9d5073.57696e67526964657273  6 dp
+txs 1174382  deltas 1617538  parties seen 173388
+COVERAGE UNRECORDED — this ledger predates the completeness flag, so whether these are holdings or a window of movement is not known.
+non-zero balances: 11796  ·  net units: 100000000000000  ·  unresolved sources: 0
+  re-run `walk` to stamp it — an incremental resume is enough.
+
+  22120897274857  22.12%  script   addr1wypr0np3xatwhddulsnj3aaac65…  -
+  16209153304886  16.21%  script   addr1zxhew7fmsup08qvhdnkg8ccra88…  stake1uy0lhtxxcrg6ca
+  13328909731658  13.33%  script   addr1wy9z0v8mrkhtyll43fu6mnhu0p8…  -
+   9238900000000   9.24%  wallet   addr1q9a6vmfpajsnn6pkq8tqj9qej0v…  stake1u82h4w48l3xkh3
+   5384257816526   5.38%  wallet   addr1qyk9t3uyjvk2v3eny2vv5mt93z4…  stake1u83snfrry90eff
+   4151423326659   4.15%  wallet   addr1q8w3amqje077s8vwrzvy9qgfuj9…  stake1uxqr9gazhcsqk2
+   1982469155671   1.98%  script   addr1z8nvjzjeydcn4atcd93aac8allv…  stake1u9kvydpd4xxcdd
+   1625025570073   1.63%  script   addr1x8pydstdswmdqmg2rdt59dzql3z…  stake17ygrxh9m9c2j78
+   1369642857013   1.37%  wallet   addr1qxanpvy0369alsd74930yyh3pr7…  stake1ux3gzk7n3m947f
+   1208753138068   1.21%  wallet   addr1q9lxym523pnns50dyymdv3n8vkt…  stake1uxd5jxns935zjp
+   1208333333333   1.21%  wallet   addr1qyf569gwulcfgw0jdjnla2m9tdu…  stake1uxe07dp608pcxl
+   1009388589711   1.01%  wallet   addr1q8kfww79vg0zslk4swnwrnttjff…  stake1uydntkxh5rnk5v
+    805413823055   0.81%  wallet   addr1q9xc480ha4xzas6cer0qjeh8x3s…  stake1u80m4tzazshgkf
+    789116496926   0.79%  wallet   addr1qy5n23mf4fzaj4l3j8vkd9789n0…  stake1uy0q2du0kfualq
+    760817668505   0.76%  wallet   addr1q83k8tslh7dex59nkhqymqtgd64…  stake1u9ztutdcj2h7ta
+    721278357171   0.72%  wallet   addr1qyn7ddedvgh00rsv8hdzvya6t67…  stake1uynw9cmykgvrtg
+    580000000000   0.58%  wallet   addr1qxeqeryjzehw5zz7vefw6z0hc8g…  stake1uyemycjqtuzvwa
+    458186100125   0.46%  wallet   addr1qywls0fquzmv63fp9qw3458pqes…  stake1u9nnvvrpqaz9ya
+    428571428600   0.43%  wallet   addr1q8kt4ks4586d6rckevprfmmcjl9…  stake1ux2n95ld4hvlae
+    423214285741   0.42%  wallet   addr1qy3l8fwssw8mvadaqalsshwegnu…  stake1uytgv6plevfl82
+    388590585556   0.39%  wallet   addr1q9uxhz8je2lnyvf97k5vyq4j2hy…  stake1u9dq45lul2ykjn
+    376778329924   0.38%  wallet   addr1qxl60zpzr0lsvnv32d6x0enfcwu…  stake1ux6ka268w9zklk
+    342112000000   0.34%  wallet   addr1qxs6ekeg7hj85wfsrwqpk7r36pp…  stake1u9lu46h2tv6esc
+    331089389512   0.33%  script   addr1w8qnfkpe5e99m7umz4vxnmelxs5…  -
+    300237867237   0.30%  wallet   addr1q9lvp59kpu8ukgtsep5la927sp7…  stake1uykp26kw5cdfn4
+
+AT MINT
+   100000000000000  100.00%  wallet   addr1q8r4d9xfsj4xqz9uty275skk6jvckjuvz3w…
+
+SUPPLY CASCADE
+  nominal supply        100000000000000
+− provably unspendable      143365824   0.00%  (1 sink addr, basis: proven)
+= reachable float      99999856634176  100.00%
+    of which pooled        1597208757   0.00%  (5 pools, basis: decoded)
+    script-held        55998737584811  56.00%  (344 addrs, basis: chain — KIND UNKNOWN)
+    key wallets        43999521840608  44.00%  (11446 addrs, basis: chain)
+  note: script-held may be vesting, locked, or an open order — identifying it needs the declared layer, not the chain.
+
+pools 17  reserve-curve rows 51494
+  wingriders-v2 base 16208862418284  quote    350944450797 lovelace  spot      0.02165139 ADA  fee None  key:ambiguous
+  wingriders-v1 base  1982299495609  quote     42920769498 lovelace  spot      0.02165201 ADA  fee None  key:value
+  minswap-v1 base     1018790504  quote        22117084 lovelace  spot   too thin to quote  fee None  key:value
+  sundae-v1 base      264859902  quote        12000000 lovelace  spot   too thin to quote  fee Some(100)  key:datum
+  splash  base      305814081  quote         7056040 lovelace  spot   too thin to quote  fee None  key:datum
+  sundae-v1 base       55023231  quote         3909569 lovelace  spot   too thin to quote  fee Some(30)  key:datum
+  minswap-v2 base           2027  quote          982564 lovelace  spot   too thin to quote  fee Some(30)  key:ambiguous
+  note: 5 of 7 pools hold under 100 ADA — their reserves still count toward the aggregate, but a pool that thin cannot price anything
+
+spot                        0.02165204 ADA/token   (liquidity-weighted, piecewise-constant)
+  quoted per whole token at 6 dp
+notional cap                   2165204 ADA   (all supply x spot)
+realisable      278249 .. 333005     ADA   (sell 43999521840608 .. 99998259425419 into the curve)
+honesty ratio           12.9% .. 15.4%
+  the spread is 55998737584811 script-held tokens of unknown liquidity — not noise, an unanswered question
+  note: 4 of 7 pools have no decoded fee — realisable is optimistic by that pool's fee

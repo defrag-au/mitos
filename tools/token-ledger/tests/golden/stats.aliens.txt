@@ -1,0 +1,59 @@
+ledger: aliens  16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7.416c69656e73  0 dp
+txs 6670  deltas 6609  parties seen 537
+COVERAGE UNRECORDED — this ledger predates the completeness flag, so whether these are holdings or a window of movement is not known.
+non-zero balances: 60  ·  net units: 1000000000  ·  unresolved sources: 0
+  re-run `walk` to stamp it — an incremental resume is enough.
+
+       430655750  43.07%  pool     addr1x89ksjnfu7ys02tedvslc9g2wk9…  stake17xe0d2lkpnx7jt
+       172953400  17.30%  pool     addr1z8ke0c9p89rjfwmuh98jpt8ky74…  stake1u8clalecaht8jg
+        35071804   3.51%  wallet   addr1qylnwp3lp2re0jtw9kf0dfvxf4m…  stake1u8m0ldamjy0a36
+        34878551   3.49%  wallet   addr1qxjtswzvrgz3uynrr3uh4ekwc3g…  stake1u8l9c6n0f2w6ek
+        31415927   3.14%  vesting  addr1zyupekdkyr8f6lrnm4zulcs8juw…  stake1u8pnqhu4d67950
+        26748856   2.67%  wallet   addr1q90xk6plfkwxky5l9t0du3sq7af…  stake1u867znggacw5dq
+        25685522   2.57%  wallet   addr1q9cquxx6m0kcgdvnaa2epwmg78d…  stake1u9588g2t3ttfuu
+        25000000   2.50%  wallet   addr1q938r7fpat04r4ez2wlzxjja8ee…  stake1uylq65sr745njk
+        24281864   2.43%  vesting  addr1zyupekdkyr8f6lrnm4zulcs8juw…  stake1u8jdj77t835q3g
+        22594540   2.26%  script   addr1x9d238ne9evvyu8vrqpqdfz6ltp…  stake178j4hkafm9ushc
+        20222073   2.02%  wallet   addr1qxwet57tcw39ecuqvvvlsp5enff…  stake1uxnaf5ezvkw6sm
+        16780334   1.68%  wallet   addr1q970umlf9xyy4cddfe747sh2cl6…  stake1u9ulpq8s6n0xcf
+        15550262   1.56%  wallet   addr1qymnnxq5rmes2p6awtw983t3drl…  stake1u8a6dq0xn28cak
+        12768078   1.28%  wallet   addr1q924gn7ugn6vr07mz628tvrmrch…  stake1uxtwg7534ckttd
+        11820519   1.18%  wallet   addr1q9qfxgz6tfpj4eakgt0ejuycn89…  stake1uxq75jcjhkdmgn
+        10908064   1.09%  wallet   addr1q9wtjfq7pfft66sckgspkgp795t…  stake1u9pfg67kzapgxa
+        10000000   1.00%  wallet   addr1qygsjw2767aw6zda9k2zq6n5253…  stake1u8njek8z5jt2cp
+         9226064   0.92%  wallet   addr1q9c7f4we6cja8qvlc63ycep97xd…  stake1u8653j3mcjks5d
+         7722148   0.77%  wallet   addr1q8szj04tflt3d44r0lkcatf7jvu…  stake1uy4zw3l564ru0p
+         6770067   0.68%  wallet   addr1qxfeach4jwdaah8cxax43vj3wsm…  stake1u8gm56jex4z82u
+         4063508   0.41%  vesting  addr1w8wma0rzvdexhnqrty6t8dcur7c…  -
+         4058096   0.41%  wallet   addr1q99qpegypskhugq6nss8gjkwvjl…  stake1u8962x3wtddcq2
+         3060280   0.31%  wallet   addr1qy6v9dwq4dqe3jvevkt5gekl4g8…  stake1u9zya7z0n9d7dz
+         3057014   0.31%  wallet   addr1qxgtajjjkg2jyqp6tph5mmpxr0w…  stake1u8vp9sgnct9eh8
+         2801038   0.28%  wallet   addr1qx4v9ceuwle5drkkux5q36nnpvu…  stake1uxsupc7txfyt9a
+
+AT MINT
+         965309014  96.53%  script   addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28…
+          34690986   3.47%  wallet   addr1qyng8whtfrhkxfghajfekfpe3pd6260rdna…
+  ⇒ 96.5% went straight to a CONTRACT at mint — launchpad-shaped, not a team allocation.
+
+SUPPLY CASCADE
+  nominal supply             1000000000
+− provably unspendable         930088   0.09%  (1 sink addr, basis: proven)
+= reachable float           999069912  99.91%
+    of which pooled         603609150  60.36%  (2 pools, basis: decoded)
+    vesting                  59761299   5.98%  (3 addrs, basis: decoded)
+      still locked         24281864   2.43%
+      matured              35479435   3.55%  (claimable now, unclaimed)
+    script-held              23856567   2.39%  (2 addrs, basis: chain — KIND UNKNOWN)
+    key wallets             311842896  31.18%  (52 addrs, basis: chain)
+  note: script-held may be vesting, locked, or an open order — identifying it needs the declared layer, not the chain.
+
+pools 2  reserve-curve rows 1895
+  splash  base      430655750  quote     13122272884 lovelace  spot      0.00003047 ADA  fee None  key:datum
+  cswap   base      172953400  quote      5279743625 lovelace  spot      0.00003053 ADA  fee Some(85)  key:datum
+
+spot                        0.00003049 ADA/token   (liquidity-weighted, piecewise-constant)
+notional cap                     30487 ADA   (all supply x spot)
+realisable        6685 .. 6970       ADA   (sell 347322331 .. 371178898 into the curve)
+honesty ratio           21.9% .. 22.9%
+  the spread is 23856567 script-held tokens of unknown liquidity — not noise, an unanswered question
+  note: 1 of 2 pools have no decoded fee — realisable is optimistic by that pool's fee

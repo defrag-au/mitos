@@ -143,17 +143,30 @@ pub fn collect_sales<T: Clone>(
 // ============================================================
 
 const JPG_V1_ADDR: &str = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm";
+/// V2 and V3 are the SAME validator (script hash `c727443d…`) in two bech32
+/// forms: `addr1x` carries a script staking part, `addr1w` carries none. Both
+/// occur on chain and both must be recognised.
 const JPG_V2_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V3_ADDR: &str = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V4_ADDR: &str = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp";
+const JPG_V3_ADDR: &str = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7eg0fcr8k";
+
+// V4: deliberately absent. The constant that used to sit here
+// (`addr1w999n67e…g4xkcp`) fails its bech32 checksum, so it could never equal a
+// real on-chain address and the V4 match arm was dead code that merely looked
+// like coverage. `address-registry` pulled its V4 row for the same reason.
+// Reinstate only with an address that round-trips — `jpg_constants_are_real_
+// addresses` will hold any replacement to that.
 
 /// Classify a jpg.store sale-contract address to its version, or `None`.
+///
+/// Note the V3 constant was previously also a checksum-invalid string. Because
+/// [`is_marketplace_escrow`] is built on this, an asset re-escrowed at the
+/// undelegated address classified as `None` and so read as a *buyer delivery* —
+/// i.e. a re-listing was booked as a completed sale.
 pub fn classify_jpg_address(addr: &str) -> Option<JpgStoreContractVersion> {
     match addr {
         JPG_V1_ADDR => Some(JpgStoreContractVersion::V1),
         JPG_V2_ADDR => Some(JpgStoreContractVersion::V2),
         JPG_V3_ADDR => Some(JpgStoreContractVersion::V3),
-        JPG_V4_ADDR => Some(JpgStoreContractVersion::V4),
         _ => None,
     }
 }
@@ -396,6 +409,70 @@ mod tests {
     // A real jpg.store payment-script address, used here only as a stable
     // Shelley address to exercise the credential extraction/match path.
     const SHELLEY_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
+
+    /// Every hardcoded jpg address must be a real, round-tripping bech32
+    /// address, and must be distinct from its siblings.
+    ///
+    /// Two of these constants were checksum-invalid strings. They matched
+    /// nothing, so the match arms built on them were dead while looking like
+    /// coverage — and `is_marketplace_escrow` consequently misread a re-listing
+    /// at the undelegated address as a buyer delivery. Nothing failed loudly;
+    /// the ledger just quietly booked a sale that never happened.
+    #[test]
+    fn jpg_constants_are_real_addresses() {
+        use pallas_addresses::Address;
+
+        for (label, addr) in [
+            ("V1", JPG_V1_ADDR),
+            ("V2", JPG_V2_ADDR),
+            ("V3", JPG_V3_ADDR),
+        ] {
+            let decoded = Address::from_bech32(addr)
+                .unwrap_or_else(|e| panic!("{label} address {addr} does not decode: {e}"));
+            assert_eq!(
+                decoded.to_bech32().unwrap(),
+                addr,
+                "{label} address does not round-trip — header and payload disagree, so it \
+                 can never equal an on-chain address"
+            );
+        }
+
+        assert_ne!(JPG_V1_ADDR, JPG_V2_ADDR);
+        assert_ne!(JPG_V2_ADDR, JPG_V3_ADDR);
+    }
+
+    /// V2 and V3 are two bech32 forms of ONE validator, so they must share a
+    /// payment credential while remaining distinct addresses. If a future edit
+    /// points V3 at a different script, this catches it.
+    #[test]
+    fn jpg_v2_and_v3_are_the_same_validator() {
+        let v2 = address_payment_cred(JPG_V2_ADDR).expect("V2 has a payment cred");
+        let v3 = address_payment_cred(JPG_V3_ADDR).expect("V3 has a payment cred");
+        assert_eq!(
+            v2, v3,
+            "V2 and V3 must be the same script in delegated and undelegated form"
+        );
+    }
+
+    /// Both forms of the V2/V3 validator must classify, or an asset re-escrowed
+    /// there is mistaken for a delivery to a buyer.
+    #[test]
+    fn both_forms_of_the_v2_validator_are_recognised_as_escrow() {
+        assert_eq!(
+            classify_jpg_address(JPG_V2_ADDR),
+            Some(JpgStoreContractVersion::V2)
+        );
+        assert_eq!(
+            classify_jpg_address(JPG_V3_ADDR),
+            Some(JpgStoreContractVersion::V3)
+        );
+        assert!(is_marketplace_escrow(JPG_V2_ADDR));
+        assert!(
+            is_marketplace_escrow(JPG_V3_ADDR),
+            "the undelegated form must count as escrow — this is the regression that \
+             booked re-listings as sales"
+        );
+    }
 
     #[test]
     fn cred_parsing_rejects_wrong_length_and_empty() {
@@ -654,9 +731,37 @@ mod tests {
             Some(JpgStoreContractVersion::V1)
         );
         assert_eq!(
-            classify_jpg_address(JPG_V4_ADDR),
-            Some(JpgStoreContractVersion::V4)
+            classify_jpg_address(JPG_V2_ADDR),
+            Some(JpgStoreContractVersion::V2)
         );
         assert!(classify_jpg_address("addr1notjpg").is_none());
+    }
+
+    /// V4 is a KNOWN GAP, asserted here so it stays visible.
+    ///
+    /// This test previously asserted the opposite — that the V4 constant
+    /// classified as `V4`. That passed only because it compared a
+    /// checksum-invalid string against itself: a tautology. No real address
+    /// could ever equal it, so V4 listings and sales were never matched, and
+    /// the passing assertion made the gap look covered.
+    ///
+    /// Kept as an explicit statement of what is missing rather than deleted, so
+    /// that supplying a genuine V4 address is a visible, deliberate change.
+    /// When one is found: add the constant, restore the match arm, extend
+    /// `jpg_constants_are_real_addresses`, and replace this test.
+    #[test]
+    fn jpg_v4_is_not_classifiable_no_valid_address_is_known() {
+        const CHECKSUM_INVALID_V4: &str =
+            "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp";
+
+        assert!(
+            pallas_addresses::Address::from_bech32(CHECKSUM_INVALID_V4).is_err(),
+            "this string now decodes — if a valid V4 address has been found, wire it up \
+             rather than leaving V4 unmatched"
+        );
+        assert!(
+            classify_jpg_address(CHECKSUM_INVALID_V4).is_none(),
+            "nothing may classify as V4 off a string that cannot appear on chain"
+        );
     }
 }

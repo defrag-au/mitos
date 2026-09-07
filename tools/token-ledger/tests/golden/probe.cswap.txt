@@ -1,0 +1,82 @@
+
+payment credential 1b26cc41dcd8530a4ba9ae584922b5957c365583a25eda8770597a6b
+  372380324886642 tokens across 480 UTxOs / 1 address(es)
+  lock-datum decode: 0/480 ok · 480 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1zydjdnzpmnv9xzjt4xh9sjfzkk2hcdj4sw39ak58wpvh56cgjrxwszhuqj73gufx56c8qwnuhvf2nw5dzdr5f50rqr5q2m7uqv
+
+payment credential d547c9e1e26e4bc80b56eb979dda7a011280933cb2784f74b584ec8f
+  34968663762012 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 1 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1z8250j0pufhyhjqt2m4e08w60gq39qyn8je8snm5kkzwer7ylps4ja2t0vl0zpcrfcljw8utzjvzna9u9pwaze0mys5shcw3zj
+
+payment credential 2b5cebef0f9a56d923695af04b09a86f3e9488814e72b78cecd447ea
+  732671969259 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 1/1 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ MATCHES the Shield/CrowdLock lock shape. 1 distinct owner(s).
+     unlock 689013000000 .. 689013000000 (unix ms)
+     To count it as vesting, register this credential with evidence — a shape match is a hint, not a decision.
+     addr1zy44e6l0p7d9dkfrd9d0qjcf4phna9ygs9889duvan2y06kylps4ja2t0vl0zpcrfcljw8utzjvzna9u9pwaze0mys5sd58qmy
+
+payment credential e9f1d49defa5d1f3ba0981c3199cccc69b831dd6409857cafce50caf
+  641839141939 tokens across 3 UTxOs / 1 address(es)
+  lock-datum decode: 0/3 ok · 3 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1w85lr4yaa7jarua6pxquxxvuenrfhqca6eqfs472lnjsetcmkrsmp
+
+payment credential af97793b8702f381976cec83e303e9ce17781458c73c4bb16fe02b83
+  638484691248 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 1 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ undetermined: the datum is hash-only and unspent, so the chain has not revealed it. Not evidence either way.
+     addr1zxhew7fmsup08qvhdnkg8ccra88pw7q5trrncja3dlszhql7qlnp65039ceage6ryskmf2gtpr0uskxam8jdd6hj3j6setcx78
+
+payment credential 2b0ff0ebf7419d4ad8f95903cefd9bb1c0b758d2cd65d51c0903050d
+  192000000000 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 1 no datum at all
+  ⇒ carries no datum — not a lock of any kind. Some other contract.
+     addr1xy4slu8t7aqe6jkcl9vs8nhanwcupd6c6txkt4gupyps2rfjjna9mvvl26ka09s5yt30nkzvvgkad22vastvw9hpd9wsx5dvw9
+
+payment credential 84e117bef45dd5a74fed6311b879357525ada6b86f03e2d3d185aea9
+  190461418892 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 1 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1zxzwz9a773watf60a433rwrex46jttdxhphs8ckn6xz6a2dksyd8pn7amnr48geat0yft0uezfunealzy4ghl0cayp4s3eq8ha
+
+payment credential c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c
+  10000000000 tokens across 2 UTxOs / 1 address(es)
+  lock-datum decode: 0/2 ok · 2 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcn8dh4u6y08fn42pzy8y566ype4cwwdl4qc57lmx64ld38gsd297st
+
+payment credential 9d6ed16c6d36dee26c6a7da0d83a494de19f8947c92fb520985f9bfa
+  7500000000 tokens across 3 UTxOs / 3 address(es)
+  lock-datum decode: 0/3 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 3 no datum at all
+  ⇒ carries no datum — not a lock of any kind. Some other contract.
+     addr1zxwka5tvd5mdacnvdf76pkp6f9x7r8ufglyjldfqnp0eh7h56mgaesqfm3509frdnxrnnwgykllt7xp4ts2phjvejw7squfszh
+     addr1zxwka5tvd5mdacnvdf76pkp6f9x7r8ufglyjldfqnp0eh7sa6ntleljgxpgglljtnn03sedy5zxgnj67p9cu9tkrnt3s0kpdk2
+     addr1zxwka5tvd5mdacnvdf76pkp6f9x7r8ufglyjldfqnp0eh7sya09pgsuxyyv4ye72d6hqgkfeu3kylmy8jug70ynwq60q5k3ee7
+
+payment credential 00fb107bfbd51b3a5638867d3688e986ba38ff34fb738f5bd42b20d5
+  2500000000 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 1 no datum at all
+  ⇒ carries no datum — not a lock of any kind. Some other contract.
+     addr1zyq0kyrml023kwjk8zr86d5gaxrt5w8lxnah8r6m6s4jp4g3r6dxnzml343sx8jweqn4vn3fz2kj8kgu9czghx0jrsyqqktyhv
+
+payment credential 9068a7a3f008803edac87af1619860f2cdcde40c26987325ace138ad
+  2500000000 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 1 no datum at all
+  ⇒ carries no datum — not a lock of any kind. Some other contract.
+     addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd
+
+payment credential e0302560ced2fdcbfcb2602697df970cd0d6a38f94b32703f51c312b
+  2500000000 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 1 no datum at all
+  ⇒ carries no datum — not a lock of any kind. Some other contract.
+     addr1z8srqftqemf0mjlukfszd97ljuxdp44r372txfcr75wrz2auzrlrz2kdd83wzt9u9n9qt2swgvhrmmn96k55nq6yuj4qw992w9
+
+payment credential bbece14f554b0020fe2715d05801f4680ebd40d11a58f14740b9f2c5
+  3279772 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 1 no datum at all
+  ⇒ carries no datum — not a lock of any kind. Some other contract.
+     addr1wxa7ec20249sqg87yu2aqkqp735qa02q6yd93u28gzul93ghspjnt

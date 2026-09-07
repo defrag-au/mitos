@@ -576,7 +576,7 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
             .count();
         if loose >= segments::ROLLUP_AFTER_PASSES {
             let t = Instant::now();
-            segments::rollup(dir, manifest, now_unix())?;
+            segments::rollup(dir, manifest, now_unix(), segments::RollupReason::Routine)?;
             tracing::info!(
                 passes = loose,
                 secs = format!("{:.1}", t.elapsed().as_secs_f64()),

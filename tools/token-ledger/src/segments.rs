@@ -277,6 +277,26 @@ pub fn compact(
 /// landing. Every extra pass is a footer per read for every reader.
 pub const ROLLUP_AFTER_PASSES: usize = 3;
 
+/// Why a rollup is running, which decides whether ONE file is worth folding.
+///
+/// The distinction only exists because a rollup does two jobs. Folding files
+/// is the obvious one and is pointless on an archive that is already a single
+/// file. The other is RECOMPUTING what the merge derives — `units` above all —
+/// and that is worth doing over one file precisely when the code that derives
+/// it has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupReason {
+    /// The automatic path, after [`ROLLUP_AFTER_PASSES`]. Nothing to gain from
+    /// re-folding a single file: it would rewrite an identical artifact and
+    /// churn R2 on every landing.
+    Routine,
+    /// Asked for by hand. Re-folds even a single file, because the reason a
+    /// human forces a rollup is that a derived number changed — `units` gained
+    /// a CIP-68/CIP-27 filter, and every archive sealed before it reports a
+    /// count that is no longer what the code means.
+    Forced,
+}
+
 /// Fold EVERYTHING the manifest names — rollup, passes, corrections — into
 /// one file at the policy's root, and rewrite the manifest to point at it.
 ///
@@ -285,12 +305,21 @@ pub const ROLLUP_AFTER_PASSES: usize = 3;
 /// output has no corrections file. Sequence numbers keep counting, so a
 /// reader mid-flight on the old manifest still finds old files until the
 /// prune; the manifest is written BEFORE the old files are removed.
-pub fn rollup(dir: &Path, manifest: &mut crate::archive::Manifest, sealed_unix: u64) -> Result<()> {
+pub fn rollup(
+    dir: &Path,
+    manifest: &mut crate::archive::Manifest,
+    sealed_unix: u64,
+    reason: RollupReason,
+) -> Result<()> {
     // IMMUTABLE only: the volatile tail is replaced whole on its next
     // refresh, so folding it into a file nothing rewrites would freeze a
     // stretch that can still roll back.
     let old_files = manifest.immutable_files();
-    if old_files.len() < 2 {
+    let least = match reason {
+        RollupReason::Routine => 2,
+        RollupReason::Forced => 1,
+    };
+    if old_files.len() < least {
         return Ok(());
     }
     let inputs: Vec<PathBuf> = old_files.iter().map(|(rel, _)| dir.join(rel)).collect();
@@ -382,20 +411,42 @@ pub fn run_rollup(args: RollupArgs) -> Result<()> {
         anyhow::bail!("no archive at {}", dir.display());
     };
     let before = manifest.files().len();
+    // What the manifest claimed BEFORE, so the line below can say whether
+    // anything actually moved. Without this a no-op printed the existing
+    // rollup entry and read as success — the archive equivalent of a silent
+    // failure, and the reason this command was trusted when it had done
+    // nothing at all.
+    let was = manifest.rollup.as_ref().map(|r| (r.file.clone(), r.units));
     let t = std::time::Instant::now();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    rollup(&dir, &mut manifest, now)?;
+    rollup(&dir, &mut manifest, now, RollupReason::Forced)?;
     let r = manifest.rollup.as_ref();
-    println!(
-        "rolled {before} files into {} ({} rows, {} units) in {:.1}s",
-        r.map_or("nothing", |r| r.file.as_str()),
-        r.map_or(0, |r| r.rows),
-        r.map_or(0, |r| r.units),
-        t.elapsed().as_secs_f64()
-    );
+    let now_is = r.map(|r| (r.file.clone(), r.units));
+    match now_is == was {
+        true => println!(
+            "nothing to roll — {before} file(s), already folded and unchanged \
+             ({} units)",
+            r.map_or(0, |r| r.units)
+        ),
+        false => println!(
+            "rolled {before} files into {} ({} rows, {} units{}) in {:.1}s",
+            r.map_or("nothing", |r| r.file.as_str()),
+            r.map_or(0, |r| r.rows),
+            r.map_or(0, |r| r.units),
+            // The number this whole exercise is about: say what it WAS when
+            // a re-fold changed it, so a recount is visible rather than
+            // something to go and diff a manifest for.
+            match was.map(|(_, u)| u) {
+                Some(before_units) if Some(before_units) != r.map(|r| r.units) =>
+                    format!(", was {before_units}"),
+                _ => String::new(),
+            },
+            t.elapsed().as_secs_f64()
+        ),
+    }
     Ok(())
 }
 
@@ -920,7 +971,7 @@ mod tests {
             .unwrap()
             .feed_rows(10, None)
             .unwrap();
-        rollup(dir, &mut manifest, 7).unwrap();
+        rollup(dir, &mut manifest, 7, RollupReason::Routine).unwrap();
         assert_eq!(manifest.files().len(), 1, "one file, at the root");
         assert_eq!(manifest.rolled_up_through, Some(1));
         assert!(dir.join(crate::archive::PENDING).exists());
@@ -934,5 +985,29 @@ mod tests {
         let one = after.iter().find(|r| r.tx_hash == vec![1; 32]).unwrap();
         assert_eq!(one.units[0].parties.len(), 2, "the correction is folded in");
         assert_eq!(a.coverage().total_txs, 3);
+
+        // AND A FORCED ROLLUP RE-FOLDS THE ONE FILE. Routine finds nothing to
+        // do — correctly, since re-folding a single file rewrites an identical
+        // artifact — but a human forcing one is asking for the derived numbers
+        // to be recomputed, which is the only way an archive sealed before the
+        // `units` filter existed ever stops reporting the old count.
+        let rolled = manifest.rollup.clone().unwrap();
+        rollup(dir, &mut manifest, 8, RollupReason::Routine).unwrap();
+        assert_eq!(
+            manifest.rollup.as_ref().unwrap().file,
+            rolled.file,
+            "routine leaves an already-folded archive alone"
+        );
+        rollup(dir, &mut manifest, 9, RollupReason::Forced).unwrap();
+        let forced = manifest.rollup.as_ref().unwrap();
+        assert_ne!(forced.file, rolled.file, "forced writes a new artifact");
+        assert_eq!(forced.rows, rolled.rows, "with the same rows");
+        assert_eq!(forced.units, 2, "and a freshly counted `units`");
+        let mut a = PolicyArchive::open(dir).unwrap().unwrap();
+        assert_eq!(
+            a.feed_rows(10, None).unwrap(),
+            before,
+            "a re-fold changes the count, never the history"
+        );
     }
 }

@@ -464,13 +464,12 @@ impl PolicyArchive {
             first_slot,
             last_slot,
             total_txs,
-            units: self
-                .manifest
-                .passes
-                .iter()
-                .map(|p| p.units)
-                .max()
-                .unwrap_or(0),
+            // ONE implementation, on the manifest. This was a second copy of
+            // the same `max` that had already drifted from it — it never
+            // consulted `rollup` at all, so a fully folded archive reported
+            // the count of whichever pass happened to be largest, from files
+            // that no longer exist. See [`Manifest::units`].
+            units: self.manifest.units(),
             unresolved: self.manifest.latest_pass().map_or(0, |p| p.pending),
             completeness: self.manifest.completeness(),
         }

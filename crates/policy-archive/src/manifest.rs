@@ -454,9 +454,27 @@ impl Manifest {
 
     /// A LOWER BOUND on the policy's distinct units: the most any one pass
     /// or rollup saw.
+    ///
+    /// # A ROLLED-UP PASS DOES NOT VOTE
+    ///
+    /// Its rows are in the rollup and its file is gone, so its count is
+    /// subsumed — and taking a `max` across both is how a stale number
+    /// outlived the thing that produced it.
+    ///
+    /// This was harmless while every count was computed the same way: a
+    /// rollup merges strictly more rows than any single pass, so it always
+    /// won the `max` anyway. It stopped being harmless the moment `units`
+    /// gained a meaning — CIP-68 reference twins and CIP-27 royalty tokens
+    /// are no longer counted — because a rollup written by the new code
+    /// (5,000 for Mekka S1) then lost the `max` to a pass entry written by
+    /// the old code (9,690), and re-folding the archive could not shift it.
+    /// A number nothing can correct is worse than one that is merely wrong.
+    ///
+    /// LOOSE passes still vote: their rows are genuinely not in the rollup.
     pub fn units(&self) -> u64 {
         self.passes
             .iter()
+            .filter(|p| !p.rolled_up)
             .map(|p| p.units)
             .chain(self.rollup.as_ref().map(|r| r.units))
             .max()
@@ -603,6 +621,41 @@ mod tests {
             secs: 0.0,
             written_unix: 0,
         }
+    }
+
+    /// A CORRECTED ROLLUP MUST BE ABLE TO LOWER THE COUNT.
+    ///
+    /// The exact shape that made a wrong number uncorrectable: `units` stopped
+    /// counting CIP-68 reference twins and CIP-27 royalty tokens, a forced
+    /// rollup recomputed Mekka S1 from 9,690 to 5,000 — and the old pass
+    /// entries, still carrying 9,690 for files that no longer exist, won the
+    /// `max` and put the stale number straight back on the page.
+    ///
+    /// A rolled-up pass's rows are IN the rollup, so its count is subsumed.
+    /// A loose pass's are not, so its count still counts.
+    #[test]
+    fn a_rolled_up_pass_cannot_outvote_the_rollup_that_replaced_it() {
+        let mut m = Manifest::new("ab");
+        let mut stale = pass(0);
+        stale.units = 9_690;
+        stale.rolled_up = true;
+        m.passes = vec![stale];
+        m.rollup = Some(FileEntry {
+            units: 5_000,
+            ..entry("archive-0001.parquet")
+        });
+        assert_eq!(
+            m.units(),
+            5_000,
+            "the rollup counted every row and is the only file left"
+        );
+
+        // A pass still waiting to be folded genuinely holds rows the rollup
+        // does not, so it is still evidence of a lower bound.
+        let mut loose = pass(1);
+        loose.units = 6_100;
+        m.passes.push(loose);
+        assert_eq!(m.units(), 6_100, "a LOOSE pass still votes");
     }
 
     /// A rollup REPLACES the passes it covers in the file list and takes
