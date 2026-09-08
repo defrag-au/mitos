@@ -33,8 +33,12 @@ pub const CHUNK_SLOTS: u64 = 21_600;
 #[derive(Debug, Deserialize)]
 struct RegistryFile {
     token: Vec<TokenEntry>,
-    #[serde(default)]
-    sink: Vec<SinkEntry>,
+    // `sink` was here until 2026-09-08. Burn sinks moved to
+    // `shared-crates/address-registry` as `ScriptCategory::Burn { evidence }`,
+    // keyed by payment credential — a sink is a property of the SCRIPT, and
+    // holding it per-token meant a sink was only known to the tokens somebody
+    // had already registered it against. `serde` still ignores an unknown key,
+    // so an old file with a `[[sink]]` table loads without complaint.
     #[serde(default)]
     lock_platform: Vec<LockPlatform>,
 }
@@ -73,17 +77,12 @@ impl LockPlatform {
 
 /// An address tokens can reach but never leave.
 ///
-/// **`evidence` is mandatory and is the point of the type.** "Provably
-/// unspendable" and "believed unspendable" are different claims, and an address
-/// that removes supply from the float — and, under `BURN_LEDGER.md`, buys paid
-/// access — is exactly where an unexamined assumption becomes expensive. So a
-/// sink cannot be registered without saying how it was established, mirroring
-/// the address-registry convention of storing a `source` string.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SinkEntry {
-    pub address: String,
-    pub evidence: String,
-}
+// `SinkEntry` lived here until 2026-09-08. Its rule — that `evidence` is
+// mandatory, because "provably unspendable" and "believed unspendable" are
+// different claims about an address that removes supply from the float —
+// survives intact as `address_registry::ScriptCategory::Burn { evidence }`.
+// It stopped being a per-token concern the moment two walked tokens were found
+// sending supply to the same script.
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenEntry {
@@ -283,11 +282,6 @@ pub fn load_or_unit(path: &Path, name_or_unit: &str) -> Result<TokenEntry> {
 pub fn find_by_unit(path: &Path, unit: &str) -> Result<Option<TokenEntry>> {
     let unit = unit.to_lowercase();
     Ok(read(path)?.token.into_iter().find(|t| t.unit() == unit))
-}
-
-/// Every registered unspendable sink.
-pub fn load_sinks(path: &Path) -> Result<Vec<SinkEntry>> {
-    Ok(read(path)?.sink)
 }
 
 /// Every registered lock platform, validated.

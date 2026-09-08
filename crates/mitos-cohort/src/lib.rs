@@ -102,6 +102,12 @@ impl Cohort {
     }
 }
 
+/// Lower-case hex. The registry's lookups are exact and its own guard test
+/// enforces lower case, so this must not use an upper-case formatter.
+fn hex_lower(bytes: &[u8; 28]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The 28-byte payment credential of a Shelley address, if it has one.
 pub fn payment_cred(address: &str) -> Option<[u8; 28]> {
     match Address::from_bech32(address).ok()? {
@@ -144,19 +150,11 @@ pub struct Classification {
 /// kind, read through pallas rather than by matching a bech32 prefix —
 /// `addr1z` covers two distinct address types and a prefix test would silently
 /// mis-sort one of them.
-pub fn classify(
-    address: &str,
-    sinks: &[String],
-    pools: &[String],
-    lock_creds: &[[u8; 28]],
-) -> Classification {
+pub fn classify(address: &str, pools: &[String], lock_creds: &[[u8; 28]]) -> Classification {
     let c = |cohort: Cohort| Classification {
         cohort,
         basis: cohort.basis(),
     };
-    if sinks.iter().any(|s| s == address) {
-        return c(Cohort::Burn);
-    }
     if pools.iter().any(|p| p == address) {
         return c(Cohort::Pool);
     }
@@ -166,6 +164,20 @@ pub fn classify(
                 pallas_addresses::ShelleyPaymentPart::Key(h)
                 | pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
             };
+            // Burn sinks come from `address-registry`, by CREDENTIAL. They used
+            // to be an exact-address list loaded from per-token config, which
+            // made a property of the script into a property of each token that
+            // happened to reach it — and meant a sink was only known to the
+            // tokens somebody had already registered it against.
+            if matches!(
+                address_registry::lookup_payment_credential(&hex_lower(&cred))
+                    .map(|e| &e.category),
+                Some(address_registry::AddressCategory::Script(
+                    address_registry::ScriptCategory::Burn { .. }
+                ))
+            ) {
+                return c(Cohort::Burn);
+            }
             // Lock platforms glue a per-locker stake credential onto one shared
             // payment script, so this must match the payment part only — a
             // full-address set would need one entry per locker and would miss
@@ -219,7 +231,7 @@ mod tests {
     /// to 96% of supply.
     #[test]
     fn a_bonding_curve_is_inventory() {
-        let c = classify(CURVE, &[], &[], &[]);
+        let c = classify(CURVE, &[], &[]);
         assert_eq!(c.cohort, Cohort::Inventory);
         assert_eq!(c.basis, "decoded");
     }
@@ -230,24 +242,37 @@ mod tests {
     /// a token's unsold inventory is being counted as pooled liquidity.
     #[test]
     fn a_shared_stake_credential_does_not_make_two_contracts_one() {
-        assert_eq!(classify(CURVE, &[], &[], &[]).cohort, Cohort::Inventory);
+        assert_eq!(classify(CURVE, &[], &[]).cohort, Cohort::Inventory);
         // Not registered as a pool here, so it falls to the honest residual —
         // the point is only that it is NOT read as the curve.
         assert_eq!(
-            classify(SPLASH_POOL, &[], &[], &[]).cohort,
+            classify(SPLASH_POOL, &[], &[]).cohort,
             Cohort::Script,
             "the pool must not inherit the curve's cohort from a shared stake part"
         );
         // And with the pool registered, it is a pool rather than inventory.
         let pools = vec![SPLASH_POOL.to_string()];
-        assert_eq!(classify(SPLASH_POOL, &[], &pools, &[]).cohort, Cohort::Pool);
+        assert_eq!(classify(SPLASH_POOL, &pools, &[]).cohort, Cohort::Pool);
     }
 
+    /// The sink is no longer injectable — it comes from `address-registry`, by
+    /// credential, with the evidence for its unspendability attached. So this
+    /// asserts the REAL one resolves rather than that an arbitrary address can
+    /// be declared a burn, which is a stronger test: a caller can no longer
+    /// nominate a sink by passing a list.
     #[test]
-    fn sink_beats_everything() {
-        let sinks = vec![BURN.to_string()];
-        assert_eq!(classify(BURN, &sinks, &[], &[]).cohort, Cohort::Burn);
-        assert_eq!(classify(BURN, &sinks, &[], &[]).cohort.basis(), "proven");
+    fn the_registered_sink_is_proven_burn() {
+        assert_eq!(classify(BURN, &[], &[]).cohort, Cohort::Burn);
+        assert_eq!(classify(BURN, &[], &[]).basis, "proven");
+    }
+
+    /// And an address nobody registered is NOT a burn, however much it looks
+    /// like one. `addr1w…` is script-payment-with-no-stake — the same shape as
+    /// the real sink — and shape is not evidence.
+    #[test]
+    fn an_unregistered_script_is_not_a_sink() {
+        const LOOKALIKE: &str = "addr1w8n8kq3j96v03a3znqqy9f54prt8uf6s4lyj7nuf2cvg2ucnwhs68";
+        assert_eq!(classify(LOOKALIKE, &[], &[]).cohort, Cohort::Script);
     }
 
     #[test]
@@ -255,15 +280,15 @@ mod tests {
         // Without the pool set this is just "a script"; with it, it is a pool.
         // Getting that precedence backwards would hide every pool inside the
         // unclassified band.
-        assert_eq!(classify(CSWAP, &[], &[], &[]).cohort, Cohort::Script);
+        assert_eq!(classify(CSWAP, &[], &[]).cohort, Cohort::Script);
         let pools = vec![CSWAP.to_string()];
-        assert_eq!(classify(CSWAP, &[], &pools, &[]).cohort, Cohort::Pool);
+        assert_eq!(classify(CSWAP, &pools, &[]).cohort, Cohort::Pool);
     }
 
     #[test]
     fn script_payment_is_not_a_wallet() {
-        assert_eq!(classify(CSWAP, &[], &[], &[]).cohort, Cohort::Script);
-        assert_eq!(classify(CSWAP, &[], &[], &[]).cohort.basis(), "chain");
+        assert_eq!(classify(CSWAP, &[], &[]).cohort, Cohort::Script);
+        assert_eq!(classify(CSWAP, &[], &[]).cohort.basis(), "chain");
     }
 
     #[test]
@@ -272,14 +297,14 @@ mod tests {
         // decode failures — an unclassified band that grows because of our own
         // bugs would be worse than useless.
         assert_eq!(
-            classify("not-an-address", &[], &[], &[]).cohort,
+            classify("not-an-address", &[], &[]).cohort,
             Cohort::Wallet
         );
     }
 
     #[test]
     fn key_payment_is_a_wallet() {
-        assert_eq!(classify(WALLET, &[], &[], &[]).cohort, Cohort::Wallet);
+        assert_eq!(classify(WALLET, &[], &[]).cohort, Cohort::Wallet);
     }
 
     // Two real $Aliens holders: same CrowdLock payment script, different
@@ -291,9 +316,9 @@ mod tests {
 
     #[test]
     fn crowdlock_is_vesting_across_differing_stake_parts() {
-        assert_eq!(classify(LOCK_A, &[], &[], &[]).cohort, Cohort::Vesting);
-        assert_eq!(classify(LOCK_B, &[], &[], &[]).cohort, Cohort::Vesting);
-        assert_eq!(classify(LOCK_A, &[], &[], &[]).cohort.basis(), "decoded");
+        assert_eq!(classify(LOCK_A, &[], &[]).cohort, Cohort::Vesting);
+        assert_eq!(classify(LOCK_B, &[], &[]).cohort, Cohort::Vesting);
+        assert_eq!(classify(LOCK_A, &[], &[]).cohort.basis(), "decoded");
         assert_ne!(
             payment_cred(LOCK_A),
             None,
@@ -317,11 +342,11 @@ mod tests {
         // Unregistered it is just an unnamed script; registered it is vesting,
         // and the basis says we could not read its schedule.
         assert_eq!(
-            classify(UNKNOWN_SCRIPT, &[], &[], &[]).cohort,
+            classify(UNKNOWN_SCRIPT, &[], &[]).cohort,
             Cohort::Script
         );
         let creds = [payment_cred(UNKNOWN_SCRIPT).expect("payment cred")];
-        let got = classify(UNKNOWN_SCRIPT, &[], &[], &creds);
+        let got = classify(UNKNOWN_SCRIPT, &[], &creds);
         assert_eq!(got.cohort, Cohort::Vesting);
         assert_eq!(
             got.basis, "registered",
@@ -329,8 +354,8 @@ mod tests {
         );
         // Built-in platforms keep the stronger basis even when registered
         // ones exist alongside them.
-        assert_eq!(classify(LOCK_A, &[], &[], &creds).basis, "decoded");
-        assert_eq!(classify(SNEKFUN_LOCK, &[], &[], &[]).basis, "decoded");
+        assert_eq!(classify(LOCK_A, &[], &creds).basis, "decoded");
+        assert_eq!(classify(SNEKFUN_LOCK, &[], &[]).basis, "decoded");
     }
 
     /// snek.fun is recognised by the crate now, not by local config — so it
@@ -339,15 +364,25 @@ mod tests {
 
     #[test]
     fn snekfun_is_recognised_without_any_local_registration() {
-        let got = classify(SNEKFUN_LOCK, &[], &[], &[]);
+        let got = classify(SNEKFUN_LOCK, &[], &[]);
         assert_eq!(got.cohort, Cohort::Vesting);
         assert_eq!(got.basis, "decoded");
     }
 
+    /// Precedence: provably-gone outranks locked-for-now, and outranks a
+    /// launchpad curve. Asserted by ORDER in `classify` rather than by
+    /// injecting a sink, now that sinks come from the registry — if a
+    /// credential were ever registered as both, burn must win.
     #[test]
-    fn a_sink_still_wins_over_vesting() {
-        // Precedence matters: provably-gone outranks locked-for-now.
-        let sinks = vec![LOCK_A.to_string()];
-        assert_eq!(classify(LOCK_A, &sinks, &[], &[]).cohort, Cohort::Burn);
+    fn burn_is_checked_before_every_other_script_cohort() {
+        let src = include_str!("lib.rs");
+        let burn_at = src.find("return c(Cohort::Burn);").expect("burn arm");
+        let launchpad_at = src.find("is_snek_fun_curve").expect("launchpad arm");
+        let vesting_at = src.find("is_crowd_lock").expect("vesting arm");
+        assert!(
+            burn_at < launchpad_at && burn_at < vesting_at,
+            "burn must be tested first — provably unspendable outranks every \
+             claim about what a script is FOR"
+        );
     }
 }

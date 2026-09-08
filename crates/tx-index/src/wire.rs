@@ -81,6 +81,25 @@ pub enum AuxResponse {
     },
 }
 
+/// `POST /aux` — many tx hashes in one round trip.
+///
+/// Single-hash `GET /tx/{hash}/aux` is sub-millisecond locally, but a caller
+/// walking a whole book over a tunnel pays the round trip, not the lookup. The
+/// batch exists so that walk is bounded by the number of BATCHES rather than
+/// the number of listings.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuxBatchRequest {
+    pub tx_hashes: Vec<String>,
+}
+
+/// One `AuxResponse` per requested hash, in request order — including the
+/// `unknown_tx` and `no_metadata` cases, so the caller can tell a miss from a
+/// definitive "no metadata" without a second request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuxBatchResponse {
+    pub results: Vec<AuxResponse>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutRefRequest {
     pub tx_hash: String,

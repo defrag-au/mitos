@@ -304,10 +304,6 @@ pub fn run(args: WalkArgs) -> Result<()> {
     // Loaded before the walk: the datum-capture decision needs to know which
     // scripts are already-named lock platforms, so it only keeps datums for
     // the genuinely unnamed ones.
-    let sinks: Vec<String> = registry::load_sinks(&args.tokens)?
-        .into_iter()
-        .map(|s| s.address)
-        .collect();
     let lock_creds: Vec<[u8; 28]> = registry::load_lock_platforms(&args.tokens)?
         .iter()
         .map(registry::LockPlatform::cred_bytes)
@@ -618,7 +614,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 // evidence needed to understand it.
                 let worth_keeping = !pool_hit
                     && unlock_ts_ms.is_none()
-                    && cohort::classify(&out.address, &sinks, &[], &lock_creds).cohort
+                    && cohort::classify(&out.address, &[], &lock_creds).cohort
                         != cohort::Cohort::Wallet;
                 let datum_cbor = worth_keeping.then(|| datum.map(<[u8]>::to_vec)).flatten();
                 let datum_hash = out.datum_hash.as_ref().map(|h| h.as_ref().to_vec());
@@ -798,10 +794,9 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
     // Classify from the addresses just recorded. Derived, so it costs a pass
     // over the party table and never a re-walk.
-    let classified = ledger.classify_parties(&sinks, &lock_creds)?;
+    let classified = ledger.classify_parties(&lock_creds)?;
     tracing::info!(
         classified,
-        sinks = sinks.len(),
         lock_platforms = lock_creds.len(),
         "walk: parties classified"
     );
@@ -870,10 +865,10 @@ pub fn run(args: WalkArgs) -> Result<()> {
 /// function of the stored address rather than something the walk decided.
 pub fn classify(db: &std::path::Path, tokens: &std::path::Path) -> Result<()> {
     let mut ledger = Ledger::open(db).with_context(|| format!("opening {}", db.display()))?;
-    let sinks = registry::load_sinks(tokens)?;
-    for s in &sinks {
-        println!("sink {} — {}", s.address, s.evidence.trim());
-    }
+    // Sinks are no longer listed from config — they live in
+    // `address-registry`, by credential, and `classify` looks each party's own
+    // credential up. Nothing to enumerate here, and nothing to get out of step
+    // with what the classifier actually consults.
     let platforms = registry::load_lock_platforms(tokens)?;
     for p in &platforms {
         println!(
@@ -883,15 +878,13 @@ pub fn classify(db: &std::path::Path, tokens: &std::path::Path) -> Result<()> {
             p.evidence.trim()
         );
     }
-    let addresses: Vec<String> = sinks.iter().map(|s| s.address.clone()).collect();
     let creds: Vec<[u8; 28]> = platforms
         .iter()
         .map(registry::LockPlatform::cred_bytes)
         .collect::<Result<_>>()?;
-    let n = ledger.classify_parties(&addresses, &creds)?;
+    let n = ledger.classify_parties(&creds)?;
     println!(
-        "classified {n} parties against {} sink(s) and {} lock platform(s)",
-        addresses.len(),
+        "classified {n} parties against the registry's burn sinks and {} lock platform(s)",
         creds.len()
     );
     Ok(())

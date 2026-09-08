@@ -20,12 +20,17 @@
 //! [`PoolV2::reserve_a`] / [`reserve_b`](PoolV2::reserve_b) are authoritative
 //! and callers must not substitute the value.
 //!
-//! ## V1 and V2 are SWAPPED in `shared-crates/address-registry`
+//! ## V1 and V2 were SWAPPED in `shared-crates/address-registry` — FIXED
 //!
 //! Verified on chain 2026-06-24: the credential labelled "Minswap V2" there
 //! (`e1317b15…`) is actually V1, and the one labelled "Minswap" (`ea07b733…`)
-//! is V2. The constants below are correct; anything keying off that registry's
-//! labels inherits the error.
+//! is V2. The constants below were correct and the registry inherited the
+//! swap.
+//!
+//! Corrected in that crate on 2026-09-08, by re-deriving each credential from
+//! its own address prefix rather than trusting either file. Note the labels
+//! there never carried a version — only the comments did — so the error was
+//! invisible to a lookup and misleading only to a reader.
 
 use pallas_codec::minicbor;
 use pallas_primitives::{Constr, PlutusData};

@@ -7,6 +7,8 @@
 //! - `GET  /tx/{hash}` — the body (hex) + every output, decoded.
 //! - `GET  /tx/{hash}/out/{index}` — one output.
 //! - `GET  /tx/{hash}/aux` — the tx's auxiliary data (metadata) CBOR.
+//! - `POST /aux` — `{tx_hashes:[…]}` → one aux result per hash, in order.
+//!   For walkers resolving a whole book; bounded by batches, not listings.
 //! - `POST /resolve` — `{items:[{tx_hash,index}]}` → one result per item,
 //!   in order, each with its own status. For walkers resolving in batches.
 //!
@@ -26,8 +28,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 use tx_index::wire::{
-    AuxResponse, HealthResponse, OutputResponse, ResolveRequest, ResolveResponse, ResolveResult,
-    ResolveStatus, TxResponse,
+    AuxBatchRequest, AuxBatchResponse, AuxResponse, HealthResponse, OutputResponse, ResolveRequest,
+    ResolveResponse, ResolveResult, ResolveStatus, TxResponse,
 };
 use tx_index::{Coverage, IndexHandle, Resolution};
 
@@ -125,6 +127,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .route("/tx/{hash}", get(tx))
             .route("/tx/{hash}/aux", get(aux))
             .route("/tx/{hash}/out/{index}", get(output))
+            .route("/aux", post(aux_batch))
             .route("/resolve", post(resolve))
             .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -297,6 +300,67 @@ async fn aux(
             tx_hash: hex::encode(h),
         },
     }))
+}
+
+/// `POST /aux` — auxiliary data for many transactions in one round trip.
+/// Same per-item semantics as [`aux`], one result per requested hash in order.
+async fn aux_batch(
+    State(state): State<AppState>,
+    Json(req): Json<AuxBatchRequest>,
+) -> Result<Json<AuxBatchResponse>, AppError> {
+    if req.tx_hashes.len() > MAX_BATCH {
+        return Err(AppError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "{} hashes; the batch ceiling is {MAX_BATCH}",
+                req.tx_hashes.len()
+            ),
+        ));
+    }
+    let idx = state.index.get();
+    let results = tokio::task::spawn_blocking(move || {
+        req.tx_hashes
+            .into_iter()
+            .map(|hex_hash| {
+                // A malformed hash is reported as unknown rather than failing
+                // the batch: one bad entry must not cost the caller the other
+                // 999 lookups it asked for.
+                let Ok(h) = parse_hash(&hex_hash) else {
+                    return AuxResponse::UnknownTx { tx_hash: hex_hash };
+                };
+                match idx.tx(&h) {
+                    Ok(Some(body)) => {
+                        let cbor = body.aux.map(|loc| idx.read_span(loc)).transpose();
+                        match cbor {
+                            Ok(Some(cbor)) => AuxResponse::Found {
+                                tx_hash: hex::encode(body.hash),
+                                era: body.era.to_string(),
+                                chunk: body.loc.chunk,
+                                aux_cbor: hex::encode(cbor),
+                            },
+                            Ok(None) => AuxResponse::NoMetadata {
+                                tx_hash: hex::encode(body.hash),
+                                era: body.era.to_string(),
+                                chunk: body.loc.chunk,
+                            },
+                            Err(e) => {
+                                tracing::warn!(tx = %hex_hash, error = %format!("{e:#}"), "batch aux read failed");
+                                AuxResponse::UnknownTx { tx_hash: hex_hash }
+                            }
+                        }
+                    }
+                    Ok(None) => AuxResponse::UnknownTx { tx_hash: hex_hash },
+                    Err(e) => {
+                        tracing::warn!(tx = %hex_hash, error = %format!("{e:#}"), "batch aux lookup failed");
+                        AuxResponse::UnknownTx { tx_hash: hex_hash }
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(AuxBatchResponse { results }))
 }
 
 async fn output(

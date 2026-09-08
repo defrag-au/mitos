@@ -20,3 +20,12 @@ mitos-vesting-decode = { path = "../mitos-vesting-decode" }
 # Launchpad bonding-curve recognition by payment credential. Same pure-decode
 # class as the vesting crate, so this keeps the wasm cost unchanged.
 mitos-launchpad-decode = { path = "../mitos-launchpad-decode" }
+# Burn sinks, by payment credential, each carrying the evidence for why it is
+# unspendable. Replaced a per-token `[[sink]]` table in token-ledger's
+# `tokens.toml` on 2026-09-08 — a sink is a property of the SCRIPT, not of a
+# token, and two of the tokens walked here send supply to the same one.
+#
+# It is the one registry this crate consults rather than receives. The others
+# (pools, lock credentials) stay parameters because they are per-walk; a
+# provably-unspendable script is not.
+address-registry = { workspace = true }
