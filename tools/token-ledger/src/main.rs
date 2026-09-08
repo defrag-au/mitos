@@ -18,6 +18,7 @@
 mod archive;
 mod buffer;
 mod export;
+mod observer;
 mod policy_api;
 mod publish;
 mod registry;

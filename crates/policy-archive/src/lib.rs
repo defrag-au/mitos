@@ -48,6 +48,9 @@ pub mod graph;
 pub mod groups;
 pub mod manifest;
 pub mod multi;
+/// What a script output HELD, decoded or not — the tier that lets a decoder
+/// added later re-derive its history from the archive instead of from chunks.
+pub mod observation;
 pub mod reader;
 pub mod schema;
 pub mod writer;
@@ -61,6 +64,9 @@ pub use graph::{
 pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
 pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
+pub use observation::{
+    Decoded, OBSERVATIONS, OBSERVATION_FORMAT, Observation, ObservationWriter, read_all,
+};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
 pub use writer::{ArchiveWriter, Written};

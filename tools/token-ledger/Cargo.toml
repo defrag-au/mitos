@@ -70,6 +70,9 @@ mitos-cohort = { path = "../../crates/mitos-cohort" }
 # them. Separate crate from `mitos-cohort` because it needs the walker's output
 # shape; see either crate's header for why the split is by dependency class.
 mitos-pool-observe = { path = "../../crates/mitos-pool-observe" }
+# Bonding-curve recognition + datum. A launch is the token's most consequential
+# single event and the observer that records it is a thin adapter over this.
+mitos-launchpad-decode = { path = "../../crates/mitos-launchpad-decode" }
 
 # The artifacts `export` writes — shared with the egui WASM frontend that
 # loads them, so the format lives in a crate rather than in this tool.

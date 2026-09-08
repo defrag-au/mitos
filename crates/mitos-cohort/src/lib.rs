@@ -113,6 +113,18 @@ pub fn payment_cred(address: &str) -> Option<[u8; 28]> {
     }
 }
 
+/// Whether the address's PAYMENT part is a script.
+///
+/// Read through pallas rather than by bech32 prefix: `addr1z` covers two
+/// distinct address types and a prefix test silently mis-sorts one of them.
+/// Byron and stake addresses are not scripts.
+pub fn is_script_address(address: &str) -> bool {
+    matches!(
+        Address::from_bech32(address),
+        Ok(Address::Shelley(sh)) if sh.payment().is_script()
+    )
+}
+
 /// A cohort together with how firmly it is known.
 ///
 /// Basis is per-classification rather than per-cohort because `vesting` can be

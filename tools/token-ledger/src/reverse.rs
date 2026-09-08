@@ -370,6 +370,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         },
     )?;
 
+    let mut observations: Vec<policy_archive::Observation> = Vec::new();
     let walked = pass(
         &immutable,
         &all_chunks,
@@ -383,6 +384,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         &mut pending,
         !args.no_sieve,
         &hooks,
+        &mut observations,
     )?;
     let segments = writer.finish()?;
 
@@ -399,6 +401,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         pending: &pending,
         compact: !args.no_compact,
         secs: started.elapsed().as_secs_f64(),
+        observations,
     })?;
 
     tracing::info!(
@@ -455,6 +458,8 @@ struct Landing<'a> {
     pending: &'a Pending,
     compact: bool,
     secs: f64,
+    /// What the pass saw at script addresses, decoded or not.
+    observations: Vec<policy_archive::Observation>,
 }
 
 /// Land one pass: compact its segments (or keep them), write the pending
@@ -477,6 +482,7 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         pending,
         compact,
         secs,
+        mut observations,
     } = l;
     // UNDER THE POLICY'S LOCK from here: another job may have landed since
     // this one loaded the manifest, so what is on disk is the truth and
@@ -531,6 +537,25 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     };
     let pending_file = pending.to_file();
     let pending_bytes = archive::store_pending(&pass_dir.join(archive::PENDING), &pending_file)?;
+
+    // Observations, if the pass took any. Written BEFORE the manifest for the
+    // same reason every other file is: a reader that sees the pass sees its
+    // files. Sorted by slot so the footer's statistics can be seeked on.
+    if !observations.is_empty() {
+        observations.sort_by_key(|o| (o.slot, o.address.clone()));
+        let path = pass_dir.join(policy_archive::OBSERVATIONS);
+        let mut w =
+            policy_archive::ObservationWriter::new(std::fs::File::create(&path)?, &stamp)?;
+        for o in observations {
+            w.push(o);
+        }
+        let written = w.close()?;
+        tracing::info!(
+            rows = written.rows,
+            bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            "pass: observations written"
+        );
+    }
 
     // Coverage and completeness are DERIVED from the passes now; the
     // manifest's cached fields are refreshed on write.
@@ -1205,6 +1230,11 @@ struct Scan<'a> {
     backfilled: usize,
     /// Inputs the index answered inside this job rather than the descent.
     resolved_by_index: u64,
+    /// Who may annotate a script output. `None` records raw candidates only —
+    /// which is still worth doing, because the bytes a decoder would need are
+    /// what the archive is keeping.
+    observers: Option<&'a [Box<dyn crate::observer::OutputObserver>]>,
+    observations: &'a mut Vec<policy_archive::Observation>,
 }
 
 impl Scan<'_> {
@@ -1265,6 +1295,7 @@ impl Scan<'_> {
                 // OUTPUTS: this transaction's own positive deltas, AND the
                 // resolution of whatever spent them later.
                 let mut deltas: Vec<(Vec<u8>, String, i64)> = Vec::new();
+                let mut seen: Vec<policy_archive::Observation> = Vec::new();
                 for out in &dtx.outputs {
                     let units = units_in_output(tx, out, self.policy, self.watched);
                     if units.is_empty() {
@@ -1272,6 +1303,35 @@ impl Scan<'_> {
                     }
                     for (name, qty) in &units {
                         deltas.push((name.clone(), out.address.clone(), *qty));
+                    }
+                    // Only SCRIPT-held outputs. A wallet holding the token is
+                    // a movement and nothing more; there is no state on it to
+                    // observe, and recording every one would multiply the file
+                    // by the holder count for no reader.
+                    if mitos_cohort::is_script_address(&out.address) {
+                        let datum: Option<&[u8]> = out
+                            .datum_hash
+                            .as_ref()
+                            .and_then(|h| dtx.witness_datums.get(h))
+                            .map(|v| v.as_slice())
+                            .or(out.inline_datum.as_deref());
+                        for (name, qty) in &units {
+                            seen.push(policy_archive::Observation {
+                                slot,
+                                block_time,
+                                tx_hash: dtx.tx_hash.to_vec(),
+                                address: out.address.clone(),
+                                lovelace: out.lovelace as i64,
+                                unit_name: name.clone(),
+                                unit_amount: *qty,
+                                datum: datum.map(|d| d.to_vec()),
+                                decoded: self.observers.and_then(|obs| {
+                                    crate::observer::observe_all(
+                                        obs, out, *qty, self.policy, name, datum,
+                                    )
+                                }),
+                            });
+                        }
                     }
                     resolved.extend(self.pending.resolve(
                         &(dtx.tx_hash, out.index),
@@ -1292,6 +1352,9 @@ impl Scan<'_> {
                 if read_before {
                     continue;
                 }
+                // Kept only past the read-before gate, for the same reason the
+                // movement rows are: a window read twice would double them.
+                self.observations.append(&mut seen);
 
                 // INPUTS: register interest ONLY where a source is missing —
                 // per unit, by how much. Conservation says exactly that.
@@ -1421,6 +1484,12 @@ pub fn scan_blocks(
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
+        // The chain tail is re-derived whole on every refresh, so anything
+        // observed here would be written again by the immutable pass that
+        // later covers the same slots. Observations come from the archive's
+        // own passes only.
+        observers: None,
+        observations: &mut Vec::new(),
     };
     // The rows went to the writer; nothing here needs them a second time.
     scan.blocks(blocks, floor, ceiling)?;
@@ -1452,11 +1521,18 @@ fn pass(
     pending: &mut Pending,
     sieve: bool,
     hooks: &Hooks<'_>,
+    // Held for the pass rather than spilled like movements. Observations are
+    // an order of magnitude sparser — $PERP has ~5,000 pool states against
+    // 29,545 movements — so the segment machinery would be ceremony. If a
+    // policy is ever found where this is not true, the measurement will say so
+    // before the memory does.
+    observations: &mut Vec<policy_archive::Observation>,
 ) -> Result<Walked> {
     let policy_vec = policy.to_vec();
     let needles = sieve
         .then(|| chain_sieve::Needles::new(std::slice::from_ref(&policy_vec)))
         .transpose()?;
+    let observers = crate::observer::default_observers();
     let mut scan = Scan {
         immutable,
         policy,
@@ -1470,6 +1546,8 @@ fn pass(
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
+        observers: Some(&observers),
+        observations,
     };
 
     let mut lowest = ceiling;
@@ -1793,6 +1871,7 @@ mod tests {
             pending: &pending,
             compact: true,
             secs: 0.0,
+            observations: Vec::new(),
         })
         .unwrap();
         assert_eq!((out.unresolved, out.written), (1, 2));
@@ -1838,6 +1917,7 @@ mod tests {
             pending: &pending,
             compact: false,
             secs: 0.0,
+            observations: Vec::new(),
         })
         .unwrap();
         assert_eq!(out.unresolved, 0, "settled, and its ADA input forgotten");
