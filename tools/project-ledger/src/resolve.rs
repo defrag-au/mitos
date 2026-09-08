@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 use mitos_chain_walk::decode::OutRef;
 
-use crate::koios::Koios;
 use crate::store::{CachedOutput, Ledger};
+use mitos_koios::Koios;
 
 /// The remote rung. Trait so a walk can run offline (tests; a box with no
 /// egress) and so the source is swappable.

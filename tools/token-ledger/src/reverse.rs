@@ -136,6 +136,27 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub first_mint: Option<u64>,
 
+    /// PROBE the policy's first mint from Koios when nothing else knows it,
+    /// instead of walking to genesis.
+    ///
+    /// A reverse walk meets the tip first and the mint LAST, so the single
+    /// most useful fact about a policy is the one it learns last — and until
+    /// it does, it has no floor and reads the whole chain below the policy
+    /// for nothing. MEASURED on $VIPER: its archive walked `[0, …]` in 847 s
+    /// when its first mint is at slot 93,220,447, so 47% of the range it read
+    /// could not have held a single row.
+    ///
+    /// One request, and the answer is the MINIMUM creation across the
+    /// policy's assets — see `mitos_koios::floor_unix` for why that
+    /// distinction has teeth.
+    ///
+    /// ⚠️ Off by default and never silent. A floor that is too HIGH does not
+    /// fail: it produces a short archive that calls itself COMPLETE, because
+    /// a floor is what completeness is measured against. So this is an
+    /// explicit opt-in, and what it found is logged with its source.
+    #[arg(long)]
+    pub probe_first_mint: bool,
+
     /// Read this window as a SEEK: a reader asked for it, so it is a
     /// bounded window rather than a step of a descent. Only the summary
     /// line differs now that every job resolves through the index.
@@ -318,7 +339,15 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
     let first_mint = token
         .floor_slot
         .or(manifest.first_mint_slot)
-        .or(args.first_mint);
+        .or(args.first_mint)
+        // LAST: only when nothing local knows. The probe is one request and
+        // the three sources above are free, so asking an indexer what the box
+        // already holds would be a cost paid on every pass.
+        .or_else(|| {
+            args.probe_first_mint
+                .then(|| probe_first_mint(&policy_hex))
+                .flatten()
+        });
     let floor = pass_floor(ceiling, args.to_slot, args.days, first_mint);
     let mode = match args.seek {
         true => Mode::Seek,
@@ -653,6 +682,64 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         unresolved: pending_file.spenders.len() as u64,
         pending_bytes,
     })
+}
+
+/// One request for the policy's first mint, when nothing local knows it.
+///
+/// ⚠️ **The tx-index cannot answer this**, and it is worth saying why rather
+/// than leaving it as an open question: its entry is
+/// `(hash prefix → chunk, offset, len, aux)` and carries no policy dimension
+/// at all. "Where is transaction H" and "which transaction first minted
+/// policy P" are different questions, and only the first is indexed. Making
+/// it answer the second means a second index over ~110M entries with per-tx
+/// mint decoding during extraction — a real build, not a lookup.
+///
+/// So the probe is external, and deliberately soft: a failure means the walk
+/// proceeds WITHOUT a floor (reads more than it needs, still correct) rather
+/// than not at all. The opposite bias — inventing a floor — is the one that
+/// produces a short archive claiming completeness.
+fn probe_first_mint(policy_hex: &str) -> Option<u64> {
+    let koios = match mitos_koios::Koios::new(None, std::env::var("KOIOS_TOKEN").ok()) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = %e, "probe: no koios client; walking without a floor");
+            return None;
+        }
+    };
+    let assets = match koios.policy_asset_info(policy_hex) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "probe: koios failed; walking without a floor");
+            return None;
+        }
+    };
+    let Some(unix) = mitos_koios::floor_unix(&assets) else {
+        tracing::warn!(
+            assets = assets.len(),
+            "probe: koios knows no creation time here; walking without a floor"
+        );
+        return None;
+    };
+    let probed = token_ledger_wire::sample::unix_to_slot(unix);
+    // ONE IMMUTABLE FILE OF MARGIN, the same insurance `project-ledger`'s
+    // seed takes, and for the same reason: the two failure directions are not
+    // symmetric. A floor slightly too LOW costs one chunk of reading. A floor
+    // slightly too HIGH truncates the archive AND lets it call itself
+    // complete, because completeness is measured against this number. So the
+    // probe deliberately under-shoots.
+    let slot = probed.saturating_sub(crate::registry::CHUNK_SLOTS);
+    // Logged with its SOURCE and the count behind it. "Where did this number
+    // come from" has to survive into the record rather than living in a shell
+    // history.
+    tracing::info!(
+        slot,
+        probed,
+        unix,
+        assets = assets.len(),
+        source = "koios/policy_asset_info(min creation_time) − 1 chunk",
+        "probe: first mint"
+    );
+    Some(slot)
 }
 
 /// The supply invariant, on every landing — see `policy_archive::supply`.

@@ -790,6 +790,12 @@ fn run_job(
         to_slot: Some(job.range.from),
         from_slot: Some(job.range.to),
         first_mint: job.first_mint,
+        // The hosted surface learns the mint from its CALLER (`?to_slot=`),
+        // so a job that arrived without one has no floor and would read to
+        // genesis. Probing per JOB would be one Koios call per job on a
+        // policy walked by four workers; it belongs once per policy, at
+        // admission, and `want_walk` is where that would go.
+        probe_first_mint: false,
         seek: job.kind == JobKind::Seek,
         // The serve's index is already open and hot-swappable; the CLI flag
         // is for running the same job by hand.

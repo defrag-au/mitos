@@ -3728,6 +3728,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-koios"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+]
+
+[[package]]
 name = "mitos-launchpad-decode"
 version = "0.0.1"
 dependencies = [
@@ -4803,6 +4812,7 @@ dependencies = [
  "hex",
  "memchr",
  "mitos-chain-walk",
+ "mitos-koios",
  "pallas-addresses 1.1.1",
  "pallas-codec 1.1.1",
  "pallas-crypto 1.1.1",
@@ -6316,6 +6326,7 @@ dependencies = [
  "mitos-chain-walk",
  "mitos-cohort",
  "mitos-dex-decode",
+ "mitos-koios",
  "mitos-launchpad-decode",
  "mitos-pool-observe",
  "mitos-vesting-decode",

@@ -32,7 +32,6 @@ use mitos_chain_walk::slot_to_unix;
 use pallas_traverse::{MultiEraBlock, MultiEraTx};
 
 use crate::asset_class::AssetClass;
-use crate::koios::Koios;
 use crate::mint::{cip27_royalty, policy_script};
 use crate::party::{Resolved, resolve_str};
 use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
@@ -42,6 +41,7 @@ use crate::store::{
     AliasRow, AssetEventRow, AssetInflowRow, Ledger, MintPaymentRow, RelayHopRow, TxDeltaRow,
     UnitFlowRow, ValueEventRow,
 };
+use mitos_koios::Koios;
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {

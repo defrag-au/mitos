@@ -19,7 +19,6 @@ mod classify;
 mod deep_dive;
 mod distributions;
 mod enrich;
-mod koios;
 mod local;
 mod mint;
 mod party;

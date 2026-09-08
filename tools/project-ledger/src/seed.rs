@@ -19,11 +19,11 @@ use chain_ledger::{Frontier, Role};
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
 
 use crate::activity::Activity;
-use crate::koios::Koios;
 use crate::party::stake_party;
 use crate::registry::Registry;
 use crate::state::{Buffer, Holders, Relays, WalkState};
 use crate::store::Ledger;
+use mitos_koios::Koios;
 
 pub const META_POLICY: &str = "policy_id";
 pub const META_POLICY_LABEL: &str = "policy_label";
@@ -118,11 +118,10 @@ pub fn run(args: SeedArgs) -> Result<()> {
         if assets.is_empty() {
             bail!("koios knows no assets under policy {}", policy.id);
         }
-        let earliest = assets
-            .iter()
-            .filter_map(|a| a.creation_time)
-            .min()
-            .context("no creation_time in koios rows")?;
+        // The MINIMUM, via the crate — this rule is shared with token-ledger
+        // and is exactly the one that has been got wrong before.
+        let earliest =
+            mitos_koios::floor_unix(&assets).context("no creation_time in koios rows")?;
         let slot = unix_to_slot(earliest as u64)
             .context("first mint predates Shelley — that's not an NFT policy")?;
         (slot, "koios", Some(assets.len()))

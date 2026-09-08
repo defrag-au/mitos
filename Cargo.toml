@@ -37,6 +37,11 @@ members = [
     "crates/policy-archive",
     "crates/none-match-indexer",
     "crates/tx-index",
+    # Lifted out of the project-ledger BINARY 2026-09-09: token-ledger needs
+    # the same `policy_asset_info` call to find a policy's first mint, and a
+    # second copy of a client whose row shapes have already drifted under us
+    # is how the two quietly disagree.
+    "crates/mitos-koios",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",

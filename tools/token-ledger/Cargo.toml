@@ -77,6 +77,10 @@ mitos-launchpad-decode = { path = "../../crates/mitos-launchpad-decode" }
 # The artifacts `export` writes — shared with the egui WASM frontend that
 # loads them, so the format lives in a crate rather than in this tool.
 token-ledger-wire = { path = "../../crates/token-ledger-wire" }
+# The floor probe: one `policy_asset_info` call when nothing local knows a
+# policy's first mint. Shared with project-ledger so the MINIMUM-creation rule
+# has one home.
+mitos-koios = { path = "../../crates/mitos-koios" }
 
 # Curated token decimals, keyed by full unit. Decimals are NOT on chain, so a
 # walker cannot derive them — this is the shared table of the ones we can

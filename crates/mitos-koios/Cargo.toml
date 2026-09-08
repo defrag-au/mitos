@@ -1,0 +1,15 @@
+[package]
+name = "mitos-koios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Koios calls this workspace actually makes, in one place — plus the FLOOR rule (a policy's first mint is the MINIMUM creation across its assets, never the first row). Lifted out of project-ledger 2026-09-09 when token-ledger needed the same three calls."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json"] }
+serde = { workspace = true }
