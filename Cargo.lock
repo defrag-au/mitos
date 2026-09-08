@@ -3743,6 +3743,7 @@ dependencies = [
  "mitos-community-events",
  "pallas-addresses 1.1.1",
  "pallas-codec 1.1.1",
+ "pallas-crypto 1.1.1",
  "pallas-primitives 1.1.1",
 ]
 

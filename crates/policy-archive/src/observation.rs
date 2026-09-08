@@ -83,8 +83,27 @@ pub const MESSAGE_TYPE: &str = "
         OPTIONAL INT64 fee_bps;
         OPTIONAL INT64 total_lp;
         OPTIONAL BYTE_ARRAY reserve_source;
+        OPTIONAL BYTE_ARRAY pricing;
     }
 ";
+
+/// How a venue's reserves turn into a price — the question a price projection
+/// must branch on and cannot infer.
+///
+/// This column was added after the first end-to-end run priced $PERP at half
+/// its real value. A snek.fun bonding curve holds ADA and tokens exactly like a
+/// pool, so `Σquote/Σbase` swept its 261,194,031 tokens into the aggregate and
+/// halved the answer. A curve's reserves do NOT imply its price: fitted at the
+/// bottom the implied constant-product reserve is ~1,250 ADA and at the cap
+/// ~3,884, so reading one as the other is roughly 3× wrong — and silently.
+pub mod pricing {
+    /// `x·y = k` over the recorded reserves. Every DEX pool here.
+    pub const CONSTANT_PRODUCT: &str = "constant-product";
+    /// A launchpad bonding curve. Real reserves, real supply, and a price this
+    /// crate deliberately does not know how to compute — see
+    /// `SNEK_FUN_LAUNCH_LIFECYCLE.md`.
+    pub const BONDING_CURVE: &str = "bonding-curve";
+}
 
 /// What a decoder made of an output. Absent on a candidate nothing claimed.
 ///
@@ -107,6 +126,10 @@ pub struct Decoded {
     pub fee_bps: Option<i64>,
     pub total_lp: Option<i64>,
     pub reserve_source: String,
+    /// One of [`pricing`]. Empty on a row written before the column existed,
+    /// which a price projection must treat as "not known to be priceable"
+    /// rather than assuming the common case.
+    pub pricing: String,
 }
 
 /// One script output holding the watched policy's units, at one transaction.
@@ -312,8 +335,12 @@ fn write_group<W: Write + Send>(
         .decoded
         .as_ref()
         .map(|d| ByteArray::from(d.reserve_source.as_bytes())));
+    opt_bytes!(|r: &Observation| r
+        .decoded
+        .as_ref()
+        .map(|d| ByteArray::from(d.pricing.as_bytes())));
 
-    debug_assert_eq!(col, 19, "every schema column must be written");
+    debug_assert_eq!(col, 20, "every schema column must be written");
     rg.close()?;
     Ok(())
 }
@@ -368,6 +395,9 @@ pub fn read_all(bytes: &[u8]) -> Result<Vec<Observation>> {
                 ("total_lp", Field::Long(v)) => d.total_lp = Some(*v),
                 ("reserve_source", Field::Bytes(b)) => {
                     d.reserve_source = String::from_utf8_lossy(b.data()).into_owned()
+                }
+                ("pricing", Field::Bytes(b)) => {
+                    d.pricing = String::from_utf8_lossy(b.data()).into_owned()
                 }
                 _ => {}
             }
@@ -425,6 +455,7 @@ mod tests {
                 fee_bps: Some(30),
                 total_lp: Some(12_345),
                 reserve_source: "value".into(),
+                pricing: pricing::CONSTANT_PRODUCT.into(),
             }),
             ..candidate(slot)
         }

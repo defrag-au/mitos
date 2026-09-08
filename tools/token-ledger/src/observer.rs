@@ -67,6 +67,7 @@ impl OutputObserver for DexObserver {
             fee_bps: obs.fee_bps,
             total_lp: obs.total_lp,
             reserve_source: obs.reserve_source.as_str().to_string(),
+            pricing: policy_archive::observation::pricing::CONSTANT_PRODUCT.to_string(),
         })
     }
 }
@@ -126,6 +127,11 @@ impl OutputObserver for LaunchpadObserver {
             fee_bps: None,
             total_lp: None,
             reserve_source: "value".to_string(),
+            // ⚠️ NOT constant-product, and saying so is what stops the curve's
+            // reserves being summed into a `Σquote/Σbase` aggregate. On the
+            // first end-to-end run they were, and $PERP priced at half its
+            // real value — 261,194,031 curve tokens joined a 189M base.
+            pricing: policy_archive::observation::pricing::BONDING_CURVE.to_string(),
         })
     }
 }

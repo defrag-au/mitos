@@ -1405,6 +1405,89 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// `token-ledger archive` — read an archive back the way a Worker would,
 /// and say what it cost.
+/// What the observation tier adds to a policy: who was decoded, what was kept
+/// undecoded, and the price the archive can defend at its own tip.
+fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
+    let mut rows: Vec<policy_archive::Observation> = Vec::new();
+    let mut bytes = 0u64;
+    for p in &m.passes {
+        let path = dir.join(&p.dir).join(policy_archive::OBSERVATIONS);
+        if !path.exists() {
+            continue;
+        }
+        bytes += std::fs::metadata(&path).map(|f| f.len()).unwrap_or(0);
+        rows.extend(policy_archive::read_all(&std::fs::read(&path)?)?);
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let decoded = rows.iter().filter(|o| o.decoded.is_some()).count();
+    let with_datum = rows.iter().filter(|o| o.datum.is_some()).count();
+    println!(
+        "observations {} rows, {bytes} bytes — {decoded} decoded, {} kept as \
+         UNDECODED CANDIDATES ({with_datum} carry a datum a later decoder can re-read)",
+        rows.len(),
+        rows.len() - decoded,
+    );
+    let mut by_venue: BTreeMap<&str, usize> = BTreeMap::new();
+    for o in rows.iter().filter_map(|o| o.decoded.as_ref()) {
+        *by_venue.entry(o.venue.as_str()).or_default() += 1;
+    }
+    for (venue, n) in &by_venue {
+        println!("  {venue:14} {n} observations");
+    }
+
+    // Price at the deepest slot the archive reaches. Piecewise-constant, so
+    // this is the last figure the archive can defend rather than an estimate
+    // of "now".
+    let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    let spot = policy_archive::spot_at(&rows, at);
+    match spot.ada.as_ref() {
+        Some(d) => {
+            println!(
+                "price       {:.8} ADA/unit at slot {at}  ({} ADA pool(s), Σbase {}, \
+                 Σquote {} lovelace)",
+                d.rate().unwrap_or(0.0) / 1_000_000.0,
+                d.pools,
+                d.base,
+                d.quote
+            );
+            if !d.any_pool_above(policy_archive::price::DEFAULT_FLOOR_LOVELACE) {
+                println!(
+                    "  ⚠ every contributing pool is below the {} ADA depth floor — the \
+                     aggregate is still the right sum, but no single pool here is worth \
+                     quoting on its own",
+                    policy_archive::price::DEFAULT_FLOOR_LOVELACE / 1_000_000
+                );
+            }
+        }
+        // Undefined, never zero.
+        None => println!("price       UNDEFINED at slot {at} — no ADA-paired pool observed"),
+    }
+    for u in &spot.unresolved {
+        println!(
+            "  UNRESOLVED  paired with {}.{} — Σquote {} across {} pool(s); pricing it \
+             needs that unit's OWN archive",
+            hex::encode(&u.quote_unit.policy),
+            String::from_utf8_lossy(&u.quote_unit.name),
+            u.quote,
+            u.pools
+        );
+    }
+    // Real reserves under a model this crate will not evaluate. Reported so
+    // the liquidity is visible without being priced — the distinction that
+    // halved $PERP's price when it was missing.
+    for u in &spot.unpriceable {
+        println!(
+            "  OFF-MODEL   {} base / {} quote across {} venue(s) — held, but not \
+             constant-product, so deliberately absent from the price above",
+            u.base, u.quote, u.pools
+        );
+    }
+    Ok(())
+}
+
 pub fn inspect(args: InspectArgs) -> Result<()> {
     let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
     let Some(mut a) = PolicyArchive::open(&dir)? else {
@@ -1458,6 +1541,8 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
     );
     let (reqs, bytes) = a.fetched();
     println!("footers     {reqs} requests, {bytes} bytes");
+
+    report_observations(&dir, m)?;
 
     let density = a.density(86_400);
     println!("density     {} daily buckets", density.len());
