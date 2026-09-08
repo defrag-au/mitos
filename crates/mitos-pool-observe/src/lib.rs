@@ -105,7 +105,192 @@ impl KeyBasis {
     }
 }
 
+/// One side of a pool: WHAT the asset is, and how much of it the pool holds.
+///
+/// ADA is the empty policy with the empty name — the convention the chain
+/// itself uses and that every pool datum here spells the same way, so no side
+/// needs a special case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Side {
+    pub policy: Vec<u8>,
+    pub name: Vec<u8>,
+    /// How much of it the pool holds — `None` when the pool demonstrably holds
+    /// this asset but the walk did not decode the amount.
+    ///
+    /// That gap is real and narrow. `mitos_chain_walk::decode::Asset` carries a
+    /// policy and a name but **no quantity** — the walk extracts only the
+    /// watched asset's amount — so for the venues whose reserves come from the
+    /// UTxO's VALUE (CSwap, Splash), the far side of a token/token pool is
+    /// identifiable but unmeasured. Every other case is knowable: ADA from
+    /// `lovelace`, and the datum-sourced venues publish both reserves.
+    ///
+    /// Recorded as `None` rather than `0` on purpose. A zero reserve is a
+    /// price of zero and an infinite one depending on which side it lands, and
+    /// this codebase's expensive mistakes have all been a readable-looking
+    /// number standing in for something nobody measured.
+    pub reserve: Option<i64>,
+}
+
+impl Side {
+    pub fn ada(reserve: i64) -> Self {
+        Side {
+            policy: Vec::new(),
+            name: Vec::new(),
+            reserve: Some(reserve),
+        }
+    }
+
+    pub fn new(policy: Vec<u8>, name: Vec<u8>, reserve: i64) -> Self {
+        Side {
+            policy,
+            name,
+            reserve: Some(reserve),
+        }
+    }
+
+    /// The pool holds this asset; how much is not knowable from this output.
+    pub fn unmeasured(policy: Vec<u8>, name: Vec<u8>) -> Self {
+        Side {
+            policy,
+            name,
+            reserve: None,
+        }
+    }
+
+    pub fn is_ada(&self) -> bool {
+        self.policy.is_empty() && self.name.is_empty()
+    }
+
+    pub fn is(&self, policy: &[u8], name: &[u8]) -> bool {
+        self.policy == policy && self.name == name
+    }
+}
+
+/// The identity of the side that is NOT the watched asset, from a datum that
+/// names both. Used to give a token/token pool a real counter-asset instead of
+/// the silence the old `ada_paired: false` left behind.
+fn other_asset(
+    a_policy: &[u8],
+    a_name: &[u8],
+    b_policy: &[u8],
+    b_name: &[u8],
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    if a_policy == watched_policy && a_name == watched_name {
+        (b_policy.to_vec(), b_name.to_vec())
+    } else {
+        (a_policy.to_vec(), a_name.to_vec())
+    }
+}
+
+/// The watched side's reserve and the quote side, for a venue whose `ada_pair`
+/// already applies its own reserve rule.
+///
+/// `pair` is `Some((ada_reserve, token_reserve))` when one side is ADA. When it
+/// is `None` the pool is token/token and the counter-asset is still NAMED from
+/// the datum, but left [`Side::unmeasured`].
+///
+/// Its raw amount IS readable from the value now that `Asset` carries a
+/// quantity — and reading it would still be wrong for the venues this helper
+/// serves. Sundae V3 nets `protocol_fees` and WingRiders nets a treasury,
+/// per side; taking the raw value instead is precisely the reserve-source
+/// error this crate exists to prevent, only quieter because a token/token pool
+/// is not priced today. Measuring these properly means netting the far side's
+/// own treasury, which needs the datum index the ADA path never has to work
+/// out. Left undone deliberately rather than approximated.
+///
+/// CSwap and Splash hold nothing but reserves, so their far side needs no
+/// netting and IS measured — see [`side_from_value`].
+fn base_and_quote(
+    pair: Option<(u64, u64)>,
+    qty: i64,
+    a: (&[u8], &[u8]),
+    b: (&[u8], &[u8]),
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> (i64, Side) {
+    match pair {
+        Some((ada, token)) => (
+            i64::try_from(token).unwrap_or(i64::MAX),
+            Side::ada(i64::try_from(ada).unwrap_or(i64::MAX)),
+        ),
+        None => {
+            let (p, n) = other_asset(a.0, a.1, b.0, b.1, watched_policy, watched_name);
+            (qty, Side::unmeasured(p, n))
+        }
+    }
+}
+
+/// A side named by a datum, measured from the output's VALUE where that is
+/// possible — ADA from `lovelace`, the watched asset from the quantity the walk
+/// already extracted, and anything else left [`Side::unmeasured`].
+fn side_from_value(
+    out: &DecodedOutput,
+    policy: &[u8],
+    name: &[u8],
+    watched_qty: i64,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Side {
+    if policy.is_empty() && name.is_empty() {
+        Side::ada(out.lovelace as i64)
+    } else if policy == watched_policy && name == watched_name {
+        Side::new(policy.to_vec(), name.to_vec(), watched_qty)
+    } else {
+        // Since `Asset` gained a quantity (2026-09-08) the far side of a
+        // token/token pool is measurable from the value like any other, so
+        // this is a lookup rather than the shrug it used to be. Still
+        // `unmeasured` when the asset is absent from the value — which would
+        // mean the datum names a side the output does not hold.
+        match out
+            .assets
+            .iter()
+            .find(|a| a.policy == policy && a.name == name)
+            .and_then(|a| a.quantity)
+        {
+            Some(q) => Side::new(
+                policy.to_vec(),
+                name.to_vec(),
+                i64::try_from(q).unwrap_or(i64::MAX),
+            ),
+            None => Side::unmeasured(policy.to_vec(), name.to_vec()),
+        }
+    }
+}
+
+/// Orient a decoded pool's two sides so `base` is the WATCHED asset.
+///
+/// Returns `None` when neither side is the watched asset, which would mean the
+/// recogniser matched a pool that does not hold what we are following — a
+/// wrong answer worth declining rather than guessing an orientation for.
+pub fn orient(a: Side, b: Side, watched_policy: &[u8], watched_name: &[u8]) -> Option<(Side, Side)> {
+    if a.is(watched_policy, watched_name) {
+        Some((a, b))
+    } else if b.is(watched_policy, watched_name) {
+        Some((b, a))
+    } else {
+        None
+    }
+}
+
 /// One pool observation at one transaction.
+///
+/// ## Both sides are named, and ADA is not privileged
+///
+/// An earlier shape carried `base_reserve` (the watched asset), `quote_reserve`
+/// (lovelace) and an `ada_paired: bool`. That could not *represent* a
+/// token/token pool — only exclude one — and the exclusion is not an edge case:
+/// of 15 live WingRiders V2 pools sampled 2026-08-30, **only 4 were
+/// ADA-paired**; the rest were NIGHT/IAG, EDM/HKDG, NIGHT/USDA, ßUSDM/iUSD.
+/// The flag made the exclusion safe rather than silent, which is exactly why
+/// the shape read as finished.
+///
+/// Now both sides carry their own identity, so a token/token pool is a
+/// first-class observation. Whether it can price the watched asset *directly*
+/// becomes a question a reader asks ([`PoolObservation::ada_paired`]) rather
+/// than a fact the walk decided; pricing it through another pair is the
+/// currency graph's job, outside this crate.
 pub struct PoolObservation {
     pub dex: &'static str,
     pub address: String,
@@ -113,32 +298,46 @@ pub struct PoolObservation {
     pub key_policy: Vec<u8>,
     pub key_name: Vec<u8>,
     pub key_basis: KeyBasis,
-    /// Whether the pool's other side is ADA.
+    /// The watched asset's side.
+    pub base: Side,
+    /// Whatever the pool pairs it with — `None` when the pool is recognised but
+    /// its pair is not, which is the no-datum fallback's honest answer.
     ///
-    /// **Only an ADA-paired pool can price the token**, and this is not an
-    /// edge case: of 15 live WingRiders V2 pools sampled 2026-08-30, only 4
-    /// paired with ADA — the rest are token/token (NIGHT/IAG, EDM/HKDG,
-    /// NIGHT/USDA, ßUSDM/iUSD…). A token/token pool's lovelace is its
-    /// min-UTxO carrier, so reading it as a quote reserve produces a spot
-    /// price wrong by orders of magnitude, silently.
+    /// Three distinguishable states, and each is a different question:
     ///
-    /// Such a pool still holds real supply and must still be counted in the
-    /// `pool` cohort — it just cannot contribute to the price. The two uses
-    /// are separated here rather than left for a caller to remember.
-    pub ada_paired: bool,
-    /// Watched-asset reserve.
-    pub base_reserve: i64,
-    /// Lovelace reserve.
+    /// | state | meaning |
+    /// |---|---|
+    /// | `None` | we do not know what this pool pairs the asset WITH |
+    /// | `Some(side)`, `reserve: None` | we know what, not how much |
+    /// | `Some(side)`, `reserve: Some(_)` | fully measured |
     ///
-    /// Includes the output's min-UTxO carrier ADA, which is a couple of ADA
-    /// against pool reserves in the hundreds of thousands — under a
+    /// When the side is ADA its reserve includes the output's min-UTxO carrier
+    /// — a couple of ADA against reserves in the hundreds of thousands, under a
     /// thousandth of a percent on spot. Recorded whole rather than netted:
     /// deducting a carrier estimate from a real reserve is the kind of
     /// correction that is wrong more often than the error it fixes.
-    pub quote_reserve: i64,
+    pub quote: Option<Side>,
     pub fee_bps: Option<i64>,
     pub total_lp: Option<i64>,
     pub reserve_source: ReserveSource,
+}
+
+impl PoolObservation {
+    /// Whether this pool can price the watched asset DIRECTLY.
+    ///
+    /// Derived, never stored: a stored flag can disagree with the sides it
+    /// describes, and this one did the deciding for every caller. An unknown
+    /// pair is not ADA-paired — the conservative reading, since treating a
+    /// token/token pool's min-UTxO carrier as a quote reserve puts spot out by
+    /// orders of magnitude while the reverse merely omits it from the price.
+    pub fn ada_paired(&self) -> bool {
+        self.quote.as_ref().is_some_and(Side::is_ada)
+    }
+
+    /// The quote reserve, when the pair is both known AND measured.
+    pub fn quote_reserve(&self) -> Option<i64> {
+        self.quote.as_ref().and_then(|q| q.reserve)
+    }
 }
 
 /// Recognise a pool output, if this is one.
@@ -157,16 +356,16 @@ pub fn recognise(
     // stake part is contract-derived per pool, so a full-address set would
     // need an entry each and miss every new one. CSwap and Splash genuinely
     // are single addresses.
-    let cred = crate::cohort::payment_cred(&out.address);
+    let cred = mitos_cohort::payment_cred(&out.address);
     if let Some(cred) = cred {
         if mitos_dex_decode::minswap::is_minswap_v2(&cred) {
-            return minswap_v2(out, qty, datum);
+            return minswap_v2(out, qty, datum, watched_policy, watched_name);
         }
         if mitos_dex_decode::wingriders::is_wingriders_v2(&cred) {
             return wingriders_v2(out, qty, datum, watched_policy, watched_name);
         }
         if mitos_dex_decode::splash::is_splash_pool(&cred) {
-            return splash(out, qty, datum);
+            return splash(out, qty, datum, watched_policy, watched_name);
         }
         if mitos_dex_decode::sundae::is_sundae_v3(&cred) {
             return sundae_v3(out, qty, datum, watched_policy, watched_name);
@@ -198,23 +397,33 @@ pub fn recognise(
         && let Some(bytes) = datum
         && let Some(d) = cswap::decode_pool_datum(bytes)
     {
-        // CSwap names its pair in the datum, so ADA-pairing is published
-        // rather than inferred: ADA is the empty policy and empty name.
-        let ada_paired = (d.quote_policy.is_empty() && d.quote_name.is_empty())
-            || (d.base_policy.is_empty() && d.base_name.is_empty());
-        return Some(PoolObservation {
-            dex,
-            address: out.address.clone(),
-            key_policy: d.lp_policy,
-            key_name: d.lp_name,
-            key_basis: KeyBasis::Datum,
-            ada_paired,
-            base_reserve: qty,
-            quote_reserve: out.lovelace as i64,
-            fee_bps: Some(d.pool_fee_bps as i64),
-            total_lp: Some(d.total_lp_tokens as i64),
-            reserve_source: ReserveSource::Value,
-        });
+        // CSwap names its pair in the datum, so the pairing is PUBLISHED rather
+        // than inferred. Its UTxO holds nothing but reserves, so the watched
+        // side is the quantity the walk already extracted and the other side is
+        // whatever the value holds for the datum's other asset.
+        let a = side_from_value(out, &d.base_policy, &d.base_name, qty, watched_policy, watched_name);
+        let b = side_from_value(
+            out,
+            &d.quote_policy,
+            &d.quote_name,
+            qty,
+            watched_policy,
+            watched_name,
+        );
+        if let Some((base, quote)) = orient(a, b, watched_policy, watched_name) {
+            return Some(PoolObservation {
+                dex,
+                address: out.address.clone(),
+                key_policy: d.lp_policy,
+                key_name: d.lp_name,
+                key_basis: KeyBasis::Datum,
+                base,
+                quote: Some(quote),
+                fee_bps: Some(d.pool_fee_bps as i64),
+                total_lp: Some(d.total_lp_tokens as i64),
+                reserve_source: ReserveSource::Value,
+            });
+        }
     }
 
     // Otherwise fall back to the value: the lone asset that is neither ADA nor
@@ -232,15 +441,16 @@ pub fn recognise(
         key_policy,
         key_name,
         key_basis,
-        // Without a decoded datum the pair is unknown, so ADA-pairing is
-        // INFERRED from the value: a pool holding meaningful ADA beyond its
-        // min-UTxO carrier is ADA-paired. Conservative by design — a
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), qty),
+        // Without a decoded datum the pair is genuinely unknown, so ADA-pairing
+        // is INFERRED from the value: a pool holding meaningful ADA beyond its
+        // min-UTxO carrier is taken to be ADA-paired, and one that is not gets
+        // `None` — we cannot name what it pairs with. Conservative by design: a
         // token/token pool wrongly treated as ADA-paired would publish a spot
-        // price off by orders of magnitude, whereas the reverse merely omits
-        // it from the price while still counting its supply.
-        ada_paired: out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING,
-        base_reserve: qty,
-        quote_reserve: out.lovelace as i64,
+        // price off by orders of magnitude, whereas the reverse merely omits it
+        // from the price while still counting its supply.
+        quote: (out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING)
+            .then(|| Side::ada(out.lovelace as i64)),
         fee_bps: None,
         total_lp: None,
         reserve_source: ReserveSource::Value,
@@ -327,23 +537,50 @@ enum ValueKey<'a> {
 /// Both known pool contracts decode the same way. The pool NFT is a genuine
 /// one-per-pool instance key, which upgrades Splash from the value-inferred
 /// `ambiguous` identity it had while only its address was known.
-fn splash(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<PoolObservation> {
+fn splash(
+    out: &DecodedOutput,
+    qty: i64,
+    datum: Option<&[u8]>,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Option<PoolObservation> {
     let d = datum.and_then(mitos_dex_decode::splash::decode_pool_datum);
-    let (key_policy, key_name, key_basis, ada_paired) = match &d {
-        Some(p) => (
-            p.pool_nft.policy.clone(),
-            p.pool_nft.name.clone(),
-            KeyBasis::Datum,
-            p.is_ada_paired(),
-        ),
+    let (key_policy, key_name, key_basis, quote) = match &d {
+        Some(p) => {
+            let a = side_from_value(
+                out,
+                &p.asset_a.policy,
+                &p.asset_a.name,
+                qty,
+                watched_policy,
+                watched_name,
+            );
+            let b = side_from_value(
+                out,
+                &p.asset_b.policy,
+                &p.asset_b.name,
+                qty,
+                watched_policy,
+                watched_name,
+            );
+            (
+                p.pool_nft.policy.clone(),
+                p.pool_nft.name.clone(),
+                KeyBasis::Datum,
+                orient(a, b, watched_policy, watched_name).map(|(_, q)| q),
+            )
+        }
         // A pool we recognise by credential but cannot read. Reserves are
         // still the value — that part does not depend on the datum — so it is
-        // recorded rather than dropped, with its identity marked unknown.
+        // recorded rather than dropped, with its identity marked unknown and
+        // its pair inferred from the lovelace the same way the generic
+        // no-datum fallback does it.
         None => (
             Vec::new(),
             Vec::new(),
             KeyBasis::Unknown,
-            out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING,
+            (out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING)
+                .then(|| Side::ada(out.lovelace as i64)),
         ),
     };
     Some(PoolObservation {
@@ -352,9 +589,8 @@ fn splash(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<PoolObs
         key_policy,
         key_name,
         key_basis,
-        ada_paired,
-        base_reserve: qty,
-        quote_reserve: out.lovelace as i64,
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), qty),
+        quote,
         fee_bps: None,
         total_lp: None,
         reserve_source: ReserveSource::Value,
@@ -381,11 +617,14 @@ fn sundae_v3(
     } else {
         (out.lovelace, qty as u64)
     };
-    let (base, quote, ada_paired) = match d.ada_pair(value_a, value_b) {
-        Some((ada, token)) => (token, ada, true),
-        // Token/token: real supply, no ADA price.
-        None => (qty as u64, 0, false),
-    };
+    let (base_reserve, quote) = base_and_quote(
+        d.ada_pair(value_a, value_b),
+        qty,
+        (&d.asset_a_policy, &d.asset_a_name),
+        (&d.asset_b_policy, &d.asset_b_name),
+        watched_policy,
+        watched_name,
+    );
     Some(PoolObservation {
         dex: "sundae-v3",
         address: out.address.clone(),
@@ -396,9 +635,8 @@ fn sundae_v3(
         key_policy: mitos_dex_decode::sundae::POOL_NFT_POLICY.to_vec(),
         key_name: d.nft_name(),
         key_basis: KeyBasis::Datum,
-        ada_paired,
-        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
-        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base_reserve),
+        quote: Some(quote),
         // Sundae's fee is already in ten-thousandths, which is basis points.
         // The conservative side of bid/ask — they differ on 7 of 996 pools.
         fee_bps: Some(d.max_fee_per_10_thousand() as i64),
@@ -427,19 +665,22 @@ fn sundae_v1(
     } else {
         (out.lovelace, qty as u64)
     };
-    let (base, quote, ada_paired) = match d.ada_pair(value_a, value_b) {
-        Some((ada, token)) => (token, ada, true),
-        None => (qty as u64, 0, false),
-    };
+    let (base_reserve, quote) = base_and_quote(
+        d.ada_pair(value_a, value_b),
+        qty,
+        (&d.asset_a_policy, &d.asset_a_name),
+        (&d.asset_b_policy, &d.asset_b_name),
+        watched_policy,
+        watched_name,
+    );
     Some(PoolObservation {
         dex: "sundae-v1",
         address: out.address.clone(),
         key_policy: mitos_dex_decode::sundae::V1_NFT_POLICY.to_vec(),
         key_name: d.nft_name(),
         key_basis: KeyBasis::Datum,
-        ada_paired,
-        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
-        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base_reserve),
+        quote: Some(quote),
         // A real fraction from the datum — 1/100, 3/1000 and 1/2000 all occur,
         // so this is computed, never assumed.
         fee_bps: d.fee_bps().map(|f| f as i64),
@@ -469,10 +710,14 @@ fn minswap_v1(
     } else {
         (out.lovelace, qty as u64)
     };
-    let (base, quote, ada_paired) = match d.ada_pair(value_a, value_b) {
-        Some((ada, token)) => (token, ada, true),
-        None => (qty as u64, 0, false),
-    };
+    let (base_reserve, quote) = base_and_quote(
+        d.ada_pair(value_a, value_b),
+        qty,
+        (&d.asset_a.policy, &d.asset_a.name),
+        (&d.asset_b.policy, &d.asset_b.name),
+        watched_policy,
+        watched_name,
+    );
     // One NFT per pool, so its name is a genuine instance key — better than the
     // shared-policy `ambiguous` V2 is still stuck on.
     let nft = out
@@ -489,9 +734,8 @@ fn minswap_v1(
         key_policy,
         key_name,
         key_basis,
-        ada_paired,
-        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
-        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base_reserve),
+        quote: Some(quote),
         // V1's datum carries no fee — it was a protocol constant, and this
         // crate has not verified which. Reported unknown rather than guessed.
         fee_bps: None,
@@ -515,10 +759,14 @@ fn wingriders_v1(
     } else {
         (out.lovelace, qty as u64)
     };
-    let (base, quote, ada_paired) = match d.ada_pair(value_a, value_b) {
-        Some((ada, token)) => (token, ada, true),
-        None => (qty as u64, 0, false),
-    };
+    let (base_reserve, quote) = base_and_quote(
+        d.ada_pair(value_a, value_b),
+        qty,
+        (&d.asset_a_policy, &d.asset_a_name),
+        (&d.asset_b_policy, &d.asset_b_name),
+        watched_policy,
+        watched_name,
+    );
     // V1's pool NFT is named `L` on every pool, so it marks a pool without
     // identifying one. The LP token under the same policy carries a per-pool
     // 32-byte name — that is the instance key.
@@ -536,9 +784,8 @@ fn wingriders_v1(
         key_policy,
         key_name,
         key_basis,
-        ada_paired,
-        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
-        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base_reserve),
+        quote: Some(quote),
         fee_bps: None,
         total_lp: None,
         reserve_source: ReserveSource::ValueMinusTreasury,
@@ -546,30 +793,44 @@ fn wingriders_v1(
 }
 
 /// Minswap V2 — reserves come from the datum, never the value.
-fn minswap_v2(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<PoolObservation> {
+fn minswap_v2(
+    out: &DecodedOutput,
+    qty: i64,
+    datum: Option<&[u8]>,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Option<PoolObservation> {
     let d = datum.and_then(mitos_dex_decode::minswap::decode_v2_pool_datum)?;
     // Without the datum there is nothing usable: the value would overstate
     // reserves by the ADA deposit and every accrued fee, and on a dead pool by
     // millions of times. Better to record no pool than a fictional one.
-    let (ada, token) = match d.ada_pair() {
-        Some(pair) => pair,
-        // Token/token: real supply, no ADA price. Reserves left at the
-        // watched-asset quantity so the supply still counts.
-        None => {
-            return Some(PoolObservation {
-                dex: "minswap-v2",
-                address: out.address.clone(),
-                key_policy: mitos_dex_decode::minswap::V2_AUTHEN_POLICY.to_vec(),
-                key_name: Vec::new(),
-                key_basis: KeyBasis::Datum,
-                ada_paired: false,
-                base_reserve: qty,
-                quote_reserve: 0,
-                fee_bps: Some(d.fee_a_bps as i64),
-                total_lp: Some(d.total_liquidity as i64),
-                reserve_source: ReserveSource::Datum,
-            });
-        }
+    //
+    // Because BOTH reserves are published, this is the one venue whose
+    // token/token pools are fully measured — the others read reserves from the
+    // value, where the far side's amount was never decoded.
+    let sides = orient(
+        Side::new(
+            d.asset_a.policy.clone(),
+            d.asset_a.name.clone(),
+            i64::try_from(d.reserve_a).unwrap_or(i64::MAX),
+        ),
+        Side::new(
+            d.asset_b.policy.clone(),
+            d.asset_b.name.clone(),
+            i64::try_from(d.reserve_b).unwrap_or(i64::MAX),
+        ),
+        watched_policy,
+        watched_name,
+    );
+    // A pool recognised by credential whose datum names neither side as the
+    // asset we follow. Recorded rather than dropped, with the supply the walk
+    // measured and no claim about the pair.
+    let (base, quote) = match sides {
+        Some((base, quote)) => (base, Some(quote)),
+        None => (
+            Side::new(watched_policy.to_vec(), watched_name.to_vec(), qty),
+            None,
+        ),
     };
     Some(PoolObservation {
         dex: "minswap-v2",
@@ -580,9 +841,8 @@ fn minswap_v2(out: &DecodedOutput, qty: i64, datum: Option<&[u8]>) -> Option<Poo
         key_policy: mitos_dex_decode::minswap::V2_AUTHEN_POLICY.to_vec(),
         key_name: Vec::new(),
         key_basis: KeyBasis::Ambiguous,
-        ada_paired: true,
-        base_reserve: i64::try_from(token).unwrap_or(i64::MAX),
-        quote_reserve: i64::try_from(ada).unwrap_or(i64::MAX),
+        base,
+        quote,
         fee_bps: Some(d.fee_a_bps as i64),
         total_lp: Some(d.total_liquidity as i64),
         reserve_source: ReserveSource::Datum,
@@ -606,20 +866,22 @@ fn wingriders_v2(
     } else {
         (out.lovelace, qty as u64)
     };
-    let ada_pair = d.ada_pair(value_a, value_b);
-    let (base, quote, ada_paired) = match ada_pair {
-        Some((ada, token)) => (token, ada, true),
-        None => (qty as u64, 0, false),
-    };
+    let (base_reserve, quote) = base_and_quote(
+        d.ada_pair(value_a, value_b),
+        qty,
+        (&d.asset_a_policy, &d.asset_a_name),
+        (&d.asset_b_policy, &d.asset_b_name),
+        watched_policy,
+        watched_name,
+    );
     Some(PoolObservation {
         dex: "wingriders-v2",
         address: out.address.clone(),
         key_policy: mitos_dex_decode::wingriders::V2_LP_POLICY.to_vec(),
         key_name: Vec::new(),
         key_basis: KeyBasis::Ambiguous,
-        ada_paired,
-        base_reserve: i64::try_from(base).unwrap_or(i64::MAX),
-        quote_reserve: i64::try_from(quote).unwrap_or(i64::MAX),
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base_reserve),
+        quote: Some(quote),
         // WingRiders' fee is a numerator over the denominator at field 9;
         // not surfaced by the decoder yet, so reported as unknown rather than
         // guessed — an assumed fee makes the realisable figure quietly wrong.
@@ -680,17 +942,12 @@ mod tests {
             address: mitos_dex_decode::sundae::POOL_ADDR.to_string(),
             lovelace: 233_854_410_616,
             assets: vec![
-                Asset {
-                    policy: mitos_dex_decode::sundae::POOL_NFT_POLICY.to_vec(),
-                    name: hex::decode(
-                        "000de1405b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b",
-                    )
-                    .unwrap(),
-                },
-                Asset {
-                    policy: NIGHT_POLICY.to_vec(),
-                    name: b"NIGHT".to_vec(),
-                },
+                Asset::nft(
+                    mitos_dex_decode::sundae::POOL_NFT_POLICY.to_vec(),
+                    hex::decode("000de1405b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b")
+                        .unwrap(),
+                ),
+                Asset::new(NIGHT_POLICY.to_vec(), b"NIGHT".to_vec(), NIGHT_HELD as u64),
             ],
             index: 0,
             datum_hash: None,
@@ -716,10 +973,9 @@ mod tests {
             lovelace,
             assets: assets
                 .iter()
-                .map(|(p, n, _)| Asset {
-                    policy: hex::decode(p).unwrap(),
-                    name: hex::decode(n).unwrap(),
-                })
+                // The fixtures always carried a quantity here; until `Asset`
+                // could hold one it was discarded at this line.
+                .map(|(p, n, q)| Asset::new(hex::decode(p).unwrap(), hex::decode(n).unwrap(), *q))
                 .collect(),
             index: 0,
             datum_hash: None,
@@ -759,9 +1015,9 @@ mod tests {
         let obs = recognise(&out, 1_356_132_463_270, &chimpy, b"CHIMPY", Some(&datum))
             .expect("V1 credential must be recognised");
         assert_eq!(obs.dex, "minswap-v1");
-        assert!(obs.ada_paired);
-        assert_eq!(obs.quote_reserve, 718_437_917);
-        assert_eq!(obs.base_reserve, 1_356_132_463_270);
+        assert!(obs.ada_paired());
+        assert_eq!(obs.quote_reserve(), Some(718_437_917));
+        assert_eq!(obs.base.reserve, Some(1_356_132_463_270));
         assert_eq!(obs.total_lp, Some(30_955_673_379));
         // One NFT per pool, so the identity is exact rather than ambiguous.
         assert_eq!(obs.key_basis, KeyBasis::Value);
@@ -796,8 +1052,8 @@ mod tests {
         let obs = recognise(&out, 1_982_469_155_671, &wrt, b"WingRiders", Some(&datum))
             .expect("V1 credential must be recognised");
         assert_eq!(obs.dex, "wingriders-v1");
-        assert_eq!(obs.quote_reserve, 42_920_769_498);
-        assert_eq!(obs.base_reserve, 1_982_299_495_609);
+        assert_eq!(obs.quote_reserve(), Some(42_920_769_498));
+        assert_eq!(obs.base.reserve, Some(1_982_299_495_609));
         assert_eq!(obs.reserve_source, ReserveSource::ValueMinusTreasury);
         // The `L` NFT marks a pool; the 32-byte LP name identifies it.
         assert_eq!(obs.key_basis, KeyBasis::Value);
@@ -826,8 +1082,8 @@ mod tests {
         let obs = recognise(&out, 85_688_442_537, &adamars, b"ADAMARS", Some(&datum))
             .expect("V1 credential must be recognised");
         assert_eq!(obs.dex, "sundae-v1");
-        assert_eq!(obs.quote_reserve, 632_695_954);
-        assert_eq!(obs.base_reserve, 85_688_442_537);
+        assert_eq!(obs.quote_reserve(), Some(632_695_954));
+        assert_eq!(obs.base.reserve, Some(85_688_442_537));
         assert_eq!(obs.fee_bps, Some(100));
         assert_eq!(obs.total_lp, Some(7_348_469_228));
         assert_eq!(obs.key_basis, KeyBasis::Datum);
@@ -876,11 +1132,11 @@ mod tests {
         let obs = recognise(&out, NIGHT_HELD, &NIGHT_POLICY, b"NIGHT", None)
             .expect("the V3 credential must be recognised");
         assert_eq!(obs.dex, "sundae-v3");
-        assert!(obs.ada_paired);
-        assert_eq!(obs.base_reserve, NIGHT_HELD);
+        assert!(obs.ada_paired());
+        assert_eq!(obs.base.reserve, Some(NIGHT_HELD));
         // 233,854,410,616 held less 7,833,416,031 of protocol fees. Reading
         // the raw value would put spot 3.5% high on a pool this size.
-        assert_eq!(obs.quote_reserve, 226_020_994_585);
+        assert_eq!(obs.quote_reserve(), Some(226_020_994_585));
         assert_eq!(obs.reserve_source, ReserveSource::ValueMinusTreasury);
         assert_eq!(obs.fee_bps, Some(30));
         assert_eq!(obs.total_lp, Some(612_407_562_355));
@@ -1002,19 +1258,83 @@ mod tests {
     }
 
     #[test]
+    /// The far side of a token/token pool is MEASURED from the value, not
+    /// shrugged at. This is the capability `Asset::quantity` bought: before it,
+    /// a pool could be seen to hold a third asset but never how much of it, so
+    /// every token/token pair was a dead end no matter which venue it sat on.
+    #[test]
+    fn a_token_token_pair_measures_its_far_side_from_the_value() {
+        const WATCHED: [u8; 28] = [1; 28];
+        const OTHER: [u8; 28] = [2; 28];
+        let out = DecodedOutput {
+            address: "addr1xtest".into(),
+            // A min-UTxO carrier, NOT a quote reserve — the distinction the old
+            // shape could not express.
+            lovelace: 2_000_000,
+            assets: vec![
+                Asset::new(WATCHED.to_vec(), b"TOK".to_vec(), 500),
+                Asset::new(OTHER.to_vec(), b"USD".to_vec(), 12_345),
+            ],
+            index: 0,
+            datum_hash: None,
+            inline_datum: None,
+            min_utxo: 0,
+        };
+
+        let far = side_from_value(&out, &OTHER, b"USD", 500, &WATCHED, b"TOK");
+        assert_eq!(far.reserve, Some(12_345), "the far side is measurable now");
+        assert!(!far.is_ada(), "a token side must never read as ADA");
+
+        // The watched side still comes from the quantity the walk extracted,
+        // and ADA still comes from the output's lovelace.
+        let mine = side_from_value(&out, &WATCHED, b"TOK", 500, &WATCHED, b"TOK");
+        assert_eq!(mine.reserve, Some(500));
+        let ada = side_from_value(&out, &[], &[], 500, &WATCHED, b"TOK");
+        assert!(ada.is_ada());
+        assert_eq!(ada.reserve, Some(2_000_000));
+
+        // An asset the datum names but the output does not hold stays
+        // unmeasured rather than reading as zero.
+        let absent = side_from_value(&out, &[9; 28], b"GONE", 500, &WATCHED, b"TOK");
+        assert_eq!(absent.reserve, None);
+    }
+
+    /// `ada_paired` is derived, so an unknown pair can never read as ADA — the
+    /// conservative direction, since a token/token pool mistaken for ADA-paired
+    /// publishes a price wrong by orders of magnitude.
+    #[test]
+    fn an_unknown_pair_is_not_ada_paired() {
+        let obs = PoolObservation {
+            dex: "test",
+            address: "addr1xtest".into(),
+            key_policy: Vec::new(),
+            key_name: Vec::new(),
+            key_basis: KeyBasis::Unknown,
+            base: Side::new(vec![1; 28], b"TOK".to_vec(), 10),
+            quote: None,
+            fee_bps: None,
+            total_lp: None,
+            reserve_source: ReserveSource::Value,
+        };
+        assert!(!obs.ada_paired());
+        assert_eq!(obs.quote_reserve(), None);
+
+        // Named but unmeasured is also not priceable, and for a different
+        // reason — the caller must not be able to confuse the two.
+        let named = PoolObservation {
+            quote: Some(Side::unmeasured(vec![2; 28], b"USD".to_vec())),
+            ..obs
+        };
+        assert!(!named.ada_paired());
+        assert_eq!(named.quote_reserve(), None);
+        assert!(named.quote.as_ref().is_some_and(|q| !q.is_ada()));
+    }
+
+    #[test]
     fn value_key_refuses_to_guess_between_two_candidates() {
-        let watched = Asset {
-            policy: vec![1; 28],
-            name: b"TOK".to_vec(),
-        };
-        let lp = Asset {
-            policy: vec![2; 28],
-            name: b"LP".to_vec(),
-        };
-        let nft = Asset {
-            policy: vec![3; 28],
-            name: b"NFT".to_vec(),
-        };
+        let watched = Asset::new(vec![1; 28], b"TOK".to_vec(), 1_000);
+        let lp = Asset::nft(vec![2; 28], b"LP".to_vec());
+        let nft = Asset::nft(vec![3; 28], b"NFT".to_vec());
         let one = vec![watched.clone(), lp.clone()];
         assert!(matches!(
             value_key(&one, &watched.policy, &watched.name),

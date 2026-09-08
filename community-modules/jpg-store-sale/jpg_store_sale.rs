@@ -11,7 +11,7 @@
 
 use mitos_community_events::jpg_store_sale::JpgStoreSale;
 use mitos_marketplace_decode::{
-    AssetId, DecodeTx, TxInput, TxOutput, classify_jpg_address, decode_jpg_sales, is_buy_redeemer,
+    AssetId, DecodeTx, TxInput, TxOutput, Venue, classify_jpg_address, decode_jpg_sales,
 };
 
 use crate::mitos::platform_v2::emit;
@@ -45,7 +45,11 @@ fn to_asset_ids(assets: &[crate::mitos::platform_v2::types::AssetEntry]) -> Vec<
 /// to avoid the per-hash host lookups a blanket resolve would incur.
 fn build_input(c: &ConsumedEvent) -> TxInput {
     let at_venue = classify_jpg_address(&c.prior_output.address).is_some();
-    let is_buy = c.redeemer.as_deref().map(is_buy_redeemer).unwrap_or(false);
+    let is_buy = c
+        .redeemer
+        .as_deref()
+        .map(|r| Venue::JpgStore.is_buy_redeemer(r))
+        .unwrap_or(false);
     let datum = if at_venue && is_buy {
         resolve_datum_bytes(c.prior_datum.as_ref())
     } else {

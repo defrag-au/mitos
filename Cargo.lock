@@ -3621,6 +3621,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-cohort"
+version = "0.0.1"
+dependencies = [
+ "mitos-vesting-decode",
+ "pallas-addresses 1.1.1",
+]
+
+[[package]]
 name = "mitos-community-events"
 version = "0.0.1"
 dependencies = [
@@ -3767,6 +3775,16 @@ dependencies = [
  "url",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "mitos-pool-observe"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "mitos-chain-walk",
+ "mitos-cohort",
+ "mitos-dex-decode",
 ]
 
 [[package]]
@@ -6283,7 +6301,9 @@ dependencies = [
  "hex",
  "libc",
  "mitos-chain-walk",
+ "mitos-cohort",
  "mitos-dex-decode",
+ "mitos-pool-observe",
  "mitos-vesting-decode",
  "object_store",
  "pallas-addresses 1.1.1",

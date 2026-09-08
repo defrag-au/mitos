@@ -586,10 +586,12 @@ fn decode_assets(s: &str) -> Result<Vec<Asset>> {
     pairs
         .into_iter()
         .map(|[p, n]| {
-            Ok(Asset {
-                policy: hex::decode(&p).context("asset policy hex")?,
-                name: hex::decode(&n).context("asset name hex")?,
-            })
+            // The buffered store keeps `[policy, name]` pairs and no amount,
+            // so the quantity is genuinely unrecorded here rather than one.
+            Ok(Asset::unmeasured(
+                hex::decode(&p).context("asset policy hex")?,
+                hex::decode(&n).context("asset name hex")?,
+            ))
         })
         .collect()
 }
@@ -638,10 +640,7 @@ mod tests {
             BufferedOutput {
                 address: "addr1abc".into(),
                 lovelace: 42,
-                assets: vec![Asset {
-                    policy: vec![9u8; 28],
-                    name: b"Bud".to_vec(),
-                }],
+                assets: vec![Asset::nft(vec![9u8; 28], b"Bud".to_vec())],
                 datum_bytes: Some(vec![0xd8, 0x79, 0x80]),
                 datum_hash: Some(Hash::from([2u8; 32])),
                 venue: "jpg".into(),

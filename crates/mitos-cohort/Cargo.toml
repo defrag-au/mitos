@@ -1,0 +1,19 @@
+[package]
+name = "mitos-cohort"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "What KIND of holder an address is — burn / pool / vesting / script / wallet, with how firmly each is known. A pure function of the address plus two registries, so reclassifying is a re-derivation and never a re-walk."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+# Address parsing only. Read through pallas rather than by bech32 prefix:
+# `addr1z` covers two distinct address types and a prefix test silently
+# mis-sorts one of them.
+pallas-addresses.workspace = true
+# Lock-platform recognition by payment credential (CrowdLock / Shield,
+# snek.fun). A decode crate, so this adds nothing beyond pallas.
+mitos-vesting-decode = { path = "../mitos-vesting-decode" }

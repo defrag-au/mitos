@@ -15,7 +15,7 @@ use mitos_community_events::wayup_store_sale::{Sale as WayupSale, WayupStoreSale
 use pallas_addresses::{Address, ShelleyDelegationPart, ShelleyPaymentPart};
 
 use crate::DecodeTx;
-use crate::datum::{decode_listing_datum, is_buy_redeemer};
+use crate::datum::{Venue, decode_listing_datum};
 
 /// A matched sale before venue projection: one asset, the buyer that received
 /// it, and the decoded listing terms. `tag` carries any venue-specific datum
@@ -64,8 +64,12 @@ struct Pending<T> {
 /// credential ([`address_bears_cred`]). Without this, ~71% of jpg "sales" are
 /// phantom (the owner reclaiming/relisting their own NFT), because the receiving
 /// wallet is not a marketplace escrow and so escapes the check above.
+/// `venue` selects whose redeemer convention decides "is this a buy". It is a
+/// required argument rather than a default because jpg.store and Wayup use
+/// OPPOSITE constructors — see [`Venue`].
 pub fn collect_sales<T: Clone>(
     tx: &DecodeTx,
+    venue: Venue,
     classify: impl Fn(&str) -> Option<T>,
     is_marketplace_escrow: impl Fn(&str) -> bool,
 ) -> Vec<MatchedSale<T>> {
@@ -78,7 +82,7 @@ pub fn collect_sales<T: Clone>(
         let Some(redeemer) = input.redeemer.as_ref() else {
             continue;
         };
-        if !is_buy_redeemer(redeemer) {
+        if !venue.is_buy_redeemer(redeemer) {
             continue;
         }
         let Some(datum) = input.datum.as_ref() else {
@@ -212,7 +216,12 @@ const JPG_FEE_CRED_HEX: &str = "84cc25ea4c29951d40b443b95bbc5676bc425470f96376d1
 /// settlement across the tx's listings. Bundle members repeat their listing's
 /// whole share, mirroring how they repeat the whole-bundle price.
 pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
-    let matched = collect_sales(tx, classify_jpg_address, is_marketplace_escrow);
+    let matched = collect_sales(
+        tx,
+        Venue::JpgStore,
+        classify_jpg_address,
+        is_marketplace_escrow,
+    );
     if matched.is_empty() {
         return Vec::new();
     }
@@ -235,7 +244,8 @@ pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
         let Some(redeemer) = input.redeemer.as_ref() else {
             continue;
         };
-        if !is_buy_redeemer(redeemer) {
+        // Same gate as `collect_sales` above, and this loop is jpg-only.
+        if !Venue::JpgStore.is_buy_redeemer(redeemer) {
             continue;
         }
         let Some(decoded) = input.datum.as_deref().and_then(decode_listing_datum) else {
@@ -331,6 +341,7 @@ pub fn decode_wayup_sales(tx: &DecodeTx, cfg: &WayupSaleConfig) -> Vec<WayupStor
 
     collect_sales(
         tx,
+        Venue::Wayup,
         |addr| cfg.is_listing_address(addr).then_some(()),
         is_marketplace_escrow,
     )
@@ -536,7 +547,8 @@ mod tests {
                 address: JPG_V2_ADDR.into(),
                 assets: vec![asset],
                 datum: Some(datum),
-                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                // jpg BUY = constructor 1 (`d87a…`), carrying an input index.
+                redeemer: Some(vec![0xd8, 0x7a, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
             outputs,
@@ -626,7 +638,8 @@ mod tests {
                 address: JPG_V1_ADDR.into(),
                 assets: vec![asset.clone()],
                 datum: Some(listing_datum(&seller, &[(&seller, "1a389fd980")])),
-                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                // jpg BUY = constructor 1 (`d87a…`), carrying an input index.
+                redeemer: Some(vec![0xd8, 0x7a, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
             // NFT re-escrowed at the Wayup sale contract (the migration), plus
@@ -691,7 +704,8 @@ mod tests {
                     RECLAIM_OWNER_PKH,
                     &[(RECLAIM_OWNER_PKH, "1a0939c880")],
                 )),
-                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                // jpg BUY = constructor 1 (`d87a…`), carrying an input index.
+                redeemer: Some(vec![0xd8, 0x7a, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
             outputs: vec![TxOutput {

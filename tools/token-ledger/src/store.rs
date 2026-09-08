@@ -46,7 +46,7 @@ use pallas_primitives::Hash;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
-use crate::pools::PoolObservation;
+use mitos_pool_observe::PoolObservation;
 
 /// Cursor keys, named once. A reader that spelled `walked_from` where the
 /// writer says `walk_from` once read `None`, concluded the ledger covered
@@ -670,6 +670,19 @@ impl Ledger {
             "ada_paired",
             "INTEGER NOT NULL DEFAULT 1",
         )?;
+        // WHAT the pool pairs the watched asset with. Added 2026-09-08 when
+        // `PoolObservation` gained two named sides: `ada_paired` could only say
+        // that a pool was NOT priceable, never what it actually held, so every
+        // token/token pool was a silent dead end. NULL means the pair is
+        // genuinely unknown — the no-datum fallback's honest answer — and is
+        // distinct from a recorded empty policy, which is ADA.
+        //
+        // Nothing reads these yet. They are written now so the currency graph
+        // that will resolve `TOKEN/OTHER ⋈ OTHER/ADA` does not need a re-walk
+        // to find its input, the same reasoning that says record the undecoded
+        // candidate rather than re-walk for it later.
+        ensure_column(&conn, "pool_state", "quote_policy", "BLOB")?;
+        ensure_column(&conn, "pool_state", "quote_name", "BLOB")?;
         ensure_column(&conn, "buffered", "unlock_ts_ms", "INTEGER")?;
         ensure_column(&conn, "buffered", "owner_pkh", "TEXT")?;
         ensure_column(&conn, "buffered", "datum_cbor", "BLOB")?;
@@ -1154,17 +1167,26 @@ impl Ledger {
                 tx.execute(
                     "INSERT OR IGNORE INTO pool_state
                          (tx_ord, pool_id, base_reserve, quote_reserve,
-                          fee_bps, total_lp, reserve_source, ada_paired)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                          fee_bps, total_lp, reserve_source, ada_paired,
+                          quote_policy, quote_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         ord,
                         pool_id,
-                        obs.base_reserve,
-                        obs.quote_reserve,
+                        // `base` is the watched asset, so the walk always
+                        // measured it; the fallback never fires in practice.
+                        obs.base.reserve.unwrap_or(0),
+                        // 0 when the pair is unknown or unmeasured — and in
+                        // exactly those cases `ada_paired` is 0 too, which is
+                        // the flag every read query already gates on, so the
+                        // zero can never reach a price.
+                        obs.quote_reserve().unwrap_or(0),
                         obs.fee_bps,
                         obs.total_lp,
                         obs.reserve_source.as_str(),
-                        obs.ada_paired as i64
+                        obs.ada_paired() as i64,
+                        obs.quote.as_ref().map(|q| q.policy.clone()),
+                        obs.quote.as_ref().map(|q| q.name.clone())
                     ],
                 )?;
             }
@@ -1290,7 +1312,7 @@ impl Ledger {
             let mut stmt =
                 tx.prepare("UPDATE party SET cohort = ?2, basis = ?3 WHERE party_id = ?1")?;
             for (id, address) in &addresses {
-                let c = crate::cohort::classify(address, sinks, &pools, lock_creds);
+                let c = mitos_cohort::classify(address, sinks, &pools, lock_creds);
                 stmt.execute(params![id, c.cohort.as_str(), c.basis])?;
             }
         }

@@ -46,17 +46,18 @@ use mitos_community_events::wayup_store_listing::{
     Unlisting as WayupUnlisting, WayupStoreContractVersion, WayupStoreListing,
 };
 
-use crate::datum::decode_listing_datum;
+use crate::datum::{Venue, decode_listing_datum};
 use crate::sales::{WayupSaleConfig, classify_jpg_address};
 use crate::{DecodeTx, OutputDatum};
 
-/// jpg.store / Wayup listing **cancel** (delist) redeemer: constructor 1 with
-/// empty fields, exactly `d87a80`. The live modules match the full three bytes
-/// (not the `d87a` prefix `datum::is_cancel_redeemer` uses), so a richer
-/// constructor-1 redeemer would NOT be treated as a delist — preserved here to
-/// keep goldens byte-identical.
-fn is_delist_redeemer(bytes: &[u8]) -> bool {
-    bytes == [0xd8, 0x7a, 0x80]
+/// Was this listing spend a **delist**, under the venue's own convention?
+///
+/// This used to be a single `bytes == [0xd8, 0x7a, 0x80]` check shared by both
+/// venues. `d87a80` is Wayup's delist — and jpg.store's **BUY**, so every
+/// jpg purchase was emitted as an `Unlisting` and no jpg sale was ever
+/// recorded. See [`Venue`] for the measured conventions.
+fn is_delist_redeemer(venue: Venue, bytes: &[u8]) -> bool {
+    venue.is_delist_redeemer(bytes)
 }
 
 fn sum_payouts(payouts: &[ListingPayout]) -> u64 {
@@ -134,6 +135,7 @@ struct ConsumedListing<V> {
 /// payload-then-resolver `true`). See the module docs for the resolution split.
 fn collect_listings<V: Clone>(
     tx: &DecodeTx,
+    venue: Venue,
     classify: impl Fn(&str) -> Option<V>,
     resolve: impl Fn(&[u8]) -> Option<Vec<u8>>,
     create_uses_resolver: bool,
@@ -171,7 +173,7 @@ fn collect_listings<V: Clone>(
         let Some(redeemer) = input.redeemer.as_ref() else {
             continue;
         };
-        if !is_delist_redeemer(redeemer) {
+        if !is_delist_redeemer(venue, redeemer) {
             continue;
         }
         let bundle_size = (input.assets.len() > 1).then_some(input.assets.len() as u32);
@@ -286,7 +288,7 @@ pub fn decode_jpg_listings(
     tx: &DecodeTx,
     resolve: impl Fn(&[u8]) -> Option<Vec<u8>>,
 ) -> Vec<JpgStoreListing> {
-    collect_listings(tx, classify_jpg_address, resolve, false)
+    collect_listings(tx, Venue::JpgStore, classify_jpg_address, resolve, false)
         .into_iter()
         .map(project_jpg)
         .collect()
@@ -372,6 +374,7 @@ pub fn decode_wayup_listings(
 ) -> Vec<WayupStoreListing> {
     collect_listings(
         tx,
+        Venue::Wayup,
         |addr| {
             cfg.is_listing_address(addr)
                 .then_some(WayupStoreContractVersion::V1)
@@ -553,7 +556,8 @@ mod tests {
                 address: JPG_V2_ADDR.into(),
                 assets: vec![asset()],
                 datum: Some(listing_datum(&seller, &[(&seller, "1a389fd980")])),
-                redeemer: Some(vec![0xd8, 0x7a, 0x80]),
+                // jpg DELIST = constructor 0 (`d879…`); `d87a80` is jpg's buy.
+                redeemer: Some(vec![0xd8, 0x79, 0x80]),
                 ..Default::default()
             }],
             ..Default::default()
@@ -580,7 +584,8 @@ mod tests {
                 address: JPG_V2_ADDR.into(),
                 assets: vec![asset()],
                 datum: Some(prior),
-                redeemer: Some(vec![0xd8, 0x7a, 0x80]),
+                // jpg DELIST = constructor 0 (`d879…`); `d87a80` is jpg's buy.
+                redeemer: Some(vec![0xd8, 0x79, 0x80]),
                 ..Default::default()
             }],
             outputs: vec![TxOutput {

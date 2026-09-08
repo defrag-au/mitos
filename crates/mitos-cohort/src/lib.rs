@@ -5,7 +5,18 @@
 //! and a wallet somebody told us belongs to the team are not the same kind of
 //! claim, and rendering them identically launders a guess into a fact.
 //!
-//! This module deliberately stops at what the chain proves:
+//! # Why this is its own crate, separate from `mitos-pool-observe`
+//!
+//! Both were modules of the `token-ledger` binary, which made them unreachable
+//! from the archive path and from a Worker reading R2 — the interpretive layer
+//! existed and was locked inside an executable. Splitting them apart rather
+//! than into one crate is a **dependency** decision, not a taste one: this
+//! crate needs only `pallas-addresses` and a vesting decoder, so it links into
+//! wasm cheaply, while `mitos-pool-observe` pulls `mitos-chain-walk` for the
+//! walker's output shape. Fused, every consumer that only wanted to ask "what
+//! kind of holder is this address" would link the whole chain-walk stack.
+//!
+//! This crate deliberately stops at what the chain proves:
 //!
 //! | Cohort | Basis | What it rests on |
 //! |---|---|---|
@@ -32,6 +43,8 @@
 //!
 //! Because every cohort below is a pure function of the stored address (plus
 //! the pool and sink sets), reclassifying is a re-derivation, never a re-walk.
+//! That property is load-bearing — see `POLICY_ARCHIVE_OBSERVATIONS.md`, which
+//! rejected inlining cohorts per movement precisely to protect it.
 
 use pallas_addresses::Address;
 

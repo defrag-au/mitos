@@ -19,11 +19,68 @@ use pallas_traverse::{MultiEraOutput, MultiEraTx, OriginalHash};
 /// An output reference (origin tx hash + output index).
 pub type OutRef = (Hash<32>, u32);
 
-/// A native asset (policy id + on-chain asset-name bytes).
+/// A native asset in an output's value — policy id, on-chain asset-name bytes,
+/// and how many.
+///
+/// The quantity was absent until 2026-09-08, and its absence had a cost worth
+/// recording: a walker could see *that* a pool held some third asset but never
+/// *how much*, so the far side of a token/token DEX pool was identifiable and
+/// unmeasurable. Every consumer that wanted an amount had to be handed one out
+/// of band.
+///
+/// It is `Option` because not every `Asset` comes from a decode. Two stores —
+/// market-ledger's buffered outputs and project-ledger's state — persist only
+/// `(policy, name)` pairs and rebuild `Asset`s from them; those get
+/// [`Asset::unmeasured`] rather than a zero, because a zero quantity is a real
+/// and different claim.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Asset {
     pub policy: Vec<u8>,
     pub name: Vec<u8>,
+    /// How many of it the output holds. `None` when whatever produced this
+    /// `Asset` did not record an amount.
+    pub quantity: Option<u64>,
+}
+
+impl Asset {
+    /// An asset whose quantity is known.
+    pub fn new(policy: Vec<u8>, name: Vec<u8>, quantity: u64) -> Self {
+        Asset {
+            policy,
+            name,
+            quantity: Some(quantity),
+        }
+    }
+
+    /// Exactly one — the shape of an NFT, and the common case wherever a
+    /// collection asset is built by hand.
+    ///
+    /// Named rather than left to `new(.., 1)` so a reader can see at the call
+    /// site that the single quantity is the *point* and not a placeholder.
+    pub fn nft(policy: Vec<u8>, name: Vec<u8>) -> Self {
+        Asset::new(policy, name, 1)
+    }
+
+    /// Identity only: this asset is present, and the amount was never recorded.
+    ///
+    /// For rebuilding an `Asset` from a store that kept only the pair. Do not
+    /// use it to paper over a decode that could have supplied the amount.
+    pub fn unmeasured(policy: Vec<u8>, name: Vec<u8>) -> Self {
+        Asset {
+            policy,
+            name,
+            quantity: None,
+        }
+    }
+
+    /// Whether the output holds exactly one of this asset.
+    ///
+    /// `false` for an unmeasured asset — "we did not record it" is not
+    /// evidence of a single, and an NFT surface that treats it as one would
+    /// count assets it has never seen the quantity of.
+    pub fn is_single(&self) -> bool {
+        self.quantity == Some(1)
+    }
 }
 
 /// A decoded produced output.
@@ -181,6 +238,11 @@ fn decode_output(index: u32, o: &MultiEraOutput<'_>) -> DecodedOutput {
                 .map(|a| Asset {
                     policy: policy.clone(),
                     name: a.name().to_vec(),
+                    // Straight from the value. An output's asset entry always
+                    // carries a positive coin, so `None` here would mean pallas
+                    // could not read one — carried through rather than
+                    // flattened to zero.
+                    quantity: a.output_coin(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -233,6 +295,34 @@ mod tests {
     use super::*;
     use pallas_traverse::MultiEraBlock;
     use std::path::PathBuf;
+
+    /// The three ways an `Asset` can come into being are three different
+    /// claims, and the dangerous confusion is the last one: "we did not record
+    /// the amount" must never read as "there is one of it", or an NFT surface
+    /// starts counting assets whose quantity it has never seen.
+    #[test]
+    fn unmeasured_is_not_a_single() {
+        assert!(Asset::nft(vec![1; 28], b"Bud".to_vec()).is_single());
+        assert!(!Asset::new(vec![1; 28], b"TOK".to_vec(), 5_000).is_single());
+
+        let unknown = Asset::unmeasured(vec![1; 28], b"Bud".to_vec());
+        assert_eq!(unknown.quantity, None);
+        assert!(!unknown.is_single());
+    }
+
+    /// A zero quantity is a real and different claim from an unrecorded one,
+    /// so the two must not collapse onto each other.
+    #[test]
+    fn zero_is_not_unmeasured() {
+        assert_eq!(
+            Asset::new(vec![1; 28], b"TOK".to_vec(), 0).quantity,
+            Some(0)
+        );
+        assert_ne!(
+            Asset::new(vec![1; 28], b"TOK".to_vec(), 0),
+            Asset::unmeasured(vec![1; 28], b"TOK".to_vec())
+        );
+    }
 
     /// Decode every tx of a captured mainnet block fixture — exercises the real
     /// pallas decode path (redeemer ordering, witness datums, output datums) on

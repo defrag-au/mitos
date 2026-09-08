@@ -24,8 +24,11 @@ use mitos_chain_walk::decode::{DecodedOutput, decode_tx};
 use mitos_chain_walk::{open_blocks, slot_to_unix};
 
 use crate::buffer::{BufferedOutput, OutrefBuffer};
-use crate::cohort;
-use crate::pools;
+// Both were modules here until 2026-09-08. They are crates now so the archive
+// path and a Worker can reach them; aliased to their old names so the call
+// sites below read unchanged.
+use mitos_cohort as cohort;
+use mitos_pool_observe as pools;
 use crate::registry;
 use crate::store::{AssetMeta, Balance, Completeness, Ledger, TxRow};
 
@@ -1444,7 +1447,7 @@ fn cap_report(
     };
 
     let realise = |sell: i128| -> f64 {
-        crate::pools::constant_product_out(
+        pools::constant_product_out(
             i64::try_from(base).unwrap_or(i64::MAX),
             i64::try_from(quote).unwrap_or(i64::MAX),
             i64::try_from(sell).unwrap_or(i64::MAX),

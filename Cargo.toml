@@ -19,6 +19,12 @@ members = [
     "crates/mitos-module-kit",
     "crates/mitos-dex-decode",
     "crates/mitos-vesting-decode",
+    # Split out of the token-ledger BINARY 2026-09-08 so the archive path and a
+    # Worker can reach the interpretive layer. Two crates, not one, because
+    # `mitos-cohort` is wasm-cheap (pallas-addresses only) while
+    # `mitos-pool-observe` links the chain-walk output shape.
+    "crates/mitos-cohort",
+    "crates/mitos-pool-observe",
     "crates/mitos-marketplace-decode",
     "crates/chain-sieve",
     "crates/market-ledger-wire",

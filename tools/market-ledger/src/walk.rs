@@ -645,10 +645,7 @@ mod tests {
             outputs: vec![DecodedOutput {
                 address: JPG_SALE_ADDR.into(),
                 lovelace: 2_000_000,
-                assets: vec![Asset {
-                    policy: vec![9u8; 28],
-                    name: b"Bud1".to_vec(),
-                }],
+                assets: vec![Asset::nft(vec![9u8; 28], b"Bud1".to_vec())],
                 index: 0,
                 datum_hash,
                 inline_datum: inline,

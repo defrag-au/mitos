@@ -61,6 +61,16 @@ mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
 # seam as the DEX crate.
 mitos-vesting-decode = { path = "../../crates/mitos-vesting-decode" }
 
+# What KIND of holder an address is, and how firmly that is known. Was a module
+# of this binary until 2026-09-08, which put the interpretive layer somewhere
+# the archive path and a Worker could not reach. Kept free of `mitos-chain-walk`
+# so it stays cheap to link into wasm.
+mitos-cohort = { path = "../../crates/mitos-cohort" }
+# Recognise a pool OUTPUT and read its reserves the way that venue publishes
+# them. Separate crate from `mitos-cohort` because it needs the walker's output
+# shape; see either crate's header for why the split is by dependency class.
+mitos-pool-observe = { path = "../../crates/mitos-pool-observe" }
+
 # The artifacts `export` writes — shared with the egui WASM frontend that
 # loads them, so the format lives in a crate rather than in this tool.
 token-ledger-wire = { path = "../../crates/token-ledger-wire" }

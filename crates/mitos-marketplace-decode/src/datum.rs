@@ -1,26 +1,76 @@
 //! Pure redeemer + listing-datum decode primitives.
 //!
 //! jpg.store and Wayup share the listing-datum shape
-//! (`Constr 0 [ List<Payout>, Bytes(owner_credential) ]`) and the buy/cancel
-//! redeemer constructors, so this is one implementation for both venues. The
-//! only interpretation difference is the `owner_credential`: jpg encodes the
-//! seller's **payment** pkh, Wayup the seller's **stake** credential — callers
-//! label [`DecodedListing::cred_hex`] accordingly.
+//! (`Constr 0 [ List<Payout>, Bytes(owner_credential) ]`), so the datum decode
+//! is one implementation for both venues.
+//!
+//! They do **not** share their redeemer constructors — that is [`Venue`]'s
+//! whole reason to exist, and this header previously claimed the opposite. Two
+//! things therefore differ per venue:
+//!
+//! - **Redeemer constructors are OPPOSITE.** See [`Venue`].
+//! - **`owner_credential`**: jpg encodes the seller's **payment** pkh, Wayup
+//!   the seller's **stake** credential — callers label
+//!   [`DecodedListing::cred_hex`] accordingly.
 
 use mitos_community_events::marketplace::ListingPayout;
 use pallas_primitives::{BigInt, PlutusData};
 
-/// jpg.store / Wayup Buy redeemer: constructor 0. On-wire the field varies per
-/// spend (often an input index), so match on the `d879` constructor prefix
-/// only, never the full bytes.
-pub fn is_buy_redeemer(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xd8, 0x79])
+/// Which venue's redeemer convention applies.
+///
+/// **The two venues are OPPOSITE, and this must never collapse into one shared
+/// predicate.** It was one, on the stated assumption that jpg.store and Wayup
+/// "share the buy/cancel redeemer constructors". They do not. Measured on chain
+/// 2026-09-08 by tallying real spends and checking which satisfied the listing
+/// datum's payouts:
+///
+/// | venue | buy | delist |
+/// |---|---|---|
+/// | jpg.store (V1–V3) | constructor **1** (`d87a…`) | constructor 0 (`d879…`) |
+/// | Wayup | constructor **0** (`d879…`) | constructor 1 (`d87a…`) |
+///
+/// Evidence: Wayup tx `6e2ef8b9…` spends 25 listings with constructor 0 and
+/// pays every datum payout; jpg txs `f917009c…` / `f940d7e7…` use constructor 1
+/// and pay theirs, while jpg constructor-0 spends pay **none** of them (the
+/// asset goes back to the seller — a delist).
+///
+/// The shared version was right for Wayup and inverted for jpg, so jpg sales
+/// were never recorded and every jpg purchase was booked as an Unlisting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Venue {
+    JpgStore,
+    Wayup,
 }
 
-/// Cancel / delist redeemer: constructor 1 (`d87a…`). The listing modules'
-/// domain, not the sale modules' — exposed so callers can discriminate.
-pub fn is_cancel_redeemer(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xd8, 0x7a])
+impl Venue {
+    /// Every variant, so a caller adding a venue is forced to state its
+    /// convention rather than inherit someone else's.
+    pub const ALL: [Venue; 2] = [Venue::JpgStore, Venue::Wayup];
+
+    /// CBOR constructor prefix this venue uses for a **buy**.
+    fn buy_prefix(self) -> [u8; 2] {
+        match self {
+            Venue::JpgStore => [0xd8, 0x7a],
+            Venue::Wayup => [0xd8, 0x79],
+        }
+    }
+
+    /// Does `bytes` spend a listing as a purchase under this venue's contract?
+    ///
+    /// Prefix match, never full bytes: the redeemer sometimes carries a field
+    /// (an input index) and a richer constructor must still read as a buy.
+    pub fn is_buy_redeemer(self, bytes: &[u8]) -> bool {
+        bytes.starts_with(&self.buy_prefix())
+    }
+
+    /// Does `bytes` spend a listing as a delist (cancel)? The other
+    /// constructor — the two paths are exhaustive for these contracts.
+    pub fn is_delist_redeemer(self, bytes: &[u8]) -> bool {
+        bytes.len() >= 2
+            && bytes.starts_with(&[0xd8])
+            && !self.is_buy_redeemer(bytes)
+            && (bytes[1] == 0x79 || bytes[1] == 0x7a)
+    }
 }
 
 /// A decoded listing (ask) datum. `Default` is the empty listing (no payouts,
@@ -206,19 +256,53 @@ fn decode_bigint_u64(i: &BigInt) -> Option<u64> {
 mod tests {
     use super::*;
 
+    const CONSTR_0: [u8; 3] = [0xd8, 0x79, 0x80];
+    const CONSTR_1: [u8; 3] = [0xd8, 0x7a, 0x80];
+
+    /// Wayup buys with constructor 0. Measured: tx `6e2ef8b9…` spends 25
+    /// listings this way and pays every datum payout.
     #[test]
-    fn buy_redeemer_matches_constructor_0_prefix() {
-        // d8799f00ff (indefinite Constr 0 [0]) and d8799f09ff both = Buy.
-        assert!(is_buy_redeemer(&[0xd8, 0x79, 0x9f, 0x00, 0xff]));
-        assert!(is_buy_redeemer(&[0xd8, 0x79, 0x9f, 0x09, 0xff]));
-        assert!(!is_buy_redeemer(&[0xd8, 0x7a, 0x80])); // Cancel
-        assert!(!is_buy_redeemer(&[]));
+    fn wayup_buys_with_constructor_0() {
+        assert!(Venue::Wayup.is_buy_redeemer(&CONSTR_0));
+        assert!(Venue::Wayup.is_delist_redeemer(&CONSTR_1));
+        // A redeemer carrying a field (an input index) is still a buy.
+        assert!(Venue::Wayup.is_buy_redeemer(&[0xd8, 0x79, 0x9f, 0x09, 0xff]));
+    }
+
+    /// jpg.store buys with constructor **1** — the opposite of Wayup.
+    /// Measured: `f917009c…` / `f940d7e7…` use constructor 1 and satisfy the
+    /// datum's payouts; constructor-0 spends satisfy none and return the asset
+    /// to the seller.
+    #[test]
+    fn jpg_buys_with_constructor_1() {
+        assert!(Venue::JpgStore.is_buy_redeemer(&CONSTR_1));
+        assert!(Venue::JpgStore.is_delist_redeemer(&CONSTR_0));
+        assert!(Venue::JpgStore.is_buy_redeemer(&[0xd8, 0x7a, 0x9f, 0x00, 0xff]));
+    }
+
+    /// The guard that would have caught the original bug: no constructor may
+    /// mean the same thing at both venues. If a future edit makes the two
+    /// conventions agree, that is the bug, not a simplification.
+    #[test]
+    fn the_two_venues_disagree_on_every_constructor() {
+        for redeemer in [CONSTR_0, CONSTR_1] {
+            assert_ne!(
+                Venue::JpgStore.is_buy_redeemer(&redeemer),
+                Venue::Wayup.is_buy_redeemer(&redeemer),
+                "jpg.store and Wayup use OPPOSITE redeemer constructors; a shared \
+                 predicate is wrong for one of them"
+            );
+        }
     }
 
     #[test]
-    fn cancel_redeemer_matches_constructor_1_prefix() {
-        assert!(is_cancel_redeemer(&[0xd8, 0x7a, 0x80]));
-        assert!(!is_cancel_redeemer(&[0xd8, 0x79, 0x9f, 0x00, 0xff]));
+    fn nonsense_redeemers_are_neither() {
+        for venue in Venue::ALL {
+            assert!(!venue.is_buy_redeemer(&[]));
+            assert!(!venue.is_delist_redeemer(&[]));
+            // Not a constructor at all.
+            assert!(!venue.is_delist_redeemer(&[0x00]));
+        }
     }
 
     #[test]
