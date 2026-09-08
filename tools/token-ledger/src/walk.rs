@@ -27,10 +27,10 @@ use crate::buffer::{BufferedOutput, OutrefBuffer};
 // Both were modules here until 2026-09-08. They are crates now so the archive
 // path and a Worker can reach them; aliased to their old names so the call
 // sites below read unchanged.
-use mitos_cohort as cohort;
-use mitos_pool_observe as pools;
 use crate::registry;
 use crate::store::{AssetMeta, Balance, Completeness, Ledger, TxRow};
+use mitos_cohort as cohort;
+use mitos_pool_observe as pools;
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {

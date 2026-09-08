@@ -24,7 +24,7 @@ pub mod offer_lifecycle;
 pub mod offers;
 pub mod sales;
 
-pub use datum::{DecodedListing, Venue, decode_listing_datum};
+pub use datum::{DecodedListing, ListingContract, decode_listing_datum};
 pub use listings::{decode_jpg_listings, decode_wayup_listings};
 pub use offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 pub use offer_lifecycle::{decode_jpg_offer_lifecycle, decode_wayup_offer_lifecycle};

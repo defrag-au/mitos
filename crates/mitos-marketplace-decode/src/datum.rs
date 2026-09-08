@@ -4,11 +4,11 @@
 //! (`Constr 0 [ List<Payout>, Bytes(owner_credential) ]`), so the datum decode
 //! is one implementation for both venues.
 //!
-//! They do **not** share their redeemer constructors — that is [`Venue`]'s
-//! whole reason to exist, and this header previously claimed the opposite. Two
-//! things therefore differ per venue:
+//! They do **not** share their redeemer constructors, and neither do jpg's own
+//! contract versions — that is [`ListingContract`]'s whole reason to exist. Two
+//! things differ per contract:
 //!
-//! - **Redeemer constructors are OPPOSITE.** See [`Venue`].
+//! - **Redeemer constructors.** See [`ListingContract`].
 //! - **`owner_credential`**: jpg encodes the seller's **payment** pkh, Wayup
 //!   the seller's **stake** credential — callers label
 //!   [`DecodedListing::cred_hex`] accordingly.
@@ -16,46 +16,65 @@
 use mitos_community_events::marketplace::ListingPayout;
 use pallas_primitives::{BigInt, PlutusData};
 
-/// Which venue's redeemer convention applies.
+/// Which listing validator's redeemer convention applies.
 ///
-/// **The two venues are OPPOSITE, and this must never collapse into one shared
-/// predicate.** It was one, on the stated assumption that jpg.store and Wayup
-/// "share the buy/cancel redeemer constructors". They do not. Measured on chain
-/// 2026-09-08 by tallying real spends and checking which satisfied the listing
-/// datum's payouts:
+/// **The convention belongs to the VALIDATOR, not the venue** — jpg.store
+/// changed its own between V1 and V2, so a venue-wide predicate is wrong for one
+/// jpg era whichever way it is set. Measured on chain 2026-09-08 over 165 real
+/// listing spends, binned by (version, constructor) and scored on whether the
+/// spend actually paid the listing datum's payouts
+/// (`tools/market-ledger/scripts/jpg_redeemer_audit.py`):
 ///
-/// | venue | buy | delist |
-/// |---|---|---|
-/// | jpg.store (V1–V3) | constructor **1** (`d87a…`) | constructor 0 (`d879…`) |
-/// | Wayup | constructor **0** (`d879…`) | constructor 1 (`d87a…`) |
+/// | contract | buy | delist | settled-payout rate |
+/// |---|---|---|---|
+/// | jpg.store **V1** | constructor **1** (`d87a…`) | constructor 0 | 53/58 buy, 0/5 delist |
+/// | jpg.store **V2/V3** | constructor **0** (`d879…`) | constructor 1 | 43/43 buy, 1/59 delist |
+/// | Wayup | constructor **0** (`d879…`) | constructor 1 | — |
 ///
-/// Evidence: Wayup tx `6e2ef8b9…` spends 25 listings with constructor 0 and
-/// pays every datum payout; jpg txs `f917009c…` / `f940d7e7…` use constructor 1
-/// and pay theirs, while jpg constructor-0 spends pay **none** of them (the
-/// asset goes back to the seller — a delist).
+/// Worked examples. jpg V1 `f917009c…` spends with constructor 1 and pays all
+/// three datum payouts (royalty 1.44 ₳, fee 0.984 ₳, seller 21.576 ₳) to parties
+/// other than the spender — a buy. jpg V2 `eb3d777c…` spends with constructor 0
+/// and pays its single 77,518 ₳ payout exactly, plus 1,582 ₳ to
+/// [`JPG_FEE_CRED_HEX`](crate::sales) — also a buy, on the opposite constructor.
+/// jpg V2 `8d68adf8…` spends with constructor 1, pays neither of its payouts and
+/// returns everything to the owner — a delist.
 ///
-/// The shared version was right for Wayup and inverted for jpg, so jpg sales
-/// were never recorded and every jpg purchase was booked as an Unlisting.
+/// Two bugs have already come from collapsing this. The original shared
+/// predicate (buy = constructor 0 everywhere) was right for Wayup and V2/V3 but
+/// inverted for **V1**, so every V1-era purchase — the 2022–23 bulk of jpg's
+/// history — was booked as an Unlisting. Flipping it venue-wide to constructor 1
+/// merely moves the inversion onto V2/V3 and discards ~320k genuine 2024–26
+/// sales. Both eras are only correct if the convention is chosen per contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Venue {
-    JpgStore,
+pub enum ListingContract {
+    /// jpg.store V1 — `addr1zxgx3far…`. Buys with constructor 1.
+    JpgV1,
+    /// jpg.store V2 and V3 — one validator, two bech32 forms. Buys with
+    /// constructor 0.
+    JpgV2V3,
+    /// Wayup's sale validator. Buys with constructor 0.
     Wayup,
 }
 
-impl Venue {
-    /// Every variant, so a caller adding a venue is forced to state its
+impl ListingContract {
+    /// Every variant, so a caller adding a contract is forced to state its
     /// convention rather than inherit someone else's.
-    pub const ALL: [Venue; 2] = [Venue::JpgStore, Venue::Wayup];
+    pub const ALL: [ListingContract; 3] = [
+        ListingContract::JpgV1,
+        ListingContract::JpgV2V3,
+        ListingContract::Wayup,
+    ];
 
-    /// CBOR constructor prefix this venue uses for a **buy**.
+    /// CBOR constructor prefix this contract uses for a **buy**.
     fn buy_prefix(self) -> [u8; 2] {
         match self {
-            Venue::JpgStore => [0xd8, 0x7a],
-            Venue::Wayup => [0xd8, 0x79],
+            ListingContract::JpgV1 => [0xd8, 0x7a],
+            ListingContract::JpgV2V3 => [0xd8, 0x79],
+            ListingContract::Wayup => [0xd8, 0x79],
         }
     }
 
-    /// Does `bytes` spend a listing as a purchase under this venue's contract?
+    /// Does `bytes` spend a listing as a purchase under this contract?
     ///
     /// Prefix match, never full bytes: the redeemer sometimes carries a field
     /// (an input index) and a richer constructor must still read as a buy.
@@ -259,49 +278,90 @@ mod tests {
     const CONSTR_0: [u8; 3] = [0xd8, 0x79, 0x80];
     const CONSTR_1: [u8; 3] = [0xd8, 0x7a, 0x80];
 
-    /// Wayup buys with constructor 0. Measured: tx `6e2ef8b9…` spends 25
-    /// listings this way and pays every datum payout.
+    /// Wayup buys with constructor 0.
     #[test]
     fn wayup_buys_with_constructor_0() {
-        assert!(Venue::Wayup.is_buy_redeemer(&CONSTR_0));
-        assert!(Venue::Wayup.is_delist_redeemer(&CONSTR_1));
+        assert!(ListingContract::Wayup.is_buy_redeemer(&CONSTR_0));
+        assert!(ListingContract::Wayup.is_delist_redeemer(&CONSTR_1));
         // A redeemer carrying a field (an input index) is still a buy.
-        assert!(Venue::Wayup.is_buy_redeemer(&[0xd8, 0x79, 0x9f, 0x09, 0xff]));
+        assert!(ListingContract::Wayup.is_buy_redeemer(&[0xd8, 0x79, 0x9f, 0x09, 0xff]));
     }
 
-    /// jpg.store buys with constructor **1** — the opposite of Wayup.
-    /// Measured: `f917009c…` / `f940d7e7…` use constructor 1 and satisfy the
-    /// datum's payouts; constructor-0 spends satisfy none and return the asset
-    /// to the seller.
+    /// jpg V1 buys with constructor **1**. Measured: 53 of 58 V1 constructor-1
+    /// spends pay the datum's payouts (e.g. `f917009c…`); 0 of 5 constructor-0
+    /// spends do.
     #[test]
-    fn jpg_buys_with_constructor_1() {
-        assert!(Venue::JpgStore.is_buy_redeemer(&CONSTR_1));
-        assert!(Venue::JpgStore.is_delist_redeemer(&CONSTR_0));
-        assert!(Venue::JpgStore.is_buy_redeemer(&[0xd8, 0x7a, 0x9f, 0x00, 0xff]));
+    fn jpg_v1_buys_with_constructor_1() {
+        assert!(ListingContract::JpgV1.is_buy_redeemer(&CONSTR_1));
+        assert!(ListingContract::JpgV1.is_delist_redeemer(&CONSTR_0));
+        assert!(ListingContract::JpgV1.is_buy_redeemer(&[0xd8, 0x7a, 0x9f, 0x00, 0xff]));
     }
 
-    /// The guard that would have caught the original bug: no constructor may
-    /// mean the same thing at both venues. If a future edit makes the two
-    /// conventions agree, that is the bug, not a simplification.
+    /// jpg V2/V3 buys with constructor **0** — jpg reversed its own convention
+    /// after V1. Measured: 43 of 43 V2 constructor-0 spends pay the datum's
+    /// payouts (e.g. `eb3d777c…`); 1 of 59 constructor-1 spends do.
     #[test]
-    fn the_two_venues_disagree_on_every_constructor() {
+    fn jpg_v2_v3_buys_with_constructor_0() {
+        assert!(ListingContract::JpgV2V3.is_buy_redeemer(&CONSTR_0));
+        assert!(ListingContract::JpgV2V3.is_delist_redeemer(&CONSTR_1));
+        assert!(ListingContract::JpgV2V3.is_buy_redeemer(&[0xd8, 0x79, 0x9f, 0x00, 0xff]));
+    }
+
+    /// The guard for the bug that bit twice: jpg's two contract generations
+    /// disagree, so no single jpg-wide predicate can be right. A shared one is
+    /// wrong for whichever era it was not measured against — first V1 (the
+    /// 2022–23 bulk), then V2/V3 (2024–26) when it was flipped venue-wide.
+    #[test]
+    fn jpg_v1_and_v2_disagree_on_every_constructor() {
         for redeemer in [CONSTR_0, CONSTR_1] {
             assert_ne!(
-                Venue::JpgStore.is_buy_redeemer(&redeemer),
-                Venue::Wayup.is_buy_redeemer(&redeemer),
-                "jpg.store and Wayup use OPPOSITE redeemer constructors; a shared \
-                 predicate is wrong for one of them"
+                ListingContract::JpgV1.is_buy_redeemer(&redeemer),
+                ListingContract::JpgV2V3.is_buy_redeemer(&redeemer),
+                "jpg V1 and V2/V3 use OPPOSITE redeemer constructors; one jpg-wide \
+                 predicate is wrong for one of the two eras"
             );
+        }
+    }
+
+    /// Wayup agrees with jpg V2/V3 and differs from V1 — recorded so that a
+    /// future "simplification" back to one venue-wide predicate has to confront
+    /// which of the three it would break.
+    #[test]
+    fn wayup_agrees_with_jpg_v2_not_v1() {
+        for redeemer in [CONSTR_0, CONSTR_1] {
+            assert_eq!(
+                ListingContract::Wayup.is_buy_redeemer(&redeemer),
+                ListingContract::JpgV2V3.is_buy_redeemer(&redeemer),
+            );
+            assert_ne!(
+                ListingContract::Wayup.is_buy_redeemer(&redeemer),
+                ListingContract::JpgV1.is_buy_redeemer(&redeemer),
+            );
+        }
+    }
+
+    /// Every contract reads a spend as exactly one of buy or delist — the two
+    /// constructors are exhaustive, so a spend can never be both or neither.
+    #[test]
+    fn buy_and_delist_partition_the_constructors() {
+        for contract in ListingContract::ALL {
+            for redeemer in [CONSTR_0, CONSTR_1] {
+                assert_ne!(
+                    contract.is_buy_redeemer(&redeemer),
+                    contract.is_delist_redeemer(&redeemer),
+                    "{contract:?} must read {redeemer:02x?} as exactly one of buy/delist"
+                );
+            }
         }
     }
 
     #[test]
     fn nonsense_redeemers_are_neither() {
-        for venue in Venue::ALL {
-            assert!(!venue.is_buy_redeemer(&[]));
-            assert!(!venue.is_delist_redeemer(&[]));
+        for contract in ListingContract::ALL {
+            assert!(!contract.is_buy_redeemer(&[]));
+            assert!(!contract.is_delist_redeemer(&[]));
             // Not a constructor at all.
-            assert!(!venue.is_delist_redeemer(&[0x00]));
+            assert!(!contract.is_delist_redeemer(&[0x00]));
         }
     }
 

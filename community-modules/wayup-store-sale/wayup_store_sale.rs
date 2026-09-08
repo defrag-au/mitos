@@ -15,7 +15,7 @@ use std::cell::RefCell;
 
 use mitos_community_events::wayup_store_sale::WayupStoreSale;
 use mitos_marketplace_decode::{
-    AssetId, DecodeTx, TxInput, TxOutput, Venue, WayupSaleConfig, decode_wayup_sales,
+    AssetId, DecodeTx, ListingContract, TxInput, TxOutput, WayupSaleConfig, decode_wayup_sales,
 };
 use serde::Deserialize;
 
@@ -68,7 +68,7 @@ fn build_input(c: &ConsumedEvent) -> TxInput {
     let is_buy = c
         .redeemer
         .as_deref()
-        .map(|r| Venue::Wayup.is_buy_redeemer(r))
+        .map(|r| ListingContract::Wayup.is_buy_redeemer(r))
         .unwrap_or(false);
     let datum = if at_venue && is_buy {
         resolve_datum_bytes(c.prior_datum.as_ref())

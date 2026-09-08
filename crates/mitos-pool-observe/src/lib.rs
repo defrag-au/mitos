@@ -264,7 +264,12 @@ fn side_from_value(
 /// Returns `None` when neither side is the watched asset, which would mean the
 /// recogniser matched a pool that does not hold what we are following — a
 /// wrong answer worth declining rather than guessing an orientation for.
-pub fn orient(a: Side, b: Side, watched_policy: &[u8], watched_name: &[u8]) -> Option<(Side, Side)> {
+pub fn orient(
+    a: Side,
+    b: Side,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Option<(Side, Side)> {
     if a.is(watched_policy, watched_name) {
         Some((a, b))
     } else if b.is(watched_policy, watched_name) {
@@ -401,7 +406,14 @@ pub fn recognise(
         // than inferred. Its UTxO holds nothing but reserves, so the watched
         // side is the quantity the walk already extracted and the other side is
         // whatever the value holds for the datum's other asset.
-        let a = side_from_value(out, &d.base_policy, &d.base_name, qty, watched_policy, watched_name);
+        let a = side_from_value(
+            out,
+            &d.base_policy,
+            &d.base_name,
+            qty,
+            watched_policy,
+            watched_name,
+        );
         let b = side_from_value(
             out,
             &d.quote_policy,
