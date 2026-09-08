@@ -314,6 +314,10 @@ fn write_tail(
         rolled_up: false,
         movements: Some(compacted.movements),
         corrections: compacted.corrections,
+        // The tail observes nothing: it is re-derived whole every tick, and
+        // the immutable pass that later covers the same slots writes the
+        // observations for them.
+        observations: None,
         segments: Vec::new(),
         // The tail carries NO state forward: it is re-derived whole every
         // tick, so there is no sidecar and nothing for a later job to load.

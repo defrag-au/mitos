@@ -117,11 +117,20 @@ pub const MANIFEST_FORMAT: u32 = 1;
 pub enum FileKind {
     Movements,
     Corrections,
+    /// What a script output HELD — a different schema entirely, and one a
+    /// movements reader must never try to parse. See [`crate::observation`].
+    Observations,
 }
 
 /// Kind by filename. `FileEntry` carries no kind because the name already
 /// says it and a manifest edit cannot disagree with the file it names.
 pub fn kind_of(file: &str) -> FileKind {
+    // Observations FIRST. The fallthrough is `Movements`, so a file this does
+    // not recognise is handed to a reader expecting movement columns — which
+    // is why a new kind has to be taught here and not merely listed.
+    if file == crate::observation::OBSERVATIONS {
+        return FileKind::Observations;
+    }
     match file.starts_with("corr-") || file == CORRECTIONS {
         true => FileKind::Corrections,
         false => FileKind::Movements,
@@ -398,7 +407,18 @@ impl Manifest {
     /// Every Parquet file a reader must merge, as `(relative path, kind)`,
     /// relative to the policy's directory or key prefix.
     pub fn files(&self) -> Vec<(String, FileKind)> {
-        self.files_from(&self.passes.iter().collect::<Vec<_>>())
+        let mut out = self.files_from(&self.passes.iter().collect::<Vec<_>>());
+        // Observations ride the FULL list — what gets published and pruned —
+        // but never the rollup's, below.
+        for p in &self.passes {
+            if let Some(f) = &p.observations {
+                out.push((
+                    format!("{}/{}", p.dir, f.file),
+                    FileKind::Observations,
+                ));
+            }
+        }
+        out
     }
 
     /// The files a ROLLUP may fold: the immutable ones only.
@@ -544,6 +564,15 @@ pub struct PassEntry {
     pub movements: Option<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corrections: Option<FileEntry>,
+    /// What this pass saw at script addresses, decoded or not.
+    ///
+    /// Named here because the manifest is what the PUBLISHER uploads and what
+    /// the pruner keeps — a file the manifest does not name exists on the box
+    /// and reaches no consumer. It is deliberately excluded from
+    /// [`Manifest::immutable_files`]: a rollup folds movement parquets, and
+    /// this is a different schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<FileEntry>,
     /// A pass left UNCOMPACTED: the segments it spilled while walking, in
     /// order, kind by filename (`seg-`/`corr-`). Empty once compacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -610,6 +639,51 @@ mod tests {
         }
     }
 
+    /// The gap that shipped once: an observations file written to disk and
+    /// never NAMED here. The publisher uploads exactly what the manifest names
+    /// and the pruner deletes what it does not, so the whole tier sat on the
+    /// box and reached no consumer.
+    ///
+    /// It must appear in `files()` — publish, prune, bundle — and must NOT
+    /// appear in `immutable_files()`, which a rollup folds as movement
+    /// parquets.
+    #[test]
+    fn observations_are_published_but_never_rolled_up() {
+        let mut m = Manifest::new(&"ab".repeat(28));
+        let mut p = pass(0);
+        p.observations = Some(entry(crate::observation::OBSERVATIONS));
+        m.passes.push(p);
+
+        let published: Vec<_> = m.files().into_iter().collect();
+        assert!(
+            published
+                .iter()
+                .any(|(f, k)| f.ends_with(crate::observation::OBSERVATIONS)
+                    && *k == FileKind::Observations),
+            "observations must be published: {published:?}"
+        );
+        assert!(
+            !m.immutable_files()
+                .iter()
+                .any(|(f, _)| f.ends_with(crate::observation::OBSERVATIONS)),
+            "a rollup folds movement parquets; an observations file is a \
+             different schema and must never be merged into one"
+        );
+    }
+
+    /// `kind_of`'s fallthrough is `Movements`, so an unrecognised name is
+    /// handed to a reader expecting movement columns. A new kind has to be
+    /// TAUGHT here, not merely listed.
+    #[test]
+    fn an_observations_file_is_not_mistaken_for_movements() {
+        assert_eq!(
+            kind_of(crate::observation::OBSERVATIONS),
+            FileKind::Observations
+        );
+        assert_eq!(kind_of(MOVEMENTS), FileKind::Movements);
+        assert_eq!(kind_of(CORRECTIONS), FileKind::Corrections);
+    }
+
     fn pass(seq: u32) -> PassEntry {
         PassEntry {
             seq,
@@ -621,6 +695,7 @@ mod tests {
             rolled_up: false,
             movements: Some(entry(MOVEMENTS)),
             corrections: (seq > 0).then(|| entry(CORRECTIONS)),
+            observations: None,
             segments: Vec::new(),
             pending: 0,
             found: 0,

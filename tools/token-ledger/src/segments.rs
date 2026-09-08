@@ -954,6 +954,7 @@ mod tests {
                 rolled_up: false,
                 movements: Some(mvs),
                 corrections: corr,
+                observations: None,
                 segments: Vec::new(),
                 pending: 0,
                 found: 0,

@@ -86,6 +86,10 @@ pub const GRADUATED_LP_POLICY: [u8; 28] = [
 /// `(lovelace − SEED) / (cap − SEED)`.
 pub const CURVE_SEED_LOVELACE: i64 = 3_000_000;
 
+/// The curve's address, for consumers that match by address rather than by
+/// credential. Its payment part is [`BONDING_CURVE_CRED`].
+pub const BONDING_CURVE_ADDR: &str = "addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28n934sznu95tdj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrs2993lw";
+
 pub fn is_snek_fun_curve(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &BONDING_CURVE_CRED
 }

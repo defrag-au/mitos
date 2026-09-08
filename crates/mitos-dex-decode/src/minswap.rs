@@ -51,6 +51,24 @@ pub const V2_PAYMENT_CRED: [u8; 28] = [
 
 /// Minswap V2's shared "authen" policy — mints every V2 pool's NFT and LP
 /// token, so the LP *name* is what distinguishes one pool from another.
+/// The V2 ORDER contract's payment credential.
+///
+/// Its stake part is the CUSTOMER's, like Splash and unlike CSwap. Measured on
+/// $PERP: **359 distinct order addresses**, of which **354 (99%)** carry a
+/// stake that also appears as an ordinary wallet holder.
+///
+/// Derived from the order address prefix
+/// `addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcn`, whose enterprise form
+/// `addr1w8p79rp…qst2ctf` is the one `shared-crates/address-registry` records.
+pub const V2_ORDER_CRED: [u8; 28] = [
+    0xc3, 0xe2, 0x8c, 0x36, 0xc3, 0x44, 0x73, 0x15, 0xba, 0x5a, 0x56, 0xf3, 0x3d, 0xa6, 0xa6, 0xdd,
+    0xc1, 0x77, 0x0a, 0x87, 0x6a, 0x8d, 0x9f, 0x0c, 0xb3, 0xa9, 0x7c, 0x4c,
+];
+
+pub fn is_minswap_v2_order(payment_cred: &[u8; 28]) -> bool {
+    payment_cred == &V2_ORDER_CRED
+}
+
 pub const V2_AUTHEN_POLICY: [u8; 28] = [
     0xf5, 0x80, 0x8c, 0x2c, 0x99, 0x0d, 0x86, 0xda, 0x54, 0xbf, 0xc9, 0x7d, 0x89, 0xce, 0xe6, 0xef,
     0xa2, 0x0c, 0xd8, 0x46, 0x16, 0x16, 0x35, 0x94, 0x78, 0xd9, 0x6b, 0x4c,

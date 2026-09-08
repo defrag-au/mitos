@@ -553,6 +553,7 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     // Observations, if the pass took any. Written BEFORE the manifest for the
     // same reason every other file is: a reader that sees the pass sees its
     // files. Sorted by slot so the footer's statistics can be seeked on.
+    let mut observations_entry = None;
     if !observations.is_empty() {
         observations.sort_by_key(|o| (o.slot, o.address.clone()));
         let path = pass_dir.join(policy_archive::OBSERVATIONS);
@@ -567,6 +568,17 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
             bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             "pass: observations written"
         );
+        // NAMED in the manifest, or it reaches no consumer: the publisher
+        // uploads exactly the files the manifest names, and the pruner deletes
+        // what it does not. Writing the file without recording it left the
+        // whole tier on the box and out of R2.
+        observations_entry = Some(FileEntry {
+            file: policy_archive::OBSERVATIONS.to_string(),
+            rows: written.rows,
+            min_slot: written.min_slot,
+            max_slot: written.max_slot,
+            units: 0,
+        });
     }
 
     // Coverage and completeness are DERIVED from the passes now; the
@@ -592,6 +604,7 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         rolled_up: false,
         movements,
         corrections,
+        observations: observations_entry,
         segments: kept,
         pending: pending_file.spenders.len() as u64,
         found: walked.written,

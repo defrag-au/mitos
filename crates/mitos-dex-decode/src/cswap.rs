@@ -20,6 +20,29 @@ pub const POOL_SCRIPT_ADDR: &str = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zl
 /// the same payment script, so consumers prefix-match.
 pub const ORDER_SCRIPT_ADDR_PREFIX: &str = "addr1z8d9k3aw6w24eyfjacy809h68dv2rwnpw0arrfau98jk6nh";
 
+/// Payment credential of [`ORDER_SCRIPT_ADDR_PREFIX`].
+pub const ORDER_CRED: [u8; 28] = [
+    0xda, 0x5b, 0x47, 0xae, 0xd3, 0x95, 0x5c, 0x91, 0x32, 0xee, 0x08, 0x77, 0x96, 0xfa, 0x3b, 0x58,
+    0xa1, 0xba, 0x61, 0x73, 0xfa, 0x31, 0xa7, 0xbc, 0x29, 0xe5, 0x6d, 0x4e,
+];
+
+/// ⚠️ **CSwap's order contract is ONE address, not one per trader.**
+///
+/// Splash and Minswap glue the customer's stake credential onto their order
+/// script, so a fill spent from one names its own trader. CSwap does not.
+/// MEASURED on $PERP: 949 order rows across **one** address, whose single
+/// stake matches **no** wallet holder in the archive — against Splash's 571 of
+/// 571 and Minswap's 354 of 359.
+///
+/// So a consumer must recover a CSwap trader from the PLACEMENT leg
+/// (`wallet → order`), never from the fill. Treating this venue like the
+/// others attributes every CSwap trade to the same address.
+pub const ORDER_IS_SHARED_ADDRESS: bool = true;
+
+pub fn is_cswap_order(payment_cred: &[u8; 28]) -> bool {
+    payment_cred == &ORDER_CRED
+}
+
 /// CSwap farm script address. LP tokens are locked here when a
 /// user stakes for yield. CSwap uses one canonical farm script;
 /// staked-LP UTxOs all sit at this address and carry the

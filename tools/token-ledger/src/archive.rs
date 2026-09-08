@@ -129,7 +129,13 @@ pub fn store_manifest(dir: &Path, m: &Manifest) -> Result<()> {
 pub fn store_bundle(dir: &Path, m: &Manifest) -> Result<PathBuf> {
     use policy_archive::reader::{FOOTER_HINT, footer_length, footer_request};
     let mut files = Vec::new();
-    for (rel, _) in m.files() {
+    for (rel, kind) in m.files() {
+        // The bundle is a cache of movement FOOTERS, so an observations
+        // footer has no place in it — a reader opening the archive from the
+        // bundle would find a file it cannot parse.
+        if kind == policy_archive::FileKind::Observations {
+            continue;
+        }
         let path = dir.join(&rel);
         let mut f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let total = f.metadata()?.len();
@@ -401,6 +407,13 @@ impl PolicyArchive {
         });
         let mut files = Vec::new();
         for (rel, kind) in manifest.files() {
+            // A movements reader must never be handed an observations file:
+            // different schema, and `kind_of`'s fallthrough is `Movements`, so
+            // the failure would be a decode error rather than a skip. The
+            // observation tier is read through `policy_archive::observation`.
+            if kind == policy_archive::FileKind::Observations {
+                continue;
+            }
             files.push(OpenFile::open(&dir.join(rel), kind)?);
         }
         // A running pass's segments can vanish under us when it lands and
@@ -1405,6 +1418,102 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// `token-ledger archive` — read an archive back the way a Worker would,
 /// and say what it cost.
+/// What the fold makes of a page of the feed — the difference between "lots of
+/// transfers" and a list of trades.
+fn report_trades(a: &mut PolicyArchive) -> Result<()> {
+    use policy_archive::trade::{Event, Party};
+    use std::collections::BTreeMap;
+
+    // A page rather than the whole archive: this is a report, and the fold is
+    // per-transaction so a sample is representative of the shape.
+    let rows = a.feed_rows(2_000, None)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let roles = venue_roles();
+    let folded = policy_archive::trade::fold(&rows, &roles);
+
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut named = 0usize;
+    let mut unnamed_by_venue = 0usize;
+    for (_, _, e) in &folded {
+        let k = match e {
+            Event::Fill { party, .. } => {
+                match party {
+                    Party::Stake(_) | Party::Wallet(_) => named += 1,
+                    Party::NotEncodedByVenue => unnamed_by_venue += 1,
+                    Party::Ambiguous => {}
+                }
+                "fill"
+            }
+            Event::Placement { .. } => "placement",
+            Event::Cancellation { .. } => "cancellation",
+            Event::BatchedFill { .. } => "batched fill",
+            Event::Transfer => "transfer",
+        };
+        *kinds.entry(k).or_default() += 1;
+    }
+    let total = folded.len();
+    let traded: usize = total - kinds.get("transfer").copied().unwrap_or(0);
+    println!(
+        "trades      over the newest {total} movements: {traded} are venue activity, \
+         {} plain transfers",
+        kinds.get("transfer").copied().unwrap_or(0)
+    );
+    for (k, n) in &kinds {
+        if *k != "transfer" {
+            println!("  {k:14} {n}");
+        }
+    }
+    if named + unnamed_by_venue > 0 {
+        println!(
+            "  trader named on {named} fill(s); {unnamed_by_venue} on a venue whose order \
+             contract is ONE shared address, so the trader is in the placement leg"
+        );
+    }
+    Ok(())
+}
+
+/// Venue roles by payment credential, from `mitos-dex-decode`.
+///
+/// Built here rather than in `policy-archive`, which is linked by consumers
+/// that must not pull in a decode stack — the same seam `mitos_cohort::classify`
+/// uses for pools and lock platforms. And built from the DECODE crate rather
+/// than `address-registry`, because only the decode crate distinguishes a
+/// pool from an order contract: the registry records both as
+/// `Exchange { label }`.
+fn venue_roles() -> policy_archive::trade::Roles {
+    use mitos_dex_decode::{cswap, minswap, splash};
+    use policy_archive::trade::{OrderKeying, Role, Roles};
+
+    let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mut r = Roles::default();
+    for c in splash::POOL_CREDS {
+        r.roles.insert(hex(&c), Role::Pool);
+    }
+    r.roles.insert(hex(&minswap::V1_PAYMENT_CRED), Role::Pool);
+    r.roles.insert(hex(&minswap::V2_PAYMENT_CRED), Role::Pool);
+    r.roles.insert(hex(&splash::ORDER_CRED), Role::Order);
+    r.roles.insert(hex(&minswap::V2_ORDER_CRED), Role::Order);
+    r.roles.insert(hex(&cswap::ORDER_CRED), Role::Order);
+    // CSwap's order contract is ONE address for every trader, so a fill spent
+    // from it cannot name who traded. Stated by the decode crate, not assumed.
+    if cswap::ORDER_IS_SHARED_ADDRESS {
+        r.keying.insert(hex(&cswap::ORDER_CRED), OrderKeying::Shared);
+    }
+    // CSwap's pool and the snek.fun curve are addresses rather than creds
+    // upstream; derive them the same way every other consumer must.
+    for (addr, role) in [
+        (cswap::POOL_SCRIPT_ADDR, Role::Pool),
+        (mitos_launchpad_decode::BONDING_CURVE_ADDR, Role::Curve),
+    ] {
+        if let Some((cred, _)) = policy_archive::trade::address_parts(addr) {
+            r.roles.insert(cred, role);
+        }
+    }
+    r
+}
+
 /// What the observation tier adds to a policy: who was decoded, what was kept
 /// undecoded, and the price the archive can defend at its own tip.
 fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
@@ -1561,6 +1670,7 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
     println!("footers     {reqs} requests, {bytes} bytes");
 
     report_observations(&dir, m)?;
+    report_trades(&mut a)?;
 
     let density = a.density(86_400);
     println!("density     {} daily buckets", density.len());
@@ -1746,6 +1856,7 @@ mod tests {
             rolled_up: false,
             movements: None,
             corrections: None,
+            observations: None,
             segments: Vec::new(),
             pending: 0,
             found: 0,
@@ -1810,6 +1921,7 @@ mod tests {
                 rolled_up: false,
                 movements: None,
                 corrections: None,
+                observations: None,
                 segments: Vec::new(),
                 pending: 0,
                 found: 0,

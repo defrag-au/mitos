@@ -57,6 +57,9 @@ pub mod price;
 /// What a policy's units ARE — and therefore what is worth recording about it.
 pub mod profile;
 pub mod reader;
+/// Movements → TRADES: folding a swap's two or three transactions back into
+/// the one thing a person did.
+pub mod trade;
 pub mod schema;
 pub mod writer;
 

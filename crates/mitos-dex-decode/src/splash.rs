@@ -60,6 +60,24 @@ pub fn is_splash_pool(payment_cred: &[u8; 28]) -> bool {
 /// stake credential to the same payment script, so consumers prefix-match.
 pub const ORDER_SCRIPT_ADDR_PREFIX: &str = "addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207q";
 
+/// Payment credential of [`ORDER_SCRIPT_ADDR_PREFIX`].
+///
+/// A consumer holding a raw credential cannot prefix-match a bech32 string —
+/// `policy-archive`'s movement rows are the case in point. Measured on $PERP:
+/// **571 distinct order addresses**, one per trader, all this one credential.
+///
+/// The stake part is the CUSTOMER's, and on $PERP **571 of 571** of those
+/// stakes also appear as an ordinary wallet holder, so a fill spent from here
+/// names its own trader.
+pub const ORDER_CRED: [u8; 28] = [
+    0x46, 0x4e, 0xee, 0xe8, 0x9f, 0x05, 0xaf, 0xf7, 0x87, 0xd4, 0x00, 0x45, 0xaf, 0x2a, 0x40, 0xa8,
+    0x3f, 0xd9, 0x6c, 0x51, 0x31, 0x97, 0xd3, 0x2f, 0xbc, 0x54, 0xff, 0x02,
+];
+
+pub fn is_splash_order(payment_cred: &[u8; 28]) -> bool {
+    payment_cred == &ORDER_CRED
+}
+
 /// An asset as Splash encodes it: `Constr 121 [policy, name]`. ADA is the
 /// empty policy with the empty name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
