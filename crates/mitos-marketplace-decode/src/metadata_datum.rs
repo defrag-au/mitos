@@ -45,6 +45,43 @@ pub fn recover_datum_from_metadata(aux_cbor: &[u8], datum_hash: &[u8]) -> Option
     None
 }
 
+/// The raw auxiliary-data CBOR of a whole transaction, ready for
+/// [`recover_datum_from_metadata`].
+///
+/// A caller that has a tx from an indexer (Koios `/tx_cbor`, a chunk store)
+/// rather than a block cannot reach its metadata through `pallas_traverse`:
+/// `MultiEraTx::aux_data` is `pub(crate)`, and `metadata()` hands back a
+/// DECODED view. Recovery needs the original bytes — the datum hash is taken
+/// over CBOR that does not survive a decode/re-encode round trip.
+///
+/// Auxiliary data is the LAST element of the transaction array in every era
+/// that has it (`[body, wits, is_valid, aux]` from Alonzo, `[body, wits, aux]`
+/// before), so it is found positionally rather than by era. `None` covers both
+/// a `null` aux field and a transaction carrying none.
+pub fn aux_data_from_tx_cbor(tx_cbor: &[u8]) -> Option<Vec<u8>> {
+    let mut d = pallas_codec::minicbor::Decoder::new(tx_cbor);
+    let len = d.array().ok()??;
+    if len < 3 {
+        return None;
+    }
+
+    // Walk to the last element, remembering where it starts.
+    let mut start = 0usize;
+    for _ in 0..len {
+        start = d.position();
+        d.skip().ok()?;
+    }
+    let end = d.position();
+
+    let slice = tx_cbor.get(start..end)?;
+    // A nullable aux field encodes as CBOR `null` (0xf6) when absent — that is
+    // a present-but-empty answer, not metadata.
+    if slice == [0xf6] {
+        return None;
+    }
+    Some(slice.to_vec())
+}
+
 /// Walk aux-data for jpg.store's labels-50+ chunked-hex convention.
 ///
 /// A datum can span several labels; a value containing `,` terminates the
@@ -262,6 +299,73 @@ mod tests {
     fn the_real_fixture_yields_exactly_one_candidate() {
         let aux = hex::decode(JPG_V2_LISTING_AUX).expect("fixture is hex");
         assert_eq!(parse_metadata_datums(&aux).len(), 1);
+    }
+
+    /// Build a minimal Alonzo-shaped tx: `[body, wits, is_valid, aux]`.
+    fn tx_with(aux: Option<&[u8]>) -> Vec<u8> {
+        let mut e = pallas_codec::minicbor::Encoder::new(Vec::new());
+        e.array(4).unwrap();
+        e.map(0).unwrap(); // body
+        e.map(0).unwrap(); // witness set
+        e.bool(true).unwrap(); // is_valid
+        match aux {
+            Some(bytes) => e.writer_mut().extend_from_slice(bytes),
+            None => {
+                e.null().unwrap();
+            }
+        }
+        e.into_writer()
+    }
+
+    #[test]
+    fn extracts_aux_from_a_whole_tx() {
+        let aux_bytes = aux(&[(50, "abcd")]);
+        let tx = tx_with(Some(&aux_bytes));
+        assert_eq!(aux_data_from_tx_cbor(&tx), Some(aux_bytes));
+    }
+
+    /// A `null` aux field is "this tx has no metadata", not a byte string to
+    /// hand the parser.
+    #[test]
+    fn a_null_aux_field_is_none() {
+        assert_eq!(aux_data_from_tx_cbor(&tx_with(None)), None);
+    }
+
+    /// Pre-Alonzo transactions are `[body, wits, aux]` — three elements, aux
+    /// still last. Finding it positionally is what makes one rule cover both.
+    #[test]
+    fn extracts_aux_from_a_three_element_tx() {
+        let aux_bytes = aux(&[(50, "beef")]);
+        let mut e = pallas_codec::minicbor::Encoder::new(Vec::new());
+        e.array(3).unwrap();
+        e.map(0).unwrap();
+        e.map(0).unwrap();
+        e.writer_mut().extend_from_slice(&aux_bytes);
+        assert_eq!(aux_data_from_tx_cbor(&e.into_writer()), Some(aux_bytes));
+    }
+
+    /// The extracted bytes must be the ORIGINAL slice: the datum hash is taken
+    /// over CBOR that a decode/re-encode would not reproduce, so a round trip
+    /// here would silently break recovery.
+    #[test]
+    fn extracted_aux_still_recovers_a_datum() {
+        let datum = vec![0x2a; 40];
+        let hash = Hasher::<256>::hash(&datum);
+        let tx = tx_with(Some(&aux(&[(50, hex::encode(&datum).as_str())])));
+
+        let extracted = aux_data_from_tx_cbor(&tx).expect("tx carries aux data");
+        assert_eq!(
+            recover_datum_from_metadata(&extracted, hash.as_ref()),
+            Some(datum)
+        );
+    }
+
+    #[test]
+    fn malformed_tx_cbor_is_none_not_a_panic() {
+        assert_eq!(aux_data_from_tx_cbor(&[]), None);
+        assert_eq!(aux_data_from_tx_cbor(&[0xff, 0x00]), None);
+        // An array too short to be a transaction.
+        assert_eq!(aux_data_from_tx_cbor(&[0x82, 0xa0, 0xa0]), None);
     }
 
     #[test]

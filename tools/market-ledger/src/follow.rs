@@ -360,6 +360,12 @@ fn apply_block(
         time: slot_to_unix(blk.slot()),
     };
     for tx in blk.txs() {
+        // PHASE-2 FAILURE — see the same guard in `walk.rs`. The tail needs it
+        // as much as the walk: a losing race for a listing is a live-tip
+        // event, so this is where one would arrive FIRST.
+        if !tx.is_valid() {
+            continue;
+        }
         process_tx(
             decode_tx(&tx),
             registry,

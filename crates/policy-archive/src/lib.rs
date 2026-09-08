@@ -57,10 +57,13 @@ pub mod price;
 /// What a policy's units ARE — and therefore what is worth recording about it.
 pub mod profile;
 pub mod reader;
+pub mod schema;
+/// The archive's own reconciliation — `Σ amounts == Σ net_mint`, graded by how
+/// far the walk reached. Both sides come out of the same file.
+pub mod supply;
 /// Movements → TRADES: folding a swap's two or three transactions back into
 /// the one thing a person did.
 pub mod trade;
-pub mod schema;
 pub mod writer;
 
 pub use bundle::{BUNDLE, BUNDLE_FORMAT, Bundle, BundledFooter};
@@ -73,12 +76,13 @@ pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
 pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
 pub use observation::{
-    Decoded, OBSERVATIONS, OBSERVATION_FORMAT, Observation, ObservationWriter, read_all,
+    Decoded, OBSERVATION_FORMAT, OBSERVATIONS, Observation, ObservationWriter, read_all,
 };
 pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
 pub use profile::{Class, Profile};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
+pub use supply::{Balance, Because, Diagnose, Offender, Reconciler, Verdict};
 pub use writer::{ArchiveWriter, Written};
 
 /// Everything that can go wrong on either side of the file.

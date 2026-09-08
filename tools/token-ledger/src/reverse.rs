@@ -557,8 +557,7 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     if !observations.is_empty() {
         observations.sort_by_key(|o| (o.slot, o.address.clone()));
         let path = pass_dir.join(policy_archive::OBSERVATIONS);
-        let mut w =
-            policy_archive::ObservationWriter::new(std::fs::File::create(&path)?, &stamp)?;
+        let mut w = policy_archive::ObservationWriter::new(std::fs::File::create(&path)?, &stamp)?;
         for o in observations {
             w.push(o);
         }
@@ -644,6 +643,8 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         }
     }
 
+    reconcile_landed(dir, manifest);
+
     Ok(Outcome {
         floor: walked.floor,
         written,
@@ -652,6 +653,57 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         unresolved: pending_file.spenders.len() as u64,
         pending_bytes,
     })
+}
+
+/// The supply invariant, on every landing — see `policy_archive::supply`.
+///
+/// Affordable here precisely because the archive carries its own known total:
+/// no second source, no external call, one scan of files this process just
+/// wrote. That is what a `--reconcile` verb could never be, because a check
+/// nobody runs is not a check.
+///
+/// ⚠️ NEVER fails the landing. The pass is already on disk and discarding it
+/// helps nobody; the point is to say so loudly at the moment the bad rows were
+/// written rather than whenever someone next looks. MEASURED value of doing it
+/// here: $VIPER carried a phantom 1.86 billion units for the life of its
+/// archive, and the signal that would have caught it — `pending=1` — had been
+/// printed on every pass line all along.
+///
+/// [`Diagnose::Totals`] because memory here is bounded by UNITS, not
+/// transactions, and a landing on a policy with millions of them still has to
+/// fit. `archive --policy …` names the offending transactions when one fires.
+fn reconcile_landed(dir: &Path, manifest: &Manifest) {
+    use policy_archive::supply::{Diagnose, Verdict};
+
+    let completeness = manifest.completeness();
+    let reconciled = archive::PolicyArchive::open(dir)
+        .and_then(|a| match a {
+            Some(mut a) => a.reconcile(Diagnose::Totals).map(Some),
+            None => Ok(None),
+        })
+        .map(|r| r.map(|r| r.verdict(completeness)));
+    match reconciled {
+        Ok(Some(Verdict::Balanced)) => {
+            tracing::info!(?completeness, "landing: supply reconciled")
+        }
+        Ok(Some(Verdict::BelowFloor { gap, units })) => tracing::info!(
+            gap,
+            units,
+            ?completeness,
+            "landing: supply still sourced below the floor — coverage, not an error"
+        ),
+        Ok(Some(Verdict::Failed { because, offenders })) => tracing::error!(
+            because = because.as_wire(),
+            ?completeness,
+            units = offenders.len(),
+            gap = offenders.first().map(|b| b.gap()).unwrap_or(0),
+            "landing: RECONCILIATION FAILED — run `archive --policy` to name the transactions"
+        ),
+        Ok(None) => {}
+        // The check is a check, not a gate: a reader problem here must not
+        // read as a supply problem.
+        Err(e) => tracing::warn!(error = %e, "landing: could not reconcile"),
+    }
 }
 
 pub(crate) fn now_unix() -> u64 {
@@ -1268,6 +1320,10 @@ struct Scan<'a> {
     backfilled: usize,
     /// Inputs the index answered inside this job rather than the descent.
     resolved_by_index: u64,
+    /// Transactions the block declared INVALID (phase-2 failure) and this
+    /// walk therefore skipped. Counted rather than merely skipped, because
+    /// "no phantom credits" and "we never looked" read identically otherwise.
+    invalid_txs: u64,
     /// Who may annotate a script output. `None` records raw candidates only —
     /// which is still worth doing, because the bytes a decoder would need are
     /// what the archive is keeping.
@@ -1320,6 +1376,32 @@ impl Scan<'_> {
 
             let txs: Vec<_> = blk.txs();
             for tx in txs.iter().rev() {
+                // PHASE-2 FAILURE. The BLOCK declares this transaction
+                // invalid, so the ledger never created its outputs and never
+                // consumed its inputs — only its collateral was taken. Its
+                // body is still in the chunk and decodes perfectly, which is
+                // what makes this silent: reading its outputs credits supply
+                // that never existed, and no source will ever resolve against
+                // it because the inputs it names were not spent.
+                //
+                // MEASURED on $VIPER (caff9380): ONE such transaction,
+                // 25d4ce8b…, credited 1,863,467,585 units — 2.4% of a supply
+                // the archive otherwise reconciled to the unit. It surfaced
+                // as `pending=1` for the whole walk and as a supply gap on a
+                // COMPLETE archive, which is the one state that cannot be
+                // explained by coverage. See `policy_archive::supply`.
+                //
+                // ⚠️ Skipping the transaction entirely is right for a token
+                // ledger even though its collateral WAS consumed: the
+                // collateral return hands the same units back, so recording
+                // neither side nets to the same balance as recording both.
+                // The residue is a later spend of a collateral-return output,
+                // which shows up as an unresolved source — honest, and the
+                // opposite of a phantom credit.
+                if !tx.is_valid() {
+                    self.invalid_txs += 1;
+                    continue;
+                }
                 let dtx = decode_tx(tx);
 
                 let mut net_mint: HashMap<Vec<u8>, i64> = HashMap::new();
@@ -1372,7 +1454,12 @@ impl Scan<'_> {
                         for (name, qty) in &units {
                             let decoded = self.observers.and_then(|obs| {
                                 crate::observer::observe_all(
-                                    obs, out, *qty, self.policy, name, datum,
+                                    obs,
+                                    out,
+                                    *qty,
+                                    self.policy,
+                                    name,
+                                    datum,
                                 )
                             });
                             // PROFILE GATE. A decoded observation is always
@@ -1383,9 +1470,7 @@ impl Scan<'_> {
                             // one, and keeping those means millions of rows
                             // whose meaning is market-ledger's to supply, not
                             // this archive's.
-                            if decoded.is_none()
-                                && !policy_archive::Profile::keep_candidate(*qty)
-                            {
+                            if decoded.is_none() && !policy_archive::Profile::keep_candidate(*qty) {
                                 continue;
                             }
                             seen.push(policy_archive::Observation {
@@ -1554,6 +1639,7 @@ pub fn scan_blocks(
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
+        invalid_txs: 0,
         profile: policy_archive::Profile::default(),
         units_seen: std::collections::HashSet::new(),
         fungible_units: std::collections::HashSet::new(),
@@ -1622,6 +1708,7 @@ fn pass(
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
+        invalid_txs: 0,
         profile: policy_archive::Profile::default(),
         units_seen: std::collections::HashSet::new(),
         fungible_units: std::collections::HashSet::new(),
@@ -1680,6 +1767,7 @@ fn pass(
         by_index = scan.resolved_by_index,
         still_waiting = scan.pending.len(),
         written = scan.written,
+        invalid_txs = scan.invalid_txs,
         "reverse: range read"
     );
 

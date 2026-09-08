@@ -284,6 +284,14 @@ pub fn run(args: WalkArgs) -> Result<()> {
         ctx.time = slot_to_unix(slot);
 
         for tx in blk.txs() {
+            // PHASE-2 FAILURE: the block declares this transaction invalid, so
+            // the ledger never created its outputs. This ledger ATTRIBUTES —
+            // a phantom output is money credited to a party who never received
+            // it, in exactly the surface where a wrong number becomes a claim
+            // about a person.
+            if !tx.is_valid() {
+                continue;
+            }
             let d = decode_tx(&tx);
             process_tx(
                 &tx,

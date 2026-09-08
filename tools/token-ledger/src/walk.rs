@@ -508,6 +508,15 @@ pub fn run(args: WalkArgs) -> Result<()> {
         let mut rows: Vec<TxRow> = Vec::new();
 
         for tx in blk.txs() {
+            // PHASE-2 FAILURE — the same guard the reverse walk carries, for
+            // the same reason. The two walks derive the same rows from the
+            // same chunks and their outputs are compared against each other
+            // (14,971 transactions, 30,803 deltas, zero differences), so a
+            // guard on only one side would turn that reconciliation from a
+            // check into a source of false alarms.
+            if !tx.is_valid() {
+                continue;
+            }
             // Net mint per watched unit. Read from the raw tx — the shared
             // decode surface doesn't carry the mint field.
             let mut net_mint: HashMap<Vec<u8>, i64> = HashMap::new();

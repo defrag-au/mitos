@@ -412,10 +412,7 @@ impl Manifest {
         // but never the rollup's, below.
         for p in &self.passes {
             if let Some(f) = &p.observations {
-                out.push((
-                    format!("{}/{}", p.dir, f.file),
-                    FileKind::Observations,
-                ));
+                out.push((format!("{}/{}", p.dir, f.file), FileKind::Observations));
             }
         }
         out

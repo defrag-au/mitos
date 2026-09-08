@@ -577,6 +577,38 @@ impl PolicyArchive {
         Ok(rows)
     }
 
+    /// The supply invariant over the WHOLE archive — see
+    /// [`policy_archive::supply`].
+    ///
+    /// Streams every group through the reconciler rather than collecting rows,
+    /// because this is the one report that cannot sample: a page would balance
+    /// or not by accident of where it was cut.
+    ///
+    /// ⚠️ Reads MOVEMENTS **and** CORRECTIONS. A correction file is where a
+    /// later pass records the source it finally resolved, so reconciling
+    /// movements alone reports every one of those as still below the floor —
+    /// a gap that shrinks to zero only if you read the files that closed it.
+    pub fn reconcile(
+        &mut self,
+        diagnose: policy_archive::Diagnose,
+    ) -> Result<policy_archive::Reconciler> {
+        let mut r = policy_archive::Reconciler::new(diagnose);
+        for i in 0..self.files.len() {
+            match self.files[i].kind {
+                FileKind::Movements | FileKind::Corrections => {}
+                // A different schema entirely; parsing it here would be the
+                // exact mistake `kind_of` is ordered to prevent.
+                FileKind::Observations => continue,
+            }
+            for g in 0..self.files[i].archive.num_groups() {
+                let f = &mut self.files[i];
+                f.fetch_group(g)?;
+                r.observe_all(f.archive.read_group(&f.bytes, g)?.iter());
+            }
+        }
+        Ok(r)
+    }
+
     /// Every row of one transaction, unfolded — see [`Self::movements_page`].
     pub fn movements_of(&mut self, tx_hash: &[u8]) -> Result<Vec<Movement>> {
         let mut rows = Vec::new();
@@ -1420,6 +1452,94 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
 /// and say what it cost.
 /// What the fold makes of a page of the feed — the difference between "lots of
 /// transfers" and a list of trades.
+/// The archive reconciled against itself.
+///
+/// Graded, not asserted: on a partial archive the gap is the supply whose
+/// source the walk has not descended to, which is a coverage number worth
+/// printing rather than a failure worth hiding.
+fn report_supply(a: &mut PolicyArchive) -> Result<()> {
+    use policy_archive::supply::{Because, Diagnose, Verdict};
+
+    let completeness = a.manifest.completeness();
+    // Named offenders: `inspect` is the diagnostic surface, and a total with
+    // no transaction behind it is not actionable.
+    let r = a.reconcile(Diagnose::PerTransaction)?;
+    let balances = r.balances();
+    if balances.is_empty() {
+        return Ok(());
+    }
+    let minted: i64 = balances.iter().map(|b| b.minted).sum();
+    let moved: i64 = balances.iter().map(|b| b.moved).sum();
+    println!(
+        "supply      Σ net_mint={minted} Σ amounts={moved} over {} unit(s)",
+        balances.len()
+    );
+    match r.verdict(completeness) {
+        Verdict::Balanced => println!("  reconciled: the archive balances"),
+        Verdict::BelowFloor { gap, units } => println!(
+            "  {gap} still sourced BELOW THE FLOOR across {units} unit(s) — \
+             coverage, not an error; it closes as the walk deepens"
+        ),
+        Verdict::Failed { offenders, because } => {
+            println!("  *** RECONCILIATION FAILED — {} ***", because.as_wire());
+            match because {
+                Because::CompleteButUnbalanced => println!(
+                    "  the archive claims to reach the first mint, so nothing is \
+                     left below the floor to explain this"
+                ),
+                Because::MintedButUnattributed => println!(
+                    "  supply was minted that no party row received — coverage \
+                     cannot produce this; a mint's recipients are its own outputs"
+                ),
+            }
+            for b in offenders.iter().take(5) {
+                println!(
+                    "  {:>16}  minted={} moved={} gap={}",
+                    unit_label(&b.name),
+                    b.minted,
+                    b.moved,
+                    b.gap()
+                );
+            }
+            report_offending_txs(&r);
+        }
+    }
+    Ok(())
+}
+
+/// The transactions behind a failure, so the next step is `archive --tx <hash>`
+/// rather than a re-walk.
+fn report_offending_txs(r: &policy_archive::Reconciler) {
+    let txs = r.offenders();
+    if txs.is_empty() {
+        return;
+    }
+    let long: i64 = txs.iter().map(|o| o.gap()).filter(|g| *g > 0).sum();
+    let short: i64 = txs.iter().map(|o| o.gap()).filter(|g| *g < 0).sum();
+    println!(
+        "  {} transaction(s) did not conserve: {long} unsourced, {short} unreceived",
+        txs.len()
+    );
+    for o in txs.iter().take(10) {
+        println!(
+            "    {} {:>14}  net_mint={} moved={} gap={}",
+            hex::encode(&o.tx_hash),
+            unit_label(&o.name),
+            o.net_mint,
+            o.moved,
+            o.gap()
+        );
+    }
+}
+
+/// A unit's asset name as text where it is text, hex where it is not.
+fn unit_label(name: &[u8]) -> String {
+    match std::str::from_utf8(name) {
+        Ok(s) if s.chars().all(|c| !c.is_control()) => s.to_string(),
+        Ok(_) | Err(_) => hex::encode(name),
+    }
+}
+
 fn report_trades(a: &mut PolicyArchive) -> Result<()> {
     use policy_archive::trade::{Event, Party};
     use std::collections::BTreeMap;
@@ -1499,7 +1619,8 @@ fn venue_roles() -> policy_archive::trade::Roles {
     // CSwap's order contract is ONE address for every trader, so a fill spent
     // from it cannot name who traded. Stated by the decode crate, not assumed.
     if cswap::ORDER_IS_SHARED_ADDRESS {
-        r.keying.insert(hex(&cswap::ORDER_CRED), OrderKeying::Shared);
+        r.keying
+            .insert(hex(&cswap::ORDER_CRED), OrderKeying::Shared);
     }
     // CSwap's pool and the snek.fun curve are addresses rather than creds
     // upstream; derive them the same way every other consumer must.
@@ -1670,6 +1791,7 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
     println!("footers     {reqs} requests, {bytes} bytes");
 
     report_observations(&dir, m)?;
+    report_supply(&mut a)?;
     report_trades(&mut a)?;
 
     let density = a.density(86_400);

@@ -27,7 +27,9 @@ pub mod sales;
 
 pub use datum::{DecodedListing, ListingContract, decode_listing_datum};
 pub use listings::{decode_jpg_listings, decode_wayup_listings};
-pub use metadata_datum::{parse_metadata_datums, recover_datum_from_metadata};
+pub use metadata_datum::{
+    aux_data_from_tx_cbor, parse_metadata_datums, recover_datum_from_metadata,
+};
 pub use offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 pub use offer_lifecycle::{decode_jpg_offer_lifecycle, decode_wayup_offer_lifecycle};
 pub use offers::{

@@ -247,6 +247,16 @@ pub(crate) fn extract_cred_hits(
 ) {
     let slot = block.slot();
     for (ti, tx) in block.txs().iter().enumerate() {
+        // PHASE-2 FAILURE: the block declares this transaction invalid, so
+        // the ledger never created these outputs. The sieve's whole job is
+        // "did this wallet receive anything", and a phantom credit answers it
+        // WRONG in the direction a user would notice — funds shown arriving
+        // that never arrived. Its body decodes perfectly, which is why this
+        // has to be an explicit check rather than something a decode error
+        // would have caught.
+        if !tx.is_valid() {
+            continue;
+        }
         let outputs = tx.outputs();
         // Decode each output once; per-output, which targets it pays.
         struct Decoded {
@@ -375,6 +385,13 @@ fn extract_sweep_hits(
 ) {
     let slot = block.slot();
     for (ti, tx) in block.txs().iter().enumerate() {
+        // PHASE-2 FAILURE — and the sweep is the worse half. An invalid
+        // transaction NAMES the inputs it meant to spend without consuming
+        // them, so without this the sieve reads an owned UTxO as swept away
+        // while it is still sitting there.
+        if !tx.is_valid() {
+            continue;
+        }
         let inputs: Vec<([u8; 32], u32)> = tx
             .consumes()
             .iter()

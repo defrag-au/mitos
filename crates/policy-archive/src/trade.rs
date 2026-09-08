@@ -118,14 +118,26 @@ pub enum Event {
     /// The asset moved from a wallet to an order contract. Usually the first
     /// leg of a `Fill` that lands later; on a venue with a shared order
     /// address it is the ONLY leg that names the trader.
-    Placement { venue_cred: String, party: Party, amount: i64 },
+    Placement {
+        venue_cred: String,
+        party: Party,
+        amount: i64,
+    },
     /// An order returned the asset to a wallet — the swap did NOT happen.
     /// Indistinguishable from an ordinary transfer without knowing the
     /// contract, which is why it was invisible before.
-    Cancellation { venue_cred: String, party: Party, amount: i64 },
+    Cancellation {
+        venue_cred: String,
+        party: Party,
+        amount: i64,
+    },
     /// Several orders spent into a pool in one transaction. Named and counted;
     /// deliberately not decomposed.
-    BatchedFill { venue_cred: String, orders: usize, amount: i64 },
+    BatchedFill {
+        venue_cred: String,
+        orders: usize,
+        amount: i64,
+    },
     /// Nothing here matched a venue — an ordinary movement.
     Transfer,
 }
@@ -207,9 +219,7 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
     // address for every order, in which case nobody can say from this tx.
     let party_from_order = |cred: &str, stake: &Option<String>| match roles.keying_of(cred) {
         OrderKeying::Shared => Party::NotEncodedByVenue,
-        OrderKeying::CustomerStake => stake
-            .clone()
-            .map_or(Party::Ambiguous, Party::Stake),
+        OrderKeying::CustomerStake => stake.clone().map_or(Party::Ambiguous, Party::Stake),
     };
 
     match (from_role, to_role) {
@@ -304,9 +314,17 @@ mod tests {
     /// a placement and a fill, with the trader named from the order address.
     #[test]
     fn an_order_spent_into_a_pool_is_a_fill_with_a_named_trader() {
-        let e = classify_move(&mv(&[(SPLASH_ORDER_A, -50_000), (SPLASH_POOL, 50_000)]), &roles());
+        let e = classify_move(
+            &mv(&[(SPLASH_ORDER_A, -50_000), (SPLASH_POOL, 50_000)]),
+            &roles(),
+        );
         match e {
-            Event::Fill { party, amount, into_pool, .. } => {
+            Event::Fill {
+                party,
+                amount,
+                into_pool,
+                ..
+            } => {
                 assert_eq!(amount, 50_000);
                 assert!(into_pool);
                 let want = address_parts(SPLASH_ORDER_A).unwrap().1.unwrap();
@@ -343,7 +361,10 @@ mod tests {
         // And the placement leg, which DOES name them, is where to look.
         assert!(matches!(
             classify_move(&mv(&[(WALLET, -1_000), (CSWAP_ORDER, 1_000)]), &roles()),
-            Event::Placement { party: Party::NotEncodedByVenue, .. }
+            Event::Placement {
+                party: Party::NotEncodedByVenue,
+                ..
+            }
         ));
     }
 
@@ -371,7 +392,12 @@ mod tests {
     #[test]
     fn a_pool_paying_a_wallet_is_the_other_side_of_a_fill() {
         match classify_move(&mv(&[(SPLASH_POOL, -700), (WALLET, 700)]), &roles()) {
-            Event::Fill { into_pool, party, amount, .. } => {
+            Event::Fill {
+                into_pool,
+                party,
+                amount,
+                ..
+            } => {
                 assert!(!into_pool);
                 assert_eq!(amount, 700);
                 assert_eq!(party, Party::Wallet(WALLET.into()));
@@ -385,7 +411,10 @@ mod tests {
     #[test]
     fn an_ordinary_transfer_is_left_alone() {
         assert_eq!(
-            classify_move(&mv(&[(WALLET, -10), (SPLASH_ORDER_B, 10)]), &Roles::default()),
+            classify_move(
+                &mv(&[(WALLET, -10), (SPLASH_ORDER_B, 10)]),
+                &Roles::default()
+            ),
             Event::Transfer
         );
     }
@@ -393,7 +422,10 @@ mod tests {
     #[test]
     fn address_parts_splits_payment_and_stake() {
         let (cred, stake) = address_parts(SPLASH_POOL).unwrap();
-        assert_eq!(cred, "cb684a69e78907a9796b21fc150a758af5f2805e5ed5d5a8ce9f76f1");
+        assert_eq!(
+            cred,
+            "cb684a69e78907a9796b21fc150a758af5f2805e5ed5d5a8ce9f76f1"
+        );
         assert_eq!(
             stake.unwrap(),
             "b2f6abf60ccde92eae1a2f4fdf65f2eaf6208d872c6f0e597cc10b07"
