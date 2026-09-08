@@ -63,9 +63,19 @@ run() {
   fi
 }
 
+# `classify` FIRST, and it is not optional. Cohorts are STORED on the party
+# row, re-derived from the address rather than decided by the walk — that is
+# what makes reclassification a one-second re-derivation instead of a re-walk.
+# The consequence for this harness is that `stats` would otherwise report
+# cohorts assigned by whatever code walked the ledger months ago, and a change
+# to classification would show NO drift while being completely live in
+# production. Running it here means the baseline always reflects current code.
+TOKENS=${TOKENS:-/opt/mitos/src/tools/token-ledger/tokens.toml}
+
 for db in "$ROOT"/db/*.db; do
   [ -e "$db" ] || continue
   name=$(basename "$db" .db)
+  "$BIN" classify --db "$db" --tokens "$TOKENS" >/dev/null 2>&1 || true
   run "stats.$name.txt" "$BIN" stats --db "$db" --top "$TOP"
   run "probe.$name.txt" "$BIN" probe --db "$db"
 done

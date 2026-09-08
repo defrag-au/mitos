@@ -34,7 +34,7 @@ pub use offers::{
 };
 pub use sales::{
     MatchedSale, WayupSaleConfig, classify_jpg_address, decode_jpg_sales, decode_wayup_sales,
-    is_marketplace_escrow,
+    is_marketplace_escrow, jpg_listing_contract,
 };
 
 /// A native asset (policy id + on-chain asset-name bytes).

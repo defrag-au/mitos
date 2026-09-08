@@ -3624,6 +3624,7 @@ dependencies = [
 name = "mitos-cohort"
 version = "0.0.1"
 dependencies = [
+ "mitos-launchpad-decode",
  "mitos-vesting-decode",
  "pallas-addresses 1.1.1",
 ]
@@ -3718,6 +3719,15 @@ dependencies = [
 
 [[package]]
 name = "mitos-dex-decode"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "pallas-codec 1.1.1",
+ "pallas-primitives 1.1.1",
+]
+
+[[package]]
+name = "mitos-launchpad-decode"
 version = "0.0.1"
 dependencies = [
  "hex",

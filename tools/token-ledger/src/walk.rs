@@ -1186,15 +1186,63 @@ fn mint_report(ledger: &Ledger, total: i128) -> Result<()> {
     }
     // A launchpad is the difference between "the team held the supply" and
     // "a contract sold it", and the two read identically on a holder chart.
-    if let Some((_, cohort, got)) = dist.first()
-        && cohort.as_deref() != Some("wallet")
-        && *got as f64 / total as f64 > 0.5
-    {
-        println!(
-            "  ⇒ {:.1}% went straight to a CONTRACT at mint — launchpad-shaped, \
-             not a team allocation.",
-            100.0 * *got as f64 / total as f64
-        );
+    //
+    // Until the curve was decoded this could only say "a CONTRACT" and guess
+    // from the share. When the mint's largest destination is a recognised
+    // bonding curve there is nothing left to infer, and the REMAINDER becomes
+    // the interesting half: whatever did not go to the curve was bought from
+    // it by the creator in this same transaction, at the cheapest point on it.
+    // On $PERP that was 70% of supply for 9,440 ADA.
+    // Found ANYWHERE in the split, not just as the largest destination. The
+    // "largest" test is a relic of having to guess from share alone, and it
+    // fails on exactly the launch worth reporting: $PERP's creator took 70%,
+    // so the curve is the SECOND entry and the note went missing on the most
+    // extreme pre-buy in the set.
+    let curve = dist
+        .iter()
+        .find(|(_, cohort, _)| cohort.as_deref() == Some("inventory"));
+    match (curve, dist.first()) {
+        (Some((_, _, got)), _) => {
+            let to_curve = 100.0 * *got as f64 / total as f64;
+            let rest = total as i64 - *got;
+            println!(
+                "  ⇒ {to_curve:.1}% went to a LAUNCHPAD BONDING CURVE at mint — \
+                 sold to buyers, not allocated."
+            );
+            if rest > 0 {
+                // Deliberately stops at what THIS walk saw. The remainder
+                // leaving the curve in the mint transaction is a fact here;
+                // that it was PAID for is not, because the walk follows this
+                // policy's units and never sees the ADA leg.
+                //
+                // On all four snek.fun launches checked by hand the ADA was
+                // there — $PERP's creator put in 9,440 ADA for 70% — so a
+                // pre-buy is much the likeliest reading. It is still an
+                // inference from four tokens on one platform, and this file
+                // has already been wrong once by generalising launchpad
+                // mechanics from a small sample.
+                println!(
+                    "     the other {:>14}  {:5.2}%  left the curve to a wallet in the \
+                     SAME tx — a creator pre-buy at the curve's opening price on every \
+                     launch checked, though this walk does not see the ADA leg that \
+                     would prove it.",
+                    rest,
+                    100.0 * rest as f64 / total as f64
+                );
+            }
+        }
+        // No recognised curve: fall back to the share-based hint, which is all
+        // an unrecognised launchpad can support.
+        (None, Some((_, cohort, got)))
+            if cohort.as_deref() != Some("wallet") && *got as f64 / total as f64 > 0.5 =>
+        {
+            println!(
+                "  ⇒ {:.1}% went straight to a CONTRACT at mint — launchpad-shaped, \
+                 not a team allocation.",
+                100.0 * *got as f64 / total as f64
+            );
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1263,11 +1311,15 @@ fn cascade_report(ledger: &Ledger, total: i128) -> Result<()> {
     };
 
     let burn = get("burn");
+    let inventory = get("inventory");
     let pool = get("pool");
     let vesting = get("vesting");
     let script = get("script");
     let wallet = get("wallet");
-    let float = total as i64 - burn;
+    // Unsold launchpad inventory is deducted BESIDE the burn, not counted
+    // within the float. Leaving it in would make a token nobody has bought
+    // read as ~100% float — see `Cohort::Inventory`.
+    let float = total as i64 - burn - inventory;
     let pct = |v: i64| 100.0 * v as f64 / total as f64;
     let (locked, matured, undated) = vesting_split(ledger)?;
 
@@ -1280,6 +1332,18 @@ fn cascade_report(ledger: &Ledger, total: i128) -> Result<()> {
         pct(burn),
         count("burn")
     );
+    // Printed only when there is any, so a token that never touched a
+    // launchpad does not grow a permanent zero row — but NEVER hidden when
+    // non-zero, because the whole point of the band is that this supply is not
+    // float and a reader must see why the two numbers differ.
+    if inventory > 0 {
+        println!(
+            "− unsold inventory     {:>14}  {:5.2}%  ({} curve addr, basis: decoded)",
+            inventory,
+            pct(inventory),
+            count("inventory")
+        );
+    }
     println!("= reachable float      {float:>14}  {:5.2}%", pct(float));
     println!(
         "    of which pooled    {:>14}  {:5.2}%  ({} pools, basis: decoded)",

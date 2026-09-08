@@ -53,6 +53,18 @@ use pallas_addresses::Address;
 pub enum Cohort {
     /// Provably unspendable. Removed from supply, permanently.
     Burn,
+    /// Sitting on a launchpad bonding curve, unsold. Nobody has ever owned it.
+    ///
+    /// Deducted from supply ALONGSIDE `Burn` rather than counted within the
+    /// float, and the reason is arithmetic rather than taste. A bonding curve
+    /// is a pool and is tradeable against, so the LP-in-float rule superficially
+    /// applies — but applying it makes a token nobody has bought read as ~100%
+    /// float, and the realisable band would price selling stock that was never
+    /// held. A token that has sold 1% of supply should read as ~1% float.
+    ///
+    /// Empties into `Pool` at graduation, in one transaction, at a known slot —
+    /// so the transition is an event on the spine rather than a reclassification.
+    Inventory,
     /// A decoded DEX pool. In the float — see the LP-in-float decision — but
     /// its own band, because a pool is not a holder.
     Pool,
@@ -72,6 +84,7 @@ impl Cohort {
     pub fn as_str(&self) -> &'static str {
         match self {
             Cohort::Burn => "burn",
+            Cohort::Inventory => "inventory",
             Cohort::Pool => "pool",
             Cohort::Vesting => "vesting",
             Cohort::Script => "script",
@@ -83,7 +96,7 @@ impl Cohort {
     pub fn basis(&self) -> &'static str {
         match self {
             Cohort::Burn => "proven",
-            Cohort::Pool | Cohort::Vesting => "decoded",
+            Cohort::Inventory | Cohort::Pool | Cohort::Vesting => "decoded",
             Cohort::Script | Cohort::Wallet => "chain",
         }
     }
@@ -145,7 +158,12 @@ pub fn classify(
             // payment script, so this must match the payment part only — a
             // full-address set would need one entry per locker and would miss
             // every new one.
-            if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred)
+            // Checked before the lock platforms because a launchpad curve is a
+            // stronger claim than either: the contract is named, and what it
+            // holds has never been owned by anybody.
+            if mitos_launchpad_decode::is_snek_fun_curve(&cred) {
+                c(Cohort::Inventory)
+            } else if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred)
                 || mitos_vesting_decode::snek_fun::is_snek_fun(&cred)
             {
                 c(Cohort::Vesting)
@@ -178,6 +196,40 @@ mod tests {
     const CSWAP: &str = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
     // An ordinary base address.
     const WALLET: &str = "addr1qylnwp3lp2re0jtw9kf0dfvxf4mkvwt3jqzqhqzc5jvxjqrcfxvqcnf2v7xqcnqzsxsdxaewwqnyzcnrqhqhqhqhqhqcnfsz3";
+
+    /// snek.fun's bonding curve — script payment AND script stake, `addr1x`.
+    const CURVE: &str = "addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28n934sznu95tdj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrs2993lw";
+    /// Splash's pool contract, which shares the curve's STAKE credential.
+    const SPLASH_POOL: &str = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z";
+
+    /// Unsold launchpad supply is its own cohort, not the `script — KIND
+    /// UNKNOWN` residual it used to land in. On a token mid-bonding this is up
+    /// to 96% of supply.
+    #[test]
+    fn a_bonding_curve_is_inventory() {
+        let c = classify(CURVE, &[], &[], &[]);
+        assert_eq!(c.cohort, Cohort::Inventory);
+        assert_eq!(c.basis, "decoded");
+    }
+
+    /// The curve and Splash's pool share a stake credential exactly, which is
+    /// how a registry elsewhere came to call the curve "DexHunter". Matching on
+    /// the PAYMENT credential is what keeps them apart — if this ever fails,
+    /// a token's unsold inventory is being counted as pooled liquidity.
+    #[test]
+    fn a_shared_stake_credential_does_not_make_two_contracts_one() {
+        assert_eq!(classify(CURVE, &[], &[], &[]).cohort, Cohort::Inventory);
+        // Not registered as a pool here, so it falls to the honest residual —
+        // the point is only that it is NOT read as the curve.
+        assert_eq!(
+            classify(SPLASH_POOL, &[], &[], &[]).cohort,
+            Cohort::Script,
+            "the pool must not inherit the curve's cohort from a shared stake part"
+        );
+        // And with the pool registered, it is a pool rather than inventory.
+        let pools = vec![SPLASH_POOL.to_string()];
+        assert_eq!(classify(SPLASH_POOL, &[], &pools, &[]).cohort, Cohort::Pool);
+    }
 
     #[test]
     fn sink_beats_everything() {

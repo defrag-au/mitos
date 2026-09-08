@@ -31,9 +31,10 @@ non-zero balances: 99  ·  net units: 1000000000  ·  unresolved sources: 0
          4506713   0.45%  wallet   addr1q9g3p5ek74p7003rvjt30syrwf8…  stake1uxuhlxnq246ttm
 
 AT MINT
-         961617458  96.16%  script   addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28…
+         961617458  96.16%  inventory  addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28…
           38382542   3.84%  wallet   addr1qyds7aedqu87ql8xvpz0gayj8jn3c2xa2qm…
-  ⇒ 96.2% went straight to a CONTRACT at mint — launchpad-shaped, not a team allocation.
+  ⇒ 96.2% went to a LAUNCHPAD BONDING CURVE at mint — sold to buyers, not allocated.
+     the other       38382542   3.84%  left the curve to a wallet in the SAME tx — a creator pre-buy at the curve's opening price on every launch checked, though this walk does not see the ADA leg that would prove it.
 
 SUPPLY CASCADE
   nominal supply             1000000000

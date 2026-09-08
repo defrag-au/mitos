@@ -17,3 +17,6 @@ pallas-addresses.workspace = true
 # Lock-platform recognition by payment credential (CrowdLock / Shield,
 # snek.fun). A decode crate, so this adds nothing beyond pallas.
 mitos-vesting-decode = { path = "../mitos-vesting-decode" }
+# Launchpad bonding-curve recognition by payment credential. Same pure-decode
+# class as the vesting crate, so this keeps the wasm cost unchanged.
+mitos-launchpad-decode = { path = "../mitos-launchpad-decode" }
