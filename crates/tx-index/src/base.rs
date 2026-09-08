@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 
-use crate::format::{BaseHeader, ENTRY_BYTES, Entry, Location, bucket_of};
+use crate::format::{BaseHeader, ENTRY_BYTES, Entry, bucket_of};
 
 pub const BASE_FILE: &str = "base.idx";
 
@@ -74,9 +74,10 @@ impl BaseFile {
         Entry::read(self.raw(i))
     }
 
-    /// Every location whose prefix equals `prefix`. Entries within a bucket
-    /// are sorted, so the scan stops at the first larger prefix.
-    pub fn find(&self, prefix: u64) -> Vec<Location> {
+    /// Every entry whose prefix equals `prefix`. Entries within a bucket are
+    /// sorted, so the scan stops at the first larger prefix. Returns whole
+    /// entries so the caller can reach the aux span without a second read.
+    pub fn find(&self, prefix: u64) -> Vec<Entry> {
         let b = bucket_of(prefix, self.header.dir_bits);
         let (lo, hi) = (self.fence(b), self.fence(b + 1));
         let mut out = Vec::new();
@@ -88,7 +89,7 @@ impl BaseFile {
             if p > prefix {
                 break;
             }
-            out.push(Entry::read(self.raw(i)).loc);
+            out.push(Entry::read(self.raw(i)));
         }
         out
     }

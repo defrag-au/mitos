@@ -530,14 +530,18 @@ where
 /// `datum_by_hash` (Plutus datums). All other methods delegate
 /// directly to `inner`.
 ///
-/// Resolution order (same shape for both lookups):
+/// Resolution order:
 /// 1. Local `IndexerDataCache` (fast, on-disk, permanent)
 /// 2. `inner` (dolos: archive for aux_data, `DATUM_NS` for datums)
-/// 3. Maestro REST API (when configured)
+/// 3. **aux_data only** — the local `tx-index` over the Mithril chunk
+///    store, when configured. A local mmap read; see
+///    [`crate::local_tx_index`] for why it is a tier rather than
+///    another `FallbackProvider`.
+/// 4. The remote fallback provider (when configured)
 ///
-/// Steps 2 and 3 write back to cache (step 1) on a hit so future
-/// calls never reach them again for the same hash. The datum
-/// path's step-3 hit covers the CIP-68 snapshot-gap (hash-only
+/// Every tier past the first writes back to cache (step 1) on a hit
+/// so future calls never reach them again for the same hash. The
+/// datum path's remote hit covers the CIP-68 snapshot-gap (hash-only
 /// ref datums whose preimage never landed in `DATUM_NS`).
 ///
 /// Sits between the real data plane and the `TrapContextLogger`
@@ -547,6 +551,7 @@ where
 pub struct CachingDataPlane {
     inner: std::sync::Arc<dyn DataPlaneFacade>,
     cache: Option<std::sync::Arc<crate::indexer_data_cache::IndexerDataCache>>,
+    local_index: Option<std::sync::Arc<crate::local_tx_index::LocalTxIndex>>,
     fallback: Option<std::sync::Arc<dyn crate::fallback::FallbackProvider>>,
 }
 
@@ -554,11 +559,13 @@ impl CachingDataPlane {
     pub fn new(
         inner: std::sync::Arc<dyn DataPlaneFacade>,
         cache: Option<std::sync::Arc<crate::indexer_data_cache::IndexerDataCache>>,
+        local_index: Option<std::sync::Arc<crate::local_tx_index::LocalTxIndex>>,
         fallback: Option<std::sync::Arc<dyn crate::fallback::FallbackProvider>>,
     ) -> Self {
         Self {
             inner,
             cache,
+            local_index,
             fallback,
         }
     }
@@ -690,7 +697,28 @@ impl DataPlaneFacade for CachingDataPlane {
             return Ok(Some(cbor));
         }
 
-        // Tier 3: Maestro fallback — only when configured.
+        // Tier 3: the local tx-index over the Mithril chunk store. This is
+        // where a bootstrap re-walk of old transactions is won or lost — see
+        // `crate::local_tx_index`.
+        if let Some(local) = &self.local_index {
+            match local.tx_metadata(tx_hash).await {
+                tx_index::AuxLookup::Found(cbor) => {
+                    if let Some(cache) = &self.cache {
+                        cache.insert_aux(tx_hash, &cbor);
+                    }
+                    return Ok(Some(cbor));
+                }
+                // FINAL: the index holds this tx and it has no metadata.
+                // Falling through here would send the majority of all
+                // transactions to the remote provider for nothing.
+                tx_index::AuxLookup::NoMetadata => return Ok(None),
+                // The index cannot say — not in a completed chunk (volatile
+                // tip), or the lookup failed. Ask the remote.
+                tx_index::AuxLookup::UnknownTx => {}
+            }
+        }
+
+        // Tier 4: the remote fallback provider — only when configured.
         if let Some(fallback) = &self.fallback {
             let tx_hex = hex::encode(tx_hash);
             match fallback.fetch_aux_data(&tx_hex).await {

@@ -10,6 +10,17 @@
 //! Hashing is blake2b-256 over the body bytes — the same computation
 //! `MultiEraTx::hash()` does — but done here on the borrowed slice without
 //! cloning the witness set alongside, which is what `block.txs()` would cost.
+//!
+//! ## Auxiliary data
+//!
+//! A block stores metadata out-of-line: `auxiliary_data_set` is a map from
+//! TRANSACTION INDEX to aux data, not from tx hash. So the pairing is
+//! positional — body `i` owns `auxiliary_data_set[i]` — and it is only sound
+//! because both come from the same decoded block in the same pass. Most
+//! transactions have no entry, which is why the span is optional rather than
+//! a sentinel offset.
+//!
+//! Byron has no auxiliary data at all; its txs always index as `None`.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -20,7 +31,7 @@ use pallas_crypto::hash::Hasher;
 use pallas_traverse::{Era, MultiEraBlock};
 
 use crate::format::{
-    Entry, Location, SegmentHeader, chunk_number, chunk_u16, era_to_u8, prefix_of,
+    AuxSpan, Entry, Location, SegmentHeader, chunk_number, chunk_u16, era_to_u8, prefix_of,
 };
 use crate::segment::write_segment;
 
@@ -90,27 +101,21 @@ pub fn extract_chunk(immutable: &Path, chunk: u16) -> Result<Extracted> {
             Some(_) => {}
         }
 
-        for body in bodies(&block)? {
-            let start = body.as_ptr() as usize;
-            let end = start + body.len();
-            if start < base_ptr || end > base_ptr + bytes.len() {
-                bail!(
-                    "chunk {chunk}: tx body at block byte {pos} is not borrowed from the chunk buffer"
-                );
-            }
-            let offset = start - base_ptr;
-            let hash = Hasher::<256>::hash(body);
+        for tx in txs(&block)? {
+            let body_span = span_of(tx.body, base_ptr, bytes.len(), chunk, pos, "tx body")?;
+            let aux_span = tx
+                .aux
+                .map(|a| span_of(a, base_ptr, bytes.len(), chunk, pos, "auxiliary data"))
+                .transpose()?;
+            let hash = Hasher::<256>::hash(tx.body);
             entries.push(Entry {
                 prefix: prefix_of(&hash),
                 loc: Location {
                     chunk,
-                    offset: u32::try_from(offset).with_context(|| {
-                        format!("chunk {chunk}: body offset {offset} exceeds u32")
-                    })?,
-                    len: u16::try_from(body.len()).with_context(|| {
-                        format!("chunk {chunk}: body of {} bytes exceeds u16", body.len())
-                    })?,
+                    offset: body_span.0,
+                    len: body_span.1,
                 },
+                aux: aux_span.map(|(offset, len)| AuxSpan { offset, len }),
             });
         }
         pos += len;
@@ -143,23 +148,86 @@ pub fn extract_to_segment(immutable: &Path, index_dir: &Path, chunk: u16) -> Res
     Ok(ex)
 }
 
-/// The raw body slice of every transaction in the block, in block order.
+/// Turn a slice borrowed from the chunk buffer into a `(offset, len)` pair,
+/// range-checked against the buffer it must have come from.
+///
+/// The check is not ceremony: an offset recorded for a slice that is NOT
+/// inside this buffer would be a plausible-looking number pointing at
+/// unrelated bytes, and the reader's hash verification would only catch it
+/// for bodies — aux data is not hash-addressed, so a bad span there would be
+/// silently served as someone else's metadata.
+fn span_of(
+    slice: &[u8],
+    base_ptr: usize,
+    buf_len: usize,
+    chunk: u16,
+    block_pos: usize,
+    what: &str,
+) -> Result<(u32, u16)> {
+    let start = slice.as_ptr() as usize;
+    let end = start + slice.len();
+    if start < base_ptr || end > base_ptr + buf_len {
+        bail!(
+            "chunk {chunk}: {what} at block byte {block_pos} is not borrowed from the chunk buffer"
+        );
+    }
+    let offset = start - base_ptr;
+    Ok((
+        u32::try_from(offset)
+            .with_context(|| format!("chunk {chunk}: {what} offset {offset} exceeds u32"))?,
+        u16::try_from(slice.len()).with_context(|| {
+            format!("chunk {chunk}: {what} of {} bytes exceeds u16", slice.len())
+        })?,
+    ))
+}
+
+/// One transaction's raw slices, both borrowed from the chunk buffer.
+struct TxSlices<'a> {
+    body: &'a [u8],
+    /// `None` for the majority of transactions, which carry no metadata.
+    aux: Option<&'a [u8]>,
+}
+
+/// Every transaction in the block, in block order.
+///
 /// Byron's hashed item is the inner `Tx` of each `[tx, witnesses]` payload;
-/// Shelley onward it is each element of the body array.
-fn bodies<'a>(block: &'a MultiEraBlock<'_>) -> Result<Vec<&'a [u8]>> {
+/// Shelley onward it is each element of the body array. Auxiliary data is
+/// looked up positionally in `auxiliary_data_set`, which is keyed by
+/// transaction index.
+fn txs<'a>(block: &'a MultiEraBlock<'_>) -> Result<Vec<TxSlices<'a>>> {
+    /// Shelley-onward eras all encode the block identically for our purposes:
+    /// a body array plus an index-keyed aux map.
+    macro_rules! bodies_with_aux {
+        ($b:expr) => {
+            $b.transaction_bodies
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let idx = u32::try_from(i).expect("tx index fits u32");
+                    TxSlices {
+                        body: k.raw_cbor(),
+                        aux: $b.auxiliary_data_set.get(&idx).map(|a| a.raw_cbor()),
+                    }
+                })
+                .collect()
+        };
+    }
+
     Ok(match block {
         MultiEraBlock::EpochBoundary(_) => Vec::new(),
+        // Byron predates transaction metadata entirely.
         MultiEraBlock::Byron(b) => b
             .body
             .tx_payload
             .iter()
-            .map(|p| p.transaction.raw_cbor())
+            .map(|p| TxSlices {
+                body: p.transaction.raw_cbor(),
+                aux: None,
+            })
             .collect(),
-        MultiEraBlock::AlonzoCompatible(b, _) => {
-            b.transaction_bodies.iter().map(|k| k.raw_cbor()).collect()
-        }
-        MultiEraBlock::Babbage(b) => b.transaction_bodies.iter().map(|k| k.raw_cbor()).collect(),
-        MultiEraBlock::Conway(b) => b.transaction_bodies.iter().map(|k| k.raw_cbor()).collect(),
+        MultiEraBlock::AlonzoCompatible(b, _) => bodies_with_aux!(b),
+        MultiEraBlock::Babbage(b) => bodies_with_aux!(b),
+        MultiEraBlock::Conway(b) => bodies_with_aux!(b),
         // `MultiEraBlock` is `#[non_exhaustive]` upstream. A block shape this
         // build cannot name must fail the chunk, not silently index nothing.
         other => bail!(

@@ -54,6 +54,8 @@ pub mod observation;
 /// Price, as far as ONE policy's archive can honestly take it — and a name for
 /// everything it cannot.
 pub mod price;
+/// What a policy's units ARE — and therefore what is worth recording about it.
+pub mod profile;
 pub mod reader;
 pub mod schema;
 pub mod writer;
@@ -71,6 +73,7 @@ pub use observation::{
     Decoded, OBSERVATIONS, OBSERVATION_FORMAT, Observation, ObservationWriter, read_all,
 };
 pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
+pub use profile::{Class, Profile};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
 pub use writer::{ArchiveWriter, Written};

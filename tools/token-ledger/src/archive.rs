@@ -1503,6 +1503,24 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
         m.walk_to,
         m.passes.len()
     );
+    if let Some(p) = &m.profile {
+        // What the archive DECIDED this policy is — and therefore whether
+        // undecoded candidates were kept at all. Without it, "no candidates"
+        // and "we did not keep any" are indistinguishable.
+        println!(
+            "profile     {} — {} unit(s): {} held in quantity, {} only ever singly",
+            p.class().as_str(),
+            p.units_seen,
+            p.fungible_units,
+            p.single_units
+        );
+        if p.class() == policy_archive::Class::Collection {
+            println!(
+                "  candidates NOT kept: every script output holds one, so they are \
+                 marketplace escrows — market-ledger's to interpret, not this archive's"
+            );
+        }
+    }
     if let Some(r) = &m.rollup {
         println!(
             "rollup      {} rows={} units={} through pass {:?}",

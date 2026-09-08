@@ -76,9 +76,21 @@ fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
 ///
 /// The fix is the one the sibling offer module has always used: recover the
 /// preimage from the transaction's own metadata (jpg publishes it under labels
-/// 50+) and hash-verify it. That is a read of aux data the host already holds
-/// with the block — no per-listing lookup, so the boot-stall rule the crate
-/// protects is untouched; the payload simply arrives already resolved.
+/// 50+) and hash-verify it.
+///
+/// **Cost, honestly stated.** On the LIVE path this is free: the metadata rides
+/// in the block being processed, so `tx_metadata` is a local read. On a
+/// BOOTSTRAP re-walk it is not — those listings were created years ago, the
+/// host no longer holds their blocks, and every call goes out to the configured
+/// fallback provider. Measured on mainnet: ~4 lookups/second, which over the
+/// ~219k-listing residual jpg book is ~14 hours of remote calls.
+///
+/// That is precisely the boot-stall the crate's payload-only create rule exists
+/// to avoid, arrived at from a different direction — so a bootstrap of this
+/// module must be treated as a deliberate, supervised operation, not a routine
+/// recapture. A local index that can serve aux data would remove the cost
+/// (`tx-index` on the infra box indexes tx BODIES, not auxiliary data, so it
+/// does not cover this today).
 fn build_output(p: &ProducedEvent) -> TxOutput {
     let datum = p.datum.as_ref().map(|d| {
         let payload = if !d.payload.is_empty() {

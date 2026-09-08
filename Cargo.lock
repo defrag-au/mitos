@@ -3783,6 +3783,7 @@ dependencies = [
  "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "tx-index",
  "url",
  "wasmtime",
  "wasmtime-wasi",

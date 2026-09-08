@@ -162,6 +162,18 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub no_sieve: bool,
 
+    /// Write movements only — no observation tier.
+    ///
+    /// Ingestion speed is a first-class goal for this walk, so the cost of
+    /// observing is a lever rather than a fact. Measure with and without on
+    /// the policy in question before deciding: the marginal cost is a
+    /// payment-credential test on every output, plus a datum copy and a decode
+    /// for the ones at script addresses — which is small for a fungible token
+    /// with a handful of pools, and is dominated by the CANDIDATE rule on a
+    /// collection where every listing is a script output.
+    #[arg(long)]
+    pub no_observe: bool,
+
     /// Log a progress line every N chunks.
     #[arg(long, default_value_t = 250)]
     pub report_every: u64,
@@ -384,7 +396,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         &mut pending,
         !args.no_sieve,
         &hooks,
-        &mut observations,
+        (!args.no_observe).then_some(&mut observations),
     )?;
     let segments = writer.finish()?;
 
@@ -561,6 +573,15 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     // manifest's cached fields are refreshed on write.
     manifest.first_mint_slot = first_mint;
     manifest.updated_unix = sealed_unix;
+    // MERGE, never replace. Each pass sees one window; a policy's fungible
+    // unit may have moved only in a stretch this pass did not cover, and
+    // overwriting would let the class flip as passes land out of order.
+    // `complete` is the manifest's own coverage answer, not a pass's.
+    let mut prof = manifest.profile.take().unwrap_or_default();
+    prof.units_seen = prof.units_seen.max(walked.profile.units_seen);
+    prof.fungible_units = prof.fungible_units.max(walked.profile.fungible_units);
+    prof.single_units = prof.single_units.max(walked.profile.single_units);
+    manifest.profile = Some(prof);
     manifest.passes.push(PassEntry {
         seq,
         dir: PassEntry::dir_name(seq),
@@ -1085,6 +1106,10 @@ struct Walked {
     backfilled: usize,
     /// Inputs the index answered inside the job — see [`Outcome::by_index`].
     by_index: u64,
+    /// What this pass learned about the policy's units. MERGED into the
+    /// manifest's rather than replacing it: a pass sees its own window, and a
+    /// ten-day window can miss a unit class the policy has had for years.
+    profile: policy_archive::Profile,
 }
 
 /// Chunk numbers to visit, highest first, covering `[floor, ceiling)`.
@@ -1234,7 +1259,13 @@ struct Scan<'a> {
     /// which is still worth doing, because the bytes a decoder would need are
     /// what the archive is keeping.
     observers: Option<&'a [Box<dyn crate::observer::OutputObserver>]>,
-    observations: &'a mut Vec<policy_archive::Observation>,
+    /// `None` on the fast-ingest path — the tier is skipped whole.
+    observations: Option<&'a mut Vec<policy_archive::Observation>>,
+    /// Tier-1 profile, accumulated as units come into view. Costs a set
+    /// insert per unit sighting and answers what the policy IS.
+    profile: policy_archive::Profile,
+    units_seen: std::collections::HashSet<Vec<u8>>,
+    fungible_units: std::collections::HashSet<Vec<u8>>,
 }
 
 impl Scan<'_> {
@@ -1308,6 +1339,16 @@ impl Scan<'_> {
                     // a movement and nothing more; there is no state on it to
                     // observe, and recording every one would multiply the file
                     // by the holder count for no reader.
+                    // Every unit sighting feeds the profile, script-held or
+                    // not — what a policy IS does not depend on where it sits.
+                    for (name, qty) in &units {
+                        let was = self.fungible_units.contains(name);
+                        let first = self.units_seen.insert(name.clone());
+                        self.profile.observe(first, was, *qty);
+                        if *qty > 1 {
+                            self.fungible_units.insert(name.clone());
+                        }
+                    }
                     if mitos_cohort::is_script_address(&out.address) {
                         let datum: Option<&[u8]> = out
                             .datum_hash
@@ -1316,6 +1357,24 @@ impl Scan<'_> {
                             .map(|v| v.as_slice())
                             .or(out.inline_datum.as_deref());
                         for (name, qty) in &units {
+                            let decoded = self.observers.and_then(|obs| {
+                                crate::observer::observe_all(
+                                    obs, out, *qty, self.policy, name, datum,
+                                )
+                            });
+                            // PROFILE GATE. A decoded observation is always
+                            // worth keeping; an undecoded CANDIDATE is only
+                            // worth keeping where a pool could plausibly be —
+                            // i.e. where the output holds a quantity. On a
+                            // collection every listing escrow holds exactly
+                            // one, and keeping those means millions of rows
+                            // whose meaning is market-ledger's to supply, not
+                            // this archive's.
+                            if decoded.is_none()
+                                && !policy_archive::Profile::keep_candidate(*qty)
+                            {
+                                continue;
+                            }
                             seen.push(policy_archive::Observation {
                                 slot,
                                 block_time,
@@ -1325,11 +1384,7 @@ impl Scan<'_> {
                                 unit_name: name.clone(),
                                 unit_amount: *qty,
                                 datum: datum.map(|d| d.to_vec()),
-                                decoded: self.observers.and_then(|obs| {
-                                    crate::observer::observe_all(
-                                        obs, out, *qty, self.policy, name, datum,
-                                    )
-                                }),
+                                decoded,
                             });
                         }
                     }
@@ -1354,7 +1409,9 @@ impl Scan<'_> {
                 }
                 // Kept only past the read-before gate, for the same reason the
                 // movement rows are: a window read twice would double them.
-                self.observations.append(&mut seen);
+                if let Some(sink) = self.observations.as_mut() {
+                    sink.append(&mut seen);
+                }
 
                 // INPUTS: register interest ONLY where a source is missing —
                 // per unit, by how much. Conservation says exactly that.
@@ -1484,12 +1541,15 @@ pub fn scan_blocks(
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
+        profile: policy_archive::Profile::default(),
+        units_seen: std::collections::HashSet::new(),
+        fungible_units: std::collections::HashSet::new(),
         // The chain tail is re-derived whole on every refresh, so anything
         // observed here would be written again by the immutable pass that
         // later covers the same slots. Observations come from the archive's
         // own passes only.
         observers: None,
-        observations: &mut Vec::new(),
+        observations: None,
     };
     // The rows went to the writer; nothing here needs them a second time.
     scan.blocks(blocks, floor, ceiling)?;
@@ -1526,7 +1586,10 @@ fn pass(
     // 29,545 movements — so the segment machinery would be ceremony. If a
     // policy is ever found where this is not true, the measurement will say so
     // before the memory does.
-    observations: &mut Vec<policy_archive::Observation>,
+    //
+    // `None` skips the tier entirely (`--no-observe`), which is the fast-ingest
+    // path: no credential test, no datum copy, no decode.
+    observations: Option<&mut Vec<policy_archive::Observation>>,
 ) -> Result<Walked> {
     let policy_vec = policy.to_vec();
     let needles = sieve
@@ -1546,7 +1609,12 @@ fn pass(
         written: 0,
         backfilled: 0,
         resolved_by_index: 0,
-        observers: Some(&observers),
+        profile: policy_archive::Profile::default(),
+        units_seen: std::collections::HashSet::new(),
+        fungible_units: std::collections::HashSet::new(),
+        // Both or neither: an observer with nowhere to put its answer would
+        // decode for nothing.
+        observers: observations.is_some().then_some(&observers),
         observations,
     };
 
@@ -1611,6 +1679,7 @@ fn pass(
         written: scan.written,
         backfilled: scan.backfilled,
         by_index: scan.resolved_by_index,
+        profile: scan.profile,
     })
 }
 
@@ -1866,6 +1935,7 @@ mod tests {
                 written: 2,
                 backfilled: 0,
                 by_index: 0,
+                profile: policy_archive::Profile::default(),
             },
             segments: w.finish().unwrap(),
             pending: &pending,
@@ -1912,6 +1982,7 @@ mod tests {
                 written: 1,
                 backfilled: 1,
                 by_index: 0,
+                profile: policy_archive::Profile::default(),
             },
             segments: w.finish().unwrap(),
             pending: &pending,

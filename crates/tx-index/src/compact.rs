@@ -148,7 +148,7 @@ pub fn compact(index_dir: &Path) -> Result<CompactStats> {
 mod tests {
     use super::*;
     use crate::base::BaseFile;
-    use crate::format::{Location, SegmentHeader};
+    use crate::format::{AuxSpan, Location, SegmentHeader};
     use crate::segment::write_segment;
     use std::path::PathBuf;
 
@@ -181,6 +181,13 @@ mod tests {
                         offset: i * 7,
                         len: 50,
                     },
+                    // Every third tx carries metadata, so compaction is
+                    // exercised on a mix — a base that dropped or smeared the
+                    // aux span across the bucket sort would show up here.
+                    aux: (i % 3 == 0).then(|| AuxSpan {
+                        offset: i * 7 + 5_000,
+                        len: 11,
+                    }),
                 })
                 .collect();
             // A deliberate cross-chunk prefix collision.
@@ -214,7 +221,9 @@ mod tests {
 
         for e in &all {
             let hits = base.find(e.prefix);
-            assert!(hits.contains(&e.loc), "missing {e:?}");
+            // Compare the WHOLE entry, not just the body location: the aux
+            // span must come back through compaction unchanged too.
+            assert!(hits.contains(e), "missing {e:?}");
         }
         // The collision returns both locations.
         assert_eq!(base.find(mix(0)).len(), 2);

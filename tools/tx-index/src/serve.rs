@@ -6,6 +6,7 @@
 //! - `GET  /health` — coverage; open.
 //! - `GET  /tx/{hash}` — the body (hex) + every output, decoded.
 //! - `GET  /tx/{hash}/out/{index}` — one output.
+//! - `GET  /tx/{hash}/aux` — the tx's auxiliary data (metadata) CBOR.
 //! - `POST /resolve` — `{items:[{tx_hash,index}]}` → one result per item,
 //!   in order, each with its own status. For walkers resolving in batches.
 //!
@@ -25,8 +26,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 use tx_index::wire::{
-    HealthResponse, OutputResponse, ResolveRequest, ResolveResponse, ResolveResult, ResolveStatus,
-    TxResponse,
+    AuxResponse, HealthResponse, OutputResponse, ResolveRequest, ResolveResponse, ResolveResult,
+    ResolveStatus, TxResponse,
 };
 use tx_index::{Coverage, IndexHandle, Resolution};
 
@@ -122,6 +123,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
         let data = Router::new()
             .route("/tx/{hash}", get(tx))
+            .route("/tx/{hash}/aux", get(aux))
             .route("/tx/{hash}/out/{index}", get(output))
             .route("/resolve", post(resolve))
             .layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -256,6 +258,44 @@ async fn tx(
         offset: body.loc.offset,
         body_cbor: hex::encode(&body.cbor),
         outputs,
+    }))
+}
+
+/// A transaction's auxiliary data. All three outcomes are 200 — the caller
+/// branches on `status`, never on the HTTP code. See [`AuxResponse`].
+async fn aux(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Json<AuxResponse>, AppError> {
+    let h = parse_hash(&hash)?;
+    let idx = state.index.get();
+    // `tx()` rather than `tx_metadata()`: the response reports the era and
+    // chunk, which only the located body carries, and it is the same read.
+    let found = tokio::task::spawn_blocking(move || {
+        let Some(body) = idx.tx(&h)? else {
+            return Ok::<_, anyhow::Error>(None);
+        };
+        let cbor = body.aux.map(|loc| idx.read_span(loc)).transpose()?;
+        Ok(Some((body, cbor)))
+    })
+    .await
+    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+
+    Ok(Json(match found {
+        Some((body, Some(cbor))) => AuxResponse::Found {
+            tx_hash: hex::encode(body.hash),
+            era: body.era.to_string(),
+            chunk: body.loc.chunk,
+            aux_cbor: hex::encode(cbor),
+        },
+        Some((body, None)) => AuxResponse::NoMetadata {
+            tx_hash: hex::encode(body.hash),
+            era: body.era.to_string(),
+            chunk: body.loc.chunk,
+        },
+        None => AuxResponse::UnknownTx {
+            tx_hash: hex::encode(h),
+        },
     }))
 }
 

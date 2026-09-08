@@ -25,8 +25,8 @@ use clap::{Parser, ValueEnum};
 use tx_index::compact::compact;
 use tx_index::extract::{extract_to_segment, list_chunks};
 use tx_index::segment::list_segments;
-use tx_index::wire::{OutputResponse, TxResponse};
-use tx_index::{Index, Resolution};
+use tx_index::wire::{AuxResponse, OutputResponse, TxResponse};
+use tx_index::{AuxLookup, Index, Resolution};
 
 #[derive(Parser, Debug)]
 #[command(about = "tx hash → chunk offset index over a Mithril immutable DB")]
@@ -99,6 +99,30 @@ struct LookupArgs {
     /// Output index to resolve; omitted = the whole body + every output.
     #[arg(long)]
     index: Option<u32>,
+
+    /// Fetch the tx's auxiliary data (metadata) instead of its outputs.
+    #[arg(long, conflicts_with = "index")]
+    aux: bool,
+}
+
+/// What a `lookup` was asked for. The flags are mutually exclusive (clap
+/// enforces it); this is the decided shape the command matches on.
+enum LookupMode {
+    /// The whole body plus every output.
+    Body,
+    Output(u32),
+    /// Auxiliary data (metadata).
+    Aux,
+}
+
+impl LookupArgs {
+    fn mode(&self) -> LookupMode {
+        match (self.aux, self.index) {
+            (true, _) => LookupMode::Aux,
+            (false, Some(i)) => LookupMode::Output(i),
+            (false, None) => LookupMode::Body,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -267,8 +291,39 @@ fn parse_hash(s: &str) -> Result<[u8; 32]> {
 fn lookup(a: LookupArgs) -> Result<()> {
     let idx = Index::open(&a.dirs.index_dir, &a.dirs.immutable)?;
     let hash = parse_hash(&a.hash)?;
-    match a.index {
-        None => {
+    match a.mode() {
+        LookupMode::Aux => {
+            let resp = match idx.tx_metadata(&hash)? {
+                // The era/chunk come from the located body, so re-read it for
+                // the response envelope rather than inventing placeholders.
+                AuxLookup::Found(cbor) => {
+                    let body = idx
+                        .tx(&hash)?
+                        .context("body vanished between metadata lookup and re-read")?;
+                    AuxResponse::Found {
+                        tx_hash: hex::encode(body.hash),
+                        era: body.era.to_string(),
+                        chunk: body.loc.chunk,
+                        aux_cbor: hex::encode(cbor),
+                    }
+                }
+                AuxLookup::NoMetadata => {
+                    let body = idx
+                        .tx(&hash)?
+                        .context("body vanished between metadata lookup and re-read")?;
+                    AuxResponse::NoMetadata {
+                        tx_hash: hex::encode(body.hash),
+                        era: body.era.to_string(),
+                        chunk: body.loc.chunk,
+                    }
+                }
+                AuxLookup::UnknownTx => AuxResponse::UnknownTx {
+                    tx_hash: hex::encode(hash),
+                },
+            };
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+        LookupMode::Body => {
             let Some(body) = idx.tx(&hash)? else {
                 bail!("no body with hash {} in any completed chunk", a.hash);
             };
@@ -283,7 +338,7 @@ fn lookup(a: LookupArgs) -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
-        Some(index) => match idx.resolve(&hash, index)? {
+        LookupMode::Output(index) => match idx.resolve(&hash, index)? {
             Resolution::Found { body, output } => {
                 let resp = OutputResponse {
                     tx_hash: hex::encode(body.hash),

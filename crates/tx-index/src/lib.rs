@@ -47,8 +47,8 @@ pub mod reader;
 pub mod segment;
 pub mod wire;
 
-pub use format::{Entry, Location, prefix_of};
-pub use reader::{Coverage, Index, IndexHandle, Located, Resolution, TxBody};
+pub use format::{AuxSpan, Entry, Location, prefix_of};
+pub use reader::{AuxLookup, Coverage, Index, IndexHandle, Located, Resolution, TxBody};
 
 /// The tx hash of a body: blake2b-256 over its bytes. The one computation
 /// extraction, verification and the read side must all agree on.

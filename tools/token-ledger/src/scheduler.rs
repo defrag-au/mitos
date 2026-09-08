@@ -796,6 +796,11 @@ fn run_job(
         tx_index_dir: None,
         no_compact: false,
         no_sieve: false,
+        // The hosted surface observes. Ingestion speed matters most on a cold
+        // policy a reader is waiting for, and that is the FIRST job's ten-day
+        // window, not the descent behind it — so this is the place to revisit
+        // if the measurement says the tier costs a reader anything.
+        no_observe: false,
         report_every: u64::MAX,
     };
     let pass_dir = hub

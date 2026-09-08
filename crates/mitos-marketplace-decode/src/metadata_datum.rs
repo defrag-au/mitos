@@ -11,9 +11,15 @@
 //!
 //! Everything here is pure: the caller fetches the aux-data bytes from its own
 //! host (`chain_data::tx_metadata`) and passes them in. That keeps the crate
-//! wasm-safe and import-free, and it is why the recovery is cheap — the
-//! metadata rides in the block the host already has, so there is no per-listing
-//! lookup and no boot-stall risk.
+//! wasm-safe and import-free.
+//!
+//! **What it costs the caller.** On the LIVE path the metadata rides in the
+//! block the host is already processing, so the fetch is local and free. On a
+//! BOOTSTRAP re-walk it is not: those transactions are years old, and each one
+//! is a lookup against whatever the host's fallback is. Measured on mainnet
+//! that was ~4/second — hours, for the residual jpg book. The fix is on the
+//! host side (a local aux-data index), not here; this module is only noting
+//! that the call it asks for is not always cheap.
 
 use pallas_codec::minicbor::data::Type;
 use pallas_crypto::hash::Hasher;
@@ -211,6 +217,51 @@ mod tests {
             recover_datum_from_metadata(&aux, hash.as_ref()),
             Some(datum)
         );
+    }
+
+    /// Auxiliary data of a REAL jpg.store V2 listing create: mainnet tx
+    /// `c3e6f5a6…`, immutable chunk 5429, Babbage. Output 0 sits at the jpg V2
+    /// listing address and commits its datum by HASH ONLY — precisely the
+    /// shape that decoded to no payouts and price 0 before this recovery
+    /// existed.
+    ///
+    /// These are the exact bytes `tx-index` serves from the chunk store, so
+    /// this test is the seam between the index and the decoder.
+    ///
+    /// Note the shape: a BARE metadata map (`a8`, a map of 8), NOT the tagged
+    /// post-Alonzo form — in a Babbage-era transaction. Both are live on
+    /// mainnet, which is why the parser must accept either.
+    const JPG_V2_LISTING_AUX: &str = "a8181e61361832784064383739396639666438373939666438373939666438373939663538316336366235646461336666383334343236636163633864666337343238663635343562183378403261656166376266646539313131633361396234373066666438373939666438373939666438373939663538316363373363316638666661633334643734383018347840653835363866333330633965396561343463393330376533643865613832643266333466323366666666666666663161303163396333383066666438373939661835784064383739396664383739396635383163366230313530663761343262373730373635663130616438353365623765333337353138633566613064616363373861183678406432393334353063666664383739396664383739396664383739396635383163303135643637336539396236323235646466636630633033306635666165386618377840323565383735386134323135323364353161663965333466666666666666666631613162366230623030666666663538316336623031353066376134326237371838782d30373635663130616438353365623765333337353138633566613064616363373861643239333435306366662c";
+
+    /// The hash output 0 of that transaction actually committed to.
+    const JPG_V2_LISTING_DATUM_HASH: &str =
+        "a7f897b965eb2919b9626f8524b0f3ead45a64c99b5dfa4cda6f97a58c9bb186";
+
+    #[test]
+    fn recovers_a_real_jpg_listing_datum_from_chain_aux_data() {
+        let aux = hex::decode(JPG_V2_LISTING_AUX).expect("fixture is hex");
+        let want = hex::decode(JPG_V2_LISTING_DATUM_HASH).expect("fixture is hex");
+
+        let datum = recover_datum_from_metadata(&aux, &want)
+            .expect("the listing datum is recoverable from its own tx metadata");
+
+        // The hash check is what makes recovery safe, so assert it directly
+        // rather than trusting the function that already checked it.
+        assert_eq!(Hasher::<256>::hash(&datum).as_ref(), want.as_slice());
+        assert_eq!(
+            &datum[..2],
+            &[0xd8, 0x79],
+            "a jpg listing datum is a constructor-0 Plutus datum"
+        );
+    }
+
+    /// The label-30 entry in that same fixture is jpg's own annotation and sits
+    /// below the 50 floor; a parser that swept it in would offer a candidate
+    /// that cannot hash, masking a real failure as a near miss.
+    #[test]
+    fn the_real_fixture_yields_exactly_one_candidate() {
+        let aux = hex::decode(JPG_V2_LISTING_AUX).expect("fixture is hex");
+        assert_eq!(parse_metadata_datums(&aux).len(), 1);
     }
 
     #[test]

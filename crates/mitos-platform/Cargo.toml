@@ -35,6 +35,11 @@ wasmtime-wasi = { version = "44" }
 # Data plane — module host fns proxy through this for chain reads.
 mitos-data-plane = { path = "../mitos-data-plane" }
 
+# Local tx hash → (chunk, offset) index over the Mithril chunk store.
+# Serves the aux-data tier by mmap instead of a remote provider; see
+# `src/local_tx_index.rs`.
+tx-index = { path = "../tx-index" }
+
 # Wire-format types shared with the CF companion runtime —
 # `SubscribeRequest`, `SubscribeResponse`, `DialBackOverride`,
 # `ChainPoint`. Same crate the cnft.dev-workers companion imports

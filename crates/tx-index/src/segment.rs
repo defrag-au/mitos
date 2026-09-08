@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 
-use crate::format::{
-    ENTRY_BYTES, Entry, Location, SEGMENT_HEADER_BYTES, SegmentHeader, chunk_number,
-};
+use crate::format::{ENTRY_BYTES, Entry, SEGMENT_HEADER_BYTES, SegmentHeader, chunk_number};
 
 pub const SEGMENTS_DIR: &str = "segments";
 
@@ -128,9 +126,10 @@ impl SegmentFile {
         (0..self.len()).map(|i| self.entry(i))
     }
 
-    /// Every location whose prefix equals `prefix` (sorted → binary search
-    /// to the run, then walk it).
-    pub fn find(&self, prefix: u64) -> Vec<Location> {
+    /// Every entry whose prefix equals `prefix` (sorted → binary search to
+    /// the run, then walk it). Returns whole entries, not just body
+    /// locations, so the caller can reach the aux span without a second read.
+    pub fn find(&self, prefix: u64) -> Vec<Entry> {
         let n = self.len();
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
@@ -148,7 +147,7 @@ impl SegmentFile {
             if e.prefix != prefix {
                 break;
             }
-            out.push(e.loc);
+            out.push(e);
             i += 1;
         }
         out
@@ -158,6 +157,7 @@ impl SegmentFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{AuxSpan, Location};
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tx-index-seg-{name}-{}", std::process::id()));
@@ -174,6 +174,7 @@ mod tests {
                 offset,
                 len: 100,
             },
+            aux: None,
         }
     }
 
@@ -195,10 +196,61 @@ mod tests {
         assert_eq!(seg.find(1).len(), 1);
         let five = seg.find(5);
         assert_eq!(five.len(), 2);
-        assert_eq!(five[0].offset, 20);
-        assert_eq!(five[1].offset, 30);
-        assert_eq!(seg.find(9)[0].offset, 40);
+        assert_eq!(five[0].loc.offset, 20);
+        assert_eq!(five[1].loc.offset, 30);
+        assert_eq!(seg.find(9)[0].loc.offset, 40);
         assert_eq!(seg.find(10), vec![]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The aux span has to survive the segment write/mmap round trip — it is
+    /// the field a v1 index did not have, so nothing older covers it.
+    #[test]
+    fn aux_spans_survive_a_segment_round_trip() {
+        let dir = scratch("aux");
+        let with_aux = Entry {
+            prefix: 2,
+            loc: Location {
+                chunk: 7,
+                offset: 10,
+                len: 100,
+            },
+            aux: Some(AuxSpan {
+                offset: 900,
+                len: 42,
+            }),
+        };
+        let entries = vec![e(1, 10), with_aux];
+        write_segment(
+            &dir,
+            SegmentHeader {
+                era: 6,
+                chunk: 7,
+                count: 2,
+            },
+            &entries,
+        )
+        .unwrap();
+
+        let seg = SegmentFile::open(&segment_path(&dir, 7)).unwrap();
+        assert_eq!(seg.find(1)[0].aux, None);
+        let hit = seg.find(2);
+        assert_eq!(
+            hit[0].aux,
+            Some(AuxSpan {
+                offset: 900,
+                len: 42
+            })
+        );
+        assert_eq!(
+            hit[0].aux_location(),
+            Some(Location {
+                chunk: 7,
+                offset: 900,
+                len: 42
+            }),
+            "aux borrows the body's chunk"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

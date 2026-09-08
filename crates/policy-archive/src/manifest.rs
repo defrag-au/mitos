@@ -170,6 +170,14 @@ pub struct Manifest {
     /// removed the pass directory that held it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<String>,
+    /// What this policy's units ARE, accumulated by the walks.
+    ///
+    /// Stamped here because it records what the archive ASSUMED, not merely
+    /// what it found — in particular whether undecoded candidates were worth
+    /// keeping. A reader that finds no candidates must be able to tell "there
+    /// were none" from "this is a collection and we did not keep them".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::profile::Profile>,
     pub passes: Vec<PassEntry>,
     pub updated_unix: u64,
 }
@@ -187,6 +195,7 @@ impl Manifest {
             rolled_up_through: None,
             rollup_seq: 0,
             pending: None,
+            profile: None,
             passes: Vec::new(),
             updated_unix: 0,
         }

@@ -27,11 +27,13 @@ use crate::format::{Location, era_from_u8, prefix_of};
 use crate::segment::{SegmentFile, list_segments, segment_path};
 use crate::wire::ResolvedOutput;
 
-/// A candidate hit: where a body with the requested prefix lives.
+/// A candidate hit: where a body with the requested prefix lives, and where
+/// its auxiliary data lives if it has any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Located {
     pub loc: Location,
     pub era: Era,
+    pub aux: Option<Location>,
 }
 
 /// A verified body: the bytes whose blake2b-256 IS the requested hash.
@@ -41,12 +43,34 @@ pub struct TxBody {
     pub era: Era,
     pub loc: Location,
     pub cbor: Vec<u8>,
+    /// Where this tx's auxiliary data sits, when it has any. Carried on the
+    /// VERIFIED body on purpose — see [`Index::tx_metadata`].
+    pub aux: Option<Location>,
 }
 
 impl TxBody {
     pub fn outputs(&self) -> Result<Vec<ResolvedOutput>> {
         decode::outputs(self.era, &self.cbor)
     }
+}
+
+/// What an auxiliary-data lookup came back with.
+///
+/// Three states, not two. "This transaction is indexed and carries no
+/// metadata" is a FINAL answer; "this transaction is not in any completed
+/// chunk" means the index cannot say and the caller should ask elsewhere. An
+/// `Option` collapses those into one `None` — and since most transactions
+/// carry no metadata, a caller that treats `None` as "not found" would send
+/// nearly every lookup out to a remote provider. That is precisely the cost
+/// this index exists to remove, so the distinction is in the type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuxLookup {
+    Found(Vec<u8>),
+    /// Indexed, and definitively carries no auxiliary data.
+    NoMetadata,
+    /// No body with that hash in any completed chunk — volatile tip, or a
+    /// hash that never landed.
+    UnknownTx,
 }
 
 /// What an outref lookup came back with.
@@ -129,24 +153,29 @@ impl Index {
         let mut out = Vec::new();
         for s in &self.tail {
             let era = era_from_u8(s.header.era)?;
-            out.extend(s.find(prefix).into_iter().map(|loc| Located { loc, era }));
+            out.extend(s.find(prefix).into_iter().map(|e| Located {
+                loc: e.loc,
+                era,
+                aux: e.aux_location(),
+            }));
         }
         if let Some(b) = &self.base {
-            for loc in b.find(prefix) {
+            for e in b.find(prefix) {
                 let era_byte = b
-                    .era_of(loc.chunk)
-                    .ok_or_else(|| anyhow!("base has no era for chunk {}", loc.chunk))?;
+                    .era_of(e.loc.chunk)
+                    .ok_or_else(|| anyhow!("base has no era for chunk {}", e.loc.chunk))?;
                 out.push(Located {
-                    loc,
+                    loc: e.loc,
                     era: era_from_u8(era_byte)?,
+                    aux: e.aux_location(),
                 });
             }
         }
         Ok(out)
     }
 
-    /// Read the body bytes at a location.
-    pub fn read_body(&self, loc: Location) -> Result<Vec<u8>> {
+    /// Read the raw bytes of a span (a body, or a tx's auxiliary data).
+    pub fn read_span(&self, loc: Location) -> Result<Vec<u8>> {
         let path = chunk_path(&self.immutable, loc.chunk);
         let f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let mut buf = vec![0u8; usize::from(loc.len)];
@@ -165,7 +194,7 @@ impl Index {
     /// The verified body for `hash`, if any completed chunk holds it.
     pub fn tx(&self, hash: &[u8; 32]) -> Result<Option<TxBody>> {
         for cand in self.locate(hash)? {
-            let cbor = self.read_body(cand.loc)?;
+            let cbor = self.read_span(cand.loc)?;
             let got = Hasher::<256>::hash(&cbor);
             if got.as_ref() == hash {
                 return Ok(Some(TxBody {
@@ -173,6 +202,7 @@ impl Index {
                     era: cand.era,
                     loc: cand.loc,
                     cbor,
+                    aux: cand.aux,
                 }));
             }
             tracing::debug!(
@@ -182,6 +212,31 @@ impl Index {
             );
         }
         Ok(None)
+    }
+
+    /// The raw auxiliary-data (metadata) CBOR for `hash`. See [`AuxLookup`]
+    /// for why the two negatives are distinct.
+    ///
+    /// **Why this goes through the verified body.** The index stores an 8-byte
+    /// hash prefix, so a lookup can land on the wrong transaction. For a body
+    /// that is harmless — the bytes are re-hashed and a mismatch just moves to
+    /// the next candidate. Auxiliary data has no such self-check: it is not
+    /// hash-addressed, so serving it straight off a located entry would hand
+    /// back another transaction's metadata as if it were this one's, and
+    /// nothing downstream could tell.
+    ///
+    /// Reading the body first costs one extra `pread` and makes the prefix
+    /// collision impossible to observe. That is the right trade: this exists to
+    /// feed datum recovery, where believing the wrong metadata means decoding a
+    /// listing against a stranger's datum.
+    pub fn tx_metadata(&self, hash: &[u8; 32]) -> Result<AuxLookup> {
+        let Some(body) = self.tx(hash)? else {
+            return Ok(AuxLookup::UnknownTx);
+        };
+        match body.aux {
+            Some(aux) => Ok(AuxLookup::Found(self.read_span(aux)?)),
+            None => Ok(AuxLookup::NoMetadata),
+        }
     }
 
     /// Resolve an outref to its producing output.
