@@ -1,0 +1,42 @@
+# policy-index — (policy, asset) → the MINT that created it, over a Mithril
+# immutable DB. The companion tx-index could never be: its entry is keyed by
+# transaction hash and carries no policy dimension, so "which transaction first
+# minted policy P" is unanswerable there however cheap a hash lookup is.
+#
+# Rides tx-index's extraction pass rather than opening its own. That is not a
+# convenience — MEASURED 2026-09-09, the mint decode costs +1.8% ON TOP of a
+# pass that already decodes every block, and a second independent pass would
+# cost +100%. The shared pass IS the design.
+#
+# Design: cnft.dev-workers docs/design/POLICY_INDEX.md.
+[package]
+name = "policy-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "(policy, asset) → its mint transaction, over a Mithril immutable DB — the mint-keyed companion to tx-index"
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+# Block/tx shapes only. No pallas-hardano: chunk splitting belongs to whoever
+# owns the extraction pass, which is tx-index.
+pallas-traverse = { workspace = true }
+pallas-primitives = { workspace = true }
+# blake2b — asset names are human-chosen and do NOT bucket; hashing restores
+# the uniformity the prefix directory depends on.
+pallas-crypto = { workspace = true }
+
+memmap2 = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+# The extraction pass this crate rides. A DEV-dependency only: the direction
+# is policy-index → tx-index, and the example is where they are wired
+# together, so neither crate's shipped code depends on the other.
+tx-index = { path = "../tx-index" }

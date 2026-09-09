@@ -4749,6 +4749,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "policy-index"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "memmap2",
+ "pallas-crypto 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "tempfile",
+ "tracing",
+ "tx-index",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

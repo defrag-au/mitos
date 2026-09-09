@@ -66,9 +66,31 @@ pub struct Extracted {
     pub wall_secs: f64,
 }
 
+/// Told about every transaction this pass locates, as it locates it.
+///
+/// The seam exists so a SECOND index can be derived from the SAME decode.
+/// MEASURED 2026-09-09: harvesting mints alongside costs +1.8%, where an
+/// independent pass over the same chunks would cost +100% — the block decode
+/// is the expense and it is already paid here. See `crates/policy-index`.
+///
+/// ⚠️ Deliberately a callback over primitives rather than a trait over a
+/// foreign type: neither crate depends on the other, and the caller wires
+/// them together. A shared trait would have made this crate depend on every
+/// index that ever wants to ride along.
+pub type TxObserver<'o> = &'o mut dyn FnMut(&MultiEraBlock<'_>, usize, Location, Option<AuxSpan>);
+
 /// Decode every block in `NNNNN.chunk`, hash every tx body, return the
 /// sorted entries. Refuses a chunk whose blocks disagree on era.
 pub fn extract_chunk(immutable: &Path, chunk: u16) -> Result<Extracted> {
+    extract_chunk_observed(immutable, chunk, &mut |_, _, _, _| {})
+}
+
+/// [`extract_chunk`], calling `observe` for every transaction located.
+pub fn extract_chunk_observed(
+    immutable: &Path,
+    chunk: u16,
+    observe: TxObserver<'_>,
+) -> Result<Extracted> {
     let started = Instant::now();
     let path = chunk_path(immutable, chunk);
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -101,21 +123,27 @@ pub fn extract_chunk(immutable: &Path, chunk: u16) -> Result<Extracted> {
             Some(_) => {}
         }
 
-        for tx in txs(&block)? {
+        for (i, tx) in txs(&block)?.into_iter().enumerate() {
             let body_span = span_of(tx.body, base_ptr, bytes.len(), chunk, pos, "tx body")?;
             let aux_span = tx
                 .aux
                 .map(|a| span_of(a, base_ptr, bytes.len(), chunk, pos, "auxiliary data"))
                 .transpose()?;
             let hash = Hasher::<256>::hash(tx.body);
+            let loc = Location {
+                chunk,
+                offset: body_span.0,
+                len: body_span.1,
+            };
+            let aux = aux_span.map(|(offset, len)| AuxSpan { offset, len });
+            // Before the push, so an observer sees a transaction even if the
+            // entry vector is later filtered — the two indexes decide
+            // independently what is worth keeping.
+            observe(&block, i, loc, aux);
             entries.push(Entry {
                 prefix: prefix_of(&hash),
-                loc: Location {
-                    chunk,
-                    offset: body_span.0,
-                    len: body_span.1,
-                },
-                aux: aux_span.map(|(offset, len)| AuxSpan { offset, len }),
+                loc,
+                aux,
             });
         }
         pos += len;
