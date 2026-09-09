@@ -15,8 +15,44 @@
 //! over coordination."
 
 pub mod cswap;
+pub mod minswap;
 pub mod originator;
 pub mod splash;
+pub mod sundae;
+pub mod wingriders;
+
+use pallas_primitives::{BigInt, PlutusData};
+
+/// Non-negative `u64` out of a `PlutusData` integer.
+///
+/// Shared by every pool decoder — lifted here from `cswap` when the second and
+/// third arrived, rather than copied per DEX where one copy could quietly
+/// disagree about negatives or oversized big-ints.
+pub(crate) fn bigint_to_u64(b: &BigInt) -> Option<u64> {
+    match b {
+        BigInt::Int(i) => {
+            let v: i128 = (*i).into();
+            if v < 0 { None } else { u64::try_from(v).ok() }
+        }
+        BigInt::BigUInt(bytes) => {
+            let raw: &[u8] = bytes;
+            if raw.len() > 8 {
+                return None;
+            }
+            let mut buf = [0u8; 8];
+            buf[8 - raw.len()..].copy_from_slice(raw);
+            Some(u64::from_be_bytes(buf))
+        }
+        BigInt::BigNInt(_) => None,
+    }
+}
+
+pub(crate) fn bounded_bytes(pd: &PlutusData) -> Option<Vec<u8>> {
+    match pd {
+        PlutusData::BoundedBytes(b) => Some((**b).to_vec()),
+        _ => None,
+    }
+}
 
 /// Redistribute one LP provider's share of a pool's reserve of
 /// some asset: `lp_held / total_lp_supply` of `pool_reserve`.

@@ -31,10 +31,9 @@ impl BufferedOutput {
     pub fn asset_list(&self) -> Vec<Asset> {
         self.assets
             .iter()
-            .map(|(p, n)| Asset {
-                policy: p.clone(),
-                name: n.clone(),
-            })
+            // `BufferedOutput` stores `(policy, name)` pairs only, so the
+            // amount is unrecorded here rather than one.
+            .map(|(p, n)| Asset::unmeasured(p.clone(), n.clone()))
             .collect()
     }
 }

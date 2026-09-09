@@ -52,7 +52,24 @@ CREATE TABLE IF NOT EXISTS party (
     -- chain cannot say who owns anything. It is the boundary every
     -- returned/unreconciled verdict is measured against, so a wrong 1 here
     -- launders an extraction into a deployment.
-    project_side           INTEGER NOT NULL DEFAULT 0
+    project_side           INTEGER NOT NULL DEFAULT 0,
+    -- WHO the operator says this party is: founder | contractor | treasury |
+    -- ... Distinct from `role` above, which is the FRONTIER's state for this
+    -- party (declared | promoted | holder | royalty | mint_payee) and says
+    -- nothing about identity. The two were nearly conflated; they answer
+    -- different questions and a party routinely has both -- $jprigs33 is
+    -- frontier `declared` (seated as a terminal) and identity `founder`.
+    --
+    -- Three INDEPENDENT axes, and collapsing any pair loses a real case:
+    --   identity     (declared_role)  who is this
+    --   boundary     (project_side)   is value here inside or outside
+    --   expansion    (expand)         may this party recruit others
+    -- $jprigs33 is founder / outside / never-expands.
+    declared_role          TEXT,
+    -- What a `contractor` was engaged to do (dev | art | marketing |
+    -- moderation). NULL everywhere else, and NULL is not a gap -- it groups as
+    -- unspecified rather than inventing a bucket.
+    declared_function      TEXT
 );
 
 -- Edge tables, both slot-keyed so one playhead scrubs both.
@@ -450,6 +467,172 @@ CREATE TABLE IF NOT EXISTS asset_inflow (
 CREATE INDEX IF NOT EXISTS idx_ai_party  ON asset_inflow(party);
 CREATE INDEX IF NOT EXISTS idx_ai_policy ON asset_inflow(policy_id);
 CREATE INDEX IF NOT EXISTS idx_ai_slot   ON asset_inflow(slot);
+
+-- ===========================================================================
+-- DISTRIBUTIONS — what left the project, to whom, in what unit, and against
+-- what was promised. Design: docs/design/DISTRIBUTIONS_REPORT.md
+-- ===========================================================================
+
+-- `provenance`'s per-holder result, persisted.
+--
+-- Until this existed the command only printed, so nothing downstream could use
+-- it and every consumer had to re-derive the funding trace -- the one piece of
+-- logic here least worth duplicating. `distributions` reads this to decide
+-- which mints were bought with the project's own money.
+--
+-- `core_share` is a FLOOR, not a verdict: `unknown_share` is the fraction of
+-- windowed inbound with no resolved payer, so a holder at 40% core and 50%
+-- unknown could be anywhere. Both are stored precisely so a reader can never
+-- take the first number without the second.
+CREATE TABLE IF NOT EXISTS provenance_verdict (
+    holder        TEXT PRIMARY KEY,
+    assets        INTEGER NOT NULL,   -- holder-facing units they minted
+    mint_spend    TEXT    NOT NULL,   -- i128 as TEXT: lovelace overflows i64 in aggregate
+    core_share    REAL    NOT NULL,   -- 0..1, funding traced to the core cluster
+    unknown_share REAL    NOT NULL,   -- 0..1, funding with no resolved payer
+    via           TEXT,               -- per-unit decomposition, e.g. 'ada 12% · USDM 98%'
+    flagged       INTEGER NOT NULL,   -- 1 when core_share >= the run's threshold
+    -- The run's parameters. A verdict read without them is uninterpretable:
+    -- the same wallet flags or does not depending on the threshold, and a
+    -- re-tune must be visible rather than a silent reinterpretation.
+    threshold     REAL    NOT NULL,
+    window_days   INTEGER NOT NULL,
+    roots_basis   TEXT    NOT NULL    -- asserted | derived — where coreness was anchored
+);
+CREATE INDEX IF NOT EXISTS idx_pv_flagged ON provenance_verdict(flagged);
+
+-- THE DENOMINATOR, computed once and cited by every section. Singleton.
+--
+-- Mint proceeds are NOT the raise. A project that funds its own wallets to
+-- mint its own supply books its own money as revenue, and every share computed
+-- on that figure is understated.
+--
+-- Measured on Mekka S2 (2026-08-30): of 68,821 ADA of treasury mint proceeds,
+-- 15,350 came from 15 transactions that delivered 148 assets to project-side
+-- wallets and 0 assets to anyone else. Contractor pay read as 21.7% against
+-- gross, apparently on target, and 27.9% against the external raise -- about
+-- 40% OVER the 20% that was pledged.
+--
+-- `gross_proceeds` is kept because the GAP between the two is the self-mint
+-- finding. It is not a base: no share may be computed on it.
+CREATE TABLE IF NOT EXISTS distribution_base (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    computed_unix   INTEGER NOT NULL,
+    floor_slot      INTEGER NOT NULL,   -- window opens at the policy's first mint
+    tip_slot        INTEGER NOT NULL,   -- and closes at the snapshot tip
+    gross_proceeds  INTEGER NOT NULL,   -- lovelace: all mint_payment to project-side
+    circular        INTEGER NOT NULL,   -- of which: mints delivered to project-side
+    external_raise  INTEGER NOT NULL,   -- gross - circular. THE base.
+    circular_txs    INTEGER NOT NULL,
+    circular_assets INTEGER NOT NULL
+);
+
+-- One row per party per role per UNIT. Units are NEVER summed together.
+--
+-- There is deliberately no total-value column. Converting assets to ADA needs
+-- a price assumption the chain never made, and an ADA-only total is worse than
+-- none: it systematically under-reports whoever was paid in kind. On S2 the
+-- founder took 105 assets against 12 ADA of min-UTxO carrier, so a lovelace
+-- sum puts their share of the raise at 0.0% -- false, and false in the
+-- direction that always flatters the project.
+CREATE TABLE IF NOT EXISTS distribution_leg (
+    party        TEXT    NOT NULL,
+    role         TEXT    NOT NULL,   -- founder | contractor | ops | project | ...
+    function     TEXT,               -- dev | art | marketing | moderation
+    unit         TEXT    NOT NULL,   -- 'lovelace' | 'asset'
+    quantity     INTEGER NOT NULL,
+    legs         INTEGER NOT NULL,
+    -- Assets received for which NO consideration was paid. The founder
+    -- extraction measure: `$jprigs33` took 105 assets across 11 transactions
+    -- and paid ADA in zero of them. Meaningless on lovelace rows, left 0.
+    unpaid_units INTEGER NOT NULL DEFAULT 0,
+    -- How many of those units the party STILL HOLDS.
+    --
+    -- Distinct from `quantity`, which is what they ACQUIRED, and the two must
+    -- not be used interchangeably: `$jprigs33` received 105 and holds 79,
+    -- having passed 26 on. Reporting the acquired figure on a chart labelled
+    -- as holdings overstates a current position by a third, and reporting only
+    -- holdings would hide a give-away that was subsequently sold.
+    held_now     INTEGER,
+    first_slot   INTEGER,
+    last_slot    INTEGER,
+    -- observed | asserted | derived. A role resting on an operator assertion
+    -- must never render identically to one the chain showed.
+    basis        TEXT    NOT NULL,
+    PRIMARY KEY (party, role, unit)
+);
+CREATE INDEX IF NOT EXISTS idx_dleg_role ON distribution_leg(role);
+
+-- Every leg decomposes to transactions. A figure you cannot open is not
+-- evidence, and this is what makes a report citable rather than assertable.
+CREATE TABLE IF NOT EXISTS distribution_evidence (
+    party        TEXT    NOT NULL,
+    unit         TEXT    NOT NULL,
+    tx_hash      TEXT    NOT NULL,
+    quantity     INTEGER NOT NULL,
+    -- Consideration paid BY this party in this same transaction, above the
+    -- min-UTxO carrier floor. Carrier ADA rides along with every asset
+    -- transfer and is NOT payment -- `$jprigs33` shows 11.7 ADA outbound that
+    -- is entirely carrier, and a naive 'did any ADA move' test reads it as a
+    -- purchase. Record the floor, never deduct it.
+    consideration INTEGER NOT NULL DEFAULT 0,
+    slot         INTEGER NOT NULL,
+    PRIMARY KEY (party, unit, tx_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_devid_party ON distribution_evidence(party);
+
+-- ADVERTISED commitments. These are CLAIMS transcribed from marketing, never
+-- chain facts, so each carries where it came from.
+--
+-- `share` is NULLABLE ON PURPOSE. NULL means nothing was published for this
+-- category, and must render as a bar with NO target marker. A
+-- `NOT NULL DEFAULT 0` here would manufacture a promise of zero that nobody
+-- made -- which matters because the two categories with no published
+-- allocation (founder pay, team-held supply) are exactly the ones where the
+-- finding is that they sit OUTSIDE the published terms entirely, rather than
+-- overrunning them.
+CREATE TABLE IF NOT EXISTS commitment (
+    category TEXT PRIMARY KEY,   -- hashpower | ops_team | marketing | supply
+    share    REAL,               -- NULL = nothing was advertised. LOAD BEARING.
+    source   TEXT NOT NULL,      -- e.g. 'docs/cases/MEKKA_COMMITMENTS.md'
+    -- Which published breakdown this line belongs to. A project publishes
+    -- SEVERAL: how mint funds are split, and separately how ongoing rewards
+    -- are split. They are different pools measured against different flows,
+    -- and mixing them breaks the exhaustiveness test that makes the
+    -- elimination argument work -- two breakdowns each summing to 100% look
+    -- like one breakdown summing to 200%.
+    grp      TEXT NOT NULL DEFAULT 'mint_funds',
+
+    -- An OFF-CHAIN counterpart: something claimed to have discharged this
+    -- line that the walk cannot see. Miners bought with the money exist in a
+    -- warehouse, not in a UTxO, so the largest commitment a mining project
+    -- makes is exactly the one the chain is worst at measuring.
+    --
+    -- Held SEPARATE from the measured share on purpose. Measured comes from
+    -- the walk and is reproducible; this comes from a person or a document
+    -- and is not. Folding them into one number would let an assertion inherit
+    -- the credibility of a measurement, which is the whole failure this tool
+    -- exists to avoid.
+    --
+    -- Denominated in lovelace like everything else here, so any conversion is
+    -- forced into `counterpart_source` where a reader can see the rate and
+    -- the date it came from.
+    counterpart_lovelace INTEGER,        -- NULL = nothing claimed against this line
+    counterpart_basis    TEXT,           -- asserted | document | observed
+    counterpart_source   TEXT,           -- who said so, and any rate applied
+
+    -- The event that must happen before this line can be spent against at all.
+    -- NULL = unconditional, so silence against it is a real gap.
+    --
+    -- A project can publish a breakdown for money it does not yet have — how
+    -- the proceeds of a sale WILL be split, before the sale happens. That line
+    -- is unmeasured for a completely different reason than a line whose
+    -- spending the walk simply cannot see, and flagging it as a coverage gap
+    -- would be wrong: there is nothing to cover yet. Recording the condition
+    -- keeps a future promise visible without letting it read as a failure to
+    -- deliver on a present one.
+    contingent_on        TEXT
+);
 ";
 
 /// Bring an EXISTING ledger's schema up to date.
@@ -493,6 +676,39 @@ fn migrate(conn: &Connection) -> Result<()> {
             "project_side",
             "project_side INTEGER NOT NULL DEFAULT 0",
         ),
+        // NULL on pre-existing rows is correct and not a gap: a ledger seeded
+        // before these existed carries no identity assertion, and NULL says
+        // exactly that. Defaulting either to a value would fabricate an
+        // assertion nobody made.
+        ("party", "declared_role", "declared_role TEXT"),
+        ("party", "declared_function", "declared_function TEXT"),
+        // NULL on rows written before this existed = "not measured", which is
+        // right: 0 would claim the party holds nothing.
+        ("distribution_leg", "held_now", "held_now INTEGER"),
+        // Existing rows are mint-fund lines — that is all the table held
+        // before rewards breakdowns could be recorded.
+        (
+            "commitment",
+            "grp",
+            "grp TEXT NOT NULL DEFAULT 'mint_funds'",
+        ),
+        // NULL on pre-existing rows = nobody has claimed anything against this
+        // line, which is the honest default. A zero would assert that someone
+        // claimed nothing was spent — a much stronger statement than silence.
+        (
+            "commitment",
+            "counterpart_lovelace",
+            "counterpart_lovelace INTEGER",
+        ),
+        ("commitment", "counterpart_basis", "counterpart_basis TEXT"),
+        (
+            "commitment",
+            "counterpart_source",
+            "counterpart_source TEXT",
+        ),
+        // NULL on pre-existing rows = unconditional, which is what every
+        // commitment recorded before this column existed was.
+        ("commitment", "contingent_on", "contingent_on TEXT"),
     ] {
         if !has_column(conn, table, column)? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))
@@ -544,7 +760,17 @@ pub struct SecondarySaleRow {
 }
 
 /// Tables a `reset` clears: everything a walk derives and would re-derive.
-pub const RESET_DERIVED_TABLES: [&str; 25] = [
+pub const RESET_DERIVED_TABLES: [&str; 29] = [
+    // Derived from the walk + the CURRENT role set. Keeping them would let a
+    // distribution computed under an old project boundary survive a re-walk
+    // that would no longer draw it — and the boundary is exactly what gets
+    // refined between runs, so these must never outlive one.
+    "distribution_base",
+    "distribution_leg",
+    "distribution_evidence",
+    // Derived, and doubly so: it depends on both the walk and the core roots,
+    // and the roots are refined between runs by design.
+    "provenance_verdict",
     // Derived: the next walk reads the same blocks and re-records it. Keeping
     // it would let an inflow captured under an OLD project-side set survive a
     // re-walk that would no longer draw it.
@@ -581,11 +807,17 @@ pub const RESET_DERIVED_TABLES: [&str; 25] = [
 /// Tables a `reset` KEEPS: the input-resolution layer plus the discovered
 /// holder and handle sets — all bought by scanning rather than derived, and
 /// all what the NEXT walk is there to use.
-pub const RESET_KEPT_TABLES: [&str; 4] = [
+pub const RESET_KEPT_TABLES: [&str; 5] = [
     "outref_cache",
     "wanted_outref",
     "discovered_holder",
     "discovered_handle",
+    // ASSERTED, not derived. A commitment is transcribed from marketing by an
+    // operator; no walk can reproduce it, so clearing it on reset would
+    // silently discard the only record of what was promised — and a
+    // measured-vs-target view would then render every target as absent, which
+    // reads as "nothing was pledged" rather than "we lost the pledge".
+    "commitment",
 ];
 
 /// A row of `asset_event`.
@@ -657,6 +889,60 @@ pub struct AssetInflowRow {
     pub tx_hash: String,
     pub slot: u64,
     pub block_time: i64,
+}
+
+/// The `distribution_base` singleton — the denominator every share cites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionBase {
+    pub computed_unix: u64,
+    pub floor_slot: u64,
+    pub tip_slot: u64,
+    pub gross_proceeds: i64,
+    pub circular: i64,
+    pub external_raise: i64,
+    pub circular_txs: u64,
+    pub circular_assets: u64,
+}
+
+/// A row of `distribution_leg` — one party, one role, one UNIT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionLegRow {
+    pub party: String,
+    pub role: String,
+    pub function: Option<String>,
+    pub unit: String,
+    pub quantity: i64,
+    pub legs: u64,
+    pub unpaid_units: u64,
+    /// Units still held. `None` on lovelace legs, where it is meaningless.
+    /// NEVER interchangeable with `quantity` — see the column comment.
+    pub held_now: Option<i64>,
+    pub first_slot: Option<u64>,
+    pub last_slot: Option<u64>,
+    pub basis: String,
+}
+
+/// A row of `distribution_evidence` — the transaction behind a leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionEvidenceRow {
+    pub party: String,
+    pub unit: String,
+    pub tx_hash: String,
+    pub quantity: i64,
+    pub consideration: i64,
+    pub slot: u64,
+}
+
+/// A row of `provenance_verdict` — one holder's funding verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvenanceVerdictRow {
+    pub holder: String,
+    pub assets: u64,
+    pub mint_spend: i128,
+    pub core_share: f64,
+    pub unknown_share: f64,
+    pub via: Option<String>,
+    pub flagged: bool,
 }
 
 /// A row of `unit_flow` — one output's worth of one unit, moving.
@@ -937,6 +1223,172 @@ impl Ledger {
             "UPDATE party SET project_side = 1, source = COALESCE(source, ?) WHERE key = ?",
             params![source, key],
         )?)
+    }
+
+    /// Record WHO the operator says a party is, and (for a contractor) what
+    /// they were engaged to do.
+    ///
+    /// Identity, not frontier state: this writes `declared_role`, never
+    /// `role`. Survives a re-walk the same way `project_side` does — the
+    /// checkpoint's party upsert rewrites only frontier-derived columns, so an
+    /// assertion is not clobbered by re-reading the same blocks. Returns 0 when
+    /// the party has no row, so a caller can say so rather than assume it
+    /// landed.
+    pub fn set_declared_identity(
+        &self,
+        key: &str,
+        role: &str,
+        function: Option<&str>,
+    ) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE party SET declared_role = ?, declared_function = ? WHERE key = ?",
+            params![role, function, key],
+        )?)
+    }
+
+    /// Replace the provenance verdicts wholesale.
+    ///
+    /// Wholesale because a verdict only means anything alongside the run that
+    /// produced it: mixing rows from two thresholds would give a `flagged`
+    /// column that means different things on different rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_provenance_verdicts(
+        &mut self,
+        rows: &[ProvenanceVerdictRow],
+        threshold: f64,
+        window_days: u64,
+        roots_basis: &str,
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM provenance_verdict", [])?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO provenance_verdict
+                   (holder, assets, mint_spend, core_share, unknown_share, via,
+                    flagged, threshold, window_days, roots_basis)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for r in rows {
+                n += stmt.execute(params![
+                    r.holder,
+                    u64_i64(r.assets),
+                    r.mint_spend.to_string(),
+                    r.core_share,
+                    r.unknown_share,
+                    r.via,
+                    i64::from(r.flagged),
+                    threshold,
+                    u64_i64(window_days),
+                    roots_basis,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Read-only connection, for the analysis passes that only query.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Replace the base, legs and evidence as ONE transaction.
+    ///
+    /// Wholesale and atomic together: a base written without its legs, or legs
+    /// carrying a stale base, is a report whose percentages cite a denominator
+    /// that is not the one they were computed against. Partial state here is
+    /// worse than none.
+    pub fn replace_distributions(
+        &mut self,
+        base: &DistributionBase,
+        legs: &[DistributionLegRow],
+        evidence: &[DistributionEvidenceRow],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM distribution_base", [])?;
+        tx.execute("DELETE FROM distribution_leg", [])?;
+        tx.execute("DELETE FROM distribution_evidence", [])?;
+        tx.execute(
+            "INSERT INTO distribution_base
+               (id, computed_unix, floor_slot, tip_slot, gross_proceeds, circular,
+                external_raise, circular_txs, circular_assets)
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                u64_i64(base.computed_unix),
+                u64_i64(base.floor_slot),
+                u64_i64(base.tip_slot),
+                base.gross_proceeds,
+                base.circular,
+                base.external_raise,
+                u64_i64(base.circular_txs),
+                u64_i64(base.circular_assets),
+            ],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO distribution_leg
+                   (party, role, function, unit, quantity, legs, unpaid_units,
+                    held_now, first_slot, last_slot, basis)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for l in legs {
+                stmt.execute(params![
+                    l.party,
+                    l.role,
+                    l.function,
+                    l.unit,
+                    l.quantity,
+                    u64_i64(l.legs),
+                    u64_i64(l.unpaid_units),
+                    l.held_now,
+                    l.first_slot.map(u64_i64),
+                    l.last_slot.map(u64_i64),
+                    l.basis,
+                ])?;
+            }
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO distribution_evidence
+                   (party, unit, tx_hash, quantity, consideration, slot)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )?;
+            for e in evidence {
+                stmt.execute(params![
+                    e.party,
+                    e.unit,
+                    e.tx_hash,
+                    e.quantity,
+                    e.consideration,
+                    u64_i64(e.slot),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Parties the operator declared as paid contractors.
+    ///
+    /// Excluded from the self-mint set: once someone has been paid for work,
+    /// the money is theirs and minting with it is a purchase. Keyed on
+    /// `contractor` alone — an `ops` wallet is a project wallet, not a person,
+    /// however it sits relative to the value boundary.
+    pub fn declared_contractors(&self) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM party WHERE declared_role = 'contractor'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Holders whose mint funding traced to the project — the wallets whose
+    /// mints were bought with the project's own money.
+    pub fn core_funded_holders(&self) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT holder FROM provenance_verdict WHERE flagged = 1")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Every wallet the project owns. The walk reads this once at start-up to
@@ -2165,6 +2617,166 @@ mod tests {
         let l = Ledger::open_in_memory().unwrap();
         assert_eq!(l.set_project_side("stake1nobody", "cli").unwrap(), 0);
         assert!(l.project_side_parties().unwrap().is_empty());
+    }
+
+    /// Identity, boundary and expansion are THREE independent axes, and the
+    /// party row has to carry all three without collapsing any pair.
+    ///
+    /// `$jprigs33` is the case that forces it: identity `founder`, outside the
+    /// boundary, and never expanding. Collapse identity into `role` and the
+    /// frontier state overwrites who they are; collapse identity into the
+    /// boundary and naming a founder silently moves 105 free asset transfers
+    /// inside the perimeter, where they net out and vanish.
+    #[test]
+    fn identity_boundary_and_expansion_are_independent_on_the_party_row() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.conn
+            .execute(
+                "INSERT INTO party (key, has_stake, role, watched_from_slot, expand)
+                 VALUES ('stake1jp', 1, 'declared', 100, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            l.set_declared_identity("stake1jp", "founder", None)
+                .unwrap(),
+            1
+        );
+
+        let (frontier_role, identity, project_side, expand): (String, String, i64, i64) = l
+            .conn
+            .query_row(
+                "SELECT role, declared_role, project_side, expand FROM party WHERE key='stake1jp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(frontier_role, "declared", "frontier state is untouched");
+        assert_eq!(identity, "founder", "identity is its own column");
+        assert_eq!(project_side, 0, "naming a founder must not bound them in");
+        assert_eq!(expand, 0, "and must not let them recruit");
+    }
+
+    /// A contractor's function is stored for grouping; naming a party with no
+    /// row reports 0 rather than pretending it landed.
+    #[test]
+    fn a_declared_function_is_stored_and_an_unseated_party_reports_zero() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.conn
+            .execute(
+                "INSERT INTO party (key, has_stake, role, watched_from_slot, expand)
+                 VALUES ('stake1dwess', 1, 'holder', 100, 0)",
+                [],
+            )
+            .unwrap();
+        l.set_declared_identity("stake1dwess", "contractor", Some("art"))
+            .unwrap();
+
+        let f: Option<String> = l
+            .conn
+            .query_row(
+                "SELECT declared_function FROM party WHERE key='stake1dwess'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(f.as_deref(), Some("art"));
+
+        assert_eq!(
+            l.set_declared_identity("stake1nobody", "founder", None)
+                .unwrap(),
+            0,
+            "declaring an unseated party must not look like it worked"
+        );
+    }
+
+    /// "Nothing was advertised" and "zero was advertised" are DIFFERENT claims
+    /// and the schema must be able to tell them apart.
+    ///
+    /// A NULL `share` renders as a bar with no target marker; 0.0 renders as a
+    /// target of zero, which asserts a commitment nobody made. The two
+    /// categories that carry the strongest S2 findings — founder pay and
+    /// team-held supply — are precisely the ones with no published allocation,
+    /// so collapsing NULL to 0 would turn "outside the published terms
+    /// entirely" into "overran a zero budget", a weaker and different claim.
+    #[test]
+    fn an_unadvertised_commitment_is_null_not_zero() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.conn
+            .execute_batch(
+                "INSERT INTO commitment (category, share, source)
+                   VALUES ('ops_team', 0.15, 'docs/cases/MEKKA_COMMITMENTS.md');
+                 INSERT INTO commitment (category, share, source)
+                   VALUES ('supply', NULL, 'nothing published for S2');",
+            )
+            .unwrap();
+
+        let published: Option<f64> = l
+            .conn
+            .query_row(
+                "SELECT share FROM commitment WHERE category = 'ops_team'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unpublished: Option<f64> = l
+            .conn
+            .query_row(
+                "SELECT share FROM commitment WHERE category = 'supply'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(published, Some(0.15));
+        assert_eq!(
+            unpublished, None,
+            "an unadvertised category must read as absent, never as a zero target"
+        );
+    }
+
+    /// A commitment is ASSERTED — transcribed from marketing by an operator —
+    /// so no walk can reproduce it and `reset` must not clear it. The
+    /// distribution tables beside it ARE derived and must go, because they are
+    /// computed against a project boundary that is refined between runs.
+    #[test]
+    fn reset_keeps_the_commitments_but_clears_the_distributions() {
+        let mut l = Ledger::open_in_memory().unwrap();
+        l.conn
+            .execute_batch(
+                "INSERT INTO commitment (category, share, source)
+                   VALUES ('hashpower', 0.80, 'MEKKA_COMMITMENTS.md');
+                 INSERT INTO distribution_base
+                   (id, computed_unix, floor_slot, tip_slot, gross_proceeds,
+                    circular, external_raise, circular_txs, circular_assets)
+                   VALUES (1, 100, 192544877, 196408791, 68821, 15350, 53471, 15, 148);
+                 INSERT INTO distribution_leg
+                   (party, role, unit, quantity, legs, basis)
+                   VALUES ('stake1jp', 'founder', 'asset', 105, 11, 'asserted');
+                 INSERT INTO distribution_evidence
+                   (party, unit, tx_hash, quantity, slot)
+                   VALUES ('stake1jp', 'asset', 'deadbeef', 105, 195000000);",
+            )
+            .unwrap();
+
+        l.reset_derived().unwrap();
+
+        let count = |t: &str| -> i64 {
+            l.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            count("commitment"),
+            1,
+            "clearing the commitments would discard the only record of what was \
+             promised, and every target would then render as absent — which reads \
+             as 'nothing was pledged'"
+        );
+        assert_eq!(count("distribution_base"), 0);
+        assert_eq!(count("distribution_leg"), 0);
+        assert_eq!(count("distribution_evidence"), 0);
     }
 
     /// `reset_derived` names its tables in a list, so a table added to `SCHEMA`

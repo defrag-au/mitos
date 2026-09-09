@@ -11,12 +11,17 @@
 
 [venue.jpg]
 decoder = "jpg"
-# Sale contracts V1–V4 (exact bech32).
+# Sale contracts (exact bech32). V1 is its own validator; V2 and V3 are ONE
+# validator (script hash c727443d…) in its delegated (addr1x) and undelegated
+# (addr1w) bech32 forms — both occur on chain, so both must be listed.
+#
+# V4 is absent: no address that passes its bech32 checksum is known. The string
+# previously here did not, so it matched nothing and this list has never covered
+# V4. See the note in `mitos-marketplace-decode`'s `sales.rs`.
 sale_addrs = [
     "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm",
     "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
-    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx",
-    "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp",
+    "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7eg0fcr8k",
 ]
 # Collection-offer (CO) V2 contract.
 offer_addrs = [

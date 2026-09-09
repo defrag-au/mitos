@@ -19,17 +19,12 @@
 //! (Mithril semantics), and pallas-hardano's own reader pops it for the same
 //! reason. The tail belongs to the spool, not the sieve.
 
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::path::Path;
 
-use aho_corasick::AhoCorasick;
-use anyhow::{Context, Result, bail};
-use memchr::memmem::Finder;
-use mitos_chain_walk::mithril::CHUNK_SLOTS;
-use mitos_chain_walk::open_blocks;
+use anyhow::Result;
+// The scanning machine itself lives in `chain-sieve` (shared with
+// token-ledger's sieve walk); re-exported so call sites keep their names.
+pub use chain_sieve::{Needles, ScanStats, list_chunks};
 use pallas_addresses::{Address, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_traverse::MultiEraBlock;
 
@@ -115,50 +110,15 @@ pub struct MintedUnit {
     pub quantity: i64,
 }
 
-#[derive(Default)]
-pub struct ScanStats {
-    pub chunks: u64,
-    pub bytes: u64,
-    pub hit_chunks: u64,
-    pub hit_blocks: u64,
-    /// Blocks whose bytes matched but no tx output did — datum/metadata
-    /// mentions or byte coincidences. A false-positive rate gauge.
-    pub unmatched_hit_blocks: u64,
-    pub wall_secs: f64,
-}
-
-/// Sorted chunk numbers on disk within `[floor_chunk, newest)` — the newest
-/// file is excluded (still growing).
-pub fn list_chunks(immutable: &Path, floor_chunk: u64) -> Result<Vec<u64>> {
-    let mut nums: Vec<u64> = std::fs::read_dir(immutable)
-        .with_context(|| format!("reading {}", immutable.display()))?
-        .filter_map(|e| {
-            let name = e.ok()?.file_name().into_string().ok()?;
-            let stem = name.strip_suffix(".chunk")?;
-            stem.parse::<u64>().ok()
+/// Forward chain-sieve's progress into this tool's `Progress` enum.
+fn fwd<'x>(on: Prog<'x>) -> impl Fn(chain_sieve::ScanProgress<'_>) + Sync + use<'x> {
+    move |sp| {
+        on(Progress::Scan {
+            pass: sp.pass,
+            done: sp.done,
+            total: sp.total,
+            gb_per_s: sp.gb_per_s,
         })
-        .collect();
-    nums.sort_unstable();
-    if nums.len() < 2 {
-        bail!("need at least 2 chunk files (the newest is excluded as still-growing)");
-    }
-    nums.pop();
-    Ok(nums.into_iter().filter(|n| *n >= floor_chunk).collect())
-}
-
-/// Any of the target patterns, over any byte slice. Both pass shapes fit
-/// behind this one trait object-free enum so the worker loop is shared.
-enum Needles<'a> {
-    Creds(Vec<Finder<'a>>),
-    Hashes(AhoCorasick),
-}
-
-impl Needles<'_> {
-    fn hit(&self, haystack: &[u8]) -> bool {
-        match self {
-            Needles::Creds(fs) => fs.iter().any(|f| f.find(haystack).is_some()),
-            Needles::Hashes(ac) => ac.is_match(haystack),
-        }
     }
 }
 
@@ -172,21 +132,19 @@ pub fn cred_scan(
     threads: usize,
     on: Prog<'_>,
 ) -> Result<(Vec<FoundTx>, ScanStats)> {
-    let flat: Vec<[u8; 28]> = targets.iter().flatten().copied().collect();
-    let ac = (flat.len() > 3)
-        .then(|| AhoCorasick::new(&flat))
-        .transpose()
-        .context("building cred automaton")?;
-    run(
+    let flat: Vec<Vec<u8>> = targets
+        .iter()
+        .flatten()
+        .map(|c| c.as_slice().to_vec())
+        .collect();
+    let on = fwd(on);
+    chain_sieve::scan_extract(
         immutable,
         chunks,
         threads,
         "cred",
-        on,
-        || match &ac {
-            Some(ac) => Needles::Hashes(ac.clone()),
-            None => Needles::Creds(flat.iter().map(Finder::new).collect()),
-        },
+        &on,
+        || Needles::new(&flat).expect("cred needles"),
         &|block, _needles, out| {
             extract_cred_hits(block, targets, out);
         },
@@ -204,118 +162,19 @@ pub fn sweep_scan(
     threads: usize,
     on: Prog<'_>,
 ) -> Result<(Vec<FoundTx>, ScanStats)> {
-    let ac = AhoCorasick::new(own_hashes).context("building sweep automaton")?;
-    run(
+    let flat: Vec<Vec<u8>> = own_hashes.iter().map(|h| h.as_slice().to_vec()).collect();
+    let on = fwd(on);
+    chain_sieve::scan_extract(
         immutable,
         chunks,
         threads,
         "sweep",
-        on,
-        move || Needles::Hashes(ac.clone()),
+        &on,
+        || Needles::new(&flat).expect("sweep needles"),
         &|block, needles, out| {
             extract_sweep_hits(block, needles, owned, out);
         },
     )
-}
-
-/// The shared worker harness: chunk queue → raw memmem → block pass on hit.
-#[allow(clippy::too_many_arguments)]
-fn run<'a, MkNeedles>(
-    immutable: &Path,
-    chunks: &[u64],
-    threads: usize,
-    pass: &str,
-    on: Prog<'_>,
-    mk_needles: MkNeedles,
-    extract: &(dyn Fn(&MultiEraBlock<'_>, &Needles<'_>, &mut Vec<FoundTx>) + Sync),
-) -> Result<(Vec<FoundTx>, ScanStats)>
-where
-    MkNeedles: Fn() -> Needles<'a> + Sync,
-{
-    let started = Instant::now();
-    let queue: Mutex<VecDeque<u64>> = Mutex::new(chunks.iter().copied().collect());
-    let done_chunks = AtomicU64::new(0);
-    let done_bytes = AtomicU64::new(0);
-    let total = chunks.len() as u64;
-
-    let worker = |_: usize| -> Result<(Vec<FoundTx>, ScanStats)> {
-        let needles = mk_needles();
-        let mut found = Vec::new();
-        let mut stats = ScanStats::default();
-        loop {
-            let chunk = { queue.lock().expect("queue").pop_front() };
-            let Some(chunk) = chunk else { break };
-            let path: PathBuf = immutable.join(format!("{chunk:05}.chunk"));
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            stats.chunks += 1;
-            stats.bytes += bytes.len() as u64;
-            let dc = done_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            let db = done_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            if dc.is_multiple_of(100) {
-                let secs = started.elapsed().as_secs_f64();
-                on(Progress::Scan {
-                    pass,
-                    done: dc,
-                    total,
-                    gb_per_s: db as f64 / 1e9 / secs,
-                });
-            }
-            if !needles.hit(&bytes) {
-                continue;
-            }
-            stats.hit_chunks += 1;
-            drop(bytes);
-
-            // Block pass over just this chunk: fuzzy-seek to its first slot,
-            // stop at the next chunk's.
-            let start = chunk * CHUNK_SLOTS;
-            let end = (chunk + 1) * CHUNK_SLOTS;
-            let blocks = open_blocks(immutable, Some((start, Vec::new())))
-                .with_context(|| format!("seeking chunk {chunk}"))?;
-            for raw in blocks {
-                let raw = raw.map_err(|e| anyhow::anyhow!("reading block: {e:?}"))?;
-                let block = MultiEraBlock::decode(&raw)
-                    .map_err(|e| anyhow::anyhow!("decoding block in chunk {chunk}: {e:?}"))?;
-                if block.slot() >= end {
-                    break;
-                }
-                if !needles.hit(&raw) {
-                    continue;
-                }
-                stats.hit_blocks += 1;
-                let before = found.len();
-                extract(&block, &needles, &mut found);
-                if found.len() == before {
-                    stats.unmatched_hit_blocks += 1;
-                }
-            }
-        }
-        Ok((found, stats))
-    };
-
-    let per_thread: Vec<(Vec<FoundTx>, ScanStats)> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads.max(1))
-            .map(|i| s.spawn(move || worker(i)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("worker panicked"))
-            .collect::<Result<Vec<_>>>()
-    })?;
-
-    let mut found = Vec::new();
-    let mut stats = ScanStats::default();
-    for (f, st) in per_thread {
-        found.extend(f);
-        stats.chunks += st.chunks;
-        stats.bytes += st.bytes;
-        stats.hit_chunks += st.hit_chunks;
-        stats.hit_blocks += st.hit_blocks;
-        stats.unmatched_hit_blocks += st.unmatched_hit_blocks;
-    }
-    stats.wall_secs = started.elapsed().as_secs_f64();
-    Ok((found, stats))
 }
 
 /// 32-byte pallas `Hash` → owned array.
@@ -388,6 +247,16 @@ pub(crate) fn extract_cred_hits(
 ) {
     let slot = block.slot();
     for (ti, tx) in block.txs().iter().enumerate() {
+        // PHASE-2 FAILURE: the block declares this transaction invalid, so
+        // the ledger never created these outputs. The sieve's whole job is
+        // "did this wallet receive anything", and a phantom credit answers it
+        // WRONG in the direction a user would notice — funds shown arriving
+        // that never arrived. Its body decodes perfectly, which is why this
+        // has to be an explicit check rather than something a decode error
+        // would have caught.
+        if !tx.is_valid() {
+            continue;
+        }
         let outputs = tx.outputs();
         // Decode each output once; per-output, which targets it pays.
         struct Decoded {
@@ -516,6 +385,13 @@ fn extract_sweep_hits(
 ) {
     let slot = block.slot();
     for (ti, tx) in block.txs().iter().enumerate() {
+        // PHASE-2 FAILURE — and the sweep is the worse half. An invalid
+        // transaction NAMES the inputs it meant to spend without consuming
+        // them, so without this the sieve reads an owned UTxO as swept away
+        // while it is still sitting there.
+        if !tx.is_valid() {
+            continue;
+        }
         let inputs: Vec<([u8; 32], u32)> = tx
             .consumes()
             .iter()

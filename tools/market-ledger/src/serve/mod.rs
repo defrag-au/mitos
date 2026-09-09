@@ -64,6 +64,7 @@ fn router(state: AppState, token: auth::AuthToken) -> Router {
         .route("/events", get(handlers::events))
         .route("/count", get(handlers::count))
         .route("/listings", get(handlers::listings))
+        .route("/listings/scan", get(handlers::listings_scan))
         .layer(axum::middleware::from_fn_with_state(
             token,
             auth::require_auth,

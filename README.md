@@ -73,11 +73,11 @@ Shipped + in production:
   production modules had migrated.
   Design: [`MITOS_PLATFORM_V2.md`](docs/strategy/MITOS_PLATFORM_V2.md);
   deployment story: [`MITOS_PLATFORM_DEPLOYMENT.md`](docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md).
-- **Community modules.** Thirteen wasm modules ship in `community-modules/`
-  — jpg.store (listing / offer / sale), CIP-25 / CIP-68 mints, CSWAP +
-  Splash DEXes, holder distribution, asset movement, vesting, burn
-  taxonomies. Loadable by any bundle, addressable from any companion by
-  name. Design:
+- **Community modules.** Nineteen wasm modules ship in `community-modules/`
+  — jpg.store **and Wayup** (listing / offer / sale each), CIP-25 / CIP-68
+  mints, CSWAP + Splash DEXes, holder distribution, collection holders +
+  metadata, asset movement, vesting, credit and burn taxonomies. Loadable by
+  any bundle, addressable from any companion by name. Design:
   [`COMMUNITY_MODULES.md`](docs/strategy/COMMUNITY_MODULES.md).
 - **Companion runtime v1.** CF Worker Durable Object SDK
   (`mitos-companion`) absorbing the per-companion subscribe / HTTP
@@ -125,53 +125,113 @@ For the longer arc see [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) and
 [`docs/strategy/MODULE_COMPOSITION.md`](docs/strategy/MODULE_COMPOSITION.md)
 (upstream-module dependencies — roadmap, not built).
 
+## ⚠️ Two families live here
+
+The repository holds **two kinds of program that share almost nothing but a
+workspace and a pallas pin.** Knowing which one you are looking at is the first
+thing to establish, because the conventions differ completely.
+
+| | **A — the bundle** | **B — snapshot walkers** |
+|---|---|---|
+| what it is | one long-running process | one-shot / on-demand binaries |
+| chain source | **Dolos**, live, following the tip | **Mithril immutable chunk files**, certified, offline |
+| unit of work | a wasm module reacting to an eUTXO event | a walk over a slot range |
+| output | events pushed to a CF companion | Parquet / sqlite / a memory-mapped index |
+| lives in | `bundles/`, `community-modules/`, `crates/mitos-*` | `tools/{token,market,project}-ledger`, `wallet-*`, `*-index` |
+| entry point | `docs/design/ARCHITECTURE.md` | each tool's own `README.md` |
+
+Family B does **not** load the wasm runtime, subscribe to anything, or talk to
+Dolos. It reads chunk files. If you are editing a walker and find yourself
+reaching for `mitos-platform`, you are in the wrong half.
+
+They meet in exactly two places: the shared **decode crates**
+(`mitos-dex-decode`, `mitos-marketplace-decode`, `mitos-vesting-decode`,
+`mitos-launchpad-decode`) — a datum is a datum whoever is reading it — and the
+`pallas` version pin.
+
 ## Layout
 
 ```
 mitos/
-├── crates/
-│   ├── mitos-core/                # dispatcher, `Bundle`, replicate-router test surface, in-tree `Indexer` trait
-│   ├── mitos-protocol/            # framework-free wire types (subscribe, interest, wire frames)
-│   ├── mitos-data-plane/          # typed chain-data lookups over Dolos
-│   ├── mitos-platform/            # wasm module runtime (v2 dispatch, aux-data cache, Maestro fallback, dialer)
-│   ├── mitos-companion/           # CF Worker DO runtime SDK (companion-side; HTTP apply / recapture)
-│   ├── mitos-community-events/    # shared event types for community modules
-│   ├── mitos-module-kit/          # module-side helpers (budget limiter, page sizer, re-entrant chunking)
-│   ├── mitos-dex-decode/          # shared DEX datum decoders (cswap / splash)
-│   ├── mitos-vesting-decode/      # shared vesting datum decoders (Shield, CrowdLock)
-│   └── none-match-indexer/        # residual-pass coordinator for the synchronised dispatcher
-├── community-modules/             # wasm modules loaded at bundle startup
-│   ├── asset-metadata-update/
-│   ├── asset-transfer/
-│   ├── burn-address/
-│   ├── cip-25-mint/
-│   ├── cip-68-mint/
-│   ├── cswap-dex/
-│   ├── holder-distribution/
-│   ├── jpg-store-listing/
-│   ├── jpg-store-offer/
-│   ├── jpg-store-sale/
-│   ├── splash-dex/
-│   ├── standard-burn/
-│   └── vesting-tracker/
-├── bundles/
-│   └── default/                   # composite binary: Dolos + Platform v2 runtime
-├── tools/
-│   ├── mitos-admin/               # admin HTTP client (modules, recapture, emissions, companions)
-│   ├── mitos-build/               # builds wasm module artifacts + manifests
-│   ├── mitos-run/                 # local fixture-driven module test runner
-│   ├── mitos-tail/                # WS CBOR client for the `/replicate/{indexer}` test surface
-│   ├── capture-block/             # capture chain blocks for tests
-│   └── diff-collection-ownership/ # parallel-run convergence diff harness
-└── docs/
-    ├── design/                    # contract docs (ARCHITECTURE, RECAPTURE, ROADMAP, …)
-    └── strategy/                  # active-workstream design docs
+├── bundles/default/               # A: composite binary — Dolos + Platform v2 runtime
+├── community-modules/             # A: 13 wasm modules loaded at bundle startup
+└── docs/{design,strategy}/        # contract docs and active-workstream docs
 ```
 
-The default bundle links the framework crates and runs the Platform v2 host;
+### `crates/` — libraries
+
+**A — the framework**
+
+| crate | what |
+|---|---|
+| `mitos-platform` | wasm module runtime (v2 dispatch, aux-data cache, Maestro fallback, dialer). The largest thing in the repo. |
+| `mitos-core` | dispatcher, `Bundle`, replicate-router test surface, in-tree `Indexer` trait |
+| `mitos-data-plane` | typed chain-state queries over Dolos |
+| `mitos-protocol` | framework-free wire types (subscribe, interest, frames) |
+| `mitos-companion` | CF Worker Durable Object SDK — the *companion* side |
+| `mitos-community-events` | typed event payloads modules emit |
+| `mitos-module-kit` | module-author helpers (budget limiter, re-entrant chunking) |
+| `none-match-indexer` | residual pass for movements no specific domain claimed |
+
+**B — walkers, indexes and archives**
+
+| crate | what |
+|---|---|
+| `chain-sieve` | SIMD substring search over raw chunk bytes; CBOR decode only on hit. The scanning machine every "needle in 225 GB" tool shares. |
+| `tx-index` | tx hash → `(chunk, body offset)`. Input resolution in one `pread`. |
+| `policy-index` | `(policy, asset)` → its mint tx **and its metadata span**. Rides tx-index's extraction pass. |
+| `policy-archive` | the sealed Parquet archive of one policy's movements — writer, reader, and the tiers over it |
+| `token-ledger-wire` / `market-ledger-wire` | wire formats those tools' consumers decode |
+
+**Shared by both — decode**
+
+| crate | what |
+|---|---|
+| `mitos-dex-decode` | CSwap / Splash / Minswap pool + order datums and credentials |
+| `mitos-marketplace-decode` | jpg.store / Wayup redeemers and listing datums |
+| `mitos-vesting-decode` | Shield / CrowdLock vesting datums |
+| `mitos-launchpad-decode` | snek.fun bonding curves — a launch is not a constant-product pool |
+| `mitos-cohort` | what KIND of holder an address is (burn / pool / vesting / script / wallet) and how firmly that is known |
+| `mitos-pool-observe` | read a DEX pool's reserves the way that venue actually publishes them |
+| `mitos-koios` | the Koios calls this workspace makes, in one place, plus the first-mint FLOOR rule |
+
+### `tools/` — binaries
+
+**B — snapshot walkers and their indexes**
+
+| tool | what | README |
+|---|---|---|
+| `token-ledger` | one policy's movements → Parquet archive, on demand; serves a live correcting feed | [→](tools/token-ledger/README.md) |
+| `market-ledger` | listings / offers / sales across marketplaces into one slot-keyed ledger | [→](tools/market-ledger/README.md) |
+| `project-ledger` | one project's mint window: capital in, holders forming, capital out | [→](tools/project-ledger/README.md) |
+| `wallet-sieve` | on-demand single-wallet flow excavation | [→](tools/wallet-sieve/README.md) |
+| `wallet-trace` | wallet clustering from vkey witness sets | [→](tools/wallet-trace/README.md) |
+| `tx-index` | build + serve the tx-hash index | [→](tools/tx-index/README.md) |
+| `mitos-chain-walk` | *library*, not a binary: the shared walker plumbing (bootstrap, chunk iteration, bare-pallas decode, checkpoint mirror) | [→](tools/mitos-chain-walk/README.md) |
+
+**A — framework tooling**
+
+| tool | what | README |
+|---|---|---|
+| `mitos-admin` | admin HTTP client (modules, recapture, emissions, companions) | [→](tools/mitos-admin/README.md) |
+| `mitos-build` | builds wasm module artifacts + manifests | [→](tools/mitos-build/README.md) |
+| `mitos-run` | fixture-driven local module runner — no Dolos, no host | [→](tools/mitos-run/README.md) |
+| `mitos-tail` | WS CBOR client for the `/replicate/{indexer}` test surface | |
+| `capture-block` | capture chain blocks as test fixtures | |
+| `diff-collection-ownership` | parallel-run convergence diff harness | |
+
+The default bundle links the family-A crates and runs the Platform v2 host;
 modules are *not* baked into the binary. Each community module is built into a
 wasm artifact + manifest by `mitos-build` and loaded via the platform registry
 at host startup.
+
+> **Where the documentation actually is.** Crates without a `README.md` are
+> documented by their `//!` module header, which is kept current because it
+> sits next to the code — start there, not with a search. The design rationale
+> for anything substantial lives in `docs/design/` or `docs/strategy/`, and the
+> analytical walkers' designs live in the sibling `cnft.dev-workers/docs/design/`
+> repo (`TX_INDEX.md`, `POLICY_INDEX.md`, `POLICY_ARCHIVE_*.md`,
+> `MARKET_LEDGER.md`, …).
 
 ## Building
 
@@ -187,14 +247,23 @@ If you have cargo on PATH already (e.g. via system rustup), plain
 requirement.
 
 Dolos crate dependencies are git-pinned to a specific tag in `Cargo.toml`
-(currently `v1.0.3`). First build will resolve and compile them — this
-takes a while. Subsequent rebuilds are incremental.
+(currently **`v1.2.0`** — `Cargo.toml` is the authority, and its comment
+carries the reasoning for the pin). First build will resolve and compile them;
+this takes a while, and subsequent rebuilds are incremental.
 
 **The pinned Dolos tag must match the version that wrote the data
 directory you're pointing the bundle at.** Dolos's WAL schema is versioned
 and a mismatch fails fast with `WAL schema not compatible: found=N
 expected=M`. See [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) Phase 1
 notes for the full incident and recovery commands.
+
+⚠️ **v1.2.0 versions the WAL on-disk schema and force-resets on
+incompatibility**, so expect a Dolos **resync** on first run after the bump.
+Two other pins are load-bearing and documented in `Cargo.toml`: one `pallas`
+across mitos and the embedded Dolos (they share types at the follower
+boundary), and a `utxorpc-spec` held at 0.19.0 — 0.19.2 made
+`asset_name`/`policy_id` optional within the 0.19 line and will not compile
+Dolos, so a broad `cargo update` can break the build.
 
 ## Running
 

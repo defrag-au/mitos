@@ -1,0 +1,19 @@
+
+payment credential 2d14d214d3904b13f14799199f0a03dedae66fd52b77ba1bc65dec72
+  20922905 tokens across 18 UTxOs / 1 address(es)
+  lock-datum decode: 0/18 ok · 18 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1wyk3f5s56wgykyl3g7v3n8c2q00d4en0654h0wsmcew7cusg6lfzx
+
+payment credential 464eeee89f05aff787d40045af2a40a83fd96c513197d32fbc54ff02
+  2087665 tokens across 2 UTxOs / 2 address(es)
+  lock-datum decode: 0/2 ok · 2 readable but a different shape · 0 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ has state, but NOT the Shield/CrowdLock shape — a different design.
+     addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207qj6x0pkn9v8hmrtrrcwa85f0a3gz2mr45t8xvgf0cy433yqn553d6
+     addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207qjktcfgj07ewka8szepz8mq4wj8vcvrgl7y75z8ya3tpkgqmda8h2
+
+payment credential af97793b8702f381976cec83e303e9ce17781458c73c4bb16fe02b83
+  1641801 tokens across 1 UTxOs / 1 address(es)
+  lock-datum decode: 0/1 ok · 0 readable but a different shape · 1 hash-only (UNTESTABLE — unspent) · 0 no datum at all
+  ⇒ undetermined: the datum is hash-only and unspent, so the chain has not revealed it. Not evidence either way.
+     addr1zxhew7fmsup08qvhdnkg8ccra88pw7q5trrncja3dlszhqa40rw2u28d3gcgxpqfdjqxstcecd6k2jy5m3mlpn4uqt8q8pcfwh

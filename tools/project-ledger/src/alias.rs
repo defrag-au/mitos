@@ -59,10 +59,7 @@ mod tests {
     use super::*;
 
     fn asset(policy: [u8; 28], name: &[u8]) -> Asset {
-        Asset {
-            policy: policy.to_vec(),
-            name: name.to_vec(),
-        }
+        Asset::nft(policy.to_vec(), name.to_vec())
     }
 
     #[test]

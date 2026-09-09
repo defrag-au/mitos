@@ -15,7 +15,7 @@ use std::cell::RefCell;
 
 use mitos_community_events::wayup_store_sale::WayupStoreSale;
 use mitos_marketplace_decode::{
-    AssetId, DecodeTx, TxInput, TxOutput, WayupSaleConfig, decode_wayup_sales, is_buy_redeemer,
+    AssetId, DecodeTx, ListingContract, TxInput, TxOutput, WayupSaleConfig, decode_wayup_sales,
 };
 use serde::Deserialize;
 
@@ -65,7 +65,11 @@ fn to_asset_ids(assets: &[crate::mitos::platform_v2::types::AssetEntry]) -> Vec<
 /// avoid the per-hash host lookups a blanket resolve would incur.
 fn build_input(c: &ConsumedEvent) -> TxInput {
     let at_venue = SALE_CONFIG.with(|cfg| cfg.borrow().is_listing_address(&c.prior_output.address));
-    let is_buy = c.redeemer.as_deref().map(is_buy_redeemer).unwrap_or(false);
+    let is_buy = c
+        .redeemer
+        .as_deref()
+        .map(|r| ListingContract::Wayup.is_buy_redeemer(r))
+        .unwrap_or(false);
     let datum = if at_venue && is_buy {
         resolve_datum_bytes(c.prior_datum.as_ref())
     } else {

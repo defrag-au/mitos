@@ -1,0 +1,35 @@
+# tx-index — tx hash → (chunk, body offset) locator over a Mithril immutable DB.
+#
+# The immutable DB is indexed by SLOT (the .primary/.secondary sidecars) and
+# nothing on disk maps a tx hash to anything — a hash is computed, never
+# stored, so every walker that resolves inputs today either keeps its own
+# UTxO buffer or decodes-and-hashes whole bands of chunks to find one body.
+# This crate pays that decode+hash ONCE per completed chunk, emits an
+# append-only segment per chunk, and compacts them into a prefix-directory
+# array that answers a random hash in one directory read + one short scan.
+#
+# Design: cnft.dev-workers docs/design/TX_INDEX.md.
+[package]
+name = "tx-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "tx hash → (chunk, body offset) locator over a Mithril immutable DB, for O(1) input resolution"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Block/tx decode straight from chunk bytes (no pallas-hardano: the extractor
+# splits CBOR items itself so it knows every byte offset it records).
+pallas-traverse = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-codec = { workspace = true }
+# blake2b-256 — the tx hash, computed at extraction and re-verified on read.
+pallas-crypto = { workspace = true }
+
+memmap2 = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }

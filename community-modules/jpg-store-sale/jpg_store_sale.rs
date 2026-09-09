@@ -11,7 +11,8 @@
 
 use mitos_community_events::jpg_store_sale::JpgStoreSale;
 use mitos_marketplace_decode::{
-    AssetId, DecodeTx, TxInput, TxOutput, classify_jpg_address, decode_jpg_sales, is_buy_redeemer,
+    AssetId, DecodeTx, TxInput, TxOutput, classify_jpg_address, decode_jpg_sales,
+    jpg_listing_contract,
 };
 
 use crate::mitos::platform_v2::emit;
@@ -44,9 +45,12 @@ fn to_asset_ids(assets: &[crate::mitos::platform_v2::types::AssetEntry]) -> Vec<
 /// call) is done lazily — only for jpg-script consumes with a Buy redeemer —
 /// to avoid the per-hash host lookups a blanket resolve would incur.
 fn build_input(c: &ConsumedEvent) -> TxInput {
-    let at_venue = classify_jpg_address(&c.prior_output.address).is_some();
-    let is_buy = c.redeemer.as_deref().map(is_buy_redeemer).unwrap_or(false);
-    let datum = if at_venue && is_buy {
+    // The buy constructor depends on WHICH jpg validator this listing sits at —
+    // V1 and V2/V3 are opposite — so classify first and ask that contract.
+    let is_buy = classify_jpg_address(&c.prior_output.address)
+        .zip(c.redeemer.as_deref())
+        .is_some_and(|(version, r)| jpg_listing_contract(&version).is_buy_redeemer(r));
+    let datum = if is_buy {
         resolve_datum_bytes(c.prior_datum.as_ref())
     } else {
         None

@@ -1,0 +1,21 @@
+# The byte-sieve core, extracted from wallet-sieve so every "find my needle
+# in 225 GB of chunks" tool shares one scanning machine.
+#
+# Two primitives:
+# - `scan_extract` — wallet-sieve's harness, generic over the hit type:
+#   parallel chunk queue → raw memmem → block pass on hit → extract.
+# - `block_gate` — for ORDERED, stateful consumers (token-ledger's walk):
+#   a per-block memmem gate applied inside an existing sequential pass, so
+#   decode is only paid on blocks that can possibly matter.
+[package]
+name = "chain-sieve"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+aho-corasick = "1"
+anyhow = { workspace = true }
+memchr = "2"
+mitos-chain-walk = { path = "../../tools/mitos-chain-walk" }
+pallas-traverse = { workspace = true }

@@ -1,0 +1,15 @@
+# token-ledger-wire — the compact binary artifacts `token-ledger export`
+# writes and consumers (egui WASM frontends, workers) load. Pure types +
+# codec: serde + postcard only, no runtime deps, safe for
+# wasm32-unknown-unknown.
+
+[package]
+name = "token-ledger-wire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }

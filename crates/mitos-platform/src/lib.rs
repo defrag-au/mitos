@@ -66,6 +66,7 @@ pub mod indexer_data_cache;
 pub mod inspect;
 pub mod koios;
 pub mod lag_tolerant;
+pub mod local_tx_index;
 pub mod maestro;
 pub mod maestro_fallback_plane;
 pub mod manifest;

@@ -11,7 +11,11 @@ pub enum Progress<'a> {
         total: u64,
         gb_per_s: f64,
     },
-    /// The resolve pass ticking through bands, newest first.
+    /// The resolve pass naming senders through the tx index, one point
+    /// lookup per wanted hash.
+    Lookup { done: usize, total: usize },
+    /// The resolve SWEEP ticking through bands, newest first — the fallback
+    /// for chunks the index has not covered yet.
     Resolve {
         done: usize,
         total: usize,

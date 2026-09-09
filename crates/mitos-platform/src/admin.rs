@@ -286,6 +286,7 @@ fn admin_router_inner(
             "/_admin/modules/{id}/emissions/{emission_id}/replay",
             post(replay_emission),
         )
+        .route("/_admin/utxos", get(get_utxos_by_address))
         .route("/_admin/blocks/{slot}", get(get_block_by_slot))
         .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
         .layer(axum::middleware::from_fn_with_state(scopes, require_auth));
@@ -448,6 +449,37 @@ pub struct CompanionsResponse {
     /// A recapture is currently in flight for this module.
     pub recapture_in_progress: bool,
     pub companions: Vec<CompanionDetail>,
+}
+
+/// Query for `GET /_admin/utxos`.
+#[derive(Debug, Deserialize)]
+struct UtxosQuery {
+    /// Bech32 address whose unspent set to list.
+    address: String,
+}
+
+/// One unspent output reference.
+#[derive(Debug, Serialize)]
+struct UtxoRefEntry {
+    tx_hash: String,
+    index: u32,
+}
+
+/// Response for `GET /_admin/utxos`.
+#[derive(Debug, Serialize)]
+struct UtxosResponse {
+    address: String,
+    count: usize,
+    /// The data plane capped this result, so it is a PREFIX of the unspent set
+    /// and not the set itself.
+    ///
+    /// Reported because the difference is invisible otherwise, and the
+    /// consequence is severe for the obvious consumer: a reconciler that
+    /// treats "not in this list" as "not on chain" will delete live rows. The
+    /// jpg ask-book walker did precisely that against the V1 listing address,
+    /// which holds more than the cap.
+    truncated: bool,
+    utxos: Vec<UtxoRefEntry>,
 }
 
 /// Query for `GET /_admin/events`.
@@ -2094,6 +2126,55 @@ async fn last_trap(
 /// `503 Service Unavailable` when the admin router was mounted
 /// without a chain-data handle (artifact-only deployments).
 /// `404 Not Found` when the slot isn't in the archive.
+/// `GET /_admin/utxos?address=<bech32>` — the current unspent set at an
+/// address, as bare output references.
+///
+/// Read-only, and deliberately REFS ONLY. Decoding 170k outputs into one
+/// response would be a multi-hundred-megabyte body dominated by datum
+/// payloads; a caller that wants the outputs resolves the refs itself, and on
+/// this box `tx-index` does that from the chunk store in well under a
+/// millisecond each. The split is the point: mitos knows what is UNSPENT
+/// (which needs the whole chain's spend history), tx-index knows what any
+/// output CONTAINS. Neither can answer the other's question.
+///
+/// The motivating caller is the jpg ask-book backfill, which needs the
+/// residual listing set — see the mirror's `/_admin/asks/backfill`.
+async fn get_utxos_by_address(
+    State(state): State<AdminState>,
+    axum::extract::Query(q): axum::extract::Query<UtxosQuery>,
+) -> Result<Response, HandlerError> {
+    let Some(chain_data) = state.chain_data.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin router mounted without chain-data handle; utxo query unavailable",
+        )
+            .into_response());
+    };
+    let address = q.address.trim();
+    if address.is_empty() {
+        return Ok((StatusCode::BAD_REQUEST, "address is required").into_response());
+    }
+    match chain_data.utxos_by_address(address).await {
+        Ok(refs) => {
+            let utxos: Vec<UtxoRefEntry> = refs
+                .into_iter()
+                .map(|r| UtxoRefEntry {
+                    tx_hash: hex::encode(r.tx_hash),
+                    index: r.index,
+                })
+                .collect();
+            Ok(Json(UtxosResponse {
+                address: address.to_owned(),
+                count: utxos.len(),
+                truncated: utxos.len() >= mitos_data_plane::UTXOS_BY_ADDRESS_HARD_CAP,
+                utxos,
+            })
+            .into_response())
+        }
+        Err(e) => Err(HandlerError::ChainData(format!("utxos_by_address: {e}"))),
+    }
+}
+
 async fn get_block_by_slot(
     State(state): State<AdminState>,
     Path(slot): Path<u64>,

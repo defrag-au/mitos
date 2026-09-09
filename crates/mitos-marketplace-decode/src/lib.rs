@@ -19,13 +19,17 @@
 
 pub mod datum;
 pub mod listings;
+pub mod metadata_datum;
 pub mod offer_datum;
 pub mod offer_lifecycle;
 pub mod offers;
 pub mod sales;
 
-pub use datum::{DecodedListing, decode_listing_datum, is_buy_redeemer, is_cancel_redeemer};
+pub use datum::{DecodedListing, ListingContract, decode_listing_datum};
 pub use listings::{decode_jpg_listings, decode_wayup_listings};
+pub use metadata_datum::{
+    aux_data_from_tx_cbor, parse_metadata_datums, recover_datum_from_metadata,
+};
 pub use offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 pub use offer_lifecycle::{decode_jpg_offer_lifecycle, decode_wayup_offer_lifecycle};
 pub use offers::{
@@ -34,7 +38,7 @@ pub use offers::{
 };
 pub use sales::{
     MatchedSale, WayupSaleConfig, classify_jpg_address, decode_jpg_sales, decode_wayup_sales,
-    is_marketplace_escrow,
+    is_marketplace_escrow, jpg_listing_contract,
 };
 
 /// A native asset (policy id + on-chain asset-name bytes).

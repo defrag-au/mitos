@@ -1,0 +1,129 @@
+[package]
+name = "token-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "token-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# Shared walker plumbing: Mithril bootstrap, immutable-DB iteration, bare-pallas
+# tx decode, crash-visible checkpoint mirror. Same seam market-ledger and
+# project-ledger use — this tool adds no chain plumbing of its own.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+# The sieve gate — memmem raw blocks for the policy id, decode only on hit.
+# Shared machinery with wallet-sieve.
+chain-sieve = { path = "../../crates/chain-sieve" }
+# tx hash → body over the same snapshot: a DETOUR — a window read ahead of
+# the descent for a seek below the floor — resolves its inputs on the spot
+# instead of waiting for the descent to reach them.
+tx-index = { path = "../../crates/tx-index" }
+
+# `serve` — the hosted any-token-on-demand surface. Tokio is confined to
+# serve::run, per the wallet-sieve convention.
+# The sealed Parquet archive — writer AND reader in one crate, so `seal` and
+# `archive` here, a Worker over R2, and a wasm frontend all speak one format.
+# It pins `parquet` with `default-features = false` (no `arrow`, which
+# measured 16× larger in wasm) and SNAPPY only, because every reader has to
+# link whatever the writer chose. See docs/design/POLICY_ARCHIVE_AND_SCALE.md.
+policy-archive = { path = "../../crates/policy-archive" }
+# WHAT COUNTS AS A UNIT of a collection — `AssetRole::of_bytes`. A policy's
+# on-chain asset list is not its supply: CIP-68 mints a reference twin per
+# collectible and CIP-27 adds a royalty token, so counting the raw list
+# doubled Mekka S1 (5,000 NFTs, 9,690 "units") and added a phantom +1 to
+# every CIP-25 drop. The vocabulary is shared with the frontends that draw
+# the same numbers, because two implementations of "is this a unit" is two
+# answers.
+cardano-assets = { workspace = true }
+# The pending-input sidecar a reverse pass carries between passes — the same
+# codec the wire artifacts use, for the same reason (compact, no schema file).
+postcard = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+# SSE progress on the policy feed — the same streaming shape wallet-sieve's
+# `/events` uses, so flow-explorer consumes both identically.
+tokio-stream = { workspace = true }
+# The in-process archive publisher: R2 through an S3 client (conditional
+# manifest put, list, delete), the KV bundle through the Cloudflare API.
+object_store = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+tower-http = { workspace = true }
+
+# Pool script addresses + the CSwap pool datum (LP policy/name = the pool
+# INSTANCE key, fee bps, LP supply). Pure decode, no WIT coupling — the shared
+# unit, per the crate's own "composition over coordination" note.
+mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }
+
+# CrowdLock / Shield lock recognition (payment credential) + the lock datum
+# (unlock timestamp + the real owner behind the contract). Same pure-decode
+# seam as the DEX crate.
+mitos-vesting-decode = { path = "../../crates/mitos-vesting-decode" }
+
+# What KIND of holder an address is, and how firmly that is known. Was a module
+# of this binary until 2026-09-08, which put the interpretive layer somewhere
+# the archive path and a Worker could not reach. Kept free of `mitos-chain-walk`
+# so it stays cheap to link into wasm.
+mitos-cohort = { path = "../../crates/mitos-cohort" }
+# Recognise a pool OUTPUT and read its reserves the way that venue publishes
+# them. Separate crate from `mitos-cohort` because it needs the walker's output
+# shape; see either crate's header for why the split is by dependency class.
+mitos-pool-observe = { path = "../../crates/mitos-pool-observe" }
+# Bonding-curve recognition + datum. A launch is the token's most consequential
+# single event and the observer that records it is a thin adapter over this.
+mitos-launchpad-decode = { path = "../../crates/mitos-launchpad-decode" }
+
+# The artifacts `export` writes — shared with the egui WASM frontend that
+# loads them, so the format lives in a crate rather than in this tool.
+token-ledger-wire = { path = "../../crates/token-ledger-wire" }
+# The floor probe: one `policy_asset_info` call when nothing local knows a
+# policy's first mint. Shared with project-ledger so the MINIMUM-creation rule
+# has one home.
+mitos-koios = { path = "../../crates/mitos-koios" }
+# The LOCAL floor probe: (policy → first chunk) in ~3 µs, against a Koios
+# round-trip. Koios stays as the fallback for a policy the index has not
+# reached, so the walk never depends on the index existing.
+policy-index = { path = "../../crates/policy-index" }
+
+# Curated token decimals, keyed by full unit. Decimals are NOT on chain, so a
+# walker cannot derive them — this is the shared table of the ones we can
+# vouch for, already used by project-ledger. Serde-only, no I/O.
+chain-ledger = { workspace = true }
+
+# The ledger. Full fidelity on the walk box; the export is what gets optimised.
+rusqlite = { workspace = true }
+
+# pallas directly for the buffer/mint assembly and stake-address derivation.
+pallas-traverse = { workspace = true }
+pallas-addresses = { workspace = true }
+pallas-primitives = { workspace = true }
+
+# `posix_fadvise` — a walk hands each chunk's pages back to the page cache
+# so it does not evict market-ledger's and mitos's working sets on its way
+# through the snapshot. See `reverse::drop_chunk_pages`.
+libc = { workspace = true }
+
+# gzip for the published artifacts, IN PROCESS. `push-artifacts.sh` shells
+# out to `gzip -9`; the archive publisher replaced that shape for a reason and
+# the graph artifact does not reintroduce it.
+flate2 = "1"
+
+clap = { workspace = true }
+serde = { workspace = true }
+# The catalogue card — a small JSON sidecar per token so a listing surface
+# does not have to fetch and decode every spine.
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+
+# The watched-token registry is a small TOML file; parse it directly rather
+# than pull the whole `config` stack (same choice market-ledger makes for its
+# venue registry).
+toml = "0.8"
+
+[dev-dependencies]
+# A throwaway ledger + archive on disk for the seal round-trip test.
+tempfile = "3"

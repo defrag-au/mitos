@@ -1,0 +1,33 @@
+ledger: 43a056f26f68662461fee21869fe3d944b3cbf276be0c7a5201b25a4  43a056f26f68662461fee21869fe3d944b3cbf276be0c7a5201b25a4 (whole policy)  decimals unknown
+txs 1973  deltas 36987  parties seen 138
+PARTIAL LEDGER — coverage reaches back only to slot 0, so these are NET MOVEMENTS in that window, NOT holdings.
+parties that moved: 109  ·  net units moved: 34383  ·  movements still missing a source: 5300
+  deepen with `reverse` until the unresolved count stops falling.
+
+            9156  26.63%  wallet   addr1q8h5l3vmwxfqrgk70f865vngk47…  stake1u94awh49qf7lzu
+            4217  12.26%  wallet   addr1q83h0r5jnulea5v05qf5w6jgdqy…  stake1u9dd5fe0k8jqzt
+            3237   9.41%  wallet   addr1q9tz72ua4ycrx7sn0wqjzq3992c…  stake1u9533jwajkec6q
+            3145   9.15%  wallet   addr1qyhr3kczkscg6ugvhhgjfdlkslw…  stake1uxf394sx835lq4
+            2725   7.93%  wallet   addr1q99qpegypskhugq6nss8gjkwvjl…  stake1u8962x3wtddcq2
+            1547   4.50%  wallet   addr1qyqrengtwrhua2yeyp8h0y2gtk5…  stake1u83qwm49uvapkh
+            1492   4.34%  wallet   addr1qxqplflgrujkk05hhcrq9jg4xx4…  stake1u8el5039cvxzgg
+             696   2.02%  wallet   addr1qyrscm45c3cyl9sqrsav5r6f223…  stake1ux3lghjny5u3yc
+             598   1.74%  wallet   addr1qxhlmdh7g4h4a3g6d77y48355py…  stake1u8f8sf3gvemaz7
+             586   1.70%  wallet   addr1q97dcck74v4ny7s0vu0fkt52cl6…  stake1uy36vwfvfxf7e9
+             578   1.68%  wallet   addr1qyjym4hwkc3yrgksje2mpamd4m2…  stake1ux8p7evjnzsm76
+             564   1.64%  wallet   addr1q98282v3tsfn58sch9rexsyz266…  stake1uxctgmcu3750vp
+             513   1.49%  wallet   addr1qykm9mvmmhhz2uua2jqdtufzx7u…  stake1uyuamf6gl2u467
+             508   1.48%  wallet   addr1qxt4zcrgu4eu8jdy7ajgudqrwf4…  stake1uxplukf5hmt4up
+             412   1.20%  wallet   addr1q9s2vtmhpjsmsvkg6rnt2zu4vw2…  stake1uyf8vucm9vf2rg
+             407   1.18%  wallet   addr1qy9mg28evkzcfghsmfnwaf30vu9…  stake1uxmaqke42j9q6v
+             301   0.88%  wallet   addr1q8c6tr7zea729xj0fgqxxgkqhqt…  stake1u9dk3g762pu3d4
+             300   0.87%  wallet   addr1qyp7jdpmylh6fl3d088w3ehgndl…  stake1u9pnzqcrvnt6nj
+             272   0.79%  wallet   addr1q9nlqhev0mdvhhz0d2k7qg8mavd…  stake1uxxd32q7ep3cg2
+             270   0.79%  wallet   addr1q9j542uvtdmshepzyz4v3ua94qj…  stake1u9rh2ptagufk03
+             253   0.74%  wallet   addr1qyfqje8r64v4tshp8af0z54qnx7…  stake1uydx3n6mjgnf5r
+             230   0.67%  wallet   addr1qy9mrgfydjgjp20h00ttj09ahwr…  stake1u8vfrqum5uucvh
+             176   0.51%  wallet   addr1qxxcq4yw6wa2cd06xn53p8m4y2p…  stake1u84jyw2effrllj
+             141   0.41%  wallet   addr1q9uzdw0wg5tj2cm6gawrqz9s2jx…  stake1u8rsft9xhc2q40
+             140   0.41%  wallet   addr1qyrgyu3x5vqul78qa2g9q8l62xx…  stake1uxmc9vartujaeh
+
+mint, cascade and cap reports SKIPPED — each divides by supply, and a partial ledger has no supply figure to divide by.

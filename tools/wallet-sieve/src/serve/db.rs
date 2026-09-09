@@ -149,6 +149,23 @@ fn migrate(conn: &Connection) -> Result<()> {
         // measured row counts, so a rotated exchange address is caught on its
         // own merits rather than needing to be recognised.
         ("wallet", "oversize_rows", "INTEGER"),
+        // When this row was last offered to market-ledger, or NULL if never.
+        //
+        // THE ABSENCE OF A VERDICT IS A VERDICT. `market IS NULL` alone cannot
+        // tell "not yet asked" from "asked, and market-ledger has never heard
+        // of it" — and the second is the common case, because most rows are
+        // ordinary transfers that no marketplace was ever involved in.
+        // Without this column the enrichment pass re-asks the same permanently
+        // unanswerable question every refresh: measured on the live cache,
+        // 33,639 hashes re-probed every twenty minutes for a yield of ZERO,
+        // against 133,740 of 169,490 rows (79%) that are NULL and always will
+        // be.
+        //
+        // Not a plain boolean, because market-ledger is itself a follower and
+        // may simply not have reached this block yet. The timestamp lets
+        // `hashes_needing_market` re-ask only where the check plausibly RAN
+        // TOO EARLY — see `MARKET_SETTLE_SECS`.
+        ("flow", "market_checked_unix", "INTEGER"),
     ] {
         if let Err(e) = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), []) {
             let msg = e.to_string();
@@ -166,6 +183,26 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// an incremental run produces few (often zero) new txs, and a wallet's
 /// existing rows would otherwise never be labelled at all. Capped so a deep
 /// history backfills across runs instead of stalling one.
+/// How long after a block market-ledger is assumed to have caught up with it.
+///
+/// The follower is a few seconds behind the tip in normal operation; ten
+/// minutes is generous enough that a "no" recorded after it is a real no, and
+/// short enough that a row asked about too early gets exactly one more chance.
+const MARKET_SETTLE_SECS: i64 = 600;
+
+/// Rows still worth asking market-ledger about.
+///
+/// Two conditions, and the second is the one that matters. `market IS NULL`
+/// finds everything unlabelled — but most rows are ordinary transfers that no
+/// venue ever touched, so they are unlabelled PERMANENTLY and re-asking is
+/// pure waste. `market_checked_unix` distinguishes "not yet asked" from
+/// "asked, and the answer was no".
+///
+/// A recorded no is only final if the check ran after market-ledger had
+/// plausibly indexed that block. A row enriched seconds after it landed may
+/// have been asked about before the follower got there, so it stays eligible;
+/// one asked about ten minutes past its block time is settled and drops out
+/// for good.
 pub fn hashes_needing_market(
     conn: &Connection,
     canonical: &str,
@@ -173,15 +210,58 @@ pub fn hashes_needing_market(
 ) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT tx_hash FROM flow
-         WHERE target = ?1 AND market IS NULL
+         WHERE target = ?1
+           AND market IS NULL
+           AND (market_checked_unix IS NULL
+                OR market_checked_unix < slot + ?3 + ?4)
          ORDER BY slot DESC LIMIT ?2",
     )?;
-    let mut rows = stmt.query(params![canonical, limit])?;
+    let mut rows = stmt.query(params![
+        canonical,
+        limit,
+        slot_epoch_offset(),
+        MARKET_SETTLE_SECS
+    ])?;
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
         out.push(hex::encode(r.get::<_, Vec<u8>>(0)?));
     }
     Ok(out)
+}
+
+/// `unix = slot + offset` for the Shelley era, where one slot is one second.
+///
+/// Derived from the real conversion rather than restated as a literal, so the
+/// SQL above cannot drift from `slot_to_unix` if the era constants move.
+fn slot_epoch_offset() -> i64 {
+    let anchor = crate::excavate::SHELLEY_START_SLOT;
+    slot_to_unix(anchor) as i64 - anchor as i64
+}
+
+/// Record that market-ledger was asked about these rows, whatever it said.
+///
+/// Called with EVERY hash probed, not just the ones that came back with a
+/// verdict — the whole point is to remember the noes. Rows that did get a
+/// label are already excluded from the next pass by `market IS NOT NULL`;
+/// this is what retires the ones that never will be.
+pub fn mark_market_checked(
+    conn: &mut Connection,
+    canonical: &str,
+    hashes: &[String],
+    now_unix: u64,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE flow SET market_checked_unix = ?1 WHERE target = ?2 AND tx_hash = ?3",
+        )?;
+        for h in hashes {
+            let raw = hex::decode(h).with_context(|| format!("market hash {h}"))?;
+            stmt.execute(params![now_unix, canonical, raw])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Stitch market-ledger verdicts onto stored rows (the enrichment pass, like
@@ -483,6 +563,14 @@ pub struct StoreOpts {
     /// Rows held when the backfill gave up on this wallet. `None` leaves any
     /// existing verdict alone — an ordinary refresh must not clear a cap.
     pub oversize_rows: Option<u64>,
+    /// This write comes from the SHALLOW COMPANION of a deep request — a
+    /// windowed pass run purely to get rows on screen while the full sweep
+    /// runs in the other lane.
+    ///
+    /// It means the write is racing a deeper one for the same wallet, so it
+    /// must not overwrite the `owned` set with its narrower view. See the
+    /// guard in [`store_timeline`].
+    pub provisional: bool,
 }
 
 /// Persist one wallet's excavation result. Returns the number of NEW flow
@@ -553,21 +641,54 @@ pub fn store_timeline(
                     .transpose()?,
             ])?;
         }
-        tx.execute("DELETE FROM owned WHERE target = ?1", params![canonical])?;
-        let mut own = tx.prepare(
-            "INSERT INTO owned (target, tx_hash, idx, lovelace, assets, units, script)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        for ((hash, idx), (lovelace, units, script)) in &timeline.owned {
-            own.execute(params![
-                canonical,
-                hash.as_slice(),
-                idx,
-                lovelace,
-                units.len() as u32,
-                serde_json::to_string(units)?,
-                *script as i64,
-            ])?;
+        // THE OWNED SET IS REPLACED WHOLE, SO THE NARROWER WRITE MUST YIELD.
+        //
+        // `flow` rows and `scanned_from_slot` are already safe against a
+        // racing write — the first goes in with INSERT OR IGNORE, the second
+        // takes a MIN so depth only ever deepens. `owned` has no such
+        // arithmetic: it is a DELETE plus a re-insert, so whoever lands last
+        // wins outright.
+        //
+        // That matters because a deep request now runs a shallow companion
+        // alongside it. The companion's owned set is derived from its window
+        // only, so if it landed after the full sweep it would drop every UTxO
+        // created before the window and never spent — and `owned` is the seed
+        // every later incremental classifies from, so the loss would outlive
+        // the run that caused it, re-signing old spends as receives.
+        //
+        // Cheap to prevent, and the condition is exact: skip the rewrite when
+        // a strictly deeper scan is already recorded.
+        let outranked = opts.provisional
+            && match opts.scanned_from {
+                Some(mine) => tx
+                    .query_row(
+                        "SELECT scanned_from_slot FROM wallet WHERE target = ?1",
+                        params![canonical],
+                        |r| r.get::<_, Option<u64>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .is_some_and(|held| held < mine.floor()),
+                // Asserting no depth at all, so anything on disk outranks it.
+                None => true,
+            };
+        if !outranked {
+            tx.execute("DELETE FROM owned WHERE target = ?1", params![canonical])?;
+            let mut own = tx.prepare(
+                "INSERT INTO owned (target, tx_hash, idx, lovelace, assets, units, script)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for ((hash, idx), (lovelace, units, script)) in &timeline.owned {
+                own.execute(params![
+                    canonical,
+                    hash.as_slice(),
+                    idx,
+                    lovelace,
+                    units.len() as u32,
+                    serde_json::to_string(units)?,
+                    *script as i64,
+                ])?;
+            }
         }
         let (new_first, new_last) = if timeline.txs.is_empty() {
             (None, None)
@@ -634,6 +755,96 @@ pub fn update_senders(
         }
     }
     Ok(())
+}
+
+/// One row by transaction hash, with what surrounds it.
+///
+/// # Why this exists
+///
+/// `query_rows` is newest-first with a `before_slot` cursor, which is right
+/// for a feed and useless for "show me THIS transaction". A link shared out of
+/// a wallet is usually to something old — that is what makes it worth
+/// sharing — so resolving it by paging meant reading down to it, and anything
+/// past the first page simply could not be found. The consumer degraded to a
+/// wallet-level card and the shared row went unshown.
+///
+/// # Why the counts come back with it
+///
+/// The same question — "where does this row sit in the wallet?" — answers both
+/// callers. The reader's view needs the row; the interface around it needs to
+/// say how much lies either side, because a feed that stops without explaining
+/// itself reads as "there is nothing here". Two queries over the same index,
+/// one round trip.
+///
+/// `None` when the wallet holds no such transaction, which is an ordinary
+/// outcome: a mistyped hash, or a link to somebody else's wallet.
+pub fn query_row_at(conn: &Connection, canonical: &str, tx_hash: &[u8]) -> Result<Option<RowAt>> {
+    // The row's own slot first — everything else is positional against it.
+    let found: Option<(u64, i64)> = conn
+        .query_row(
+            "SELECT slot, tx_idx FROM flow WHERE target = ?1 AND tx_hash = ?2",
+            params![canonical, tx_hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((slot, tx_idx)) = found else {
+        return Ok(None);
+    };
+
+    // Strictly newer / strictly older, by the SAME ordering the feed pages in
+    // (`slot DESC, tx_idx DESC`). Using slot alone would miscount the rows
+    // sharing this row's slot — a batched submission puts several there, and
+    // they would land on both sides of the split or neither.
+    let newer: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM flow
+         WHERE target = ?1 AND (slot > ?2 OR (slot = ?2 AND tx_idx > ?3))",
+        params![canonical, slot, tx_idx],
+        |r| r.get(0),
+    )?;
+    let older: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM flow
+         WHERE target = ?1 AND (slot < ?2 OR (slot = ?2 AND tx_idx < ?3))",
+        params![canonical, slot, tx_idx],
+        |r| r.get(0),
+    )?;
+    let oldest_slot: Option<u64> = conn.query_row(
+        "SELECT MIN(slot) FROM flow WHERE target = ?1",
+        params![canonical],
+        |r| r.get(0),
+    )?;
+
+    // Reuses `query_rows` rather than repeating its column list and its JSON
+    // decoding — that decode has grown four columns since it was written, and
+    // a second copy would be a second thing to remember. `before_slot` is
+    // exclusive, so ask from just above this row and take the one we want.
+    let row = query_rows(conn, canonical, ROW_AT_WINDOW, Some(slot + 1))?
+        .into_iter()
+        .find(|r| r.tx == hex::encode(tx_hash));
+
+    Ok(row.map(|row| RowAt {
+        row,
+        newer,
+        older,
+        oldest_slot,
+    }))
+}
+
+/// How far `query_row_at` reads to re-decode the row it already located.
+///
+/// A slot holds a handful of a wallet's transactions at the very most, so this
+/// is generous by two orders of magnitude — it exists so a pathological slot
+/// cannot turn one lookup into a table scan.
+const ROW_AT_WINDOW: u32 = 64;
+
+/// One transaction and its position in the wallet.
+pub struct RowAt {
+    pub row: report::Row,
+    /// Transactions strictly newer than this one.
+    pub newer: u64,
+    /// Transactions strictly older.
+    pub older: u64,
+    /// The oldest slot cached for this wallet — how far back "older" reaches.
+    pub oldest_slot: Option<u64>,
 }
 
 pub fn count_flows(conn: &Connection, canonical: &str) -> Result<u64> {
@@ -912,6 +1123,82 @@ mod cache_tests {
         }
     }
 
+    /// One flow row at `slot`, unlabelled and never offered to market-ledger.
+    fn add_row(conn: &Connection, target: &str, hash: &str, slot: u64) {
+        conn.execute(
+            "INSERT INTO flow (target, slot, tx_idx, tx_hash, kind, lovelace_in,
+                               lovelace_out, assets_in, assets_out)
+             VALUES (?1, ?2, 0, ?3, 'transfer', 0, 0, 0, 0)",
+            params![target, slot, hex::decode(hash).expect("hex")],
+        )
+        .expect("insert flow");
+    }
+
+    /// THE ENRICHMENT PASS MUST TERMINATE.
+    ///
+    /// Most rows are ordinary transfers no venue ever touched, so they are
+    /// unlabelled permanently. Measured on the live cache before this: 33,639
+    /// hashes re-probed every twenty minutes for a yield of zero. Once a row
+    /// has been asked about — after market-ledger had time to index its block
+    /// — the no is final and it drops out.
+    #[test]
+    fn a_settled_no_is_never_asked_again() {
+        let mut conn = cache();
+        let slot = 100_000_000;
+        add_row(&conn, "w", "aa", slot);
+        assert_eq!(
+            hashes_needing_market(&conn, "w", 10).expect("query").len(),
+            1,
+            "never asked, so eligible"
+        );
+        // Checked well after the block was indexable.
+        let long_after = slot_to_unix(slot) + MARKET_SETTLE_SECS as u64 + 1;
+        mark_market_checked(&mut conn, "w", &["aa".into()], long_after).expect("mark");
+        assert!(
+            hashes_needing_market(&conn, "w", 10)
+                .expect("query")
+                .is_empty(),
+            "asked and answered — re-asking is the bug this closes"
+        );
+    }
+
+    /// The other side of the rule. market-ledger is itself a follower, so a
+    /// row enriched moments after it landed may have been asked about before
+    /// the follower reached that block. That no is not trustworthy, and the
+    /// row stays eligible for exactly one more pass.
+    #[test]
+    fn a_no_recorded_too_early_is_asked_again() {
+        let mut conn = cache();
+        let slot = 100_000_000;
+        add_row(&conn, "w", "bb", slot);
+        // Checked while the follower could plausibly still have been behind.
+        let too_soon = slot_to_unix(slot) + 1;
+        mark_market_checked(&mut conn, "w", &["bb".into()], too_soon).expect("mark");
+        assert_eq!(
+            hashes_needing_market(&conn, "w", 10).expect("query").len(),
+            1,
+            "the follower may not have reached this block yet"
+        );
+    }
+
+    /// A row that DID get a label leaves by the other door — `market IS NULL`
+    /// — and must not depend on the checked stamp to stay gone.
+    #[test]
+    fn a_labelled_row_needs_no_further_asking() {
+        let conn = cache();
+        add_row(&conn, "w", "cc", 100_000_000);
+        conn.execute(
+            "UPDATE flow SET market = '{}' WHERE target = 'w'",
+            rusqlite::params![],
+        )
+        .expect("label");
+        assert!(
+            hashes_needing_market(&conn, "w", 10)
+                .expect("query")
+                .is_empty()
+        );
+    }
+
     /// The core ordering rule: eviction follows REQUEST recency, so the wallet
     /// nobody has asked for goes and the one in active use stays — even though
     /// both were re-stored by the refresh watcher at the same moment.
@@ -1115,5 +1402,114 @@ mod cache_tests {
         assert_eq!(s.wallets, 2);
         assert_eq!(s.flows, 505);
         assert_eq!(s.largest_wallet_flows, 500);
+    }
+
+    // ── query_row_at ────────────────────────────────────────────────────────
+
+    /// A flow row at an explicit `(slot, tx_idx)`, so ordering within one slot
+    /// can be exercised — which is the part `query_row_at` can get wrong.
+    fn add_row_at(conn: &Connection, target: &str, hash: &str, slot: u64, tx_idx: i64) {
+        conn.execute(
+            "INSERT INTO flow (target, slot, tx_idx, tx_hash, kind, lovelace_in,
+                               lovelace_out, assets_in, assets_out)
+             VALUES (?1, ?2, ?3, ?4, 'transfer', 0, 0, 0, 0)",
+            params![target, slot, tx_idx, hex::decode(hash).expect("hex")],
+        )
+        .expect("insert flow");
+    }
+
+    fn hash(byte: &str) -> Vec<u8> {
+        hex::decode(byte.repeat(32)).expect("hex")
+    }
+
+    /// The whole point: a row deep in a wallet resolves directly, where paging
+    /// would have had to read past everything newer to reach it.
+    #[test]
+    fn a_row_is_found_by_hash_however_deep_it_sits() {
+        let conn = cache();
+        for i in 0..50u64 {
+            add_row_at(&conn, "w", &format!("{:02x}", i).repeat(32), 1_000 + i, 0);
+        }
+        let at = query_row_at(&conn, "w", &hash("07"))
+            .expect("query")
+            .expect("the row");
+        assert_eq!(at.row.slot, 1_007);
+        assert_eq!(at.newer, 42, "50 rows, 7 older, itself excluded");
+        assert_eq!(at.older, 7);
+        assert_eq!(at.oldest_slot, Some(1_000));
+    }
+
+    /// The newest row has nothing above it and the oldest nothing below —
+    /// the boundaries a count that is off by one gets wrong.
+    #[test]
+    fn the_ends_of_a_wallet_count_correctly() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 10, 0);
+        add_row_at(&conn, "w", &"bb".repeat(32), 20, 0);
+        add_row_at(&conn, "w", &"cc".repeat(32), 30, 0);
+
+        let newest = query_row_at(&conn, "w", &hash("cc")).unwrap().unwrap();
+        assert_eq!((newest.newer, newest.older), (0, 2));
+        let oldest = query_row_at(&conn, "w", &hash("aa")).unwrap().unwrap();
+        assert_eq!((oldest.newer, oldest.older), (2, 0));
+    }
+
+    /// SEVERAL ROWS IN ONE SLOT. A batched submission puts more than one of a
+    /// wallet's transactions in the same slot, and counting on `slot` alone
+    /// would put its siblings on both sides of the split — or neither.
+    /// The feed pages by `slot DESC, tx_idx DESC`, so this must too.
+    #[test]
+    fn rows_sharing_a_slot_are_split_by_their_index() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 500, 0);
+        add_row_at(&conn, "w", &"bb".repeat(32), 500, 1);
+        add_row_at(&conn, "w", &"cc".repeat(32), 500, 2);
+
+        let middle = query_row_at(&conn, "w", &hash("bb")).unwrap().unwrap();
+        assert_eq!(
+            (middle.newer, middle.older),
+            (1, 1),
+            "one sibling each side, not two or zero"
+        );
+        // And the totals reconcile: every other row is on exactly one side.
+        assert_eq!(middle.newer + middle.older, 2);
+    }
+
+    /// One wallet's transaction is not another's. The counts must come from
+    /// the named wallet alone, or a busy neighbour inflates them.
+    #[test]
+    fn another_wallets_rows_are_not_counted() {
+        let conn = cache();
+        add_row_at(&conn, "mine", &"aa".repeat(32), 10, 0);
+        add_row_at(&conn, "theirs", &"bb".repeat(32), 20, 0);
+        add_row_at(&conn, "theirs", &"cc".repeat(32), 30, 0);
+
+        let at = query_row_at(&conn, "mine", &hash("aa")).unwrap().unwrap();
+        assert_eq!((at.newer, at.older), (0, 0));
+        // …and a hash belonging to the other wallet is simply absent here.
+        assert!(query_row_at(&conn, "mine", &hash("bb")).unwrap().is_none());
+    }
+
+    /// An unknown hash is an ordinary outcome — a mistyped link — not an error.
+    #[test]
+    fn an_unknown_hash_is_none_rather_than_an_error() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 10, 0);
+        assert!(query_row_at(&conn, "w", &hash("ff")).unwrap().is_none());
+    }
+
+    /// The returned row is the DECODED one, carrying everything the feed's
+    /// rows carry — it is re-read through `query_rows` for exactly that
+    /// reason, rather than duplicating a column list that has grown four
+    /// times since it was written.
+    #[test]
+    fn the_returned_row_is_fully_decoded() {
+        let conn = cache();
+        add_row_at(&conn, "w", &"aa".repeat(32), 12_345, 0);
+        let at = query_row_at(&conn, "w", &hash("aa")).unwrap().unwrap();
+        assert_eq!(at.row.tx, "aa".repeat(32));
+        assert_eq!(at.row.slot, 12_345);
+        assert_eq!(at.row.kind, "transfer");
+        assert!(!at.row.time.is_empty(), "the formatted time is populated");
     }
 }

@@ -99,15 +99,29 @@ pub struct MarketTarget {
 
 /// Look up market events for `hashes` (hex). Returns the subset that matched;
 /// any failure degrades to an empty map with a warning.
-pub fn lookup(db: &Path, hashes: &[String]) -> HashMap<String, MarketEvent> {
-    if hashes.is_empty() || !db.exists() {
-        return HashMap::new();
+/// Ask market-ledger about these transactions.
+///
+/// `None` means the question could not be PUT — no database, locked, schema
+/// moved. `Some(map)` means it was answered, and a hash missing from the map
+/// is a real "market-ledger has never heard of this transaction".
+///
+/// The distinction is not cosmetic. The caller records answers so it stops
+/// re-asking, and most answers are noes — 79% of cached rows are ordinary
+/// transfers no venue ever touched. Collapsing an outage into an empty map
+/// would retire those rows permanently on the strength of a locked file, and
+/// nothing would ever ask again.
+pub fn lookup(db: &Path, hashes: &[String]) -> Option<HashMap<String, MarketEvent>> {
+    if hashes.is_empty() {
+        return Some(HashMap::new());
+    }
+    if !db.exists() {
+        return None;
     }
     match try_lookup(db, hashes) {
-        Ok(found) => found,
+        Ok(found) => Some(found),
         Err(e) => {
             tracing::warn!("market enrichment unavailable: {e:#}");
-            HashMap::new()
+            None
         }
     }
 }
@@ -231,8 +245,24 @@ fn venue_of(conn: &Connection, tx: &str) -> anyhow::Result<String> {
 }
 
 /// Kinds where money actually moved.
+///
+/// # Why this defers rather than matching strings
+///
+/// It WAS `matches!(kind, "sold" | "offer_filled" | "bought" | "sale")`, and
+/// it had drifted badly: `offer_filled`, `bought` and `sale` are not kinds the
+/// ledger has ever written, while `offer_accepted` and
+/// `collection_offer_accepted` — which it writes for every accepted offer —
+/// were both missing.
+///
+/// The consequence was not cosmetic. [`MarketEvent::kind`] is chosen by
+/// ranking settlements first, so a transaction carrying an accepted offer AND
+/// a listing was headlined as the LISTING — the exact mislabelling the
+/// per-leg split was introduced to prevent.
+///
+/// `EventKind` owns this question because it owns the vocabulary; a kind it
+/// does not recognise reads as NOT a settlement, which is the safe direction.
 fn is_settlement(kind: &str) -> bool {
-    matches!(kind, "sold" | "offer_filled" | "bought" | "sale")
+    market_ledger_wire::EventKind::from_db_str(kind).is_some_and(|k| k.is_settlement())
 }
 
 #[cfg(test)]
@@ -242,15 +272,76 @@ mod tests {
     #[test]
     fn settlement_outranks_listing() {
         assert!(is_settlement("sold"));
-        assert!(is_settlement("offer_filled"));
         assert!(!is_settlement("listed"));
         assert!(!is_settlement("delisted"));
     }
 
+    /// THE DRIFT THIS REPLACED. The old hand-written list recognised three
+    /// kinds the ledger never writes and missed the two it writes for every
+    /// accepted offer — so an accepted offer lost the headline to a listing
+    /// in the same transaction.
+    #[test]
+    fn an_accepted_offer_is_a_settlement() {
+        assert!(is_settlement("offer_accepted"));
+        assert!(is_settlement("collection_offer_accepted"));
+    }
+
+    /// Every kind the ledger can write is classified, and nothing else is.
+    /// Walking `EventKind::ALL` is what stops this going stale again.
+    #[test]
+    fn the_vocabulary_is_the_ledgers_own() {
+        use market_ledger_wire::EventKind;
+        for kind in EventKind::ALL {
+            assert_eq!(
+                is_settlement(kind.as_db_str()),
+                kind.is_settlement(),
+                "{kind:?} classified differently from the ledger"
+            );
+        }
+        // Kinds the old list carried that no ledger row has ever used.
+        for dead in ["offer_filled", "bought", "sale"] {
+            assert!(!is_settlement(dead), "{dead} is not a ledger kind");
+        }
+    }
+
+    /// Still not an error — but no longer an empty ANSWER either.
+    ///
+    /// This used to assert `is_empty()`, which could not tell an outage from
+    /// "market-ledger has never heard of this transaction". The caller now
+    /// writes the noes down so it stops re-asking, so conflating the two
+    /// would retire rows permanently because a file was briefly unreadable.
     #[test]
     fn missing_database_is_not_an_error() {
         let found = lookup(Path::new("/nonexistent/market.db"), &["abc".into()]);
-        assert!(found.is_empty());
+        assert!(
+            found.is_none(),
+            "a missing database is an outage, not a verdict"
+        );
+    }
+
+    /// The other half of that distinction, and the one that makes the
+    /// enrichment pass terminate: a database that IS readable and simply has
+    /// nothing to say answers `Some(empty)`, which is a real no.
+    #[test]
+    fn a_readable_ledger_with_no_match_is_an_answer() {
+        let path = std::env::temp_dir().join("wallet-sieve-market-empty.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE market_events (
+                     tx_hash TEXT, kind TEXT, venue TEXT, price_lovelace INTEGER,
+                     policy_id TEXT, asset_name_hex TEXT, bundle_size INTEGER);",
+            )
+            .expect("schema");
+        }
+        let found = lookup(&path, &["deadbeef".into()]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            found.map(|f| f.len()),
+            Some(0),
+            "answered, and the answer is no"
+        );
     }
 
     /// Build a ledger holding just the rows a test cares about, and read one
@@ -284,7 +375,7 @@ mod tests {
                 .expect("insert");
             }
         }
-        let found = lookup(&path, &[tx.to_string()]);
+        let found = lookup(&path, &[tx.to_string()]).expect("the ledger is readable");
         let _ = std::fs::remove_file(&path);
         found.get(tx).cloned().expect("event for tx")
     }

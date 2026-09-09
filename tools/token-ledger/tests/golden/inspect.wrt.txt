@@ -1,0 +1,24 @@
+domain 54772901..196407896  (1174382 txs, 1617538 movements, 173388 parties)
+
+SPINE ONLY (checkpoint resolution, as of tx 1174381)
+  burn          143365824   0.00%
+  pool         1597208757   0.00%
+  script   55998737584811  56.00%
+  wallet   43999521840608  44.00%
+  TOTAL    100000000000000  holders 11796
+
++ DETAIL (exact, as of tx 1174381)
+  burn          143365824   0.00%
+  pool         1597208757   0.00%
+  script   55998737584811  56.00%
+  wallet   43999521840608  44.00%
+  TOTAL    100000000000000  holders 11796
+
+spot          0.02165204 ADA/token
+notional cap       2165203 ADA
+realisable          278248 .. 333004 ADA
+honesty ratio         12.9% .. 15.4%
+uncertain     55998737584811 tokens of unknown liquidity
+  note: 4 of 7 pools have no decoded fee — realisable is optimistic
+
+vesting at this instant: 0 matured / 0 still locked

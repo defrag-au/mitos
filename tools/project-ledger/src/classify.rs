@@ -209,8 +209,19 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
         // customer to mislabel.
         if let Some(svc) = lookup_stake(&key) {
             caps.push((
+                // EXHAUSTIVE on purpose — no `_` arm. `address-registry` adds
+                // a variant when a new class of shared service is named, and a
+                // catch-all would silently classify it as something it is not.
+                // A compile error is the correct outcome: it puts the decision
+                // in front of someone.
                 match svc.kind {
                     StakeServiceKind::MintingProvider => ProviderCapability::Minting,
+                    // Both share the holder problem the registry exists to
+                    // solve: liquidity and listings sit at their addresses, so
+                    // they top every holder list. Naming them is what stops a
+                    // walk expanding into thousands of unrelated sellers.
+                    StakeServiceKind::Marketplace => ProviderCapability::Marketplace,
+                    StakeServiceKind::Exchange => ProviderCapability::Dex,
                 },
                 Basis::Asserted,
             ));

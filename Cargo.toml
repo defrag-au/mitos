@@ -19,9 +19,33 @@ members = [
     "crates/mitos-module-kit",
     "crates/mitos-dex-decode",
     "crates/mitos-vesting-decode",
+    # Split out of the token-ledger BINARY 2026-09-08 so the archive path and a
+    # Worker can reach the interpretive layer. Two crates, not one, because
+    # `mitos-cohort` is wasm-cheap (pallas-addresses only) while
+    # `mitos-pool-observe` links the chain-walk output shape.
+    "crates/mitos-cohort",
+    "crates/mitos-pool-observe",
+    # A launch is a token's most consequential single event and rendered as a
+    # transfer to an unnamed script until 2026-09-08. Beside the DEX decoders
+    # rather than inside them: a bonding curve is not constant-product, its
+    # inventory has never been owned, and it has a published finish line.
+    "crates/mitos-launchpad-decode",
     "crates/mitos-marketplace-decode",
+    "crates/chain-sieve",
     "crates/market-ledger-wire",
+    "crates/token-ledger-wire",
+    "crates/policy-archive",
     "crates/none-match-indexer",
+    "crates/tx-index",
+    # The mint-keyed companion to tx-index. A separate crate, but NOT a
+    # separate extraction pass — it is pure over blocks tx-index already
+    # decoded, which is what keeps it at the measured +1.8% rather than +100%.
+    "crates/policy-index",
+    # Lifted out of the project-ledger BINARY 2026-09-09: token-ledger needs
+    # the same `policy_asset_info` call to find a policy's first mint, and a
+    # second copy of a client whose row shapes have already drifted under us
+    # is how the two quietly disagree.
+    "crates/mitos-koios",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",
@@ -32,8 +56,10 @@ members = [
     "tools/mitos-chain-walk",
     "tools/market-ledger",
     "tools/project-ledger",
+    "tools/token-ledger",
     "tools/wallet-sieve",
     "tools/wallet-trace",
+    "tools/tx-index",
 ]
 resolver = "2"
 
@@ -99,6 +125,10 @@ pallas-traverse = { version = "1.1.1", features = ["unstable"] }
 # (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
 # feature (mitos's pallas is `unstable`-only), so depend on it directly.
 pallas-hardano = "1.1.1"
+# blake2b-256 for tx-index's read-side verification: a located body is
+# re-hashed and compared to the full requested hash, so the index can store an
+# 8-byte prefix per entry and never return a false positive.
+pallas-crypto = "1.1.1"
 # N2N chainsync/blockfetch client for market-ledger's `follow` tip tail
 # (self-contained — see MARKET_LEDGER.md "Follow mode"). Same pin as the rest
 # of the family; the only crate whose 1.1.1 sources differ from 1.0.0, and only
@@ -109,22 +139,22 @@ pallas-network = "1.1.1"
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
 # Pinned to a specific shared-crates rev for reproducibility; bump
 # deliberately when shared-crates lands changes mitos needs.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1", features = ["cip14", "cip25"] }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4", features = ["cip14", "cip25"] }
 
 # Known script/contract addresses — DEX pools and batchers, marketplaces,
 # aggregators. Re-added 2026-08-20 for `project-ledger classify`: without it a
 # swap's return leg reads as project income, and on Mekka that was 74,626 ₳ of
 # a supposed 132,590 ₳ "unexplained" inbound. Same rev as every other
 # shared-crate here — a second rev would resolve a second copy of the crate.
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1" }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4" }
 # Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
 # by the protocol-event taxonomy in `mitos-core::protocol`. Same
 # shape the existing classifier emits, so mitos events deserialize
 # identically on the CF side.
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4" }
 # Pure, I/O-free wallet-flow model (`TxView`/`net_deltas`/`movements`) + the
 # project-walk `frontier` state machine. Consumed by `tools/project-ledger`.
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "eef5943cbf867f2b7ee9c816c0351a71c56c37f1" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -152,6 +182,15 @@ hex = "0.4"
 # Storage backend for indexer materialized views (separate from Dolos's
 # state store — each indexer owns its own view).
 redb = "2"
+# tx-index maps its base + segment files read-only; the page cache is the
+# whole caching story, a rebuilt base is swapped by rename and old mappings
+# keep the old inode alive until dropped.
+memmap2 = "0.9"
+# `posix_fadvise(DONTNEED)`: a full-history policy walk streams 216 GB of
+# Mithril chunks past the sieve gate and reads almost none of them twice, so
+# it hands each chunk's pages back rather than evict the other services that
+# share the box's cache. Linux only, behind a cfg.
+libc = "0.2"
 
 # Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
 # compiles sqlite from source (on-box build, no system dep).
@@ -169,6 +208,9 @@ config = { version = "0.14", default-features = false, features = ["toml"] }
 
 # HTTP client for the diff harness (polls both workers' read APIs).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+# S3-compatible client for R2 — the policy archive publisher (token-ledger).
+# `aws` only; no cloud SDK, no arrow.
+object_store = { version = "0.12", default-features = false, features = ["aws"] }
 
 [profile.release]
 opt-level = 3

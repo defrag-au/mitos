@@ -195,6 +195,23 @@ pub fn run(args: WalkArgs) -> Result<()> {
         {
             let cache_get = |h: &Hash<32>| ledger.get_datum(h).unwrap_or(None);
             for tx in blk.txs() {
+                // PHASE-2 FAILURE: the block declares this transaction
+                // invalid, so the ledger never created its outputs and never
+                // consumed the listing it names. Its body is still in the
+                // chunk and decodes perfectly — which is exactly how a
+                // losing race for a listing would otherwise be recorded as a
+                // SALE THAT NEVER HAPPENED, at a real price, in the series
+                // pricing reads.
+                //
+                // MEASURED 2026-09-09: 1,000 sale-type events sampled across
+                // the full slot span (73.4M–196.1M) — ZERO came from an
+                // invalid transaction, so nothing here is retrospectively
+                // wrong and no re-walk is owed. The guard is what keeps that
+                // true. See `token-ledger`'s $VIPER case, where the same
+                // omission credited 1.86 billion units that never existed.
+                if !tx.is_valid() {
+                    continue;
+                }
                 process_tx(
                     decode_tx(&tx),
                     &registry,
@@ -645,10 +662,7 @@ mod tests {
             outputs: vec![DecodedOutput {
                 address: JPG_SALE_ADDR.into(),
                 lovelace: 2_000_000,
-                assets: vec![Asset {
-                    policy: vec![9u8; 28],
-                    name: b"Bud1".to_vec(),
-                }],
+                assets: vec![Asset::nft(vec![9u8; 28], b"Bud1".to_vec())],
                 index: 0,
                 datum_hash,
                 inline_datum: inline,

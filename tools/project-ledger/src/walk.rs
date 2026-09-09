@@ -32,7 +32,6 @@ use mitos_chain_walk::slot_to_unix;
 use pallas_traverse::{MultiEraBlock, MultiEraTx};
 
 use crate::asset_class::AssetClass;
-use crate::koios::Koios;
 use crate::mint::{cip27_royalty, policy_script};
 use crate::party::{Resolved, resolve_str};
 use crate::resolve::{LadderStats, Offline, Remote, resolve_missing};
@@ -42,6 +41,7 @@ use crate::store::{
     AliasRow, AssetEventRow, AssetInflowRow, Ledger, MintPaymentRow, RelayHopRow, TxDeltaRow,
     UnitFlowRow, ValueEventRow,
 };
+use mitos_koios::Koios;
 
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
@@ -284,6 +284,14 @@ pub fn run(args: WalkArgs) -> Result<()> {
         ctx.time = slot_to_unix(slot);
 
         for tx in blk.txs() {
+            // PHASE-2 FAILURE: the block declares this transaction invalid, so
+            // the ledger never created its outputs. This ledger ATTRIBUTES —
+            // a phantom output is money credited to a party who never received
+            // it, in exactly the surface where a wrong number becomes a claim
+            // about a person.
+            if !tx.is_valid() {
+                continue;
+            }
             let d = decode_tx(&tx);
             process_tx(
                 &tx,
@@ -1296,6 +1304,34 @@ pub fn process_tx(
     // - BYRON addresses. Legacy addresses carry no staking credential AT ALL,
     //   so "stakeless" says nothing about them — they are ordinary old
     //   wallets, and 54 were caught before this guard.
+    //
+    // MEMBERSHIP IS **NOT** AN EXCLUSION, and used to be — this was a bug.
+    //
+    // Arming used to skip any output that was already a frontier member, on
+    // the reasoning that a member's outbound is booked in `value_event`
+    // anyway. That silently blinded the table exactly where it mattered most:
+    // at `--max-hops >= 2` the seed's OWN single-use relays are promoted at
+    // hop 1, so they were never armed, and `relay_hop` had a hole precisely
+    // around the wallet under investigation.
+    //
+    // Measured on Mekka S2 (2026-08-30): the S2 treasury's three documented
+    // swap-desk purchases — 5,555 / 5,650 / 5,000 ₳ on 08-02/05/07, each via
+    // a fresh bare address forwarding to one desk within ~12 minutes — left
+    // ZERO `relay_hop` rows, while eight *more distant* payers (whose relays
+    // sat beyond the hop limit and so stayed unpromoted) recorded 21 hops onto
+    // that same desk. The nearer and more important the money, the more
+    // certain the table was to miss it.
+    //
+    // Dropping the exclusion is safe because `Relays::arm` already applies the
+    // real discriminator: an address armed more than once is rejected outright
+    // (`seen > 1`), so an ordinary member wallet — used repeatedly — still
+    // produces no hop. Single use is what makes a relay a relay; membership
+    // never had any bearing on it.
+    //
+    // CONSEQUENCE for readers: a promoted relay's movement is now recorded in
+    // BOTH `relay_hop` and `value_event`. That is intended — `relay_hop`
+    // states that a shape occurred, `value_event` is the money ledger — but it
+    // means the two must never be summed together as value.
     if !ctx.follow_relays {
         return Ok(());
     }
@@ -1305,7 +1341,6 @@ pub fn process_tx(
             if o.resolved.party.has_stake_credential
                 || o.resolved.payment_is_script
                 || !o.resolved.party.key.starts_with("addr")
-                || state.frontier.is_member(&o.resolved.party)
                 || o.lovelace < ctx.relay_min_lovelace
             {
                 continue;
@@ -1353,6 +1388,28 @@ fn dominant_member_payer(
 /// is still passing the rest on, and the destination is the finding. Outputs
 /// are recorded individually rather than summed — a sweep that fans into two
 /// destinations is two facts, not an average.
+///
+/// `quantity` is the relay's ATTRIBUTED share of an output, never the output's
+/// face value.
+///
+/// The distinction is not pedantic and the difference is not small. A sweeping
+/// transaction routinely spends the relay's UTxO alongside unrelated ones, and
+/// booking the whole output credited the relay with every other input's money
+/// too. Measured on Mekka S2 (2026-08-30): the relay carrying 5,650 ₳ to the
+/// swap desk was booked at **40,601 ₳ — 7.2× over** — because the sweep bundled
+/// six other UTxOs into one payment. That is the gross-attribution failure this
+/// codebase exists to refuse, reappearing one hop out.
+///
+/// So each output takes a pro-rata slice of what the relay actually RECEIVED
+/// (`c.lovelace`, observed when the candidate was armed). The invariant is that
+/// a relay can never deliver more than it took in — per-relay, per-sweep,
+/// `SUM(quantity) <= c.lovelace`.
+///
+/// Residual imprecision, stated because it is real: the true figure is the
+/// relay's contribution net of its share of the fee, which a multi-input
+/// transaction does not decide. Pro-rata is an upper bound accurate to the fee
+/// (5,650.0 attributed vs 5,649.9 actually forwarded). Bounded and slightly
+/// high beats unbounded and 7× high.
 fn record_relay_hops(
     swept: &[RelayCandidate],
     outs: &[Out<'_>],
@@ -1371,16 +1428,41 @@ fn record_relay_hops(
             );
             continue;
         }
+
+        // The denominator: every output this sweep delivered onward. Change
+        // back to the relay is excluded from both sides, so a relay that keeps
+        // a slice apportions only what it actually passed on.
+        let onward: u128 = outs
+            .iter()
+            .filter(|o| o.resolved.party.key != c.address && o.lovelace > 0)
+            .map(|o| u128::from(o.lovelace))
+            .sum();
+        if onward == 0 {
+            continue;
+        }
+
         for o in outs {
             if o.resolved.party.key == c.address || o.lovelace == 0 {
                 continue;
             }
+            // Bounded on BOTH sides, and it needs both:
+            //   - pro-rata share of what the relay RECEIVED — caps the sweep
+            //     bundling other inputs (the 7.2× case);
+            //   - the output's own value — caps a relay that kept change, where
+            //     the pro-rata share of a smaller onward total would otherwise
+            //     exceed what that output actually carried.
+            // u128 throughout: carried × lovelace overflows u64 at mainnet
+            // amounts.
+            let pro_rata = u128::from(c.lovelace).saturating_mul(u128::from(o.lovelace)) / onward;
+            let attributed = pro_rata.min(u128::from(o.lovelace));
             rows.relays.push(RelayHopRow {
                 relay_addr: c.address.clone(),
                 from_party: c.from_party.clone(),
                 to_addr: o.resolved.party.key.clone(),
                 unit: "lovelace".to_owned(),
-                quantity: o.lovelace as i64,
+                // `attributed <= o.lovelace`, a u64, so this cannot truncate;
+                // the clamp is belt-and-braces against a future bound change.
+                quantity: attributed.min(i64::MAX as u128) as i64,
                 in_tx: c.tx.clone(),
                 out_tx: out_tx.to_owned(),
                 in_slot: c.slot,
@@ -1864,6 +1946,64 @@ mod tests {
         let mut rows = Rows::default();
         record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
         assert_eq!(rows.relays.len(), 2);
+        // Fanning out cannot manufacture value: the legs still sum to what the
+        // relay took in (7,500 received, 7,499.3 forwarded, 0.7 to fee).
+        let total: i64 = rows.relays.iter().map(|r| r.quantity).sum();
+        assert!(
+            total <= 7_500_000_000,
+            "fan-out attributed {total} against 7,500 ADA received"
+        );
+    }
+
+    /// A relay cannot deliver more than it received, however the sweeping
+    /// transaction is shaped.
+    ///
+    /// The bug: `quantity` was the OUTPUT's face value, so a sweep that spent
+    /// the relay's UTxO alongside unrelated ones credited the relay with all
+    /// of them. On Mekka S2 a relay carrying 5,650 ₳ to the swap desk was
+    /// booked at 40,601 ₳ — 7.2× over — which is gross attribution, the exact
+    /// error this codebase refuses everywhere else.
+    #[test]
+    fn a_relay_is_never_credited_with_more_than_it_carried() {
+        let mut sc = BTreeSet::new();
+        let mut m = BTreeSet::new();
+        let ctx = relay_ctx(1_100, &mut sc, &mut m);
+
+        // The real shape: relay carried 7,500; the sweep bundles other inputs
+        // and pays 40,601 onward. Only the relay's own money is attributable.
+        let outs = [out(0, "addr1vswapdesk", 40_601_300_000, vec![])];
+        let mut rows = Rows::default();
+        record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
+
+        assert_eq!(rows.relays.len(), 1);
+        assert_eq!(
+            rows.relays[0].quantity, 7_500_000_000,
+            "attribution is capped at what the relay actually received, \
+             not the face value of an output funded by six other UTxOs"
+        );
+    }
+
+    /// The other side of the bound: a relay that keeps change must not be
+    /// credited with more than the leg it actually forwarded. Pro-rata against
+    /// the onward total alone would over-state this one, so the output's own
+    /// value is the second cap.
+    #[test]
+    fn a_relay_that_keeps_change_is_credited_only_with_what_it_forwarded() {
+        let mut sc = BTreeSet::new();
+        let mut m = BTreeSet::new();
+        let ctx = relay_ctx(1_100, &mut sc, &mut m);
+        let outs = [
+            out(0, "addr1vswaphotwallet", 7_000_000_000, vec![]),
+            out(1, "addr1vrelay", 499_300_000, vec![]),
+        ];
+        let mut rows = Rows::default();
+        record_relay_hops(&[candidate(1_000)], &outs, &ctx, "outtx", &mut rows);
+
+        assert_eq!(rows.relays.len(), 1);
+        assert_eq!(
+            rows.relays[0].quantity, 7_000_000_000,
+            "7,500 received, 499.3 kept as change — the hop carried 7,000"
+        );
     }
 
     #[test]
@@ -1910,6 +2050,40 @@ mod tests {
             !r.is_single_use("addr1vrelay"),
             "and it stays disqualified — a hot wallet must never record a hop"
         );
+    }
+
+    /// Membership must NOT suppress arming, and the single-use test — not
+    /// membership — is what separates a relay from a wallet.
+    ///
+    /// The bug this pins: arming used to skip outputs that were already
+    /// frontier members. At `--max-hops >= 2` a seed's own single-use relays
+    /// are promoted at hop 1, so the treasury's three Mekka S2 swap-desk
+    /// purchases recorded ZERO hops while eight more distant payers recorded
+    /// 21 onto the same desk. `relay_hop` was blindest closest to the seed.
+    ///
+    /// Both halves are asserted together on purpose: dropping the exclusion is
+    /// only safe *because* `arm` still rejects a repeat address, so a test
+    /// that checked one without the other could pass while the fix was unsafe.
+    #[test]
+    fn a_promoted_single_use_address_still_records_a_hop() {
+        let mut r = Relays::default();
+
+        // The relay is also a watched member — the treasury's own hop-1 relay.
+        assert!(
+            r.arm((Hash::new([7u8; 32]), 0), candidate(5_555_000_000)),
+            "membership is irrelevant: a first-sighting bare address is still a relay"
+        );
+        assert!(
+            r.is_single_use("addr1vrelay"),
+            "and it must be reachable by the sweep-target rule"
+        );
+
+        // The safety half: repetition still disqualifies, member or not.
+        assert!(
+            !r.arm((Hash::new([8u8; 32]), 0), candidate(1_000_000_000)),
+            "a member wallet used twice is still a wallet, not a relay"
+        );
+        assert!(!r.is_single_use("addr1vrelay"));
     }
 
     /// The bound that stops this becoming a second frontier.

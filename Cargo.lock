@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "address-registry"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=eef5943cbf867f2b7ee9c816c0351a71c56c37f1#eef5943cbf867f2b7ee9c816c0351a71c56c37f1"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "phf",
  "serde",
@@ -44,6 +44,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
+ "const-random",
+ "getrandom 0.3.2",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -683,7 +685,7 @@ dependencies = [
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=eef5943cbf867f2b7ee9c816c0351a71c56c37f1#eef5943cbf867f2b7ee9c816c0351a71c56c37f1"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
@@ -734,9 +736,20 @@ dependencies = [
 [[package]]
 name = "chain-ledger"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=eef5943cbf867f2b7ee9c816c0351a71c56c37f1#eef5943cbf867f2b7ee9c816c0351a71c56c37f1"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "chain-sieve"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "memchr",
+ "mitos-chain-walk",
+ "pallas-traverse 1.1.1",
 ]
 
 [[package]]
@@ -942,6 +955,26 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "const-random"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87e00182fe74b066627d63b85fd550ac2998d4b0bd86bfed477a0ae4c7c71359"
+dependencies = [
+ "const-random-macro",
+]
+
+[[package]]
+name = "const-random-macro"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d839f2a20b0aee515dc581a6172f2321f96cab76c1a38a4c584a194955390e"
+dependencies = [
+ "getrandom 0.2.15",
+ "once_cell",
+ "tiny-keccak",
+]
 
 [[package]]
 name = "convert_case"
@@ -2379,6 +2412,7 @@ checksum = "459196ed295495a68f7d7fe1d84f6c4b7ff0e21fe3017b2f283c6fac3ad803c9"
 dependencies = [
  "cfg-if",
  "crunchy",
+ "num-traits",
 ]
 
 [[package]]
@@ -2539,6 +2573,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
 name = "hyper"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2570,6 +2610,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
@@ -2840,6 +2881,12 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
+
+[[package]]
+name = "integer-encoding"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
 name = "interval-heap"
@@ -3256,6 +3303,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3268,6 +3325,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -3555,6 +3621,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-cohort"
+version = "0.0.1"
+dependencies = [
+ "address-registry",
+ "mitos-launchpad-decode",
+ "mitos-vesting-decode",
+ "pallas-addresses 1.1.1",
+]
+
+[[package]]
 name = "mitos-community-events"
 version = "0.0.1"
 dependencies = [
@@ -3646,6 +3722,25 @@ dependencies = [
 name = "mitos-dex-decode"
 version = "0.0.1"
 dependencies = [
+ "hex",
+ "pallas-codec 1.1.1",
+ "pallas-primitives 1.1.1",
+]
+
+[[package]]
+name = "mitos-koios"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+]
+
+[[package]]
+name = "mitos-launchpad-decode"
+version = "0.0.1"
+dependencies = [
+ "hex",
  "pallas-codec 1.1.1",
  "pallas-primitives 1.1.1",
 ]
@@ -3658,6 +3753,7 @@ dependencies = [
  "mitos-community-events",
  "pallas-addresses 1.1.1",
  "pallas-codec 1.1.1",
+ "pallas-crypto 1.1.1",
  "pallas-primitives 1.1.1",
 ]
 
@@ -3680,6 +3776,7 @@ dependencies = [
  "mitos-data-plane",
  "mitos-protocol",
  "pallas",
+ "pallas-addresses 1.1.1",
  "pallas-primitives 1.1.1",
  "pallas-traverse 1.1.1",
  "redb 2.6.3",
@@ -3696,9 +3793,20 @@ dependencies = [
  "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "tx-index",
  "url",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "mitos-pool-observe"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "mitos-chain-walk",
+ "mitos-cohort",
+ "mitos-dex-decode",
 ]
 
 [[package]]
@@ -3924,6 +4032,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -3970,6 +4079,41 @@ dependencies = [
  "hashbrown 0.17.0",
  "indexmap 2.14.0",
  "memchr",
+]
+
+[[package]]
+name = "object_store"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbfbfff40aeccab00ec8a910b57ca8ecf4319b335c542f2edcd19dd25a1e2a00"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "form_urlencoded",
+ "futures",
+ "http",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "itertools 0.14.0",
+ "md-5",
+ "parking_lot",
+ "percent-encoding",
+ "quick-xml",
+ "rand 0.9.1",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "wasm-bindgen-futures",
+ "web-time",
 ]
 
 [[package]]
@@ -4064,6 +4208,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -4394,6 +4547,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet"
+version = "55.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b17da4150748086bd43352bc77372efa9b6e3dbd06a04831d2a98c041c225cfa"
+dependencies = [
+ "ahash",
+ "bytes",
+ "chrono",
+ "half",
+ "hashbrown 0.15.5",
+ "num",
+ "num-bigint",
+ "paste",
+ "seq-macro",
+ "snap",
+ "thrift",
+ "twox-hash",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4535,7 +4708,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pipeline-types"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=eef5943cbf867f2b7ee9c816c0351a71c56c37f1#eef5943cbf867f2b7ee9c816c0351a71c56c37f1"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "cardano-assets",
  "hex",
@@ -4561,6 +4734,35 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "policy-archive"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "futures-executor",
+ "parquet",
+ "postcard",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "policy-index"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "memmap2",
+ "pallas-codec 1.1.1",
+ "pallas-crypto 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "tempfile",
+ "tracing",
+ "tx-index",
+]
 
 [[package]]
 name = "portable-atomic"
@@ -4626,6 +4828,7 @@ dependencies = [
  "hex",
  "memchr",
  "mitos-chain-walk",
+ "mitos-koios",
  "pallas-addresses 1.1.1",
  "pallas-codec 1.1.1",
  "pallas-crypto 1.1.1",
@@ -4729,6 +4932,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -5105,6 +5318,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5399,6 +5613,12 @@ dependencies = [
  "serde",
  "serde_core",
 ]
+
+[[package]]
+name = "seq-macro"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bc711410fbe7399f390ca1c3b60ad0f53f80e95c5eb935e52268a0e2cd49acc"
 
 [[package]]
 name = "serde"
@@ -5700,6 +5920,12 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "socket2"
@@ -6023,6 +6249,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "thrift"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
+dependencies = [
+ "byteorder",
+ "integer-encoding",
+ "ordered-float",
+]
+
+[[package]]
 name = "time"
 version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6056,6 +6293,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6079,6 +6325,56 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "token-ledger"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum 0.8.4",
+ "cardano-assets",
+ "chain-ledger",
+ "chain-sieve",
+ "clap",
+ "flate2",
+ "hex",
+ "libc",
+ "mitos-chain-walk",
+ "mitos-cohort",
+ "mitos-dex-decode",
+ "mitos-koios",
+ "mitos-launchpad-decode",
+ "mitos-pool-observe",
+ "mitos-vesting-decode",
+ "object_store",
+ "pallas-addresses 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "policy-archive",
+ "policy-index",
+ "postcard",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "token-ledger-wire",
+ "tokio",
+ "tokio-stream",
+ "toml 0.8.20",
+ "tower-http 0.6.6",
+ "tracing",
+ "tracing-subscriber",
+ "tx-index",
+]
+
+[[package]]
+name = "token-ledger-wire"
+version = "0.0.1"
+dependencies = [
+ "postcard",
+ "serde",
+]
 
 [[package]]
 name = "tokio"
@@ -6553,6 +6849,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
+name = "tx-index"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "memmap2",
+ "pallas-codec 1.1.1",
+ "pallas-crypto 1.1.1",
+ "pallas-primitives 1.1.1",
+ "pallas-traverse 1.1.1",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "tx-index-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum 0.8.4",
+ "clap",
+ "hex",
+ "policy-index",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http 0.6.6",
+ "tracing",
+ "tracing-subscriber",
+ "tx-index",
+]
+
+[[package]]
 name = "tx3-cardano"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6601,7 +6930,7 @@ dependencies = [
 [[package]]
 name = "tx_insights"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=eef5943cbf867f2b7ee9c816c0351a71c56c37f1#eef5943cbf867f2b7ee9c816c0351a71c56c37f1"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "cardano-assets",
  "serde",
@@ -6869,8 +7198,10 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "axum 0.8.4",
+ "chain-sieve",
  "clap",
  "hex",
+ "market-ledger-wire",
  "memchr",
  "mitos-chain-walk",
  "pallas-addresses 1.1.1",
@@ -6884,6 +7215,7 @@ dependencies = [
  "tower-http 0.6.6",
  "tracing",
  "tracing-subscriber",
+ "tx-index",
 ]
 
 [[package]]
@@ -7075,7 +7407,7 @@ dependencies = [
 [[package]]
 name = "wasm_safe_serde"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=eef5943cbf867f2b7ee9c816c0351a71c56c37f1#eef5943cbf867f2b7ee9c816c0351a71c56c37f1"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "serde",
  "serde_json",

@@ -24,7 +24,8 @@
 
 use mitos_community_events::jpg_store_listing::JpgStoreListing;
 use mitos_marketplace_decode::{
-    classify_jpg_address, decode_jpg_listings, AssetId, DecodeTx, OutputDatum, TxInput, TxOutput,
+    classify_jpg_address, decode_jpg_listings, recover_datum_from_metadata, AssetId, DecodeTx,
+    OutputDatum, TxInput, TxOutput,
 };
 
 use crate::mitos::platform_v2::chain_data;
@@ -64,18 +65,53 @@ fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
 }
 
 /// Build a neutral `TxOutput`, carrying the produced UTxO's on-chain index and
-/// datum (inline payload + hash, unresolved — the crate's create path is
-/// payload-only and its update path resolves the hash itself).
+/// its **resolved** datum.
+///
+/// jpg commits listing datums by hash, so `payload` is empty on virtually every
+/// jpg create — and the crate's create path is payload-only by design (it must
+/// never issue a per-listing hash lookup while re-scanning the stranded jpg
+/// book). Left as-is, that combination decodes every jpg create to no payouts
+/// and price 0, which is exactly why the ask book stayed empty while the bid
+/// book worked.
+///
+/// The fix is the one the sibling offer module has always used: recover the
+/// preimage from the transaction's own metadata (jpg publishes it under labels
+/// 50+) and hash-verify it.
+///
+/// **Cost, honestly stated.** On the LIVE path this is free: the metadata rides
+/// in the block being processed, so `tx_metadata` is a local read. On a
+/// BOOTSTRAP re-walk it is not — those listings were created years ago, the
+/// host no longer holds their blocks, and every call goes out to the configured
+/// fallback provider. Measured on mainnet: ~4 lookups/second, which over the
+/// ~219k-listing residual jpg book is ~14 hours of remote calls.
+///
+/// That is precisely the boot-stall the crate's payload-only create rule exists
+/// to avoid, arrived at from a different direction — so a bootstrap of this
+/// module must be treated as a deliberate, supervised operation, not a routine
+/// recapture. A local index that can serve aux data would remove the cost
+/// (`tx-index` on the infra box indexes tx BODIES, not auxiliary data, so it
+/// does not cover this today).
 fn build_output(p: &ProducedEvent) -> TxOutput {
+    let datum = p.datum.as_ref().map(|d| {
+        let payload = if !d.payload.is_empty() {
+            d.payload.clone()
+        } else {
+            chain_data::tx_metadata(&p.tx_hash)
+                .and_then(|aux| recover_datum_from_metadata(&aux, &d.hash))
+                .unwrap_or_default()
+        };
+        OutputDatum {
+            payload,
+            hash: d.hash.clone(),
+        }
+    });
+
     TxOutput {
         address: p.output.address.clone(),
         lovelace: p.output.lovelace,
         assets: to_asset_ids(&p.output.assets),
         index: p.oref.index,
-        datum: p.datum.as_ref().map(|d| OutputDatum {
-            payload: d.payload.clone(),
-            hash: d.hash.clone(),
-        }),
+        datum,
     }
 }
 

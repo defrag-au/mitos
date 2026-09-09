@@ -1,0 +1,30 @@
+[package]
+name = "mitos-pool-observe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Recognise a DEX pool OUTPUT and read its reserves the way that venue actually publishes them — value, datum fields, or value-minus-treasury. The layer above mitos-dex-decode that knows which rule each venue needs, and declines to quote when it cannot."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+# The per-venue credentials and datum decoders. This crate is the layer that
+# knows which RESERVE RULE each of them needs — reading the value where the
+# datum is authoritative overstated a Minswap pool by 314,000,000×.
+mitos-dex-decode = { path = "../mitos-dex-decode" }
+# `DecodedOutput` / `Asset` — the walker's output shape. This is the dependency
+# that keeps this crate on the walker side of the split: `mitos-cohort` is
+# deliberately free of it so a Worker can classify parties without linking the
+# chain-walk stack.
+mitos-chain-walk = { path = "../../tools/mitos-chain-walk" }
+# `payment_cred` — Minswap and WingRiders are matched on the payment credential
+# because their stake part is contract-derived per pool.
+mitos-cohort = { path = "../mitos-cohort" }
+
+[dev-dependencies]
+# Golden pool datums are COPIED hex from real chain UTxOs — never retyped; a
+# hand-transcribed WingRiders byte once shifted a treasury by 512. Dev-only, so
+# the crate stays as light as `mitos-dex-decode` for its wasm consumers.
+hex = { workspace = true }

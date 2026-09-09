@@ -186,6 +186,12 @@ pub fn resolve_local(args: &LocalArgs) -> Result<()> {
         // only a match pays for output decoding.
         if args.harvest_handles && handle_finder.find(&bytes).is_some() {
             for tx in blk.txs() {
+                // PHASE-2 FAILURE — a handle in an output that was never
+                // created would name a wallet that never held it, and handle
+                // labels TRAVEL through this codebase.
+                if !tx.is_valid() {
+                    continue;
+                }
                 let d = decode_tx(&tx);
                 for o in &d.outputs {
                     let mut named: Option<String> = None;
@@ -212,6 +218,12 @@ pub fn resolve_local(args: &LocalArgs) -> Result<()> {
             // The hot path is this single lookup, run once per transaction on
             // mainnet — everything else is behind it.
             if !wanted.contains(tx.hash().as_ref()) {
+                continue;
+            }
+            // PHASE-2 FAILURE. Ordered AFTER the `wanted` lookup on purpose:
+            // that lookup is the hot path and this costs a branch on the few
+            // transactions that survive it.
+            if !tx.is_valid() {
                 continue;
             }
             found_txs += 1;

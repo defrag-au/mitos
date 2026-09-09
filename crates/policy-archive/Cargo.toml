@@ -1,0 +1,36 @@
+# policy-archive — the sealed Parquet archive of a policy's movements: the
+# writer token-ledger `seal` uses, and the reader a Worker or wasm frontend
+# uses to open it over HTTP range requests.
+#
+# One crate for both halves ON PURPOSE. The column names, the footer stamp and
+# the row-group alignment are a contract between a writer on cardano-infra and
+# readers at the edge; keeping them in one place means a drift is a compile
+# error rather than a file nobody can address by name.
+#
+# `parquet` with `default-features = false`: the default set drags in `arrow`,
+# which measured 16× larger compiled to wasm. Codecs are explicit — SNAPPY only,
+# because every reader (including a browser bundle) has to link whatever the
+# writer chose. See docs/design/TOKEN_LEDGER_PARQUET.md in cnft.dev-workers.
+
+[package]
+name = "policy-archive"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+parquet = { version = "55", default-features = false, features = ["snap"] }
+bytes = "1"
+thiserror = { workspace = true }
+# The manifest is JSON on disk and in R2; the same struct on both sides of
+# the wire is the point of it living here.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The per-policy bundle (manifest + footers) for a key-value store, in the
+# same encoding as the pending sidecar.
+postcard = { workspace = true }
+
+[dev-dependencies]
+# Drives the runtime-free async reader in tests.
+futures-executor = "0.3"

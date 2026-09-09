@@ -1,0 +1,18 @@
+[package]
+name = "mitos-launchpad-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Launchpad bonding-curve recognition + datum decode. A launch is a token's single most consequential event and every surface we run rendered it as a transfer to an unnamed script; this is the crate that names it. Mirrors mitos-dex-decode / mitos-vesting-decode."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+pallas-codec.workspace = true
+pallas-primitives.workspace = true
+
+[dev-dependencies]
+# Golden datums are COPIED hex from real chain UTxOs, never retyped.
+hex = { workspace = true }

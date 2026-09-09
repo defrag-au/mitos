@@ -45,7 +45,9 @@ pub use types::{
     ValidityInterval,
 };
 
-pub use impls::{LocalDataPlane, extract_aux_cbor, project_typed_output};
+pub use impls::{
+    LocalDataPlane, UTXOS_BY_ADDRESS_HARD_CAP, extract_aux_cbor, project_typed_output,
+};
 
 use async_trait::async_trait;
 use cardano_assets::PolicyId;

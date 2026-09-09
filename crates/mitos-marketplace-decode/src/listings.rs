@@ -46,17 +46,19 @@ use mitos_community_events::wayup_store_listing::{
     Unlisting as WayupUnlisting, WayupStoreContractVersion, WayupStoreListing,
 };
 
-use crate::datum::decode_listing_datum;
-use crate::sales::{WayupSaleConfig, classify_jpg_address};
+use crate::datum::{ListingContract, decode_listing_datum};
+use crate::sales::{WayupSaleConfig, classify_jpg_address, jpg_listing_contract};
 use crate::{DecodeTx, OutputDatum};
 
-/// jpg.store / Wayup listing **cancel** (delist) redeemer: constructor 1 with
-/// empty fields, exactly `d87a80`. The live modules match the full three bytes
-/// (not the `d87a` prefix `datum::is_cancel_redeemer` uses), so a richer
-/// constructor-1 redeemer would NOT be treated as a delist — preserved here to
-/// keep goldens byte-identical.
-fn is_delist_redeemer(bytes: &[u8]) -> bool {
-    bytes == [0xd8, 0x7a, 0x80]
+/// Was this listing spend a **delist**, under its own contract's convention?
+///
+/// This used to be a single `bytes == [0xd8, 0x7a, 0x80]` check shared by every
+/// venue and version. `d87a80` is the delist for Wayup and jpg V2/V3 — but it is
+/// jpg **V1**'s BUY, so every V1-era purchase was emitted as an `Unlisting` and
+/// no V1 sale was ever recorded. See [`ListingContract`] for the measured
+/// conventions.
+fn is_delist_redeemer(contract: ListingContract, bytes: &[u8]) -> bool {
+    contract.is_delist_redeemer(bytes)
 }
 
 fn sum_payouts(payouts: &[ListingPayout]) -> u64 {
@@ -129,12 +131,15 @@ struct ConsumedListing<V> {
 }
 
 /// Venue-agnostic listing classifier. `classify` gates which addresses are the
-/// venue's listing contract (returning its version tag); `create_uses_resolver`
-/// selects the create-path datum policy (jpg = payload-only `false`; Wayup =
+/// venue's listing contract (returning its version tag); `contract` maps that
+/// tag to the validator whose redeemer convention applies, per input, since jpg
+/// V1 and V2/V3 delist on opposite constructors; `create_uses_resolver` selects
+/// the create-path datum policy (jpg = payload-only `false`; Wayup =
 /// payload-then-resolver `true`). See the module docs for the resolution split.
 fn collect_listings<V: Clone>(
     tx: &DecodeTx,
     classify: impl Fn(&str) -> Option<V>,
+    contract: impl Fn(&V) -> ListingContract,
     resolve: impl Fn(&[u8]) -> Option<Vec<u8>>,
     create_uses_resolver: bool,
 ) -> Vec<ListingEvent<V>> {
@@ -171,7 +176,7 @@ fn collect_listings<V: Clone>(
         let Some(redeemer) = input.redeemer.as_ref() else {
             continue;
         };
-        if !is_delist_redeemer(redeemer) {
+        if !is_delist_redeemer(contract(&version), redeemer) {
             continue;
         }
         let bundle_size = (input.assets.len() > 1).then_some(input.assets.len() as u32);
@@ -286,10 +291,16 @@ pub fn decode_jpg_listings(
     tx: &DecodeTx,
     resolve: impl Fn(&[u8]) -> Option<Vec<u8>>,
 ) -> Vec<JpgStoreListing> {
-    collect_listings(tx, classify_jpg_address, resolve, false)
-        .into_iter()
-        .map(project_jpg)
-        .collect()
+    collect_listings(
+        tx,
+        classify_jpg_address,
+        jpg_listing_contract,
+        resolve,
+        false,
+    )
+    .into_iter()
+    .map(project_jpg)
+    .collect()
 }
 
 fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
@@ -376,6 +387,7 @@ pub fn decode_wayup_listings(
             cfg.is_listing_address(addr)
                 .then_some(WayupStoreContractVersion::V1)
         },
+        |_| ListingContract::Wayup,
         resolve,
         true,
     )
@@ -553,6 +565,8 @@ mod tests {
                 address: JPG_V2_ADDR.into(),
                 assets: vec![asset()],
                 datum: Some(listing_datum(&seller, &[(&seller, "1a389fd980")])),
+                // At V2 the DELIST is constructor 1 (`d87a80`); constructor 0 is
+                // V2's buy. V1 is the other way round.
                 redeemer: Some(vec![0xd8, 0x7a, 0x80]),
                 ..Default::default()
             }],
@@ -580,6 +594,8 @@ mod tests {
                 address: JPG_V2_ADDR.into(),
                 assets: vec![asset()],
                 datum: Some(prior),
+                // At V2 the DELIST is constructor 1 (`d87a80`); constructor 0 is
+                // V2's buy. V1 is the other way round.
                 redeemer: Some(vec![0xd8, 0x7a, 0x80]),
                 ..Default::default()
             }],

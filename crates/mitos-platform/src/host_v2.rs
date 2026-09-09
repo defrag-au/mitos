@@ -447,10 +447,14 @@ where
         if fallback_opt.is_some() {
             tracing::info!(module = %id, "chain-data fallback provider enabled");
         }
+        // The local chunk-store index sits ahead of the remote fallback for
+        // aux-data; absent, aux-data lookups just take the remote path.
+        let local_index_opt = crate::local_tx_index::shared();
         let caching_plane: Arc<dyn DataPlaneFacade> =
             Arc::new(crate::host_fns::CachingDataPlane::new(
                 self.data_plane.clone(),
                 cache_opt,
+                local_index_opt,
                 fallback_opt.clone(),
             ));
         let config = self.storage.read_config(id)?.unwrap_or_default();

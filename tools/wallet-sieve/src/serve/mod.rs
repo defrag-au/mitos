@@ -4,6 +4,10 @@
 //!
 //! Surface:
 //! - `GET  /health` — open.
+//! - `GET  /flows/{target}/tx/{hash}` — ONE row by hash, plus how many sit
+//!   either side of it. Keyed off the primary key, so a transaction deep in a
+//!   wallet's history costs the same as its newest one — which paging could
+//!   not offer, and which is what a shared link needs.
 //! - `GET  /flows/{target}` — cached rows newest-first (`?limit`,
 //!   `?before_slot` pagination) + wallet meta + any job state.
 //! - `POST /flows/{target}/refresh` — start (or join) an excavation.
@@ -42,6 +46,12 @@ pub struct ServeArgs {
     /// Immutable DB dir the excavations scan.
     #[arg(long)]
     immutable: PathBuf,
+
+    /// tx-index dir (base.idx + segments/) for sender resolution — the
+    /// index `tx-index-refresh` maintains beside the chunk store. Unusable
+    /// = the decode+hash sweep, with a warning per resolve.
+    #[arg(long, default_value = "/opt/tx-index/mainnet")]
+    index_dir: PathBuf,
 
     /// Threads per excavation (one excavation runs at a time).
     #[arg(long, default_value_t = 10)]
@@ -132,6 +142,7 @@ pub struct AppState {
 fn router(state: AppState, token: auth::AuthToken) -> Router {
     let gated = Router::new()
         .route("/flows/{target}", get(handlers::flows))
+        .route("/flows/{target}/tx/{hash}", get(handlers::flow_tx))
         .route("/flows/{target}/refresh", post(handlers::refresh))
         .route("/flows/{target}/events", get(handlers::events))
         .layer(axum::middleware::from_fn_with_state(
@@ -161,6 +172,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let registry = jobs::Registry::start(jobs::Config {
         db_path: args.db.clone(),
         immutable: args.immutable.clone(),
+        index_dir: args.index_dir.clone(),
         tail_db: args.tail_db.clone(),
         market_db: args.market_db.clone(),
         // Slots are seconds on Shelley, so a day is 86,400 of them.

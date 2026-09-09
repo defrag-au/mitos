@@ -184,6 +184,80 @@ pub struct ListingsParams {
     format: Option<String>,
 }
 
+/// Query for `GET /listings/scan`.
+#[derive(Debug, Deserialize)]
+pub struct ScanParams {
+    venue: Option<String>,
+    /// Resume after this `policy_id`; pair with `after_asset`.
+    after_policy: Option<String>,
+    after_asset: Option<String>,
+    limit: Option<u32>,
+}
+
+/// One page of [`ScanParams`], plus the cursor to resume from.
+///
+/// `next_after_*` are `None` at the end of the scan — that, not an empty page,
+/// is how a caller knows it has seen everything. A reconciler acting on a
+/// partial scan deletes live rows, so "did I reach the end" has to be an
+/// explicit answer rather than something inferred from a short page.
+#[derive(Serialize)]
+struct ListingsScanJson {
+    listings: Vec<crate::store::Listing>,
+    next_after_policy: Option<String>,
+    next_after_asset: Option<String>,
+}
+
+/// `GET /listings/scan` — page the entire listings projection.
+///
+/// The per-policy `/listings` cannot answer "everything currently listed"
+/// without a policy list, and the alternatives for that question are all
+/// worse: mitos `utxos_by_address` silently truncates at 100K (it hid ~84K jpg
+/// V1 listings and a reconciler built on it deleted live rows), and paging
+/// Koios costs ~60s per thousand.
+pub async fn listings_scan(
+    State(state): State<AppState>,
+    Query(params): Query<ScanParams>,
+) -> Result<Response, ApiError> {
+    let limit = params
+        .limit
+        .unwrap_or(state.default_limit)
+        .min(state.max_limit);
+    let venue = params.venue.clone();
+    let after = match (&params.after_policy, &params.after_asset) {
+        (Some(p), Some(a)) => Some((p.clone(), a.clone())),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "after_policy and after_asset must be given together".into(),
+            ));
+        }
+    };
+
+    let db = state.db.clone();
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.open_ro()?;
+        query::scan_listings(
+            &conn,
+            venue.as_deref(),
+            after.as_ref().map(|(p, a)| (p.as_str(), a.as_str())),
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))??;
+
+    // A full page implies there may be more; a short one is the end. The
+    // cursor is the last row seen, so the next page resumes strictly after it.
+    let complete = (rows.len() as u32) < limit;
+    let cursor = if complete { None } else { rows.last() };
+    Ok(Json(ListingsScanJson {
+        next_after_policy: cursor.map(|r| r.policy_id.clone()),
+        next_after_asset: cursor.map(|r| r.asset_name_hex.clone()),
+        listings: rows,
+    })
+    .into_response())
+}
+
 /// `?format=json` debug body for `/listings`.
 #[derive(Serialize)]
 struct ListingsJson {

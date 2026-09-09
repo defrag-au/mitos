@@ -15,7 +15,7 @@ use mitos_community_events::wayup_store_sale::{Sale as WayupSale, WayupStoreSale
 use pallas_addresses::{Address, ShelleyDelegationPart, ShelleyPaymentPart};
 
 use crate::DecodeTx;
-use crate::datum::{decode_listing_datum, is_buy_redeemer};
+use crate::datum::{ListingContract, decode_listing_datum};
 
 /// A matched sale before venue projection: one asset, the buyer that received
 /// it, and the decoded listing terms. `tag` carries any venue-specific datum
@@ -64,9 +64,16 @@ struct Pending<T> {
 /// credential ([`address_bears_cred`]). Without this, ~71% of jpg "sales" are
 /// phantom (the owner reclaiming/relisting their own NFT), because the receiving
 /// wallet is not a marketplace escrow and so escapes the check above.
+/// `contract` maps a classified listing to the validator whose redeemer
+/// convention decides "is this a buy". It is derived **per input** from that
+/// input's own classification, not fixed per venue or per transaction, because
+/// jpg.store reversed its convention between V1 and V2 — see
+/// [`ListingContract`]. One transaction may legitimately spend listings at both
+/// jpg generations (and at Wayup), each needing its own reading.
 pub fn collect_sales<T: Clone>(
     tx: &DecodeTx,
     classify: impl Fn(&str) -> Option<T>,
+    contract: impl Fn(&T) -> ListingContract,
     is_marketplace_escrow: impl Fn(&str) -> bool,
 ) -> Vec<MatchedSale<T>> {
     let mut pending: BTreeMap<(Vec<u8>, Vec<u8>), Pending<T>> = BTreeMap::new();
@@ -78,7 +85,7 @@ pub fn collect_sales<T: Clone>(
         let Some(redeemer) = input.redeemer.as_ref() else {
             continue;
         };
-        if !is_buy_redeemer(redeemer) {
+        if !contract(&tag).is_buy_redeemer(redeemer) {
             continue;
         }
         let Some(datum) = input.datum.as_ref() else {
@@ -143,18 +150,50 @@ pub fn collect_sales<T: Clone>(
 // ============================================================
 
 const JPG_V1_ADDR: &str = "addr1zxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tvpw288a4x0xf8pxgcntelxmyclq83s0ykeehchz2wtspks905plm";
+/// V2 and V3 are the SAME validator (script hash `c727443d…`) in two bech32
+/// forms: `addr1x` carries a script staking part, `addr1w` carries none. Both
+/// occur on chain and both must be recognised.
 const JPG_V2_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V3_ADDR: &str = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
-const JPG_V4_ADDR: &str = "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp";
+const JPG_V3_ADDR: &str = "addr1w8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7eg0fcr8k";
+
+// V4: deliberately absent. The constant that used to sit here
+// (`addr1w999n67e…g4xkcp`) fails its bech32 checksum, so it could never equal a
+// real on-chain address and the V4 match arm was dead code that merely looked
+// like coverage. `address-registry` pulled its V4 row for the same reason.
+// Reinstate only with an address that round-trips — `jpg_constants_are_real_
+// addresses` will hold any replacement to that.
 
 /// Classify a jpg.store sale-contract address to its version, or `None`.
+///
+/// Note the V3 constant was previously also a checksum-invalid string. Because
+/// [`is_marketplace_escrow`] is built on this, an asset re-escrowed at the
+/// undelegated address classified as `None` and so read as a *buyer delivery* —
+/// i.e. a re-listing was booked as a completed sale.
 pub fn classify_jpg_address(addr: &str) -> Option<JpgStoreContractVersion> {
     match addr {
         JPG_V1_ADDR => Some(JpgStoreContractVersion::V1),
         JPG_V2_ADDR => Some(JpgStoreContractVersion::V2),
         JPG_V3_ADDR => Some(JpgStoreContractVersion::V3),
-        JPG_V4_ADDR => Some(JpgStoreContractVersion::V4),
         _ => None,
+    }
+}
+
+/// Which validator's redeemer convention a jpg listing version answers to.
+///
+/// V1 is its own contract and buys on the opposite constructor to V2/V3 — see
+/// [`ListingContract`]. Matched exhaustively on purpose: a new jpg version must
+/// state which convention it follows rather than silently inherit V2's.
+pub fn jpg_listing_contract(version: &JpgStoreContractVersion) -> ListingContract {
+    match version {
+        JpgStoreContractVersion::V1 => ListingContract::JpgV1,
+        JpgStoreContractVersion::V2 | JpgStoreContractVersion::V3 => ListingContract::JpgV2V3,
+        // Unreachable through `classify_jpg_address`, which has no V4 address to
+        // match (see the constants above), and V4 listings carry no payout datum
+        // so they are dropped before a sale can be projected. Its convention is
+        // therefore UNMEASURED — if a real V4 address is ever reinstated, run
+        // `tools/market-ledger/scripts/jpg_redeemer_audit.py` against it before
+        // trusting this arm.
+        JpgStoreContractVersion::V4 => ListingContract::JpgV2V3,
     }
 }
 
@@ -199,7 +238,12 @@ const JPG_FEE_CRED_HEX: &str = "84cc25ea4c29951d40b443b95bbc5676bc425470f96376d1
 /// settlement across the tx's listings. Bundle members repeat their listing's
 /// whole share, mirroring how they repeat the whole-bundle price.
 pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
-    let matched = collect_sales(tx, classify_jpg_address, is_marketplace_escrow);
+    let matched = collect_sales(
+        tx,
+        classify_jpg_address,
+        jpg_listing_contract,
+        is_marketplace_escrow,
+    );
     if matched.is_empty() {
         return Vec::new();
     }
@@ -216,13 +260,15 @@ pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
     let mut listings_total: u64 = 0;
     let mut payouts_to_fees: u64 = 0;
     for input in &tx.inputs {
-        if classify_jpg_address(&input.address).is_none() {
+        let Some(version) = classify_jpg_address(&input.address) else {
             continue;
-        }
+        };
         let Some(redeemer) = input.redeemer.as_ref() else {
             continue;
         };
-        if !is_buy_redeemer(redeemer) {
+        // Same gate as `collect_sales` above — per listing version, since V1 and
+        // V2/V3 buy on opposite constructors.
+        if !jpg_listing_contract(&version).is_buy_redeemer(redeemer) {
             continue;
         }
         let Some(decoded) = input.datum.as_deref().and_then(decode_listing_datum) else {
@@ -319,6 +365,7 @@ pub fn decode_wayup_sales(tx: &DecodeTx, cfg: &WayupSaleConfig) -> Vec<WayupStor
     collect_sales(
         tx,
         |addr| cfg.is_listing_address(addr).then_some(()),
+        |()| ListingContract::Wayup,
         is_marketplace_escrow,
     )
     .into_iter()
@@ -397,6 +444,70 @@ mod tests {
     // Shelley address to exercise the credential extraction/match path.
     const SHELLEY_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
 
+    /// Every hardcoded jpg address must be a real, round-tripping bech32
+    /// address, and must be distinct from its siblings.
+    ///
+    /// Two of these constants were checksum-invalid strings. They matched
+    /// nothing, so the match arms built on them were dead while looking like
+    /// coverage — and `is_marketplace_escrow` consequently misread a re-listing
+    /// at the undelegated address as a buyer delivery. Nothing failed loudly;
+    /// the ledger just quietly booked a sale that never happened.
+    #[test]
+    fn jpg_constants_are_real_addresses() {
+        use pallas_addresses::Address;
+
+        for (label, addr) in [
+            ("V1", JPG_V1_ADDR),
+            ("V2", JPG_V2_ADDR),
+            ("V3", JPG_V3_ADDR),
+        ] {
+            let decoded = Address::from_bech32(addr)
+                .unwrap_or_else(|e| panic!("{label} address {addr} does not decode: {e}"));
+            assert_eq!(
+                decoded.to_bech32().unwrap(),
+                addr,
+                "{label} address does not round-trip — header and payload disagree, so it \
+                 can never equal an on-chain address"
+            );
+        }
+
+        assert_ne!(JPG_V1_ADDR, JPG_V2_ADDR);
+        assert_ne!(JPG_V2_ADDR, JPG_V3_ADDR);
+    }
+
+    /// V2 and V3 are two bech32 forms of ONE validator, so they must share a
+    /// payment credential while remaining distinct addresses. If a future edit
+    /// points V3 at a different script, this catches it.
+    #[test]
+    fn jpg_v2_and_v3_are_the_same_validator() {
+        let v2 = address_payment_cred(JPG_V2_ADDR).expect("V2 has a payment cred");
+        let v3 = address_payment_cred(JPG_V3_ADDR).expect("V3 has a payment cred");
+        assert_eq!(
+            v2, v3,
+            "V2 and V3 must be the same script in delegated and undelegated form"
+        );
+    }
+
+    /// Both forms of the V2/V3 validator must classify, or an asset re-escrowed
+    /// there is mistaken for a delivery to a buyer.
+    #[test]
+    fn both_forms_of_the_v2_validator_are_recognised_as_escrow() {
+        assert_eq!(
+            classify_jpg_address(JPG_V2_ADDR),
+            Some(JpgStoreContractVersion::V2)
+        );
+        assert_eq!(
+            classify_jpg_address(JPG_V3_ADDR),
+            Some(JpgStoreContractVersion::V3)
+        );
+        assert!(is_marketplace_escrow(JPG_V2_ADDR));
+        assert!(
+            is_marketplace_escrow(JPG_V3_ADDR),
+            "the undelegated form must count as escrow — this is the regression that \
+             booked re-listings as sales"
+        );
+    }
+
     #[test]
     fn cred_parsing_rejects_wrong_length_and_empty() {
         assert!(parse_cred("").is_none());
@@ -459,6 +570,9 @@ mod tests {
                 address: JPG_V2_ADDR.into(),
                 assets: vec![asset],
                 datum: Some(datum),
+                // This listing is at V2, whose BUY is constructor 0 (`d879…`),
+                // here carrying an input index. The V1 fixtures below use the
+                // opposite constructor — that contrast is the point.
                 redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
@@ -549,7 +663,8 @@ mod tests {
                 address: JPG_V1_ADDR.into(),
                 assets: vec![asset.clone()],
                 datum: Some(listing_datum(&seller, &[(&seller, "1a389fd980")])),
-                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                // jpg BUY = constructor 1 (`d87a…`), carrying an input index.
+                redeemer: Some(vec![0xd8, 0x7a, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
             // NFT re-escrowed at the Wayup sale contract (the migration), plus
@@ -588,6 +703,69 @@ mod tests {
         assert_eq!(sales.len(), 1);
     }
 
+    /// The guard for the per-version convention: ONE transaction buying a jpg V1
+    /// listing and a jpg V2 listing must record BOTH sales, even though the two
+    /// spends carry opposite redeemer constructors.
+    ///
+    /// Any tx-wide or venue-wide reading of the redeemer drops exactly one of
+    /// them — which is how both prior bugs presented. Mixed-generation buys are
+    /// real: `6e2ef8b9…` settles jpg and Wayup listings together, and jpg's own
+    /// two generations overlapped for years.
+    #[test]
+    fn one_tx_can_buy_at_both_jpg_generations() {
+        let v1_seller = "aa".repeat(28);
+        let v2_seller = "bb".repeat(28);
+        let v1_asset = AssetId {
+            policy: vec![1; 28],
+            name: b"OldGen".to_vec(),
+        };
+        let v2_asset = AssetId {
+            policy: vec![2; 28],
+            name: b"NewGen".to_vec(),
+        };
+        let tx = DecodeTx {
+            tx_hash: vec![0x77; 32],
+            inputs: vec![
+                TxInput {
+                    address: JPG_V1_ADDR.into(),
+                    assets: vec![v1_asset.clone()],
+                    datum: Some(listing_datum(&v1_seller, &[(&v1_seller, "1a389fd980")])),
+                    // V1 buys on constructor 1.
+                    redeemer: Some(vec![0xd8, 0x7a, 0x9f, 0x00, 0xff]),
+                    ..Default::default()
+                },
+                TxInput {
+                    address: JPG_V2_ADDR.into(),
+                    assets: vec![v2_asset.clone()],
+                    datum: Some(listing_datum(&v2_seller, &[(&v2_seller, "1a389fd980")])),
+                    // V2 buys on constructor 0 — the opposite.
+                    redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x01, 0xff]),
+                    ..Default::default()
+                },
+            ],
+            outputs: vec![TxOutput {
+                address: "addr1buyer".into(),
+                lovelace: 2_630_000,
+                assets: vec![v1_asset, v2_asset],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut names: Vec<String> = decode_jpg_sales(&tx)
+            .into_iter()
+            .map(|s| match s {
+                JpgStoreSale::Sale(sale) => sale.asset_name_hex,
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![hex::encode(b"NewGen"), hex::encode(b"OldGen")],
+            "both jpg generations must be read with their OWN buy constructor"
+        );
+    }
+
     /// The owner wallet + its listing owner pkh from tx `e00cbce7…` — the owner
     /// reclaimed Wave1Flame129 from a jpg V1 listing back to this wallet (payment
     /// cred == the listing datum's owner pkh) in the same tx that migrated other
@@ -614,7 +792,8 @@ mod tests {
                     RECLAIM_OWNER_PKH,
                     &[(RECLAIM_OWNER_PKH, "1a0939c880")],
                 )),
-                redeemer: Some(vec![0xd8, 0x79, 0x9f, 0x00, 0xff]),
+                // jpg BUY = constructor 1 (`d87a…`), carrying an input index.
+                redeemer: Some(vec![0xd8, 0x7a, 0x9f, 0x00, 0xff]),
                 ..Default::default()
             }],
             outputs: vec![TxOutput {
@@ -654,9 +833,37 @@ mod tests {
             Some(JpgStoreContractVersion::V1)
         );
         assert_eq!(
-            classify_jpg_address(JPG_V4_ADDR),
-            Some(JpgStoreContractVersion::V4)
+            classify_jpg_address(JPG_V2_ADDR),
+            Some(JpgStoreContractVersion::V2)
         );
         assert!(classify_jpg_address("addr1notjpg").is_none());
+    }
+
+    /// V4 is a KNOWN GAP, asserted here so it stays visible.
+    ///
+    /// This test previously asserted the opposite — that the V4 constant
+    /// classified as `V4`. That passed only because it compared a
+    /// checksum-invalid string against itself: a tautology. No real address
+    /// could ever equal it, so V4 listings and sales were never matched, and
+    /// the passing assertion made the gap look covered.
+    ///
+    /// Kept as an explicit statement of what is missing rather than deleted, so
+    /// that supplying a genuine V4 address is a visible, deliberate change.
+    /// When one is found: add the constant, restore the match arm, extend
+    /// `jpg_constants_are_real_addresses`, and replace this test.
+    #[test]
+    fn jpg_v4_is_not_classifiable_no_valid_address_is_known() {
+        const CHECKSUM_INVALID_V4: &str =
+            "addr1w999n67e47he8y0v36hjtzluargwu25zw94f6lqnm82aqqsg4xkcp";
+
+        assert!(
+            pallas_addresses::Address::from_bech32(CHECKSUM_INVALID_V4).is_err(),
+            "this string now decodes — if a valid V4 address has been found, wire it up \
+             rather than leaving V4 unmatched"
+        );
+        assert!(
+            classify_jpg_address(CHECKSUM_INVALID_V4).is_none(),
+            "nothing may classify as V4 off a string that cannot appear on chain"
+        );
     }
 }
