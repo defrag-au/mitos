@@ -154,7 +154,8 @@ pub fn shared() -> Option<Arc<LocalTxIndex>> {
             let immutable = std::env::var(IMMUTABLE_ENV).ok().filter(|s| !s.is_empty());
             match (index_dir, immutable) {
                 (Some(index_dir), Some(immutable)) => {
-                    let (index_dir, immutable) = (PathBuf::from(index_dir), PathBuf::from(immutable));
+                    let (index_dir, immutable) =
+                        (PathBuf::from(index_dir), PathBuf::from(immutable));
                     match LocalTxIndex::open(&index_dir, &immutable) {
                         Ok(idx) => {
                             let cov = idx.handle.get().coverage();

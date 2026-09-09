@@ -218,7 +218,10 @@ pub async fn listings_scan(
     State(state): State<AppState>,
     Query(params): Query<ScanParams>,
 ) -> Result<Response, ApiError> {
-    let limit = params.limit.unwrap_or(state.default_limit).min(state.max_limit);
+    let limit = params
+        .limit
+        .unwrap_or(state.default_limit)
+        .min(state.max_limit);
     let venue = params.venue.clone();
     let after = match (&params.after_policy, &params.after_asset) {
         (Some(p), Some(a)) => Some((p.clone(), a.clone())),
@@ -226,7 +229,7 @@ pub async fn listings_scan(
         _ => {
             return Err(ApiError::BadRequest(
                 "after_policy and after_asset must be given together".into(),
-            ))
+            ));
         }
     };
 

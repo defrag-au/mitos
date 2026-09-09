@@ -467,13 +467,13 @@ fn milestones(rows: &[SampleRow], pools: &[PoolInfo], cohorts: &[String]) -> Vec
         && let Some(r) = rows
             .iter()
             .find(|r| r.totals.get(bi).is_some_and(|v| *v > 0))
-        {
-            out.push(Milestone {
-                unix: r.unix,
-                kind: MilestoneKind::FirstBurn,
-                label: "first burn".to_string(),
-            });
-        }
+    {
+        out.push(Milestone {
+            unix: r.unix,
+            kind: MilestoneKind::FirstBurn,
+            label: "first burn".to_string(),
+        });
+    }
 
     // First maturity: locked supply becoming claimable is the arrival of
     // sell pressure, and nothing in a level chart marks it.

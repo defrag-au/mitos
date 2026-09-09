@@ -192,9 +192,7 @@ fn build(a: BuildArgs) -> Result<()> {
     let mut todo: Vec<u16> = chunks
         .iter()
         .copied()
-        .filter(|c| {
-            !have.contains(c) || (a.policy_index_dir.is_some() && !policy_have.contains(c))
-        })
+        .filter(|c| !have.contains(c) || (a.policy_index_dir.is_some() && !policy_have.contains(c)))
         .collect();
     if a.max_chunks > 0 {
         todo.truncate(a.max_chunks);
@@ -320,12 +318,8 @@ fn extract_all(
                                                 chunk: loc.chunk,
                                                 body_offset: loc.offset,
                                                 body_len: loc.len as usize,
-                                                aux_offset: aux
-                                                    .map(|a| a.offset)
-                                                    .unwrap_or(0),
-                                                aux_len: aux
-                                                    .map(|a| a.len as usize)
-                                                    .unwrap_or(0),
+                                                aux_offset: aux.map(|a| a.offset).unwrap_or(0),
+                                                aux_len: aux.map(|a| a.len as usize).unwrap_or(0),
                                             },
                                         );
                                     },
@@ -351,9 +345,7 @@ fn extract_all(
                                     );
                                 }
                                 policy_index::write_segment(pdir, chunk, &mints.records)
-                                    .with_context(|| {
-                                        format!("writing policy segment {chunk}")
-                                    })?;
+                                    .with_context(|| format!("writing policy segment {chunk}"))?;
                                 ex
                             }
                         };

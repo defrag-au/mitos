@@ -170,8 +170,7 @@ pub fn classify(address: &str, pools: &[String], lock_creds: &[[u8; 28]]) -> Cla
             // happened to reach it — and meant a sink was only known to the
             // tokens somebody had already registered it against.
             if matches!(
-                address_registry::lookup_payment_credential(&hex_lower(&cred))
-                    .map(|e| &e.category),
+                address_registry::lookup_payment_credential(&hex_lower(&cred)).map(|e| &e.category),
                 Some(address_registry::AddressCategory::Script(
                     address_registry::ScriptCategory::Burn { .. }
                 ))
@@ -296,10 +295,7 @@ mod tests {
         // Fall back to wallet rather than inflating the script band with
         // decode failures — an unclassified band that grows because of our own
         // bugs would be worse than useless.
-        assert_eq!(
-            classify("not-an-address", &[], &[]).cohort,
-            Cohort::Wallet
-        );
+        assert_eq!(classify("not-an-address", &[], &[]).cohort, Cohort::Wallet);
     }
 
     #[test]
@@ -341,10 +337,7 @@ mod tests {
     fn a_registered_platform_is_vesting_but_weaker_evidence() {
         // Unregistered it is just an unnamed script; registered it is vesting,
         // and the basis says we could not read its schedule.
-        assert_eq!(
-            classify(UNKNOWN_SCRIPT, &[], &[]).cohort,
-            Cohort::Script
-        );
+        assert_eq!(classify(UNKNOWN_SCRIPT, &[], &[]).cohort, Cohort::Script);
         let creds = [payment_cred(UNKNOWN_SCRIPT).expect("payment cred")];
         let got = classify(UNKNOWN_SCRIPT, &[], &creds);
         assert_eq!(got.cohort, Cohort::Vesting);

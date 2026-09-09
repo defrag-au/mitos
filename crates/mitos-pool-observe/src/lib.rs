@@ -1269,7 +1269,6 @@ mod tests {
         assert_eq!(constant_product_out(1_000, 1_000, 0, 0), 0);
     }
 
-    #[test]
     /// The far side of a token/token pool is MEASURED from the value, not
     /// shrugged at. This is the capability `Asset::quantity` bought: before it,
     /// a pool could be seen to hold a third asset but never how much of it, so
