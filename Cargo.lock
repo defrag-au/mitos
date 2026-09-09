@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "address-registry"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c#c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "phf",
  "serde",
@@ -685,7 +685,7 @@ dependencies = [
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c#c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
@@ -736,7 +736,7 @@ dependencies = [
 [[package]]
 name = "chain-ledger"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c#c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "serde",
 ]
@@ -4708,7 +4708,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pipeline-types"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c#c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "cardano-assets",
  "hex",
@@ -6927,7 +6927,7 @@ dependencies = [
 [[package]]
 name = "tx_insights"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c#c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "cardano-assets",
  "serde",
@@ -7404,7 +7404,7 @@ dependencies = [
 [[package]]
 name = "wasm_safe_serde"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c#c3cfd7d12d72a12ebe2d0f3d3a11c0fb57d0409c"
+source = "git+https://github.com/defrag-au/shared-crates?rev=e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4#e5c5997cf51f43ed8a099f42cfe7dc0d6feba8d4"
 dependencies = [
  "serde",
  "serde_json",

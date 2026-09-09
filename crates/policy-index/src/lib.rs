@@ -63,10 +63,14 @@
 //!
 //! Design: `cnft.dev-workers/docs/design/POLICY_INDEX.md`.
 
+pub mod base;
+pub mod compact;
 pub mod extract;
 pub mod format;
 pub mod segment;
 
+pub use base::{Base, base_path};
+pub use compact::{CompactStats, compact};
 pub use extract::{Mints, TxSpans};
 pub use format::{
     BaseHeader, DIR_BITS, PolicyRun, RECORD_BYTES, Record, SegmentHeader, bucket_of, name_prefix,

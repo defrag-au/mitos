@@ -38,6 +38,14 @@ use crate::types::{
 /// single async fn (e.g. inside an indexer's `subscribe`
 /// callback that has `&domain` available). For longer-lived
 /// usage, callers can wrap a `&Arc<D>` by dereferencing.
+/// Most refs [`ChainDataPlane::utxos_by_address`] will return.
+///
+/// A result of exactly this length is INDISTINGUISHABLE from a complete one in
+/// the return type, so any caller whose logic depends on completeness must
+/// compare against it and refuse to conclude anything from the gap. The jpg
+/// V1 listing address holds more than this.
+pub const UTXOS_BY_ADDRESS_HARD_CAP: usize = 100_000;
+
 pub struct LocalDataPlane<'a, D: Domain> {
     domain: &'a D,
 }
@@ -430,19 +438,24 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         // Cap at 100K refs to bound host-side memory; addresses
         // with more UTxOs warrant the predicate-based
         // `search_utxos` flow with proper pagination (Phase B+).
-        const HARD_CAP: usize = 100_000;
+        //
+        // The cap is PUBLIC because a caller cannot otherwise tell a complete
+        // answer from a truncated one — the return type is a plain Vec. A
+        // consumer that treats "absent from this list" as "absent from chain"
+        // will delete real data: the jpg ask-book reconciler did exactly that
+        // against the V1 listing address, which has more than 100K UTxOs.
         let total: Vec<TxoRef> = utxo_set.into_iter().collect();
-        if total.len() > HARD_CAP {
+        if total.len() > UTXOS_BY_ADDRESS_HARD_CAP {
             tracing::warn!(
                 address = %address,
-                returned = HARD_CAP,
+                returned = UTXOS_BY_ADDRESS_HARD_CAP,
                 total = total.len(),
                 "utxos_by_address result truncated at hard cap"
             );
         }
         Ok(total
             .into_iter()
-            .take(HARD_CAP)
+            .take(UTXOS_BY_ADDRESS_HARD_CAP)
             .map(OutputRef::from)
             .collect())
     }

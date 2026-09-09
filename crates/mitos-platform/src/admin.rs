@@ -470,6 +470,15 @@ struct UtxoRefEntry {
 struct UtxosResponse {
     address: String,
     count: usize,
+    /// The data plane capped this result, so it is a PREFIX of the unspent set
+    /// and not the set itself.
+    ///
+    /// Reported because the difference is invisible otherwise, and the
+    /// consequence is severe for the obvious consumer: a reconciler that
+    /// treats "not in this list" as "not on chain" will delete live rows. The
+    /// jpg ask-book walker did precisely that against the V1 listing address,
+    /// which holds more than the cap.
+    truncated: bool,
     utxos: Vec<UtxoRefEntry>,
 }
 
@@ -2157,6 +2166,7 @@ async fn get_utxos_by_address(
             Ok(Json(UtxosResponse {
                 address: address.to_owned(),
                 count: utxos.len(),
+                truncated: utxos.len() >= mitos_data_plane::UTXOS_BY_ADDRESS_HARD_CAP,
                 utxos,
             })
             .into_response())

@@ -7,4 +7,6 @@
 
 mod local;
 
-pub use local::{LocalDataPlane, extract_aux_cbor, project_typed_output};
+pub use local::{
+    LocalDataPlane, UTXOS_BY_ADDRESS_HARD_CAP, extract_aux_cbor, project_typed_output,
+};
