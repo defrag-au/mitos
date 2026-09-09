@@ -319,6 +319,11 @@ pub fn open_footer(path: &Path) -> Result<(RangeFile, SparseBytes, Archive)> {
 
 struct OpenFile {
     kind: FileKind,
+    /// Which chain this file's pass read. Carried because a VOLATILE file is
+    /// replaced whole on every refresh and may legitimately cover a stretch an
+    /// immutable pass has also written rows for — so anything that TOTALS
+    /// across files has to exclude it. See [`PolicyArchive::reconcile`].
+    range: RangeKind,
     source: RangeFile,
     bytes: SparseBytes,
     archive: Archive,
@@ -327,10 +332,11 @@ struct OpenFile {
 }
 
 impl OpenFile {
-    fn open(path: &Path, kind: FileKind) -> Result<Self> {
+    fn open(path: &Path, kind: FileKind, range: RangeKind) -> Result<Self> {
         let (source, bytes, archive) = open_footer(path)?;
         Ok(Self {
             kind,
+            range,
             source,
             bytes,
             archive,
@@ -405,6 +411,14 @@ impl PolicyArchive {
                     .unwrap_or_default(),
             )
         });
+        // Which of the manifest's files belong to IMMUTABLE passes. The
+        // rollup already makes this distinction for the same underlying
+        // reason; totals need it too.
+        let immutable: std::collections::HashSet<String> = manifest
+            .immutable_files()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
         let mut files = Vec::new();
         for (rel, kind) in manifest.files() {
             // A movements reader must never be handed an observations file:
@@ -414,14 +428,19 @@ impl PolicyArchive {
             if kind == policy_archive::FileKind::Observations {
                 continue;
             }
-            files.push(OpenFile::open(&dir.join(rel), kind)?);
+            let range = match immutable.contains(&rel) {
+                true => RangeKind::Immutable,
+                false => RangeKind::Volatile,
+            };
+            files.push(OpenFile::open(&dir.join(rel), kind, range)?);
         }
         // A running pass's segments can vanish under us when it lands and
         // compacts them; one request seeing the archive without them is
-        // better than one request failing.
+        // better than one request failing. Volatile by nature: they are the
+        // live view of a pass that has not landed.
         for (path, kind) in extra {
             if path.exists() {
-                files.push(OpenFile::open(path, *kind)?);
+                files.push(OpenFile::open(path, *kind, RangeKind::Volatile)?);
             }
         }
         Ok(Some(Self { manifest, files }))
@@ -432,7 +451,9 @@ impl PolicyArchive {
     pub fn open_files(files: &[(PathBuf, FileKind)]) -> Result<Self> {
         let mut opened = Vec::new();
         for (path, kind) in files {
-            opened.push(OpenFile::open(path, *kind)?);
+            // No manifest to say otherwise, and this reads a compaction's
+            // OUTPUT — immutable by construction.
+            opened.push(OpenFile::open(path, *kind, RangeKind::Immutable)?);
         }
         Ok(Self {
             manifest: Manifest::new(""),
@@ -599,6 +620,30 @@ impl PolicyArchive {
                 // A different schema entirely; parsing it here would be the
                 // exact mistake `kind_of` is ordered to prevent.
                 FileKind::Observations => continue,
+            }
+            // ⚠️ IMMUTABLE FILES ONLY, and this is a correctness requirement
+            // rather than a performance one.
+            //
+            // The supply invariant is a claim about the IMMUTABLE archive. The
+            // volatile tail is a projection of the last few hours that is
+            // REPLACED WHOLE on every refresh, and a top-up walk that climbs
+            // into a stretch the tail also covers must write its own rows
+            // anyway ("or the next refresh shrinks the tail out from under
+            // them" — see `reverse.rs`). So for a window, the same transaction
+            // legitimately has rows in both.
+            //
+            // A total across both then double-counts AMOUNTS while counting
+            // `net_mint` once per `(tx, unit)` — which reads as `moved >
+            // minted`, i.e. a positive gap, i.e. exactly the shape of a real
+            // fault. MEASURED 2026-09-09: this produced RECONCILIATION FAILED
+            // on 7 of 23 live policies (`units=229 gap=1` and similar) whose
+            // archives were, on direct inspection, perfectly balanced.
+            //
+            // 🔑 A check that cries wolf is worse than no check: it gets muted,
+            // and then it is not there for the real one.
+            match self.files[i].range {
+                RangeKind::Immutable => {}
+                RangeKind::Volatile => continue,
             }
             for g in 0..self.files[i].archive.num_groups() {
                 let f = &mut self.files[i];
@@ -1880,6 +1925,92 @@ mod tests {
             amount,
             net_mint,
         }
+    }
+
+    fn stamp_for(policy: &str) -> policy_archive::Stamp {
+        policy_archive::Stamp {
+            policy_hex: policy.to_string(),
+            completeness: Completeness::Complete,
+            walk_from: Some(0),
+            walk_to: Some(1_000),
+            covered_from: 0,
+            covered_to: 999,
+            sealed_unix: 0,
+        }
+    }
+
+    /// ⚠️ THE FALSE ALARM THIS GUARD EXISTS FOR.
+    ///
+    /// The volatile tail is REPLACED WHOLE on every refresh, and a top-up walk
+    /// that climbs into a stretch the tail also covers must write its own rows
+    /// anyway. So for a window, the same transaction legitimately has rows in
+    /// an immutable file AND in the tail.
+    ///
+    /// Totalling across both double-counts AMOUNTS while counting `net_mint`
+    /// once per `(tx, unit)` — which reads as `moved > minted`: a positive gap,
+    /// indistinguishable in shape from a real fault. MEASURED 2026-09-09 on the
+    /// live box: RECONCILIATION FAILED on 7 of 23 policies whose archives were,
+    /// on inspection, perfectly balanced.
+    ///
+    /// A check that cries wolf gets muted, and then it is not there for the
+    /// real one.
+    #[test]
+    fn the_volatile_tail_is_excluded_from_the_supply_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+
+        // A mint of 10 to alice, then alice → bob, both in the immutable file.
+        let immutable = vec![
+            mv(1, "A", "alice", 10, 10),
+            mv(2, "A", "alice", -10, 0),
+            mv(2, "A", "bob", 10, 0),
+        ];
+        // The SAME transaction 2, as the TAIL saw it: the arrival at bob, with
+        // the source leg absent because the tail records what it read and the
+        // resolution of alice's spend lives in the immutable file.
+        //
+        // ⚠️ It has to be the UNMATCHED leg to reproduce the fault. A doubled
+        // transfer nets to nothing and hides the bug — the first draft of this
+        // test duplicated both legs and passed for the wrong reason.
+        let tail = vec![mv(2, "A", "bob", 10, 0)];
+
+        let mv_path = dir.path().join("movements.parquet");
+        let tail_path = dir.path().join("tail.parquet");
+        crate::segments::write_file(&mv_path, &stamp, immutable).unwrap();
+        crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+
+        let both = PolicyArchive {
+            manifest: Manifest::new("aa"),
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        let mut both = both;
+        let r = both.reconcile(policy_archive::Diagnose::Totals).unwrap();
+        assert_eq!(
+            r.verdict(Completeness::Complete),
+            policy_archive::Verdict::Balanced,
+            "the tail's duplicate of tx 2 must not be summed into the total"
+        );
+
+        // And the guard must be load-bearing: tagging the tail IMMUTABLE — as
+        // the pre-fix reader effectively did — reproduces the false alarm.
+        let mut mistagged = PolicyArchive {
+            manifest: Manifest::new("aa"),
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+            ],
+        };
+        let bad = mistagged
+            .reconcile(policy_archive::Diagnose::Totals)
+            .unwrap();
+        assert_ne!(
+            bad.verdict(Completeness::Complete),
+            policy_archive::Verdict::Balanced,
+            "if this passes, the test is not exercising the guard"
+        );
     }
 
     /// The sum rule: an output (+1) and its later-resolved source (−1) for
