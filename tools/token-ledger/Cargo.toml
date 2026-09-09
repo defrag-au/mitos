@@ -81,6 +81,10 @@ token-ledger-wire = { path = "../../crates/token-ledger-wire" }
 # policy's first mint. Shared with project-ledger so the MINIMUM-creation rule
 # has one home.
 mitos-koios = { path = "../../crates/mitos-koios" }
+# The LOCAL floor probe: (policy → first chunk) in ~3 µs, against a Koios
+# round-trip. Koios stays as the fallback for a policy the index has not
+# reached, so the walk never depends on the index existing.
+policy-index = { path = "../../crates/policy-index" }
 
 # Curated token decimals, keyed by full unit. Decimals are NOT on chain, so a
 # walker cannot derive them — this is the shared table of the ones we can

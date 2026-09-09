@@ -16,6 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 tx-index = { path = "../../crates/tx-index" }
+# The mint-keyed companion, built from the SAME extraction pass. Here rather
+# than as its own service because a second pass would cost +100% against the
+# measured +1.8% — see `--policy-index-dir`.
+policy-index = { path = "../../crates/policy-index" }
 
 clap = { workspace = true }
 anyhow = { workspace = true }

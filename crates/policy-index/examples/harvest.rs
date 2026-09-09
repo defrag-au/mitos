@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         oversize += mints.oversize_skipped;
         segment::write_segment(out, chunk, &mints.records)?;
         done += 1;
-        if done % 1000 == 0 {
+        if done.is_multiple_of(1000) {
             let mb = bytes as f64 / 1_048_576.0;
             println!(
                 "  {done} chunks, {records} records, {:.0} MB/s",
@@ -102,6 +102,35 @@ fn main() -> Result<()> {
         t.elapsed().as_secs_f64()
     );
 
+    // The half that leaves the file: go back to the chunks and confirm the
+    // transactions really mint what the records claim.
+    let sample: u64 = std::env::var("VERIFY_SAMPLE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000);
+    let t = Instant::now();
+    let (stats, failures) = policy_index::verify_sample(&base, immutable, sample)?;
+    println!(
+        "re-derive {} sampled, {} confirmed, {} failed, {} chunks absent ({:.1}s)",
+        stats.sampled,
+        stats.confirmed,
+        failures.len(),
+        stats.skipped_no_chunk,
+        t.elapsed().as_secs_f64()
+    );
+    for f in failures.iter().take(10) {
+        println!(
+            "  FAIL {} chunk {} body {}+{}",
+            f.fault.as_wire(),
+            f.record.chunk,
+            f.record.offset,
+            f.record.len
+        );
+    }
+    if !failures.is_empty() {
+        bail!("{} sampled records could not be re-derived", failures.len());
+    }
+
     // ── look one up ───────────────────────────────────────────────────────
     if let Some(hex_policy) = args.get(5) {
         let policy = hex::decode(hex_policy)?;
@@ -115,7 +144,10 @@ fn main() -> Result<()> {
         println!("first chunk      {first:?}   (floor probe in {probe_us:.0} µs)");
         println!("mint events      {}", all.len());
         println!("distinct assets  {}", assets.len());
-        println!("burns            {}", all.iter().filter(|r| r.burned).count());
+        println!(
+            "burns            {}",
+            all.iter().filter(|r| r.burned).count()
+        );
         println!(
             "with metadata    {}",
             all.iter().filter(|r| r.aux_span().is_some()).count()

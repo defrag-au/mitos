@@ -136,8 +136,8 @@ pub struct ReverseArgs {
     #[arg(long)]
     pub first_mint: Option<u64>,
 
-    /// PROBE the policy's first mint from Koios when nothing else knows it,
-    /// instead of walking to genesis.
+    /// PROBE the policy's first mint when nothing else knows it, instead of
+    /// walking to genesis.
     ///
     /// A reverse walk meets the tip first and the mint LAST, so the single
     /// most useful fact about a policy is the one it learns last — and until
@@ -146,9 +146,13 @@ pub struct ReverseArgs {
     /// when its first mint is at slot 93,220,447, so 47% of the range it read
     /// could not have held a single row.
     ///
-    /// One request, and the answer is the MINIMUM creation across the
-    /// policy's assets — see `mitos_koios::floor_unix` for why that
-    /// distinction has teeth.
+    /// Two sources, in this order:
+    ///
+    /// 1. **`policy-index`** (`--policy-index-dir`) — local, certified,
+    ///    MEASURED at 3 µs;
+    /// 2. **Koios** `policy_asset_info` — one request, the MINIMUM creation
+    ///    across the policy's assets (see `mitos_koios::floor_unix` for why
+    ///    that distinction has teeth).
     ///
     /// ⚠️ Off by default and never silent. A floor that is too HIGH does not
     /// fail: it produces a short archive that calls itself COMPLETE, because
@@ -156,6 +160,12 @@ pub struct ReverseArgs {
     /// explicit opt-in, and what it found is logged with its source.
     #[arg(long)]
     pub probe_first_mint: bool,
+
+    /// A `policy-index` built over the SAME immutable snapshot — the local
+    /// answer to [`Self::probe_first_mint`], with Koios kept as the fallback
+    /// for a policy the index has not reached.
+    #[arg(long, env = "POLICY_INDEX_DIR")]
+    pub policy_index_dir: Option<PathBuf>,
 
     /// Read this window as a SEEK: a reader asked for it, so it is a
     /// bounded window rather than a step of a descent. Only the summary
@@ -345,7 +355,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
         // already holds would be a cost paid on every pass.
         .or_else(|| {
             args.probe_first_mint
-                .then(|| probe_first_mint(&policy_hex))
+                .then(|| probe_first_mint(&policy_hex, args.policy_index_dir.as_deref()))
                 .flatten()
         });
     let floor = pass_floor(ceiling, args.to_slot, args.days, first_mint);
@@ -684,21 +694,68 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
     })
 }
 
-/// One request for the policy's first mint, when nothing local knows it.
+/// The policy's first mint, when nothing local knows it: the `policy-index`
+/// first, Koios only if the index cannot say.
 ///
 /// ⚠️ **The tx-index cannot answer this**, and it is worth saying why rather
 /// than leaving it as an open question: its entry is
 /// `(hash prefix → chunk, offset, len, aux)` and carries no policy dimension
 /// at all. "Where is transaction H" and "which transaction first minted
-/// policy P" are different questions, and only the first is indexed. Making
-/// it answer the second means a second index over ~110M entries with per-tx
-/// mint decoding during extraction — a real build, not a lookup.
+/// policy P" are different questions, and only the first is indexed. That is
+/// what `policy-index` was built for.
 ///
-/// So the probe is external, and deliberately soft: a failure means the walk
-/// proceeds WITHOUT a floor (reads more than it needs, still correct) rather
-/// than not at all. The opposite bias — inventing a floor — is the one that
-/// produces a short archive claiming completeness.
-fn probe_first_mint(policy_hex: &str) -> Option<u64> {
+/// Deliberately soft throughout: a failure means the walk proceeds WITHOUT a
+/// floor (reads more than it needs, still correct) rather than not at all. The
+/// opposite bias — inventing a floor — is the one that produces a short
+/// archive claiming completeness.
+fn probe_first_mint(policy_hex: &str, index_dir: Option<&Path>) -> Option<u64> {
+    if let Some(dir) = index_dir
+        && let Some(slot) = probe_via_index(policy_hex, dir)
+    {
+        return Some(slot);
+    }
+    probe_via_koios(policy_hex)
+}
+
+/// The local answer. MEASURED at 3 µs against a Koios round-trip.
+///
+/// 🔑 **No margin arithmetic here, and that is a property rather than an
+/// omission.** The index locates a first mint to its CHUNK, and a chunk's
+/// first slot is by construction at or below the mint inside it — so
+/// `chunk × CHUNK_SLOTS` under-shoots by less than one chunk automatically.
+/// The Koios path has to subtract a chunk by hand precisely because a slot
+/// from an indexer can be LATE, and a floor that is too high truncates an
+/// archive while letting it call itself complete.
+///
+/// ⚠️ Absence is not evidence: a policy the index has never seen returns
+/// `None` and falls through to Koios. The index covers the snapshot it was
+/// built over, and a policy first minted after that is exactly the case a
+/// stale index would otherwise answer wrongly.
+fn probe_via_index(policy_hex: &str, dir: &Path) -> Option<u64> {
+    let path = policy_index::base_path(dir);
+    let base = match policy_index::Base::open(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "probe: no policy index; trying koios");
+            return None;
+        }
+    };
+    let policy = hex::decode(policy_hex).ok()?;
+    let prefix = policy_index::policy_prefix(&policy);
+    let chunk = base.first_chunk_of(prefix)?;
+    let slot = u64::from(chunk) * crate::registry::CHUNK_SLOTS;
+    let (from, to) = base.covers();
+    tracing::info!(
+        slot,
+        chunk,
+        index_covers = format!("{from}..={to}"),
+        source = "policy-index/first_chunk",
+        "probe: first mint"
+    );
+    Some(slot)
+}
+
+fn probe_via_koios(policy_hex: &str) -> Option<u64> {
     let koios = match mitos_koios::Koios::new(None, std::env::var("KOIOS_TOKEN").ok()) {
         Ok(k) => k,
         Err(e) => {

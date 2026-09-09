@@ -210,6 +210,64 @@ pub fn fetch_events(
 /// (unpriced last), capped at `limit`. Returns the rows + the true total count
 /// (so a consumer can tell a page truncated). No cursor pagination yet —
 /// per-policy listing counts sit well under a generous limit.
+/// One page of the WHOLE listings projection, keyset-paged by its primary key.
+///
+/// `fetch_listings` answers "what is listed for this policy", which is the
+/// question a collection page asks. This answers "what is listed, everywhere",
+/// which is the question a RECONCILER asks — and it cannot be served by
+/// looping the per-policy query, because that needs a policy list nobody holds.
+///
+/// Keyset, not `OFFSET`: the projection has a quarter of a million rows and
+/// deep offsets degrade linearly, which is what made the equivalent Koios scan
+/// unusable at ~60s per thousand rows. `(policy_id, asset_name_hex)` is the
+/// primary key, so each page is an index seek.
+///
+/// The caller passes the last row it saw; `None` starts from the beginning.
+pub fn scan_listings(
+    conn: &Connection,
+    venue: Option<&str>,
+    after: Option<(&str, &str)>,
+    limit: u32,
+) -> Result<Vec<crate::store::Listing>> {
+    let mut filter = String::from("WHERE 1=1");
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(v) = venue {
+        filter.push_str(" AND venue = ?");
+        params.push(v.to_string().into());
+    }
+    if let Some((policy, asset)) = after {
+        filter.push_str(" AND (policy_id, asset_name_hex) > (?, ?)");
+        params.push(policy.to_string().into());
+        params.push(asset.to_string().into());
+    }
+
+    let sql = format!(
+        "SELECT policy_id, asset_name_hex, venue, price_lovelace, seller_stake,
+                tx_hash, output_index, listed_slot, listed_time
+         FROM listings {filter}
+         ORDER BY policy_id, asset_name_hex
+         LIMIT ?"
+    );
+    params.push((limit as i64).into());
+    let mut stmt = conn.prepare(&sql).context("preparing listings scan")?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok(crate::store::Listing {
+                policy_id: r.get(0)?,
+                asset_name_hex: r.get(1)?,
+                venue: r.get(2)?,
+                price_lovelace: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                seller_stake: r.get(4)?,
+                tx_hash: r.get(5)?,
+                output_index: r.get::<_, i64>(6)? as u32,
+                listed_slot: r.get::<_, i64>(7)? as u64,
+                listed_time: r.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub fn fetch_listings(
     conn: &Connection,
     policy: &str,

@@ -171,7 +171,18 @@ pub fn extract_chunk_observed(
 
 /// Extract a chunk and write its segment. The unit of incremental work.
 pub fn extract_to_segment(immutable: &Path, index_dir: &Path, chunk: u16) -> Result<Extracted> {
-    let ex = extract_chunk(immutable, chunk)?;
+    extract_to_segment_observed(immutable, index_dir, chunk, &mut |_, _, _, _| {})
+}
+
+/// [`extract_to_segment`] with a [`TxObserver`], so a second index is derived
+/// from the same decode rather than from a second pass over the same bytes.
+pub fn extract_to_segment_observed(
+    immutable: &Path,
+    index_dir: &Path,
+    chunk: u16,
+    observe: TxObserver<'_>,
+) -> Result<Extracted> {
+    let ex = extract_chunk_observed(immutable, chunk, observe)?;
     write_segment(index_dir, ex.header, &ex.entries)?;
     Ok(ex)
 }

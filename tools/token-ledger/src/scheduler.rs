@@ -616,7 +616,20 @@ fn sweeper(hub: Arc<PolicyHub>) {
                 .flatten()
                 .and_then(|m| m.immutable_walk_to())
                 .is_some_and(|to| to < tip);
-            if behind && hub.sched.want_walk(&policy, None) {
+            // A top-up after a snapshot refresh: the manifest usually already
+            // carries `first_mint_slot`, but a policy admitted before the
+            // index existed may not — so ask here too rather than let it walk
+            // to genesis on a top-up.
+            //
+            // ⚠️ INSIDE the `behind &&`, deliberately. This sweep visits every
+            // watched policy on every pass; hoisting the probe out would run
+            // it — and log an admission line — for policies that are not being
+            // admitted to anything.
+            if behind
+                && hub
+                    .sched
+                    .want_walk(&policy, hub.first_mint_from_index(&policy))
+            {
                 tracing::info!(policy, tip, "policy: topping up after a snapshot refresh");
             }
         }
@@ -796,6 +809,7 @@ fn run_job(
         // policy walked by four workers; it belongs once per policy, at
         // admission, and `want_walk` is where that would go.
         probe_first_mint: false,
+        policy_index_dir: None,
         seek: job.kind == JobKind::Seek,
         // The serve's index is already open and hot-swappable; the CLI flag
         // is for running the same job by hand.

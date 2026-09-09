@@ -73,6 +73,21 @@ pub struct ServeArgs {
     #[arg(long)]
     pub tx_index_dir: Option<PathBuf>,
 
+    /// A `policy-index` over the same snapshot. With it, a policy admitted
+    /// without a `?to_slot=` gets its first mint LOCALLY at admission — in
+    /// microseconds — instead of walking to genesis or asking Koios.
+    ///
+    /// MEASURED on $VIPER: its archive walked `[0, …]` in 847 s when its
+    /// first mint sits at slot 93,220,447, so 47% of what it read could not
+    /// have held a row.
+    ///
+    /// ⚠️ Optional, and a missing or unreadable index is a WARNING, not a
+    /// refusal to start: the floor probe falls back to Koios and a walk with
+    /// no floor is slow rather than wrong. An optimisation must not become
+    /// load-bearing.
+    #[arg(long, env = "POLICY_INDEX_DIR")]
+    pub policy_index_dir: Option<PathBuf>,
+
     /// Walk workers: how many policies descend at once. Measured on
     /// cardano-infra: eight concurrent 60-day walks cost what one costs
     /// (the sieve gate is CPU-bound, twelve cores); four is the co-tenant's
@@ -173,18 +188,19 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // path above. They answer different questions: that one builds an immutable
     // snapshot for a finished token, this one serves a live, correcting feed.
     // token-explorer depends on the first and is untouched.
-    let policy_hub = crate::policy_api::PolicyHub::new(
-        args.data_dir.clone(),
-        args.tokens.clone(),
-        args.archive_dir.clone(),
-        args.publish_archive.then(crate::publish::Targets::from_env),
-        args.tx_index_dir.clone(),
-        crate::scheduler::Pool {
+    let policy_hub = crate::policy_api::PolicyHub::new(crate::policy_api::HubConfig {
+        data_dir: args.data_dir.clone(),
+        tokens: args.tokens.clone(),
+        archive_dir: args.archive_dir.clone(),
+        publish: args.publish_archive.then(crate::publish::Targets::from_env),
+        tx_index_dir: args.tx_index_dir.clone(),
+        policy_index_dir: args.policy_index_dir.clone(),
+        pool: crate::scheduler::Pool {
             walk_workers: args.walk_workers.max(1),
             seek_workers: args.seek_workers.max(1),
         },
-        std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
-    );
+        bearer: std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
+    });
 
     // THE VOLATILE TAIL, from the box's chain-tail spool. No-op without
     // `--tail-db`; token-ledger follows nothing itself.

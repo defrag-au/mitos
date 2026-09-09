@@ -68,6 +68,9 @@ pub mod compact;
 pub mod extract;
 pub mod format;
 pub mod segment;
+/// Re-derivation from the chunks — the half of `verify` that can catch a
+/// faithfully stored wrong answer.
+pub mod verify;
 
 pub use base::{Base, base_path};
 pub use compact::{CompactStats, compact};
@@ -77,3 +80,4 @@ pub use format::{
     policy_prefix,
 };
 pub use segment::{Segment, list_segments, segment_path, segments_dir, write_segment};
+pub use verify::{Failure, Fault, VerifyStats, verify_sample};

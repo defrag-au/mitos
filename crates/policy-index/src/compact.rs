@@ -106,8 +106,8 @@ pub fn compact(index_dir: &Path) -> Result<CompactStats> {
         .with_context(|| format!("creating {}", tmp.display()))?;
     file.set_len(header.file_len())?;
     // SAFETY: this file is private to this call until the rename below.
-    let mut map = unsafe { MmapMut::map_mut(&file) }
-        .with_context(|| format!("mapping {}", tmp.display()))?;
+    let mut map =
+        unsafe { MmapMut::map_mut(&file) }.with_context(|| format!("mapping {}", tmp.display()))?;
 
     // ── 1. fences (exclusive prefix sum, plus the terminator) ─────────────
     let mut cursors = vec![0u32; n_buckets + 1];

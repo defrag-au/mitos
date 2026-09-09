@@ -25,6 +25,10 @@ disallowed_methods = "deny"
 # owns the extraction pass, which is tx-index.
 pallas-traverse = { workspace = true }
 pallas-primitives = { workspace = true }
+# `verify` decodes a mint field straight from a body's CBOR rather than
+# through pallas's era machinery — the two agreeing by sharing code would
+# prove nothing about the spans this index records.
+pallas-codec = { workspace = true }
 # blake2b — asset names are human-chosen and do NOT bucket; hashing restores
 # the uniformity the prefix directory depends on.
 pallas-crypto = { workspace = true }

@@ -85,6 +85,12 @@ impl Base {
         (self.header.first_chunk, self.header.last_chunk)
     }
 
+    /// A record by its position in the array — for `verify`, which walks by
+    /// stride rather than by policy.
+    pub fn record_at_index(&self, i: usize) -> Record {
+        self.record_at(i)
+    }
+
     fn record_at(&self, i: usize) -> Record {
         let at = self.header.records_off as usize + i * RECORD_BYTES;
         Record::read(&self.mmap[at..at + RECORD_BYTES])
@@ -92,11 +98,7 @@ impl Base {
 
     fn perm_at(&self, i: usize) -> u32 {
         let at = self.header.perm_off as usize + i * PERM_BYTES;
-        u32::from_le_bytes(
-            self.mmap[at..at + PERM_BYTES]
-                .try_into()
-                .expect("4 bytes"),
-        )
+        u32::from_le_bytes(self.mmap[at..at + PERM_BYTES].try_into().expect("4 bytes"))
     }
 
     fn run_at(&self, i: usize) -> PolicyRun {

@@ -282,26 +282,55 @@ pub struct PolicyHub {
     /// tx hash → body over the snapshot, for resolving a seek's inputs on
     /// the spot. `None` without `--tx-index-dir`.
     pub(crate) index: Option<tx_index::IndexHandle>,
+    /// (policy → its first mint's chunk) over the same snapshot. Held OPEN
+    /// rather than opened per lookup: the answer is a binary search over a
+    /// resident table, so opening a 666 MiB mapping each time would cost
+    /// orders of magnitude more than the lookup it serves.
+    ///
+    /// `None` without `--policy-index-dir`, and the walk then falls back to
+    /// Koios exactly as before.
+    pub(crate) policy_index: Option<policy_index::Base>,
     /// The pool: walk jobs, seek jobs, what is in flight. See
     /// `scheduler.rs`.
     pub(crate) sched: crate::scheduler::Scheduler,
     bearer: Option<String>,
 }
 
+/// What a [`PolicyHub`] is built from.
+///
+/// ⚠️ A STRUCT rather than eight positional arguments, and not merely to
+/// satisfy a lint: four of these are `Option<PathBuf>`/`Option<String>` in a
+/// row, so transposing two at the call site would compile cleanly and open the
+/// wrong index — the tx-index as the policy index, say, which fails its magic
+/// check loudly, or two paths swapped, which does not.
+pub struct HubConfig {
+    pub data_dir: PathBuf,
+    pub tokens: PathBuf,
+    pub archive_dir: PathBuf,
+    /// Where a landed archive goes — R2 and the KV bundle — or `None` to
+    /// leave it on disk. See `publish.rs`.
+    pub publish: Option<crate::publish::Targets>,
+    /// A tx-index over the same snapshot, for seeks.
+    pub tx_index_dir: Option<PathBuf>,
+    /// A policy-index over the same snapshot, for first mints at admission.
+    pub policy_index_dir: Option<PathBuf>,
+    /// How many workers of each kind.
+    pub pool: crate::scheduler::Pool,
+    pub bearer: Option<String>,
+}
+
 impl PolicyHub {
-    /// `publish`: where a landed archive goes — R2 and the KV bundle — or
-    /// `None` to leave it on disk. See `publish.rs`. `tx_index_dir`: a
-    /// tx-index over the same snapshot, for seeks. `pool`: how many
-    /// workers of each kind.
-    pub fn new(
-        data_dir: PathBuf,
-        tokens: PathBuf,
-        archive_dir: PathBuf,
-        publish: Option<crate::publish::Targets>,
-        tx_index_dir: Option<PathBuf>,
-        pool: crate::scheduler::Pool,
-        bearer: Option<String>,
-    ) -> Arc<Self> {
+    pub fn new(cfg: HubConfig) -> Arc<Self> {
+        let HubConfig {
+            data_dir,
+            tokens,
+            archive_dir,
+            publish,
+            tx_index_dir,
+            policy_index_dir,
+            pool,
+            bearer,
+        } = cfg;
         let index = tx_index_dir.and_then(|dir| {
             match tx_index::IndexHandle::open(&dir, &data_dir.join("immutable")) {
                 Ok(h) => {
@@ -320,6 +349,30 @@ impl PolicyHub {
                 }
             }
         });
+        let policy_index = policy_index_dir.and_then(|dir| {
+            let path = policy_index::base_path(&dir);
+            match policy_index::Base::open(&path) {
+                Ok(b) => {
+                    let (from, to) = b.covers();
+                    tracing::info!(
+                        path = %path.display(),
+                        records = b.len(),
+                        policies = b.policies(),
+                        covers = format!("{from}..={to}"),
+                        "policy: policy-index open — first mints resolve locally"
+                    );
+                    Some(b)
+                }
+                Err(e) => {
+                    // A warning, not a failure: the floor probe falls back to
+                    // Koios, and a walk with no floor is slow rather than
+                    // wrong. Refusing to start over a missing index would make
+                    // an optimisation load-bearing.
+                    tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "policy: policy-index NOT open — first mints fall back to koios");
+                    None
+                }
+            }
+        });
         if let Some(t) = &publish {
             tracing::info!(targets = %t.describe(), "policy: publishing landed archives");
         }
@@ -329,11 +382,43 @@ impl PolicyHub {
             archive_dir,
             jobs: Mutex::new(HashMap::new()),
             index,
+            policy_index,
             sched: crate::scheduler::Scheduler::new(),
             bearer,
         });
         crate::scheduler::spawn(Arc::clone(&hub), pool, publish);
         hub
+    }
+
+    /// The policy's first mint from the local index, as a slot.
+    ///
+    /// Called at ADMISSION — once per policy, when a caller asked for a walk
+    /// without saying where the mint is. Not per job: four walk workers on one
+    /// policy would otherwise ask four times, and on the Koios path that was
+    /// four network calls.
+    ///
+    /// 🔑 **A chunk's first slot is by construction at or below any mint
+    /// inside it**, so this under-shoots by less than one chunk with no margin
+    /// arithmetic. That matters because the error directions are not
+    /// symmetric: a floor too LOW costs reading, a floor too HIGH truncates an
+    /// archive AND lets it call itself complete.
+    ///
+    /// `None` for a policy the index has not reached — which is exactly the
+    /// newly-minted policy the snapshot predates, and precisely why the Koios
+    /// fallback still earns its place.
+    pub(crate) fn first_mint_from_index(&self, policy_hex: &str) -> Option<u64> {
+        let base = self.policy_index.as_ref()?;
+        let policy = hex::decode(policy_hex).ok()?;
+        let chunk = base.first_chunk_of(policy_index::policy_prefix(&policy))?;
+        let slot = u64::from(chunk) * crate::registry::CHUNK_SLOTS;
+        tracing::info!(
+            policy = policy_hex,
+            slot,
+            chunk,
+            source = "policy-index",
+            "policy: first mint at admission"
+        );
+        Some(slot)
     }
 
     pub(crate) fn set(&self, policy: &str, state: PolicyJob) {
@@ -925,7 +1010,11 @@ pub async fn refresh(
         return Ok(Json(state));
     }
     hub.set(&policy, PolicyJob::Queued);
-    hub.sched.want_walk(&policy, q.to_slot);
+    // The CALLER's `?to_slot=` first — it is an assertion by whoever asked and
+    // may be better informed than the snapshot. The index only answers when
+    // nothing said, which used to mean walking to genesis.
+    let first_mint = q.to_slot.or_else(|| hub.first_mint_from_index(&policy));
+    hub.sched.want_walk(&policy, first_mint);
     Ok(Json(PolicyJob::Queued))
 }
 
