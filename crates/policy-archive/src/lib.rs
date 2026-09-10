@@ -58,6 +58,10 @@ pub mod price;
 pub mod profile;
 pub mod reader;
 pub mod schema;
+/// ONE ordered stream that tells a token's story — movements and observations
+/// merged onto a single spine, so every visualisation is a FOLD over it rather
+/// than a join across endpoints.
+pub mod story;
 /// The archive's own reconciliation — `Σ amounts == Σ net_mint`, graded by how
 /// far the walk reached. Both sides come out of the same file.
 pub mod supply;
@@ -82,6 +86,7 @@ pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
 pub use profile::{Class, Profile};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
+pub use story::{Kind as StoryKind, PoolState, Story, StoryEvent, Trader};
 pub use supply::{Balance, Because, Diagnose, Offender, Reconciler, Verdict};
 pub use writer::{ArchiveWriter, Written};
 

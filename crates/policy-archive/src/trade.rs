@@ -261,14 +261,33 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
 }
 
 /// Fold a feed page. One event per `(transaction, unit)`.
-pub fn fold(rows: &[FeedRow], roles: &Roles) -> Vec<(Vec<u8>, u64, Event)> {
+pub fn fold(rows: &[FeedRow], roles: &Roles) -> Vec<Folded> {
     rows.iter()
         .flat_map(|r| {
-            r.units
-                .iter()
-                .map(move |u| (r.tx_hash.clone(), r.slot, classify_move(u, roles)))
+            r.units.iter().map(move |u| Folded {
+                tx_hash: r.tx_hash.clone(),
+                slot: r.slot,
+                block_time: r.block_time,
+                unit: u.name.clone(),
+                event: classify_move(u, roles),
+            })
         })
         .collect()
+}
+
+/// One classified movement, with everything needed to place it on a timeline.
+///
+/// ⚠️ `unit` is not decoration. On a COLLECTION every event is about one
+/// specific asset, and a fold that drops it can describe a policy but never an
+/// NFT — which is half of what these archives are for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folded {
+    pub tx_hash: Vec<u8>,
+    pub slot: u64,
+    pub block_time: u64,
+    /// On-chain asset-name bytes. IDENTITY only — never decode for display.
+    pub unit: Vec<u8>,
+    pub event: Event,
 }
 
 #[cfg(test)]

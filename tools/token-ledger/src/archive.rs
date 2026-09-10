@@ -1601,7 +1601,8 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
     let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
     let mut named = 0usize;
     let mut unnamed_by_venue = 0usize;
-    for (_, _, e) in &folded {
+    for f in &folded {
+        let e = &f.event;
         let k = match e {
             Event::Fill { party, .. } => {
                 match party {
@@ -1647,7 +1648,7 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
 /// than `address-registry`, because only the decode crate distinguishes a
 /// pool from an order contract: the registry records both as
 /// `Exchange { label }`.
-fn venue_roles() -> policy_archive::trade::Roles {
+pub fn venue_roles() -> policy_archive::trade::Roles {
     use mitos_dex_decode::{cswap, minswap, splash};
     use policy_archive::trade::{OrderKeying, Role, Roles};
 
@@ -1682,17 +1683,35 @@ fn venue_roles() -> policy_archive::trade::Roles {
 
 /// What the observation tier adds to a policy: who was decoded, what was kept
 /// undecoded, and the price the archive can defend at its own tip.
-fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
+/// Every observation the archive holds, across its passes.
+///
+/// ⚠️ Read from the pass directories rather than through `PolicyArchive`,
+/// which deliberately skips `FileKind::Observations` — a different schema, and
+/// `kind_of`'s fallthrough is `Movements`, so handing one to a movements
+/// reader is a decode error rather than a skip.
+///
+/// Shared by the CLI report and the `/policy/{p}/price` route so the two
+/// cannot drift into pricing from different row sets.
+pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive::Observation>> {
     let mut rows: Vec<policy_archive::Observation> = Vec::new();
-    let mut bytes = 0u64;
     for p in &m.passes {
         let path = dir.join(&p.dir).join(policy_archive::OBSERVATIONS);
         if !path.exists() {
             continue;
         }
-        bytes += std::fs::metadata(&path).map(|f| f.len()).unwrap_or(0);
         rows.extend(policy_archive::read_all(&std::fs::read(&path)?)?);
     }
+    Ok(rows)
+}
+
+fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
+    let rows = read_observations(dir, m)?;
+    let bytes: u64 = m
+        .passes
+        .iter()
+        .filter_map(|p| std::fs::metadata(dir.join(&p.dir).join(policy_archive::OBSERVATIONS)).ok())
+        .map(|f| f.len())
+        .sum();
     if rows.is_empty() {
         return Ok(());
     }

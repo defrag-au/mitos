@@ -69,6 +69,29 @@ token-ledger serve --data-dir <db> --archive-dir <dir> [--publish-archive] \
 | `GET /policy/{p}/events` | the correcting feed |
 | `GET /policy/{p}/density` | daily histogram, from footers alone |
 | `GET /policy/{p}/tx/{hash}` | one transaction's rows |
+| `GET /policy/{p}/price` | spot, plus a NAME for everything it cannot price |
+| `GET /policy/{p}/trades` | movements folded into fills / placements / cancellations |
+| `GET /policy/{p}/supply` | the archive reconciled against itself, plus the profile |
+| `GET /policy/{p}/launch` | a launchpad token's launch, graduation, and the curve over time |
+
+⚠️ **`quote_per_base_raw` is not a display price.** For an ADA pair the quote
+is **lovelace**, so $PERP reads `226.58` and renders as `0.00022658 ADA`.
+Converting needs both sides' decimals, which live in the token registry — this
+archive knows neither and deliberately does not guess.
+
+⚠️ **`/launch`'s `points` are ordered by `(slot, curve position)`, not by
+proven transaction order.** MEASURED on $PERP: ten of eleven sightings share
+one slot, because the whole bonding happened inside a single block. Within a
+slot, ascending lovelace is ascending position up the curve — recovering true
+transaction order would mean following the chain of curve UTxOs. A sell moves
+back DOWN the curve, so one inside a single block would appear out of sequence.
+`distinct_slots` tells a consumer how much of the ordering is proven.
+
+⚠️ `/price`'s three lists are different CLAIMS, not degrees of confidence:
+`ada` is priced; `unresolved` has real reserves against a non-ADA unit and
+needs *that* unit's archive; `unpriceable` has real reserves under a model this
+crate will not evaluate (a bonding curve is not constant-product). Collapsing
+them is how a price halves without anyone noticing — it did, on $PERP.
 
 `?to_slot=` on refresh is the caller asserting the policy's first mint. Without
 it the daemon asks the **policy-index** (microseconds, local) and falls back to

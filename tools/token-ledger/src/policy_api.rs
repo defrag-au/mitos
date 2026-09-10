@@ -953,6 +953,649 @@ pub async fn density(
     }))
 }
 
+// ─── the interpretive tiers ──────────────────────────────────────────────────
+//
+// Everything below serves what the `archive` CLI has been able to print since
+// 2026-09-08 but nothing could FETCH. The rows, the graph and the density tier
+// were reachable over HTTP; price, trades and the supply reconciliation were
+// not, so a consumer could draw who-moved-what and nothing about what any of
+// it meant.
+
+/// One side of a pair, as far as this policy's own archive can state it.
+#[derive(Serialize)]
+pub struct PairDepthDto {
+    /// ⚠️ **RAW quote units per RAW base unit — not a display price.**
+    ///
+    /// Named the long way on purpose. For an ADA pair the quote is
+    /// **lovelace**, so $PERP reads `226.58` here and `0.00022658 ADA` on a
+    /// screen — a consumer that renders this field directly is wrong by 10⁶.
+    ///
+    /// Converting to a display price needs BOTH sides' decimals, and this
+    /// archive knows neither: decimals live in the token registry, and the
+    /// on-chain asset name is identity only. That is why the conversion is
+    /// left to the caller rather than guessed at here.
+    ///
+    /// `None` on a zero base — a pool holding none of the asset prices
+    /// nothing. **Never rendered as zero.**
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_per_base_raw: Option<f64>,
+    pub base: String,
+    pub quote: String,
+    pub pools: usize,
+    /// The thinnest quote-side reserve of any contributing pool — the
+    /// aggregate's weakest link.
+    pub thinnest: i64,
+    /// Hex policy of what the asset is paired WITH; **empty means ADA**, and
+    /// that is the only case where the quote's decimals are known (6).
+    pub quote_policy: String,
+    /// Hex asset name — IDENTITY only. Never decode it for display; the token
+    /// registry is authoritative for that.
+    pub quote_name: String,
+}
+
+fn depth_dto(d: &policy_archive::PairDepth) -> PairDepthDto {
+    PairDepthDto {
+        quote_per_base_raw: d.rate(),
+        // i128 as a string: a reserve can exceed what JSON numbers carry
+        // safely, and a silently-rounded reserve is a silently-wrong price.
+        base: d.base.to_string(),
+        quote: d.quote.to_string(),
+        pools: d.pools,
+        thinnest: d.thinnest,
+        quote_policy: hex::encode(&d.quote_unit.policy),
+        quote_name: hex::encode(&d.quote_unit.name),
+    }
+}
+
+/// `GET /policy/{p}/price` — spot, and a name for everything it cannot price.
+///
+/// ⚠️ The three lists are not degrees of confidence, they are different
+/// CLAIMS, and collapsing them is how a price halves without anyone noticing:
+///
+/// - `ada` — priced, constant-product, ADA-paired. `None` is **UNDEFINED**,
+///   never zero.
+/// - `unresolved` — real reserves against a non-ADA unit. Pricing it needs
+///   THAT unit's own archive; this one cannot and does not guess.
+/// - `unpriceable` — real reserves under a model this crate will not evaluate
+///   (a bonding curve is not constant-product). Reported so the liquidity is
+///   visible without being priced.
+#[derive(Serialize)]
+pub struct PolicyPriceResponse {
+    pub policy: String,
+    pub cached: bool,
+    /// The slot the price is defended AT. Piecewise-constant, so this is the
+    /// last figure the archive can defend — not an estimate of "now".
+    pub at_slot: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ada: Option<PairDepthDto>,
+    /// Every contributing pool sits below the depth floor: the aggregate is
+    /// still the right sum, but no single pool is worth quoting alone.
+    pub thin: bool,
+    pub depth_floor_lovelace: i64,
+    pub unresolved: Vec<PairDepthDto>,
+    pub unpriceable: Vec<PairDepthDto>,
+    pub observations: usize,
+}
+
+pub async fn price(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+) -> Result<Json<PolicyPriceResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    let spot = policy_archive::spot_at(&rows, at);
+    let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
+    Ok(Json(PolicyPriceResponse {
+        policy,
+        cached: manifest.is_some(),
+        at_slot: at,
+        thin: spot.ada.as_ref().is_some_and(|d| !d.any_pool_above(floor)),
+        ada: spot.ada.as_ref().map(depth_dto),
+        depth_floor_lovelace: floor,
+        unresolved: spot.unresolved.iter().map(depth_dto).collect(),
+        unpriceable: spot.unpriceable.iter().map(depth_dto).collect(),
+        observations: rows.len(),
+    }))
+}
+
+/// `GET /policy/{p}/trades` — the fold, over the newest page of movements.
+///
+/// This is the answer to "why does this token show lots of transfers rather
+/// than dex trades": a swap is two or three transactions, and the movements
+/// alone cannot say which. Folding them names fills, placements and
+/// cancellations — a cancellation being `order → wallet`, which is
+/// indistinguishable from an ordinary transfer unless you know the contract.
+#[derive(Serialize)]
+pub struct PolicyTradesResponse {
+    pub policy: String,
+    pub cached: bool,
+    /// Movements folded to produce this.
+    pub over_movements: usize,
+    pub venue_events: usize,
+    pub transfers: usize,
+    pub fills: usize,
+    pub placements: usize,
+    pub cancellations: usize,
+    /// Several orders into one pool. **Named and counted, never decomposed** —
+    /// "the largest mover is the trader" is wrong exactly here.
+    pub batched_fills: usize,
+    /// Fills whose trader the venue encodes in the order contract's stake.
+    pub trader_named: usize,
+    /// Fills on a venue whose order contract is ONE shared address, so the
+    /// trader is in the placement leg and this fill cannot name them.
+    /// ⚠️ Distinct from "we could not work it out".
+    pub trader_not_encoded_by_venue: usize,
+}
+
+pub async fn trades(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+    Query(q): Query<FeedQuery>,
+) -> Result<Json<PolicyTradesResponse>, ApiError> {
+    use policy_archive::trade::{Event, Party};
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let jobs = hub.sched.inflight_for(&policy);
+    let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let Some(mut a) = archive else {
+        return Ok(Json(PolicyTradesResponse {
+            policy,
+            cached: false,
+            over_movements: 0,
+            venue_events: 0,
+            transfers: 0,
+            fills: 0,
+            placements: 0,
+            cancellations: 0,
+            batched_fills: 0,
+            trader_named: 0,
+            trader_not_encoded_by_venue: 0,
+        }));
+    };
+    let limit = q.limit.unwrap_or(2_000).clamp(1, 5_000);
+    let rows = a.feed_rows(limit, None).map_err(internal)?;
+    let folded = policy_archive::trade::fold(&rows, &crate::archive::venue_roles());
+
+    let mut r = PolicyTradesResponse {
+        policy,
+        cached: true,
+        over_movements: folded.len(),
+        venue_events: 0,
+        transfers: 0,
+        fills: 0,
+        placements: 0,
+        cancellations: 0,
+        batched_fills: 0,
+        trader_named: 0,
+        trader_not_encoded_by_venue: 0,
+    };
+    for f in &folded {
+        let e = &f.event;
+        match e {
+            Event::Fill { party, .. } => {
+                r.fills += 1;
+                match party {
+                    Party::Stake(_) | Party::Wallet(_) => r.trader_named += 1,
+                    Party::NotEncodedByVenue => r.trader_not_encoded_by_venue += 1,
+                    Party::Ambiguous => {}
+                }
+            }
+            Event::Placement { .. } => r.placements += 1,
+            Event::Cancellation { .. } => r.cancellations += 1,
+            Event::BatchedFill { .. } => r.batched_fills += 1,
+            Event::Transfer => r.transfers += 1,
+        }
+    }
+    r.venue_events = r.over_movements - r.transfers;
+    Ok(Json(r))
+}
+
+/// `GET /policy/{p}/supply` — the archive reconciled against ITSELF, plus what
+/// the policy IS.
+///
+/// Both sides come out of the same file, so this needs no second source. The
+/// **sign** of the gap is the whole check: positive is a source the walk has
+/// not descended to (normal on a partial archive, damning on a complete one),
+/// negative is supply minted that reached nobody (impossible at any
+/// completeness).
+#[derive(Serialize)]
+pub struct PolicySupplyResponse {
+    pub policy: String,
+    pub cached: bool,
+    pub completeness: &'static str,
+    /// `Σ net_mint`, counted once per `(transaction, unit)`.
+    pub minted: i64,
+    /// `Σ amount` over every party row.
+    pub moved: i64,
+    /// `balanced` | `below-floor` | `failed`.
+    pub verdict: &'static str,
+    /// Outstanding supply, when the verdict is not `balanced`.
+    pub gap: i64,
+    /// Units contributing to that gap.
+    pub gap_units: usize,
+    /// Why a failure is a failure rather than a coverage number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub because: Option<&'static str>,
+    /// `fungible` | `collection` | `mixed` | `unknown` — what the units ARE,
+    /// which decides whether a cohort band or a cascade even means anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units_seen: Option<u64>,
+}
+
+pub async fn supply(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+) -> Result<Json<PolicySupplyResponse>, ApiError> {
+    use policy_archive::supply::Verdict;
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let jobs = hub.sched.inflight_for(&policy);
+    let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let Some(mut a) = archive else {
+        return Ok(Json(PolicySupplyResponse {
+            policy,
+            cached: false,
+            completeness: policy_archive::Completeness::Unrecorded.as_wire(),
+            minted: 0,
+            moved: 0,
+            verdict: "balanced",
+            gap: 0,
+            gap_units: 0,
+            because: None,
+            class: None,
+            units_seen: None,
+        }));
+    };
+    let completeness = a.manifest.completeness();
+    let profile = a.manifest.profile.clone();
+    let r = a
+        .reconcile(policy_archive::Diagnose::Totals)
+        .map_err(internal)?;
+    let balances = r.balances();
+    let (verdict, gap, gap_units, because) = match r.verdict(completeness) {
+        Verdict::Balanced => ("balanced", 0, 0, None),
+        Verdict::BelowFloor { gap, units } => ("below-floor", gap, units, None),
+        Verdict::Failed { offenders, because } => (
+            "failed",
+            offenders.iter().map(|b| b.gap()).sum(),
+            offenders.len(),
+            Some(because.as_wire()),
+        ),
+    };
+    Ok(Json(PolicySupplyResponse {
+        policy,
+        cached: true,
+        completeness: completeness.as_wire(),
+        minted: balances.iter().map(|b| b.minted).sum(),
+        moved: balances.iter().map(|b| b.moved).sum(),
+        verdict,
+        gap,
+        gap_units,
+        because,
+        class: profile.as_ref().map(|p| p.class().as_str()),
+        units_seen: profile.as_ref().map(|p| p.units_seen),
+    }))
+}
+
+/// One sighting of the bonding curve — a point on the launch timeline.
+#[derive(Serialize)]
+pub struct CurvePointDto {
+    pub slot: u64,
+    pub unix: u64,
+    /// Lovelace the curve held at this sighting.
+    pub lovelace: i64,
+    /// Tokens still ON the curve — the unsold inventory. ⚠️ Never part of
+    /// float: it has never been owned by anyone.
+    pub tokens_left: i64,
+    /// How far up its own cap, 0.0–1.0. `None` when the datum did not decode,
+    /// which is a different statement from 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f64>,
+}
+
+/// How we know what state the launch is in. The codebase's basis discipline:
+/// an inference and an observation must not read the same.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaunchBasis {
+    /// The curve reached its cap in an observation we hold.
+    CurveAtCap,
+    /// Curve sightings stop and other venues' begin — it trades elsewhere now.
+    TradedElsewhereAfter,
+    /// Curve sightings, none at cap, nothing after.
+    StillOnTheCurve,
+    /// No curve observation at all.
+    NoLaunchObserved,
+}
+
+impl LaunchBasis {
+    fn state(self) -> &'static str {
+        match self {
+            LaunchBasis::CurveAtCap | LaunchBasis::TradedElsewhereAfter => "graduated",
+            LaunchBasis::StillOnTheCurve => "bonding",
+            LaunchBasis::NoLaunchObserved => "unknown",
+        }
+    }
+}
+
+/// `GET /policy/{p}/launch` — a launchpad token's most consequential event,
+/// and the shape of it over time.
+///
+/// Until 2026-09-08 a launch rendered as a transfer to an unnamed script. This
+/// is the same data, named.
+///
+/// Serves the POINTS as well as the summary on purpose: a consumer building
+/// its own timeline should not have to accept our reduction of it.
+#[derive(Serialize)]
+pub struct PolicyLaunchResponse {
+    pub policy: String,
+    pub cached: bool,
+    /// `snek.fun`, or absent when no launchpad observation exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
+    pub state: &'static str,
+    pub basis: LaunchBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launched_at_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launched_at_unix: Option<u64>,
+    /// Lovelace at which the pool graduates, INCLUDING the seed, straight
+    /// from the datum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ada_cap_threshold: Option<i64>,
+    /// ⚠️ The seed is lovelace the pool was CREATED holding, not money the
+    /// curve took. Netting it is the difference between 42,069.01 ADA and a
+    /// number that looks right.
+    pub curve_seed_lovelace: i64,
+    /// What the curve had to collect: `ada_cap_threshold − seed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ada_to_collect: Option<i64>,
+    /// The market cap it graduates at — only when a sighting at the cap lets
+    /// us state the tokens left there. Absent rather than estimated.
+    ///
+    /// ⚠️ This is priced off what the CURVE COLLECTED. The DEX pool that
+    /// results opens ~1.88% lower, because a flat ~209.58 ADA executor fee
+    /// leaves in the graduation transaction. Rendering one beside the other
+    /// without naming both reads as an arithmetic bug rather than a fee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graduation_market_cap_lovelace: Option<i64>,
+    /// The timeline, ordered by `(slot, curve position)`.
+    ///
+    /// ⚠️ **Within a slot this is curve position, NOT proven transaction
+    /// order.** Sightings sharing a slot are ordered by ascending lovelace,
+    /// which is ascending position up the curve — recovering their true
+    /// transaction order would mean following the chain of curve UTxOs. A sell
+    /// moves back DOWN the curve, so one occurring inside a single block would
+    /// appear out of sequence here.
+    ///
+    /// This matters more than it sounds: MEASURED on $PERP, ten of eleven
+    /// sightings share one slot.
+    pub points: Vec<CurvePointDto>,
+    /// How many distinct slots the points cover. `1` means the whole launch
+    /// happened inside a single block, and no ordering within it is proven.
+    pub distinct_slots: usize,
+    /// Venue observations recorded AFTER the last curve sighting — the
+    /// evidence behind `traded-elsewhere-after`.
+    pub venues_after: Vec<String>,
+}
+
+pub async fn launch(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+) -> Result<Json<PolicyLaunchResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+
+    // Curve sightings, oldest first. The observer tags them `BONDING_CURVE`
+    // rather than by venue name, because "not constant-product" is the
+    // property that matters and a second launchpad would share it.
+    let mut curve: Vec<&policy_archive::Observation> = rows
+        .iter()
+        .filter(|o| {
+            o.decoded
+                .as_ref()
+                .is_some_and(|d| d.pricing == policy_archive::observation::pricing::BONDING_CURVE)
+        })
+        .collect();
+    // ⚠️ SLOT, then CURVE POSITION — and the second key is not a tiebreak for
+    // tidiness.
+    //
+    // MEASURED on $PERP: ten of eleven sightings share ONE slot, because the
+    // whole bonding happened inside a single block. Sorting by slot alone
+    // leaves those ten in the order the parquet happened to yield, so a
+    // consumer drawing a line gets a zigzag through the same instant.
+    //
+    // Within a slot the true TRANSACTION order is not recoverable here — it
+    // would mean following the chain of curve UTxOs, each spending the last.
+    // What IS recoverable is the curve's own position: lovelace in and tokens
+    // out move strictly together, so ascending lovelace is ascending position
+    // up the curve. That is the meaningful axis for a bonding curve and it is
+    // deterministic.
+    //
+    // It is NOT proven time order: a sell moves back down the curve, and one
+    // inside a single block would be re-ordered by this. Stated in the
+    // response so a consumer can decide whether that matters to it, rather
+    // than discovering it from a chart that looks fine.
+    curve.sort_by(|a, b| {
+        a.slot
+            .cmp(&b.slot)
+            .then_with(|| a.lovelace.cmp(&b.lovelace))
+    });
+
+    let venue = curve
+        .first()
+        .and_then(|o| o.decoded.as_ref())
+        .map(|d| d.venue.clone());
+    let last_curve_slot = curve.last().map(|o| o.slot);
+
+    // Anything else, at a venue, after the curve went quiet.
+    let mut venues_after: Vec<String> = rows
+        .iter()
+        .filter(|o| last_curve_slot.is_some_and(|s| o.slot > s))
+        .filter_map(|o| o.decoded.as_ref())
+        .filter(|d| d.pricing != policy_archive::observation::pricing::BONDING_CURVE)
+        .map(|d| d.venue.clone())
+        .collect();
+    venues_after.sort();
+    venues_after.dedup();
+
+    // The datum carries the cap. Take it from the newest sighting that
+    // decodes: the parameters do not change, and the newest is likeliest to
+    // be the one nearest the cap.
+    let pool = curve
+        .iter()
+        .rev()
+        .filter_map(|o| o.datum.as_deref())
+        .find_map(mitos_launchpad_decode::decode_bonding_datum);
+
+    let points: Vec<CurvePointDto> = curve
+        .iter()
+        .map(|o| CurvePointDto {
+            slot: o.slot,
+            unix: o.block_time,
+            lovelace: o.lovelace,
+            tokens_left: o.unit_amount,
+            progress: pool.as_ref().and_then(|p| p.progress(o.lovelace)),
+        })
+        .collect();
+
+    // At the cap? Use THAT point's tokens_left; anything else would be an
+    // estimate wearing an exact number's clothes.
+    let at_cap = points
+        .iter()
+        .find(|p| p.progress.is_some_and(|f| f >= 0.99));
+
+    // Supply, for the market cap. A full reconcile for one figure, but this
+    // route is not polled the way the feed is, and the alternative is asking
+    // the caller to join two responses to learn the headline fact about a
+    // launch.
+    let supply = match at_cap.is_some() {
+        false => None,
+        true => {
+            let jobs = hub.sched.inflight_for(&policy);
+            let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
+            archive.and_then(|mut a| {
+                a.reconcile(policy_archive::Diagnose::Totals)
+                    .ok()
+                    .map(|r| r.balances().iter().map(|b| b.minted).sum::<i64>())
+                    .filter(|s| *s > 0)
+            })
+        }
+    };
+    let basis = match (curve.is_empty(), at_cap.is_some(), venues_after.is_empty()) {
+        (true, _, _) => LaunchBasis::NoLaunchObserved,
+        (false, true, _) => LaunchBasis::CurveAtCap,
+        (false, false, false) => LaunchBasis::TradedElsewhereAfter,
+        (false, false, true) => LaunchBasis::StillOnTheCurve,
+    };
+
+    Ok(Json(PolicyLaunchResponse {
+        policy,
+        cached: manifest.is_some(),
+        venue,
+        state: basis.state(),
+        basis,
+        launched_at_slot: curve.first().map(|o| o.slot),
+        launched_at_unix: curve.first().map(|o| o.block_time),
+        ada_cap_threshold: pool.as_ref().map(|p| p.ada_cap_threshold),
+        curve_seed_lovelace: mitos_launchpad_decode::CURVE_SEED_LOVELACE,
+        ada_to_collect: pool
+            .as_ref()
+            .map(|p| p.ada_cap_threshold - mitos_launchpad_decode::CURVE_SEED_LOVELACE),
+        graduation_market_cap_lovelace: match (&pool, at_cap, supply) {
+            // Needs all three: the cap from the datum, the tokens still on
+            // the curve AT the cap, and the token's supply. Absent when any
+            // is missing — an estimate here would wear an exact number's
+            // clothes.
+            (Some(p), Some(c), Some(s)) => p.graduation_market_cap(s, c.tokens_left),
+            _ => None,
+        },
+        distinct_slots: {
+            let mut s: Vec<u64> = points.iter().map(|p| p.slot).collect();
+            s.dedup();
+            s.len()
+        },
+        points,
+        venues_after,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct StoryQuery {
+    /// Window floor, inclusive. Absent = as far back as `limit` reaches.
+    pub from: Option<u64>,
+    /// Window ceiling, exclusive.
+    pub to: Option<u64>,
+    pub limit: Option<u32>,
+    /// `1` to include 32-byte transaction hashes. **Off by default**: they are
+    /// the single largest cost in the payload, and a chart does not need them.
+    pub txs: Option<u8>,
+    /// `json` for a debugging / non-Rust view. The default is postcard.
+    pub format: Option<String>,
+}
+
+/// `GET /policy/{p}/story` — **one ordered stream that tells the token's
+/// story**, and the surface a visualisation framework is meant to build on.
+///
+/// The other routes here slice the archive by KIND OF ANALYSIS, which makes us
+/// the ones deciding what questions are askable and leaves a consumer joining
+/// several time bases before it can draw anything. This slices by TIME and
+/// makes the kind a property of each event, so every visualisation is a fold:
+/// price is a filter to pool states, holders a fold over transfers, volume a
+/// fold over fills, the launch a filter to curve states.
+///
+/// ⚠️ **Postcard by default, not JSON**, and `policy_archive::story::wire`
+/// explains why at length: field names and addresses repeated per event, 64
+/// hex characters where 32 bytes would do, and — the silent one — a JS number
+/// cannot hold an `i64`. `?format=json` exists for debugging and for consumers
+/// that cannot decode postcard; it is not the intended path.
+pub async fn story(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+    Query(q): Query<StoryQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    use policy_archive::story::wire;
+
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let observations = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+
+    let jobs = hub.sched.inflight_for(&policy);
+    let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let limit = q.limit.unwrap_or(2_000).clamp(1, 5_000);
+    let to = q.to.unwrap_or(u64::MAX);
+    let from = q.from.unwrap_or(0);
+
+    let rows = match archive {
+        Some(mut a) => a.feed_rows(limit, q.to).map_err(internal)?,
+        None => Vec::new(),
+    };
+    // `feed_rows` pages NEWEST-first from a ceiling; the window's floor is
+    // applied here. Stated rather than hidden: a caller asking for a deep
+    // window with a small limit gets the newest end of it, not the oldest.
+    let rows: Vec<_> = rows.into_iter().filter(|r| r.slot >= from).collect();
+    let obs: Vec<_> = observations
+        .into_iter()
+        .filter(|o| o.slot >= from && o.slot < to)
+        .collect();
+
+    let built = policy_archive::story::build(&rows, &obs, &crate::archive::venue_roles());
+    let lo = built.events.first().map(|e| e.slot).unwrap_or(from);
+    let hi = built.events.last().map(|e| e.slot).unwrap_or(from);
+    let complete = manifest
+        .as_ref()
+        .is_some_and(|m| m.completeness() == policy_archive::Completeness::Complete);
+    let stream = wire::encode(
+        &built,
+        &policy,
+        lo,
+        hi,
+        complete,
+        match q.txs.unwrap_or(0) {
+            0 => wire::Txs::Omit,
+            _ => wire::Txs::Include,
+        },
+    );
+
+    match q.format.as_deref() {
+        Some("json") => Ok(Json(stream).into_response()),
+        _ => {
+            let bytes = wire::to_bytes(&stream).map_err(|e| internal(anyhow::anyhow!("{e}")))?;
+            Ok((
+                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                bytes,
+            )
+                .into_response())
+        }
+    }
+}
+
 /// `GET /policy/{policy}/tx/{hash}` — ONE row by hash. Never scans.
 pub async fn row_at(
     State(hub): State<Arc<PolicyHub>>,
@@ -1082,6 +1725,15 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         .route("/policy/{policy}", get(feed))
         .route("/policy/{policy}/tx/{hash}", get(row_at))
         .route("/policy/{policy}/density", get(density))
+        // The interpretive tiers — what the movements MEAN. Present in the
+        // archive since 2026-09-08 and unreachable over HTTP until now.
+        .route("/policy/{policy}/price", get(price))
+        .route("/policy/{policy}/trades", get(trades))
+        .route("/policy/{policy}/supply", get(supply))
+        .route("/policy/{policy}/launch", get(launch))
+        // THE stream. The routes above are summaries derived from the same
+        // archive; this is the substrate a consumer folds for itself.
+        .route("/policy/{policy}/story", get(story))
         .route("/policy/{policy}/refresh", post(refresh))
         .route("/policy/{policy}/seek", post(seek))
         .route("/policy/{policy}/events", get(events))
