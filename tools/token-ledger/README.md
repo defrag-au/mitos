@@ -73,6 +73,24 @@ token-ledger serve --data-dir <db> --archive-dir <dir> [--publish-archive] \
 | `GET /policy/{p}/trades` | movements folded into fills / placements / cancellations |
 | `GET /policy/{p}/supply` | the archive reconciled against itself, plus the profile |
 | `GET /policy/{p}/launch` | a launchpad token's launch, graduation, and the curve over time |
+| `GET /policy/{p}/story` | **THE STREAM** — one ordered sequence of typed events, postcard |
+
+⚠️ **`/story` is the substrate; the routes above it are derived conveniences.**
+It slices by TIME with the kind as a property of each event, so a consumer
+folds it for itself: filter `PoolState` for a price series, `CurveState` for the
+launch, fold `Transfer` for holders, fold `Fill` for volume. Postcard by
+default (`?format=json` for debugging), `?txs=1` for 32-byte hashes — MEASURED
+at 2.65× the gzipped payload, so off by default.
+
+⚠️ **Observations are clipped to the slots the movements cover.** They are not
+bounded by `limit` otherwise, and an earlier version merged the archive's whole
+observation history into every window — a price series and a holder count
+folded from the same stream then covered different periods.
+
+⚠️ **CHAPTER MARKERS carry what falls OUTSIDE the window** (`FirstMint`,
+`Launch`, `Graduation`, each tagged `Before`/`Within`/`After`). $PERP launched
+30M slots before a 5,000-movement window reaches, and without them
+`curve points: 0` is indistinguishable from "this token never launched".
 
 ⚠️ **`quote_per_base_raw` is not a display price.** For an ADA pair the quote
 is **lovelace**, so $PERP reads `226.58` and renders as `0.00022658 ADA`.

@@ -71,7 +71,15 @@ use super::{Kind, PoolState, Story, StoryEvent, Trader};
 
 /// Byte 0 of every encoded [`StoryStream`]. Bump on ANY change to the types in
 /// this module — see the encoding contract above.
-pub const STORY_WIRE_VERSION: u8 = 1;
+///
+/// - **v2** — added [`StoryStream::markers`]. Appending a field to a struct
+///   inside a `Vec` is breaking under postcard, and so is appending one to the
+///   envelope, so this is a version and not a compatible addition.
+/// - **v3** — added [`StoryStream::pool_keys`] / [`StoryStream::pool_key`].
+///   Without the pool INSTANCE a consumer cannot aggregate a venue that runs
+///   several, and the first one that tried reported a venue's liquidity as
+///   unpublished while the archive held 29,121 ADA of it.
+pub const STORY_WIRE_VERSION: u8 = 3;
 
 /// Absent index — the `Option<u32>` postcard would otherwise cost a byte for.
 pub const NONE_IDX: u32 = u32::MAX;
@@ -208,8 +216,58 @@ pub struct StoryStream {
     /// rate from reserves MUST check this: a bonding curve's reserves are real
     /// and its rate is not `quote / base`.
     pub pool_pricing: Vec<u8>,
+    /// Pool instance keys, interned. Parallel to the `PoolState` rows via
+    /// [`StoryStream::pool_key`].
+    pub pool_keys: Vec<Vec<u8>>,
+    /// Which pool each `PoolState` row is, indexing [`StoryStream::pool_keys`],
+    /// or [`NONE_IDX`] where the venue publishes no instance key.
+    ///
+    /// ⚠️ **A venue runs MANY pools.** Grouping by venue alone and taking the
+    /// latest sighting takes the latest of whichever pool moved last — which
+    /// reported `splash: liquidity not published` on a policy whose splash
+    /// pools held 29,121 ADA. Group by `(venue, pool)`, take the latest per
+    /// pool, then aggregate.
+    pub pool_key: Vec<u32>,
 
     pub rows: Vec<EventRow>,
+
+    /// Chapter markers — the few moments worth drawing WHEREVER they fall,
+    /// including outside this window.
+    ///
+    /// ⚠️ Deliberately NOT merged into `rows`. The rows are an ordered window
+    /// and every fold assumes that; splicing an out-of-frame launch into them
+    /// would put an event at a slot the window does not cover and quietly
+    /// break the contract that makes folding safe.
+    pub markers: Vec<MarkerRow>,
+}
+
+/// A marker on the wire. Slots are ABSOLUTE — there are a handful of these and
+/// delta-encoding against a window they may sit outside would be nonsense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkerRow {
+    pub slot: u64,
+    /// `0` when unknown — a first mint's time is not in the observations.
+    pub unix: u64,
+    pub kind: MarkerTag,
+    pub at: WhereTag,
+}
+
+/// ⚠️ APPEND ONLY, like every other tag here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkerTag {
+    FirstMint,  // 0
+    Launch,     // 1
+    Graduation, // 2
+}
+
+/// Which side of the window a marker falls on. **`Before`/`After` is the whole
+/// point**: it is what lets a consumer draw an edge indicator instead of
+/// reading an absence as "this never happened".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WhereTag {
+    Before, // 0
+    Within, // 1
+    After,  // 2
 }
 
 /// Whether to spend 32 bytes per transaction on identity.
@@ -282,6 +340,8 @@ pub fn encode(
     let mut t = Intern::default();
     let mut rows = Vec::with_capacity(story.events.len());
     let mut pool_quote = Vec::new();
+    let mut pool_keys: Vec<Vec<u8>> = Vec::new();
+    let mut pool_key: Vec<u32> = Vec::new();
     let mut pool_pricing = Vec::new();
     let (mut last_slot, mut last_unix) = (0u64, 0u64);
 
@@ -398,6 +458,10 @@ pub fn encode(
                     crate::observation::pricing::BONDING_CURVE => 1,
                     _ => 0,
                 });
+                pool_key.push(match &p.pool {
+                    Some(k) => idx(&mut pool_keys, k.clone()),
+                    None => NONE_IDX,
+                });
             }
             Kind::CurveState {
                 venue,
@@ -445,8 +509,49 @@ pub fn encode(
         quote_units: t.quote_units,
         pool_quote,
         pool_pricing,
+        pool_keys,
+        pool_key,
         rows,
+        markers: story
+            .markers
+            .iter()
+            .map(|m| MarkerRow {
+                slot: m.slot,
+                unix: m.unix,
+                kind: match m.kind {
+                    super::MarkerKind::FirstMint => MarkerTag::FirstMint,
+                    super::MarkerKind::Launch => MarkerTag::Launch,
+                    super::MarkerKind::Graduation => MarkerTag::Graduation,
+                },
+                at: match m.at {
+                    super::Where::Before => WhereTag::Before,
+                    super::Where::Within => WhereTag::Within,
+                    super::Where::After => WhereTag::After,
+                },
+            })
+            .collect(),
     }
+}
+
+/// Markers back as domain types.
+pub fn decode_markers(s: &StoryStream) -> Vec<super::Marker> {
+    s.markers
+        .iter()
+        .map(|m| super::Marker {
+            slot: m.slot,
+            unix: m.unix,
+            kind: match m.kind {
+                MarkerTag::FirstMint => super::MarkerKind::FirstMint,
+                MarkerTag::Launch => super::MarkerKind::Launch,
+                MarkerTag::Graduation => super::MarkerKind::Graduation,
+            },
+            at: match m.at {
+                WhereTag::Before => super::Where::Before,
+                WhereTag::Within => super::Where::Within,
+                WhereTag::After => super::Where::After,
+            },
+        })
+        .collect()
 }
 
 fn write_trader(r: &mut EventRow, t: &mut Intern, p: &Trader) {
@@ -543,12 +648,23 @@ pub fn decode(s: &StoryStream) -> Vec<StoryEvent> {
                 amount: r.amount,
             },
             Tag::PoolState => {
+                // ⚠️ EVERY parallel column is read at `pool_at` BEFORE the
+                // increment. Reading one after it silently shifts that column
+                // by one pool — the reserves of pool N described as pool N+1,
+                // which decodes cleanly and is entirely wrong.
                 let q = s.pool_quote.get(pool_at).copied().unwrap_or(NONE_IDX);
                 let pricing = s.pool_pricing.get(pool_at).copied().unwrap_or(0);
+                let pool = s
+                    .pool_key
+                    .get(pool_at)
+                    .copied()
+                    .filter(|i| *i != NONE_IDX)
+                    .and_then(|i| s.pool_keys.get(i as usize).cloned());
                 pool_at += 1;
                 let (qp, qn) = s.quote_units.get(q as usize).cloned().unwrap_or_default();
                 Kind::PoolState(PoolState {
                     venue: venue_of(s, r.venue),
+                    pool,
                     base: r.amount,
                     quote: flag.then_some(r.extra),
                     quote_policy: (!qp.is_empty()).then_some(qp),
@@ -620,6 +736,7 @@ mod tests {
         Story {
             distinct_slots: slots.len(),
             events,
+            markers: Vec::new(),
         }
     }
 
@@ -668,6 +785,7 @@ mod tests {
                 5,
                 Kind::PoolState(PoolState {
                     venue: "splash".into(),
+                    pool: Some(b"POOL".to_vec()),
                     base: 1_000,
                     quote: Some(2_000),
                     quote_policy: None,
@@ -753,6 +871,55 @@ mod tests {
         }
     }
 
+    /// ⚠️ THE PARALLEL COLUMNS MUST STAY IN STEP. Two pool states with
+    /// different keys, quotes and models: if any column is read after the
+    /// cursor advances, pool N comes back wearing pool N+1's identity — and it
+    /// decodes cleanly, so nothing complains.
+    #[test]
+    fn parallel_pool_columns_stay_aligned_across_several_pools() {
+        let pool = |key: &[u8], base: i64, quote: Option<i64>, bonding: bool| {
+            Kind::PoolState(PoolState {
+                venue: "splash".into(),
+                pool: Some(key.to_vec()),
+                base,
+                quote,
+                quote_policy: None,
+                quote_name: None,
+                pricing: match bonding {
+                    true => crate::observation::pricing::BONDING_CURVE.into(),
+                    false => crate::observation::pricing::CONSTANT_PRODUCT.into(),
+                },
+            })
+        };
+        let s = story(vec![
+            ev(1, pool(b"POOL_A", 100, Some(1_000), false)),
+            ev(2, pool(b"POOL_B", 200, None, true)),
+            ev(3, pool(b"POOL_C", 300, Some(3_000), false)),
+        ]);
+        // `Include`, so the whole-set comparison is meaningful: `Omit` drops
+        // the hashes on purpose and the events would differ for that reason
+        // rather than for anything this test is about.
+        let got = round_trip(&s, Txs::Include);
+        assert_eq!(got, s.events);
+        // Spelled out, because an off-by-one here is invisible in a whole-set
+        // comparison if the values happen to be similar.
+        match (&got[0].kind, &got[1].kind, &got[2].kind) {
+            (Kind::PoolState(a), Kind::PoolState(b), Kind::PoolState(c)) => {
+                assert_eq!(a.pool.as_deref(), Some(b"POOL_A".as_slice()));
+                assert_eq!(b.pool.as_deref(), Some(b"POOL_B".as_slice()));
+                assert_eq!(c.pool.as_deref(), Some(b"POOL_C".as_slice()));
+                assert_eq!((a.base, a.quote), (100, Some(1_000)));
+                assert_eq!((b.base, b.quote), (200, None));
+                assert_eq!(
+                    b.pricing,
+                    crate::observation::pricing::BONDING_CURVE,
+                    "the bonding model must land on POOL_B, not a neighbour"
+                );
+            }
+            other => panic!("expected three pool states, got {other:?}"),
+        }
+    }
+
     /// ⚠️ An unstated quote reserve must not come back as 0 — a rate computed
     /// from it would price the pool at infinity.
     #[test]
@@ -761,6 +928,8 @@ mod tests {
             1,
             Kind::PoolState(PoolState {
                 venue: "v".into(),
+                // A venue that publishes no instance key — the `None` case.
+                pool: None,
                 base: 100,
                 quote: None,
                 quote_policy: None,
@@ -781,6 +950,7 @@ mod tests {
             1,
             Kind::PoolState(PoolState {
                 venue: "snek.fun".into(),
+                pool: Some(b"CURVE".to_vec()),
                 base: 1,
                 quote: Some(2),
                 quote_policy: None,
@@ -860,6 +1030,83 @@ mod tests {
         for (i, t) in Tag::ALL.iter().enumerate() {
             let encoded = postcard::to_allocvec(t).unwrap();
             assert_eq!(encoded[0], i as u8, "{expect:?}[{i}] moved on the wire");
+        }
+    }
+
+    /// Markers survive the wire with their SIDE intact — the field that lets a
+    /// consumer tell "out of frame" from "never happened".
+    #[test]
+    fn markers_round_trip_with_which_side_they_fall_on() {
+        use crate::story::{Marker, MarkerKind, Where};
+        let s = story(vec![ev(
+            9_000,
+            Kind::Ambiguous {
+                parties: 2,
+                amount: 1,
+            },
+        )])
+        .with_markers(vec![
+            Marker {
+                slot: 100,
+                unix: 7,
+                kind: MarkerKind::Launch,
+                at: Where::Before,
+            },
+            Marker {
+                slot: 9_000,
+                unix: 9,
+                kind: MarkerKind::Graduation,
+                at: Where::Within,
+            },
+        ]);
+        let w = encode(&s, "aa", 8_000, 10_000, true, Txs::Omit);
+        let back = decode_markers(&from_bytes(&to_bytes(&w).unwrap()).unwrap());
+        assert_eq!(back, s.markers);
+        assert_eq!(back[0].at, Where::Before);
+    }
+
+    /// ⚠️ Markers are NOT rows. A fold over `rows` must never see an event at
+    /// a slot the window does not cover.
+    #[test]
+    fn markers_do_not_leak_into_the_event_rows() {
+        use crate::story::{Marker, MarkerKind, Where};
+        let s = story(vec![ev(
+            9_000,
+            Kind::Ambiguous {
+                parties: 2,
+                amount: 1,
+            },
+        )])
+        .with_markers(vec![Marker {
+            slot: 100,
+            unix: 7,
+            kind: MarkerKind::Launch,
+            at: Where::Before,
+        }]);
+        let w = encode(&s, "aa", 8_000, 10_000, true, Txs::Omit);
+        assert_eq!(w.rows.len(), 1);
+        assert_eq!(decode(&w).len(), 1);
+        assert!(decode(&w).iter().all(|e| e.slot >= 8_000));
+    }
+
+    /// ⚠️ APPEND ONLY, same contract as the event tags.
+    #[test]
+    fn marker_tags_are_append_only() {
+        for (i, t) in [
+            MarkerTag::FirstMint,
+            MarkerTag::Launch,
+            MarkerTag::Graduation,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(postcard::to_allocvec(t).unwrap()[0], i as u8);
+        }
+        for (i, t) in [WhereTag::Before, WhereTag::Within, WhereTag::After]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(postcard::to_allocvec(t).unwrap()[0], i as u8);
         }
     }
 

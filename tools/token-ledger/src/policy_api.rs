@@ -1560,12 +1560,44 @@ pub async fn story(
     // applied here. Stated rather than hidden: a caller asking for a deep
     // window with a small limit gets the newest end of it, not the oldest.
     let rows: Vec<_> = rows.into_iter().filter(|r| r.slot >= from).collect();
+
+    // ⚠️ OBSERVATIONS ARE CLIPPED TO THE SLOTS THE MOVEMENTS ACTUALLY COVER,
+    // and this is a correctness fix rather than a size one.
+    //
+    // `limit` bounds the movements but says nothing about observations, so an
+    // earlier version merged EVERY observation in the archive into whatever
+    // movement window was asked for. MEASURED in the browser benchmark: a
+    // 5,000-movement request came back as 13,265 events over 9,137 slots —
+    // 8,265 of them the archive's entire observation history.
+    //
+    // The size was the least of it. The stream was INCOHERENT: pool states
+    // from months earlier sat beside transfers from the last few weeks, so a
+    // price series folded from it covered a different period than a holder
+    // count folded from the same stream, and nothing in the payload said so.
+    let (floor, ceiling) = match (
+        rows.iter().map(|r| r.slot).min(),
+        rows.iter().map(|r| r.slot).max(),
+    ) {
+        (Some(lo), Some(hi)) => (lo.max(from), hi.min(to)),
+        // No movements in the window: an observation-only stretch is not a
+        // window anyone asked for, so it is empty rather than everything.
+        _ => (from, from),
+    };
+    // Markers come from ALL observations, before the clip — that is the point
+    // of them. A launch 30 million slots below the window is out of frame, not
+    // absent, and only the full set can say so.
+    let marks = policy_archive::story::markers(
+        &observations,
+        manifest.as_ref().and_then(|m| m.first_mint_slot),
+        (floor, ceiling),
+    );
     let obs: Vec<_> = observations
         .into_iter()
-        .filter(|o| o.slot >= from && o.slot < to)
+        .filter(|o| o.slot >= floor && o.slot <= ceiling)
         .collect();
 
-    let built = policy_archive::story::build(&rows, &obs, &crate::archive::venue_roles());
+    let built = policy_archive::story::build(&rows, &obs, &crate::archive::venue_roles())
+        .with_markers(marks);
     let lo = built.events.first().map(|e| e.slot).unwrap_or(from);
     let hi = built.events.last().map(|e| e.slot).unwrap_or(from);
     let complete = manifest

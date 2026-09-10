@@ -1649,19 +1649,37 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
 /// pool from an order contract: the registry records both as
 /// `Exchange { label }`.
 pub fn venue_roles() -> policy_archive::trade::Roles {
-    use mitos_dex_decode::{cswap, minswap, splash};
+    use mitos_dex_decode::{cswap, minswap, splash, venue};
     use policy_archive::trade::{OrderKeying, Role, Roles};
 
     let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let mut r = Roles::default();
+    // ⚠️ NAME every credential as it is registered, FROM `venue`'s constants.
+    //
+    // A pool observation carries the venue's name and a fill carries only its
+    // credential, so without the mapping the two describe the same venue and
+    // never join — which drew `splash: 0 fills` beside `da5b47ae…: 334 fills`.
+    //
+    // And the names come from `mitos_dex_decode::venue`, not from literals
+    // here, because `mitos-pool-observe` spells the observation side from the
+    // same constants. Typing them again is how the halves drift back apart —
+    // it is what produced the bug the first time.
     for c in splash::POOL_CREDS {
-        r.roles.insert(hex(&c), Role::Pool);
+        r.register(hex(&c), Role::Pool, venue::SPLASH);
     }
-    r.roles.insert(hex(&minswap::V1_PAYMENT_CRED), Role::Pool);
-    r.roles.insert(hex(&minswap::V2_PAYMENT_CRED), Role::Pool);
-    r.roles.insert(hex(&splash::ORDER_CRED), Role::Order);
-    r.roles.insert(hex(&minswap::V2_ORDER_CRED), Role::Order);
-    r.roles.insert(hex(&cswap::ORDER_CRED), Role::Order);
+    r.register(
+        hex(&minswap::V1_PAYMENT_CRED),
+        Role::Pool,
+        venue::MINSWAP_V1,
+    );
+    r.register(
+        hex(&minswap::V2_PAYMENT_CRED),
+        Role::Pool,
+        venue::MINSWAP_V2,
+    );
+    r.register(hex(&splash::ORDER_CRED), Role::Order, venue::SPLASH);
+    r.register(hex(&minswap::V2_ORDER_CRED), Role::Order, venue::MINSWAP_V2);
+    r.register(hex(&cswap::ORDER_CRED), Role::Order, venue::CSWAP);
     // CSwap's order contract is ONE address for every trader, so a fill spent
     // from it cannot name who traded. Stated by the decode crate, not assumed.
     if cswap::ORDER_IS_SHARED_ADDRESS {
@@ -1670,12 +1688,16 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
     }
     // CSwap's pool and the snek.fun curve are addresses rather than creds
     // upstream; derive them the same way every other consumer must.
-    for (addr, role) in [
-        (cswap::POOL_SCRIPT_ADDR, Role::Pool),
-        (mitos_launchpad_decode::BONDING_CURVE_ADDR, Role::Curve),
+    for (addr, role, name) in [
+        (cswap::POOL_SCRIPT_ADDR, Role::Pool, venue::CSWAP),
+        (
+            mitos_launchpad_decode::BONDING_CURVE_ADDR,
+            Role::Curve,
+            venue::SNEK_FUN,
+        ),
     ] {
         if let Some((cred, _)) = policy_archive::trade::address_parts(addr) {
-            r.roles.insert(cred, role);
+            r.register(cred, role, name);
         }
     }
     r

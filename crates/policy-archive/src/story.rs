@@ -167,6 +167,18 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolState {
     pub venue: String,
+    /// WHICH pool — the instance key (its pool NFT), not the venue.
+    ///
+    /// ⚠️ A venue runs MANY pools and a consumer that groups by venue alone
+    /// cannot aggregate them: "the latest sighting" then means the latest of
+    /// whichever pool happened to move last, and a token/token pair with no
+    /// measured ADA side erases a measured one. MEASURED on $PERP — a token
+    /// band grouping by venue reported `splash: liquidity not published`
+    /// while the archive held 29,121 ADA.
+    ///
+    /// `None` where the venue does not publish an instance key, which is
+    /// itself the answer: those pools cannot be told apart here.
+    pub pool: Option<Vec<u8>>,
     /// The watched policy's reserve.
     pub base: i64,
     /// The quote-side reserve. `None` is **"this venue does not publish it"**,
@@ -246,12 +258,139 @@ impl Kind {
 }
 
 /// A window of the stream, and what it is a window OF.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Story {
     pub events: Vec<StoryEvent>,
     /// Distinct slots covered. `1` means everything here shares a block and
     /// **no ordering within it is proven**.
     pub distinct_slots: usize,
+    /// Chapter markers — the few events that matter to a timeline WHEREVER
+    /// they sit, including outside this window. See [`Marker`].
+    pub markers: Vec<Marker>,
+}
+
+impl Story {
+    /// Attach chapter markers. Separate from [`build`] because markers are
+    /// derived from the WHOLE archive while the events are a window of it, and
+    /// folding that into one call would hide which input each came from.
+    pub fn with_markers(mut self, markers: Vec<Marker>) -> Self {
+        self.markers = markers;
+        self
+    }
+}
+
+/// A moment worth drawing however far outside the window it falls.
+///
+/// # ⚠️ Why these are not just events
+///
+/// A token's life can span 50 million slots, and a window that holds the
+/// present cannot also hold a launch three years earlier. MEASURED on $PERP:
+/// it launched at slot 145,246,220, and a 5,000-movement window reaches back
+/// only to ~175,900,000 — **30 million slots short**.
+///
+/// Without markers a consumer sees `curve points: 0` and has no way to tell
+/// *"this token never launched on a curve"* from *"the launch is out of
+/// frame"*. Those read identically and one of them is a lie, so the stream
+/// carries the answer rather than leaving it to be inferred from an absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    pub slot: u64,
+    pub unix: u64,
+    pub kind: MarkerKind,
+    /// Where this sits relative to the window the events cover.
+    pub at: Where,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind {
+    /// The policy's first mint — where its life starts.
+    FirstMint,
+    /// The first sighting of a bonding curve.
+    Launch,
+    /// The curve reached its cap, or trading moved to other venues.
+    Graduation,
+}
+
+/// Whether a marker falls inside the window, or which side of it.
+///
+/// A consumer draws an in-frame marker on the timeline and an out-of-frame one
+/// as an edge indicator — "there is something back there" — which is the whole
+/// reason to send it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Where {
+    Before,
+    Within,
+    After,
+}
+
+/// Derive chapter markers from the archive's FULL observation set.
+///
+/// ⚠️ Pass every observation, not the window's — that is the point. `window`
+/// is only used to say which side of it each marker falls on.
+pub fn markers(
+    all: &[Observation],
+    first_mint_slot: Option<u64>,
+    window: (u64, u64),
+) -> Vec<Marker> {
+    let side = |slot: u64| match slot {
+        s if s < window.0 => Where::Before,
+        s if s > window.1 => Where::After,
+        _ => Where::Within,
+    };
+    let mut out = Vec::new();
+
+    if let Some(slot) = first_mint_slot {
+        // The unix time of a first mint is not in the observations (a mint is
+        // a movement), so it is left to the caller's slot→time conversion
+        // rather than guessed at here.
+        out.push(Marker {
+            slot,
+            unix: 0,
+            kind: MarkerKind::FirstMint,
+            at: side(slot),
+        });
+    }
+
+    let mut curve: Vec<&Observation> = all
+        .iter()
+        .filter(|o| {
+            o.decoded
+                .as_ref()
+                .is_some_and(|d| d.pricing == pricing::BONDING_CURVE)
+        })
+        .collect();
+    curve.sort_by_key(|o| o.slot);
+
+    if let Some(first) = curve.first() {
+        out.push(Marker {
+            slot: first.slot,
+            unix: first.block_time,
+            kind: MarkerKind::Launch,
+            at: side(first.slot),
+        });
+    }
+    // Graduation: the last curve sighting, but only when something at ANOTHER
+    // venue happened afterwards. A curve still being traded is not a
+    // graduation, and calling it one would put a finish line on a token that
+    // never crossed it.
+    if let Some(last) = curve.last() {
+        let traded_elsewhere_after = all.iter().any(|o| {
+            o.slot > last.slot
+                && o.decoded
+                    .as_ref()
+                    .is_some_and(|d| d.pricing != pricing::BONDING_CURVE)
+        });
+        if traded_elsewhere_after {
+            out.push(Marker {
+                slot: last.slot,
+                unix: last.block_time,
+                kind: MarkerKind::Graduation,
+                at: side(last.slot),
+            });
+        }
+    }
+    out.sort_by_key(|m| m.slot);
+    out
 }
 
 /// Merge movements and observations into one ordered stream.
@@ -261,6 +400,22 @@ pub struct Story {
 pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> Story {
     let mut events: Vec<StoryEvent> = Vec::new();
 
+    // ⚠️ A trade event carries the venue's CREDENTIAL; a pool observation
+    // carries its NAME. Resolve here so both sides of the stream speak the
+    // same vocabulary — otherwise a consumer grouping by venue sees `splash`
+    // with no fills and a hex string with all of them, which is what the first
+    // token band drew.
+    //
+    // An unregistered credential keeps its hex, deliberately: that is a gap in
+    // OUR registry rather than an absence of trading, and the credential is
+    // what lets someone identify the venue and close it.
+    let name = |cred: &str| {
+        roles
+            .name_of(cred)
+            .map(str::to_string)
+            .unwrap_or_else(|| cred.to_string())
+    };
+
     for f in fold(rows, roles) {
         let kind = match &f.event {
             Event::Fill {
@@ -269,7 +424,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 amount,
                 into_pool,
             } => Kind::Fill {
-                venue: venue_cred.clone(),
+                venue: name(venue_cred),
                 party: party.into(),
                 amount: *amount,
                 into_pool: *into_pool,
@@ -279,7 +434,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 party,
                 amount,
             } => Kind::Placement {
-                venue: venue_cred.clone(),
+                venue: name(venue_cred),
                 party: party.into(),
                 amount: *amount,
             },
@@ -288,7 +443,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 party,
                 amount,
             } => Kind::Cancellation {
-                venue: venue_cred.clone(),
+                venue: name(venue_cred),
                 party: party.into(),
                 amount: *amount,
             },
@@ -297,7 +452,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 orders,
                 amount,
             } => Kind::BatchedFill {
-                venue: venue_cred.clone(),
+                venue: name(venue_cred),
                 orders: *orders,
                 amount: *amount,
             },
@@ -334,6 +489,11 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
             },
             Some(d) => Kind::PoolState(PoolState {
                 venue: d.venue.clone(),
+                // The pool NFT's asset name — unique per pool instance where
+                // the venue mints one. `key_basis` records how firmly it is
+                // known; an absent key is a pool this stream cannot separate
+                // from its siblings.
+                pool: (!d.key_name.is_empty()).then(|| d.key_name.clone()),
                 base: d.base_reserve,
                 // `None` is "the venue does not publish it", which is not 0.
                 quote: d.quote_reserve,
@@ -366,6 +526,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
     Story {
         distinct_slots: slots.len(),
         events,
+        markers: Vec::new(),
     }
 }
 
@@ -405,6 +566,10 @@ fn direction_of(rows: &[FeedRow], tx: &[u8], unit: &[u8]) -> Option<Kind> {
 mod tests {
     use super::*;
     use crate::feed::{PartyMove, UnitMove};
+
+    /// A real Splash pool address, so the credential derived from it is the
+    /// one on chain.
+    const SPLASH_POOL: &str = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z";
 
     fn row(tx: u8, slot: u64, unit: &str, net_mint: i64, parties: &[(&str, i64)]) -> FeedRow {
         FeedRow {
@@ -468,6 +633,54 @@ mod tests {
         assert!(matches!(s.events[2].kind, Kind::PoolState(_)));
         // Ascending, so a timeline can read it straight through.
         assert!(s.events.windows(2).all(|w| w[0].slot <= w[1].slot));
+    }
+
+    /// ⚠️ A FILL AND A POOL STATE MUST NAME THE SAME VENUE THE SAME WAY.
+    ///
+    /// The trade fold works from credentials and an observation from a decoded
+    /// venue name, so without resolution one says `da5b47ae…` and the other
+    /// says `cswap`. A consumer grouping by venue then draws named pools with
+    /// no trading beside hex strings doing all of it — which is exactly what
+    /// the first token band rendered.
+    #[test]
+    fn a_fill_and_a_pool_state_agree_on_the_venue_name() {
+        let mut roles = Roles::default();
+        let cred = crate::trade::address_parts(SPLASH_POOL).unwrap().0;
+        roles.register(cred, crate::trade::Role::Pool, "splash");
+
+        let rows = vec![row(1, 10, "A", 0, &[("alice", -5), (SPLASH_POOL, 5)])];
+        let obs = vec![obs(11, "A", 100, 50, Some("splash"))];
+        let s = build(&rows, &obs, &roles);
+
+        let venues: Vec<&str> = s
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::Fill { venue, .. } => Some(venue.as_str()),
+                Kind::PoolState(p) => Some(p.venue.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(venues.len(), 2);
+        assert!(
+            venues.iter().all(|v| *v == "splash"),
+            "fill and pool state disagree: {venues:?}"
+        );
+    }
+
+    /// ⚠️ An UNREGISTERED credential keeps its hex rather than becoming
+    /// "unknown". That is a gap in our registry, not an absence of trading,
+    /// and the credential is what lets someone go and close it.
+    #[test]
+    fn an_unregistered_venue_keeps_its_credential() {
+        let rows = vec![row(1, 10, "A", 0, &[("alice", -5), (SPLASH_POOL, 5)])];
+        let s = build(&rows, &[], &Roles::default());
+        // With no roles at all it is not even a fill — but the naming rule is
+        // what matters, so assert the fold did not invent a venue.
+        assert!(s.events.iter().all(|e| !matches!(
+            &e.kind,
+            Kind::Fill { venue, .. } if venue == "unknown"
+        )));
     }
 
     /// ⚠️ Every event carries its UNIT, or the stream can describe a policy
@@ -552,6 +765,78 @@ mod tests {
             .collect();
         assert_eq!(seen, vec![500, 700, 900]);
         assert_eq!(s.distinct_slots, 1, "all one block — ordering is unproven");
+    }
+
+    fn curve(slot: u64, lovelace: i64) -> Observation {
+        let base = obs(slot, "A", lovelace, 10, Some("snek.fun"));
+        Observation {
+            decoded: Some(crate::observation::Decoded {
+                pricing: pricing::BONDING_CURVE.into(),
+                ..base.decoded.clone().unwrap()
+            }),
+            ..base
+        }
+    }
+
+    /// ⚠️ THE CASE MARKERS EXIST FOR. A launch far below the window must come
+    /// back as `Before`, not as an absence — `curve points: 0` cannot
+    /// otherwise be told apart from "this token never launched on a curve".
+    #[test]
+    fn a_launch_below_the_window_is_marked_before_it() {
+        let all = vec![
+            curve(100, 500),
+            curve(150, 900),
+            obs(9_000, "A", 1, 1, Some("splash")),
+        ];
+        let m = markers(&all, Some(50), (8_000, 10_000));
+
+        let launch = m.iter().find(|m| m.kind == MarkerKind::Launch).unwrap();
+        assert_eq!(launch.slot, 100);
+        assert_eq!(launch.at, Where::Before, "out of frame, not absent");
+
+        let mint = m.iter().find(|m| m.kind == MarkerKind::FirstMint).unwrap();
+        assert_eq!((mint.slot, mint.at), (50, Where::Before));
+    }
+
+    /// A marker inside the window says so, so a consumer draws it on the
+    /// timeline rather than as an edge indicator.
+    #[test]
+    fn a_launch_inside_the_window_is_marked_within() {
+        let all = vec![curve(9_100, 500), obs(9_500, "A", 1, 1, Some("splash"))];
+        let m = markers(&all, None, (9_000, 10_000));
+        assert_eq!(m[0].at, Where::Within);
+    }
+
+    /// ⚠️ A curve still being traded has NOT graduated. Marking one would put
+    /// a finish line on a token that never crossed it.
+    #[test]
+    fn a_curve_with_nothing_after_it_is_not_a_graduation() {
+        let all = vec![curve(100, 500), curve(150, 900)];
+        let m = markers(&all, None, (0, 1_000));
+        assert!(m.iter().all(|m| m.kind != MarkerKind::Graduation));
+        assert!(m.iter().any(|m| m.kind == MarkerKind::Launch));
+    }
+
+    /// …and one that later trades elsewhere HAS.
+    #[test]
+    fn a_curve_followed_by_another_venue_is_a_graduation() {
+        let all = vec![
+            curve(100, 500),
+            curve(150, 900),
+            obs(200, "A", 1, 1, Some("splash")),
+        ];
+        let m = markers(&all, None, (0, 1_000));
+        let g = m.iter().find(|m| m.kind == MarkerKind::Graduation).unwrap();
+        assert_eq!(g.slot, 150, "the LAST curve sighting is the finish line");
+    }
+
+    /// A policy with no launchpad history gets no launch marker — an empty
+    /// list is the honest answer, not a zeroed one.
+    #[test]
+    fn a_policy_that_never_launched_on_a_curve_has_no_launch_marker() {
+        let all = vec![obs(500, "A", 1, 1, Some("splash"))];
+        let m = markers(&all, None, (0, 1_000));
+        assert!(m.is_empty());
     }
 
     /// Deterministic: the same inputs give byte-identical output, whichever
