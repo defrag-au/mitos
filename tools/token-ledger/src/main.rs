@@ -75,6 +75,10 @@ enum Command {
     /// read, one object per policy for R2. Runs on its own after every few
     /// passes; this forces it.
     Rollup(segments::RollupArgs),
+    /// Repoint manifests at observations files a pre-fix rollup stranded —
+    /// it removed the pass directory that held them while the manifest went
+    /// on naming it, which emptied every interpretive tier AND broke publish.
+    RepairObservations(segments::RepairObservationsArgs),
     /// Write a policy's bundle — manifest plus every footer, one blob for
     /// KV — from its manifest. Landing writes one; this backfills.
     Bundle(archive::BundleArgs),
@@ -160,6 +164,7 @@ fn main() -> Result<()> {
         Command::Archive(args) => archive::inspect(args),
         Command::Graph(args) => archive::graph(args),
         Command::Rollup(args) => segments::run_rollup(args),
+        Command::RepairObservations(args) => segments::run_repair_observations(args),
         Command::Bundle(args) => archive::bundle(args),
         Command::Publish(args) => publish::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),

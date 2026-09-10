@@ -472,6 +472,30 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
     }
 
     for o in observations {
+        // ⚠️ A SCRIPT WE CAN NAME IS NOT UNCLAIMED.
+        //
+        // `recognise` decodes RESERVES, so it correctly declines an order
+        // contract — it is not a pool and has none. But the roles table knows
+        // exactly whose contract it is, and the movement through it is already
+        // in the stream as a `Placement` or a `Cancellation`. Reporting it a
+        // second time as "no decoder claimed this" overstates our blind spot
+        // with something we have already explained.
+        //
+        // MEASURED on $DONUT the moment Sundae's order credential landed: 492
+        // of 499 "unclaimed" outputs were the order contract whose placements
+        // the same stream was now naming. The remaining 7 are the real edge of
+        // coverage — a burn sink and two singletons — which is the number that
+        // was worth showing all along.
+        //
+        // Nothing is lost: the raw observation, datum included, stays in the
+        // ARCHIVE. This is the projection, and an order contract holds no
+        // reserves for a later decoder to re-read.
+        if o.decoded.is_none()
+            && crate::trade::address_parts(&o.address)
+                .is_some_and(|(cred, _)| roles.role_of(&cred).is_some())
+        {
+            continue;
+        }
         let kind = match &o.decoded {
             None => Kind::UnclaimedScript {
                 address: o.address.clone(),
@@ -706,6 +730,41 @@ mod tests {
             Kind::UnclaimedScript { has_datum, .. } => assert!(has_datum),
             k => panic!("expected UnclaimedScript, got {k:?}"),
         }
+    }
+
+    /// ⚠️ …BUT A SCRIPT WE CAN NAME IS NOT A GAP IN OUR COVERAGE.
+    ///
+    /// `recognise` decodes RESERVES and correctly declines an order contract,
+    /// which has none. The roles table knows whose it is, and the movement
+    /// through it is already in the stream as a placement. Emitting it AGAIN
+    /// as "no decoder claimed this" reports a blind spot we do not have.
+    ///
+    /// MEASURED on $DONUT the moment Sundae's order credential landed: 492 of
+    /// 499 "unclaimed" outputs were that contract. The 7 that remained are the
+    /// real edge of coverage, and are the number worth showing.
+    #[test]
+    fn a_script_the_roles_table_names_is_not_unclaimed() {
+        // A real SundaeSwap V3 order address, from
+        // `ae24323c…#0`. Its payment credential is what the roles table holds.
+        const SUNDAE_ORDER: &str = "addr1z8ax5k9mutg07p2ngscu3chsauktmstq92z9de938j8nqa7zcka2k2tsgmuedt4xl2j5awftvqzmmv3vs2yduzqxfcmsyun6n3";
+        let mut o = obs(5, "A", 1_000, 7, None);
+        o.address = SUNDAE_ORDER.into();
+
+        // Unknown to the roles table: a genuine gap, and it is reported.
+        let blind = build(&[], std::slice::from_ref(&o), &Roles::default());
+        assert_eq!(blind.events.len(), 1);
+        assert!(matches!(blind.events[0].kind, Kind::UnclaimedScript { .. }));
+
+        // Named by the roles table: not a gap, and not reported twice.
+        let (cred, _) = crate::trade::address_parts(SUNDAE_ORDER).expect("a real address");
+        let mut roles = Roles::default();
+        roles.register(cred, crate::trade::Role::Order, "sundae-v3");
+        let known = build(&[], &[o], &roles);
+        assert!(
+            known.events.is_empty(),
+            "a named contract is explained by its own placement: {:?}",
+            known.events,
+        );
     }
 
     /// An arrival with no source is NOT a mint. Reading it as one would invent

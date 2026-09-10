@@ -187,6 +187,46 @@ impl Cap {
     }
 }
 
+/// The cap band from PRIMITIVES — total supply and the merged pool reserves.
+///
+/// The sibling of [`cap_at`] for a caller that has no `Spine`: the policy
+/// archive's STORY STREAM carries pool reserves and the archive's reconciled
+/// supply, but no per-cohort balances, because a cohort split is a cumulative
+/// fold over the whole history and the stream is a WINDOW.
+///
+/// # ⚠️ THE REALISABLE FIGURE IS AN UPPER BOUND, and low == high
+///
+/// Without cohorts this cannot tell a wallet's tokens from a vesting lock, a
+/// burn sink or an open order, so it treats **everything not in a pool as
+/// sellable**. Real float is smaller, so real realisable is smaller — the
+/// honesty ratio this yields is the best the token could possibly be, never
+/// the worst. That is the safe direction for a figure whose failure mode is
+/// flattering a thin market, and it is why the band is a LINE here rather than
+/// a range: the uncertainty is real but one-sided, and drawing a band would
+/// imply a lower bound nobody computed.
+///
+/// `None` when there is no price — no pool, or none holding the asset. **Not
+/// zero**: before the first pool a cap is undefined, and zero is a number.
+pub fn cap_from_reserves(supply: i64, base: i64, quote: i64, fee_bps: u32) -> Option<Cap> {
+    if base <= 0 || quote <= 0 || supply <= 0 {
+        return None;
+    }
+    let spot = quote as f64 / base as f64;
+    // Pooled supply counts toward the NOTIONAL — it is the most reachable
+    // supply on chain — and is excluded from the SELL quantity, because
+    // selling the pool into itself is incoherent. Two denominators, on
+    // purpose; see [`sell_quantities`].
+    let sellable = (supply - base).max(0);
+    let realisable = constant_product_out(base, quote, sellable, fee_bps);
+    Some(Cap {
+        spot_lovelace: spot,
+        notional: ((supply as f64) * spot) as i64,
+        realisable_low: realisable,
+        realisable_high: realisable,
+        uncertain: 0,
+    })
+}
+
 /// Which cohorts feed the sell quantity.
 ///
 /// Three deliberate choices, each argued in `TOKEN_LEDGER.md`:
@@ -429,5 +469,60 @@ mod tests {
         assert_eq!(fee_coverage(&s), (1, 1));
         s.pools[0].fee_bps = None;
         assert_eq!(fee_coverage(&s), (0, 1));
+    }
+
+    /// The notional counts POOLED supply; the sell quantity excludes it.
+    /// Two denominators, deliberately — see [`sell_quantities`].
+    #[test]
+    fn a_cap_from_reserves_does_not_sell_the_pool_into_itself() {
+        // 1,000 supply, 200 of it pooled against 100 ADA.
+        let c = cap_from_reserves(1_000, 200, 100_000_000, 0).unwrap();
+        assert_eq!(c.spot_lovelace, 500_000.0);
+        assert_eq!(c.notional, 500_000_000, "ALL supply at spot, pool included");
+        // Selling the other 800 into a 200/100₳ pool: 100₳ × 800 / 1,000.
+        assert_eq!(c.realisable_high, 80_000_000);
+        assert_eq!(c.realisable_low, c.realisable_high, "a line, not a band");
+        assert_eq!(c.uncertain, 0);
+    }
+
+    /// ⚠️ THE FIGURE THIS EXISTS TO EXPOSE. A huge supply against a thin pool
+    /// has an enormous notional cap and can realise almost none of it — the
+    /// realisable figure is bounded by the pool's whole ADA reserve, however
+    /// much is sold.
+    #[test]
+    fn a_thin_pool_cannot_realise_its_own_notional() {
+        // A billion supply, 1,000 of it pooled against 10 ADA.
+        let c = cap_from_reserves(1_000_000_000, 1_000, 10_000_000, 0).unwrap();
+        let (low, high) = c.honesty_ratio();
+        assert_eq!(low, high);
+        assert!(high < 0.01, "under a hundredth of a percent, got {high}");
+        assert!(
+            c.realisable_high < 10_000_000,
+            "never more than the pool's entire quote reserve",
+        );
+    }
+
+    /// ⚠️ No pool is UNDEFINED, not zero. A cap of 0 ₳ reads as a worthless
+    /// token; the truth is that nothing has ever priced it.
+    #[test]
+    fn no_pool_is_no_cap() {
+        assert!(cap_from_reserves(1_000, 0, 0, 0).is_none());
+        assert!(
+            cap_from_reserves(1_000, 100, 0, 0).is_none(),
+            "no quote side"
+        );
+        assert!(cap_from_reserves(0, 100, 100, 0).is_none(), "no supply");
+    }
+
+    /// The fee comes off the input, so a fee can only LOWER what is realised.
+    #[test]
+    fn a_fee_lowers_the_realisable_figure() {
+        let free = cap_from_reserves(1_000, 200, 100_000_000, 0).unwrap();
+        let charged = cap_from_reserves(1_000, 200, 100_000_000, 30).unwrap();
+        assert!(charged.realisable_high < free.realisable_high);
+        assert_eq!(
+            charged.notional, free.notional,
+            "a fee changes what you get, never what it is quoted at"
+        );
     }
 }

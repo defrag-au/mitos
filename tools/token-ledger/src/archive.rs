@@ -1649,57 +1649,64 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
 /// pool from an order contract: the registry records both as
 /// `Exchange { label }`.
 pub fn venue_roles() -> policy_archive::trade::Roles {
-    use mitos_dex_decode::{cswap, minswap, splash, venue};
+    use mitos_dex_decode::venue::{self, SiteKey, SiteRole};
     use policy_archive::trade::{OrderKeying, Role, Roles};
 
     let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let mut r = Roles::default();
-    // ⚠️ NAME every credential as it is registered, FROM `venue`'s constants.
+
+    // ⚠️ FROM THE REGISTRY, never a second hand-written list.
     //
-    // A pool observation carries the venue's name and a fill carries only its
-    // credential, so without the mapping the two describe the same venue and
-    // never join — which drew `splash: 0 fills` beside `da5b47ae…: 334 fills`.
+    // This function USED to enumerate the venues itself, and it named four
+    // where `mitos-pool-observe::recognise` decodes seven. The observation
+    // side and the fold side are two readings of the same contracts, and two
+    // lists of the same thing drift.
     //
-    // And the names come from `mitos_dex_decode::venue`, not from literals
-    // here, because `mitos-pool-observe` spells the observation side from the
-    // same constants. Typing them again is how the halves drift back apart —
-    // it is what produced the bug the first time.
-    for c in splash::POOL_CREDS {
-        r.register(hex(&c), Role::Pool, venue::SPLASH);
-    }
-    r.register(
-        hex(&minswap::V1_PAYMENT_CRED),
-        Role::Pool,
-        venue::MINSWAP_V1,
-    );
-    r.register(
-        hex(&minswap::V2_PAYMENT_CRED),
-        Role::Pool,
-        venue::MINSWAP_V2,
-    );
-    r.register(hex(&splash::ORDER_CRED), Role::Order, venue::SPLASH);
-    r.register(hex(&minswap::V2_ORDER_CRED), Role::Order, venue::MINSWAP_V2);
-    r.register(hex(&cswap::ORDER_CRED), Role::Order, venue::CSWAP);
-    // CSwap's order contract is ONE address for every trader, so a fill spent
-    // from it cannot name who traded. Stated by the decode crate, not assumed.
-    if cswap::ORDER_IS_SHARED_ADDRESS {
-        r.keying
-            .insert(hex(&cswap::ORDER_CRED), OrderKeying::Shared);
-    }
-    // CSwap's pool and the snek.fun curve are addresses rather than creds
-    // upstream; derive them the same way every other consumer must.
-    for (addr, role, name) in [
-        (cswap::POOL_SCRIPT_ADDR, Role::Pool, venue::CSWAP),
-        (
-            mitos_launchpad_decode::BONDING_CURVE_ADDR,
-            Role::Curve,
-            venue::SNEK_FUN,
-        ),
-    ] {
-        if let Some((cred, _)) = policy_archive::trade::address_parts(addr) {
-            r.register(cred, role, name);
+    // MEASURED on $DONUT: 765 SundaeSwap V3 pool states holding 6,028 ₳, and
+    // every one of its swaps classified as a plain transfer, because Sundae's
+    // credential was in one list and not the other. `venue::SITES` is now the
+    // only list, and `every_recognised_pool_contract_has_a_site` fails the
+    // build if a decoder is added without one.
+    for site in venue::SITES {
+        let role = match site.role {
+            SiteRole::Pool => Role::Pool,
+            SiteRole::Order => Role::Order,
+        };
+        let cred = match site.key {
+            SiteKey::Cred(c) => Some(hex(&c)),
+            // An address-keyed site still registers by CREDENTIAL — the fold
+            // matches on the payment part, and deriving it here is what every
+            // other consumer must do too.
+            SiteKey::Address(a) => policy_archive::trade::address_parts(a).map(|(c, _)| c),
+        };
+        let Some(cred) = cred else {
+            continue;
+        };
+        // A contract that serves every trader through ONE address cannot name
+        // who traded. Declared by the registry rather than assumed here.
+        if site.shared {
+            r.keying.insert(cred.clone(), OrderKeying::Shared);
         }
+        r.register(cred, role, site.venue);
     }
+
+    // The LAUNCHPAD's two contracts. A different crate — snek.fun is not a
+    // DEX — and the curve takes `Role::Curve` rather than `Role::Pool`,
+    // because its price is not `x·y=k`.
+    //
+    // ⚠️ Registering the ORDER contract is what turns a wallet's payment into
+    // a PLACEMENT and the batcher's spend into a FILL. Without it both read as
+    // plain transfers, and $Aliens carried 144 of them as "unclaimed".
+    if let Some((cred, _)) =
+        policy_archive::trade::address_parts(mitos_launchpad_decode::BONDING_CURVE_ADDR)
+    {
+        r.register(cred, Role::Curve, venue::SNEK_FUN);
+    }
+    r.register(
+        hex(&mitos_launchpad_decode::ORDER_CRED),
+        Role::Order,
+        venue::SNEK_FUN,
+    );
     r
 }
 
@@ -1714,14 +1721,35 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
 ///
 /// Shared by the CLI report and the `/policy/{p}/price` route so the two
 /// cannot drift into pricing from different row sets.
+/// Every observation the archive holds, from wherever the manifest says it is.
+///
+/// # ⚠️ A NAMED FILE THAT IS MISSING IS AN ERROR, NOT A ZERO
+///
+/// This used to `continue` past a path that did not exist, and that silence
+/// cost the whole interpretive tier: a routine rollup removed the pass
+/// directories while the manifest went on naming `pass-0000/observations.
+/// parquet`, so `/price` answered `observations: 0`, `/story` carried no pool
+/// state, and a token trading on three venues rendered as if it had never been
+/// priced. Nothing anywhere said a file was missing.
+///
+/// A pass that recorded no observations names none, which is the honest zero
+/// and still returns nothing. A pass that names one and cannot produce it is
+/// a broken archive and now says so.
 pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive::Observation>> {
     let mut rows: Vec<policy_archive::Observation> = Vec::new();
     for p in &m.passes {
-        let path = dir.join(&p.dir).join(policy_archive::OBSERVATIONS);
-        if !path.exists() {
+        let Some(rel) = p.observations_path() else {
             continue;
-        }
-        rows.extend(policy_archive::read_all(&std::fs::read(&path)?)?);
+        };
+        let path = dir.join(&rel);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "pass {} names {rel} and it is not there — the archive is \
+                 incomplete and needs re-walking, not reading",
+                p.seq,
+            )
+        })?;
+        rows.extend(policy_archive::read_all(&bytes)?);
     }
     Ok(rows)
 }
@@ -2269,5 +2297,98 @@ mod tests {
         let bytes = postcard::to_stdvec(&p).unwrap();
         let back: PendingFile = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.spenders, p.spenders);
+    }
+
+    /// ⚠️ THE $DONUT TEST, at the level where both halves are visible.
+    ///
+    /// `venue::SITES` is the registry and this is its only consumer for the
+    /// fold, so what matters here is that the translation LOSES NOTHING: every
+    /// site must land in `Roles`, under its own venue name, with the shared
+    /// flag intact.
+    ///
+    /// It was a hand-written list naming four venues while
+    /// `mitos-pool-observe` decoded seven, and $DONUT rendered as an untraded
+    /// token with 765 SundaeSwap pool sightings against zero fills.
+    #[test]
+    fn every_site_reaches_the_trade_fold() {
+        use mitos_dex_decode::venue::{self, SiteKey, SiteRole};
+        let roles = venue_roles();
+        let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        for site in venue::SITES {
+            let cred = match site.key {
+                SiteKey::Cred(c) => hex(&c),
+                SiteKey::Address(a) => {
+                    policy_archive::trade::address_parts(a)
+                        .expect("a site address must parse")
+                        .0
+                }
+            };
+            let got = roles.role_of(&cred);
+            assert_eq!(
+                got,
+                Some(match site.role {
+                    SiteRole::Pool => policy_archive::trade::Role::Pool,
+                    SiteRole::Order => policy_archive::trade::Role::Order,
+                }),
+                "{} ({:?}) did not reach the fold",
+                site.venue,
+                site.role,
+            );
+            assert_eq!(
+                roles.name_of(&cred),
+                Some(site.venue),
+                "{}'s credential joins under the wrong name — a pool state and \
+                 a fill would then describe the same venue and never join",
+                site.venue,
+            );
+        }
+
+        // The four that were missing, named explicitly: a regression here is
+        // the exact defect, and a count assertion would not say which.
+        for v in [
+            venue::SUNDAE_V3,
+            venue::SUNDAE_V1,
+            venue::WINGRIDERS_V2,
+            venue::WINGRIDERS_V1,
+        ] {
+            assert!(
+                venue::SITES.iter().any(|s| s.venue == v),
+                "{v} is decoded by the observer and must be foldable",
+            );
+        }
+
+        // The launchpad is NOT a DEX site — its own crate, and a `Curve` role,
+        // because its price is not `x·y=k`. BOTH its contracts must land.
+        let curve =
+            policy_archive::trade::address_parts(mitos_launchpad_decode::BONDING_CURVE_ADDR)
+                .unwrap()
+                .0;
+        assert_eq!(
+            roles.role_of(&curve),
+            Some(policy_archive::trade::Role::Curve)
+        );
+        assert_eq!(roles.name_of(&curve), Some(venue::SNEK_FUN));
+
+        // ⚠️ THE CURVE'S ADDRESS AND ITS CREDENTIAL MUST AGREE. The crate
+        // offers both, for consumers that match either way, and two spellings
+        // of one contract is precisely how a venue's halves stop joining.
+        // Asserted here because this is where a bech32 decoder is in scope.
+        assert_eq!(
+            curve,
+            hex(&mitos_launchpad_decode::BONDING_CURVE_CRED),
+            "the curve address does not carry the curve credential",
+        );
+
+        // ⚠️ The ORDER contract is what turns a wallet's payment into a
+        // PLACEMENT and the batcher's spend into a FILL. Without it $Aliens
+        // carried 144 of them as "unclaimed".
+        let order = hex(&mitos_launchpad_decode::ORDER_CRED);
+        assert_eq!(
+            roles.role_of(&order),
+            Some(policy_archive::trade::Role::Order)
+        );
+        assert_eq!(roles.name_of(&order), Some(venue::SNEK_FUN));
+        assert_ne!(order, curve, "the order is not the curve");
     }
 }
