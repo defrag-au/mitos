@@ -29,6 +29,10 @@ tx-index = { path = "../../crates/tx-index" }
 # measured 16× larger in wasm) and SNAPPY only, because every reader has to
 # link whatever the writer chose. See docs/design/POLICY_ARCHIVE_AND_SCALE.md.
 policy-archive = { path = "../../crates/policy-archive" }
+# Burn sinks, by CREDENTIAL. The ORIGIN totals them so exactly one place knows
+# which addresses are sinks — a second copy in the gateway would be a second
+# thing to update when a sink is added, and they would disagree in between.
+address-registry = { workspace = true }
 # WHAT COUNTS AS A UNIT of a collection — `AssetRole::of_bytes`. A policy's
 # on-chain asset list is not its supply: CIP-68 mints a reference twin per
 # collectible and CIP-27 adds a royalty token, so counting the raw list

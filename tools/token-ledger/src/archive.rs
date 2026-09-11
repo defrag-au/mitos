@@ -1250,6 +1250,39 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
     }))
 }
 
+/// Fold every movement in an archive into a holder table.
+///
+/// ⚠️ Pages the WHOLE archive, newest-first, exactly as [`build_graph`] does —
+/// a balance is a cumulative fold over all history, and a page of it is not a
+/// smaller version of the answer, it is a different and wrong one.
+///
+/// Costs one pass over the movement rows: $PERP is 15,258 of them, $NIKEPIG's
+/// archive rather more. That is why the result is worth caching upstream and
+/// why the route below takes a `limit` on the OUTPUT rather than the input.
+pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>> {
+    let Some(mut a) = PolicyArchive::open(dir)? else {
+        return Ok(None);
+    };
+    let mut all: Vec<policy_archive::Movement> = Vec::new();
+    let mut before: Option<u64> = None;
+    const PAGE: u32 = 5_000;
+    loop {
+        let page = a.movements_page(PAGE, before)?;
+        let Some(oldest) = page.iter().map(|m| m.slot).min() else {
+            break;
+        };
+        all.extend(page);
+        let next = Some(oldest);
+        // A page that does not advance ends the walk — which also guards the
+        // pathological case of one slot holding more rows than a page.
+        if next == before {
+            break;
+        }
+        before = next;
+    }
+    Ok(Some(policy_archive::holders::fold(all.into_iter())))
+}
+
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
 /// or `None` when the policy has no archive. The publisher compresses at
 /// upload time and decides then whether that pays.

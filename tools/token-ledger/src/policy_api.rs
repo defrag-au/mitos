@@ -1418,6 +1418,160 @@ pub async fn live(
     }))
 }
 
+/// One party's holding.
+#[derive(Serialize)]
+pub struct HolderDto {
+    /// Stake credential hex, or the bech32 address where there is no stake
+    /// part. The key a caller resolves a handle against.
+    pub key: String,
+    /// One address this party used — NOT a claim that it is the only one.
+    pub address: String,
+    /// ⚠️ A STRING. Balances exceed 2^53 on tokens with many decimals, and a
+    /// JS number would round them silently — the same reason the story stream
+    /// is postcard.
+    pub amount: String,
+    pub movements: u32,
+    pub addresses: u32,
+    /// What `address-registry` calls this address — "burn address", a venue, a
+    /// contract. The ONLY thing that can name a script, which is exactly what
+    /// the interesting holdings are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A registered burn sink: units that exist on chain and can never move.
+    pub burn_sink: bool,
+}
+
+/// `GET /policy/{p}/holders` — who holds it.
+///
+/// # ⚠️ Why this route had to exist
+///
+/// There was no way to ask an ARCHIVE who holds a token. The only holder table
+/// in the estate reads the per-policy sqlite database — the database being
+/// retired — so the question that settles a supply disagreement was the one
+/// the sqlite-free path could not answer.
+///
+/// MEASURED: $PERP reconciles at `Σ net_mint = 1,000,000,000` with one mint and
+/// **zero burns**, while aggregators quote 866.37M. The 133.63M difference is
+/// parked at `$burnsnek`, a trusted burn sink — units that exist on chain, so
+/// we count them, and can never move, so nobody else does.
+#[derive(Serialize)]
+pub struct PolicyHoldersResponse {
+    pub policy: String,
+    pub holders: Vec<HolderDto>,
+    /// Σ of every positive balance, as a string.
+    ///
+    /// ⚠️ Compare against `/supply`'s `minted`: they agree only when every unit
+    /// is attributed, and a gap measures how much of the supply this table
+    /// cannot place.
+    pub held: String,
+    /// Σ held at registered burn sinks, over EVERY holder rather than the
+    /// returned page — see the handler.
+    pub burned: String,
+    /// `held − burned`: supply that can actually move, and the figure other
+    /// sites quote as the market cap's denominator.
+    pub circulating: String,
+    /// Distinct parties with a positive balance — the honest holder count,
+    /// before any `limit` is applied to the list.
+    pub parties: usize,
+    /// Movement rows folded.
+    pub rows: u64,
+    /// Parties whose balance came out NEGATIVE — impossible on chain, so a
+    /// count of inbound movements the archive is missing rather than a
+    /// rounding curiosity.
+    pub negative: usize,
+}
+
+pub async fn holders(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+    Query(q): Query<HoldersQuery>,
+) -> Result<Json<PolicyHoldersResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let fold = crate::archive::build_holders(&dir)
+        .map_err(internal)?
+        .unwrap_or(policy_archive::holders::Fold {
+            holders: Vec::new(),
+            held: 0,
+            rows: 0,
+            negative: 0,
+        });
+    // ⚠️ `parties` is taken BEFORE the limit. A truncated list that also
+    // reported a truncated count would make a policy look concentrated
+    // precisely because the caller asked for a short list.
+    let parties = fold.holders.len();
+    let limit = q.limit.unwrap_or(50).clamp(1, 2_000);
+
+    // ⚠️ `burned` is totalled over EVERY holder, not the returned page. A sink
+    // ranked below the limit would otherwise drop out of the total and
+    // `circulating` would depend on the page size — a number that changes with
+    // how you asked for it is not a number.
+    let mut burned: i64 = 0;
+    let mut out: Vec<HolderDto> = Vec::with_capacity(limit.min(fold.holders.len()));
+    for (rank, h) in fold.holders.into_iter().enumerate() {
+        // ⚠️ BY PAYMENT CREDENTIAL, not by address.
+        //
+        // A burn sink is registered as a `CredentialEntry` — it is a property
+        // of the SCRIPT, not of one address, and `$PERP` and `$Aliens` both
+        // send supply to this same one. `lookup_address_match` does not see it:
+        // it matched `Splash exchange` on a venue address and returned nothing
+        // for `addr1w8qmxkacj…`, so the first cut reported `burned: 0` on a
+        // token whose sink holds 13.4% of supply.
+        let cred = policy_archive::trade::address_parts(&h.address).map(|(pay, _)| pay);
+        let entry = cred
+            .as_deref()
+            .and_then(address_registry::registry::lookup_payment_credential);
+        let burn_sink = matches!(
+            entry.map(|e| &e.category),
+            Some(address_registry::registry::AddressCategory::Script(
+                address_registry::registry::ScriptCategory::Burn { .. }
+            ))
+        );
+        if burn_sink {
+            burned += h.amount;
+        }
+        if rank >= limit {
+            continue;
+        }
+        // Credential first, then the address tables — the credential is the
+        // more specific statement where both have something to say.
+        let label = entry.map(|e| e.category.to_string()).or_else(|| {
+            address_registry::registry::lookup_address_match(
+                &h.address,
+                address_registry::registry::RegistryNetwork::Mainnet,
+            )
+            .map(|(cat, _)| cat.to_string())
+        });
+        out.push(HolderDto {
+            key: h.key,
+            address: h.address,
+            amount: h.amount.to_string(),
+            movements: h.movements,
+            addresses: h.addresses,
+            label,
+            burn_sink,
+        });
+    }
+
+    Ok(Json(PolicyHoldersResponse {
+        policy,
+        holders: out,
+        held: fold.held.to_string(),
+        burned: burned.to_string(),
+        circulating: (fold.held - burned).to_string(),
+        parties,
+        rows: fold.rows,
+        negative: fold.negative,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct HoldersQuery {
+    pub limit: Option<usize>,
+}
+
 /// One sighting of the bonding curve — a point on the launch timeline.
 #[derive(Serialize)]
 pub struct CurvePointDto {
@@ -1930,6 +2084,7 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         // archive since 2026-09-08 and unreachable over HTTP until now.
         .route("/policy/{policy}/price", get(price))
         .route("/policy/{policy}/live", get(live))
+        .route("/policy/{policy}/holders", get(holders))
         .route("/policy/{policy}/trades", get(trades))
         .route("/policy/{policy}/supply", get(supply))
         .route("/policy/{policy}/launch", get(launch))

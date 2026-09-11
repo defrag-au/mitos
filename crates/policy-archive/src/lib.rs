@@ -46,6 +46,9 @@ pub mod density;
 pub mod feed;
 pub mod graph;
 pub mod groups;
+/// WHO HOLDS IT — the balance table, folded from movements. The question an
+/// archive could not answer without the sqlite database beside it.
+pub mod holders;
 pub mod manifest;
 pub mod multi;
 /// What a script output HELD, decoded or not — the tier that lets a decoder
