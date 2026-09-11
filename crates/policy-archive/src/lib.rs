@@ -68,6 +68,10 @@ pub mod supply;
 /// Movements → TRADES: folding a swap's two or three transactions back into
 /// the one thing a person did.
 pub mod trade;
+/// **Fold once, project many** — one cumulative view of a policy's state, and
+/// the projections read off it. Every "latest state per pool" pass in this
+/// workspace was once its own, and they disagreed.
+pub mod view;
 pub mod writer;
 
 pub use bundle::{BUNDLE, BUNDLE_FORMAT, Bundle, BundledFooter};

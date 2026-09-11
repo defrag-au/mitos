@@ -1062,32 +1062,51 @@ pub async fn price(
 ) -> Result<Json<PolicyPriceResponse>, ApiError> {
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
+    Ok(Json(price_of(&hub, policy).map_err(internal)?.0))
+}
+
+/// The price projection, and the [`PolicyView`](policy_archive::view::PolicyView)
+/// it was read off.
+///
+/// Split out so [`live`] can answer price AND supply from ONE fold at ONE
+/// moment. The route above is unchanged; this is the same body with the
+/// gate and the `Json` wrapper lifted off.
+fn price_of(
+    hub: &PolicyHub,
+    policy: String,
+) -> anyhow::Result<(PolicyPriceResponse, policy_archive::view::PolicyView)> {
     let dir = hub.policy_dir(&policy);
-    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let manifest = archive::load_manifest(&dir)?;
     let rows = match &manifest {
-        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        Some(m) => crate::archive::read_observations(&dir, m)?,
         None => Vec::new(),
     };
     let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
-    let spot = policy_archive::spot_at(&rows, at);
+    // ONE fold; the response and anything else asked of this policy this
+    // request are projections off it.
+    let view = policy_archive::view::PolicyView::from_observations(&rows);
+    let spot = view.spot(at, &policy_archive::view::Projection::default());
     let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
-    Ok(Json(PolicyPriceResponse {
-        policy,
-        cached: manifest.is_some(),
-        at_slot: at,
-        // ⚠️ `any_pool_above`, which now answers the question its name asks.
-        // It used to be `thinnest >= floor` — "does EVERY pool clear it" —
-        // so one dust pool made a token with 54,853 ₳ of depth report that
-        // nothing was tradeable.
-        thin: spot.ada.as_ref().is_some_and(|d| !d.any_pool_above(floor)),
-        ada: spot.ada.as_ref().map(depth_dto),
-        depth_floor_lovelace: floor,
-        unresolved: spot.unresolved.iter().map(depth_dto).collect(),
-        unpriceable: spot.unpriceable.iter().map(depth_dto).collect(),
-        stale: spot.stale.iter().map(depth_dto).collect(),
-        stale_after_slots: policy_archive::price::DEFAULT_STALE_AFTER_SLOTS,
-        observations: rows.len(),
-    }))
+    Ok((
+        PolicyPriceResponse {
+            policy,
+            cached: manifest.is_some(),
+            at_slot: at,
+            // ⚠️ `any_pool_above`, which now answers the question its name
+            // asks. It used to be `thinnest >= floor` — "does EVERY pool clear
+            // it" — so one dust pool made a token with 54,853 ₳ of depth
+            // report that nothing was tradeable.
+            thin: spot.ada.as_ref().is_some_and(|d| !d.any_pool_above(floor)),
+            ada: spot.ada.as_ref().map(depth_dto),
+            depth_floor_lovelace: floor,
+            unresolved: spot.unresolved.iter().map(depth_dto).collect(),
+            unpriceable: spot.unpriceable.iter().map(depth_dto).collect(),
+            stale: spot.stale.iter().map(depth_dto).collect(),
+            stale_after_slots: policy_archive::price::DEFAULT_STALE_AFTER_SLOTS,
+            observations: rows.len(),
+        },
+        view,
+    ))
 }
 
 /// `GET /policy/{p}/trades` — the fold, over the newest page of movements.
@@ -1222,13 +1241,18 @@ pub async fn supply(
     headers: HeaderMap,
     AxPath(policy): AxPath<String>,
 ) -> Result<Json<PolicySupplyResponse>, ApiError> {
-    use policy_archive::supply::Verdict;
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
+    Ok(Json(supply_of(&hub, policy).map_err(internal)?))
+}
+
+/// The supply reconciliation. Split out for [`live`] — see [`price_of`].
+fn supply_of(hub: &PolicyHub, policy: String) -> anyhow::Result<PolicySupplyResponse> {
+    use policy_archive::supply::Verdict;
     let jobs = hub.sched.inflight_for(&policy);
-    let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View { archive, .. } = view(hub, &policy, &jobs)?;
     let Some(mut a) = archive else {
-        return Ok(Json(PolicySupplyResponse {
+        return Ok(PolicySupplyResponse {
             policy,
             cached: false,
             completeness: policy_archive::Completeness::Unrecorded.as_wire(),
@@ -1240,13 +1264,11 @@ pub async fn supply(
             because: None,
             class: None,
             units_seen: None,
-        }));
+        });
     };
     let completeness = a.manifest.completeness();
     let profile = a.manifest.profile.clone();
-    let r = a
-        .reconcile(policy_archive::Diagnose::Totals)
-        .map_err(internal)?;
+    let r = a.reconcile(policy_archive::Diagnose::Totals)?;
     let balances = r.balances();
     let (verdict, gap, gap_units, because) = match r.verdict(completeness) {
         Verdict::Balanced => ("balanced", 0, 0, None),
@@ -1258,7 +1280,7 @@ pub async fn supply(
             Some(because.as_wire()),
         ),
     };
-    Ok(Json(PolicySupplyResponse {
+    Ok(PolicySupplyResponse {
         policy,
         cached: true,
         completeness: completeness.as_wire(),
@@ -1270,6 +1292,129 @@ pub async fn supply(
         because,
         class: profile.as_ref().map(|p| p.class().as_str()),
         units_seen: profile.as_ref().map(|p| p.units_seen),
+    })
+}
+
+/// How many pools landed in each of [`policy_archive::view::Bucket`]'s four
+/// outcomes.
+///
+/// # ⚠️ `unusable` is the one the price CANNOT report
+///
+/// [`PolicyPriceResponse`] names `unresolved`, `unpriceable` and `stale`
+/// precisely so a reader can see liquidity that is deliberately not counted —
+/// and then silently drops the fourth category, because a pool with no
+/// measurable far side never enters a `Spot` at all.
+///
+/// MEASURED: $PERP has two Splash pools whose pair no decoder could name. The
+/// archive CLI shows them (`·`, `PAIR UNNAMED`); every wire dropped them
+/// entirely. They hold no ADA, so nothing is being hidden today — but "we see
+/// a pool and cannot read it" is a finding, and the rule in this crate is that
+/// a finding is reported rather than filtered.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BucketTally {
+    /// Summed into the price.
+    pub priced: usize,
+    /// Real reserves under a model this crate does not evaluate.
+    pub off_model: usize,
+    /// Last seen beyond the staleness horizon.
+    pub stale: usize,
+    /// Seen, and nothing summable about it.
+    pub unusable: usize,
+}
+
+/// One policy's whole live document, from ONE fold at ONE moment.
+///
+/// # ⚠️ Why this exists rather than two calls
+///
+/// `PolicyDo` used to read `/price` and then `/supply` and stitch the two into
+/// a document that CLAIMS to describe one instant. They are separate reads of
+/// a live archive with separate ceilings — `/price` is bounded by the newest
+/// OBSERVATION and `/supply` by the newest MOVEMENT — so `cap = supply × price`
+/// could multiply two different moments together, and `at_slot` named only one
+/// of them.
+///
+/// That is the same class of error the whole view exists to end, one layer up:
+/// a document assembled from independently-derived parts is a document nobody
+/// can date. Here the reads happen once, in one request, and `at_slot` is
+/// theirs jointly.
+///
+/// It is also half the work: both routes re-read the archive from disk, which
+/// on $NIKEPIG is 264,016 observation rows.
+/// # ⚠️ EACH HALF FAILS ON ITS OWN
+///
+/// Combining two routes must not combine their failures. The two-call version
+/// this replaces kept whichever half answered — a broken observations file cost
+/// the price and left the supply — and collapsing that into one `?` would have
+/// traded a narrow correctness win for a wider outage.
+///
+/// So both are `Option`, and [`Self::unreadable`] says which failed and why.
+/// That is strictly more than the caller had before: two non-200s carried no
+/// reason at all.
+#[derive(Serialize)]
+pub struct PolicyLiveResponse {
+    pub policy: String,
+    /// The observation ceiling — what `price` is dated by, and therefore the
+    /// document's date. `0` when the price could not be read.
+    pub at_slot: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<PolicyPriceResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supply: Option<PolicySupplyResponse>,
+    pub pools: BucketTally,
+    /// What could not be read, and why. Empty when both halves answered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
+}
+
+/// `GET /policy/{p}/live` — the whole document, one read.
+pub async fn live(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+) -> Result<Json<PolicyLiveResponse>, ApiError> {
+    use policy_archive::view::Bucket;
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let mut unreadable: Vec<String> = Vec::new();
+
+    let priced = match price_of(&hub, policy.clone()) {
+        Ok(ok) => Some(ok),
+        Err(e) => {
+            tracing::warn!("policy {policy} live: price unreadable: {e:#}");
+            unreadable.push(format!("price: {e:#}"));
+            None
+        }
+    };
+    let supply = match supply_of(&hub, policy.clone()) {
+        Ok(ok) => Some(ok),
+        Err(e) => {
+            tracing::warn!("policy {policy} live: supply unreadable: {e:#}");
+            unreadable.push(format!("supply: {e:#}"));
+            None
+        }
+    };
+
+    let pools = match &priced {
+        Some((price, view)) => {
+            let counts = view.buckets(price.at_slot, &policy_archive::view::Projection::default());
+            let n = |b: Bucket| counts.get(&b).copied().unwrap_or(0);
+            BucketTally {
+                priced: n(Bucket::Priced),
+                off_model: n(Bucket::OffModel),
+                stale: n(Bucket::Stale),
+                unusable: n(Bucket::Unusable),
+            }
+        }
+        None => BucketTally::default(),
+    };
+    let price = priced.map(|(p, _)| p);
+    Ok(Json(PolicyLiveResponse {
+        policy,
+        at_slot: price.as_ref().map(|p| p.at_slot).unwrap_or(0),
+        price,
+        supply,
+        pools,
+        unreadable,
     }))
 }
 
@@ -1784,6 +1929,7 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         // The interpretive tiers — what the movements MEAN. Present in the
         // archive since 2026-09-08 and unreachable over HTTP until now.
         .route("/policy/{policy}/price", get(price))
+        .route("/policy/{policy}/live", get(live))
         .route("/policy/{policy}/trades", get(trades))
         .route("/policy/{policy}/supply", get(supply))
         .route("/policy/{policy}/launch", get(launch))

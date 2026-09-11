@@ -1786,7 +1786,10 @@ fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
     // this is the last figure the archive can defend rather than an estimate
     // of "now".
     let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
-    let spot = policy_archive::spot_at(&rows, at);
+    // ONE fold, then every projection below reads off it — the price, the
+    // depth notes and the per-pool table all describe the same state.
+    let view = policy_archive::view::PolicyView::from_observations(&rows);
+    let spot = view.spot(at, &policy_archive::view::Projection::default());
     match spot.ada.as_ref() {
         Some(d) => {
             println!(
@@ -1833,63 +1836,69 @@ fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
     //
     // That is invisible in an aggregate and obvious in this table, which is
     // the only reason it is printed.
-    /// One pool at its newest ADA-paired sighting.
-    struct LastSeen {
-        slot: u64,
-        base: i64,
-        quote: i64,
-        venue: String,
-    }
-    let mut per_pool: BTreeMap<(String, Vec<u8>), LastSeen> = BTreeMap::new();
-    for o in rows.iter() {
-        let Some(d) = &o.decoded else { continue };
-        let Some(qr) = d.quote_reserve else { continue };
-        // ADA pairs only — the same set the aggregate is built from.
-        if !d.quote_policy.as_ref().is_none_or(|p| p.is_empty()) {
-            continue;
-        }
-        let key = (o.address.clone(), d.key_name.clone());
-        let e = per_pool.entry(key).or_insert(LastSeen {
-            slot: 0,
-            base: 0,
-            quote: 0,
-            venue: String::new(),
-        });
-        if o.slot >= e.slot {
-            *e = LastSeen {
-                slot: o.slot,
-                base: o.unit_amount,
-                quote: qr,
-                venue: d.venue.clone(),
-            };
-        }
-    }
+    //
+    // # ⚠️ READ OFF THE SAME FOLD AS THE PRICE, deliberately
+    //
+    // This used to run its OWN pass over the rows, and it disagreed with the
+    // aggregate above it in four ways at once — it keyed a pool by address and
+    // key NAME (dropping the key policy), summed `unit_amount` where the price
+    // sums `base_reserve`, broke slot ties the other way round, and marked
+    // every pool "counted" that was not aged out, including pools the price
+    // never summed because they are on another pricing model or have no
+    // measurable far side. A table whose job is to explain the number above it
+    // cannot be derived separately from that number.
+    let projection = policy_archive::view::Projection::default();
+    // ADA pairs AND pairs nothing could name.
+    //
+    // ⚠️ The unnamed ones are here on purpose. A venue recognised the pool and
+    // could not say what it pairs with, which is a finding — and the previous
+    // table treated "no pair named" as "paired with ADA" and printed an ADA
+    // rate for it. $PERP had a Minswap V2 pool quoted at 0.00015969 ADA that
+    // holds no ADA at all. Dropping such a pool would swap a wrong number for
+    // a missing one; it is shown, marked, and given no rate.
+    let mut per_pool: Vec<_> = view
+        .pools()
+        .filter(|(_, p)| {
+            p.quote_unit
+                .as_ref()
+                .is_none_or(policy_archive::Unit::is_ada)
+        })
+        .collect();
     if per_pool.len() > 1 {
-        let horizon = policy_archive::price::DEFAULT_STALE_AFTER_SLOTS;
-        println!("  pools at their LAST sighting  (⌀ = excluded from the price above)");
-        let mut rows: Vec<_> = per_pool.into_iter().collect();
-        rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.slot));
-        for ((addr, _), s) in rows {
-            let behind = at.saturating_sub(s.slot);
+        println!(
+            "  pools at their LAST sighting  (⌀ aged out · ≠ another pricing model · \
+             · nothing summable; blank = counted in the price above)"
+        );
+        per_pool.sort_by_key(|(k, p)| (std::cmp::Reverse(p.slot), k.address.clone()));
+        for (key, pool) in per_pool {
+            let behind = at.saturating_sub(pool.slot);
             // ~1 slot per second on Cardano, so days are a fair rendering.
             let age = match behind {
                 0..=86_400 => "current".to_string(),
                 n => format!("{} days", n / 86_400),
             };
-            let counted = match behind > horizon {
-                true => "⌀",
-                false => " ",
+            let counted = match pool.bucket(at, &projection) {
+                policy_archive::view::Bucket::Priced => " ",
+                policy_archive::view::Bucket::Stale => "⌀",
+                policy_archive::view::Bucket::OffModel => "≠",
+                policy_archive::view::Bucket::Unusable => "·",
             };
-            let rate = match s.base > 0 {
-                true => format!("{:.8}", s.quote as f64 / s.base as f64 / 1e6),
-                false => "        —".to_string(),
+            let quote = pool.quote.unwrap_or(0);
+            // A rate ONLY where the far side is known to be ADA. An unnamed
+            // pair has a real reserve and no unit to divide by.
+            let rate = match (pool.base > 0, pool.quote, &pool.quote_unit) {
+                (true, Some(q), Some(_)) => {
+                    format!("{:.8} ADA", q as f64 / pool.base as f64 / 1e6)
+                }
+                (_, _, None) => "PAIR UNNAMED".to_string(),
+                _ => "— ADA".to_string(),
             };
             println!(
-                "  {counted} {:<14} {:>16} base {:>15} lovelace  {rate} ADA  {age:>9}  {}",
-                s.venue,
-                s.base,
-                s.quote,
-                &addr[..addr.len().min(24)],
+                "  {counted} {:<14} {:>16} base {:>15} lovelace  {rate:>14}  {age:>9}  {}",
+                pool.venue,
+                pool.base,
+                quote,
+                &key.address[..key.address.len().min(24)],
             );
         }
     }

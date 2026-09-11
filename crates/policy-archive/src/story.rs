@@ -140,7 +140,11 @@ pub enum Kind {
     PoolState(PoolState),
     /// A bonding curve's position. **This is the launch timeline.**
     CurveState {
-        venue: String,
+        /// WHICH curve — an index into [`Story::pools`], for the same reason
+        /// [`PoolState::pool`] is one. A launchpad runs one curve per token but
+        /// a policy can be relaunched, and a curve has an address like any
+        /// other contract.
+        pool: u32,
         /// Lovelace the curve held.
         lovelace: i64,
         /// Units still ON the curve — unsold inventory that has never been
@@ -163,11 +167,44 @@ pub enum Kind {
     },
 }
 
+/// WHICH pool. **Identity, not a sighting** — a pool's venue, address and
+/// instance key never change, so they are stated once in [`Story::pools`] and
+/// referred to by ordinal thereafter.
+///
+/// # ⚠️ All three parts are load-bearing, and that is MEASURED
+///
+/// This type replaced a bare instance key, which could not tell two pools
+/// apart often enough to matter:
+///
+/// - **Without `address`**: a venue that hosts every pool at one script address
+///   and distinguishes them by a pool NFT is fine, but one that derives a stake
+///   part per pool is not — and dropping the address merged pools that share an
+///   instance key. The archive tool's own table did exactly this and lost a
+///   cswap pool holding **200,000,000 base / 602 ₳** on policy `8fe8039d…`; it
+///   was never printed at all.
+/// - **Without `key_policy`**: two pools at one address under different key
+///   policies collapse into one.
+/// - **Without `key_name`**: every pool at a shared address collapses.
+///
+/// The old shape also made the key `Option`, and `None` — "this venue
+/// publishes no instance key" — merged every such pool into a single bucket.
+/// That is most of Minswap V2's rows. A pool always has an address, so there
+/// is no honest `None` here and the variant is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PoolIdent {
+    pub venue: String,
+    /// The script address, bech32, as the rows spell it.
+    pub address: String,
+    pub key_policy: Vec<u8>,
+    /// The pool NFT's asset name. Empty where the venue mints none — which is
+    /// no longer ambiguous, because `address` still separates the pools.
+    pub key_name: Vec<u8>,
+}
+
 /// A pool's reserves at a slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolState {
-    pub venue: String,
-    /// WHICH pool — the instance key (its pool NFT), not the venue.
+    /// WHICH pool — an index into [`Story::pools`].
     ///
     /// ⚠️ A venue runs MANY pools and a consumer that groups by venue alone
     /// cannot aggregate them: "the latest sighting" then means the latest of
@@ -176,9 +213,10 @@ pub struct PoolState {
     /// band grouping by venue reported `splash: liquidity not published`
     /// while the archive held 29,121 ADA.
     ///
-    /// `None` where the venue does not publish an instance key, which is
-    /// itself the answer: those pools cannot be told apart here.
-    pub pool: Option<Vec<u8>>,
+    /// Grouping by this ordinal is correct by construction, which is the
+    /// whole reason it is an ordinal and not a name. Resolve it with
+    /// [`Story::pool`].
+    pub pool: u32,
     /// The watched policy's reserve.
     pub base: i64,
     /// The quote-side reserve. `None` is **"this venue does not publish it"**,
@@ -261,6 +299,14 @@ impl Kind {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Story {
     pub events: Vec<StoryEvent>,
+    /// Every pool and curve the events refer to, stated once.
+    ///
+    /// ⚠️ **This is what makes the stream foldable by a client.** Before it
+    /// existed, a `PoolState` carried its venue and instance key and nothing
+    /// else, so a consumer folding the stream could not tell two pools apart
+    /// at the resolution the archive's own price uses — and therefore could
+    /// not reproduce it. See [`PoolIdent`].
+    pub pools: Vec<PoolIdent>,
     /// Distinct slots covered. `1` means everything here shares a block and
     /// **no ordering within it is proven**.
     pub distinct_slots: usize,
@@ -270,6 +316,22 @@ pub struct Story {
 }
 
 impl Story {
+    /// Resolve a [`PoolState::pool`] or [`Kind::CurveState`] ordinal.
+    ///
+    /// `None` only on a stream whose table and rows disagree, which is a bug
+    /// in whatever produced it — reported rather than papered over with a
+    /// placeholder venue.
+    pub fn pool(&self, ix: u32) -> Option<&PoolIdent> {
+        self.pools.get(ix as usize)
+    }
+
+    /// The venue a pool ordinal belongs to, or `"?"` where the table does not
+    /// name it. For DISPLAY only — anything aggregating must group by the
+    /// ordinal, which is the point of having one.
+    pub fn venue(&self, ix: u32) -> &str {
+        self.pool(ix).map_or("?", |p| p.venue.as_str())
+    }
+
     /// Attach chapter markers. Separate from [`build`] because markers are
     /// derived from the WHOLE archive while the events are a window of it, and
     /// folding that into one call would hide which input each came from.
@@ -397,8 +459,34 @@ pub fn markers(
 ///
 /// Pure: give it the same inputs on a box or in a Worker and it yields the
 /// same stream.
+/// Intern one observation's pool, returning its ordinal.
+///
+/// Linear, because a policy has a handful of pools — $NIKEPIG, the widest here,
+/// has 14 across seven venues — and a map would cost more than it saves while
+/// losing the stable, first-seen ordering an ordinal wants.
+fn intern_pool(
+    pools: &mut Vec<PoolIdent>,
+    o: &Observation,
+    d: &crate::observation::Decoded,
+) -> u32 {
+    let ident = PoolIdent {
+        venue: d.venue.clone(),
+        address: o.address.clone(),
+        key_policy: d.key_policy.clone(),
+        key_name: d.key_name.clone(),
+    };
+    match pools.iter().position(|p| *p == ident) {
+        Some(i) => i as u32,
+        None => {
+            pools.push(ident);
+            (pools.len() - 1) as u32
+        }
+    }
+}
+
 pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> Story {
     let mut events: Vec<StoryEvent> = Vec::new();
+    let mut pools: Vec<PoolIdent> = Vec::new();
 
     // ⚠️ A trade event carries the venue's CREDENTIAL; a pool observation
     // carries its NAME. Resolve here so both sides of the stream speak the
@@ -503,7 +591,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 has_datum: o.datum.is_some(),
             },
             Some(d) if d.pricing == pricing::BONDING_CURVE => Kind::CurveState {
-                venue: d.venue.clone(),
+                pool: intern_pool(&mut pools, o, d),
                 lovelace: o.lovelace,
                 tokens_left: o.unit_amount,
                 // The crate cannot decode the curve's own parameters — that
@@ -512,12 +600,12 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 progress: None,
             },
             Some(d) => Kind::PoolState(PoolState {
-                venue: d.venue.clone(),
-                // The pool NFT's asset name — unique per pool instance where
-                // the venue mints one. `key_basis` records how firmly it is
-                // known; an absent key is a pool this stream cannot separate
-                // from its siblings.
-                pool: (!d.key_name.is_empty()).then(|| d.key_name.clone()),
+                // ⚠️ Interned on ADDRESS + key policy + key name, not on the
+                // instance key alone. The key alone is empty for every pool on
+                // a venue that mints no pool NFT, which merged them; and it is
+                // shared across key policies at one address, which merged
+                // those. See `PoolIdent`.
+                pool: intern_pool(&mut pools, o, d),
                 base: d.base_reserve,
                 // `None` is "the venue does not publish it", which is not 0.
                 quote: d.quote_reserve,
@@ -550,6 +638,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
     Story {
         distinct_slots: slots.len(),
         events,
+        pools,
         markers: Vec::new(),
     }
 }
@@ -681,7 +770,9 @@ mod tests {
             .iter()
             .filter_map(|e| match &e.kind {
                 Kind::Fill { venue, .. } => Some(venue.as_str()),
-                Kind::PoolState(p) => Some(p.venue.as_str()),
+                // Through the pool TABLE, which is the only place a pool's
+                // venue is stated from v4 on.
+                Kind::PoolState(p) => Some(s.venue(p.pool)),
                 _ => None,
             })
             .collect();

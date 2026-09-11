@@ -35,9 +35,8 @@
 //!    NOT monotonic, so the rule is to withhold a thin pool's quote, never to
 //!    correct it.
 
-use std::collections::HashMap;
-
 use crate::observation::Observation;
+use crate::view::{PolicyView, Projection};
 
 /// A unit, as the observation rows spell it. ADA is the empty policy with the
 /// empty name.
@@ -204,95 +203,15 @@ pub fn spot_at(observations: &[Observation], slot: u64) -> Spot {
 /// `u64::MAX` restores the old behaviour of summing every pool's last
 /// sighting however old — kept reachable so a caller auditing history can ask
 /// for it deliberately, never by default.
+///
+/// ⚠️ **A convenience over [`crate::view`], not a second implementation.** It
+/// folds and projects in one breath, which is exactly what a caller answering
+/// ONE question at ONE slot wants and exactly the wrong shape for a caller
+/// answering many — each call re-reads every row. A reader walking a scrub axis
+/// should hold a [`PolicyView`] and re-project it; that is the whole reason the
+/// fold was lifted out.
 pub fn spot_at_within(observations: &[Observation], slot: u64, stale_after: u64) -> Spot {
-    // Latest observation at or before `slot`, per pool. The pool is keyed by
-    // its ADDRESS plus its instance key: one address hosts many pools on every
-    // venue that derives a stake part per pool, and merging them would sum
-    // unrelated reserves.
-    let mut latest: HashMap<(String, Vec<u8>, Vec<u8>), &Observation> = HashMap::new();
-    for o in observations.iter().filter(|o| o.slot <= slot) {
-        let Some(d) = &o.decoded else { continue };
-        let key = (o.address.clone(), d.key_policy.clone(), d.key_name.clone());
-        latest
-            .entry(key)
-            .and_modify(|cur| {
-                // Ties broken by tx_hash so the answer cannot depend on the
-                // order rows happened to arrive in.
-                if (o.slot, &o.tx_hash) > (cur.slot, &cur.tx_hash) {
-                    *cur = o;
-                }
-            })
-            .or_insert(o);
-    }
-
-    let mut by_pair: HashMap<Unit, PairDepth> = HashMap::new();
-    let mut off_model: HashMap<Unit, PairDepth> = HashMap::new();
-    let mut stale: HashMap<Unit, PairDepth> = HashMap::new();
-    for o in latest.values() {
-        let Some(d) = &o.decoded else { continue };
-        let (Some(qp), Some(qn), Some(qr)) = (&d.quote_policy, &d.quote_name, d.quote_reserve)
-        else {
-            // Pair unknown, or known but unmeasured. Both are real states and
-            // neither can be summed. See `Observation`.
-            continue;
-        };
-        if d.base_reserve <= 0 || qr <= 0 {
-            continue;
-        }
-        let unit = Unit {
-            policy: qp.clone(),
-            name: qn.clone(),
-        };
-        // ⚠️ STALE FIRST, before the model split. A pool nobody has touched in
-        // a month cannot set a price whatever its pricing model says, and
-        // letting it through here is what put $NIKEPIG 50% high.
-        let bucket = match slot.saturating_sub(o.slot) > stale_after {
-            true => &mut stale,
-            false => match d.pricing.as_str() {
-                crate::observation::pricing::CONSTANT_PRODUCT => &mut by_pair,
-                // Anything not KNOWN to be constant-product is set aside
-                // rather than summed. An empty `pricing` — a row written
-                // before the column existed — lands here too.
-                _ => &mut off_model,
-            },
-        };
-        let e = bucket.entry(unit.clone()).or_insert(PairDepth {
-            quote_unit: unit,
-            base: 0,
-            quote: 0,
-            pools: 0,
-            thinnest: i64::MAX,
-            deepest: 0,
-        });
-        e.base += d.base_reserve as i128;
-        e.quote += qr as i128;
-        e.pools += 1;
-        e.thinnest = e.thinnest.min(qr);
-        e.deepest = e.deepest.max(qr);
-    }
-
-    let mut ada = None;
-    let mut unresolved: Vec<PairDepth> = Vec::new();
-    for (unit, depth) in by_pair {
-        match unit.is_ada() {
-            true => ada = Some(depth),
-            false => unresolved.push(depth),
-        }
-    }
-    // Deterministic order for a caller that renders or hashes it.
-    unresolved.sort_by(|a, b| b.quote.cmp(&a.quote).then(a.quote_unit.cmp(&b.quote_unit)));
-    let mut unpriceable: Vec<PairDepth> = off_model.into_values().collect();
-    unpriceable.sort_by(|a, b| b.quote.cmp(&a.quote).then(a.quote_unit.cmp(&b.quote_unit)));
-    let mut stale: Vec<PairDepth> = stale.into_values().collect();
-    stale.sort_by(|a, b| b.quote.cmp(&a.quote).then(a.quote_unit.cmp(&b.quote_unit)));
-
-    Spot {
-        slot,
-        ada,
-        unresolved,
-        unpriceable,
-        stale,
-    }
+    PolicyView::upto(observations, slot).spot(slot, &Projection::within(stale_after))
 }
 
 /// Every slot at which the price could have changed — one per observation that

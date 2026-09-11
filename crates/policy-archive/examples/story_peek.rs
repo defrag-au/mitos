@@ -48,7 +48,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let events = wire::decode(&stream);
+    let story = wire::decode(&stream);
+    let events = &story.events;
 
     println!("version   {}", stream.version);
     println!("policy    {}", stream.policy);
@@ -60,7 +61,7 @@ fn main() {
 
     // ── kinds ────────────────────────────────────────────────────────────
     let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
-    for e in &events {
+    for e in events {
         *kinds.entry(kind_name(&e.kind)).or_default() += 1;
     }
     println!("\nkinds");
@@ -75,12 +76,9 @@ fn main() {
     // sighting is whichever moved last, not the venue's state.
     println!("\npools  (venue / pool key)");
     let mut pools: BTreeMap<(String, String), Seen> = BTreeMap::new();
-    for e in &events {
+    for e in events {
         if let Kind::PoolState(p) = &e.kind {
-            let key = (
-                p.venue.clone(),
-                p.pool.as_deref().map(hex).unwrap_or_else(|| "—".into()),
-            );
+            let key = pool_label(&story, p.pool);
             let sightings = pools.get(&key).map(|s| s.sightings).unwrap_or(0) + 1;
             pools.insert(
                 key,
@@ -102,15 +100,15 @@ fn main() {
     // pricing and `PoolState` for everything else, so a table of `PoolState`
     // alone reports a launchpad token as having no venue — which is how
     // $Aliens showed 439 snek.fun fills against nothing at all.
-    for e in &events {
+    for e in events {
         if let Kind::CurveState {
-            venue,
+            pool,
             lovelace,
             tokens_left,
             progress,
         } = &e.kind
         {
-            let key = (venue.clone(), "curve".to_string());
+            let key = pool_label(&story, *pool);
             let sightings = pools.get(&key).map(|s| s.sightings).unwrap_or(0) + 1;
             pools.insert(
                 key,
@@ -151,7 +149,7 @@ fn main() {
     // an order contract derives its stake part per trader — so one contract
     // shows up as hundreds of addresses and one credential.
     let mut unclaimed: BTreeMap<String, (usize, usize, i64)> = BTreeMap::new();
-    for e in &events {
+    for e in events {
         if let Kind::UnclaimedScript {
             address, amount, ..
         } = &e.kind
@@ -166,7 +164,7 @@ fn main() {
     }
     // Distinct addresses per credential — the tell for a per-trader contract.
     let mut addrs: BTreeMap<String, std::collections::HashSet<&str>> = BTreeMap::new();
-    for e in &events {
+    for e in events {
         if let Kind::UnclaimedScript { address, .. } = &e.kind {
             let cred = policy_archive::trade::address_parts(address)
                 .map(|(c, _)| c)
@@ -203,7 +201,7 @@ fn main() {
 
     // ── fills, by venue — these must JOIN the pools above ────────────────
     let mut fills: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-    for e in &events {
+    for e in events {
         if let Kind::Fill {
             venue, into_pool, ..
         } = &e.kind
@@ -223,6 +221,74 @@ fn main() {
             false => "   ⚠️ NO POOL OF THIS NAME — the two halves are not joining",
         };
         println!("  {venue:<14} {n:>6} fills  ({sold} sells){flag}");
+    }
+
+    // ── THE CLIENT FOLD ──────────────────────────────────────────────────
+    //
+    // 🔑 This is what wire v4 was for. Nothing here reads the archive: it
+    // folds the STREAM with the same `PolicyView` the box folds observations
+    // with, so the figure below is what a browser can compute for itself with
+    // no round trip. Compare it to `token-ledger archive --policy <p>`.
+    //
+    // ⚠️ A WINDOW IS NOT THE ARCHIVE. These agree only when the window
+    // contains a sighting of every pool — so a short window reads LOW, and
+    // that is a fact about coverage rather than a disagreement. `pools folded`
+    // against the archive's pool count is what says which you are looking at.
+    let view = policy_archive::view::PolicyView::from_story(&story);
+    let at = view.ceiling().unwrap_or(0);
+    let spot = view.spot(at, &policy_archive::view::Projection::default());
+    println!("\nclient fold  (PolicyView over THIS STREAM — no archive access)");
+    println!(
+        "  pools folded {}   candidates {}   unresolved refs {}",
+        view.pool_count(),
+        view.candidates(),
+        view.unresolved_pool_refs(),
+    );
+    match spot.ada.as_ref() {
+        Some(d) => println!(
+            "  price        {:.8} ADA/unit at slot {at}  ({} ADA pool(s), Σbase {}, Σquote {})",
+            d.rate().unwrap_or(0.0) / 1_000_000.0,
+            d.pools,
+            d.base,
+            d.quote,
+        ),
+        None => println!("  price        UNDEFINED — no ADA-paired pool in this window"),
+    }
+    for (label, set) in [
+        ("unresolved", &spot.unresolved),
+        ("unpriceable", &spot.unpriceable),
+        ("stale", &spot.stale),
+    ] {
+        for u in set {
+            println!(
+                "  {label:<12} Σquote {} across {} pool(s)",
+                u.quote, u.pools
+            );
+        }
+    }
+}
+
+/// One pool, as a table key: its venue and enough of its identity to tell it
+/// from its siblings.
+///
+/// ⚠️ Reads the pool TABLE rather than the sighting. Before v4 a pool state
+/// carried only its instance key, so every pool on a venue that mints no pool
+/// NFT keyed as `—` and they all collapsed into one row — which is exactly the
+/// merge this diagnostic exists to expose.
+fn pool_label(story: &policy_archive::story::Story, ix: u32) -> (String, String) {
+    match story.pool(ix) {
+        Some(p) => {
+            let key = match p.key_name.is_empty() {
+                // No pool NFT: the address IS the identity, so show that
+                // rather than a dash that reads as "unknown".
+                true => format!("@{}", &p.address[..p.address.len().min(18)]),
+                false => hex(&p.key_name),
+            };
+            (p.venue.clone(), key)
+        }
+        // A row pointing outside the table is a bug in the producer, and
+        // naming it beats rendering it as a pool that merely has no venue.
+        None => ("?".to_string(), format!("UNRESOLVED #{ix}")),
     }
 }
 

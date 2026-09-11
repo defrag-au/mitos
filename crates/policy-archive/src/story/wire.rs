@@ -75,11 +75,59 @@ use super::{Kind, PoolState, Story, StoryEvent, Trader};
 /// - **v2** — added [`StoryStream::markers`]. Appending a field to a struct
 ///   inside a `Vec` is breaking under postcard, and so is appending one to the
 ///   envelope, so this is a version and not a compatible addition.
-/// - **v3** — added [`StoryStream::pool_keys`] / [`StoryStream::pool_key`].
+/// - **v3** — added a pool-key table and [`StoryStream::pool_key`].
 ///   Without the pool INSTANCE a consumer cannot aggregate a venue that runs
 ///   several, and the first one that tried reported a venue's liquidity as
 ///   unpublished while the archive held 29,121 ADA of it.
-pub const STORY_WIRE_VERSION: u8 = 3;
+///
+/// # ⚠️ v4 — the change that made this stream FOLDABLE. Read before bumping.
+///
+/// **v3 had the ordinal machinery and interned the wrong thing in it.** Its
+/// table held the instance KEY alone — the pool NFT's asset name, because that
+/// was all a `PoolState` carried. The box folds by
+/// [`crate::view::PoolKey`], which is `{address, key_policy, key_name}`, and
+/// **all three are load-bearing**; that is not a guess, it is what the
+/// archive tool's own pool table got wrong while it derived its own:
+///
+/// - dropping `key_policy` MERGED a cswap pool holding 200,000,000 base /
+///   602 ₳ out of existence on policy `8fe8039d…` — it was never printed;
+/// - the key was an `Option`, and `None` — "this venue publishes no instance
+///   key" — was most of Minswap V2's rows, so every such pool collapsed into
+///   one bucket and their reserves merged.
+///
+/// A client folding v3 therefore could not reproduce the price, which forced
+/// the arrangement where the box folds and the client is handed a projection.
+///
+/// v4 keeps [`StoryStream::pool_key`] byte for byte and changes what it
+/// indexes:
+///
+/// 1. the table becomes [`StoryStream::pools`] — pool IDENTITIES, with the
+///    address interned against [`StoryStream::addresses`] rather than repeated
+///    (a bech32 per pool state is 1,113 copies on $PERP alone);
+/// 2. `pool_key` then ALWAYS resolves. Every pool has an address, so
+///    [`NONE_IDX`] stops meaning "unidentifiable" and that case is gone;
+/// 3. [`super::PoolState`] carries the ordinal, so `story::build` interns once
+///    and the encoder stops being the only place that knows pool identity is
+///    incomplete.
+///
+/// Two things the plan had not reckoned with, both found by building it:
+///
+/// - **`CurveState` needed an ordinal too.** `build` splits a bonding curve out
+///   of the pool stream, so without one a client folding the stream could not
+///   key the curve's reserves and the two folds disagreed on exactly the
+///   liquidity `Spot::unpriceable` and `Spot::stale` are meant to report. It
+///   gets [`StoryStream::curve_pool`] — its own cursor, not a share of
+///   `pool_key`, so neither can drift past the other.
+/// - **[`EventRow::venue`] is now unset on both tags.** A venue is a property
+///   of the POOL and the table states it; a copy on the row is a copy that can
+///   disagree.
+///
+/// [`decode`] returns a [`Story`] rather than bare events as a consequence: an
+/// ordinal is meaningless without the table beside it. `view::PolicyView` can
+/// now fold a `Kind` event, and its `observations_and_story_fold_identically`
+/// asserts that folding the stream and folding the archive give the same
+/// answer — the property this whole change was for.
+pub const STORY_WIRE_VERSION: u8 = 4;
 
 /// Absent index — the `Option<u32>` postcard would otherwise cost a byte for.
 pub const NONE_IDX: u32 = u32::MAX;
@@ -133,6 +181,27 @@ pub enum TraderKind {
     Wallet,            // 1
     NotEncodedByVenue, // 2
     Unknown,           // 3
+}
+
+/// One pool's IDENTITY, stated once and referred to by ordinal thereafter.
+///
+/// # ⚠️ Why the address is an INDEX and not a string
+///
+/// A bech32 script address is ~60 bytes and a policy's pool states repeat it
+/// constantly — $PERP alone carries 1,113 of them in one window. The stream
+/// already interns every address it mentions for exactly this reason, so a pool
+/// costs an index into that table rather than a copy of it, and a pool's
+/// address is automatically the SAME string a `Transfer` to it would use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolRow {
+    /// Into [`StoryStream::venues`].
+    pub venue: u32,
+    /// Into [`StoryStream::addresses`].
+    pub address: u32,
+    pub key_policy: Vec<u8>,
+    /// The pool NFT's asset name. Empty where the venue mints none — which is
+    /// not ambiguous, because `address` still separates those pools.
+    pub key_name: Vec<u8>,
 }
 
 /// One event. Fields are shared across kinds — `tag` says how to read them.
@@ -216,18 +285,31 @@ pub struct StoryStream {
     /// rate from reserves MUST check this: a bonding curve's reserves are real
     /// and its rate is not `quote / base`.
     pub pool_pricing: Vec<u8>,
-    /// Pool instance keys, interned. Parallel to the `PoolState` rows via
-    /// [`StoryStream::pool_key`].
-    pub pool_keys: Vec<Vec<u8>>,
-    /// Which pool each `PoolState` row is, indexing [`StoryStream::pool_keys`],
-    /// or [`NONE_IDX`] where the venue publishes no instance key.
+    /// Every pool and curve the rows refer to, stated once.
+    ///
+    /// ⚠️ **v4 replaced a table of instance KEYS with a table of pool
+    /// IDENTITIES**, and that is what makes this stream foldable by a client
+    /// rather than merely readable. See [`PoolRow`].
+    pub pools: Vec<PoolRow>,
+    /// Which pool each `PoolState` row is, indexing [`StoryStream::pools`].
+    /// Parallel to the `PoolState` rows in order.
     ///
     /// ⚠️ **A venue runs MANY pools.** Grouping by venue alone and taking the
     /// latest sighting takes the latest of whichever pool moved last — which
     /// reported `splash: liquidity not published` on a policy whose splash
-    /// pools held 29,121 ADA. Group by `(venue, pool)`, take the latest per
-    /// pool, then aggregate.
+    /// pools held 29,121 ADA. Group by THIS, which is correct by construction.
+    ///
+    /// No [`NONE_IDX`]: every pool has an address, so every `PoolState`
+    /// resolves. The `Option` this used to carry merged every pool on a venue
+    /// that mints no pool NFT into one bucket.
     pub pool_key: Vec<u32>,
+    /// Which curve each `CurveState` row is, indexing [`StoryStream::pools`].
+    /// Parallel to the `CurveState` rows in order.
+    ///
+    /// Its own array rather than sharing `pool_key`, so neither cursor can
+    /// drift past the other — the failure `pool_quote` already warns about,
+    /// where reading one entry late describes pool N's reserves as pool N+1's.
+    pub curve_pool: Vec<u32>,
 
     pub rows: Vec<EventRow>,
 
@@ -340,10 +422,25 @@ pub fn encode(
     let mut t = Intern::default();
     let mut rows = Vec::with_capacity(story.events.len());
     let mut pool_quote = Vec::new();
-    let mut pool_keys: Vec<Vec<u8>> = Vec::new();
     let mut pool_key: Vec<u32> = Vec::new();
+    let mut curve_pool: Vec<u32> = Vec::new();
     let mut pool_pricing = Vec::new();
     let (mut last_slot, mut last_unix) = (0u64, 0u64);
+
+    // ⚠️ INTERNED FIRST, before any row. The pool table's addresses and venues
+    // index the same side tables the rows do, and building it up front means a
+    // pool's address is the very same entry a `Transfer` to that address uses
+    // rather than a second copy of the string.
+    let pools: Vec<PoolRow> = story
+        .pools
+        .iter()
+        .map(|p| PoolRow {
+            venue: t.venue(&p.venue),
+            address: t.address(&p.address),
+            key_policy: p.key_policy.clone(),
+            key_name: p.key_name.clone(),
+        })
+        .collect();
 
     for e in &story.events {
         let mut r = EventRow {
@@ -445,7 +542,11 @@ pub fn encode(
             Kind::PoolState(p) => {
                 r.tag = Tag::PoolState;
                 r.amount = p.base;
-                r.venue = t.venue(&p.venue);
+                // ⚠️ `r.venue` STAYS UNSET for this tag. The venue is a
+                // property of the pool, and the pool table already states it —
+                // a second copy on the row is a second copy that can disagree.
+                // The decoder reads it from `pools[pool_key[n]]`.
+                //
                 // `None` quote is "the venue does not publish it" — encoded as
                 // a cleared flag, not as 0, so a consumer cannot compute a
                 // rate from a reserve that was never stated.
@@ -458,19 +559,17 @@ pub fn encode(
                     crate::observation::pricing::BONDING_CURVE => 1,
                     _ => 0,
                 });
-                pool_key.push(match &p.pool {
-                    Some(k) => idx(&mut pool_keys, k.clone()),
-                    None => NONE_IDX,
-                });
+                pool_key.push(p.pool);
             }
             Kind::CurveState {
-                venue,
+                pool,
                 lovelace,
                 tokens_left,
                 progress: _,
             } => {
                 r.tag = Tag::CurveState;
-                r.venue = t.venue(venue);
+                // As `PoolState` above: venue comes from the pool table.
+                curve_pool.push(*pool);
                 // Progress is DERIVED from the curve's own parameters, which
                 // this crate cannot decode — so it is not on the wire. A
                 // consumer computes it from lovelace and the cap, or does
@@ -509,8 +608,9 @@ pub fn encode(
         quote_units: t.quote_units,
         pool_quote,
         pool_pricing,
-        pool_keys,
+        pools,
         pool_key,
+        curve_pool,
         rows,
         markers: story
             .markers
@@ -589,11 +689,20 @@ pub fn from_bytes(b: &[u8]) -> Result<StoryStream, String> {
     postcard::from_bytes(b).map_err(|e| format!("decoding story: {e}"))
 }
 
-/// Re-inflate the rows into [`StoryEvent`]s — the inverse of [`encode`], for a
-/// consumer that wants the domain types back rather than the columns.
-pub fn decode(s: &StoryStream) -> Vec<StoryEvent> {
+/// Re-inflate the columns into a [`Story`] — the inverse of [`encode`], for a
+/// consumer that wants the domain types back.
+///
+/// # ⚠️ Returns a `Story`, not bare events
+///
+/// It used to return `Vec<StoryEvent>`, which was adequate while a `PoolState`
+/// carried its own venue and key. From v4 a pool state is an ORDINAL, so the
+/// events are meaningless without [`Story::pools`] — handing back events alone
+/// would hand back something no consumer could resolve, and invite each of them
+/// to reach into the raw `StoryStream` for the table.
+pub fn decode(s: &StoryStream) -> Story {
     let (mut slot, mut unix) = (0u64, 0u64);
     let mut pool_at = 0usize;
+    let mut curve_at = 0usize;
     let addr = |i: u32| -> Option<String> {
         (i != NONE_IDX)
             .then(|| s.addresses.get(i as usize).cloned())
@@ -654,16 +763,10 @@ pub fn decode(s: &StoryStream) -> Vec<StoryEvent> {
                 // which decodes cleanly and is entirely wrong.
                 let q = s.pool_quote.get(pool_at).copied().unwrap_or(NONE_IDX);
                 let pricing = s.pool_pricing.get(pool_at).copied().unwrap_or(0);
-                let pool = s
-                    .pool_key
-                    .get(pool_at)
-                    .copied()
-                    .filter(|i| *i != NONE_IDX)
-                    .and_then(|i| s.pool_keys.get(i as usize).cloned());
+                let pool = s.pool_key.get(pool_at).copied().unwrap_or(NONE_IDX);
                 pool_at += 1;
                 let (qp, qn) = s.quote_units.get(q as usize).cloned().unwrap_or_default();
                 Kind::PoolState(PoolState {
-                    venue: venue_of(s, r.venue),
                     pool,
                     base: r.amount,
                     quote: flag.then_some(r.extra),
@@ -675,12 +778,16 @@ pub fn decode(s: &StoryStream) -> Vec<StoryEvent> {
                     },
                 })
             }
-            Tag::CurveState => Kind::CurveState {
-                venue: venue_of(s, r.venue),
-                lovelace: r.extra,
-                tokens_left: r.extra2,
-                progress: None,
-            },
+            Tag::CurveState => {
+                let pool = s.curve_pool.get(curve_at).copied().unwrap_or(NONE_IDX);
+                curve_at += 1;
+                Kind::CurveState {
+                    pool,
+                    lovelace: r.extra,
+                    tokens_left: r.extra2,
+                    progress: None,
+                }
+            }
             Tag::UnclaimedScript => Kind::UnclaimedScript {
                 address: addr(r.party_a).unwrap_or_default(),
                 amount: r.amount,
@@ -699,7 +806,25 @@ pub fn decode(s: &StoryStream) -> Vec<StoryEvent> {
             kind,
         });
     }
-    out
+    Story {
+        events: out,
+        pools: s
+            .pools
+            .iter()
+            .map(|p| super::PoolIdent {
+                venue: venue_of(s, p.venue),
+                address: s
+                    .addresses
+                    .get(p.address as usize)
+                    .cloned()
+                    .unwrap_or_default(),
+                key_policy: p.key_policy.clone(),
+                key_name: p.key_name.clone(),
+            })
+            .collect(),
+        distinct_slots: s.distinct_slots as usize,
+        markers: decode_markers(s),
+    }
 }
 
 fn venue_of(s: &StoryStream, i: u32) -> String {
@@ -730,17 +855,46 @@ mod tests {
         }
     }
 
+    /// A pool table wide enough for any ordinal the tests below use.
+    fn pools(n: u32) -> Vec<super::super::PoolIdent> {
+        (0..n)
+            .map(|i| super::super::PoolIdent {
+                venue: format!("venue{i}"),
+                address: format!("addr{i}"),
+                key_policy: vec![i as u8; 28],
+                key_name: format!("pool{i}").into_bytes(),
+            })
+            .collect()
+    }
+
+    /// ⚠️ The table is sized from the events, never padded. A pool row interns
+    /// an address, so a fixed-size table would add addresses to every test —
+    /// including `repeated_parties_are_interned_once`, which counts them and
+    /// went from 2 to 6 when this was `pools(4)`.
     fn story(events: Vec<StoryEvent>) -> Story {
         let mut slots: Vec<u64> = events.iter().map(|e| e.slot).collect();
         slots.dedup();
+        let widest = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::PoolState(p) => Some(p.pool),
+                Kind::CurveState { pool, .. } => Some(*pool),
+                _ => None,
+            })
+            .max();
         Story {
             distinct_slots: slots.len(),
             events,
+            pools: widest.map(|w| pools(w + 1)).unwrap_or_default(),
             markers: Vec::new(),
         }
     }
 
     fn round_trip(s: &Story, txs: Txs) -> Vec<StoryEvent> {
+        round_trip_story(s, txs).events
+    }
+
+    fn round_trip_story(s: &Story, txs: Txs) -> Story {
         let w = encode(s, "aa", 0, 100, true, txs);
         let bytes = to_bytes(&w).unwrap();
         decode(&from_bytes(&bytes).unwrap())
@@ -784,8 +938,7 @@ mod tests {
             ev(
                 5,
                 Kind::PoolState(PoolState {
-                    venue: "splash".into(),
-                    pool: Some(b"POOL".to_vec()),
+                    pool: 1,
                     base: 1_000,
                     quote: Some(2_000),
                     quote_policy: None,
@@ -796,7 +949,7 @@ mod tests {
             ev(
                 6,
                 Kind::CurveState {
-                    venue: "snek.fun".into(),
+                    pool: 2,
                     lovelace: 9_440_340_600,
                     tokens_left: 300_000_001,
                     progress: None,
@@ -877,10 +1030,9 @@ mod tests {
     /// decodes cleanly, so nothing complains.
     #[test]
     fn parallel_pool_columns_stay_aligned_across_several_pools() {
-        let pool = |key: &[u8], base: i64, quote: Option<i64>, bonding: bool| {
+        let pool = |ix: u32, base: i64, quote: Option<i64>, bonding: bool| {
             Kind::PoolState(PoolState {
-                venue: "splash".into(),
-                pool: Some(key.to_vec()),
+                pool: ix,
                 base,
                 quote,
                 quote_policy: None,
@@ -892,9 +1044,9 @@ mod tests {
             })
         };
         let s = story(vec![
-            ev(1, pool(b"POOL_A", 100, Some(1_000), false)),
-            ev(2, pool(b"POOL_B", 200, None, true)),
-            ev(3, pool(b"POOL_C", 300, Some(3_000), false)),
+            ev(1, pool(0, 100, Some(1_000), false)),
+            ev(2, pool(1, 200, None, true)),
+            ev(3, pool(2, 300, Some(3_000), false)),
         ]);
         // `Include`, so the whole-set comparison is meaningful: `Omit` drops
         // the hashes on purpose and the events would differ for that reason
@@ -905,9 +1057,7 @@ mod tests {
         // comparison if the values happen to be similar.
         match (&got[0].kind, &got[1].kind, &got[2].kind) {
             (Kind::PoolState(a), Kind::PoolState(b), Kind::PoolState(c)) => {
-                assert_eq!(a.pool.as_deref(), Some(b"POOL_A".as_slice()));
-                assert_eq!(b.pool.as_deref(), Some(b"POOL_B".as_slice()));
-                assert_eq!(c.pool.as_deref(), Some(b"POOL_C".as_slice()));
+                assert_eq!((a.pool, b.pool, c.pool), (0, 1, 2));
                 assert_eq!((a.base, a.quote), (100, Some(1_000)));
                 assert_eq!((b.base, b.quote), (200, None));
                 assert_eq!(
@@ -927,9 +1077,7 @@ mod tests {
         let s = story(vec![ev(
             1,
             Kind::PoolState(PoolState {
-                venue: "v".into(),
-                // A venue that publishes no instance key — the `None` case.
-                pool: None,
+                pool: 0,
                 base: 100,
                 quote: None,
                 quote_policy: None,
@@ -949,8 +1097,7 @@ mod tests {
         let s = story(vec![ev(
             1,
             Kind::PoolState(PoolState {
-                venue: "snek.fun".into(),
-                pool: Some(b"CURVE".to_vec()),
+                pool: 3,
                 base: 1,
                 quote: Some(2),
                 quote_policy: None,
@@ -1085,8 +1232,8 @@ mod tests {
         }]);
         let w = encode(&s, "aa", 8_000, 10_000, true, Txs::Omit);
         assert_eq!(w.rows.len(), 1);
-        assert_eq!(decode(&w).len(), 1);
-        assert!(decode(&w).iter().all(|e| e.slot >= 8_000));
+        assert_eq!(decode(&w).events.len(), 1);
+        assert!(decode(&w).events.iter().all(|e| e.slot >= 8_000));
     }
 
     /// ⚠️ APPEND ONLY, same contract as the event tags.
@@ -1162,7 +1309,7 @@ mod tests {
             vec![1_000, 0, 8_999]
         );
         assert_eq!(
-            decode(&w).iter().map(|e| e.slot).collect::<Vec<_>>(),
+            decode(&w).events.iter().map(|e| e.slot).collect::<Vec<_>>(),
             vec![1_000, 1_000, 9_999]
         );
     }
