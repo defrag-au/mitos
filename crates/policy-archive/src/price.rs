@@ -82,6 +82,12 @@ pub struct PairDepth {
     /// caller judges the aggregate's weakest link by, and the figure a path
     /// through several pairs must carry forward as its own weakest hop.
     pub thinnest: i64,
+    /// The DEEPEST contributing pool's quote reserve.
+    ///
+    /// ⚠️ Carried because [`Self::any_pool_above`] cannot be answered from
+    /// [`Self::thinnest`], and answering it from `thinnest` anyway is the bug
+    /// this field exists to end — see that method.
+    pub deepest: i64,
 }
 
 impl PairDepth {
@@ -91,10 +97,27 @@ impl PairDepth {
         (self.base > 0).then(|| self.quote as f64 / self.base as f64)
     }
 
-    /// Whether any single contributing pool cleared the floor. An aggregate
+    /// Whether ANY single contributing pool cleared the floor. An aggregate
     /// made entirely of dust is still summed — rule 4 — but a caller deciding
     /// whether to PUBLISH it wants to know.
+    ///
+    /// # ⚠️ This was `thinnest >= floor`, which is the opposite question
+    ///
+    /// `thinnest >= floor` is true only when EVERY pool clears it, so one dust
+    /// pool beside four deep ones made this false and the caller printed
+    /// *"every contributing pool is below the depth floor"* — a sentence that
+    /// matched neither the check nor the data.
+    ///
+    /// MEASURED on $NIKEPIG: a 3 ₳ WingRiders pool sat beside a 54,853 ₳
+    /// Minswap V2 pool, and the page warned that nothing was deep enough to
+    /// trade at. Two different claims, and both of them wrong.
     pub fn any_pool_above(&self, floor: i64) -> bool {
+        self.deepest >= floor
+    }
+
+    /// Whether EVERY contributing pool cleared the floor — the honest name for
+    /// what `any_pool_above` used to compute.
+    pub fn all_pools_above(&self, floor: i64) -> bool {
         self.thinnest >= floor
     }
 }
@@ -118,6 +141,16 @@ pub struct Spot {
     /// FORMULA. Counting it as a pool is the specific error that halved
     /// $PERP's price on the first end-to-end run.
     pub unpriceable: Vec<PairDepth>,
+    /// Pools last seen longer ago than the staleness horizon.
+    ///
+    /// A FOURTH problem, and again a different one: these reserves were real
+    /// when they were written and the archive cannot tell whether they still
+    /// exist. Reported so a reader can see liquidity that is not being
+    /// counted, and excluded from the price because a pool nobody has
+    /// arbitraged in a month is not at market.
+    ///
+    /// See [`DEFAULT_STALE_AFTER_SLOTS`] for what this cost $NIKEPIG.
+    pub stale: Vec<PairDepth>,
 }
 
 impl Spot {
@@ -134,13 +167,44 @@ impl Spot {
     }
 }
 
-/// Resolve the price at `slot` from a policy's observations.
+/// How far back a pool sighting may be and still describe the price NOW.
+///
+/// ⚠️ **A pool observation is evidence about the slot it was written at, not
+/// about today**, and the archive cannot tell a pool that still holds its
+/// reserves from one whose liquidity was withdrawn. An observation is only
+/// written when a pool's UTxO is touched WHILE HOLDING the asset — so a pool
+/// that is emptied stops being observed at the moment BEFORE it emptied, and
+/// its final, full reserves would otherwise sit in the sum for ever.
+///
+/// MEASURED on $NIKEPIG (2026-09-11): thirteen ADA pools summed to
+/// 0.00276 ₳/unit. The five touched within eleven days agreed at
+/// **0.00184–0.00186** — matching the market — and the other eight were last
+/// seen 215 to 809 days earlier, holding **~185,600 ₳** frozen at prices up to
+/// 15× current. They dragged the published price **50% high**.
+///
+/// Thirty days: constant-product pools are arbitraged continuously, so one
+/// untouched for a month is either empty or not at market. Either way it
+/// cannot set a price. Its reserves are REPORTED — see [`Spot::stale`] — and
+/// not summed.
+pub const DEFAULT_STALE_AFTER_SLOTS: u64 = 30 * 86_400;
+
+/// Resolve the price at `slot` from a policy's observations, with the default
+/// staleness horizon.
 ///
 /// `observations` need not be sorted. Only rows a decoder claimed, with a
 /// measured quote reserve, can contribute — an unmeasured far side cannot be
 /// summed, and guessing a zero for it would drag the aggregate toward zero
 /// exactly where the data is thinnest.
 pub fn spot_at(observations: &[Observation], slot: u64) -> Spot {
+    spot_at_within(observations, slot, DEFAULT_STALE_AFTER_SLOTS)
+}
+
+/// As [`spot_at`], with the staleness horizon given explicitly.
+///
+/// `u64::MAX` restores the old behaviour of summing every pool's last
+/// sighting however old — kept reachable so a caller auditing history can ask
+/// for it deliberately, never by default.
+pub fn spot_at_within(observations: &[Observation], slot: u64, stale_after: u64) -> Spot {
     // Latest observation at or before `slot`, per pool. The pool is keyed by
     // its ADDRESS plus its instance key: one address hosts many pools on every
     // venue that derives a stake part per pool, and merging them would sum
@@ -163,6 +227,7 @@ pub fn spot_at(observations: &[Observation], slot: u64) -> Spot {
 
     let mut by_pair: HashMap<Unit, PairDepth> = HashMap::new();
     let mut off_model: HashMap<Unit, PairDepth> = HashMap::new();
+    let mut stale: HashMap<Unit, PairDepth> = HashMap::new();
     for o in latest.values() {
         let Some(d) = &o.decoded else { continue };
         let (Some(qp), Some(qn), Some(qr)) = (&d.quote_policy, &d.quote_name, d.quote_reserve)
@@ -178,13 +243,18 @@ pub fn spot_at(observations: &[Observation], slot: u64) -> Spot {
             policy: qp.clone(),
             name: qn.clone(),
         };
-        // Anything not KNOWN to be constant-product is set aside rather than
-        // summed. An empty `pricing` — a row written before the column existed
-        // — lands here too: "not known to be priceable" is the safe reading,
-        // and the unsafe one halves a token's price.
-        let bucket = match d.pricing.as_str() {
-            crate::observation::pricing::CONSTANT_PRODUCT => &mut by_pair,
-            _ => &mut off_model,
+        // ⚠️ STALE FIRST, before the model split. A pool nobody has touched in
+        // a month cannot set a price whatever its pricing model says, and
+        // letting it through here is what put $NIKEPIG 50% high.
+        let bucket = match slot.saturating_sub(o.slot) > stale_after {
+            true => &mut stale,
+            false => match d.pricing.as_str() {
+                crate::observation::pricing::CONSTANT_PRODUCT => &mut by_pair,
+                // Anything not KNOWN to be constant-product is set aside
+                // rather than summed. An empty `pricing` — a row written
+                // before the column existed — lands here too.
+                _ => &mut off_model,
+            },
         };
         let e = bucket.entry(unit.clone()).or_insert(PairDepth {
             quote_unit: unit,
@@ -192,11 +262,13 @@ pub fn spot_at(observations: &[Observation], slot: u64) -> Spot {
             quote: 0,
             pools: 0,
             thinnest: i64::MAX,
+            deepest: 0,
         });
         e.base += d.base_reserve as i128;
         e.quote += qr as i128;
         e.pools += 1;
         e.thinnest = e.thinnest.min(qr);
+        e.deepest = e.deepest.max(qr);
     }
 
     let mut ada = None;
@@ -211,12 +283,15 @@ pub fn spot_at(observations: &[Observation], slot: u64) -> Spot {
     unresolved.sort_by(|a, b| b.quote.cmp(&a.quote).then(a.quote_unit.cmp(&b.quote_unit)));
     let mut unpriceable: Vec<PairDepth> = off_model.into_values().collect();
     unpriceable.sort_by(|a, b| b.quote.cmp(&a.quote).then(a.quote_unit.cmp(&b.quote_unit)));
+    let mut stale: Vec<PairDepth> = stale.into_values().collect();
+    stale.sort_by(|a, b| b.quote.cmp(&a.quote).then(a.quote_unit.cmp(&b.quote_unit)));
 
     Spot {
         slot,
         ada,
         unresolved,
         unpriceable,
+        stale,
     }
 }
 
@@ -427,5 +502,91 @@ mod tests {
             obs(200, "b", b"p2", 1, Some(1), true),
         ];
         assert_eq!(price_slots(&rows), vec![100, 200]);
+    }
+
+    /// ⚠️ THE $NIKEPIG DEFECT. An observation is written only when a pool is
+    /// touched WHILE HOLDING the asset, so a pool whose liquidity is withdrawn
+    /// stops being observed at the moment BEFORE it emptied — and its final,
+    /// full reserves were summed into the price for ever after.
+    ///
+    /// MEASURED: thirteen pools summed to 0.00276 ₳/unit; the five touched
+    /// within eleven days agreed at 0.00184–0.00186, matching the market. The
+    /// eight stale ones held ~185,600 ₳ frozen at up to 15× current and
+    /// dragged the published price **50% high**.
+    #[test]
+    fn a_pool_nobody_has_touched_for_a_month_cannot_set_the_price() {
+        let now = 200 * 86_400;
+        let rows = vec![
+            // Live: 1,000 base against 2,000,000 lovelace → 2,000/unit.
+            obs(now - 86_400, "live", b"A", 1_000, Some(2_000_000), true),
+            // Abandoned 100 days ago at 30,000/unit — fifteen times the price.
+            obs(
+                now - 100 * 86_400,
+                "dead",
+                b"B",
+                1_000,
+                Some(30_000_000),
+                true,
+            ),
+        ];
+        let s = spot_at(&rows, now);
+        let ada = s.ada.as_ref().expect("a live ADA pool");
+        assert_eq!(ada.pools, 1, "only the live pool prices anything");
+        assert_eq!(ada.rate(), Some(2_000.0), "the market rate, undragged");
+
+        // ⚠️ REPORTED, not discarded: the reserves were real when written and
+        // the archive cannot say whether they still exist.
+        assert_eq!(s.stale.len(), 1);
+        assert_eq!(s.stale[0].quote, 30_000_000);
+
+        // And the old behaviour stays reachable for a caller auditing history
+        // — deliberately, never by default.
+        let all = spot_at_within(&rows, now, u64::MAX);
+        assert_eq!(all.ada.as_ref().unwrap().pools, 2);
+        assert!(all.stale.is_empty());
+        assert_eq!(
+            all.ada.as_ref().unwrap().rate(),
+            Some(16_000.0),
+            "dragged 8×"
+        );
+    }
+
+    /// A pool touched INSIDE the horizon still counts, however quiet — this
+    /// must not become "only pools that traded today".
+    #[test]
+    fn a_quiet_but_recent_pool_still_prices() {
+        let now = 200 * 86_400;
+        let rows = vec![
+            obs(now - 86_400, "a", b"A", 1_000, Some(2_000_000), true),
+            obs(now - 29 * 86_400, "b", b"B", 1_000, Some(2_000_000), true),
+        ];
+        let s = spot_at(&rows, now);
+        assert_eq!(s.ada.as_ref().unwrap().pools, 2);
+        assert!(s.stale.is_empty());
+    }
+
+    /// ⚠️ `any` AND `every` ARE DIFFERENT QUESTIONS, and `any_pool_above` was
+    /// computing the second while its caller printed a sentence about the
+    /// first. MEASURED on $NIKEPIG: a 3 ₳ pool beside a 54,853 ₳ pool made the
+    /// page say *"every contributing pool is below the depth floor"*.
+    #[test]
+    fn a_dust_pool_beside_a_deep_one_does_not_make_them_all_dust() {
+        let now = 86_400;
+        let rows = vec![
+            obs(now, "deep", b"A", 1_000, Some(54_853_000_000), true),
+            obs(now, "dust", b"B", 1_000, Some(3_000_000), true),
+        ];
+        let d = spot_at(&rows, now).ada.expect("an ADA pair");
+        assert_eq!(d.pools, 2);
+        assert_eq!(d.thinnest, 3_000_000);
+        assert_eq!(d.deepest, 54_853_000_000);
+        assert!(
+            d.any_pool_above(DEFAULT_FLOOR_LOVELACE),
+            "one pool holds 54,853 ADA — something here is worth quoting",
+        );
+        assert!(
+            !d.all_pools_above(DEFAULT_FLOOR_LOVELACE),
+            "…but not every pool is, and that is the other question",
+        );
     }
 }

@@ -985,6 +985,10 @@ pub struct PairDepthDto {
     /// The thinnest quote-side reserve of any contributing pool — the
     /// aggregate's weakest link.
     pub thinnest: i64,
+    /// The DEEPEST contributing pool's quote reserve — what decides whether
+    /// ANY pool here is worth quoting. `thinnest` answers the other question.
+    #[serde(default)]
+    pub deepest: i64,
     /// Hex policy of what the asset is paired WITH; **empty means ADA**, and
     /// that is the only case where the quote's decimals are known (6).
     pub quote_policy: String,
@@ -1002,6 +1006,7 @@ fn depth_dto(d: &policy_archive::PairDepth) -> PairDepthDto {
         quote: d.quote.to_string(),
         pools: d.pools,
         thinnest: d.thinnest,
+        deepest: d.deepest,
         quote_policy: hex::encode(&d.quote_unit.policy),
         quote_name: hex::encode(&d.quote_unit.name),
     }
@@ -1030,10 +1035,23 @@ pub struct PolicyPriceResponse {
     pub ada: Option<PairDepthDto>,
     /// Every contributing pool sits below the depth floor: the aggregate is
     /// still the right sum, but no single pool is worth quoting alone.
+    /// ⚠️ NOT ONE contributing pool clears the depth floor — so the aggregate
+    /// is a sum, not a price anyone could trade at.
+    ///
+    /// Was computed from `thinnest`, which answers the OPPOSITE question
+    /// ("does EVERY pool clear it"), so one dust pool beside four deep ones
+    /// raised this flag. $NIKEPIG: a 3 ₳ pool beside a 54,853 ₳ pool.
     pub thin: bool,
     pub depth_floor_lovelace: i64,
     pub unresolved: Vec<PairDepthDto>,
     pub unpriceable: Vec<PairDepthDto>,
+    /// Pools last seen longer ago than the staleness horizon: real when
+    /// written, possibly withdrawn since, and excluded from the price. See
+    /// `policy_archive::price::DEFAULT_STALE_AFTER_SLOTS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale: Vec<PairDepthDto>,
+    /// How far back a sighting may be and still count, in slots.
+    pub stale_after_slots: u64,
     pub observations: usize,
 }
 
@@ -1057,11 +1075,17 @@ pub async fn price(
         policy,
         cached: manifest.is_some(),
         at_slot: at,
+        // ⚠️ `any_pool_above`, which now answers the question its name asks.
+        // It used to be `thinnest >= floor` — "does EVERY pool clear it" —
+        // so one dust pool made a token with 54,853 ₳ of depth report that
+        // nothing was tradeable.
         thin: spot.ada.as_ref().is_some_and(|d| !d.any_pool_above(floor)),
         ada: spot.ada.as_ref().map(depth_dto),
         depth_floor_lovelace: floor,
         unresolved: spot.unresolved.iter().map(depth_dto).collect(),
         unpriceable: spot.unpriceable.iter().map(depth_dto).collect(),
+        stale: spot.stale.iter().map(depth_dto).collect(),
+        stale_after_slots: policy_archive::price::DEFAULT_STALE_AFTER_SLOTS,
         observations: rows.len(),
     }))
 }

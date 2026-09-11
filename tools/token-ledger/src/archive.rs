@@ -1797,17 +1797,114 @@ fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
                 d.base,
                 d.quote
             );
-            if !d.any_pool_above(policy_archive::price::DEFAULT_FLOOR_LOVELACE) {
+            let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
+            if !d.any_pool_above(floor) {
                 println!(
-                    "  ⚠ every contributing pool is below the {} ADA depth floor — the \
-                     aggregate is still the right sum, but no single pool here is worth \
-                     quoting on its own",
-                    policy_archive::price::DEFAULT_FLOOR_LOVELACE / 1_000_000
+                    "  ⚠ NOT ONE contributing pool clears the {} ADA depth floor — the \
+                     aggregate is still the right sum, but nothing here is worth quoting \
+                     on its own",
+                    floor / 1_000_000
+                );
+            } else if !d.all_pools_above(floor) {
+                // ⚠️ A DIFFERENT AND MUCH MILDER STATEMENT, and conflating the
+                // two is what made $NIKEPIG — 54,853 ₳ deep on Minswap V2 —
+                // report that nothing could be traded at this price.
+                println!(
+                    "  note: the thinnest contributing pool holds {} lovelace, under the \
+                     {} ADA floor; its reserves count toward the sum but its own price \
+                     would not be worth quoting",
+                    d.thinnest,
+                    floor / 1_000_000
                 );
             }
         }
         // Undefined, never zero.
         None => println!("price       UNDEFINED at slot {at} — no ADA-paired pool observed"),
+    }
+
+    // ⚠️ EVERY CONTRIBUTING POOL, WITH THE SLOT IT WAS LAST SEEN AT.
+    //
+    // The aggregate above sums each pool's LAST observation, whenever that
+    // was, because an observation is only written when the pool's UTxO is
+    // touched WHILE HOLDING the asset. A pool whose liquidity was withdrawn
+    // stops being observed at the moment BEFORE it emptied — so its final,
+    // full reserves sit in the sum for ever, priced at whatever the token was
+    // worth then.
+    //
+    // That is invisible in an aggregate and obvious in this table, which is
+    // the only reason it is printed.
+    /// One pool at its newest ADA-paired sighting.
+    struct LastSeen {
+        slot: u64,
+        base: i64,
+        quote: i64,
+        venue: String,
+    }
+    let mut per_pool: BTreeMap<(String, Vec<u8>), LastSeen> = BTreeMap::new();
+    for o in rows.iter() {
+        let Some(d) = &o.decoded else { continue };
+        let Some(qr) = d.quote_reserve else { continue };
+        // ADA pairs only — the same set the aggregate is built from.
+        if !d.quote_policy.as_ref().is_none_or(|p| p.is_empty()) {
+            continue;
+        }
+        let key = (o.address.clone(), d.key_name.clone());
+        let e = per_pool.entry(key).or_insert(LastSeen {
+            slot: 0,
+            base: 0,
+            quote: 0,
+            venue: String::new(),
+        });
+        if o.slot >= e.slot {
+            *e = LastSeen {
+                slot: o.slot,
+                base: o.unit_amount,
+                quote: qr,
+                venue: d.venue.clone(),
+            };
+        }
+    }
+    if per_pool.len() > 1 {
+        let horizon = policy_archive::price::DEFAULT_STALE_AFTER_SLOTS;
+        println!("  pools at their LAST sighting  (⌀ = excluded from the price above)");
+        let mut rows: Vec<_> = per_pool.into_iter().collect();
+        rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.slot));
+        for ((addr, _), s) in rows {
+            let behind = at.saturating_sub(s.slot);
+            // ~1 slot per second on Cardano, so days are a fair rendering.
+            let age = match behind {
+                0..=86_400 => "current".to_string(),
+                n => format!("{} days", n / 86_400),
+            };
+            let counted = match behind > horizon {
+                true => "⌀",
+                false => " ",
+            };
+            let rate = match s.base > 0 {
+                true => format!("{:.8}", s.quote as f64 / s.base as f64 / 1e6),
+                false => "        —".to_string(),
+            };
+            println!(
+                "  {counted} {:<14} {:>16} base {:>15} lovelace  {rate} ADA  {age:>9}  {}",
+                s.venue,
+                s.base,
+                s.quote,
+                &addr[..addr.len().min(24)],
+            );
+        }
+    }
+    // ⚠️ REAL WHEN WRITTEN, POSSIBLY WITHDRAWN SINCE. Reported so the reader
+    // sees liquidity the price deliberately does not count.
+    for u in &spot.stale {
+        println!(
+            "  STALE       {} base / {} quote across {} pool(s) — last seen over {} days \
+             before the price slot, so not counted: a pool nobody has arbitraged in a \
+             month is either empty or not at market",
+            u.base,
+            u.quote,
+            u.pools,
+            policy_archive::price::DEFAULT_STALE_AFTER_SLOTS / 86_400,
+        );
     }
     for u in &spot.unresolved {
         println!(
