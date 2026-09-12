@@ -55,6 +55,53 @@ pub struct AddressCredit {
     /// Native assets carried by the output, if any. Empty for a
     /// pure-ADA credit (the common payment case).
     pub assets: Vec<CreditedAsset>,
+    /// Raw PlutusData CBOR of an INLINE datum on the credited
+    /// output, or `None` when it carries none.
+    ///
+    /// Forwarded raw for the same reason `metadata` is: this
+    /// module stays dumb about intent, and the consumer owns the
+    /// schema. A softburn consumer decodes a claim tag here; the
+    /// same field carries a registry definition, a CIP-68 fuel
+    /// datum, an escrow datum and a protocol config, depending on
+    /// which watched address the credit landed at.
+    ///
+    /// **Inline only.** A datum-by-hash resolves through the
+    /// witness set, which is not available on the live path — the
+    /// same lag that makes `metadata` unreliable at dispatch time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datum: Option<Vec<u8>>,
+    /// Distinct stake credentials (28-byte hashes, hex) across
+    /// EVERY input of the transaction, in first-seen order.
+    ///
+    /// This is what lets a consumer attribute a credit to a
+    /// wallet without an external indexer — and, more to the
+    /// point, lets it refuse to. `from_address` above is the
+    /// LARGEST input and is a presentation convenience; it must
+    /// never be used to decide whose money this was.
+    ///
+    /// An input whose address carries no delegation part
+    /// (enterprise, or a true enterprise-script) contributes
+    /// nothing here, so a transaction mixing enterprise and
+    /// delegated inputs yields the delegated stake alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_stake_credentials: Vec<String>,
+    /// How many inputs could NOT be resolved to a prior output at
+    /// all — pruned past the archive horizon, and dispatched as a
+    /// placeholder with an empty address.
+    ///
+    /// **Load-bearing.** Without it, `input_stake_credentials` is
+    /// silently partial: a two-wallet transaction whose second
+    /// input is unresolved looks exactly like a one-wallet
+    /// transaction, and a consumer would attribute it
+    /// confidently to whoever happened to be resolvable. A
+    /// non-zero count means "this set is incomplete", and the
+    /// only safe reading is that nobody can be named.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub inputs_unresolved: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

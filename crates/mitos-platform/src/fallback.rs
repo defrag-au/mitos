@@ -9,8 +9,8 @@
 //! - archive-pruned prior outputs, via
 //!   [`crate::maestro_fallback_plane::MaestroFallbackPlane`].
 //!
-//! Selection is by `MITOS_FALLBACK_PROVIDER` (`maestro` default,
-//! `koios`, or `none`); see [`shared`]. The batch methods are the
+//! Selection is by `MITOS_FALLBACK_PROVIDER` (`koios` default,
+//! `maestro`, or `none`); see [`shared`]. The batch methods are the
 //! enabler for the CIP-25 cold-start prefetch — a provider with a
 //! native batch endpoint (Koios `/tx_metadata`) overrides them with
 //! one HTTP call; the default impl fans out over the single methods
@@ -112,41 +112,151 @@ pub trait FallbackProvider: Send + Sync {
     }
 }
 
+/// Which fallback source a deployment has selected.
+///
+/// A named decision rather than a bare string compared at the use
+/// site: the parse happens once, every arm is explicit, and the one
+/// that matters most — what *absence* of configuration means — has a
+/// name and a place to hang the reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Koios,
+    /// Rollback path only. The Maestro Developer API shuts down
+    /// 2026-09-18; after that this arm cannot resolve anything.
+    Maestro,
+    /// Fallback disabled — the planes pass through.
+    None,
+}
+
+impl Provider {
+    /// What an unset or unrecognised `MITOS_FALLBACK_PROVIDER` means.
+    ///
+    /// **Koios, deliberately.** Maestro shuts down 2026-09-18, so any
+    /// path that silently lands on Maestro is a path that silently
+    /// stops resolving — and an absent env var fails at *runtime*, on
+    /// a cache miss, not at startup where it would be noticed. A
+    /// rebuilt box, a dropped env line or a typo must degrade to
+    /// "works", not to "quietly resolves nothing". Koios also builds a
+    /// working keyless client, so this default holds with no secrets
+    /// present at all.
+    ///
+    /// **Consequence worth knowing:** that last property cuts both
+    /// ways. Before this was the default, an environment with no
+    /// `MAESTRO_API_KEY` — a test run, CI, a bare `cargo run` — got
+    /// `None` and made no network calls at all. That was accidental
+    /// (prod always had a key), but it was load-bearing by habit. An
+    /// unconfigured environment now gets a *live* Koios client, so any
+    /// context that must not talk to the network has to say
+    /// [`Provider::None`] explicitly rather than rely on silence.
+    pub const DEFAULT: Provider = Provider::Koios;
+
+    /// Parse a raw `MITOS_FALLBACK_PROVIDER` value; `None` = unset.
+    ///
+    /// Anything unrecognised resolves to [`Self::DEFAULT`] — not an
+    /// error, and deliberately not Maestro. A misspelled provider must
+    /// not be able to select a dead API, and must not disable
+    /// resolution either; only an explicit `none` does that.
+    pub fn from_env_value(raw: Option<&str>) -> Provider {
+        let Some(raw) = raw else {
+            return Provider::DEFAULT;
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => Provider::DEFAULT,
+            "koios" => Provider::Koios,
+            "maestro" => Provider::Maestro,
+            "none" => Provider::None,
+            other => {
+                tracing::warn!(
+                    provider = %other,
+                    default = ?Provider::DEFAULT,
+                    "unknown MITOS_FALLBACK_PROVIDER; using the default",
+                );
+                Provider::DEFAULT
+            }
+        }
+    }
+}
+
 /// Return the configured fallback provider, or `None` when fallback
 /// is disabled / unconfigured. Process-wide — each provider lazy-
 /// inits its own `shared()` singleton, so the connection pool and
 /// rate-limit semaphore stay global.
 ///
-/// `MITOS_FALLBACK_PROVIDER`:
-/// - unset / `maestro` (default) → Maestro (`MAESTRO_API_KEY`);
-///   `None` if no key, exactly as before this abstraction.
-/// - `none` → fallback disabled (planes pass through).
+/// `MITOS_FALLBACK_PROVIDER`, parsed by [`Provider::from_env_value`]:
+/// - unset / unrecognised → [`Provider::DEFAULT`] (Koios).
 /// - `koios` → Koios ([`crate::koios::KoiosProvider`]). Builds a
 ///   working client even without `KOIOS_API_KEY` (free public tier),
 ///   so this is `Some` unless the HTTP client fails to build.
+/// - `maestro` → Maestro (`MAESTRO_API_KEY`); `None` if no key.
+///   Rollback path only — see [`Provider::Maestro`].
+/// - `none` → fallback disabled (planes pass through).
 pub fn shared() -> Option<Arc<dyn FallbackProvider>> {
-    let selected =
-        std::env::var("MITOS_FALLBACK_PROVIDER").unwrap_or_else(|_| "maestro".to_owned());
-    match selected.as_str() {
-        "none" => {
-            tracing::info!("fallback provider disabled (MITOS_FALLBACK_PROVIDER=none)");
-            None
-        }
-        "koios" => {
-            // Koios builds a working client even without an API key
-            // (free public tier), so this is `Some` unless the HTTP
-            // client itself fails to build.
+    let raw = std::env::var("MITOS_FALLBACK_PROVIDER").ok();
+    match Provider::from_env_value(raw.as_deref()) {
+        Provider::Koios => {
             crate::koios::KoiosProvider::shared().map(|c| c as Arc<dyn FallbackProvider>)
         }
-        other => {
-            if other != "maestro" {
-                tracing::warn!(provider = %other, "unknown MITOS_FALLBACK_PROVIDER; using Maestro");
-            }
+        Provider::Maestro => {
+            tracing::warn!(
+                "MITOS_FALLBACK_PROVIDER=maestro — the Maestro Developer API shuts \
+                 down 2026-09-18; this is a rollback path only",
+            );
             maestro_provider()
+        }
+        Provider::None => {
+            tracing::info!("fallback provider disabled (MITOS_FALLBACK_PROVIDER=none)");
+            None
         }
     }
 }
 
 fn maestro_provider() -> Option<Arc<dyn FallbackProvider>> {
     crate::maestro::MaestroClient::shared().map(|c| c as Arc<dyn FallbackProvider>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Provider;
+
+    /// The whole point of the 2026-09-18 change: absence of config must
+    /// not select the API that is going away.
+    #[test]
+    fn unset_selects_koios_not_maestro() {
+        assert_eq!(Provider::from_env_value(None), Provider::Koios);
+        assert_eq!(Provider::from_env_value(Some("")), Provider::Koios);
+    }
+
+    /// A typo must not be able to select a dead provider, and must not
+    /// silently disable resolution either.
+    #[test]
+    fn unknown_values_fall_back_to_the_default() {
+        for raw in ["maestroo", "MITOS_FALLBACK_PROVIDR", "kois", "yes", "0"] {
+            assert_eq!(
+                Provider::from_env_value(Some(raw)),
+                Provider::DEFAULT,
+                "{raw} should resolve to the default",
+            );
+        }
+        assert_eq!(Provider::DEFAULT, Provider::Koios);
+    }
+
+    #[test]
+    fn explicit_values_are_honoured() {
+        assert_eq!(Provider::from_env_value(Some("koios")), Provider::Koios);
+        assert_eq!(Provider::from_env_value(Some("maestro")), Provider::Maestro);
+        assert_eq!(Provider::from_env_value(Some("none")), Provider::None);
+    }
+
+    /// Env files get hand-edited; stray case and whitespace are the
+    /// most common way a correct intent reads as a typo.
+    #[test]
+    fn parsing_tolerates_case_and_whitespace() {
+        assert_eq!(Provider::from_env_value(Some("  koios ")), Provider::Koios);
+        assert_eq!(Provider::from_env_value(Some("KOIOS")), Provider::Koios);
+        assert_eq!(Provider::from_env_value(Some("None")), Provider::None);
+        assert_eq!(
+            Provider::from_env_value(Some(" Maestro")),
+            Provider::Maestro
+        );
+    }
 }

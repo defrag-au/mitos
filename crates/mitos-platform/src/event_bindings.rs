@@ -160,6 +160,11 @@ fn typed_output_to_wit(o: mitos_data_plane::TypedOutput) -> bindings_v2::TypedOu
                 quantity: a.quantity,
             })
             .collect(),
+        // `None` at `DecodeLevel::Lean`, which is the point of carrying the
+        // level on the output: a module that reads `datum` and finds nothing
+        // cannot tell "no datum" from "not decoded" unless the caller asked
+        // for a level that resolves them.
+        datum: o.datum.map(typed_datum_to_wit),
     }
 }
 

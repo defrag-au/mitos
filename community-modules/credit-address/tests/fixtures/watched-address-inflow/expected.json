@@ -9,6 +9,9 @@
       }
     ],
     "from_address": "addr1qxvtxteraurl5n3d9eae5yyzgpx7zutzqsmx9tyhsv76wsvasazx8r5xwqtnfjsfrnat3h6yrycd2hfm9qpg7d0hf50s599tqx",
+    "input_stake_credentials": [
+      "9d8744638e86701734ca091cfab8df441930d55d3b28028f35f74d1f"
+    ],
     "lovelace": 1198180,
     "output_index": 0,
     "slot": 158943010,

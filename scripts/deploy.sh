@@ -167,7 +167,21 @@ step_build_community_modules() {
                 continue
             fi
             wasm=\"\${d}target/mitos/\${name}/\${name}.wasm\"
-            if [ -f \"\$wasm\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.rs\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.toml\" -newer \"\$wasm\" -print -quit)\" ]; then
+            # Freshness compares the module sources AND the platform WIT.
+            # The WIT is the module ABI: a record gaining a field
+            # regenerates every set of bindings, and a module built against
+            # the old shape does not load into the new host.
+            #
+            # Without the WIT here, a WIT-only change looks like a no-op to
+            # every module dir, all of them are skipped as fresh, and the
+            # host comes up new-ABI with old-ABI modules — a deployment
+            # that reports success and loads nothing.
+            #
+            # NOTE no apostrophes and no line continuations in this block:
+            # it is handed to ssh inside a single-quoted string, so either
+            # one ends the string early and the remote shell dies with
+            # "syntax error: unexpected end of file".
+            if [ -f \"\$wasm\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.rs\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.toml\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find crates/mitos-platform/wit-v2 -name \"*.wit\" -newer \"\$wasm\" -print -quit)\" ]; then
                 FRESH=\$((FRESH+1))
                 continue
             fi
