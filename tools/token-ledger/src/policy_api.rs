@@ -294,6 +294,27 @@ pub struct PolicyHub {
     /// `scheduler.rs`.
     pub(crate) sched: crate::scheduler::Scheduler,
     bearer: Option<String>,
+    /// policy → (the archive's `updated_unix` it was folded at, the table).
+    ///
+    /// # ⚠️ Cached because the fold pages EVERY movement row
+    ///
+    /// A balance is a cumulative fold over all history, so answering "who holds
+    /// it" reads the whole archive — the most expensive read in this API. The
+    /// `/live` document is rebuilt by every policy DO every 150 seconds, and
+    /// folding 31,388 rows per policy per tick to produce a number that changes
+    /// hourly is the wrong trade.
+    ///
+    /// Keyed on the archive's own `updated_unix` rather than a clock: the
+    /// answer is a pure function of the archive, so it is stale exactly when
+    /// the archive has moved and never merely because time passed.
+    holders: Mutex<HashMap<String, (u64, policy_archive::holders::Fold)>>,
+    /// policy → (archive `updated_unix`, the price + volume series).
+    ///
+    /// Cached for the same reason as [`Self::holders`] and harder: the series
+    /// folds the WHOLE archive's story, which on $NIKEPIG is 264,016
+    /// observations merged with every movement. Keyed on the archive's own
+    /// version, so it is recomputed when the archive moves and not before.
+    series: Mutex<HashMap<String, (u64, Arc<policy_archive::series::Series>)>>,
 }
 
 /// What a [`PolicyHub`] is built from.
@@ -385,6 +406,8 @@ impl PolicyHub {
             policy_index,
             sched: crate::scheduler::Scheduler::new(),
             bearer,
+            holders: Mutex::new(HashMap::new()),
+            series: Mutex::new(HashMap::new()),
         });
         crate::scheduler::spawn(Arc::clone(&hub), pool, publish);
         hub
@@ -1361,9 +1384,82 @@ pub struct PolicyLiveResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supply: Option<PolicySupplyResponse>,
     pub pools: BucketTally,
+    /// Σ held at registered burn sinks — units that exist on chain and can
+    /// never move.
+    ///
+    /// ⚠️ **The denominator of the market cap should be `minted − burned`**,
+    /// which is what every aggregator quotes. MEASURED on $PERP: we said
+    /// 227,089 ₳ against Bending's 196.26K, and the whole 15.7% was
+    /// 133,632,385 units at `$burnsnek`.
+    pub burned: String,
+    /// `supply.minted − burned`. Absent when supply could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circulating: Option<String>,
+    /// Volume, changes, all-time high and low — everything time-based, from
+    /// one fold of the series.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<StatsDto>,
     /// What could not be read, and why. Empty when both halves answered.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unreadable: Vec<String>,
+}
+
+/// The time-based statistics, from the series.
+///
+/// ⚠️ Every `change_*` is `Option` and **absent means the series does not reach
+/// back that far** — never 0%. "Unchanged over 30 days" and "this token is
+/// three days old" are different statements and a reader acts differently on
+/// them.
+#[derive(Serialize)]
+pub struct StatsDto {
+    /// Lovelace per RAW unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_1h: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_24h: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_7d: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_30d: Option<f64>,
+    pub volume_24h_lovelace: i64,
+    pub trades_24h: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_unix: Option<u64>,
+    /// How much series there is — the honest bound on everything above.
+    pub points: usize,
+    pub trades: usize,
+    /// Trades seen before any price existed, so they could not be valued. A
+    /// volume figure missing trades says so rather than looking small.
+    pub unvalued: u64,
+}
+
+impl From<policy_archive::series::Stats> for StatsDto {
+    fn from(s: policy_archive::series::Stats) -> Self {
+        StatsDto {
+            spot: s.spot,
+            change_1h: s.change_1h,
+            change_24h: s.change_24h,
+            change_7d: s.change_7d,
+            change_30d: s.change_30d,
+            volume_24h_lovelace: s.volume_24h_lovelace,
+            trades_24h: s.trades_24h,
+            high: s.high.map(|p| p.spot),
+            high_unix: s.high.map(|p| p.unix),
+            low: s.low.map(|p| p.spot),
+            low_unix: s.low.map(|p| p.unix),
+            points: s.points,
+            trades: s.trades,
+            unvalued: s.unvalued,
+        }
+    }
 }
 
 /// `GET /policy/{p}/live` — the whole document, one read.
@@ -1407,6 +1503,39 @@ pub async fn live(
         }
         None => BucketTally::default(),
     };
+    // ⚠️ CACHED — see `PolicyHub::holders`. This document is rebuilt by every
+    // policy DO every 150 s and the fold pages every movement row, so it is
+    // memoised against the archive's `updated_unix` and recomputed only when
+    // the archive has actually moved.
+    //
+    // Fail-soft: a burn total we could not compute is 0 and `circulating`
+    // falls back to `minted`, which is the figure we published before this
+    // existed — never a failed document.
+    let burned = match holders_of(&hub, &policy) {
+        Ok(fold) => burn_split(&fold).0,
+        Err(e) => {
+            tracing::warn!("policy {policy} live: burn total unreadable: {e:#}");
+            unreadable.push(format!("burned: {e:#}"));
+            0
+        }
+    };
+    let circulating = supply
+        .as_ref()
+        .map(|s| (s.minted - burned).max(0).to_string());
+
+    // ⚠️ Evaluated at the WALL CLOCK, not at the archive's tip. "24-hour
+    // volume" means the last 24 hours of the world; measuring from the tip
+    // would silently widen the window by however far behind the archive is and
+    // report a day of volume as if it were today's.
+    let stats = match series_of(&hub, &policy) {
+        Ok(s) => Some(StatsDto::from(s.stats(crate::reverse::now_unix()))),
+        Err(e) => {
+            tracing::warn!("policy {policy} live: series unreadable: {e:#}");
+            unreadable.push(format!("stats: {e:#}"));
+            None
+        }
+    };
+
     let price = priced.map(|(p, _)| p);
     Ok(Json(PolicyLiveResponse {
         policy,
@@ -1414,6 +1543,9 @@ pub async fn live(
         price,
         supply,
         pools,
+        burned: burned.to_string(),
+        circulating,
+        stats,
         unreadable,
     }))
 }
@@ -1481,6 +1613,83 @@ pub struct PolicyHoldersResponse {
     pub negative: usize,
 }
 
+/// The holder table, memoised against the archive's own `updated_unix`.
+///
+/// See [`PolicyHub::holders`] for why this is cached at all.
+fn holders_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<policy_archive::holders::Fold> {
+    let dir = hub.policy_dir(policy);
+    // The version we would be answering for. A manifest that cannot be read is
+    // an empty archive, not an error: the policy may simply never have been
+    // walked.
+    let version = archive::load_manifest(&dir)?
+        .map(|m| m.updated_unix)
+        .unwrap_or(0);
+    if let Some((at, fold)) = hub.holders.lock().expect("holders cache").get(policy)
+        && *at == version
+    {
+        return Ok(fold.clone());
+    }
+    let fold = crate::archive::build_holders(&dir)?.unwrap_or(policy_archive::holders::Fold {
+        holders: Vec::new(),
+        held: 0,
+        rows: 0,
+        negative: 0,
+    });
+    hub.holders
+        .lock()
+        .expect("holders cache")
+        .insert(policy.to_string(), (version, fold.clone()));
+    Ok(fold)
+}
+
+/// The price + volume series, memoised against the archive's `updated_unix`.
+fn series_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<Arc<policy_archive::series::Series>> {
+    let dir = hub.policy_dir(policy);
+    let version = archive::load_manifest(&dir)?
+        .map(|m| m.updated_unix)
+        .unwrap_or(0);
+    if let Some((at, s)) = hub.series.lock().expect("series cache").get(policy)
+        && *at == version
+    {
+        return Ok(Arc::clone(s));
+    }
+    let built = Arc::new(crate::archive::build_series(&dir)?.unwrap_or_default());
+    hub.series
+        .lock()
+        .expect("series cache")
+        .insert(policy.to_string(), (version, Arc::clone(&built)));
+    Ok(built)
+}
+
+/// Σ held at registered burn sinks, and what that leaves circulating.
+///
+/// ⚠️ **By payment CREDENTIAL, never by address.** A sink is a property of the
+/// SCRIPT — `$PERP` and `$Aliens` send to the same one — so it is registered as
+/// a `CredentialEntry`. `lookup_address_match` does not see it: asked about
+/// `$burnsnek` it returned nothing while happily naming venue addresses, which
+/// reported `burned: 0` on a token whose sink holds 13.4% of supply.
+fn burn_split(fold: &policy_archive::holders::Fold) -> (i64, i64) {
+    let burned: i64 = fold
+        .holders
+        .iter()
+        .filter(|h| is_burn_sink(&h.address))
+        .map(|h| h.amount)
+        .sum();
+    (burned, fold.held - burned)
+}
+
+fn is_burn_sink(address: &str) -> bool {
+    let Some((pay, _)) = policy_archive::trade::address_parts(address) else {
+        return false;
+    };
+    matches!(
+        address_registry::registry::lookup_payment_credential(&pay).map(|e| &e.category),
+        Some(address_registry::registry::AddressCategory::Script(
+            address_registry::registry::ScriptCategory::Burn { .. }
+        ))
+    )
+}
+
 pub async fn holders(
     State(hub): State<Arc<PolicyHub>>,
     headers: HeaderMap,
@@ -1489,78 +1698,54 @@ pub async fn holders(
 ) -> Result<Json<PolicyHoldersResponse>, ApiError> {
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
-    let dir = hub.policy_dir(&policy);
-    let fold = crate::archive::build_holders(&dir)
-        .map_err(internal)?
-        .unwrap_or(policy_archive::holders::Fold {
-            holders: Vec::new(),
-            held: 0,
-            rows: 0,
-            negative: 0,
-        });
+    let fold = holders_of(&hub, &policy).map_err(internal)?;
     // ⚠️ `parties` is taken BEFORE the limit. A truncated list that also
     // reported a truncated count would make a policy look concentrated
     // precisely because the caller asked for a short list.
     let parties = fold.holders.len();
     let limit = q.limit.unwrap_or(50).clamp(1, 2_000);
 
-    // ⚠️ `burned` is totalled over EVERY holder, not the returned page. A sink
-    // ranked below the limit would otherwise drop out of the total and
-    // `circulating` would depend on the page size — a number that changes with
-    // how you asked for it is not a number.
-    let mut burned: i64 = 0;
-    let mut out: Vec<HolderDto> = Vec::with_capacity(limit.min(fold.holders.len()));
-    for (rank, h) in fold.holders.into_iter().enumerate() {
-        // ⚠️ BY PAYMENT CREDENTIAL, not by address.
-        //
-        // A burn sink is registered as a `CredentialEntry` — it is a property
-        // of the SCRIPT, not of one address, and `$PERP` and `$Aliens` both
-        // send supply to this same one. `lookup_address_match` does not see it:
-        // it matched `Splash exchange` on a venue address and returned nothing
-        // for `addr1w8qmxkacj…`, so the first cut reported `burned: 0` on a
-        // token whose sink holds 13.4% of supply.
-        let cred = policy_archive::trade::address_parts(&h.address).map(|(pay, _)| pay);
-        let entry = cred
-            .as_deref()
-            .and_then(address_registry::registry::lookup_payment_credential);
-        let burn_sink = matches!(
-            entry.map(|e| &e.category),
-            Some(address_registry::registry::AddressCategory::Script(
-                address_registry::registry::ScriptCategory::Burn { .. }
-            ))
-        );
-        if burn_sink {
-            burned += h.amount;
-        }
-        if rank >= limit {
-            continue;
-        }
-        // Credential first, then the address tables — the credential is the
-        // more specific statement where both have something to say.
-        let label = entry.map(|e| e.category.to_string()).or_else(|| {
-            address_registry::registry::lookup_address_match(
-                &h.address,
-                address_registry::registry::RegistryNetwork::Mainnet,
-            )
-            .map(|(cat, _)| cat.to_string())
-        });
-        out.push(HolderDto {
-            key: h.key,
-            address: h.address,
-            amount: h.amount.to_string(),
-            movements: h.movements,
-            addresses: h.addresses,
-            label,
-            burn_sink,
-        });
-    }
+    // ⚠️ Totalled over EVERY holder, then the list is truncated — never the
+    // other way round. A sink ranked below the limit would otherwise drop out
+    // and `circulating` would depend on the page size, which is not a number.
+    let (burned, circulating) = burn_split(&fold);
+
+    let out: Vec<HolderDto> = fold
+        .holders
+        .into_iter()
+        .take(limit)
+        .map(|h| {
+            let cred = policy_archive::trade::address_parts(&h.address).map(|(pay, _)| pay);
+            let entry = cred
+                .as_deref()
+                .and_then(address_registry::registry::lookup_payment_credential);
+            // Credential first, then the address tables — the credential is
+            // the more specific statement where both have something to say.
+            let label = entry.map(|e| e.category.to_string()).or_else(|| {
+                address_registry::registry::lookup_address_match(
+                    &h.address,
+                    address_registry::registry::RegistryNetwork::Mainnet,
+                )
+                .map(|(cat, _)| cat.to_string())
+            });
+            HolderDto {
+                burn_sink: is_burn_sink(&h.address),
+                key: h.key,
+                address: h.address,
+                amount: h.amount.to_string(),
+                movements: h.movements,
+                addresses: h.addresses,
+                label,
+            }
+        })
+        .collect();
 
     Ok(Json(PolicyHoldersResponse {
         policy,
         holders: out,
         held: fold.held.to_string(),
         burned: burned.to_string(),
-        circulating: (fold.held - burned).to_string(),
+        circulating: circulating.to_string(),
         parties,
         rows: fold.rows,
         negative: fold.negative,

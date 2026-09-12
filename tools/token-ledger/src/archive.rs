@@ -1283,6 +1283,46 @@ pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>
     Ok(Some(policy_archive::holders::fold(all.into_iter())))
 }
 
+/// Fold a policy's WHOLE archive into the price + volume series.
+///
+/// ⚠️ The whole archive, not a window. An all-time high over the last 5,000
+/// movements is not an all-time high, and a 30-day change needs 30 days.
+///
+/// Built from the STORY rather than from movements and observations
+/// separately, so the merge onto one slot spine — and the intra-slot ordering
+/// that values a trade at the PRE-swap price — has exactly one definition.
+pub fn build_series(dir: &Path) -> Result<Option<policy_archive::series::Series>> {
+    let Some(mut a) = PolicyArchive::open(dir)? else {
+        return Ok(None);
+    };
+    let Some(manifest) = load_manifest(dir)? else {
+        return Ok(None);
+    };
+    let observations = read_observations(dir, &manifest)?;
+
+    let mut rows: Vec<policy_archive::FeedRow> = Vec::new();
+    let mut before: Option<u64> = None;
+    const PAGE: u32 = 5_000;
+    loop {
+        let page = a.feed_rows(PAGE, before)?;
+        let Some(oldest) = page.iter().map(|r| r.slot).min() else {
+            break;
+        };
+        rows.extend(page);
+        let next = Some(oldest);
+        if next == before {
+            break;
+        }
+        before = next;
+    }
+
+    let story = policy_archive::story::build(&rows, &observations, &venue_roles());
+    Ok(Some(policy_archive::series::fold(
+        &story,
+        &policy_archive::view::Projection::default(),
+    )))
+}
+
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
 /// or `None` when the policy has no archive. The publisher compresses at
 /// upload time and decides then whether that pays.

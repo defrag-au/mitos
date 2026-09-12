@@ -61,6 +61,9 @@ pub mod price;
 pub mod profile;
 pub mod reader;
 pub mod schema;
+/// The price + volume SERIES — ONE fold behind 24h volume, the 1h/24h/7d/30d
+/// changes, the all-time high and the all-time low. Six stats, one pass.
+pub mod series;
 /// ONE ordered stream that tells a token's story — movements and observations
 /// merged onto a single spine, so every visualisation is a FOLD over it rather
 /// than a join across endpoints.
