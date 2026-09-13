@@ -46,6 +46,9 @@ pub mod density;
 pub mod feed;
 pub mod graph;
 pub mod groups;
+/// WHO HOLDS IT — the balance table, folded from movements. The question an
+/// archive could not answer without the sqlite database beside it.
+pub mod holders;
 pub mod manifest;
 pub mod multi;
 /// What a script output HELD, decoded or not — the tier that lets a decoder
@@ -58,12 +61,23 @@ pub mod price;
 pub mod profile;
 pub mod reader;
 pub mod schema;
+/// The price + volume SERIES — ONE fold behind 24h volume, the 1h/24h/7d/30d
+/// changes, the all-time high and the all-time low. Six stats, one pass.
+pub mod series;
+/// ONE ordered stream that tells a token's story — movements and observations
+/// merged onto a single spine, so every visualisation is a FOLD over it rather
+/// than a join across endpoints.
+pub mod story;
 /// The archive's own reconciliation — `Σ amounts == Σ net_mint`, graded by how
 /// far the walk reached. Both sides come out of the same file.
 pub mod supply;
 /// Movements → TRADES: folding a swap's two or three transactions back into
 /// the one thing a person did.
 pub mod trade;
+/// **Fold once, project many** — one cumulative view of a policy's state, and
+/// the projections read off it. Every "latest state per pool" pass in this
+/// workspace was once its own, and they disagreed.
+pub mod view;
 pub mod writer;
 
 pub use bundle::{BUNDLE, BUNDLE_FORMAT, Bundle, BundledFooter};
@@ -82,6 +96,7 @@ pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
 pub use profile::{Class, Profile};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
+pub use story::{Kind as StoryKind, PoolState, Story, StoryEvent, Trader};
 pub use supply::{Balance, Because, Diagnose, Offender, Reconciler, Verdict};
 pub use writer::{ArchiveWriter, Written};
 

@@ -22,9 +22,15 @@ impl ChainDataHost for HostStateV2 {
             .iter()
             .map(into_dp_ref_owned)
             .collect::<wasmtime::Result<Vec<_>>>()?;
+        // `WithDatum`, not `Lean`: an output's datum is what says what the
+        // output is FOR, and a cold-start walk that can see value arrive but
+        // not the intent attached to it has to go back to the chain for the
+        // one thing it came for. Costs an extra redb lookup per
+        // HASH-referenced datum plus a CBOR pass; an output with no datum
+        // costs nothing extra, which is the overwhelming majority.
         let pairs = self
             .data_plane
-            .read_utxos(&dp_refs, mitos_data_plane::DecodeLevel::Lean)
+            .read_utxos(&dp_refs, mitos_data_plane::DecodeLevel::WithDatum)
             .await
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         // Each output carries its own ref — the data plane
@@ -311,6 +317,9 @@ fn empty_typed_output() -> bindings_v2::TypedOutput {
         address: String::new(),
         lovelace: 0,
         assets: Vec::new(),
+        // Nothing was resolved, so there is nothing to say about a datum.
+        // The empty address is the sentinel a module checks.
+        datum: None,
     }
 }
 
@@ -366,6 +375,7 @@ fn typed_output_to_wit(o: mitos_data_plane::TypedOutput) -> bindings_v2::TypedOu
                 quantity: a.quantity,
             })
             .collect(),
+        datum: o.datum.map(typed_datum_to_wit),
     }
 }
 
@@ -430,5 +440,9 @@ fn from_dp_output(o: mitos_data_plane::TypedOutput) -> WitTypedOutput {
                 quantity: a.quantity,
             })
             .collect(),
+        // This is the `read-utxos` and `tx-record` route — the two that had
+        // no way to reach a datum before, which is the whole reason the
+        // field exists.
+        datum: o.datum.map(typed_datum_to_wit),
     }
 }

@@ -96,7 +96,10 @@ impl OutputObserver for LaunchpadObserver {
         }
         let pool = datum.and_then(mitos_launchpad_decode::decode_bonding_datum);
         Some(Decoded {
-            venue: "snek.fun".to_string(),
+            // From the constant, not a literal: the trade fold names the same
+            // curve from `venue::SNEK_FUN`, and two spellings would stop a
+            // curve state and a curve fill joining.
+            venue: mitos_dex_decode::venue::SNEK_FUN.to_string(),
             key_policy: pool
                 .as_ref()
                 .map(|p| p.pool_nft.policy.clone())

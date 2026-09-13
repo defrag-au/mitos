@@ -1023,11 +1023,30 @@ pub fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> Typ
                 .collect::<Vec<_>>()
         })
         .collect();
+    // INLINE datums are carried unconditionally: they live in the output's
+    // own bytes, so projecting one costs a CBOR decode and no lookup at all.
+    // A HASH-referenced datum is the thing `DecodeLevel::WithDatum` names —
+    // it needs the witness-set / state read this free function has no domain
+    // handle for — so it stays `None` here and `decoded_at` stays `Lean`
+    // rather than overstating what was resolved.
+    let datum = match output.datum() {
+        Some(DatumOption::Data(cbor_wrap)) => {
+            let raw = cbor_wrap.0.raw_cbor().to_vec();
+            let payload = pallas::codec::minicbor::decode::<PlutusData>(&raw).ok();
+            Some(TypedDatum {
+                hash: cbor_wrap.0.original_hash(),
+                payload,
+                original_cbor: Some(raw),
+            })
+        }
+        _ => None,
+    };
+
     TypedOutput {
         address,
         lovelace,
         assets,
-        datum: None,
+        datum,
         script_ref: None,
         original_cbor: None,
         decoded_at: DecodeLevel::Lean,

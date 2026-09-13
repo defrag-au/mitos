@@ -410,9 +410,13 @@ impl Manifest {
         let mut out = self.files_from(&self.passes.iter().collect::<Vec<_>>());
         // Observations ride the FULL list — what gets published and pruned —
         // but never the rollup's, below.
+        //
+        // ⚠️ Through [`PassEntry::observations_path`], NOT a `{dir}/{file}`
+        // join: a ROLLED-UP pass no longer has a directory, and joining one
+        // named a path that `remove_dir_all` had already taken.
         for p in &self.passes {
-            if let Some(f) = &p.observations {
-                out.push((format!("{}/{}", p.dir, f.file), FileKind::Observations));
+            if let Some(rel) = p.observations_path() {
+                out.push((rel, FileKind::Observations));
             }
         }
         out
@@ -604,6 +608,38 @@ impl PassEntry {
     /// while names are unique.
     pub fn tip_dir_name(seq: u32) -> String {
         format!("tip-{seq:04}")
+    }
+
+    /// Where this pass's observations are, relative to the policy directory —
+    /// or `None` if it recorded none.
+    ///
+    /// # ⚠️ A ROLLED-UP PASS HAS NO DIRECTORY
+    ///
+    /// The rollup folds movement parquets and then removes the pass
+    /// directories whole. Observations are deliberately NOT folded (different
+    /// schema), so they are MOVED to the policy root first and this method is
+    /// the only thing that knows which of the two shapes applies.
+    ///
+    /// MEASURED, and the reason this is a method rather than a `join` at each
+    /// call site: $PERP's manifest named `pass-0000/observations.parquet` with
+    /// 8,257 rows after `remove_dir_all` had taken the directory. Every reader
+    /// skipped the missing file without a word, so `/price` answered
+    /// `observations: 0`, `/story` carried no pool state at all, and the token
+    /// band rendered a policy that trades on three venues as if it had never
+    /// been priced.
+    pub fn observations_path(&self) -> Option<String> {
+        let f = self.observations.as_ref()?;
+        Some(match self.rolled_up {
+            true => f.file.clone(),
+            false => format!("{}/{}", self.dir, f.file),
+        })
+    }
+
+    /// The name a rolled-up pass's observations take at the policy root. The
+    /// pass `seq` stays in it, so no two passes collide and the file can still
+    /// be traced back to the walk that wrote it.
+    pub fn rolled_observations_name(seq: u32) -> String {
+        format!("observations-{seq:04}.parquet")
     }
 }
 

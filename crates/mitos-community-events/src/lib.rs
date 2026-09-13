@@ -102,6 +102,9 @@ mod decode_tests {
                 asset_name_hex: "b".repeat(8),
                 quantity: 1,
             }],
+            datum: Some(vec![0xd8, 0x79, 0x80]),
+            input_stake_credentials: vec!["e".repeat(56)],
+            inputs_unresolved: 1,
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&credit, &mut buf).unwrap();
@@ -113,6 +116,8 @@ mod decode_tests {
         assert_eq!(parsed["from_address"], "addr_test1payer");
         assert_eq!(parsed["slot"], 125_000_000u64);
         assert_eq!(parsed["assets"][0]["quantity"], 1);
+        assert_eq!(parsed["input_stake_credentials"][0], "e".repeat(56));
+        assert_eq!(parsed["inputs_unresolved"], 1);
     }
 
     #[test]

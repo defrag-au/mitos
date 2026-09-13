@@ -1756,6 +1756,29 @@ impl Scan<'_> {
 /// index's coverage ends.
 ///
 /// `blocks` must be NEWEST FIRST and already gated.
+/// Scan loose blocks — the volatile tail — into segments.
+///
+/// `observations` collects pool and curve sightings. ⚠️ **Pass one.**
+///
+/// # ⚠️ The tail used to observe NOTHING, and it made the price a day stale
+///
+/// The original reasoning was that anything observed here would be written
+/// again by the immutable pass that later covers the same slots, so the tail
+/// could skip it. True, and the wrong conclusion: the tail is the ONLY thing
+/// covering `[immutable_tip, chain_tip)`, which is up to a day wide, so
+/// skipping observations there meant **no pool state for the most recent day**.
+///
+/// MEASURED on $PERP (2026-09-11): the newest FILL sat at slot 197,530,378 and
+/// the newest POOL STATE at 197,416,293 — **31.7 hours earlier**. A fill spends
+/// and recreates a pool UTxO, so the state existed and was simply not recorded.
+/// The published spot was a day and a half old while the feed showed the trades
+/// that moved it.
+///
+/// Writing them twice is harmless and was never the objection: the tail is a
+/// single volatile entry REPLACED whole, and a duplicate sighting of one pool
+/// at one slot folds to the same answer — `PolicyView` keys by pool and takes
+/// the max by `(slot, tx_hash)`.
+#[allow(clippy::too_many_arguments)]
 pub fn scan_blocks(
     blocks: Vec<(u64, Vec<u8>)>,
     policy: &[u8],
@@ -1764,7 +1787,9 @@ pub fn scan_blocks(
     ceiling: u64,
     writer: &mut SegmentWriter,
     resolver: Option<&tx_index::Index>,
+    observations: &mut Vec<policy_archive::Observation>,
 ) -> Result<Outcome> {
+    let observers = crate::observer::default_observers();
     // The tail carries NO state between refreshes: it is re-derived whole
     // every time, because it is replaced whole every time. So a fresh
     // pending set, and whatever it cannot settle is an honest gap rather
@@ -1787,12 +1812,10 @@ pub fn scan_blocks(
         profile: policy_archive::Profile::default(),
         units_seen: std::collections::HashSet::new(),
         fungible_units: std::collections::HashSet::new(),
-        // The chain tail is re-derived whole on every refresh, so anything
-        // observed here would be written again by the immutable pass that
-        // later covers the same slots. Observations come from the archive's
-        // own passes only.
-        observers: None,
-        observations: None,
+        // ⚠️ The tail OBSERVES. It is the only cover for the volatile range,
+        // so skipping this left the price a day stale — see the fn header.
+        observers: Some(&observers),
+        observations: Some(observations),
     };
     // The rows went to the writer; nothing here needs them a second time.
     scan.blocks(blocks, floor, ceiling)?;

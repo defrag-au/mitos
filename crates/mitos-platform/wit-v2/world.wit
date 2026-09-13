@@ -73,6 +73,21 @@ interface types {
         address: string,
         lovelace: u64,
         assets: list<asset-entry>,
+        /// Datum carried by this output, if any.
+        ///
+        /// Added because an output's datum is the only thing that says what
+        /// the output is FOR, and two routes had no way to reach it:
+        /// `read-utxos` and `tx-record.outputs` both hand back a
+        /// `typed-output`, so a cold-start walk or an archive lookup could
+        /// see value arrive and never see the intent attached to it. The
+        /// host already resolved it — the conversion to WIT simply dropped
+        /// it on the floor.
+        ///
+        /// On a DISPATCHED event this is the same datum as the event's own
+        /// field (`produced-event.datum`, `consumed-event.prior-datum`);
+        /// both are populated, and either may be read. The event-level
+        /// fields are kept because every existing module uses them.
+        datum: option<typed-datum>,
     }
 
     /// Where on chain we are. Variant so we can represent

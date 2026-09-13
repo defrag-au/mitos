@@ -94,6 +94,39 @@ pub fn is_snek_fun_curve(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &BONDING_CURVE_CRED
 }
 
+/// Payment credential of snek.fun's ORDER contract — where a buy or sell
+/// waits before a batcher spends it into the curve.
+///
+/// # Why this is here and not in `mitos-dex-decode`
+///
+/// The curve is a launchpad, not a DEX, and its order contract belongs beside
+/// it. `venue::SITES` deliberately covers DEX contracts only; the launchpad's
+/// two credentials are registered together by the consumer.
+///
+/// # ⚠️ It is snek.fun's OWN contract, not an aggregator's
+///
+/// Established rather than assumed, because naming a router after one of the
+/// venues it routes to would be exactly the mislabelling this workspace keeps
+/// hitting. MEASURED: of the first **20 transactions that spend this
+/// contract, 20 consume [`BONDING_CURVE_CRED`] and nothing else** — it routes
+/// to one pool, so it is that pool's order contract.
+///
+/// # ⚠️ The STAKE part names the trader
+///
+/// Like Sundae and unlike CSwap, the trader's own stake credential is composed
+/// onto this script: **144 outputs across 66 distinct addresses** on $Aliens.
+/// So a snek.fun order leg can say who placed it.
+///
+/// Found from `1f489de2…` (a placement) and `7727a852…` (its fill).
+pub const ORDER_CRED: [u8; 28] = [
+    0xd9, 0x14, 0x3a, 0xc6, 0x34, 0x73, 0xb1, 0x7a, 0x21, 0x5d, 0x1b, 0x74, 0x84, 0xdf, 0xb6, 0xac,
+    0x6b, 0x4a, 0x00, 0x05, 0xbe, 0xb0, 0xe2, 0x6a, 0x6c, 0xa0, 0x2c, 0x96,
+];
+
+pub fn is_snek_fun_order(payment_cred: &[u8; 28]) -> bool {
+    payment_cred == &ORDER_CRED
+}
+
 /// An asset as the bonding datum spells it. ADA is the empty policy with the
 /// empty name — the same convention every DEX datum here uses.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -336,5 +369,26 @@ mod tests {
         assert!(decode_bonding_datum(&[]).is_none());
         // `Constr 0 [Int 1]` — valid PlutusData, not a bonding pool.
         assert!(decode_bonding_datum(&hex::decode("d8799f01ff").unwrap()).is_none());
+    }
+
+    /// Both snek.fun credentials, pinned as HEX so they can be checked against
+    /// a block explorer — the only way anyone will ever verify them.
+    ///
+    /// ⚠️ The CURVE and the ORDER are different contracts. Registering one as
+    /// the other turns every placement into a swap, or every swap into an
+    /// intention, from the same movement.
+    #[test]
+    fn the_curve_and_the_order_are_distinct_contracts() {
+        assert_eq!(
+            hex::encode(BONDING_CURVE_CRED),
+            "905ab869961b094f1b8197278cfe15b45cbe49fa8f32c6b014f85a2d",
+        );
+        assert_eq!(
+            hex::encode(ORDER_CRED),
+            "d9143ac63473b17a215d1b7484dfb6ac6b4a0005beb0e26a6ca02c96",
+        );
+        assert_ne!(BONDING_CURVE_CRED, ORDER_CRED);
+        assert!(is_snek_fun_curve(&BONDING_CURVE_CRED) && !is_snek_fun_order(&BONDING_CURVE_CRED));
+        assert!(is_snek_fun_order(&ORDER_CRED) && !is_snek_fun_curve(&ORDER_CRED));
     }
 }

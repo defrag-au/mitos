@@ -372,6 +372,29 @@ pub fn rollup(
         .iter_mut()
         .filter(|p| p.kind == crate::archive::RangeKind::Immutable)
     {
+        // ⚠️ OBSERVATIONS ARE NOT FOLDED, SO THEY MUST BE MOVED.
+        //
+        // The merge above takes movement parquets only — an observation is a
+        // different schema and merging it into one would corrupt both. The
+        // prune below then removes the pass DIRECTORY whole, so anything left
+        // in it goes with it. `pending` was already carried out for exactly
+        // this reason; observations were not, and 8,257 of $PERP's were
+        // deleted by a routine rollup while the manifest went on naming them.
+        //
+        // Moved BEFORE `rolled_up` flips, because that flag is what
+        // `observations_path` reads to decide which of the two shapes to
+        // return.
+        if let Some(f) = pass.observations.as_mut() {
+            let from = dir.join(&pass.dir).join(&f.file);
+            let name = crate::archive::PassEntry::rolled_observations_name(pass.seq);
+            if from.exists() {
+                // Rename, not copy: an observations file is the only record
+                // of what a walk saw at a script address, and a half-copy that
+                // then loses its source is unrecoverable without re-walking.
+                std::fs::rename(&from, dir.join(&name))?;
+                f.file = name;
+            }
+        }
         pass.rolled_up = true;
     }
     manifest.rolled_up_through = manifest.latest_pass().map(|p| p.seq);
@@ -447,6 +470,136 @@ pub fn run_rollup(args: RollupArgs) -> Result<()> {
             t.elapsed().as_secs_f64()
         ),
     }
+    Ok(())
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RepairObservationsArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// One policy, or every policy under the root when absent.
+    #[arg(long)]
+    pub policy: Option<String>,
+    /// Actually rewrite the manifests. Absent, it only reports.
+    #[arg(long)]
+    pub apply: bool,
+    /// Clear an observations entry whose file cannot be found ANYWHERE.
+    ///
+    /// ⚠️ That is a deletion of the record that a walk once saw those rows,
+    /// and it is opt-in for that reason. The alternative — re-walking the
+    /// pass's range — recovers the rows themselves and is what you want unless
+    /// the range is trivial.
+    #[arg(long)]
+    pub forget_missing: bool,
+}
+
+/// `token-ledger repair-observations` — repoint manifests at the observations
+/// files a pre-fix rollup left stranded.
+///
+/// # What went wrong
+///
+/// A rollup folds movement parquets and then removed the pass DIRECTORY whole.
+/// Observations are not folded — a different schema — so they went with the
+/// directory while the manifest carried on naming `pass-NNNN/observations.
+/// parquet`. Two things followed, and the second is the loud one:
+///
+/// - every reader skipped the missing file in silence, so `/price` answered
+///   `observations: 0` and `/story` carried no pool state;
+/// - the PUBLISHER `stat`s what the manifest names, so publishing failed at
+///   its first step and R2 and KV froze at the last good tick.
+///
+/// The freeze is what makes recovery cheap: the prune never ran, so R2 still
+/// holds the pre-rollup copies. Restore them beside the archive as
+/// `observations-NNNN.parquet` and this repoints the manifest at them.
+pub fn run_repair_observations(args: RepairObservationsArgs) -> Result<()> {
+    let dirs: Vec<PathBuf> = match &args.policy {
+        Some(p) => vec![crate::archive::policy_dir(
+            &args.archive_dir,
+            &p.to_lowercase(),
+        )],
+        None => {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(&args.archive_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.join("manifest.json").exists())
+                .collect();
+            v.sort();
+            v
+        }
+    };
+
+    let (mut repointed, mut missing, mut ok) = (0usize, 0usize, 0usize);
+    for dir in &dirs {
+        let Some(mut manifest) = crate::archive::load_manifest(dir)? else {
+            continue;
+        };
+        let policy = manifest.policy.clone();
+        let mut changed = false;
+        for pass in manifest.passes.iter_mut() {
+            let Some(entry) = pass.observations.as_mut() else {
+                continue;
+            };
+            let named = match pass.rolled_up {
+                true => entry.file.clone(),
+                false => format!("{}/{}", pass.dir, entry.file),
+            };
+            if dir.join(&named).exists() {
+                ok += 1;
+                continue;
+            }
+            // The rolled name at the root — where the fixed rollup puts it,
+            // and where a restore from R2 should land.
+            let rolled = crate::archive::PassEntry::rolled_observations_name(pass.seq);
+            // Or still in the pass directory, if the prune never reached it.
+            let in_pass = format!("{}/{}", pass.dir, policy_archive::OBSERVATIONS);
+            let found = [rolled.clone(), in_pass.clone()]
+                .into_iter()
+                .find(|c| dir.join(c).exists());
+            match found {
+                Some(at) => {
+                    println!("{policy} pass {}: {named} → {at}", pass.seq);
+                    if args.apply {
+                        // Land it at the rolled name so the next rollup is a
+                        // no-op rather than another move.
+                        if at == in_pass {
+                            std::fs::rename(dir.join(&at), dir.join(&rolled))?;
+                        }
+                        entry.file = rolled;
+                        pass.rolled_up = true;
+                    }
+                    repointed += 1;
+                    changed = true;
+                }
+                None => {
+                    println!(
+                        "{policy} pass {}: {named} MISSING — {} rows unrecoverable \
+                         from disk; restore from R2 (`policy-archive/{policy}/{in_pass}`) \
+                         or re-walk [{}, {})",
+                        pass.seq, entry.rows, pass.floor, pass.ceiling,
+                    );
+                    missing += 1;
+                    if args.apply && args.forget_missing {
+                        pass.observations = None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed && args.apply {
+            crate::archive::store_manifest(dir, &manifest)?;
+            crate::archive::store_bundle(dir, &manifest)?;
+        }
+    }
+
+    println!(
+        "\n{} archive(s): {ok} already correct, {repointed} repointed, {missing} missing{}",
+        dirs.len(),
+        match args.apply {
+            true => "",
+            false => " — REPORT ONLY, pass --apply to write",
+        }
+    );
     Ok(())
 }
 
@@ -1009,6 +1162,143 @@ mod tests {
             a.feed_rows(10, None).unwrap(),
             before,
             "a re-fold changes the count, never the history"
+        );
+    }
+
+    /// ⚠️ THE DEFECT THAT EMPTIED THE INTERPRETIVE TIER, pinned.
+    ///
+    /// A rollup folds MOVEMENT parquets. It does not fold observations — a
+    /// different schema — and then it removed the pass directory whole, taking
+    /// the observations with it while the manifest went on naming
+    /// `pass-0000/observations.parquet`.
+    ///
+    /// Every reader skipped the missing file in silence. MEASURED on $PERP:
+    /// 8,257 observations deleted, `/price` answering `observations: 0`,
+    /// `/story` carrying no pool state at all, and a token trading on cswap,
+    /// minswap-v2 and splash rendering as though it had never been priced.
+    ///
+    /// Movements survive a rollup because they are merged. Observations
+    /// survive it because they are MOVED. Neither may simply disappear.
+    #[test]
+    fn a_rollup_carries_observations_out_of_the_pass_directory() {
+        use crate::archive::{Manifest, PassEntry, store_manifest};
+        use policy_archive::{Observation, ObservationWriter};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut manifest = Manifest::new(&"ab".repeat(28));
+
+        let mut entries = Vec::new();
+        for seq in [0u32, 1] {
+            let pd = dir.join(PassEntry::dir_name(seq));
+            std::fs::create_dir_all(&pd).unwrap();
+            let mvs = write_file(
+                &pd.join(crate::archive::MOVEMENTS),
+                &stamp(),
+                vec![mv(500 + seq as u64, seq as u8 + 1, "A", "alice", 1, 0)],
+            )
+            .unwrap();
+
+            let sink = std::fs::File::create(pd.join(policy_archive::OBSERVATIONS)).unwrap();
+            let mut w = ObservationWriter::new(sink, &stamp()).unwrap();
+            w.push(Observation {
+                slot: 500 + seq as u64,
+                block_time: 1_700_000_000,
+                tx_hash: vec![seq as u8; 32],
+                address: format!("addr_pool_{seq}"),
+                lovelace: 29_121_000_000,
+                unit_name: b"A".to_vec(),
+                unit_amount: 1_000,
+                datum: None,
+                decoded: None,
+            });
+            w.close().unwrap();
+
+            entries.push((seq, mvs));
+        }
+        for (seq, mvs) in entries {
+            manifest.passes.push(PassEntry {
+                seq,
+                dir: PassEntry::dir_name(seq),
+                ceiling: 1_000,
+                floor: 400,
+                windows: Vec::new(),
+                kind: crate::archive::RangeKind::Immutable,
+                rolled_up: false,
+                movements: Some(mvs),
+                corrections: None,
+                observations: Some(crate::archive::FileEntry {
+                    file: policy_archive::OBSERVATIONS.to_string(),
+                    rows: 1,
+                    min_slot: Some(500),
+                    max_slot: Some(501),
+                    units: 0,
+                }),
+                segments: Vec::new(),
+                pending: 0,
+                found: 0,
+                written: 0,
+                backfilled: 0,
+                units: 0,
+                secs: 0.0,
+                written_unix: 0,
+            });
+        }
+        store_manifest(dir, &manifest).unwrap();
+
+        let before = crate::archive::read_observations(dir, &manifest).unwrap();
+        assert_eq!(before.len(), 2);
+
+        rollup(dir, &mut manifest, 7, RollupReason::Routine).unwrap();
+
+        assert!(
+            !dir.join(PassEntry::dir_name(0)).exists(),
+            "the pass directories still go — the movements are folded"
+        );
+        // The manifest points at where the file ACTUALLY is…
+        for p in &manifest.passes {
+            let rel = p.observations_path().expect("still named");
+            assert!(
+                dir.join(&rel).exists(),
+                "manifest names {rel} and it is not on disk",
+            );
+        }
+        // …and the rows read back identically.
+        let after = crate::archive::read_observations(dir, &manifest).unwrap();
+        assert_eq!(
+            after, before,
+            "a rollup moves observations, never eats them"
+        );
+
+        // They stay PUBLISHED, too: what the manifest does not name, the
+        // publisher never uploads and the pruner deletes.
+        assert!(
+            manifest
+                .files()
+                .iter()
+                .filter(|(_, k)| *k == FileKind::Observations)
+                .count()
+                == 2,
+            "both passes' observations are still named: {:?}",
+            manifest.files()
+        );
+        // And never as an input to the next merge — that would hand a
+        // movement reader observation columns.
+        assert!(
+            !manifest
+                .immutable_files()
+                .iter()
+                .any(|(_, k)| *k == FileKind::Observations),
+        );
+
+        // A SECOND rollup must not lose them either: the files are at the
+        // root now, and `rename` on a path that has already moved is a no-op
+        // rather than a deletion.
+        rollup(dir, &mut manifest, 8, RollupReason::Forced).unwrap();
+        assert_eq!(
+            crate::archive::read_observations(dir, &manifest).unwrap(),
+            before,
+            "re-folding an already-folded archive keeps them",
         );
     }
 }

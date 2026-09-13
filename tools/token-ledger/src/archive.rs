@@ -1250,6 +1250,79 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
     }))
 }
 
+/// Fold every movement in an archive into a holder table.
+///
+/// ⚠️ Pages the WHOLE archive, newest-first, exactly as [`build_graph`] does —
+/// a balance is a cumulative fold over all history, and a page of it is not a
+/// smaller version of the answer, it is a different and wrong one.
+///
+/// Costs one pass over the movement rows: $PERP is 15,258 of them, $NIKEPIG's
+/// archive rather more. That is why the result is worth caching upstream and
+/// why the route below takes a `limit` on the OUTPUT rather than the input.
+pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>> {
+    let Some(mut a) = PolicyArchive::open(dir)? else {
+        return Ok(None);
+    };
+    let mut all: Vec<policy_archive::Movement> = Vec::new();
+    let mut before: Option<u64> = None;
+    const PAGE: u32 = 5_000;
+    loop {
+        let page = a.movements_page(PAGE, before)?;
+        let Some(oldest) = page.iter().map(|m| m.slot).min() else {
+            break;
+        };
+        all.extend(page);
+        let next = Some(oldest);
+        // A page that does not advance ends the walk — which also guards the
+        // pathological case of one slot holding more rows than a page.
+        if next == before {
+            break;
+        }
+        before = next;
+    }
+    Ok(Some(policy_archive::holders::fold(all.into_iter())))
+}
+
+/// Fold a policy's WHOLE archive into the price + volume series.
+///
+/// ⚠️ The whole archive, not a window. An all-time high over the last 5,000
+/// movements is not an all-time high, and a 30-day change needs 30 days.
+///
+/// Built from the STORY rather than from movements and observations
+/// separately, so the merge onto one slot spine — and the intra-slot ordering
+/// that values a trade at the PRE-swap price — has exactly one definition.
+pub fn build_series(dir: &Path) -> Result<Option<policy_archive::series::Series>> {
+    let Some(mut a) = PolicyArchive::open(dir)? else {
+        return Ok(None);
+    };
+    let Some(manifest) = load_manifest(dir)? else {
+        return Ok(None);
+    };
+    let observations = read_observations(dir, &manifest)?;
+
+    let mut rows: Vec<policy_archive::FeedRow> = Vec::new();
+    let mut before: Option<u64> = None;
+    const PAGE: u32 = 5_000;
+    loop {
+        let page = a.feed_rows(PAGE, before)?;
+        let Some(oldest) = page.iter().map(|r| r.slot).min() else {
+            break;
+        };
+        rows.extend(page);
+        let next = Some(oldest);
+        if next == before {
+            break;
+        }
+        before = next;
+    }
+
+    let story = policy_archive::story::build(&rows, &observations, &venue_roles());
+    Ok(Some(policy_archive::series::fold(
+        &story,
+        &policy_archive::view::Projection::default(),
+    )))
+}
+
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
 /// or `None` when the policy has no archive. The publisher compresses at
 /// upload time and decides then whether that pays.
@@ -1601,7 +1674,8 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
     let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
     let mut named = 0usize;
     let mut unnamed_by_venue = 0usize;
-    for (_, _, e) in &folded {
+    for f in &folded {
+        let e = &f.event;
         let k = match e {
             Event::Fill { party, .. } => {
                 match party {
@@ -1647,52 +1721,120 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
 /// than `address-registry`, because only the decode crate distinguishes a
 /// pool from an order contract: the registry records both as
 /// `Exchange { label }`.
-fn venue_roles() -> policy_archive::trade::Roles {
-    use mitos_dex_decode::{cswap, minswap, splash};
+pub fn venue_roles() -> policy_archive::trade::Roles {
+    use mitos_dex_decode::venue::{self, SiteKey, SiteRole};
     use policy_archive::trade::{OrderKeying, Role, Roles};
 
     let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let mut r = Roles::default();
-    for c in splash::POOL_CREDS {
-        r.roles.insert(hex(&c), Role::Pool);
-    }
-    r.roles.insert(hex(&minswap::V1_PAYMENT_CRED), Role::Pool);
-    r.roles.insert(hex(&minswap::V2_PAYMENT_CRED), Role::Pool);
-    r.roles.insert(hex(&splash::ORDER_CRED), Role::Order);
-    r.roles.insert(hex(&minswap::V2_ORDER_CRED), Role::Order);
-    r.roles.insert(hex(&cswap::ORDER_CRED), Role::Order);
-    // CSwap's order contract is ONE address for every trader, so a fill spent
-    // from it cannot name who traded. Stated by the decode crate, not assumed.
-    if cswap::ORDER_IS_SHARED_ADDRESS {
-        r.keying
-            .insert(hex(&cswap::ORDER_CRED), OrderKeying::Shared);
-    }
-    // CSwap's pool and the snek.fun curve are addresses rather than creds
-    // upstream; derive them the same way every other consumer must.
-    for (addr, role) in [
-        (cswap::POOL_SCRIPT_ADDR, Role::Pool),
-        (mitos_launchpad_decode::BONDING_CURVE_ADDR, Role::Curve),
-    ] {
-        if let Some((cred, _)) = policy_archive::trade::address_parts(addr) {
-            r.roles.insert(cred, role);
+
+    // ⚠️ FROM THE REGISTRY, never a second hand-written list.
+    //
+    // This function USED to enumerate the venues itself, and it named four
+    // where `mitos-pool-observe::recognise` decodes seven. The observation
+    // side and the fold side are two readings of the same contracts, and two
+    // lists of the same thing drift.
+    //
+    // MEASURED on $DONUT: 765 SundaeSwap V3 pool states holding 6,028 ₳, and
+    // every one of its swaps classified as a plain transfer, because Sundae's
+    // credential was in one list and not the other. `venue::SITES` is now the
+    // only list, and `every_recognised_pool_contract_has_a_site` fails the
+    // build if a decoder is added without one.
+    for site in venue::SITES {
+        let role = match site.role {
+            SiteRole::Pool => Role::Pool,
+            SiteRole::Order => Role::Order,
+        };
+        let cred = match site.key {
+            SiteKey::Cred(c) => Some(hex(&c)),
+            // An address-keyed site still registers by CREDENTIAL — the fold
+            // matches on the payment part, and deriving it here is what every
+            // other consumer must do too.
+            SiteKey::Address(a) => policy_archive::trade::address_parts(a).map(|(c, _)| c),
+        };
+        let Some(cred) = cred else {
+            continue;
+        };
+        // A contract that serves every trader through ONE address cannot name
+        // who traded. Declared by the registry rather than assumed here.
+        if site.shared {
+            r.keying.insert(cred.clone(), OrderKeying::Shared);
         }
+        r.register(cred, role, site.venue);
     }
+
+    // The LAUNCHPAD's two contracts. A different crate — snek.fun is not a
+    // DEX — and the curve takes `Role::Curve` rather than `Role::Pool`,
+    // because its price is not `x·y=k`.
+    //
+    // ⚠️ Registering the ORDER contract is what turns a wallet's payment into
+    // a PLACEMENT and the batcher's spend into a FILL. Without it both read as
+    // plain transfers, and $Aliens carried 144 of them as "unclaimed".
+    if let Some((cred, _)) =
+        policy_archive::trade::address_parts(mitos_launchpad_decode::BONDING_CURVE_ADDR)
+    {
+        r.register(cred, Role::Curve, venue::SNEK_FUN);
+    }
+    r.register(
+        hex(&mitos_launchpad_decode::ORDER_CRED),
+        Role::Order,
+        venue::SNEK_FUN,
+    );
     r
 }
 
 /// What the observation tier adds to a policy: who was decoded, what was kept
 /// undecoded, and the price the archive can defend at its own tip.
-fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
+/// Every observation the archive holds, across its passes.
+///
+/// ⚠️ Read from the pass directories rather than through `PolicyArchive`,
+/// which deliberately skips `FileKind::Observations` — a different schema, and
+/// `kind_of`'s fallthrough is `Movements`, so handing one to a movements
+/// reader is a decode error rather than a skip.
+///
+/// Shared by the CLI report and the `/policy/{p}/price` route so the two
+/// cannot drift into pricing from different row sets.
+/// Every observation the archive holds, from wherever the manifest says it is.
+///
+/// # ⚠️ A NAMED FILE THAT IS MISSING IS AN ERROR, NOT A ZERO
+///
+/// This used to `continue` past a path that did not exist, and that silence
+/// cost the whole interpretive tier: a routine rollup removed the pass
+/// directories while the manifest went on naming `pass-0000/observations.
+/// parquet`, so `/price` answered `observations: 0`, `/story` carried no pool
+/// state, and a token trading on three venues rendered as if it had never been
+/// priced. Nothing anywhere said a file was missing.
+///
+/// A pass that recorded no observations names none, which is the honest zero
+/// and still returns nothing. A pass that names one and cannot produce it is
+/// a broken archive and now says so.
+pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive::Observation>> {
     let mut rows: Vec<policy_archive::Observation> = Vec::new();
-    let mut bytes = 0u64;
     for p in &m.passes {
-        let path = dir.join(&p.dir).join(policy_archive::OBSERVATIONS);
-        if !path.exists() {
+        let Some(rel) = p.observations_path() else {
             continue;
-        }
-        bytes += std::fs::metadata(&path).map(|f| f.len()).unwrap_or(0);
-        rows.extend(policy_archive::read_all(&std::fs::read(&path)?)?);
+        };
+        let path = dir.join(&rel);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "pass {} names {rel} and it is not there — the archive is \
+                 incomplete and needs re-walking, not reading",
+                p.seq,
+            )
+        })?;
+        rows.extend(policy_archive::read_all(&bytes)?);
     }
+    Ok(rows)
+}
+
+fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
+    let rows = read_observations(dir, m)?;
+    let bytes: u64 = m
+        .passes
+        .iter()
+        .filter_map(|p| std::fs::metadata(dir.join(&p.dir).join(policy_archive::OBSERVATIONS)).ok())
+        .map(|f| f.len())
+        .sum();
     if rows.is_empty() {
         return Ok(());
     }
@@ -1717,7 +1859,10 @@ fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
     // this is the last figure the archive can defend rather than an estimate
     // of "now".
     let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
-    let spot = policy_archive::spot_at(&rows, at);
+    // ONE fold, then every projection below reads off it — the price, the
+    // depth notes and the per-pool table all describe the same state.
+    let view = policy_archive::view::PolicyView::from_observations(&rows);
+    let spot = view.spot(at, &policy_archive::view::Projection::default());
     match spot.ada.as_ref() {
         Some(d) => {
             println!(
@@ -1728,17 +1873,120 @@ fn report_observations(dir: &Path, m: &Manifest) -> Result<()> {
                 d.base,
                 d.quote
             );
-            if !d.any_pool_above(policy_archive::price::DEFAULT_FLOOR_LOVELACE) {
+            let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
+            if !d.any_pool_above(floor) {
                 println!(
-                    "  ⚠ every contributing pool is below the {} ADA depth floor — the \
-                     aggregate is still the right sum, but no single pool here is worth \
-                     quoting on its own",
-                    policy_archive::price::DEFAULT_FLOOR_LOVELACE / 1_000_000
+                    "  ⚠ NOT ONE contributing pool clears the {} ADA depth floor — the \
+                     aggregate is still the right sum, but nothing here is worth quoting \
+                     on its own",
+                    floor / 1_000_000
+                );
+            } else if !d.all_pools_above(floor) {
+                // ⚠️ A DIFFERENT AND MUCH MILDER STATEMENT, and conflating the
+                // two is what made $NIKEPIG — 54,853 ₳ deep on Minswap V2 —
+                // report that nothing could be traded at this price.
+                println!(
+                    "  note: the thinnest contributing pool holds {} lovelace, under the \
+                     {} ADA floor; its reserves count toward the sum but its own price \
+                     would not be worth quoting",
+                    d.thinnest,
+                    floor / 1_000_000
                 );
             }
         }
         // Undefined, never zero.
         None => println!("price       UNDEFINED at slot {at} — no ADA-paired pool observed"),
+    }
+
+    // ⚠️ EVERY CONTRIBUTING POOL, WITH THE SLOT IT WAS LAST SEEN AT.
+    //
+    // The aggregate above sums each pool's LAST observation, whenever that
+    // was, because an observation is only written when the pool's UTxO is
+    // touched WHILE HOLDING the asset. A pool whose liquidity was withdrawn
+    // stops being observed at the moment BEFORE it emptied — so its final,
+    // full reserves sit in the sum for ever, priced at whatever the token was
+    // worth then.
+    //
+    // That is invisible in an aggregate and obvious in this table, which is
+    // the only reason it is printed.
+    //
+    // # ⚠️ READ OFF THE SAME FOLD AS THE PRICE, deliberately
+    //
+    // This used to run its OWN pass over the rows, and it disagreed with the
+    // aggregate above it in four ways at once — it keyed a pool by address and
+    // key NAME (dropping the key policy), summed `unit_amount` where the price
+    // sums `base_reserve`, broke slot ties the other way round, and marked
+    // every pool "counted" that was not aged out, including pools the price
+    // never summed because they are on another pricing model or have no
+    // measurable far side. A table whose job is to explain the number above it
+    // cannot be derived separately from that number.
+    let projection = policy_archive::view::Projection::default();
+    // ADA pairs AND pairs nothing could name.
+    //
+    // ⚠️ The unnamed ones are here on purpose. A venue recognised the pool and
+    // could not say what it pairs with, which is a finding — and the previous
+    // table treated "no pair named" as "paired with ADA" and printed an ADA
+    // rate for it. $PERP had a Minswap V2 pool quoted at 0.00015969 ADA that
+    // holds no ADA at all. Dropping such a pool would swap a wrong number for
+    // a missing one; it is shown, marked, and given no rate.
+    let mut per_pool: Vec<_> = view
+        .pools()
+        .filter(|(_, p)| {
+            p.quote_unit
+                .as_ref()
+                .is_none_or(policy_archive::Unit::is_ada)
+        })
+        .collect();
+    if per_pool.len() > 1 {
+        println!(
+            "  pools at their LAST sighting  (⌀ aged out · ≠ another pricing model · \
+             · nothing summable; blank = counted in the price above)"
+        );
+        per_pool.sort_by_key(|(k, p)| (std::cmp::Reverse(p.slot), k.address.clone()));
+        for (key, pool) in per_pool {
+            let behind = at.saturating_sub(pool.slot);
+            // ~1 slot per second on Cardano, so days are a fair rendering.
+            let age = match behind {
+                0..=86_400 => "current".to_string(),
+                n => format!("{} days", n / 86_400),
+            };
+            let counted = match pool.bucket(at, &projection) {
+                policy_archive::view::Bucket::Priced => " ",
+                policy_archive::view::Bucket::Stale => "⌀",
+                policy_archive::view::Bucket::OffModel => "≠",
+                policy_archive::view::Bucket::Unusable => "·",
+            };
+            let quote = pool.quote.unwrap_or(0);
+            // A rate ONLY where the far side is known to be ADA. An unnamed
+            // pair has a real reserve and no unit to divide by.
+            let rate = match (pool.base > 0, pool.quote, &pool.quote_unit) {
+                (true, Some(q), Some(_)) => {
+                    format!("{:.8} ADA", q as f64 / pool.base as f64 / 1e6)
+                }
+                (_, _, None) => "PAIR UNNAMED".to_string(),
+                _ => "— ADA".to_string(),
+            };
+            println!(
+                "  {counted} {:<14} {:>16} base {:>15} lovelace  {rate:>14}  {age:>9}  {}",
+                pool.venue,
+                pool.base,
+                quote,
+                &key.address[..key.address.len().min(24)],
+            );
+        }
+    }
+    // ⚠️ REAL WHEN WRITTEN, POSSIBLY WITHDRAWN SINCE. Reported so the reader
+    // sees liquidity the price deliberately does not count.
+    for u in &spot.stale {
+        println!(
+            "  STALE       {} base / {} quote across {} pool(s) — last seen over {} days \
+             before the price slot, so not counted: a pool nobody has arbitraged in a \
+             month is either empty or not at market",
+            u.base,
+            u.quote,
+            u.pools,
+            policy_archive::price::DEFAULT_STALE_AFTER_SLOTS / 86_400,
+        );
     }
     for u in &spot.unresolved {
         println!(
@@ -2228,5 +2476,98 @@ mod tests {
         let bytes = postcard::to_stdvec(&p).unwrap();
         let back: PendingFile = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.spenders, p.spenders);
+    }
+
+    /// ⚠️ THE $DONUT TEST, at the level where both halves are visible.
+    ///
+    /// `venue::SITES` is the registry and this is its only consumer for the
+    /// fold, so what matters here is that the translation LOSES NOTHING: every
+    /// site must land in `Roles`, under its own venue name, with the shared
+    /// flag intact.
+    ///
+    /// It was a hand-written list naming four venues while
+    /// `mitos-pool-observe` decoded seven, and $DONUT rendered as an untraded
+    /// token with 765 SundaeSwap pool sightings against zero fills.
+    #[test]
+    fn every_site_reaches_the_trade_fold() {
+        use mitos_dex_decode::venue::{self, SiteKey, SiteRole};
+        let roles = venue_roles();
+        let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        for site in venue::SITES {
+            let cred = match site.key {
+                SiteKey::Cred(c) => hex(&c),
+                SiteKey::Address(a) => {
+                    policy_archive::trade::address_parts(a)
+                        .expect("a site address must parse")
+                        .0
+                }
+            };
+            let got = roles.role_of(&cred);
+            assert_eq!(
+                got,
+                Some(match site.role {
+                    SiteRole::Pool => policy_archive::trade::Role::Pool,
+                    SiteRole::Order => policy_archive::trade::Role::Order,
+                }),
+                "{} ({:?}) did not reach the fold",
+                site.venue,
+                site.role,
+            );
+            assert_eq!(
+                roles.name_of(&cred),
+                Some(site.venue),
+                "{}'s credential joins under the wrong name — a pool state and \
+                 a fill would then describe the same venue and never join",
+                site.venue,
+            );
+        }
+
+        // The four that were missing, named explicitly: a regression here is
+        // the exact defect, and a count assertion would not say which.
+        for v in [
+            venue::SUNDAE_V3,
+            venue::SUNDAE_V1,
+            venue::WINGRIDERS_V2,
+            venue::WINGRIDERS_V1,
+        ] {
+            assert!(
+                venue::SITES.iter().any(|s| s.venue == v),
+                "{v} is decoded by the observer and must be foldable",
+            );
+        }
+
+        // The launchpad is NOT a DEX site — its own crate, and a `Curve` role,
+        // because its price is not `x·y=k`. BOTH its contracts must land.
+        let curve =
+            policy_archive::trade::address_parts(mitos_launchpad_decode::BONDING_CURVE_ADDR)
+                .unwrap()
+                .0;
+        assert_eq!(
+            roles.role_of(&curve),
+            Some(policy_archive::trade::Role::Curve)
+        );
+        assert_eq!(roles.name_of(&curve), Some(venue::SNEK_FUN));
+
+        // ⚠️ THE CURVE'S ADDRESS AND ITS CREDENTIAL MUST AGREE. The crate
+        // offers both, for consumers that match either way, and two spellings
+        // of one contract is precisely how a venue's halves stop joining.
+        // Asserted here because this is where a bech32 decoder is in scope.
+        assert_eq!(
+            curve,
+            hex(&mitos_launchpad_decode::BONDING_CURVE_CRED),
+            "the curve address does not carry the curve credential",
+        );
+
+        // ⚠️ The ORDER contract is what turns a wallet's payment into a
+        // PLACEMENT and the batcher's spend into a FILL. Without it $Aliens
+        // carried 144 of them as "unclaimed".
+        let order = hex(&mitos_launchpad_decode::ORDER_CRED);
+        assert_eq!(
+            roles.role_of(&order),
+            Some(policy_archive::trade::Role::Order)
+        );
+        assert_eq!(roles.name_of(&order), Some(venue::SNEK_FUN));
+        assert_ne!(order, curve, "the order is not the curve");
     }
 }

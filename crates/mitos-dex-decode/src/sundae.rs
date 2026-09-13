@@ -81,6 +81,36 @@ pub fn is_sundae_v3(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &POOL_PAYMENT_CRED
 }
 
+/// SundaeSwap **V3** order (escrow) payment credential — where a trader's
+/// swap waits for a batcher.
+///
+/// # ⚠️ The STAKE part names the trader, so these orders are NOT shared
+///
+/// Unlike CSwap — whose order contract is one address for everybody, so a
+/// movement spent from it can never say who traded — Sundae composes the
+/// trader's own stake credential onto this payment script. One contract,
+/// many addresses.
+///
+/// MEASURED on **$DONUT** (`a8d877eb…`): **492 outputs across 253 distinct
+/// addresses** on this one credential, which is 492 of the archive's 499
+/// unclaimed script outputs. Established from
+/// `ae24323c24dc38dac8f94b20818845e478ddcbfb3345dc76ab9a69373a6a3515` — a BUY
+/// placement, 503.28 ₳ in with no tokens, datum committed by hash.
+///
+/// ⚠️ That transaction does **not** appear in $DONUT's archive at all: no
+/// DONUT moved in it. A buy placement is invisible to the watched policy's
+/// walk, and only the SELL side (wallet → order carrying tokens) and the
+/// return legs are recorded. So the order tier this credential unlocks is
+/// half the picture by construction, not by omission.
+pub const ORDER_PAYMENT_CRED: [u8; 28] = [
+    0xfa, 0x6a, 0x58, 0xbb, 0xe2, 0xd0, 0xff, 0x05, 0x53, 0x44, 0x31, 0xc8, 0xe2, 0xf0, 0xef, 0x2c,
+    0xbd, 0xc1, 0x60, 0x2a, 0x84, 0x56, 0xe4, 0xb1, 0x3c, 0x8f, 0x30, 0x77,
+];
+
+pub fn is_sundae_order(payment_cred: &[u8; 28]) -> bool {
+    payment_cred == &ORDER_PAYMENT_CRED
+}
+
 /// SundaeSwap **V1** pool payment credential (script hash, 28 bytes).
 pub const V1_PAYMENT_CRED: [u8; 28] = [
     0x40, 0x20, 0xe7, 0xfc, 0x2d, 0xe7, 0x5a, 0x07, 0x29, 0xc3, 0xcc, 0x3a, 0xf7, 0x15, 0xb3, 0x4d,
@@ -550,5 +580,33 @@ mod tests {
     fn a_wrong_arity_is_rejected_rather_than_half_read() {
         let short = "d8799f581c67d2bb41de1b0e97f6a9d2b720ee0bfe0a92d4651e5ea6ba5e250f3f00ff";
         assert!(decode_v3_pool_datum(&hex::decode(short).unwrap()).is_none());
+    }
+
+    /// The V3 order credential, pinned against the transaction it was read
+    /// from: `ae24323c…#0`, a 503.28 ₳ buy placement at
+    /// `addr1z8ax5k9mutg07p2ngscu3chsauktmstq92z9de938j8nqa…`.
+    ///
+    /// Pinned as HEX rather than as the byte array, so the assertion is
+    /// legible against a block explorer — the only way anyone will ever check
+    /// it — instead of restating the constant in the same notation.
+    #[test]
+    fn the_v3_order_credential_is_the_one_on_chain() {
+        assert_eq!(
+            hex::encode(ORDER_PAYMENT_CRED),
+            "fa6a58bbe2d0ff05534431c8e2f0ef2cbdc1602a8456e4b13c8f3077",
+        );
+        assert!(is_sundae_order(&ORDER_PAYMENT_CRED));
+    }
+
+    /// ⚠️ THE ORDER IS NOT THE POOL. Registering one as the other converts
+    /// every placement into a swap, or every swap into an intention — the
+    /// roles produce different events from the same movement.
+    #[test]
+    fn the_order_and_pool_credentials_are_distinct() {
+        assert_ne!(ORDER_PAYMENT_CRED, POOL_PAYMENT_CRED);
+        assert_ne!(ORDER_PAYMENT_CRED, V1_PAYMENT_CRED);
+        assert!(!is_sundae_v3(&ORDER_PAYMENT_CRED));
+        assert!(!is_sundae_v1(&ORDER_PAYMENT_CRED));
+        assert!(!is_sundae_order(&POOL_PAYMENT_CRED));
     }
 }

@@ -41,7 +41,7 @@
 //! carries the difference rather than flattening it.
 
 use mitos_chain_walk::decode::{Asset, DecodedOutput};
-use mitos_dex_decode::cswap;
+use mitos_dex_decode::{cswap, venue};
 
 /// Where a row's reserves were read from.
 ///
@@ -392,13 +392,13 @@ pub fn recognise(
     }
 
     let dex = if out.address == cswap::POOL_SCRIPT_ADDR {
-        "cswap"
+        venue::CSWAP
     } else {
         return None;
     };
 
     // CSwap publishes its instance key, its fee and its LP supply. Take them.
-    if dex == "cswap"
+    if dex == venue::CSWAP
         && let Some(bytes) = datum
         && let Some(d) = cswap::decode_pool_datum(bytes)
     {
@@ -596,7 +596,7 @@ fn splash(
         ),
     };
     Some(PoolObservation {
-        dex: "splash",
+        dex: venue::SPLASH,
         address: out.address.clone(),
         key_policy,
         key_name,
@@ -638,7 +638,7 @@ fn sundae_v3(
         watched_name,
     );
     Some(PoolObservation {
-        dex: "sundae-v3",
+        dex: venue::SUNDAE_V3,
         address: out.address.clone(),
         // The pool script mints its own NFT, and the NFT's name is the datum's
         // `ident` behind a CIP-68 label — one per pool, so this is a genuine
@@ -686,7 +686,7 @@ fn sundae_v1(
         watched_name,
     );
     Some(PoolObservation {
-        dex: "sundae-v1",
+        dex: venue::SUNDAE_V1,
         address: out.address.clone(),
         key_policy: mitos_dex_decode::sundae::V1_NFT_POLICY.to_vec(),
         key_name: d.nft_name(),
@@ -741,7 +741,7 @@ fn minswap_v1(
         None => (Vec::new(), Vec::new(), KeyBasis::Unknown),
     };
     Some(PoolObservation {
-        dex: "minswap-v1",
+        dex: venue::MINSWAP_V1,
         address: out.address.clone(),
         key_policy,
         key_name,
@@ -791,7 +791,7 @@ fn wingriders_v1(
         None => (Vec::new(), Vec::new(), KeyBasis::Unknown),
     };
     Some(PoolObservation {
-        dex: "wingriders-v1",
+        dex: venue::WINGRIDERS_V1,
         address: out.address.clone(),
         key_policy,
         key_name,
@@ -845,7 +845,7 @@ fn minswap_v2(
         ),
     };
     Some(PoolObservation {
-        dex: "minswap-v2",
+        dex: venue::MINSWAP_V2,
         address: out.address.clone(),
         // The authen policy is shared across every V2 pool, so the LP NAME is
         // what distinguishes them. Left empty until the value-side lookup that
@@ -887,7 +887,7 @@ fn wingriders_v2(
         watched_name,
     );
     Some(PoolObservation {
-        dex: "wingriders-v2",
+        dex: venue::WINGRIDERS_V2,
         address: out.address.clone(),
         key_policy: mitos_dex_decode::wingriders::V2_LP_POLICY.to_vec(),
         key_name: Vec::new(),

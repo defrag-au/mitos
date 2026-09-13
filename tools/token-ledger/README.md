@@ -69,6 +69,47 @@ token-ledger serve --data-dir <db> --archive-dir <dir> [--publish-archive] \
 | `GET /policy/{p}/events` | the correcting feed |
 | `GET /policy/{p}/density` | daily histogram, from footers alone |
 | `GET /policy/{p}/tx/{hash}` | one transaction's rows |
+| `GET /policy/{p}/price` | spot, plus a NAME for everything it cannot price |
+| `GET /policy/{p}/trades` | movements folded into fills / placements / cancellations |
+| `GET /policy/{p}/supply` | the archive reconciled against itself, plus the profile |
+| `GET /policy/{p}/launch` | a launchpad token's launch, graduation, and the curve over time |
+| `GET /policy/{p}/story` | **THE STREAM** — one ordered sequence of typed events, postcard |
+
+⚠️ **`/story` is the substrate; the routes above it are derived conveniences.**
+It slices by TIME with the kind as a property of each event, so a consumer
+folds it for itself: filter `PoolState` for a price series, `CurveState` for the
+launch, fold `Transfer` for holders, fold `Fill` for volume. Postcard by
+default (`?format=json` for debugging), `?txs=1` for 32-byte hashes — MEASURED
+at 2.65× the gzipped payload, so off by default.
+
+⚠️ **Observations are clipped to the slots the movements cover.** They are not
+bounded by `limit` otherwise, and an earlier version merged the archive's whole
+observation history into every window — a price series and a holder count
+folded from the same stream then covered different periods.
+
+⚠️ **CHAPTER MARKERS carry what falls OUTSIDE the window** (`FirstMint`,
+`Launch`, `Graduation`, each tagged `Before`/`Within`/`After`). $PERP launched
+30M slots before a 5,000-movement window reaches, and without them
+`curve points: 0` is indistinguishable from "this token never launched".
+
+⚠️ **`quote_per_base_raw` is not a display price.** For an ADA pair the quote
+is **lovelace**, so $PERP reads `226.58` and renders as `0.00022658 ADA`.
+Converting needs both sides' decimals, which live in the token registry — this
+archive knows neither and deliberately does not guess.
+
+⚠️ **`/launch`'s `points` are ordered by `(slot, curve position)`, not by
+proven transaction order.** MEASURED on $PERP: ten of eleven sightings share
+one slot, because the whole bonding happened inside a single block. Within a
+slot, ascending lovelace is ascending position up the curve — recovering true
+transaction order would mean following the chain of curve UTxOs. A sell moves
+back DOWN the curve, so one inside a single block would appear out of sequence.
+`distinct_slots` tells a consumer how much of the ordering is proven.
+
+⚠️ `/price`'s three lists are different CLAIMS, not degrees of confidence:
+`ada` is priced; `unresolved` has real reserves against a non-ADA unit and
+needs *that* unit's archive; `unpriceable` has real reserves under a model this
+crate will not evaluate (a bonding curve is not constant-product). Collapsing
+them is how a price halves without anyone noticing — it did, on $PERP.
 
 `?to_slot=` on refresh is the caller asserting the policy's first mint. Without
 it the daemon asks the **policy-index** (microseconds, local) and falls back to

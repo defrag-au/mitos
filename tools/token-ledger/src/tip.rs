@@ -277,6 +277,7 @@ fn write_tail(
         sealed_unix,
     };
     let mut writer = SegmentWriter::new(&tip_dir, stamp.clone())?;
+    let mut observations: Vec<policy_archive::Observation> = Vec::new();
     let out = reverse::scan_blocks(
         blocks.to_vec(),
         policy_bytes,
@@ -287,8 +288,37 @@ fn write_tail(
         ceiling,
         &mut writer,
         index,
+        &mut observations,
     )?;
     let segments = writer.finish()?;
+
+    // Sorted by slot so the footer's statistics can be seeked on, exactly as
+    // an immutable pass writes its own.
+    let mut observations_entry = None;
+    if !observations.is_empty() {
+        observations.sort_by_key(|o| (o.slot, o.address.clone()));
+        let path = tip_dir.join(policy_archive::OBSERVATIONS);
+        let mut w = policy_archive::ObservationWriter::new(std::fs::File::create(&path)?, &stamp)?;
+        let rows = observations.len();
+        for o in observations {
+            w.push(o);
+        }
+        let written = w.close()?;
+        tracing::info!(
+            policy,
+            rows = written.rows,
+            max_slot = ?written.max_slot,
+            "tip: observations written — the volatile range now carries pool state"
+        );
+        let _ = rows;
+        observations_entry = Some(archive::FileEntry {
+            file: policy_archive::OBSERVATIONS.to_string(),
+            rows: written.rows,
+            min_slot: written.min_slot,
+            max_slot: written.max_slot,
+            units: 0,
+        });
+    }
     // The ceiling at infinity: every row of the tail is its own, so the
     // merge folds them and drops what nets to nothing, exactly as a landed
     // range's compaction does.
@@ -314,10 +344,11 @@ fn write_tail(
         rolled_up: false,
         movements: Some(compacted.movements),
         corrections: compacted.corrections,
-        // The tail observes nothing: it is re-derived whole every tick, and
-        // the immutable pass that later covers the same slots writes the
-        // observations for them.
-        observations: None,
+        // ⚠️ NAMED, or it reaches no consumer: the publisher uploads exactly
+        // the files the manifest names and the pruner deletes what it does
+        // not. Writing the file without recording it left the whole tier on
+        // the box once already.
+        observations: observations_entry,
         segments: Vec::new(),
         // The tail carries NO state forward: it is re-derived whole every
         // tick, so there is no sidecar and nothing for a later job to load.

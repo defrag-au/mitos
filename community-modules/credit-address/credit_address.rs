@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 
 use mitos_community_events::credit_address::{AddressCredit, CreditedAsset};
 use mitos_module_kit::ReentrantRound;
+use pallas_addresses::{Address, ShelleyDelegationPart};
 use serde::Deserialize;
 
 use crate::mitos::platform_v2::chain_data;
@@ -127,6 +128,7 @@ fn emit_address_credit(event: &AddressCredit) {
 /// Shared by the live `Produced` path and the cold-start walk so
 /// both emit an identical wire shape.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_output_credit(
     address: &str,
     tx_hash_hex: &str,
@@ -135,6 +137,8 @@ fn emit_output_credit(
     from_address: &str,
     slot: u64,
     metadata: Option<Vec<u8>>,
+    datum: Option<Vec<u8>>,
+    inputs: &TxInputs,
     assets: &[AssetEntry],
 ) {
     let credited: Vec<CreditedAsset> = assets
@@ -154,10 +158,82 @@ fn emit_output_credit(
         slot,
         metadata,
         assets: credited,
+        datum,
+        input_stake_credentials: inputs.stake_credentials.clone(),
+        inputs_unresolved: inputs.unresolved,
     });
 }
 
-fn handle_produced(p: &ProducedEvent, payer_by_tx: &HashMap<Vec<u8>, (u64, String)>) {
+// ============================================================
+// Input attribution
+// ============================================================
+
+/// What a transaction's inputs say about who funded it.
+///
+/// Collected once per transaction and shared by every credited
+/// output in it, because attribution is a property of the
+/// transaction rather than of any one output.
+#[derive(Debug, Default, Clone)]
+struct TxInputs {
+    /// Largest-lovelace input address — the existing
+    /// `from_address`. A presentation convenience; NEVER an
+    /// attribution.
+    payer: String,
+    payer_lovelace: u64,
+    /// Distinct stake credentials, first-seen order.
+    stake_credentials: Vec<String>,
+    /// Inputs whose prior output could not be resolved.
+    unresolved: u32,
+}
+
+impl TxInputs {
+    /// Fold one input in. `address` is empty when the platform
+    /// could not resolve the prior output.
+    fn observe(&mut self, address: &str, lovelace: u64) {
+        if address.is_empty() {
+            self.unresolved += 1;
+            return;
+        }
+        if lovelace > self.payer_lovelace {
+            self.payer_lovelace = lovelace;
+            self.payer = address.to_string();
+        }
+        if let Some(cred) = stake_credential_hex(address) {
+            if !self.stake_credentials.contains(&cred) {
+                self.stake_credentials.push(cred);
+            }
+        }
+    }
+
+    fn has_payer(&self) -> bool {
+        !self.payer.is_empty()
+    }
+}
+
+/// The 28-byte stake credential of a bech32 address, hex.
+///
+/// `None` for an address with no delegation part (enterprise, or
+/// a true enterprise-script), for a pointer delegation, and for
+/// Byron — in every case the input tells us nothing about a stake
+/// and contributes nothing to the set.
+///
+/// Script-payment + key-delegation "frankenaddresses" (jpg.store
+/// v3, Splash and friends) DO yield their stake credential, the
+/// same call `collection-holders` makes: the contract locks the
+/// value but the owner's identity travels with the stake part.
+fn stake_credential_hex(address: &str) -> Option<String> {
+    let addr = Address::from_bech32(address).ok()?;
+    let Address::Shelley(shelley) = addr else {
+        return None;
+    };
+    match shelley.delegation() {
+        ShelleyDelegationPart::Key(hash) => Some(hex::encode(**hash)),
+        ShelleyDelegationPart::Script(hash) => Some(hex::encode(**hash)),
+        _ => None,
+    }
+}
+
+fn handle_produced(p: &ProducedEvent, inputs_by_tx: &HashMap<Vec<u8>, TxInputs>) {
     // Per-output filter: the platform dispatches every Produced
     // event in any TX that touched a watched address, NOT just
     // outputs at the watched address. Bounce non-matching outputs
@@ -172,34 +248,48 @@ fn handle_produced(p: &ProducedEvent, payer_by_tx: &HashMap<Vec<u8>, (u64, Strin
     // inputs for the payer (no extra work); only consult the record's inputs when
     // they didn't resolve.
     let record = chain_data::read_tx(&p.tx_hash);
-    let from_address = match payer_by_tx.get(&p.tx_hash) {
-        Some((_, addr)) if !addr.is_empty() => addr.clone(),
+
+    // Prefer the dispatched `Consumed` events: the platform resolves and
+    // dispatches one per input of a relevant transaction, so the whole input
+    // set is already in hand and no archive lookup is needed. Fall back to
+    // the record only when the batch carried none for this transaction.
+    let inputs = match inputs_by_tx.get(&p.tx_hash) {
+        Some(inputs) if inputs.has_payer() => inputs.clone(),
         _ => {
-            let resolved = record.as_ref().and_then(|r| {
-                payer_of(
-                    r.inputs
-                        .iter()
-                        .map(|i| (i.prior_output.address.as_str(), i.prior_output.lovelace)),
-                )
-            });
-            match resolved {
-                Some(addr) => addr,
-                None => {
-                    logging::log(
-                        LogLevel::Warn,
-                        LOG_TARGET,
-                        &format!(
-                            "credit at {} in {}: unresolvable payer — skipping (backstop will catch it)",
-                            p.output.address,
-                            hex::encode(&p.tx_hash)
-                        ),
-                    );
-                    return;
+            let mut collected = TxInputs::default();
+            if let Some(record) = record.as_ref() {
+                for input in &record.inputs {
+                    collected.observe(&input.prior_output.address, input.prior_output.lovelace);
                 }
             }
+            collected
         }
     };
+
+    if !inputs.has_payer() {
+        logging::log(
+            LogLevel::Warn,
+            LOG_TARGET,
+            &format!(
+                "credit at {} in {}: unresolvable payer — skipping (backstop will catch it)",
+                p.output.address,
+                hex::encode(&p.tx_hash)
+            ),
+        );
+        return;
+    }
+    let from_address = inputs.payer.clone();
     let metadata = record.and_then(|r| r.aux_data);
+    // Inline datum bytes, straight off the dispatched output — resolved from
+    // the block, so unlike `metadata` it IS reliable on the live path. An
+    // empty payload is a datum carried BY HASH: the bytes live in the witness
+    // set, which is not available here, so it reads as absent rather than as
+    // an empty datum.
+    let datum = p
+        .datum
+        .as_ref()
+        .map(|d| d.payload.clone())
+        .filter(|payload| !payload.is_empty());
     // Emit EVERY credit, including pure-ADA — unlike burn-address we
     // do NOT skip asset-less outputs: a pure-ADA payment is the
     // common case here. The consumer classifies intent.
@@ -211,6 +301,8 @@ fn handle_produced(p: &ProducedEvent, payer_by_tx: &HashMap<Vec<u8>, (u64, Strin
         &from_address,
         slot_of(&p.cursor),
         metadata,
+        datum,
+        &inputs,
         &p.output.assets,
     );
 }
@@ -245,12 +337,11 @@ fn process_address_page(addr: &str, refs: &[WitOutputRef]) -> Option<usize> {
             );
             continue;
         };
-        let Some(from_address) = payer_of(
-            record
-                .inputs
-                .iter()
-                .map(|i| (i.prior_output.address.as_str(), i.prior_output.lovelace)),
-        ) else {
+        let mut inputs = TxInputs::default();
+        for input in &record.inputs {
+            inputs.observe(&input.prior_output.address, input.prior_output.lovelace);
+        }
+        if !inputs.has_payer() {
             logging::log(
                 LogLevel::Warn,
                 LOG_TARGET,
@@ -260,9 +351,20 @@ fn process_address_page(addr: &str, refs: &[WitOutputRef]) -> Option<usize> {
                 ),
             );
             continue;
-        };
+        }
+        let from_address = inputs.payer.clone();
         let slot = slot_of(&record.cursor);
         let metadata = record.aux_data;
+        // The cold-start walk reads the datum too, since `typed-output`
+        // carries one. That is what makes a sink's backfill COMPLETE: a
+        // sink never spends, so its unspent set is its entire history, and
+        // now the intent attached to each credit comes with it rather than
+        // only the value.
+        let datum = output
+            .datum
+            .as_ref()
+            .map(|d| d.payload.clone())
+            .filter(|payload| !payload.is_empty());
         emit_output_credit(
             addr,
             &hex::encode(&oref.tx_hash),
@@ -271,6 +373,8 @@ fn process_address_page(addr: &str, refs: &[WitOutputRef]) -> Option<usize> {
             &from_address,
             slot,
             metadata,
+            datum,
+            &inputs,
             &output.assets,
         );
         credit_events += 1;
@@ -474,31 +578,34 @@ impl Guest for Module {
     }
 
     fn handle_events(events: Vec<DispatchEvent>) {
-        // Pass 1: per spending-TX, find the largest-lovelace consumed
-        // input — the payer. Keyed on `consuming_tx_hash` so a
-        // multi-TX batch resolves each TX's payer independently.
-        // Reading Consumed here is for payer attribution only; we
+        // Pass 1: fold every consumed input per spending-TX. Keyed on
+        // `consuming_tx_hash` so a multi-TX batch resolves each TX
+        // independently. Reading Consumed here is for attribution only; we
         // still emit CREDITS for inbound outputs only (a bidirectional
         // "movement" module would also emit on the spend side).
-        let mut payer_by_tx: HashMap<Vec<u8>, (u64, String)> = HashMap::new();
+        //
+        // Two different facts come out of this one pass:
+        //   - `payer`, the largest-lovelace input, for display;
+        //   - the distinct stake credentials plus a count of inputs that
+        //     could not be resolved, for attribution.
+        // They must not be confused. An UNRESOLVED input is counted rather
+        // than skipped: dropping it would make the credential set look
+        // complete when it is not, and a consumer would then attribute a
+        // multi-wallet burn to whichever wallet happened to resolve.
+        let mut inputs_by_tx: HashMap<Vec<u8>, TxInputs> = HashMap::new();
         for event in &events {
             if let DispatchEvent::Utxo(UtxoEvent::Consumed(c)) = event {
-                if c.prior_output.address.is_empty() {
-                    continue;
-                }
-                let best = payer_by_tx
+                inputs_by_tx
                     .entry(c.consuming_tx_hash.clone())
-                    .or_insert((0, String::new()));
-                if c.prior_output.lovelace > best.0 {
-                    *best = (c.prior_output.lovelace, c.prior_output.address.clone());
-                }
+                    .or_default()
+                    .observe(&c.prior_output.address, c.prior_output.lovelace);
             }
         }
         // Pass 2: emit a credit for each watched produced output,
-        // tagged with its TX's payer + slot.
+        // tagged with its TX's payer, inputs, datum + slot.
         for event in &events {
             if let DispatchEvent::Utxo(UtxoEvent::Produced(p)) = event {
-                handle_produced(p, &payer_by_tx);
+                handle_produced(p, &inputs_by_tx);
             }
         }
     }

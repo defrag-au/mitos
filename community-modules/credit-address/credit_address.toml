@@ -14,3 +14,7 @@ policies = []
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
 mitos-module-kit = { path = "../../crates/mitos-module-kit" }
+# Stake-credential extraction from a bech32 input address — the same call
+# `collection-holders` makes, so "whose address is this" has one answer
+# across the module set.
+pallas-addresses = "1.0.0-alpha.6"

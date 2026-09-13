@@ -76,6 +76,16 @@ pub struct Roles {
     /// How each ORDER credential keys its customer. Absent means
     /// [`OrderKeying::CustomerStake`], the common case.
     pub keying: HashMap<String, OrderKeying>,
+    /// Credential → the venue's NAME.
+    ///
+    /// ⚠️ Without this a fill carries a raw credential while a pool
+    /// observation carries `"splash"`, so the two never join and a consumer
+    /// shows named venues with no activity beside hex strings doing all the
+    /// trading. That is exactly what the first token band did.
+    ///
+    /// Only the decode crate knows this mapping, which is why it is supplied
+    /// with the roles rather than guessed at downstream.
+    pub names: HashMap<String, String>,
 }
 
 impl Roles {
@@ -87,6 +97,24 @@ impl Roles {
             .get(cred_hex)
             .copied()
             .unwrap_or(OrderKeying::CustomerStake)
+    }
+
+    /// The venue's name, or `None` when nothing has registered this
+    /// credential.
+    ///
+    /// ⚠️ `None` is a real answer and must reach the reader as one: an
+    /// unnamed venue is a gap in OUR registry, not an absence of trading, and
+    /// showing the credential is what lets someone go and identify it.
+    pub fn name_of(&self, cred_hex: &str) -> Option<&str> {
+        self.names.get(cred_hex).map(String::as_str)
+    }
+
+    /// Register a venue's credential, role and name together — the three
+    /// facts that must not drift apart.
+    pub fn register(&mut self, cred_hex: impl Into<String>, role: Role, venue: &str) {
+        let cred = cred_hex.into();
+        self.roles.insert(cred.clone(), role);
+        self.names.insert(cred, venue.to_string());
     }
 }
 
@@ -261,14 +289,33 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
 }
 
 /// Fold a feed page. One event per `(transaction, unit)`.
-pub fn fold(rows: &[FeedRow], roles: &Roles) -> Vec<(Vec<u8>, u64, Event)> {
+pub fn fold(rows: &[FeedRow], roles: &Roles) -> Vec<Folded> {
     rows.iter()
         .flat_map(|r| {
-            r.units
-                .iter()
-                .map(move |u| (r.tx_hash.clone(), r.slot, classify_move(u, roles)))
+            r.units.iter().map(move |u| Folded {
+                tx_hash: r.tx_hash.clone(),
+                slot: r.slot,
+                block_time: r.block_time,
+                unit: u.name.clone(),
+                event: classify_move(u, roles),
+            })
         })
         .collect()
+}
+
+/// One classified movement, with everything needed to place it on a timeline.
+///
+/// ⚠️ `unit` is not decoration. On a COLLECTION every event is about one
+/// specific asset, and a fold that drops it can describe a policy but never an
+/// NFT — which is half of what these archives are for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folded {
+    pub tx_hash: Vec<u8>,
+    pub slot: u64,
+    pub block_time: u64,
+    /// On-chain asset-name bytes. IDENTITY only — never decode for display.
+    pub unit: Vec<u8>,
+    pub event: Event,
 }
 
 #[cfg(test)]
