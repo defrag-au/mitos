@@ -97,6 +97,21 @@ struct BlockFacts {
     pool: [u8; 28],
     body_size: u64,
     tx_count: u32,
+    /// Slots since the previous block on chain.
+    ///
+    /// ⚠️ MEASURED, not assumed: this DOES correlate with how full the block
+    /// is — Pearson +0.52, Spearman +0.67 over a year of hatches. An earlier
+    /// version of this comment claimed it could not, reasoning that block
+    /// arrival is memoryless. Memorylessness governs ARRIVAL TIMES; it says
+    /// nothing about block contents, and a longer gap gives the mempool more
+    /// time to fill, so the next block is bigger.
+    ///
+    /// `body_size` and `tx_count` are tighter still (Spearman 0.90) and are
+    /// one axis wearing two hats. Measure the joint distribution before
+    /// selling any two block facts as two traits.
+    gap: Option<u64>,
+    epoch: u64,
+    slot_in_epoch: u64,
     /// The lottery draw for the configured domain.
     lottery: f64,
     /// The chain's own leader value, as a fraction of its bound.
@@ -110,6 +125,9 @@ struct Qualifying {
     pool: [u8; 28],
     body_size: u64,
     tx_count: u32,
+    gap: Option<u64>,
+    epoch: u64,
+    slot_in_epoch: u64,
     lottery: f64,
 }
 
@@ -160,6 +178,9 @@ impl Tally {
                             pool: facts.pool,
                             body_size: facts.body_size,
                             tx_count: facts.tx_count,
+                            gap: facts.gap,
+                            epoch: facts.epoch,
+                            slot_in_epoch: facts.slot_in_epoch,
                             lottery: facts.lottery,
                         });
                     }
@@ -213,7 +234,7 @@ fn fraction(bytes: &[u8]) -> f64 {
     (u64::from_be_bytes(lead) >> (64 - F64_MANTISSA_BITS)) as f64 / TWO_POW_53
 }
 
-fn facts(block: &MultiEraBlock<'_>, domain: &[u8]) -> Option<BlockFacts> {
+fn facts(block: &MultiEraBlock<'_>, domain: &[u8], prev_slot: Option<u64>) -> Option<BlockFacts> {
     let header = block.header();
     // The RAW output, which the producer cannot choose — not the already
     // range-extended leader value.
@@ -236,15 +257,37 @@ fn facts(block: &MultiEraBlock<'_>, domain: &[u8]) -> Option<BlockFacts> {
     tagged.extend_from_slice(domain);
     tagged.extend_from_slice(&vrf_output);
 
+    let slot = block.slot();
+    let (epoch, slot_in_epoch) = epoch_position(slot);
     Some(BlockFacts {
-        slot: block.slot(),
+        slot,
         height: block.number(),
         pool,
         body_size,
         tx_count: block.tx_count() as u32,
+        gap: prev_slot.map(|p| slot.saturating_sub(p)),
+        epoch,
+        slot_in_epoch,
         lottery: fraction(Hasher::<256>::hash(&tagged).as_ref()),
         leader: fraction(&header.leader_vrf_output().ok()?),
     })
+}
+
+/// Mainnet slot → `(epoch, slot within that epoch)`.
+///
+/// Shelley began at epoch 208, slot 4_492_800, and every epoch since is
+/// 432_000 one-second slots. A slot↔time mapping that forgets the era offset
+/// is wrong by weeks and says nothing about it, so this is checked against a
+/// value computed elsewhere — see the test.
+fn epoch_position(slot: u64) -> (u64, u64) {
+    const SHELLEY_START_SLOT: u64 = 4_492_800;
+    const SHELLEY_START_EPOCH: u64 = 208;
+    const EPOCH_SLOTS: u64 = 432_000;
+    let since = slot.saturating_sub(SHELLEY_START_SLOT);
+    (
+        SHELLEY_START_EPOCH + since / EPOCH_SLOTS,
+        since % EPOCH_SLOTS,
+    )
 }
 
 /// Sorted chunk numbers, NEWEST EXCLUDED — the newest immutable file is still
@@ -281,6 +324,7 @@ fn walk_band(
     let mut tally = Tally::new(thresholds.len());
     let blocks = open_blocks(immutable, Some((from_slot, Vec::new())))
         .with_context(|| format!("seeking to slot {from_slot}"))?;
+    let mut prev_slot: Option<u64> = None;
     for raw in blocks {
         let raw = raw.map_err(|e| anyhow::anyhow!("reading block: {e:?}"))?;
         let block =
@@ -288,10 +332,14 @@ fn walk_band(
         if block.slot() >= to_slot {
             break;
         }
-        match facts(&block, domain) {
+        match facts(&block, domain, prev_slot) {
             Some(facts) => tally.record(&facts, thresholds, keep_detail),
             None => tally.no_vrf += 1,
         }
+        // Every block advances the clock, including the Byron ones no beat can
+        // be made from: a gap is to the previous BLOCK, never to the previous
+        // qualifying one.
+        prev_slot = Some(block.slot());
     }
     Ok(tally)
 }
@@ -468,22 +516,52 @@ fn report(cli: &Cli, tally: &Tally, thresholds: &[f64], wall_secs: f64) -> Resul
     if let Some(path) = &cli.csv {
         let mut file =
             std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-        writeln!(file, "slot,height,pool,body_size,tx_count,lottery")?;
+        writeln!(
+            file,
+            "slot,height,pool,body_size,tx_count,gap,epoch,slot_in_epoch,lottery"
+        )?;
         let mut rows = tally.qualifying.clone();
         rows.sort_by_key(|q| q.slot);
         for q in rows {
+            // An empty `gap` is the first block of a band, which has no
+            // predecessor inside it — NOT a zero-slot gap. Blank rather than 0
+            // so an analysis cannot average the two together.
+            let gap = q.gap.map(|g| g.to_string()).unwrap_or_default();
             writeln!(
                 file,
-                "{},{},{},{},{},{:.9}",
+                "{},{},{},{},{},{},{},{},{:.9}",
                 q.slot,
                 q.height,
                 hex::encode(q.pool),
                 q.body_size,
                 q.tx_count,
+                gap,
+                q.epoch,
+                q.slot_in_epoch,
                 q.lottery
             )?;
         }
         tracing::info!(path = %path.display(), "wrote qualifying blocks");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Checked against a number this crate did not compute: the live
+    /// `/heartbeat` snapshot reported epoch 655, slot_in_epoch 345_935 at slot
+    /// 197_942_735. An era offset that is forgotten or wrong puts this out by
+    /// weeks while still looking entirely plausible, so the assertion has to
+    /// come from outside.
+    #[test]
+    fn the_epoch_of_a_slot_matches_what_the_chain_reports() {
+        assert_eq!(epoch_position(197_942_735), (655, 345_935));
+        // Shelley's first slot IS the epoch-208 boundary, and epochs run
+        // 432_000 slots from there.
+        assert_eq!(epoch_position(4_492_800), (208, 0));
+        assert_eq!(epoch_position(4_492_800 + 432_000), (209, 0));
+        assert_eq!(epoch_position(4_492_800 + 432_000 - 1), (208, 431_999));
+    }
 }
