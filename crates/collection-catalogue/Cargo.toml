@@ -1,0 +1,29 @@
+# collection-catalogue — the chain-derived index of what collections exist:
+# policy id, size, every known alias with its PROVENANCE, and advisory flags.
+#
+# Pure types + codec: serde + postcard only, no runtime deps, safe for
+# wasm32-unknown-unknown. Same posture and the same append-only wire contract
+# as `market-ledger-wire` — the writer is `policy-ledger catalogue build` on
+# cardano-infra and the readers are a Worker and an egui WASM command palette,
+# so the struct definitions here ARE the format.
+#
+# Design: cnft.dev-workers docs/design/COLLECTION_CATALOGUE.md.
+[package]
+name = "collection-catalogue"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "The published catalogue of Cardano collections derived from the policy index"
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+# OPTIONAL, for readers of the STORED object, which is gzipped. Pure Rust
+# (miniz_oxide backend), so it stays wasm-safe; off by default so the writer and
+# any consumer that never touches the stored bytes remain serde + postcard only.
+flate2 = { version = "1", optional = true }
+
+[features]
+# `decode_stored`: inflate a gzipped stored catalogue before decoding it.
+gzip = ["dep:flate2"]

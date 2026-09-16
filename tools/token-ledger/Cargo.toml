@@ -49,8 +49,13 @@ tokio = { workspace = true }
 # SSE progress on the policy feed — the same streaming shape wallet-sieve's
 # `/events` uses, so flow-explorer consumes both identically.
 tokio-stream = { workspace = true }
-# The in-process archive publisher: R2 through an S3 client (conditional
-# manifest put, list, delete), the KV bundle through the Cloudflare API.
+# The in-process publisher: R2 through an S3 client (conditional manifest put,
+# list, delete), the KV bundle through the Cloudflare API. Shared with the
+# catalogue publisher since 2026-09-15 — `publish.rs` keeps only the ORDER an
+# archive publishes in, which is the part that was never generic.
+cf-publish = { path = "../../crates/cf-publish" }
+# Still direct: `put_graph` builds its own cache attributes, and `Attributes`
+# is object_store's type.
 object_store = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true }

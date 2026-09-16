@@ -711,6 +711,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-publish"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "object_store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -864,6 +877,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "collection-catalogue"
+version = "0.0.1"
+dependencies = [
+ "flate2",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
@@ -4767,6 +4789,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "policy-ledger"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "cf-publish",
+ "clap",
+ "collection-catalogue",
+ "flate2",
+ "hex",
+ "pallas-crypto 1.1.1",
+ "policy-index",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5915,6 +5954,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8347046d4ebd943127157b94d63abb990fcf729dc4e9978927fdf4ac3c998d06"
 
 [[package]]
+name = "slotling-backtest"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "mitos-chain-walk",
+ "pallas-crypto 1.1.1",
+ "pallas-traverse 1.1.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6336,6 +6389,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.4",
  "cardano-assets",
+ "cf-publish",
  "chain-ledger",
  "chain-sieve",
  "clap",

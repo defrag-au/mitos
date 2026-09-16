@@ -1,0 +1,29 @@
+[package]
+name = "slotling-backtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Measure how often a block-lottery threshold would fire over certified Cardano history, and on whose blocks"
+
+[[bin]]
+name = "slotling-backtest"
+path = "src/main.rs"
+
+[dependencies]
+# Immutable-DB iteration (fuzzy slot seek, band-parallel walks) — the same
+# plumbing every other walker in this workspace uses.
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+# Block/header decode. The VRF range extension we measure is pallas's own
+# `derive_tagged_vrf_output`, so the leader value here is the node's, not a
+# reimplementation of it.
+pallas-traverse = { workspace = true }
+# blake2b-224 for the issuer key -> pool id, and blake2b-256 for the lottery
+# value's domain-tagged hash.
+pallas-crypto = { workspace = true }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }

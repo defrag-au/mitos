@@ -35,6 +35,13 @@ members = [
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
     "crates/policy-archive",
+    # The published catalogue of what collections EXIST — pure types + postcard,
+    # written on cardano-infra and read by a Worker and an egui WASM palette.
+    "crates/collection-catalogue",
+    # R2 + KV publishing, shared by token-ledger's archive publisher and the
+    # catalogue's. Only the generic half moved; the ORDER each artifact
+    # publishes in stays with the artifact.
+    "crates/cf-publish",
     "crates/none-match-indexer",
     "crates/tx-index",
     # The mint-keyed companion to tx-index. A separate crate, but NOT a
@@ -56,10 +63,17 @@ members = [
     "tools/mitos-chain-walk",
     "tools/market-ledger",
     "tools/project-ledger",
+    # Artifacts derived from the policy index — the collection catalogue.
+    # A READER of the index, never a walker: the daily `tx-index build
+    # --policy-index-dir` already pays the extraction pass.
+    "tools/policy-ledger",
     "tools/token-ledger",
     "tools/wallet-sieve",
     "tools/wallet-trace",
     "tools/tx-index",
+    # Reads the chunk store, writes nothing: measures what a block-lottery
+    # threshold would have selected over certified history.
+    "tools/slotling-backtest",
 ]
 resolver = "2"
 

@@ -106,6 +106,24 @@ impl Base {
         PolicyRun::read(&self.mmap[at..at + POLICY_BYTES])
     }
 
+    /// Every policy run, in prefix order — the side table read straight
+    /// through rather than probed.
+    ///
+    /// # Why this is public
+    ///
+    /// A whole-corpus consumer (the catalogue builder, `examples/profile`)
+    /// wants *every* policy, and without this it has to recover the runs by
+    /// scanning the record array and watching `policy_prefix` change: O(15M)
+    /// to learn something the 24-byte side table already states in O(231k).
+    /// The first draft of the profiler did exactly that, with a comment
+    /// explaining that the accessor was private.
+    ///
+    /// The two agree by construction — `verify_structure` is what pins that —
+    /// so this is the same answer for 1/65th of the reads.
+    pub fn runs(&self) -> impl Iterator<Item = PolicyRun> + '_ {
+        (0..self.header.policies as usize).map(|i| self.run_at(i))
+    }
+
     /// The policy table entry for a prefix, by binary search over a table the
     /// page cache keeps resident.
     pub fn run_of(&self, policy_prefix: u64) -> Option<PolicyRun> {
@@ -345,6 +363,34 @@ mod tests {
             rec(1, 555, 1, false),
         ]);
         assert_eq!(base.candidates(1, 100).len(), 2);
+    }
+
+    /// ⚠️ The side table and a scan of the record array must name the same
+    /// runs, in the same order — a whole-corpus consumer reads the table and a
+    /// sampling stride over a DIFFERENT run list picks different policies.
+    #[test]
+    fn the_policy_table_lists_the_same_runs_a_record_scan_would() {
+        let (_d, base) = built(vec![
+            rec(5, 1, 0, false),
+            rec(1, 9, 3, false),
+            rec(5, 2, 7, false),
+            rec(1, 3, 4, false),
+            rec(9, 1, 2, false),
+        ]);
+        // The same recovery the profiler used to do by hand.
+        let mut scanned: Vec<(u64, u32, u32)> = Vec::new();
+        for (i, r) in base.records().enumerate() {
+            match scanned.last_mut() {
+                Some((p, _, len)) if *p == r.policy_prefix => *len += 1,
+                _ => scanned.push((r.policy_prefix, i as u32, 1)),
+            }
+        }
+        let listed: Vec<(u64, u32, u32)> = base
+            .runs()
+            .map(|r| (r.policy_prefix, r.start, r.len))
+            .collect();
+        assert_eq!(listed, scanned);
+        assert_eq!(listed.len(), base.policies() as usize);
     }
 
     #[test]

@@ -1,0 +1,32 @@
+# cf-publish — the shared half of publishing a derived artifact to Cloudflare
+# from cardano-infra: an R2 bucket over the S3 surface, a Workers KV fan-out,
+# and the `published.json` vocabulary that records how each step went.
+#
+# Lifted out of `tools/token-ledger/src/publish.rs` (2026-09-15) when the
+# collection catalogue became the second publisher. Only the GENERIC parts
+# moved — credentials, the client, conditional put, KV, the outcome record.
+# What each artifact publishes, in what order, stays with the artifact: an
+# archive flips a manifest and prunes its predecessors, a catalogue flips a
+# pointer at a content-addressed blob. Those are not the same sequence and
+# pretending otherwise would be a worse abstraction than the duplication.
+#
+# ⚠️ Do NOT shell out. `push-archive.sh` was deleted for exactly this — the
+# user's verdict was "an incredibly brittle surface": one exit code covered a
+# four-step publish, nothing recorded whether an artifact had reached the edge,
+# and the flip could not be conditional.
+[package]
+name = "cf-publish"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "R2 + Workers KV publishing for cardano-infra's derived artifacts"
+
+[dependencies]
+anyhow = { workspace = true }
+object_store = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
