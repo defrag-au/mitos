@@ -129,25 +129,24 @@ dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 # block means the probe went `Inconclusive` (the bytes aren't a complete block
 # wrapper, e.g. a divergent / reseed-only WAL tip), NOT an unknown era — chase
 # the chain/state, not the pallas version.
-pallas = { version = "1.1.1", features = ["unstable"] }
-pallas-addresses = "1.1.1"
-pallas-codec = "1.1.1"
-pallas-primitives = "1.1.1"
-pallas-traverse = { version = "1.1.1", features = ["unstable"] }
+pallas = { version = "1.4.0", features = ["unstable"] }
+pallas-addresses = "1.4.0"
+pallas-codec = "1.4.0"
+pallas-primitives = "1.4.0"
+pallas-traverse = { version = "1.4.0", features = ["unstable"] }
 # Immutable-DB (cardano-node / Mithril snapshot) chunk reader — the
 # `market-ledger` walker iterates certified history from plain chunk files
 # (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
 # feature (mitos's pallas is `unstable`-only), so depend on it directly.
-pallas-hardano = "1.1.1"
+pallas-hardano = "1.4.0"
 # blake2b-256 for tx-index's read-side verification: a located body is
 # re-hashed and compared to the full requested hash, so the index can store an
 # 8-byte prefix per entry and never return a false positive.
-pallas-crypto = "1.1.1"
+pallas-crypto = "1.4.0"
 # N2N chainsync/blockfetch client for market-ledger's `follow` tip tail
 # (self-contained — see MARKET_LEDGER.md "Follow mode"). Same pin as the rest
-# of the family; the only crate whose 1.1.1 sources differ from 1.0.0, and only
-# in `localmsgsubmission` (unused here).
-pallas-network = "1.1.1"
+# of the family.
+pallas-network = "1.4.0"
 
 # Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
 # TokenType, asset-name decoders. Shared with cnft.dev-workers.
