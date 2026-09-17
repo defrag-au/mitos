@@ -24,6 +24,10 @@ pallas-crypto = { workspace = true }
 
 clap = { workspace = true }
 anyhow = { workspace = true }
+# Fixture dumps are typed structs, never `json!` — the field set is a contract
+# the prototype crate parses.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hex = { workspace = true }
