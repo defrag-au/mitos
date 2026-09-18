@@ -219,6 +219,42 @@ impl Manifest {
         wasm_bytes: &[u8],
         accepted_abis: &[(u32, &str)],
     ) -> Result<(), ManifestError> {
+        self.validate_abi_against_host(accepted_abis)?;
+
+        // Wasm bytes must hash + size to what the manifest claims.
+        let actual_size = wasm_bytes.len() as u64;
+        if actual_size != self.module.size_bytes {
+            return Err(ManifestError::SizeMismatch {
+                manifest: self.module.size_bytes,
+                actual: actual_size,
+            });
+        }
+
+        let computed_sha = sha256_hex(wasm_bytes);
+        if computed_sha != self.module.sha256 {
+            return Err(ManifestError::ShaMismatch {
+                manifest: self.module.sha256.clone(),
+                computed: computed_sha,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// The manifest-only half of [`Manifest::validate_against_host`]:
+    /// everything checkable without the wasm bytes to hand.
+    ///
+    /// Split out so the *start* path can enforce it. Activation
+    /// validates once against the bytes it is about to write; every
+    /// subsequent start re-checks the ABI, because a module that was
+    /// activated legitimately under an older host must not keep
+    /// running after the host's WIT moves underneath it. Re-hashing
+    /// every module's wasm on every boot would buy nothing there —
+    /// the bytes haven't changed, the *host* has.
+    pub fn validate_abi_against_host(
+        &self,
+        accepted_abis: &[(u32, &str)],
+    ) -> Result<(), ManifestError> {
         validate_module_id(&self.module.id)?;
         validate_trap_strategy(&self.trap_policy.strategy)?;
 
@@ -268,23 +304,6 @@ impl Manifest {
                 });
             }
             Some(_) => {}
-        }
-
-        // Wasm bytes must hash + size to what the manifest claims.
-        let actual_size = wasm_bytes.len() as u64;
-        if actual_size != self.module.size_bytes {
-            return Err(ManifestError::SizeMismatch {
-                manifest: self.module.size_bytes,
-                actual: actual_size,
-            });
-        }
-
-        let computed_sha = sha256_hex(wasm_bytes);
-        if computed_sha != self.module.sha256 {
-            return Err(ManifestError::ShaMismatch {
-                manifest: self.module.sha256.clone(),
-                computed: computed_sha,
-            });
         }
 
         Ok(())

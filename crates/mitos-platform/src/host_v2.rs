@@ -243,6 +243,28 @@ struct RunningSlotV2 {
 /// `S` is the `TipSubscription` type the host pumps from. Same
 /// concrete type for every running slot — production wires
 /// `dolos`'s broadcast subscription via the `SubscriptionFactory`.
+/// Where a host gets its chain-data fallback provider.
+///
+/// A named choice rather than an ambient lookup, because "did this
+/// host just make a network call?" is not something a caller should
+/// have to infer from process environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackSource {
+    /// Process configuration — `MITOS_FALLBACK_PROVIDER`, which
+    /// defaults to Koios. Production.
+    FromEnv,
+    /// No fallback: the wired data plane is the only source of chain
+    /// data.
+    ///
+    /// Exists for tests. A test that wires a stub plane is asserting
+    /// "no chain data is available"; inheriting the production default
+    /// meant the host quietly resolved prior outputs over the real
+    /// network instead — ~0.5s per lookup, which turned three
+    /// integration tests into network-dependent 7-second affairs that
+    /// failed against their own fixed sleeps.
+    Disabled,
+}
+
 pub struct ModuleHostV2<S, P>
 where
     S: TipSubscription,
@@ -274,6 +296,8 @@ where
     /// held across the guard.
     interest_senders:
         Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>>,
+    /// Where `start` resolves the chain-data fallback provider from.
+    fallback_source: FallbackSource,
     /// Set of module ids with an in-flight recapture. Mutual
     /// exclusion is per-module: a second `recapture_module(id)`
     /// while the first is mid-flight returns
@@ -343,7 +367,16 @@ where
             last_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dialer: std::sync::OnceLock::new(),
             event_ring: std::sync::OnceLock::new(),
+            fallback_source: FallbackSource::FromEnv,
         }
+    }
+
+    /// Choose where this host gets its chain-data fallback provider.
+    /// Defaults to [`FallbackSource::FromEnv`]; see that type for why
+    /// the override exists.
+    pub fn with_fallback_source(mut self, source: FallbackSource) -> Self {
+        self.fallback_source = source;
+        self
     }
 
     /// Inject the shared operational-events ring. `&self` via
@@ -411,6 +444,25 @@ where
             .storage
             .read_manifest(id)?
             .ok_or_else(|| PlatformError::Decode(format!("no manifest for {id}")))?;
+
+        // Refuse to START a module whose manifest doesn't satisfy this
+        // host's ABI — including the WIT revision its bindings were
+        // generated from.
+        //
+        // Activation already checks this, but activation happened
+        // against whatever host was running at the time. A module
+        // activated legitimately last week must not keep running after
+        // the host's WIT moves underneath it, and auto-load can't undo
+        // that: by then the module is already in storage, and the only
+        // lever there is destructive removal (losing the module's
+        // cursor and state). Enforcing at start is the non-destructive
+        // equivalent — the artifact stays put, it just doesn't run, and
+        // rebuilding it is the whole remedy.
+        manifest.validate_abi_against_host(&[(
+            crate::registry_v2::HOST_ABI_MAJOR_V2,
+            "mitos:platform-v2/mitos-module-v2",
+        )])?;
+
         let wasm_path = self
             .storage
             .current_wasm_path(id)?
@@ -443,7 +495,10 @@ where
                 None
             }
         };
-        let fallback_opt = crate::fallback::shared();
+        let fallback_opt = match self.fallback_source {
+            FallbackSource::FromEnv => crate::fallback::shared(),
+            FallbackSource::Disabled => None,
+        };
         if fallback_opt.is_some() {
             tracing::info!(module = %id, "chain-data fallback provider enabled");
         }

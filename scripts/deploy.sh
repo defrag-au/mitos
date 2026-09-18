@@ -225,13 +225,15 @@ step_verify() {
     fi
     log "  service: $active"
 
-    # Poll the health endpoint — the HTTP server binds a few seconds
+    # Poll the health endpoint — the HTTP server binds some seconds
     # after `systemctl restart` returns (dolos WAL recovery + indexer
-    # bootstrap happen first). Real-world bind time on the prod host
-    # is ~12s post-restart; allow a generous 30s window.
+    # bootstrap happen first). Quiescent bind time is ~12s, but a
+    # mainnet restart while the box is busy has been measured well
+    # past 30s: the old window reported a false failure (and dumped
+    # the journal) on a deploy that had in fact succeeded. 90s.
     local health=""
     local attempt=0
-    while (( attempt < 15 )); do
+    while (( attempt < 45 )); do
         if health=$(ssh "$MITOS_HOST" "curl -sS --max-time 5 --connect-timeout 2 http://127.0.0.1:$MITOS_HEALTH_PORT/health" 2>&1) \
             && [[ -n "$health" ]]; then
             break
@@ -241,7 +243,7 @@ step_verify() {
     done
 
     if [[ -z "$health" ]] || ! printf "%s" "$health" | grep -q '"status"'; then
-        err "Health endpoint did not respond after 30s: ${health:-(empty)}"
+        err "Health endpoint did not respond after 90s: ${health:-(empty)}"
         warn "Recent journal:"
         ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE -n 30 --no-pager" >&2 || true
         return 1

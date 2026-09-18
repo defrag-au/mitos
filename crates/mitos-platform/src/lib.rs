@@ -109,6 +109,14 @@ pub enum PlatformError {
     #[error("module quarantined after {failures} consecutive failures")]
     Quarantined { failures: u32 },
 
+    /// The activated manifest doesn't satisfy this host's ABI, so
+    /// the module is refused rather than started. Distinct from
+    /// [`PlatformError::AbiMismatch`], which is about the wasm's own
+    /// exported `module-version`; this is the manifest contract,
+    /// including the WIT revision the bindings were generated from.
+    #[error("module refused: {0}")]
+    ManifestRefused(#[from] crate::manifest::ManifestError),
+
     #[error("wasmtime: {0}")]
     Wasmtime(#[from] wasmtime::Error),
 

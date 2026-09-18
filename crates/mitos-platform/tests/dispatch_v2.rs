@@ -29,13 +29,16 @@ use std::sync::Arc;
 use dolos_core::TipEvent;
 use mitos_data_plane::ChainPoint;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
-use mitos_platform::host_v2::{EmitterFactory, KvFactory, ModuleHostV2, SubscriptionFactory};
+use mitos_platform::host_v2::{
+    EmitterFactory, FallbackSource, KvFactory, ModuleHostV2, SubscriptionFactory,
+};
 use mitos_platform::registry_v2::ResourceBudget;
 use mitos_platform::storage::ModuleStorage;
 use tokio::sync::Mutex;
 
 use common::{
     NullChainDataPlane, OneShotSub, fixture_block_cbor, manifest_v2, tempdir, test_indexer_wasm,
+    wait_for,
 };
 
 /// Shape the test-indexer emits per asset. Mirror of the
@@ -150,7 +153,8 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
         kv_factory,
         emitter_factory,
         ResourceBudget::default(),
-    );
+    )
+    .with_fallback_source(FallbackSource::Disabled);
 
     host.start("test-indexer", false).await.expect("start");
 
@@ -160,19 +164,20 @@ async fn dispatch_emits_per_asset_under_watched_policy() {
     ))
     .expect("send tip event");
 
-    // Give the follower + drain tasks time to dispatch the block,
-    // run the module, and flush emission rows to the redb store.
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    // Wait for the follower + drain tasks to dispatch the block, run
+    // the module, and flush emission rows to the redb store. Polled
+    // rather than slept — a fixed wait turns a slow pipeline into an
+    // assertion failure that reads like a logic bug.
+    let rows = wait_for("emission rows to reach the store", || {
+        let emissions = storage.emissions_store("test-indexer").ok()?;
+        let rows = emissions
+            .list_queued_for_companion("test-companion", "test-client")
+            .ok()?;
+        (rows.len() >= expected_count).then_some(rows)
+    })
+    .await;
 
     host.stop("test-indexer").await.expect("stop");
-
-    // Inspect the emissions store directly.
-    let emissions = storage
-        .emissions_store("test-indexer")
-        .expect("emissions store");
-    let rows = emissions
-        .list_queued_for_companion("test-companion", "test-client")
-        .expect("list emissions");
 
     assert_eq!(
         rows.len(),

@@ -23,13 +23,16 @@ use std::sync::Arc;
 use dolos_core::TipEvent;
 use mitos_data_plane::ChainPoint;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
-use mitos_platform::host_v2::{EmitterFactory, KvFactory, ModuleHostV2, SubscriptionFactory};
+use mitos_platform::host_v2::{
+    EmitterFactory, FallbackSource, KvFactory, ModuleHostV2, SubscriptionFactory,
+};
 use mitos_platform::registry_v2::ResourceBudget;
 use mitos_platform::storage::ModuleStorage;
 use tokio::sync::Mutex;
 
 use common::{
     NullChainDataPlane, OneShotSub, fixture_block_cbor, manifest_v2, tempdir, test_indexer_wasm,
+    wait_for,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -83,7 +86,8 @@ async fn start_replace_stop_roundtrip_v2() {
         kv_factory.clone(),
         emitter_factory.clone(),
         ResourceBudget::default(),
-    );
+    )
+    .with_fallback_source(FallbackSource::Disabled);
 
     // 1. Start the module.
     host.start("test-indexer", false).await.expect("start");
@@ -100,18 +104,17 @@ async fn start_replace_stop_roundtrip_v2() {
     ))
     .expect("send tip event");
 
-    // 3. Give the follower a moment to drain the queue and
-    //    flush the cursor. 500ms is generous on the slow side
-    //    of CI; a faster signal would be a notify-based hook,
-    //    but the v1 test used the same pattern and never
-    //    flaked.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
+    // 3. Wait for the follower to drain the queue and flush the
+    //    cursor. Polled rather than slept: the old fixed 500ms
+    //    encoded a guess, and when the guess was wrong the failure
+    //    read as "cursor absent" (a logic bug) rather than "not yet"
+    //    (a timing one).
+    //
     // 4. Cursor was checkpointed.
-    let persisted = storage
-        .read_cursor("test-indexer")
-        .expect("read cursor")
-        .expect("cursor present after dispatch");
+    let persisted = wait_for("follower to flush the cursor", || {
+        storage.read_cursor("test-indexer").ok().flatten()
+    })
+    .await;
     assert_eq!(
         persisted.slot(),
         186_000_000,
@@ -150,7 +153,8 @@ async fn start_replace_stop_roundtrip_v2() {
         kv_factory,
         emitter_factory,
         ResourceBudget::default(),
-    );
+    )
+    .with_fallback_source(FallbackSource::Disabled);
     host_2
         .start("test-indexer", false)
         .await
@@ -171,5 +175,82 @@ async fn start_replace_stop_roundtrip_v2() {
         .expect("stop after restart");
 
     drop(tx);
+    std::fs::remove_dir_all(&storage_dir).ok();
+}
+
+/// A module already activated under an older host must not keep
+/// running once the host's WIT moves underneath it.
+///
+/// Auto-load can refuse to *activate* a skewed artifact, but by the
+/// time the skew exists the module is already in storage — refusing
+/// activation there leaves it running. `start` is the chokepoint that
+/// actually stops it, and it covers auto-resume, admin restart and
+/// recapture alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_refuses_a_module_built_against_a_different_wit() {
+    let Some(wasm_path) = test_indexer_wasm() else {
+        eprintln!("skipping: test-indexer wasm not built");
+        return;
+    };
+    let wasm = std::fs::read(&wasm_path).expect("read wasm");
+
+    // Activate directly, as an older host would have: storage
+    // performs no validation, so this is exactly the state a
+    // previously-legitimate module is left in after a WIT change.
+    let mut manifest = manifest_v2(&wasm);
+    manifest.abi.wit_sha = Some("11".repeat(32));
+
+    let storage_dir = tempdir("lifecycle-v2-wit-skew");
+    let storage = ModuleStorage::new(&storage_dir);
+    storage.activate(&manifest, &wasm).expect("activate");
+
+    let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
+    let chain_plane = Arc::new(NullChainDataPlane);
+    let dp: Arc<dyn DataPlaneFacade> = chain_plane.clone();
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let rx_holder = Arc::new(Mutex::new(rx));
+    let sub_factory: SubscriptionFactory<OneShotSub> = Arc::new({
+        let rx_holder = rx_holder.clone();
+        move |_resume_cursor: Option<ChainPoint>| OneShotSub {
+            rx: rx_holder.clone(),
+        }
+    });
+    let kv_factory: KvFactory = Arc::new(|_id: &str| state_kv::ModuleKv::new_in_memory());
+    let emitter_factory: EmitterFactory = Arc::new(emit::EventSink::new);
+
+    let host = ModuleHostV2::new(
+        storage.clone(),
+        engine,
+        dp,
+        chain_plane,
+        sub_factory,
+        kv_factory,
+        emitter_factory,
+        ResourceBudget::default(),
+    )
+    .with_fallback_source(FallbackSource::Disabled);
+
+    let err = host
+        .start("test-indexer", false)
+        .await
+        .expect_err("start must refuse a WIT-skewed module");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("wit revision mismatch"),
+        "refusal should name the WIT revision skew, got: {msg}"
+    );
+    assert!(
+        host.list().await.is_empty(),
+        "a refused module must not be running"
+    );
+
+    // And auto-resume — the path a process restart actually takes —
+    // must leave it stopped rather than starting it anyway.
+    host.auto_resume().await;
+    assert!(
+        host.list().await.is_empty(),
+        "auto-resume must not start a refused module"
+    );
+
     std::fs::remove_dir_all(&storage_dir).ok();
 }

@@ -271,6 +271,28 @@ pub fn tempdir(name: &str) -> PathBuf {
     p
 }
 
+/// Poll `cond` until it returns `Some`, or panic after ~10s.
+///
+/// Replaces the fixed `sleep(500ms)` these tests used to use before
+/// asserting. A fixed sleep encodes a guess about how long the
+/// follower takes, and when that guess is wrong the failure looks
+/// like a logic bug ("cursor absent") rather than a timing one.
+/// Polling also means the fast path stays fast — a passing test
+/// returns as soon as the condition holds instead of always paying
+/// the full wait.
+pub async fn wait_for<T>(what: &str, mut cond: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(v) = cond() {
+            return v;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 10s waiting for: {what}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// Marker type to silence the rustc warning for unused `Arc` /
 /// types pulled in by re-exports the test module references but
 /// the file itself doesn't directly use.

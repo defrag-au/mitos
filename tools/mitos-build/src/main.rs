@@ -365,20 +365,52 @@ fn cargo_target_dir(workspace: &Path) -> anyhow::Result<PathBuf> {
 
 fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::Result<PathBuf> {
     tracing::info!(crate_name = %crate_name, profile = %profile, "cargo build");
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
-        .arg("--target")
-        .arg("wasm32-wasip2")
-        .arg("--profile")
-        .arg(profile)
-        .arg("-p")
-        .arg(crate_name)
-        .current_dir(workspace);
-    let status = cmd
-        .status()
-        .with_context(|| "running cargo (is it on PATH?)")?;
-    if !status.success() {
-        return Err(anyhow!("cargo build failed (exit {:?})", status.code()));
+    let run = || -> anyhow::Result<bool> {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
+            .arg("--target")
+            .arg("wasm32-wasip2")
+            .arg("--profile")
+            .arg(profile)
+            .arg("-p")
+            .arg(crate_name)
+            .current_dir(workspace);
+        Ok(cmd
+            .status()
+            .with_context(|| "running cargo (is it on PATH?)")?
+            .success())
+    };
+
+    if !run()? {
+        // The generated workspace keeps its own Cargo.lock, and
+        // nothing regenerates it — we rewrite Cargo.toml every run,
+        // but the lock survives. That's fine until the dependency
+        // graph moves somewhere the generated manifest can't see:
+        // bump the shared-crates git rev and a crate BEHIND that rev
+        // can raise its pallas requirement, leaving the lock pinning
+        // a version that no longer satisfies anyone. Cargo then fails
+        // to select a version rather than re-resolving.
+        //
+        // Drop the lock and try once more. A genuine incompatibility
+        // fails again on the retry and surfaces normally; a merely
+        // stale pin heals. Deliberately NOT `--locked` anywhere here:
+        // these workspaces are build scratch, regenerated at will, so
+        // reproducibility lives in the source tree's lock, not this one.
+        let lock = workspace.join("Cargo.lock");
+        if lock.exists() {
+            tracing::warn!(
+                lock = %lock.display(),
+                "cargo build failed; dropping the generated lockfile and retrying once"
+            );
+            std::fs::remove_file(&lock).with_context(|| format!("removing {}", lock.display()))?;
+            if !run()? {
+                return Err(anyhow!(
+                    "cargo build failed (also after dropping the lockfile)"
+                ));
+            }
+        } else {
+            return Err(anyhow!("cargo build failed"));
+        }
     }
 
     // Resolve the produced .wasm. Cargo writes to
