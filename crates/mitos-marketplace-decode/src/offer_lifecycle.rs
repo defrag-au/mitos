@@ -64,11 +64,13 @@ fn is_jpg_offer_cancel(redeemer: &[u8]) -> bool {
 struct OfferInput<V> {
     prior_tx_hash: Vec<u8>,
     prior_output_index: u32,
-    prior_lovelace: u64,
-    /// What the consumed offer actually locked. Carried alongside the lovelace
-    /// because the PARTIAL-accept path below reports a price without ever
-    /// seeing a delivery, and a swap's min-ADA reported there would be exactly
-    /// the poisoned figure [`AssetPrice`] exists to prevent.
+    /// What the consumed offer actually locked.
+    ///
+    /// This replaced a bare `prior_lovelace: u64`. Every consumer of that field
+    /// — the update's previous price, and the PARTIAL-accept path that reports
+    /// a price without ever seeing a delivery — would otherwise report a swap's
+    /// min-ADA as a bid, which is the poisoned figure [`AssetPrice`] exists to
+    /// prevent.
     prior_price: AssetPrice,
     redeemer: Option<Vec<u8>>,
     version: V,
@@ -78,7 +80,10 @@ struct OfferInput<V> {
 /// A produced offer UTxO (a fresh/replacement bid) with its resolved datum.
 struct OfferOutput<V> {
     output_index: u32,
-    lovelace: u64,
+    /// What the bidder locked. Not a `u64`: a swap offer's UTxO holds the
+    /// offered assets and only min-ADA, so the balance alone would report a
+    /// fake bid — the same trap the accept side carries [`AssetPrice`] for.
+    price: AssetPrice,
     datum_bytes: Vec<u8>,
     /// How the output carried the datum, when the host said. Travels
     /// with the bytes because a consumer needs both to spend it.
@@ -109,7 +114,6 @@ fn collect_offers<V: Clone>(
         consumed.push(OfferInput {
             prior_tx_hash: input.oref_tx_hash.clone(),
             prior_output_index: input.oref_index,
-            prior_lovelace: input.lovelace,
             prior_price: crate::offers::consideration(input),
             redeemer: input.redeemer.clone(),
             version,
@@ -130,7 +134,7 @@ fn collect_offers<V: Clone>(
         };
         produced.push(OfferOutput {
             output_index: output.index,
-            lovelace: output.lovelace,
+            price: crate::offers::consideration_out(output),
             datum_bytes: datum.payload.clone(),
             datum_kind: datum.kind,
             version,
@@ -215,8 +219,8 @@ pub fn decode_jpg_offer_lifecycle(tx: &DecodeTx) -> Vec<JpgStoreOffer> {
                 prior_tx_hash: hex::encode(&consume.prior_tx_hash),
                 prior_output_index: consume.prior_output_index,
                 new_output_index: produced.output_index,
-                previous_lovelace: consume.prior_lovelace,
-                new_lovelace: produced.lovelace,
+                previous_price: consume.prior_price.clone(),
+                new_price: produced.price.clone(),
                 datum_cbor: produced.datum_bytes,
                 datum_kind: produced.datum_kind,
                 target_policy: produced.decoded.target_policy,
@@ -267,7 +271,7 @@ pub fn decode_jpg_offer_lifecycle(tx: &DecodeTx) -> Vec<JpgStoreOffer> {
             bidder_pkh: p.decoded.bidder_pkh,
             tx_hash: tx_hash_hex.clone(),
             output_index: p.output_index,
-            lovelace: p.lovelace,
+            price: p.price,
             datum_cbor: p.datum_bytes,
             datum_kind: p.datum_kind,
             target_policy: p.decoded.target_policy,
@@ -317,8 +321,8 @@ pub fn decode_wayup_offer_lifecycle(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Ve
                 prior_tx_hash: hex::encode(&consume.prior_tx_hash),
                 prior_output_index: consume.prior_output_index,
                 new_output_index: produced.output_index,
-                previous_lovelace: consume.prior_lovelace,
-                new_lovelace: produced.lovelace,
+                previous_price: consume.prior_price.clone(),
+                new_price: produced.price.clone(),
                 datum_cbor: produced.datum_bytes,
                 datum_kind: produced.datum_kind,
                 target_policy: produced.decoded.target_policy,
@@ -351,7 +355,7 @@ pub fn decode_wayup_offer_lifecycle(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Ve
             bidder_pkh: p.decoded.bidder_pkh,
             tx_hash: tx_hash_hex.clone(),
             output_index: p.output_index,
-            lovelace: p.lovelace,
+            price: p.price,
             datum_cbor: p.datum_bytes,
             datum_kind: p.datum_kind,
             target_policy: p.decoded.target_policy,

@@ -68,12 +68,16 @@ pub struct MarketEventRow {
     pub venue: String,
 }
 
-/// The consideration as JSON, or `None` when it is plain ADA and the numeric
-/// column already says everything.
+/// The consideration as JSON — **only when there is something to say**.
+///
+/// `Lovelace` is already fully described by the numeric column, and `Unknown`
+/// has nothing to describe: serialising it wrote `{"kind":"unknown"}` onto
+/// every one of 219,205 cancels, a detail column repeating what `price_kind`
+/// already said. Only `InKind` carries payload a reader cannot get elsewhere.
 fn price_detail(price: &AssetPrice) -> Option<String> {
     match price {
-        AssetPrice::Lovelace(_) => None,
-        other => serde_json::to_string(other).ok(),
+        AssetPrice::InKind { .. } => serde_json::to_string(price).ok(),
+        AssetPrice::Lovelace(_) | AssetPrice::Unknown => None,
     }
 }
 
@@ -336,7 +340,7 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             c.target_asset_names.first().map(String::as_str),
-            Some(c.lovelace),
+            &c.price,
             Some(c.output_index),
             "offer_created",
             JPG_MARKETPLACE,
@@ -348,7 +352,7 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             &u.bidder_pkh,
             u.target_policy.as_deref(),
             u.target_asset_names.first().map(String::as_str),
-            Some(u.new_lovelace),
+            &u.new_price,
             Some(u.new_output_index),
             "offer_updated",
             JPG_MARKETPLACE,
@@ -360,7 +364,9 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             None,
-            None,
+            // A cancel reports no bid — the offer's price is a property of the
+            // offer, not of withdrawing it.
+            &AssetPrice::Unknown,
             None,
             "offer_cancelled",
             JPG_MARKETPLACE,
@@ -401,7 +407,7 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             c.target_asset_names.first().map(String::as_str),
-            Some(c.lovelace),
+            &c.price,
             Some(c.output_index),
             "offer_created",
             WAYUP_MARKETPLACE,
@@ -413,7 +419,7 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             &u.bidder_pkh,
             u.target_policy.as_deref(),
             u.target_asset_names.first().map(String::as_str),
-            Some(u.new_lovelace),
+            &u.new_price,
             Some(u.new_output_index),
             "offer_updated",
             WAYUP_MARKETPLACE,
@@ -425,7 +431,8 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             None,
-            None,
+            // See the jpg arm — a cancel reports no bid.
+            &AssetPrice::Unknown,
             None,
             "offer_cancelled",
             WAYUP_MARKETPLACE,
@@ -449,7 +456,11 @@ fn offer_book_row(
     bidder_pkh: &str,
     target_policy: Option<&str>,
     target_asset: Option<&str>,
-    lovelace: Option<u64>,
+    // `price` is an `AssetPrice`, not an `Option<u64>`: an open swap offer has
+    // no lovelace bid, and flattening it here would put the min-ADA straight
+    // back into the book the accept side was just fixed to keep out. A cancel
+    // carries no bid at all and passes `Unknown`.
+    price: &AssetPrice,
     output_index: Option<u32>,
     kind: &str,
     marketplace: &str,
@@ -466,10 +477,10 @@ fn offer_book_row(
             .then(|| fingerprint(policy, asset))
             .flatten(),
         kind: kind.into(),
-        price_lovelace: lovelace,
+        price_lovelace: price.lovelace(),
         buyer_price_lovelace: None,
-        price_kind: AssetPrice::LOVELACE_KIND.into(),
-        price_detail: None,
+        price_kind: price.kind().into(),
+        price_detail: price_detail(price),
         seller_stake: None,
         buyer_stake: stake_keyhash_to_bech32(bidder_pkh, false),
         marketplace: marketplace.into(),

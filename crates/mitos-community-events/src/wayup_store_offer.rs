@@ -46,9 +46,14 @@ pub struct OfferCreate {
     pub tx_hash: String,
     /// Output index within `tx_hash` of the offer UTxO.
     pub output_index: u32,
-    /// Lovelace locked at the offer script (the bid amount,
-    /// including the standard min-utxo overhead).
-    pub lovelace: u64,
+    /// What the bidder locked at the offer script.
+    ///
+    /// An [`AssetPrice`] rather than a `u64` for the same reason as
+    /// [`OfferAccept::price`]: Wayup offers are not always ADA, and a bare
+    /// number cannot say so. Create and accept must agree — an offer that
+    /// reports a min-ADA bid while open and no price when it fills is two
+    /// stories about one offer.
+    pub price: AssetPrice,
     /// Raw datum CBOR — preserved for forensics + so the
     /// companion can build a cancel TX against the offer's
     /// actual on-chain bytes without a chain round-trip.
@@ -135,8 +140,11 @@ pub struct OfferUpdate {
     pub prior_output_index: u32,
     /// New offer UTxO produced in the same TX.
     pub new_output_index: u32,
-    pub previous_lovelace: u64,
-    pub new_lovelace: u64,
+    /// The bid before and after the reprice. Both [`AssetPrice`] — an offer
+    /// can be repriced without becoming ADA-denominated, and a swap offer
+    /// repriced to another swap must not surface as a lovelace move.
+    pub previous_price: AssetPrice,
+    pub new_price: AssetPrice,
     /// Raw datum CBOR for the new offer UTxO (consumers need it
     /// to build a cancel TX against the updated offer's bytes).
     #[serde(with = "serde_bytes")]

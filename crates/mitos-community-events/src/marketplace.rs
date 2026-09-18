@@ -101,6 +101,24 @@ impl AssetPrice {
         }
     }
 
+    /// The lovelace the offer UTxO actually holds, whatever the consideration
+    /// was — **a ledger fact, not a price.**
+    ///
+    /// The distinction is the whole point of having two accessors. A consumer
+    /// building a transaction against the offer (a cancel, a spend) MUST have
+    /// the real balance and must not be handed `None` because the bid happened
+    /// to be assets; a consumer computing a median MUST NOT be handed a
+    /// min-ADA figure. Same number, opposite requirements — so
+    /// [`lovelace`](Self::lovelace) answers "what was the bid" and this answers
+    /// "what is in the UTxO".
+    pub fn locked_lovelace(&self) -> u64 {
+        match self {
+            Self::Lovelace(v) => *v,
+            Self::InKind { lovelace, .. } => *lovelace,
+            Self::Unknown => 0,
+        }
+    }
+
     /// What to call this **to a reader**, as against [`Self::kind`]'s storage
     /// slug.
     ///

@@ -139,20 +139,34 @@ pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
 /// because separating a real ADA component from the min-ADA the assets require
 /// is a calculation we cannot do reliably.
 pub(crate) fn consideration(input: &TxInput) -> AssetPrice {
-    if input.assets.is_empty() {
-        return AssetPrice::Lovelace(input.lovelace);
+    locked_value(input.lovelace, &input.assets)
+}
+
+/// The same reading for a **produced** offer UTxO — an offer being created or
+/// repriced, where the bid has not been consumed yet.
+///
+/// Create and accept must agree, or the book lies in a way the fills do not:
+/// a swap offer that reports a min-ADA bid while it sits open, then correctly
+/// reports no price when it fills, is two different stories about one offer.
+pub(crate) fn consideration_out(out: &TxOutput) -> AssetPrice {
+    locked_value(out.lovelace, &out.assets)
+}
+
+fn locked_value(lovelace: u64, assets: &[AssetId]) -> AssetPrice {
+    if assets.is_empty() {
+        return AssetPrice::Lovelace(lovelace);
     }
     AssetPrice::InKind {
-        lovelace: input.lovelace,
-        assets: input
-            .assets
+        lovelace,
+        assets: assets
             .iter()
             .map(|a| AssetAmount {
                 policy: hex::encode(&a.policy),
                 name: hex::encode(&a.name),
                 // `AssetId` carries identity only; an offer UTxO's quantities
                 // are NFTs in every case observed. A fungible-denominated offer
-                // would need `TxInput` to carry amounts — flagged, not guessed.
+                // would need the input/output types to carry amounts —
+                // flagged, not guessed.
                 quantity: 1,
             })
             .collect(),
