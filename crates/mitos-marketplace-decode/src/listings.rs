@@ -93,6 +93,9 @@ enum ListingEvent<V> {
         payouts: Vec<ListingPayout>,
         version: V,
         bundle_size: Option<u32>,
+        /// Hex CBOR of the exact preimage `payouts` was decoded from — what a
+        /// buyer must witness for a hash-datum listing.
+        datum_cbor: Option<String>,
     },
     Update {
         policy_hex: String,
@@ -105,6 +108,8 @@ enum ListingEvent<V> {
         payouts: Vec<ListingPayout>,
         version: V,
         bundle_size: Option<u32>,
+        /// As [`ListingEvent::Create::datum_cbor`], for the NEW listing UTxO.
+        datum_cbor: Option<String>,
     },
     Unlisting {
         policy_hex: String,
@@ -197,20 +202,30 @@ fn collect_listings<V: Clone>(
         let policy_hex = hex::encode(&policy);
         let asset_name_hex = hex::encode(&asset_name);
 
+        // Bytes and decode are carried TOGETHER, never derived separately.
+        //
+        // `datum_cbor` on the emitted event must be the exact preimage that
+        // produced `payouts`: a buyer witnesses those bytes while paying those
+        // payouts, and if a fallback path could decode from one source while
+        // reporting bytes from another, the transaction fails phase-2 with the
+        // buyer's collateral burned. Pairing them makes that unrepresentable.
+        //
         // Create path reads the inline payload only. Updates (and Wayup creates)
         // additionally fall back to the resolver.
+        let decode_bytes =
+            |bytes: Vec<u8>| decode_listing_datum(&bytes).map(|decoded| (bytes, decoded));
         let payload_decoded = produced
             .datum
             .as_ref()
             .filter(|d| !d.payload.is_empty())
-            .and_then(|d| decode_listing_datum(&d.payload));
+            .and_then(|d| decode_bytes(d.payload.clone()));
 
         if let Some(prior) = consumed.remove(&(policy.clone(), asset_name.clone())) {
-            let decoded = payload_decoded
+            let (datum_cbor, decoded) = payload_decoded
                 .or_else(|| {
-                    resolve_produced(produced.datum.as_ref(), &resolve)
-                        .and_then(|b| decode_listing_datum(&b))
+                    resolve_produced(produced.datum.as_ref(), &resolve).and_then(decode_bytes)
                 })
+                .map(|(bytes, decoded)| (Some(hex::encode(bytes)), decoded))
                 .unwrap_or_default();
             let new_price = sum_payouts(&decoded.payouts);
             let previous_price = prior
@@ -230,16 +245,17 @@ fn collect_listings<V: Clone>(
                 payouts: decoded.payouts,
                 version: produced.version,
                 bundle_size: produced.bundle_size,
+                datum_cbor,
             });
         } else {
-            let decoded = if create_uses_resolver {
+            let (datum_cbor, decoded) = if create_uses_resolver {
                 payload_decoded.or_else(|| {
-                    resolve_produced(produced.datum.as_ref(), &resolve)
-                        .and_then(|b| decode_listing_datum(&b))
+                    resolve_produced(produced.datum.as_ref(), &resolve).and_then(decode_bytes)
                 })
             } else {
                 payload_decoded
             }
+            .map(|(bytes, decoded)| (Some(hex::encode(bytes)), decoded))
             .unwrap_or_default();
             let price = sum_payouts(&decoded.payouts);
             out.push(ListingEvent::Create {
@@ -252,6 +268,7 @@ fn collect_listings<V: Clone>(
                 payouts: decoded.payouts,
                 version: produced.version,
                 bundle_size: produced.bundle_size,
+                datum_cbor,
             });
         }
     }
@@ -315,6 +332,7 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             version,
             bundle_size,
+            datum_cbor,
         } => JpgStoreListing::Create(JpgListingCreate {
             policy: policy_hex,
             asset_name_hex,
@@ -325,6 +343,7 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
         }),
         ListingEvent::Update {
             policy_hex,
@@ -337,6 +356,7 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             version,
             bundle_size,
+            datum_cbor,
         } => JpgStoreListing::Update(JpgListingUpdate {
             policy: policy_hex,
             asset_name_hex,
@@ -348,6 +368,7 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
         }),
         ListingEvent::Unlisting {
             policy_hex,
@@ -408,6 +429,7 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             version,
             bundle_size,
+            datum_cbor,
         } => WayupStoreListing::Create(WayupListingCreate {
             policy: policy_hex,
             asset_name_hex,
@@ -418,6 +440,7 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
         }),
         ListingEvent::Update {
             policy_hex,
@@ -430,6 +453,7 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             version,
             bundle_size,
+            datum_cbor,
         } => WayupStoreListing::Update(WayupListingUpdate {
             policy: policy_hex,
             asset_name_hex,
@@ -441,6 +465,7 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
         }),
         ListingEvent::Unlisting {
             policy_hex,

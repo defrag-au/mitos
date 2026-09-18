@@ -74,6 +74,25 @@ pub struct ListingCreate {
     /// `None` for ordinary single-asset listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_size: Option<u32>,
+    /// The listing datum's raw CBOR, lowercase hex.
+    ///
+    /// Carried in ADDITION to `payouts`, which is the same datum decoded,
+    /// because the two answer different questions: payouts are what the
+    /// validator checks, but **buying** a listing whose output commits to a
+    /// datum HASH requires witnessing the preimage, and bytes cannot be
+    /// reconstructed from the decode.
+    ///
+    /// This module is the cheapest place in the system to state them. jpg
+    /// commits listing datums by hash and never witnesses the preimage on
+    /// chain, so the only source is the creating transaction's metadata —
+    /// which this module already reads to produce `payouts` at all. Every
+    /// consumer that omits this ends up re-fetching that transaction and
+    /// re-scanning its metadata for bytes that were in hand here.
+    ///
+    /// `None` when the preimage could not be recovered, which is also the
+    /// value every event emitted before this field existed decodes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datum_cbor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +118,11 @@ pub struct ListingUpdate {
     /// `None` for ordinary single-asset listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_size: Option<u32>,
+    /// The NEW listing datum's raw CBOR, lowercase hex. See
+    /// [`ListingCreate::datum_cbor`] — an update produces a fresh listing
+    /// UTxO, so the buyable datum is the post-update one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datum_cbor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
