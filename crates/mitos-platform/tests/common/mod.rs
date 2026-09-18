@@ -231,6 +231,7 @@ pub fn manifest_v2(wasm: &[u8]) -> Manifest {
             version_minor: 0,
             wit_package: "mitos:platform-v2".to_owned(),
             wit_world: "mitos-module-v2".to_owned(),
+            wit_sha: Some(mitos_platform::manifest::host_wit_sha().to_owned()),
         },
         trap_policy: TrapPolicySection {
             strategy: "replay".to_owned(),

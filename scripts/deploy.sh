@@ -251,6 +251,49 @@ step_verify() {
     if ! printf "%s" "$health" | ssh "$MITOS_HOST" "command -v jq >/dev/null 2>&1 && jq ." 2>/dev/null; then
         printf "  %s\n" "$health" >&2
     fi
+
+    step_verify_modules
+}
+
+# Read the host's own community-module activation report and fail the
+# deploy if anything was refused.
+#
+# Deliberately NOT a bash-side comparison of artifact shas against
+# what the host loaded: the host already validates every module
+# (manifest vs wasm bytes, ABI major, wit world, wit revision) and
+# reports the result. Re-deriving that here would repeat the mistake
+# that made this check necessary — see the note in
+# step_build_community_modules. Read the authority; don't reimplement it.
+#
+# Scoped to the CURRENT boot via ActiveEnterTimestamp so a summary
+# from a previous run can't be mistaken for this one's.
+step_verify_modules() {
+    local since line refused
+    since=$(ssh "$MITOS_HOST" "systemctl show -p ActiveEnterTimestamp --value $MITOS_SERVICE" 2>/dev/null) || since=""
+    if [[ -n "$since" ]]; then
+        line=$(ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE --since '$since' --no-pager | grep 'community-modules auto-load complete' | tail -1" 2>&1)
+    else
+        line=$(ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE -n 2000 --no-pager | grep 'community-modules auto-load complete' | tail -1" 2>&1)
+    fi
+
+    if [[ -z "$line" ]]; then
+        warn "  no community-module auto-load summary this boot (auto-load disabled?)"
+        return 0
+    fi
+    printf "  %s\n" "$line" >&2
+
+    refused=$(printf "%s" "$line" | grep -o 'refused_count=[0-9]*' | cut -d= -f2)
+    if [[ -z "$refused" ]]; then
+        warn "  host predates refused_count reporting — rebuild it to get this check"
+        return 0
+    fi
+    if [[ "$refused" != "0" ]]; then
+        err "$refused community module(s) REFUSED — they are NOT running"
+        warn "Refusals from this boot:"
+        ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE --since '$since' --no-pager | grep 'community module REFUSED' " >&2 || true
+        return 1
+    fi
+    log "  community modules: no refusals"
 }
 
 # ----------------------------------------------------------------------

@@ -698,6 +698,7 @@ mod tests {
                 version_minor: 0,
                 wit_package: "mitos:platform".to_owned(),
                 wit_world: "mitos-module".to_owned(),
+                wit_sha: Some(crate::manifest::host_wit_sha().to_owned()),
             },
             trap_policy: TrapPolicySection {
                 strategy: "replay".to_owned(),
