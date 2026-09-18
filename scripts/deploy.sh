@@ -143,19 +143,44 @@ step_build_community_modules() {
     # community-modules/<name>/target/mitos/<name>/, exactly where
     # the host's community-module auto-load reads from.
     #
+    # There is deliberately NO freshness check here. Cargo is the
+    # freshness authority, and it already tracks every input:
+    #
+    #   <name>.rs           -> generated src/lib.rs        (tracked)
+    #   <name>.toml [deps]  -> generated Cargo.toml        (tracked)
+    #   crates/mitos-*      -> path deps of that Cargo.toml (tracked)
+    #   wit-v2/*.wit        -> include_str! into mitos-build, which
+    #                          writes the generated wit/ that
+    #                          wit_bindgen::generate! tracks (tracked,
+    #                          which is why step 2 rebuilds mitos-build
+    #                          BEFORE this step runs)
+    #
+    # An earlier version of this step compared the wasm mtime against
+    # the module dir plus the WIT. It re-derived that graph in bash and
+    # got one edge wrong — the dependency crates — so a change confined
+    # to e.g. mitos-community-events left every module reported "fresh"
+    # and shipped stale wasm under a successful deploy. Do not
+    # reintroduce a gate here; add the input to the crate instead and
+    # cargo will find it.
+    #
+    # A no-op mitos-build is ~0.6s (cargo itself ~0.3s), so re-running
+    # all ~20 unconditionally costs ~12s. That is the whole price.
+    #
     # Per-module resilience:
     #   - source missing → skip silently
-    #   - existing wasm newer than every .rs + .toml file in the
-    #     module dir → skip (idempotent cache)
     #   - mitos-build failure → log, increment FAILED, keep going.
     #     auto-load gets whatever artifacts succeeded.
     #
     # Single-quoted heredoc on purpose — the loop body runs on the
     # remote box, so $name etc. must NOT expand locally.
+    #
+    # NOTE no apostrophes and no line continuations in the remote block:
+    # it is handed to ssh inside a single-quoted string, so either one
+    # ends the string early and the remote shell dies with
+    # "syntax error: unexpected end of file".
     run "ssh '$MITOS_HOST' '
         cd $MITOS_SRC_REMOTE
         BUILT=0
-        FRESH=0
         SKIPPED=0
         FAILED=0
         for d in community-modules/*/; do
@@ -166,26 +191,6 @@ step_build_community_modules() {
                 SKIPPED=\$((SKIPPED+1))
                 continue
             fi
-            wasm=\"\${d}target/mitos/\${name}/\${name}.wasm\"
-            # Freshness compares the module sources AND the platform WIT.
-            # The WIT is the module ABI: a record gaining a field
-            # regenerates every set of bindings, and a module built against
-            # the old shape does not load into the new host.
-            #
-            # Without the WIT here, a WIT-only change looks like a no-op to
-            # every module dir, all of them are skipped as fresh, and the
-            # host comes up new-ABI with old-ABI modules — a deployment
-            # that reports success and loads nothing.
-            #
-            # NOTE no apostrophes and no line continuations in this block:
-            # it is handed to ssh inside a single-quoted string, so either
-            # one ends the string early and the remote shell dies with
-            # "syntax error: unexpected end of file".
-            if [ -f \"\$wasm\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.rs\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.toml\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find crates/mitos-platform/wit-v2 -name \"*.wit\" -newer \"\$wasm\" -print -quit)\" ]; then
-                FRESH=\$((FRESH+1))
-                continue
-            fi
-            echo \"  building \$name\"
             if ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
                 BUILT=\$((BUILT+1))
             else
@@ -194,7 +199,7 @@ step_build_community_modules() {
                 echo \"    auto-load will skip this module; other modules will continue\"
             fi
         done
-        echo \"  community modules: built=\$BUILT  fresh=\$FRESH  skipped=\$SKIPPED  failed=\$FAILED\"
+        echo \"  community modules: ok=\$BUILT  skipped=\$SKIPPED  failed=\$FAILED\"
     '"
 }
 

@@ -39,7 +39,8 @@ pub struct MarketEventRow {
     pub price_lovelace: Option<u64>,
     pub buyer_price_lovelace: Option<u64>,
     /// What KIND of consideration the price columns describe — `"lovelace"`,
-    /// `"bundle"`, `"unknown"`.
+    /// `"in_kind"`, `"unknown"`. The reader-facing name for each is
+    /// `AssetPrice::label()` — `"in_kind"` classifies, `"P2P trade"` explains.
     ///
     /// `price_lovelace` is populated **only** for `"lovelace"`, so the numeric
     /// column is never a lie: a swap reads NULL and drops out of every `AVG`,

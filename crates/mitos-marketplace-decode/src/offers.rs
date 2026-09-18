@@ -135,14 +135,14 @@ pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
 /// What the bidder locked, as an [`AssetPrice`].
 ///
 /// Assets present ⇒ the consideration is not ADA, however much lovelace rides
-/// along with them. The lovelace is still reported (see [`AssetPrice::Bundle`])
+/// along with them. The lovelace is still reported (see [`AssetPrice::InKind`])
 /// because separating a real ADA component from the min-ADA the assets require
 /// is a calculation we cannot do reliably.
 pub(crate) fn consideration(input: &TxInput) -> AssetPrice {
     if input.assets.is_empty() {
         return AssetPrice::Lovelace(input.lovelace);
     }
-    AssetPrice::Bundle {
+    AssetPrice::InKind {
         lovelace: input.lovelace,
         assets: input
             .assets
@@ -485,9 +485,10 @@ mod tests {
             None,
             "a swap must not surface a lovelace price"
         );
-        assert_eq!(price.kind(), "bundle");
-        let AssetPrice::Bundle { lovelace, assets } = &price else {
-            panic!("expected Bundle, got {price:?}");
+        assert_eq!(price.kind(), "in_kind");
+        assert_eq!(price.label(), "P2P trade");
+        let AssetPrice::InKind { lovelace, assets } = &price else {
+            panic!("expected InKind, got {price:?}");
         };
         // The balance is still reported — it is what the UTxO held. What is
         // refused is calling it a price.

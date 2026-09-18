@@ -61,7 +61,14 @@ pub struct AssetAmount {
 pub enum AssetPrice {
     /// Paid in ADA. The only variant comparable with other prices.
     Lovelace(u64),
-    /// Consideration includes assets — a swap, or assets plus ADA.
+    /// Paid **in kind** — the consideration includes assets. A peer-to-peer
+    /// trade, in user-facing terms; see [`Self::label`].
+    ///
+    /// Named for the consideration, NOT for the shape of the value. "Bundle"
+    /// was the obvious word and is the wrong one: `market_events` already has a
+    /// `bundle_size` column meaning *several assets sold together in one sale*,
+    /// so a `price_kind = 'bundle'` beside it would put two unrelated senses of
+    /// the word in the same row.
     ///
     /// **`lovelace` is the UTxO's whole balance and therefore includes
     /// whatever min-ADA the assets required.** The two are deliberately NOT
@@ -69,10 +76,10 @@ pub enum AssetPrice {
     /// of min-ADA" means computing the UTxO's minimum, which depends on the
     /// serialised width of every quantity in it — a calculation this codebase
     /// has already got wrong once. Reporting the observed balance is honest;
-    /// reporting a "swap" with the min-ADA quietly subtracted would be a guess
-    /// wearing a type. If we ever compute min-ADA reliably, a `Swap` reading
+    /// reporting a bare "swap" with the min-ADA quietly subtracted would be a
+    /// guess wearing a type. If we ever compute min-ADA reliably, that reading
     /// derives from this — it does not need to have been stored.
-    Bundle {
+    InKind {
         lovelace: u64,
         assets: Vec<AssetAmount>,
     },
@@ -90,7 +97,27 @@ impl AssetPrice {
     pub fn lovelace(&self) -> Option<u64> {
         match self {
             Self::Lovelace(v) => Some(*v),
-            Self::Bundle { .. } | Self::Unknown => None,
+            Self::InKind { .. } | Self::Unknown => None,
+        }
+    }
+
+    /// What to call this **to a reader**, as against [`Self::kind`]'s storage
+    /// slug.
+    ///
+    /// The two are deliberately different words for the same thing. `in_kind`
+    /// classifies the consideration precisely, which is what a column wants;
+    /// it tells a person nothing. What actually happened is that two people
+    /// swapped assets directly instead of one paying the other — a **P2P
+    /// trade** — and that is real market activity worth naming as such rather
+    /// than presenting as a sale with a missing price.
+    ///
+    /// Kept beside `kind()` so the pair cannot drift, which is the usual fate
+    /// of a display string defined at whichever call site needed it first.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Lovelace(_) => "ADA",
+            Self::InKind { .. } => "P2P trade",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -103,7 +130,7 @@ impl AssetPrice {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Lovelace(_) => Self::LOVELACE_KIND,
-            Self::Bundle { .. } => "bundle",
+            Self::InKind { .. } => "in_kind",
             Self::Unknown => "unknown",
         }
     }
