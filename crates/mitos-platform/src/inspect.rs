@@ -105,7 +105,7 @@ impl DataPlaneFacade for NullDataPlane {
     async fn read_output_datums(
         &self,
         refs: &[mitos_data_plane::OutputRef],
-    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<mitos_data_plane::TypedDatum>>> {
         Ok(vec![None; refs.len()])
     }
 

@@ -34,7 +34,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cardano_assets::PolicyId;
-use mitos_data_plane::{AssetEntry, DecodeLevel, OutputRef, Resolution, TypedDatum, TypedOutput};
+use mitos_data_plane::{
+    AssetEntry, DatumKind, DecodeLevel, OutputRef, Resolution, TypedDatum, TypedOutput,
+};
 use pallas_primitives::{Hash, PlutusData};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
@@ -108,9 +110,11 @@ struct TxoAsset {
 
 #[derive(Deserialize)]
 struct TxoDatum {
-    /// `"hash"` or `"inline"`.
+    /// `"hash"` or `"inline"`. Load-bearing: Maestro returns
+    /// `bytes` for BOTH kinds, so the shape cannot be inferred
+    /// from their presence the way it can on Koios.
     #[serde(rename = "type")]
-    _kind: String,
+    kind: String,
     hash: String,
     /// Hex-encoded raw CBOR of the datum payload. Always present
     /// for inline datums; present for hash-attached datums when
@@ -432,8 +436,14 @@ fn datum_from_maestro(d: TxoDatum) -> Option<TypedDatum> {
     } else {
         (None, None)
     };
+    let kind = if d.kind.eq_ignore_ascii_case("inline") {
+        DatumKind::Inline
+    } else {
+        DatumKind::Hash
+    };
     Some(TypedDatum {
         hash,
+        kind,
         payload,
         original_cbor,
     })

@@ -38,6 +38,22 @@ impl AssetEntry {
     }
 }
 
+/// How an output carries its datum.
+///
+/// A property of the OUTPUT, not of the contract or its version:
+/// jpg.store's V2 offers carry hash datums and its V3 offers
+/// inline ones today, but a venue-wide rule read off the version
+/// is the kind of assumption that has already reversed once on
+/// that marketplace. Record what the chain says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatumKind {
+    /// Bytes live on the output itself. A spend witnesses nothing.
+    Inline,
+    /// The output commits to a hash; the preimage lives in a
+    /// witness set. A spend must witness those bytes.
+    Hash,
+}
+
 /// Server-resolved datum. Hash always present when any datum
 /// exists on the output; payload populated whenever the plane
 /// could resolve it (inline datum directly, or hash-referenced
@@ -50,9 +66,20 @@ impl AssetEntry {
 /// `original_cbor`. If `payload.is_some()` you have decoded
 /// PlutusData regardless of which on-chain shape the datum
 /// actually had.
+///
+/// `kind` is the one place the distinction survives, because
+/// resolution being caller-blind does not make the shape
+/// irrelevant: a transaction SPENDING this output must witness
+/// the preimage of a hash datum, and must NOT witness one for an
+/// inline datum (the ledger rejects it as
+/// `NotAllowedSupplementalDatums`). Without this, a consumer that
+/// holds the bytes still has to re-read the output on chain just
+/// to learn which shape it was.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypedDatum {
     pub hash: Hash<32>,
+    /// How the output carries this datum.
+    pub kind: DatumKind,
     /// `Some` iff the plane successfully resolved + decoded the
     /// datum body. `None` for hash-references the plane couldn't
     /// resolve (witness-set absent — rare in current state but

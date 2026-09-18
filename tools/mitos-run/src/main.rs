@@ -232,6 +232,24 @@ fn default_version() -> u32 {
     1
 }
 
+/// Fixture spelling of [`mitos_data_plane::DatumKind`].
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FixtureDatumKind {
+    #[default]
+    Hash,
+    Inline,
+}
+
+impl From<FixtureDatumKind> for mitos_data_plane::DatumKind {
+    fn from(kind: FixtureDatumKind) -> Self {
+        match kind {
+            FixtureDatumKind::Hash => Self::Hash,
+            FixtureDatumKind::Inline => Self::Inline,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FixtureUtxo {
     /// 64-hex tx_hash.
@@ -249,6 +267,15 @@ struct FixtureUtxo {
     /// simulate "host couldn't resolve, fall back to metadata".
     #[serde(default)]
     datum_payload_hex: Option<String>,
+    /// How the output carries its datum. Defaults to `hash`.
+    ///
+    /// Stated rather than inferred: `datum_payload_hex` is set for
+    /// EITHER shape whenever the host could resolve, so its presence
+    /// says nothing about the shape. A fixture exercising a module's
+    /// inline path has to say so — and an unrecognised spelling fails
+    /// the fixture load rather than silently testing the other path.
+    #[serde(default)]
+    datum_kind: FixtureDatumKind,
     /// Native assets at the output. Set when the synthesized
     /// UTxO needs to carry NFTs (e.g. listed assets at a
     /// marketplace script address) for module emit-paths that
@@ -376,6 +403,7 @@ impl FixtureDataPlane {
                 .with_context(|| format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index))?;
             let datum = datum_hash_bytes.map(|h| mitos_data_plane::TypedDatum {
                 hash: pallas_primitives::Hash::new(h),
+                kind: u.datum_kind.into(),
                 payload: None,
                 original_cbor: datum_payload,
             });
@@ -559,13 +587,12 @@ impl FixtureDataPlane {
                 // hash-only or inline bytes so the dispatcher's
                 // `backfill_prior_datum` step on Consumed events
                 // can fill the witness payload.
-                let (datum_hash, inline_bytes) =
-                    mitos_data_plane::block_events::extract_datum_info(output);
-                if let Some(hash) = datum_hash {
+                if let Some(draft) = mitos_data_plane::block_events::extract_datum_info(output) {
                     typed_output.datum = Some(mitos_data_plane::TypedDatum {
-                        hash,
+                        hash: draft.hash,
+                        kind: draft.kind,
                         payload: None,
-                        original_cbor: inline_bytes,
+                        original_cbor: draft.inline_bytes,
                     });
                 }
                 // Harvested block outputs feed `by_ref` only, so
@@ -689,6 +716,10 @@ impl mitos_data_plane::ChainDataPlane for FixtureDataPlane {
             .cloned()
             .map(|bytes| mitos_data_plane::TypedDatum {
                 hash: *hash,
+                // This side-door mirrors the real plane's: it resolves a
+                // hash against a witness-set table, so the datum was
+                // carried by hash.
+                kind: mitos_data_plane::DatumKind::Hash,
                 payload: None,
                 original_cbor: Some(bytes),
             }))

@@ -77,13 +77,14 @@ pub trait DataPlaneFacade: Send + Sync + 'static {
     ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>>;
 
     /// Bulk datum lookup paired with `read_utxos` for the
-    /// bootstrap pattern. Returns parallel `Option<(hash,
-    /// payload)>` per ref — caller-blind inline / hash
-    /// resolution.
+    /// bootstrap pattern. Returns a parallel `Option<TypedDatum>`
+    /// per ref — resolution is caller-blind, but the datum keeps
+    /// its [`mitos_data_plane::DatumKind`], which a spender needs
+    /// and a `(hash, payload)` pair could not carry.
     async fn read_output_datums(
         &self,
         refs: &[mitos_data_plane::OutputRef],
-    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>>;
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<mitos_data_plane::TypedDatum>>>;
 
     /// Datum hashes per ref, decoupled from byte resolution —
     /// `Some(hash)` even when the host couldn't resolve the
@@ -290,23 +291,14 @@ where
     async fn read_output_datums(
         &self,
         refs: &[mitos_data_plane::OutputRef],
-    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
-        let datums = mitos_data_plane::ChainDataPlane::read_output_datums(self, refs).await?;
-        Ok(datums
-            .into_iter()
-            .map(|opt| {
-                // Preserve the hash even when the bytes are
-                // unresolved (`original_cbor == None`): a hash-only
-                // datum the local plane couldn't resolve still
-                // carries a meaningful hash, and the caller falls
-                // back to `datum_by_hash` (which has the Maestro
-                // fallback) on an empty payload. Collapsing this to
-                // `None` would drop the hash and strand cold-start
-                // for snapshot-gapped CIP-68 ref datums. `None`
-                // remains "no datum on the output."
-                opt.map(|td| (td.hash.to_vec(), td.original_cbor.unwrap_or_default()))
-            })
-            .collect())
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<mitos_data_plane::TypedDatum>>> {
+        // A datum whose bytes are unresolved (`original_cbor == None`)
+        // is still returned: the hash is meaningful on its own, and the
+        // caller falls back to `datum_by_hash` (which has the Maestro
+        // fallback) on an empty payload. Collapsing it to `None` would
+        // drop the hash and strand cold-start for snapshot-gapped CIP-68
+        // ref datums. `None` remains "no datum on the output."
+        mitos_data_plane::ChainDataPlane::read_output_datums(self, refs).await
     }
 
     async fn read_output_hashes(
@@ -666,7 +658,7 @@ impl DataPlaneFacade for CachingDataPlane {
     async fn read_output_datums(
         &self,
         refs: &[mitos_data_plane::OutputRef],
-    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+    ) -> mitos_data_plane::DataPlaneResult<Vec<Option<mitos_data_plane::TypedDatum>>> {
         self.inner.read_output_datums(refs).await
     }
 

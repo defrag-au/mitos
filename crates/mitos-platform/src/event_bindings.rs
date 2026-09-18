@@ -179,6 +179,10 @@ fn typed_datum_to_wit(d: mitos_data_plane::TypedDatum) -> bindings_v2::TypedDatu
         // — modules detect that and fall back via
         // `chain-data::tx-metadata`.
         payload: d.original_cbor.unwrap_or_default(),
+        kind: match d.kind {
+            mitos_data_plane::DatumKind::Inline => bindings_v2::DatumKind::Inline,
+            mitos_data_plane::DatumKind::Hash => bindings_v2::DatumKind::Hash,
+        },
     }
 }
 

@@ -50,7 +50,9 @@ use std::time::Duration;
 use futures_util::future::join_all;
 
 use cardano_assets::PolicyId;
-use mitos_data_plane::{AssetEntry, DecodeLevel, OutputRef, Resolution, TypedDatum, TypedOutput};
+use mitos_data_plane::{
+    AssetEntry, DatumKind, DecodeLevel, OutputRef, Resolution, TypedDatum, TypedOutput,
+};
 use pallas_primitives::alonzo::AuxiliaryData;
 use pallas_primitives::{Hash, Int, Metadata, Metadatum, PlutusData};
 use serde::Deserialize;
@@ -594,6 +596,7 @@ fn datum_from_koios(
         let payload = pallas::codec::minicbor::decode::<PlutusData>(&cbor).ok();
         return Some(TypedDatum {
             hash,
+            kind: DatumKind::Inline,
             payload,
             original_cbor: Some(cbor),
         });
@@ -606,6 +609,7 @@ fn datum_from_koios(
     let hash = parse_hash32(h)?;
     Some(TypedDatum {
         hash,
+        kind: DatumKind::Hash,
         payload: None,
         original_cbor: None,
     })

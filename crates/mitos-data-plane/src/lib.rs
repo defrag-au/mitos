@@ -42,6 +42,7 @@ pub use types::{
     OutputRefPattern, Page, PageRequest, ProducedEvent, ReferencedEvent, ReferencedInput,
     Resolution, RollbackEvent, ScriptLanguage, StakeCred, TickEvent, TxContextEvent, TxEventBatch,
     TxRecord, TypedDatum, TypedOutput, TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate,
+    DatumKind,
     ValidityInterval,
 };
 

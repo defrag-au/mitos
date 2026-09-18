@@ -7,7 +7,8 @@
 
 use crate::bindings_v2::{
     self, AssetEntry as WitAssetEntry, AssetId as WitAssetId, ChainDataHost,
-    OutputRef as WitOutputRef, StakeCred as WitStakeCred, TypedDatum as WitTypedDatum,
+    DatumKind as WitDatumKind, OutputRef as WitOutputRef, StakeCred as WitStakeCred,
+    TypedDatum as WitTypedDatum,
     TypedOutput as WitTypedOutput, UtxoPage as WitUtxoPage,
 };
 use crate::host_fns_v2::HostStateV2;
@@ -129,7 +130,7 @@ impl ChainDataHost for HostStateV2 {
             .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         Ok(resolved
             .into_iter()
-            .map(|opt| opt.map(|(hash, payload)| WitTypedDatum { hash, payload }))
+            .map(|opt| opt.map(typed_datum_to_wit))
             .collect())
     }
 
@@ -382,7 +383,15 @@ fn typed_output_to_wit(o: mitos_data_plane::TypedOutput) -> bindings_v2::TypedOu
 fn typed_datum_to_wit(d: mitos_data_plane::TypedDatum) -> WitTypedDatum {
     WitTypedDatum {
         hash: d.hash.as_ref().to_vec(),
+        kind: datum_kind_to_wit(d.kind),
         payload: d.original_cbor.unwrap_or_default(),
+    }
+}
+
+fn datum_kind_to_wit(kind: mitos_data_plane::DatumKind) -> WitDatumKind {
+    match kind {
+        mitos_data_plane::DatumKind::Inline => WitDatumKind::Inline,
+        mitos_data_plane::DatumKind::Hash => WitDatumKind::Hash,
     }
 }
 

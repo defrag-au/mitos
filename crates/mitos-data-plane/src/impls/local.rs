@@ -27,7 +27,7 @@ use pallas_traverse::MultiEraOutput;
 use crate::ChainDataPlane;
 use crate::types::{
     AssetEntry, AssetPattern, ChainTip, DataPlaneError, DataPlaneResult, DecodeLevel, OutputRef,
-    Page, PageRequest, ScriptLanguage, TypedDatum, TypedOutput, TypedScript, UtxoPattern,
+    DatumKind, Page, PageRequest, ScriptLanguage, TypedDatum, TypedOutput, TypedScript, UtxoPattern,
     UtxoPredicate,
 };
 
@@ -208,24 +208,25 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
     ///   exist but minicbor decode fails (rare; logged debug).
     fn resolve_output_datum(&self, output: &MultiEraOutput<'_>) -> Option<TypedDatum> {
         let datum_opt = output.datum()?;
-        let (hash, bytes): (pallas_primitives::Hash<32>, Option<Vec<u8>>) = match datum_opt {
-            DatumOption::Data(cbor_wrap) => {
-                let raw = cbor_wrap.0.raw_cbor().to_vec();
-                let h = cbor_wrap.0.original_hash();
-                (h, Some(raw))
-            }
-            DatumOption::Hash(h) => {
-                let key = EntityKey::from(h);
-                let bytes = self
-                    .domain
-                    .state()
-                    .read_entity_typed::<DatumState>(DATUM_NS, &key)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.bytes);
-                (h, bytes)
-            }
-        };
+        let (hash, bytes, kind): (pallas_primitives::Hash<32>, Option<Vec<u8>>, DatumKind) =
+            match datum_opt {
+                DatumOption::Data(cbor_wrap) => {
+                    let raw = cbor_wrap.0.raw_cbor().to_vec();
+                    let h = cbor_wrap.0.original_hash();
+                    (h, Some(raw), DatumKind::Inline)
+                }
+                DatumOption::Hash(h) => {
+                    let key = EntityKey::from(h);
+                    let bytes = self
+                        .domain
+                        .state()
+                        .read_entity_typed::<DatumState>(DATUM_NS, &key)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.bytes);
+                    (h, bytes, DatumKind::Hash)
+                }
+            };
 
         let payload =
             bytes
@@ -240,6 +241,7 @@ impl<'a, D: Domain> LocalDataPlane<'a, D> {
 
         Some(TypedDatum {
             hash,
+            kind,
             payload,
             original_cbor: bytes,
         })
@@ -557,6 +559,10 @@ impl<D: Domain> ChainDataPlane for LocalDataPlane<'_, D> {
         };
         Ok(Some(TypedDatum {
             hash: *hash,
+            // `DATUM_NS` is populated from witness sets, and inline datums
+            // are deliberately absent from it — anything this side-door
+            // resolves was carried by hash.
+            kind: DatumKind::Hash,
             payload,
             original_cbor: Some(bytes),
         }))
@@ -1035,6 +1041,7 @@ pub fn project_typed_output(output: &pallas_traverse::MultiEraOutput<'_>) -> Typ
             let payload = pallas::codec::minicbor::decode::<PlutusData>(&raw).ok();
             Some(TypedDatum {
                 hash: cbor_wrap.0.original_hash(),
+                kind: DatumKind::Inline,
                 payload,
                 original_cbor: Some(raw),
             })
