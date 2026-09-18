@@ -52,6 +52,15 @@ pub struct OfferCreate {
     /// actual on-chain bytes without a chain round-trip.
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the offer UTxO carries `datum_cbor` — the other half of
+    /// building that cancel without a chain round-trip, since the
+    /// bytes are only witnessable when the shape says so.
+    ///
+    /// `None` on events emitted before this field existed. Read it as
+    /// "unknown", not as a default: guessing wrong builds a cancel the
+    /// ledger rejects.
+    #[serde(default)]
+    pub datum_kind: Option<crate::DatumKind>,
     /// Policy this offer targets, when the datum specifies one.
     pub target_policy: Option<String>,
     /// Asset names (lowercase hex) the offer is constrained to.
@@ -124,6 +133,10 @@ pub struct OfferUpdate {
     /// to build a cancel TX against the updated offer's bytes).
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the new offer UTxO carries `datum_cbor`. `None` on events
+    /// from before this field existed.
+    #[serde(default)]
+    pub datum_kind: Option<crate::DatumKind>,
     pub target_policy: Option<String>,
     pub target_asset_names: Vec<String>,
     pub co_version: WayupStoreOfferVersion,

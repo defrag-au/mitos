@@ -33,9 +33,23 @@ use mitos_marketplace_decode::{
 use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
-use crate::mitos::platform_v2::types::{AssetEntry, ConsumedEvent, ProducedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{
+    AssetEntry, ConsumedEvent, DatumKind as WitDatumKind, ProducedEvent, UtxoEvent,
+};
 
 const LOG_TARGET: &str = "jpg-store-offer-module";
+
+/// The host's datum shape, in the wire vocabulary consumers read.
+///
+/// Recorded so a consumer holding `datum_cbor` can build a cancel
+/// without re-reading the output: a hash datum's preimage must be
+/// witnessed, an inline one must not.
+fn to_event_datum_kind(kind: WitDatumKind) -> mitos_community_events::DatumKind {
+    match kind {
+        WitDatumKind::Inline => mitos_community_events::DatumKind::Inline,
+        WitDatumKind::Hash => mitos_community_events::DatumKind::Hash,
+    }
+}
 
 fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
     assets
@@ -70,13 +84,13 @@ fn resolve_datum_bytes(tx_hash: &[u8], datum_hash: &[u8], payload: &[u8]) -> Opt
 /// candidates (assets only). Both carry the on-chain output index.
 fn build_output(p: &ProducedEvent) -> TxOutput {
     let datum = if classify_jpg_offer_address(&p.output.address).is_some() {
-        p.datum
-            .as_ref()
-            .and_then(|d| resolve_datum_bytes(&p.tx_hash, &d.hash, &d.payload))
-            .map(|bytes| OutputDatum {
+        p.datum.as_ref().and_then(|d| {
+            resolve_datum_bytes(&p.tx_hash, &d.hash, &d.payload).map(|bytes| OutputDatum {
                 payload: bytes,
                 hash: Vec::new(),
+                kind: Some(to_event_datum_kind(d.kind)),
             })
+        })
     } else {
         None
     };

@@ -73,6 +73,9 @@ struct OfferOutput<V> {
     output_index: u32,
     lovelace: u64,
     datum_bytes: Vec<u8>,
+    /// How the output carried the datum, when the host said. Travels
+    /// with the bytes because a consumer needs both to spend it.
+    datum_kind: Option<mitos_community_events::DatumKind>,
     version: V,
     decoded: DecodedOffer,
 }
@@ -121,6 +124,7 @@ fn collect_offers<V: Clone>(
             output_index: output.index,
             lovelace: output.lovelace,
             datum_bytes: datum.payload.clone(),
+            datum_kind: datum.kind,
             version,
             decoded,
         });
@@ -206,6 +210,7 @@ pub fn decode_jpg_offer_lifecycle(tx: &DecodeTx) -> Vec<JpgStoreOffer> {
                 previous_lovelace: consume.prior_lovelace,
                 new_lovelace: produced.lovelace,
                 datum_cbor: produced.datum_bytes,
+                datum_kind: produced.datum_kind,
                 target_policy: produced.decoded.target_policy,
                 target_asset_names: produced.decoded.target_asset_names,
                 co_version: produced.version,
@@ -256,6 +261,7 @@ pub fn decode_jpg_offer_lifecycle(tx: &DecodeTx) -> Vec<JpgStoreOffer> {
             output_index: p.output_index,
             lovelace: p.lovelace,
             datum_cbor: p.datum_bytes,
+            datum_kind: p.datum_kind,
             target_policy: p.decoded.target_policy,
             target_asset_names: p.decoded.target_asset_names,
             co_version: p.version,
@@ -306,6 +312,7 @@ pub fn decode_wayup_offer_lifecycle(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Ve
                 previous_lovelace: consume.prior_lovelace,
                 new_lovelace: produced.lovelace,
                 datum_cbor: produced.datum_bytes,
+                datum_kind: produced.datum_kind,
                 target_policy: produced.decoded.target_policy,
                 target_asset_names: produced.decoded.target_asset_names,
                 co_version: WayupStoreOfferVersion::V1,
@@ -338,6 +345,7 @@ pub fn decode_wayup_offer_lifecycle(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Ve
             output_index: p.output_index,
             lovelace: p.lovelace,
             datum_cbor: p.datum_bytes,
+            datum_kind: p.datum_kind,
             target_policy: p.decoded.target_policy,
             target_asset_names: p.decoded.target_asset_names,
             co_version: WayupStoreOfferVersion::V1,

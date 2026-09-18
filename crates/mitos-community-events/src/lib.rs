@@ -7,6 +7,28 @@
 //!
 //! See `docs/strategy/COMMUNITY_MODULES.md` for the design.
 
+use serde::{Deserialize, Serialize};
+
+/// How an output carries its datum.
+///
+/// Recorded at ingest because a transaction SPENDING the output needs
+/// it: a hash datum's preimage must be witnessed, and witnessing one
+/// for an inline datum is rejected as `NotAllowedSupplementalDatums`.
+/// A consumer holding the datum bytes still cannot build a spend
+/// without knowing which shape they came in.
+///
+/// A property of the OUTPUT, not of a contract version — jpg.store's
+/// V2 offers are hash-datum and its V3 inline today, but reading that
+/// off the version is the sort of venue-wide rule that has already
+/// reversed once on that marketplace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatumKind {
+    /// Bytes live on the output; a spend witnesses nothing.
+    Inline,
+    /// The output commits to a hash; a spend witnesses the preimage.
+    Hash,
+}
+
 pub mod asset_metadata_update;
 pub mod asset_transfer;
 pub mod burn_address;

@@ -32,8 +32,16 @@ use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::types::{
-    AssetEntry, ConsumedEvent, ProducedEvent, TypedDatum, UtxoEvent,
+    AssetEntry, ConsumedEvent, DatumKind as WitDatumKind, ProducedEvent, TypedDatum, UtxoEvent,
 };
+
+/// The host's datum shape, in the wire vocabulary consumers read.
+fn to_event_datum_kind(kind: WitDatumKind) -> mitos_community_events::DatumKind {
+    match kind {
+        WitDatumKind::Inline => mitos_community_events::DatumKind::Inline,
+        WitDatumKind::Hash => mitos_community_events::DatumKind::Hash,
+    }
+}
 
 const LOG_TARGET: &str = "jpg-store-listing-module";
 
@@ -103,6 +111,7 @@ fn build_output(p: &ProducedEvent) -> TxOutput {
         OutputDatum {
             payload,
             hash: d.hash.clone(),
+            kind: Some(to_event_datum_kind(d.kind)),
         }
     });
 

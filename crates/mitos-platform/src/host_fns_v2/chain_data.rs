@@ -8,8 +8,7 @@
 use crate::bindings_v2::{
     self, AssetEntry as WitAssetEntry, AssetId as WitAssetId, ChainDataHost,
     DatumKind as WitDatumKind, OutputRef as WitOutputRef, StakeCred as WitStakeCred,
-    TypedDatum as WitTypedDatum,
-    TypedOutput as WitTypedOutput, UtxoPage as WitUtxoPage,
+    TypedDatum as WitTypedDatum, TypedOutput as WitTypedOutput, UtxoPage as WitUtxoPage,
 };
 use crate::host_fns_v2::HostStateV2;
 use crate::host_fns_v2::scan_cache::ScanPage;

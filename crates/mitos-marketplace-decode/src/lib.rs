@@ -83,6 +83,14 @@ pub struct OutputDatum {
     pub payload: Vec<u8>,
     /// 32-byte datum hash. Empty when the output carries an inline datum or none.
     pub hash: Vec<u8>,
+    /// How the output carried the datum, as the host reported it.
+    ///
+    /// Not inferable from the two fields above: a caller may populate
+    /// `payload` for a HASH datum it resolved elsewhere (jpg.store
+    /// offers recover theirs from tx metadata and clear `hash`), so
+    /// "payload present" does not mean inline. `None` when the caller
+    /// didn't know.
+    pub kind: Option<mitos_community_events::DatumKind>,
 }
 
 /// A resolved transaction output.

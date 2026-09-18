@@ -498,6 +498,7 @@ mod tests {
             datum: Some(OutputDatum {
                 payload: datum_payload,
                 hash: Vec::new(),
+                kind: None,
             }),
         }
     }
@@ -540,6 +541,7 @@ mod tests {
                 datum: Some(OutputDatum {
                     payload: Vec::new(),
                     hash: vec![0x99; 32],
+                    kind: None,
                 }),
             }],
             ..Default::default()
@@ -608,6 +610,7 @@ mod tests {
                 datum: Some(OutputDatum {
                     payload: Vec::new(),
                     hash: new_hash.clone(),
+                    kind: None,
                 }),
             }],
             ..Default::default()
@@ -642,6 +645,7 @@ mod tests {
                 datum: Some(OutputDatum {
                     payload: Vec::new(),
                     hash: hash.clone(),
+                    kind: None,
                 }),
             }],
             ..Default::default()

@@ -594,6 +594,18 @@ fn build_output(
     d: &DecodedTx,
     cache_get: DatumCacheGet<'_>,
 ) -> TxOutput {
+    /// The walker records an inline datum as BOTH bytes and hash, and a
+    /// hash datum as hash alone (`mitos_chain_walk::decode`), so the
+    /// bytes discriminate. `None` when the output carries no datum.
+    fn datum_kind_of(o: &DecodedOutput) -> Option<mitos_community_events::DatumKind> {
+        if o.inline_datum.is_some() {
+            Some(mitos_community_events::DatumKind::Inline)
+        } else {
+            o.datum_hash
+                .map(|_| mitos_community_events::DatumKind::Hash)
+        }
+    }
+
     let datum = match registry
         .watch_for(&o.address)
         .map(|w| (w.venue.clone(), w.channel))
@@ -603,6 +615,7 @@ fn build_output(
             Some(OutputDatum {
                 payload: resolve_produced_datum(o, d, is_jpg, cache_get).unwrap_or_default(),
                 hash: Vec::new(),
+                kind: datum_kind_of(o),
             })
         }
         Some((venue, Channel::Sale)) => {
@@ -613,6 +626,7 @@ fn build_output(
                     .datum_hash
                     .map(|h| h.as_ref().to_vec())
                     .unwrap_or_default(),
+                kind: datum_kind_of(o),
             })
         }
         None => None,

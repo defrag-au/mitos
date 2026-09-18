@@ -37,12 +37,11 @@ mod tests;
 
 pub use types::{
     AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip,
-    Cip25Resolution, ConsumedEvent, ConsumedInput, DataPlaneError, DataPlaneResult, DecodeLevel,
-    DispatchEvent, InterestPredicate, InterestSet, MintEntry, MintedEvent, OutputRef,
+    Cip25Resolution, ConsumedEvent, ConsumedInput, DataPlaneError, DataPlaneResult, DatumKind,
+    DecodeLevel, DispatchEvent, InterestPredicate, InterestSet, MintEntry, MintedEvent, OutputRef,
     OutputRefPattern, Page, PageRequest, ProducedEvent, ReferencedEvent, ReferencedInput,
     Resolution, RollbackEvent, ScriptLanguage, StakeCred, TickEvent, TxContextEvent, TxEventBatch,
     TxRecord, TypedDatum, TypedOutput, TypedScript, UtxoEvent, UtxoPattern, UtxoPredicate,
-    DatumKind,
     ValidityInterval,
 };
 

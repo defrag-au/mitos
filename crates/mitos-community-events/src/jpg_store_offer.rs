@@ -37,6 +37,8 @@ pub enum JpgStoreOfferVersion {
     V3,
 }
 
+pub use crate::DatumKind;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferCreate {
     /// 56-char lowercase hex pkh of the bidder (payment cred
@@ -55,6 +57,14 @@ pub struct OfferCreate {
     /// offer the consume refers to.
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the offer UTxO carries `datum_cbor`.
+    ///
+    /// `None` on events emitted before this field existed. Read it as
+    /// "unknown", not as a default: a consumer that guesses wrong
+    /// builds a cancel the ledger rejects, so an unknown shape means
+    /// resolve it on chain.
+    #[serde(default)]
+    pub datum_kind: Option<DatumKind>,
     /// Policy this offer targets, when the datum specifies one.
     /// `None` when the datum carries an allow-list instead of a
     /// single policy (rare).
@@ -131,6 +141,11 @@ pub struct OfferUpdate {
     /// updated offer would fail script validation.
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the new offer UTxO carries `datum_cbor` — the other half
+    /// of that cancel: the bytes are only witnessable when the shape
+    /// says so. `None` on events from before this field existed.
+    #[serde(default)]
+    pub datum_kind: Option<DatumKind>,
     pub target_policy: Option<String>,
     /// Asset names (lowercase hex) the new offer is constrained
     /// to. Preserved from the prior offer (updates change price,
