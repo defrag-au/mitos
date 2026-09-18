@@ -262,3 +262,33 @@ strip = "symbols"
 # address-registry re-added 2026-08-21: project-ledger's classify consumes it
 # again (workspace.dependencies entry above), so it belongs in the block.
 # address-registry = { path = "../shared-crates/address-registry" }
+
+# `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which
+# returns None for an output stored in an earlier era — and a resolved UTxO
+# keeps the era it was created in. So a script published before Conway is
+# invisible to it, and `POST /api/tx/submit` rejects valid transactions with
+# `ScriptWitnessMissing`. Babbage ran to epoch 506; jpg.store's collection-offer
+# script reference is epoch 366 and Wayup's epoch 475, so every cancel we submit
+# hits it. Fixed on our fork, upstream PR to follow.
+#
+# ⚠️ The WHOLE family is patched to one rev deliberately. Patching
+# `pallas-validate` alone would pull its siblings out of the fork as path deps,
+# leaving two copies of `pallas-primitives` in the graph and type errors across
+# every boundary that passes one.
+#
+# ⚠️ Unlike the sibling block above, this is a PUSHED git rev, so CI and the box
+# resolve it the same way we do. It stays ACTIVE — do not comment it out.
+# Remove the block once the fix is released upstream.
+[patch.crates-io]
+pallas = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-addresses = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-codec = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-configs = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-crypto = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-hardano = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-network = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-primitives = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-traverse = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-txbuilder = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-utxorpc = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
+pallas-validate = { git = "https://github.com/defrag-au/pallas", rev = "0b8f97991f9d8c28ae60a7720872b8189d1cd265" }
