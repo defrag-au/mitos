@@ -16,8 +16,16 @@
 //!   (`target_recipient`) AND the bidder is not among the tx's required signers
 //!   (only a cancel needs the bidder's signature to reclaim the locked lovelace).
 //!
-//! The consumed offer's locked lovelace is the bid price (`price_lovelace`) —
-//! read from the input, never inferred from outputs.
+//! The consumed offer's locked **value** is the bid — read from the input,
+//! never inferred from outputs.
+//!
+//! ⚠️ **That value is not always lovelace.** Wayup carries asset-denominated
+//! offers (swap this NFT for that one), where the UTxO holds the offered assets
+//! and only enough lovelace to carry them. Reading `input.lovelace` on one of
+//! those yields a min-ADA figure — measured on mainnet 2026-09-18, exactly
+//! 2.5 ADA on 137 of 9,526 Wayup offer events — which is indistinguishable from
+//! a cheap bid and silently poisons every realized-price median downstream.
+//! So the bid is an [`AssetPrice`], and a swap cannot be read as a number.
 //!
 //! ## Batched fills
 //!
@@ -38,9 +46,11 @@ use mitos_community_events::wayup_store_offer::{
     OfferAccept as WayupOfferAccept, WayupStoreOfferVersion,
 };
 
+use mitos_community_events::marketplace::{AssetAmount, AssetPrice};
+
 use crate::offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 use crate::sales::address_payment_cred;
-use crate::{AssetId, DecodeTx, TxOutput};
+use crate::{AssetId, DecodeTx, TxInput, TxOutput};
 
 // ============================================================
 // jpg.store
@@ -113,13 +123,40 @@ pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
             prior_output_index: input.oref_index,
             policy,
             asset_name_hex,
-            price_lovelace: input.lovelace,
+            price: consideration(input),
             seller_address,
             co_version: version,
             collection_offer: decoded.target_asset_names.is_empty(),
         });
     }
     out
+}
+
+/// What the bidder locked, as an [`AssetPrice`].
+///
+/// Assets present ⇒ the consideration is not ADA, however much lovelace rides
+/// along with them. The lovelace is still reported (see [`AssetPrice::Bundle`])
+/// because separating a real ADA component from the min-ADA the assets require
+/// is a calculation we cannot do reliably.
+pub(crate) fn consideration(input: &TxInput) -> AssetPrice {
+    if input.assets.is_empty() {
+        return AssetPrice::Lovelace(input.lovelace);
+    }
+    AssetPrice::Bundle {
+        lovelace: input.lovelace,
+        assets: input
+            .assets
+            .iter()
+            .map(|a| AssetAmount {
+                policy: hex::encode(&a.policy),
+                name: hex::encode(&a.name),
+                // `AssetId` carries identity only; an offer UTxO's quantities
+                // are NFTs in every case observed. A fungible-denominated offer
+                // would need `TxInput` to carry amounts — flagged, not guessed.
+                quantity: 1,
+            })
+            .collect(),
+    }
 }
 
 /// First unclaimed non-offer output delivering a target-policy asset →
@@ -225,7 +262,7 @@ pub fn decode_wayup_offer_accepts(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Vec<
             prior_output_index: input.oref_index,
             policy,
             asset_name_hex,
-            price_lovelace: input.lovelace,
+            price: consideration(input),
             // Wayup commingles seller proceeds into change — no reliable seller.
             seller_address: String::new(),
             co_version: WayupStoreOfferVersion::V1,
@@ -422,6 +459,49 @@ mod tests {
         }
     }
 
+    /// A swap offer — the bidder locked NFTs, not ADA — must NOT report a
+    /// price in lovelace.
+    ///
+    /// The real shape, mainnet `90fe241b…` output 0: a Wayup offer UTxO
+    /// holding 2.5 ADA plus Pirate754 and Pirate858, accepted for Pirate700.
+    /// Read as `input.lovelace` that recorded a 2.5 ADA sale of an NFT, and
+    /// 137 such rows sat in the realized-price medians. `Bundle` keeps the
+    /// lovelace visible (it is the UTxO's real balance) while making it
+    /// unreachable through the accessor a price series uses.
+    #[test]
+    fn a_swap_offer_has_no_lovelace_price() {
+        let swap_input = TxInput {
+            lovelace: 2_500_000,
+            assets: vec![
+                asset(MEKANISM_POLICY, "4d656b616e69736d373534"),
+                asset(MEKANISM_POLICY, "4d656b616e69736d383538"),
+            ],
+            ..wayup_offer_input(Some(vec![0xd8, 0x7a, 0x80]))
+        };
+        let price = consideration(&swap_input);
+
+        assert_eq!(
+            price.lovelace(),
+            None,
+            "a swap must not surface a lovelace price"
+        );
+        assert_eq!(price.kind(), "bundle");
+        let AssetPrice::Bundle { lovelace, assets } = &price else {
+            panic!("expected Bundle, got {price:?}");
+        };
+        // The balance is still reported — it is what the UTxO held. What is
+        // refused is calling it a price.
+        assert_eq!(*lovelace, 2_500_000);
+        assert_eq!(assets.len(), 2);
+
+        // Control: the same input without assets IS an ADA bid.
+        let ada_input = TxInput {
+            assets: vec![],
+            ..swap_input
+        };
+        assert_eq!(consideration(&ada_input).lovelace(), Some(2_500_000));
+    }
+
     #[test]
     fn wayup_accept_picks_recipient_asset_not_change() {
         let tx = DecodeTx {
@@ -455,7 +535,7 @@ mod tests {
         let a = &accepts[0];
         assert_eq!(a.policy, MEKANISM_POLICY);
         assert_eq!(a.asset_name_hex, MEKANISM_2212);
-        assert_eq!(a.price_lovelace, 55_000_000);
+        assert_eq!(a.price, AssetPrice::Lovelace(55_000_000));
         assert_eq!(a.prior_output_index, 1);
         assert!(a.collection_offer);
         assert_eq!(a.seller_address, "");
@@ -584,7 +664,7 @@ mod tests {
         assert_eq!(a.bidder_pkh, JPG_BIDDER);
         assert_eq!(a.policy, TAPPY_POLICY);
         assert_eq!(a.asset_name_hex, TAPPY_3589);
-        assert_eq!(a.price_lovelace, 153_000_000);
+        assert_eq!(a.price, AssetPrice::Lovelace(153_000_000));
         assert_eq!(a.seller_address, JPG_SELLER_ADDR);
         assert!(a.collection_offer);
         assert_eq!(a.prior_output_index, 0);

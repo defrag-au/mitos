@@ -27,6 +27,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::marketplace::AssetPrice;
+
 /// Wayup offer-contract version. Only one contract is live
 /// today; the enum is kept for forward-compat with a future
 /// contract revision (mirrors jpg.store's V2/V3 split).
@@ -96,11 +98,17 @@ pub struct OfferAccept {
     /// offer it's the asset the offer was tied to.
     pub policy: String,
     pub asset_name_hex: String,
-    /// Lovelace the bidder had locked in the offer (the bid).
+    /// What the bidder had locked in the offer (the bid).
+    ///
     /// Read from the consumed offer UTxO — NOT inferred from
     /// outputs, since Wayup folds the seller's proceeds into
     /// change rather than a dedicated output.
-    pub price_lovelace: u64,
+    ///
+    /// An enum because Wayup offers are not always ADA: a swap
+    /// locks the offered NFTs and only min-ADA to carry them, and
+    /// as a bare `u64` that was indistinguishable from a 2.5 ADA
+    /// bid. See [`AssetPrice`].
+    pub price: AssetPrice,
     /// Bech32 address that received the delivered asset (the
     /// bidder's wallet). Wayup commingles the seller's proceeds
     /// into change, so a reliable *seller* address is not

@@ -45,6 +45,8 @@ use mitos_community_events::wayup_store_offer::{
     OfferUpdate as WayupOfferUpdate, WayupStoreOffer, WayupStoreOfferVersion,
 };
 
+use mitos_community_events::marketplace::AssetPrice;
+
 use crate::DecodeTx;
 use crate::offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 use crate::offers::{
@@ -63,6 +65,11 @@ struct OfferInput<V> {
     prior_tx_hash: Vec<u8>,
     prior_output_index: u32,
     prior_lovelace: u64,
+    /// What the consumed offer actually locked. Carried alongside the lovelace
+    /// because the PARTIAL-accept path below reports a price without ever
+    /// seeing a delivery, and a swap's min-ADA reported there would be exactly
+    /// the poisoned figure [`AssetPrice`] exists to prevent.
+    prior_price: AssetPrice,
     redeemer: Option<Vec<u8>>,
     version: V,
     decoded: DecodedOffer,
@@ -103,6 +110,7 @@ fn collect_offers<V: Clone>(
             prior_tx_hash: input.oref_tx_hash.clone(),
             prior_output_index: input.oref_index,
             prior_lovelace: input.lovelace,
+            prior_price: crate::offers::consideration(input),
             redeemer: input.redeemer.clone(),
             version,
             decoded,
@@ -246,7 +254,7 @@ pub fn decode_jpg_offer_lifecycle(tx: &DecodeTx) -> Vec<JpgStoreOffer> {
                 prior_output_index: consume.prior_output_index,
                 policy: String::new(),
                 asset_name_hex: String::new(),
-                price_lovelace: consume.prior_lovelace,
+                price: consume.prior_price.clone(),
                 seller_address: String::new(),
                 co_version: consume.version,
                 collection_offer: consume.decoded.target_asset_names.is_empty(),

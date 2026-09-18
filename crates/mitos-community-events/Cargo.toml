@@ -18,6 +18,10 @@ default = []
 decode = ["dep:ciborium", "dep:serde_json"]
 
 [dependencies]
+# `DatumKind` — the one definition, shared with the host data plane and
+# the consuming workers. This crate compiles INTO every wasm module, so
+# watch the module sizes if cardano-assets ever grows a heavy default.
+cardano-assets = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 # Compact CBOR encoding of raw byte fields (e.g.
 # `jpg_store_offer::OfferCreate::datum_cbor`). Without this,

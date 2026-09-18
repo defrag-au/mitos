@@ -232,24 +232,6 @@ fn default_version() -> u32 {
     1
 }
 
-/// Fixture spelling of [`mitos_data_plane::DatumKind`].
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum FixtureDatumKind {
-    #[default]
-    Hash,
-    Inline,
-}
-
-impl From<FixtureDatumKind> for mitos_data_plane::DatumKind {
-    fn from(kind: FixtureDatumKind) -> Self {
-        match kind {
-            FixtureDatumKind::Hash => Self::Hash,
-            FixtureDatumKind::Inline => Self::Inline,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct FixtureUtxo {
     /// 64-hex tx_hash.
@@ -267,7 +249,8 @@ struct FixtureUtxo {
     /// simulate "host couldn't resolve, fall back to metadata".
     #[serde(default)]
     datum_payload_hex: Option<String>,
-    /// How the output carries its datum. Defaults to `hash`.
+    /// How the output carries its datum — `"Hash"` (the default when
+    /// absent) or `"Inline"`.
     ///
     /// Stated rather than inferred: `datum_payload_hex` is set for
     /// EITHER shape whenever the host could resolve, so its presence
@@ -275,7 +258,7 @@ struct FixtureUtxo {
     /// inline path has to say so — and an unrecognised spelling fails
     /// the fixture load rather than silently testing the other path.
     #[serde(default)]
-    datum_kind: FixtureDatumKind,
+    datum_kind: Option<mitos_data_plane::DatumKind>,
     /// Native assets at the output. Set when the synthesized
     /// UTxO needs to carry NFTs (e.g. listed assets at a
     /// marketplace script address) for module emit-paths that
@@ -403,7 +386,7 @@ impl FixtureDataPlane {
                 .with_context(|| format!("utxo datum_payload_hex for {}#{}", u.tx_hash, u.index))?;
             let datum = datum_hash_bytes.map(|h| mitos_data_plane::TypedDatum {
                 hash: pallas_primitives::Hash::new(h),
-                kind: u.datum_kind.into(),
+                kind: u.datum_kind.unwrap_or(mitos_data_plane::DatumKind::Hash),
                 payload: None,
                 original_cbor: datum_payload,
             });

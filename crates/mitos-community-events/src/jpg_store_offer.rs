@@ -28,6 +28,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::marketplace::AssetPrice;
+
 /// jpg.store CO contract version. V2 and V3 share the same
 /// underlying script; they differ only in address-encoding (V2
 /// uses one staking credential, V3 uses another).
@@ -102,10 +104,15 @@ pub struct OfferAccept {
     /// asset the offer was tied to.
     pub policy: String,
     pub asset_name_hex: String,
-    /// Lovelace the bidder paid (= the offer UTxO's locked
-    /// lovelace minus any change retained by the bidder, which
-    /// the chain settles by the script's payout rules).
-    pub price_lovelace: u64,
+    /// What the bidder paid, from the offer UTxO's locked value
+    /// (the chain settles the split by the script's payout rules).
+    ///
+    /// An enum because an offer's consideration is not always ADA
+    /// — see [`AssetPrice`]. jpg offers observed to date are all
+    /// lovelace, but the type is shared with Wayup, where they
+    /// are not, and a venue-specific price shape would put the
+    /// same trap back one crate over.
+    pub price: AssetPrice,
     /// Bech32 of the address that received the lovelace. The
     /// seller's identity; payment-cred extraction is left to
     /// consumers (avoids pulling bech32 → cred decoders into

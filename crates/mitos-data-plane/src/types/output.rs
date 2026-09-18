@@ -38,21 +38,11 @@ impl AssetEntry {
     }
 }
 
-/// How an output carries its datum.
-///
-/// A property of the OUTPUT, not of the contract or its version:
-/// jpg.store's V2 offers carry hash datums and its V3 offers
-/// inline ones today, but a venue-wide rule read off the version
-/// is the kind of assumption that has already reversed once on
-/// that marketplace. Record what the chain says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DatumKind {
-    /// Bytes live on the output itself. A spend witnesses nothing.
-    Inline,
-    /// The output commits to a hash; the preimage lives in a
-    /// witness set. A spend must witness those bytes.
-    Hash,
-}
+/// How an output carries its datum — the canonical definition lives in
+/// `cardano-assets` beside `UtxoTag`, because host, wire and app layers
+/// all need the same answer and it is a property of the chain rather
+/// than of any one of them.
+pub use cardano_assets::DatumKind;
 
 /// Server-resolved datum. Hash always present when any datum
 /// exists on the output; payload populated whenever the plane

@@ -23,8 +23,13 @@ CREATE TABLE IF NOT EXISTS market_events (
     asset_name_hex       TEXT    NOT NULL,
     fingerprint          TEXT,
     kind                 TEXT    NOT NULL,
+    -- Set ONLY when price_kind = 'lovelace', so the numeric columns are never
+    -- a min-ADA figure wearing a price's clothes. See `AssetPrice`.
     price_lovelace       INTEGER,
     buyer_price_lovelace INTEGER,
+    price_kind           TEXT    NOT NULL DEFAULT 'lovelace',
+    -- JSON of the consideration when it is not plain ADA (a swap's assets).
+    price_detail         TEXT,
     seller_stake         TEXT,
     buyer_stake          TEXT,
     marketplace          TEXT    NOT NULL,
@@ -171,10 +176,11 @@ impl Ledger {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO market_events (
                     tx_hash, policy_id, asset_name_hex, fingerprint, kind,
-                    price_lovelace, buyer_price_lovelace, seller_stake, buyer_stake,
+                    price_lovelace, buyer_price_lovelace, price_kind, price_detail,
+                    seller_stake, buyer_stake,
                     marketplace, bundle_size, output_index, fee_waived,
                     slot, block_height, block_time, source, venue
-                 ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?,?)",
+                 ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?, ?,?,?,?, ?,?,?,?,?)",
             )?;
             for r in rows {
                 inserted += stmt.execute(params![
@@ -185,6 +191,8 @@ impl Ledger {
                     r.kind,
                     r.price_lovelace.map(u64_i64),
                     r.buyer_price_lovelace.map(u64_i64),
+                    r.price_kind,
+                    r.price_detail,
                     r.seller_stake,
                     r.buyer_stake,
                     r.marketplace,
@@ -599,6 +607,7 @@ fn decode_assets(s: &str) -> Result<Vec<Asset>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mitos_community_events::marketplace::AssetPrice;
 
     fn sold_row() -> MarketEventRow {
         MarketEventRow {
@@ -609,6 +618,8 @@ mod tests {
             kind: "sold".into(),
             price_lovelace: Some(1_000),
             buyer_price_lovelace: Some(1_020),
+            price_kind: AssetPrice::LOVELACE_KIND.into(),
+            price_detail: None,
             seller_stake: None,
             buyer_stake: None,
             marketplace: "jpg.store".into(),

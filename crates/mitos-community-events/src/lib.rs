@@ -7,8 +7,6 @@
 //!
 //! See `docs/strategy/COMMUNITY_MODULES.md` for the design.
 
-use serde::{Deserialize, Serialize};
-
 /// How an output carries its datum.
 ///
 /// Recorded at ingest because a transaction SPENDING the output needs
@@ -17,17 +15,9 @@ use serde::{Deserialize, Serialize};
 /// A consumer holding the datum bytes still cannot build a spend
 /// without knowing which shape they came in.
 ///
-/// A property of the OUTPUT, not of a contract version — jpg.store's
-/// V2 offers are hash-datum and its V3 inline today, but reading that
-/// off the version is the sort of venue-wide rule that has already
-/// reversed once on that marketplace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DatumKind {
-    /// Bytes live on the output; a spend witnesses nothing.
-    Inline,
-    /// The output commits to a hash; a spend witnesses the preimage.
-    Hash,
-}
+/// Re-exported from `cardano-assets` so the modules, the host and the
+/// consuming workers all name the same type.
+pub use cardano_assets::DatumKind;
 
 pub mod asset_metadata_update;
 pub mod asset_transfer;
