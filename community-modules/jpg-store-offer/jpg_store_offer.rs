@@ -26,7 +26,8 @@
 use mitos_community_events::jpg_store_offer::JpgStoreOffer;
 use mitos_marketplace_decode::recover_datum_from_metadata;
 use mitos_marketplace_decode::{
-    classify_jpg_offer_address, decode_jpg_offer_lifecycle, AssetId, DecodeTx, OutputDatum, TxInput,
+    classify_jpg_offer_address, decode_jpg_offer_lifecycle, AssetId, AssetQuantity, DecodeTx,
+    OutputDatum, TxInput,
     TxOutput,
 };
 
@@ -51,12 +52,18 @@ fn to_event_datum_kind(kind: WitDatumKind) -> mitos_community_events::DatumKind 
     }
 }
 
-fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
+/// The host's assets in the decoders' shared vocabulary. Carries `quantity`,
+/// which this used to discard — an in-kind offer's locked value was reported
+/// as one of each regardless of what was actually escrowed.
+fn to_asset_amounts(assets: &[AssetEntry]) -> Vec<AssetQuantity> {
     assets
         .iter()
-        .map(|e| AssetId {
-            policy: e.asset.policy.clone(),
-            name: e.asset.name.clone(),
+        .map(|e| AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+            },
+            quantity: e.quantity,
         })
         .collect()
 }
@@ -97,7 +104,7 @@ fn build_output(p: &ProducedEvent) -> TxOutput {
     TxOutput {
         address: p.output.address.clone(),
         lovelace: p.output.lovelace,
-        assets: to_asset_ids(&p.output.assets),
+        assets: to_asset_amounts(&p.output.assets),
         index: p.oref.index,
         datum,
     }

@@ -534,7 +534,7 @@ mod tests {
         assert!(!cfg.is_listing_address(SHELLEY_ADDR));
     }
 
-    use crate::{AssetId, TxInput, TxOutput};
+    use crate::{AssetId, AssetQuantity, TxInput, TxOutput};
 
     /// jpg.store's real fee address — payment cred [`JPG_FEE_CRED_HEX`].
     const JPG_FEE_ADDR: &str = "addr1xxzvcf02fs5e282qk3pmjkau2emtcsj5wrukxak3np90n2evjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eksg6pw3p";
@@ -554,9 +554,12 @@ mod tests {
     }
 
     fn sale_tx(datum: Vec<u8>, extra_outputs: Vec<TxOutput>) -> DecodeTx {
-        let asset = AssetId {
-            policy: vec![1; 28],
-            name: b"Bud".to_vec(),
+        let asset = AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([1u8; 28]),
+                asset_name_hex: hex::encode(b"Bud"),
+            },
+            quantity: 1,
         };
         let mut outputs = vec![TxOutput {
             address: "addr1buyer".into(),
@@ -654,9 +657,12 @@ mod tests {
     #[test]
     fn cross_venue_migration_is_not_a_sale() {
         let seller = "aa".repeat(28);
-        let asset = AssetId {
-            policy: vec![7; 28],
-            name: b"Naru09878".to_vec(),
+        let asset = AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([7u8; 28]),
+                asset_name_hex: hex::encode(b"Naru09878"),
+            },
+            quantity: 1,
         };
         let tx = DecodeTx {
             tx_hash: vec![0x08; 32],
@@ -716,13 +722,19 @@ mod tests {
     fn one_tx_can_buy_at_both_jpg_generations() {
         let v1_seller = "aa".repeat(28);
         let v2_seller = "bb".repeat(28);
-        let v1_asset = AssetId {
-            policy: vec![1; 28],
-            name: b"OldGen".to_vec(),
+        let v1_asset = AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([1u8; 28]),
+                asset_name_hex: hex::encode(b"OldGen"),
+            },
+            quantity: 1,
         };
-        let v2_asset = AssetId {
-            policy: vec![2; 28],
-            name: b"NewGen".to_vec(),
+        let v2_asset = AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([2u8; 28]),
+                asset_name_hex: hex::encode(b"NewGen"),
+            },
+            quantity: 1,
         };
         let tx = DecodeTx {
             tx_hash: vec![0x77; 32],
@@ -779,9 +791,12 @@ mod tests {
     /// (not a marketplace escrow) must NOT be booked as a sale.
     #[test]
     fn reclaim_to_owner_wallet_is_not_a_sale() {
-        let asset = AssetId {
-            policy: vec![9; 28],
-            name: b"Wave1Flame129".to_vec(),
+        let asset = AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([9u8; 28]),
+                asset_name_hex: hex::encode(b"Wave1Flame129"),
+            },
+            quantity: 1,
         };
         let tx = DecodeTx {
             tx_hash: vec![0xe0; 32],

@@ -15,7 +15,8 @@ use std::cell::RefCell;
 
 use mitos_community_events::wayup_store_sale::WayupStoreSale;
 use mitos_marketplace_decode::{
-    AssetId, DecodeTx, ListingContract, TxInput, TxOutput, WayupSaleConfig, decode_wayup_sales,
+    AssetId, AssetQuantity, DecodeTx, ListingContract, TxInput, TxOutput, WayupSaleConfig,
+    decode_wayup_sales,
 };
 use serde::Deserialize;
 
@@ -50,12 +51,19 @@ fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     crate::mitos::platform_v2::chain_data::datum_by_hash(&d.hash)
 }
 
-fn to_asset_ids(assets: &[crate::mitos::platform_v2::types::AssetEntry]) -> Vec<AssetId> {
+/// The host's assets in the decoders' shared vocabulary. Carries `quantity`,
+/// which this used to discard — see the jpg listing module.
+fn to_asset_amounts(
+    assets: &[crate::mitos::platform_v2::types::AssetEntry],
+) -> Vec<AssetQuantity> {
     assets
         .iter()
-        .map(|e| AssetId {
-            policy: e.asset.policy.clone(),
-            name: e.asset.name.clone(),
+        .map(|e| AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+            },
+            quantity: e.quantity,
         })
         .collect()
 }
@@ -78,7 +86,7 @@ fn build_input(c: &ConsumedEvent) -> TxInput {
     TxInput {
         address: c.prior_output.address.clone(),
         lovelace: c.prior_output.lovelace,
-        assets: to_asset_ids(&c.prior_output.assets),
+        assets: to_asset_amounts(&c.prior_output.assets),
         datum,
         redeemer: c.redeemer.clone(),
         // Sale decode ignores the spent UTxO's oref (offer-accepts use it).
@@ -162,7 +170,7 @@ impl Guest for Module {
                     tx.outputs.push(TxOutput {
                         address: p.output.address.clone(),
                         lovelace: p.output.lovelace,
-                        assets: to_asset_ids(&p.output.assets),
+                        assets: to_asset_amounts(&p.output.assets),
                         ..Default::default()
                     });
                 }

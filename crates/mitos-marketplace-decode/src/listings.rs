@@ -527,14 +527,19 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssetId, TxInput, TxOutput};
+    use crate::{AssetId, AssetQuantity, TxInput, TxOutput};
 
     const JPG_V2_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
 
-    fn asset() -> AssetId {
-        AssetId {
-            policy: vec![1; 28],
-            name: b"Bud".to_vec(),
+    /// One escrowed NFT. `quantity: 1` — which is what every existing
+    /// scenario is, and exactly why the missing quantity went unnoticed.
+    fn asset() -> AssetQuantity {
+        AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([1u8; 28]),
+                asset_name_hex: hex::encode(b"Bud"),
+            },
+            quantity: 1,
         }
     }
 

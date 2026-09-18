@@ -387,7 +387,7 @@ fn parse_cred(hex_str: &str) -> Option<[u8; 28]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssetId, TxInput};
+    use crate::{AssetId, AssetQuantity, TxInput};
 
     // Real Wayup offer-accept datum (collection-wide Mekanism bid, 55 ADA),
     // from `wayup-store-offer/tests/fixtures/offer-accept`.
@@ -420,10 +420,15 @@ mod tests {
             .unwrap()
     }
 
-    fn asset(policy_hex: &str, name_hex: &str) -> AssetId {
-        AssetId {
-            policy: hex::decode(policy_hex).unwrap(),
-            name: hex::decode(name_hex).unwrap(),
+    /// Hex in, hex out — the neutral shape speaks the shared `AssetId`
+    /// vocabulary now, so these no longer decode to bytes.
+    fn asset(policy_hex: &str, name_hex: &str) -> AssetQuantity {
+        AssetQuantity {
+            asset_id: AssetId {
+                policy_id: policy_hex.to_owned(),
+                asset_name_hex: name_hex.to_owned(),
+            },
+            quantity: 1,
         }
     }
 

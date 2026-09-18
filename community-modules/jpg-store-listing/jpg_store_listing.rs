@@ -24,8 +24,8 @@
 
 use mitos_community_events::jpg_store_listing::JpgStoreListing;
 use mitos_marketplace_decode::{
-    classify_jpg_address, decode_jpg_listings, recover_datum_from_metadata, AssetId, DecodeTx,
-    OutputDatum, TxInput, TxOutput,
+    classify_jpg_address, decode_jpg_listings, recover_datum_from_metadata, AssetId, AssetQuantity,
+    DecodeTx, OutputDatum, TxInput, TxOutput,
 };
 
 use crate::mitos::platform_v2::chain_data;
@@ -62,12 +62,21 @@ fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     chain_data::datum_by_hash(&d.hash)
 }
 
-fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
+/// The host's assets in the decoders' shared vocabulary.
+///
+/// Carries `quantity`, which this used to discard: the neutral shape held
+/// identity only, so anything rebuilding a UTxO from it silently assumed one
+/// of each. Correct for an NFT and wrong for anything fungible — and a value
+/// rebuilt at the wrong quantity does not balance.
+fn to_asset_amounts(assets: &[AssetEntry]) -> Vec<AssetQuantity> {
     assets
         .iter()
-        .map(|e| AssetId {
-            policy: e.asset.policy.clone(),
-            name: e.asset.name.clone(),
+        .map(|e| AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+            },
+            quantity: e.quantity,
         })
         .collect()
 }
@@ -118,7 +127,7 @@ fn build_output(p: &ProducedEvent) -> TxOutput {
     TxOutput {
         address: p.output.address.clone(),
         lovelace: p.output.lovelace,
-        assets: to_asset_ids(&p.output.assets),
+        assets: to_asset_amounts(&p.output.assets),
         index: p.oref.index,
         datum,
     }
@@ -139,7 +148,7 @@ fn build_input(c: &ConsumedEvent) -> TxInput {
     TxInput {
         address: c.prior_output.address.clone(),
         lovelace: c.prior_output.lovelace,
-        assets: to_asset_ids(&c.prior_output.assets),
+        assets: to_asset_amounts(&c.prior_output.assets),
         datum,
         redeemer: c.redeemer.clone(),
         ..Default::default()

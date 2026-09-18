@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use mitos_marketplace_decode::{
-    AssetId, DecodeTx, OutputDatum, TxInput, TxOutput, decode_jpg_listings,
+    AssetId, AssetQuantity, DecodeTx, OutputDatum, TxInput, TxOutput, decode_jpg_listings,
     decode_jpg_offer_lifecycle, decode_jpg_sales, decode_listing_datum, decode_wayup_listings,
     decode_wayup_offer_lifecycle, decode_wayup_sales,
 };
@@ -359,7 +359,7 @@ pub(crate) fn process_tx(
             inputs.push(TxInput {
                 address: b.address,
                 lovelace: b.lovelace,
-                assets: b.assets.iter().map(asset_id).collect(),
+                assets: b.assets.iter().map(asset_amount).collect(),
                 datum,
                 redeemer: inp.redeemer.clone(),
                 oref_tx_hash: inp.oref.0.as_ref().to_vec(),
@@ -634,16 +634,23 @@ fn build_output(
     TxOutput {
         address: o.address.clone(),
         lovelace: o.lovelace,
-        assets: o.assets.iter().map(asset_id).collect(),
+        assets: o.assets.iter().map(asset_amount).collect(),
         index: o.index,
         datum,
     }
 }
 
-fn asset_id(a: &Asset) -> AssetId {
-    AssetId {
-        policy: a.policy.clone(),
-        name: a.name.clone(),
+fn asset_amount(a: &Asset) -> AssetQuantity {
+    AssetQuantity {
+        asset_id: AssetId {
+            policy_id: hex::encode(&a.policy),
+            asset_name_hex: hex::encode(&a.name),
+        },
+        // `None` means whatever produced this `Asset` recorded no amount —
+        // see its doc. Defaulted to 1, NOT 0: this walker feeds listing and
+        // sale decode, where every asset is an NFT, and 0 would read as
+        // "nothing moved" and silently drop the row.
+        quantity: a.quantity.unwrap_or(1),
     }
 }
 
