@@ -17,4 +17,8 @@ pallas-addresses.workspace = true
 # that makes attacker-supplied metadata safe to read. See `metadata_datum`.
 pallas-crypto.workspace = true
 mitos-community-events = { path = "../mitos-community-events" }
+# `AssetQuantity` / `AssetId` — the neutral decode shape uses the shared asset
+# vocabulary rather than one of its own. Already in every wasm module's graph
+# via `mitos-community-events`, so this costs no module size.
+cardano-assets = { workspace = true }
 hex.workspace = true

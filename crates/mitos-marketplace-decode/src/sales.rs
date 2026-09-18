@@ -22,8 +22,10 @@ use crate::datum::{ListingContract, decode_listing_datum};
 /// the classifier attached to the listing address (e.g. jpg contract version).
 #[derive(Debug, Clone)]
 pub struct MatchedSale<T> {
-    pub policy: Vec<u8>,
-    pub asset_name: Vec<u8>,
+    /// Hex, matching the shared [`AssetId`](crate::AssetId) vocabulary the
+    /// neutral shape now uses — every consumer wanted hex anyway and was
+    /// encoding it themselves.
+    pub asset: crate::AssetId,
     pub tx_hash: Vec<u8>,
     pub buyer_address: String,
     /// Owner credential hex from the listing datum (jpg: seller payment pkh;
@@ -76,7 +78,7 @@ pub fn collect_sales<T: Clone>(
     contract: impl Fn(&T) -> ListingContract,
     is_marketplace_escrow: impl Fn(&str) -> bool,
 ) -> Vec<MatchedSale<T>> {
-    let mut pending: BTreeMap<(Vec<u8>, Vec<u8>), Pending<T>> = BTreeMap::new();
+    let mut pending: BTreeMap<crate::AssetId, Pending<T>> = BTreeMap::new();
 
     for input in &tx.inputs {
         let Some(tag) = classify(&input.address) else {
@@ -98,7 +100,7 @@ pub fn collect_sales<T: Clone>(
         let bundle_size = (input.assets.len() > 1).then_some(input.assets.len() as u32);
         for asset in &input.assets {
             pending.insert(
-                (asset.policy.clone(), asset.name.clone()),
+                asset.asset_id.clone(),
                 Pending {
                     cred_hex: decoded.cred_hex.clone(),
                     payouts: decoded.payouts.clone(),
@@ -119,7 +121,7 @@ pub fn collect_sales<T: Clone>(
             continue;
         }
         for asset in &output.assets {
-            let Some(p) = pending.remove(&(asset.policy.clone(), asset.name.clone())) else {
+            let Some(p) = pending.remove(&asset.asset_id) else {
                 continue;
             };
             // The NFT returned to the lister's own credential (jpg: owner payment
@@ -130,8 +132,7 @@ pub fn collect_sales<T: Clone>(
                 continue;
             }
             sales.push(MatchedSale {
-                policy: asset.policy.clone(),
-                asset_name: asset.name.clone(),
+                asset: asset.asset_id.clone(),
                 tx_hash: tx.tx_hash.clone(),
                 buyer_address: output.address.clone(),
                 cred_hex: p.cred_hex,
@@ -294,8 +295,8 @@ pub fn decode_jpg_sales(tx: &DecodeTx) -> Vec<JpgStoreSale> {
                     / u128::from(listings_total)) as u64
             };
             JpgStoreSale::Sale(JpgSale {
-                policy: hex::encode(&s.policy),
-                asset_name_hex: hex::encode(&s.asset_name),
+                policy: s.asset.policy_id.clone(),
+                asset_name_hex: s.asset.asset_name_hex.clone(),
                 tx_hash: hex::encode(&s.tx_hash),
                 seller_pkh: s.cred_hex,
                 buyer_address: s.buyer_address,
@@ -371,8 +372,8 @@ pub fn decode_wayup_sales(tx: &DecodeTx, cfg: &WayupSaleConfig) -> Vec<WayupStor
     .into_iter()
     .map(|s| {
         WayupStoreSale::Sale(WayupSale {
-            policy: hex::encode(&s.policy),
-            asset_name_hex: hex::encode(&s.asset_name),
+            policy: s.asset.policy_id.clone(),
+            asset_name_hex: s.asset.asset_name_hex.clone(),
             tx_hash: hex::encode(&s.tx_hash),
             seller_stake_pkh: s.cred_hex,
             buyer_address: s.buyer_address,

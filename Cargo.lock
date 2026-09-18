@@ -3772,6 +3772,7 @@ dependencies = [
 name = "mitos-marketplace-decode"
 version = "0.0.1"
 dependencies = [
+ "cardano-assets",
  "hex",
  "mitos-community-events",
  "pallas-addresses 1.4.0",

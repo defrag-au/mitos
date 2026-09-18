@@ -50,7 +50,7 @@ use mitos_community_events::marketplace::{AssetAmount, AssetPrice};
 
 use crate::offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 use crate::sales::address_payment_cred;
-use crate::{AssetId, DecodeTx, TxInput, TxOutput};
+use crate::{AssetQuantity, DecodeTx, TxInput, TxOutput};
 
 // ============================================================
 // jpg.store
@@ -152,7 +152,7 @@ pub(crate) fn consideration_out(out: &TxOutput) -> AssetPrice {
     locked_value(out.lovelace, &out.assets)
 }
 
-fn locked_value(lovelace: u64, assets: &[AssetId]) -> AssetPrice {
+fn locked_value(lovelace: u64, assets: &[AssetQuantity]) -> AssetPrice {
     if assets.is_empty() {
         return AssetPrice::Lovelace(lovelace);
     }
@@ -161,13 +161,13 @@ fn locked_value(lovelace: u64, assets: &[AssetId]) -> AssetPrice {
         assets: assets
             .iter()
             .map(|a| AssetAmount {
-                policy: hex::encode(&a.policy),
-                name: hex::encode(&a.name),
-                // `AssetId` carries identity only; an offer UTxO's quantities
-                // are NFTs in every case observed. A fungible-denominated offer
-                // would need the input/output types to carry amounts —
-                // flagged, not guessed.
-                quantity: 1,
+                policy: a.asset_id.policy_id.clone(),
+                name: a.asset_id.asset_name_hex.clone(),
+                // The real quantity, as the host reported it. This was pinned
+                // at 1 while the neutral shape carried identity only — correct
+                // for every NFT and silently wrong for a fungible-denominated
+                // offer.
+                quantity: a.quantity,
             })
             .collect(),
     }
@@ -181,15 +181,16 @@ fn jpg_find_delivered<'a>(
     claimed: &mut ClaimedDeliveries,
 ) -> Option<(String, String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
-    let target_policy_bytes = hex::decode(target_policy).ok()?;
     let target_asset_set = asset_name_set(decoded);
     for out in outputs {
         for asset in &out.assets {
-            if asset.policy != target_policy_bytes {
+            if !asset.asset_id.policy_id.eq_ignore_ascii_case(target_policy) {
                 continue;
             }
-            if let Some(ref set) = target_asset_set
-                && !set.iter().any(|n| n == &asset.name)
+            if let Some(set) = target_asset_set
+                && !set
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&asset.asset_id.asset_name_hex))
             {
                 continue;
             }
@@ -198,7 +199,7 @@ fn jpg_find_delivered<'a>(
             }
             return Some((
                 target_policy.to_owned(),
-                hex::encode(&asset.name),
+                asset.asset_id.asset_name_hex.clone(),
                 out.address.clone(),
             ));
         }
@@ -294,7 +295,6 @@ fn wayup_find_delivered<'a>(
     claimed: &mut ClaimedDeliveries,
 ) -> Option<(String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
-    let target_policy_bytes = hex::decode(target_policy).ok()?;
     let target_recipient = decoded.target_recipient?;
     let target_asset_set = asset_name_set(decoded);
     for out in outputs {
@@ -302,18 +302,23 @@ fn wayup_find_delivered<'a>(
             continue;
         }
         for asset in &out.assets {
-            if asset.policy != target_policy_bytes {
+            if !asset.asset_id.policy_id.eq_ignore_ascii_case(target_policy) {
                 continue;
             }
-            if let Some(ref set) = target_asset_set
-                && !set.iter().any(|n| n == &asset.name)
+            if let Some(set) = target_asset_set
+                && !set
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&asset.asset_id.asset_name_hex))
             {
                 continue;
             }
             if !claim(claimed, out, asset) {
                 continue;
             }
-            return Some((target_policy.to_owned(), hex::encode(&asset.name)));
+            return Some((
+                target_policy.to_owned(),
+                asset.asset_id.asset_name_hex.clone(),
+            ));
         }
     }
     None
@@ -334,12 +339,12 @@ fn bidder_in_signers(bidder_pkh: &str, signers: &[Vec<u8>]) -> bool {
 /// Deliveries already reported by an earlier offer in the same tx, keyed by
 /// `(output index, asset name)`. One physical asset settles exactly one offer,
 /// so a second offer matching the same output/asset must keep looking.
-type ClaimedDeliveries = HashSet<(u32, Vec<u8>)>;
+type ClaimedDeliveries = HashSet<(u32, String)>;
 
 /// Claim a delivery for the offer currently being decoded. `false` when an
 /// earlier offer in this tx already took it.
-fn claim(claimed: &mut ClaimedDeliveries, out: &TxOutput, asset: &AssetId) -> bool {
-    claimed.insert((out.index, asset.name.clone()))
+fn claim(claimed: &mut ClaimedDeliveries, out: &TxOutput, asset: &AssetQuantity) -> bool {
+    claimed.insert((out.index, asset.asset_id.asset_name_hex.clone()))
 }
 
 /// Tx outputs that are NOT at an offer address of *either* venue — the
@@ -353,18 +358,17 @@ fn non_offer_outputs(tx: &DecodeTx) -> impl Iterator<Item = &TxOutput> {
 
 /// The offer's asset-name allow-list as decoded bytes, or `None` for a
 /// collection-wide offer (empty list).
-fn asset_name_set(decoded: &DecodedOffer) -> Option<Vec<Vec<u8>>> {
-    if decoded.target_asset_names.is_empty() {
-        None
-    } else {
-        Some(
-            decoded
-                .target_asset_names
-                .iter()
-                .filter_map(|n| hex::decode(n).ok())
-                .collect(),
-        )
-    }
+/// The datum's target asset names, as hex.
+///
+/// These used to be hex-DECODED so they could be compared against the neutral
+/// shape's raw bytes. Now that the shape is `AssetId` (already hex) the decode
+/// is gone — but so is the case-insensitivity that comparing bytes gave for
+/// free, which is why every comparison against this set uses
+/// `eq_ignore_ascii_case`. A datum that spells its asset names in upper-case
+/// hex would otherwise stop matching, and the symptom would be an offer that
+/// silently never finds its delivery.
+fn asset_name_set(decoded: &DecodedOffer) -> Option<&[String]> {
+    (!decoded.target_asset_names.is_empty()).then(|| decoded.target_asset_names.as_slice())
 }
 
 fn parse_cred(hex_str: &str) -> Option<[u8; 28]> {
