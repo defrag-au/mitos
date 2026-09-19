@@ -29,3 +29,7 @@ community-modules/**/build/
 /snapshot
 /.dingo
 /.dolos
+
+# Agent scratch — draft PR text, captures, one-off analysis. Same convention
+# as shared-crates, so scratch written here cannot be committed by accident.
+.tmp/
