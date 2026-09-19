@@ -634,6 +634,7 @@ pub(crate) mod testing {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         std::fs::write(dir.join(format!("{key}.cbor")), request.encode().unwrap())
             .expect("write registration");
@@ -988,6 +989,7 @@ mod tests {
                 auth_header: None,
                 auth_value: None,
             }),
+            announced: Vec::new(),
         };
         std::fs::write(root.join("policy_a.cbor"), legacy.encode().unwrap()).unwrap();
 

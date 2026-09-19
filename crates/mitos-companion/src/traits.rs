@@ -16,7 +16,7 @@
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::wire::ChainPoint;
-use mitos_protocol::SubscribeTarget;
+use mitos_protocol::{AnnouncedModule, SubscribeTarget};
 
 /// Top-level companion trait. Implemented once per dApp companion.
 /// Owns the channel set, config, schema, and dApp RPC routes.
@@ -118,6 +118,23 @@ pub trait MitosCompanion: Send + Sync + 'static {
     /// resolved.
     fn client_id(&self) -> Option<String> {
         None
+    }
+
+    /// The module artifact(s) this worker was BUILT against, announced on
+    /// every subscribe.
+    ///
+    /// Default empty, so no existing companion changes and a worker that
+    /// returns nothing gets a byte-identical subscribe. A worker opts in by
+    /// embedding its `built-module.json` and returning
+    /// [`AnnouncedModule::from_built`] — and by SERVING the two files at
+    /// `BuiltModule::served_paths()` under its own hostname, which is where
+    /// the host will fetch them from.
+    ///
+    /// Announcing is idempotent and cheap: every one of a client's ~91 DOs
+    /// announces the same build, and all but the first are recognised as
+    /// already-in-flight and cause no second fetch.
+    fn announced_modules(&self) -> Vec<AnnouncedModule> {
+        Vec::new()
     }
 
     /// Drop the portion of the dApp's projected state that

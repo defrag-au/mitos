@@ -208,6 +208,9 @@ pub fn write_companion_subscription(
         resume_from: None,
         interests,
         dial_back: None,
+        // These fixtures announce nothing, which is every companion until an
+        // operator opts one in — so the request they encode is unchanged.
+        announced: Vec::new(),
     };
     std::fs::write(
         dir.join(format!("{companion_key}.cbor")),

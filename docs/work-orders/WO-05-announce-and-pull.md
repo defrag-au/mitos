@@ -12,6 +12,113 @@
 
 **Depends on:** WO-01, 02, 03, 04. **Blocks:** WO-06.
 
+## Implemented 2026-09-19 — open items for review
+
+Acceptance passes: `mitos-protocol` 41, `mitos-companion` 31,
+`mitos-platform` 238, `mitos-core` 28, `mitos-lifecycle` 87, the four
+integration files UNMODIFIED except the one sanctioned field;
+`cargo check -p mitos-protocol -p mitos-companion --target wasm32-unknown-unknown`
+exit 0; clippy `--workspace --all-targets -D warnings` 0; workspace check 0;
+`cargo fmt --check` 0 diffs; goldens 69/69.
+
+### ⚠️ BLOCKING — the manifest digest does not survive a restart
+
+**The three lines that matter**, all in `crates/mitos-lifecycle/src/client_move.rs`:
+
+```rust
+// :123 — the PERSISTED part of a row. No manifest digest.
+pub struct Move { target, url, intent, revision_policy, stage }
+
+// :474 — announce() builds it from the ModuleRef, which HAS
+// `manifest: Sha256Hex` (:74), and drops it on the floor.
+next.pending = Some(Move { target, url: module_ref.url, intent, .. });
+
+// :369 — so recover() can only re-issue this, and the executor has
+// nothing to run verification step 2 against.
+Stage::Fetching => vec![Effect::EnsureArtifact { url, wasm }]
+```
+
+Re-fetching anyway would mean accepting whatever manifest the worker serves at
+that moment — exactly what pinning the manifest exists to prevent (a manifest
+with `recapture` quietly removed). So I did NOT weaken the check. Instead a
+re-issued `EnsureArtifact` with no digest in hand fails the move with a named
+reason and the client's next announcement re-drives it, which costs nothing
+operationally: every one of a client's companions re-announces on every DO
+wake. See `MoveManager::cannot_verify` in `crates/mitos-platform/src/moves.rs`.
+
+**This means acceptance 7's `boot_refetches_a_row_that_was_fetching` is not
+satisfiable as written.** The test is there as
+`boot_cannot_verify_a_row_that_was_fetching_and_says_so`, asserting the
+behaviour above and pointing here. It is the one acceptance item this order
+does not meet.
+
+Two ways to close it, both above my remit:
+
+1. **Put the digest on `Move` and on the effect.** Roughly:
+   - `Move` gains `pub manifest: Sha256Hex` (`:123`), set from
+     `module_ref.manifest` at `:474`;
+   - `Effect::EnsureArtifact` gains `manifest: Sha256Hex` (`:223`), so the
+     effect carries everything its executor needs and `recover()` at `:369`
+     re-issues a complete one;
+   - host side: `Pinned` in `moves.rs` disappears, `cannot_verify` disappears,
+     `ensure_artifact` reads the digest off the row, and the test reverts to
+     the order's `boot_refetches_a_row_that_was_fetching`.
+
+   It is additive to a serialised struct, so an existing row on disk would
+   fail to parse — but no row exists anywhere yet, so that costs nothing
+   today and will not be true after this ships.
+2. **Persist it host-side beside the row.** A second file and a second crash
+   window per row — the README's own warning about multi-step writes — so I
+   did not.
+
+I think (1) is right, and doing it BEFORE this ships is what makes the
+migration question moot. But it changes the pure crate's persisted shape, so
+the order says report rather than guess.
+
+### Deviations
+
+1. **`AnnouncedModule::from_built` lives in `mitos-protocol`, not
+   `mitos-companion`.** The order puts it under §2 (the worker's side), but
+   `AnnouncedModule` is the wire type and `mitos-companion` would otherwise
+   need `mitos-lifecycle` just to name `BuiltModule`. `mitos-protocol` gained
+   `sha2` + `hex` for the digest check; both are pure Rust and the wasm32
+   check passes.
+2. **`validate_with_wasmtime` moved to `inspect.rs` as
+   `validate_component`**, with its own `ComponentRefused` error, as the order
+   asked. `inspect.rs` already owned wasmtime-side validation for both
+   callers.
+3. **`HttpFetcher` uses `Response::chunk()`, not `bytes_stream()`.** The
+   latter needs reqwest's `stream` feature, which is a workspace-wide
+   change for no extra guarantee — `chunk()` gives the same
+   stop-at-`max`-while-reading behaviour.
+4. **`Effect::EnsureArtifact`'s `url` is ignored**; the puller re-derives it
+   from `ArtifactSource::for_client`. That keeps "the host derives the URL" a
+   single code path rather than two that must agree.
+5. `RowStage` is a host-side enum rather than a rendering of the lifecycle
+   crate's `Stage`, which carries the resolved plan an operator does not need.
+
+### Found but not fixed
+
+- `crates/mitos-platform/src/moves.rs` — `MoveError` is declared and never
+  constructed; every refusal is a `String` reason on `AnnounceResult`. Left
+  because the order's contract is "an announcement never fails the
+  subscribe", so there is no error to return. Worth deleting or using in
+  WO-06.
+- `Effect::ReleaseCatchUpSlot` and `RequestCatchUpSlot` are no-ops here, so
+  nothing records WHO is waiting. The order says "add the row to an in-memory
+  queue"; since nothing drains it and a restart empties it, I left the queue
+  out rather than build one that only ever grows. WO-06 needs a real one.
+
+### Questions
+
+The blocking one is above. One smaller: `announce` returns `Accepted` as soon
+as the move is recorded, so a client whose artifact then turns out to be
+unreachable still sees `Accepted` in its subscribe response, with the refusal
+only on the event ring. That is what "an announcement never fails the
+subscribe" implies, and the alternative (await the fetch, report its outcome)
+would make a subscribe wait on a download — but it is worth confirming the
+response semantics are what you want.
+
 ## What this order does, and where it deliberately stops
 
 A worker says, on subscribe, "this is the module I was BUILT against". The host

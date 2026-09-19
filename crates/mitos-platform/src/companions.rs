@@ -51,8 +51,8 @@ use axum::routing::post;
 use mitos_lifecycle::access::{Attempt, Denied, Granted, Principal};
 use mitos_lifecycle::ids::ClientId;
 use mitos_protocol::{
-    HTTP_DELIVERY_MIME, InterestOp, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse,
-    SubscribeTarget, decode_interest_mutation,
+    AnnounceOutcome, AnnounceResult, HTTP_DELIVERY_MIME, InterestOp, SUBSCRIBE_MIME,
+    SubscribeRequest, SubscribeResponse, SubscribeTarget, decode_interest_mutation,
 };
 
 use crate::indexer_bridge::IndexerBridgeHandle;
@@ -75,6 +75,7 @@ pub fn companion_router(
     indexer_bridge: Option<IndexerBridgeHandle>,
     events: crate::events::EventRing,
     lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    moves: Option<Arc<crate::moves::MoveManager>>,
 ) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
@@ -85,6 +86,7 @@ pub fn companion_router(
         auth: auth.clone(),
         operator_as_client_recently: OperatorAsClientDebounce::default(),
         lifecycle,
+        moves,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -130,6 +132,9 @@ struct CompanionState {
     /// immediately rather than waiting for the 60s tick. `None` in tests that
     /// exercise persistence alone, and in artifact-only routers.
     lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    /// Client rows and artifact pulls. `None` means the host does not accept
+    /// announcements at all, and every one is refused saying so.
+    moves: Option<Arc<crate::moves::MoveManager>>,
 }
 
 /// Tell the lifecycle the registrations changed.
@@ -898,9 +903,17 @@ async fn subscribe_handler(
             }
         }
     }
+    // Announcements are handled LAST, after the registration is on disk and
+    // `reconcile` has run — so a client that is about to be adopted onto its
+    // instance already is one. An announcement NEVER fails the subscribe: a
+    // refusal is reported here and the companion stays registered and served
+    // by the instance it is on.
+    let announced = process_announcements(&state, &principal, &client_id, &request).await;
+
     let response = SubscribeResponse {
         status: "subscribed".to_string(),
         next_emission_id,
+        announced,
     };
     let body = response
         .encode()
@@ -910,6 +923,74 @@ async fn subscribe_handler(
         .header(header::CONTENT_TYPE, SUBSCRIBE_MIME)
         .body(Body::from(body))
         .expect("response builder"))
+}
+
+/// One outcome per announcement on the request.
+///
+/// An entry for a module this request does not TARGET is refused: a client
+/// announcing a build of something it is not subscribing to has nothing the
+/// host can act on, and accepting it would let one subscribe drive a move for
+/// any module on the box.
+async fn process_announcements(
+    state: &CompanionState,
+    principal: &Principal,
+    client_id: &ClientId,
+    request: &SubscribeRequest,
+) -> Vec<AnnounceOutcome> {
+    if request.announced.is_empty() {
+        return Vec::new();
+    }
+    let Some(moves) = state.moves.as_ref() else {
+        return request
+            .announced
+            .iter()
+            .map(|a| AnnounceOutcome {
+                module: a.module.clone(),
+                result: AnnounceResult::Refused {
+                    reason: "this host does not accept announcements".to_owned(),
+                },
+            })
+            .collect();
+    };
+
+    let targeted: std::collections::BTreeSet<&str> = request
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            SubscribeTarget::Module { name } => Some(name.as_str()),
+            SubscribeTarget::Indexer { .. } => None,
+        })
+        .collect();
+
+    let mut outcomes = Vec::with_capacity(request.announced.len());
+    for announced in &request.announced {
+        let result = if !targeted.contains(announced.module.as_str()) {
+            AnnounceResult::Refused {
+                reason: format!(
+                    "this subscribe does not target module `{}`",
+                    announced.module
+                ),
+            }
+        } else {
+            moves
+                .announce(client_id, &announced.module, announced)
+                .await
+        };
+        if let AnnounceResult::Refused { reason } = &result {
+            tracing::warn!(
+                client_id = %client_id,
+                module = %announced.module,
+                ?principal,
+                %reason,
+                "announcement refused; the companion is still registered and served",
+            );
+        }
+        outcomes.push(AnnounceOutcome {
+            module: announced.module.clone(),
+            result,
+        });
+    }
+    outcomes
 }
 
 /// Validate + persist a wasm-module target. Does NOT hand to the
@@ -1263,6 +1344,8 @@ fn migrate_one(legacy_bytes: &[u8], client_id: &str) -> Result<Vec<u8>, String> 
         resume_from: m.resume_from,
         interests: m.interests,
         dial_back: m.dial_back,
+        // A legacy flat record predates announcements entirely.
+        announced: Vec::new(),
     };
     req.encode().map_err(|e| format!("re-encode: {e}"))
 }
@@ -1413,6 +1496,7 @@ mod tests {
             None,
             crate::events::EventRing::new(),
             None,
+            None,
         )
     }
 
@@ -1437,6 +1521,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let body = cbor(&req);
         let response = router
@@ -1468,6 +1553,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let body = cbor(&req);
         let response = router
@@ -1614,6 +1700,7 @@ mod tests {
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let bytes = cbor(&req);
         let decoded: SubscribeRequest = ciborium::de::from_reader(&bytes[..]).unwrap();
@@ -1722,6 +1809,7 @@ mod tests {
                     auth_header: None,
                     auth_value: None,
                 }),
+                announced: Vec::new(),
             },
             SubscribeRequest {
                 targets: vec![SubscribeTarget::Module {
@@ -1738,6 +1826,7 @@ mod tests {
                     auth_header: None,
                     auth_value: None,
                 }),
+                announced: Vec::new(),
             },
         ];
         for req in requests.drain(..) {
@@ -1829,6 +1918,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let body = cbor(&req);
         let response = tokio::runtime::Runtime::new().unwrap().block_on(
@@ -2010,6 +2100,7 @@ mod tests {
                 resume_from: None,
                 interests,
                 dial_back: None,
+                announced: Vec::new(),
             };
             std::fs::write(dir.join(format!("{key}.cbor")), req.encode().unwrap()).unwrap();
         };
@@ -2073,6 +2164,7 @@ mod tests {
             None,
             events.clone(),
             None,
+            None,
         );
         (router, events)
     }
@@ -2107,6 +2199,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         }
     }
 

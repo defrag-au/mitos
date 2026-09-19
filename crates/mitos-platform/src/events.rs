@@ -111,6 +111,14 @@ pub enum EventKind {
     /// the only place a failed start or reap is visible as a query rather
     /// than a journal grep.
     LifecycleEffectFailed { effect: String, error: String },
+    /// A client's announced move could not proceed: the artifact was
+    /// unreachable or refused, a rollback was not permitted, or the fork cap
+    /// was reached.
+    ///
+    /// Never fatal to the subscribe — the client stays registered and served
+    /// by the instance it is on — so this ring is where an operator finds out
+    /// that a worker's new build is NOT the one running.
+    MoveFailed { client_id: String, reason: String },
 }
 
 impl EventKind {
@@ -132,6 +140,7 @@ impl EventKind {
             EventKind::OperatorTokenUsedAsClient { .. } => "operator_token_used_as_client",
             EventKind::InstanceAlert { .. } => "instance_alert",
             EventKind::LifecycleEffectFailed { .. } => "lifecycle_effect_failed",
+            EventKind::MoveFailed { .. } => "move_failed",
         }
     }
 }

@@ -42,8 +42,8 @@ pub use protocol::{
 };
 pub use submit::{SUBMIT_MIME, SubmitTxRequest, SubmitTxResponse, SubmitWireError};
 pub use subscribe::{
-    DialBackOverride, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeTarget,
-    SubscribeWireError,
+    AnnounceOutcome, AnnounceResult, AnnouncedModule, DialBackOverride, MismatchedConfig,
+    SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse, SubscribeTarget, SubscribeWireError,
 };
 pub use wire::{
     ChainPoint, ClientMessage, InterestOp, ServerMessage, SubscribeReply, decode_client,

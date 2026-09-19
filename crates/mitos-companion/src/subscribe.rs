@@ -338,6 +338,7 @@ mod tests {
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![Interest::any()],
             dial_back: None,
+            announced: Vec::new(),
         };
         let bytes = encode_subscribe(&req).unwrap();
         let decoded = decode_subscribe(&bytes).unwrap();
@@ -353,6 +354,7 @@ mod tests {
         let resp = SubscribeResponse {
             status: "subscribed".into(),
             next_emission_id: 42,
+            announced: Vec::new(),
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&resp, &mut buf).unwrap();
@@ -376,6 +378,7 @@ mod tests {
                 auth_header: Some("X-Custom-Auth".into()),
                 auth_value: Some("token-abc".into()),
             }),
+            announced: Vec::new(),
         };
         let bytes = encode_subscribe(&req).unwrap();
         let decoded = decode_subscribe(&bytes).unwrap();

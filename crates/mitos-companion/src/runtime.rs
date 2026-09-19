@@ -638,6 +638,11 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // `Module { name: C::NAME }` for backward compat with
         // single-wasm-module companions.
         let targets = self.inner.subscribe_targets();
+        // What this worker was BUILT against. Empty for every companion that
+        // has not opted in, and then the request encodes exactly as it always
+        // did. Every one of a client's DOs announces the same build; the host
+        // recognises all but the first as already in flight.
+        let announced = self.inner.announced_modules();
         let request = SubscribeRequest {
             targets,
             companion_key,
@@ -645,10 +650,21 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             resume_from,
             interests,
             dial_back,
+            announced,
         };
 
         match subscribe_via_env(&self.env, &request).await {
             Ok(resp) => {
+                // An announcement never fails the subscribe, so an outcome is
+                // reported rather than acted on: a refusal leaves this
+                // companion registered and served where it already was.
+                for outcome in &resp.announced {
+                    tracing::info!(
+                        module = %outcome.module,
+                        result = ?outcome.result,
+                        "announcement outcome",
+                    );
+                }
                 tracing::info!(
                     next_emission_id = resp.next_emission_id,
                     "subscribe call succeeded"

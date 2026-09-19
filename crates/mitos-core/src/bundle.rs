@@ -335,6 +335,7 @@ impl Bundle {
         let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut module_watchdog_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut module_lifecycle_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut module_moves_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
@@ -636,6 +637,28 @@ impl Bundle {
             // lifecycle `StartFollower` also re-asserts the module's
             // scan-interest, exactly as the watchdog does after a revive.
             lifecycle.set_dialer(dialer.clone());
+
+            // Client rows and artifact pulls. A worker announces the module
+            // it was BUILT against; the host records it, fetches it into the
+            // CAS, and works out what the move would involve — and stops
+            // there. Nothing grants a catch-up slot yet, so an announcement
+            // changes only what `GET …/rows` shows.
+            let fetcher: Arc<dyn mitos_platform::fetch::ArtifactFetcher> =
+                Arc::new(mitos_platform::fetch::HttpFetcher::new()?);
+            let puller = Arc::new(mitos_platform::fetch::ArtifactPuller::new(
+                storage.clone(),
+                fetcher,
+            ));
+            let moves = Arc::new(mitos_platform::moves::MoveManager::new(
+                storage.clone(),
+                puller,
+                authenticator.clone(),
+                lifecycle.clone(),
+                event_ring.clone(),
+            ));
+            // Re-issue whatever each row says is already in flight.
+            moves.boot().await;
+
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),
                 authenticator.clone(),
@@ -643,6 +666,7 @@ impl Bundle {
                 Some(indexer_bridge),
                 event_ring.clone(),
                 Some(lifecycle.clone()),
+                Some(moves.clone()),
             ));
 
             // Transaction submission: let a consumer (the minting engine) push a
@@ -698,6 +722,11 @@ impl Bundle {
             let lifecycle_handle =
                 mitos_platform::lifecycle::spawn_tick(lifecycle.clone(), exit.clone());
 
+            // The rows' own timer, on the same cadence: a client that no
+            // longer has any registration for a module loses its pending
+            // move, and then its row.
+            let moves_handle = mitos_platform::moves::spawn_tick(moves, exit.clone());
+
             // Periodic emissions-log compaction. Hourly sweep
             // ages out Acked rows (7d) + flips stuck Pending
             // rows to Timeout (24h). See `mitos_platform::compaction`.
@@ -711,6 +740,7 @@ impl Bundle {
             module_compaction_handle = Some(compaction_handle);
             module_watchdog_handle = Some(watchdog_handle);
             module_lifecycle_handle = Some(lifecycle_handle);
+            module_moves_handle = Some(moves_handle);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -776,6 +806,11 @@ impl Bundle {
         // Same for the lifecycle tick: a `Reap` mid-flight removes a module
         // directory, which must not race the follower teardown below.
         if let Some(handle) = module_lifecycle_handle {
+            let _ = handle.await;
+        }
+
+        // …and the rows' tick, which writes row files under the same dirs.
+        if let Some(handle) = module_moves_handle {
             let _ = handle.await;
         }
 

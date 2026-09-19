@@ -42,7 +42,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use mitos_data_plane::ChainPoint;
-use mitos_lifecycle::ids::{InstanceKey, ModuleId, Sha256Hex};
+use mitos_lifecycle::client_move::ClientRow;
+use mitos_lifecycle::ids::{ClientId, InstanceKey, ModuleId, Sha256Hex};
 use mitos_lifecycle::instance::LifecycleRecord;
 
 use crate::manifest::Manifest;
@@ -60,6 +61,8 @@ const INSTANCE_MARKER: &str = "instance.toml";
 const INSTANCES_DIR: &str = "instances";
 /// The instance's `LifecycleRecord` — see [`ModuleStorage::read_lifecycle`].
 const LIFECYCLE_RECORD: &str = "lifecycle.toml";
+/// A client's row — see [`ModuleStorage::read_row`].
+const CLIENT_ROW: &str = "rows/<client>.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -418,6 +421,47 @@ impl ModuleStorage {
 
     fn cas_config_dir(&self) -> PathBuf {
         self.root.join(CAS_DIR).join("config")
+    }
+
+    fn cas_manifest_dir(&self) -> PathBuf {
+        self.root.join(CAS_DIR).join("manifest")
+    }
+
+    /// A manifest keyed by its OWN digest, holding the bytes exactly as
+    /// fetched.
+    ///
+    /// Distinct from the copy beside the wasm (`_cas/wasm/<wasm>.manifest.toml`,
+    /// keyed by the WASM's sha, which the facade still reads). A manifest's
+    /// bytes change on every build — `build_id` is in them — while the wasm's
+    /// may not, so two announcements can legitimately pin two different
+    /// manifests over one wasm, and keyed by the wasm they would overwrite
+    /// each other. Keyed by their own digest they cannot.
+    pub fn manifest_by_digest_path(&self, sha: &Sha256Hex) -> PathBuf {
+        self.cas_manifest_dir().join(format!("{sha}.toml"))
+    }
+
+    /// Store a manifest's RAW bytes under their own digest. A second put of
+    /// the same digest is a no-op, as everywhere else in the CAS.
+    pub fn put_manifest(&self, bytes: &[u8]) -> Result<Sha256Hex, StorageError> {
+        let sha = Sha256Hex::parse(&crate::manifest::sha256_hex(bytes))?;
+        let path = self.manifest_by_digest_path(&sha);
+        if path.exists() {
+            return Ok(sha);
+        }
+        std::fs::create_dir_all(self.cas_manifest_dir())?;
+        write_atomic(&path, bytes)?;
+        Ok(sha)
+    }
+
+    pub fn read_manifest_by_digest(
+        &self,
+        sha: &Sha256Hex,
+    ) -> Result<Option<Manifest>, StorageError> {
+        let path = self.manifest_by_digest_path(sha);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Manifest::parse(&std::fs::read_to_string(path)?)?))
     }
 
     /// Where the wasm bytes for a digest live. Shared by every instance and
@@ -862,6 +906,91 @@ impl ModuleStorage {
     /// where each registered companion's `SubscribeRequest` lives.
     pub fn module_dir_for_companions(&self, id: &str) -> PathBuf {
         self.module_dir(id).join("companions")
+    }
+
+    /// Per-module CLIENT ROW directory — `<module>/rows/<client_id>.toml`.
+    ///
+    /// Module-level, like `companions/`, and for the same reason turned up a
+    /// level: a row is the unit of VERSIONING, so it outlives any one
+    /// instance and must not live inside one. A client id belongs to at most
+    /// one namespace (WO-02), which is what makes it a sufficient file name.
+    pub fn module_dir_for_rows(&self, id: &str) -> PathBuf {
+        self.module_dir(id).join("rows")
+    }
+
+    fn row_path(&self, module: &str, client: &ClientId) -> PathBuf {
+        self.module_dir_for_rows(module)
+            .join(format!("{client}.toml"))
+    }
+
+    /// `Ok(None)` when this client has never announced for this module.
+    pub fn read_row(
+        &self,
+        module: &str,
+        client: &ClientId,
+    ) -> Result<Option<ClientRow>, StorageError> {
+        let path = self.row_path(module, client);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        toml::from_str(&raw)
+            .map(Some)
+            .map_err(|e| StorageError::MalformedPointer {
+                module: module.to_owned(),
+                file: CLIENT_ROW,
+                why: e.to_string(),
+            })
+    }
+
+    pub fn write_row(&self, module: &str, row: &ClientRow) -> Result<(), StorageError> {
+        let dir = self.module_dir_for_rows(module);
+        std::fs::create_dir_all(&dir)?;
+        let toml = toml::to_string(row).map_err(|e| StorageError::Serialise {
+            what: "client row",
+            why: e.to_string(),
+        })?;
+        write_atomic(&self.row_path(module, &row.client.client), toml.as_bytes())
+    }
+
+    /// Idempotent: a missing row is `Ok(())`.
+    pub fn remove_row(&self, module: &str, client: &ClientId) -> Result<(), StorageError> {
+        match std::fs::remove_file(self.row_path(module, client)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every row for a module. A row that will not parse is logged and
+    /// skipped rather than failing the whole listing — one unreadable row
+    /// must not hide the others from `GET …/rows`.
+    pub fn list_rows(&self, module: &str) -> Result<Vec<ClientRow>, StorageError> {
+        let dir = self.module_dir_for_rows(module);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "toml") {
+                continue;
+            }
+            match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|raw| toml::from_str::<ClientRow>(&raw).map_err(|e| e.to_string()))
+            {
+                Ok(row) => out.push(row),
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "client row is unreadable; skipping it",
+                ),
+            }
+        }
+        out.sort_by(|a, b| a.client.client.as_str().cmp(b.client.client.as_str()));
+        Ok(out)
     }
 
     /// Count registered companions for a module across the two-level

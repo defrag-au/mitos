@@ -190,6 +190,35 @@ pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError
     })
 }
 
+/// Wasmtime refused the bytes as a component.
+///
+/// Its own error type rather than an HTTP handler's: both the admin upload
+/// path and the artifact fetcher run this check, and the fetcher has no
+/// business depending on `admin::HandlerError`.
+#[derive(Debug, thiserror::Error)]
+pub enum ComponentRefused {
+    #[error("engine: {0}")]
+    Engine(String),
+    #[error("component: {0}")]
+    Component(String),
+}
+
+/// Independent wasmtime-side validation. Confirms the component parses and
+/// the world declared by the manifest is what wasmtime sees in the binary's
+/// metadata. Dry-instantiation + version-export round-trip is future work —
+/// the actual host's `start()` path catches those on first activation; the
+/// cost of doing it here too hasn't earned its keep.
+pub fn validate_component(wasm_bytes: &[u8]) -> Result<(), ComponentRefused> {
+    // A minimal engine just for parse-validation. Cheap to construct; doesn't
+    // need the platform's full Config.
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    let engine = Engine::new(&config).map_err(|e| ComponentRefused::Engine(e.to_string()))?;
+    let _component = Component::from_binary(&engine, wasm_bytes)
+        .map_err(|e| ComponentRefused::Component(e.to_string()))?;
+    Ok(())
+}
+
 fn trap_strategy_to_string(s: TrapStrategy) -> String {
     match s {
         TrapStrategy::Replay => "replay",

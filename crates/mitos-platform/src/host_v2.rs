@@ -1965,6 +1965,7 @@ mod interest_filter_tests {
                 auth_header: None,
                 auth_value: None,
             }),
+            announced: Vec::new(),
         };
         let path = dir.join("companion.cbor");
         std::fs::write(&path, req.encode().expect("encode")).expect("write");

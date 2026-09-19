@@ -49,6 +49,10 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use mitos_lifecycle::access::{ClientSet, OperatorTokenAsClient};
+// The move's phase, not the instance's — both are called `Phase`, and they
+// describe different things: where a client's move has got to versus what an
+// instance IS.
+use mitos_lifecycle::client_move::{Phase as MovePhase, Stage};
 use mitos_lifecycle::ids::Revision;
 use mitos_lifecycle::instance::{
     BootAction, DesiredState, Effect, Event, EvictMode, Instance, OperatorCommand, Phase, Rejected,
@@ -231,6 +235,7 @@ fn admin_router_inner(
         .route("/_admin/modules/{id}/unpin", post(unpin_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
         .route("/_admin/modules/{id}/companions", get(list_companions))
+        .route("/_admin/modules/{id}/rows", get(list_rows))
         .route(
             "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
             axum::routing::delete(delete_companion),
@@ -465,6 +470,86 @@ impl From<&Instance> for StatusLifecycle {
             governing_tier: instance.governing.map(|p| p.tier),
         }
     }
+}
+
+/// One client's row: where it is being served from, and where it is going.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RowSummary {
+    /// `namespace/client`.
+    pub client: String,
+    /// The instance serving it today. `None` before its first move commits —
+    /// which, until WO-06, is every row that was not adopted.
+    pub current: Option<RowPlacement>,
+    /// The move in flight. Until WO-06 grants a catch-up slot, one that got
+    /// past its fetch parks at `stage: planned`, `phase: queued` and stays
+    /// there.
+    pub pending: Option<RowPending>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RowPlacement {
+    /// The instance directory name — truncated digests, as on disk.
+    pub instance: String,
+    pub revision: Revision,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RowPending {
+    pub target: String,
+    pub revision: Revision,
+    pub stage: RowStage,
+    /// `None` while fetching — there is no plan until the upgrade ledger has
+    /// been read off the artifact.
+    pub phase: Option<MovePhase>,
+}
+
+/// How far a pending move has got. The lifecycle crate's `Stage` carries the
+/// resolved plan with it; this is the half an operator reads.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RowStage {
+    /// The artifact is being pulled, so there is no plan yet.
+    Fetching,
+    Planned,
+}
+
+/// `GET /_admin/modules/{id}/rows` — the client rows for a module.
+///
+/// READ-ONLY, and deliberately so: it lists what is on disk and never adopts
+/// a row on the way past. Adoption WRITES, and this route does not hold the
+/// row lock.
+async fn list_rows(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    let rows = state
+        .storage
+        .list_rows(&id)?
+        .into_iter()
+        .map(|row| RowSummary {
+            client: format!("{}/{}", row.client.namespace, row.client.client),
+            current: row.current.map(|p| RowPlacement {
+                instance: p.instance.dir_name(),
+                revision: p.revision,
+            }),
+            pending: row.pending.map(|p| RowPending {
+                target: p.target.instance.dir_name(),
+                revision: p.target.revision,
+                stage: match p.stage {
+                    Stage::Fetching => RowStage::Fetching,
+                    Stage::Planned { .. } => RowStage::Planned,
+                },
+                phase: match p.stage {
+                    Stage::Fetching => None,
+                    Stage::Planned { phase, .. } => Some(phase),
+                },
+            }),
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(rows).into_response())
 }
 
 /// Best-effort: a read surface must not 500 because one module's record is
@@ -1717,7 +1802,8 @@ async fn upload_module(
     // Independent wasmtime validation: even if the manifest claims
     // valid shape, we re-load the bytes to confirm wasmtime
     // accepts the component. Cheap, catches tampered manifests.
-    validate_with_wasmtime(&wasm_bytes)?;
+    crate::inspect::validate_component(&wasm_bytes)
+        .map_err(|e| HandlerError::Wasmtime(e.to_string()))?;
 
     // Activate, then start ONLY IF the instance expects a follower.
     //
@@ -2739,24 +2825,6 @@ async fn replay_emission(
     .into_response())
 }
 
-/// Independent wasmtime-side validation. Confirms the component
-/// parses and the world declared by the manifest is what wasmtime
-/// sees in the binary's metadata. Dry-instantiation + version-export
-/// round-trip is future work — the actual host's `start()` path
-/// catches those on first activation; the cost of doing it here too
-/// hasn't earned its keep.
-fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
-    // Build a minimal engine just for parse-validation. Cheap to
-    // construct; doesn't need the platform's full Config.
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|e| HandlerError::Wasmtime(format!("engine: {e}")))?;
-    let _component = wasmtime::component::Component::from_binary(&engine, wasm_bytes)
-        .map_err(|e| HandlerError::Wasmtime(format!("component: {e}")))?;
-    Ok(())
-}
-
 /// The admin router's auth, proven through the REAL router.
 ///
 /// The four unit tests that used to live here exercised a private
@@ -2800,6 +2868,7 @@ mod tests {
         "/_admin/modules",
         "/_admin/modules/m",
         "/_admin/modules/m/companions",
+        "/_admin/modules/m/rows",
         "/_admin/modules/m/last-trap",
         "/_admin/modules/m/emissions",
         "/_admin/utxos",
@@ -3083,6 +3152,7 @@ mod tests {
             None,
             w.events.clone(),
             Some(w.lifecycle.clone()),
+            None,
         );
         let request = mitos_protocol::SubscribeRequest {
             targets: vec![mitos_protocol::SubscribeTarget::Module { name: "m".into() }],
@@ -3091,6 +3161,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let mut body = Vec::new();
         ciborium::ser::into_writer(&request, &mut body).unwrap();

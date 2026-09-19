@@ -311,6 +311,7 @@ fn subscribe_request_carries_full_interest_set() {
         resume_from: None,
         interests,
         dial_back: None,
+        announced: Vec::new(),
     };
     let bytes = encode_subscribe(&req).unwrap();
     let decoded = decode_subscribe(&bytes).unwrap();
