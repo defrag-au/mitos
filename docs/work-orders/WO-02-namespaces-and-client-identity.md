@@ -6,6 +6,132 @@ its tests; `the_whole_decision_table` is the specification for this order.
 **Depends on:** WO-01 (only for the dependency on `mitos-lifecycle`).
 **Blocks:** WO-03 (instances need a `ClientKey`, which needs a namespace).
 
+## Implemented 2026-09-19 — open items for review
+
+Acceptance all passes (`mitos-platform` 184 + the four integration files
+unmodified, `mitos-core` 28, `mitos-lifecycle` 64, clippy and
+`cargo check --workspace --all-targets` exit 0, `cargo fmt --check` clean).
+What is NOT settled:
+
+### ⚠️ Needs a decision — `/replicate/{indexer}` is not in the census
+
+The attempt table does not list it, and the order says to stop and report
+exactly that. It is the synthetic-client WebSocket surface `mitos-tail`
+consumes; no worker in the census holds a token for it.
+
+Today only the full operator token opens it. It is a `GET`, so letting
+`require_admin` handle it would map it to `Admin(Read)` and hand it to the
+read-only dashboard token as a side effect of this change. So it is mapped to
+`Attempt::Admin(AdminAccess::Mutate)` via `auth::require_admin_mutate`, which
+admits **exactly who it admits today** and widens nothing at rollout. Pinned
+by `the_replicate_surface_stays_operator_only`; documented as a placeholder at
+both the definition and the call site.
+
+If `/replicate` should carry `ReadChain` (it streams indexer changes, not
+chain data) or an attempt of its own, that belongs in `access.rs` and can be
+changed later without an outage — which is why the non-widening option was
+chosen rather than a guess at the right one.
+
+### Found but not fixed
+
+- `crates/mitos-platform/src/companions.rs:1290` — `client_companions_dir`
+  uses the RAW `client_id` as a directory name while `validate_client_id`
+  validates the TRIMMED one. Pre-existing; a padded id produces a directory
+  that no longer round-trips. Narrowed in practice now that authorization
+  parses the raw value through `ClientId::parse`, but the validator and the
+  path builder still disagree.
+- `a_namespace_token_gets_403_on_every_admin_route` iterates a hand-maintained
+  const list, not the router — axum exposes no route table. A route added
+  without adding it to that list is silently untested. Commented as such at
+  the list.
+
+### Deviations from this order, in full
+
+1. `Registry::operator_token_as_client()` added to `mitos-lifecycle` — a pure
+   getter mirroring `namespaces()`. `/_admin/status` must report the rollout
+   stage; the alternative was hardcoding "legacy means allow-with-warning" in
+   the host, which is the drift the pure crate exists to prevent.
+2. `Bundle::new` now returns `anyhow::Result<Self>` — it is where
+   `MITOS_NAMESPACES_FILE` loads, and a misconfigured registry must stop the
+   host. One call site. This is also why `bundles/default/src/main.rs` changed.
+3. The three router constructors take `Arc<Authenticator>` (the order's
+   preferred option). `AuthToken` stays, narrowed to the outbound dial-back
+   credential. `AuthToken::readonly_from_env()` deleted — its only caller was
+   the removed middleware.
+4. `InterestMutationError::NoneGranted` beyond the one specified variant: a
+   persisted `client_id` that no longer parses is skipped, and there is then
+   no `Denied` to quote. Same 403, typed rather than fabricated.
+
+Two behaviour notes: the read-only token now gets **403** on the companion and
+tx routes where v2 gave 401 (those middlewares only knew the full token) —
+that is this order's own 401/403 split applied consistently. And a `client_id`
+with surrounding whitespace, which `validate_client_id` trims but persists
+raw, now fails `ClientId::parse` and returns the existing 400
+`invalid_client_id`.
+
+Acceptance item 5 resolves to **zero** `require_auth` rather than one: each
+middleware is now named for what it authorizes (`require_admin`,
+`require_submit_tx`, `require_read_chain`, `require_recapture`), with
+`authenticate` doing authentication alone. One `constant_time_eq` remains, in
+`crates/mitos-platform/src/auth.rs`.
+
+## Review — 2026-09-19
+
+Implemented in `824f06b`. Acceptance re-run independently and it matches the
+report exactly: `mitos-platform` 184, `mitos-core` 28, `mitos-lifecycle` 64,
+the four integration files unmodified, clippy `-D warnings` 0,
+`cargo check --workspace --all-targets` 0. No test ignored or weakened.
+
+**No defects found in the implementation.** What was checked by reading, not
+by trusting the tests:
+
+- `resolve` compares against every token with no early exit, and open mode
+  cannot combine with a configured registry (refused at startup).
+- `guard` FAILS CLOSED: a request with no `Principal` in its extensions is a
+  401, not a default.
+- Router layering is right: recapture and the rest are separate sub-routers,
+  each with its own authorization layer, and `authenticate` wraps both
+  OUTERMOST. `/metrics` is merged after, so it stays open.
+- Subscribe authorizes before anything is persisted or handed to the dialer.
+- **The side door in interest mutation is closed.** Only granted registrations
+  are rewritten — but the handler also tells the MODULE to stop scanning
+  removed interests. Had that union been computed over the granted subset, a
+  dev `Remove` would have stopped the module watching a policy prod still
+  holds. It is not: `load_module_interest_union` re-reads EVERY registration
+  from disk after the writes (a pre-existing guard), so it holds.
+
+**The three open items, settled in review** (uncommitted on top of `824f06b`):
+
+1. *`/replicate/{indexer}`.* The implementation did exactly what the order
+   asked — stopped, chose the option that widens nothing, reported it. That
+   conservative choice is also the right FINAL answer: the only consumer is
+   `tools/mitos-tail`, an operator tool (the workers' `/_internal/replicate`
+   is their own dial-back route, not this one). But "`Admin(Mutate)` on a
+   `GET`" reads as a bug to the next person, so it is now a named rule:
+   `Attempt::TailIndexer`, operator-full only, in the decision table.
+   `require_admin_mutate` → `require_tail_indexer`. It is NOT `Admin(Read)`
+   because the read-only token lives in `mitos-watch`, a deployed worker, and
+   this is a long-lived socket carrying every indexer change.
+2. *`validate_client_id` trimmed; the path builder used the raw id.* The rules
+   were otherwise identical to `ClientId::parse`, and no test asserted a
+   padded id was ACCEPTED — so the validator now delegates to
+   `ClientId::parse`. One check for the id that becomes a path and the id that
+   is authorized.
+3. *The admin route lists are hand-maintained.* New test
+   `the_route_lists_cover_the_whole_router` reads `admin_router_inner`'s own
+   source and fails when the router has a path, or a handler method, that the
+   lists do not account for. Mutation-checked: adding an unlisted
+   `POST /_admin/mutant` fails it and names the route.
+
+The four deviations are all accepted. `Bundle::new` returning `Result` is the
+right call — a host that cannot enforce its declared boundary must not serve.
+
+**Still open — for the operator, not a code change.** `constant_time_eq`
+returns early on a LENGTH mismatch, so token length is observable. Pre-existing
+and negligible while every token is `openssl rand -hex 32` (all 64 chars);
+comparing SHA-256 digests would remove it. Raise it in the `/security-review`
+this order's deploy note already calls for.
+
 ## Why
 
 v2 has ONE shared `MITOS_AUTH_TOKEN`, checked by THREE separate copies of the

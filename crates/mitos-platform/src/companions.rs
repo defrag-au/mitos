@@ -1264,24 +1264,17 @@ fn validate_companion_key(key: &str) -> std::result::Result<(), SubscribeError> 
 /// sentinels) and any string starting with a dot (so the dotfile-
 /// reserved `.unreachable` directory remains distinguishable from a
 /// legitimate `client_id`).
+///
+/// The rules are [`ClientId::parse`]'s, and this DELEGATES to it rather than
+/// restating them. It used to validate the TRIMMED id while
+/// `client_companions_dir` built a path from the RAW one, so a padded id
+/// passed validation and produced a directory that never round-tripped. Two
+/// validators that agree today are two that can disagree tomorrow; the id
+/// that becomes a path and the id that is authorized must be one check.
 fn validate_client_id(client_id: &str) -> std::result::Result<(), SubscribeError> {
-    let trimmed = client_id.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        return Err(SubscribeError::InvalidClientId(format!(
-            "len {} not in 1..=128 (after trim)",
-            trimmed.len()
-        )));
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-    {
-        return Err(SubscribeError::InvalidClientId(trimmed.to_string()));
-    }
-    if trimmed == "." || trimmed == ".." || trimmed.starts_with('.') {
-        return Err(SubscribeError::InvalidClientId(trimmed.to_string()));
-    }
-    Ok(())
+    ClientId::parse(client_id)
+        .map(|_| ())
+        .map_err(|e| SubscribeError::InvalidClientId(e.to_string()))
 }
 
 /// On-disk directory holding all companion registrations for a single

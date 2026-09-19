@@ -2633,6 +2633,84 @@ mod tests {
         "/_admin/blocks/by-tx/aa",
     ];
 
+    /// The tripwire for the two lists above. axum exposes no route table, so
+    /// the lists are hand-maintained — and a route added to the router but not
+    /// to a list is silently absent from every "who may reach it" test. This
+    /// reads `admin_router_inner`'s own SOURCE and fails when the router has a
+    /// route, or a handler method, that the lists do not account for.
+    ///
+    /// It is a tripwire, not a parser: it counts `get(` / `post(` /
+    /// `delete(` calls and route-path literals in that one function. If it
+    /// fails after you touched the router, the fix is almost always to add the
+    /// new route to `MUTATING_ROUTES` or `READ_ROUTES`.
+    #[test]
+    fn the_route_lists_cover_the_whole_router() {
+        let source = include_str!("admin.rs");
+        let start = source
+            .find("fn admin_router_inner(")
+            .expect("admin_router_inner exists");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("function has an end");
+        let code: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Every path template in the router, made concrete the way the lists
+        // spell it.
+        let mut templates = Vec::new();
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find("\"/") {
+            let tail = &rest[at + 1..];
+            let close = tail.find('"').expect("string literal closes");
+            templates.push(&tail[..close]);
+            rest = &tail[close + 1..];
+        }
+        let concrete = |template: &str| {
+            template
+                .replace("{id}", "m")
+                .replace("{client_id}", "c")
+                .replace("{companion_key}", "k")
+                .replace("{emission_id}", "1")
+                .replace("{slot}", "1")
+                .replace("{tx_hash}", "aa")
+        };
+        // The two routes deliberately outside both lists, each with its own
+        // test: recapture (`RecaptureModule`) and the open `/metrics`.
+        let elsewhere = ["/_admin/modules/m/recapture", "/metrics"];
+        for template in &templates {
+            let path = concrete(template);
+            assert!(
+                !path.contains('{'),
+                "route `{template}` has a path parameter this test cannot make concrete — teach \
+                 `concrete` about it"
+            );
+            let listed = READ_ROUTES.contains(&path.as_str())
+                || MUTATING_ROUTES.iter().any(|(_, p)| *p == path)
+                || elsewhere.contains(&path.as_str());
+            assert!(
+                listed,
+                "`{template}` is on the admin router but in neither route list, so no test \
+                 checks who may reach it"
+            );
+        }
+
+        // …and every METHOD, because a `.post(..)` added to an existing path
+        // adds no new template.
+        let count = |needle: &str| code.matches(needle).count();
+        assert_eq!(
+            count("get("),
+            READ_ROUTES.len() + 1,
+            "GET handlers on the router vs READ_ROUTES (+1 for the open /metrics)"
+        );
+        assert_eq!(
+            count("post(") + count("delete("),
+            MUTATING_ROUTES.len() + 1,
+            "POST/DELETE handlers on the router vs MUTATING_ROUTES (+1 for recapture)"
+        );
+    }
+
     fn tempdir(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("mitos-admin-auth-{name}-{}", std::process::id()));

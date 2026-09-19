@@ -569,21 +569,17 @@ fixed_attempt_middleware!(
 );
 
 fixed_attempt_middleware!(
-    /// `Admin(Mutate)` on a route that is a `GET`, used by `/replicate/{indexer}`.
+    /// `GET /replicate/{indexer}` — the WebSocket change stream `mitos-tail`
+    /// consumes. Operator-full only; see [`Attempt::TailIndexer`] for why that
+    /// is a decision rather than a default.
     ///
-    /// That route is the synthetic-client WebSocket surface `mitos-tail`
-    /// consumes, and it is the one route WO-02's attempt table does not list.
-    /// Today only the full operator token opens it, so mapping it to
-    /// `Admin(Read)` — which [`require_admin`] would pick for a `GET` — would
-    /// hand it to the read-only dashboard token as a side effect of this
-    /// change. `Admin(Mutate)` admits exactly who it admits now.
-    ///
-    /// This is deliberately the CONSERVATIVE placeholder, not an opinion: it
-    /// widens nothing at rollout, so whichever attempt `/replicate` should
-    /// really carry can be decided in `access.rs` later without an outage in
-    /// between.
-    require_admin_mutate,
-    Attempt::Admin(AdminAccess::Mutate)
+    /// NOT [`require_admin`]: that picks `Admin(Read)` for a `GET`, which
+    /// would hand this socket to the read-only token as a side effect. WO-02's
+    /// implementation found the route missing from the order's attempt table
+    /// and held it at "exactly who it admits today"; the review made that the
+    /// named rule it is now.
+    require_tail_indexer,
+    Attempt::TailIndexer
 );
 
 /// The two-namespace host every auth test in this crate runs against: `prod`
@@ -1016,18 +1012,18 @@ backfill_concurrency = 1
     }
 
     /// `/replicate/{indexer}` keeps exactly the access it has today: the full
-    /// operator token and nobody else. See `require_admin_mutate`.
+    /// operator token and nobody else. See `Attempt::TailIndexer`.
     #[tokio::test]
     async fn the_replicate_surface_stays_operator_only() {
         use axum::http::StatusCode;
 
         assert_eq!(
-            probe(require_admin_mutate, Some(FULL)).await,
+            probe(require_tail_indexer, Some(FULL)).await,
             StatusCode::OK
         );
         for token in [PROD, DEV, READONLY] {
             assert_eq!(
-                probe(require_admin_mutate, Some(token)).await,
+                probe(require_tail_indexer, Some(token)).await,
                 StatusCode::FORBIDDEN,
             );
         }

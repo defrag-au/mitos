@@ -132,6 +132,17 @@ pub enum Attempt<'a> {
     /// client-scoped (it must, for `Refill::Recapture`) this case narrows to
     /// "its own clients" and the tier rule goes away.
     RecaptureModule,
+    /// `GET /replicate/{indexer}` — the WebSocket change stream `mitos-tail`
+    /// consumes. OPERATOR-FULL ONLY, and that is a decision, not a default.
+    ///
+    /// It is a `GET`, so a method-based rule would file it under
+    /// `Admin(Read)` and hand it to the read-only token. That token is held
+    /// by `mitos-watch` — a deployed Cloudflare worker, a far less protected
+    /// place than an operator's laptop — and this route is a long-lived
+    /// socket carrying every indexer change, not a status read. The census
+    /// found exactly one consumer, an operator tool. Widen it when a second
+    /// consumer exists and says what it needs.
+    TailIndexer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +273,10 @@ impl Registry {
 
             (
                 Principal::Operator(OperatorScope::Full),
-                Attempt::Admin(_) | Attempt::SubmitTx | Attempt::RecaptureModule,
+                Attempt::Admin(_)
+                | Attempt::SubmitTx
+                | Attempt::RecaptureModule
+                | Attempt::TailIndexer,
             ) => Ok(Granted::Plain),
             (Principal::Operator(OperatorScope::ReadOnly), Attempt::Admin(AdminAccess::Read)) => {
                 Ok(Granted::Plain)
@@ -286,7 +300,9 @@ impl Registry {
                 }
             }
 
-            (Principal::Namespace(_), Attempt::Admin(_)) => Err(Denied::NamespaceTokenOnAdmin),
+            (Principal::Namespace(_), Attempt::Admin(_) | Attempt::TailIndexer) => {
+                Err(Denied::NamespaceTokenOnAdmin)
+            }
             (Principal::Namespace(namespace), Attempt::RecaptureModule) => {
                 // `Tier` orders by protection, most protected first. A
                 // namespace that is not AT the top would be disturbing
@@ -603,6 +619,14 @@ mod tests {
                 &Principal::Namespace(ns("prod")),
                 Attempt::RecaptureModule,
                 true,
+            ),
+            (&full, Attempt::TailIndexer, true),
+            (&ro, Attempt::TailIndexer, false),
+            (&dev_ns, Attempt::TailIndexer, false),
+            (
+                &Principal::Namespace(ns("prod")),
+                Attempt::TailIndexer,
+                false,
             ),
         ];
         for (principal, attempt, expected) in table {

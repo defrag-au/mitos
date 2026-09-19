@@ -149,7 +149,7 @@ Done / Partially done / Blocked
 | # | Title | Depends on | Status |
 |---|---|---|---|
 | 01 | Instance-keyed storage + content-addressed artifacts | — | **done**, reviewed 2026-09-19 — see its "Review" section |
-| 02 | Namespaces: a token resolves to a principal | 01 | **ready** |
+| 02 | Namespaces: a token resolves to a principal | 01 | **done**, reviewed 2026-09-19 — no defects; `/replicate` settled as `Attempt::TailIndexer`. Needs `/security-review` before mainnet |
 | 03 | Instance lifecycle wired — `Instance::on_boot` replaces `auto_resume`; operator stop/start/pin/evict; fixes resurrect-on-restart. First callers leave the storage facade. | 02 | not written |
 | 04 | Manifest v3 fields — `revision`, `state_schema`, `[[upgrade]]`; `mitos-build` emits them and the `ModuleRef` const | — (parallel) | not written |
 | 05 | `ModuleRef` on subscribe + persisted client rows + pull-by-digest into the CAS (`client_move` up to `Queued`) | 03, 04 | not written |

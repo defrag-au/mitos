@@ -97,12 +97,11 @@ struct ReplicateState {
 ///
 /// `auth` gates every upgrade request.
 ///
-/// This route is NOT in WO-02's attempt table — it is a synthetic-client
-/// surface with no worker in the token census — so it keeps exactly the
-/// access it has today: the full operator token and nobody else. See
-/// [`mitos_platform::auth::require_admin_mutate`] for why that is spelled
-/// `Admin(Mutate)` on a `GET`, and why it is a placeholder rather than a
-/// judgement.
+/// Operator-full only — `mitos_lifecycle::access::Attempt::TailIndexer`. The
+/// token census found one consumer of this surface, `mitos-tail`, an operator
+/// tool; it is a `GET`, but deliberately NOT `Admin(Read)`, which would hand a
+/// long-lived socket carrying every indexer change to the read-only token a
+/// deployed worker holds.
 pub fn replicate_router(
     handles: &[Arc<dyn IndexerHandle>],
     domain: DomainAdapter,
@@ -122,7 +121,7 @@ pub fn replicate_router(
     router
         .layer(axum::middleware::from_fn_with_state(
             auth.clone(),
-            mitos_platform::auth::require_admin_mutate,
+            mitos_platform::auth::require_tail_indexer,
         ))
         .layer(axum::middleware::from_fn_with_state(
             auth,
