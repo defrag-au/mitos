@@ -122,6 +122,22 @@ enum Held {
     Write,
 }
 
+/// What a cached redb handle belongs to.
+///
+/// Handles were keyed by module id, which is exactly why a second instance of
+/// a module could not run: both would resolve to one `kv.redb` handle and
+/// overwrite each other's cursor. Keyed by INSTANCE they are separate, and
+/// the `&str` API keeps working by resolving the module's current instance
+/// and addressing that one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StateAddr {
+    Instance(InstanceKey),
+    /// Never activated: no `current.toml`, so the state lives in the module
+    /// directory where v2 put it. Tests and a few tools write a cursor to
+    /// such a module and it must keep working — see `state_dir`.
+    Unactivated(String),
+}
+
 /// Write-tmp-then-rename. The tmp sits beside the target so the rename never
 /// crosses a filesystem, which is what makes it atomic.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
@@ -178,14 +194,13 @@ fn instance_key_toml(key: &InstanceKey) -> Result<String, StorageError> {
 #[derive(Clone)]
 pub struct ModuleStorage {
     root: PathBuf,
-    cursor_stores: Arc<Mutex<HashMap<String, CursorStore>>>,
-    emissions_stores: Arc<Mutex<HashMap<String, crate::emissions::EmissionsStore>>>,
-    kv_stores: Arc<Mutex<HashMap<String, crate::vendored::balius::kv::RedbKv>>>,
-    /// Per-module watched-UTxO index handles (`watched.redb`). Shared
-    /// `Arc` per module so the follower's plane (reader) and driver
-    /// (writer) observe the same instance. See
-    /// `crate::watched_ref_index`.
-    watched_stores: Arc<Mutex<HashMap<String, Arc<crate::watched_ref_index::WatchedRefIndex>>>>,
+    cursor_stores: Arc<Mutex<HashMap<StateAddr, CursorStore>>>,
+    emissions_stores: Arc<Mutex<HashMap<StateAddr, crate::emissions::EmissionsStore>>>,
+    kv_stores: Arc<Mutex<HashMap<StateAddr, crate::vendored::balius::kv::RedbKv>>>,
+    /// Per-instance watched-UTxO index handles (`watched.redb`). Shared
+    /// `Arc` per instance so the follower's plane (reader) and driver
+    /// (writer) observe the same one. See `crate::watched_ref_index`.
+    watched_stores: Arc<Mutex<HashMap<StateAddr, Arc<crate::watched_ref_index::WatchedRefIndex>>>>,
     /// Platform-wide indexer-data cache (aux_data + datums). One
     /// handle shared across all module followers — `None` until
     /// first `indexer_data_cache()` call.
@@ -247,24 +262,52 @@ impl ModuleStorage {
         id: &str,
         cache_size: Option<usize>,
     ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
+        let addr = self
+            .addr_of(id)
+            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
+        self.kv_store_addr(&addr, cache_size)
+    }
+
+    /// The KV of ONE instance. Two instances of a module have two.
+    pub fn kv_store_at(
+        &self,
+        key: &InstanceKey,
+        cache_size: Option<usize>,
+    ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
+        self.instance_state_dir(key)
+            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
+        self.kv_store_addr(&StateAddr::Instance(key.clone()), cache_size)
+    }
+
+    fn kv_store_addr(
+        &self,
+        addr: &StateAddr,
+        cache_size: Option<usize>,
+    ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
         let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
-        if let Some(s) = cache.get(id) {
+        if let Some(s) = cache.get(addr) {
             return Ok(s.clone());
         }
-        let path = self
-            .kv_path(id)
-            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
+        let path = self.dir_of(addr).join("kv.redb");
         let store = crate::vendored::balius::kv::RedbKv::try_new(path, cache_size)?;
-        cache.insert(id.to_owned(), store.clone());
+        cache.insert(addr.clone(), store.clone());
         Ok(store)
     }
 
-    /// Drop the cached KV handle for a module. Mirror of
+    /// Drop the cached KV handle. Mirror of
     /// `close_cursor` / `close_emissions`. Called from
     /// `host::stop` so a follower restart re-opens redb cleanly.
     pub fn close_kv(&self, id: &str) {
-        let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
-        cache.remove(id);
+        if let Ok(addr) = self.addr_of(id) {
+            self.kv_stores.lock().expect("kv_stores mutex").remove(&addr);
+        }
+    }
+
+    pub fn close_kv_at(&self, key: &InstanceKey) {
+        self.kv_stores
+            .lock()
+            .expect("kv_stores mutex")
+            .remove(&StateAddr::Instance(key.clone()));
     }
 
     /// Get-or-open the per-module watched-UTxO index. Idempotent;
@@ -274,35 +317,69 @@ impl ModuleStorage {
     /// the next bootstrap) rather than taking the follower down —
     /// same posture as `kv_store`.
     pub fn watched_index(&self, id: &str) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
+        match self.addr_of(id) {
+            Ok(addr) => self.watched_index_addr(&addr),
+            Err(e) => Self::watched_fallback(id, &e.to_string()),
+        }
+    }
+
+    /// The watched set of ONE instance.
+    ///
+    /// Keeps `watched_index`'s posture of degrading to in-memory rather than
+    /// taking a follower down: the set re-seeds at the next bootstrap, and a
+    /// dead follower is worse than a cold watched index.
+    pub fn watched_index_at(
+        &self,
+        key: &InstanceKey,
+    ) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
+        match self.instance_state_dir(key) {
+            Ok(_) => self.watched_index_addr(&StateAddr::Instance(key.clone())),
+            Err(e) => Self::watched_fallback(key.module.as_str(), &e.to_string()),
+        }
+    }
+
+    fn watched_index_addr(
+        &self,
+        addr: &StateAddr,
+    ) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
         let mut cache = self.watched_stores.lock().expect("watched_stores mutex");
-        if let Some(idx) = cache.get(id) {
+        if let Some(idx) = cache.get(addr) {
             return idx.clone();
         }
-        let idx = match self
-            .watched_path(id)
-            .map_err(|e| e.to_string())
-            .and_then(|path| {
-                crate::watched_ref_index::WatchedRefIndex::open(path).map_err(|e| e.to_string())
-            }) {
+        let path = self.dir_of(addr).join("watched.redb");
+        let idx = match crate::watched_ref_index::WatchedRefIndex::open(path) {
             Ok(idx) => Arc::new(idx),
-            Err(e) => {
-                tracing::error!(
-                    module = %id,
-                    error = %e,
-                    "watched.redb open failed; falling back to in-memory watched index"
-                );
-                Arc::new(crate::watched_ref_index::WatchedRefIndex::in_memory())
-            }
+            Err(e) => Self::watched_fallback(&format!("{addr:?}"), &e.to_string()),
         };
-        cache.insert(id.to_owned(), idx.clone());
+        cache.insert(addr.clone(), idx.clone());
         idx
     }
 
-    /// Drop the cached watched-index handle for a module. Mirror of
+    fn watched_fallback(what: &str, error: &str) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
+        tracing::error!(
+            instance = %what,
+            error = %error,
+            "watched.redb open failed; falling back to in-memory watched index"
+        );
+        Arc::new(crate::watched_ref_index::WatchedRefIndex::in_memory())
+    }
+
+    /// Drop the cached watched-index handle. Mirror of
     /// `close_kv`; release the redb file lock before `remove_module_dir`.
     pub fn close_watched(&self, id: &str) {
-        let mut cache = self.watched_stores.lock().expect("watched_stores mutex");
-        cache.remove(id);
+        if let Ok(addr) = self.addr_of(id) {
+            self.watched_stores
+                .lock()
+                .expect("watched_stores mutex")
+                .remove(&addr);
+        }
+    }
+
+    pub fn close_watched_at(&self, key: &InstanceKey) {
+        self.watched_stores
+            .lock()
+            .expect("watched_stores mutex")
+            .remove(&StateAddr::Instance(key.clone()));
     }
 
     /// Get-or-open the platform-wide indexer-data cache holding
@@ -355,30 +432,59 @@ impl ModuleStorage {
         &self,
         id: &str,
     ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
+        let addr = self.addr_of(id).map_err(|e| {
+            crate::emissions::EmissionsError::Io(std::io::Error::other(e.to_string()))
+        })?;
+        self.emissions_store_addr(&addr)
+    }
+
+    /// The emissions log of ONE instance. Each instance keeps its own, and
+    /// which one a client's companions are served from is
+    /// `mitos_lifecycle::routing::fan_out`'s decision.
+    pub fn emissions_store_at(
+        &self,
+        key: &InstanceKey,
+    ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
+        self.instance_state_dir(key).map_err(|e| {
+            crate::emissions::EmissionsError::Io(std::io::Error::other(e.to_string()))
+        })?;
+        self.emissions_store_addr(&StateAddr::Instance(key.clone()))
+    }
+
+    fn emissions_store_addr(
+        &self,
+        addr: &StateAddr,
+    ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
         let mut cache = self
             .emissions_stores
             .lock()
             .expect("emissions_stores mutex");
-        if let Some(s) = cache.get(id) {
+        if let Some(s) = cache.get(addr) {
             return Ok(s.clone());
         }
-        let path = self.emissions_path(id).map_err(|e| {
-            crate::emissions::EmissionsError::Io(std::io::Error::other(e.to_string()))
-        })?;
-        let store = crate::emissions::EmissionsStore::open(path)?;
-        cache.insert(id.to_owned(), store.clone());
+        let store =
+            crate::emissions::EmissionsStore::open(self.dir_of(addr).join("emissions.redb"))?;
+        cache.insert(addr.clone(), store.clone());
         Ok(store)
     }
 
-    /// Drop the cached emissions store handle for a module.
+    /// Drop the cached emissions store handle.
     /// Mirror of `close_cursor` — used during follower stop so
     /// the next start re-opens redb cleanly.
     pub fn close_emissions(&self, id: &str) {
-        let mut cache = self
-            .emissions_stores
+        if let Ok(addr) = self.addr_of(id) {
+            self.emissions_stores
+                .lock()
+                .expect("emissions_stores mutex")
+                .remove(&addr);
+        }
+    }
+
+    pub fn close_emissions_at(&self, key: &InstanceKey) {
+        self.emissions_stores
             .lock()
-            .expect("emissions_stores mutex");
-        cache.remove(id);
+            .expect("emissions_stores mutex")
+            .remove(&StateAddr::Instance(key.clone()));
     }
 
     /// Get-or-open the cursor store for a module. First call
@@ -386,21 +492,62 @@ impl ModuleStorage {
     /// subsequent calls are O(1) HashMap lookup + cheap clone
     /// (`CursorStore` holds `Arc<redb::Database>` internally).
     fn cursor_store(&self, id: &str) -> Result<CursorStore, StorageError> {
+        self.cursor_store_addr(&self.addr_of(id)?)
+    }
+
+    fn cursor_store_addr(&self, addr: &StateAddr) -> Result<CursorStore, StorageError> {
         let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
-        if let Some(s) = cache.get(id) {
+        if let Some(s) = cache.get(addr) {
             return Ok(s.clone());
         }
-        let store = CursorStore::open(self.cursor_path(id)?)?;
-        cache.insert(id.to_owned(), store.clone());
+        let store = CursorStore::open(self.dir_of(addr).join("cursor.redb"))?;
+        cache.insert(addr.clone(), store.clone());
         Ok(store)
     }
 
-    /// Drop the cached cursor store for a module. Used by
-    /// `host::stop` so a follower restart re-opens the database
-    /// (ensuring no stale handle outlives a Driver replacement).
+    /// Drop the cached cursor store. Used by `host::stop` so a follower
+    /// restart re-opens the database (ensuring no stale handle outlives a
+    /// Driver replacement).
     pub fn close_cursor(&self, id: &str) {
-        let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
-        cache.remove(id);
+        if let Ok(addr) = self.addr_of(id) {
+            self.cursor_stores
+                .lock()
+                .expect("cursor_stores mutex")
+                .remove(&addr);
+        }
+    }
+
+    pub fn close_cursor_at(&self, key: &InstanceKey) {
+        self.cursor_stores
+            .lock()
+            .expect("cursor_stores mutex")
+            .remove(&StateAddr::Instance(key.clone()));
+    }
+
+    /// Persist ONE instance's cursor. Two instances of a module follow
+    /// independently and each advances its own.
+    pub fn write_cursor_at(
+        &self,
+        key: &InstanceKey,
+        cursor: &ChainPoint,
+    ) -> Result<(), StorageError> {
+        self.instance_state_dir(key)?;
+        self.cursor_store_addr(&StateAddr::Instance(key.clone()))?
+            .write(cursor)
+    }
+
+    pub fn read_cursor_at(&self, key: &InstanceKey) -> Result<Option<ChainPoint>, StorageError> {
+        let dir = self.instance_state_dir(key)?;
+        if !dir.join("cursor.redb").exists() {
+            return Ok(None);
+        }
+        self.cursor_store_addr(&StateAddr::Instance(key.clone()))?
+            .read()
+    }
+
+    /// Where ONE instance's trap fixture goes.
+    pub fn last_trap_path_at(&self, key: &InstanceKey) -> Result<PathBuf, StorageError> {
+        Ok(self.instance_state_dir(key)?.join("last-trap.toml"))
     }
 
     pub fn root(&self) -> &Path {
@@ -735,15 +882,83 @@ impl ModuleStorage {
     /// exactly where v2 put it, so the facade keeps behaving as it did for a
     /// module that only ever had a cursor written to it.
     fn state_dir(&self, module_id: &str) -> Result<PathBuf, StorageError> {
-        let _guard = self.repoint.read().expect("repoint lock");
-        match self.current_instance_locked(module_id, Held::Read)? {
-            Some(key) => Ok(self.instance_dir(&key)),
-            None => {
-                let dir = self.module_dir(module_id);
-                std::fs::create_dir_all(&dir)?;
-                Ok(dir)
+        Ok(self.dir_of(&self.addr_of(module_id)?))
+    }
+
+    /// Move every cached handle from one instance key to another, after the
+    /// directory holding their files has been renamed.
+    ///
+    /// Caller holds `repoint` for WRITE. All four caches, together — a
+    /// partial re-key would leave one store reachable and another not, and
+    /// the follower would be half-alive.
+    fn rekey_caches(&self, from: &InstanceKey, to: &InstanceKey) {
+        fn rekey<T>(
+            cache: &Mutex<HashMap<StateAddr, T>>,
+            from: &StateAddr,
+            to: StateAddr,
+            what: &'static str,
+        ) {
+            let mut cache = cache.lock().unwrap_or_else(|_| panic!("{what} mutex"));
+            if let Some(handle) = cache.remove(from) {
+                cache.insert(to, handle);
             }
         }
+        let from = StateAddr::Instance(from.clone());
+        let to = StateAddr::Instance(to.clone());
+        rekey(&self.cursor_stores, &from, to.clone(), "cursor_stores");
+        rekey(&self.emissions_stores, &from, to.clone(), "emissions_stores");
+        rekey(&self.kv_stores, &from, to.clone(), "kv_stores");
+        rekey(&self.watched_stores, &from, to, "watched_stores");
+    }
+
+    /// Which state a `&str` names: the module's current instance, or the
+    /// module directory when it was never activated.
+    ///
+    /// Resolve and decide under ONE read guard, so a concurrent repoint
+    /// cannot slip between them — the same reason `state_dir` held it.
+    fn addr_of(&self, module_id: &str) -> Result<StateAddr, StorageError> {
+        let _guard = self.repoint.read().expect("repoint lock");
+        Ok(match self.current_instance_locked(module_id, Held::Read)? {
+            Some(key) => StateAddr::Instance(key),
+            None => StateAddr::Unactivated(module_id.to_owned()),
+        })
+    }
+
+    /// The directory an address's state files live in.
+    ///
+    /// The `Unactivated` arm CREATES it, because that is what v2 did for a
+    /// module nobody ever activated and `cursor_round_trip` depends on it.
+    /// The `Instance` arm never does — see `instance_state_dir`.
+    fn dir_of(&self, addr: &StateAddr) -> PathBuf {
+        match addr {
+            StateAddr::Instance(key) => self.instance_dir(key),
+            StateAddr::Unactivated(module) => {
+                let dir = self.module_dir(module);
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+        }
+    }
+
+    /// The directory of an instance that MUST already exist.
+    ///
+    /// Every `*_at` method goes through this, and none of them creates
+    /// anything. WO-01's review is why: an implicit `create_dir_all` behind
+    /// `activate`'s rename resurrects the old directory, and a follower then
+    /// resumes on an empty cursor inside it. Instance directories are created
+    /// in exactly the two places they are today — `write_instance_marker`,
+    /// reached from `activate` and from the migration.
+    fn instance_state_dir(&self, key: &InstanceKey) -> Result<PathBuf, StorageError> {
+        let _guard = self.repoint.read().expect("repoint lock");
+        let dir = self.instance_dir(key);
+        if !dir.is_dir() {
+            return Err(StorageError::NoSuchInstance {
+                module: key.module.to_string(),
+                instance: key.dir_name(),
+                found: 0,
+            });
+        }
+        Ok(dir)
     }
 
     /// Rename the module's instance directory to `next`'s name and point
@@ -791,6 +1006,19 @@ impl ModuleStorage {
                 // never reopens by path once `ModuleStorage` has cached the
                 // handle. It looks wrong and is not.
                 std::fs::rename(&from, &to)?;
+                // …but the caches are keyed by InstanceKey, so those surviving
+                // handles are now filed under a key whose directory is gone.
+                // The next `kv_store_at(next)` would miss the cache and open
+                // the same file a second time — redb refuses that, and the
+                // module cannot start. Re-key inside the same WRITE guard,
+                // right after the rename.
+                //
+                // In memory only, so it opens no crash window. It lives here
+                // rather than in the callers because there are two of them
+                // (`activate` and `write_config`, since config is half of
+                // instance identity) and an upload carrying a config renames
+                // TWICE — K1 → K2 → K3. Neither caller can forget it.
+                self.rekey_caches(cur, next);
             }
         }
         self.write_instance_marker(next)?;
@@ -2003,6 +2231,240 @@ mod tests {
         assert!(storage.read_manifest("nope").unwrap().is_none());
         assert!(storage.read_current_wasm("nope").unwrap().is_none());
         assert!(storage.current_wasm_path("nope").unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------------
+    // Instance-addressed handles. Until these, every cache was keyed by
+    // module id, which is exactly why a second instance could not run: both
+    // would share one `kv.redb` handle and overwrite each other's cursor.
+    // ---------------------------------------------------------------------
+
+    /// An instance directory built the only way one can be outside
+    /// `activate` — the marker write, which is also how the host tests make
+    /// a second instance.
+    fn second_instance(storage: &ModuleStorage, wasm: &[u8]) -> InstanceKey {
+        let manifest = sample_manifest(wasm);
+        storage.put_artifact(&manifest, wasm).unwrap();
+        let key = InstanceKey {
+            module: module("test-module"),
+            wasm: sha(wasm),
+            config: None,
+        };
+        storage.write_instance_marker(&key).unwrap();
+        key
+    }
+
+    #[test]
+    fn two_instances_of_one_module_have_separate_handles() {
+        let dir = tempdir("two-instances");
+        let storage = ModuleStorage::new(&dir);
+        let wasm_a = b"instance A";
+        storage.activate(&sample_manifest(wasm_a), wasm_a).unwrap();
+        let a = storage.current_instance("test-module").unwrap().unwrap();
+        let b = second_instance(&storage, b"instance B");
+        assert_ne!(a, b);
+
+        // Two cursors, advancing independently.
+        storage.write_cursor_at(&a, &ChainPoint::Slot(100)).unwrap();
+        storage.write_cursor_at(&b, &ChainPoint::Slot(900)).unwrap();
+        assert_eq!(storage.read_cursor_at(&a).unwrap().unwrap().slot(), 100);
+        assert_eq!(storage.read_cursor_at(&b).unwrap().unwrap().slot(), 900);
+
+        // Two KVs. Opening both at once also proves redb's single-writer
+        // lock is not being tripped — one file each, not one shared.
+        let kv_a = storage.kv_store_at(&a, None).unwrap();
+        let kv_b = storage.kv_store_at(&b, None).unwrap();
+        kv_a.set_value("test-module", "k", b"from A".to_vec()).unwrap();
+        kv_b.set_value("test-module", "k", b"from B".to_vec()).unwrap();
+        assert_eq!(kv_a.get_value("test-module", "k").unwrap(), b"from A");
+        assert_eq!(kv_b.get_value("test-module", "k").unwrap(), b"from B");
+
+        // And two emissions logs.
+        assert!(storage.emissions_store_at(&a).is_ok());
+        assert!(storage.emissions_store_at(&b).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every `*_at` method refuses a missing instance and creates nothing.
+    /// WO-01's review is why: an implicit `create_dir_all` behind
+    /// `activate`'s rename resurrects the old directory, and a follower then
+    /// resumes on an empty cursor inside it.
+    #[test]
+    fn an_at_call_on_a_missing_instance_is_an_error_and_creates_nothing() {
+        let dir = tempdir("at-missing");
+        let storage = ModuleStorage::new(&dir);
+        let wasm = b"at missing";
+        storage.activate(&sample_manifest(wasm), wasm).unwrap();
+        let before = instance_dirs(&dir, "test-module");
+
+        // A key whose directory was never created.
+        let ghost = InstanceKey {
+            module: module("test-module"),
+            wasm: sha(b"never written"),
+            config: None,
+        };
+
+        assert!(storage.kv_store_at(&ghost, None).is_err());
+        assert!(storage.emissions_store_at(&ghost).is_err());
+        assert!(storage.read_cursor_at(&ghost).is_err());
+        assert!(
+            storage
+                .write_cursor_at(&ghost, &ChainPoint::Slot(1))
+                .is_err()
+        );
+        assert!(storage.last_trap_path_at(&ghost).is_err());
+        // `watched_index_at` degrades to in-memory rather than failing —
+        // its established posture — but must still write nothing.
+        let _ = storage.watched_index_at(&ghost);
+
+        assert_eq!(
+            instance_dirs(&dir, "test-module"),
+            before,
+            "an `*_at` call created an instance directory",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `activate` RENAMES the live instance directory, and the open redb
+    /// handles survive it because they hold fds. But the caches are keyed by
+    /// `InstanceKey`, so without a re-key the next `*_at(K2)` would miss and
+    /// open the same file twice — which redb refuses.
+    #[test]
+    fn activate_carries_open_handles_to_the_new_key() {
+        let dir = tempdir("carry-handles");
+        let storage = ModuleStorage::new(&dir);
+
+        let wasm_a = b"handles A";
+        storage.activate(&sample_manifest(wasm_a), wasm_a).unwrap();
+        let k1 = storage.current_instance("test-module").unwrap().unwrap();
+
+        // All four open, with something written through each.
+        let kv = storage.kv_store_at(&k1, None).unwrap();
+        kv.set_value("test-module", "carried", b"yes".to_vec())
+            .unwrap();
+        storage.write_cursor_at(&k1, &ChainPoint::Slot(777)).unwrap();
+        let _emissions = storage.emissions_store_at(&k1).unwrap();
+        let _watched = storage.watched_index_at(&k1);
+
+        let wasm_b = b"handles B";
+        storage.activate(&sample_manifest(wasm_b), wasm_b).unwrap();
+        let k2 = storage.current_instance("test-module").unwrap().unwrap();
+        assert_ne!(k1, k2);
+
+        // The SAME handles, reachable under the new key — and no second
+        // redb open, which would fail with "Database already open".
+        assert_eq!(
+            storage
+                .kv_store_at(&k2, None)
+                .unwrap()
+                .get_value("test-module", "carried")
+                .unwrap(),
+            b"yes",
+        );
+        assert_eq!(storage.read_cursor_at(&k2).unwrap().unwrap().slot(), 777);
+        assert!(storage.emissions_store_at(&k2).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An upload carrying a config renames TWICE — K1 → K2 (new wasm), then
+    /// K2 → K3 (new config, which is half of instance identity). The re-key
+    /// lives in `repoint_locked` so neither caller can forget one.
+    #[test]
+    fn an_upload_with_a_config_carries_them_across_both_renames() {
+        let dir = tempdir("carry-two-renames");
+        let storage = ModuleStorage::new(&dir);
+
+        let wasm_a = b"two renames A";
+        storage.activate(&sample_manifest(wasm_a), wasm_a).unwrap();
+        let k1 = storage.current_instance("test-module").unwrap().unwrap();
+        let kv = storage.kv_store_at(&k1, None).unwrap();
+        kv.set_value("test-module", "carried", b"twice".to_vec())
+            .unwrap();
+        storage.write_cursor_at(&k1, &ChainPoint::Slot(4242)).unwrap();
+
+        let wasm_b = b"two renames B";
+        storage.activate(&sample_manifest(wasm_b), wasm_b).unwrap();
+        storage.write_config("test-module", b"a config").unwrap();
+        let k3 = storage.current_instance("test-module").unwrap().unwrap();
+        assert!(k3.config.is_some());
+
+        assert_eq!(
+            storage
+                .kv_store_at(&k3, None)
+                .unwrap()
+                .get_value("test-module", "carried")
+                .unwrap(),
+            b"twice",
+        );
+        assert_eq!(storage.read_cursor_at(&k3).unwrap().unwrap().slot(), 4242);
+        assert_eq!(
+            instance_dirs(&dir, "test-module"),
+            vec![k3.dir_name()],
+            "two renames must leave ONE directory, not three",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Between `activate`'s rename and the upload handler's `replace`, the
+    /// running follower still holds K1. Its cursor write must fail — and
+    /// resurrect nothing. `flush_cursor` already logs and carries on; the
+    /// follower is stopped milliseconds later and the restart replays at
+    /// most one block, which is the at-least-once the cursor always had.
+    #[test]
+    fn a_cursor_write_to_the_old_key_after_a_rename_fails_and_resurrects_nothing() {
+        let dir = tempdir("stale-cursor-write");
+        let storage = ModuleStorage::new(&dir);
+
+        let wasm_a = b"stale A";
+        storage.activate(&sample_manifest(wasm_a), wasm_a).unwrap();
+        let k1 = storage.current_instance("test-module").unwrap().unwrap();
+        storage.write_cursor_at(&k1, &ChainPoint::Slot(1)).unwrap();
+
+        let wasm_b = b"stale B";
+        storage.activate(&sample_manifest(wasm_b), wasm_b).unwrap();
+        let k2 = storage.current_instance("test-module").unwrap().unwrap();
+
+        let err = storage
+            .write_cursor_at(&k1, &ChainPoint::Slot(2))
+            .unwrap_err();
+        assert!(matches!(err, StorageError::NoSuchInstance { .. }), "{err}");
+        assert_eq!(
+            instance_dirs(&dir, "test-module"),
+            vec![k2.dir_name()],
+            "the stale write resurrected the old instance directory",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `Unactivated` path: a module that was never activated keeps its
+    /// state in the module directory, exactly where v2 put it.
+    #[test]
+    fn an_unactivated_module_still_takes_a_cursor() {
+        let dir = tempdir("unactivated");
+        let storage = ModuleStorage::new(&dir);
+
+        assert!(storage.read_cursor("never-activated").unwrap().is_none());
+        storage
+            .write_cursor("never-activated", &ChainPoint::Slot(5))
+            .unwrap();
+        assert_eq!(
+            storage.read_cursor("never-activated").unwrap().unwrap().slot(),
+            5,
+        );
+        assert!(
+            dir.join("never-activated").join("cursor.redb").is_file(),
+            "an unactivated module's state belongs in the module directory",
+        );
+        assert!(
+            !dir.join("never-activated").join("instances").exists(),
+            "and must not have invented an instance",
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

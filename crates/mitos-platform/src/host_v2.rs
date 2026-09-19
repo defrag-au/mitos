@@ -2074,3 +2074,150 @@ mod interest_filter_tests {
         assert!(!cache.companion_wants(&path, Some(POLICY_B)));
     }
 }
+
+/// The emission fan-out — `drain_one` and `fan_out_undo`.
+///
+/// Neither had a test before this order. Both are plain synchronous
+/// functions over a `ModuleStorage` and an `EmissionsStore`, so they need no
+/// host, no engine and no chain.
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use crate::emissions::UNSUBSCRIBED_COMPANION_ID;
+    use cardano_assets::PolicyId;
+    use mitos_protocol::{AssetSelector, Interest, SubscribeRequest, SubscribeTarget};
+
+    const MODULE: &str = "ownership-indexer";
+    // 56 lowercase hex each. NOTE: `interest_filter_tests`'s `POLICY_B` is
+    // 57 characters — a typo that never surfaced there because that module
+    // only ever passes it as a raw `&str`, never through `PolicyId::new`.
+    const POLICY_A: &str = "43a056aabbccddeeff00112233445566778899aabbccddeeff001122";
+    const POLICY_B: &str = "de7925aabbccddeeff00112233445566778899aabbccddeeff001122";
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        storage: ModuleStorage,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let wasm = b"fan-out test wasm";
+        storage
+            .activate(&crate::companions::testing::manifest_for(MODULE, wasm), wasm)
+            .unwrap();
+        Fixture { _tmp: tmp, storage }
+    }
+
+    /// One registration. `interests` empty ⇒ unbounded, which the filter
+    /// always passes.
+    fn register(storage: &ModuleStorage, client: &str, key: &str, policies: &[&str]) {
+        let dir = storage.module_dir_for_companions(MODULE).join(client);
+        std::fs::create_dir_all(&dir).unwrap();
+        let interests: Vec<Interest> = policies
+            .iter()
+            .map(|p| Interest {
+                asset: AssetSelector::Policy(PolicyId::new(*p).unwrap()),
+                ..Interest::any()
+            })
+            .collect();
+        let req = SubscribeRequest {
+            targets: vec![SubscribeTarget::Module {
+                name: MODULE.into(),
+            }],
+            companion_key: key.into(),
+            client_id: client.into(),
+            resume_from: None,
+            interests,
+            dial_back: None,
+            announced: Vec::new(),
+        };
+        std::fs::write(dir.join(format!("{key}.cbor")), req.encode().unwrap()).unwrap();
+    }
+
+    fn event(policy: Option<&str>) -> emit::EmittedEvent {
+        emit::EmittedEvent {
+            module_id: MODULE.to_owned(),
+            channel: 1,
+            payload: b"payload".to_vec(),
+            chain_point: mitos_protocol::ChainPoint::Slot(42),
+            partition_key: policy.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
+            is_undo: false,
+        }
+    }
+
+    /// Every row in a store, as `(client_id, companion_key)`.
+    fn rows(store: &crate::emissions::EmissionsStore) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = store
+            .list_filtered(|_| true)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.client_id, r.companion_id))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// **Pins today's behaviour, written and run BEFORE the instance
+    /// addressing went in.** Two clients, three companions, one bounded
+    /// interest that filters one of them out, plus the no-companion
+    /// sentinel case.
+    #[test]
+    fn with_one_instance_and_no_rows_the_fan_out_is_unchanged() {
+        let f = fixture();
+        let store = f.storage.emissions_store(MODULE).unwrap();
+
+        // No companions at all ⇒ the sentinel keeps the event so the first
+        // subscriber can reclaim it.
+        drain_one(
+            &f.storage,
+            &store,
+            MODULE,
+            event(Some(POLICY_A)),
+            &mut InterestCache::default(),
+        );
+        assert_eq!(
+            rows(&store),
+            vec![(String::new(), UNSUBSCRIBED_COMPANION_ID.to_owned())],
+        );
+
+        // Two clients, three companions. `jpgsm`'s is bounded to POLICY_B,
+        // so an event for POLICY_A must reach the other two only.
+        let f = fixture();
+        let store = f.storage.emissions_store(MODULE).unwrap();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        register(&f.storage, "ownership.cnft.dev", "policy_b", &[]);
+        register(&f.storage, "jpgsm.cnft.dev", "policy_a", &[POLICY_B]);
+
+        drain_one(
+            &f.storage,
+            &store,
+            MODULE,
+            event(Some(POLICY_A)),
+            &mut InterestCache::default(),
+        );
+        assert_eq!(
+            rows(&store),
+            vec![
+                ("ownership.cnft.dev".to_owned(), "policy_a".to_owned()),
+                ("ownership.cnft.dev".to_owned(), "policy_b".to_owned()),
+            ],
+            "the bounded companion must be filtered out, and no sentinel written",
+        );
+
+        // An undo is unconditional: no interest filter, no sentinel.
+        let f = fixture();
+        let store = f.storage.emissions_store(MODULE).unwrap();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        register(&f.storage, "jpgsm.cnft.dev", "policy_a", &[POLICY_B]);
+        fan_out_undo(&f.storage, &store, MODULE, event(Some(POLICY_A)));
+        assert_eq!(
+            rows(&store),
+            vec![
+                ("jpgsm.cnft.dev".to_owned(), "policy_a".to_owned()),
+                ("ownership.cnft.dev".to_owned(), "policy_a".to_owned()),
+            ],
+            "an undo reaches every subscriber regardless of interest",
+        );
+    }
+}
