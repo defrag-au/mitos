@@ -187,10 +187,10 @@ Done / Partially done / Blocked
 | 03 | Instance lifecycle wired — a persisted `LifecycleRecord` per instance; `LifecycleManager` replaces `auto_resume` and drives the watchdog; operator stop/start/pin/evict. Fixes an operator's stop being undone by a restart, by the watchdog, and by an upload. (Stays on the storage facade — host slots are still keyed by module id until two instances can exist.) | 02 | **done**, reviewed 2026-09-19 — 3 review fixes (a `Reap` that never retried; an unlocked read that could write; a loud diagnostic for under-counted adoption) |
 | 04 | The manifest's `[lifecycle]` section (`revision`, `state_schema`, `[[lifecycle.upgrade]]`) — ONE table, stripped from `config.cbor` because the config's sha is instance identity; `mitos-build` emits `built-module.json` | — (parallel) | **done**, reviewed 2026-09-19 — no implementation defects; the wasm-sha question settled by construction; 2 review fixes (typos in `[lifecycle]` were silent — a gap in the pure types; a failed build left a stale `built-module.json`) |
 | 05 | A worker announces its build on subscribe (digests only — NO url: the host derives the fetch location from the client id, and only for a client the operator named); persisted client rows; pull-by-digest into the CAS, incl. a manifest CAS keyed by MANIFEST digest. `client_move` runs to `Queued` and stops — observable, not behavioural | 03, 04 | **done**, reviewed 2026-09-19 — the reported blocker was a gap in the PURE crate (`Move` dropped the manifest pin; now persisted, and `url` removed from the pure types entirely) + 2 review fixes (a subscribe awaited the download under the row lock; a stored artifact skipped the checks about the announcement ⇒ rollback bypass) |
-| 06 | The DATA plane is instance-addressed — storage handle caches, host slots, the follower's cursor, and the emission fan-out (`routing::fan_out`). A second instance of a module CAN run; nothing starts one. One instance ⇒ byte-identical behaviour. Shaped around `activate` RENAMING a live instance directory on every upload | 01, 03, 05 | **implemented 2026-09-20, awaiting review** — all acceptance met (goldens 69/69; the fan-out baseline passed BEFORE the change and still does). One behaviour change a test caught: a fan-out `Skip` is not "no subscriber", so the instance that does not serve a client must not sentinel its event. See its "Implemented" section |
+| 06 | The DATA plane is instance-addressed — storage handle caches, host slots, the follower's cursor, and the emission fan-out (`routing::fan_out`). A second instance of a module CAN run; nothing starts one. One instance ⇒ byte-identical behaviour. Shaped around `activate` RENAMING a live instance directory on every upload | 01, 03, 05 | **done**, reviewed 2026-09-20 — a SPEC error of the order's (a follower running across the rename lost a block's emissions ⇒ `upload` now quiesces first) + 2 review fixes (the new follower reused the old one's redb handles after every upload; a cached `&str` read could return "no cursor" mid-upload). Implementer's own catch: a fan-out `Skip` is not "no subscriber" |
 | 07 | The CONTROL plane is instance-addressed — `LifecycleManager` + `lifecycle.toml` per instance (tick over instances, not modules), one dialer drain per instance, instance-aware evict; CLIENT-scoped recapture (see WO-02 on why it is whole-module today) | 06 | not written |
 | 08 | An instance is CREATED — the catch-up slot queue (`next_catch_up`), `EnsureInstance`, `state_prep` executed (copy with the parent paused / rebuild), instance-scoped upgrade actions; a row whose `current` names a renamed-away instance is re-adopted before a move is planned. `client_move` runs to `CatchingUp` | 07 | not written |
-| 09 | The switch — `FanOut::Hold` + the advisory diff, pause both at a boundary, drain-or-purge, `CommitSwitch` (THE atomic write) + `ResolveCommit`, attach/detach ownership moves from `reconcile` to rows, scoped refill, the Apply frame carries the instance digest | 08 | not written |
+| 09 | The switch — `FanOut::Hold` + the advisory diff, pause both at a boundary, drain-or-purge, `CommitSwitch` (THE atomic write) + `ResolveCommit`, attach/detach ownership moves from `reconcile` to rows, scoped refill, the Apply frame carries the instance digest. ⚠️ The fan-out's `RowCache` trusts mtime: `Committing` → `CommitSwitch` can land inside one timestamp tick, so the commit must INVALIDATE it | 08 | not written |
 | 10 | Client lease + probe | 05 | not written |
 | 11 | GC — CAS refcounts, `orphaned-v2/`, retained instances; delete `auto_resume` | 03 | not written |
 | — | D2 semver ABI gate; D11 reporting + MCP | independent | not written — the WIT split is designed by hand, not delegated |
@@ -214,3 +214,20 @@ claim that was wrong and would have shipped a bug or an outage:
   table BEFORE writing the order. The order then maps routes and nothing else.
 - **Pin every example with a test.** `WO-02-namespaces.example.toml` is parsed
   by a test in the lifecycle crate, so it cannot drift from the types.
+- **A window you declare TOLERABLE must be walked through every rule the order
+  ADDS, not just the ones it inherits — and its length measured, not
+  assumed.** WO-06 told the implementer a follower may run across `activate`'s
+  rename: cursor write refused for "milliseconds", replay ≤ 1 block, do not
+  reorder `upload`. True of the cursor. But the same order introduced
+  `routing::fan_out`, under which that follower is no longer the module's
+  current instance and writes no emission rows; and the window is a block's
+  DISPATCH time, because `stop` awaits the follower. Implemented exactly as
+  written, every upload could drop a block's emissions. An instruction of the
+  form "do NOT fix this" deserves more scrutiny than any other line in an
+  order: it switches off the implementer's judgement at exactly that spot.
+- **When you write "the bug is X" in a review comment, the comment is a
+  claim — check it like one.** WO-06's review first explained a real defect
+  with a mechanism the code made impossible (a mutex held across the open). It
+  surfaced only because the explanation had to be written next to the code it
+  described. Mutation-check the fix: a test that passes both with and without
+  it has explained nothing.

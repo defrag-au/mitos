@@ -356,7 +356,20 @@ async fn replace_after_an_upload_stops_the_renamed_instance_and_starts_the_new_k
         .expect("still activated");
     assert_ne!(after, h.first, "write_config should have repointed");
 
+    // The running follower's handles were re-keyed to `after` by the rename.
+    // A `Weak`, so holding it cannot itself keep the old handle alive.
+    let old_handle = std::sync::Arc::downgrade(&h.storage.watched_index_at(&after));
+
     h.host.replace(MODULE).await.expect("replace");
+
+    // v2 re-opened redb on every replace. Stopping `first` closes `first`'s
+    // cache entries — of which there are none, they moved — so unless the
+    // start of `after` closes them too, every deploy hands the new follower
+    // the old follower's handles.
+    assert!(
+        old_handle.upgrade().is_none(),
+        "the replaced follower's handles outlived it: the new follower is reusing them",
+    );
 
     assert_eq!(
         h.host.running_instances_of(MODULE).await,

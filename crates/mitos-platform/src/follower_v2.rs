@@ -503,13 +503,13 @@ fn flush_cursor(storage: &ModuleStorage, instance: &InstanceKey, driver: &Driver
     let Some(cursor) = driver.cursor() else {
         return;
     };
-    // Best-effort, and that matters in one window: between `activate`'s
-    // rename and the upload handler's `replace`, this follower still holds
-    // the OLD key and the write returns `NoSuchInstance`. It is logged and
-    // carried past — the follower is stopped milliseconds later and the
-    // restart replays at most one block, which is the at-least-once the
-    // cursor has always had. Creating the directory here would resurrect the
-    // renamed-away instance; see `ModuleStorage::instance_state_dir`.
+    // Best-effort. A follower should never see `NoSuchInstance` here:
+    // `LifecycleManager::upload` stops it BEFORE `activate` renames its
+    // directory, precisely so that it never runs holding a key that is gone.
+    // If it happens anyway it is logged and carried past, and the restart
+    // replays from the last cursor that did land. What must never happen is
+    // creating the directory to make the write succeed — that resurrects the
+    // renamed-away instance; see `ModuleStorage::locate_held`.
     if let Err(e) = storage.write_cursor_at(instance, cursor) {
         tracing::warn!(
             module = %instance.module,

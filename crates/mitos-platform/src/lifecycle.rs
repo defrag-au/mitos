@@ -530,9 +530,39 @@ impl LifecycleManager {
         let lock = self.lock_for(&module);
         let _guard = lock.lock().await;
 
-        self.storage.activate(manifest, wasm)?;
-        if let Some(config) = config {
-            self.storage.write_config(&module, config)?;
+        // QUIESCE FIRST. `activate` and `write_config` each RENAME the
+        // instance directory, and a follower that is running across a rename
+        // is holding a key that no longer exists: its cursor write is refused
+        // (`NoSuchInstance` — creating the directory would resurrect it), and
+        // the fan-out sees an instance that is not the module's current one
+        // and writes no rows. A follower mid-block when the upload lands would
+        // lose that block's emissions, and the replay would run against KV
+        // state that had already absorbed the block — so a module that emits
+        // on CHANGE would not emit them again. Stopping awaits the follower,
+        // which finishes its block and flushes its cursor under the key it
+        // was started with.
+        //
+        // Not a lifecycle event: nobody decided this instance should stop.
+        // The record is untouched, and `on_boot` below restarts it.
+        if let Err(e) = self.host.stop(&module).await {
+            self.effect_failed(&module, "quiesce_for_upload", &e.to_string());
+        }
+
+        let activated = self.storage.activate(manifest, wasm).and_then(|()| {
+            config.map_or(Ok(()), |config| self.storage.write_config(&module, config))
+        });
+        if let Err(e) = activated {
+            // The follower was stopped for an upload that did not happen.
+            // Put it back — on whatever `current.toml` names now, which is
+            // the old instance, or the half-way one if only the config
+            // failed.
+            if matches!(
+                self.peek(&module).map(|instance| instance.on_boot()),
+                Ok(BootAction::StartFollower)
+            ) {
+                self.execute(&module, Effect::StartFollower).await;
+            }
+            return Err(e.into());
         }
 
         let action = self.load_or_adopt(&module)?.on_boot();
@@ -862,6 +892,81 @@ mod tests {
                 .module
                 .sha256,
             manifest.module.sha256,
+        );
+    }
+
+    /// `activate` RENAMES the instance directory. A follower still running
+    /// across that holds a key that no longer exists: its cursor write is
+    /// refused and the fan-out, seeing an instance that is not the module's
+    /// current one, writes no rows — so a block in flight loses its emissions.
+    /// The follower must already be stopped when the directory moves.
+    #[tokio::test]
+    async fn an_upload_stops_the_follower_before_it_renames_anything() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.host.clear();
+        let before = h.storage.current_instance(MODULE).unwrap().unwrap();
+
+        let seen_at_stop = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (storage, seen) = (h.storage.clone(), seen_at_stop.clone());
+        h.host.on_stop(move || {
+            seen.lock()
+                .unwrap()
+                .push(storage.current_instance(MODULE).unwrap());
+        });
+
+        let wasm = b"a whole new build";
+        let manifest = crate::companions::testing::manifest_for(MODULE, wasm);
+        h.manager
+            .upload(&manifest, wasm, Some(b"\xa0"))
+            .await
+            .expect("upload accepted");
+
+        assert_eq!(
+            *seen_at_stop.lock().unwrap(),
+            vec![Some(before.clone())],
+            "the follower was stopped AFTER its directory had been renamed",
+        );
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::Stop(MODULE.to_owned()),
+                HostCall::Replace(MODULE.to_owned())
+            ],
+        );
+        assert_ne!(h.storage.current_instance(MODULE).unwrap(), Some(before));
+    }
+
+    /// The follower is stopped FOR the upload, so an upload that then fails
+    /// must not leave the module down.
+    #[tokio::test]
+    async fn a_failed_upload_puts_the_follower_back() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.host.clear();
+        let before = h.storage.current_instance(MODULE).unwrap();
+
+        // A manifest that describes different bytes: `activate` refuses it.
+        let manifest = crate::companions::testing::manifest_for(MODULE, b"what was built");
+        let refused = h.manager.upload(&manifest, b"what arrived", None).await;
+
+        assert!(refused.is_err());
+        assert_eq!(h.storage.current_instance(MODULE).unwrap(), before);
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::Stop(MODULE.to_owned()),
+                HostCall::Replace(MODULE.to_owned())
+            ],
+            "the old follower was not restarted",
         );
     }
 

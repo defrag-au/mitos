@@ -138,6 +138,20 @@ enum StateAddr {
     Unactivated(String),
 }
 
+/// How a caller names the state it wants: the way every v2 call site does, or
+/// exactly.
+enum Target<'a> {
+    /// Whatever `current.toml` resolves to — the `&str` API.
+    Current(&'a str),
+    Exact(&'a InstanceKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IfAbsent {
+    Create,
+    Leave,
+}
+
 /// Write-tmp-then-rename. The tmp sits beside the target so the rename never
 /// crosses a filesystem, which is what makes it atomic.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
@@ -224,6 +238,10 @@ pub struct ModuleStorage {
     /// directory; nothing outside `cfg(test)` can install one.
     #[cfg(test)]
     repoint_hook: Arc<Mutex<Option<RepointHook>>>,
+    /// Fires in `cursor_store_for` between locating the state and looking it
+    /// up in the cache — the window a repoint must not be able to enter.
+    #[cfg(test)]
+    located_hook: Arc<Mutex<Option<RepointHook>>>,
 }
 
 #[cfg(test)]
@@ -241,6 +259,8 @@ impl ModuleStorage {
             repoint: Arc::new(RwLock::new(())),
             #[cfg(test)]
             repoint_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            located_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -262,10 +282,7 @@ impl ModuleStorage {
         id: &str,
         cache_size: Option<usize>,
     ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
-        let addr = self
-            .addr_of(id)
-            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
-        self.kv_store_addr(&addr, cache_size)
+        self.kv_store_for(&Target::Current(id), cache_size)
     }
 
     /// The KV of ONE instance. Two instances of a module have two.
@@ -274,23 +291,25 @@ impl ModuleStorage {
         key: &InstanceKey,
         cache_size: Option<usize>,
     ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
-        self.instance_state_dir(key)
-            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
-        self.kv_store_addr(&StateAddr::Instance(key.clone()), cache_size)
+        self.kv_store_for(&Target::Exact(key), cache_size)
     }
 
-    fn kv_store_addr(
+    fn kv_store_for(
         &self,
-        addr: &StateAddr,
+        target: &Target<'_>,
         cache_size: Option<usize>,
     ) -> Result<crate::vendored::balius::kv::RedbKv, crate::vendored::balius::kv::KvError> {
+        // Held across locate, open AND insert — see `locate_held`.
+        let _guard = self.repoint.read().expect("repoint lock");
+        let (addr, dir) = self
+            .locate_held(target)
+            .map_err(|e| crate::vendored::balius::kv::KvError::Internal(e.to_string()))?;
         let mut cache = self.kv_stores.lock().expect("kv_stores mutex");
-        if let Some(s) = cache.get(addr) {
+        if let Some(s) = cache.get(&addr) {
             return Ok(s.clone());
         }
-        let path = self.dir_of(addr).join("kv.redb");
-        let store = crate::vendored::balius::kv::RedbKv::try_new(path, cache_size)?;
-        cache.insert(addr.clone(), store.clone());
+        let store = crate::vendored::balius::kv::RedbKv::try_new(dir.join("kv.redb"), cache_size)?;
+        cache.insert(addr, store.clone());
         Ok(store)
     }
 
@@ -320,10 +339,7 @@ impl ModuleStorage {
     /// the next bootstrap) rather than taking the follower down —
     /// same posture as `kv_store`.
     pub fn watched_index(&self, id: &str) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
-        match self.addr_of(id) {
-            Ok(addr) => self.watched_index_addr(&addr),
-            Err(e) => Self::watched_fallback(id, &e.to_string()),
-        }
+        self.watched_index_for(&Target::Current(id), id)
     }
 
     /// The watched set of ONE instance.
@@ -335,26 +351,31 @@ impl ModuleStorage {
         &self,
         key: &InstanceKey,
     ) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
-        match self.instance_state_dir(key) {
-            Ok(_) => self.watched_index_addr(&StateAddr::Instance(key.clone())),
-            Err(e) => Self::watched_fallback(key.module.as_str(), &e.to_string()),
-        }
+        self.watched_index_for(&Target::Exact(key), key.module.as_str())
     }
 
-    fn watched_index_addr(
+    fn watched_index_for(
         &self,
-        addr: &StateAddr,
+        target: &Target<'_>,
+        what: &str,
     ) -> Arc<crate::watched_ref_index::WatchedRefIndex> {
+        // Held across locate, open AND insert — see `locate_held`.
+        let _guard = self.repoint.read().expect("repoint lock");
+        let (addr, dir) = match self.locate_held(target) {
+            Ok(located) => located,
+            // NOT cached: there is no address to file it under, and an
+            // instance that does not exist must not acquire one.
+            Err(e) => return Self::watched_fallback(what, &e.to_string()),
+        };
         let mut cache = self.watched_stores.lock().expect("watched_stores mutex");
-        if let Some(idx) = cache.get(addr) {
+        if let Some(idx) = cache.get(&addr) {
             return idx.clone();
         }
-        let path = self.dir_of(addr).join("watched.redb");
-        let idx = match crate::watched_ref_index::WatchedRefIndex::open(path) {
+        let idx = match crate::watched_ref_index::WatchedRefIndex::open(dir.join("watched.redb")) {
             Ok(idx) => Arc::new(idx),
-            Err(e) => Self::watched_fallback(&format!("{addr:?}"), &e.to_string()),
+            Err(e) => Self::watched_fallback(what, &e.to_string()),
         };
-        cache.insert(addr.clone(), idx.clone());
+        cache.insert(addr, idx.clone());
         idx
     }
 
@@ -435,10 +456,7 @@ impl ModuleStorage {
         &self,
         id: &str,
     ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
-        let addr = self.addr_of(id).map_err(|e| {
-            crate::emissions::EmissionsError::Io(std::io::Error::other(e.to_string()))
-        })?;
-        self.emissions_store_addr(&addr)
+        self.emissions_store_for(&Target::Current(id))
     }
 
     /// The emissions log of ONE instance. Each instance keeps its own, and
@@ -448,26 +466,27 @@ impl ModuleStorage {
         &self,
         key: &InstanceKey,
     ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
-        self.instance_state_dir(key).map_err(|e| {
-            crate::emissions::EmissionsError::Io(std::io::Error::other(e.to_string()))
-        })?;
-        self.emissions_store_addr(&StateAddr::Instance(key.clone()))
+        self.emissions_store_for(&Target::Exact(key))
     }
 
-    fn emissions_store_addr(
+    fn emissions_store_for(
         &self,
-        addr: &StateAddr,
+        target: &Target<'_>,
     ) -> Result<crate::emissions::EmissionsStore, crate::emissions::EmissionsError> {
+        // Held across locate, open AND insert — see `locate_held`.
+        let _guard = self.repoint.read().expect("repoint lock");
+        let (addr, dir) = self.locate_held(target).map_err(|e| {
+            crate::emissions::EmissionsError::Io(std::io::Error::other(e.to_string()))
+        })?;
         let mut cache = self
             .emissions_stores
             .lock()
             .expect("emissions_stores mutex");
-        if let Some(s) = cache.get(addr) {
+        if let Some(s) = cache.get(&addr) {
             return Ok(s.clone());
         }
-        let store =
-            crate::emissions::EmissionsStore::open(self.dir_of(addr).join("emissions.redb"))?;
-        cache.insert(addr.clone(), store.clone());
+        let store = crate::emissions::EmissionsStore::open(dir.join("emissions.redb"))?;
+        cache.insert(addr, store.clone());
         Ok(store)
     }
 
@@ -494,18 +513,56 @@ impl ModuleStorage {
     /// per module pays the redb open cost (~hundreds of ms);
     /// subsequent calls are O(1) HashMap lookup + cheap clone
     /// (`CursorStore` holds `Arc<redb::Database>` internally).
-    fn cursor_store(&self, id: &str) -> Result<CursorStore, StorageError> {
-        self.cursor_store_addr(&self.addr_of(id)?)
+    ///
+    /// `Ok(None)` only under [`IfAbsent::Leave`]: a READ of a cursor that was
+    /// never written must not create `cursor.redb` on the way to saying so.
+    fn cursor_store_for(
+        &self,
+        target: &Target<'_>,
+        if_absent: IfAbsent,
+    ) -> Result<Option<CursorStore>, StorageError> {
+        // Held across locate, open AND insert — see `locate_held`.
+        let _guard = self.repoint.read().expect("repoint lock");
+        let (addr, dir) = self.locate_held(target)?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .located_hook
+                .lock()
+                .expect("located_hook mutex")
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
+        if let Some(s) = cache.get(&addr) {
+            return Ok(Some(s.clone()));
+        }
+        let path = dir.join("cursor.redb");
+        if if_absent == IfAbsent::Leave && !path.exists() {
+            return Ok(None);
+        }
+        let store = CursorStore::open(path)?;
+        cache.insert(addr, store.clone());
+        Ok(Some(store))
     }
 
-    fn cursor_store_addr(&self, addr: &StateAddr) -> Result<CursorStore, StorageError> {
-        let mut cache = self.cursor_stores.lock().expect("cursor_stores mutex");
-        if let Some(s) = cache.get(addr) {
-            return Ok(s.clone());
+    fn write_cursor_for(
+        &self,
+        target: &Target<'_>,
+        cursor: &ChainPoint,
+    ) -> Result<(), StorageError> {
+        self.cursor_store_for(target, IfAbsent::Create)?
+            .expect("IfAbsent::Create always yields a store")
+            .write(cursor)
+    }
+
+    fn read_cursor_for(&self, target: &Target<'_>) -> Result<Option<ChainPoint>, StorageError> {
+        match self.cursor_store_for(target, IfAbsent::Leave)? {
+            Some(store) => store.read(),
+            None => Ok(None),
         }
-        let store = CursorStore::open(self.dir_of(addr).join("cursor.redb"))?;
-        cache.insert(addr.clone(), store.clone());
-        Ok(store)
     }
 
     /// Drop the cached cursor store. Used by `host::stop` so a follower
@@ -534,18 +591,11 @@ impl ModuleStorage {
         key: &InstanceKey,
         cursor: &ChainPoint,
     ) -> Result<(), StorageError> {
-        self.instance_state_dir(key)?;
-        self.cursor_store_addr(&StateAddr::Instance(key.clone()))?
-            .write(cursor)
+        self.write_cursor_for(&Target::Exact(key), cursor)
     }
 
     pub fn read_cursor_at(&self, key: &InstanceKey) -> Result<Option<ChainPoint>, StorageError> {
-        let dir = self.instance_state_dir(key)?;
-        if !dir.join("cursor.redb").exists() {
-            return Ok(None);
-        }
-        self.cursor_store_addr(&StateAddr::Instance(key.clone()))?
-            .read()
+        self.read_cursor_for(&Target::Exact(key))
     }
 
     /// Where ONE instance's trap fixture goes.
@@ -932,6 +982,53 @@ impl ModuleStorage {
         })
     }
 
+    /// Resolve a target to its cache address and directory. **Caller holds
+    /// `repoint` for READ, and keeps holding it until the handle it opens is
+    /// IN the cache.**
+    ///
+    /// Resolving under the guard and looking up after it is not enough. While
+    /// the caches were keyed by module id, a `&str` caller whose handle was
+    /// already cached could not fail: the key never changed. Keyed by
+    /// instance, it can — resolve `K1`, release, an upload renames `K1 → K2`
+    /// and re-keys the caches, and the lookup for `K1` now MISSES; the
+    /// fallback open of `K1/…` then fails, because that directory is gone. A
+    /// transient error, but on paths that treat an open failure as final: the
+    /// dialer's drain task logs it and EXITS. Holding the guard makes the
+    /// resolution and the lookup one step — before the rename both say `K1`,
+    /// after it both say `K2`.
+    ///
+    /// (It is NOT what keeps a late opener from filing a handle under a stale
+    /// key. Each `*_for` holds its cache mutex across the open, and
+    /// `rekey_caches` takes the same mutex, so the re-key already waits for
+    /// the insert. Keep that too.)
+    fn locate_held(&self, target: &Target<'_>) -> Result<(StateAddr, PathBuf), StorageError> {
+        match target {
+            Target::Current(id) => match self.current_instance_locked(id, Held::Read)? {
+                Some(key) => {
+                    let dir = self.instance_dir(&key);
+                    Ok((StateAddr::Instance(key), dir))
+                }
+                None => {
+                    let addr = StateAddr::Unactivated((*id).to_owned());
+                    let dir = self.dir_of(&addr);
+                    Ok((addr, dir))
+                }
+            },
+            // Never created here — see `instance_state_dir`.
+            Target::Exact(key) => {
+                let dir = self.instance_dir(key);
+                if !dir.is_dir() {
+                    return Err(StorageError::NoSuchInstance {
+                        module: key.module.to_string(),
+                        instance: key.dir_name(),
+                        found: 0,
+                    });
+                }
+                Ok((StateAddr::Instance((*key).clone()), dir))
+            }
+        }
+    }
+
     /// The directory an address's state files live in.
     ///
     /// The `Unactivated` arm CREATES it, because that is what v2 did for a
@@ -1007,12 +1104,16 @@ impl ModuleStorage {
                     &from.join(INSTANCE_MARKER),
                     instance_key_toml(next)?.as_bytes(),
                 )?;
-                // This runs while the module's follower is LIVE — the upload
-                // handler calls `activate` and only then `host.replace()`.
-                // It is safe on unix: the cached redb handles hold file
-                // descriptors, which name inodes and not paths, and redb
-                // never reopens by path once `ModuleStorage` has cached the
-                // handle. It looks wrong and is not.
+                // The module's FOLLOWER is not running across this:
+                // `LifecycleManager::upload` stops it first, because a
+                // follower holding the old key can neither write its cursor
+                // nor have its emissions fanned out. But handles are still
+                // open — the dialer's drain keeps `emissions.redb` for the
+                // life of the process, and an admin read may have any of the
+                // others. That is safe on unix: a cached redb handle holds a
+                // file descriptor, which names an inode and not a path, and
+                // redb never reopens by path once `ModuleStorage` has cached
+                // the handle.
                 std::fs::rename(&from, &to)?;
                 // …but the caches are keyed by InstanceKey, so those surviving
                 // handles are now filed under a key whose directory is gone.
@@ -1376,8 +1477,9 @@ impl ModuleStorage {
 
     /// Per-instance crash-safe cursor file (redb).
     ///
-    /// Crate-private — callers go through `cursor_store(id)`.
-    /// See `emissions_path` for the rationale.
+    /// Test-only, like its three siblings: production reaches the cursor
+    /// through `cursor_store_for`, which resolves and opens under one guard.
+    #[cfg(test)]
     pub(crate) fn cursor_path(&self, id: &str) -> Result<PathBuf, StorageError> {
         Ok(self.state_dir(id)?.join("cursor.redb"))
     }
@@ -1427,7 +1529,7 @@ impl ModuleStorage {
     /// per module lifetime, one redb commit per block. See
     /// `ModuleStorage` doc comment for why this matters.
     pub fn write_cursor(&self, id: &str, cursor: &ChainPoint) -> Result<(), StorageError> {
-        self.cursor_store(id)?.write(cursor)
+        self.write_cursor_for(&Target::Current(id), cursor)
     }
 
     /// Read the persisted cursor, if any. `Ok(None)` means the
@@ -1435,11 +1537,7 @@ impl ModuleStorage {
     /// `ChainPoint::Origin` (or whatever the configured start
     /// point is).
     pub fn read_cursor(&self, id: &str) -> Result<Option<ChainPoint>, StorageError> {
-        let path = self.cursor_path(id)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        self.cursor_store(id)?.read()
+        self.read_cursor_for(&Target::Current(id))
     }
 
     /// List registered module ids — the directories that have a
@@ -2123,6 +2221,56 @@ mod tests {
             std::fs::read_to_string(storage.instance_dir(&key_b).join("last-trap.toml")).unwrap(),
             "trapped",
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `&str` caller whose handle is ALREADY cached must not be able to
+    /// fail because an upload landed mid-call. Keyed by module id it could
+    /// not; keyed by instance it can, unless resolving and looking up are one
+    /// step: resolve `K1`, the upload renames and re-keys, the lookup for `K1`
+    /// misses, and the fallback open of `K1/cursor.redb` finds no directory.
+    #[test]
+    fn a_cached_handle_survives_an_upload_that_lands_mid_call() {
+        use std::sync::mpsc;
+
+        let dir = tempdir("upload-mid-call");
+        let storage = ModuleStorage::new(&dir);
+        let wasm_a = b"mid-call A";
+        storage.activate(&sample_manifest(wasm_a), wasm_a).unwrap();
+        let cursor = ChainPoint::Slot(42);
+        // Cached from here on.
+        storage.write_cursor("test-module", &cursor).unwrap();
+
+        // Park the reader between "located" and "looked up", and start the
+        // upload while it is parked.
+        let (located, wait_until_located) = mpsc::channel();
+        storage
+            .located_hook
+            .lock()
+            .unwrap()
+            .replace(Arc::new(move || {
+                // Only the first call parks; later ones must not block.
+                if located.send(()).is_ok() {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }));
+
+        let reader_storage = storage.clone();
+        let reader = std::thread::spawn(move || reader_storage.read_cursor("test-module"));
+
+        wait_until_located.recv().expect("reader reached the hook");
+        drop(wait_until_located);
+        let wasm_b = b"mid-call B";
+        storage.activate(&sample_manifest(wasm_b), wasm_b).unwrap();
+
+        assert_eq!(
+            reader.join().expect("reader thread").unwrap(),
+            Some(cursor.clone()),
+            "a cached read failed because an upload renamed the instance mid-call",
+        );
+        // …and the handle followed the rename.
+        assert_eq!(storage.read_cursor("test-module").unwrap(), Some(cursor));
 
         std::fs::remove_dir_all(&dir).ok();
     }

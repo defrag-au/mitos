@@ -897,22 +897,39 @@ where
             let mut slots = self.slots.lock().await;
             slots.remove(key)
         };
-        let Some(slot) = slot else {
-            return Ok(());
+        if let Some(slot) = &slot {
+            slot.cancel.cancel();
+        }
+        let sha = match slot {
+            Some(slot) => {
+                let _ = slot.task.await;
+                let _ = slot.drain_task.await;
+                Some(slot.sha)
+            }
+            None => None,
         };
-        slot.cancel.cancel();
-        let _ = slot.task.await;
-        let _ = slot.drain_task.await;
         // Evict THIS instance's cached handles so a future start re-opens
         // redb cleanly — and only this instance's, or stopping one would
         // close the other's files underneath it.
+        //
+        // WITH OR WITHOUT a slot, and the second case is the common one:
+        // after an upload the running follower is K1, but `repoint_locked`
+        // has already re-keyed its handles to K2. `stop(id)` stops K1 and
+        // closes K1's entries — there are none — and then `start_instance(K2)`
+        // arrives here with no K2 slot. Returning early would hand the new
+        // follower the old follower's handles on every deploy, where v2
+        // re-opened them. Nothing else can be holding them: the only follower
+        // that did has just been awaited above, by whichever call stopped it.
         self.storage.close_cursor_at(key);
         self.storage.close_kv_at(key);
         self.storage.close_watched_at(key);
+        let Some(sha) = sha else {
+            return Ok(());
+        };
         tracing::info!(
             module = %key.module,
             instance = %key.dir_name(),
-            sha = %slot.sha,
+            sha = %sha,
             "v2 module stopped",
         );
         Ok(())
@@ -1392,6 +1409,10 @@ pub(crate) mod testing {
         /// Modules whose `evict_module` fails — a `Reap` whose host-side
         /// teardown failed must leave the directory alone and be retried.
         fail_evict: HashSet<String>,
+        /// Runs inside `stop`, so a test can record what the WORLD looked
+        /// like at the moment a follower was stopped — an ordering against
+        /// something that is not a host call.
+        on_stop: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     #[derive(Clone, Default)]
@@ -1448,6 +1469,10 @@ pub(crate) mod testing {
                 .insert(module.to_owned());
         }
 
+        pub(crate) fn on_stop(&self, observe: impl Fn() + Send + Sync + 'static) {
+            self.0.lock().expect("fake host mutex").on_stop = Some(Arc::new(observe));
+        }
+
         /// The teardown that was failing now works.
         pub(crate) fn heal_evict(&self, module: &str) {
             self.0
@@ -1488,7 +1513,14 @@ pub(crate) mod testing {
 
         async fn stop(&self, id: &str) -> PlatformResult<()> {
             self.record(HostCall::Stop(id.to_owned()));
-            self.0.lock().expect("fake host mutex").running.remove(id);
+            let observe = {
+                let mut inner = self.0.lock().expect("fake host mutex");
+                inner.running.remove(id);
+                inner.on_stop.clone()
+            };
+            if let Some(observe) = observe {
+                observe();
+            }
             Ok(())
         }
 
@@ -1663,7 +1695,25 @@ pub(crate) async fn run_emit_drain(
                 // Resolved per EVENT, not once per task: an upload moves the
                 // module's current instance under a running drain, and a row
                 // naming a renamed-away instance follows whatever it is NOW.
-                let module_current = storage.current_instance(&module_id).ok().flatten();
+                //
+                // An ERROR here is not "unactivated" — this task is running
+                // an instance, so the module plainly is. It fails OPEN, as
+                // the interest filter does: with one instance that is exactly
+                // v2, and with two it is a duplicate rather than silence. But
+                // it says so, per event, for as long as the pointer is broken.
+                let module_current = match storage.current_instance(&module_id) {
+                    Ok(current) => current,
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %module_id,
+                            instance = %instance.dir_name(),
+                            error = %e,
+                            "cannot resolve the module's current instance; delivering to every \
+                             companion from this instance",
+                        );
+                        None
+                    }
+                };
                 if event.is_undo {
                     // Chain rollback: broadcast an undo emission to every
                     // subscribed companion (no interest filter — a reorg is

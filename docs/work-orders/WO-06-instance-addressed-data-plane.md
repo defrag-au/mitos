@@ -119,6 +119,86 @@ has no sentinel, so its early `continue` is correct and is left alone.
    instance as `Stopped` under `FakeHost` — which is what the admin tests
    assert. If WO-07 gives `FakeHost` instances, that assertion changes with it.
 
+## Review 2026-09-20 — one spec error of mine, two defects, one correction
+
+Acceptance re-run independently and matches (core 28, lifecycle 93, platform
+lib 257, integration files as reported, `two_instances_v2` 5; clippy
+`--workspace -D warnings` 0). Scope matches "Files" plus `lib.rs` (the new
+error variant); no `#[ignore]`; the four integration files carry exactly the
+sanctioned closure edit. After review: platform lib **260**.
+
+Worth saying first: the sentinel finding in the report above is the best catch
+of the series — a `Skip` that skipped the WALK, not just the write, would have
+let an unrelated later subscriber reclaim an event another instance had
+already delivered. It was found by a test the order asked for and it is fixed
+in the right place. Deviations 1–5 all agreed; 3 and 4 corrected mistakes in
+my order (one test wasm cannot make two wasm-keyed instances; a shared
+one-shot subscription makes "both cursors advanced" a scheduler lottery).
+
+**1. MY SPEC ERROR — an upload dropped the emissions of a block in flight.**
+The order said a follower may run across `activate`'s rename: its cursor write
+is refused for "milliseconds", replay ≤ 1 block, do not reorder `upload`. I
+reasoned about the cursor and forgot the very rule this order introduces. A
+follower started as `K1` and still running after the rename is, to
+`routing::fan_out`, an instance that is NOT the module's current one (`K2`) —
+so it `Skip`s every companion and `Drop`s the sentinel. And the window is not
+milliseconds: `stop` AWAITS the follower, which finishes its block first —
+seconds, for a heavy module. That block's emissions were dropped, its cursor
+not written, and the replay then ran against KV state that had already
+absorbed the block, so a module that emits on CHANGE would never emit them
+again. Before this order they were delivered. Implemented exactly as written;
+the error is the order's.
+Fix, at the cause: `LifecycleManager::upload` now QUIESCES FIRST —
+`host.stop` → `activate` / `write_config` → start. Not a lifecycle event (the
+record is untouched). An upload that then fails restarts the old follower.
+Tests: `an_upload_stops_the_follower_before_it_renames_anything` (a new
+`FakeHost::on_stop` observer records what `current.toml` said AT the stop) and
+`a_failed_upload_puts_the_follower_back`. No existing assertion depended on
+the old order. Comments in `repoint_locked` and `flush_cursor` that described
+a live follower crossing the rename are corrected; the cache re-key stays,
+because the dialer's drain and admin reads still hold handles across it.
+
+**2. DEFECT — after every upload the new follower reused the old follower's
+redb handles.** `stop(id)` stops the `K1` slot and closes `K1`'s cache entries
+— but the rename had already re-keyed them to `K2`, so it closed nothing; then
+`start_instance(K2)` → `stop_instance(K2)` found no slot and returned before
+its own close. v2 re-opened on every replace ("ensuring no stale handle
+outlives a Driver replacement"). `stop_instance` now closes the key's handles
+with or without a slot. Test: the existing `replace_after_an_upload…` holds a
+`Weak` to the pre-replace handle and asserts it is gone. Mutation-checked:
+restoring the early return fails it.
+
+**3. DEFECT — a cached `&str` read could fail, or LIE, mid-upload.** Resolve
+and cache lookup were two steps: resolve `K1`, the upload renames and re-keys,
+the lookup for `K1` misses, the fallback open finds no directory. For
+`read_cursor` that is not an error but `Ok(None)` — "this module has no
+cursor". Impossible while the cache was keyed by module id. Now every store
+goes through `locate_held` with the `repoint` read guard held across resolve,
+lookup, open and insert (`Target::{Current, Exact}`; `IfAbsent::{Create,
+Leave}` replaces the exists-then-open pair). Test:
+`a_cached_handle_survives_an_upload_that_lands_mid_call`, using a new
+`located_hook`. Mutation-checked: releasing the guard early fails it, with
+`None`.
+
+**A correction to my own review, left in because it is the more useful
+lesson.** I first diagnosed (3) as "a slow opener files its handle under a
+stale key after the re-key ran". It cannot: each store holds its CACHE MUTEX
+across the open, and `rekey_caches` takes the same mutex, so the re-key waits
+for the insert. I only found the real defect because the fix needed a comment
+explaining the bug, and the explanation did not survive being written down.
+
+Also: `module_current` folded a READ ERROR into "unactivated ⇒ deliver". It
+still fails open — a duplicate beats silence — but now says so at `warn`.
+
+**For WO-09, recorded in the index:** `RowCache` trusts mtime. Two row writes
+inside one kernel timestamp tick (~4 ms) look like one, and `Committing` →
+`CommitSwitch` can be that close. The commit must INVALIDATE the fan-out's
+cache, not wait to be noticed.
+
+Answers: Q1 — agreed, acceptable, and WO-09 owns it. Q2 — agreed; WO-07 gives
+`FakeHost` instances and that assertion moves with it. `POLICY_B`'s 57 hex
+characters: left for the operator, as reported.
+
 ## What this order does, and where it deliberately stops
 
 WO-01 made the DISK layout instance-keyed. Everything above the disk is still
@@ -215,6 +295,9 @@ coming, and it must arrive as a compile error at your call sites.
     the restart replays at most one block, which is the at-least-once the
     cursor has always had. Do NOT "fix" this by creating the directory, by
     falling back to the module's current instance, or by reordering `upload`.
+    **⚠️ THIS BULLET WAS WRONG — see "Review". It reasoned about the cursor
+    and forgot the fan-out, and "milliseconds" is a block's dispatch time.
+    `upload` IS now reordered.**
 
 ### 2. Host — a slot is an instance
 
@@ -281,7 +364,8 @@ directory — `dir_name`, the full key, `current: bool`-SHAPED AS AN ENUM
 - Creating an instance, copying state, `EnsureInstance`, slots, the move.
 - Any route or timer that starts a second instance.
 - `FanOut::Hold`, held emissions, the diff.
-- Reordering `upload`, or making `activate` copy instead of rename.
+- ~~Reordering `upload`~~ (wrong — done in review, see above), or making
+  `activate` copy instead of rename.
 - Rewriting rows when `activate` renames. `routing` is built so that nothing
   has to: read its module doc.
 
