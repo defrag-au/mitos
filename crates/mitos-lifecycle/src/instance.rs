@@ -325,6 +325,29 @@ impl Instance {
         }
     }
 
+    /// The effects to re-issue on EVERY tick, not just at boot — the subset of
+    /// [`Instance::recover`] that is safe to repeat while the host is up.
+    ///
+    /// A `Reaped` instance whose record is still on disk is one whose `Reap`
+    /// did not finish: the host refuses to remove a directory when its own
+    /// follower teardown failed, because unlinking files under open redb
+    /// handles leaves a follower writing to an inode nothing can reach. That
+    /// is the right refusal, but `Tick` on a reaped instance is
+    /// [`Rejected::Reaped`], so without this the half-reaped directory would
+    /// sit there until the next host restart — dialled, listed and counted.
+    ///
+    /// Deliberately NOT `recover()`: that also returns `StartFollower`, and
+    /// re-issuing that every minute would restart every healthy follower.
+    /// Liveness is the watchdog's job; only cleanup belongs here.
+    pub fn pending_cleanup(&self) -> Vec<Effect> {
+        match self.phase {
+            Phase::Reaped => vec![Effect::Reap],
+            Phase::Staging | Phase::Active | Phase::Draining { .. } | Phase::Stopped { .. } => {
+                vec![]
+            }
+        }
+    }
+
     /// Whether this instance's follower SHOULD be running. The only thing that
     /// decides what a restart resumes — and what the watchdog revives: v2's
     /// watchdog restarted any module with companions and no live follower, so
@@ -904,6 +927,31 @@ mod tests {
         );
         assert_eq!(reaped.recover(), vec![Effect::Reap]);
         assert!(reaped.reconcile(&BTreeMap::from([(c, prod())])).is_empty());
+    }
+
+    /// A `Reap` the host could not finish must be retried while the host is
+    /// UP — `Tick` on a reaped instance is rejected, so nothing else would.
+    /// And it must be ONLY cleanup: re-issuing `StartFollower` every tick
+    /// would restart every healthy follower once a minute.
+    #[test]
+    fn only_an_unfinished_reap_is_reissued_on_a_tick() {
+        let c = client("prod", "ownership.cnft.dev");
+        let running = Instance::adopt(key(), &BTreeMap::from([(c, prod())]));
+        assert_eq!(running.recover(), vec![Effect::StartFollower]);
+        assert!(
+            running.pending_cleanup().is_empty(),
+            "a healthy follower is never restarted by the tick"
+        );
+
+        let (reaped, _) = run(
+            running,
+            vec![(
+                Event::Operator(OperatorCommand::Evict(EvictMode::Force)),
+                T0,
+            )],
+        );
+        assert_eq!(reaped.step(Event::Tick, T0), Err(Rejected::Reaped));
+        assert_eq!(reaped.pending_cleanup(), vec![Effect::Reap]);
     }
 
     /// The record is what goes to disk, as TOML. Every phase must survive the

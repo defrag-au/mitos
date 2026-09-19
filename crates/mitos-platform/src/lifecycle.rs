@@ -191,12 +191,18 @@ impl LifecycleManager {
     /// with clients becomes `Active`, one without becomes `Active` + `Pinned`.
     /// See `Instance::adopt` for why pinning the client-ful case would leave a
     /// zombie follower behind per deploy.
-    pub fn load_or_adopt(&self, module: &str) -> Result<Instance, LifecycleError> {
+    ///
+    /// **Caller must hold this module's lock.** Adoption WRITES, and every
+    /// other write to the record is a read-modify-write under that lock. An
+    /// unlocked adoption landing after a locked `apply` would overwrite the
+    /// transition it had just persisted — silently discarding, say, an
+    /// operator's stop. Callers without the lock use [`Self::peek`].
+    fn load_or_adopt(&self, module: &str) -> Result<Instance, LifecycleError> {
         let key = self.current_key(module)?;
         match self.storage.read_lifecycle(module)? {
             Some(record) => Ok(Instance::from_record(key, record)),
             None => {
-                let instance = Instance::adopt(key, &self.on_disk_clients(module));
+                let instance = self.adopted(module, key);
                 self.storage.write_lifecycle(module, &instance.record())?;
                 tracing::info!(
                     module = %module,
@@ -204,21 +210,59 @@ impl LifecycleManager {
                     attached = instance.attached.len(),
                     "instance adopted into the lifecycle",
                 );
+                // Adoption counts client DIRECTORIES. The flat-file migration
+                // runs first, but it leaves a record it cannot decode "in
+                // place", and it can fail outright — and what adoption
+                // concludes is written down and sticky: a subscribed module
+                // recorded as client-less is `Pinned`, and never retires when
+                // its clients later move. Refusing to adopt would be worse (a
+                // module with one corrupt legacy file could never start), so
+                // this is made LOUD instead: it lands on the event ring, where
+                // the deploy check looks.
+                if crate::companions::has_flat_companions(&self.storage, module) {
+                    self.effect_failed(
+                        module,
+                        "adopt",
+                        "legacy flat companion records remain after migration; this module's \
+                         clients may be under-counted — if it shows `pinned` but is subscribed, \
+                         fix the records and `unpin` it",
+                    );
+                }
                 Ok(instance)
             }
         }
     }
 
+    fn adopted(&self, module: &str, key: InstanceKey) -> Instance {
+        Instance::adopt(key, &self.on_disk_clients(module))
+    }
+
+    /// The instance as it IS or WOULD BE adopted — without writing anything.
+    ///
+    /// For callers that do not hold the module lock: the watchdog and the
+    /// admin API's read surfaces. Deriving the adoption instead of persisting
+    /// it is safe because every reader derives the same answer from the same
+    /// directory listing, and the next locked caller writes it down. The same
+    /// rule as WO-01's crash repair: a path that is not holding the write lock
+    /// never writes.
+    fn peek(&self, module: &str) -> Result<Instance, LifecycleError> {
+        let key = self.current_key(module)?;
+        Ok(match self.storage.read_lifecycle(module)? {
+            Some(record) => Instance::from_record(key, record),
+            None => self.adopted(module, key),
+        })
+    }
+
     /// Whether this module's follower SHOULD be running. The watchdog's whole
-    /// decision, and the upload handler's.
+    /// decision. Reads only — the watchdog does not hold the module lock.
     pub fn expects_follower(&self, module: &str) -> Result<BootAction, LifecycleError> {
-        Ok(self.load_or_adopt(module)?.on_boot())
+        Ok(self.peek(module)?.on_boot())
     }
 
     /// The persisted record, for the admin API's read surfaces. `Ok(None)`
     /// when the module has no instance at all.
     pub fn instance(&self, module: &str) -> Result<Option<Instance>, LifecycleError> {
-        match self.load_or_adopt(module) {
+        match self.peek(module) {
             Ok(instance) => Ok(Some(instance)),
             Err(LifecycleError::NotRegistered(_)) => Ok(None),
             Err(e) => Err(e),
@@ -447,6 +491,20 @@ impl LifecycleManager {
             match self.apply_locked(&module, Event::Tick).await {
                 Ok(_) | Err(LifecycleError::Rejected(_)) => {}
                 Err(e) => tracing::warn!(module = %module, error = %e, "lifecycle tick failed"),
+            }
+            // `Tick` on a reaped instance is REJECTED, so a `Reap` that could
+            // not finish — `reap` refuses to remove a directory when the
+            // host-side teardown failed — would otherwise wait for the next
+            // host restart. `pending_cleanup` is the machine's list of what
+            // is safe to re-issue while the host is up; it is empty for every
+            // phase but `Reaped`.
+            match self.load_or_adopt(&module) {
+                Ok(instance) => self.execute_all(&module, &instance.pending_cleanup()).await,
+                // The reap finished and took the module with it.
+                Err(LifecycleError::NotRegistered(_)) => {}
+                Err(e) => {
+                    tracing::warn!(module = %module, error = %e, "lifecycle tick: reload failed")
+                }
             }
         }
     }
@@ -1093,6 +1151,79 @@ mod tests {
             h.manager.expects_follower(MODULE).unwrap(),
             BootAction::StartFollower,
         );
+    }
+
+    /// `reap` refuses to remove a directory when the host-side teardown
+    /// failed — unlinking files under open redb handles leaves a follower
+    /// writing to an inode nothing can reach. But `Tick` on a reaped instance
+    /// is REJECTED, so without `pending_cleanup` the half-reaped module would
+    /// sit there, listed and dialled, until the next host restart.
+    #[tokio::test]
+    async fn a_reap_that_could_not_finish_is_retried_on_the_next_tick() {
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.manager.boot().await;
+        h.host.fail_evict(MODULE);
+
+        h.operator(MODULE, OperatorCommand::Evict(EvictMode::Force))
+            .await;
+        assert_eq!(h.instance(MODULE).phase, Phase::Reaped);
+        assert!(
+            h.storage.current_instance(MODULE).unwrap().is_some(),
+            "the directory must survive a teardown that failed",
+        );
+
+        // Still failing: the tick retries, and still must not unlink.
+        h.host.clear();
+        h.manager.tick().await;
+        assert!(h.host.evicted(MODULE), "the tick must retry the reap");
+        assert!(h.storage.current_instance(MODULE).unwrap().is_some());
+
+        // Teardown works now: the next tick finishes the job, with no restart.
+        h.host.heal_evict(MODULE);
+        h.manager.tick().await;
+        assert!(
+            h.storage.current_instance(MODULE).unwrap().is_none(),
+            "the retried reap must remove the module",
+        );
+        // …and a tick over a module that is simply gone is quiet.
+        h.manager.tick().await;
+    }
+
+    /// The watchdog and the admin read surfaces do NOT hold the module lock,
+    /// so they must never WRITE the record. Every other write is a
+    /// read-modify-write under that lock; an unlocked adoption landing after a
+    /// locked `apply` would overwrite the transition it had just persisted —
+    /// silently discarding, say, an operator's stop.
+    #[tokio::test]
+    async fn reading_the_lifecycle_never_writes_it() {
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.subscribe(MODULE, PROD_CLIENT);
+
+        // No boot, no apply: the instance has no record yet.
+        assert!(h.storage.read_lifecycle(MODULE).unwrap().is_none());
+
+        // Both read surfaces answer — with what adoption WOULD conclude…
+        assert_eq!(
+            h.manager.expects_follower(MODULE).unwrap(),
+            BootAction::StartFollower,
+        );
+        let peeked = h.instance(MODULE);
+        assert_eq!(peeked.desired, DesiredState::Running);
+        assert_eq!(peeked.attached.len(), 1);
+
+        // …and neither wrote it down.
+        assert!(
+            h.storage.read_lifecycle(MODULE).unwrap().is_none(),
+            "an unlocked read persisted the adoption",
+        );
+
+        // The first LOCKED caller does, and concludes the same thing.
+        h.manager.reconcile(MODULE).await.unwrap();
+        let record = h.storage.read_lifecycle(MODULE).unwrap().expect("adopted");
+        assert_eq!(record.desired, peeked.desired);
+        assert_eq!(record.attached, peeked.attached);
     }
 
     #[tokio::test]

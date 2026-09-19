@@ -1078,6 +1078,25 @@ struct LegacyDialBackOverride {
     url: Option<String>,
 }
 
+/// Whether a module still has legacy FLAT registrations — `<key>.cbor` files
+/// directly under `companions/` rather than under a `<client_id>/` directory.
+///
+/// Lifecycle adoption counts client DIRECTORIES, and what it concludes is
+/// written down and sticky. So it asks this first: adopting while flat files
+/// remain would record a subscribed module as client-less ⇒ `Pinned` ⇒ never
+/// retiring when its clients later move. The migration below normally clears
+/// them, but it can FAIL, and "it was called" is not "it worked". Uses exactly
+/// the migration's own test for what a flat record is.
+pub(crate) fn has_flat_companions(storage: &ModuleStorage, module_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(storage.module_dir_for_companions(module_id)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("cbor")
+    })
+}
+
 /// One-time migration of pre-fix flat companion files into the
 /// two-level layout. Idempotent — re-running on an already-migrated
 /// module is a no-op (no flat files left to find).

@@ -1245,6 +1245,9 @@ pub(crate) mod testing {
         /// Modules whose `replace` fails — an effect that fails must not roll
         /// the lifecycle record back.
         fail_replace: HashSet<String>,
+        /// Modules whose `evict_module` fails — a `Reap` whose host-side
+        /// teardown failed must leave the directory alone and be retried.
+        fail_evict: HashSet<String>,
     }
 
     #[derive(Clone, Default)]
@@ -1289,6 +1292,25 @@ pub(crate) mod testing {
                 .expect("fake host mutex")
                 .fail_replace
                 .insert(module.to_owned());
+        }
+
+        /// Make `evict_module` fail for `module`, as a teardown that could not
+        /// close its redb handles does.
+        pub(crate) fn fail_evict(&self, module: &str) {
+            self.0
+                .lock()
+                .expect("fake host mutex")
+                .fail_evict
+                .insert(module.to_owned());
+        }
+
+        /// The teardown that was failing now works.
+        pub(crate) fn heal_evict(&self, module: &str) {
+            self.0
+                .lock()
+                .expect("fake host mutex")
+                .fail_evict
+                .remove(module);
         }
 
         /// The follower task exited on its own — no `stop` call, it is just
@@ -1362,7 +1384,11 @@ pub(crate) mod testing {
 
         async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
             self.record(HostCall::Evict(id.to_owned()));
-            self.0.lock().expect("fake host mutex").running.remove(id);
+            let mut inner = self.0.lock().expect("fake host mutex");
+            if inner.fail_evict.contains(id) {
+                return Err(PlatformError::Decode(format!("fake evict failure: {id}")));
+            }
+            inner.running.remove(id);
             Ok(Vec::new())
         }
 

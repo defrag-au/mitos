@@ -104,9 +104,21 @@ otherwise careful, so it gets its own section.
   skips work because its output is already there is trusting that. So every
   such output is written to a sibling temp name and RENAMED into place — never
   written in place — or a crash mid-write is silently accepted next time.
-- **A shared (read) lock must never write.** A recovery path that "just fixes
-  it up" while holding a read lock races with every other reader doing the
-  same. Derive the answer on read; persist it under the write lock.
+- **A path that does not hold the WRITE lock must never write.** A recovery or
+  "adopt it if it's missing" step that "just fixes it up" on the way to
+  answering a READ races with every locked read-modify-write beside it, and
+  the loser's transition is silently discarded. Derive the answer on read;
+  persist it under the lock. This has now been found TWICE in otherwise careful
+  code — WO-01's crash repair (under a shared read lock) and WO-03's
+  `load_or_adopt` (called by the watchdog with no lock at all) — so treat any
+  function named `load_or_*`, `get_or_create` or `ensure_*` as suspect: ask who
+  calls it, and whether each of them holds the lock.
+- **A state that REJECTS its own tick needs a retry path.** A terminal state
+  whose cleanup effect can fail is never revisited by the normal event loop —
+  the machine refuses the event. WO-03's half-finished `Reap` waited for a
+  host restart. Give the machine a `pending_cleanup()`-style list of what is
+  safe to re-issue on every tick, and keep it SEPARATE from boot recovery,
+  which usually also restarts things.
 - **Anything skipped or failed gets its own bucket in the summary.** A report
   of `migrated = 19` reads as healthy whether or not a twentieth was dropped.
 
@@ -150,7 +162,7 @@ Done / Partially done / Blocked
 |---|---|---|---|
 | 01 | Instance-keyed storage + content-addressed artifacts | — | **done**, reviewed 2026-09-19 — see its "Review" section |
 | 02 | Namespaces: a token resolves to a principal | 01 | **done**, reviewed 2026-09-19 — no defects; `/replicate` settled as `Attempt::TailIndexer`. Needs `/security-review` before mainnet |
-| 03 | Instance lifecycle wired — a persisted `LifecycleRecord` per instance; `LifecycleManager` replaces `auto_resume` and drives the watchdog; operator stop/start/pin/evict. Fixes an operator's stop being undone by a restart, by the watchdog, and by an upload. (Stays on the storage facade — host slots are still keyed by module id until two instances can exist.) | 02 | **implemented**, awaiting review — see its "Implemented" section |
+| 03 | Instance lifecycle wired — a persisted `LifecycleRecord` per instance; `LifecycleManager` replaces `auto_resume` and drives the watchdog; operator stop/start/pin/evict. Fixes an operator's stop being undone by a restart, by the watchdog, and by an upload. (Stays on the storage facade — host slots are still keyed by module id until two instances can exist.) | 02 | **done**, reviewed 2026-09-19 — 3 review fixes (a `Reap` that never retried; an unlocked read that could write; a loud diagnostic for under-counted adoption) |
 | 04 | Manifest v3 fields — `revision`, `state_schema`, `[[upgrade]]`; `mitos-build` emits them and the `ModuleRef` const | — (parallel) | not written |
 | 05 | `ModuleRef` on subscribe + persisted client rows + pull-by-digest into the CAS (`client_move` up to `Queued`) | 03, 04 | not written |
 | 06 | The move itself — staging, catch-up, quiesce, commit, scoped refill (needs a CLIENT-SCOPED recapture; see WO-02 on why it is whole-module today) | 05 | not written |

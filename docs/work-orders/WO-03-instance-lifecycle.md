@@ -85,6 +85,68 @@ on a stale attached set. That is what the order asks for ("`evict`:
 evaluated against the disk rather than against what the record said a moment
 earlier.
 
+## Review — 2026-09-19
+
+Implemented in `346fc54`. Acceptance re-run independently and it matches the
+report: `mitos-platform` 204, `mitos-core` 28, `mitos-lifecycle` 70, the four
+integration files unmodified, clippy `--workspace --all-targets -D warnings` 0,
+`cargo check --workspace --all-targets` 0. No test ignored or weakened.
+
+**The two judgement calls, as asked.**
+
+- *Deviation 1 — flat migration inside `manager.boot()`.* **Accepted, and
+  better than the order.** "Adoption never sees flat files" is now structural
+  rather than a call order somebody has to preserve in `bundle.rs`.
+- *Deviation 5 — `Reap` does not remove the directory if `evict_module`
+  failed.* **Accepted; the reasoning is right** — unlinking files under open
+  redb handles is how a follower ends up writing to an inode nothing can
+  reach. But the report's next sentence is WRONG: "the next tick retries the
+  whole effect" does not happen. `Tick` on a reaped instance is
+  `Rejected::Reaped`, `tick()` swallows `Rejected`, so a half-reaped module sat
+  there — listed, dialled and counted — until the next host restart. See
+  fix 1. The decision was sound; the claim about its consequence was not
+  checked, which is the same lesson as the README's "verify every *this is
+  safe* sentence".
+
+The question about `reconcile` before the evict check: intended, and right.
+The check should be against what is TRUE, not what the record said a minute
+ago; a stale attached set would 409 an evict that is perfectly safe.
+
+Deviations 2, 3, 4 and 6 accepted. `LifecycleEffectFailed` as its own
+`EventKind` is correct — a failed effect is not an alert.
+
+**Fixed in review** (uncommitted on top of `346fc54`):
+
+1. *A `Reap` that could not finish was never retried.* New pure function
+   `Instance::pending_cleanup()` — `[Reap]` for `Reaped`, empty for every
+   other phase — and `tick()` re-issues it. Deliberately NOT `recover()`, which
+   also returns `StartFollower`: re-issuing that every minute would restart
+   every healthy follower. Liveness stays the watchdog's job. Test
+   `a_reap_that_could_not_finish_is_retried_on_the_next_tick`
+   (mutation-checked), plus `FakeHost::fail_evict` / `heal_evict`.
+2. *An unlocked read could WRITE the record.* `expects_follower` and
+   `instance` called `load_or_adopt`, which persists an adoption — and the
+   watchdog and the admin read surfaces do not hold the module lock. Every
+   other write is a read-modify-write under that lock, so an unlocked adoption
+   landing after a locked `apply` would overwrite the transition it had just
+   persisted, silently discarding e.g. an operator's stop. Now `peek()` derives
+   the adoption without writing, `load_or_adopt` is private and documented as
+   lock-only. Test `reading_the_lifecycle_never_writes_it`. **This is WO-01's
+   "a read lock must never write" again, in a new file** — the README rule
+   now says so in general terms.
+3. *A failed flat-file migration could still under-count clients.* The boot
+   path warns and adopts anyway, and what adoption concludes is sticky. I
+   first made adoption REFUSE while flat files remain, then found the
+   migration deliberately leaves an undecodable record "in place" for ever —
+   so a module with one corrupt legacy file could never have started, a far
+   worse failure than the one being guarded. It is a loud diagnostic instead:
+   `has_flat_companions` + a `LifecycleEffectFailed { effect: "adopt" }` on the
+   event ring at the moment such an adoption is written.
+
+**Found but not fixed — agreed with all three.** `auto_resume` should go once
+`tests/lifecycle_v2.rs` moves to the manager (WO-08). The `cancelled_companions`
+granularity change is real; `mitos-admin`'s evict output will differ.
+
 ## Why
 
 v2 has no notion of what an operator WANTS. `DELETE /_admin/modules/{id}` only
