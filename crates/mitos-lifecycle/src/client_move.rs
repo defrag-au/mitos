@@ -328,6 +328,25 @@ impl ClientRow {
         }
     }
 
+    /// The row for a client that is ALREADY being served by `placement` but
+    /// has never announced anything — every client there is, the day a host
+    /// first understands announcements.
+    ///
+    /// Starting such a client at `current: None` would be a lie with
+    /// consequences: the machine treats `None` as a FIRST subscribe, which
+    /// skips catch-up, the pause and the drain and simply attaches — so the
+    /// client's first announcement would switch it to the new instance with
+    /// no hand-off at all, dropping whatever the old one still owed it. It is
+    /// on an instance, so the row says so.
+    pub fn adopt(client: ClientKey, module: ModuleId, placement: Placement) -> Self {
+        Self {
+            client,
+            module,
+            current: Some(placement),
+            pending: None,
+        }
+    }
+
     pub fn step(&self, event: Event) -> Step {
         match event {
             Event::Announce {
@@ -1132,6 +1151,87 @@ mod tests {
             key("aa"),
             "still on the old one"
         );
+    }
+
+    /// An adopted client's first announcement must be a real HAND-OFF. Had the
+    /// row started at `current: None` the machine would have treated it as a
+    /// first subscribe and attached it to the new instance with no catch-up,
+    /// no pause and no drain — dropping whatever the old instance still owed.
+    #[test]
+    fn an_adopted_clients_first_announcement_is_a_hand_off_not_a_first_subscribe() {
+        let adopted = ClientRow::adopt(
+            row().client,
+            module(),
+            module_ref("aa", 0).placement(&module()),
+        );
+        let (state, effects) = run(
+            adopted,
+            vec![
+                announce("bb", 1),
+                progress("bb", ready(&[])),
+                progress("bb", Progress::SlotGranted),
+                progress("bb", Progress::InstanceReady),
+            ],
+        );
+        assert!(matches!(
+            state.pending.unwrap().stage,
+            Stage::Planned {
+                phase: Phase::CatchingUp,
+                ..
+            }
+        ));
+        assert!(
+            effects.contains(&Effect::HoldAndDiff {
+                staging: key("bb"),
+                live: key("aa"),
+            }),
+            "an adopted client must catch up against the instance it is on: {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitSwitch { .. }))
+        );
+    }
+
+    /// The row is what goes to disk, as TOML, in EVERY phase — a move can be
+    /// interrupted anywhere and `recover` reads it back.
+    #[test]
+    fn a_row_round_trips_through_toml_in_every_phase() {
+        let steps = [
+            announce("bb", 3),
+            progress("bb", ready(&[(3, UpgradeAction::Recapture)])),
+            progress("bb", Progress::SlotGranted),
+            progress("bb", Progress::InstanceReady),
+            progress("bb", Progress::CaughtUp),
+            progress(
+                "bb",
+                Progress::Quiesced {
+                    queue: ClientQueue::Pending,
+                },
+            ),
+            progress("bb", Progress::QueueDrained),
+            progress(
+                "bb",
+                Progress::Quiesced {
+                    queue: ClientQueue::Empty,
+                },
+            ),
+            progress("bb", Progress::SwitchCommitted),
+        ];
+        let mut states = vec![row(), settled("aa", 2)];
+        let mut state = settled("aa", 2);
+        for step in steps {
+            state = state.step(step).expect("accepted").next;
+            states.push(state.clone());
+        }
+        for state in states {
+            let text = toml::to_string(&state)
+                .unwrap_or_else(|e| panic!("{:?} does not serialise: {e}", state.pending));
+            let back: ClientRow = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("does not parse back: {e}\n{text}"));
+            assert_eq!(back, state, "\n{text}");
+        }
     }
 
     #[test]

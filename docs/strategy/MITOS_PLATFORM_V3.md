@@ -237,12 +237,21 @@ lifecycle journal, exposed via API/MCP, and alerts when non-empty on a
 ### D8 — Delivery is PULL by digest
 
 ```
-ModuleRef { url, wasm_sha256, manifest_sha256, revision, config: Option<bytes> }   // config ≤ 64 KiB
+AnnouncedModule { module, wasm_sha256, manifest_sha256, revision, config: Option<bytes> }   // config ≤ 64 KiB
 ```
 
-carried on `SubscribeRequest`. `mitos-build` emits `built-module.json`
-(`mitos_lifecycle::artifact::BuiltModule` — the digests, no URL); the worker
-embeds it and supplies the base URL it serves from. A cross-repo consumer
+carried on `SubscribeRequest.announced`. **There is no URL on the wire.** The
+host COMPUTES where to fetch from — `https://<client_id>/.well-known/mitos/
+<module>/<wasm>.{wasm,manifest.toml}` (`artifact::ArtifactSource`) — because
+a client id already IS the worker's public hostname. And it does so only for
+a client the OPERATOR named in a namespace's `clients` list
+(`Registry::may_announce`): under legacy/open mode a client id is whatever
+the caller typed, so the host would be fetching from a hostname of the
+caller's choosing. Together those leave no SSRF surface to police — no
+allowlist, no redirect rules beyond "none", no IP-literal parsing on a
+caller-supplied string. `mitos-build` emits `built-module.json`
+(`mitos_lifecycle::artifact::BuiltModule` — the digests); the worker embeds
+it and serves the two files at `served_paths()`. A cross-repo consumer
 commits a `mitos-modules.lock`. mitos: sha in CAS → nothing; else fetch →
 verify BOTH shas → `validate_against_host` → wasmtime validate → store.
 

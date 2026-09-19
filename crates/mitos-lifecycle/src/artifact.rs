@@ -7,7 +7,9 @@
 //!   copied verbatim by `mitos-build` into the manifest, and read by the HOST.
 //!   One type for all three, so they cannot drift.
 //! - [`BuiltModule`] is emitted by `mitos-build` beside the artifact. A worker
-//!   embeds it and turns it into the [`ModuleRef`] it announces on subscribe.
+//!   embeds it, ANNOUNCES its digests on subscribe, and serves the two files at
+//!   [`BuiltModule::served_paths`]. The host turns the announcement into a
+//!   [`ModuleRef`] — deriving the URL itself, see [`ArtifactSource`].
 //!
 //! # Why `[lifecycle]` is ONE table
 //!
@@ -23,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::client_move::ModuleRef;
-use crate::ids::{ModuleId, Revision, Sha256Hex};
+use crate::ids::{ClientId, ModuleId, Revision, Sha256Hex};
 use crate::state_prep::StateSchema;
 use crate::upgrade::{self, LedgerError, UpgradeEntry};
 
@@ -87,8 +89,8 @@ impl LifecycleSection {
 
 /// What `mitos-build` writes beside an artifact, as `built-module.json`.
 ///
-/// It has no URL: the builder does not know where the worker will serve the
-/// artifact from. The worker supplies that — see [`BuiltModule::module_ref`].
+/// It has no URL, and neither does the announcement: the host derives where to
+/// fetch from out of the client's authenticated identity — [`ArtifactSource`].
 ///
 /// `manifest` is here because the MANIFEST must be pinned too. The wasm's sha
 /// pins the code, but the manifest carries the `[[lifecycle.upgrade]]` actions
@@ -106,39 +108,111 @@ pub struct BuiltModule {
 }
 
 impl BuiltModule {
-    /// The pointer a worker announces, given the base URL it serves its own
-    /// artifacts from. Layout mirrors the host's CAS: the wasm and its
-    /// manifest sit side by side, named by the wasm's sha.
-    ///
-    /// ```text
-    /// <base>/.well-known/mitos/<module>/<wasm-sha>.wasm
-    /// <base>/.well-known/mitos/<module>/<wasm-sha>.manifest.toml
-    /// ```
-    pub fn module_ref(&self, base_url: &str) -> ModuleRef {
-        ModuleRef {
-            url: self.artifact_url(base_url),
-            wasm: self.wasm.clone(),
-            manifest: self.manifest.clone(),
-            config: self.config.clone(),
-            revision: self.revision,
+    /// The two paths a worker must SERVE, relative to its own origin, for the
+    /// host to be able to fetch this build. Layout mirrors the host's CAS: the
+    /// wasm and its manifest side by side, named by the wasm's sha.
+    pub fn served_paths(&self) -> [String; 2] {
+        let stem = well_known_stem(&self.module, &self.wasm);
+        [format!("{stem}.wasm"), format!("{stem}.manifest.toml")]
+    }
+}
+
+fn well_known_stem(module: &ModuleId, wasm: &Sha256Hex) -> String {
+    format!("/.well-known/mitos/{module}/{wasm}")
+}
+
+/// Where the host fetches an announced artifact from.
+///
+/// **There is no URL on the wire, on purpose.** The obvious design lets a
+/// worker announce `{ url, sha }`, and then the host has to police the URL:
+/// https only, no redirects, no private address ranges, DNS rebinding. Every
+/// one of those is a check that can be got subtly wrong, in front of a box
+/// whose loopback serves an admin API and three ledgers.
+///
+/// But a client id IS the worker's public hostname (`ownership.cnft.dev`,
+/// `hooks.epochify.space`), it is AUTHENTICATED — a namespace token may only
+/// act as the clients its namespace lists — and the path is fully determined
+/// by the module and the wasm's sha. So the host can COMPUTE the URL from
+/// things it already trusts, and the question "may I fetch this URL" never
+/// arises: a caller can only ever make the host fetch a fixed path from a
+/// hostname an operator wrote into the namespace registry.
+///
+/// The cost is that a worker must serve its own artifacts. That is what D8
+/// wanted anyway (it versions the artifact atomically with the worker), and an
+/// allowlisted alternative origin can be added later without touching this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactSource {
+    pub wasm_url: String,
+    pub manifest_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SourceRefused {
+    #[error(
+        "client id `{0}` is not a hostname, so there is nowhere to fetch its artifacts from — a \
+         client that announces a module must be identified by the hostname it serves them on"
+    )]
+    ClientIsNotAHostname(ClientId),
+}
+
+impl ArtifactSource {
+    pub fn for_client(
+        client: &ClientId,
+        module: &ModuleId,
+        wasm: &Sha256Hex,
+    ) -> Result<Self, SourceRefused> {
+        if !is_hostname(client.as_str()) {
+            return Err(SourceRefused::ClientIsNotAHostname(client.clone()));
         }
+        let stem = format!("https://{client}{}", well_known_stem(module, wasm));
+        Ok(Self {
+            wasm_url: format!("{stem}.wasm"),
+            manifest_url: format!("{stem}.manifest.toml"),
+        })
     }
+}
 
-    pub fn artifact_url(&self, base_url: &str) -> String {
-        format!("{}.wasm", self.stem(base_url))
-    }
+/// A DNS hostname with at least two labels. Deliberately strict: this string
+/// is about to be interpolated into a URL, and `ClientId` alone permits `_`
+/// and a bare word. No port, no userinfo and no path can appear — `:`, `@` and
+/// `/` are not in `ClientId`'s alphabet to begin with — and an IP literal is
+/// refused by requiring an alphabetic final label.
+fn is_hostname(value: &str) -> bool {
+    let labels: Vec<&str> = value.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+        && labels
+            .last()
+            .is_some_and(|tld| tld.chars().all(|c| c.is_ascii_lowercase()))
+}
 
-    pub fn manifest_url(&self, base_url: &str) -> String {
-        format!("{}.manifest.toml", self.stem(base_url))
-    }
-
-    fn stem(&self, base_url: &str) -> String {
-        format!(
-            "{}/.well-known/mitos/{}/{}",
-            base_url.trim_end_matches('/'),
-            self.module,
-            self.wasm,
-        )
+impl ModuleRef {
+    /// The ref the host builds for a client's announcement: the digests the
+    /// worker announced, and the URL the HOST derived. See [`ArtifactSource`].
+    pub fn announced_by(
+        client: &ClientId,
+        module: &ModuleId,
+        wasm: Sha256Hex,
+        manifest: Sha256Hex,
+        config: Option<Sha256Hex>,
+        revision: Revision,
+    ) -> Result<Self, SourceRefused> {
+        let source = ArtifactSource::for_client(client, module, &wasm)?;
+        Ok(ModuleRef {
+            url: source.wasm_url,
+            wasm,
+            manifest,
+            config,
+            revision,
+        })
     }
 }
 
@@ -286,21 +360,88 @@ mod tests {
         }
     }
 
+    fn client(id: &str) -> ClientId {
+        ClientId::parse(id).unwrap()
+    }
+
+    /// The worker serves; the host computes where from. They must agree, and
+    /// neither is told a URL by the other.
     #[test]
-    fn a_worker_turns_its_built_module_into_the_ref_it_announces() {
+    fn the_host_fetches_exactly_what_the_worker_serves() {
         let b = built();
-        let wasm = "ab".repeat(32);
-        let expected =
-            format!("https://ownership.cnft.dev/.well-known/mitos/wayup-store-offer/{wasm}");
-        // A trailing slash on the base is the commonest way to get `//`.
-        for base in ["https://ownership.cnft.dev", "https://ownership.cnft.dev/"] {
-            let module_ref = b.module_ref(base);
-            assert_eq!(module_ref.url, format!("{expected}.wasm"));
-            assert_eq!(b.manifest_url(base), format!("{expected}.manifest.toml"));
-            assert_eq!(module_ref.wasm, b.wasm);
-            assert_eq!(module_ref.manifest, b.manifest);
-            assert_eq!(module_ref.config, b.config);
-            assert_eq!(module_ref.revision, Revision(5));
+        let source =
+            ArtifactSource::for_client(&client("ownership.cnft.dev"), &b.module, &b.wasm).unwrap();
+        let [wasm_path, manifest_path] = b.served_paths();
+        assert_eq!(
+            source.wasm_url,
+            format!("https://ownership.cnft.dev{wasm_path}")
+        );
+        assert_eq!(
+            source.manifest_url,
+            format!("https://ownership.cnft.dev{manifest_path}")
+        );
+        assert_eq!(
+            wasm_path,
+            format!(
+                "/.well-known/mitos/wayup-store-offer/{}.wasm",
+                "ab".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn the_ref_a_host_builds_carries_the_derived_url_and_the_announced_digests() {
+        let b = built();
+        let module_ref = ModuleRef::announced_by(
+            &client("hooks.dev.epochify.space"),
+            &b.module,
+            b.wasm.clone(),
+            b.manifest.clone(),
+            b.config.clone(),
+            b.revision,
+        )
+        .unwrap();
+        assert!(
+            module_ref
+                .url
+                .starts_with("https://hooks.dev.epochify.space/.well-known/mitos/")
+        );
+        assert_eq!(module_ref.wasm, b.wasm);
+        assert_eq!(module_ref.manifest, b.manifest);
+        assert_eq!(module_ref.config, b.config);
+        assert_eq!(module_ref.revision, Revision(5));
+    }
+
+    /// Every one of these is a VALID `ClientId` — that alphabet permits `_`, a
+    /// bare word and digits-and-dots. None may become a fetch target.
+    #[test]
+    fn only_a_real_hostname_is_ever_fetched_from() {
+        let b = built();
+        for not_a_host in [
+            "worker-prod",                          // a bare word
+            "localhost",                            // one label
+            "127.0.0.1",                            // an IP literal
+            "10.0.0.5",                             // …a private one
+            "169.254.169.254",                      // the metadata address
+            "client_a.cnft.dev",                    // `_` is not a hostname character
+            "550e8400-e29b-41d4-a716-446655440000", // a UUID client id
+            "Ownership.cnft.dev",                   // hostnames here are lowercase
+            "a..b",                                 // an empty label
+            "-bad.cnft.dev",
+        ] {
+            let id = client(not_a_host);
+            assert_eq!(
+                ArtifactSource::for_client(&id, &b.module, &b.wasm),
+                Err(SourceRefused::ClientIsNotAHostname(id)),
+                "{not_a_host} must not be fetched from"
+            );
+        }
+        for host in [
+            "ownership.cnft.dev",
+            "jpgsm.cnft.dev",
+            "hooks.epochify.space",
+        ] {
+            assert!(ArtifactSource::for_client(&client(host), &b.module, &b.wasm).is_ok());
         }
     }
 

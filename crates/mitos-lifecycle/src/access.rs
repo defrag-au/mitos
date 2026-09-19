@@ -175,6 +175,15 @@ pub enum Denied {
     WholeModuleOpFromLowerTier(Namespace),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnnounceRefused {
+    #[error(
+        "client `{0}` is not named in any namespace's `clients` list, so the host will not fetch \
+         an artifact from it"
+    )]
+    ClientNotListed(ClientId),
+}
+
 impl Registry {
     pub fn configured(
         namespaces: Vec<NamespaceDef>,
@@ -249,6 +258,31 @@ impl Registry {
             namespace: def.name.clone(),
             client: client.clone(),
         })
+    }
+
+    /// May the host FETCH an artifact on `client`'s say-so?
+    ///
+    /// The fetch goes to the client id as a hostname
+    /// ([`crate::artifact::ArtifactSource`]), so this asks one thing: did the
+    /// OPERATOR write that hostname down? Under [`ClientSet::Any`] — legacy
+    /// mode, and open mode with it — a client id is whatever the caller typed
+    /// into the request body, and the host would be fetching from a hostname
+    /// of the caller's choosing. Only a client named in a [`ClientSet::Only`]
+    /// list may announce.
+    ///
+    /// This deliberately does NOT look at the principal. Until the rollout
+    /// reaches [`OperatorTokenAsClient::Refuse`] any holder of the shared
+    /// token can act as a listed client — but all that buys is making the
+    /// host pull, from that client's OWN hostname, a build that client
+    /// genuinely serves.
+    pub fn may_announce(&self, client: &ClientId) -> Result<&NamespaceDef, AnnounceRefused> {
+        self.namespaces
+            .iter()
+            .find(|def| match &def.clients {
+                ClientSet::Only(clients) => clients.contains(client),
+                ClientSet::Any => false,
+            })
+            .ok_or_else(|| AnnounceRefused::ClientNotListed(client.clone()))
     }
 
     fn is_legacy(&self) -> bool {
@@ -380,6 +414,33 @@ mod tests {
     }
 
     const WARN: OperatorTokenAsClient = OperatorTokenAsClient::AllowWithWarning;
+
+    #[test]
+    fn only_a_client_the_operator_named_may_announce() {
+        let registry = mainnet(WARN);
+        let def = registry
+            .may_announce(&client("ownership.cnft.dev"))
+            .unwrap();
+        assert_eq!(def.name, ns("prod"));
+        assert_eq!(
+            registry.may_announce(&client("evil.example.com")),
+            Err(AnnounceRefused::ClientNotListed(client("evil.example.com")))
+        );
+    }
+
+    /// Legacy mode OWNS every client id — `namespace_of` answers for any
+    /// string the caller typed — which is exactly why it may not name a
+    /// hostname for the host to fetch from.
+    #[test]
+    fn a_legacy_registry_owns_every_client_and_lets_none_announce() {
+        let registry = Registry::legacy(ns("default"), prod());
+        let anyone = client("ownership.cnft.dev");
+        assert!(registry.namespace_of(&anyone).is_some());
+        assert_eq!(
+            registry.may_announce(&anyone),
+            Err(AnnounceRefused::ClientNotListed(anyone.clone()))
+        );
+    }
 
     /// THE property: a dev token cannot act as a prod client — not to
     /// subscribe as it, and not to rewrite its interest set.
