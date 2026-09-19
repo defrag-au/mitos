@@ -31,8 +31,11 @@
 //! rule about paths that do not hold the lock. The row is corrected by the
 //! next thing that legitimately writes it.
 
+use std::collections::BTreeMap;
+
 use crate::client_move::ClientRow;
-use crate::ids::InstanceKey;
+use crate::ids::{ClientKey, InstanceKey};
+use crate::policy::NamespaceProfile;
 
 /// Whether an instance's directory exists. The one thing about the world
 /// [`fan_out`] needs, asked lazily: it matters only for a row that names some
@@ -107,6 +110,71 @@ pub fn unclaimed(this: &InstanceKey, module_current: &InstanceKey) -> Unclaimed 
     }
 }
 
+/// One client of a module, as the host finds it: who, under which profile,
+/// and its row if it has one.
+pub struct Subscriber<'a> {
+    pub client: ClientKey,
+    pub profile: NamespaceProfile,
+    pub row: Option<&'a ClientRow>,
+}
+
+/// The clients `this` instance holds a reference for — what the host hands to
+/// [`crate::instance::Instance::reconcile`].
+///
+/// It is [`fan_out`] and nothing else, on purpose. "Whose events do I write"
+/// and "who keeps me alive" must be ONE rule: were they two, an instance
+/// could be delivering to a client that is not counted among its references,
+/// and be ejected as abandoned underneath it — or hold a reference for a
+/// client it never speaks to, and never retire.
+pub fn attached_to<'a>(
+    this: &InstanceKey,
+    module_current: &InstanceKey,
+    subscribers: impl IntoIterator<Item = Subscriber<'a>>,
+    dir_of: impl Fn(&InstanceKey) -> InstanceDir,
+) -> BTreeMap<ClientKey, NamespaceProfile> {
+    subscribers
+        .into_iter()
+        .filter_map(
+            |subscriber| match fan_out(subscriber.row, this, module_current, &dir_of) {
+                FanOut::Deliver => Some((subscriber.client, subscriber.profile)),
+                FanOut::Skip => None,
+            },
+        )
+        .collect()
+}
+
+/// When, within one drain tick, a companion's queued rows in `this`
+/// instance's store are sent.
+///
+/// One drain serves a whole MODULE and reads every instance's store — not one
+/// drain per instance, which would let two tasks POST to the same companion
+/// at once and would split the recapture wipe's "never overlaps an apply"
+/// guarantee across tasks that cannot see each other.
+///
+/// A client is written to by exactly one instance at a time, but rows it was
+/// owed by the instance it has LEFT may still be queued there. Those are
+/// older than anything its new instance has for it, so they go first — and a
+/// companion whose leftovers failed is backed off before its serving pass
+/// runs, by the retry state the drain already keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DrainPass {
+    /// Rows in the store of an instance that no longer serves this client.
+    Leftover,
+    Serving,
+}
+
+pub fn drain_pass(
+    row: Option<&ClientRow>,
+    this: &InstanceKey,
+    module_current: &InstanceKey,
+    dir_of: impl FnOnce(&InstanceKey) -> InstanceDir,
+) -> DrainPass {
+    match fan_out(row, this, module_current, dir_of) {
+        FanOut::Deliver => DrainPass::Serving,
+        FanOut::Skip => DrainPass::Leftover,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +213,66 @@ mod tests {
 
     fn never_asked(_: &InstanceKey) -> InstanceDir {
         panic!("the directory was checked for a row that did not need it")
+    }
+
+    fn named(host: &str) -> ClientKey {
+        ClientKey {
+            namespace: Namespace::parse("prod").unwrap(),
+            client: ClientId::parse(host).unwrap(),
+        }
+    }
+
+    /// The refcount twin of `exactly_one_live_instance_serves_a_client`: over
+    /// a module's live instances the attached sets PARTITION its clients. A
+    /// client in two sets keeps a retired instance alive for ever; a client in
+    /// none lets the instance serving it be ejected as abandoned.
+    #[test]
+    fn the_attached_sets_of_a_modules_instances_partition_its_clients() {
+        use crate::policy::fixtures::prod;
+
+        let live = [key("aa"), key("bb")];
+        let dir_of = |asked: &InstanceKey| {
+            if live.contains(asked) {
+                InstanceDir::Present
+            } else {
+                InstanceDir::Gone
+            }
+        };
+        let rows = [
+            (named("no-row.cnft.dev"), None),
+            (named("unplaced.cnft.dev"), Some(unplaced())),
+            (named("on-aa.cnft.dev"), Some(placed_on("aa"))),
+            (named("on-bb.cnft.dev"), Some(placed_on("bb"))),
+            (named("renamed-away.cnft.dev"), Some(placed_on("cc"))),
+        ];
+        for module_current in &live {
+            let mut seen = Vec::new();
+            for this in &live {
+                let subscribers = rows.iter().map(|(client, row)| Subscriber {
+                    client: client.clone(),
+                    profile: prod(),
+                    row: row.as_ref(),
+                });
+                seen.extend(attached_to(this, module_current, subscribers, dir_of).into_keys());
+            }
+            seen.sort();
+            let mut all: Vec<_> = rows.iter().map(|(client, _)| client.clone()).collect();
+            all.sort();
+            assert_eq!(seen, all, "with current {module_current:?}");
+        }
+    }
+
+    /// A moved client may still be owed rows by the instance it left. They
+    /// are older than anything its new instance holds, so they are sent first.
+    #[test]
+    fn what_the_old_instance_still_owes_is_sent_before_the_new_one_speaks() {
+        let (left, now_on) = (key("aa"), key("bb"));
+        let row = placed_on("bb");
+        let from_old = drain_pass(Some(&row), &left, &left, |_| InstanceDir::Present);
+        let from_new = drain_pass(Some(&row), &now_on, &left, never_asked);
+        assert_eq!(from_old, DrainPass::Leftover);
+        assert_eq!(from_new, DrainPass::Serving);
+        assert!(from_old < from_new, "passes run in their `Ord` order");
     }
 
     /// Today, in full: one instance, no rows. If this ever fails, a deploy of
