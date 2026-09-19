@@ -49,9 +49,13 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use mitos_lifecycle::access::{ClientSet, OperatorTokenAsClient};
+use mitos_lifecycle::instance::{
+    BootAction, DesiredState, Effect, Event, EvictMode, Instance, OperatorCommand, Phase, Rejected,
+};
 use mitos_lifecycle::policy::Tier;
 
 use crate::auth::{AuthMode, Authenticator};
+use crate::lifecycle::LifecycleError;
 use crate::manifest::{Manifest, ManifestError};
 use crate::storage::{ModuleStorage, StorageError};
 
@@ -109,6 +113,11 @@ struct AdminState {
     /// layers already did — but `GET /_admin/status` reports the posture
     /// (mode, namespaces, unowned clients) from it.
     auth: Arc<Authenticator>,
+    /// The instance lifecycle. Every handler that stops, starts, uploads or
+    /// retires a module goes through this rather than calling the host
+    /// directly, because the host has no idea what an operator wants.
+    /// `None` in artifact-only routers, where there is no host either.
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -128,6 +137,7 @@ pub fn admin_router(storage: ModuleStorage, auth: Arc<Authenticator>) -> axum::R
         SystemTime::now(),
         crate::events::EventRing::new(),
         auth,
+        None,
     )
 }
 
@@ -154,6 +164,7 @@ pub fn admin_router_with_host(
     started_at: SystemTime,
     events: crate::events::EventRing,
     auth: Arc<Authenticator>,
+    lifecycle: Arc<crate::lifecycle::LifecycleManager>,
 ) -> axum::Router {
     admin_router_inner(
         storage,
@@ -163,6 +174,7 @@ pub fn admin_router_with_host(
         started_at,
         events,
         auth,
+        Some(lifecycle),
     )
 }
 
@@ -175,6 +187,7 @@ fn admin_router_inner(
     started_at: SystemTime,
     events: crate::events::EventRing,
     auth: Arc<Authenticator>,
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
 ) -> axum::Router {
     let state = AdminState {
         storage,
@@ -184,6 +197,7 @@ fn admin_router_inner(
         started_at,
         events,
         auth: auth.clone(),
+        lifecycle,
     };
 
     // Recapture is its OWN sub-router because it is the one admin route a
@@ -210,6 +224,9 @@ fn admin_router_inner(
             get(get_module).post(upload_module).delete(delete_module),
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
+        .route("/_admin/modules/{id}/start", post(start_module))
+        .route("/_admin/modules/{id}/pin", post(pin_module))
+        .route("/_admin/modules/{id}/unpin", post(unpin_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
         .route("/_admin/modules/{id}/companions", get(list_companions))
         .route(
@@ -265,6 +282,11 @@ pub struct ModuleSummary {
     pub abi_version: String,
     pub trap_strategy: String,
     pub crate_version: String,
+    /// The instance lifecycle, on the READ routes (`GET /_admin/modules` and
+    /// `GET /_admin/modules/{id}`). Absent from an upload response, which
+    /// describes the artifact rather than what is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<StatusLifecycle>,
 }
 
 impl From<&Manifest> for ModuleSummary {
@@ -276,6 +298,7 @@ impl From<&Manifest> for ModuleSummary {
             abi_version: format!("{}.{}", m.abi.version_major, m.abi.version_minor),
             trap_strategy: m.trap_policy.strategy.clone(),
             crate_version: m.build.crate_version.clone(),
+            lifecycle: None,
         }
     }
 }
@@ -390,6 +413,57 @@ pub struct StatusModule {
     /// Age of the last captured trap fixture, or `None` if none.
     /// A small value means a module recently trapped.
     pub last_trap_secs_ago: Option<u64>,
+    /// The instance lifecycle. `None` only on an artifact-only router, which
+    /// has no lifecycle wired.
+    ///
+    /// Read `lifecycle.desired` against `running` to tell the two failures
+    /// apart: `Running`/`false` is an outage the watchdog is about to fix;
+    /// `Stopped`/`false` is an operator's decision and must be left alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<StatusLifecycle>,
+}
+
+/// An instance's lifecycle, as the admin API reports it. The lifecycle
+/// crate's own enums, not renderings of them — a new phase is then a compile
+/// error here rather than a string nobody updated.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusLifecycle {
+    /// What IS: `active`, `draining`, `stopped`, `staging`, `reaped`.
+    pub phase: Phase,
+    /// What is WANTED: `running`, `stopped`, `pinned`. Orthogonal to `phase`.
+    pub desired: DesiredState,
+    /// Attached clients as `namespace/client`. These are what keeps the
+    /// instance alive; when the last one leaves, WHY it left decides whether
+    /// the instance drains, stops or alerts.
+    pub attached: Vec<String>,
+    /// The tier governing this instance — the most protected of every
+    /// namespace that has EVER attached, never relaxed on detach. `None`
+    /// before any client has attached.
+    pub governing_tier: Option<Tier>,
+}
+
+impl From<&Instance> for StatusLifecycle {
+    fn from(instance: &Instance) -> Self {
+        Self {
+            phase: instance.phase,
+            desired: instance.desired,
+            attached: crate::lifecycle::attached_labels(instance),
+            governing_tier: instance.governing.map(|p| p.tier),
+        }
+    }
+}
+
+/// Best-effort: a read surface must not 500 because one module's record is
+/// unreadable, and the operator has `/_admin/events` for the reason.
+fn lifecycle_of(state: &AdminState, id: &str) -> Option<StatusLifecycle> {
+    let instance = state.lifecycle.as_ref()?.instance(id);
+    match instance {
+        Ok(instance) => instance.as_ref().map(StatusLifecycle::from),
+        Err(e) => {
+            tracing::warn!(module = %id, error = %e, "status: lifecycle unreadable");
+            None
+        }
+    }
 }
 
 /// Serialized view of a module's last rebootstrap result.
@@ -562,6 +636,24 @@ enum HandlerError {
     /// `recapture_failed` event from the detached recapture task.
     #[error("module `{0}` not registered")]
     ModuleNotFound(String),
+
+    /// The instance lifecycle refused the operator's command. A legitimate
+    /// state, not a malformed request — `StillAttached` is the evict
+    /// safety check, and `Reaped` is a module that is already gone.
+    #[error("{0}")]
+    Lifecycle(#[from] crate::lifecycle::LifecycleError),
+
+    /// An operator command on a router with no lifecycle wired (artifact-only
+    /// deployments and the inspector). Same posture as `RecaptureUnavailable`.
+    #[error("lifecycle unavailable: no host wired in this admin router")]
+    LifecycleUnavailable,
+
+    /// An operation that would START a follower, on an instance that is not
+    /// supposed to be running. Recapture is the one that does: it wipes the
+    /// bootstrap flags and restarts the module, so allowing it here would be
+    /// a fourth way an operator's stop gets undone.
+    #[error("module `{0}` is not running; start it first (POST …/start)")]
+    NotRunnable(String),
 }
 
 impl HandlerError {
@@ -589,6 +681,11 @@ impl HandlerError {
             Self::RecaptureInProgress(_) => "recapture_in_progress",
             Self::RecaptureUnavailable(_) => "recapture_unavailable",
             Self::ModuleNotFound(_) => "not_found",
+            Self::Lifecycle(LifecycleError::NotRegistered(_)) => "not_found",
+            Self::Lifecycle(LifecycleError::Rejected(_)) => "lifecycle_rejected",
+            Self::Lifecycle(LifecycleError::Storage(_)) => "storage_io",
+            Self::LifecycleUnavailable => "lifecycle_unavailable",
+            Self::NotRunnable(_) => "not_runnable",
         }
     }
 
@@ -602,6 +699,13 @@ impl HandlerError {
             Self::RecaptureUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::RecaptureCompanionUnknown(_) => StatusCode::NOT_FOUND,
             Self::ModuleNotFound(_) => StatusCode::NOT_FOUND,
+            // A refusal is a state, not a bad request: `StillAttached` is the
+            // evict safety check an operator overrides with `?force=true`.
+            Self::Lifecycle(LifecycleError::Rejected(_)) => StatusCode::CONFLICT,
+            Self::Lifecycle(LifecycleError::NotRegistered(_)) => StatusCode::NOT_FOUND,
+            Self::Lifecycle(LifecycleError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::LifecycleUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NotRunnable(_) => StatusCode::CONFLICT,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -881,6 +985,7 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
             bootstrap_in_progress: bootstrapping.contains(&id),
             last_result,
             last_trap_secs_ago,
+            lifecycle: lifecycle_of(&state, &id),
         });
     }
 
@@ -1500,7 +1605,9 @@ async fn list_modules(
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(m) = state.storage.read_manifest(&id)? {
-            out.push((&m).into());
+            let mut summary = ModuleSummary::from(&m);
+            summary.lifecycle = lifecycle_of(&state, &id);
+            out.push(summary);
         }
     }
     Ok(Json(out))
@@ -1511,7 +1618,11 @@ async fn get_module(
     Path(id): Path<String>,
 ) -> Result<Response, HandlerError> {
     match state.storage.read_manifest(&id)? {
-        Some(m) => Ok(Json(ModuleSummary::from(&m)).into_response()),
+        Some(m) => {
+            let mut summary = ModuleSummary::from(&m);
+            summary.lifecycle = lifecycle_of(&state, &id);
+            Ok(Json(summary).into_response())
+        }
         None => Ok((StatusCode::NOT_FOUND, "module not registered").into_response()),
     }
 }
@@ -1593,32 +1704,43 @@ async fn upload_module(
     // accepts the component. Cheap, catches tampered manifests.
     validate_with_wasmtime(&wasm_bytes)?;
 
-    // Write artifact + manifest + symlink atomically.
-    state.storage.activate(&manifest, &wasm_bytes)?;
-
-    // If config was supplied, write it alongside. Atomic via
-    // write-then-rename. Absence is meaningful — the host
-    // distinguishes "no config" (call `init(&[])`) from "empty
-    // CBOR config" (call `init(b'')`).
-    if let Some(cfg) = config_bytes.as_ref() {
-        state.storage.write_config(&id, cfg)?;
-    }
-
-    tracing::info!(
-        module = %manifest.module.id,
-        sha = %manifest.module.sha256,
-        size = manifest.module.size_bytes,
-        "module uploaded + activated",
-    );
-
-    // If a host is wired in, start (or replace) the running
-    // instance so the new sha actually takes effect. In
-    // artifact-only mode (test harness, read-only deployments)
-    // skip this step — the artifact is on disk, that's all.
-    if let Some(host) = &state.host {
-        host.replace(&id)
-            .await
-            .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    // Activate, then start ONLY IF the instance expects a follower.
+    //
+    // v2 called `host.replace` unconditionally here, which was the third way
+    // an operator's stop got undone — deploy a new sha and a module somebody
+    // had deliberately stopped came back. The artifact still lands on disk
+    // either way; what the lifecycle decides is whether it RUNS.
+    //
+    // Config absence is meaningful — the host distinguishes "no config"
+    // (`init(&[])`) from "empty CBOR config" (`init(b'')`) — so it is only
+    // written when the field was present.
+    match state.lifecycle.as_ref() {
+        Some(lifecycle) => {
+            let action = lifecycle
+                .upload(&manifest, &wasm_bytes, config_bytes.as_deref())
+                .await?;
+            tracing::info!(
+                module = %manifest.module.id,
+                sha = %manifest.module.sha256,
+                size = manifest.module.size_bytes,
+                ?action,
+                "module uploaded + activated",
+            );
+        }
+        // Artifact-only mode (test harness, read-only deployments): the
+        // artifact is on disk, and there is no follower to start.
+        None => {
+            state.storage.activate(&manifest, &wasm_bytes)?;
+            if let Some(cfg) = config_bytes.as_ref() {
+                state.storage.write_config(&id, cfg)?;
+            }
+            tracing::info!(
+                module = %manifest.module.id,
+                sha = %manifest.module.sha256,
+                size = manifest.module.size_bytes,
+                "module uploaded + activated (artifact-only)",
+            );
+        }
     }
 
     Ok(Json(UploadResponse {
@@ -1634,18 +1756,67 @@ async fn delete_module(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    if let Some(host) = &state.host {
-        host.stop(&id)
-            .await
-            .map_err(|e| HandlerError::Wasmtime(format!("host.stop: {e}")))?;
-    }
-    // V1.5 doesn't yet remove the artifact directory — that's a
-    // safer default while we still don't have rollback CLI
-    // surface; operators can `rm -rf` if they really want it
-    // gone. The lifecycle effect (stop + drop slot) is what
-    // matters for "delete."
+    // `Operator(Stop)` rather than `host.stop`. The difference is that the
+    // intent is PERSISTED, so the next restart, the watchdog and the next
+    // upload all leave it alone — in v2 each of those undid this within a
+    // tick, a deploy, or a reboot.
+    operator(&state, &id, OperatorCommand::Stop).await?;
+    // The artifact directory stays: a stop is not a retirement, and rollback
+    // wants the state. `POST …/evict` is the destructive one.
     tracing::info!(module = %id, "module stopped via DELETE");
     Ok((StatusCode::NO_CONTENT, ()).into_response())
+}
+
+/// Feed one operator command to the lifecycle and return its effects.
+async fn operator(
+    state: &AdminState,
+    id: &str,
+    command: OperatorCommand,
+) -> Result<Vec<Effect>, HandlerError> {
+    let lifecycle = state
+        .lifecycle
+        .as_ref()
+        .ok_or(HandlerError::LifecycleUnavailable)?;
+    Ok(lifecycle.apply(id, Event::Operator(command)).await?)
+}
+
+/// `POST /_admin/modules/{id}/start` — undo a stop. Also un-pins, so a
+/// started instance with no clients drains like any other.
+async fn start_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+    operator(&state, &id, OperatorCommand::Start).await?;
+    Ok((StatusCode::OK, "started").into_response())
+}
+
+/// `POST /_admin/modules/{id}/pin` — "run this with no subscribers, and
+/// neither alert nor eject." For a module whose consumers are coming.
+async fn pin_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+    operator(&state, &id, OperatorCommand::Pin).await?;
+    Ok((StatusCode::OK, "pinned").into_response())
+}
+
+/// `POST /_admin/modules/{id}/unpin` — hand it back to its clients. With
+/// none attached it starts draining under its governing policy.
+async fn unpin_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+    operator(&state, &id, OperatorCommand::Unpin).await?;
+    Ok((StatusCode::OK, "unpinned").into_response())
 }
 
 /// Query params for `POST /_admin/modules/{id}/evict`.
@@ -1693,104 +1864,59 @@ async fn evict_module(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let Some(host) = &state.host else {
-        return Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no host wired in this admin router",
-        )
-            .into_response());
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        return Err(HandlerError::LifecycleUnavailable);
     };
 
-    // Safety check: refuse if any companion record exists for
-    // this module, unless the operator passed `?force=true`. The
-    // expectation is consumer-side cleanup retires its companion
-    // record first (via the consumer's own admin surface) so
-    // there's nothing to enumerate by the time evict runs.
-    //
-    // Companions live under the two-level layout
-    // `<storage>/<id>/companions/<client_id>/<companion_key>.cbor`
-    // (see `docs/design/MULTI_CLIENT_COMPANIONS.md`). The reported
-    // identifiers are `client_id:companion_key` so an operator can
-    // distinguish two consumers that share a key.
-    if !query.force {
-        let companions_dir = state.storage.module_dir_for_companions(&id);
-        if companions_dir.exists() {
-            let mut entries: Vec<String> = Vec::new();
-            let read_dir = std::fs::read_dir(&companions_dir).map_err(|e| {
-                HandlerError::Storage(StorageError::Io(std::io::Error::other(format!(
-                    "read companions dir {}: {e}",
-                    companions_dir.display()
-                ))))
-            })?;
-            for client_entry in read_dir.flatten() {
-                let file_type = match client_entry.file_type() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let client_id = match client_entry.file_name().to_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                // Skip the `.unreachable/` quarantine dir.
-                if client_id.starts_with('.') {
-                    continue;
-                }
-                let client_dir = client_entry.path();
-                let inner = match std::fs::read_dir(&client_dir) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                for inner_entry in inner.flatten() {
-                    if let Some(key) = inner_entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|s| s.strip_suffix(".cbor"))
-                    {
-                        entries.push(format!("{client_id}:{key}"));
-                    }
-                }
-            }
-            if !entries.is_empty() {
-                return Ok((
-                    StatusCode::CONFLICT,
-                    Json(EvictConflictBody {
-                        error: "companions still registered",
-                        companion_keys: entries,
-                        hint: "retire consumers + remove their companion records, or pass ?force=true to override",
-                    }),
-                )
-                    .into_response());
-            }
+    // Reconcile FIRST, so the safety check below is asked of an attached set
+    // that matches the disk. Without this, a client whose registration was
+    // removed while the host was down would still be counted as attached and
+    // an evict would 409 on a module nobody is using.
+    lifecycle.reconcile(&id).await?;
+
+    let mode = if query.force {
+        EvictMode::Force
+    } else {
+        EvictMode::RefuseIfAttached
+    };
+
+    // The lifecycle owns the safety check now: `Rejected::StillAttached` IS
+    // "companions still registered", asked of the attached set rather than a
+    // directory walk. Keeping both would mean two answers to one question.
+    let attached = lifecycle
+        .instance(&id)?
+        .map(|i| crate::lifecycle::attached_labels(&i))
+        .unwrap_or_default();
+    match lifecycle
+        .apply(&id, Event::Operator(OperatorCommand::Evict(mode)))
+        .await
+    {
+        Ok(_) => {}
+        Err(LifecycleError::Rejected(Rejected::StillAttached(_))) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(EvictConflictBody {
+                    error: "clients still attached",
+                    companion_keys: attached,
+                    hint: "retire consumers + remove their companion records, or pass ?force=true to override",
+                }),
+            )
+                .into_response());
         }
+        Err(e) => return Err(e.into()),
     }
 
-    // Drive the host-side retirement: stop slot, drop dialer
-    // state, close DB handles. Returns the companion keys we
-    // just cancelled (could be non-empty under `?force=true`).
-    let cancelled_companions = host
-        .evict_module(&id)
-        .await
-        .map_err(|e| HandlerError::Wasmtime(format!("host.evict_module: {e}")))?;
-
-    if query.force && !cancelled_companions.is_empty() {
+    if query.force && !attached.is_empty() {
         tracing::warn!(
             module = %id,
-            companions = ?cancelled_companions,
-            "evict --force reaped in-memory companions despite registered records",
+            clients = ?attached,
+            "evict --force retired an instance with clients still attached",
         );
     }
 
-    // Filesystem step — caller's surface; storage knows the
-    // paths. Idempotent on missing dir (already-half-retired
-    // module).
-    state.storage.remove_module_dir(&id)?;
-
     tracing::info!(
         module = %id,
-        cancelled = cancelled_companions.len(),
+        attached = attached.len(),
         force = query.force,
         "module evicted (slot stopped, dialer state cleared, artifact removed)",
     );
@@ -1798,7 +1924,7 @@ async fn evict_module(
         StatusCode::OK,
         Json(EvictResponse {
             module: id,
-            cancelled_companions,
+            cancelled_companions: attached,
             artifact_removed: true,
         }),
     )
@@ -1864,6 +1990,18 @@ async fn delete_companion(
         ))))
     })?;
 
+    // The client's LAST record being gone is a detach. Best-effort: the 60s
+    // tick reconciles again, and `reconcile` is a diff so nothing is lost.
+    if let Some(lifecycle) = state.lifecycle.as_ref()
+        && let Err(e) = lifecycle.reconcile(&id).await
+    {
+        tracing::warn!(
+            module = %id,
+            error = %e,
+            "lifecycle reconcile after delete-companion failed; the next tick retries",
+        );
+    }
+
     tracing::info!(
         module = %id,
         client_id = %client_id,
@@ -1894,9 +2032,17 @@ async fn restart_module(
         )
             .into_response());
     };
-    host.replace(&id)
-        .await
-        .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    // `Operator(Start)` first, because restart on a STOPPED module must mean
+    // "start it", and that has to change the persisted intent or the watchdog
+    // would stop it again. If the instance was already running, `Start`
+    // produces no `StartFollower` — and then a restart means what it always
+    // meant: cycle the follower in place.
+    let effects = operator(&state, &id, OperatorCommand::Start).await?;
+    if !effects.contains(&Effect::StartFollower) {
+        host.replace(&id)
+            .await
+            .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    }
     tracing::info!(module = %id, "module restarted");
     Ok((StatusCode::OK, "restarted").into_response())
 }
@@ -1957,6 +2103,16 @@ async fn recapture_module(
             "no host wired in this admin router".to_owned(),
         ));
     };
+
+    // A recapture on an instance that is not supposed to be running would
+    // START it — recapture's whole job is to wipe the bootstrap flags and
+    // restart. That is a fourth way an operator's stop gets undone, so it is
+    // a 409 instead.
+    if let Some(lifecycle) = state.lifecycle.as_ref()
+        && lifecycle.expects_follower(&id)? == BootAction::LeaveStopped
+    {
+        return Err(HandlerError::NotRunnable(id));
+    }
 
     // `companion=<key>` — scoped resync, not the coordinated
     // module-wide rebuild. Resolve the companion's persisted
@@ -2609,6 +2765,9 @@ mod tests {
         (Method::POST, "/_admin/modules/m"),
         (Method::DELETE, "/_admin/modules/m"),
         (Method::POST, "/_admin/modules/m/restart"),
+        (Method::POST, "/_admin/modules/m/start"),
+        (Method::POST, "/_admin/modules/m/pin"),
+        (Method::POST, "/_admin/modules/m/unpin"),
         (Method::POST, "/_admin/modules/m/evict"),
         (Method::DELETE, "/_admin/modules/m/companions/c/k"),
         (Method::DELETE, "/_admin/modules/m/emissions"),
@@ -2742,6 +2901,224 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    /// A router with a FAKE host and a real lifecycle over `dir`, plus the
+    /// pieces a companion router needs to share the same manager.
+    struct Wired {
+        router: axum::Router,
+        storage: ModuleStorage,
+        host: crate::host_v2::testing::FakeHost,
+        lifecycle: Arc<crate::lifecycle::LifecycleManager>,
+        events: crate::events::EventRing,
+        auth: Arc<Authenticator>,
+    }
+
+    fn wired(dir: &std::path::Path) -> Wired {
+        let storage = ModuleStorage::new(dir);
+        let host = crate::host_v2::testing::FakeHost::new();
+        let handle: Arc<dyn crate::host_v2::ModuleHostHandle> = Arc::new(host.clone());
+        let auth = Arc::new(configured_authenticator(
+            OperatorTokenAsClient::AllowWithWarning,
+        ));
+        let events = crate::events::EventRing::new();
+        let lifecycle = Arc::new(crate::lifecycle::LifecycleManager::new(
+            storage.clone(),
+            handle.clone(),
+            auth.clone(),
+            events.clone(),
+            crate::lifecycle::system_clock(),
+        ));
+        let router = admin_router_with_host(
+            storage.clone(),
+            handle,
+            Vec::new(),
+            None,
+            SystemTime::now(),
+            events.clone(),
+            auth.clone(),
+            lifecycle.clone(),
+        );
+        Wired {
+            router,
+            storage,
+            host,
+            lifecycle,
+            events,
+            auth,
+        }
+    }
+
+    /// `POST …/evict` with the lifecycle wired: the safety check is now the
+    /// attached set, not a directory walk.
+    #[tokio::test]
+    async fn evict_refuses_while_attached_and_force_overrides() {
+        let dir = tempdir("evict-attached");
+        let w = wired(&dir);
+        let wasm = b"evict test wasm";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        crate::lifecycle::testing::write_registration(
+            &w.storage,
+            "m",
+            crate::auth::testing::PROD_CLIENT,
+            "policy_a",
+        );
+        w.lifecycle.boot().await;
+
+        assert_eq!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/evict",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
+        assert!(!w.host.evicted("m"));
+
+        assert_eq!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/evict?force=true",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert!(w.host.evicted("m"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Recapture wipes the bootstrap flags and RESTARTS the module, so on a
+    /// stopped instance it would be a fourth way an operator's stop gets
+    /// undone.
+    #[tokio::test]
+    async fn recapture_on_a_stopped_module_is_409() {
+        let dir = tempdir("recapture-stopped");
+        let w = wired(&dir);
+        let wasm = b"recapture stopped wasm";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        w.lifecycle.boot().await;
+
+        // Running: it gets past the lifecycle guard.
+        assert_ne!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
+
+        assert_eq!(
+            call(&w.router, Method::DELETE, "/_admin/modules/m", Some(FULL)).await,
+            StatusCode::NO_CONTENT,
+        );
+        assert_eq!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Subscribe → attached; the last companion record deleted → detached.
+    /// Through the REAL routers, sharing one manager, because the hooks that
+    /// call `reconcile` live in the handlers.
+    #[tokio::test]
+    async fn a_subscribe_attaches_and_the_last_delete_detaches() {
+        use crate::auth::testing::{PROD, PROD_CLIENT};
+
+        let dir = tempdir("attach-detach");
+        let w = wired(&dir);
+        let wasm = b"attach detach wasm";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        w.lifecycle.boot().await;
+        assert!(
+            w.lifecycle
+                .instance("m")
+                .unwrap()
+                .unwrap()
+                .attached
+                .is_empty(),
+            "nothing is attached before anyone subscribes",
+        );
+
+        let companions = crate::companions::companion_router(
+            w.storage.clone(),
+            w.auth.clone(),
+            None,
+            None,
+            w.events.clone(),
+            Some(w.lifecycle.clone()),
+        );
+        let request = mitos_protocol::SubscribeRequest {
+            targets: vec![mitos_protocol::SubscribeTarget::Module { name: "m".into() }],
+            companion_key: "policy_a".into(),
+            client_id: PROD_CLIENT.into(),
+            resume_from: None,
+            interests: vec![],
+            dial_back: None,
+        };
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&request, &mut body).unwrap();
+        let response = companions
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/subscribe")
+                    .header("content-type", "application/cbor")
+                    .header(header::AUTHORIZATION, format!("Bearer {PROD}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let attached =
+            crate::lifecycle::attached_labels(&w.lifecycle.instance("m").unwrap().unwrap());
+        assert_eq!(attached, vec!["prod/ownership.cnft.dev"]);
+
+        // …and the admin delete of that client's last record detaches it.
+        assert_eq!(
+            call(
+                &w.router,
+                Method::DELETE,
+                &format!("/_admin/modules/m/companions/{PROD_CLIENT}/policy_a"),
+                Some(FULL),
+            )
+            .await,
+            StatusCode::NO_CONTENT,
+        );
+        assert!(
+            w.lifecycle
+                .instance("m")
+                .unwrap()
+                .unwrap()
+                .attached
+                .is_empty(),
+            "deleting the last companion record did not detach the client",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

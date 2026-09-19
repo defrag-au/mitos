@@ -1215,6 +1215,179 @@ pub struct RecaptureOutcome {
     pub events_emitted: u64,
 }
 
+/// A recording [`ModuleHostHandle`] for tests that exercise the lifecycle
+/// without a wasmtime engine or a data plane.
+///
+/// ONE fake, shared by every test module that needs one. `ModuleHostV2` is the
+/// trait's only real implementor and it needs an engine and a chain, so
+/// before this the watchdog and the admin evict path had no test coverage at
+/// all. Three copies of a fake is three chances for one of them to quietly
+/// stop matching the trait.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// One recorded call. The lifecycle's whole job is deciding WHICH of
+    /// these happen and when, so the assertions are almost always "was this
+    /// module's follower touched, and how".
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum HostCall {
+        Replace(String),
+        Stop(String),
+        Evict(String),
+    }
+
+    #[derive(Default)]
+    struct Inner {
+        calls: Vec<HostCall>,
+        running: HashSet<String>,
+        /// Modules whose `replace` fails — an effect that fails must not roll
+        /// the lifecycle record back.
+        fail_replace: HashSet<String>,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct FakeHost(Arc<StdMutex<Inner>>);
+
+    impl FakeHost {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(crate) fn calls(&self) -> Vec<HostCall> {
+            self.0.lock().expect("fake host mutex").calls.clone()
+        }
+
+        /// True when `replace` was called for `module` at any point.
+        pub(crate) fn started(&self, module: &str) -> bool {
+            self.calls()
+                .iter()
+                .any(|c| c == &HostCall::Replace(module.to_owned()))
+        }
+
+        pub(crate) fn stopped(&self, module: &str) -> bool {
+            self.calls()
+                .iter()
+                .any(|c| c == &HostCall::Stop(module.to_owned()))
+        }
+
+        pub(crate) fn evicted(&self, module: &str) -> bool {
+            self.calls()
+                .iter()
+                .any(|c| c == &HostCall::Evict(module.to_owned()))
+        }
+
+        pub(crate) fn clear(&self) {
+            self.0.lock().expect("fake host mutex").calls.clear();
+        }
+
+        /// Make `replace` fail for `module`, as a crash-looping follower does.
+        pub(crate) fn fail_replace(&self, module: &str) {
+            self.0
+                .lock()
+                .expect("fake host mutex")
+                .fail_replace
+                .insert(module.to_owned());
+        }
+
+        /// The follower task exited on its own — no `stop` call, it is just
+        /// gone. This is the class the watchdog exists to close: a dispatch
+        /// error killing the task, or a cancelled `start` inside a recapture
+        /// leaving the slot empty (the 2026-06 holder-distribution outage).
+        pub(crate) fn follower_died(&self, module: &str) {
+            self.0
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .remove(module);
+        }
+
+        fn record(&self, call: HostCall) {
+            self.0.lock().expect("fake host mutex").calls.push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModuleHostHandle for FakeHost {
+        async fn replace(&self, id: &str) -> PlatformResult<()> {
+            self.record(HostCall::Replace(id.to_owned()));
+            let mut inner = self.0.lock().expect("fake host mutex");
+            if inner.fail_replace.contains(id) {
+                return Err(PlatformError::Decode(format!("fake replace failure: {id}")));
+            }
+            inner.running.insert(id.to_owned());
+            Ok(())
+        }
+
+        async fn stop(&self, id: &str) -> PlatformResult<()> {
+            self.record(HostCall::Stop(id.to_owned()));
+            self.0.lock().expect("fake host mutex").running.remove(id);
+            Ok(())
+        }
+
+        async fn stop_all(&self) {}
+
+        async fn list_running(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .iter()
+                .cloned()
+                .collect()
+        }
+
+        async fn recapture_module(
+            &self,
+            id: &str,
+            _reason: Option<String>,
+            _companion_timeout: Duration,
+        ) -> PlatformResult<RecaptureOutcome> {
+            Ok(RecaptureOutcome {
+                module: id.to_owned(),
+                companion_count: 0,
+                events_emitted: 0,
+            })
+        }
+
+        async fn route_interest(
+            &self,
+            _module_id: &str,
+            _op: mitos_protocol::InterestOp,
+            _items: Vec<mitos_protocol::Interest>,
+        ) -> Result<(), InterestRouteError> {
+            Ok(())
+        }
+
+        async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
+            self.record(HostCall::Evict(id.to_owned()));
+            self.0.lock().expect("fake host mutex").running.remove(id);
+            Ok(Vec::new())
+        }
+
+        async fn cancel_companion_task(
+            &self,
+            _module_id: &str,
+            _client_id: &str,
+            _companion_key: &str,
+        ) {
+        }
+
+        async fn recapture_in_flight(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn bootstrap_in_flight(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn last_results(&self) -> Vec<(String, LastResult)> {
+            Vec::new()
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<S, P> ModuleHostHandle for ModuleHostV2<S, P>
 where

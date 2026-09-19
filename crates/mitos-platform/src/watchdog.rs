@@ -10,14 +10,26 @@
 //! mutations).
 //!
 //! The watchdog closes the class: every tick it compares the set of
-//! modules that *should* be running (companions registered) against
-//! truthful liveness (`list_running`, which excludes finished
-//! follower tasks) and restarts the difference. After a revive it
+//! modules that *should* be running against truthful liveness
+//! (`list_running`, which excludes finished follower tasks) and
+//! restarts the difference. After a revive it
 //! re-asserts the module's scan-interest from the persisted companion
 //! set (`CompanionDialer::reconcile_module_interest`) so a companion
 //! that subscribed while the module was dead — whose interest
 //! mutation was dropped with `NotRunning` — is picked up instead of
 //! staying stranded until the next full host restart.
+//!
+//! "Should be running" is the LIFECYCLE's answer
+//! (`LifecycleManager::expects_follower`), not a companion count. Two
+//! consequences, both intended:
+//!
+//! - **An operator-stopped module is no longer revived.** v2 counted
+//!   companions, so `DELETE /_admin/modules/{id}` on a SUBSCRIBED
+//!   module was undone within one tick — not merely on the next
+//!   restart. That is the bug this closes.
+//! - **A pinned module with no companions that crashes IS revived.**
+//!   v2 treated "nothing subscribed" as a valid idle state and left
+//!   it dead. If an operator pinned it, they want it running.
 //!
 //! Guards:
 //! - skips modules with a recapture or bootstrap in flight (both
@@ -36,9 +48,12 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use mitos_lifecycle::instance::BootAction;
+
 use crate::dialer::CompanionDialer;
 use crate::events::{EventKind, EventRing};
 use crate::host_v2::ModuleHostHandle;
+use crate::lifecycle::LifecycleManager;
 use crate::storage::ModuleStorage;
 
 /// Sweep cadence. A dead-but-subscribed module is an outage for its
@@ -58,6 +73,7 @@ pub const FIRST_TICK_DELAY: Duration = Duration::from_secs(120);
 pub fn spawn(
     storage: ModuleStorage,
     host: Arc<dyn ModuleHostHandle>,
+    lifecycle: Arc<LifecycleManager>,
     dialer: CompanionDialer,
     events: EventRing,
     cancel: CancellationToken,
@@ -65,6 +81,7 @@ pub fn spawn(
     spawn_with_config(
         storage,
         host,
+        lifecycle,
         dialer,
         events,
         cancel,
@@ -74,9 +91,11 @@ pub fn spawn(
 }
 
 /// As `spawn`, with explicit knobs (tests use shorter intervals).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_with_config(
     storage: ModuleStorage,
     host: Arc<dyn ModuleHostHandle>,
+    lifecycle: Arc<LifecycleManager>,
     dialer: CompanionDialer,
     events: EventRing,
     cancel: CancellationToken,
@@ -94,16 +113,17 @@ pub fn spawn_with_config(
                     return;
                 }
                 _ = tick.tick() => {
-                    sweep(&storage, host.as_ref(), &dialer, &events).await;
+                    sweep(&storage, host.as_ref(), &lifecycle, &dialer, &events).await;
                 }
             }
         }
     })
 }
 
-async fn sweep(
+pub(crate) async fn sweep(
     storage: &ModuleStorage,
     host: &dyn ModuleHostHandle,
+    lifecycle: &LifecycleManager,
     dialer: &CompanionDialer,
     events: &EventRing,
 ) {
@@ -126,15 +146,23 @@ async fn sweep(
         if running.contains(&id) || busy.contains(&id) {
             continue;
         }
-        if storage.count_companions(&id) == 0 {
-            // Nothing subscribed — a stopped module is a valid idle
-            // state, not an outage.
-            continue;
+        // The lifecycle decides, not a companion count. An instance an
+        // operator stopped stays stopped — that is the whole fix.
+        match lifecycle.expects_follower(&id) {
+            Ok(BootAction::StartFollower) => {}
+            Ok(BootAction::LeaveStopped) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    module = %id,
+                    error = %e,
+                    "watchdog: cannot read the lifecycle; leaving this module alone",
+                );
+                continue;
+            }
         }
         tracing::warn!(
             module = %id,
-            "watchdog: module has registered companions but no live \
-             follower; restarting"
+            "watchdog: module should be running but has no live follower; restarting"
         );
         let outcome = match host.replace(&id).await {
             Ok(()) => {

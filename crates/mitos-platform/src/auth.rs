@@ -645,6 +645,12 @@ pub(crate) mod testing {
         .unwrap()
     }
 
+    /// A host with no namespace config — one implicit namespace owning every
+    /// client, exactly v2.
+    pub(crate) fn legacy_authenticator() -> Authenticator {
+        Authenticator::legacy(Some(FULL.to_owned()), Some(READONLY.to_owned()))
+    }
+
     pub(crate) fn configured_authenticator(mode: OperatorTokenAsClient) -> Authenticator {
         Authenticator::configured(
             two_namespace_registry(mode),

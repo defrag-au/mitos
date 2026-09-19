@@ -152,7 +152,11 @@ pub enum Event {
     Operator(OperatorCommand),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialised like its neighbours in this file, because the host REPORTS it:
+/// an alert reaches an operator through `GET /_admin/events`, not only
+/// through the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstanceAlert {
     /// Zero clients, vanished rather than moved, under `AlertOnly`. Still
     /// running; an operator decides.

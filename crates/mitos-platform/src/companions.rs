@@ -74,6 +74,7 @@ pub fn companion_router(
     dialer: Option<CompanionDialer>,
     indexer_bridge: Option<IndexerBridgeHandle>,
     events: crate::events::EventRing,
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
 ) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
@@ -83,6 +84,7 @@ pub fn companion_router(
         resync_recently: ResyncDebounce::default(),
         auth: auth.clone(),
         operator_as_client_recently: OperatorAsClientDebounce::default(),
+        lifecycle,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -123,6 +125,30 @@ struct CompanionState {
     /// Per-client debounce for `OperatorTokenUsedAsClient` — see
     /// `record_operator_token_used_as_client`.
     operator_as_client_recently: OperatorAsClientDebounce,
+    /// The instance lifecycle. Told to reconcile after a registration is
+    /// written or removed, so an attach or detach lands on the record
+    /// immediately rather than waiting for the 60s tick. `None` in tests that
+    /// exercise persistence alone, and in artifact-only routers.
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+}
+
+/// Tell the lifecycle the registrations changed.
+///
+/// Best-effort on purpose: a failure here is logged and the request still
+/// succeeds, because the 60s tick reconciles again. This is a hint that saves
+/// a minute, not the mechanism — `Instance::reconcile` diffs the disk, so a
+/// call that never happens is corrected rather than lost.
+async fn nudge_lifecycle(state: &CompanionState, module: &str) {
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        return;
+    };
+    if let Err(e) = lifecycle.reconcile(module).await {
+        tracing::warn!(
+            module = %module,
+            error = %e,
+            "lifecycle reconcile after a registration change failed; the next tick retries",
+        );
+    }
 }
 
 /// Debounce for the `operator_token_used_as_client` event.
@@ -485,6 +511,15 @@ async fn interest_mutation_handler(
         }
     }
 
+    // A mutation that emptied a record DELETED it above, which is a detach.
+    // Reconcile the affected modules once each rather than per registration:
+    // it is a diff, so one call covers every change to that module.
+    let touched: std::collections::BTreeSet<&str> =
+        registrations.iter().map(|(m, _, _)| m.as_str()).collect();
+    for module in &touched {
+        nudge_lifecycle(&state, module).await;
+    }
+
     // Propagate to each running follower's in-memory filter so
     // the change is live without waiting for the next host
     // restart. Best-effort: a follower that's not currently
@@ -773,6 +808,11 @@ async fn subscribe_handler(
                 if next_emission_id == 0 {
                     next_emission_id = id;
                 }
+                // The registration is now on disk, so the client can attach.
+                // On an instance an operator STOPPED this records the client
+                // and does NOT start it — the attach is remembered and served
+                // the moment the operator starts it.
+                nudge_lifecycle(&state, name).await;
                 state.events.record(
                     name.as_str(),
                     crate::events::EventKind::CompanionSubscribed {
@@ -1352,6 +1392,7 @@ mod tests {
             None,
             None,
             crate::events::EventRing::new(),
+            None,
         )
     }
 
@@ -2011,6 +2052,7 @@ mod tests {
             None,
             None,
             events.clone(),
+            None,
         );
         (router, events)
     }

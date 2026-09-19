@@ -334,6 +334,7 @@ impl Bundle {
         let mut module_host: Option<Arc<dyn mitos_platform::host_v2::ModuleHostHandle>> = None;
         let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut module_watchdog_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut module_lifecycle_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
@@ -553,10 +554,24 @@ impl Bundle {
                 }
             }
 
-            // Auto-resume: walk every manifest on disk and start
-            // it. Single bad module is logged and skipped so it
-            // can't abort bundle startup.
-            host.auto_resume().await;
+            // The instance lifecycle. REPLACES `host.auto_resume()`: what a
+            // restart resumes is now the persisted `DesiredState`, not "every
+            // directory with a manifest", so a module an operator stopped
+            // stays stopped. Constructed here because the admin router, the
+            // companion router and the watchdog all share this one instance.
+            let lifecycle = Arc::new(mitos_platform::lifecycle::LifecycleManager::new(
+                storage.clone(),
+                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>,
+                authenticator.clone(),
+                event_ring.clone(),
+                mitos_platform::lifecycle::system_clock(),
+            ));
+            // Adopt every module, reconcile it against the registrations on
+            // disk, and re-issue what its record says should already be true.
+            // The dialer is deliberately NOT set yet: `start_all()` below
+            // reconciles every module's interest itself, so a `StartFollower`
+            // during boot must not duplicate that work.
+            lifecycle.boot().await;
 
             // The dialer's OUTBOUND credential — the token it presents when
             // it calls a companion back. Same env var, same value; it is not
@@ -617,12 +632,17 @@ impl Bundle {
             // `docs/design/RECAPTURE.md`.
             host.set_dialer(dialer.clone());
             dialer.start_all().await;
+            // AFTER `start_all`, for the reason above: from here on a
+            // lifecycle `StartFollower` also re-asserts the module's
+            // scan-interest, exactly as the watchdog does after a revive.
+            lifecycle.set_dialer(dialer.clone());
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),
                 authenticator.clone(),
                 Some(dialer.clone()),
                 Some(indexer_bridge),
                 event_ring.clone(),
+                Some(lifecycle.clone()),
             ));
 
             // Transaction submission: let a consumer (the minting engine) push a
@@ -651,6 +671,7 @@ impl Bundle {
                 started_at,
                 event_ring.clone(),
                 authenticator.clone(),
+                lifecycle.clone(),
             ));
 
             // Module watchdog — revives any module that has
@@ -664,10 +685,18 @@ impl Bundle {
             let watchdog_handle = mitos_platform::watchdog::spawn(
                 storage.clone(),
                 host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>,
+                lifecycle.clone(),
                 dialer.clone(),
                 event_ring.clone(),
                 exit.clone(),
             );
+
+            // The lifecycle's own 60s timer: reconcile every module against
+            // the registrations on disk, then feed `Tick`. This is what
+            // expires a drain grace period and reaps a retained instance —
+            // and what corrects any path that forgot to reconcile.
+            let lifecycle_handle =
+                mitos_platform::lifecycle::spawn_tick(lifecycle.clone(), exit.clone());
 
             // Periodic emissions-log compaction. Hourly sweep
             // ages out Acked rows (7d) + flips stuck Pending
@@ -681,6 +710,7 @@ impl Bundle {
             module_host = Some(host);
             module_compaction_handle = Some(compaction_handle);
             module_watchdog_handle = Some(watchdog_handle);
+            module_lifecycle_handle = Some(lifecycle_handle);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -740,6 +770,12 @@ impl Bundle {
         // now. Await it so a mid-sweep restart can't race the
         // follower teardown below.
         if let Some(handle) = module_watchdog_handle {
+            let _ = handle.await;
+        }
+
+        // Same for the lifecycle tick: a `Reap` mid-flight removes a module
+        // directory, which must not race the follower teardown below.
+        if let Some(handle) = module_lifecycle_handle {
             let _ = handle.await;
         }
 

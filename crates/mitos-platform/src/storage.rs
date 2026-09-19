@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use mitos_data_plane::ChainPoint;
 use mitos_lifecycle::ids::{InstanceKey, ModuleId, Sha256Hex};
+use mitos_lifecycle::instance::LifecycleRecord;
 
 use crate::manifest::Manifest;
 
@@ -57,6 +58,8 @@ const CURRENT_POINTER: &str = "current.toml";
 /// this file is the source of truth and `list_instances` reads it.
 const INSTANCE_MARKER: &str = "instance.toml";
 const INSTANCES_DIR: &str = "instances";
+/// The instance's `LifecycleRecord` — see [`ModuleStorage::read_lifecycle`].
+const LIFECYCLE_RECORD: &str = "lifecycle.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -814,6 +817,44 @@ impl ModuleStorage {
     /// the operator runs.
     pub fn last_trap_path(&self, id: &str) -> Result<PathBuf, StorageError> {
         Ok(self.state_dir(id)?.join("last-trap.toml"))
+    }
+
+    /// The instance's persisted [`LifecycleRecord`] — what an operator WANTS
+    /// and what the machine has decided, beside the state it governs.
+    ///
+    /// Deliberately holds no [`InstanceKey`]: an upload RENAMES the instance
+    /// directory to a new key and this file moves with it untouched, so there
+    /// is no window in which the two could disagree. The key is read from
+    /// `instance.toml`.
+    fn lifecycle_path(&self, id: &str) -> Result<PathBuf, StorageError> {
+        Ok(self.state_dir(id)?.join("lifecycle.toml"))
+    }
+
+    /// `Ok(None)` means the instance predates lifecycle state — every module
+    /// on the first v3 boot — and must be ADOPTED rather than defaulted.
+    pub fn read_lifecycle(&self, id: &str) -> Result<Option<LifecycleRecord>, StorageError> {
+        let path = self.lifecycle_path(id)?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        toml::from_str(&raw)
+            .map(Some)
+            .map_err(|e| StorageError::MalformedPointer {
+                module: id.to_owned(),
+                file: LIFECYCLE_RECORD,
+                why: e.to_string(),
+            })
+    }
+
+    pub fn write_lifecycle(&self, id: &str, record: &LifecycleRecord) -> Result<(), StorageError> {
+        let path = self.lifecycle_path(id)?;
+        let toml = toml::to_string(record).map_err(|e| StorageError::Serialise {
+            what: "lifecycle record",
+            why: e.to_string(),
+        })?;
+        write_atomic(&path, toml.as_bytes())
     }
 
     /// Per-module companions registration directory.

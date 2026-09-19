@@ -97,6 +97,20 @@ pub enum EventKind {
     ///
     /// Debounced per client — see `companions::OperatorAsClientDebounce`.
     OperatorTokenUsedAsClient { client_id: String },
+    /// The instance lifecycle wants an operator to look at this module. The
+    /// only alert today is "every client vanished and the governing policy is
+    /// `AlertOnly`" — in production a vanished client is far more likely an
+    /// outage on the client's side than a decision, so the follower keeps
+    /// running and a human decides. The transport is this ring and a log line;
+    /// D11 adds a webhook.
+    InstanceAlert {
+        alert: mitos_lifecycle::instance::InstanceAlert,
+    },
+    /// A lifecycle effect failed. The record is NOT rolled back — it is what
+    /// should be true, and the watchdog is what closes the gap — so this is
+    /// the only place a failed start or reap is visible as a query rather
+    /// than a journal grep.
+    LifecycleEffectFailed { effect: String, error: String },
 }
 
 impl EventKind {
@@ -116,6 +130,8 @@ impl EventKind {
             EventKind::FollowerExited { .. } => "follower_exited",
             EventKind::WatchdogRestart { .. } => "watchdog_restart",
             EventKind::OperatorTokenUsedAsClient { .. } => "operator_token_used_as_client",
+            EventKind::InstanceAlert { .. } => "instance_alert",
+            EventKind::LifecycleEffectFailed { .. } => "lifecycle_effect_failed",
         }
     }
 }

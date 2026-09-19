@@ -8,6 +8,83 @@ comments carry the reasoning; this order does not repeat it.
 **Depends on:** WO-01 (instance dirs), WO-02 (`Registry::client_key`, profiles).
 **Blocks:** WO-05, WO-06, WO-08.
 
+## Implemented 2026-09-19 — open items for review
+
+Acceptance all passes: `mitos-platform` 204 + the four integration files
+UNMODIFIED, `mitos-core` 28, `mitos-lifecycle` 70, clippy `--workspace
+--all-targets -D warnings` exit 0, `cargo check --workspace --all-targets`
+exit 0, `cargo fmt --check` 0 diffs, goldens 69/69 (rebuilt `mitos-run`).
+Every existing test passes unchanged — there was no sanctioned exception in
+this order and none was needed.
+
+Two new files' worth of surface to review: `crates/mitos-platform/src/lifecycle.rs`
+(the manager, plus 17 tests) and `host_v2::testing::FakeHost`, the one
+recording `ModuleHostHandle` — which is also the first test coverage the
+watchdog and the admin evict path have ever had.
+
+### Deviations
+
+**1 and 5 are judgement calls — please scrutinise those two rather than
+accepting them.** Both change WHERE or WHETHER something the order specified
+happens. 2, 3, 4 and 6 are mechanical.
+
+1. **The flat-companion migration runs INSIDE `manager.boot()`**, as its first
+   action per module, rather than as a separate step 3 in `bundle.rs`. Same
+   ordering, but `migrate_flat_companions_for_module` is `pub(crate)` and
+   `bundle.rs` is another crate — and putting it next to adoption makes the
+   invariant ("adoption must never see flat files") structural instead of
+   dependent on someone preserving a call order in the bundle. Still
+   idempotent; `dialer.start_all()` still runs it again.
+2. **A second `EventKind`.** The order says events.rs gains one
+   (`InstanceAlert`) but also requires "Record the failure on the event ring"
+   for a failed effect. That is a different thing from an alert, so it is
+   `LifecycleEffectFailed { effect, error }`.
+3. **`InstanceAlert` gained `Serialize`/`Deserialize` + `rename_all` in
+   `mitos-lifecycle`.** The event ring is a typed `#[derive(Serialize)]` enum
+   and the alert reaches an operator through `GET /_admin/events`, so the
+   alternative was a stringly-typed `alert: String` in the host. `Phase`,
+   `DesiredState` and `Tier` in the same crate already derive it for the same
+   reason. No logic changed.
+4. **`HandlerError::NotRunnable`** for "recapture on a stopped module ⇒ 409".
+   The first draft reused `Rejected::StagingIsNotOperable`, which was a lie —
+   it is not a staging instance.
+5. **`Reap` does not remove the directory if `host.evict_module` failed.** The
+   order says the effect is today's evict-handler body, which removes
+   unconditionally. Removing files under redb handles the host failed to close
+   is how a follower ends up writing to an unlinked inode; the failure is
+   recorded and the next tick retries the whole effect.
+6. `companion_router` and `admin_router_with_host` take the manager, so their
+   signatures changed. `ModuleSummary` gained
+   `lifecycle: Option<StatusLifecycle>` (skipped when absent) rather than a
+   new wrapper type, so an upload response is unchanged.
+
+### Found but not fixed
+
+- `crates/mitos-platform/src/admin.rs` — `evict` reports the lifecycle's
+  ATTACHED set where v2 reported `client_id:companion_key` pairs from a
+  directory walk. Same field name (`cancelled_companions`), different
+  granularity: one entry per client, not per registration. No consumer in this
+  repo reads it, but `mitos-admin`'s evict output will look different.
+- `crates/mitos-platform/src/watchdog.rs:130` — the sweep now calls
+  `expects_follower` per module, which reads `lifecycle.toml` from disk each
+  tick. Fine at ~15 modules and a 60s cadence; it is a per-module file read
+  where v2 did a directory count.
+- `ModuleHostV2::auto_resume` is now dead in production — only
+  `tests/lifecycle_v2.rs` calls it. Left in place deliberately (that file must
+  not change), but it is a second, now-divergent answer to "what should be
+  running" sitting in the codebase. WO-08 or a follow-up should delete it once
+  that test moves to the manager.
+
+### Questions
+
+None blocking. One thing worth a reviewer's eye: **`reconcile` is called
+before the evict authorization check**, so `POST …/evict` on a module whose
+registrations were removed while the host was down succeeds instead of 409ing
+on a stale attached set. That is what the order asks for ("`evict`:
+`reconcile` first"), and it is right, but it does mean the safety check is
+evaluated against the disk rather than against what the record said a moment
+earlier.
+
 ## Why
 
 v2 has no notion of what an operator WANTS. `DELETE /_admin/modules/{id}` only
