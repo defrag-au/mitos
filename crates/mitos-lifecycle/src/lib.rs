@@ -45,6 +45,7 @@ pub mod ids;
 pub mod instance;
 pub mod lease;
 pub mod policy;
+pub mod routing;
 pub mod state_prep;
 pub mod upgrade;
 
