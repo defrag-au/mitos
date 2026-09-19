@@ -17,7 +17,7 @@
 //! [`DesiredState`], and [`Instance::on_boot`] is the only thing that decides
 //! what a restart resumes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -196,7 +196,42 @@ pub enum BootAction {
 
 type Step = Result<Transition<Instance, Effect>, Rejected>;
 
+/// What the host PERSISTS for an instance — everything except its key.
+///
+/// The key is deliberately absent. It already lives in the instance
+/// directory's marker, and a v2-style upload RENAMES that directory to a new
+/// key while the instance carries on. A second copy of the key in here would
+/// open a crash window between the rename and rewriting this file, in which
+/// the two disagree. With one copy there is nothing to disagree with: the
+/// record moves with the directory, and the key is read from the marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRecord {
+    pub phase: Phase,
+    pub desired: DesiredState,
+    pub attached: BTreeSet<ClientKey>,
+    pub governing: Option<NamespaceProfile>,
+}
+
 impl Instance {
+    pub fn record(&self) -> LifecycleRecord {
+        LifecycleRecord {
+            phase: self.phase,
+            desired: self.desired,
+            attached: self.attached.clone(),
+            governing: self.governing,
+        }
+    }
+
+    pub fn from_record(key: InstanceKey, record: LifecycleRecord) -> Self {
+        Self {
+            key,
+            phase: record.phase,
+            desired: record.desired,
+            attached: record.attached,
+            governing: record.governing,
+        }
+    }
+
     /// A new instance, created by a client move.
     pub fn staging(key: InstanceKey) -> Self {
         Self {
@@ -208,8 +243,90 @@ impl Instance {
         }
     }
 
-    /// The ONLY thing that decides what a restart resumes. Note what is absent:
-    /// nothing here looks at whether an artifact or manifest exists on disk.
+    /// Take ownership of an instance that was running BEFORE lifecycle state
+    /// existed — every v2 module, the first time a v3 host boots — or that an
+    /// operator installed by upload. The rule is "change nothing":
+    ///
+    /// - **It has clients** ⇒ `Active`, governed by them. From here on it
+    ///   behaves like any other instance, which matters: when its clients later
+    ///   MOVE to a newer instance it must retire as `Superseded`. Pinning it
+    ///   would leave one zombie follower behind per deploy, for ever.
+    /// - **It has none** ⇒ `Active` and [`DesiredState::Pinned`]. v2 ran a
+    ///   module whether or not anyone subscribed, and an operator who uploads
+    ///   one owns its lifetime. `Pinned` is the honest encoding of that — it
+    ///   neither alerts nor ejects — and it is VISIBLE, so the operator can
+    ///   unpin or evict the ones nobody wants.
+    pub fn adopt(key: InstanceKey, clients: &BTreeMap<ClientKey, NamespaceProfile>) -> Self {
+        Self {
+            key,
+            phase: Phase::Active,
+            desired: if clients.is_empty() {
+                DesiredState::Pinned
+            } else {
+                DesiredState::Running
+            },
+            attached: clients.keys().cloned().collect(),
+            governing: clients.values().copied().reduce(NamespaceProfile::protect),
+        }
+    }
+
+    /// The events that bring `attached` into line with the clients that have
+    /// a registration ON DISK right now.
+    ///
+    /// The host does not hook each path that adds or removes a registration —
+    /// there are at least four (subscribe, an interest mutation emptying a
+    /// record, the admin delete, the legacy flat-file migration), and the next
+    /// one someone adds would be missed silently. It calls this after any of
+    /// them, at boot, and on every tick; being a diff, it is idempotent and a
+    /// missed call is corrected by the next one.
+    ///
+    /// Attaches come FIRST, so swapping one client for another never passes
+    /// through zero and drains an instance that is about to be wanted.
+    /// A client whose registrations vanished is `Unsubscribed`; a lease expiry
+    /// is fed directly as its own `Detach` BEFORE the files are removed.
+    pub fn reconcile(&self, on_disk: &BTreeMap<ClientKey, NamespaceProfile>) -> Vec<Event> {
+        if self.phase == Phase::Reaped {
+            return Vec::new();
+        }
+        let attach = on_disk
+            .iter()
+            .filter(|(client, _)| !self.attached.contains(*client))
+            .map(|(client, profile)| Event::Attach {
+                client: client.clone(),
+                profile: *profile,
+            });
+        let detach = self
+            .attached
+            .iter()
+            .filter(|client| !on_disk.contains_key(*client))
+            .map(|client| Event::Detach {
+                client: client.clone(),
+                cause: DetachCause::Unsubscribed,
+            });
+        attach.chain(detach).collect()
+    }
+
+    /// The effects to re-issue for a state loaded from disk after a restart.
+    ///
+    /// Follower liveness is in-memory, so after ANY restart nothing is running
+    /// and [`Instance::on_boot`] says what should be. The one effect that can
+    /// be left half-done on disk is `Reap` — the state says `Reaped` but the
+    /// directory is still there — and it is idempotent, so it is simply run
+    /// again.
+    pub fn recover(&self) -> Vec<Effect> {
+        match (self.phase, self.on_boot()) {
+            (Phase::Reaped, _) => vec![Effect::Reap],
+            (_, BootAction::StartFollower) => vec![Effect::StartFollower],
+            (_, BootAction::LeaveStopped) => vec![],
+        }
+    }
+
+    /// Whether this instance's follower SHOULD be running. The only thing that
+    /// decides what a restart resumes — and what the watchdog revives: v2's
+    /// watchdog restarted any module with companions and no live follower, so
+    /// an operator's stop on a SUBSCRIBED module was undone within one tick,
+    /// not merely on the next restart. Note what is absent: nothing here looks
+    /// at whether an artifact, a manifest or a companion exists on disk.
     pub fn on_boot(&self) -> BootAction {
         match (self.phase, self.desired) {
             (Phase::Reaped | Phase::Stopped { .. }, _) | (_, DesiredState::Stopped) => {
@@ -674,6 +791,162 @@ mod tests {
         assert_eq!(state.phase, Phase::Active);
     }
 
+    // ── Adoption, reconcile, recovery — what WO-03 wires ─────────────────
+
+    /// A v2 module nobody subscribes to keeps running and says nothing, which
+    /// is what v2 did — but now VISIBLY, as `Pinned`.
+    #[test]
+    fn adopting_a_module_nobody_subscribes_to_changes_nothing() {
+        let adopted = Instance::adopt(key(), &BTreeMap::new());
+        assert_eq!(adopted.desired, DesiredState::Pinned);
+        assert_eq!(adopted.on_boot(), BootAction::StartFollower);
+        let (state, effects) = run(adopted, vec![(Event::Tick, after(10 * 365 * 24 * 3600))]);
+        assert!(effects.is_empty());
+        assert_eq!(state.phase, Phase::Active);
+    }
+
+    /// The reason a SUBSCRIBED module is NOT pinned on adoption: every deploy
+    /// moves its clients off it, and a pinned instance would never retire.
+    #[test]
+    fn an_adopted_instance_with_clients_retires_when_they_move_on() {
+        let p = client("prod", "ownership.cnft.dev");
+        let d = client("dev", "ownership.dev.cnft.dev");
+        let adopted = Instance::adopt(
+            key(),
+            &BTreeMap::from([(p.clone(), prod()), (d.clone(), dev())]),
+        );
+        assert_eq!(adopted.desired, DesiredState::Running);
+        assert_eq!(adopted.governing, Some(prod().protect(dev())));
+
+        let (state, effects) = run(
+            adopted,
+            vec![
+                (detach(&d, DetachCause::Moved), after(1)),
+                (detach(&p, DetachCause::Moved), after(2)),
+            ],
+        );
+        assert_eq!(effects, vec![Effect::StopFollower]);
+        assert!(matches!(
+            state.phase,
+            Phase::Stopped {
+                cause: StopCause::ZeroRef {
+                    why: ZeroRefCause::Superseded
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reconcile_is_a_diff_and_applying_it_converges() {
+        let a = client("prod", "ownership.cnft.dev");
+        let b = client("prod", "jpgsm.cnft.dev");
+        let c = client("dev", "ownership.dev.cnft.dev");
+        let start = Instance::adopt(
+            key(),
+            &BTreeMap::from([(a.clone(), prod()), (b.clone(), prod())]),
+        );
+
+        // `b` unsubscribed and `c` arrived, by whatever path.
+        let on_disk = BTreeMap::from([(a.clone(), prod()), (c.clone(), dev())]);
+        let events = start.reconcile(&on_disk);
+        assert_eq!(
+            events,
+            vec![attach(&c, dev()), detach(&b, DetachCause::Unsubscribed)],
+            "attaches first, so a swap never passes through zero"
+        );
+
+        let (state, _) = run(start, events.into_iter().map(|e| (e, T0)).collect());
+        assert_eq!(state.attached, BTreeSet::from([a, c]));
+        assert!(
+            state.reconcile(&on_disk).is_empty(),
+            "idempotent once applied"
+        );
+    }
+
+    /// Swapping the ONLY client for another must not drain the instance.
+    #[test]
+    fn reconcile_never_passes_through_zero_clients() {
+        let old = client("prod", "ownership.cnft.dev");
+        let new = client("prod", "jpgsm.cnft.dev");
+        let start = Instance::adopt(key(), &BTreeMap::from([(old, prod())]));
+        let events = start.reconcile(&BTreeMap::from([(new, prod())]));
+        let (state, effects) = run(start, events.into_iter().map(|e| (e, T0)).collect());
+        assert!(effects.is_empty(), "no alert, no stop: {effects:?}");
+        assert_eq!(state.phase, Phase::Active);
+    }
+
+    #[test]
+    fn recovery_restarts_what_should_run_and_finishes_a_half_done_reap() {
+        let c = client("prod", "ownership.cnft.dev");
+        let running = Instance::adopt(key(), &BTreeMap::from([(c.clone(), prod())]));
+        assert_eq!(running.recover(), vec![Effect::StartFollower]);
+
+        let (stopped, _) = run(
+            running.clone(),
+            vec![(Event::Operator(OperatorCommand::Stop), T0)],
+        );
+        assert!(
+            stopped.recover().is_empty(),
+            "an operator stop survives a restart"
+        );
+
+        let (reaped, _) = run(
+            running,
+            vec![(
+                Event::Operator(OperatorCommand::Evict(EvictMode::Force)),
+                T0,
+            )],
+        );
+        assert_eq!(reaped.recover(), vec![Effect::Reap]);
+        assert!(reaped.reconcile(&BTreeMap::from([(c, prod())])).is_empty());
+    }
+
+    /// The record is what goes to disk, as TOML. Every phase must survive the
+    /// trip — nested tagged enums and `Option`s are exactly where a format
+    /// quietly refuses.
+    #[test]
+    fn every_phase_round_trips_through_the_persisted_record() {
+        let p = client("prod", "ownership.cnft.dev");
+        let clients = BTreeMap::from([(p.clone(), prod())]);
+        let base = Instance::adopt(key(), &clients);
+        let states = vec![
+            Instance::staging(key()),
+            base.clone(),
+            Instance::adopt(key(), &BTreeMap::new()),
+            run(
+                base.clone(),
+                vec![(detach(&p, DetachCause::LeaseExpired), after(5))],
+            )
+            .0,
+            run(
+                base.clone(),
+                vec![(detach(&p, DetachCause::Moved), after(5))],
+            )
+            .0,
+            run(
+                base.clone(),
+                vec![(Event::Operator(OperatorCommand::Stop), after(5))],
+            )
+            .0,
+            run(
+                base,
+                vec![(
+                    Event::Operator(OperatorCommand::Evict(EvictMode::Force)),
+                    T0,
+                )],
+            )
+            .0,
+        ];
+        for state in states {
+            let text = toml::to_string(&state.record())
+                .unwrap_or_else(|e| panic!("{:?} does not serialise: {e}", state.phase));
+            let back: LifecycleRecord = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{:?} does not parse back: {e}\n{text}", state.phase));
+            assert_eq!(Instance::from_record(key(), back), state, "\n{text}");
+        }
+    }
+
     #[test]
     fn a_released_staging_instance_is_reaped_but_a_switched_one_is_not() {
         let (state, effects) = run(Instance::staging(key()), vec![(Event::StagingReleased, T0)]);
@@ -810,7 +1083,14 @@ mod tests {
     #[test]
     fn invariants_hold_over_every_event_sequence() {
         let events = alphabet();
-        let mut frontier = vec![(Instance::staging(key()), true, T0)];
+        // Three ways an instance comes to exist: created by a move, adopted
+        // with clients, adopted with none. All are born with a follower.
+        let with_clients = BTreeMap::from([(client("prod", "p"), prod())]);
+        let mut frontier = vec![
+            (Instance::staging(key()), true, T0),
+            (Instance::adopt(key(), &with_clients), true, T0),
+            (Instance::adopt(key(), &BTreeMap::new()), true, T0),
+        ];
         let mut visited = 0_usize;
         for _depth in 0..6 {
             let mut next_frontier = Vec::new();
