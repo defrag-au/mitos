@@ -3769,6 +3769,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitos-lifecycle"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "toml 0.8.20",
+]
+
+[[package]]
 name = "mitos-marketplace-decode"
 version = "0.0.1"
 dependencies = [

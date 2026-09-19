@@ -1,0 +1,24 @@
+[package]
+name = "mitos-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Platform v3's state machines — instance lifecycle, client move, state preparation, upgrade actions, client lease — as pure reducers. No I/O, no clock, no wasmtime: the host executes the effects these return."
+
+# PURE, and that is the whole point. Every decision about when a module
+# instance is created, moved onto, drained, stopped or reaped lives here, where
+# it can be tested exhaustively in milliseconds. The host (`mitos-platform`)
+# owns followers, redb handles and the dialer, and its only job with respect to
+# lifecycle is to feed events in and execute the effects that come out.
+#
+# Nothing below may pull a runtime: no tokio, no wasmtime, no redb, no pallas.
+# `serde` is here because every one of these types is persisted (the revision
+# ledger, the lifecycle journal) or crosses the wire (`ModuleRef`).
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The manifest `[[upgrade]]` shape is specified as TOML, so its tests parse TOML.
+toml = "0.8"

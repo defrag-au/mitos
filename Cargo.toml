@@ -53,6 +53,10 @@ members = [
     # second copy of a client whose row shapes have already drifted under us
     # is how the two quietly disagree.
     "crates/mitos-koios",
+    # Platform v3's state machines (docs/strategy/MITOS_PLATFORM_V3.md §5) as
+    # pure reducers — no tokio, no wasmtime, no redb. Every lifecycle DECISION
+    # lives here; `mitos-platform` only executes the effects it returns.
+    "crates/mitos-lifecycle",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",
