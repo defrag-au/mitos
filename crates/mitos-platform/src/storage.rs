@@ -299,7 +299,10 @@ impl ModuleStorage {
     /// `host::stop` so a follower restart re-opens redb cleanly.
     pub fn close_kv(&self, id: &str) {
         if let Ok(addr) = self.addr_of(id) {
-            self.kv_stores.lock().expect("kv_stores mutex").remove(&addr);
+            self.kv_stores
+                .lock()
+                .expect("kv_stores mutex")
+                .remove(&addr);
         }
     }
 
@@ -906,7 +909,12 @@ impl ModuleStorage {
         let from = StateAddr::Instance(from.clone());
         let to = StateAddr::Instance(to.clone());
         rekey(&self.cursor_stores, &from, to.clone(), "cursor_stores");
-        rekey(&self.emissions_stores, &from, to.clone(), "emissions_stores");
+        rekey(
+            &self.emissions_stores,
+            &from,
+            to.clone(),
+            "emissions_stores",
+        );
         rekey(&self.kv_stores, &from, to.clone(), "kv_stores");
         rekey(&self.watched_stores, &from, to, "watched_stores");
     }
@@ -1250,17 +1258,33 @@ impl ModuleStorage {
         count
     }
 
-    /// Per-module emissions log path. Single redb file at
-    /// `<storage_root>/<id>/emissions.redb` — feeds the companion
-    /// dialer's outbound Apply stream with per-row delivery state.
+    /// Per-instance emissions log path, resolved through the module's
+    /// current pointer.
     ///
-    /// Crate-private — callers outside `mitos-platform` MUST go
-    /// through `emissions_store(id)` so the cached
-    /// `Arc<Database>` handle is shared. Direct path access
-    /// would let callers `Database::open` themselves and trip
-    /// the single-writer lock.
+    /// Test-only since the data plane became instance-addressed: production
+    /// reaches emissions through `emissions_store` / `emissions_store_at`,
+    /// which share one cached `Arc<Database>` per instance (redb is
+    /// single-writer). It stays because
+    /// `opening_state_for_a_missing_instance_is_an_error_not_a_mkdir` proves
+    /// the refusal per PATH, which is a stronger statement than proving it
+    /// per store.
+    #[cfg(test)]
     pub(crate) fn emissions_path(&self, id: &str) -> Result<PathBuf, StorageError> {
         Ok(self.state_dir(id)?.join("emissions.redb"))
+    }
+
+    /// Per-instance crash-safe KV file (redb). Test-only — see
+    /// [`Self::emissions_path`].
+    #[cfg(test)]
+    pub(crate) fn kv_path(&self, id: &str) -> Result<PathBuf, StorageError> {
+        Ok(self.state_dir(id)?.join("kv.redb"))
+    }
+
+    /// Per-instance watched-UTxO index file (redb). Test-only — see
+    /// [`Self::emissions_path`].
+    #[cfg(test)]
+    pub(crate) fn watched_path(&self, id: &str) -> Result<PathBuf, StorageError> {
+        Ok(self.state_dir(id)?.join("watched.redb"))
     }
 
     fn lock_path(&self, id: &str) -> PathBuf {
@@ -1396,22 +1420,6 @@ impl ModuleStorage {
             return Ok(None);
         };
         self.read_config_bytes(&sha)
-    }
-
-    /// Per-instance crash-safe KV file (redb, via the vendored
-    /// `RedbKv`). Bundle's KV factory points at this.
-    ///
-    /// Crate-private — callers go through `kv_store(id)`.
-    /// See `emissions_path` for the rationale.
-    pub(crate) fn kv_path(&self, id: &str) -> Result<PathBuf, StorageError> {
-        Ok(self.state_dir(id)?.join("kv.redb"))
-    }
-
-    /// Per-instance watched-UTxO index file (redb). Crate-private —
-    /// callers go through `watched_index(id)` so the cached
-    /// `Arc<Database>` handle is shared (single-writer lock).
-    pub(crate) fn watched_path(&self, id: &str) -> Result<PathBuf, StorageError> {
-        Ok(self.state_dir(id)?.join("watched.redb"))
     }
 
     /// Persist the driver's last-applied cursor atomically.
@@ -2275,8 +2283,10 @@ mod tests {
         // lock is not being tripped — one file each, not one shared.
         let kv_a = storage.kv_store_at(&a, None).unwrap();
         let kv_b = storage.kv_store_at(&b, None).unwrap();
-        kv_a.set_value("test-module", "k", b"from A".to_vec()).unwrap();
-        kv_b.set_value("test-module", "k", b"from B".to_vec()).unwrap();
+        kv_a.set_value("test-module", "k", b"from A".to_vec())
+            .unwrap();
+        kv_b.set_value("test-module", "k", b"from B".to_vec())
+            .unwrap();
         assert_eq!(kv_a.get_value("test-module", "k").unwrap(), b"from A");
         assert_eq!(kv_b.get_value("test-module", "k").unwrap(), b"from B");
 
@@ -2344,7 +2354,9 @@ mod tests {
         let kv = storage.kv_store_at(&k1, None).unwrap();
         kv.set_value("test-module", "carried", b"yes".to_vec())
             .unwrap();
-        storage.write_cursor_at(&k1, &ChainPoint::Slot(777)).unwrap();
+        storage
+            .write_cursor_at(&k1, &ChainPoint::Slot(777))
+            .unwrap();
         let _emissions = storage.emissions_store_at(&k1).unwrap();
         let _watched = storage.watched_index_at(&k1);
 
@@ -2383,7 +2395,9 @@ mod tests {
         let kv = storage.kv_store_at(&k1, None).unwrap();
         kv.set_value("test-module", "carried", b"twice".to_vec())
             .unwrap();
-        storage.write_cursor_at(&k1, &ChainPoint::Slot(4242)).unwrap();
+        storage
+            .write_cursor_at(&k1, &ChainPoint::Slot(4242))
+            .unwrap();
 
         let wasm_b = b"two renames B";
         storage.activate(&sample_manifest(wasm_b), wasm_b).unwrap();
@@ -2453,7 +2467,11 @@ mod tests {
             .write_cursor("never-activated", &ChainPoint::Slot(5))
             .unwrap();
         assert_eq!(
-            storage.read_cursor("never-activated").unwrap().unwrap().slot(),
+            storage
+                .read_cursor("never-activated")
+                .unwrap()
+                .unwrap()
+                .slot(),
             5,
         );
         assert!(

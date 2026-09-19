@@ -149,6 +149,17 @@ pub enum PlatformError {
     /// Maps to HTTP 504 from the admin endpoint.
     #[error("recapture coordination failed: {0}")]
     RecaptureCoordination(String),
+
+    /// A whole-module operation (recapture, evict) was asked of a module
+    /// that has more than one instance. Both were written when a module WAS
+    /// an instance; neither has a defined meaning across two, so they refuse
+    /// rather than pick one. Unreachable in production, where every module
+    /// has exactly one instance.
+    #[error(
+        "module `{module}` has {found} instances; recapture and evict are whole-module \
+         operations and have no defined meaning across more than one"
+    )]
+    MultipleInstances { module: String, found: usize },
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;

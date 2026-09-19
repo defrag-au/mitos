@@ -27,6 +27,8 @@
 
 use std::sync::Arc;
 
+use mitos_lifecycle::ids::InstanceKey;
+
 use crate::budget::TrapClass;
 use crate::driver_v2::DriverV2;
 use crate::host_fns::{DataPlaneFacade, emit};
@@ -42,7 +44,10 @@ use crate::{PlatformError, PlatformResult};
 /// onboard cold-starts.
 #[derive(Clone)]
 pub struct BackfillFactory {
-    pub module_id: String,
+    /// The instance the disposable instances belong to. A backfill shares
+    /// the live follower's state KV and emit sink, so it must address the
+    /// same instance — not "the module", which may have two.
+    pub instance: InstanceKey,
     pub registry: Arc<ModuleRegistryV2>,
     /// Data plane the disposable instance's host-fns resolve against.
     /// Same `CachingDataPlane` the live instance uses.
@@ -67,7 +72,7 @@ impl BackfillFactory {
         &self,
         seed_page: Option<u32>,
     ) -> PlatformResult<(DriverV2, Arc<TrapContextLogger>)> {
-        let kv = (self.kv_factory)(&self.module_id);
+        let kv = (self.kv_factory)(&self.instance);
         let trap_logger = Arc::new(TrapContextLogger::new(self.caching_plane.clone()));
 
         let mut instance = self
@@ -95,22 +100,22 @@ impl BackfillFactory {
             let snap = trap_logger.snapshot();
             match self
                 .storage
-                .last_trap_path(&self.module_id)
+                .last_trap_path_at(&self.instance)
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
-                    write_fixture(&snap, &self.module_id, &path)
+                    write_fixture(&snap, self.instance.module.as_str(), &path)
                         .map(|()| path)
                         .map_err(|e| e.to_string())
                 }) {
                 Ok(path) => tracing::error!(
-                    module = %self.module_id,
+                    module = %self.instance.module,
                     trap = %trap,
                     peak_memory_bytes = peak_memory,
                     fixture = %path.display(),
                     "backfill init trapped; fixture written for local replay (mitos-run --fixture)",
                 ),
                 Err(write_err) => tracing::warn!(
-                    module = %self.module_id,
+                    module = %self.instance.module,
                     trap = %trap,
                     peak_memory_bytes = peak_memory,
                     error = %write_err,
@@ -189,7 +194,7 @@ pub(crate) async fn run_rebootstrap_pump(
     factory: &BackfillFactory,
     mode: crate::bindings_v2::RebootstrapMode,
 ) -> BackfillOutcome {
-    let module_id = factory.module_id.as_str();
+    let module_id = factory.instance.module.as_str();
 
     let (mut driver, mut trap_logger) = match factory.instantiate(None).await {
         Ok(d) => d,
@@ -324,7 +329,7 @@ pub(crate) async fn run_rebootstrap_pump(
                         let snap = trap_logger.snapshot();
                         match factory
                             .storage
-                            .last_trap_path(module_id)
+                            .last_trap_path_at(&factory.instance)
                             .map_err(|e| e.to_string())
                             .and_then(|path| {
                                 write_fixture(&snap, module_id, &path)

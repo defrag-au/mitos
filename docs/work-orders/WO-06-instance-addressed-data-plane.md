@@ -11,6 +11,114 @@ invasive; alone").
 **Depends on:** WO-01, 03, 05. **Blocks:** WO-07 (control plane), and through
 it the move.
 
+## Implemented 2026-09-20 — notes for review
+
+Every acceptance item passes.
+
+| Acceptance | Result |
+|---|---|
+| 1. `cargo test -p mitos-platform -p mitos-core -p mitos-lifecycle` | `mitos-core` 28, `mitos-lifecycle` 93, `mitos-platform` lib 257, `bootstrap_by_policy_v2` 1, `community_module_interest` 2, `dispatch_v2` 1, `dynamic_interest_v2` 1, `lifecycle_v2` 2, `two_instances_v2` 5 — **0 failed** |
+| 1. integration files carry ONLY the sanctioned edit | `git diff --stat crates/mitos-platform/tests` = 4 files, 10 insertions / 5 deletions — the five `KvFactory` closures and their `use`. No assertion, fixture or helper touched; `tests/common/mod.rs` unmodified |
+| 2. clippy `--workspace --all-targets --all-features -D warnings` | 0 |
+| 2. `cargo check --workspace --all-targets` | 0 |
+| 2. `cargo fmt --check` | 0 diffs |
+| 3. storage (six named tests) | all present and passing |
+| 4. host (`tests/two_instances_v2.rs`, five named tests) | 5 passed |
+| 5. fan-out (seven named tests) | 7 passed — see below on the pinned baseline |
+| 6. admin | `the_instances_route_lists_both_and_marks_the_current_one`, `reading_instances_writes_nothing`, and `the_route_lists_cover_the_whole_router` all pass |
+| 7. goldens | **69/69**, after `cargo build --release --bin mitos-run` AND `mitos-build` over all 19 community modules |
+
+### The baseline passed BEFORE the change
+
+`with_one_instance_and_no_rows_the_fan_out_is_unchanged` was written against
+`drain_one` / `fan_out_undo` as they were and run before any instance
+addressing went in:
+
+```
+test host_v2::fan_out_tests::with_one_instance_and_no_rows_the_fan_out_is_unchanged ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+It still passes unmodified. That, plus the five untouched integration files,
+is the whole of "with one instance the behaviour is byte-identical".
+
+### Found by a test, fixed: a `Skip` is not "no subscriber"
+
+`a_client_whose_row_names_the_second_instance_is_served_by_it_alone` failed
+the first time it ran, and the reason was worth the test.
+
+The first draft did what the order's bullet says literally — `Skip` ⇒
+`continue` past the client. But `drain_one` writes a SENTINEL row when it
+walked the companions directory and saw no companion at all, so that the
+first-ever subscriber can reclaim events emitted before it arrived. Skipping
+the client directory outright left `saw_companion` false, so the instance
+that did NOT serve the only client wrote a sentinel for an event that had in
+fact been delivered — and a later, unrelated subscriber would have reclaimed
+it.
+
+A `Skip` means "another instance is writing this client's row", not "nobody
+is subscribed". The walk now descends far enough to set `saw_companion` and
+withholds only the `append` (`host_v2.rs`, the `serves` binding). `fan_out_undo`
+has no sentinel, so its early `continue` is correct and is left alone.
+
+### Deviations, all small
+
+1. **`recapture_module` asks `refuse_if_forked` BEFORE the dialer lookup.**
+   It was after, so a forked module with no dialer wired reported "dialer not
+   wired" — the true reason masked by unrelated wiring. Production always has
+   a dialer, so nothing changes there; the test reads the real reason.
+2. **The admin enum is `InstanceRole`, not `Role`.** Variants are `Current` /
+   `Other` as specified; the prefix matches this file's `RowSummary` /
+   `RowPlacement` / `RowStage`. Its sibling `SlotState::{Running, Stopped}` is
+   an enum for the same reason, though the order only asked for one.
+3. **The second instance in the host tests is config-keyed, not wasm-keyed.**
+   The order suggests `put_artifact(&manifest, &wasm)` + `write_instance_marker`,
+   but there is one test wasm and `put_artifact` of the same bytes is a no-op
+   — the same bytes give the same key, so that recipe yields one instance, not
+   two. `put_config` + `write_instance_marker` is the other half of the same
+   public surface and does give a distinct instance. Config bytes are empty,
+   which the test-indexer's `init` treats exactly as no config, so the second
+   instance differs in identity and nothing else.
+4. **`tests/two_instances_v2.rs` defines its own `BroadcastSub`.** `common`'s
+   `OneShotSub` shares ONE receiver across every subscription it hands out, so
+   a tip event reaches whichever follower wakes first. Harmless with one
+   instance, fatal here: "both cursors advanced" would depend on the
+   scheduler. `common/mod.rs` is a shared fixture and changing it is not
+   sanctioned, so the new subscription lives in the new file.
+5. **`emissions_path` / `kv_path` / `watched_path` are now `#[cfg(test)]`.**
+   Production reaches all three through the instance-addressed stores. They
+   are kept because `opening_state_for_a_missing_instance_is_an_error_not_a_mkdir`
+   proves the no-mkdir refusal per PATH, which is stronger than proving it per
+   store. No assertion changed.
+
+### Found, NOT fixed
+
+- **`interest_filter_tests::POLICY_B` is 57 hex characters** (`host_v2.rs`), one
+  over. It has never surfaced because that module only passes it as a raw
+  `&str`; my `fan_out_tests` module was the first to put a constant through
+  `PolicyId::new`, which rejected it. I used a correct 56-char constant in the
+  new module and left theirs alone — changing it is a test edit this order
+  does not sanction, and it asserts nothing about length. One line, someone
+  else's call.
+
+### Questions for the reviewer
+
+1. **The sentinel across a fork is still only approximately right.** With two
+   instances and NO companions at all, only the current instance keeps the
+   unclaimed row — that is `routing::unclaimed` and it is correct. But the
+   fix above means a client served by instance B also suppresses instance A's
+   sentinel, which is right for that client and says nothing about a *future*
+   client. Two instances, one client on B, then a brand-new client subscribes:
+   it reclaims A's sentinel rows from before the fork and nothing from after.
+   I believe that is acceptable (sentinel reclaim is best-effort and the
+   window is "before the first subscriber"), but it is a behaviour that only
+   exists once a module can fork, and WO-09's `Hold` may want to name it.
+2. **`ModuleHostHandle::running_instances` returns `Vec::new()` on `FakeHost`.**
+   `FakeHost` is module-addressed and the lifecycle watchdog it serves stays
+   module-addressed until WO-07. So the admin instances route reports every
+   instance as `Stopped` under `FakeHost` — which is what the admin tests
+   assert. If WO-07 gives `FakeHost` instances, that assertion changes with it.
+
 ## What this order does, and where it deliberately stops
 
 WO-01 made the DISK layout instance-keyed. Everything above the disk is still

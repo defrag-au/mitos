@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use dolos_core::{TipEvent, TipSubscription};
 use mitos_data_plane::ChainDataPlane;
+use mitos_lifecycle::ids::InstanceKey;
 use pallas_traverse::MultiEraBlock;
 use tokio_util::sync::CancellationToken;
 
@@ -57,7 +58,10 @@ pub async fn run_chain_follower_v2<S, P>(
     cancel: CancellationToken,
     data_plane: Arc<P>,
     storage: ModuleStorage,
-    module_id: String,
+    // The INSTANCE this follower runs as. Everything it opens or writes —
+    // its cursor, its KV, its trap fixture — is addressed by this, so a
+    // second instance of the same module cannot overwrite it.
+    instance: InstanceKey,
     kv_factory: KvFactory,
     trap_logger: Arc<TrapContextLogger>,
     event_ring: Option<crate::events::EventRing>,
@@ -69,6 +73,10 @@ where
     P: ChainDataPlane + Sync + Send + 'static,
 {
     tracing::info!("v2 chain-follower started");
+    // The module this instance is OF. Logging, the module's own exports and
+    // the trap fixture's header are all module-level; the state this
+    // follower opens and the cursor it writes are not.
+    let module_id: &str = instance.module.as_str();
     // Open the platform-wide aux-data cache once before the loop.
     // Blocks with aux_data are harvested proactively after each
     // successful apply so future bootstraps can resolve without
@@ -91,7 +99,7 @@ where
                     Some(update) => {
                         apply_interest_update(
                             &mut driver,
-                            &module_id,
+                            &instance,
                             update,
                             data_plane.as_ref(),
                             &kv_factory,
@@ -136,7 +144,7 @@ where
                         if let Some(ref cache) = aux_cache {
                             harvest_block_aux_data(block_bytes, cache);
                         }
-                        flush_cursor(&storage, &module_id, &driver);
+                        flush_cursor(&storage, &instance, &driver);
                     }
                     Err(crate::PlatformError::Decode(e)) => {
                         // Match v1's posture: host-side decode
@@ -160,10 +168,10 @@ where
                         // instance-scoped; fold that in with the write so
                         // both failures land on the same warn.
                         match storage
-                            .last_trap_path(&module_id)
+                            .last_trap_path_at(&instance)
                             .map_err(|e| e.to_string())
                             .and_then(|path| {
-                                write_fixture(&snap, &module_id, &path)
+                                write_fixture(&snap, module_id, &path)
                                     .map(|()| path)
                                     .map_err(|e| e.to_string())
                             }) {
@@ -185,7 +193,7 @@ where
                         // /_admin/events` see it without a journal grep.
                         if let Some(ring) = &event_ring {
                             ring.record(
-                                module_id.clone(),
+                                module_id,
                                 crate::events::EventKind::Trap {
                                     reason: e.to_string(),
                                 },
@@ -208,7 +216,7 @@ where
                     return Err(crate::PlatformError::Wasmtime(e));
                 }
                 tracing::info!(?to_cursor, "v2 follower: rollback dispatched");
-                flush_cursor(&storage, &module_id, &driver);
+                flush_cursor(&storage, &instance, &driver);
             }
             TipEvent::Mark(point) => {
                 tracing::trace!(?point, "v2 follower: mark");
@@ -216,7 +224,7 @@ where
                 // the cursor-only checkpoint that lets a restart
                 // resume from a known point even when no module-
                 // visible blocks have arrived.
-                flush_cursor(&storage, &module_id, &driver);
+                flush_cursor(&storage, &instance, &driver);
             }
         }
     }
@@ -256,7 +264,7 @@ fn harvest_block_aux_data(block_bytes: &[u8], cache: &crate::indexer_data_cache:
 #[allow(clippy::too_many_arguments)]
 async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     driver: &mut DriverV2,
-    module_id: &str,
+    instance: &InstanceKey,
     update: InterestUpdate,
     plane: &P,
     kv_factory: &KvFactory,
@@ -265,6 +273,10 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
     event_ring: Option<&crate::events::EventRing>,
 ) {
     use mitos_protocol::InterestOp as WireOp;
+
+    // Interest and the module's own exports are module-level concepts; only
+    // the STATE this opens is per-instance.
+    let module_id: &str = instance.module.as_str();
 
     // 1. Apply the op to the driver's InterestSet so subsequent
     //    block-dispatch filtering reflects the new predicates.
@@ -376,7 +388,7 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
         // unindexed and the gate would wrongly skip them. See
         // `docs/design/WATCHED_UTXO_INDEX.md`.
         if let Some(index) = driver.watched_index() {
-            let mut seed_kv = kv_factory(module_id);
+            let mut seed_kv = kv_factory(instance);
             for predicate in &update.predicates {
                 crate::bootstrap_v2::seed_predicate_watched(
                     index.as_ref(),
@@ -450,7 +462,7 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
             // double-fire a module that also cold-starts inline (e.g.
             // vesting-tracker), so it's opt-in via the manifest flag.
             // Idempotent via the per-scope state-kv flag.
-            let mut bootstrap_kv = kv_factory(module_id);
+            let mut bootstrap_kv = kv_factory(instance);
             for predicate in &update.predicates {
                 match crate::bootstrap_v2::bootstrap_one_predicate(
                     driver,
@@ -487,13 +499,21 @@ async fn apply_interest_update<P: ChainDataPlane + Sync + Send + 'static>(
 /// Persist the driver's post-apply cursor to module storage.
 /// Best-effort: a transient redb error is logged but doesn't
 /// kill the follower (next successful flush will overwrite).
-fn flush_cursor(storage: &ModuleStorage, module_id: &str, driver: &DriverV2) {
+fn flush_cursor(storage: &ModuleStorage, instance: &InstanceKey, driver: &DriverV2) {
     let Some(cursor) = driver.cursor() else {
         return;
     };
-    if let Err(e) = storage.write_cursor(module_id, cursor) {
+    // Best-effort, and that matters in one window: between `activate`'s
+    // rename and the upload handler's `replace`, this follower still holds
+    // the OLD key and the write returns `NoSuchInstance`. It is logged and
+    // carried past — the follower is stopped milliseconds later and the
+    // restart replays at most one block, which is the at-least-once the
+    // cursor has always had. Creating the directory here would resurrect the
+    // renamed-away instance; see `ModuleStorage::instance_state_dir`.
+    if let Err(e) = storage.write_cursor_at(instance, cursor) {
         tracing::warn!(
-            module = %module_id,
+            module = %instance.module,
+            instance = %instance.dir_name(),
             error = %e,
             "v2 follower: cursor flush failed; will retry on next event",
         );

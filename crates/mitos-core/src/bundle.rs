@@ -447,8 +447,12 @@ impl Bundle {
             // a second `Database::open` of the same file fails
             // with `Database already open`.
             let storage_for_kv = storage.clone();
-            let kv_factory: mitos_platform::host_v2::KvFactory = Arc::new(move |id: &str| {
-                match storage_for_kv.kv_store(id, None) {
+            // Keyed by INSTANCE: two instances of one module have two KVs,
+            // and handing both the same handle is the overwrite the whole
+            // instance-addressing change exists to make impossible.
+            let kv_factory: mitos_platform::host_v2::KvFactory = Arc::new(move |key| {
+                let id = key.module.as_str();
+                match storage_for_kv.kv_store_at(key, None) {
                     Ok(kv) => mitos_platform::host_fns::state_kv::ModuleKv::Redb(kv),
                     Err(e) => {
                         // Fall back to in-memory rather than refusing

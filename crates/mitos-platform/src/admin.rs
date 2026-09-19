@@ -18,6 +18,8 @@
 //!   stop slot, drop dialer state, remove artifact directory.
 //!   Refuses if companion records exist for the module unless
 //!   `?force=true`. Idempotent across re-invocation.
+//! - `GET  /_admin/modules/{id}/instances` — every instance directory
+//!   of a module, and which one `current.toml` points at
 //! - `GET  /_admin/modules/{id}/last-trap` — trap-context fixture
 //! - `GET  /_admin/modules/{id}/emissions` — emissions log
 //! - `DELETE /_admin/modules/{id}/emissions` — purge
@@ -236,6 +238,7 @@ fn admin_router_inner(
         .route("/_admin/modules/{id}/evict", post(evict_module))
         .route("/_admin/modules/{id}/companions", get(list_companions))
         .route("/_admin/modules/{id}/rows", get(list_rows))
+        .route("/_admin/modules/{id}/instances", get(list_instances))
         .route(
             "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
             axum::routing::delete(delete_companion),
@@ -550,6 +553,114 @@ async fn list_rows(
         })
         .collect::<Vec<_>>();
     Ok(Json(rows).into_response())
+}
+
+/// One instance directory of a module.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstanceSummary {
+    /// The directory name on disk, and how a row's placement spells an
+    /// instance (`RowPlacement::instance`) — so an operator can match the two
+    /// by eye.
+    pub dir: String,
+    /// The FULL key. `dir` truncates both digests to 16 hex characters, which
+    /// is enough for a directory name and not enough to identify an artifact.
+    pub wasm: String,
+    /// `None` for an instance with no config override.
+    pub config: Option<String>,
+    pub role: InstanceRole,
+    pub slot: SlotState,
+    /// The instance's own cursor. `None` when it has never checkpointed — a
+    /// second instance that has not started yet reads exactly like one that
+    /// has started and not yet reached a block.
+    pub cursor: Option<u64>,
+}
+
+/// Whether `current.toml` resolves to this instance.
+///
+/// An enum, not a `bool`: a third answer is coming the moment a move can
+/// create a staging instance, and it must arrive as a compile error at every
+/// match rather than as a `false`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstanceRole {
+    /// What every `&str`-addressed operator tool means by "the module".
+    Current,
+    Other,
+}
+
+/// Whether the host has a live slot for this instance. An instance directory
+/// outlives its slot — `stop` leaves the directory alone — so "on disk" and
+/// "running" are two questions.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SlotState {
+    Running,
+    Stopped,
+}
+
+/// `GET /_admin/modules/{id}/instances` — every instance directory of a
+/// module, and which one is current.
+///
+/// READ-ONLY, and deliberately so: it reads the markers, `current.toml`, each
+/// instance's cursor and the host's slot table. It never creates an instance
+/// directory, adopts a row or repairs a pointer — which is why it goes
+/// through `read_cursor_at` (which requires the directory) rather than
+/// anything that would create one on the way past.
+async fn list_instances(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    let not_registered = || (StatusCode::NOT_FOUND, "module not registered").into_response();
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok(not_registered());
+    }
+    // A registered module always has a parsable id; an unparsable one cannot
+    // be registered, so this is the same 404 rather than a new error shape.
+    let Ok(module) = mitos_lifecycle::ids::ModuleId::parse(&id) else {
+        return Ok(not_registered());
+    };
+
+    let current = state.storage.current_instance(&id)?;
+    let running = match &state.host {
+        Some(host) => host.running_instances(&id).await,
+        None => Vec::new(),
+    };
+
+    let instances = state
+        .storage
+        .list_instances(&module)?
+        .into_iter()
+        .map(|key| InstanceSummary {
+            dir: key.dir_name(),
+            wasm: key.wasm.to_string(),
+            config: key.config.as_ref().map(|c| c.to_string()),
+            role: match current.as_ref() {
+                Some(current) if *current == key => InstanceRole::Current,
+                _ => InstanceRole::Other,
+            },
+            slot: match running.contains(&key) {
+                true => SlotState::Running,
+                false => SlotState::Stopped,
+            },
+            // A cursor this route cannot read is reported as absent rather
+            // than failing the listing: one unreadable instance must not hide
+            // the others, exactly as `list_rows` treats an unparsable row.
+            cursor: state
+                .storage
+                .read_cursor_at(&key)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "instances: cursor unreadable",
+                    );
+                    None
+                })
+                .map(|c| c.slot()),
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(instances).into_response())
 }
 
 /// Best-effort: a read surface must not 500 because one module's record is
@@ -2869,6 +2980,7 @@ mod tests {
         "/_admin/modules/m",
         "/_admin/modules/m/companions",
         "/_admin/modules/m/rows",
+        "/_admin/modules/m/instances",
         "/_admin/modules/m/last-trap",
         "/_admin/modules/m/emissions",
         "/_admin/utxos",
@@ -3369,6 +3481,142 @@ mod tests {
             .await,
             StatusCode::FORBIDDEN,
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `GET …/instances`, the whole point of it: two directories, one of
+    /// which `current.toml` points at.
+    #[tokio::test]
+    async fn the_instances_route_lists_both_and_marks_the_current_one() {
+        let dir = tempdir("instances-list");
+        let w = wired(&dir);
+
+        let live = b"the live artifact";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", live), live)
+            .unwrap();
+        let current = w.storage.current_instance("m").unwrap().unwrap();
+
+        // A second instance, made the only way one can be outside `activate`
+        // — `put_artifact` then the marker. Creating instances is WO-08's.
+        let other_wasm = b"a second artifact";
+        let other_manifest = crate::companions::testing::manifest_for("m", other_wasm);
+        w.storage.put_artifact(&other_manifest, other_wasm).unwrap();
+        let other = mitos_lifecycle::ids::InstanceKey {
+            module: mitos_lifecycle::ids::ModuleId::parse("m").unwrap(),
+            wasm: mitos_lifecycle::ids::Sha256Hex::parse(&crate::manifest::sha256_hex(other_wasm))
+                .unwrap(),
+            config: None,
+        };
+        w.storage.write_instance_marker(&other).unwrap();
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/modules/m/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<InstanceSummary> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            listed.len(),
+            2,
+            "both instance directories should be listed"
+        );
+        let by_dir = |key: &mitos_lifecycle::ids::InstanceKey| {
+            listed
+                .iter()
+                .find(|i| i.dir == key.dir_name())
+                .unwrap_or_else(|| panic!("{} missing from the listing", key.dir_name()))
+        };
+        assert_eq!(by_dir(&current).role, InstanceRole::Current);
+        assert_eq!(by_dir(&other).role, InstanceRole::Other);
+        // The full digest, not the truncated directory name — the point of
+        // carrying `wasm` as its own field.
+        assert_eq!(by_dir(&other).wasm, other.wasm.to_string());
+        assert_eq!(by_dir(&other).config, None);
+        // `FakeHost` has no slots, and neither instance has ever run.
+        assert_eq!(by_dir(&current).slot, SlotState::Stopped);
+        assert_eq!(by_dir(&current).cursor, None);
+
+        // An unregistered module is a 404, not an empty list — the operator
+        // asking about a typo must not read it as "no instances".
+        assert_eq!(
+            call(
+                &w.router,
+                Method::GET,
+                "/_admin/modules/nope/instances",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// It is a READ surface. Nothing about the module directory may differ
+    /// after a request — no instance directory conjured by a path helper, no
+    /// cursor file created by opening one, no row adopted on the way past.
+    #[tokio::test]
+    async fn reading_instances_writes_nothing() {
+        let dir = tempdir("instances-read-only");
+        let w = wired(&dir);
+        let wasm = b"read-only artifact";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+
+        /// Every path under a directory, sorted — the whole subtree, so a
+        /// file created three levels down still shows up.
+        fn tree(root: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(next) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&next) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path.clone());
+                    }
+                    out.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            out.sort();
+            out
+        }
+
+        let before = tree(&dir);
+        assert_eq!(
+            call(
+                &w.router,
+                Method::GET,
+                "/_admin/modules/m/instances",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_eq!(tree(&dir), before, "the instances route wrote to disk");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
