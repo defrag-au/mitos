@@ -180,22 +180,31 @@ A's:
 ### D6 — Upgrade actions: typed, keyed by revision, split by scope
 
 ```toml
-[module]
-id = "wayup-store-offer"
+[lifecycle]
 revision = 5
 state_schema = 2
 
-[[upgrade]]
+[[lifecycle.upgrade]]
 since = 3
 actions = ["recapture"]
 
-[[upgrade]]
+[[lifecycle.upgrade]]
 since = 5
 actions = ["purge-emissions", "reset-watched"]
 ```
 
+ONE table, in both the module's `.toml` and its manifest
+(`mitos_lifecycle::artifact::LifecycleSection`). Not `[module] revision` +
+top-level `[[upgrade]]` as first drafted: `mitos-build` ships the module's
+whole `.toml` to the module as `config.cbor`, and the config's sha is part of
+instance identity — so build metadata left in there would reach the module's
+`Config` deserialiser AND make a bare `revision` bump fork a new,
+byte-identical instance. `mitos-build` strips `[lifecycle]` exactly as it
+strips `[deps]`. Every field defaults to 0 / empty, which is what every pre-v3
+artifact IS.
+
 The ledger is the client row's `revision`. On a move from `r_old` the
-host takes every `[[upgrade]]` with `since > r_old` and runs the UNION —
+host takes every `[[lifecycle.upgrade]]` with `since > r_old` and runs the UNION —
 because environments skip builds (dev takes 3, 4, 5; prod jumps 2 → 5).
 
 `enum UpgradeAction`, kebab-case serde, unknown ⇒ module refused. Each
@@ -228,13 +237,30 @@ lifecycle journal, exposed via API/MCP, and alerts when non-empty on a
 ### D8 — Delivery is PULL by digest
 
 ```
-ModuleRef { url, wasm_sha256, revision, config: Option<bytes> }   // config ≤ 64 KiB
+ModuleRef { url, wasm_sha256, manifest_sha256, revision, config: Option<bytes> }   // config ≤ 64 KiB
 ```
 
-carried on `SubscribeRequest`. The worker embeds it at build time
-(`mitos-build` emits the const; a cross-repo consumer commits a
-`mitos-modules.lock`). mitos: sha in CAS → nothing; else fetch → verify
-sha → `validate_against_host` → wasmtime validate → store.
+carried on `SubscribeRequest`. `mitos-build` emits `built-module.json`
+(`mitos_lifecycle::artifact::BuiltModule` — the digests, no URL); the worker
+embeds it and supplies the base URL it serves from. A cross-repo consumer
+commits a `mitos-modules.lock`. mitos: sha in CAS → nothing; else fetch →
+verify BOTH shas → `validate_against_host` → wasmtime validate → store.
+
+- **The manifest is pinned too**, by the digest of its FILE BYTES. The wasm sha
+  pins the code, but the manifest carries the upgrade actions and the interest
+  set and is fetched from the same public place — an unpinned one could arrive
+  with `recapture` quietly removed. Raw bytes rather than a canonical form, so
+  the digest never depends on a builder's and a host's TOML serialisers
+  agreeing. `build_id` therefore gives every build a new manifest digest, which
+  is harmless: the manifest is NOT part of instance identity, so a no-change
+  rebuild announces the instance the client is already on.
+- **The wasm build is NOT reproducible across machines** (found 2026-09-19):
+  `debug = "line-tables-only"` with no `--remap-path-prefix` embeds absolute
+  source paths, so one source built in two checkouts yields two wasm shas —
+  under instance-per-digest, two instances for ever. A module with more than
+  one consumer (`jpg-store-*`: `jpgsm` AND `ownership`) must be BUILT ONCE and
+  its `built-module.json` shared. Reproducible builds would lift this and are
+  worth their own piece of work.
 
 - The simplest artifact host is the worker itself, serving
   `/.well-known/mitos/<id>/<sha>.wasm` as a static asset (artifacts are

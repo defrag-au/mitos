@@ -65,7 +65,17 @@ use crate::{Transition, UnixSecs};
 pub struct ModuleRef {
     pub url: String,
     pub wasm: Sha256Hex,
+    /// The MANIFEST's digest, pinned alongside the wasm's. The wasm sha pins
+    /// the code, but the manifest carries the upgrade actions and the interest
+    /// set, and it is fetched from the same public place — a host that took an
+    /// unpinned manifest could be handed one with `recapture` quietly removed.
+    /// NOT part of instance identity: two manifests over one wasm and config
+    /// run the same code on the same state.
+    pub manifest: Sha256Hex,
     pub config: Option<Sha256Hex>,
+    /// Also IN the manifest. Announced here because the rollback check runs
+    /// before anything is fetched; the host must refuse an artifact whose
+    /// manifest disagrees with the revision that was announced for it.
     pub revision: Revision,
 }
 
@@ -723,6 +733,7 @@ mod tests {
         ModuleRef {
             url: format!("https://example.invalid/{byte}.wasm"),
             wasm: Sha256Hex::parse(&byte.repeat(32)).unwrap(),
+            manifest: Sha256Hex::parse(&"00".repeat(32)).unwrap(),
             config: None,
             revision: Revision(revision),
         }

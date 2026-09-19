@@ -208,7 +208,14 @@ impl fmt::Display for InstanceKey {
 /// ledger ([`crate::upgrade`]) and NOTHING else — it is not identity. Two
 /// digests may share a revision (a dev rebuild without a bump); that is a move
 /// with no actions, not an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// `Default` is 0, and 0 MEANS something: an artifact built before revisions
+/// existed. Declared revisions start at 1 (`upgrade::validate` refuses a
+/// `since = 0`), so nothing can ever be "since" a pre-v3 artifact, and a move
+/// between two of them crosses no action.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Revision(pub u32);
 
 /// A slot number. Only ever compared, never converted to time here — that

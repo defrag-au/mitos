@@ -163,8 +163,8 @@ Done / Partially done / Blocked
 | 01 | Instance-keyed storage + content-addressed artifacts | — | **done**, reviewed 2026-09-19 — see its "Review" section |
 | 02 | Namespaces: a token resolves to a principal | 01 | **done**, reviewed 2026-09-19 — no defects; `/replicate` settled as `Attempt::TailIndexer`. Needs `/security-review` before mainnet |
 | 03 | Instance lifecycle wired — a persisted `LifecycleRecord` per instance; `LifecycleManager` replaces `auto_resume` and drives the watchdog; operator stop/start/pin/evict. Fixes an operator's stop being undone by a restart, by the watchdog, and by an upload. (Stays on the storage facade — host slots are still keyed by module id until two instances can exist.) | 02 | **done**, reviewed 2026-09-19 — 3 review fixes (a `Reap` that never retried; an unlocked read that could write; a loud diagnostic for under-counted adoption) |
-| 04 | Manifest v3 fields — `revision`, `state_schema`, `[[upgrade]]`; `mitos-build` emits them and the `ModuleRef` const | — (parallel) | not written |
-| 05 | `ModuleRef` on subscribe + persisted client rows + pull-by-digest into the CAS (`client_move` up to `Queued`) | 03, 04 | not written |
+| 04 | The manifest's `[lifecycle]` section (`revision`, `state_schema`, `[[lifecycle.upgrade]]`) — ONE table, stripped from `config.cbor` because the config's sha is instance identity; `mitos-build` emits `built-module.json` | — (parallel) | **ready** |
+| 05 | `ModuleRef` on subscribe + persisted client rows + pull-by-digest into the CAS, incl. a manifest CAS keyed by MANIFEST digest (`client_move` up to `Queued`) | 03, 04 | not written |
 | 06 | The move itself — staging, catch-up, quiesce, commit, scoped refill (needs a CLIENT-SCOPED recapture; see WO-02 on why it is whole-module today) | 05 | not written |
 | 07 | Client lease + probe | 05 | not written |
 | 08 | GC — CAS refcounts, `orphaned-v2/`, retained instances | 03 | not written |

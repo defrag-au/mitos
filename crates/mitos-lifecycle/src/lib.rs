@@ -39,6 +39,7 @@
 //! deserialises into), storage layout, and anything that touches a follower.
 
 pub mod access;
+pub mod artifact;
 pub mod client_move;
 pub mod ids;
 pub mod instance;

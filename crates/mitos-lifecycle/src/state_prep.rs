@@ -18,7 +18,12 @@
 use serde::{Deserialize, Serialize};
 
 /// The `state_schema` a manifest declares. Compared, never interpreted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// `Default` is 0 — what every artifact built before this existed declares by
+/// declaring nothing. Two of them are EQUAL, so moving between them is
+/// `CopyCompatible`: new code resumes on the old state, exactly as v2's
+/// in-place replace did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StateSchema(pub u32);
 
 /// Whether the new artifact exports `migrate`. Read from the component's
