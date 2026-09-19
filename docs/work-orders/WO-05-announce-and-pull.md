@@ -119,6 +119,60 @@ subscribe" implies, and the alternative (await the fetch, report its outcome)
 would make a subscribe wait on a download — but it is worth confirming the
 response semantics are what you want.
 
+## Review 2026-09-19 — the blocker closed, two defects fixed
+
+Acceptance re-run independently and matches. Commit scope matches "Files"
+(plus `inspect.rs`, `host_v2.rs`, `lifecycle.rs`, each justified); no
+`#[ignore]`; `tests/common/mod.rs` has exactly the sanctioned field. Row and
+manifest writes are write-then-rename; the size cap stops the READ; the
+half-stored-artifact window was found and tested without being asked for.
+After review: lifecycle 88, platform 242, clippy `--workspace -D warnings` 0,
+workspace check 0.
+
+**1. The blocker — a gap in the PURE crate, and correctly reported rather
+than worked around.** `Move` dropped the manifest digest, so the pin held only
+as long as the process did. Closed as option (1), and further: `url` is gone
+from `ModuleRef`, `Move` and `Effect::EnsureArtifact` altogether (deviation 4
+had already made it dead weight — one derivation, nothing stored that could
+disagree with it), and `manifest` takes its place on `Move` and on the effect.
+Host side, `Pinned` and `cannot_verify` are deleted. Tests:
+`a_fetch_interrupted_by_a_restart_is_reissued_with_both_pins` (pure, THROUGH
+toml), `boot_refetches_a_row_that_was_fetching` (as the order named it), and
+`a_refetch_after_a_restart_still_holds_the_manifest_to_its_pin` — the worker
+swaps its manifest between crash and restart, which is the attack the pin
+exists for. How it got through: my recovery test started every case from
+`Planned`. `Fetching` was the one stage it never recovered from.
+
+**2. DEFECT — a subscribe waited on the download, under the row lock.**
+`announce` awaited `execute_all`, which awaited the pull: up to two 30-second
+fetches inside a subscribe handler with a Durable Object on the other end, so
+"an announcement never fails the subscribe" was false by timeout; the row lock
+was held throughout; and `boot` awaited every unreachable worker in turn
+before the host finished starting. The report's closing question ("`Accepted`
+as soon as the move is recorded") described the intent, not the code —
+`an_announcement_never_fails_the_subscribe` could only assert the failure was
+on the ring when the response returned BECAUSE the fetch was inline. Now
+`spawn_fetch`: the pull runs on its own task holding no lock, and takes the
+row lock only to report. `MoveManager::new` returns `Arc<Self>`
+(`new_cyclic`); `settle()` waits for running fetches (tests, shutdown). Tests:
+`an_announcement_does_not_wait_for_the_download` and
+`boot_does_not_wait_on_an_unreachable_worker`, both against a HELD fetcher and
+both under a timeout so a regression fails instead of hanging. That answers
+the question too: `Accepted` means the move was recorded; the artifact's fate
+is on the ring and the row.
+
+**3. DEFECT — a stored artifact skipped the checks about the ANNOUNCEMENT.**
+The CAS short-circuit returned the stored manifest untested. The digests and
+the ABI gate are properties of the bytes, settled when stored; module, wasm
+and REVISION agreement are properties of what this client just claimed. The
+rollback rule runs on the announced revision before any fetch, so a client
+could name the digests of a stored revision-3 build, announce revision 9, pass
+the rule, and carry the 3. Now `agrees_with()` runs on both paths. Test:
+`a_stored_artifact_is_still_held_to_the_announced_revision`.
+
+Agreed and left: deviations 1–5; `MoveError` unused (delete in WO-06); no slot
+queue (right — one that only grows is worse than none).
+
 ## What this order does, and where it deliberately stops
 
 A worker says, on subscribe, "this is the module I was BUILT against". The host

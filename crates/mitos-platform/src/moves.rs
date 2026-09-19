@@ -69,6 +69,11 @@ pub struct MoveManager {
     events: EventRing,
     /// One lock per `(module, client)` — a row's read-modify-write.
     locks: std::sync::Mutex<HashMap<RowKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// A fetch outlives the call that started it (see [`Self::spawn_fetch`]),
+    /// so the task needs an owning handle back to the manager.
+    me: std::sync::Weak<Self>,
+    /// Fetches still running, so [`Self::settle`] can wait for them.
+    fetches: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// `(module, client)` — which row a lock guards.
@@ -81,14 +86,30 @@ impl MoveManager {
         auth: Arc<Authenticator>,
         lifecycle: Arc<LifecycleManager>,
         events: EventRing,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
             storage,
             puller,
             auth,
             lifecycle,
             events,
             locks: std::sync::Mutex::new(HashMap::new()),
+            me: me.clone(),
+            fetches: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Wait for every fetch started so far. For tests, and for an orderly
+    /// shutdown; nothing on a request path may call it.
+    pub async fn settle(&self) {
+        loop {
+            let running: Vec<_> = std::mem::take(&mut *self.fetches.lock().expect("fetches mutex"));
+            if running.is_empty() {
+                return;
+            }
+            for fetch in running {
+                let _ = fetch.await;
+            }
         }
     }
 
@@ -219,15 +240,7 @@ impl MoveManager {
         self.storage
             .write_row(module.as_str(), &transition.next)
             .map_err(|e| e.to_string())?;
-        // The announcement is still in hand here, which is the ONLY place the
-        // manifest digest exists — see `Pinned`.
-        let pinned = Pinned {
-            wasm: announced.wasm.clone(),
-            manifest: announced.manifest.clone(),
-            revision: announced.revision,
-        };
-        self.execute_all(module, client, &transition.effects, Some(&pinned))
-            .await;
+        self.execute_all(module, client, &transition.effects).await;
         Ok(result)
     }
 
@@ -292,41 +305,32 @@ impl MoveManager {
     // Effects
     // -----------------------------------------------------------------
 
-    /// Boxed because the cycle is real: executing `EnsureArtifact` feeds a
-    /// `Progress` back in, which produces effects of its own. It is two deep
-    /// in this order — a fetch answer yields only slot bookkeeping — but the
-    /// shape is a cycle and the compiler is right to say so.
+    /// **Runs under the row lock, so nothing here may wait on the world.**
+    /// Every effect is either bookkeeping or starts work that reports back
+    /// later as a `Progress`.
+    ///
+    /// Boxed because the cycle is real: a fetch's answer is fed back in as a
+    /// `Progress`, which produces effects of its own.
     fn execute_all<'a>(
         &'a self,
         module: &'a ModuleId,
         client: &'a ClientId,
         effects: &'a [Effect],
-        pinned: Option<&'a Pinned>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             for effect in effects {
-                self.execute(module, client, effect, pinned).await;
+                self.execute(module, client, effect).await;
             }
         })
     }
 
-    async fn execute(
-        &self,
-        module: &ModuleId,
-        client: &ClientId,
-        effect: &Effect,
-        pinned: Option<&Pinned>,
-    ) {
+    async fn execute(&self, module: &ModuleId, client: &ClientId, effect: &Effect) {
         match effect {
-            Effect::EnsureArtifact { wasm, .. } => match pinned {
-                // The URL on the effect is the one the host derived; the
-                // puller derives it again from the same inputs rather than
-                // carrying a string around.
-                Some(pinned) if &pinned.wasm == wasm => {
-                    self.ensure_artifact(module, client, pinned).await
-                }
-                _ => self.cannot_verify(module, client, wasm).await,
-            },
+            // The effect carries BOTH pins, so one re-issued after a restart
+            // is exactly as verifiable as the first.
+            Effect::EnsureArtifact { wasm, manifest } => {
+                self.spawn_fetch(module, client, wasm, manifest);
+            }
             // A slot is never granted in this order, so the queue is a record
             // of who is waiting and nothing more. WO-06 drains it.
             Effect::RequestCatchUpSlot | Effect::ReleaseCatchUpSlot => {}
@@ -359,80 +363,63 @@ impl MoveManager {
         }
     }
 
-    /// A re-issued `EnsureArtifact` the host cannot verify.
+    /// Start the pull on its OWN task and return at once.
     ///
-    /// `Move` — the PERSISTED part of a row — carries the instance key and
-    /// the URL, but not the announced MANIFEST digest, so after a restart
-    /// there is nothing to run verification step 2 against. Re-fetching
-    /// anyway would mean accepting whatever manifest the worker serves at
-    /// that moment, which is exactly what pinning the manifest exists to
-    /// stop — a manifest with `recapture` quietly removed.
-    ///
-    /// So the move fails, loudly, and the client's NEXT announcement re-drives
-    /// it with the digest in hand. That costs nothing operationally: every one
-    /// of a client's companions re-announces on every DO wake. See this
-    /// order's report — closing this properly needs the digest on `Move`.
-    async fn cannot_verify(
+    /// The caller holds the row lock and is, as often as not, a subscribe
+    /// handler with a Durable Object waiting on the other end. A download is
+    /// up to 16 MiB from a worker that may be slow or gone; awaited here it
+    /// would make "an announcement never fails the subscribe" false by
+    /// timeout, hold the row lock for the duration, and make `boot` wait on
+    /// every unreachable worker in turn before the host finished starting.
+    fn spawn_fetch(
         &self,
         module: &ModuleId,
         client: &ClientId,
         wasm: &mitos_lifecycle::ids::Sha256Hex,
+        manifest: &mitos_lifecycle::ids::Sha256Hex,
     ) {
-        let reason = format!(
-            "the announced manifest digest for {} did not survive a restart, so the artifact \
-             cannot be verified; awaiting the client's next announcement",
-            wasm.as_str(),
-        );
-        tracing::warn!(module = %module, client = %client, %reason, "move cannot be resumed");
-        self.events.record(
-            module.as_str(),
-            EventKind::MoveFailed {
-                client_id: client.to_string(),
-                reason,
-            },
-        );
-        let target = mitos_lifecycle::ids::InstanceKey {
-            module: module.clone(),
-            wasm: wasm.clone(),
-            config: None,
+        // Only `None` while the last `Arc` is being dropped — shutting down.
+        let Some(me) = self.me.upgrade() else {
+            return;
         };
-        // The row itself knows the real target (config included); read it
-        // rather than guessing, so `Progress` is not rejected as stale.
-        let target = self
-            .storage
-            .read_row(module.as_str(), client)
-            .ok()
-            .flatten()
-            .and_then(|row| row.pending.map(|p| p.target.instance))
-            .unwrap_or(target);
-        let _ = self
-            .progress_locked(
-                module,
-                client,
-                target,
-                Progress::Failed(mitos_lifecycle::client_move::MoveFailure::ArtifactRefused),
-            )
-            .await;
+        let (module, client) = (module.clone(), client.clone());
+        let (wasm, manifest) = (wasm.clone(), manifest.clone());
+        let fetch = tokio::spawn(async move {
+            me.ensure_artifact(&module, &client, &wasm, &manifest).await;
+        });
+        let mut fetches = self.fetches.lock().expect("fetches mutex");
+        fetches.retain(|running| !running.is_finished());
+        fetches.push(fetch);
     }
 
     /// Pull the artifact, then feed the answer back as `Progress`.
-    async fn ensure_artifact(&self, module: &ModuleId, client: &ClientId, pinned: &Pinned) {
-        // Re-read the row: by the time this runs a newer announcement may
-        // have replaced the move, and then this fetch is stale.
+    ///
+    /// Holds NO lock while it pulls; takes the row lock only to report.
+    async fn ensure_artifact(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        wasm: &mitos_lifecycle::ids::Sha256Hex,
+        manifest: &mitos_lifecycle::ids::Sha256Hex,
+    ) {
+        // A plain READ of the row: by the time this runs a newer announcement
+        // may have replaced the move, and then this fetch is stale.
         let Ok(Some(row)) = self.storage.read_row(module.as_str(), client) else {
             return;
         };
         let Some(pending) = row.pending.as_ref() else {
             return;
         };
-        if pending.target.instance.wasm != pinned.wasm {
+        if &pending.target.instance.wasm != wasm || &pending.manifest != manifest {
             return;
         }
         let announced = Announced {
             module: module.clone(),
-            wasm: pinned.wasm.clone(),
-            manifest: pinned.manifest.clone(),
-            revision: pinned.revision,
+            wasm: wasm.clone(),
+            manifest: manifest.clone(),
+            // What the rollback check ran against; verification step 5 holds
+            // the fetched manifest to it.
+            revision: pending.target.revision,
         };
         let target = pending.target.instance.clone();
 
@@ -455,6 +442,8 @@ impl MoveManager {
         // A newer announcement may have landed while the fetch was in
         // flight. `Rejected::Stale` is how the machine says so, and it is
         // dropped QUIETLY — a superseded fetch is not a failure.
+        let lock = self.lock_for(module.as_str(), client);
+        let _guard = lock.lock().await;
         if let Err(e) = self.progress_locked(module, client, target, step).await {
             tracing::debug!(module = %module, client = %client, rejected = %e, "stale fetch answer");
         }
@@ -472,10 +461,9 @@ impl MoveManager {
 
     /// Feed one `Progress`.
     ///
-    /// **The caller holds the row lock.** Every call site reaches here from
-    /// inside `execute_all`, which only ever runs under it — and
-    /// `tokio::sync::Mutex` is not reentrant, so re-acquiring here would
-    /// deadlock the announce that is waiting on its own fetch.
+    /// **The caller holds the row lock** — `tokio::sync::Mutex` is not
+    /// reentrant, so this must not take it. Today the one caller is
+    /// `ensure_artifact`, which takes it only once its pull has finished.
     async fn progress_locked(
         &self,
         module: &ModuleId,
@@ -496,11 +484,7 @@ impl MoveManager {
         self.storage
             .write_row(module.as_str(), &transition.next)
             .map_err(|e| e.to_string())?;
-        // No `Pinned`: a `Progress` never produces `EnsureArtifact`, and if a
-        // future one does it must arrive with its digest rather than being
-        // fetched unverified.
-        self.execute_all(module, client, &transition.effects, None)
-            .await;
+        self.execute_all(module, client, &transition.effects).await;
         Ok(())
     }
 
@@ -527,9 +511,9 @@ impl MoveManager {
                     tracing::error!(module = %module, client = %client, error = %e, "row recover failed");
                     continue;
                 }
-                // No `Pinned` across a restart — `cannot_verify` handles a
-                // re-issued `EnsureArtifact`.
-                self.execute_all(&module_id, &client, &transition.effects, None)
+                // Starts fetches; does not wait for them. An unreachable
+                // worker must not hold up the host's start.
+                self.execute_all(&module_id, &client, &transition.effects)
                     .await;
             }
         }
@@ -569,8 +553,7 @@ impl MoveManager {
                     tracing::error!(module = %module, client = %client, error = %e, "withdraw write failed");
                     return;
                 }
-                self.execute_all(module, client, &transition.effects, None)
-                    .await;
+                self.execute_all(module, client, &transition.effects).await;
                 transition.next
             }
             // `NothingToWithdraw` — the row was already empty, which is
@@ -606,20 +589,6 @@ pub fn spawn_tick(
             }
         }
     })
-}
-
-/// Everything an announcement pins, carried from `announce` to the fetch.
-///
-/// It exists because the MANIFEST digest is not on the row. `Move` persists
-/// the instance key and the URL; the manifest digest is not part of instance
-/// identity, so it is not in the key — and `ModuleRef` carries it only as far
-/// as `step`. In-process that is fine: the announce that produced the effect
-/// still has it. Across a restart it is gone — see `cannot_verify`.
-#[derive(Debug, Clone)]
-struct Pinned {
-    wasm: mitos_lifecycle::ids::Sha256Hex,
-    manifest: mitos_lifecycle::ids::Sha256Hex,
-    revision: mitos_lifecycle::ids::Revision,
 }
 
 #[cfg(test)]
@@ -667,13 +636,13 @@ mod tests {
             ));
             let fetcher = Arc::new(FakeFetcher::new());
             let puller = Arc::new(ArtifactPuller::new(storage.clone(), fetcher.clone()));
-            let moves = Arc::new(MoveManager::new(
+            let moves = MoveManager::new(
                 storage.clone(),
                 puller,
                 auth.clone(),
                 lifecycle.clone(),
                 events.clone(),
-            ));
+            );
             Self {
                 _tmp: tmp,
                 storage,
@@ -728,7 +697,19 @@ mod tests {
             announced
         }
 
+        /// Announce, then wait for the fetch it started — what nearly every
+        /// test wants to look at. `announce_without_waiting` is the other one.
         async fn announce(&self, client: &str, announced: &AnnouncedModule) -> AnnounceResult {
+            let result = self.announce_without_waiting(client, announced).await;
+            self.moves.settle().await;
+            result
+        }
+
+        async fn announce_without_waiting(
+            &self,
+            client: &str,
+            announced: &AnnouncedModule,
+        ) -> AnnounceResult {
             self.moves
                 .announce(
                     &ClientId::parse(client).unwrap(),
@@ -1142,6 +1123,8 @@ mod tests {
             "{:?}",
             decoded.announced,
         );
+        // The response came back with the pull still running.
+        h.moves.settle().await;
         assert!(
             !h.failures().is_empty(),
             "the unreachable artifact must reach the event ring",
@@ -1229,30 +1212,11 @@ mod tests {
         assert_eq!(h.fetcher.calls(), 0);
     }
 
-    /// **Known gap** — see this order's report. `Move`, the persisted part of
-    /// a row, does not carry the announced MANIFEST digest, so after a
-    /// restart there is nothing to verify a re-fetch against. Rather than
-    /// fetch unverified, the move fails and the client's next announcement
-    /// re-drives it: every companion re-announces on every DO wake.
-    #[tokio::test]
-    async fn boot_cannot_verify_a_row_that_was_fetching_and_says_so() {
-        let h = Harness::new();
-        h.activate(&component(1), 1);
-        h.subscribe(PROD_CLIENT);
-        h.lifecycle.boot().await;
-
-        // A row stuck mid-fetch: announce a build the fetcher will not serve.
-        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
-        let source = ArtifactSource::for_client(
-            &ClientId::parse(PROD_CLIENT).unwrap(),
-            &announced.module,
-            &announced.wasm,
-        )
-        .unwrap();
-        h.fetcher.fail(&source.wasm_url, "unreachable");
-        h.announce(PROD_CLIENT, &announced).await;
-        // The fetch failed, so the move was cleared. Put it back in
-        // `Fetching` the way a crash mid-fetch would leave it.
+    /// A row exactly as a crash mid-fetch leaves it: `Fetching`, on disk, with
+    /// nothing in memory. Written directly rather than by announcing, because
+    /// an announce that returns has either finished its fetch or still has
+    /// the task running — neither is a restart.
+    fn write_a_row_stuck_fetching(h: &Harness, announced: &AnnouncedModule) {
         let mut row = ClientRow::new(
             ClientKey {
                 namespace: mitos_lifecycle::ids::Namespace::parse("prod").unwrap(),
@@ -1286,20 +1250,132 @@ mod tests {
             Stage::Fetching
         ));
         h.storage.write_row(MODULE, &row).unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_refetches_a_row_that_was_fetching() {
+        let h = Harness::new();
+        h.activate(&component(1), 1);
+        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
+        write_a_row_stuck_fetching(&h, &announced);
 
         h.moves.boot().await;
+        h.moves.settle().await;
 
         let after = h.row(PROD_CLIENT).unwrap();
         assert!(
-            after.pending.is_none(),
-            "an unverifiable re-fetch must clear the move rather than fetch blind",
+            matches!(
+                after.pending.as_ref().map(|p| &p.stage),
+                Some(Stage::Planned {
+                    phase: Phase::Queued,
+                    ..
+                })
+            ),
+            "{after:?}"
         );
-        let failures = h.failures();
-        assert!(
-            failures
-                .iter()
-                .any(|f| f.contains("did not survive a restart")),
-            "the reason must say why: {failures:?}",
+        assert!(h.storage.artifact_path(&announced.wasm).exists());
+        assert!(h.failures().is_empty(), "{:?}", h.failures());
+    }
+
+    /// The host restarts while a worker is down. `boot` must come back having
+    /// STARTED the pull — held here, as a dead worker would hold it — and the
+    /// move must then fail on its own rather than sit in `Fetching` for ever.
+    #[tokio::test]
+    async fn boot_does_not_wait_on_an_unreachable_worker() {
+        let h = Harness::new();
+        h.activate(&component(1), 1);
+        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
+        let source = ArtifactSource::for_client(
+            &ClientId::parse(PROD_CLIENT).unwrap(),
+            &announced.module,
+            &announced.wasm,
+        )
+        .unwrap();
+        h.fetcher.fail(&source.wasm_url, "unreachable");
+        write_a_row_stuck_fetching(&h, &announced);
+
+        let release = h.fetcher.hold();
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.moves.boot())
+            .await
+            .expect("boot waited on a fetch that was never going to answer");
+        assert!(matches!(
+            h.row(PROD_CLIENT).unwrap().pending.unwrap().stage,
+            Stage::Fetching
+        ));
+
+        release.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+        h.moves.settle().await;
+        assert!(h.row(PROD_CLIENT).unwrap().pending.is_none());
+        assert!(!h.failures().is_empty());
+    }
+
+    /// Why the manifest pin is PERSISTED. Between the crash and the restart
+    /// the worker starts serving a different manifest over the same wasm — a
+    /// host that had forgotten the pin could only take it on trust.
+    #[tokio::test]
+    async fn a_refetch_after_a_restart_still_holds_the_manifest_to_its_pin() {
+        let h = Harness::new();
+        h.activate(&component(1), 1);
+        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
+        write_a_row_stuck_fetching(&h, &announced);
+
+        let mut swapped = crate::companions::testing::manifest_for(MODULE, &component(2));
+        swapped.lifecycle.revision = Revision(2);
+        swapped.build.build_id = format!("{}-swapped", swapped.build.build_id);
+        let source = ArtifactSource::for_client(
+            &ClientId::parse(PROD_CLIENT).unwrap(),
+            &announced.module,
+            &announced.wasm,
+        )
+        .unwrap();
+        h.fetcher.serve(
+            &source.manifest_url,
+            swapped.to_toml().unwrap().into_bytes(),
         );
+
+        h.moves.boot().await;
+        h.moves.settle().await;
+
+        assert!(h.row(PROD_CLIENT).unwrap().pending.is_none());
+        assert!(!h.storage.artifact_path(&announced.wasm).exists());
+        assert!(!h.failures().is_empty());
+    }
+
+    /// A subscribe has a Durable Object waiting on it. The fetch is up to
+    /// 16 MiB from a worker that may be slow or gone, so `announce` must
+    /// return with the move RECORDED and the pull still to come.
+    #[tokio::test]
+    async fn an_announcement_does_not_wait_for_the_download() {
+        let h = Harness::new();
+        h.activate(&component(1), 1);
+        h.subscribe(PROD_CLIENT);
+        h.lifecycle.boot().await;
+        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
+
+        let release = h.fetcher.hold();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.announce_without_waiting(PROD_CLIENT, &announced),
+        )
+        .await
+        .expect("the announcement waited on its own download");
+        assert_eq!(first, AnnounceResult::Accepted);
+        assert!(matches!(
+            h.row(PROD_CLIENT).unwrap().pending.unwrap().stage,
+            Stage::Fetching
+        ));
+        // …and the row lock is free while the pull runs: a second
+        // announcement is answered, not queued behind the download.
+        assert_eq!(
+            h.announce_without_waiting(PROD_CLIENT, &announced).await,
+            AnnounceResult::Accepted
+        );
+
+        release.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+        h.moves.settle().await;
+        assert!(matches!(
+            h.row(PROD_CLIENT).unwrap().pending.unwrap().stage,
+            Stage::Planned { .. }
+        ));
     }
 }

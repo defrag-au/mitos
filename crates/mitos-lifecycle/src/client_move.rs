@@ -63,7 +63,6 @@ use crate::{Transition, UnixSecs};
 /// carries the config BYTES; by the time it reaches here they are a digest.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleRef {
-    pub url: String,
     pub wasm: Sha256Hex,
     /// The MANIFEST's digest, pinned alongside the wasm's. The wasm sha pins
     /// the code, but the manifest carries the upgrade actions and the interest
@@ -122,7 +121,14 @@ pub enum Stage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Move {
     pub target: Placement,
-    pub url: String,
+    /// PERSISTED, because a fetch can be interrupted by a restart and
+    /// [`ClientRow::recover`] must re-issue one that can still be VERIFIED.
+    /// Without it the choice after a crash is between failing the move and
+    /// accepting whatever manifest the worker serves at that moment — which is
+    /// exactly what pinning the manifest exists to prevent. (Found
+    /// implementing WO-05: the first cut of this struct dropped the digest,
+    /// so the pin held only for as long as the process did.)
+    pub manifest: Sha256Hex,
     pub intent: MoveIntent,
     pub revision_policy: RevisionPolicy,
     pub stage: Stage,
@@ -219,10 +225,14 @@ pub enum MoveAlert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Make the artifact present in the CAS: already there ⇒ answer at once;
-    /// otherwise fetch, verify the sha, validate against the host.
+    /// otherwise fetch, verify BOTH digests, validate against the host.
+    ///
+    /// Carries everything its executor must verify against, so a re-issued one
+    /// (from [`ClientRow::recover`]) is as good as the first. Carries no url:
+    /// the executor derives it ([`crate::artifact::ArtifactSource`]).
     EnsureArtifact {
-        url: String,
         wasm: Sha256Hex,
+        manifest: Sha256Hex,
     },
     RequestCatchUpSlot,
     ReleaseCatchUpSlot,
@@ -367,8 +377,8 @@ impl ClientRow {
         let mut next = self.clone();
         let effects = match &pending.stage {
             Stage::Fetching => vec![Effect::EnsureArtifact {
-                url: pending.url.clone(),
                 wasm: pending.target.instance.wasm.clone(),
+                manifest: pending.manifest.clone(),
             }],
             Stage::Planned {
                 phase: Phase::Committing,
@@ -431,6 +441,15 @@ impl ClientRow {
             if pending.target.instance == target.instance {
                 // Every one of a client's DOs re-announces. All but the first
                 // land here.
+                //
+                // Deliberately blind to the MANIFEST digest. A no-change
+                // rebuild moves it (`build_id`) while the wasm's stays put,
+                // and the worker then serves the new file at the same path —
+                // so a fetch in flight under the old pin is refused. That
+                // fails the move, and the next re-announce starts a fresh one
+                // under the new pin. Re-pinning here instead would have to
+                // tell the old pin's late answer from the new one's, for a
+                // window that is only as long as a download.
                 return Ok(Transition::quiet(self.clone()));
             }
             if pending.committing() {
@@ -467,13 +486,13 @@ impl ClientRow {
             None => vec![],
         };
         effects.push(Effect::EnsureArtifact {
-            url: module_ref.url.clone(),
             wasm: module_ref.wasm.clone(),
+            manifest: module_ref.manifest.clone(),
         });
         let mut next = self.clone();
         next.pending = Some(Move {
             target,
-            url: module_ref.url,
+            manifest: module_ref.manifest,
             intent,
             revision_policy: context.revision_policy,
             stage: Stage::Fetching,
@@ -750,9 +769,10 @@ mod tests {
 
     fn module_ref(byte: &str, revision: u32) -> ModuleRef {
         ModuleRef {
-            url: format!("https://example.invalid/{byte}.wasm"),
             wasm: Sha256Hex::parse(&byte.repeat(32)).unwrap(),
-            manifest: Sha256Hex::parse(&"00".repeat(32)).unwrap(),
+            // Distinct per build, so a test can tell WHICH manifest a
+            // re-issued fetch is pinned to.
+            manifest: Sha256Hex::parse(&format!("{byte}00").repeat(16)).unwrap(),
             config: None,
             revision: Revision(revision),
         }
@@ -991,8 +1011,8 @@ mod tests {
                 Effect::ReleaseCatchUpSlot,
                 Effect::ReleaseStaging(key("bb")),
                 Effect::EnsureArtifact {
-                    url: module_ref("cc", 3).url,
-                    wasm: module_ref("cc", 3).wasm
+                    wasm: module_ref("cc", 3).wasm,
+                    manifest: module_ref("cc", 3).manifest,
                 },
             ]
         );
@@ -1150,6 +1170,30 @@ mod tests {
             lost.current.unwrap().instance,
             key("aa"),
             "still on the old one"
+        );
+    }
+
+    /// The row is all that survives a restart, so THROUGH DISK is the only
+    /// honest way to ask this. A re-issued fetch must be as verifiable as the
+    /// first: were the manifest pin not persisted, the host's choice after a
+    /// crash would be to fail the move or to accept whatever manifest the
+    /// worker happens to be serving — one with `recapture` removed, say.
+    #[test]
+    fn a_fetch_interrupted_by_a_restart_is_reissued_with_both_pins() {
+        let (fetching, first) = run(settled("aa", 2), vec![announce("bb", 3)]);
+        let on_disk = toml::to_string(&fetching).unwrap();
+        let reloaded: ClientRow = toml::from_str(&on_disk).unwrap();
+
+        let expected = Effect::EnsureArtifact {
+            wasm: module_ref("bb", 3).wasm,
+            manifest: module_ref("bb", 3).manifest,
+        };
+        assert_eq!(first, vec![expected.clone()]);
+        assert_eq!(reloaded.recover().effects, vec![expected]);
+        assert_ne!(
+            module_ref("bb", 3).manifest,
+            module_ref("aa", 2).manifest,
+            "the fixture must give each build its own manifest digest, or this proves nothing"
         );
     }
 

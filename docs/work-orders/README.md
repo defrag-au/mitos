@@ -122,6 +122,28 @@ otherwise careful, so it gets its own section.
 - **Anything skipped or failed gets its own bucket in the summary.** A report
   of `migrated = 19` reads as healthy whether or not a twentieth was dropped.
 
+## Executing an effect
+
+Found reviewing WO-05, in code that got everything in the section above right.
+
+- **Effects run under the state's lock, so an effect may never WAIT ON THE
+  WORLD.** Bookkeeping, or START the work on its own task and have it report
+  back later as an event, taking the lock only then. WO-05's executor awaited
+  a download inline: a subscribe handler waited on it, the row lock was held
+  throughout, and `boot` queued behind every unreachable worker. The tell is a
+  test that can observe the work's OUTCOME the moment the request returns.
+  Test it against a fake that is HELD, under a timeout, so a regression fails
+  instead of hanging.
+- **A cache hit skips only the checks about the BYTES.** "Already stored, so
+  already verified" is true of digests and validity, and false of anything the
+  CALLER just claimed about the artifact (its revision, which module it is
+  for). Split the two kinds of check and run the second kind on both paths.
+- **Recover from EVERY persisted stage, through the serialised form.** The
+  pure crate's recovery test started each case from a late stage, so the one
+  stage whose re-issued effect was missing a field was never recovered from.
+  An effect must carry everything its executor needs; what it carries must be
+  on the persisted state; and the test that proves it round-trips through disk.
+
 ## When to stop and report instead of continuing
 
 - The work order's description of the code does not match what you find.
@@ -164,7 +186,7 @@ Done / Partially done / Blocked
 | 02 | Namespaces: a token resolves to a principal | 01 | **done**, reviewed 2026-09-19 — no defects; `/replicate` settled as `Attempt::TailIndexer`. Needs `/security-review` before mainnet |
 | 03 | Instance lifecycle wired — a persisted `LifecycleRecord` per instance; `LifecycleManager` replaces `auto_resume` and drives the watchdog; operator stop/start/pin/evict. Fixes an operator's stop being undone by a restart, by the watchdog, and by an upload. (Stays on the storage facade — host slots are still keyed by module id until two instances can exist.) | 02 | **done**, reviewed 2026-09-19 — 3 review fixes (a `Reap` that never retried; an unlocked read that could write; a loud diagnostic for under-counted adoption) |
 | 04 | The manifest's `[lifecycle]` section (`revision`, `state_schema`, `[[lifecycle.upgrade]]`) — ONE table, stripped from `config.cbor` because the config's sha is instance identity; `mitos-build` emits `built-module.json` | — (parallel) | **done**, reviewed 2026-09-19 — no implementation defects; the wasm-sha question settled by construction; 2 review fixes (typos in `[lifecycle]` were silent — a gap in the pure types; a failed build left a stale `built-module.json`) |
-| 05 | A worker announces its build on subscribe (digests only — NO url: the host derives the fetch location from the client id, and only for a client the operator named); persisted client rows; pull-by-digest into the CAS, incl. a manifest CAS keyed by MANIFEST digest. `client_move` runs to `Queued` and stops — observable, not behavioural | 03, 04 | **implemented**, awaiting review — ⚠️ one BLOCKING gap: `Move` does not persist the announced manifest digest, so a `Fetching` row cannot be verified after a restart. See its "Implemented" section |
+| 05 | A worker announces its build on subscribe (digests only — NO url: the host derives the fetch location from the client id, and only for a client the operator named); persisted client rows; pull-by-digest into the CAS, incl. a manifest CAS keyed by MANIFEST digest. `client_move` runs to `Queued` and stops — observable, not behavioural | 03, 04 | **done**, reviewed 2026-09-19 — the reported blocker was a gap in the PURE crate (`Move` dropped the manifest pin; now persisted, and `url` removed from the pure types entirely) + 2 review fixes (a subscribe awaited the download under the row lock; a stored artifact skipped the checks about the announcement ⇒ rollback bypass) |
 | 06 | The move itself — staging, catch-up, quiesce, commit, scoped refill (needs a CLIENT-SCOPED recapture; see WO-02 on why it is whole-module today) | 05 | not written |
 | 07 | Client lease + probe | 05 | not written |
 | 08 | GC — CAS refcounts, `orphaned-v2/`, retained instances | 03 | not written |

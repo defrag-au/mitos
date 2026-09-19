@@ -195,8 +195,11 @@ fn is_hostname(value: &str) -> bool {
 }
 
 impl ModuleRef {
-    /// The ref the host builds for a client's announcement: the digests the
-    /// worker announced, and the URL the HOST derived. See [`ArtifactSource`].
+    /// The ref the host builds for a client's announcement. It carries NO
+    /// url — whoever executes a fetch calls [`ArtifactSource::for_client`]
+    /// again, so there is one derivation and nothing stored that could
+    /// disagree with it. This constructor exists to REFUSE, before anything is
+    /// recorded, a client the host could never fetch from.
     pub fn announced_by(
         client: &ClientId,
         module: &ModuleId,
@@ -205,9 +208,8 @@ impl ModuleRef {
         config: Option<Sha256Hex>,
         revision: Revision,
     ) -> Result<Self, SourceRefused> {
-        let source = ArtifactSource::for_client(client, module, &wasm)?;
+        ArtifactSource::for_client(client, module, &wasm)?;
         Ok(ModuleRef {
-            url: source.wasm_url,
             wasm,
             manifest,
             config,
@@ -390,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ref_a_host_builds_carries_the_derived_url_and_the_announced_digests() {
+    fn the_ref_a_host_builds_carries_the_announced_digests_and_no_url() {
         let b = built();
         let module_ref = ModuleRef::announced_by(
             &client("hooks.dev.epochify.space"),
@@ -401,11 +403,10 @@ mod tests {
             b.revision,
         )
         .unwrap();
-        assert!(
-            module_ref
-                .url
-                .starts_with("https://hooks.dev.epochify.space/.well-known/mitos/")
-        );
+        // Where it is fetched from is `ArtifactSource`'s alone — pinned by
+        // `the_host_fetches_exactly_what_the_worker_serves`. A url stored here
+        // too would be a second derivation that could disagree with it.
+        assert!(!toml::to_string(&module_ref).unwrap().contains("https://"));
         assert_eq!(module_ref.wasm, b.wasm);
         assert_eq!(module_ref.manifest, b.manifest);
         assert_eq!(module_ref.config, b.config);

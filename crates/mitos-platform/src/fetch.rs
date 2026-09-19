@@ -146,6 +146,9 @@ impl ArtifactPuller {
         if let Some(manifest) = self.storage.read_manifest_by_digest(&announced.manifest)?
             && self.storage.artifact_path(&announced.wasm).exists()
         {
+            // Stored ⇒ the BYTES were verified. What this client claims
+            // about them has not been.
+            agrees_with(&manifest, announced)?;
             return Ok(manifest);
         }
 
@@ -174,6 +177,46 @@ impl ArtifactPuller {
 
         verify_and_store(&self.storage, announced, &wasm_bytes, &manifest_bytes)
     }
+}
+
+/// The checks that are about THIS ANNOUNCEMENT rather than about the bytes:
+/// the manifest describes the announced module, the announced wasm, at the
+/// announced revision.
+///
+/// Separate because they must run on the CAS short-circuit too. The digests
+/// and the host's ABI gate are properties of the artifact, settled once when
+/// it was stored; these are properties of what a CLIENT just claimed about
+/// it. Skip them for a stored artifact and a client could announce revision 9
+/// beside the digests of a stored revision-3 build — the rollback rule would
+/// pass the 9, and the move would carry the 3.
+fn agrees_with(manifest: &Manifest, announced: &Announced) -> Result<(), Refusal> {
+    // 3b. It is about the module that was announced.
+    if manifest.module.id != announced.module.as_str() {
+        return Err(Refusal::ManifestModule {
+            announced: announced.module.clone(),
+            found: manifest.module.id.clone(),
+        });
+    }
+
+    // 4. …and about THIS wasm. Without this a manifest could be a valid,
+    //    correctly-digested description of an entirely different artifact.
+    if manifest.module.sha256 != announced.wasm.as_str() {
+        return Err(Refusal::ManifestWasm {
+            announced: announced.wasm.clone(),
+            found: manifest.module.sha256.clone(),
+        });
+    }
+
+    // 5. The revision agrees. The rollback check already ran against the
+    //    ANNOUNCED number, so an artifact that disagrees with it was checked
+    //    against a lie.
+    if manifest.lifecycle.revision != announced.revision {
+        return Err(Refusal::RevisionMismatch {
+            announced: announced.revision.0,
+            found: manifest.lifecycle.revision.0,
+        });
+    }
+    Ok(())
 }
 
 /// The seven checks, in order, then the two writes.
@@ -211,31 +254,8 @@ pub fn verify_and_store(
         std::str::from_utf8(manifest_bytes).map_err(|e| Refusal::ManifestParse(e.to_string()))?;
     let manifest =
         Manifest::parse(manifest_text).map_err(|e| Refusal::ManifestParse(e.to_string()))?;
-    if manifest.module.id != announced.module.as_str() {
-        return Err(Refusal::ManifestModule {
-            announced: announced.module.clone(),
-            found: manifest.module.id.clone(),
-        });
-    }
-
-    // 4. …and about THIS wasm. Without this a manifest could be a valid,
-    //    correctly-digested description of an entirely different artifact.
-    if manifest.module.sha256 != announced.wasm.as_str() {
-        return Err(Refusal::ManifestWasm {
-            announced: announced.wasm.clone(),
-            found: manifest.module.sha256.clone(),
-        });
-    }
-
-    // 5. The revision agrees. The rollback check already ran against the
-    //    ANNOUNCED number, so an artifact that disagrees with it was checked
-    //    against a lie.
-    if manifest.lifecycle.revision != announced.revision {
-        return Err(Refusal::RevisionMismatch {
-            announced: announced.revision.0,
-            found: manifest.lifecycle.revision.0,
-        });
-    }
+    // 3b, 4, 5.
+    agrees_with(&manifest, announced)?;
 
     // 6. This host will run it: ABI major, WIT revision, trap policy, the
     //    wasm's own sha and size, and the upgrade ledger.
@@ -598,6 +618,32 @@ mod tests {
         assert_eq!(fetcher.calls(), 0);
     }
 
+    /// The rollback rule runs on the ANNOUNCED revision, before any fetch. So
+    /// a stored artifact must still be held to it: otherwise a client names
+    /// the digests of an old build already in the CAS, claims a revision high
+    /// enough to pass, and the move carries the old build.
+    #[tokio::test]
+    async fn a_stored_artifact_is_still_held_to_the_announced_revision() {
+        let f = good();
+        verify_and_store(
+            &f.storage,
+            &f.announced,
+            &f.wasm,
+            f.manifest_bytes.as_bytes(),
+        )
+        .unwrap();
+
+        let lying = Announced {
+            revision: mitos_lifecycle::ids::Revision(f.announced.revision.0 + 6),
+            ..f.announced.clone()
+        };
+        let err = puller(&f, Arc::new(FakeFetcher::new()))
+            .ensure(&ClientId::parse(CLIENT).unwrap(), &lying)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Refusal::RevisionMismatch { .. }), "{err}");
+    }
+
     /// Half-stored is not stored: an earlier run could have written the wasm
     /// and died before the manifest.
     #[tokio::test]
@@ -642,6 +688,7 @@ pub(crate) mod testing {
     pub(crate) struct FakeFetcher {
         responses: Mutex<HashMap<String, Result<Vec<u8>, String>>>,
         calls: AtomicUsize,
+        gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     }
 
     impl FakeFetcher {
@@ -663,6 +710,15 @@ pub(crate) mod testing {
                 .insert(url.to_owned(), Err(why.to_owned()));
         }
 
+        /// Every fetch from now on waits until permits are added to the
+        /// returned semaphore. A semaphore rather than a `Notify`: a release
+        /// that arrives BEFORE the fetch starts waiting must not be lost.
+        pub(crate) fn hold(&self) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.gate.lock().expect("fake fetcher") = Some(gate.clone());
+            gate
+        }
+
         pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
         }
@@ -672,6 +728,10 @@ pub(crate) mod testing {
     impl ArtifactFetcher for FakeFetcher {
         async fn fetch(&self, url: &str, max: usize) -> Result<Vec<u8>, FetchError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            let gate = self.gate.lock().expect("fake fetcher").clone();
+            if let Some(gate) = gate {
+                let _permit = gate.acquire().await.expect("gate is never closed");
+            }
             match self.responses.lock().expect("fake fetcher").get(url) {
                 Some(Ok(bytes)) if bytes.len() > max => Err(FetchError::TooLarge { max }),
                 Some(Ok(bytes)) => Ok(bytes.clone()),

@@ -649,14 +649,15 @@ impl Bundle {
                 storage.clone(),
                 fetcher,
             ));
-            let moves = Arc::new(mitos_platform::moves::MoveManager::new(
+            let moves = mitos_platform::moves::MoveManager::new(
                 storage.clone(),
                 puller,
                 authenticator.clone(),
                 lifecycle.clone(),
                 event_ring.clone(),
-            ));
-            // Re-issue whatever each row says is already in flight.
+            );
+            // Re-issue whatever each row says is already in flight. STARTS
+            // interrupted fetches; does not wait for them.
             moves.boot().await;
 
             app = app.merge(mitos_platform::companions::companion_router(
