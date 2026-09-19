@@ -134,40 +134,15 @@ pallas-addresses = "1.4.0"
 pallas-codec = "1.4.0"
 pallas-primitives = "1.4.0"
 pallas-traverse = { version = "1.4.0", features = ["unstable"] }
-# Immutable-DB (cardano-node / Mithril snapshot) chunk reader — the
-# `market-ledger` walker iterates certified history from plain chunk files
-# (`storage::immutable::read_blocks`). Not enabled via pallas's `hardano`
-# feature (mitos's pallas is `unstable`-only), so depend on it directly.
 pallas-hardano = "1.4.0"
-# blake2b-256 for tx-index's read-side verification: a located body is
-# re-hashed and compared to the full requested hash, so the index can store an
-# 8-byte prefix per entry and never return a false positive.
 pallas-crypto = "1.4.0"
-# N2N chainsync/blockfetch client for market-ledger's `follow` tip tail
-# (self-contained — see MARKET_LEDGER.md "Follow mode"). Same pin as the rest
-# of the family.
 pallas-network = "1.4.0"
 
-# Asset handling — typed AssetId, PolicyId, Fingerprint (CIP-14),
-# TokenType, asset-name decoders. Shared with cnft.dev-workers.
-# Pinned to a specific shared-crates rev for reproducibility; bump
-# deliberately when shared-crates lands changes mitos needs.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "d65282ccbe93074571cd58a7320f5af2f3af7b10", features = ["cip14", "cip25"] }
-
-# Known script/contract addresses — DEX pools and batchers, marketplaces,
-# aggregators. Re-added 2026-08-20 for `project-ledger classify`: without it a
-# swap's return leg reads as project income, and on Mekka that was 74,626 ₳ of
-# a supposed 132,590 ₳ "unexplained" inbound. Same rev as every other
-# shared-crate here — a second rev would resolve a second copy of the crate.
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "d65282ccbe93074571cd58a7320f5af2f3af7b10" }
-# Pipeline shared types (`PricedAsset`, `OperationPayload`) — used
-# by the protocol-event taxonomy in `mitos-core::protocol`. Same
-# shape the existing classifier emits, so mitos events deserialize
-# identically on the CF side.
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "d65282ccbe93074571cd58a7320f5af2f3af7b10" }
-# Pure, I/O-free wallet-flow model (`TxView`/`net_deltas`/`movements`) + the
-# project-walk `frontier` state machine. Consumed by `tools/project-ledger`.
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "d65282ccbe93074571cd58a7320f5af2f3af7b10" }
+# shared-crates
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }

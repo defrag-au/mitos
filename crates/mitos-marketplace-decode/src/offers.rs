@@ -154,7 +154,7 @@ pub(crate) fn consideration_out(out: &TxOutput) -> AssetPrice {
 
 fn locked_value(lovelace: u64, assets: &[AssetQuantity]) -> AssetPrice {
     if assets.is_empty() {
-        return AssetPrice::Lovelace(lovelace);
+        return AssetPrice::Lovelace { lovelace };
     }
     AssetPrice::InKind {
         lovelace,
@@ -368,7 +368,7 @@ fn non_offer_outputs(tx: &DecodeTx) -> impl Iterator<Item = &TxOutput> {
 /// hex would otherwise stop matching, and the symptom would be an offer that
 /// silently never finds its delivery.
 fn asset_name_set(decoded: &DecodedOffer) -> Option<&[String]> {
-    (!decoded.target_asset_names.is_empty()).then(|| decoded.target_asset_names.as_slice())
+    (!decoded.target_asset_names.is_empty()).then_some(decoded.target_asset_names.as_slice())
 }
 
 fn parse_cred(hex_str: &str) -> Option<[u8; 28]> {
@@ -559,7 +559,12 @@ mod tests {
         let a = &accepts[0];
         assert_eq!(a.policy, MEKANISM_POLICY);
         assert_eq!(a.asset_name_hex, MEKANISM_2212);
-        assert_eq!(a.price, AssetPrice::Lovelace(55_000_000));
+        assert_eq!(
+            a.price,
+            AssetPrice::Lovelace {
+                lovelace: 55_000_000
+            }
+        );
         assert_eq!(a.prior_output_index, 1);
         assert!(a.collection_offer);
         assert_eq!(a.seller_address, "");
@@ -688,7 +693,12 @@ mod tests {
         assert_eq!(a.bidder_pkh, JPG_BIDDER);
         assert_eq!(a.policy, TAPPY_POLICY);
         assert_eq!(a.asset_name_hex, TAPPY_3589);
-        assert_eq!(a.price, AssetPrice::Lovelace(153_000_000));
+        assert_eq!(
+            a.price,
+            AssetPrice::Lovelace {
+                lovelace: 153_000_000
+            }
+        );
         assert_eq!(a.seller_address, JPG_SELLER_ADDR);
         assert!(a.collection_offer);
         assert_eq!(a.prior_output_index, 0);

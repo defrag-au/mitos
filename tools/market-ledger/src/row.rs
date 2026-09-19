@@ -77,7 +77,7 @@ pub struct MarketEventRow {
 fn price_detail(price: &AssetPrice) -> Option<String> {
     match price {
         AssetPrice::InKind { .. } => serde_json::to_string(price).ok(),
-        AssetPrice::Lovelace(_) | AssetPrice::Unknown => None,
+        AssetPrice::Lovelace { .. } | AssetPrice::Unknown => None,
     }
 }
 

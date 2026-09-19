@@ -371,9 +371,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 45000000,
     "output_index": 0,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 45000000
+    },
     "target_asset_names": [
       "546f6f6c6865616435313836"
     ],

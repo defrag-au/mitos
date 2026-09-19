@@ -56,11 +56,30 @@ pub struct AssetAmount {
 /// mistaken for a number**. A consumer building a price series matches
 /// [`Lovelace`](Self::Lovelace) and skips the rest, rather than filtering on a
 /// magic threshold.
+/// # Why `Lovelace` is a STRUCT variant, not `Lovelace(u64)`
+///
+/// Serde's internally-tagged representation — `#[serde(tag = "kind")]` — cannot
+/// serialize a newtype variant holding a primitive: there is nowhere to put the
+/// `"kind"` key alongside a bare integer. It only works when the newtype wraps
+/// a map. The failure is at RUNTIME, not compile time:
+///
+/// ```text
+/// emit serialize failed: cannot serialize tagged newtype variant
+///                        AssetPrice::Lovelace containing an integer
+/// ```
+///
+/// It was `Lovelace(u64)`, and the consequence was that **every ADA-denominated
+/// offer event silently failed to emit** — the module logged a warning and
+/// dispatched nothing. Invisible for as long as the golden scenarios that
+/// would have caught it were failing earlier, on a stale-ABI module artifact.
+///
+/// Changing the shape cost nothing precisely because the variant had never
+/// successfully serialized: no stored event and no consumer could depend on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AssetPrice {
     /// Paid in ADA. The only variant comparable with other prices.
-    Lovelace(u64),
+    Lovelace { lovelace: u64 },
     /// Paid **in kind** — the consideration includes assets. A peer-to-peer
     /// trade, in user-facing terms; see [`Self::label`].
     ///
@@ -96,7 +115,7 @@ impl AssetPrice {
     /// sink a median.
     pub fn lovelace(&self) -> Option<u64> {
         match self {
-            Self::Lovelace(v) => Some(*v),
+            Self::Lovelace { lovelace } => Some(*lovelace),
             Self::InKind { .. } | Self::Unknown => None,
         }
     }
@@ -113,8 +132,7 @@ impl AssetPrice {
     /// "what is in the UTxO".
     pub fn locked_lovelace(&self) -> u64 {
         match self {
-            Self::Lovelace(v) => *v,
-            Self::InKind { lovelace, .. } => *lovelace,
+            Self::Lovelace { lovelace } | Self::InKind { lovelace, .. } => *lovelace,
             Self::Unknown => 0,
         }
     }
@@ -133,7 +151,7 @@ impl AssetPrice {
     /// of a display string defined at whichever call site needed it first.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Lovelace(_) => "ADA",
+            Self::Lovelace { .. } => "ADA",
             Self::InKind { .. } => "P2P trade",
             Self::Unknown => "unknown",
         }
@@ -147,9 +165,74 @@ impl AssetPrice {
     /// Stable discriminator for storage and logs.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Lovelace(_) => Self::LOVELACE_KIND,
+            Self::Lovelace { .. } => Self::LOVELACE_KIND,
             Self::InKind { .. } => "in_kind",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// EVERY variant must survive the encoding a module actually emits in.
+    ///
+    /// This exists because `Lovelace` did not. It was `Lovelace(u64)`, and
+    /// serde's internally-tagged representation cannot serialize a newtype
+    /// variant holding a primitive — so every ADA-denominated offer event
+    /// failed to emit, at runtime, with nothing but a warning in the module
+    /// log. A type that compiles and cannot be written is not caught by
+    /// anything else here.
+    ///
+    /// Round-trip rather than just encode: a shape that writes but does not
+    /// read back is the same bug one step later.
+    #[test]
+    fn every_price_variant_round_trips_through_cbor() {
+        for price in [
+            AssetPrice::Lovelace {
+                lovelace: 45_000_000,
+            },
+            AssetPrice::InKind {
+                lovelace: 2_500_000,
+                assets: vec![AssetAmount {
+                    policy: "aa".repeat(28),
+                    name: "deadbeef".into(),
+                    quantity: 3,
+                }],
+            },
+            AssetPrice::Unknown,
+        ] {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&price, &mut buf)
+                .unwrap_or_else(|e| panic!("{} did not serialise: {e}", price.kind()));
+
+            let back: AssetPrice = ciborium::de::from_reader(buf.as_slice())
+                .unwrap_or_else(|e| panic!("{} did not deserialise: {e}", price.kind()));
+            assert_eq!(back, price);
+        }
+    }
+
+    /// The quantity is load-bearing and was pinned at 1 until the neutral
+    /// decode shape carried amounts — so assert it survives rather than
+    /// trusting that it is only ever an NFT.
+    #[test]
+    fn in_kind_keeps_its_quantities() {
+        let price = AssetPrice::InKind {
+            lovelace: 2_000_000,
+            assets: vec![AssetAmount {
+                policy: "bb".repeat(28),
+                name: "01".into(),
+                quantity: 250,
+            }],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&price, &mut buf).unwrap();
+        let back: AssetPrice = ciborium::de::from_reader(buf.as_slice()).unwrap();
+
+        let AssetPrice::InKind { assets, .. } = back else {
+            panic!("variant changed");
+        };
+        assert_eq!(assets[0].quantity, 250);
     }
 }

@@ -30,3 +30,8 @@ serde_bytes = "0.11"
 # Host-side decode path — see `decode` feature flag.
 ciborium = { version = "0.2", optional = true }
 serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+# Encodes an event the way a module actually emits it. `AssetPrice::Lovelace`
+# was unserialisable for as long as nothing tried — see its doc.
+ciborium = "0.2"

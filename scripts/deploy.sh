@@ -133,7 +133,10 @@ step_build() {
     local build_sha
     build_sha=$(cd "$MITOS_SRC_LOCAL" && git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
     log "2/5 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build (on box; ~5min cold, ~30s incremental; build=$build_sha)"
-    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && MITOS_BUILD_SHA=$build_sha cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
+    # `nice`/`ionice` are NOT optional here — see mitos-operations.md. The box
+    # is a co-tenant: `market-ledger-follow` is a chainsync follower that falls
+    # behind if a build starves it, and falling behind is expensive to undo.
+    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && MITOS_BUILD_SHA=$build_sha nice -n 15 ionice -c2 -n7 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
 }
 
 step_build_community_modules() {
@@ -191,7 +194,7 @@ step_build_community_modules() {
                 SKIPPED=\$((SKIPPED+1))
                 continue
             fi
-            if ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
+            if nice -n 15 ionice -c2 -n7 ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
                 BUILT=\$((BUILT+1))
             else
                 FAILED=\$((FAILED+1))
