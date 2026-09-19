@@ -128,6 +128,84 @@ only in `/tmp` and is gone.
    indefinite if it is unreachable; nothing bounds it today. It looks like it
    belongs with WO-09's "what a departing instance still owes".
 
+## Review 2026-09-20 — one race the order did not see, one rule of mine enforced on myself
+
+Acceptance re-run independently and matches (core 28, lifecycle 95, platform
+lib 287, `two_instances_v2` 7; clippy `--workspace -D warnings` 0). Scope
+matches "Files" plus `rows.rs`, `events.rs`, `lib.rs`, each justified; no
+`#[ignore]`; `tests/` shows only additions to `two_instances_v2.rs`. After
+review: platform lib **291**.
+
+This is the strongest implementation of the series. All seven deviations
+agreed, and two of them FIX the order: `CompanionWork` (4) — my "two ordered
+work lists" would have POSTed to one companion twice at once whenever a client
+was owed by two departed instances, the exact thing `DrainPass`'s doc says the
+design exists to prevent; and `FakeHost` doing the storage half of an evict
+for real (1), without which two existing reap tests would have gone on passing
+while asserting nothing. Running the drain baseline against `git archive` in
+`/tmp` rather than skipping it, or touching the tree, was exactly right.
+
+**1. RACE, not in the order — the watchdog could start a follower INSIDE an
+upload's quiesce.** WO-06's review made `upload` hold the follower stopped
+while it renames the directory, and that gap is as long as the block in flight
+(`stop` awaits it). The watchdog snapshots "who is running" and "who should
+be" with NO lock and then called `host.start_instance` itself. A sweep landing
+in the gap starts `K1`: before the rename it runs across it — no cursor
+writes, no fan-out, WO-06's bug again — and the upload's own
+`start_instance(K2)` then fails with redb "already open", because `K1` still
+holds the files. What is left is a follower that delivers nothing, and a
+watchdog that retries `K2` and fails every sweep. The same gap undoes an
+operator's stop for one sweep. Pre-existing in shape since WO-03; WO-06's
+quiesce-first made the window seconds wide and the consequence permanent.
+Fix: `LifecycleManager::revive(key) -> Revival` — takes the module lock and
+ASKS AGAIN (directory still there? still not running? record still wants a
+follower?). The watchdog calls that. Tests:
+`a_watchdog_revive_cannot_land_inside_an_uploads_quiesce` (holds the gap open
+with `FakeHost::on_stop`; mutation-checked — drop the lock and it fails with
+an extra `StartInstance(K1)`) and
+`a_revive_restarts_a_follower_that_died_and_leaves_a_stopped_one`.
+The admin `restart` route had the same shape — the host's `&str` `replace`,
+unlocked, and the last mixed-addressing call left — and now goes through
+`LifecycleManager::cycle_follower`
+(`cycling_a_follower_addresses_the_current_instance_by_key`).
+
+**2. Q1 — yes, and the rule is mine.** `Reap` → `evict_instance` →
+`release_instance().await` under the module's lifecycle lock, which every
+subscribe to that module also takes; the drain lets go only between ticks, and
+a tick lasts as long as its slowest send (`REQUEST_TIMEOUT`). My order
+mandated the await and my README forbids it. It did not need the redesign the
+question feared, because a reap already has a retry: the wait is now BOUNDED
+(`RELEASE_WAIT`, 3s); past it `release_instance` answers
+`Released::StillBusy`, `evict_instance` fails with a typed
+`PlatformError::DrainBusy`, and `pending_cleanup` re-issues the reap next
+tick. The release frame stays queued, so the retry finds the store already
+let go; every step before it in `evict_instance` is a no-op the second time.
+Test: `a_release_does_not_wait_out_a_hanging_companion` (the receiver gained
+`hang`).
+
+**3. One bad instance must not stop its siblings — two more places.** The
+order said it for boot and tick. `reconcile_locked` returned on the first hard
+error, leaving a client that moved A → B detached from one and never attached
+to the other; it now finishes the module's other instances and returns the
+first error. `run_module_tick` aborted the whole module's tick when ONE
+store's scan failed, so a staging store that would not read stopped the live
+instance delivering; it now drains the rest and errors only if every scan
+failed.
+
+Noted, not changed: adoption still counts every client on disk rather than
+`attached_to` — over-attaches only when the CURRENT instance is adopted with a
+sibling already present, which cannot happen before WO-09, and the next
+reconcile corrects it. Multiple leftover batches for one companion run in
+`dir_name` order, not age.
+
+Q2 — the premise is slightly off: leftovers fail because the COMPANION is
+failing, and then its serving batch would fail too, so nothing is starved that
+could have been fed. The real case is a POISON row the companion rejects for
+ever, which blocks everything behind it — but that is true of one store today.
+WO-09, with "what a departing instance still owes". Both "found, not fixed"
+items agreed; the per-store emission ids are why WO-09's Apply frame carries
+the instance digest.
+
 ## What this order does, and where it deliberately stops
 
 WO-06 let a second instance of a module RUN. Nothing can yet MANAGE one:

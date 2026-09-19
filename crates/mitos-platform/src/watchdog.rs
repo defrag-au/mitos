@@ -182,22 +182,22 @@ pub(crate) async fn sweep(
                 BootAction::StartFollower => {}
                 BootAction::LeaveStopped => continue,
             }
-            tracing::warn!(
-                module = %id,
-                instance = %key.dir_name(),
-                "watchdog: instance should be running but has no live follower; restarting"
-            );
-            let outcome = match host.start_instance(key).await {
-                Ok(()) => {
+            // Everything above is a SNAPSHOT, taken with no lock. The restart
+            // itself goes through the lifecycle, which takes the module lock
+            // and asks again — see `LifecycleManager::revive` for what an
+            // upload does in the gap this would otherwise act on.
+            let outcome = match lifecycle.revive(key).await {
+                crate::lifecycle::Revival::NotNeeded => continue,
+                crate::lifecycle::Revival::Restarted => {
                     revived = true;
-                    tracing::info!(
+                    tracing::warn!(
                         module = %id,
                         instance = %key.dir_name(),
-                        "watchdog: instance restarted",
+                        "watchdog: instance had no live follower; restarted",
                     );
                     "restarted"
                 }
-                Err(e) => {
+                crate::lifecycle::Revival::Failed(e) => {
                     tracing::error!(
                         module = %id,
                         instance = %key.dir_name(),

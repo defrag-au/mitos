@@ -735,7 +735,18 @@ impl CompanionDialer {
     ///
     /// Returns at once when the module has no drain — nothing holds the store
     /// and there is nothing to wait for.
-    pub async fn release_instance(&self, key: &InstanceKey) {
+    ///
+    /// **The wait is BOUNDED.** The drain handles control frames between
+    /// ticks, and a tick lasts as long as its slowest send — up to
+    /// `REQUEST_TIMEOUT` when a companion is hanging. The caller is a `Reap`
+    /// effect running under the module's lifecycle lock, which every
+    /// subscribe to that module also takes; an unbounded wait here would make
+    /// a subscribe hang behind somebody else's unreachable worker. So past
+    /// the bound this answers [`Released::StillBusy`] and the reap fails,
+    /// typed, into the retry it already has (`pending_cleanup`). The frame
+    /// stays queued: the drain handles it when its tick ends, and the retry
+    /// finds the store already released.
+    pub async fn release_instance(&self, key: &InstanceKey) -> Released {
         let control_tx = {
             let drains = self.module_drains.lock().await;
             drains
@@ -743,7 +754,7 @@ impl CompanionDialer {
                 .map(|d| d.control_tx.clone())
         };
         let Some(control_tx) = control_tx else {
-            return;
+            return Released::Done;
         };
         let (done, wait) = oneshot::channel();
         if control_tx
@@ -754,11 +765,14 @@ impl CompanionDialer {
             .is_err()
         {
             // The drain task is gone, which means its stores went with it.
-            return;
+            return Released::Done;
         }
-        // The drain handles control frames between ticks, so this waits out
-        // at most one tick's in-flight sends.
-        let _ = wait.await;
+        match tokio::time::timeout(RELEASE_WAIT, wait).await {
+            // `Err` inside is the drain dropping the sender as it exits —
+            // its stores went with it.
+            Ok(_) => Released::Done,
+            Err(_) => Released::StillBusy,
+        }
     }
 
     /// Coordinate a per-module recapture across every subscribed
@@ -905,6 +919,18 @@ fn resolve_companion_dial(
         bulk_capability: Arc::new(AtomicU8::new(pool::BULK_UNKNOWN)),
         recapturing: Arc::new(AtomicBool::new(false)),
     })
+}
+
+/// How long a reap waits for the drain to let go of a store — a little over
+/// one quiet tick (`POLL_INTERVAL`), and far under one hung send.
+const RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// Whether the drain let go of an instance's store within [`RELEASE_WAIT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    Done,
+    /// Mid-tick. The request is still queued and WILL be honoured; ask again.
+    StillBusy,
 }
 
 /// One instance's half of a module's drain: its emissions store and the
@@ -1271,16 +1297,30 @@ async fn run_module_tick(
     concurrency: usize,
 ) -> anyhow::Result<()> {
     let mut scanned: Vec<InstanceScan> = Vec::new();
+    // With one store a failed scan WAS the tick. With several it is one
+    // instance's problem: a staging store that will not read must not stop
+    // the live instance beside it from delivering. Only when every scan
+    // failed is there nothing to do but report it.
+    let mut scan_failure = None;
+    let mut scans_ok = 0_usize;
     for (key, entry) in open {
-        let queued = entry
-            .store
-            .list_queued_grouped_by_companion()
-            .map_err(|e| {
-                anyhow::anyhow!(
+        let queued = match entry.store.list_queued_grouped_by_companion() {
+            Ok(queued) => queued,
+            Err(e) => {
+                warn!(
+                    module = %module_id,
+                    instance = %key.dir_name(),
+                    error = %e,
+                    "drain: scan of this instance's store failed; draining the others",
+                );
+                scan_failure = Some(anyhow::anyhow!(
                     "list queued grouped by companion for {}: {e}",
                     key.dir_name()
-                )
-            })?;
+                ));
+                continue;
+            }
+        };
+        scans_ok += 1;
         if queued.is_empty() {
             continue;
         }
@@ -1291,7 +1331,10 @@ async fn run_module_tick(
         });
     }
     if scanned.is_empty() {
-        return Ok(());
+        return match scan_failure {
+            Some(e) if scans_ok == 0 => Err(e),
+            _ => Ok(()),
+        };
     }
     // Deterministic, so a companion owed by two instances is always served
     // in the same sequence rather than in `HashMap` iteration order.
@@ -2043,9 +2086,26 @@ mod tests {
         struct ReceiverState {
             seen: Vec<Delivery>,
             failing: HashSet<String>,
+            /// Companions that take `HANG` to answer — a Worker that has
+            /// stopped responding, which holds the drain's tick open.
+            hanging: HashSet<String>,
         }
 
+        const HANG: Duration = Duration::from_secs(5);
+
         impl Receiver {
+            fn hang(&self, companion_key: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .hanging
+                    .insert(companion_key.to_owned());
+            }
+
+            fn recover(&self, companion_key: &str) {
+                self.0.lock().unwrap().hanging.remove(companion_key);
+            }
+
             fn fail(&self, companion_key: &str) {
                 self.0
                     .lock()
@@ -2118,7 +2178,7 @@ mod tests {
                     Err(_) => (Vec::new(), Vec::new(), false),
                 },
             };
-            {
+            let hangs = {
                 let mut state = receiver.0.lock().unwrap();
                 state.seen.push(Delivery {
                     path,
@@ -2128,6 +2188,10 @@ mod tests {
                 if state.failing.contains(&companion_key) {
                     return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
                 }
+                state.hanging.contains(&companion_key)
+            };
+            if hangs {
+                tokio::time::sleep(HANG).await;
             }
             if bulk {
                 let response = mitos_protocol::ApplyBulkResponse {
@@ -2455,7 +2519,7 @@ mod tests {
             })
             .await;
 
-            h.dialer.release_instance(&doomed).await;
+            assert_eq!(h.dialer.release_instance(&doomed).await, Released::Done);
             h.storage.close_emissions_at(&doomed);
             h.storage
                 .remove_instance_dir(&doomed)
@@ -2475,6 +2539,50 @@ mod tests {
                 h.receiver.labels().iter().any(|l| l == "after-release")
             })
             .await;
+        }
+
+        /// The caller is a `Reap` under the module's lifecycle lock, and every
+        /// subscribe to that module takes the same lock. The drain only lets
+        /// go BETWEEN ticks, and a tick lasts as long as its slowest send — so
+        /// an unbounded wait would hang a subscribe behind somebody else's
+        /// unresponsive Worker.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_release_does_not_wait_out_a_hanging_companion() {
+            let h = harness().await;
+            let doomed = h.plant(b"a second build");
+            h.subscribe("policy_a").await;
+            h.place(&doomed);
+            h.queue(&doomed, "policy_a", "opens-the-store");
+            wait_for("the doomed store to be opened", || {
+                h.receiver.labels().iter().any(|l| l == "opens-the-store")
+            })
+            .await;
+
+            // Hold a tick open: the companion accepts the POST and then says
+            // nothing for `HANG`.
+            h.receiver.hang("policy_a");
+            h.queue(&doomed, "policy_a", "hangs");
+            wait_for("the hanging send to be in flight", || {
+                h.receiver.labels().iter().any(|l| l == "hangs")
+            })
+            .await;
+
+            let asked = Instant::now();
+            assert_eq!(
+                h.dialer.release_instance(&doomed).await,
+                Released::StillBusy
+            );
+            assert!(
+                asked.elapsed() < HANG,
+                "the release waited out the hanging send: {:?}",
+                asked.elapsed(),
+            );
+
+            // The request was not dropped: once the tick ends the drain
+            // honours it, so the reap's RETRY is answered at once.
+            h.receiver.recover("policy_a");
+            tokio::time::sleep(HANG).await;
+            assert_eq!(h.dialer.release_instance(&doomed).await, Released::Done);
         }
 
         /// The requeue is crash recovery — "rows a PRIOR host process left

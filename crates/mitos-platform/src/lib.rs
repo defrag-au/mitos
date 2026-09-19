@@ -179,6 +179,16 @@ pub enum PlatformError {
         instance: String,
         siblings: usize,
     },
+
+    /// The dialer's drain did not release an instance's emissions store
+    /// within the bound. It releases between ticks, and a tick can be held
+    /// up for as long as a companion takes to time out. NOT a failure of the
+    /// reap: the request stays queued, and the retry finds it done.
+    #[error(
+        "the drain for module `{module}` is mid-tick and has not yet released instance \
+         `{instance}`; the reap will be retried"
+    )]
+    DrainBusy { module: String, instance: String },
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;

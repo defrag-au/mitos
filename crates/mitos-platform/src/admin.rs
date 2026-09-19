@@ -942,6 +942,8 @@ impl HandlerError {
             Self::Lifecycle(LifecycleError::Rejected(_)) => "lifecycle_rejected",
             Self::Lifecycle(LifecycleError::Unmanaged { .. }) => "instance_unmanaged",
             Self::Lifecycle(LifecycleError::Storage(_)) => "storage_io",
+            // What `restart` reported when it called the host itself.
+            Self::Lifecycle(LifecycleError::Host(_)) => "wasm_invalid",
             Self::LifecycleUnavailable => "lifecycle_unavailable",
             Self::NotRunnable(_) => "not_runnable",
         }
@@ -2288,21 +2290,30 @@ async fn restart_module(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let Some(host) = &state.host else {
+    if state.host.is_none() {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             "no host wired in this admin router",
         )
             .into_response());
-    };
+    }
     // `Operator(Start)` first, because restart on a STOPPED module must mean
     // "start it", and that has to change the persisted intent or the watchdog
     // would stop it again. If the instance was already running, `Start`
     // produces no `StartFollower` — and then a restart means what it always
     // meant: cycle the follower in place.
+    //
+    // Through the lifecycle, not the host: it takes the module lock, so a
+    // restart cannot start a follower inside an upload's quiesce, and it
+    // addresses the instance by key like everything else that starts one.
     let effects = operator(&state, &id, OperatorCommand::Start).await?;
     if !effects.contains(&Effect::StartFollower) {
-        host.replace(&id)
+        let lifecycle = state
+            .lifecycle
+            .as_ref()
+            .ok_or(HandlerError::LifecycleUnavailable)?;
+        lifecycle
+            .cycle_follower(&id)
             .await
             .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
     }

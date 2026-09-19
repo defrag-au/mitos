@@ -143,6 +143,27 @@ Found reviewing WO-05, in code that got everything in the section above right.
   stage whose re-issued effect was missing a field was never recovered from.
   An effect must carry everything its executor needs; what it carries must be
   on the persisted state; and the test that proves it round-trips through disk.
+- **Whatever STARTS or STOPS a follower does it under the module's lifecycle
+  lock, and decides there — not from a snapshot.** WO-06 made `upload` hold a
+  follower stopped while it renames the directory. The watchdog read "who is
+  running" and "who should be" with no lock and then started followers
+  itself; a sweep landing in that gap started the old instance in the middle
+  of its own upload, and the upload's start of the new one then failed on
+  redb "already open" (WO-07's review). An unlocked READ is fine, and is how
+  `peek` works. An unlocked ACT on what was read is not: take the lock, ask
+  again, then act. When you add a deliberate gap to one path, list every
+  OTHER path that can act inside it.
+- **If an effect must wait, BOUND the wait and fail into the retry.** "Never
+  wait on the world" has a second answer besides spawning: a machine whose
+  cleanup is re-issued every tick can afford a short bounded wait that gives
+  up with a typed "busy". WO-07's reap waited, under the module lock, for a
+  drain that lets go only between ticks — as long as a hung companion's
+  timeout. Three seconds, `DrainBusy`, retried by `pending_cleanup`; the
+  request stays queued, so the retry finds it done.
+- **"One bad X must not stop the rest" — grep for every loop over X.** Asked
+  for on boot and tick in WO-07; also needed in reconcile and in the drain's
+  store scan, both of which returned on the first error because with ONE
+  instance that was the only thing to do.
 
 ## When to stop and report instead of continuing
 
@@ -188,7 +209,7 @@ Done / Partially done / Blocked
 | 04 | The manifest's `[lifecycle]` section (`revision`, `state_schema`, `[[lifecycle.upgrade]]`) — ONE table, stripped from `config.cbor` because the config's sha is instance identity; `mitos-build` emits `built-module.json` | — (parallel) | **done**, reviewed 2026-09-19 — no implementation defects; the wasm-sha question settled by construction; 2 review fixes (typos in `[lifecycle]` were silent — a gap in the pure types; a failed build left a stale `built-module.json`) |
 | 05 | A worker announces its build on subscribe (digests only — NO url: the host derives the fetch location from the client id, and only for a client the operator named); persisted client rows; pull-by-digest into the CAS, incl. a manifest CAS keyed by MANIFEST digest. `client_move` runs to `Queued` and stops — observable, not behavioural | 03, 04 | **done**, reviewed 2026-09-19 — the reported blocker was a gap in the PURE crate (`Move` dropped the manifest pin; now persisted, and `url` removed from the pure types entirely) + 2 review fixes (a subscribe awaited the download under the row lock; a stored artifact skipped the checks about the announcement ⇒ rollback bypass) |
 | 06 | The DATA plane is instance-addressed — storage handle caches, host slots, the follower's cursor, and the emission fan-out (`routing::fan_out`). A second instance of a module CAN run; nothing starts one. One instance ⇒ byte-identical behaviour. Shaped around `activate` RENAMING a live instance directory on every upload | 01, 03, 05 | **done**, reviewed 2026-09-20 — a SPEC error of the order's (a follower running across the rename lost a block's emissions ⇒ `upload` now quiesces first) + 2 review fixes (the new follower reused the old one's redb handles after every upload; a cached `&str` read could return "no cursor" mid-upload). Implementer's own catch: a fan-out `Skip` is not "no subscriber" |
-| 07 | The CONTROL plane is instance-addressed — a lifecycle record, watchdog, compaction and reap per INSTANCE; `attached` derived by `routing::attached_to` (the SAME rule as delivery); the manager stops using the host's `&str` API. The dialer stays ONE drain per MODULE reading every instance's store, leftovers before serving (`routing::drain_pass`) — per-instance drains would POST to one companion concurrently. A non-current instance with no record is `Unmanaged`, never adopted | 06 | **implemented 2026-09-20, awaiting review** — all acceptance met (goldens 69/69; the drain baseline passed against HEAD in a `git archive` copy before the change and still does). `FakeHost` now does the storage half of a reap, because `evict_instance` removes the directory itself and two existing tests assert that. Two open questions in its "Implemented" section: a reap awaits the dialer under the module lock, and an unreachable departed instance starves the live one |
+| 07 | The CONTROL plane is instance-addressed — a lifecycle record, watchdog, compaction and reap per INSTANCE; `attached` derived by `routing::attached_to` (the SAME rule as delivery); the manager stops using the host's `&str` API. The dialer stays ONE drain per MODULE reading every instance's store, leftovers before serving (`routing::drain_pass`) — per-instance drains would POST to one companion concurrently. A non-current instance with no record is `Unmanaged`, never adopted | 06 | **done**, reviewed 2026-09-20 — strongest implementation of the series (two deviations FIXED the order: `CompanionWork`; a `FakeHost` that really removes the directory). Review: a RACE the order did not see (the unlocked watchdog could start a follower inside an upload's quiesce ⇒ `LifecycleManager::revive`, and `restart` ⇒ `cycle_follower`); the reap's wait on the drain is now BOUNDED (`DrainBusy` → retried); reconcile and the drain's store scan no longer let one bad instance stop its siblings |
 | 08 | An instance is CREATED — the catch-up slot queue (`next_catch_up`), `EnsureInstance`, `state_prep` executed (copy with the parent paused / rebuild), instance-scoped upgrade actions; a row whose `current` names a renamed-away instance is re-adopted before a move is planned. `client_move` runs to `CatchingUp` | 07 | not written |
 | 09 | The switch — `FanOut::Hold` + the advisory diff, pause both at a boundary, drain-or-purge, `CommitSwitch` (THE atomic write) + `ResolveCommit`, `AttachTo`/`DetachFrom` become "reconcile that instance" (WO-07 derives attachment from rows, so the row write IS the attach), a successor for `current.toml` when the current instance is superseded, what a departing instance still owes, CLIENT-scoped recapture for the scoped refill, the Apply frame carries the instance digest. ⚠️ The fan-out's `RowCache` trusts mtime: `Committing` → `CommitSwitch` can land inside one timestamp tick, so the commit must INVALIDATE it | 08 | not written |
 | 10 | Client lease + probe | 05 | not written |

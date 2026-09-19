@@ -1381,10 +1381,22 @@ where
         // 2. The dialer's drain holds this instance's emissions store for the
         //    life of the process, through a status writer that owns a clone.
         //    A live redb handle is exactly what makes `remove_dir_all` fail,
-        //    so ask it to let go and WAIT — `release_instance` drains the
-        //    writer's queue before it replies.
+        //    so ask it to let go and wait — `release_instance` drains the
+        //    writer's queue before it replies. The wait is BOUNDED (this runs
+        //    under the module's lifecycle lock): a drain stuck behind a
+        //    hanging companion fails this reap into its retry instead. Every
+        //    step above is a no-op the second time, and by then the queued
+        //    release has been honoured.
         if let Some(dialer) = self.dialer.get() {
-            dialer.release_instance(key).await;
+            match dialer.release_instance(key).await {
+                crate::dialer::Released::Done => {}
+                crate::dialer::Released::StillBusy => {
+                    return Err(PlatformError::DrainBusy {
+                        module: id.to_owned(),
+                        instance: key.dir_name(),
+                    });
+                }
+            }
         }
 
         // 3. Whatever this instance still owed its companions dies with the

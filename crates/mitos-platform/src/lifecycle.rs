@@ -64,6 +64,11 @@ pub enum LifecycleError {
     /// is a legitimate state, not a malformed request.
     #[error("{0}")]
     Rejected(#[from] Rejected),
+    /// The host refused something the caller asked for DIRECTLY (an
+    /// operator's restart). Effects do not use this: a failed effect is
+    /// logged and left for the watchdog, never returned.
+    #[error("host: {0}")]
+    Host(String),
 }
 
 impl LifecycleError {
@@ -77,6 +82,16 @@ impl LifecycleError {
                 | LifecycleError::Storage(StorageError::NoSuchInstance { .. })
         )
     }
+}
+
+/// What [`LifecycleManager::revive`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revival {
+    Restarted,
+    /// By the time the lock was held there was nothing to do: the follower
+    /// was back, the record no longer wanted one, or the directory had moved.
+    NotNeeded,
+    Failed(String),
 }
 
 /// What the manager knows about one instance directory.
@@ -459,6 +474,11 @@ impl LifecycleManager {
         // records would disagree about who is attached to what.
         let current = self.current_key(module)?;
         let subscribers = self.subscribers_of(module);
+        // One instance's failure must not strand its siblings: a client that
+        // left A for B is detached from one and attached to the other, and
+        // stopping half-way leaves it counted by both or by neither. The
+        // first error is still the caller's answer.
+        let mut first_error = None;
         for view in self.instances(module)? {
             if view.managed().is_none() {
                 continue;
@@ -503,11 +523,21 @@ impl LifecycleManager {
                             "reconcile: stale event",
                         );
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            module = %module,
+                            instance = %instance.key.dir_name(),
+                            ?event,
+                            error = %e,
+                            "reconcile: event failed; continuing with the module's other instances",
+                        );
+                        first_error.get_or_insert(e);
+                        break;
+                    }
                 }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// The module's clients as `routing::attached_to` wants them: who, under
@@ -797,6 +827,61 @@ impl LifecycleManager {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Revive
+    // -----------------------------------------------------------------
+
+    /// Restart an instance whose follower died — the watchdog's one action.
+    ///
+    /// Under the module lock, and it RE-CHECKS there. The watchdog works from
+    /// a snapshot taken with no lock, and `upload` deliberately holds a
+    /// follower stopped for as long as its block in flight takes to finish,
+    /// then renames its directory. A revive acting on the snapshot would
+    /// start `K1` in that gap: before the rename it runs across it (no cursor
+    /// writes, no fan-out — WO-06's review), and the upload's own
+    /// `start_instance(K2)` then fails because `K1` still holds the redb
+    /// files. The same gap is how an operator's stop could be undone for a
+    /// sweep. Waiting for the lock and asking again closes both: by then the
+    /// record says what is wanted and the directory is where it will stay.
+    pub async fn revive(&self, key: &InstanceKey) -> Revival {
+        let module = key.module.as_str();
+        let lock = self.lock_for(module);
+        let _guard = lock.lock().await;
+
+        if !self.storage.instance_dir(key).is_dir() {
+            // Renamed away (an upload) or reaped while we waited.
+            return Revival::NotNeeded;
+        }
+        if self.host.running_instances(module).await.contains(key) {
+            return Revival::NotNeeded;
+        }
+        match self.peek_at(key).map(|view| view.on_boot()) {
+            Ok(BootAction::StartFollower) => {}
+            Ok(BootAction::LeaveStopped) => return Revival::NotNeeded,
+            Err(e) => return Revival::Failed(e.to_string()),
+        }
+        match self.host.start_instance(key).await {
+            Ok(()) => Revival::Restarted,
+            Err(e) => Revival::Failed(e.to_string()),
+        }
+    }
+
+    /// Cycle the current instance's follower in place — an operator's
+    /// `restart` of a module that is already running. Under the module lock
+    /// for the same reason as [`Self::revive`], and by KEY: the host's `&str`
+    /// `replace` stops "whatever the facade last started", which is nothing
+    /// now that this manager starts every follower itself.
+    pub async fn cycle_follower(&self, module: &str) -> Result<(), LifecycleError> {
+        let lock = self.lock_for(module);
+        let _guard = lock.lock().await;
+        let key = self.current_key(module)?;
+        // `start_instance` stops the key's slot first.
+        self.host
+            .start_instance(&key)
+            .await
+            .map_err(|e| LifecycleError::Host(e.to_string()))
     }
 
     // -----------------------------------------------------------------
@@ -1344,6 +1429,98 @@ mod tests {
                 HostCall::StartInstance(after)
             ],
         );
+    }
+
+    /// `upload` holds the follower STOPPED while it renames the directory, and
+    /// the watchdog works from a snapshot taken with no lock. A revive acting
+    /// on that snapshot starts `K1` inside the gap: a follower running across
+    /// the rename again, and the upload's own start of `K2` then fails because
+    /// `K1` still holds the files. So the revive waits for the module lock and
+    /// ASKS AGAIN — and by then `K1` is not there to start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_watchdog_revive_cannot_land_inside_an_uploads_quiesce() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.host.clear();
+        let before = h.storage.current_instance(MODULE).unwrap().unwrap();
+
+        // The gap, held open: the follower is stopped, nothing is renamed yet.
+        let (in_gap, mut wait_for_gap) = tokio::sync::mpsc::unbounded_channel();
+        h.host.on_stop(move || {
+            let _ = in_gap.send(());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+
+        // What the watchdog does once its snapshot says "K1 should be running
+        // and is not" — which, inside the gap, is exactly what it says.
+        let (manager, key) = (h.manager.clone(), before.clone());
+        let watchdog = tokio::spawn(async move {
+            wait_for_gap
+                .recv()
+                .await
+                .expect("the upload reached its gap");
+            manager.revive(&key).await
+        });
+
+        let wasm = b"a whole new build";
+        let manifest = crate::companions::testing::manifest_for(MODULE, wasm);
+        h.manager
+            .upload(&manifest, wasm, None)
+            .await
+            .expect("upload accepted");
+
+        assert_eq!(watchdog.await.unwrap(), Revival::NotNeeded);
+        let after = h.storage.current_instance(MODULE).unwrap().unwrap();
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::StopInstance(before),
+                HostCall::StartInstance(after)
+            ],
+            "the watchdog started a follower inside the upload's quiesce",
+        );
+    }
+
+    /// An operator's `restart` of a running module. It used to call the
+    /// host's `&str` `replace`, which stops "whatever the facade last
+    /// started" — nothing, now that this manager starts every follower by
+    /// key — and took no lock.
+    #[tokio::test]
+    async fn cycling_a_follower_addresses_the_current_instance_by_key() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.host.clear();
+        let key = h.storage.current_instance(MODULE).unwrap().unwrap();
+
+        h.manager.cycle_follower(MODULE).await.expect("cycled");
+
+        assert_eq!(h.host.calls(), vec![HostCall::StartInstance(key)]);
+    }
+
+    /// …and when a follower really has died, it still comes back.
+    #[tokio::test]
+    async fn a_revive_restarts_a_follower_that_died_and_leaves_a_stopped_one() {
+        let h = Harness::new();
+        h.activate(MODULE);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        let key = h.storage.current_instance(MODULE).unwrap().unwrap();
+
+        assert_eq!(h.manager.revive(&key).await, Revival::NotNeeded);
+
+        h.host.follower_died(MODULE);
+        assert_eq!(h.manager.revive(&key).await, Revival::Restarted);
+
+        h.operator(MODULE, OperatorCommand::Stop).await;
+        assert_eq!(h.manager.revive(&key).await, Revival::NotNeeded);
     }
 
     /// The follower is stopped FOR the upload, so an upload that then fails
