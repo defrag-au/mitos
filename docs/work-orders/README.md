@@ -85,6 +85,30 @@ nix develop -c cargo test -p <crate>
   close it through `ModuleStorage` first.
 - **zsh does not word-split `$VAR`.** `cmd $ARGS` passes ONE argument. Use
   `${=ARGS}` or an array.
+- **Verify the WORKSPACE, not a list of `-p` targets.** A signature change in
+  `mitos-platform` can break a tool crate that no `-p` list names. Finish with
+  `nix develop -c cargo check --workspace --all-targets`.
+
+## Writing anything that changes files on disk in more than one step
+
+Both bugs found reviewing WO-01 were of this one kind, in code that was
+otherwise careful, so it gets its own section.
+
+- **Enumerate the crash point between EVERY adjacent pair of writes**, not just
+  the one the design talks about. WO-01's spec named "crash between the rename
+  and the pointer write" and the implementation handled it perfectly — and
+  there was a second window, between the rename and the marker write, that
+  nobody had listed, which left a module unable to start. For N writes there
+  are N−1 windows. Write them down, and write a test for each.
+- **"Destination exists" must mean "destination is complete."** Any step that
+  skips work because its output is already there is trusting that. So every
+  such output is written to a sibling temp name and RENAMED into place — never
+  written in place — or a crash mid-write is silently accepted next time.
+- **A shared (read) lock must never write.** A recovery path that "just fixes
+  it up" while holding a read lock races with every other reader doing the
+  same. Derive the answer on read; persist it under the write lock.
+- **Anything skipped or failed gets its own bucket in the summary.** A report
+  of `migrated = 19` reads as healthy whether or not a twentieth was dropped.
 
 ## When to stop and report instead of continuing
 
@@ -124,4 +148,4 @@ Done / Partially done / Blocked
 
 | # | Title | Depends on | Status |
 |---|---|---|---|
-| 01 | Instance-keyed storage + content-addressed artifacts | — | ready |
+| 01 | Instance-keyed storage + content-addressed artifacts | — | **done**, reviewed 2026-09-19 — see its "Review" section |

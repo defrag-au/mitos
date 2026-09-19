@@ -295,4 +295,61 @@ Run each; quote the result line in the report.
 The first boot on the new binary moves production state. Before it:
 `cp -a /var/lib/mitos/modules /var/lib/mitos/modules.pre-v3` (6.8G, ext4 so no
 reflink), then start once with `MITOS_STORAGE_MIGRATION=plan` and read the log.
-Preprod first — it is the host-binary staging environment.
+Preprod first — it is the host-binary staging environment. After the real
+start, grep the journal for `module storage migration INCOMPLETE`: any module
+it names is NOT running.
+
+## Review — 2026-09-19
+
+Implemented in `4676225`. Acceptance re-run independently: `mitos-platform`
+152 tests, `mitos-core` 28, `mitos-lifecycle` 52, the four integration test
+files UNMODIFIED and passing, clippy `-D warnings` exit 0,
+`cargo check --workspace --all-targets` exit 0. No test was ignored or
+weakened. Goldens are unaffected by construction — `mitos-run` never touches
+`ModuleStorage`.
+
+**What the implementation got right that the order got wrong.** After step 6
+removes `config.cbor`, a re-run would have derived a config-LESS key and built
+a second instance directory beside the migrated one. The implementation makes
+a committed `current.toml` win over re-derivation. The order's resumability
+requirement was right; its step list did not actually satisfy it.
+
+**Forced deviation, accepted.** `last_trap_path` (and the path helpers) became
+fallible, so `admin.rs`, `backfill_v2.rs` and `follower_v2.rs` changed despite
+not being on the Files list. Unavoidable once path resolution can fail with
+`NoSuchInstance` instead of silently `mkdir`-ing.
+
+**Unlisted but correct.** `state_dir` falls back to the MODULE directory when
+there is no `current.toml`. The order said such a module "behaves as
+unregistered"; that is true of modules but the order missed that IN-TREE
+INDEXERS (`none-match`) use `ModuleStorage` for kv + cursor by name and are
+never activated. The fallback keeps them where v2 put them, and the migration
+leaves a directory with no `manifest.toml` alone.
+
+**Fixed in review** (uncommitted on top of `4676225`):
+
+1. *Crash repair wrote under a READ lock.* `current_instance_locked` persisted
+   the repaired pointer while holding a shared lock. After a crash the
+   follower, dialer and compactor resolve one module concurrently; they would
+   race on a single `current.toml.new` and the loser's rename fails `ENOENT` —
+   a repairable crash becoming a module that does not start. Now a named
+   `Held::{Read, Write}`: a read DERIVES the repair, only a write PERSISTS it.
+2. *A second crash window.* `repoint_locked` did rename → marker → pointer. A
+   crash between the rename and the marker left a directory named for B whose
+   marker said A; `list_instances` trusted marker CONTENT, so the repair chose
+   A, whose directory no longer existed. Now the marker is written BEFORE the
+   rename, and `list_instances` ignores a marker that disagrees with its
+   directory's name. Two new tests.
+3. *Non-atomic CAS copy.* The migration's `copy` wrote straight to
+   `_cas/wasm/<sha>.wasm` and skips when the destination exists, so a crash
+   mid-copy would be accepted as complete next pass. Now `.partial` + rename.
+4. *Failures had no bucket.* `MigrationReport` gained `failed`, and the boot
+   site logs a stable `error!` line a deploy check can grep for.
+
+All four are the same class — see "Writing anything that changes files on disk
+in more than one step" in the README, added because of them.
+
+**Known and accepted.** `last_trap_path` releases the read lock before the
+caller writes the fixture. A repoint in that gap makes the write fail `ENOENT`
+(the parent was renamed away) rather than resurrect the old directory — a lost
+trap fixture, logged, never corruption.

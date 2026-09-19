@@ -335,10 +335,22 @@ impl Bundle {
                     ?mode,
                     migrated = report.migrated.len(),
                     already_v3 = report.already_v3.len(),
+                    failed = report.failed.len(),
                     orphaned_artifacts = report.orphaned_artifacts,
                     modules = ?report.migrated,
                     "module storage layout checked",
                 );
+                // Its own line at `error`, keyed on a stable message, so a
+                // deploy check can grep for it the way `step_verify_modules`
+                // reads the auto-load summary. A failed module is NOT RUNNING
+                // — the facade reports it as unregistered — and the host is
+                // deliberately left up so the other modules keep serving.
+                if !report.failed.is_empty() {
+                    tracing::error!(
+                        failed = ?report.failed,
+                        "module storage migration INCOMPLETE — these modules are not running",
+                    );
+                }
                 if mode == MigrationMode::Plan {
                     // `plan` is a different outcome, not a quieter one: the
                     // operator reads the moves above and then decides.

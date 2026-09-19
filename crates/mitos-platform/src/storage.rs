@@ -107,6 +107,15 @@ pub enum StorageError {
     Serialise { what: &'static str, why: String },
 }
 
+/// How the caller of a `*_locked` method holds the `repoint` lock. A named
+/// value rather than a `bool` because the two cases permit different things:
+/// only `Write` may persist anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    Read,
+    Write,
+}
+
 /// Write-tmp-then-rename. The tmp sits beside the target so the rename never
 /// crosses a filesystem, which is what makes it atomic.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
@@ -551,7 +560,21 @@ impl ModuleStorage {
                 continue;
             };
             match toml::from_str::<InstanceKey>(&raw) {
-                Ok(key) => out.push(key),
+                // The marker must agree with the directory it sits in. A key
+                // whose `dir_name()` is not this directory's name would send
+                // every caller to a path that does not exist, so it is not an
+                // instance this listing can vouch for. (`repoint_locked`
+                // writes the marker before renaming, so the one legitimate
+                // disagreement — crashed before the rename — is a directory
+                // `current.toml` still resolves directly, never via here.)
+                Ok(key) if entry.file_name().to_str() == Some(key.dir_name().as_str()) => {
+                    out.push(key);
+                }
+                Ok(key) => tracing::warn!(
+                    marker = %marker.display(),
+                    claims = %key.dir_name(),
+                    "instance marker disagrees with its directory name; ignoring this directory",
+                ),
                 Err(e) => tracing::warn!(
                     marker = %marker.display(),
                     error = %e,
@@ -576,7 +599,7 @@ impl ModuleStorage {
     /// way it treated an unregistered module in v2.
     pub fn current_instance(&self, module_id: &str) -> Result<Option<InstanceKey>, StorageError> {
         let _guard = self.repoint.read().expect("repoint lock");
-        self.current_instance_locked(module_id)
+        self.current_instance_locked(module_id, Held::Read)
     }
 
     /// Point a module's facade at an instance. Write-tmp-then-rename, so a
@@ -595,10 +618,21 @@ impl ModuleStorage {
         )
     }
 
-    /// Caller must already hold `repoint` (read or write).
+    /// Caller must already hold `repoint`, and says HOW — because the crash
+    /// repair below may only be PERSISTED under the write lock.
+    ///
+    /// A read lock is shared. After a crash the follower, the dialer and the
+    /// compactor all resolve the same module within moments of boot; if each
+    /// persisted the repair they would race on one `current.toml.new`, and the
+    /// loser's rename would fail with `ENOENT` — turning a repairable crash
+    /// into a module that does not start, at the one moment that matters.
+    /// Under `Held::Read` the repaired key is therefore derived and RETURNED
+    /// but not written: every reader derives the same answer from the same
+    /// directory listing, so it is idempotent, and the next writer persists it.
     fn current_instance_locked(
         &self,
         module_id: &str,
+        held: Held,
     ) -> Result<Option<InstanceKey>, StorageError> {
         let pointer = self.current_pointer_path(module_id);
         let raw = match std::fs::read_to_string(&pointer) {
@@ -633,7 +667,9 @@ impl ModuleStorage {
                 "current.toml named a missing instance directory; repairing it to the module's \
                  only instance (a crash between activate's rename and its repoint)",
             );
-            self.set_current_locked(&repaired)?;
+            if held == Held::Write {
+                self.set_current_locked(&repaired)?;
+            }
             return Ok(Some(repaired));
         }
         Err(StorageError::NoSuchInstance {
@@ -653,7 +689,7 @@ impl ModuleStorage {
     /// module that only ever had a cursor written to it.
     fn state_dir(&self, module_id: &str) -> Result<PathBuf, StorageError> {
         let _guard = self.repoint.read().expect("repoint lock");
-        match self.current_instance_locked(module_id)? {
+        match self.current_instance_locked(module_id, Held::Read)? {
             Some(key) => Ok(self.instance_dir(&key)),
             None => {
                 let dir = self.module_dir(module_id);
@@ -687,6 +723,20 @@ impl ModuleStorage {
                         instance: next.dir_name(),
                     });
                 }
+                // The marker for `next` goes into the directory BEFORE the
+                // rename, while it still has its old name. The other order
+                // has a window — renamed, marker not yet rewritten — that
+                // leaves a directory NAMED for `next` whose marker still says
+                // `cur`; the crash repair would then "repair" the pointer to
+                // `cur`, whose directory no longer exists, and the module
+                // could not start. Marker-first has no such shape: crash
+                // before the rename and the pointer still resolves (the
+                // directory is where it says); crash after it and directory
+                // name, marker and repair all agree on `next`.
+                write_atomic(
+                    &from.join(INSTANCE_MARKER),
+                    instance_key_toml(next)?.as_bytes(),
+                )?;
                 // This runs while the module's follower is LIVE — the upload
                 // handler calls `activate` and only then `host.replace()`.
                 // It is safe on unix: the cached redb handles hold file
@@ -859,7 +909,7 @@ impl ModuleStorage {
         let wasm = self.put_artifact(manifest, wasm_bytes)?;
 
         let _guard = self.repoint.write().expect("repoint lock");
-        let current = self.current_instance_locked(module.as_str())?;
+        let current = self.current_instance_locked(module.as_str(), Held::Write)?;
         let next = InstanceKey {
             module,
             wasm,
@@ -927,7 +977,7 @@ impl ModuleStorage {
 
         let _guard = self.repoint.write().expect("repoint lock");
         let current = self
-            .current_instance_locked(id)?
+            .current_instance_locked(id, Held::Write)?
             .ok_or_else(|| StorageError::NotActivated(id.to_owned()))?;
         let next = InstanceKey {
             module: current.module.clone(),
@@ -1450,11 +1500,101 @@ mod tests {
             storage.current_instance("test-module").unwrap(),
             Some(key_b.clone()),
         );
-        // The repair is persisted, not re-derived on every read.
-        let pointer =
-            std::fs::read_to_string(dir.join("test-module").join(CURRENT_POINTER)).unwrap();
-        assert_eq!(toml::from_str::<InstanceKey>(&pointer).unwrap(), key_b);
+        // A READ derives the repair and does not persist it: the read lock is
+        // shared, and concurrent readers racing on one `current.toml.new`
+        // would turn a repairable crash into a module that cannot start.
+        let pointer_path = dir.join("test-module").join(CURRENT_POINTER);
+        let pointer = std::fs::read_to_string(&pointer_path).unwrap();
+        assert_eq!(toml::from_str::<InstanceKey>(&pointer).unwrap(), key_a);
+        // …and every reader derives the same answer, so that is safe.
+        assert_eq!(
+            storage.current_instance("test-module").unwrap(),
+            Some(key_b.clone()),
+        );
 
+        // The next WRITER persists it. Re-activating the same artifact is the
+        // smallest such write.
+        let wasm_b = b"repair B";
+        let mut manifest_b = sample_manifest(wasm_b);
+        manifest_b.module.sha256 = sha256_hex(wasm_b);
+        manifest_b.module.size_bytes = wasm_b.len() as u64;
+        storage.activate(&manifest_b, wasm_b).unwrap();
+        let pointer = std::fs::read_to_string(&pointer_path).unwrap();
+        assert_eq!(toml::from_str::<InstanceKey>(&pointer).unwrap(), key_b);
+        assert_eq!(instance_dirs(&dir, "test-module").len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The window `repoint_locked`'s marker-first ordering closes. With the
+    /// marker written AFTER the rename, a crash between the two left a
+    /// directory named for B whose marker said A — and the repair pointed the
+    /// module at A, which no longer existed.
+    #[test]
+    fn a_crash_before_the_rename_still_resolves_to_the_old_instance() {
+        let dir = tempdir("crash-before-rename");
+        let storage = ModuleStorage::new(&dir);
+        let wasm_a = b"before rename A";
+        let mut manifest_a = sample_manifest(wasm_a);
+        manifest_a.module.sha256 = sha256_hex(wasm_a);
+        manifest_a.module.size_bytes = wasm_a.len() as u64;
+        storage.activate(&manifest_a, wasm_a).unwrap();
+
+        let key_a = InstanceKey {
+            module: module("test-module"),
+            wasm: sha(wasm_a),
+            config: None,
+        };
+        let key_b = InstanceKey {
+            module: module("test-module"),
+            wasm: sha(b"before rename B"),
+            config: None,
+        };
+        // Marker rewritten for B, crash before the rename: the directory
+        // still has A's name and `current.toml` still says A.
+        std::fs::write(
+            storage.instance_dir(&key_a).join(INSTANCE_MARKER),
+            instance_key_toml(&key_b).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage.current_instance("test-module").unwrap(),
+            Some(key_a),
+            "the pointer names a directory that exists, so it wins outright"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_marker_that_disagrees_with_its_directory_is_not_listed() {
+        let dir = tempdir("marker-mismatch");
+        let storage = ModuleStorage::new(&dir);
+        let key_a = InstanceKey {
+            module: module("test-module"),
+            wasm: sha(b"mismatch A"),
+            config: None,
+        };
+        let key_b = InstanceKey {
+            module: module("test-module"),
+            wasm: sha(b"mismatch B"),
+            config: None,
+        };
+        storage.write_instance_marker(&key_a).unwrap();
+        assert_eq!(
+            storage.list_instances(&key_a.module).unwrap(),
+            vec![key_a.clone()]
+        );
+
+        std::fs::write(
+            storage.instance_dir(&key_a).join(INSTANCE_MARKER),
+            instance_key_toml(&key_b).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            storage.list_instances(&key_a.module).unwrap().is_empty(),
+            "a key whose dir_name() is not this directory would send callers to a missing path"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

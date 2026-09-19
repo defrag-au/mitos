@@ -110,6 +110,12 @@ pub struct MigrationReport {
     pub migrated: Vec<String>,
     /// Modules already in the v3 layout — nothing to do.
     pub already_v3: Vec<String>,
+    /// Modules that FAILED to migrate and were skipped. Non-empty means the
+    /// boot did not fully land: a module with no `current.toml` reads as
+    /// unregistered through the facade, so it is simply NOT RUNNING. Its own
+    /// bucket for the reason `AutoLoadSummary` has four — `migrated = 19`
+    /// reads as healthy whether or not a twentieth was silently dropped.
+    pub failed: Vec<String>,
     /// Old `<sha>.wasm` rollback targets moved to `_cas/orphaned-v2/`.
     pub orphaned_artifacts: usize,
 }
@@ -185,12 +191,15 @@ pub(crate) fn run_with_hook(
                     // keep the rest of the host's modules on the old layout,
                     // and because every step is idempotent the failed one is
                     // either untouched or resumable on the next boot.
-                    Err(e) => tracing::error!(
-                        module = %name,
-                        error = %e,
-                        "storage migration failed for this module; skipping it — the other \
-                         modules still migrate and a re-run resumes this one",
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            module = %name,
+                            error = %e,
+                            "storage migration failed for this module; skipping it — the other \
+                             modules still migrate and a re-run resumes this one",
+                        );
+                        report.failed.push(name);
+                    }
                 }
             }
         }
@@ -391,7 +400,16 @@ impl Mover {
             return Ok(());
         }
         std::fs::create_dir_all(to.parent().expect("destination parent"))?;
-        std::fs::copy(from, to)?;
+        // Copy to a sibling and rename into place. The skip above trusts
+        // "destination exists" to mean "destination is COMPLETE", and a crash
+        // halfway through a direct copy would break that: the next pass would
+        // skip a truncated `<sha>.wasm` — a content-addressed file holding the
+        // wrong content, which nothing downstream re-hashes before running.
+        let mut partial = to.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        std::fs::copy(from, &partial)?;
+        std::fs::rename(&partial, to)?;
         Ok(())
     }
 
