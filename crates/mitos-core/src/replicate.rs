@@ -95,12 +95,18 @@ struct ReplicateState {
 /// resolves directly to the indexer it serves; no name lookup at
 /// runtime.
 ///
-/// `auth` gates every upgrade request via the standard axum
-/// middleware (Bearer token in `Authorization` header).
+/// `auth` gates every upgrade request.
+///
+/// This route is NOT in WO-02's attempt table — it is a synthetic-client
+/// surface with no worker in the token census — so it keeps exactly the
+/// access it has today: the full operator token and nobody else. See
+/// [`mitos_platform::auth::require_admin_mutate`] for why that is spelled
+/// `Admin(Mutate)` on a `GET`, and why it is a placeholder rather than a
+/// judgement.
 pub fn replicate_router(
     handles: &[Arc<dyn IndexerHandle>],
     domain: DomainAdapter,
-    auth: crate::auth::AuthToken,
+    auth: Arc<crate::auth::Authenticator>,
 ) -> Router {
     let mut router = Router::new();
     for handle in handles {
@@ -113,10 +119,15 @@ pub fn replicate_router(
         router = router.route(&endpoint, get(handle_upgrade).with_state(state));
         debug!(indexer = %name, endpoint = %endpoint, "replicate route mounted");
     }
-    router.layer(axum::middleware::from_fn_with_state(
-        auth,
-        crate::auth::require_auth,
-    ))
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            mitos_platform::auth::require_admin_mutate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::authenticate,
+        ))
 }
 
 async fn handle_upgrade(

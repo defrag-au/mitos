@@ -214,6 +214,14 @@ impl Registry {
         &self.namespaces
     }
 
+    /// Where the rollout has got to. Read by the host purely to REPORT it on
+    /// `/_admin/status` — the decision it drives stays in [`Self::authorize`],
+    /// so an operator watching the rollout and the rule being enforced can
+    /// never disagree.
+    pub fn operator_token_as_client(&self) -> OperatorTokenAsClient {
+        self.operator_token_as_client
+    }
+
     /// The namespace that owns `client`. A client id belongs to AT MOST one
     /// namespace ([`RegistryError::ClientInTwoNamespaces`]), which is what
     /// lets the on-disk `companions/<client_id>/` layout stay as it is: the

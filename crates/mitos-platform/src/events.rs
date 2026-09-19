@@ -84,6 +84,19 @@ pub enum EventKind {
     /// The watchdog found a module with registered companions but no
     /// live follower and restarted it (see `watchdog.rs`).
     WatchdogRestart { outcome: String },
+    /// A client action (subscribe, interest mutation) was authorised with the
+    /// OPERATOR's full token rather than the client's namespace token.
+    ///
+    /// This is the rollout's instrument: every worker holds the operator
+    /// token today, so `operator_token_as_client` starts at
+    /// `allow-with-warning` and each worker's secret is rotated to its
+    /// namespace token one at a time. A client drops out of this feed once it
+    /// has been rotated; when the feed is empty the mode can be flipped to
+    /// `refuse`. It is here rather than only in the journal precisely because
+    /// "who is left" must be a query.
+    ///
+    /// Debounced per client — see `companions::OperatorAsClientDebounce`.
+    OperatorTokenUsedAsClient { client_id: String },
 }
 
 impl EventKind {
@@ -102,6 +115,7 @@ impl EventKind {
             EventKind::Trap { .. } => "trap",
             EventKind::FollowerExited { .. } => "follower_exited",
             EventKind::WatchdogRestart { .. } => "watchdog_restart",
+            EventKind::OperatorTokenUsedAsClient { .. } => "operator_token_used_as_client",
         }
     }
 }

@@ -14,7 +14,7 @@
 
 use axum::middleware::from_fn_with_state;
 use clap::Parser;
-use mitos_core::{Bundle, require_auth};
+use mitos_core::{Bundle, authenticate, require_read_chain};
 use none_match_indexer::NoneMatchIndexer;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -91,7 +91,9 @@ async fn main() -> anyhow::Result<()> {
     let minibf_cfg = config.serve.minibf.clone();
     let minibf_domain = minibf_cfg.as_ref().map(|_| domain.clone());
 
-    let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir);
+    // Fallible: this is where `MITOS_NAMESPACES_FILE` is loaded, and a host
+    // that declares a security boundary it cannot enforce must not serve.
+    let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir)?;
 
     // Residual pass: emits `Domain::AssetMovement` for asset
     // transfers no specific-domain indexer claimed (the chain-
@@ -125,9 +127,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let (Some(cfg), Some(minibf_domain)) = (minibf_cfg, minibf_domain) {
-        let auth = bundle.auth().clone();
+        // `ReadChain`, NOT an admin attempt: minibf is a read API over PUBLIC
+        // chain data, and `wallet-viewer` calls it with the same
+        // `MITOS_AUTH_TOKEN` secret the companions use while subscribing to
+        // nothing. Gating it as admin would either 403 that worker the day
+        // its secret becomes a namespace token, or leave it holding the
+        // operator token — the one that evicts modules — for ever.
+        let auth = bundle.authenticator().clone();
         let router = dolos_minibf::build_router(cfg, minibf_domain)
-            .layer(from_fn_with_state(auth, require_auth));
+            .layer(from_fn_with_state(auth.clone(), require_read_chain))
+            .layer(from_fn_with_state(auth, authenticate));
         bundle.nest_extra("/minibf", router);
         info!("minibf bridge enabled at /minibf");
     }

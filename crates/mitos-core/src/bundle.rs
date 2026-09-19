@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::auth::AuthToken;
+use crate::auth::{AuthToken, Authenticator};
 use crate::coordinator::TxClaimCoordinator;
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
@@ -74,11 +74,15 @@ pub struct Bundle {
     /// indexer names can't accidentally shadow them. Populated via
     /// `nest_extra` — e.g. the minibf bridge in `bundles/default`.
     extra_routes: Vec<(String, axum::Router)>,
-    /// Shared-secret token loaded from `MITOS_AUTH_TOKEN` at
-    /// construction time. Stored here so bundle authors can apply
-    /// the same auth to extra routers (e.g. minibf) without calling
-    /// `AuthToken::from_env()` a second time.
+    /// Shared secret loaded from `MITOS_AUTH_TOKEN` at construction time.
+    /// OUTBOUND only now — the dial-back credential the `Replicator` and the
+    /// indexer bridge present. Inbound gating is `authenticator`'s.
     auth: AuthToken,
+    /// The host's one authenticator, built once at construction so a
+    /// misconfigured namespace registry fails before anything is served.
+    /// Bundle authors hand it to extra routers (e.g. minibf) via
+    /// [`Bundle::authenticator`].
+    authenticator: Arc<Authenticator>,
 }
 
 impl Bundle {
@@ -90,13 +94,18 @@ impl Bundle {
     /// `--modules-dir`. The bundle currently has no shared
     /// non-module state, but the binary still accepts
     /// `--data-dir` so operator scripts don't need updating.
+    ///
+    /// Fallible because the namespace registry (`MITOS_NAMESPACES_FILE`) is
+    /// loaded here. A host that declares a security boundary and cannot
+    /// enforce it must not start serving — see
+    /// [`mitos_platform::auth::AuthSetupError`] for every refusal.
     pub fn new(
         domain: DomainAdapter,
         config: RootConfig,
         listen: SocketAddr,
         _data_dir: PathBuf,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             domain,
             config,
             listen,
@@ -106,7 +115,8 @@ impl Bundle {
             residual_coordinator: None,
             extra_routes: Vec::new(),
             auth: AuthToken::from_env(),
-        }
+            authenticator: Arc::new(Authenticator::from_env()?),
+        })
     }
 
     /// Enable residual-pass mode for `Domain::AssetMovement`
@@ -187,10 +197,16 @@ impl Bundle {
         self
     }
 
-    /// The auth token loaded from `MITOS_AUTH_TOKEN` at construction.
-    /// Bundle authors can use this to apply the same shared-secret to
-    /// extra routers (e.g. `from_fn_with_state(bundle.auth().clone(), require_auth)`)
-    /// rather than reading a separate env var.
+    /// The host's authenticator. Bundle authors hand this to an extra router
+    /// along with the `Attempt` that router's callers make — e.g. minibf
+    /// takes `authenticate` + `require_read_chain`, because `wallet-viewer`
+    /// reads it and is not a subscriber in any namespace.
+    pub fn authenticator(&self) -> &Arc<Authenticator> {
+        &self.authenticator
+    }
+
+    /// The outbound dial-back credential from `MITOS_AUTH_TOKEN`. This is no
+    /// longer an inbound gate — see [`Bundle::authenticator`] for that.
     pub fn auth(&self) -> &AuthToken {
         &self.auth
     }
@@ -210,6 +226,7 @@ impl Bundle {
             residual_coordinator,
             extra_routes,
             auth,
+            authenticator,
         } = self;
 
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
@@ -300,7 +317,11 @@ impl Bundle {
         // the three legacy in-tree indexers — platform-v2 wasm
         // modules use the companion runtime's HTTPS subscribe path
         // instead (`/api/companions/subscribe`).
-        app = app.merge(replicate_router(&indexers, domain.clone(), auth.clone()));
+        app = app.merge(replicate_router(
+            &indexers,
+            domain.clone(),
+            authenticator.clone(),
+        ));
 
         // Wasm-module hosting (Bundle::enable_modules). Mounts
         // /_admin/modules/* and auto-starts followers for any
@@ -537,9 +558,22 @@ impl Bundle {
             // can't abort bundle startup.
             host.auto_resume().await;
 
-            // The platform admin router has its own AuthToken
-            // type — same shape, same env var, separate crate.
+            // The dialer's OUTBOUND credential — the token it presents when
+            // it calls a companion back. Same env var, same value; it is not
+            // the inbound gate any more.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
+
+            // Registrations on disk whose client no namespace owns. Nothing
+            // is removed and nothing stops being dialled — this is a rollout
+            // signal, logged ONCE at boot and served on `/_admin/status`.
+            let unowned = authenticator.unowned_clients(&storage);
+            if !unowned.is_empty() {
+                tracing::warn!(
+                    clients = ?unowned,
+                    "companion registrations exist for clients no namespace lists; they keep \
+                     running, but their next subscribe is a 403 — add them to a namespace",
+                );
+            }
             let host_for_admin = host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
 
             // Companion dial supervisor: maintains an outbound
@@ -585,7 +619,7 @@ impl Bundle {
             dialer.start_all().await;
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),
-                platform_auth.clone(),
+                authenticator.clone(),
                 Some(dialer.clone()),
                 Some(indexer_bridge),
                 event_ring.clone(),
@@ -593,9 +627,10 @@ impl Bundle {
 
             // Transaction submission: let a consumer (the minting engine) push a
             // signed tx through mitos into dolos's mempool, which the sync
-            // submit-stage diffuses to the chain. Same `MITOS_AUTH_TOKEN` gate as
-            // the companion API. See `crate::tx`.
-            app = app.merge(crate::tx::tx_router(domain.clone(), auth.clone()));
+            // submit-stage diffuses to the chain. `Attempt::SubmitTx`, so a
+            // namespace token works — the six `tx-submit` consumers hold the
+            // secret through a wrangler binding. See `crate::tx`.
+            app = app.merge(crate::tx::tx_router(domain.clone(), authenticator.clone()));
 
             // Pass the reserved-names set so the upload handler
             // rejects modules whose id collides with an in-tree
@@ -615,7 +650,7 @@ impl Bundle {
                 Some(chain_data),
                 started_at,
                 event_ring.clone(),
-                platform_auth,
+                authenticator.clone(),
             ));
 
             // Module watchdog — revives any module that has

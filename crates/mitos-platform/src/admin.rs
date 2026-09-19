@@ -31,36 +31,44 @@
 //!   slot in `X-Mitos-Block-Slot` so the operator can label the
 //!   fixture without a second round trip.
 //!
-//! Auth is a self-contained shared-secret bearer-token
-//! middleware mirroring `mitos-core::auth` rather than depending
-//! on mitos-core (which pulls in the dolos crate transitively).
-//! Multi-user auth is future work; today every endpoint is gated
-//! on a single `MITOS_AUTH_TOKEN`.
+//! Auth lives in [`crate::auth`] — one authenticator for all three
+//! routers, resolving a bearer token to a
+//! `mitos_lifecycle::access::Principal` and asking `authorize` the
+//! rest. This router asks for `Admin(Read)` on `GET` and
+//! `Admin(Mutate)` otherwise, with ONE exception: recapture, which
+//! a worker calls (see `Attempt::RecaptureModule`).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::Json;
-use axum::extract::{Multipart, Path, Query, Request, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
+use mitos_lifecycle::access::{ClientSet, OperatorTokenAsClient};
+use mitos_lifecycle::policy::Tier;
+
+use crate::auth::{AuthMode, Authenticator};
 use crate::manifest::{Manifest, ManifestError};
 use crate::storage::{ModuleStorage, StorageError};
 
-/// Auth posture for the admin endpoints.
+/// A shared-secret bearer token, as an OUTBOUND credential.
+///
+/// No longer an inbound gate — that is [`crate::auth::Authenticator`]'s job.
+/// What is left is the dial-back side: the companion dialer and the in-tree
+/// indexer bridge present this token when they call a worker, so the worker
+/// can tell the connection came from mitos rather than from somebody who
+/// guessed the URL.
 #[derive(Clone, Debug)]
 pub struct AuthToken(pub Option<String>);
 
 impl AuthToken {
-    /// Load from `MITOS_AUTH_TOKEN`. If unset, returns open
-    /// mode (every request allowed); a warn-level diagnostic
-    /// is left to callers since this constructor is used by
-    /// production binaries AND tests with different posture
-    /// expectations.
+    /// Load from `MITOS_AUTH_TOKEN`. `None` means the host has no
+    /// shared secret, so dial-backs go out unauthenticated — the
+    /// same posture v2 had.
     pub fn from_env() -> Self {
         match std::env::var("MITOS_AUTH_TOKEN") {
             Ok(t) if !t.is_empty() => Self(Some(t)),
@@ -71,85 +79,6 @@ impl AuthToken {
     pub fn as_deref(&self) -> Option<&str> {
         self.0.as_deref()
     }
-
-    /// Optional **read-only** scope token from `MITOS_READONLY_TOKEN`.
-    /// When set, it authorizes `GET` (read-only) admin endpoints but
-    /// not the mutating ones (recapture/evict/restart/upload/delete/
-    /// purge/replay) — handy for dashboards + agents that should
-    /// observe but not act. Unset → only the full token works.
-    pub fn readonly_from_env() -> Option<String> {
-        match std::env::var("MITOS_READONLY_TOKEN") {
-            Ok(t) if !t.is_empty() => Some(t),
-            _ => None,
-        }
-    }
-}
-
-/// Auth scopes for the admin middleware: a full-access token (any
-/// method) and an optional read-only token (`GET` only). Open mode
-/// (no full token) allows everything, preserving prior behaviour.
-#[derive(Clone)]
-struct AuthScopes {
-    full: Option<String>,
-    readonly: Option<String>,
-}
-
-async fn require_auth(
-    State(scopes): State<AuthScopes>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    // Open mode: no full token configured → allow everything
-    // (mirrors the prior behaviour; the read-only scope is moot).
-    let Some(full) = scopes.full.as_deref() else {
-        return Ok(next.run(req).await);
-    };
-
-    let provided = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    if authorize(full, scopes.readonly.as_deref(), req.method(), provided) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
-/// Pure authorization decision (extracted for unit testing). `full` is
-/// the configured full token (caller handles open mode). Returns true
-/// when `provided` matches the full token (any method), or matches the
-/// read-only token on a `GET`.
-fn authorize(
-    full: &str,
-    readonly: Option<&str>,
-    method: &axum::http::Method,
-    provided: Option<&str>,
-) -> bool {
-    let Some(provided) = provided else {
-        return false;
-    };
-    if constant_time_eq(provided.as_bytes(), full.as_bytes()) {
-        return true;
-    }
-    // Read-only token → GET only. Every read endpoint in this router is
-    // a GET; every mutation is POST/DELETE, so method is a sound proxy
-    // for "read-only-safe".
-    method == axum::http::Method::GET
-        && readonly.is_some_and(|ro| constant_time_eq(provided.as_bytes(), ro.as_bytes()))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Shared state passed to every handler.
@@ -176,6 +105,10 @@ struct AdminState {
     /// `GET /_admin/events` + records recapture events; the host /
     /// follower record traps into the same instance.
     events: crate::events::EventRing,
+    /// The host's authenticator. Handlers do not authorize with it — the
+    /// layers already did — but `GET /_admin/status` reports the posture
+    /// (mode, namespaces, unowned clients) from it.
+    auth: Arc<Authenticator>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -186,7 +119,7 @@ struct AdminState {
 /// Production wires the lifecycle-aware variant
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
-pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
+pub fn admin_router(storage: ModuleStorage, auth: Arc<Authenticator>) -> axum::Router {
     admin_router_inner(
         storage,
         None,
@@ -220,7 +153,7 @@ pub fn admin_router_with_host(
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     started_at: SystemTime,
     events: crate::events::EventRing,
-    auth: AuthToken,
+    auth: Arc<Authenticator>,
 ) -> axum::Router {
     admin_router_inner(
         storage,
@@ -241,7 +174,7 @@ fn admin_router_inner(
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     started_at: SystemTime,
     events: crate::events::EventRing,
-    auth: AuthToken,
+    auth: Arc<Authenticator>,
 ) -> axum::Router {
     let state = AdminState {
         storage,
@@ -250,16 +183,23 @@ fn admin_router_inner(
         chain_data,
         started_at,
         events,
-    };
-    // Auth scopes: the full token (any method) + an optional
-    // read-only token (`GET` only) from `MITOS_READONLY_TOKEN`.
-    let scopes = AuthScopes {
-        full: auth.0,
-        readonly: AuthToken::readonly_from_env(),
+        auth: auth.clone(),
     };
 
-    // Bearer-gated admin surface. The auth layer is applied to this
-    // sub-router only, so the open `/metrics` route below is exempt.
+    // Recapture is its OWN sub-router because it is the one admin route a
+    // WORKER calls: `holder-map`'s production cron recaptures
+    // `holder-distribution` with the same secret it subscribes with. Under
+    // `Admin(Mutate)` — which every namespace token is refused — that cron
+    // would 403 the day its secret is rotated.
+    let recapture = axum::Router::new()
+        .route("/_admin/modules/{id}/recapture", post(recapture_module))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_recapture,
+        ));
+
+    // Everything else: `Admin(Read)` on `GET`, `Admin(Mutate)` otherwise,
+    // decided once in the layer rather than in twenty handlers.
     let authed = axum::Router::new()
         .route("/_admin", get(admin_index))
         .route("/_admin/status", get(status))
@@ -270,7 +210,6 @@ fn admin_router_inner(
             get(get_module).post(upload_module).delete(delete_module),
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
-        .route("/_admin/modules/{id}/recapture", post(recapture_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
         .route("/_admin/modules/{id}/companions", get(list_companions))
         .route(
@@ -289,15 +228,29 @@ fn admin_router_inner(
         .route("/_admin/utxos", get(get_utxos_by_address))
         .route("/_admin/blocks/{slot}", get(get_block_by_slot))
         .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
-        .layer(axum::middleware::from_fn_with_state(scopes, require_auth));
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_admin,
+        ));
+
+    // Authentication wraps BOTH authorized sub-routers, outermost, so a
+    // handler can only ever run with a `Principal` in its extensions and an
+    // unknown token is a 401 before any `authorize` call is reached.
+    let gated = recapture
+        .merge(authed)
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::authenticate,
+        ));
 
     // `/metrics` is OPEN (no auth), like `/health` — operational
     // gauges/counters for Prometheus, no secrets. Kept in this router
     // (rather than the bundle) so it shares `AdminState` + the
-    // emission-scan helpers.
+    // emission-scan helpers. Merged AFTER the auth layers so it is exempt
+    // from both.
     let open = axum::Router::new().route("/metrics", get(metrics));
 
-    authed.merge(open).with_state(state)
+    gated.merge(open).with_state(state)
 }
 
 // -----------------------------------------------------------------------------
@@ -357,6 +310,47 @@ pub struct StatusResponse {
     pub archive_horizon_slot: Option<u64>,
     /// Per-module summary.
     pub modules: Vec<StatusModule>,
+    /// Which auth posture the host booted into — `legacy` when
+    /// `MITOS_NAMESPACES_FILE` is unset, `namespaces` otherwise. Lets an
+    /// operator confirm a rollout step took effect without reading the unit
+    /// file.
+    #[serde(default = "AuthMode::legacy_default")]
+    pub auth_mode: AuthMode,
+    /// The configured namespaces. Names, tiers and COUNTS only — never a
+    /// token, never a `token_env` value, never a client list that would let
+    /// this endpoint enumerate the deployment.
+    #[serde(default)]
+    pub namespaces: Vec<StatusNamespace>,
+    /// Client ids with a registration on disk that no namespace owns. They
+    /// keep running and keep being dialled; their next subscribe is a 403,
+    /// which is the signal to add them to a namespace.
+    #[serde(default)]
+    pub unowned_clients: Vec<String>,
+}
+
+impl AuthMode {
+    /// A status response from a host that predates this field came from a
+    /// host with no namespaces.
+    fn legacy_default() -> Self {
+        Self::Legacy
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusNamespace {
+    pub name: String,
+    /// The queue order for staging catch-ups, and (today) the rule for
+    /// whether this namespace may run a whole-module recapture. The lifecycle
+    /// crate's own enum, not a rendering of it — a new tier is then a compile
+    /// error here rather than a string nobody updated.
+    pub tier: Tier,
+    /// How many clients the namespace lists. A count, not the list: the
+    /// deployment's client roster is not something a read-only dashboard
+    /// token should be able to enumerate.
+    pub clients: usize,
+    /// Where the rollout has got to: still accepting the operator token as a
+    /// client credential, or refusing it.
+    pub operator_token_as_client: OperatorTokenAsClient,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -780,7 +774,9 @@ async fn admin_index() -> Json<AdminIndex> {
         service: "mitos-admin",
         version: env!("CARGO_PKG_VERSION"),
         build_sha: env!("MITOS_BUILD_SHA"),
-        auth: "Bearer MITOS_AUTH_TOKEN = full (any method); MITOS_READONLY_TOKEN = GET-only; /metrics + /health are open",
+        auth: "Bearer MITOS_AUTH_TOKEN = full (any method); MITOS_READONLY_TOKEN = GET-only; \
+               a namespace token has no admin access except POST .../recapture; \
+               /metrics + /health are open",
         endpoints: ADMIN_ENDPOINTS
             .iter()
             .map(|&(method, path, auth, description)| EndpointDoc {
@@ -888,6 +884,24 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         });
     }
 
+    // Auth posture. Names, tiers and counts — nothing derived from a token.
+    let registry = state.auth.registry();
+    let namespaces = registry
+        .namespaces()
+        .iter()
+        .map(|def| StatusNamespace {
+            name: def.name.to_string(),
+            tier: def.profile.tier,
+            clients: match &def.clients {
+                ClientSet::Only(clients) => clients.len(),
+                // The implicit legacy namespace owns every client there is,
+                // so there is no roster to count.
+                ClientSet::Any => 0,
+            },
+            operator_token_as_client: registry.operator_token_as_client(),
+        })
+        .collect();
+
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         build_sha: env!("MITOS_BUILD_SHA").to_string(),
@@ -895,6 +909,9 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         tip,
         archive_horizon_slot,
         modules,
+        auth_mode: state.auth.mode(),
+        namespaces,
+        unowned_clients: state.auth.unowned_clients(&state.storage),
     }))
 }
 
@@ -2569,38 +2586,403 @@ fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
     Ok(())
 }
 
+/// The admin router's auth, proven through the REAL router.
+///
+/// The four unit tests that used to live here exercised a private
+/// `authorize(full, readonly, method, provided)`. That function is gone and
+/// its rule moved to `mitos_lifecycle::access`, where a decision-table test
+/// already covers it — so these prove the thing the pure crate cannot: that
+/// every route actually ASKS, and asks with the right attempt.
 #[cfg(test)]
 mod tests {
-    use super::authorize;
-    use axum::http::Method;
+    use super::*;
+    use crate::auth::testing::{DEV, FULL, PROD, READONLY, configured_authenticator};
+    use axum::body::Body;
+    use axum::http::{Method, Request as HttpRequest, StatusCode};
+    use mitos_lifecycle::access::OperatorTokenAsClient;
+    use tower::ServiceExt;
 
-    const FULL: &str = "full-secret";
-    const RO: &str = "ro-secret";
+    /// Every mutating admin route, by method and path. Iterated rather than
+    /// hand-picked: a route added without a thought about who may reach it
+    /// should fail here, not in production.
+    const MUTATING_ROUTES: &[(Method, &str)] = &[
+        (Method::POST, "/_admin/modules/m"),
+        (Method::DELETE, "/_admin/modules/m"),
+        (Method::POST, "/_admin/modules/m/restart"),
+        (Method::POST, "/_admin/modules/m/evict"),
+        (Method::DELETE, "/_admin/modules/m/companions/c/k"),
+        (Method::DELETE, "/_admin/modules/m/emissions"),
+        (Method::POST, "/_admin/modules/m/emissions/1/replay"),
+    ];
 
-    #[test]
-    fn full_token_authorizes_any_method() {
-        for m in [Method::GET, Method::POST, Method::DELETE] {
-            assert!(authorize(FULL, Some(RO), &m, Some(FULL)));
+    /// Every `GET` on the admin router. Together with `MUTATING_ROUTES` and
+    /// the recapture sub-router this is the router's whole surface — if you
+    /// add a route, add it here, because "who may reach it" is not something
+    /// to find out in production.
+    const READ_ROUTES: &[&str] = &[
+        "/_admin",
+        "/_admin/status",
+        "/_admin/events",
+        "/_admin/modules",
+        "/_admin/modules/m",
+        "/_admin/modules/m/companions",
+        "/_admin/modules/m/last-trap",
+        "/_admin/modules/m/emissions",
+        "/_admin/utxos",
+        "/_admin/blocks/1",
+        "/_admin/blocks/by-tx/aa",
+    ];
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("mitos-admin-auth-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn router_at(dir: &std::path::Path, mode: OperatorTokenAsClient) -> axum::Router {
+        admin_router(
+            ModuleStorage::new(dir),
+            Arc::new(configured_authenticator(mode)),
+        )
+    }
+
+    async fn call(
+        router: &axum::Router,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+    ) -> StatusCode {
+        let mut req = HttpRequest::builder().method(method).uri(path);
+        if let Some(token) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
+        router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
     }
 
-    #[test]
-    fn readonly_token_authorizes_only_get() {
-        assert!(authorize(FULL, Some(RO), &Method::GET, Some(RO)));
-        assert!(!authorize(FULL, Some(RO), &Method::POST, Some(RO)));
-        assert!(!authorize(FULL, Some(RO), &Method::DELETE, Some(RO)));
+    #[tokio::test]
+    async fn a_namespace_token_gets_403_on_every_admin_route() {
+        let dir = tempdir("namespace-403");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        for token in [PROD, DEV] {
+            for path in READ_ROUTES {
+                assert_eq!(
+                    call(&router, Method::GET, path, Some(token)).await,
+                    StatusCode::FORBIDDEN,
+                    "GET {path} with a namespace token",
+                );
+            }
+            for (method, path) in MUTATING_ROUTES {
+                assert_eq!(
+                    call(&router, method.clone(), path, Some(token)).await,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} with a namespace token — even a PROD worker's token \
+                     must not be able to evict a module",
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn wrong_or_missing_token_rejected() {
-        assert!(!authorize(FULL, Some(RO), &Method::GET, Some("nope")));
-        assert!(!authorize(FULL, Some(RO), &Method::GET, None));
-        assert!(!authorize(FULL, Some(RO), &Method::POST, None));
+    /// The `readonly_token_authorizes_only_get` rule, now proven where the
+    /// method-to-access mapping actually lives.
+    #[tokio::test]
+    async fn the_readonly_token_reads_and_does_not_write() {
+        let dir = tempdir("readonly");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(READONLY)).await,
+            StatusCode::OK,
+        );
+        for (method, path) in MUTATING_ROUTES {
+            assert_eq!(
+                call(&router, method.clone(), path, Some(READONLY)).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} with the read-only token",
+            );
+        }
+        // …and the full token still reaches both.
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(FULL)).await,
+            StatusCode::OK,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn readonly_unset_means_only_full_works() {
-        assert!(!authorize(FULL, None, &Method::GET, Some(RO)));
-        assert!(authorize(FULL, None, &Method::GET, Some(FULL)));
+    #[tokio::test]
+    async fn an_unknown_token_is_401_and_a_wrong_principal_is_403() {
+        let dir = tempdir("401-vs-403");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        // 401 — "who are you".
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", None).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some("not-a-token")).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        // 403 — "not you". A stale token and the wrong namespace's token are
+        // different incidents; the status code is how they are told apart.
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(PROD)).await,
+            StatusCode::FORBIDDEN,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_stays_open() {
+        let dir = tempdir("metrics-open");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+        assert_eq!(
+            call(&router, Method::GET, "/metrics", None).await,
+            StatusCode::OK,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `holder-map`'s production cron recaptures `holder-distribution` with
+    /// the secret it subscribes with. Under `Admin(Mutate)` — which every
+    /// namespace token is refused — that cron would 403 the day its secret is
+    /// rotated, which is the whole reason recapture has its own attempt.
+    #[tokio::test]
+    async fn a_prod_token_may_recapture_and_a_dev_token_may_not() {
+        let dir = tempdir("recapture-attempt");
+        let storage = ModuleStorage::new(&dir);
+        let wasm = b"recapture-attempt wasm";
+        let manifest = crate::companions::testing::manifest_for("m", wasm);
+        storage.activate(&manifest, wasm).unwrap();
+        let router = admin_router(
+            storage,
+            Arc::new(configured_authenticator(
+                OperatorTokenAsClient::AllowWithWarning,
+            )),
+        );
+
+        // A prod namespace token gets PAST authorization and into the
+        // handler, which then fails on "no host wired in this admin router".
+        // That is `holder-map`'s production cron continuing to work after its
+        // secret becomes a namespace token — and because this router has
+        // `host: None`, the recapture provably never ran.
+        let reached = call(
+            &router,
+            Method::POST,
+            "/_admin/modules/m/recapture",
+            Some(PROD),
+        )
+        .await;
+        assert_ne!(
+            reached,
+            StatusCode::FORBIDDEN,
+            "a prod namespace token must reach recapture",
+        );
+        assert_ne!(reached, StatusCode::NOT_FOUND, "the module is registered");
+
+        // A dev token may NOT: recapture is whole-module today, so it would
+        // make production's companions drop their state. Refused BEFORE the
+        // handler, so nothing was invoked.
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(DEV)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The route must go through `RecaptureModule`, not `Admin(Mutate)` — the
+    /// same prod token that reaches recapture is still refused on evict.
+    #[tokio::test]
+    async fn recapture_is_not_reachable_as_admin_mutate() {
+        let dir = tempdir("recapture-vs-evict");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+        assert_eq!(
+            call(&router, Method::POST, "/_admin/modules/m/evict", Some(PROD)).await,
+            StatusCode::FORBIDDEN,
+        );
+        assert_ne!(
+            call(
+                &router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(PROD)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn status_never_leaks_a_token() {
+        let dir = tempdir("status-leak");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        for secret in [FULL, READONLY, PROD, DEV] {
+            assert!(
+                !body.contains(secret),
+                "status response contains a configured token",
+            );
+        }
+        // The env var NAMES are fine; their values are not. Neither appears
+        // in the response at all today, and neither should.
+        assert!(!body.contains("MITOS_TOKEN_PROD"));
+
+        let status: StatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.auth_mode, AuthMode::Namespaces);
+        assert_eq!(status.namespaces.len(), 2);
+        assert!(
+            status.namespaces.iter().any(|n| n.tier == Tier::Production),
+            "the prod namespace's tier must be reported",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unowned_registrations_are_reported_and_left_alone() {
+        let dir = tempdir("unowned");
+        let storage = ModuleStorage::new(&dir);
+
+        // A registration for a client no namespace lists, beside one for a
+        // client that is listed.
+        let wasm = b"unowned-test wasm";
+        let manifest = crate::companions::testing::manifest_for("mod-a", wasm);
+        storage.activate(&manifest, wasm).unwrap();
+        for client in ["ownership.cnft.dev", "preview-1234.cnft.dev"] {
+            let client_dir = storage.module_dir_for_companions("mod-a").join(client);
+            std::fs::create_dir_all(&client_dir).unwrap();
+            std::fs::write(client_dir.join("customer_42.cbor"), b"sub").unwrap();
+        }
+        let before = std::fs::read(
+            storage
+                .module_dir_for_companions("mod-a")
+                .join("preview-1234.cnft.dev")
+                .join("customer_42.cbor"),
+        )
+        .unwrap();
+
+        let router = admin_router(
+            storage.clone(),
+            Arc::new(configured_authenticator(
+                OperatorTokenAsClient::AllowWithWarning,
+            )),
+        );
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/_admin/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status.unowned_clients, vec!["preview-1234.cnft.dev"]);
+        // Reported, NOT removed. This order takes nothing away.
+        assert_eq!(
+            std::fs::read(
+                storage
+                    .module_dir_for_companions("mod-a")
+                    .join("preview-1234.cnft.dev")
+                    .join("customer_42.cbor")
+            )
+            .unwrap(),
+            before,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_mode_is_unchanged_v2() {
+        let dir = tempdir("legacy");
+        let router = admin_router(
+            ModuleStorage::new(&dir),
+            Arc::new(crate::auth::Authenticator::legacy(
+                Some(FULL.to_owned()),
+                Some(READONLY.to_owned()),
+            )),
+        );
+
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(FULL)).await,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(READONLY)).await,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                "/_admin/modules/m/evict",
+                Some(READONLY)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", None).await,
+            StatusCode::UNAUTHORIZED,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn open_mode_allows_an_unauthenticated_request() {
+        let dir = tempdir("open-mode");
+        let router = admin_router(
+            ModuleStorage::new(&dir),
+            Arc::new(crate::auth::Authenticator::legacy(None, None)),
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", None).await,
+            StatusCode::OK,
+            "a host with no MITOS_AUTH_TOKEN runs open, exactly as v2 did",
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
