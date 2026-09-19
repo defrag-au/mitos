@@ -149,3 +149,31 @@ Done / Partially done / Blocked
 | # | Title | Depends on | Status |
 |---|---|---|---|
 | 01 | Instance-keyed storage + content-addressed artifacts | — | **done**, reviewed 2026-09-19 — see its "Review" section |
+| 02 | Namespaces: a token resolves to a principal | 01 | **ready** |
+| 03 | Instance lifecycle wired — `Instance::on_boot` replaces `auto_resume`; operator stop/start/pin/evict; fixes resurrect-on-restart. First callers leave the storage facade. | 02 | not written |
+| 04 | Manifest v3 fields — `revision`, `state_schema`, `[[upgrade]]`; `mitos-build` emits them and the `ModuleRef` const | — (parallel) | not written |
+| 05 | `ModuleRef` on subscribe + persisted client rows + pull-by-digest into the CAS (`client_move` up to `Queued`) | 03, 04 | not written |
+| 06 | The move itself — staging, catch-up, quiesce, commit, scoped refill (needs a CLIENT-SCOPED recapture; see WO-02 on why it is whole-module today) | 05 | not written |
+| 07 | Client lease + probe | 05 | not written |
+| 08 | GC — CAS refcounts, `orphaned-v2/`, retained instances | 03 | not written |
+| — | D2 semver ABI gate; D11 reporting + MCP | independent | not written — the WIT split is designed by hand, not delegated |
+
+## Writing a work order (for whoever writes the next one)
+
+Learned the hard way on 01 and 02, where the FIRST draft of each contained a
+claim that was wrong and would have shipped a bug or an outage:
+
+- **Verify every "this is safe" / "nothing else uses this" sentence against
+  the code before handing the order over.** WO-01 said a live directory rename
+  was safe; seven implicit `create_dir_all` calls said otherwise. WO-02 mapped
+  `/minibf` to the admin API; a worker that is not even a subscriber calls it
+  with the shared secret.
+- **Take a census of CALLERS, not just of the code being changed** — across
+  every repo, and in config files as well as source. WO-02's first pass over
+  `.rs` files found 8 holders of the mitos token and missed 6 that hold it
+  only through a `wrangler.toml` binding.
+- **Put the decision in `mitos-lifecycle` first.** If the order needs a rule
+  ("may a dev token recapture?"), write it as a pure function with a decision
+  table BEFORE writing the order. The order then maps routes and nothing else.
+- **Pin every example with a test.** `WO-02-namespaces.example.toml` is parsed
+  by a test in the lifecycle crate, so it cannot drift from the types.

@@ -38,6 +38,7 @@
 //! — though [`upgrade::UpgradeEntry`] is the shape its `[[upgrade]]` table
 //! deserialises into), storage layout, and anything that touches a follower.
 
+pub mod access;
 pub mod client_move;
 pub mod ids;
 pub mod instance;

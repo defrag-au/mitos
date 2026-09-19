@@ -1,0 +1,53 @@
+# Example `MITOS_NAMESPACES_FILE` for the mainnet host.
+#
+# PARSED BY A TEST (`mitos_lifecycle::access::tests::the_documented_example_parses`),
+# so this file cannot drift from the types. Client lists are the subscriber
+# census taken on the box 2026-09-19.
+#
+# No secret ever goes in here. `token_env` is the NAME of an environment
+# variable; the value lives in the unit's EnvironmentFile beside
+# MITOS_AUTH_TOKEN.
+
+# Rollout: start on "allow-with-warning", rotate every worker's
+# MITOS_AUTH_TOKEN secret to its namespace token, then flip to "refuse".
+operator_token_as_client = "allow-with-warning"
+
+[[namespace]]
+name = "prod"
+token_env = "MITOS_TOKEN_PROD"
+clients = ["ownership.cnft.dev", "jpgsm.cnft.dev", "hooks.epochify.space"]
+
+[namespace.profile]
+tier = "production"
+revision = "explicit-rollback-only"
+retain_superseded_secs = 259200 # 72h — the rollback window
+
+# A vanished production client is far more likely an outage than a decision:
+# alert, keep running, wait for an operator.
+[namespace.profile.eject]
+kind = "alert-only"
+
+[namespace.profile.resources]
+fuel_per_call = 100000000
+backfill_concurrency = 4
+# max_memory_bytes omitted ⇒ no ceiling beyond the host's own
+
+[[namespace]]
+name = "dev"
+token_env = "MITOS_TOKEN_DEV"
+clients = ["ownership.dev.cnft.dev", "hooks.dev.epochify.space"]
+
+[namespace.profile]
+tier = "development"
+revision = "allow"
+retain_superseded_secs = 86400
+
+[namespace.profile.eject]
+kind = "automatic"
+grace_secs = 600
+retain_secs = 86400
+
+[namespace.profile.resources]
+fuel_per_call = 25000000
+max_memory_bytes = 536870912
+backfill_concurrency = 1
