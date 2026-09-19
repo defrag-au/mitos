@@ -48,7 +48,19 @@ pub const LIFECYCLE_TABLE: &str = "lifecycle";
 /// revision-0 artifacts crosses nothing, so it runs no actions: exactly v2's
 /// behaviour, which is what makes this safe to deploy ahead of the modules
 /// that use it.
+///
+/// **Unknown keys are REFUSED**, here and in [`UpgradeEntry`]. Because every
+/// field defaults, a typo would otherwise be silent in the worst way:
+/// `revison = 5` parses as revision 0, the author believes they bumped it, and
+/// no client ever runs their upgrade actions. Same rule as an unknown action —
+/// unverifiable is not fine. It also means a host that predates some FUTURE
+/// key refuses a manifest that uses it rather than quietly ignoring semantics
+/// it does not understand. (A host that predates this whole section is
+/// unaffected: `Manifest` itself does not deny unknown fields, so it never
+/// looks inside `[lifecycle]` at all — that is what keeps a host rollback
+/// safe.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleSection {
     #[serde(default)]
     pub revision: Revision,
@@ -223,6 +235,33 @@ mod tests {
             "[lifecycle]\nrevision = 1\n[[lifecycle.upgrade]]\nsince = 1\nactions = [\"sing\"]\n",
         );
         assert!(parsed.is_err());
+    }
+
+    /// Every field defaults, so without `deny_unknown_fields` a typo is silent
+    /// in the worst way: the author believes they bumped the revision, the
+    /// section parses as revision 0, and nobody ever runs their actions.
+    #[test]
+    fn a_typo_in_the_section_is_an_error_not_a_silent_default() {
+        let typo = toml::from_str::<ModuleToml>("[lifecycle]\nrevison = 5\n");
+        assert!(typo.is_err(), "`revison` parsed as a default revision 0");
+
+        let singular = toml::from_str::<ModuleToml>(
+            "[lifecycle]\nrevision = 1\n[[lifecycle.upgrade]]\nsince = 1\nactions = []\naction = [\"recapture\"]\n",
+        );
+        assert!(
+            singular.is_err(),
+            "`action` beside `actions` was ignored, leaving an entry that does nothing"
+        );
+    }
+
+    /// The strictness is INSIDE `[lifecycle]` only. A module's own config keys
+    /// live beside it at the top level and are none of this type's business.
+    #[test]
+    fn a_modules_own_config_keys_are_untouched_by_that_strictness() {
+        let section = parse(
+            "abi_version = 2\nrevision = 9\nv2_address = \"addr1…\"\n[lifecycle]\nrevision = 2\n",
+        );
+        assert_eq!(section.revision, Revision(2));
     }
 
     /// A manifest for a module that declares nothing must serialise exactly as

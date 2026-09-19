@@ -75,7 +75,11 @@ impl UpgradeAction {
 /// One `[[upgrade]]` table. `actions` is a SET: the host runs a fixed order of
 /// its own ([`ClientPlan`]), never the author's, because `recapture` before
 /// the switch would refill companions from the instance they are leaving.
+///
+/// Unknown keys are refused: `action = ["recapture"]` (singular) must be an
+/// error, not an entry that crosses a revision and does nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpgradeEntry {
     pub since: Revision,
     pub actions: BTreeSet<UpgradeAction>,

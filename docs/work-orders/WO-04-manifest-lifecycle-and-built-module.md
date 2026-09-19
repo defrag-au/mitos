@@ -92,6 +92,68 @@ by the order's own sanctioned exception, 4 by TOML's grammar.
 None blocking. The wasm-sha item above is the only thing I would want a second
 pair of eyes on.
 
+## Review — 2026-09-19
+
+Implemented in `b547565`. Acceptance re-run independently and it matches:
+`mitos-platform` 211, `mitos-core` 28, `mitos-lifecycle` 79, `mitos-build` 9,
+clippy `--workspace --all-targets -D warnings` 0, workspace check 0. The only
+change under `tests/` is the sanctioned one-field addition. No defects found in
+the implementation.
+
+**The wasm-sha question — SETTLED: the on-disk artifacts were stale; this
+change cannot have moved a wasm sha.** Not by running the before/after
+experiment (it needs a pre-change builder, hence a git write — declining to do
+that was correct), but by construction. A module's wasm is a function of its
+build INPUTS, and `b547565` touched none of them:
+
+- no guest crate (`mitos-protocol`, `mitos-module-kit`,
+  `mitos-community-events`, the decode crates), no `wit-v2/`, no
+  `community-modules/` source;
+- in `mitos-build`, the hunks are confined to `main()`, `build_manifest` and
+  new functions — nothing in the code that GENERATES the guest workspace — and
+  every changed line in `main()` sits AFTER the cargo invocation (hash the
+  manifest bytes, encode the config, write `built-module.json`).
+
+With the build already shown deterministic on one machine, identical inputs
+give an identical wasm. Flagging it rather than asserting it was the right
+call; this is how it gets closed without the experiment.
+
+**End-to-end check, done in review.** Built `asset-transfer` with the new
+builder: `config.cbor` byte-identical before and after, and all three digests
+in `built-module.json` equal `shasum -a 256` of the file beside them.
+
+**Deviations — all accepted.** Typed `Revision` / `StateSchema` on
+`ModuleSummary` is better than the `u32` the order asked for. On deviation 4:
+the code comment states the TOML rule correctly (a bare top-level KEY after an
+array of tables is swallowed), but the report's specific claim — that
+`interest` would have been — is doubtful, since `[interest]` is a table header
+and resets the context. Putting the section last is harmless and defensive, so
+it stays; just do not cite this as evidence that tables are swallowed.
+
+**Fixed in review** (uncommitted on top of `b547565`) — the first is a gap in
+the types I wrote, not in the implementation:
+
+1. *A typo in `[lifecycle]` was silent.* Every field of `LifecycleSection`
+   defaults, so `revison = 5` parsed as revision 0: the author believes they
+   bumped it and no client ever runs their actions. `action = [..]` (singular)
+   beside `actions` was likewise ignored. Both `LifecycleSection` and
+   `UpgradeEntry` are now `#[serde(deny_unknown_fields)]` — the same rule as an
+   unknown action. The strictness is INSIDE the table only; a module's own
+   top-level config keys are untouched (test). An older, pre-WO-04 host is
+   unaffected — `Manifest` itself still ignores unknown fields, which is what
+   keeps a host rollback safe.
+2. *A failed build left the previous `built-module.json` behind* (Opus's second
+   "found but not fixed"). It is already written last, so it is the build's
+   natural commit point; it is now REMOVED first and published by
+   write-then-rename. Without that, a build failing after it overwrote the wasm
+   leaves the old digests beside the new artifact. It failed closed — the host
+   would refuse on the sha mismatch — but at subscribe time, in another repo,
+   instead of where the build broke. This is the README's "N−1 crash windows"
+   rule applied to a build tool.
+
+`read_interest_section` still poking at `toml::Value`: agreed, leave it —
+converting it changes what a malformed `[interest]` does.
+
 ## Why
 
 WO-05 will let a worker announce, on subscribe, the artifact it was BUILT

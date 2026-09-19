@@ -264,6 +264,21 @@ async fn main() -> anyhow::Result<()> {
         source_dir.join("target").join("mitos").join(&module_id)
     });
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+    // `built-module.json` is this build's COMMIT POINT: it is written last,
+    // and it is what a worker embeds. So it is removed FIRST. Otherwise a
+    // build that fails after overwriting the wasm leaves the PREVIOUS build's
+    // digests beside the NEW artifact, and a worker embeds a description of
+    // something that is no longer there. (The host would refuse it on the sha
+    // mismatch — it fails closed — but the failure would surface at subscribe
+    // time in another repo instead of here, where the build broke.)
+    let built_out = out.join("built-module.json");
+    match std::fs::remove_file(&built_out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("removing stale {}", built_out.display()));
+        }
+    }
     let wasm_out = out.join(format!("{module_id}.wasm"));
     std::fs::copy(&wasm_path, &wasm_out)
         .with_context(|| format!("copying wasm to {}", wasm_out.display()))?;
@@ -335,12 +350,16 @@ async fn main() -> anyhow::Result<()> {
         config: config_sha,
         revision: manifest.lifecycle.revision,
     };
-    let built_out = out.join("built-module.json");
+    // LAST — see the removal above. Written to a sibling and renamed into
+    // place, so a reader never sees a half-written file either.
+    let built_tmp = out.join("built-module.json.new");
     std::fs::write(
-        &built_out,
+        &built_tmp,
         serde_json::to_string_pretty(&built).context("encode built-module.json")?,
     )
-    .with_context(|| format!("writing {}", built_out.display()))?;
+    .with_context(|| format!("writing {}", built_tmp.display()))?;
+    std::fs::rename(&built_tmp, &built_out)
+        .with_context(|| format!("publishing {}", built_out.display()))?;
 
     println!("Module:        {module_id}");
     println!("SHA-256:       {}", manifest.module.sha256);
