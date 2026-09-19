@@ -1447,39 +1447,40 @@ mod tests {
         let storage = ModuleStorage::new(tmp.path());
 
         // Hand-install a fake manifest so the subscribe handler's
-        // "module must be registered" check passes. Writing the
-        // manifest file directly is fine — `read_manifest` reads
-        // from disk every call.
+        // "module must be registered" check passes. Goes through
+        // `activate` rather than hand-writing files: registration is what
+        // `current.toml` means now, and only `activate` writes one.
         let module_id = "ownership-indexer";
-        let module_dir = tmp.path().join(module_id);
-        std::fs::create_dir_all(&module_dir).unwrap();
-        let manifest_toml = format!(
-            r#"
-[module]
-id = "{module_id}"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size_bytes = 0
-
-[abi]
-version_major = 2
-version_minor = 0
-wit_package = "mitos:platform-v2"
-wit_world = "mitos-module-v2"
-
-[trap_policy]
-strategy = "replay"
-max_retries = 3
-backoff_cap_ms = 1000
-
-[build]
-rust_version = "0.0"
-target = "wasm32-wasip2"
-profile = "release"
-build_id = "1970-01-01T00:00:00Z"
-crate_version = "0.0.0"
-"#
-        );
-        std::fs::write(module_dir.join("manifest.toml"), manifest_toml).unwrap();
+        let wasm = b"fake wasm for the registration check";
+        let manifest = crate::manifest::Manifest {
+            module: crate::manifest::ModuleSection {
+                id: module_id.to_owned(),
+                sha256: crate::manifest::sha256_hex(wasm),
+                size_bytes: wasm.len() as u64,
+            },
+            abi: crate::manifest::AbiSection {
+                version_major: 2,
+                version_minor: 0,
+                wit_package: "mitos:platform-v2".to_owned(),
+                wit_world: "mitos-module-v2".to_owned(),
+                wit_sha: Some(crate::manifest::host_wit_sha().to_owned()),
+            },
+            trap_policy: crate::manifest::TrapPolicySection {
+                strategy: "replay".to_owned(),
+                max_retries: 3,
+                backoff_cap_ms: 1000,
+            },
+            build: crate::manifest::BuildSection {
+                rust_version: "0.0".to_owned(),
+                target: "wasm32-wasip2".to_owned(),
+                profile: "release".to_owned(),
+                build_id: "1970-01-01T00:00:00Z".to_owned(),
+                git_sha: None,
+                crate_version: "0.0.0".to_owned(),
+            },
+            interest: crate::manifest::InterestSection::default(),
+        };
+        storage.activate(&manifest, wasm).unwrap();
 
         let router = build_router_with(storage.clone());
 

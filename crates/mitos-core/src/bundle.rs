@@ -318,6 +318,38 @@ impl Bundle {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
             })?;
             let storage = mitos_platform::storage::ModuleStorage::new(modules_dir.clone());
+
+            // v2 → v3 storage layout migration. It runs HERE and nowhere
+            // else: after the storage root exists, and BEFORE anything opens
+            // a redb file, auto-loads a community module or calls
+            // `auto_resume`. It moves `kv.redb` / `cursor.redb` /
+            // `watched.redb` / `emissions.redb` into an instance directory,
+            // so a handle opened before it would be holding the old path.
+            {
+                use mitos_platform::storage::migrate_v2::{self, MigrationMode};
+
+                let mode = MigrationMode::from_env()?;
+                let report = migrate_v2::run(&storage, mode)
+                    .map_err(|e| anyhow::anyhow!("module storage migration: {e}"))?;
+                info!(
+                    ?mode,
+                    migrated = report.migrated.len(),
+                    already_v3 = report.already_v3.len(),
+                    orphaned_artifacts = report.orphaned_artifacts,
+                    modules = ?report.migrated,
+                    "module storage layout checked",
+                );
+                if mode == MigrationMode::Plan {
+                    // `plan` is a different outcome, not a quieter one: the
+                    // operator reads the moves above and then decides.
+                    anyhow::bail!(
+                        "{}=plan: nothing was changed — the moves logged above are what an \
+                         `apply` run would do. Unset the variable (or set it to `apply`) to \
+                         migrate.",
+                        MigrationMode::ENV,
+                    );
+                }
+            }
             let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine()
                 .map_err(|e| anyhow::anyhow!("module engine: {e}"))?;
             // Single DomainDataPlane instance: v2 wires it as the

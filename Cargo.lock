@@ -3807,6 +3807,7 @@ dependencies = [
  "futures-util",
  "hex",
  "mitos-data-plane",
+ "mitos-lifecycle",
  "mitos-protocol",
  "pallas",
  "pallas-addresses 1.4.0",

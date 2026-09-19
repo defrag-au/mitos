@@ -40,6 +40,13 @@ mitos-data-plane = { path = "../mitos-data-plane" }
 # `src/local_tx_index.rs`.
 tx-index = { path = "../tx-index" }
 
+# Platform v3's identifiers and lifecycle state machines. This crate
+# uses `ids` only — `InstanceKey` is what the storage layout is keyed
+# by, and its validation is what keeps a module id out of a `join()`
+# it could traverse out of. The state machines stay unwired until the
+# host becomes instance-aware.
+mitos-lifecycle = { path = "../mitos-lifecycle" }
+
 # Wire-format types shared with the CF companion runtime —
 # `SubscribeRequest`, `SubscribeResponse`, `DialBackOverride`,
 # `ChainPoint`. Same crate the cnft.dev-workers companion imports

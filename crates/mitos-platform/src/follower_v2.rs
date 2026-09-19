@@ -156,9 +156,18 @@ where
                         // log) and write to `last-trap.toml` so
                         // the operator can replay locally.
                         let snap = trap_logger.snapshot();
-                        let path = storage.last_trap_path(&module_id);
-                        match write_fixture(&snap, &module_id, &path) {
-                            Ok(()) => tracing::error!(
+                        // Resolving the path can fail now that it is
+                        // instance-scoped; fold that in with the write so
+                        // both failures land on the same warn.
+                        match storage
+                            .last_trap_path(&module_id)
+                            .map_err(|e| e.to_string())
+                            .and_then(|path| {
+                                write_fixture(&snap, &module_id, &path)
+                                    .map(|()| path)
+                                    .map_err(|e| e.to_string())
+                            }) {
+                            Ok(path) => tracing::error!(
                                 module = %module_id,
                                 fixture = %path.display(),
                                 ?point,

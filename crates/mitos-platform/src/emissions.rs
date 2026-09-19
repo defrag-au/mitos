@@ -147,10 +147,12 @@ impl EmissionsStore {
     /// Open or create the emissions database at the given path.
     /// Initialises the tables on first open so subsequent reads
     /// don't race-fail on a not-yet-created table.
+    /// The parent directory must already exist. Creating it here would let a
+    /// late emission re-create an instance directory that `activate` had just
+    /// renamed away, leaving the module with two and no way to tell which is
+    /// current — instance directories are created in exactly one place, see
+    /// `ModuleStorage::write_instance_marker`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, EmissionsError> {
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         // Sole open site for emissions.redb. Routed exclusively
         // through `ModuleStorage::emissions_store` which caches
         // by path; see clippy.toml for the workspace lint.

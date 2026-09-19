@@ -853,9 +853,12 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
     let ids = state.storage.list_modules()?;
     let mut modules = Vec::with_capacity(ids.len());
     for id in ids {
-        let last_trap_secs_ago = std::fs::metadata(state.storage.last_trap_path(&id))
-            .and_then(|m| m.modified())
+        let last_trap_secs_ago = state
+            .storage
+            .last_trap_path(&id)
             .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
             .and_then(|mtime| now.duration_since(mtime).ok())
             .map(|d| d.as_secs());
         let companions = state.storage.count_companions(&id);
@@ -1027,9 +1030,12 @@ async fn metrics(State(state): State<AdminState>) -> Response {
 
     let mut mods = Vec::with_capacity(ids.len());
     for id in &ids {
-        let last_trap_age = std::fs::metadata(state.storage.last_trap_path(id))
-            .and_then(|m| m.modified())
+        let last_trap_age = state
+            .storage
+            .last_trap_path(id)
             .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
             .and_then(|mt| SystemTime::now().duration_since(mt).ok())
             .map(|d| d.as_secs());
         let stats = companion_emission_stats(&state, id);
@@ -2098,7 +2104,7 @@ async fn last_trap(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let path = state.storage.last_trap_path(&id);
+    let path = state.storage.last_trap_path(&id)?;
     match std::fs::read_to_string(&path) {
         Ok(body) => Ok((
             StatusCode::OK,

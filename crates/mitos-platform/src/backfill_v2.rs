@@ -93,9 +93,16 @@ impl BackfillFactory {
             let trap = TrapClass::classify(&e, instance.store.data().limiter().hit_oom());
             let peak_memory = instance.store.data().limiter().peak_memory_bytes();
             let snap = trap_logger.snapshot();
-            let path = self.storage.last_trap_path(&self.module_id);
-            match write_fixture(&snap, &self.module_id, &path) {
-                Ok(()) => tracing::error!(
+            match self
+                .storage
+                .last_trap_path(&self.module_id)
+                .map_err(|e| e.to_string())
+                .and_then(|path| {
+                    write_fixture(&snap, &self.module_id, &path)
+                        .map(|()| path)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(path) => tracing::error!(
                     module = %self.module_id,
                     trap = %trap,
                     peak_memory_bytes = peak_memory,
@@ -315,9 +322,16 @@ pub(crate) async fn run_rebootstrap_pump(
                         // (the onboard path previously wrote none) then
                         // abort — operator recapture is the safety net.
                         let snap = trap_logger.snapshot();
-                        let path = factory.storage.last_trap_path(module_id);
-                        match write_fixture(&snap, module_id, &path) {
-                            Ok(()) => tracing::error!(
+                        match factory
+                            .storage
+                            .last_trap_path(module_id)
+                            .map_err(|e| e.to_string())
+                            .and_then(|path| {
+                                write_fixture(&snap, module_id, &path)
+                                    .map(|()| path)
+                                    .map_err(|e| e.to_string())
+                            }) {
+                            Ok(path) => tracing::error!(
                                 module = %module_id,
                                 trap = %trap,
                                 peak_memory_bytes = driver.peak_memory_bytes(),
