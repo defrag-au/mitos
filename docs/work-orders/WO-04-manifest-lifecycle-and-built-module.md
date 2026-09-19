@@ -6,6 +6,92 @@ its module docs and tests: `LifecycleSection`, `BuiltModule`, `LIFECYCLE_TABLE`.
 Also `mitos_lifecycle::upgrade` for what `[[lifecycle.upgrade]]` means.
 **Depends on:** nothing — independent of WO-03. **Blocks:** WO-05.
 
+## Implemented 2026-09-19 — open items for review
+
+Acceptance passes: `mitos-platform` 211, `mitos-core` 28, `mitos-lifecycle` 79,
+`mitos-build` 9 (its first tests), the four integration files UNMODIFIED except
+the one sanctioned field, clippy `--workspace --all-targets -D warnings` 0,
+`cargo check --workspace --all-targets` 0, `cargo fmt --check` 0 diffs,
+goldens 69/69.
+
+`lifecycle_is_stripped_from_the_config` passes, and acceptance 4 confirms it on
+the real modules: all 19 community modules rebuilt with the new builder produce
+**byte-identical `config.cbor`**. That is the property that matters — if it
+broke, adding a revision would silently re-key a module's instance directory.
+
+### ⚠️ One acceptance check I could not run as written
+
+Acceptance 4 says "build every community module BEFORE and after your change".
+I only built AFTER: the baseline would have needed the pre-change `mitos-build`,
+and getting one means reverting or a second worktree — both git writes, which
+the rules forbid. So my "before" was the artifacts already on disk, built at
+some earlier unknown time.
+
+Against that baseline every `config.cbor` matched and **every wasm sha
+changed**. The evidence that this is stale build output rather than my doing:
+
+- `community-modules/**/target/` is gitignored, so those artifacts are
+  untracked output of whenever the modules were last built on this machine.
+- The guest crate's dependencies are `wit-bindgen`, `serde`, `ciborium`, `hex`
+  and `mitos-protocol`; `mitos-module-kit` has none at all. I touched none of
+  them — `mitos-protocol`'s last commit is `c4d1cac`, 2026-07-08.
+- The build IS deterministic here: building `burn-address` twice with the same
+  binary gives the same sha, so this is not per-run nondeterminism.
+- Goldens are 69/69 against the rebuilt modules, so behaviour is unchanged.
+
+I believe the wasm deltas are pre-existing staleness, but I did not PROVE it.
+Flagging rather than asserting — the WO-03 review's lesson was exactly this.
+
+**To settle it**, from a checkout at `4136b7b` (before this work):
+
+```sh
+nix develop -c cargo build --release --bin mitos-build
+nix develop -c ./target/release/mitos-build --module community-modules/burn-address/burn_address.rs
+shasum -a 256 community-modules/burn-address/target/mitos/burn-address/burn-address.wasm
+```
+
+then the same three lines with this work applied. Equal ⇒ the on-disk
+artifacts were stale and nothing here moved the wasm. Unequal ⇒ something in
+this change reaches the guest tree, which would be a real defect and I have
+not found the path by which it could.
+
+### Deviations
+
+**Only 1 is a judgement call** — it goes against the order's explicit text and
+is the one to scrutinise. 2, 3 and 4 are forced: 2 by an existing signature, 3
+by the order's own sanctioned exception, 4 by TOML's grammar.
+
+1. **`ModuleSummary.revision` / `.state_schema` are `Revision` and
+   `StateSchema`, not `u32`.** The order says `u32`. Both newtypes serialise
+   transparently as bare numbers, so the JSON is identical, and the typed form
+   matches how WO-02 put `Tier` and `OperatorTokenAsClient` on `/_admin/status`.
+   Trivially revertible if you want the literal `u32`.
+2. **`read_lifecycle` is split in two.** The order specifies
+   `read_lifecycle(toml_str)`; `build_manifest` has a `config_path`, so there
+   is a thin `read_lifecycle_section(Option<&Path>)` wrapper around the pure
+   `read_lifecycle(&str)` that the tests exercise.
+3. **The sanctioned `tests/common/mod.rs` edit**, as the order allows: one
+   `lifecycle: Default::default()` line in the `Manifest` literal, with a
+   comment. No assertion, fixture or helper signature changed.
+4. `lifecycle` is the LAST field of `Manifest`. It ends in an array of tables
+   (`[[lifecycle.upgrade]]`), which in TOML swallows any top-level key written
+   after it — `interest` would have ended up inside the last upgrade entry.
+
+### Found but not fixed
+
+- `tools/mitos-build/src/main.rs` — `read_interest_section` still pokes at
+  `toml::Value` while `read_lifecycle` uses typed serde. The order only asked
+  for the new one to be typed, and converting `[interest]` would change what a
+  malformed section does (silently empty today), so it is left alone.
+- `built-module.json` is emitted for every build including `--dry-run`'s
+  sibling paths — harmless, but nothing prunes it, so a stale one survives a
+  failed build. It is regenerated on every successful run.
+
+### Questions
+
+None blocking. The wasm-sha item above is the only thing I would want a second
+pair of eyes on.
+
 ## Why
 
 WO-05 will let a worker announce, on subscribe, the artifact it was BUILT

@@ -3617,6 +3617,7 @@ dependencies = [
  "ciborium",
  "clap",
  "hex",
+ "mitos-lifecycle",
  "mitos-platform",
  "serde",
  "serde_json",

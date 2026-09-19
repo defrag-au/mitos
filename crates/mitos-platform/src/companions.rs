@@ -1384,6 +1384,7 @@ pub(crate) mod testing {
                 crate_version: "0.0.0".to_owned(),
             },
             interest: InterestSection::default(),
+            lifecycle: Default::default(),
         }
     }
 }

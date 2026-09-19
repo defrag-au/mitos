@@ -51,6 +51,22 @@ pub struct Manifest {
     /// declare interest in their config or by other means.
     #[serde(default, skip_serializing_if = "InterestSection::is_empty")]
     pub interest: InterestSection,
+    /// What the module declares about its own lifecycle: its revision, its
+    /// state schema, and the actions a client must run when it crosses a
+    /// revision. Copied verbatim from the module's `[lifecycle]` table by
+    /// `mitos-build`.
+    ///
+    /// Last, and skipped when it is the default, for two reasons. Skipping
+    /// means a manifest for a module that declares nothing serialises EXACTLY
+    /// as it did before this field existed — every artifact already in a CAS
+    /// stays byte-identical. Last, because the section ends in an array of
+    /// tables (`[[lifecycle.upgrade]]`), which in TOML would swallow any
+    /// top-level key written after it.
+    #[serde(
+        default,
+        skip_serializing_if = "mitos_lifecycle::artifact::LifecycleSection::is_default"
+    )]
+    pub lifecycle: mitos_lifecycle::artifact::LifecycleSection,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,6 +209,13 @@ pub enum ManifestError {
     InvalidTrapStrategy(String),
     #[error("invalid module id `{0}` — must be [a-z0-9-]+ (max 64 chars)")]
     InvalidModuleId(String),
+    /// The `[lifecycle]` section's upgrade ledger does not hold together —
+    /// an action `since` a revision the artifact has not reached, a duplicate
+    /// `since`, or `since = 0`. The module is REFUSED, here as well as at
+    /// build time: an artifact is not trusted because a builder once accepted
+    /// it.
+    #[error("lifecycle: {0}")]
+    Lifecycle(#[from] mitos_lifecycle::upgrade::LedgerError),
 }
 
 impl Manifest {
@@ -237,6 +260,11 @@ impl Manifest {
                 computed: computed_sha,
             });
         }
+
+        // The upgrade ledger must hold together. Checked here as well as in
+        // `mitos-build` because an artifact is not trusted on the grounds
+        // that a builder once accepted it.
+        self.lifecycle.validate()?;
 
         Ok(())
     }
@@ -341,6 +369,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mitos_lifecycle::artifact::LifecycleSection;
+    use mitos_lifecycle::ids::Revision;
+    use mitos_lifecycle::state_prep::StateSchema;
+    use mitos_lifecycle::upgrade::{UpgradeAction, UpgradeEntry};
 
     fn sample(sha: &str, size: u64) -> Manifest {
         Manifest {
@@ -370,6 +402,7 @@ mod tests {
                 crate_version: "0.1.0".to_owned(),
             },
             interest: InterestSection::default(),
+            lifecycle: Default::default(),
         }
     }
 
@@ -536,5 +569,98 @@ mod tests {
             .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::InvalidTrapStrategy(_)));
+    }
+
+    // ---------------------------------------------------------------------
+    // `[lifecycle]` — what the module declares about itself.
+    // ---------------------------------------------------------------------
+
+    /// Every manifest already in a CAS has no `[lifecycle]` at all, and must
+    /// keep parsing unedited.
+    #[test]
+    fn a_manifest_without_lifecycle_parses_as_pre_v3() {
+        let text = sample(&"ab".repeat(32), 10).to_toml().unwrap();
+        assert!(!text.contains("lifecycle"));
+        let parsed = Manifest::parse(&text).unwrap();
+        assert!(parsed.lifecycle.is_default());
+        assert_eq!(parsed.lifecycle.revision, Revision(0));
+    }
+
+    /// The `skip_serializing_if` is load-bearing: a manifest for a module
+    /// that declares nothing must serialise EXACTLY as it did before this
+    /// field existed, or every artifact in a CAS changes digest on rewrite.
+    #[test]
+    fn a_default_lifecycle_is_not_serialised() {
+        let manifest = sample(&"ab".repeat(32), 10);
+        assert!(manifest.lifecycle.is_default());
+        assert!(!manifest.to_toml().unwrap().contains("lifecycle"));
+    }
+
+    #[test]
+    fn a_declared_lifecycle_round_trips() {
+        let mut manifest = sample(&"ab".repeat(32), 10);
+        manifest.lifecycle = LifecycleSection {
+            revision: Revision(5),
+            state_schema: StateSchema(2),
+            upgrade: vec![UpgradeEntry {
+                since: Revision(3),
+                actions: [UpgradeAction::Recapture].into_iter().collect(),
+            }],
+        };
+        let text = manifest.to_toml().unwrap();
+        assert_eq!(Manifest::parse(&text).unwrap(), manifest);
+    }
+
+    /// An artifact is not trusted because a builder once accepted it.
+    #[test]
+    fn a_bad_ledger_refuses_the_module() {
+        let bytes = b"hello wasm";
+        let mut manifest = sample(&sha256_hex(bytes), bytes.len() as u64);
+        manifest.lifecycle = LifecycleSection {
+            revision: Revision(2),
+            state_schema: StateSchema(0),
+            // `since` ahead of the revision the artifact has reached.
+            upgrade: vec![UpgradeEntry {
+                since: Revision(3),
+                actions: [UpgradeAction::Resync].into_iter().collect(),
+            }],
+        };
+        let err = manifest
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
+            .unwrap_err();
+        assert!(matches!(err, ManifestError::Lifecycle(_)), "{err}");
+    }
+
+    /// The host-rollback guarantee, as a test. There is deliberately no
+    /// `deny_unknown_fields` on `Manifest`, so a host that predates this
+    /// order reads a manifest carrying `[lifecycle]` and ignores it — which
+    /// is what makes rolling the host back safe.
+    #[test]
+    fn an_older_host_would_ignore_the_section() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreWo04Manifest {
+            module: ModuleSection,
+            abi: AbiSection,
+            trap_policy: TrapPolicySection,
+            build: BuildSection,
+            #[serde(default)]
+            interest: InterestSection,
+        }
+
+        let mut manifest = sample(&"ab".repeat(32), 10);
+        manifest.lifecycle = LifecycleSection {
+            revision: Revision(7),
+            state_schema: StateSchema(1),
+            upgrade: vec![UpgradeEntry {
+                since: Revision(4),
+                actions: [UpgradeAction::PurgeEmissions].into_iter().collect(),
+            }],
+        };
+        let text = manifest.to_toml().unwrap();
+        assert!(text.contains("lifecycle"), "the fixture must exercise it");
+        let old: PreWo04Manifest =
+            toml::from_str(&text).expect("an older host must still parse this manifest");
+        assert_eq!(old.module.sha256, manifest.module.sha256);
     }
 }

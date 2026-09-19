@@ -238,6 +238,7 @@ mod tests {
                 crate_version: "0.0.0".to_owned(),
             },
             interest: Default::default(),
+            lifecycle: Default::default(),
         }
     }
 

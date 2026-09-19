@@ -247,6 +247,10 @@ pub fn manifest_v2(wasm: &[u8]) -> Manifest {
             crate_version: "0.0.0".to_owned(),
         },
         interest: InterestSection::default(),
+        // The default section — revision 0, schema 0, no upgrades — is what
+        // every artifact built before `[lifecycle]` existed IS, so these
+        // fixtures are unchanged by its addition.
+        lifecycle: Default::default(),
     }
 }
 

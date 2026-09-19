@@ -49,10 +49,12 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use mitos_lifecycle::access::{ClientSet, OperatorTokenAsClient};
+use mitos_lifecycle::ids::Revision;
 use mitos_lifecycle::instance::{
     BootAction, DesiredState, Effect, Event, EvictMode, Instance, OperatorCommand, Phase, Rejected,
 };
 use mitos_lifecycle::policy::Tier;
+use mitos_lifecycle::state_prep::StateSchema;
 
 use crate::auth::{AuthMode, Authenticator};
 use crate::lifecycle::LifecycleError;
@@ -282,6 +284,16 @@ pub struct ModuleSummary {
     pub abi_version: String,
     pub trap_strategy: String,
     pub crate_version: String,
+    /// What the module declares about itself. `0` for a pre-v3 artifact,
+    /// which is informative rather than missing — every artifact built before
+    /// `[lifecycle]` existed IS revision 0, schema 0.
+    ///
+    /// `revision` is NOT identity: bumping it alone moves nobody. It is what
+    /// a client move consults to decide which upgrade actions it crosses.
+    pub revision: Revision,
+    /// The kv layout the module expects. A bump means the state is not
+    /// copy-compatible; with no `migrate` export in the WIT it means rebuild.
+    pub state_schema: StateSchema,
     /// The instance lifecycle, on the READ routes (`GET /_admin/modules` and
     /// `GET /_admin/modules/{id}`). Absent from an upload response, which
     /// describes the artifact rather than what is running.
@@ -298,6 +310,8 @@ impl From<&Manifest> for ModuleSummary {
             abi_version: format!("{}.{}", m.abi.version_major, m.abi.version_minor),
             trap_strategy: m.trap_policy.strategy.clone(),
             crate_version: m.build.crate_version.clone(),
+            revision: m.lifecycle.revision,
+            state_schema: m.lifecycle.state_schema,
             lifecycle: None,
         }
     }
@@ -671,6 +685,7 @@ impl HandlerError {
             Self::Manifest(ManifestError::InvalidModuleId(_)) => "invalid_module_id",
             Self::Manifest(ManifestError::InvalidTrapStrategy(_)) => "invalid_trap_strategy",
             Self::Manifest(ManifestError::Parse(_)) => "manifest_parse",
+            Self::Manifest(ManifestError::Lifecycle(_)) => "lifecycle_ledger",
             Self::Storage(StorageError::UploadInProgress(_)) => "upload_in_progress",
             Self::Storage(_) => "storage_io",
             Self::Wasmtime(_) => "wasm_invalid",

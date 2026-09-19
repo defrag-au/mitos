@@ -1242,6 +1242,7 @@ mod tests {
                 crate_version: "0.1.0".to_owned(),
             },
             interest: crate::manifest::InterestSection::default(),
+            lifecycle: Default::default(),
         }
     }
 

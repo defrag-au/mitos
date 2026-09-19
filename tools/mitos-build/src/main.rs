@@ -23,6 +23,8 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
+use mitos_lifecycle::artifact::{BuiltModule, LIFECYCLE_TABLE, LifecycleSection};
+use mitos_lifecycle::ids::{ModuleId, Sha256Hex};
 use mitos_platform::inspect::{InspectResult, dry_inspect};
 use mitos_platform::manifest::{
     AbiSection, BuildSection, HOST_WIT_V2, Manifest, ModuleSection, TrapPolicySection,
@@ -266,8 +268,18 @@ async fn main() -> anyhow::Result<()> {
     std::fs::copy(&wasm_path, &wasm_out)
         .with_context(|| format!("copying wasm to {}", wasm_out.display()))?;
     let manifest_out = out.join("manifest.toml");
-    std::fs::write(&manifest_out, manifest.to_toml().context("manifest toml")?)
+    // Hash the BYTES WRITTEN, not a canonical form. A canonical form would
+    // make the digest depend on the builder's and the host's TOML serialisers
+    // agreeing, across versions and across repos; raw bytes have no such
+    // dependency — the host hashes what it fetched. The cost is that
+    // `build_id` gives every build a different manifest digest, which is fine:
+    // the manifest is NOT part of instance identity, so a no-change rebuild
+    // announces a new manifest digest for the same `InstanceKey`, which
+    // `client_move` already treats as "already there".
+    let manifest_bytes = manifest.to_toml().context("manifest toml")?;
+    std::fs::write(&manifest_out, &manifest_bytes)
         .with_context(|| format!("writing {}", manifest_out.display()))?;
+    let manifest_sha = sha256_hex(manifest_bytes.as_bytes());
 
     // CBOR-encode the colocated mitos config as `config.cbor`
     // next to the wasm. The module's `init` deserialises this
@@ -284,21 +296,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         args.workspace.join("mitos.toml")
     };
-    if mitos_toml.exists() {
+    let config_sha = if mitos_toml.exists() {
         let toml_str = std::fs::read_to_string(&mitos_toml)
             .with_context(|| format!("reading {}", mitos_toml.display()))?;
-        let mut value: toml::Value = toml::from_str(&toml_str)
-            .with_context(|| format!("parsing {}", mitos_toml.display()))?;
-        // Strip the build-time-only `[deps]` table — those keys
-        // are consumed by mitos-build (see `materialise_module`)
-        // and have no business being shipped as runtime config
-        // to the module's `init`. Without this, the module's
-        // `Config` deserializer would see a bogus `deps` field.
-        if let toml::Value::Table(ref mut t) = value {
-            t.remove("deps");
-        }
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(&value, &mut buf).context("CBOR-encode mitos.toml")?;
+        let buf = encode_config(&toml_str)
+            .with_context(|| format!("encoding {}", mitos_toml.display()))?;
         let config_out = out.join("config.cbor");
         std::fs::write(&config_out, &buf)
             .with_context(|| format!("writing {}", config_out.display()))?;
@@ -307,12 +309,38 @@ async fn main() -> anyhow::Result<()> {
             cbor_bytes = buf.len(),
             "config.cbor written"
         );
+        // The same function `ModuleStorage::put_config` uses, so the
+        // builder's digest and the host's are equal by construction rather
+        // than by two implementations agreeing.
+        Some(Sha256Hex::parse(&sha256_hex(&buf))?)
     } else {
         tracing::info!(
             "no mitos.toml at {} — module will get empty config",
             mitos_toml.display()
         );
-    }
+        // `None`, not an empty digest: the host distinguishes "no config"
+        // (`init(&[])`) from an empty one, and that distinction is part of
+        // instance identity.
+        None
+    };
+
+    // `built-module.json` — what a worker embeds so it can announce, on
+    // subscribe, the artifact it was BUILT against. Nothing reads it yet
+    // (WO-05); emitting it now is what lets a worker be built against this
+    // before the host understands it.
+    let built = BuiltModule {
+        module: ModuleId::parse(&module_id)?,
+        wasm: Sha256Hex::parse(&manifest.module.sha256)?,
+        manifest: Sha256Hex::parse(&manifest_sha)?,
+        config: config_sha,
+        revision: manifest.lifecycle.revision,
+    };
+    let built_out = out.join("built-module.json");
+    std::fs::write(
+        &built_out,
+        serde_json::to_string_pretty(&built).context("encode built-module.json")?,
+    )
+    .with_context(|| format!("writing {}", built_out.display()))?;
 
     println!("Module:        {module_id}");
     println!("SHA-256:       {}", manifest.module.sha256);
@@ -856,7 +884,66 @@ fn build_manifest(
         // orchestrator can hydrate state on first deploy. v1
         // modules omit this and the section round-trips empty.
         interest: read_interest_section(config_path)?,
+        // Copied verbatim from the module's `[lifecycle]` table. Validated
+        // here so a refused artifact never leaves the builder — and again by
+        // the host, which does not trust an artifact on the grounds that a
+        // builder once accepted it.
+        lifecycle: read_lifecycle_section(config_path)?,
     })
+}
+
+/// Read and validate `[lifecycle]` from the module's `<name>.toml`.
+fn read_lifecycle_section(config_path: Option<&Path>) -> anyhow::Result<LifecycleSection> {
+    let Some(path) = config_path else {
+        return Ok(LifecycleSection::default());
+    };
+    let toml_str =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    read_lifecycle(&toml_str).with_context(|| format!("in {}", path.display()))
+}
+
+/// The env-free half of [`read_lifecycle_section`].
+///
+/// Typed serde, not `toml::Value` poking as `read_interest_section` does: an
+/// unknown upgrade action must be a PARSE error, because "unverifiable" is not
+/// the same as "fine" and a lenient fallback would ship an artifact whose
+/// declared actions the host silently disagrees about.
+fn read_lifecycle(toml_str: &str) -> anyhow::Result<LifecycleSection> {
+    #[derive(serde::Deserialize)]
+    struct ModuleToml {
+        #[serde(default)]
+        lifecycle: LifecycleSection,
+    }
+
+    let parsed: ModuleToml = toml::from_str(toml_str).context("parsing [lifecycle]")?;
+    parsed
+        .lifecycle
+        .validate()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(parsed.lifecycle)
+}
+
+/// CBOR-encode the module's `.toml` as the `config.cbor` its `init` receives.
+///
+/// Two tables are stripped. `[deps]` is consumed by this binary (see
+/// `materialise_module`) and has no business reaching the module's `Config`
+/// deserialiser. `[lifecycle]` is stripped for a sharper reason: since
+/// instance-keyed storage, **the config's sha is part of instance identity**,
+/// so leaving build metadata in here would make bumping `revision` fork a new
+/// instance whose code and config are byte-identical to the old one.
+///
+/// That is what `lifecycle_is_stripped_from_the_config` pins. Stripping one
+/// NAMED table also leaves a module free to have a config key of its own
+/// called `revision`.
+fn encode_config(toml_str: &str) -> anyhow::Result<Vec<u8>> {
+    let mut value: toml::Value = toml::from_str(toml_str).context("parsing module toml")?;
+    if let toml::Value::Table(ref mut t) = value {
+        t.remove("deps");
+        t.remove(LIFECYCLE_TABLE);
+    }
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&value, &mut buf).context("CBOR-encode mitos.toml")?;
+    Ok(buf)
 }
 
 /// Read `[interest]` from the module's `<name>.toml` if
@@ -1013,4 +1100,207 @@ fn git_sha(workspace: &Path) -> anyhow::Result<String> {
         return Err(anyhow!("git rev-parse failed"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The first tests this binary has ever had.
+///
+/// They cover the two things a build gets WRONG silently: what reaches the
+/// module as config (whose sha is instance identity), and what
+/// `built-module.json` says (read by a worker in another repo).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mitos_lifecycle::ids::Revision;
+
+    /// A module `.toml` with a `[lifecycle]` table and the SAME `.toml`
+    /// without it must produce byte-identical `config.cbor`.
+    ///
+    /// **The test that matters most in this order.** If it ever fails,
+    /// adding a revision to a module silently re-keys its instance directory
+    /// on the next deploy — a fork whose code and config are identical.
+    #[test]
+    fn lifecycle_is_stripped_from_the_config() {
+        let without = r#"
+abi_version = 2
+script_address = "addr1xyz"
+
+[interest]
+addresses = ["addr1xyz"]
+"#;
+        let with = r#"
+abi_version = 2
+script_address = "addr1xyz"
+
+[lifecycle]
+revision = 5
+state_schema = 2
+
+[[lifecycle.upgrade]]
+since = 3
+actions = ["recapture"]
+
+[[lifecycle.upgrade]]
+since = 5
+actions = ["purge-emissions", "reset-watched"]
+
+[interest]
+addresses = ["addr1xyz"]
+"#;
+        assert_eq!(
+            encode_config(with).unwrap(),
+            encode_config(without).unwrap(),
+            "declaring a lifecycle changed the config sha, which forks the instance",
+        );
+    }
+
+    /// The pre-existing behaviour, now pinned: `[deps]` is consumed by this
+    /// binary and must not reach the module's `Config` deserialiser.
+    #[test]
+    fn deps_are_still_stripped() {
+        let with = "abi_version = 2\n[deps]\nfoo = \"bar\"\n";
+        let without = "abi_version = 2\n";
+        assert_eq!(
+            encode_config(with).unwrap(),
+            encode_config(without).unwrap()
+        );
+    }
+
+    /// Stripping ONE named table is what leaves a module free to have a
+    /// config key of its own called `revision`.
+    #[test]
+    fn a_module_toml_with_a_key_called_revision_keeps_it() {
+        let toml_str = "abi_version = 2\nrevision = 9\n[lifecycle]\nrevision = 5\n";
+        let decoded: toml::Value =
+            ciborium::de::from_reader(&encode_config(toml_str).unwrap()[..]).unwrap();
+        let table = decoded.as_table().expect("a table");
+        assert_eq!(
+            table.get("revision").and_then(|v| v.as_integer()),
+            Some(9),
+            "the module's OWN revision key was stripped with the lifecycle table",
+        );
+        assert!(table.get(LIFECYCLE_TABLE).is_none());
+    }
+
+    #[test]
+    fn a_bad_ledger_fails_the_build() {
+        let err = read_lifecycle(
+            "[lifecycle]\nrevision = 2\n[[lifecycle.upgrade]]\nsince = 3\nactions = [\"resync\"]\n",
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("since = 3"), "{text}");
+        assert!(
+            text.contains('2'),
+            "the error must name the revision: {text}"
+        );
+    }
+
+    /// "Unverifiable" is not "fine": an action this builder does not know
+    /// must fail the build, not be silently dropped from the ledger.
+    #[test]
+    fn an_unknown_action_fails_the_build() {
+        assert!(
+            read_lifecycle(
+                "[lifecycle]\nrevision = 1\n[[lifecycle.upgrade]]\nsince = 1\nactions = [\"sing\"]\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_module_that_declares_nothing_builds_as_pre_v3() {
+        let section = read_lifecycle("abi_version = 2\n[interest]\naddresses = []\n").unwrap();
+        assert!(section.is_default());
+    }
+
+    /// `built-module.json` is read by a WORKER, possibly in another repo, so
+    /// its field names, order and `null` spelling are a contract. Pinned as
+    /// TEXT — a round-trip test passes however the fields are renamed.
+    #[test]
+    fn built_module_json_is_pinned() {
+        let built = BuiltModule {
+            module: ModuleId::parse("wayup-store-offer").unwrap(),
+            wasm: Sha256Hex::parse(&"ab".repeat(32)).unwrap(),
+            manifest: Sha256Hex::parse(&"cd".repeat(32)).unwrap(),
+            config: None,
+            revision: Revision(5),
+        };
+        let expected = format!(
+            "{{\n  \"module\": \"wayup-store-offer\",\n  \"wasm\": \"{}\",\n  \"manifest\": \"{}\",\n  \"config\": null,\n  \"revision\": 5\n}}",
+            "ab".repeat(32),
+            "cd".repeat(32),
+        );
+        assert_eq!(serde_json::to_string_pretty(&built).unwrap(), expected);
+    }
+
+    /// The manifest digest is over the BYTES WRITTEN, so the host can hash
+    /// what it fetched without the two TOML serialisers having to agree.
+    #[test]
+    fn the_manifest_digest_is_over_the_bytes_written() {
+        let tmp = std::env::temp_dir().join(format!("mitos-build-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("manifest.toml");
+
+        let wasm = b"some wasm bytes";
+        let mut manifest = sample_manifest(wasm);
+        manifest.lifecycle.revision = Revision(3);
+        let bytes = manifest.to_toml().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let emitted = sha256_hex(bytes.as_bytes());
+
+        let read_back = std::fs::read(&path).unwrap();
+        assert_eq!(sha256_hex(&read_back), emitted);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The builder's config digest and the host's must be equal by
+    /// construction, not by two implementations agreeing.
+    #[test]
+    fn the_config_digest_matches_the_hosts() {
+        let tmp = std::env::temp_dir().join(format!("mitos-build-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let bytes = encode_config("abi_version = 2\nscript_address = \"addr1xyz\"\n").unwrap();
+        let builder_sha = sha256_hex(&bytes);
+
+        let storage = mitos_platform::storage::ModuleStorage::new(&tmp);
+        let host_sha = storage.put_config(&bytes).unwrap();
+        assert_eq!(host_sha.as_str(), builder_sha);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    fn sample_manifest(wasm: &[u8]) -> Manifest {
+        Manifest {
+            module: ModuleSection {
+                id: "test-module".to_owned(),
+                sha256: sha256_hex(wasm),
+                size_bytes: wasm.len() as u64,
+            },
+            abi: AbiSection {
+                version_major: 2,
+                version_minor: 0,
+                wit_package: "mitos:platform-v2".to_owned(),
+                wit_world: "mitos-module-v2".to_owned(),
+                wit_sha: Some(host_wit_sha().to_owned()),
+            },
+            trap_policy: TrapPolicySection {
+                strategy: "replay".to_owned(),
+                max_retries: 3,
+                backoff_cap_ms: 1_000,
+            },
+            build: BuildSection {
+                rust_version: "1.95.0".to_owned(),
+                target: "wasm32-wasip2".to_owned(),
+                profile: "release".to_owned(),
+                build_id: "2026-09-19T12:00:00Z".to_owned(),
+                git_sha: None,
+                crate_version: "0.1.0".to_owned(),
+            },
+            interest: Default::default(),
+            lifecycle: Default::default(),
+        }
+    }
 }
