@@ -1,0 +1,46 @@
+# policy-ledger — the tooling over the POLICY INDEX, the way `token-ledger` is
+# the tooling over a policy's movements and `market-ledger` over its trades.
+#
+# Its first artifact is the COLLECTION CATALOGUE: what collections exist on
+# mainnet, what they are called and how big they are, derived from the index
+# and the Mithril chunks its aux spans point at, and published to R2 + KV.
+#
+# A reader, not a walker. It opens no chain connection and adds no extraction
+# pass — the index it reads is rebuilt daily by `tx-index build
+# --policy-index-dir` at a MEASURED +1.8%, and the catalogue rides that for
+# free. Design: cnft.dev-workers docs/design/COLLECTION_CATALOGUE.md.
+[package]
+name = "policy-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "policy-ledger"
+path = "src/main.rs"
+
+[dependencies]
+# The index, and the shared extraction that reads a policy's two spans.
+# `examples/profile` (the survey instrument) reads the same module, so the
+# catalogue cannot derive a name the survey never scored.
+policy-index = { path = "../../crates/policy-index" }
+# The published wire format — writer here, readers in a Worker and an egui
+# WASM palette, so the shape lives in a crate rather than in this tool.
+collection-catalogue = { path = "../../crates/collection-catalogue" }
+# R2 + KV, in process. ⚠️ Not rclone: `push-archive.sh` was deleted for being
+# "an incredibly brittle surface".
+cf-publish = { path = "../../crates/cf-publish" }
+
+# blake2b over the catalogue's CONTENT bytes — the change detection. Already
+# in the tree for tx-index's read-side verification; no new dependency.
+pallas-crypto = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# gzip, IN PROCESS, and only when the comparison says it pays. `push-artifacts.sh`
+# shells out to `gzip -9`; this does not reintroduce that shape.
+flate2 = "1"

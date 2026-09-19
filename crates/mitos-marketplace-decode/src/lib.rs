@@ -41,12 +41,20 @@ pub use sales::{
     is_marketplace_escrow, jpg_listing_contract,
 };
 
-/// A native asset (policy id + on-chain asset-name bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetId {
-    pub policy: Vec<u8>,
-    pub name: Vec<u8>,
-}
+/// A native asset and how much of it sits in an output or input.
+///
+/// [`cardano_assets::AssetQuantity`], not a shape of this crate's own. There
+/// was a local `AssetId { policy: Vec<u8>, name: Vec<u8> }` here that carried
+/// identity ONLY, silently dropping the quantity the host already supplies
+/// (`asset-entry.quantity` in the WIT). Invisible while every consumer asked
+/// merely *which* assets moved, and wrong the moment one needed to rebuild the
+/// UTxO: a value is not preserved by policy and name, so an output
+/// reconstructed at the wrong quantity does not balance.
+///
+/// Reusing the shared type also removes a conversion rather than adding one —
+/// `AssetId` is already hex, which is what every emitted event wants, so the
+/// decoders no longer `hex::encode` on the way out.
+pub use cardano_assets::{AssetId, AssetQuantity};
 
 /// A resolved transaction input (a UTxO being spent), carrying everything the
 /// sale decode needs: the listing's address, its **resolved** inline/witness
@@ -56,7 +64,7 @@ pub struct AssetId {
 pub struct TxInput {
     pub address: String,
     pub lovelace: u64,
-    pub assets: Vec<AssetId>,
+    pub assets: Vec<AssetQuantity>,
     /// Resolved datum CBOR (`None` if unresolved / absent).
     pub datum: Option<Vec<u8>>,
     /// Spend redeemer CBOR (`None` for non-script inputs).
@@ -83,6 +91,14 @@ pub struct OutputDatum {
     pub payload: Vec<u8>,
     /// 32-byte datum hash. Empty when the output carries an inline datum or none.
     pub hash: Vec<u8>,
+    /// How the output carried the datum, as the host reported it.
+    ///
+    /// Not inferable from the two fields above: a caller may populate
+    /// `payload` for a HASH datum it resolved elsewhere (jpg.store
+    /// offers recover theirs from tx metadata and clear `hash`), so
+    /// "payload present" does not mean inline. `None` when the caller
+    /// didn't know.
+    pub kind: Option<mitos_community_events::DatumKind>,
 }
 
 /// A resolved transaction output.
@@ -90,7 +106,7 @@ pub struct OutputDatum {
 pub struct TxOutput {
     pub address: String,
     pub lovelace: u64,
-    pub assets: Vec<AssetId>,
+    pub assets: Vec<AssetQuantity>,
     /// On-chain output index within the producing tx. Listing/offer lifecycle
     /// decode reports it as `output_index`; sale/accept decode ignores it
     /// (default 0).

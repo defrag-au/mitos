@@ -72,6 +72,33 @@ pub struct ListingCreate {
     /// `None` for ordinary single-asset listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_size: Option<u32>,
+    /// The listing datum's raw CBOR, lowercase hex.
+    ///
+    /// Carried alongside the decoded `payouts` because the two answer
+    /// different questions: payouts are what the validator checks, but BUYING
+    /// a listing whose output commits to a datum hash requires witnessing the
+    /// preimage, and bytes cannot be reconstructed from the decode.
+    ///
+    /// This module is the cheapest place to state them — it already holds the
+    /// bytes in order to produce `payouts` at all. Without it every consumer
+    /// re-fetches the creating transaction to recover what was in hand here.
+    ///
+    /// `None` when the preimage could not be recovered, which is also what
+    /// every event emitted before this field existed decodes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datum_cbor: Option<String>,
+    /// Lovelace sitting on the listing UTxO — the min-ADA escrowed alongside
+    /// the asset, NOT the asking price (that is the sum of `payouts`).
+    ///
+    /// Needed to rebuild the output a buyer spends: a value is not preserved
+    /// by asset identity alone.
+    #[serde(default)]
+    pub output_lovelace: u64,
+    /// How many of this asset the listing escrows. `1` for every NFT, which is
+    /// why its absence went unnoticed. A bundle emits one event per escrowed
+    /// asset, all sharing `(tx_hash, output_index)`.
+    #[serde(default)]
+    pub quantity: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +125,18 @@ pub struct ListingUpdate {
     /// `None` for ordinary single-asset listings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_size: Option<u32>,
+    /// The NEW listing datum's raw CBOR, lowercase hex. See
+    /// [`ListingCreate::datum_cbor`] — an update produces a fresh listing
+    /// UTxO, so the buyable datum is the post-update one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datum_cbor: Option<String>,
+    /// Lovelace on the NEW listing UTxO. See [`ListingCreate::output_lovelace`].
+    #[serde(default)]
+    pub output_lovelace: u64,
+    /// Quantity of this asset on the NEW listing UTxO. See
+    /// [`ListingCreate::quantity`].
+    #[serde(default)]
+    pub quantity: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

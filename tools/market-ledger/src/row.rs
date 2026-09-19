@@ -15,7 +15,7 @@ use cardano_assets::AssetId;
 use mitos_community_events::jpg_store_listing::JpgStoreListing;
 use mitos_community_events::jpg_store_offer::JpgStoreOffer;
 use mitos_community_events::jpg_store_sale::JpgStoreSale;
-use mitos_community_events::marketplace::ListingPayout;
+use mitos_community_events::marketplace::{AssetPrice, ListingPayout};
 use mitos_community_events::wayup_store_listing::WayupStoreListing;
 use mitos_community_events::wayup_store_offer::WayupStoreOffer;
 use mitos_community_events::wayup_store_sale::WayupStoreSale;
@@ -38,6 +38,24 @@ pub struct MarketEventRow {
     pub kind: String,
     pub price_lovelace: Option<u64>,
     pub buyer_price_lovelace: Option<u64>,
+    /// What KIND of consideration the price columns describe — `"lovelace"`,
+    /// `"in_kind"`, `"unknown"`. The reader-facing name for each is
+    /// `AssetPrice::label()` — `"in_kind"` classifies, `"P2P trade"` explains.
+    ///
+    /// `price_lovelace` is populated **only** for `"lovelace"`, so the numeric
+    /// column is never a lie: a swap reads NULL and drops out of every `AVG`,
+    /// every `WHERE price_lovelace > 0`, and the pricing model's own filter
+    /// without those queries being touched. This column is what distinguishes
+    /// that NULL from a decode failure.
+    pub price_kind: String,
+    /// The full consideration as JSON, for anything that is not plain ADA.
+    ///
+    /// A swap's assets would otherwise be discarded at this boundary — the
+    /// decode knows exactly which NFTs were put up, and collapsing that to "no
+    /// price" would throw away the only record of a real trade. Kept as JSON
+    /// because it is read far less often than it is written, and because the
+    /// shape belongs to [`AssetPrice`] rather than to a column layout.
+    pub price_detail: Option<String>,
     pub seller_stake: Option<String>,
     pub buyer_stake: Option<String>,
     pub marketplace: String,
@@ -48,6 +66,19 @@ pub struct MarketEventRow {
     pub block_height: Option<u64>,
     pub block_time: u64,
     pub venue: String,
+}
+
+/// The consideration as JSON — **only when there is something to say**.
+///
+/// `Lovelace` is already fully described by the numeric column, and `Unknown`
+/// has nothing to describe: serialising it wrote `{"kind":"unknown"}` onto
+/// every one of 219,205 cancels, a detail column repeating what `price_kind`
+/// already said. Only `InKind` carries payload a reader cannot get elsewhere.
+fn price_detail(price: &AssetPrice) -> Option<String> {
+    match price {
+        AssetPrice::InKind { .. } => serde_json::to_string(price).ok(),
+        AssetPrice::Lovelace { .. } | AssetPrice::Unknown => None,
+    }
 }
 
 const JPG_MARKETPLACE: &str = "jpg.store";
@@ -127,6 +158,10 @@ pub fn from_jpg_sale(e: &JpgStoreSale, ctx: &BlockCtx, venue: &str) -> MarketEve
         kind: "sold".into(),
         price_lovelace: Some(s.price_lovelace),
         buyer_price_lovelace: Some(s.price_lovelace + s.on_top_fee_lovelace),
+        // A sale's price is the sum of its datum payouts, which are lovelace by
+        // construction — unlike an offer, there is no asset-denominated case.
+        price_kind: AssetPrice::LOVELACE_KIND.into(),
+        price_detail: None,
         seller_stake: jpg_seller_stake(&s.seller_pkh, &s.payouts),
         buyer_stake: extract_stake_address(&s.buyer_address),
         marketplace: JPG_MARKETPLACE.into(),
@@ -155,6 +190,8 @@ pub fn from_wayup_sale(e: &WayupStoreSale, ctx: &BlockCtx, venue: &str) -> Marke
         kind: "sold".into(),
         price_lovelace: Some(s.price_lovelace),
         buyer_price_lovelace: Some(buyer_price),
+        price_kind: AssetPrice::LOVELACE_KIND.into(),
+        price_detail: None,
         seller_stake: stake_keyhash_to_bech32(&s.seller_stake_pkh, false),
         buyer_stake: extract_stake_address(&s.buyer_address),
         marketplace: WAYUP_MARKETPLACE.into(),
@@ -181,6 +218,8 @@ pub fn from_jpg_listing(e: &JpgStoreListing, ctx: &BlockCtx, venue: &str) -> Mar
         kind: kind.into(),
         price_lovelace: None,
         buyer_price_lovelace: None,
+        price_kind: AssetPrice::LOVELACE_KIND.into(),
+        price_detail: None,
         seller_stake: None,
         buyer_stake: None,
         marketplace: JPG_MARKETPLACE.into(),
@@ -227,6 +266,8 @@ pub fn from_wayup_listing(e: &WayupStoreListing, ctx: &BlockCtx, venue: &str) ->
         kind: kind.into(),
         price_lovelace: None,
         buyer_price_lovelace: None,
+        price_kind: AssetPrice::LOVELACE_KIND.into(),
+        price_detail: None,
         seller_stake: None,
         buyer_stake: None,
         marketplace: WAYUP_MARKETPLACE.into(),
@@ -276,8 +317,13 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             asset_name_hex: a.asset_name_hex.clone(),
             fingerprint: fingerprint(&a.policy, &a.asset_name_hex),
             kind: accept_kind(a.collection_offer).into(),
-            price_lovelace: Some(a.price_lovelace),
-            buyer_price_lovelace: Some(a.price_lovelace),
+            // `None` for a non-ADA consideration — see `AssetPrice`. A swap has
+            // no lovelace price; `price_kind` says so and `price_detail` keeps
+            // what was actually put up.
+            price_lovelace: a.price.lovelace(),
+            buyer_price_lovelace: a.price.lovelace(),
+            price_kind: a.price.kind().into(),
+            price_detail: price_detail(&a.price),
             seller_stake: extract_stake_address(&a.seller_address),
             buyer_stake: stake_keyhash_to_bech32(&a.bidder_pkh, false),
             marketplace: JPG_MARKETPLACE.into(),
@@ -294,7 +340,7 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             c.target_asset_names.first().map(String::as_str),
-            Some(c.lovelace),
+            &c.price,
             Some(c.output_index),
             "offer_created",
             JPG_MARKETPLACE,
@@ -306,7 +352,7 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             &u.bidder_pkh,
             u.target_policy.as_deref(),
             u.target_asset_names.first().map(String::as_str),
-            Some(u.new_lovelace),
+            &u.new_price,
             Some(u.new_output_index),
             "offer_updated",
             JPG_MARKETPLACE,
@@ -318,7 +364,9 @@ pub fn from_jpg_offer(e: &JpgStoreOffer, ctx: &BlockCtx, venue: &str) -> MarketE
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             None,
-            None,
+            // A cancel reports no bid — the offer's price is a property of the
+            // offer, not of withdrawing it.
+            &AssetPrice::Unknown,
             None,
             "offer_cancelled",
             JPG_MARKETPLACE,
@@ -336,8 +384,13 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             asset_name_hex: a.asset_name_hex.clone(),
             fingerprint: fingerprint(&a.policy, &a.asset_name_hex),
             kind: accept_kind(a.collection_offer).into(),
-            price_lovelace: Some(a.price_lovelace),
-            buyer_price_lovelace: Some(a.price_lovelace),
+            // `None` for a non-ADA consideration — see `AssetPrice`. A swap has
+            // no lovelace price; `price_kind` says so and `price_detail` keeps
+            // what was actually put up.
+            price_lovelace: a.price.lovelace(),
+            buyer_price_lovelace: a.price.lovelace(),
+            price_kind: a.price.kind().into(),
+            price_detail: price_detail(&a.price),
             seller_stake: extract_stake_address(&a.seller_address),
             buyer_stake: stake_keyhash_to_bech32(&a.bidder_pkh, false),
             marketplace: WAYUP_MARKETPLACE.into(),
@@ -354,7 +407,7 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             c.target_asset_names.first().map(String::as_str),
-            Some(c.lovelace),
+            &c.price,
             Some(c.output_index),
             "offer_created",
             WAYUP_MARKETPLACE,
@@ -366,7 +419,7 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             &u.bidder_pkh,
             u.target_policy.as_deref(),
             u.target_asset_names.first().map(String::as_str),
-            Some(u.new_lovelace),
+            &u.new_price,
             Some(u.new_output_index),
             "offer_updated",
             WAYUP_MARKETPLACE,
@@ -378,7 +431,8 @@ pub fn from_wayup_offer(e: &WayupStoreOffer, ctx: &BlockCtx, venue: &str) -> Mar
             &c.bidder_pkh,
             c.target_policy.as_deref(),
             None,
-            None,
+            // See the jpg arm — a cancel reports no bid.
+            &AssetPrice::Unknown,
             None,
             "offer_cancelled",
             WAYUP_MARKETPLACE,
@@ -402,7 +456,11 @@ fn offer_book_row(
     bidder_pkh: &str,
     target_policy: Option<&str>,
     target_asset: Option<&str>,
-    lovelace: Option<u64>,
+    // `price` is an `AssetPrice`, not an `Option<u64>`: an open swap offer has
+    // no lovelace bid, and flattening it here would put the min-ADA straight
+    // back into the book the accept side was just fixed to keep out. A cancel
+    // carries no bid at all and passes `Unknown`.
+    price: &AssetPrice,
     output_index: Option<u32>,
     kind: &str,
     marketplace: &str,
@@ -419,8 +477,10 @@ fn offer_book_row(
             .then(|| fingerprint(policy, asset))
             .flatten(),
         kind: kind.into(),
-        price_lovelace: lovelace,
+        price_lovelace: price.lovelace(),
         buyer_price_lovelace: None,
+        price_kind: price.kind().into(),
+        price_detail: price_detail(price),
         seller_stake: None,
         buyer_stake: stake_keyhash_to_bech32(bidder_pkh, false),
         marketplace: marketplace.into(),

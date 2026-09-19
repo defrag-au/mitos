@@ -18,6 +18,10 @@ default = []
 decode = ["dep:ciborium", "dep:serde_json"]
 
 [dependencies]
+# `DatumKind` — the one definition, shared with the host data plane and
+# the consuming workers. This crate compiles INTO every wasm module, so
+# watch the module sizes if cardano-assets ever grows a heavy default.
+cardano-assets = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 # Compact CBOR encoding of raw byte fields (e.g.
 # `jpg_store_offer::OfferCreate::datum_cbor`). Without this,
@@ -26,3 +30,8 @@ serde_bytes = "0.11"
 # Host-side decode path — see `decode` feature flag.
 ciborium = { version = "0.2", optional = true }
 serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+# Encodes an event the way a module actually emits it. `AssetPrice::Lovelace`
+# was unserialisable for as long as nothing tried — see its doc.
+ciborium = "0.2"

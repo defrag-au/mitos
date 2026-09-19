@@ -64,8 +64,26 @@ interface types {
     /// need metadata-encoded datums (jpg.store labels-50+)
     /// use `chain-data::tx-metadata` to recover bytes when
     /// `payload` is empty.
+    /// How an output carries its datum.
+    ///
+    /// Resolution is caller-blind, but the shape still matters to
+    /// anything that SPENDS the output: a hash datum's preimage must be
+    /// witnessed by the spending transaction, and witnessing one for an
+    /// inline datum is rejected (`NotAllowedSupplementalDatums`). A
+    /// module that records this at ingest saves every downstream
+    /// consumer a re-read of the output just to learn the shape.
+    ///
+    /// It is a property of the OUTPUT, not of the contract version.
+    enum datum-kind {
+        /// Bytes live on the output itself; a spend witnesses nothing.
+        inline,
+        /// The output commits to a hash; a spend must witness the bytes.
+        hash,
+    }
+
     record typed-datum {
         hash: list<u8>,
+        kind: datum-kind,
         payload: list<u8>,
     }
 

@@ -26,23 +26,44 @@
 use mitos_community_events::jpg_store_offer::JpgStoreOffer;
 use mitos_marketplace_decode::recover_datum_from_metadata;
 use mitos_marketplace_decode::{
-    classify_jpg_offer_address, decode_jpg_offer_lifecycle, AssetId, DecodeTx, OutputDatum, TxInput,
+    classify_jpg_offer_address, decode_jpg_offer_lifecycle, AssetId, AssetQuantity, DecodeTx,
+    OutputDatum, TxInput,
     TxOutput,
 };
 
 use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
-use crate::mitos::platform_v2::types::{AssetEntry, ConsumedEvent, ProducedEvent, UtxoEvent};
+use crate::mitos::platform_v2::types::{
+    AssetEntry, ConsumedEvent, DatumKind as WitDatumKind, ProducedEvent, UtxoEvent,
+};
 
 const LOG_TARGET: &str = "jpg-store-offer-module";
 
-fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
+/// The host's datum shape, in the wire vocabulary consumers read.
+///
+/// Recorded so a consumer holding `datum_cbor` can build a cancel
+/// without re-reading the output: a hash datum's preimage must be
+/// witnessed, an inline one must not.
+fn to_event_datum_kind(kind: WitDatumKind) -> mitos_community_events::DatumKind {
+    match kind {
+        WitDatumKind::Inline => mitos_community_events::DatumKind::Inline,
+        WitDatumKind::Hash => mitos_community_events::DatumKind::Hash,
+    }
+}
+
+/// The host's assets in the decoders' shared vocabulary. Carries `quantity`,
+/// which this used to discard — an in-kind offer's locked value was reported
+/// as one of each regardless of what was actually escrowed.
+fn to_asset_amounts(assets: &[AssetEntry]) -> Vec<AssetQuantity> {
     assets
         .iter()
-        .map(|e| AssetId {
-            policy: e.asset.policy.clone(),
-            name: e.asset.name.clone(),
+        .map(|e| AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+            },
+            quantity: e.quantity,
         })
         .collect()
 }
@@ -70,20 +91,20 @@ fn resolve_datum_bytes(tx_hash: &[u8], datum_hash: &[u8], payload: &[u8]) -> Opt
 /// candidates (assets only). Both carry the on-chain output index.
 fn build_output(p: &ProducedEvent) -> TxOutput {
     let datum = if classify_jpg_offer_address(&p.output.address).is_some() {
-        p.datum
-            .as_ref()
-            .and_then(|d| resolve_datum_bytes(&p.tx_hash, &d.hash, &d.payload))
-            .map(|bytes| OutputDatum {
+        p.datum.as_ref().and_then(|d| {
+            resolve_datum_bytes(&p.tx_hash, &d.hash, &d.payload).map(|bytes| OutputDatum {
                 payload: bytes,
                 hash: Vec::new(),
+                kind: Some(to_event_datum_kind(d.kind)),
             })
+        })
     } else {
         None
     };
     TxOutput {
         address: p.output.address.clone(),
         lovelace: p.output.lovelace,
-        assets: to_asset_ids(&p.output.assets),
+        assets: to_asset_amounts(&p.output.assets),
         index: p.oref.index,
         datum,
     }

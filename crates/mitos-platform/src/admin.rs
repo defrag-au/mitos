@@ -578,6 +578,8 @@ impl HandlerError {
             Self::Multipart(_) => "multipart_parse",
             Self::Manifest(ManifestError::AbiMismatch { .. }) => "abi_mismatch",
             Self::Manifest(ManifestError::WitMismatch { .. }) => "wit_mismatch",
+            Self::Manifest(ManifestError::WitShaMismatch { .. }) => "wit_sha_mismatch",
+            Self::Manifest(ManifestError::WitShaMissing) => "wit_sha_missing",
             Self::Manifest(ManifestError::ShaMismatch { .. }) => "sha_mismatch",
             Self::Manifest(ManifestError::SizeMismatch { .. }) => "size_mismatch",
             Self::Manifest(ManifestError::InvalidModuleId(_)) => "invalid_module_id",

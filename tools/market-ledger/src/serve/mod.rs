@@ -115,6 +115,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use mitos_community_events::marketplace::AssetPrice;
     use std::future::IntoFuture;
     use std::net::SocketAddr;
 
@@ -135,6 +136,8 @@ mod tests {
             kind: kind.into(),
             price_lovelace: Some(980_000_000),
             buyer_price_lovelace: Some(1_000_000_000),
+            price_kind: AssetPrice::LOVELACE_KIND.into(),
+            price_detail: None,
             seller_stake: Some("stake1seller".into()),
             buyer_stake: Some("stake1buyer".into()),
             marketplace: "wayup".into(),

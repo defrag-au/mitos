@@ -44,3 +44,7 @@ tempfile = "3"
 # is policy-index → tx-index, and the example is where they are wired
 # together, so neither crate's shipped code depends on the other.
 tx-index = { path = "../tx-index" }
+# `examples/profile.rs` writes JSONL for offline scoring. DEV-only for the
+# same reason as tx-index: an example's output format is not the crate's.
+serde = { workspace = true }
+serde_json = { workspace = true }

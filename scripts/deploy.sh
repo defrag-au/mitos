@@ -133,7 +133,10 @@ step_build() {
     local build_sha
     build_sha=$(cd "$MITOS_SRC_LOCAL" && git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
     log "2/5 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build (on box; ~5min cold, ~30s incremental; build=$build_sha)"
-    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && MITOS_BUILD_SHA=$build_sha cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
+    # `nice`/`ionice` are NOT optional here — see mitos-operations.md. The box
+    # is a co-tenant: `market-ledger-follow` is a chainsync follower that falls
+    # behind if a build starves it, and falling behind is expensive to undo.
+    run "ssh '$MITOS_HOST' 'cd $MITOS_SRC_REMOTE && MITOS_BUILD_SHA=$build_sha nice -n 15 ionice -c2 -n7 cargo build --profile $MITOS_BUILD_PROFILE -p mitos -p mitos-build'"
 }
 
 step_build_community_modules() {
@@ -143,19 +146,44 @@ step_build_community_modules() {
     # community-modules/<name>/target/mitos/<name>/, exactly where
     # the host's community-module auto-load reads from.
     #
+    # There is deliberately NO freshness check here. Cargo is the
+    # freshness authority, and it already tracks every input:
+    #
+    #   <name>.rs           -> generated src/lib.rs        (tracked)
+    #   <name>.toml [deps]  -> generated Cargo.toml        (tracked)
+    #   crates/mitos-*      -> path deps of that Cargo.toml (tracked)
+    #   wit-v2/*.wit        -> include_str! into mitos-build, which
+    #                          writes the generated wit/ that
+    #                          wit_bindgen::generate! tracks (tracked,
+    #                          which is why step 2 rebuilds mitos-build
+    #                          BEFORE this step runs)
+    #
+    # An earlier version of this step compared the wasm mtime against
+    # the module dir plus the WIT. It re-derived that graph in bash and
+    # got one edge wrong — the dependency crates — so a change confined
+    # to e.g. mitos-community-events left every module reported "fresh"
+    # and shipped stale wasm under a successful deploy. Do not
+    # reintroduce a gate here; add the input to the crate instead and
+    # cargo will find it.
+    #
+    # A no-op mitos-build is ~0.6s (cargo itself ~0.3s), so re-running
+    # all ~20 unconditionally costs ~12s. That is the whole price.
+    #
     # Per-module resilience:
     #   - source missing → skip silently
-    #   - existing wasm newer than every .rs + .toml file in the
-    #     module dir → skip (idempotent cache)
     #   - mitos-build failure → log, increment FAILED, keep going.
     #     auto-load gets whatever artifacts succeeded.
     #
     # Single-quoted heredoc on purpose — the loop body runs on the
     # remote box, so $name etc. must NOT expand locally.
+    #
+    # NOTE no apostrophes and no line continuations in the remote block:
+    # it is handed to ssh inside a single-quoted string, so either one
+    # ends the string early and the remote shell dies with
+    # "syntax error: unexpected end of file".
     run "ssh '$MITOS_HOST' '
         cd $MITOS_SRC_REMOTE
         BUILT=0
-        FRESH=0
         SKIPPED=0
         FAILED=0
         for d in community-modules/*/; do
@@ -166,27 +194,7 @@ step_build_community_modules() {
                 SKIPPED=\$((SKIPPED+1))
                 continue
             fi
-            wasm=\"\${d}target/mitos/\${name}/\${name}.wasm\"
-            # Freshness compares the module sources AND the platform WIT.
-            # The WIT is the module ABI: a record gaining a field
-            # regenerates every set of bindings, and a module built against
-            # the old shape does not load into the new host.
-            #
-            # Without the WIT here, a WIT-only change looks like a no-op to
-            # every module dir, all of them are skipped as fresh, and the
-            # host comes up new-ABI with old-ABI modules — a deployment
-            # that reports success and loads nothing.
-            #
-            # NOTE no apostrophes and no line continuations in this block:
-            # it is handed to ssh inside a single-quoted string, so either
-            # one ends the string early and the remote shell dies with
-            # "syntax error: unexpected end of file".
-            if [ -f \"\$wasm\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.rs\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find \"\$d\" -maxdepth 1 -name \"*.toml\" -newer \"\$wasm\" -print -quit)\" ] && [ -z \"\$(find crates/mitos-platform/wit-v2 -name \"*.wit\" -newer \"\$wasm\" -print -quit)\" ]; then
-                FRESH=\$((FRESH+1))
-                continue
-            fi
-            echo \"  building \$name\"
-            if ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
+            if nice -n 15 ionice -c2 -n7 ./target/$MITOS_BUILD_PROFILE/mitos-build --module \"\$src\" >/tmp/mitos-build-\$name.log 2>&1; then
                 BUILT=\$((BUILT+1))
             else
                 FAILED=\$((FAILED+1))
@@ -194,7 +202,7 @@ step_build_community_modules() {
                 echo \"    auto-load will skip this module; other modules will continue\"
             fi
         done
-        echo \"  community modules: built=\$BUILT  fresh=\$FRESH  skipped=\$SKIPPED  failed=\$FAILED\"
+        echo \"  community modules: ok=\$BUILT  skipped=\$SKIPPED  failed=\$FAILED\"
     '"
 }
 
@@ -220,13 +228,15 @@ step_verify() {
     fi
     log "  service: $active"
 
-    # Poll the health endpoint — the HTTP server binds a few seconds
+    # Poll the health endpoint — the HTTP server binds some seconds
     # after `systemctl restart` returns (dolos WAL recovery + indexer
-    # bootstrap happen first). Real-world bind time on the prod host
-    # is ~12s post-restart; allow a generous 30s window.
+    # bootstrap happen first). Quiescent bind time is ~12s, but a
+    # mainnet restart while the box is busy has been measured well
+    # past 30s: the old window reported a false failure (and dumped
+    # the journal) on a deploy that had in fact succeeded. 90s.
     local health=""
     local attempt=0
-    while (( attempt < 15 )); do
+    while (( attempt < 45 )); do
         if health=$(ssh "$MITOS_HOST" "curl -sS --max-time 5 --connect-timeout 2 http://127.0.0.1:$MITOS_HEALTH_PORT/health" 2>&1) \
             && [[ -n "$health" ]]; then
             break
@@ -236,7 +246,7 @@ step_verify() {
     done
 
     if [[ -z "$health" ]] || ! printf "%s" "$health" | grep -q '"status"'; then
-        err "Health endpoint did not respond after 30s: ${health:-(empty)}"
+        err "Health endpoint did not respond after 90s: ${health:-(empty)}"
         warn "Recent journal:"
         ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE -n 30 --no-pager" >&2 || true
         return 1
@@ -246,6 +256,49 @@ step_verify() {
     if ! printf "%s" "$health" | ssh "$MITOS_HOST" "command -v jq >/dev/null 2>&1 && jq ." 2>/dev/null; then
         printf "  %s\n" "$health" >&2
     fi
+
+    step_verify_modules
+}
+
+# Read the host's own community-module activation report and fail the
+# deploy if anything was refused.
+#
+# Deliberately NOT a bash-side comparison of artifact shas against
+# what the host loaded: the host already validates every module
+# (manifest vs wasm bytes, ABI major, wit world, wit revision) and
+# reports the result. Re-deriving that here would repeat the mistake
+# that made this check necessary — see the note in
+# step_build_community_modules. Read the authority; don't reimplement it.
+#
+# Scoped to the CURRENT boot via ActiveEnterTimestamp so a summary
+# from a previous run can't be mistaken for this one's.
+step_verify_modules() {
+    local since line refused
+    since=$(ssh "$MITOS_HOST" "systemctl show -p ActiveEnterTimestamp --value $MITOS_SERVICE" 2>/dev/null) || since=""
+    if [[ -n "$since" ]]; then
+        line=$(ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE --since '$since' --no-pager | grep 'community-modules auto-load complete' | tail -1" 2>&1)
+    else
+        line=$(ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE -n 2000 --no-pager | grep 'community-modules auto-load complete' | tail -1" 2>&1)
+    fi
+
+    if [[ -z "$line" ]]; then
+        warn "  no community-module auto-load summary this boot (auto-load disabled?)"
+        return 0
+    fi
+    printf "  %s\n" "$line" >&2
+
+    refused=$(printf "%s" "$line" | grep -o 'refused_count=[0-9]*' | cut -d= -f2)
+    if [[ -z "$refused" ]]; then
+        warn "  host predates refused_count reporting — rebuild it to get this check"
+        return 0
+    fi
+    if [[ "$refused" != "0" ]]; then
+        err "$refused community module(s) REFUSED — they are NOT running"
+        warn "Refusals from this boot:"
+        ssh "$MITOS_HOST" "journalctl -u $MITOS_SERVICE --since '$since' --no-pager | grep 'community module REFUSED' " >&2 || true
+        return 1
+    fi
+    log "  community modules: no refusals"
 }
 
 # ----------------------------------------------------------------------

@@ -27,6 +27,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::marketplace::AssetPrice;
+
 /// Wayup offer-contract version. Only one contract is live
 /// today; the enum is kept for forward-compat with a future
 /// contract revision (mirrors jpg.store's V2/V3 split).
@@ -44,14 +46,28 @@ pub struct OfferCreate {
     pub tx_hash: String,
     /// Output index within `tx_hash` of the offer UTxO.
     pub output_index: u32,
-    /// Lovelace locked at the offer script (the bid amount,
-    /// including the standard min-utxo overhead).
-    pub lovelace: u64,
+    /// What the bidder locked at the offer script.
+    ///
+    /// An [`AssetPrice`] rather than a `u64` for the same reason as
+    /// [`OfferAccept::price`]: Wayup offers are not always ADA, and a bare
+    /// number cannot say so. Create and accept must agree — an offer that
+    /// reports a min-ADA bid while open and no price when it fills is two
+    /// stories about one offer.
+    pub price: AssetPrice,
     /// Raw datum CBOR — preserved for forensics + so the
     /// companion can build a cancel TX against the offer's
     /// actual on-chain bytes without a chain round-trip.
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the offer UTxO carries `datum_cbor` — the other half of
+    /// building that cancel without a chain round-trip, since the
+    /// bytes are only witnessable when the shape says so.
+    ///
+    /// `None` on events emitted before this field existed. Read it as
+    /// "unknown", not as a default: guessing wrong builds a cancel the
+    /// ledger rejects.
+    #[serde(default)]
+    pub datum_kind: Option<crate::DatumKind>,
     /// Policy this offer targets, when the datum specifies one.
     pub target_policy: Option<String>,
     /// Asset names (lowercase hex) the offer is constrained to.
@@ -87,11 +103,17 @@ pub struct OfferAccept {
     /// offer it's the asset the offer was tied to.
     pub policy: String,
     pub asset_name_hex: String,
-    /// Lovelace the bidder had locked in the offer (the bid).
+    /// What the bidder had locked in the offer (the bid).
+    ///
     /// Read from the consumed offer UTxO — NOT inferred from
     /// outputs, since Wayup folds the seller's proceeds into
     /// change rather than a dedicated output.
-    pub price_lovelace: u64,
+    ///
+    /// An enum because Wayup offers are not always ADA: a swap
+    /// locks the offered NFTs and only min-ADA to carry them, and
+    /// as a bare `u64` that was indistinguishable from a 2.5 ADA
+    /// bid. See [`AssetPrice`].
+    pub price: AssetPrice,
     /// Bech32 address that received the delivered asset (the
     /// bidder's wallet). Wayup commingles the seller's proceeds
     /// into change, so a reliable *seller* address is not
@@ -118,12 +140,19 @@ pub struct OfferUpdate {
     pub prior_output_index: u32,
     /// New offer UTxO produced in the same TX.
     pub new_output_index: u32,
-    pub previous_lovelace: u64,
-    pub new_lovelace: u64,
+    /// The bid before and after the reprice. Both [`AssetPrice`] — an offer
+    /// can be repriced without becoming ADA-denominated, and a swap offer
+    /// repriced to another swap must not surface as a lovelace move.
+    pub previous_price: AssetPrice,
+    pub new_price: AssetPrice,
     /// Raw datum CBOR for the new offer UTxO (consumers need it
     /// to build a cancel TX against the updated offer's bytes).
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the new offer UTxO carries `datum_cbor`. `None` on events
+    /// from before this field existed.
+    #[serde(default)]
+    pub datum_kind: Option<crate::DatumKind>,
     pub target_policy: Option<String>,
     pub target_asset_names: Vec<String>,
     pub co_version: WayupStoreOfferVersion,

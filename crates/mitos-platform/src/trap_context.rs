@@ -89,9 +89,9 @@ pub struct ReadUtxosCall {
 #[derive(Debug, Clone)]
 pub struct ReadOutputDatumsCall {
     pub requested: Vec<OutputRef>,
-    /// `Some((hash, payload))` per requested ref when the host
-    /// could resolve; `None` when the host returned no datum.
-    pub results: Vec<Option<(Vec<u8>, Vec<u8>)>>,
+    /// `Some(datum)` per requested ref when the output had one
+    /// (bytes may still be unresolved); `None` when it had none.
+    pub results: Vec<Option<mitos_data_plane::TypedDatum>>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,7 +245,7 @@ impl DataPlaneFacade for TrapContextLogger {
     async fn read_output_datums(
         &self,
         refs: &[OutputRef],
-    ) -> DataPlaneResult<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+    ) -> DataPlaneResult<Vec<Option<mitos_data_plane::TypedDatum>>> {
         let result = self.inner.read_output_datums(refs).await?;
         self.log
             .lock()
@@ -380,13 +380,19 @@ pub fn render_fixture_toml(log: &TrapContextLog, module_id: &str) -> String {
     // Sets datum_payload_hex when host could resolve.
     for call in &log.read_output_datums {
         for (oref, entry) in call.requested.iter().zip(call.results.iter()) {
-            if let Some((hash, payload)) = entry {
+            if let Some(datum) = entry {
                 let key = (oref.tx_hash.as_ref().to_vec(), oref.index);
                 let rec = utxo_index.entry(key).or_default();
                 if rec.datum_hash.is_none() {
-                    rec.datum_hash = Some(hex::encode(hash));
+                    rec.datum_hash = Some(hex::encode(datum.hash));
                 }
-                rec.datum_payload_hex = Some(hex::encode(payload));
+                rec.datum_kind = Some(match datum.kind {
+                    mitos_data_plane::DatumKind::Inline => "inline",
+                    mitos_data_plane::DatumKind::Hash => "hash",
+                });
+                if let Some(payload) = datum.original_cbor.as_ref() {
+                    rec.datum_payload_hex = Some(hex::encode(payload));
+                }
             }
         }
     }
@@ -430,6 +436,9 @@ pub fn render_fixture_toml(log: &TrapContextLog, module_id: &str) -> String {
         if let Some(payload) = &rec.datum_payload_hex {
             let _ = writeln!(out, "datum_payload_hex = \"{payload}\"");
         }
+        if let Some(kind) = rec.datum_kind {
+            let _ = writeln!(out, "datum_kind = \"{kind}\"");
+        }
     }
 
     // tx_metadata — one entry per unique tx_hash with an
@@ -458,6 +467,11 @@ struct UtxoRecord {
     lovelace: Option<u64>,
     datum_hash: Option<String>,
     datum_payload_hex: Option<String>,
+    /// `"inline"` / `"hash"` for the replayed fixture. Captured
+    /// because the payload's presence does NOT imply the shape,
+    /// so a fixture without it would replay every datum as the
+    /// default kind and silently exercise the wrong path.
+    datum_kind: Option<&'static str>,
 }
 
 /// Surface a fixture-write failure separately from the

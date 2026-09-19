@@ -20,7 +20,7 @@ use dolos_core::TipEvent;
 use mitos_data_plane::ChainPoint;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
 use mitos_platform::host_v2::{
-    EmitterFactory, InterestRouter, KvFactory, ModuleHostV2, SubscriptionFactory,
+    EmitterFactory, FallbackSource, InterestRouter, KvFactory, ModuleHostV2, SubscriptionFactory,
 };
 use mitos_platform::registry_v2::ResourceBudget;
 use mitos_platform::storage::ModuleStorage;
@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 
 use common::{
     NullChainDataPlane, OneShotSub, fixture_block_cbor, manifest_v2, tempdir, test_indexer_wasm,
+    wait_for,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -110,7 +111,8 @@ async fn dynamic_interest_changes_filter_mid_stream() {
         kv_factory,
         emitter_factory,
         ResourceBudget::default(),
-    );
+    )
+    .with_fallback_source(FallbackSource::Disabled);
 
     host.start("test-indexer", false).await.expect("start");
 
@@ -122,8 +124,20 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     ))
     .expect("send first block");
 
-    // Settle.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for proof the block was actually dispatched before
+    // asserting on emptiness. Polling can't observe "nothing
+    // happened", so wait on the cursor — which only advances once
+    // the follower has applied this block — and then assert no
+    // emissions came with it. A bare sleep here would pass just as
+    // happily when the follower had done nothing at all.
+    wait_for("follower to apply block #1", || {
+        storage
+            .read_cursor("test-indexer")
+            .ok()
+            .flatten()
+            .filter(|c| c.slot() >= 186_000_000)
+    })
+    .await;
 
     let emissions = storage
         .emissions_store("test-indexer")
@@ -149,8 +163,15 @@ async fn dynamic_interest_changes_filter_mid_stream() {
         .await
         .expect("route_interest");
 
-    // Give the follower a tick to drain the interest channel
-    // and apply the update before we send the next block.
+    // Give the follower a tick to drain the interest channel and
+    // apply the update before we send the next block.
+    //
+    // Still a sleep, deliberately: applied-interest isn't observable
+    // from out here, so there's nothing to poll on. It's an
+    // in-process channel drain with no I/O, so 150ms is ample — but
+    // if this test ever flakes, this line is the suspect, and the
+    // real fix is to expose the driver's applied interest set rather
+    // than to raise the number.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // ---- Block #2: same fixture, but interest now matches
@@ -163,13 +184,16 @@ async fn dynamic_interest_changes_filter_mid_stream() {
     ))
     .expect("send second block");
 
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let post_update_rows = wait_for("emissions after the interest update", || {
+        let rows = emissions
+            .list_queued_for_companion("test-companion", "test-client")
+            .ok()?;
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await;
 
     host.stop("test-indexer").await.expect("stop");
 
-    let post_update_rows = emissions
-        .list_queued_for_companion("test-companion", "test-client")
-        .expect("list emissions");
     assert!(
         !post_update_rows.is_empty(),
         "block re-dispatched after route_interest(Add, watched_policy) should produce > 0 emissions; got 0 — \

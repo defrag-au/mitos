@@ -48,7 +48,7 @@ use mitos_community_events::wayup_store_listing::{
 
 use crate::datum::{ListingContract, decode_listing_datum};
 use crate::sales::{WayupSaleConfig, classify_jpg_address, jpg_listing_contract};
-use crate::{DecodeTx, OutputDatum};
+use crate::{AssetId, DecodeTx, OutputDatum};
 
 /// Was this listing spend a **delist**, under its own contract's convention?
 ///
@@ -93,6 +93,13 @@ enum ListingEvent<V> {
         payouts: Vec<ListingPayout>,
         version: V,
         bundle_size: Option<u32>,
+        /// Hex CBOR of the exact preimage `payouts` was decoded from — what a
+        /// buyer must witness for a hash-datum listing.
+        datum_cbor: Option<String>,
+        /// The listing UTxO's ADA and this member's asset quantity — what a
+        /// buyer needs to rebuild the output it spends.
+        output_lovelace: u64,
+        quantity: u64,
     },
     Update {
         policy_hex: String,
@@ -105,6 +112,11 @@ enum ListingEvent<V> {
         payouts: Vec<ListingPayout>,
         version: V,
         bundle_size: Option<u32>,
+        /// As [`ListingEvent::Create::datum_cbor`], for the NEW listing UTxO.
+        datum_cbor: Option<String>,
+        /// As above, for the NEW listing UTxO.
+        output_lovelace: u64,
+        quantity: u64,
     },
     Unlisting {
         policy_hex: String,
@@ -121,6 +133,10 @@ struct ProducedListing<V> {
     datum: Option<OutputDatum>,
     version: V,
     bundle_size: Option<u32>,
+    /// The listing UTxO's ADA, and how much of THIS member's asset it holds —
+    /// what a buyer needs to rebuild the output it will spend.
+    output_lovelace: u64,
+    quantity: u64,
 }
 
 struct ConsumedListing<V> {
@@ -145,9 +161,9 @@ fn collect_listings<V: Clone>(
 ) -> Vec<ListingEvent<V>> {
     let tx_hash_hex = hex::encode(&tx.tx_hash);
 
-    // Produced listings keyed by `(policy, asset_name)`; bundles insert one
-    // entry per escrowed asset (same key shape as the live modules).
-    let mut produced: BTreeMap<(Vec<u8>, Vec<u8>), ProducedListing<V>> = BTreeMap::new();
+    // Produced listings keyed by asset; bundles insert one entry per escrowed
+    // asset (same key shape as the live modules).
+    let mut produced: BTreeMap<AssetId, ProducedListing<V>> = BTreeMap::new();
     for output in &tx.outputs {
         let Some(version) = classify(&output.address) else {
             continue;
@@ -155,12 +171,18 @@ fn collect_listings<V: Clone>(
         let bundle_size = (output.assets.len() > 1).then_some(output.assets.len() as u32);
         for asset in &output.assets {
             produced.insert(
-                (asset.policy.clone(), asset.name.clone()),
+                asset.asset_id.clone(),
                 ProducedListing {
                     output_index: output.index,
                     datum: output.datum.clone(),
                     version: version.clone(),
                     bundle_size,
+                    // What a buyer needs to rebuild the output it will spend.
+                    // A bundle's members each carry the SAME output lovelace
+                    // and their OWN quantity, so collecting every event that
+                    // shares `(tx_hash, output_index)` reconstructs the value.
+                    output_lovelace: output.lovelace,
+                    quantity: asset.quantity,
                 },
             );
         }
@@ -168,7 +190,7 @@ fn collect_listings<V: Clone>(
 
     // Consumed listings: only cancel-redeemer spends at the venue (a Buy spend
     // is the sale module's domain). `TxInput::datum` is already resolved.
-    let mut consumed: BTreeMap<(Vec<u8>, Vec<u8>), ConsumedListing<V>> = BTreeMap::new();
+    let mut consumed: BTreeMap<AssetId, ConsumedListing<V>> = BTreeMap::new();
     for input in &tx.inputs {
         let Some(version) = classify(&input.address) else {
             continue;
@@ -182,7 +204,7 @@ fn collect_listings<V: Clone>(
         let bundle_size = (input.assets.len() > 1).then_some(input.assets.len() as u32);
         for asset in &input.assets {
             consumed.insert(
-                (asset.policy.clone(), asset.name.clone()),
+                asset.asset_id.clone(),
                 ConsumedListing {
                     prior_datum: input.datum.clone(),
                     version: version.clone(),
@@ -193,24 +215,36 @@ fn collect_listings<V: Clone>(
     }
 
     let mut out = Vec::new();
-    for ((policy, asset_name), produced) in produced {
-        let policy_hex = hex::encode(&policy);
-        let asset_name_hex = hex::encode(&asset_name);
+    for (asset, produced) in produced {
+        // Already hex — `AssetId` is the shared vocabulary, which is what the
+        // emitted events want, so nothing is encoded here any more.
+        let policy_hex = asset.policy_id.clone();
+        let asset_name_hex = asset.asset_name_hex.clone();
 
+        // Bytes and decode are carried TOGETHER, never derived separately.
+        //
+        // `datum_cbor` on the emitted event must be the exact preimage that
+        // produced `payouts`: a buyer witnesses those bytes while paying those
+        // payouts, and if a fallback path could decode from one source while
+        // reporting bytes from another, the transaction fails phase-2 with the
+        // buyer's collateral burned. Pairing them makes that unrepresentable.
+        //
         // Create path reads the inline payload only. Updates (and Wayup creates)
         // additionally fall back to the resolver.
+        let decode_bytes =
+            |bytes: Vec<u8>| decode_listing_datum(&bytes).map(|decoded| (bytes, decoded));
         let payload_decoded = produced
             .datum
             .as_ref()
             .filter(|d| !d.payload.is_empty())
-            .and_then(|d| decode_listing_datum(&d.payload));
+            .and_then(|d| decode_bytes(d.payload.clone()));
 
-        if let Some(prior) = consumed.remove(&(policy.clone(), asset_name.clone())) {
-            let decoded = payload_decoded
+        if let Some(prior) = consumed.remove(&asset) {
+            let (datum_cbor, decoded) = payload_decoded
                 .or_else(|| {
-                    resolve_produced(produced.datum.as_ref(), &resolve)
-                        .and_then(|b| decode_listing_datum(&b))
+                    resolve_produced(produced.datum.as_ref(), &resolve).and_then(decode_bytes)
                 })
+                .map(|(bytes, decoded)| (Some(hex::encode(bytes)), decoded))
                 .unwrap_or_default();
             let new_price = sum_payouts(&decoded.payouts);
             let previous_price = prior
@@ -230,16 +264,19 @@ fn collect_listings<V: Clone>(
                 payouts: decoded.payouts,
                 version: produced.version,
                 bundle_size: produced.bundle_size,
+                datum_cbor,
+                output_lovelace: produced.output_lovelace,
+                quantity: produced.quantity,
             });
         } else {
-            let decoded = if create_uses_resolver {
+            let (datum_cbor, decoded) = if create_uses_resolver {
                 payload_decoded.or_else(|| {
-                    resolve_produced(produced.datum.as_ref(), &resolve)
-                        .and_then(|b| decode_listing_datum(&b))
+                    resolve_produced(produced.datum.as_ref(), &resolve).and_then(decode_bytes)
                 })
             } else {
                 payload_decoded
             }
+            .map(|(bytes, decoded)| (Some(hex::encode(bytes)), decoded))
             .unwrap_or_default();
             let price = sum_payouts(&decoded.payouts);
             out.push(ListingEvent::Create {
@@ -252,12 +289,15 @@ fn collect_listings<V: Clone>(
                 payouts: decoded.payouts,
                 version: produced.version,
                 bundle_size: produced.bundle_size,
+                datum_cbor,
+                output_lovelace: produced.output_lovelace,
+                quantity: produced.quantity,
             });
         }
     }
 
     // Remaining consumes (no paired produce) are unlistings.
-    for ((policy, asset_name), prior) in consumed {
+    for (asset, prior) in consumed {
         let cred_hex = prior
             .prior_datum
             .as_deref()
@@ -265,8 +305,8 @@ fn collect_listings<V: Clone>(
             .map(|d| d.cred_hex)
             .unwrap_or_default();
         out.push(ListingEvent::Unlisting {
-            policy_hex: hex::encode(&policy),
-            asset_name_hex: hex::encode(&asset_name),
+            policy_hex: asset.policy_id.clone(),
+            asset_name_hex: asset.asset_name_hex.clone(),
             tx_hash_hex: tx_hash_hex.clone(),
             cred_hex,
             version: prior.version,
@@ -315,6 +355,9 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         } => JpgStoreListing::Create(JpgListingCreate {
             policy: policy_hex,
             asset_name_hex,
@@ -325,6 +368,9 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         }),
         ListingEvent::Update {
             policy_hex,
@@ -337,6 +383,9 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         } => JpgStoreListing::Update(JpgListingUpdate {
             policy: policy_hex,
             asset_name_hex,
@@ -348,6 +397,9 @@ fn project_jpg(ev: ListingEvent<JpgStoreContractVersion>) -> JpgStoreListing {
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         }),
         ListingEvent::Unlisting {
             policy_hex,
@@ -408,6 +460,9 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         } => WayupStoreListing::Create(WayupListingCreate {
             policy: policy_hex,
             asset_name_hex,
@@ -418,6 +473,9 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         }),
         ListingEvent::Update {
             policy_hex,
@@ -430,6 +488,9 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         } => WayupStoreListing::Update(WayupListingUpdate {
             policy: policy_hex,
             asset_name_hex,
@@ -441,6 +502,9 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
             payouts,
             contract_version: version,
             bundle_size,
+            datum_cbor,
+            output_lovelace,
+            quantity,
         }),
         ListingEvent::Unlisting {
             policy_hex,
@@ -463,14 +527,19 @@ fn project_wayup(ev: ListingEvent<WayupStoreContractVersion>) -> WayupStoreListi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssetId, TxInput, TxOutput};
+    use crate::{AssetId, AssetQuantity, TxInput, TxOutput};
 
     const JPG_V2_ADDR: &str = "addr1x8rjw3pawl0kelu4mj3c8x20fsczf5pl744s9mxz9v8n7efvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8ekstg4qrx";
 
-    fn asset() -> AssetId {
-        AssetId {
-            policy: vec![1; 28],
-            name: b"Bud".to_vec(),
+    /// One escrowed NFT. `quantity: 1` — which is what every existing
+    /// scenario is, and exactly why the missing quantity went unnoticed.
+    fn asset() -> AssetQuantity {
+        AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode([1u8; 28]),
+                asset_name_hex: hex::encode(b"Bud"),
+            },
+            quantity: 1,
         }
     }
 
@@ -498,6 +567,7 @@ mod tests {
             datum: Some(OutputDatum {
                 payload: datum_payload,
                 hash: Vec::new(),
+                kind: None,
             }),
         }
     }
@@ -540,6 +610,7 @@ mod tests {
                 datum: Some(OutputDatum {
                     payload: Vec::new(),
                     hash: vec![0x99; 32],
+                    kind: None,
                 }),
             }],
             ..Default::default()
@@ -608,6 +679,7 @@ mod tests {
                 datum: Some(OutputDatum {
                     payload: Vec::new(),
                     hash: new_hash.clone(),
+                    kind: None,
                 }),
             }],
             ..Default::default()
@@ -642,6 +714,7 @@ mod tests {
                 datum: Some(OutputDatum {
                     payload: Vec::new(),
                     hash: hash.clone(),
+                    kind: None,
                 }),
             }],
             ..Default::default()

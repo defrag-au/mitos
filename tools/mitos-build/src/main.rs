@@ -25,19 +25,21 @@ use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
 use mitos_platform::inspect::{InspectResult, dry_inspect};
 use mitos_platform::manifest::{
-    AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, sha256_hex,
+    AbiSection, BuildSection, HOST_WIT_V2, Manifest, ModuleSection, TrapPolicySection,
+    host_wit_sha, sha256_hex,
 };
 
-/// Host WIT contract bundled at compile time. Each `mitos-build`
-/// release pins a specific WIT version; upgrading the tool
-/// upgrades the WIT every single-file module is built against.
-///
-/// `mitos-module-v2` world — eUTXO event-stream dispatch per
-/// `MITOS_PLATFORM_V2.md`. The v1 `mitos-module` world (block-
-/// centric `handle-event` dispatch) was retired May 2026 along
-/// with the v1 dispatch path on the host — `mitos-build` no
-/// longer emits artifacts the current host can load.
-const HOST_WIT_V2: &str = include_str!("../../../crates/mitos-platform/wit-v2/world.wit");
+// `HOST_WIT_V2` is the `mitos-module-v2` world — eUTXO event-stream
+// dispatch per `MITOS_PLATFORM_V2.md`. The v1 `mitos-module` world
+// (block-centric `handle-event` dispatch) was retired May 2026 along
+// with the v1 dispatch path on the host.
+//
+// It is bundled at compile time and imported from `mitos-platform`
+// so there is exactly one `include_str!` of the file. Each
+// `mitos-build` therefore pins a WIT revision: a WIT edit needs
+// `cargo build -p mitos-build` before it can reach any module. The
+// `host_wit_sha` stamped into `abi.wit_sha` is what turns forgetting
+// that into a refusal at activation instead of a stale module.
 
 /// Absolute path to the `mitos-protocol` crate baked at compile
 /// time. Single-file modules need a path-dep into mitos-protocol
@@ -363,20 +365,52 @@ fn cargo_target_dir(workspace: &Path) -> anyhow::Result<PathBuf> {
 
 fn cargo_build_at(workspace: &Path, crate_name: &str, profile: &str) -> anyhow::Result<PathBuf> {
     tracing::info!(crate_name = %crate_name, profile = %profile, "cargo build");
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
-        .arg("--target")
-        .arg("wasm32-wasip2")
-        .arg("--profile")
-        .arg(profile)
-        .arg("-p")
-        .arg(crate_name)
-        .current_dir(workspace);
-    let status = cmd
-        .status()
-        .with_context(|| "running cargo (is it on PATH?)")?;
-    if !status.success() {
-        return Err(anyhow!("cargo build failed (exit {:?})", status.code()));
+    let run = || -> anyhow::Result<bool> {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build")
+            .arg("--target")
+            .arg("wasm32-wasip2")
+            .arg("--profile")
+            .arg(profile)
+            .arg("-p")
+            .arg(crate_name)
+            .current_dir(workspace);
+        Ok(cmd
+            .status()
+            .with_context(|| "running cargo (is it on PATH?)")?
+            .success())
+    };
+
+    if !run()? {
+        // The generated workspace keeps its own Cargo.lock, and
+        // nothing regenerates it — we rewrite Cargo.toml every run,
+        // but the lock survives. That's fine until the dependency
+        // graph moves somewhere the generated manifest can't see:
+        // bump the shared-crates git rev and a crate BEHIND that rev
+        // can raise its pallas requirement, leaving the lock pinning
+        // a version that no longer satisfies anyone. Cargo then fails
+        // to select a version rather than re-resolving.
+        //
+        // Drop the lock and try once more. A genuine incompatibility
+        // fails again on the retry and surfaces normally; a merely
+        // stale pin heals. Deliberately NOT `--locked` anywhere here:
+        // these workspaces are build scratch, regenerated at will, so
+        // reproducibility lives in the source tree's lock, not this one.
+        let lock = workspace.join("Cargo.lock");
+        if lock.exists() {
+            tracing::warn!(
+                lock = %lock.display(),
+                "cargo build failed; dropping the generated lockfile and retrying once"
+            );
+            std::fs::remove_file(&lock).with_context(|| format!("removing {}", lock.display()))?;
+            if !run()? {
+                return Err(anyhow!(
+                    "cargo build failed (also after dropping the lockfile)"
+                ));
+            }
+        } else {
+            return Err(anyhow!("cargo build failed"));
+        }
     }
 
     // Resolve the produced .wasm. Cargo writes to
@@ -797,6 +831,11 @@ fn build_manifest(
             // ABI check), so emit the v2 strings unconditionally.
             wit_package: "mitos:platform-v2".to_owned(),
             wit_world: "mitos-module-v2".to_owned(),
+            // The WIT revision the bindings were generated from —
+            // i.e. the copy compiled into THIS mitos-build. A host
+            // compiled against a different one refuses the module
+            // instead of loading a stale ABI.
+            wit_sha: Some(host_wit_sha().to_owned()),
         },
         trap_policy: TrapPolicySection {
             strategy: inspect.trap_strategy.clone(),

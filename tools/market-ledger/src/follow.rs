@@ -507,6 +507,7 @@ fn rollback(
 mod tests {
     use super::*;
     use crate::store::Ledger;
+    use mitos_community_events::marketplace::AssetPrice;
     use std::path::Path;
 
     /// The real mainnet block fixture the decode tests use — gives the
@@ -566,6 +567,8 @@ mod tests {
             kind: "sold".into(),
             price_lovelace: Some(1),
             buyer_price_lovelace: Some(1),
+            price_kind: AssetPrice::LOVELACE_KIND.into(),
+            price_detail: None,
             seller_stake: None,
             buyer_stake: None,
             marketplace: "wayup".into(),

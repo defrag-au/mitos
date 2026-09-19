@@ -67,6 +67,10 @@ pub mod base;
 pub mod compact;
 pub mod extract;
 pub mod format;
+/// What a policy IS — names and unit class, read back through the aux span.
+/// Shared by `examples/profile` (the survey instrument) and the catalogue
+/// builder, so the two cannot derive different names from the same bytes.
+pub mod profile;
 pub mod segment;
 /// Re-derivation from the chunks — the half of `verify` that can catch a
 /// faithfully stored wrong answer.
@@ -79,5 +83,6 @@ pub use format::{
     BaseHeader, DIR_BITS, PolicyRun, RECORD_BYTES, Record, SegmentHeader, bucket_of, name_prefix,
     policy_prefix,
 };
+pub use profile::{ChunkReader, Cip67Shape, PolicyEvidence, QtyShape, profile_policy};
 pub use segment::{Segment, list_segments, segment_path, segments_dir, write_segment};
 pub use verify::{Failure, Fault, VerifyStats, verify_sample};

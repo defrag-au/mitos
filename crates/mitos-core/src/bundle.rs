@@ -464,13 +464,28 @@ impl Bundle {
             //
             // See `docs/strategy/COMMUNITY_MODULES.md`.
             if let Some(cm_dir) = community_modules_dir.as_ref() {
-                let activated = crate::community_modules::auto_load(cm_dir, &storage);
+                let summary = crate::community_modules::auto_load(cm_dir, &storage);
+                // All four buckets, because `activated=0` alone is
+                // ambiguous: healthy when the rest are already_active,
+                // a failed deploy when they're refused.
                 info!(
                     community_modules_dir = %cm_dir.display(),
-                    activated_count = activated.len(),
-                    activated = ?activated,
+                    activated_count = summary.activated.len(),
+                    already_active_count = summary.already_active.len(),
+                    no_artifact_count = summary.no_artifact.len(),
+                    refused_count = summary.refused.len(),
+                    activated = ?summary.activated,
+                    refused = ?summary.refused,
                     "community-modules auto-load complete"
                 );
+                if !summary.refused.is_empty() {
+                    error!(
+                        refused = ?summary.refused,
+                        "community modules REFUSED — these are NOT running; see the per-module \
+                         errors above. A WIT revision mismatch means rebuilding mitos-build then \
+                         the modules."
+                    );
+                }
             }
 
             // Auto-resume: walk every manifest on disk and start

@@ -23,17 +23,47 @@ use mitos_platform::manifest::Manifest;
 use mitos_platform::storage::ModuleStorage;
 use tracing::{error, info, warn};
 
+/// What auto-load did with one module dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadOutcome {
+    /// Artifact differed from what storage holds; now activated.
+    Activated,
+    /// Artifact matches the activated one — nothing to do.
+    AlreadyActive,
+    /// No pre-built artifact; operator hasn't run `mitos-build`.
+    NoArtifact,
+}
+
+/// Per-outcome tally from one auto-load pass.
+///
+/// Four named buckets rather than one "touched" count, because the
+/// interesting states are the ones that aren't activation: a run
+/// reporting `activated=0` is perfectly healthy when the other 19
+/// are `already_active`, and alarming when they're `refused`. The
+/// single count couldn't tell those apart.
+#[derive(Debug, Default)]
+pub struct AutoLoadSummary {
+    /// Newly activated or refreshed.
+    pub activated: Vec<String>,
+    /// Already on this exact sha.
+    pub already_active: Vec<String>,
+    /// Module dir with source but no built artifact.
+    pub no_artifact: Vec<String>,
+    /// Failed validation or errored — NOT activated. Non-empty here
+    /// means the deploy did not fully land.
+    pub refused: Vec<String>,
+}
+
 /// Read every `community-modules/<name>/build/` artifact and
 /// activate it into `storage` if its sha differs from what's
-/// already on disk. Returns the names of modules touched (newly
-/// activated or refreshed); skipped modules don't appear.
-pub fn auto_load(community_modules_dir: &Path, storage: &ModuleStorage) -> Vec<String> {
+/// already on disk.
+pub fn auto_load(community_modules_dir: &Path, storage: &ModuleStorage) -> AutoLoadSummary {
     if !community_modules_dir.exists() {
         info!(
             dir = %community_modules_dir.display(),
             "community-modules dir absent; skipping auto-load"
         );
-        return Vec::new();
+        return AutoLoadSummary::default();
     }
 
     let entries = match std::fs::read_dir(community_modules_dir) {
@@ -44,11 +74,11 @@ pub fn auto_load(community_modules_dir: &Path, storage: &ModuleStorage) -> Vec<S
                 error = %e,
                 "community-modules read_dir failed; skipping auto-load"
             );
-            return Vec::new();
+            return AutoLoadSummary::default();
         }
     };
 
-    let mut activated = Vec::new();
+    let mut summary = AutoLoadSummary::default();
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() {
@@ -70,24 +100,23 @@ pub fn auto_load(community_modules_dir: &Path, storage: &ModuleStorage) -> Vec<S
         }
 
         match load_one(&entry.path(), &name, storage) {
-            Ok(touched) => {
-                if touched {
-                    activated.push(name);
-                }
-            }
+            Ok(LoadOutcome::Activated) => summary.activated.push(name),
+            Ok(LoadOutcome::AlreadyActive) => summary.already_active.push(name),
+            Ok(LoadOutcome::NoArtifact) => summary.no_artifact.push(name),
             Err(e) => {
                 error!(
                     module = %name,
                     error = %e,
-                    "community module auto-load failed; skipping"
+                    "community module REFUSED; not activated"
                 );
+                summary.refused.push(name);
             }
         }
     }
-    activated
+    summary
 }
 
-fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::Result<bool> {
+fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::Result<LoadOutcome> {
     // `mitos-build --module <name>.rs` writes its artifact to
     // `<workspace>/target/mitos/<module-id>/` by default. When the
     // workspace is the per-module dir (single-file shape), that's
@@ -104,7 +133,7 @@ fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::R
             build_dir.display(),
             module_dir.join(format!("{source_stem}.rs")).display()
         );
-        return Ok(false);
+        return Ok(LoadOutcome::NoArtifact);
     }
 
     let manifest_str = std::fs::read_to_string(&manifest_path)?;
@@ -118,6 +147,24 @@ fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::R
     }
     let wasm_bytes = std::fs::read(&wasm_path)?;
 
+    // Same validation the admin upload path applies
+    // (`mitos_platform::admin`): module id, trap strategy, ABI major
+    // + wit world + wit revision, and the wasm's own sha/size against
+    // what the manifest claims.
+    //
+    // This runs BEFORE the idempotency check on purpose. A stale
+    // artifact has the same sha on both sides, so checking "already
+    // active" first would report it as a cheerful skip — which is
+    // precisely how an ABI-skewed module stays live across a deploy.
+    // Validate first and the skew surfaces every boot.
+    manifest.validate_against_host(
+        &wasm_bytes,
+        &[(
+            mitos_platform::registry_v2::HOST_ABI_MAJOR_V2,
+            "mitos:platform-v2/mitos-module-v2",
+        )],
+    )?;
+
     // Idempotent: skip if storage already has this exact sha.
     if let Ok(Some(existing)) = storage.read_manifest(name)
         && existing.module.sha256 == manifest.module.sha256
@@ -127,7 +174,7 @@ fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::R
             sha = %manifest.module.sha256,
             "community module already active; skipping"
         );
-        return Ok(false);
+        return Ok(LoadOutcome::AlreadyActive);
     }
 
     storage.activate(&manifest, &wasm_bytes)?;
@@ -152,14 +199,15 @@ fn load_one(module_dir: &Path, name: &str, storage: &ModuleStorage) -> anyhow::R
         );
     }
 
-    Ok(true)
+    Ok(LoadOutcome::Activated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mitos_platform::manifest::{
-        AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, sha256_hex,
+        AbiSection, BuildSection, Manifest, ModuleSection, TrapPolicySection, host_wit_sha,
+        sha256_hex,
     };
 
     fn sample_manifest(id: &str, wasm: &[u8]) -> Manifest {
@@ -174,6 +222,7 @@ mod tests {
                 version_minor: 0,
                 wit_package: "mitos:platform-v2".to_owned(),
                 wit_world: "mitos-module-v2".to_owned(),
+                wit_sha: Some(host_wit_sha().to_owned()),
             },
             trap_policy: TrapPolicySection {
                 strategy: "replay".to_owned(),
@@ -215,8 +264,9 @@ mod tests {
     fn skips_when_dir_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = ModuleStorage::new(tmp.path().join("modules"));
-        let activated = auto_load(&tmp.path().join("does-not-exist"), &storage);
-        assert!(activated.is_empty());
+        let summary = auto_load(&tmp.path().join("does-not-exist"), &storage);
+        assert!(summary.activated.is_empty());
+        assert!(summary.refused.is_empty());
     }
 
     #[test]
@@ -231,11 +281,64 @@ mod tests {
         write_module(&community_dir, "jpg-co", "jpg_co", b"fake wasm bytes");
 
         let storage = ModuleStorage::new(tmp.path().join("modules"));
-        let activated = auto_load(&community_dir, &storage);
-        assert_eq!(activated, vec!["jpg-co".to_owned()]);
+        let summary = auto_load(&community_dir, &storage);
+        assert_eq!(summary.activated, vec!["jpg-co".to_owned()]);
         // Re-running is idempotent — sha matches, no re-activation.
-        let activated2 = auto_load(&community_dir, &storage);
-        assert!(activated2.is_empty());
+        // It lands in `already_active`, NOT in a bare "nothing
+        // happened": that distinction is the point of the buckets.
+        let summary2 = auto_load(&community_dir, &storage);
+        assert!(summary2.activated.is_empty());
+        assert_eq!(summary2.already_active, vec!["jpg-co".to_owned()]);
+        assert!(summary2.refused.is_empty());
+    }
+
+    #[test]
+    fn refuses_module_built_against_a_different_wit() {
+        // The skew that shipped stale modules: everything matches
+        // except the WIT revision the bindings came from.
+        let tmp = tempfile::tempdir().unwrap();
+        let community_dir = tmp.path().join("community-modules");
+        std::fs::create_dir_all(&community_dir).unwrap();
+        let wasm = b"fake wasm bytes";
+        let module_dir = community_dir.join("jpg-co");
+        let build_dir = module_dir.join("target").join("mitos").join("jpg-co");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::write(module_dir.join("jpg_co.rs"), "").unwrap();
+        let mut manifest = sample_manifest("jpg-co", wasm);
+        manifest.abi.wit_sha = Some("11".repeat(32));
+        std::fs::write(build_dir.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        std::fs::write(build_dir.join("jpg-co.wasm"), wasm).unwrap();
+
+        let storage = ModuleStorage::new(tmp.path().join("modules"));
+        let summary = auto_load(&community_dir, &storage);
+        assert!(
+            summary.activated.is_empty(),
+            "a module built against another WIT must not activate"
+        );
+        assert_eq!(summary.refused, vec!["jpg-co".to_owned()]);
+    }
+
+    #[test]
+    fn refuses_wasm_that_does_not_match_its_manifest() {
+        // Auto-load used to activate whatever bytes were on disk
+        // without checking them against the manifest — the admin
+        // upload path validated, this one didn't.
+        let tmp = tempfile::tempdir().unwrap();
+        let community_dir = tmp.path().join("community-modules");
+        std::fs::create_dir_all(&community_dir).unwrap();
+        let module_dir = community_dir.join("jpg-co");
+        let build_dir = module_dir.join("target").join("mitos").join("jpg-co");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::write(module_dir.join("jpg_co.rs"), "").unwrap();
+        // Manifest describes one set of bytes; the wasm is another.
+        let manifest = sample_manifest("jpg-co", b"the bytes the manifest describes");
+        std::fs::write(build_dir.join("manifest.toml"), manifest.to_toml().unwrap()).unwrap();
+        std::fs::write(build_dir.join("jpg-co.wasm"), b"different bytes entirely").unwrap();
+
+        let storage = ModuleStorage::new(tmp.path().join("modules"));
+        let summary = auto_load(&community_dir, &storage);
+        assert!(summary.activated.is_empty());
+        assert_eq!(summary.refused, vec!["jpg-co".to_owned()]);
     }
 
     #[test]
@@ -247,8 +350,10 @@ mod tests {
         // directory (e.g. README, notes).
 
         let storage = ModuleStorage::new(tmp.path().join("modules"));
-        let activated = auto_load(&community_dir, &storage);
-        assert!(activated.is_empty());
+        let summary = auto_load(&community_dir, &storage);
+        assert!(summary.activated.is_empty());
+        // A non-module dir isn't a refusal — it never had a claim.
+        assert!(summary.refused.is_empty());
     }
 
     #[test]
@@ -269,10 +374,11 @@ mod tests {
         std::fs::write(build_dir.join("foo-bar.wasm"), wasm).unwrap();
 
         let storage = ModuleStorage::new(tmp.path().join("modules"));
-        let activated = auto_load(&community_dir, &storage);
+        let summary = auto_load(&community_dir, &storage);
         assert!(
-            activated.is_empty(),
+            summary.activated.is_empty(),
             "mismatched manifest id must not activate"
         );
+        assert_eq!(summary.refused, vec!["foo-bar".to_owned()]);
     }
 }

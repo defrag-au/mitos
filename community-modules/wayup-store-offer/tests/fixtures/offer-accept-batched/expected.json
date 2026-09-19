@@ -6,7 +6,10 @@
     "collection_offer": true,
     "kind": "accept",
     "policy": "53d6297f4ede5cd3bfed7281b73fad3dac8dc86a950f7454d84c16ad",
-    "price_lovelace": 150000000,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 150000000
+    },
     "prior_output_index": 1,
     "prior_tx_hash": "b0e66535af309838f90ac2bb9772e785631c7d02d57e30754e877ec4cdffe7d5",
     "seller_address": "",

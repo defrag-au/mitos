@@ -13,6 +13,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The host's WIT contract, compiled in.
+///
+/// The single source of the ABI text for both the host and
+/// `mitos-build` — the builder consumes this const rather than
+/// `include_str!`-ing the same file down its own relative path, so
+/// the two can never disagree about what the WIT *says*.
+///
+/// They can still disagree about *which version* they were compiled
+/// against, because each bakes its own copy at its own compile time.
+/// That is the whole point: [`host_wit_sha`] turns that skew into a
+/// comparison instead of a silent mismatch. See
+/// [`Manifest::validate_against_host`].
+pub const HOST_WIT_V2: &str = include_str!("../wit-v2/world.wit");
+
+/// Lowercase hex SHA-256 of [`HOST_WIT_V2`] — the ABI fingerprint
+/// this binary was compiled against. Computed once.
+pub fn host_wit_sha() -> &'static str {
+    static SHA: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| sha256_hex(HOST_WIT_V2.as_bytes()));
+    &SHA
+}
+
 /// Top-level manifest written by `mitos-build`. Lossless TOML
 /// round-trip: serialise → deserialise yields the same struct.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +122,20 @@ pub struct AbiSection {
     pub version_minor: u32,
     pub wit_package: String,
     pub wit_world: String,
+    /// SHA-256 of the WIT the module's bindings were generated from
+    /// ([`host_wit_sha`] as of the `mitos-build` that produced it).
+    ///
+    /// The package/world names above identify the *contract*; this
+    /// identifies the *revision*. A record gaining a field changes
+    /// neither the names nor `version_minor` (nothing bumps that
+    /// automatically), so without this a module built against last
+    /// week's WIT is indistinguishable from one built against today's.
+    ///
+    /// `None` means the manifest predates this field. Read it as
+    /// "unknown", not "fine" — an unverifiable ABI is refused, same
+    /// as a mismatched one.
+    #[serde(default)]
+    pub wit_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +174,17 @@ pub enum ManifestError {
     },
     #[error("wit world mismatch: host wants {wanted}, manifest claims {got}")]
     WitMismatch { wanted: String, got: String },
+    #[error(
+        "wit revision mismatch: host serves WIT {wanted}, module was built against {got} — \
+         rebuild mitos-build first (the WIT is compiled into it), then \
+         `mitos-build --module <src>`"
+    )]
+    WitShaMismatch { wanted: String, got: String },
+    #[error(
+        "manifest has no abi.wit_sha, so the module's WIT revision can't be verified — \
+         rebuild mitos-build, then `mitos-build --module <src>`"
+    )]
+    WitShaMissing,
     #[error("manifest sha256 doesn't match wasm bytes: manifest={manifest}, computed={computed}")]
     ShaMismatch { manifest: String, computed: String },
     #[error("manifest size_bytes doesn't match wasm bytes: manifest={manifest}, actual={actual}")]
@@ -170,6 +217,42 @@ impl Manifest {
     pub fn validate_against_host(
         &self,
         wasm_bytes: &[u8],
+        accepted_abis: &[(u32, &str)],
+    ) -> Result<(), ManifestError> {
+        self.validate_abi_against_host(accepted_abis)?;
+
+        // Wasm bytes must hash + size to what the manifest claims.
+        let actual_size = wasm_bytes.len() as u64;
+        if actual_size != self.module.size_bytes {
+            return Err(ManifestError::SizeMismatch {
+                manifest: self.module.size_bytes,
+                actual: actual_size,
+            });
+        }
+
+        let computed_sha = sha256_hex(wasm_bytes);
+        if computed_sha != self.module.sha256 {
+            return Err(ManifestError::ShaMismatch {
+                manifest: self.module.sha256.clone(),
+                computed: computed_sha,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// The manifest-only half of [`Manifest::validate_against_host`]:
+    /// everything checkable without the wasm bytes to hand.
+    ///
+    /// Split out so the *start* path can enforce it. Activation
+    /// validates once against the bytes it is about to write; every
+    /// subsequent start re-checks the ABI, because a module that was
+    /// activated legitimately under an older host must not keep
+    /// running after the host's WIT moves underneath it. Re-hashing
+    /// every module's wasm on every boot would buy nothing there —
+    /// the bytes haven't changed, the *host* has.
+    pub fn validate_abi_against_host(
+        &self,
         accepted_abis: &[(u32, &str)],
     ) -> Result<(), ManifestError> {
         validate_module_id(&self.module.id)?;
@@ -209,21 +292,18 @@ impl Manifest {
             });
         }
 
-        // Wasm bytes must hash + size to what the manifest claims.
-        let actual_size = wasm_bytes.len() as u64;
-        if actual_size != self.module.size_bytes {
-            return Err(ManifestError::SizeMismatch {
-                manifest: self.module.size_bytes,
-                actual: actual_size,
-            });
-        }
-
-        let computed_sha = sha256_hex(wasm_bytes);
-        if computed_sha != self.module.sha256 {
-            return Err(ManifestError::ShaMismatch {
-                manifest: self.module.sha256.clone(),
-                computed: computed_sha,
-            });
+        // The world name matched, which only says the module targets
+        // the same contract. This says it targets the same revision
+        // of it — see `AbiSection::wit_sha`.
+        match self.abi.wit_sha.as_deref() {
+            None => return Err(ManifestError::WitShaMissing),
+            Some(got) if got != host_wit_sha() => {
+                return Err(ManifestError::WitShaMismatch {
+                    wanted: host_wit_sha().to_owned(),
+                    got: got.to_owned(),
+                });
+            }
+            Some(_) => {}
         }
 
         Ok(())
@@ -274,6 +354,7 @@ mod tests {
                 version_minor: 0,
                 wit_package: "mitos:platform-v2".to_owned(),
                 wit_world: "mitos-module-v2".to_owned(),
+                wit_sha: Some(host_wit_sha().to_owned()),
             },
             trap_policy: TrapPolicySection {
                 strategy: "replay".to_owned(),
@@ -357,6 +438,51 @@ mod tests {
             .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::WitMismatch { .. }));
+    }
+
+    #[test]
+    fn validate_wit_sha_mismatch() {
+        // The skew this exists to catch: same package, same world,
+        // same version_minor — only the WIT revision differs, which
+        // is what a record gaining a field actually looks like.
+        let bytes = b"hello wasm";
+        let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
+        m.abi.wit_sha = Some("11".repeat(32));
+        let err = m
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
+            .unwrap_err();
+        assert!(matches!(err, ManifestError::WitShaMismatch { .. }));
+    }
+
+    #[test]
+    fn validate_wit_sha_absent_is_refused_not_assumed_fine() {
+        // A manifest from before this field existed is unverifiable,
+        // not verified. Refuse it — silently accepting is the exact
+        // hole the field closes.
+        let bytes = b"hello wasm";
+        let mut m = sample(&sha256_hex(bytes), bytes.len() as u64);
+        m.abi.wit_sha = None;
+        let err = m
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
+            .unwrap_err();
+        assert!(matches!(err, ManifestError::WitShaMissing));
+    }
+
+    #[test]
+    fn wit_sha_absent_parses_as_none() {
+        // Old manifests must still PARSE — the refusal has to come
+        // from validation with its named error, not from a
+        // "missing field `wit_sha`" TOML failure.
+        let bytes = b"hello wasm";
+        let m = sample(&sha256_hex(bytes), bytes.len() as u64);
+        let toml_str = m.to_toml().unwrap();
+        let stripped: String = toml_str
+            .lines()
+            .filter(|l| !l.starts_with("wit_sha"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = Manifest::parse(&stripped).unwrap();
+        assert_eq!(parsed.abi.wit_sha, None);
     }
 
     #[test]

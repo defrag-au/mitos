@@ -16,8 +16,16 @@
 //!   (`target_recipient`) AND the bidder is not among the tx's required signers
 //!   (only a cancel needs the bidder's signature to reclaim the locked lovelace).
 //!
-//! The consumed offer's locked lovelace is the bid price (`price_lovelace`) —
-//! read from the input, never inferred from outputs.
+//! The consumed offer's locked **value** is the bid — read from the input,
+//! never inferred from outputs.
+//!
+//! ⚠️ **That value is not always lovelace.** Wayup carries asset-denominated
+//! offers (swap this NFT for that one), where the UTxO holds the offered assets
+//! and only enough lovelace to carry them. Reading `input.lovelace` on one of
+//! those yields a min-ADA figure — measured on mainnet 2026-09-18, exactly
+//! 2.5 ADA on 137 of 9,526 Wayup offer events — which is indistinguishable from
+//! a cheap bid and silently poisons every realized-price median downstream.
+//! So the bid is an [`AssetPrice`], and a swap cannot be read as a number.
 //!
 //! ## Batched fills
 //!
@@ -38,9 +46,11 @@ use mitos_community_events::wayup_store_offer::{
     OfferAccept as WayupOfferAccept, WayupStoreOfferVersion,
 };
 
+use mitos_community_events::marketplace::{AssetAmount, AssetPrice};
+
 use crate::offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 use crate::sales::address_payment_cred;
-use crate::{AssetId, DecodeTx, TxOutput};
+use crate::{AssetQuantity, DecodeTx, TxInput, TxOutput};
 
 // ============================================================
 // jpg.store
@@ -113,13 +123,54 @@ pub fn decode_jpg_offer_accepts(tx: &DecodeTx) -> Vec<JpgOfferAccept> {
             prior_output_index: input.oref_index,
             policy,
             asset_name_hex,
-            price_lovelace: input.lovelace,
+            price: consideration(input),
             seller_address,
             co_version: version,
             collection_offer: decoded.target_asset_names.is_empty(),
         });
     }
     out
+}
+
+/// What the bidder locked, as an [`AssetPrice`].
+///
+/// Assets present ⇒ the consideration is not ADA, however much lovelace rides
+/// along with them. The lovelace is still reported (see [`AssetPrice::InKind`])
+/// because separating a real ADA component from the min-ADA the assets require
+/// is a calculation we cannot do reliably.
+pub(crate) fn consideration(input: &TxInput) -> AssetPrice {
+    locked_value(input.lovelace, &input.assets)
+}
+
+/// The same reading for a **produced** offer UTxO — an offer being created or
+/// repriced, where the bid has not been consumed yet.
+///
+/// Create and accept must agree, or the book lies in a way the fills do not:
+/// a swap offer that reports a min-ADA bid while it sits open, then correctly
+/// reports no price when it fills, is two different stories about one offer.
+pub(crate) fn consideration_out(out: &TxOutput) -> AssetPrice {
+    locked_value(out.lovelace, &out.assets)
+}
+
+fn locked_value(lovelace: u64, assets: &[AssetQuantity]) -> AssetPrice {
+    if assets.is_empty() {
+        return AssetPrice::Lovelace { lovelace };
+    }
+    AssetPrice::InKind {
+        lovelace,
+        assets: assets
+            .iter()
+            .map(|a| AssetAmount {
+                policy: a.asset_id.policy_id.clone(),
+                name: a.asset_id.asset_name_hex.clone(),
+                // The real quantity, as the host reported it. This was pinned
+                // at 1 while the neutral shape carried identity only — correct
+                // for every NFT and silently wrong for a fungible-denominated
+                // offer.
+                quantity: a.quantity,
+            })
+            .collect(),
+    }
 }
 
 /// First unclaimed non-offer output delivering a target-policy asset →
@@ -130,15 +181,16 @@ fn jpg_find_delivered<'a>(
     claimed: &mut ClaimedDeliveries,
 ) -> Option<(String, String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
-    let target_policy_bytes = hex::decode(target_policy).ok()?;
     let target_asset_set = asset_name_set(decoded);
     for out in outputs {
         for asset in &out.assets {
-            if asset.policy != target_policy_bytes {
+            if !asset.asset_id.policy_id.eq_ignore_ascii_case(target_policy) {
                 continue;
             }
-            if let Some(ref set) = target_asset_set
-                && !set.iter().any(|n| n == &asset.name)
+            if let Some(set) = target_asset_set
+                && !set
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&asset.asset_id.asset_name_hex))
             {
                 continue;
             }
@@ -147,7 +199,7 @@ fn jpg_find_delivered<'a>(
             }
             return Some((
                 target_policy.to_owned(),
-                hex::encode(&asset.name),
+                asset.asset_id.asset_name_hex.clone(),
                 out.address.clone(),
             ));
         }
@@ -225,7 +277,7 @@ pub fn decode_wayup_offer_accepts(tx: &DecodeTx, cfg: &WayupOfferConfig) -> Vec<
             prior_output_index: input.oref_index,
             policy,
             asset_name_hex,
-            price_lovelace: input.lovelace,
+            price: consideration(input),
             // Wayup commingles seller proceeds into change — no reliable seller.
             seller_address: String::new(),
             co_version: WayupStoreOfferVersion::V1,
@@ -243,7 +295,6 @@ fn wayup_find_delivered<'a>(
     claimed: &mut ClaimedDeliveries,
 ) -> Option<(String, String)> {
     let target_policy = decoded.target_policy.as_deref()?;
-    let target_policy_bytes = hex::decode(target_policy).ok()?;
     let target_recipient = decoded.target_recipient?;
     let target_asset_set = asset_name_set(decoded);
     for out in outputs {
@@ -251,18 +302,23 @@ fn wayup_find_delivered<'a>(
             continue;
         }
         for asset in &out.assets {
-            if asset.policy != target_policy_bytes {
+            if !asset.asset_id.policy_id.eq_ignore_ascii_case(target_policy) {
                 continue;
             }
-            if let Some(ref set) = target_asset_set
-                && !set.iter().any(|n| n == &asset.name)
+            if let Some(set) = target_asset_set
+                && !set
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&asset.asset_id.asset_name_hex))
             {
                 continue;
             }
             if !claim(claimed, out, asset) {
                 continue;
             }
-            return Some((target_policy.to_owned(), hex::encode(&asset.name)));
+            return Some((
+                target_policy.to_owned(),
+                asset.asset_id.asset_name_hex.clone(),
+            ));
         }
     }
     None
@@ -283,12 +339,12 @@ fn bidder_in_signers(bidder_pkh: &str, signers: &[Vec<u8>]) -> bool {
 /// Deliveries already reported by an earlier offer in the same tx, keyed by
 /// `(output index, asset name)`. One physical asset settles exactly one offer,
 /// so a second offer matching the same output/asset must keep looking.
-type ClaimedDeliveries = HashSet<(u32, Vec<u8>)>;
+type ClaimedDeliveries = HashSet<(u32, String)>;
 
 /// Claim a delivery for the offer currently being decoded. `false` when an
 /// earlier offer in this tx already took it.
-fn claim(claimed: &mut ClaimedDeliveries, out: &TxOutput, asset: &AssetId) -> bool {
-    claimed.insert((out.index, asset.name.clone()))
+fn claim(claimed: &mut ClaimedDeliveries, out: &TxOutput, asset: &AssetQuantity) -> bool {
+    claimed.insert((out.index, asset.asset_id.asset_name_hex.clone()))
 }
 
 /// Tx outputs that are NOT at an offer address of *either* venue — the
@@ -302,18 +358,17 @@ fn non_offer_outputs(tx: &DecodeTx) -> impl Iterator<Item = &TxOutput> {
 
 /// The offer's asset-name allow-list as decoded bytes, or `None` for a
 /// collection-wide offer (empty list).
-fn asset_name_set(decoded: &DecodedOffer) -> Option<Vec<Vec<u8>>> {
-    if decoded.target_asset_names.is_empty() {
-        None
-    } else {
-        Some(
-            decoded
-                .target_asset_names
-                .iter()
-                .filter_map(|n| hex::decode(n).ok())
-                .collect(),
-        )
-    }
+/// The datum's target asset names, as hex.
+///
+/// These used to be hex-DECODED so they could be compared against the neutral
+/// shape's raw bytes. Now that the shape is `AssetId` (already hex) the decode
+/// is gone — but so is the case-insensitivity that comparing bytes gave for
+/// free, which is why every comparison against this set uses
+/// `eq_ignore_ascii_case`. A datum that spells its asset names in upper-case
+/// hex would otherwise stop matching, and the symptom would be an offer that
+/// silently never finds its delivery.
+fn asset_name_set(decoded: &DecodedOffer) -> Option<&[String]> {
+    (!decoded.target_asset_names.is_empty()).then_some(decoded.target_asset_names.as_slice())
 }
 
 fn parse_cred(hex_str: &str) -> Option<[u8; 28]> {
@@ -332,7 +387,7 @@ fn parse_cred(hex_str: &str) -> Option<[u8; 28]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AssetId, TxInput};
+    use crate::{AssetId, AssetQuantity, TxInput};
 
     // Real Wayup offer-accept datum (collection-wide Mekanism bid, 55 ADA),
     // from `wayup-store-offer/tests/fixtures/offer-accept`.
@@ -365,10 +420,15 @@ mod tests {
             .unwrap()
     }
 
-    fn asset(policy_hex: &str, name_hex: &str) -> AssetId {
-        AssetId {
-            policy: hex::decode(policy_hex).unwrap(),
-            name: hex::decode(name_hex).unwrap(),
+    /// Hex in, hex out — the neutral shape speaks the shared `AssetId`
+    /// vocabulary now, so these no longer decode to bytes.
+    fn asset(policy_hex: &str, name_hex: &str) -> AssetQuantity {
+        AssetQuantity {
+            asset_id: AssetId {
+                policy_id: policy_hex.to_owned(),
+                asset_name_hex: name_hex.to_owned(),
+            },
+            quantity: 1,
         }
     }
 
@@ -422,6 +482,50 @@ mod tests {
         }
     }
 
+    /// A swap offer — the bidder locked NFTs, not ADA — must NOT report a
+    /// price in lovelace.
+    ///
+    /// The real shape, mainnet `90fe241b…` output 0: a Wayup offer UTxO
+    /// holding 2.5 ADA plus Pirate754 and Pirate858, accepted for Pirate700.
+    /// Read as `input.lovelace` that recorded a 2.5 ADA sale of an NFT, and
+    /// 137 such rows sat in the realized-price medians. `Bundle` keeps the
+    /// lovelace visible (it is the UTxO's real balance) while making it
+    /// unreachable through the accessor a price series uses.
+    #[test]
+    fn a_swap_offer_has_no_lovelace_price() {
+        let swap_input = TxInput {
+            lovelace: 2_500_000,
+            assets: vec![
+                asset(MEKANISM_POLICY, "4d656b616e69736d373534"),
+                asset(MEKANISM_POLICY, "4d656b616e69736d383538"),
+            ],
+            ..wayup_offer_input(Some(vec![0xd8, 0x7a, 0x80]))
+        };
+        let price = consideration(&swap_input);
+
+        assert_eq!(
+            price.lovelace(),
+            None,
+            "a swap must not surface a lovelace price"
+        );
+        assert_eq!(price.kind(), "in_kind");
+        assert_eq!(price.label(), "P2P trade");
+        let AssetPrice::InKind { lovelace, assets } = &price else {
+            panic!("expected InKind, got {price:?}");
+        };
+        // The balance is still reported — it is what the UTxO held. What is
+        // refused is calling it a price.
+        assert_eq!(*lovelace, 2_500_000);
+        assert_eq!(assets.len(), 2);
+
+        // Control: the same input without assets IS an ADA bid.
+        let ada_input = TxInput {
+            assets: vec![],
+            ..swap_input
+        };
+        assert_eq!(consideration(&ada_input).lovelace(), Some(2_500_000));
+    }
+
     #[test]
     fn wayup_accept_picks_recipient_asset_not_change() {
         let tx = DecodeTx {
@@ -455,7 +559,12 @@ mod tests {
         let a = &accepts[0];
         assert_eq!(a.policy, MEKANISM_POLICY);
         assert_eq!(a.asset_name_hex, MEKANISM_2212);
-        assert_eq!(a.price_lovelace, 55_000_000);
+        assert_eq!(
+            a.price,
+            AssetPrice::Lovelace {
+                lovelace: 55_000_000
+            }
+        );
         assert_eq!(a.prior_output_index, 1);
         assert!(a.collection_offer);
         assert_eq!(a.seller_address, "");
@@ -584,7 +693,12 @@ mod tests {
         assert_eq!(a.bidder_pkh, JPG_BIDDER);
         assert_eq!(a.policy, TAPPY_POLICY);
         assert_eq!(a.asset_name_hex, TAPPY_3589);
-        assert_eq!(a.price_lovelace, 153_000_000);
+        assert_eq!(
+            a.price,
+            AssetPrice::Lovelace {
+                lovelace: 153_000_000
+            }
+        );
         assert_eq!(a.seller_address, JPG_SELLER_ADDR);
         assert!(a.collection_offer);
         assert_eq!(a.prior_output_index, 0);

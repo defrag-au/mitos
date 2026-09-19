@@ -28,6 +28,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::marketplace::AssetPrice;
+
 /// jpg.store CO contract version. V2 and V3 share the same
 /// underlying script; they differ only in address-encoding (V2
 /// uses one staking credential, V3 uses another).
@@ -36,6 +38,8 @@ pub enum JpgStoreOfferVersion {
     V2,
     V3,
 }
+
+pub use crate::DatumKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferCreate {
@@ -46,15 +50,28 @@ pub struct OfferCreate {
     pub tx_hash: String,
     /// Output index within `tx_hash` of the offer UTxO.
     pub output_index: u32,
-    /// Lovelace locked at the offer script (the offer amount,
-    /// including the standard 2 ADA min-utxo overhead).
-    pub lovelace: u64,
+    /// What the bidder locked at the offer script.
+    ///
+    /// An [`AssetPrice`] rather than a `u64` for the same reason as
+    /// [`OfferAccept::price`]: an offer's consideration is not always ADA, and
+    /// a bare number cannot say so. Create and accept must agree — an offer
+    /// that reports a min-ADA bid while open and no price when it fills is two
+    /// stories about one offer.
+    pub price: AssetPrice,
     /// Raw datum CBOR — preserved for forensics + so the
     /// companion can decode richer fields when consumers need
     /// them later. Also used at consume time to identify which
     /// offer the consume refers to.
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the offer UTxO carries `datum_cbor`.
+    ///
+    /// `None` on events emitted before this field existed. Read it as
+    /// "unknown", not as a default: a consumer that guesses wrong
+    /// builds a cancel the ledger rejects, so an unknown shape means
+    /// resolve it on chain.
+    #[serde(default)]
+    pub datum_kind: Option<DatumKind>,
     /// Policy this offer targets, when the datum specifies one.
     /// `None` when the datum carries an allow-list instead of a
     /// single policy (rare).
@@ -92,10 +109,15 @@ pub struct OfferAccept {
     /// asset the offer was tied to.
     pub policy: String,
     pub asset_name_hex: String,
-    /// Lovelace the bidder paid (= the offer UTxO's locked
-    /// lovelace minus any change retained by the bidder, which
-    /// the chain settles by the script's payout rules).
-    pub price_lovelace: u64,
+    /// What the bidder paid, from the offer UTxO's locked value
+    /// (the chain settles the split by the script's payout rules).
+    ///
+    /// An enum because an offer's consideration is not always ADA
+    /// — see [`AssetPrice`]. jpg offers observed to date are all
+    /// lovelace, but the type is shared with Wayup, where they
+    /// are not, and a venue-specific price shape would put the
+    /// same trap back one crate over.
+    pub price: AssetPrice,
     /// Bech32 of the address that received the lovelace. The
     /// seller's identity; payment-cred extraction is left to
     /// consumers (avoids pulling bech32 → cred decoders into
@@ -120,8 +142,11 @@ pub struct OfferUpdate {
     pub prior_output_index: u32,
     /// New offer UTxO produced in the same TX.
     pub new_output_index: u32,
-    pub previous_lovelace: u64,
-    pub new_lovelace: u64,
+    /// The bid before and after the reprice. Both [`AssetPrice`] — an offer
+    /// can be repriced without becoming ADA-denominated, and a swap offer
+    /// repriced to another swap must not surface as a lovelace move.
+    pub previous_price: AssetPrice,
+    pub new_price: AssetPrice,
     /// Raw datum CBOR for the new offer UTxO. Same field as
     /// `OfferCreate.datum_cbor` — consumers need it so they can
     /// build a cancel TX against the updated offer's actual
@@ -131,6 +156,11 @@ pub struct OfferUpdate {
     /// updated offer would fail script validation.
     #[serde(with = "serde_bytes")]
     pub datum_cbor: Vec<u8>,
+    /// How the new offer UTxO carries `datum_cbor` — the other half
+    /// of that cancel: the bytes are only witnessable when the shape
+    /// says so. `None` on events from before this field existed.
+    #[serde(default)]
+    pub datum_kind: Option<DatumKind>,
     pub target_policy: Option<String>,
     /// Asset names (lowercase hex) the new offer is constrained
     /// to. Preserved from the prior offer (updates change price,

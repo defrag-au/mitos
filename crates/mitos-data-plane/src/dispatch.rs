@@ -147,7 +147,7 @@ fn build_tx_batch(
         .enumerate()
         .map(|(idx, draft): (usize, &OutputDraft)| {
             let oref = OutputRef::new(tx.tx_hash, idx as u32);
-            let datum = datum_from_draft(draft.datum_hash, draft.inline_datum_bytes.clone());
+            let datum = datum_from_draft(draft.datum.as_ref());
             let mut output = draft.output.clone();
             output.datum = datum.clone();
             UtxoEvent::Produced(ProducedEvent {
@@ -419,8 +419,7 @@ mod tests {
                 reference_inputs: Vec::new(),
                 outputs: vec![OutputDraft {
                     output: output.clone(),
-                    datum_hash: None,
-                    inline_datum_bytes: None,
+                    datum: None,
                 }],
                 mints: Vec::new(),
                 aux_data_cbor: None,
@@ -474,8 +473,7 @@ mod tests {
                 reference_inputs: Vec::new(),
                 outputs: vec![OutputDraft {
                     output: unwatched,
-                    datum_hash: None,
-                    inline_datum_bytes: None,
+                    datum: None,
                 }],
                 mints: Vec::new(),
                 aux_data_cbor: None,
@@ -512,6 +510,7 @@ mod tests {
             assets: Vec::new(),
             datum: Some(TypedDatum {
                 hash: datum_hash,
+                kind: crate::types::DatumKind::Hash,
                 payload: None,
                 original_cbor: None,
             }),
@@ -630,8 +629,7 @@ mod tests {
                 reference_inputs: Vec::new(),
                 outputs: vec![OutputDraft {
                     output: produced_output,
-                    datum_hash: None,
-                    inline_datum_bytes: None,
+                    datum: None,
                 }],
                 mints: Vec::new(),
                 aux_data_cbor: None,

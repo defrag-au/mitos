@@ -357,9 +357,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 260000000,
     "output_index": 0,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 260000000
+    },
     "target_asset_names": [],
     "target_policy": "4523c5e21d409b81c95b45b0aea275b8ea1406e6cafea5583b9f8a5f",
     "tx_hash": "d0552d974dc721bf2d55a1b6997730f454c0c1243b0ef12c16d0b44bdbb93fcd"
@@ -722,9 +726,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 260000000,
     "output_index": 1,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 260000000
+    },
     "target_asset_names": [],
     "target_policy": "4523c5e21d409b81c95b45b0aea275b8ea1406e6cafea5583b9f8a5f",
     "tx_hash": "d0552d974dc721bf2d55a1b6997730f454c0c1243b0ef12c16d0b44bdbb93fcd"
@@ -1087,9 +1095,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 260000000,
     "output_index": 2,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 260000000
+    },
     "target_asset_names": [],
     "target_policy": "4523c5e21d409b81c95b45b0aea275b8ea1406e6cafea5583b9f8a5f",
     "tx_hash": "d0552d974dc721bf2d55a1b6997730f454c0c1243b0ef12c16d0b44bdbb93fcd"
@@ -1452,9 +1464,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 260000000,
     "output_index": 3,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 260000000
+    },
     "target_asset_names": [],
     "target_policy": "4523c5e21d409b81c95b45b0aea275b8ea1406e6cafea5583b9f8a5f",
     "tx_hash": "d0552d974dc721bf2d55a1b6997730f454c0c1243b0ef12c16d0b44bdbb93fcd"

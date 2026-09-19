@@ -28,7 +28,9 @@ use cardano_assets::PolicyId;
 use pallas_primitives::Hash;
 use pallas_traverse::{MultiEraBlock, MultiEraOutput, MultiEraTx, OriginalHash};
 
-use crate::types::{AssetEntry, ChainPoint, OutputRef, TypedDatum, TypedOutput, ValidityInterval};
+use crate::types::{
+    AssetEntry, ChainPoint, DatumKind, OutputRef, TypedDatum, TypedOutput, ValidityInterval,
+};
 
 /// Decoded block in dispatch-friendly form. Per-TX drafts that
 /// the platform's dispatcher walks to build full events after
@@ -85,14 +87,28 @@ pub struct InputDraft {
     pub redeemer: Option<Vec<u8>>,
 }
 
+/// A draft output's datum, as the block walk found it.
+///
+/// One struct rather than loose fields so a hash can never travel
+/// without the [`DatumKind`] that says how a spend must treat it —
+/// the two are only useful together, and a consumer holding the
+/// bytes still needs the kind to know whether to witness them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftDatum {
+    pub hash: Hash<32>,
+    pub kind: DatumKind,
+    /// Present only for [`DatumKind::Inline`]: a hash datum's
+    /// preimage lives in a witness set, not on the output.
+    pub inline_bytes: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputDraft {
     pub output: TypedOutput,
-    /// Datum hash + inline bytes when present. Modules see
+    /// The output's datum when it has one. Modules see
     /// `Some(typed_datum)` post-resolution; bytes get filled in
     /// by the dispatcher when resolution succeeds.
-    pub datum_hash: Option<Hash<32>>,
-    pub inline_datum_bytes: Option<Vec<u8>>,
+    pub datum: Option<DraftDatum>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,11 +319,9 @@ fn project_output_draft(output: &MultiEraOutput<'_>) -> OutputDraft {
         resolution: crate::types::Resolution::Resolved,
     };
 
-    let (datum_hash, inline_datum_bytes) = extract_datum_info(output);
     OutputDraft {
         output: typed_output,
-        datum_hash,
-        inline_datum_bytes,
+        datum: extract_datum_info(output),
     }
 }
 
@@ -315,16 +329,20 @@ fn project_output_draft(output: &MultiEraOutput<'_>) -> OutputDraft {
 /// Re-exported as `mitos_data_plane::extract_datum_info` so
 /// fixture-driven harnesses (mitos-run) can build TypedDatum
 /// from harvested outputs without re-implementing the era walk.
-pub fn extract_datum_info(output: &MultiEraOutput<'_>) -> (Option<Hash<32>>, Option<Vec<u8>>) {
+pub fn extract_datum_info(output: &MultiEraOutput<'_>) -> Option<DraftDatum> {
     use pallas::ledger::primitives::conway::DatumOption;
     match output.datum() {
-        Some(DatumOption::Hash(h)) => (Some(h), None),
-        Some(DatumOption::Data(cbor_wrap)) => {
-            let raw = cbor_wrap.0.raw_cbor().to_vec();
-            let hash = cbor_wrap.0.original_hash();
-            (Some(hash), Some(raw))
-        }
-        None => (None, None),
+        Some(DatumOption::Hash(hash)) => Some(DraftDatum {
+            hash,
+            kind: DatumKind::Hash,
+            inline_bytes: None,
+        }),
+        Some(DatumOption::Data(cbor_wrap)) => Some(DraftDatum {
+            hash: cbor_wrap.0.original_hash(),
+            kind: DatumKind::Inline,
+            inline_bytes: Some(cbor_wrap.0.raw_cbor().to_vec()),
+        }),
+        None => None,
     }
 }
 
@@ -356,15 +374,13 @@ fn extract_aux_data(tx: &MultiEraTx<'_>) -> Option<Vec<u8>> {
 /// stays `None` because we keep PlutusData decoding out of the
 /// dispatch hot path — modules that need it use minicbor
 /// themselves.
-pub fn datum_from_draft(
-    hash: Option<Hash<32>>,
-    inline_bytes: Option<Vec<u8>>,
-) -> Option<TypedDatum> {
-    let hash = hash?;
+pub fn datum_from_draft(draft: Option<&DraftDatum>) -> Option<TypedDatum> {
+    let draft = draft?;
     Some(TypedDatum {
-        hash,
+        hash: draft.hash,
+        kind: draft.kind,
         payload: None,
-        original_cbor: inline_bytes,
+        original_cbor: draft.inline_bytes.clone(),
     })
 }
 

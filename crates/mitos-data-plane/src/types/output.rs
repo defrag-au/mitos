@@ -38,6 +38,12 @@ impl AssetEntry {
     }
 }
 
+/// How an output carries its datum — the canonical definition lives in
+/// `cardano-assets` beside `UtxoTag`, because host, wire and app layers
+/// all need the same answer and it is a property of the chain rather
+/// than of any one of them.
+pub use cardano_assets::DatumKind;
+
 /// Server-resolved datum. Hash always present when any datum
 /// exists on the output; payload populated whenever the plane
 /// could resolve it (inline datum directly, or hash-referenced
@@ -50,9 +56,20 @@ impl AssetEntry {
 /// `original_cbor`. If `payload.is_some()` you have decoded
 /// PlutusData regardless of which on-chain shape the datum
 /// actually had.
+///
+/// `kind` is the one place the distinction survives, because
+/// resolution being caller-blind does not make the shape
+/// irrelevant: a transaction SPENDING this output must witness
+/// the preimage of a hash datum, and must NOT witness one for an
+/// inline datum (the ledger rejects it as
+/// `NotAllowedSupplementalDatums`). Without this, a consumer that
+/// holds the bytes still has to re-read the output on chain just
+/// to learn which shape it was.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TypedDatum {
     pub hash: Hash<32>,
+    /// How the output carries this datum.
+    pub kind: DatumKind,
     /// `Some` iff the plane successfully resolved + decoded the
     /// datum body. `None` for hash-references the plane couldn't
     /// resolve (witness-set absent — rare in current state but

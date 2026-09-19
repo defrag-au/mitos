@@ -231,6 +231,7 @@ pub fn manifest_v2(wasm: &[u8]) -> Manifest {
             version_minor: 0,
             wit_package: "mitos:platform-v2".to_owned(),
             wit_world: "mitos-module-v2".to_owned(),
+            wit_sha: Some(mitos_platform::manifest::host_wit_sha().to_owned()),
         },
         trap_policy: TrapPolicySection {
             strategy: "replay".to_owned(),
@@ -268,6 +269,28 @@ pub fn tempdir(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("create tempdir");
     p
+}
+
+/// Poll `cond` until it returns `Some`, or panic after ~10s.
+///
+/// Replaces the fixed `sleep(500ms)` these tests used to use before
+/// asserting. A fixed sleep encodes a guess about how long the
+/// follower takes, and when that guess is wrong the failure looks
+/// like a logic bug ("cursor absent") rather than a timing one.
+/// Polling also means the fast path stays fast — a passing test
+/// returns as soon as the condition holds instead of always paying
+/// the full wait.
+pub async fn wait_for<T>(what: &str, mut cond: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(v) = cond() {
+            return v;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 10s waiting for: {what}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// Marker type to silence the rustc warning for unused `Arc` /

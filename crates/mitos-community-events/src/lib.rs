@@ -7,6 +7,18 @@
 //!
 //! See `docs/strategy/COMMUNITY_MODULES.md` for the design.
 
+/// How an output carries its datum.
+///
+/// Recorded at ingest because a transaction SPENDING the output needs
+/// it: a hash datum's preimage must be witnessed, and witnessing one
+/// for an inline datum is rejected as `NotAllowedSupplementalDatums`.
+/// A consumer holding the datum bytes still cannot build a spend
+/// without knowing which shape they came in.
+///
+/// Re-exported from `cardano-assets` so the modules, the host and the
+/// consuming workers all name the same type.
+pub use cardano_assets::DatumKind;
+
 pub mod asset_metadata_update;
 pub mod asset_transfer;
 pub mod burn_address;

@@ -24,7 +24,8 @@ use std::cell::RefCell;
 
 use mitos_community_events::wayup_store_listing::WayupStoreListing;
 use mitos_marketplace_decode::{
-    decode_wayup_listings, AssetId, DecodeTx, OutputDatum, TxInput, TxOutput, WayupSaleConfig,
+    decode_wayup_listings, AssetId, AssetQuantity, DecodeTx, OutputDatum, TxInput, TxOutput,
+    WayupSaleConfig,
 };
 use serde::Deserialize;
 
@@ -32,8 +33,16 @@ use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::types::{
-    AssetEntry, ConsumedEvent, ProducedEvent, TypedDatum, UtxoEvent,
+    AssetEntry, ConsumedEvent, DatumKind as WitDatumKind, ProducedEvent, TypedDatum, UtxoEvent,
 };
+
+/// The host's datum shape, in the wire vocabulary consumers read.
+fn to_event_datum_kind(kind: WitDatumKind) -> mitos_community_events::DatumKind {
+    match kind {
+        WitDatumKind::Inline => mitos_community_events::DatumKind::Inline,
+        WitDatumKind::Hash => mitos_community_events::DatumKind::Hash,
+    }
+}
 
 const LOG_TARGET: &str = "wayup-store-listing-module";
 
@@ -65,12 +74,18 @@ fn resolve_datum_bytes(d: Option<&TypedDatum>) -> Option<Vec<u8>> {
     chain_data::datum_by_hash(&d.hash)
 }
 
-fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
+/// The host's assets in the decoders' shared vocabulary. Carries `quantity`,
+/// which this used to discard — see the sibling jpg module for why that was
+/// silently wrong for anything fungible.
+fn to_asset_amounts(assets: &[AssetEntry]) -> Vec<AssetQuantity> {
     assets
         .iter()
-        .map(|e| AssetId {
-            policy: e.asset.policy.clone(),
-            name: e.asset.name.clone(),
+        .map(|e| AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+            },
+            quantity: e.quantity,
         })
         .collect()
 }
@@ -82,11 +97,12 @@ fn build_output(p: &ProducedEvent) -> TxOutput {
     TxOutput {
         address: p.output.address.clone(),
         lovelace: p.output.lovelace,
-        assets: to_asset_ids(&p.output.assets),
+        assets: to_asset_amounts(&p.output.assets),
         index: p.oref.index,
         datum: p.datum.as_ref().map(|d| OutputDatum {
             payload: d.payload.clone(),
             hash: d.hash.clone(),
+            kind: Some(to_event_datum_kind(d.kind)),
         }),
     }
 }
@@ -106,7 +122,7 @@ fn build_input(c: &ConsumedEvent) -> TxInput {
     TxInput {
         address: c.prior_output.address.clone(),
         lovelace: c.prior_output.lovelace,
-        assets: to_asset_ids(&c.prior_output.assets),
+        assets: to_asset_amounts(&c.prior_output.assets),
         datum,
         redeemer: c.redeemer.clone(),
         ..Default::default()

@@ -1,15 +1,15 @@
 //! Publishing a policy's archive — the Parquet and manifest to R2, the
 //! bundle to Workers KV — in process, as typed steps with a record.
 //!
-//! # Why this is code and not a script
+//! # Where the machinery lives
 //!
-//! The first cut shelled out to rclone and curl after every landed pass.
-//! One exit code covered a four-step publish, so a KV failure after a
-//! successful R2 copy read as "published"; nothing recorded when, or
-//! whether, a policy had actually reached the edge; a transient API error
-//! stayed unretried until the next pass happened to land; and the manifest
-//! flip could not be conditional, so two writers on one policy would race
-//! silently. The user's verdict: *an incredibly brittle surface*.
+//! The client, the credentials, the conditional put, the KV fan-out and the
+//! [`Outcome`] vocabulary moved to `cf-publish` (2026-09-15) when the
+//! collection catalogue became the second publisher on this box. **This file
+//! is now the archive's ORDER and nothing else** — which is the part that was
+//! never generic: a catalogue flips a pointer at a content-addressed blob and
+//! prunes one predecessor, an archive flips a manifest naming many immutable
+//! files and prunes a rollup's ancestry.
 //!
 //! # The order, and why it is fixed
 //!
@@ -33,19 +33,19 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::Attributes;
 use object_store::path::Path as ObjPath;
-use object_store::{
-    Attribute, Attributes, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion,
-};
 use serde::{Deserialize, Serialize};
-use tokio_stream::StreamExt;
 
 use crate::archive::MANIFEST;
+
+/// Credentials, the client and the outcome vocabulary — shared with every
+/// other publisher on the box. See `cf-publish` for why only these moved.
+pub use cf_publish::{KvOutcome, Outcome, Targets};
+use cf_publish::{immutable_attributes, pointer_attributes};
 
 /// Key prefix in the bucket: `policy-archive/<policy_hex>/<relative path>`,
 /// the same relative paths the manifest carries.
@@ -53,122 +53,7 @@ pub const PREFIX: &str = "policy-archive";
 /// The record of the last publish, beside the manifest.
 pub const RECORD: &str = "published.json";
 
-// ── Configuration ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct R2Target {
-    pub endpoint: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub bucket: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct KvTarget {
-    pub account_id: String,
-    pub token: String,
-    /// Every namespace gets the same bundle: dev and prod read one bucket.
-    pub namespaces: Vec<String>,
-}
-
-/// Where to publish. Read from the environment the service unit loads
-/// (`/etc/default/token-ledger`), by the names the box already uses.
-#[derive(Debug, Clone, Default)]
-pub struct Targets {
-    pub r2: Option<R2Target>,
-    pub kv: Option<KvTarget>,
-}
-
-impl Targets {
-    pub fn from_env() -> Self {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let r2 = match (
-            var("R2_ENDPOINT"),
-            var("R2_ACCESS_KEY_ID"),
-            var("R2_SECRET_ACCESS_KEY"),
-            var("R2_BUCKET"),
-        ) {
-            (Some(endpoint), Some(access_key_id), Some(secret_access_key), Some(bucket)) => {
-                Some(R2Target {
-                    endpoint,
-                    access_key_id,
-                    secret_access_key,
-                    bucket,
-                })
-            }
-            _ => None,
-        };
-        let kv = match (
-            var("CF_ACCOUNT_ID").or_else(|| var("R2_ACCOUNT_ID")),
-            var("CF_KV_TOKEN"),
-            var("KV_NAMESPACE_IDS"),
-        ) {
-            (Some(account_id), Some(token), Some(ids)) => {
-                let namespaces: Vec<String> = ids.split_whitespace().map(String::from).collect();
-                (!namespaces.is_empty()).then_some(KvTarget {
-                    account_id,
-                    token,
-                    namespaces,
-                })
-            }
-            _ => None,
-        };
-        Self { r2, kv }
-    }
-
-    /// One line for the startup log — what is configured, never a secret.
-    pub fn describe(&self) -> String {
-        let r2 = match &self.r2 {
-            Some(r) => format!("r2 bucket {} at {}", r.bucket, r.endpoint),
-            None => "r2 NOT configured".to_string(),
-        };
-        let kv = match &self.kv {
-            Some(k) => format!("kv {} namespace(s)", k.namespaces.len()),
-            None => "kv NOT configured (CF_KV_TOKEN / KV_NAMESPACE_IDS)".to_string(),
-        };
-        format!("{r2}; {kv}")
-    }
-}
-
 // ── The record ───────────────────────────────────────────────────────────
-
-/// How one step of a publish went.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Outcome {
-    Done,
-    /// No target for this step; the archive is published without it.
-    NotConfigured,
-    /// An earlier step failed, so this one never ran.
-    NotAttempted,
-    Failed {
-        error: String,
-    },
-}
-
-impl Outcome {
-    fn failed(e: impl std::fmt::Display) -> Self {
-        Outcome::Failed {
-            error: format!("{e:#}"),
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        matches!(self, Outcome::Done | Outcome::NotConfigured)
-    }
-
-    /// A record written before a step existed says nothing about it, which
-    /// is `NotAttempted` — not a failure and not a success.
-    fn not_attempted() -> Self {
-        Outcome::NotAttempted
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvOutcome {
-    pub namespace: String,
-    pub outcome: Outcome,
-}
 
 /// What the last publish did — `published.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,23 +91,17 @@ impl Record {
     }
 
     pub fn summary(&self) -> String {
-        let step = |name: &str, o: &Outcome| match o {
-            Outcome::Done => format!("{name} ok"),
-            Outcome::NotConfigured => format!("{name} n/a"),
-            Outcome::NotAttempted => format!("{name} skipped"),
-            Outcome::Failed { error } => format!("{name} FAILED: {error}"),
-        };
         format!(
             "{} ({} up, {} same, {} B); {}; {}; {} ({} B); {} ({} pruned); {:.1}s",
-            step("files", &self.files),
+            self.files.describe("files"),
             self.uploaded,
             self.skipped,
             self.uploaded_bytes,
-            step("manifest", &self.manifest),
-            step("bundle", &self.bundle),
-            step("graph", &self.graph),
+            self.manifest.describe("manifest"),
+            self.bundle.describe("bundle"),
+            self.graph.describe("graph"),
             self.graph_bytes,
-            step("prune", &self.prune),
+            self.prune.describe("prune"),
             self.pruned,
             self.secs
         )
@@ -230,51 +109,23 @@ impl Record {
 }
 
 pub fn load_record(dir: &Path) -> Result<Option<Record>> {
-    let path = dir.join(RECORD);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read(&path)?;
-    Ok(Some(
-        serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?,
-    ))
+    cf_publish::load_record(&dir.join(RECORD))
 }
 
 fn store_record(dir: &Path, r: &Record) -> Result<()> {
-    let tmp = dir.join(format!("{RECORD}.tmp"));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(r)?)?;
-    std::fs::rename(&tmp, dir.join(RECORD))?;
-    Ok(())
+    cf_publish::store_record(&dir.join(RECORD), r)
 }
 
 // ── The publisher ────────────────────────────────────────────────────────
 
 pub struct Publisher {
-    store: Arc<dyn ObjectStore>,
-    kv: Option<KvTarget>,
-    http: reqwest::Client,
+    cf: cf_publish::Client,
 }
 
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-fn immutable() -> Attributes {
-    let mut a = Attributes::new();
-    a.insert(
-        Attribute::CacheControl,
-        "public, max-age=31536000, immutable".into(),
-    );
-    a
-}
-
-fn manifest_attributes() -> Attributes {
-    let mut a = Attributes::new();
-    a.insert(Attribute::CacheControl, "no-cache".into());
-    a.insert(Attribute::ContentType, "application/json".into());
-    a
 }
 
 struct Uploaded {
@@ -287,28 +138,7 @@ impl Publisher {
     /// `None` when R2 is not configured: the bundle names R2 keys, so KV on
     /// its own would publish pointers to nothing.
     pub fn new(targets: Targets) -> Result<Option<Self>> {
-        let Some(r2) = targets.r2 else {
-            return Ok(None);
-        };
-        let store = AmazonS3Builder::new()
-            .with_endpoint(&r2.endpoint)
-            .with_bucket_name(&r2.bucket)
-            .with_access_key_id(&r2.access_key_id)
-            .with_secret_access_key(&r2.secret_access_key)
-            .with_region("auto")
-            // The manifest flip: `If-Match` on the version read before the
-            // publish began. R2's S3 surface honours it.
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .build()
-            .context("building the R2 client")?;
-        Ok(Some(Self {
-            store: Arc::new(store),
-            kv: targets.kv,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .context("building the HTTP client")?,
-        }))
+        Ok(cf_publish::Client::new(targets)?.map(|cf| Self { cf }))
     }
 
     fn key(policy: &str, rel: &str) -> ObjPath {
@@ -361,14 +191,10 @@ impl Publisher {
 
         // The version the flip will be conditional on, read BEFORE anything
         // changes. Absent means "create, and fail if someone beat us".
-        let prior = match self.store.head(&manifest_key).await {
-            Ok(m) => Some(UpdateVersion {
-                e_tag: m.e_tag,
-                version: m.version,
-            }),
-            Err(object_store::Error::NotFound { .. }) => None,
+        let prior = match self.cf.version_of(&manifest_key).await {
+            Ok(v) => v,
             Err(e) => {
-                record.files = Outcome::failed(anyhow::Error::from(e).context("head manifest"));
+                record.files = Outcome::failed(e);
                 return self.finish(dir, record, started);
             }
         };
@@ -388,29 +214,18 @@ impl Publisher {
         }
 
         // 2. The manifest, conditionally.
-        let mode = prior.map_or(PutMode::Create, PutMode::Update);
         let body = std::fs::read(dir.join(MANIFEST))?;
-        let put = self
-            .store
-            .put_opts(
+        match self
+            .cf
+            .put_conditional(
                 &manifest_key,
-                PutPayload::from(body),
-                PutOptions {
-                    mode,
-                    attributes: manifest_attributes(),
-                    ..Default::default()
-                },
+                body,
+                pointer_attributes("application/json"),
+                prior,
             )
-            .await;
-        match put {
-            Ok(_) => record.manifest = Outcome::Done,
-            Err(e @ object_store::Error::Precondition { .. })
-            | Err(e @ object_store::Error::AlreadyExists { .. }) => {
-                record.manifest = Outcome::failed(format!(
-                    "the manifest in R2 changed under this publish — another writer? ({e})"
-                ));
-                return self.finish(dir, record, started);
-            }
+            .await
+        {
+            Ok(()) => record.manifest = Outcome::Done,
             Err(e) => {
                 record.manifest = Outcome::failed(e);
                 return self.finish(dir, record, started);
@@ -430,7 +245,7 @@ impl Publisher {
         }
 
         // 4. The bundle, to every namespace.
-        match &self.kv {
+        match self.cf.kv() {
             None => record.bundle = Outcome::NotConfigured,
             Some(kv) => {
                 let bytes = std::fs::read(&bundle_path)?;
@@ -439,7 +254,11 @@ impl Publisher {
                 })?;
                 let mut failed = 0usize;
                 for ns in &kv.namespaces {
-                    let outcome = match self.put_kv(kv, ns, policy, &bytes, &metadata).await {
+                    let outcome = match self
+                        .cf
+                        .put_kv(kv, ns, policy, &bytes, policy_archive::BUNDLE, &metadata)
+                        .await
+                    {
                         Ok(()) => Outcome::Done,
                         Err(e) => {
                             failed += 1;
@@ -518,31 +337,26 @@ impl Publisher {
         let gz = crate::archive::gzip(&raw)?;
         let mut attrs = Attributes::new();
         // It changes; a year-long immutable cache would pin a stale graph.
-        attrs.insert(Attribute::CacheControl, "public, max-age=300".into());
-        attrs.insert(Attribute::ContentType, "application/octet-stream".into());
+        attrs.insert(
+            object_store::Attribute::CacheControl,
+            "public, max-age=300".into(),
+        );
+        attrs.insert(
+            object_store::Attribute::ContentType,
+            "application/octet-stream".into(),
+        );
         // An ABSENT Content-Encoding is the identity encoding, so the raw
         // case sets no header — and the key's suffix already tells a reader
         // which case it is looking at.
         let (rel, body) = match gz.len() < raw.len() {
             true => {
-                attrs.insert(Attribute::ContentEncoding, "gzip".into());
+                attrs.insert(object_store::Attribute::ContentEncoding, "gzip".into());
                 (format!("{}.gz", policy_archive::GRAPH), gz)
             }
             false => (policy_archive::GRAPH.to_string(), raw),
         };
         let n = body.len() as u64;
-        let key = Self::key(policy, &rel);
-        self.store
-            .put_opts(
-                &key,
-                PutPayload::from(body),
-                PutOptions {
-                    attributes: attrs,
-                    ..Default::default()
-                },
-            )
-            .await
-            .with_context(|| format!("put {key}"))?;
+        self.cf.put(&Self::key(policy, &rel), body, attrs).await?;
         Ok(Some(n))
     }
 
@@ -557,99 +371,24 @@ impl Publisher {
                 .with_context(|| format!("stat {}", path.display()))?
                 .len();
             let key = Self::key(policy, rel);
-            match self.store.head(&key).await {
-                Ok(m) if m.size == len => {
-                    out.skipped += 1;
-                    continue;
-                }
-                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => return Err(anyhow::Error::from(e).context(format!("head {key}"))),
+            // Immutable objects never reuse a name, so size is identity
+            // enough to skip the upload.
+            if self.cf.size_of(&key).await? == Some(len) {
+                out.skipped += 1;
+                continue;
             }
             let body = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            self.store
-                .put_opts(
-                    &key,
-                    PutPayload::from(body),
-                    PutOptions {
-                        attributes: immutable(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .with_context(|| format!("put {key}"))?;
+            self.cf.put(&key, body, immutable_attributes()).await?;
             out.uploaded += 1;
             out.bytes += len;
         }
         Ok(out)
     }
 
-    /// One KV write, three attempts. The API wants multipart: the value
-    /// and a JSON metadata part.
-    async fn put_kv(
-        &self,
-        kv: &KvTarget,
-        namespace: &str,
-        policy: &str,
-        bytes: &[u8],
-        metadata: &str,
-    ) -> Result<()> {
-        let url = format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/storage/kv/namespaces/{namespace}/values/{policy}",
-            kv.account_id
-        );
-        let mut last = None;
-        for attempt in 1..=3u32 {
-            let form = reqwest::multipart::Form::new()
-                .part(
-                    "value",
-                    reqwest::multipart::Part::bytes(bytes.to_vec())
-                        .file_name(policy_archive::BUNDLE)
-                        .mime_str("application/octet-stream")?,
-                )
-                .text("metadata", metadata.to_string());
-            let sent = self
-                .http
-                .put(&url)
-                .bearer_auth(&kv.token)
-                .multipart(form)
-                .send()
-                .await;
-            match sent {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    let body: String = body.chars().take(200).collect();
-                    // 4xx is ours to fix, not to retry.
-                    if status.is_client_error() {
-                        bail!("KV PUT {status}: {body}");
-                    }
-                    last = Some(format!("KV PUT {status}: {body}"));
-                }
-                Err(e) => last = Some(format!("KV PUT: {e}")),
-            }
-            tokio::time::sleep(Duration::from_secs(u64::from(attempt) * 2)).await;
-        }
-        bail!("{} (after 3 attempts)", last.unwrap_or_default())
-    }
-
     async fn prune(&self, policy: &str, keep: &BTreeSet<ObjPath>) -> Result<usize> {
-        let prefix = ObjPath::from(format!("{PREFIX}/{policy}"));
-        let mut listed = self.store.list(Some(&prefix));
-        let mut stale = Vec::new();
-        while let Some(meta) = listed.next().await {
-            let meta = meta.context("list")?;
-            if !keep.contains(&meta.location) {
-                stale.push(meta.location);
-            }
-        }
-        for key in &stale {
-            self.store
-                .delete(key)
-                .await
-                .with_context(|| format!("delete {key}"))?;
-        }
-        Ok(stale.len())
+        self.cf
+            .prune(&ObjPath::from(format!("{PREFIX}/{policy}")), keep)
+            .await
     }
 }
 
@@ -737,36 +476,5 @@ mod tests {
         assert!(r.summary().contains("prune skipped"));
         let back: Record = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.manifest, r.manifest);
-    }
-
-    /// Targets come from the environment by the names the box already has;
-    /// KV without a token is "not configured", never an error.
-    #[test]
-    fn targets_read_the_box_environment() {
-        // SAFETY (test-only): no other thread reads these variables here.
-        unsafe {
-            std::env::set_var("R2_ENDPOINT", "https://x.r2.cloudflarestorage.com");
-            std::env::set_var("R2_ACCESS_KEY_ID", "k");
-            std::env::set_var("R2_SECRET_ACCESS_KEY", "s");
-            std::env::set_var("R2_BUCKET", "b");
-            std::env::set_var("R2_ACCOUNT_ID", "acct");
-            std::env::set_var("KV_NAMESPACE_IDS", "one two");
-            std::env::remove_var("CF_KV_TOKEN");
-        }
-        let t = Targets::from_env();
-        assert!(t.r2.is_some());
-        assert!(t.kv.is_none(), "no token, no KV");
-        unsafe {
-            std::env::set_var("CF_KV_TOKEN", "SECRET-TOKEN-VALUE");
-        }
-        let t = Targets::from_env();
-        assert!(
-            !t.describe().contains("SECRET-TOKEN-VALUE") && !t.describe().contains("acct"),
-            "never a secret or an account id in the log line: {}",
-            t.describe()
-        );
-        let kv = t.kv.expect("configured");
-        assert_eq!(kv.account_id, "acct", "falls back to the R2 account id");
-        assert_eq!(kv.namespaces, vec!["one", "two"]);
     }
 }

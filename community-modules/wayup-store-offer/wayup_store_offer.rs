@@ -24,7 +24,7 @@ use std::cell::RefCell;
 
 use mitos_community_events::wayup_store_offer::WayupStoreOffer;
 use mitos_marketplace_decode::{
-    decode_wayup_offer_lifecycle, AssetId, DecodeTx, OutputDatum, TxInput, TxOutput,
+    decode_wayup_offer_lifecycle, AssetId, AssetQuantity, DecodeTx, OutputDatum, TxInput, TxOutput,
     WayupOfferConfig,
 };
 use serde::Deserialize;
@@ -33,10 +33,23 @@ use crate::mitos::platform_v2::chain_data;
 use crate::mitos::platform_v2::emit;
 use crate::mitos::platform_v2::logging::{self, LogLevel};
 use crate::mitos::platform_v2::types::{
-    AssetEntry, ConsumedEvent, ProducedEvent, TxContextEvent, TypedDatum, UtxoEvent,
+    AssetEntry, ConsumedEvent, DatumKind as WitDatumKind, ProducedEvent, TxContextEvent,
+    TypedDatum, UtxoEvent,
 };
 
 const LOG_TARGET: &str = "wayup-store-offer-module";
+
+/// The host's datum shape, in the wire vocabulary consumers read.
+///
+/// Recorded so a consumer holding `datum_cbor` can build a cancel
+/// without re-reading the output: a hash datum's preimage must be
+/// witnessed, an inline one must not.
+fn to_event_datum_kind(kind: WitDatumKind) -> mitos_community_events::DatumKind {
+    match kind {
+        WitDatumKind::Inline => mitos_community_events::DatumKind::Inline,
+        WitDatumKind::Hash => mitos_community_events::DatumKind::Hash,
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
@@ -50,12 +63,17 @@ thread_local! {
     static OFFER_CONFIG: RefCell<WayupOfferConfig> = RefCell::new(WayupOfferConfig::default());
 }
 
-fn to_asset_ids(assets: &[AssetEntry]) -> Vec<AssetId> {
+/// The host's assets in the decoders' shared vocabulary. Carries `quantity`,
+/// which this used to discard — see the sibling jpg module.
+fn to_asset_amounts(assets: &[AssetEntry]) -> Vec<AssetQuantity> {
     assets
         .iter()
-        .map(|e| AssetId {
-            policy: e.asset.policy.clone(),
-            name: e.asset.name.clone(),
+        .map(|e| AssetQuantity {
+            asset_id: AssetId {
+                policy_id: hex::encode(&e.asset.policy),
+                asset_name_hex: hex::encode(&e.asset.name),
+            },
+            quantity: e.quantity,
         })
         .collect()
 }
@@ -74,20 +92,20 @@ fn resolve_datum_bytes(datum: &TypedDatum) -> Option<Vec<u8>> {
 /// candidates (assets only).
 fn build_output(p: &ProducedEvent, cfg: &WayupOfferConfig) -> TxOutput {
     let datum = if cfg.is_offer_address(&p.output.address) {
-        p.datum
-            .as_ref()
-            .and_then(resolve_datum_bytes)
-            .map(|bytes| OutputDatum {
+        p.datum.as_ref().and_then(|d| {
+            resolve_datum_bytes(d).map(|bytes| OutputDatum {
                 payload: bytes,
                 hash: Vec::new(),
+                kind: Some(to_event_datum_kind(d.kind)),
             })
+        })
     } else {
         None
     };
     TxOutput {
         address: p.output.address.clone(),
         lovelace: p.output.lovelace,
-        assets: to_asset_ids(&p.output.assets),
+        assets: to_asset_amounts(&p.output.assets),
         index: p.oref.index,
         datum,
     }

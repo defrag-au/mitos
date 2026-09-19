@@ -357,9 +357,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 6000000,
     "output_index": 1,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 6000000
+    },
     "target_asset_names": [],
     "target_policy": "a316bcf768f0309be743b4b7d067f3348017bf0f00f6a29562aebda2",
     "tx_hash": "3938ca11327828f9d9efdf10399f949132f48c80af88686003e262d05a090c08"
@@ -733,9 +737,13 @@
       255,
       255
     ],
+    "datum_kind": "Hash",
     "kind": "create",
-    "lovelace": 150000000,
     "output_index": 1,
+    "price": {
+      "kind": "lovelace",
+      "lovelace": 150000000
+    },
     "target_asset_names": [
       "505245443033333835"
     ],
