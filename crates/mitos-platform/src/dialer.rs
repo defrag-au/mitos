@@ -21,23 +21,38 @@
 //! once-resolved apply/recapture URLs + auth + per-companion bulk
 //! capability cache.
 //!
+//! ## One drain per MODULE, every INSTANCE's store
+//!
+//! A module can have more than one instance (WO-06), and each keeps its own
+//! `emissions.redb`. The drain still runs one task per module and reads them
+//! all — NOT one task per instance, which would let two tasks POST to the
+//! same companion at once and would split the recapture wipe's "never
+//! overlaps an apply" guarantee across tasks that cannot see each other. See
+//! `mitos_lifecycle::routing::DrainPass`.
+//!
 //! ## Per-tick lifecycle
 //!
-//! 1. **Pending requeue** — on module-task start, flip every row
-//!    left `Pending` by a prior host process back to `Queued`
-//!    (`requeue_all_pending`). Catches the host-crash-mid-request
-//!    case (analog of the legacy reconnect-time requeue).
-//! 2. **Scan once** — `list_queued_grouped_by_companion` reads all
+//! 1. **Reconcile the open stores** — `list_instances` for the module; shut
+//!    down and drop the writers of keys that are gone (an upload RENAMES the
+//!    directory, so `K1` disappears and `K2` appears with the same file),
+//!    then for keys newly seen in this process run `requeue_all_pending`,
+//!    which flips every row left `Pending` by a prior host process back to
+//!    `Queued`. Only at the START of a tick: between ticks is the one moment
+//!    no in-flight send is holding a status writer.
+//! 2. **Scan once per store** — `list_queued_grouped_by_companion` reads all
 //!    `Queued` rows in one txn, grouped by `(companion, client)`.
-//! 3. **Fan out** — for each registered companion that has rows,
-//!    is not backing off, and is not mid-recapture, spawn a
-//!    `pool::run_tick` drain (bounded by `MITOS_DIALER_MODULE_CONCURRENCY`).
+//! 3. **Plan** — [`plan_module_tick`], a pure function: each companion's
+//!    batch is tagged `Leftover` or `Serving` by `routing::drain_pass`, and
+//!    companions that are backing off or mid-recapture are dropped.
+//! 4. **Fan out** — run every `Leftover` batch to completion (bounded by
+//!    `MITOS_DIALER_MODULE_CONCURRENCY`), update `retry`, THEN run the
+//!    `Serving` batches, minus any companion whose leftovers just failed.
 //!    Each row → one HTTP POST to `/_internal/apply-<channel>`
 //!    (or the bulk route). Response status maps to:
 //!      - `2xx` → `Acked`
 //!      - `422` → `Nacked` (apply errored; won't help to retry)
 //!      - `5xx` / network error → leave `Queued`, back off + retry
-//! 4. **Backoff** — a companion's transport errors trigger
+//! 5. **Backoff** — a companion's transport errors trigger
 //!    per-companion exponential backoff up to `MAX_BACKOFF`
 //!    (tracked in the task's `retry` map; the loop keeps ticking
 //!    for the other companions). A module-level `CancellationToken`
@@ -84,6 +99,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use mitos_lifecycle::ids::InstanceKey;
+use mitos_lifecycle::routing::{self, DrainPass};
 use mitos_protocol::{
     HTTP_DELIVERY_MIME, RecaptureBody, SubscribeRequest, SubscribeTarget, encode_recapture,
 };
@@ -97,6 +114,7 @@ use crate::admin::AuthToken;
 use crate::emissions::EmissionRecord;
 use crate::host_v2::InterestRouter;
 use crate::indexer_bridge::IndexerBridgeHandle;
+use crate::rows::{RowCache, instance_dir_of};
 use crate::storage::ModuleStorage;
 
 mod pool;
@@ -249,6 +267,17 @@ enum ModuleControl {
     Recapture {
         id: CompanionId,
         reason: Option<String>,
+    },
+    /// Let go of one instance's emissions store — shut down its status
+    /// writer and drop the handle — and say when that is done.
+    ///
+    /// A reap removes the instance directory, and a status writer holding a
+    /// clone of its `emissions.redb` is exactly what makes `remove_dir_all`
+    /// fail. `evict_instance` sends this and awaits the reply before it
+    /// closes anything.
+    ReleaseInstance {
+        key: InstanceKey,
+        done: oneshot::Sender<()>,
     },
 }
 
@@ -695,6 +724,43 @@ impl CompanionDialer {
         cancelled_keys
     }
 
+    /// Ask the module's drain to let go of ONE instance's emissions store,
+    /// and wait until it has.
+    ///
+    /// `evict_instance` calls this before it closes handles and removes the
+    /// directory: the drain's status writer owns a clone of that store, and a
+    /// live redb handle is what makes `remove_dir_all` fail. The reply comes
+    /// after the writer has DRAINED, so a status update in flight is written
+    /// to the file rather than lost with it.
+    ///
+    /// Returns at once when the module has no drain — nothing holds the store
+    /// and there is nothing to wait for.
+    pub async fn release_instance(&self, key: &InstanceKey) {
+        let control_tx = {
+            let drains = self.module_drains.lock().await;
+            drains
+                .get(key.module.as_str())
+                .map(|d| d.control_tx.clone())
+        };
+        let Some(control_tx) = control_tx else {
+            return;
+        };
+        let (done, wait) = oneshot::channel();
+        if control_tx
+            .send(ModuleControl::ReleaseInstance {
+                key: key.clone(),
+                done,
+            })
+            .is_err()
+        {
+            // The drain task is gone, which means its stores went with it.
+            return;
+        }
+        // The drain handles control frames between ticks, so this waits out
+        // at most one tick's in-flight sends.
+        let _ = wait.await;
+    }
+
     /// Coordinate a per-module recapture across every subscribed
     /// companion. Snapshots the module's companions, registers a
     /// `pending_recaptures` oneshot per companion, then pushes one
@@ -841,13 +907,21 @@ fn resolve_companion_dial(
     })
 }
 
-/// Per-module drain task. Opens the module's shared
-/// `EmissionsStore` + a shared `reqwest::Client` once, then loops:
-/// each `POLL_INTERVAL` it scans the store once and fans the queued
-/// rows to every registered companion (bounded concurrency); a
-/// control channel carries recapture frames, serialised against the
-/// tick-drain so a wipe POST never overlaps an apply POST for the
-/// same companion. See the module-level docs.
+/// One instance's half of a module's drain: its emissions store and the
+/// status writer that owns redb writes to it.
+struct OpenStore {
+    store: crate::emissions::EmissionsStore,
+    status_writer: pool::StatusWriterHandle,
+}
+
+/// Per-module drain task. Holds one open store per INSTANCE of the module
+/// plus a shared `reqwest::Client`, then loops: each `POLL_INTERVAL` it
+/// reconciles the open set against the instance directories, scans each store
+/// once, and fans the queued rows to every registered companion (bounded
+/// concurrency, leftovers before serving). A control channel carries
+/// recapture frames and instance releases, serialised against the tick-drain
+/// so a wipe POST never overlaps an apply POST for the same companion. See
+/// the module-level docs.
 async fn run_module_drain(
     module_id: String,
     storage: ModuleStorage,
@@ -856,10 +930,10 @@ async fn run_module_drain(
     registry: Arc<Mutex<HashMap<CompanionId, CompanionDial>>>,
     pending_recaptures: Arc<Mutex<HashMap<CompanionId, oneshot::Sender<()>>>>,
 ) {
-    let store = match storage.emissions_store(&module_id) {
-        Ok(s) => s,
+    let module = match mitos_lifecycle::ids::ModuleId::parse(&module_id) {
+        Ok(module) => module,
         Err(e) => {
-            error!(module = %module_id, error = %e, "open EmissionsStore failed; module drain exiting");
+            error!(module = %module_id, error = %e, "not a module id; drain exiting");
             return;
         }
     };
@@ -875,28 +949,9 @@ async fn run_module_drain(
         }
     };
 
-    // Crash recovery: flip every row left Pending by a prior host
-    // process back to Queued (per-module analog of the old
-    // per-companion requeue-on-task-start).
-    match store.requeue_all_pending(&now_rfc3339()) {
-        Ok(0) => {}
-        Ok(count) => {
-            info!(module = %module_id, count, "requeued Pending emissions on module drain start")
-        }
-        Err(e) => {
-            warn!(module = %module_id, error = %e, "requeue Pending failed on module drain start")
-        }
-    }
-
     let lane_config = LaneConfig::from_env();
     let bulk_config = pool::BulkConfig::from_env();
     let concurrency = module_drain_concurrency();
-    // One status writer per module owns redb writes for the shared
-    // emissions table; every spawned companion drain sends through
-    // its cloned sender. This is strictly fewer writers contending
-    // on the single-writer txn than the old one-writer-per-companion
-    // model.
-    let status_writer = pool::spawn_status_writer(store.clone(), cancel.clone());
     info!(
         module = %module_id,
         lanes = lane_config.lanes,
@@ -905,6 +960,11 @@ async fn run_module_drain(
         "module drain task started"
     );
 
+    // One status writer per INSTANCE store: each owns redb writes to its own
+    // `emissions.redb`, and every spawned companion drain sends through a
+    // clone of the sender belonging to the store its rows came from.
+    let mut open: HashMap<InstanceKey, OpenStore> = HashMap::new();
+    let mut rows = RowCache::default();
     let mut retry: HashMap<CompanionId, RetryState> = HashMap::new();
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -915,13 +975,13 @@ async fn run_module_drain(
             biased;
 
             _ = cancel.cancelled() => {
-                status_writer.shutdown().await;
+                shutdown_open(&mut open).await;
                 return;
             }
 
             ctrl = control_rx.recv() => {
                 let Some(ctrl) = ctrl else {
-                    status_writer.shutdown().await;
+                    shutdown_open(&mut open).await;
                     return; // all senders dropped — module retired
                 };
                 match ctrl {
@@ -936,16 +996,32 @@ async fn run_module_drain(
                         )
                         .await;
                     }
+                    ModuleControl::ReleaseInstance { key, done } => {
+                        if let Some(entry) = open.remove(&key) {
+                            // Drains the queue before it returns, so a
+                            // status update in flight is written before the
+                            // caller removes the file it would have gone to.
+                            entry.status_writer.shutdown().await;
+                            info!(
+                                module = %module_id,
+                                instance = %key.dir_name(),
+                                "drain released an instance's emissions store",
+                            );
+                        }
+                        let _ = done.send(());
+                    }
                 }
             }
 
             _ = tick.tick() => {
+                reconcile_open_stores(&module, &storage, &cancel, &mut open).await;
                 if let Err(e) = run_module_tick(
+                    &storage,
                     &module_id,
-                    &store,
+                    &open,
                     &registry,
                     &client,
-                    &status_writer,
+                    &mut rows,
                     &mut retry,
                     lane_config,
                     bulk_config,
@@ -964,54 +1040,188 @@ async fn run_module_drain(
     }
 }
 
-/// One drain pass for a module: scan the store once, then deliver
-/// each eligible companion's rows concurrently (bounded). Updates
-/// `retry` from the per-companion results. Returns `Err` only if
-/// the store scan itself fails.
-#[allow(clippy::too_many_arguments)]
-async fn run_module_tick(
-    module_id: &str,
-    store: &crate::emissions::EmissionsStore,
-    registry: &Arc<Mutex<HashMap<CompanionId, CompanionDial>>>,
-    client: &reqwest::Client,
-    status_writer: &pool::StatusWriterHandle,
-    retry: &mut HashMap<CompanionId, RetryState>,
-    lane_config: LaneConfig,
-    bulk_config: pool::BulkConfig,
-    concurrency: usize,
-) -> anyhow::Result<()> {
-    let per_companion = store
-        .list_queued_grouped_by_companion()
-        .map_err(|e| anyhow::anyhow!("list queued grouped by companion: {e}"))?;
-    if per_companion.is_empty() {
-        return Ok(());
+async fn shutdown_open(open: &mut HashMap<InstanceKey, OpenStore>) {
+    for (_, entry) in open.drain() {
+        entry.status_writer.shutdown().await;
+    }
+}
+
+/// Bring the set of open per-instance stores into line with the instance
+/// directories on disk.
+///
+/// **At the START of a tick and nowhere else.** Every send a tick spawns
+/// holds a clone of its store's status sender and the tick joins them all
+/// before it returns, so between ticks is the one moment no send can be
+/// holding a writer that is about to be shut down.
+async fn reconcile_open_stores(
+    module: &mitos_lifecycle::ids::ModuleId,
+    storage: &ModuleStorage,
+    cancel: &CancellationToken,
+    open: &mut HashMap<InstanceKey, OpenStore>,
+) {
+    let listed = match storage.list_instances(module) {
+        Ok(listed) => listed,
+        Err(e) => {
+            warn!(
+                module = %module,
+                error = %e,
+                "drain: list_instances failed; keeping the stores already open",
+            );
+            return;
+        }
+    };
+
+    // Departed FIRST, and AWAITED, before anything is requeued. An upload
+    // renames the directory, so `K1` disappears and `K2` appears — and `K2`'s
+    // store IS `K1`'s file. Requeue it while `K1`'s writer still holds an
+    // unwritten `Acked` and that row goes back to `Queued`, is listed by this
+    // very tick, and is sent twice.
+    let departed: Vec<InstanceKey> = open
+        .keys()
+        .filter(|key| !listed.contains(key))
+        .cloned()
+        .collect();
+    for key in departed {
+        if let Some(entry) = open.remove(&key) {
+            entry.status_writer.shutdown().await;
+            debug!(
+                module = %module,
+                instance = %key.dir_name(),
+                "drain: instance directory gone; its store is released",
+            );
+        }
     }
 
-    let dials = { registry.lock().await.clone() };
-    let now = Instant::now();
-
-    // Build the work list: companions that are registered, not
-    // backing off, and not mid-recapture.
-    let mut work: Vec<(CompanionId, pool::TickArgs)> = Vec::new();
-    for ((companion_key, client_id), rows) in per_companion {
-        let id = CompanionId::new(module_id, &client_id, &companion_key);
-        let Some(dial) = dials.get(&id) else {
-            // Rows for an unregistered companion (e.g. the
-            // `:unsubscribed` sentinel before a subscribe claims
-            // them) — nothing to deliver to yet.
+    for key in listed {
+        if open.contains_key(&key) {
             continue;
+        }
+        let store = match storage.emissions_store_at(&key) {
+            Ok(store) => store,
+            Err(e) => {
+                warn!(
+                    module = %module,
+                    instance = %key.dir_name(),
+                    error = %e,
+                    "drain: open EmissionsStore failed; skipping this instance until next tick",
+                );
+                continue;
+            }
         };
-        if dial.recapturing.load(Ordering::Relaxed) {
-            continue;
+        // Crash recovery, once per store per process: flip every row left
+        // `Pending` by a prior host process back to `Queued`.
+        match store.requeue_all_pending(&now_rfc3339()) {
+            Ok(0) => {}
+            Ok(count) => info!(
+                module = %module,
+                instance = %key.dir_name(),
+                count,
+                "requeued Pending emissions on first sight of this instance's store",
+            ),
+            Err(e) => warn!(
+                module = %module,
+                instance = %key.dir_name(),
+                error = %e,
+                "requeue Pending failed",
+            ),
         }
-        if let Some(rs) = retry.get(&id)
-            && rs.next_retry_at > now
-        {
-            continue;
-        }
-        work.push((
-            id,
-            pool::TickArgs {
+        let status_writer = pool::spawn_status_writer(store.clone(), cancel.clone());
+        open.insert(
+            key,
+            OpenStore {
+                store,
+                status_writer,
+            },
+        );
+    }
+}
+
+/// One instance's queued rows, as scanned this tick.
+struct InstanceScan {
+    key: InstanceKey,
+    /// `((companion_key, client_id), rows)` — the shape the store's scan
+    /// returns.
+    queued: Vec<((String, String), Vec<EmissionRecord>)>,
+    /// Rows delivered from this instance report their status through THIS
+    /// store's writer. A clone of another's would write to the wrong file.
+    status_tx: mpsc::UnboundedSender<pool::StatusUpdate>,
+}
+
+/// One companion's work for one pass: its batches, one per instance that
+/// holds rows for it, run IN SEQUENCE.
+///
+/// Sequence, not concurrency: two apply POSTs to one companion at once is
+/// exactly what one-drain-per-module exists to prevent, and a client can be
+/// owed rows by more than one instance it has left.
+struct CompanionWork {
+    id: CompanionId,
+    batches: Vec<pool::TickArgs>,
+}
+
+/// One tick's work, in the order it must run.
+#[derive(Default)]
+struct TickPlan {
+    leftover: Vec<CompanionWork>,
+    serving: Vec<CompanionWork>,
+}
+
+/// Whether a companion's backoff window is still open.
+fn backing_off(retry: &HashMap<CompanionId, RetryState>, id: &CompanionId, now: Instant) -> bool {
+    matches!(retry.get(id), Some(rs) if rs.next_retry_at > now)
+}
+
+/// Decide WHAT this tick sends and IN WHICH ORDER — with no network and no
+/// clock beyond the `now` it is handed.
+///
+/// Split out of [`run_module_tick`] because every decision here is worth a
+/// test and none of them needs an HTTP receiver: which companions are skipped
+/// (unregistered, mid-recapture, backing off) and which of their batches are
+/// `Leftover` — rows an instance the client has LEFT still owes it, older
+/// than anything its current instance holds, so they go first.
+#[allow(clippy::too_many_arguments)]
+fn plan_module_tick(
+    storage: &ModuleStorage,
+    module_id: &str,
+    scanned: Vec<InstanceScan>,
+    dials: &HashMap<CompanionId, CompanionDial>,
+    module_current: Option<&InstanceKey>,
+    retry: &HashMap<CompanionId, RetryState>,
+    now: Instant,
+    rows: &mut RowCache,
+    client: &reqwest::Client,
+    lane_config: LaneConfig,
+    bulk_config: pool::BulkConfig,
+) -> TickPlan {
+    let mut leftover: Vec<CompanionWork> = Vec::new();
+    let mut serving: Vec<CompanionWork> = Vec::new();
+    for scan in scanned {
+        for ((companion_key, client_id), queued) in scan.queued {
+            let id = CompanionId::new(module_id, &client_id, &companion_key);
+            let Some(dial) = dials.get(&id) else {
+                // Rows for an unregistered companion (e.g. the
+                // `:unsubscribed` sentinel before a subscribe claims
+                // them) — nothing to deliver to yet.
+                continue;
+            };
+            if dial.recapturing.load(Ordering::Relaxed) {
+                continue;
+            }
+            if backing_off(retry, &id, now) {
+                continue;
+            }
+            let pass = match module_current {
+                Some(current) => routing::drain_pass(
+                    rows.get(storage, module_id, &client_id),
+                    &scan.key,
+                    current,
+                    |other| instance_dir_of(storage, other),
+                ),
+                // Nothing to compare against — an unactivated module, or a
+                // pointer that would not read. Fail open, as the fan-out
+                // does: everything is this instance's to serve.
+                None => DrainPass::Serving,
+            };
+            let args = pool::TickArgs {
                 client: client.clone(),
                 apply_url: dial.apply_url.clone(),
                 bulk_url: dial.bulk_url.clone(),
@@ -1021,22 +1231,132 @@ async fn run_module_tick(
                 channel: module_id.to_string(),
                 header_name: dial.header_name.clone(),
                 header_value: dial.header_value.clone(),
-                grouped: group_by_partition(rows),
+                grouped: group_by_partition(queued),
                 companion_key: dial.companion_key.clone(),
-                status_tx: status_writer.sender(),
+                status_tx: scan.status_tx.clone(),
                 lanes: lane_config.lanes,
                 now: now_rfc3339,
-            },
-        ));
+            };
+            let into = match pass {
+                DrainPass::Leftover => &mut leftover,
+                DrainPass::Serving => &mut serving,
+            };
+            match into.iter_mut().find(|work| work.id == id) {
+                Some(work) => work.batches.push(args),
+                None => into.push(CompanionWork {
+                    id,
+                    batches: vec![args],
+                }),
+            }
+        }
     }
-    if work.is_empty() {
+    TickPlan { leftover, serving }
+}
+
+/// One drain pass for a module: scan every open store once, plan, then run
+/// the leftovers to completion before the serving batches. Updates `retry`
+/// from the per-companion results. Returns `Err` only if a store scan itself
+/// fails.
+#[allow(clippy::too_many_arguments)]
+async fn run_module_tick(
+    storage: &ModuleStorage,
+    module_id: &str,
+    open: &HashMap<InstanceKey, OpenStore>,
+    registry: &Arc<Mutex<HashMap<CompanionId, CompanionDial>>>,
+    client: &reqwest::Client,
+    rows: &mut RowCache,
+    retry: &mut HashMap<CompanionId, RetryState>,
+    lane_config: LaneConfig,
+    bulk_config: pool::BulkConfig,
+    concurrency: usize,
+) -> anyhow::Result<()> {
+    let mut scanned: Vec<InstanceScan> = Vec::new();
+    for (key, entry) in open {
+        let queued = entry
+            .store
+            .list_queued_grouped_by_companion()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "list queued grouped by companion for {}: {e}",
+                    key.dir_name()
+                )
+            })?;
+        if queued.is_empty() {
+            continue;
+        }
+        scanned.push(InstanceScan {
+            key: key.clone(),
+            queued,
+            status_tx: entry.status_writer.sender(),
+        });
+    }
+    if scanned.is_empty() {
         return Ok(());
     }
+    // Deterministic, so a companion owed by two instances is always served
+    // in the same sequence rather than in `HashMap` iteration order.
+    scanned.sort_by_key(|scan| scan.key.dir_name());
 
-    // Deliver concurrently, bounded by `concurrency`.
+    let dials = { registry.lock().await.clone() };
+    let now = Instant::now();
+    // ONCE per tick, not once per row. An upload can move it mid-tick; the
+    // next tick sees the new one.
+    let module_current = match storage.current_instance(module_id) {
+        Ok(current) => current,
+        Err(e) => {
+            warn!(
+                module = %module_id,
+                error = %e,
+                "drain: current instance unreadable; treating every batch as this tick's to serve",
+            );
+            None
+        }
+    };
+
+    let plan = plan_module_tick(
+        storage,
+        module_id,
+        scanned,
+        &dials,
+        module_current.as_ref(),
+        retry,
+        now,
+        rows,
+        client,
+        lane_config,
+        bulk_config,
+    );
+
+    // Leftovers first, to completion, updating `retry` from their results…
+    run_pass(module_id, plan.leftover, concurrency, retry).await;
+    // …so a companion whose leftovers just failed is already backing off when
+    // its serving batch would have been sent. Sending it anyway would put
+    // rows the old instance still owed BEHIND rows the new one produced.
+    let now = Instant::now();
+    let serving: Vec<CompanionWork> = plan
+        .serving
+        .into_iter()
+        .filter(|work| !backing_off(retry, &work.id, now))
+        .collect();
+    run_pass(module_id, serving, concurrency, retry).await;
+    Ok(())
+}
+
+/// Deliver one pass's work list concurrently, bounded by `concurrency`, and
+/// fold the outcomes into `retry`.
+async fn run_pass(
+    module_id: &str,
+    work: Vec<CompanionWork>,
+    concurrency: usize,
+    retry: &mut HashMap<CompanionId, RetryState>,
+) {
+    if work.is_empty() {
+        return;
+    }
+    let started = Instant::now();
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut set: JoinSet<(CompanionId, anyhow::Result<()>)> = JoinSet::new();
-    for (id, args) in work {
+    for CompanionWork { id, batches } in work {
         let permit = sem
             .clone()
             .acquire_owned()
@@ -1044,7 +1364,17 @@ async fn run_module_tick(
             .expect("module drain semaphore never closed");
         set.spawn(async move {
             let _permit = permit;
-            (id, pool::run_tick(args).await)
+            // In sequence — see `CompanionWork`. The first failure ends this
+            // companion's pass: a later batch delivered past a failed earlier
+            // one would arrive out of order.
+            let mut outcome = Ok(());
+            for args in batches {
+                outcome = pool::run_tick(args).await;
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            (id, outcome)
         });
     }
 
@@ -1058,7 +1388,7 @@ async fn run_module_tick(
             Ok((id, Err(e))) => {
                 let rs = retry.entry(id.clone()).or_insert(RetryState {
                     backoff: INITIAL_BACKOFF,
-                    next_retry_at: now,
+                    next_retry_at: started,
                 });
                 let used = rs.backoff;
                 rs.next_retry_at = Instant::now() + used;
@@ -1076,7 +1406,6 @@ async fn run_module_tick(
             }
         }
     }
-    Ok(())
 }
 
 /// Handle one recapture frame in the module drain loop. Sets the
@@ -1342,6 +1671,273 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Planning: what a tick sends and in which order. No network, no
+    // clock beyond the `Instant` it is handed.
+    // -----------------------------------------------------------------
+
+    mod planning {
+        use super::super::*;
+        use mitos_lifecycle::ids::{ModuleId, Sha256Hex};
+        use std::collections::HashSet;
+
+        const MODULE: &str = "ownership-indexer";
+        const CLIENT: &str = "ownership.cnft.dev";
+        const COMPANION: &str = "policy_a";
+
+        struct Fixture {
+            _tmp: tempfile::TempDir,
+            storage: ModuleStorage,
+            current: InstanceKey,
+            other: InstanceKey,
+            client: reqwest::Client,
+        }
+
+        fn fixture() -> Fixture {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = ModuleStorage::new(tmp.path());
+            let wasm = b"planner fixture";
+            storage
+                .activate(
+                    &crate::companions::testing::manifest_for(MODULE, wasm),
+                    wasm,
+                )
+                .unwrap();
+            let current = storage.current_instance(MODULE).unwrap().unwrap();
+            let other = plant(&storage, b"a second build");
+            Fixture {
+                _tmp: tmp,
+                storage,
+                current,
+                other,
+                client: build_http_client().unwrap(),
+            }
+        }
+
+        fn plant(storage: &ModuleStorage, wasm: &[u8]) -> InstanceKey {
+            let manifest = crate::companions::testing::manifest_for(MODULE, wasm);
+            storage.put_artifact(&manifest, wasm).unwrap();
+            let key = InstanceKey {
+                module: ModuleId::parse(MODULE).unwrap(),
+                wasm: Sha256Hex::parse(&crate::manifest::sha256_hex(wasm)).unwrap(),
+                config: None,
+            };
+            storage.write_instance_marker(&key).unwrap();
+            key
+        }
+
+        fn dial() -> (CompanionId, HashMap<CompanionId, CompanionDial>) {
+            let id = CompanionId::new(MODULE, CLIENT, COMPANION);
+            let dial = CompanionDial {
+                id: id.clone(),
+                companion_key: COMPANION.to_owned(),
+                apply_url: "http://127.0.0.1:1/apply".to_owned(),
+                bulk_url: "http://127.0.0.1:1/apply-bulk".to_owned(),
+                recapture_url: "http://127.0.0.1:1/recapture".to_owned(),
+                undo_url: "http://127.0.0.1:1/undo".to_owned(),
+                header_name: None,
+                header_value: None,
+                bulk_capability: Arc::new(AtomicU8::new(pool::BULK_UNKNOWN)),
+                recapturing: Arc::new(AtomicBool::new(false)),
+            };
+            (id.clone(), HashMap::from([(id, dial)]))
+        }
+
+        /// One instance's scan result. The status receiver is dropped: these
+        /// tests only PLAN, and a send on a closed channel is the same
+        /// best-effort no-op a shut-down writer gives in production.
+        fn scan(key: &InstanceKey, ids: &[u64]) -> InstanceScan {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            InstanceScan {
+                key: key.clone(),
+                queued: vec![(
+                    (COMPANION.to_owned(), CLIENT.to_owned()),
+                    ids.iter().map(|id| super::row(*id, b"")).collect(),
+                )],
+                status_tx: tx,
+            }
+        }
+
+        fn place(storage: &ModuleStorage, instance: &InstanceKey) {
+            use mitos_lifecycle::client_move::{ClientRow, Placement};
+            use mitos_lifecycle::ids::{ClientId, ClientKey, Namespace, Revision};
+            let row = ClientRow::adopt(
+                ClientKey {
+                    namespace: Namespace::parse("prod").unwrap(),
+                    client: ClientId::parse(CLIENT).unwrap(),
+                },
+                ModuleId::parse(MODULE).unwrap(),
+                Placement {
+                    instance: instance.clone(),
+                    revision: Revision(0),
+                },
+            );
+            storage.write_row(MODULE, &row).unwrap();
+        }
+
+        fn ids_of(work: &[CompanionWork]) -> Vec<Vec<u64>> {
+            work.iter()
+                .flat_map(|w| w.batches.iter())
+                .map(|args| {
+                    args.grouped
+                        .iter()
+                        .flat_map(|(_, rows)| rows.iter().map(|r| r.id))
+                        .collect()
+                })
+                .collect()
+        }
+
+        /// A client owed rows by the instance it has LEFT gets those first:
+        /// they are older than anything its current instance holds.
+        #[test]
+        fn leftover_batches_are_planned_ahead_of_serving_ones() {
+            let f = fixture();
+            // The row places the client on the OTHER instance, so what sits
+            // in the current instance's store is a leftover.
+            place(&f.storage, &f.other);
+            let (_, dials) = dial();
+            let scanned = vec![scan(&f.current, &[1, 2]), scan(&f.other, &[7, 8])];
+
+            let plan = plan_module_tick(
+                &f.storage,
+                MODULE,
+                scanned,
+                &dials,
+                Some(&f.current),
+                &HashMap::new(),
+                Instant::now(),
+                &mut RowCache::default(),
+                &f.client,
+                LaneConfig::default(),
+                pool::BulkConfig { max: 50 },
+            );
+
+            assert_eq!(ids_of(&plan.leftover), vec![vec![1, 2]]);
+            assert_eq!(ids_of(&plan.serving), vec![vec![7, 8]]);
+        }
+
+        /// A companion inside its backoff window is skipped entirely — not
+        /// moved to the other pass, which would send it anyway.
+        #[test]
+        fn a_companion_backing_off_is_in_neither_list() {
+            let f = fixture();
+            place(&f.storage, &f.other);
+            let (id, dials) = dial();
+            let scanned = vec![scan(&f.current, &[1]), scan(&f.other, &[2])];
+            let now = Instant::now();
+            let retry = HashMap::from([(
+                id,
+                RetryState {
+                    backoff: INITIAL_BACKOFF,
+                    next_retry_at: now + Duration::from_secs(30),
+                },
+            )]);
+
+            let plan = plan_module_tick(
+                &f.storage,
+                MODULE,
+                scanned,
+                &dials,
+                Some(&f.current),
+                &retry,
+                now,
+                &mut RowCache::default(),
+                &f.client,
+                LaneConfig::default(),
+                pool::BulkConfig { max: 50 },
+            );
+
+            assert!(plan.leftover.is_empty());
+            assert!(plan.serving.is_empty());
+        }
+
+        /// No pointer to compare against — an unactivated module, or one
+        /// whose `current.toml` would not read. Fail OPEN, as the fan-out
+        /// does: silence is worse than a duplicate a companion can absorb.
+        #[test]
+        fn an_unresolvable_current_instance_plans_everything_as_serving() {
+            let f = fixture();
+            place(&f.storage, &f.other);
+            let (_, dials) = dial();
+            let scanned = vec![scan(&f.current, &[1]), scan(&f.other, &[2])];
+
+            let plan = plan_module_tick(
+                &f.storage,
+                MODULE,
+                scanned,
+                &dials,
+                None,
+                &HashMap::new(),
+                Instant::now(),
+                &mut RowCache::default(),
+                &f.client,
+                LaneConfig::default(),
+                pool::BulkConfig { max: 50 },
+            );
+
+            assert!(plan.leftover.is_empty());
+            assert_eq!(
+                ids_of(&plan.serving)
+                    .into_iter()
+                    .flatten()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([1, 2]),
+            );
+        }
+
+        /// Rows for a companion nobody has registered — the `:unsubscribed`
+        /// sentinel before a subscribe claims them — are not work.
+        #[test]
+        fn an_unregistered_companion_is_not_planned() {
+            let f = fixture();
+            let scanned = vec![scan(&f.current, &[1])];
+            let plan = plan_module_tick(
+                &f.storage,
+                MODULE,
+                scanned,
+                &HashMap::new(),
+                Some(&f.current),
+                &HashMap::new(),
+                Instant::now(),
+                &mut RowCache::default(),
+                &f.client,
+                LaneConfig::default(),
+                pool::BulkConfig { max: 50 },
+            );
+            assert!(plan.leftover.is_empty() && plan.serving.is_empty());
+        }
+
+        /// Two instances a client has left both owe it rows. They go in ONE
+        /// `CompanionWork`, run in sequence — two concurrent POSTs to one
+        /// companion is what one-drain-per-module exists to prevent.
+        #[test]
+        fn batches_from_two_instances_are_one_companions_work() {
+            let f = fixture();
+            let third = plant(&f.storage, b"a third build");
+            place(&f.storage, &third);
+            let (_, dials) = dial();
+            let scanned = vec![scan(&f.current, &[1]), scan(&f.other, &[2])];
+
+            let plan = plan_module_tick(
+                &f.storage,
+                MODULE,
+                scanned,
+                &dials,
+                Some(&f.current),
+                &HashMap::new(),
+                Instant::now(),
+                &mut RowCache::default(),
+                &f.client,
+                LaneConfig::default(),
+                pool::BulkConfig { max: 50 },
+            );
+
+            assert_eq!(plan.leftover.len(), 1, "one companion, one work item");
+            assert_eq!(plan.leftover[0].batches.len(), 2);
+            assert!(plan.serving.is_empty());
+        }
+    }
+
     #[test]
     fn group_by_partition_buckets_and_preserves_id_order() {
         // Mixed partition keys, interleaved ids. Within each key the
@@ -1401,5 +1997,550 @@ mod tests {
             bulk_url_from_apply("https://x/_internal/apply-mod?key=k&policy_id=p"),
             "https://x/_internal/apply-mod-bulk?key=k&policy_id=p"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Delivery, against a real receiver.
+    //
+    // Nothing in this crate stood up an HTTP receiver before, so the drain
+    // loop itself — the thing that actually POSTs — had no test at all. One
+    // small `axum` router is enough, and it answers the questions that the
+    // planner cannot: what ARRIVED, in what ORDER, and how many times.
+    // -----------------------------------------------------------------
+
+    mod delivery {
+        use super::super::*;
+        use mitos_lifecycle::ids::{ModuleId, Sha256Hex};
+        use std::collections::HashSet;
+        use std::sync::Mutex as StdMutex;
+
+        const MODULE: &str = "ownership-indexer";
+        const CLIENT: &str = "ownership.cnft.dev";
+
+        /// One POST, as the receiver saw it.
+        #[derive(Debug, Clone)]
+        struct Delivery {
+            #[allow(dead_code)] // in the failure message, not in an assertion
+            path: String,
+            ids: Vec<u64>,
+            /// The rows' payloads, read as text. **Emission ids are unique
+            /// per STORE, not per module** — two instances both start at 1 —
+            /// so an id cannot say which instance a row came from. The
+            /// payload can, and every test here labels its rows.
+            labels: Vec<String>,
+        }
+
+        /// A companion, as a receiver.
+        ///
+        /// Records each POST in ARRIVAL ORDER — order is the whole point of
+        /// the leftover/serving split, and a set would not show it.
+        /// `failing` makes one companion answer 500, which is what a Worker
+        /// having a bad day looks like to the drain.
+        #[derive(Clone, Default)]
+        struct Receiver(Arc<StdMutex<ReceiverState>>);
+
+        #[derive(Default)]
+        struct ReceiverState {
+            seen: Vec<Delivery>,
+            failing: HashSet<String>,
+        }
+
+        impl Receiver {
+            fn fail(&self, companion_key: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .failing
+                    .insert(companion_key.to_owned());
+            }
+
+            fn seen(&self) -> Vec<Delivery> {
+                self.0.lock().unwrap().seen.clone()
+            }
+
+            /// Every row that arrived, by label, in arrival order —
+            /// duplicates included, because "exactly once" is a claim about
+            /// the duplicates.
+            fn labels(&self) -> Vec<String> {
+                self.seen().into_iter().flat_map(|d| d.labels).collect()
+            }
+
+            /// Every emission id that arrived, in arrival order. Only
+            /// meaningful within ONE store.
+            fn ids(&self) -> Vec<u64> {
+                self.seen().into_iter().flat_map(|d| d.ids).collect()
+            }
+
+            /// Serve on an ephemeral port; returns the dial-back template.
+            async fn serve(&self) -> String {
+                let app = axum::Router::new()
+                    .fallback(axum::routing::any(handle))
+                    .with_state(self.clone());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    let _ = axum::serve(listener, app).await;
+                });
+                format!("http://{addr}/_internal/{{op}}-{{target}}?key={{key}}")
+            }
+        }
+
+        async fn handle(
+            axum::extract::State(receiver): axum::extract::State<Receiver>,
+            axum::extract::RawQuery(query): axum::extract::RawQuery,
+            request: axum::extract::Request,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let path = request.uri().path().to_owned();
+            let companion_key = query
+                .unwrap_or_default()
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("key=").map(|k| k.to_owned()))
+                .unwrap_or_default();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+
+            // Bulk first: the drain tries it before falling back per-row, so
+            // a receiver that only understood one shape would silently test
+            // the other path.
+            let label = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+            let (ids, labels, bulk) = match mitos_protocol::decode_apply_bulk(&body) {
+                Ok(batch) => (
+                    batch.emissions.iter().map(|e| e.emission_id).collect(),
+                    batch.emissions.iter().map(|e| label(&e.change)).collect(),
+                    true,
+                ),
+                Err(_) => match mitos_protocol::decode_apply(&body) {
+                    Ok(one) => (vec![one.emission_id], vec![label(&one.change)], false),
+                    // A recapture or undo body — recorded with no rows, so
+                    // the arrival order still shows it.
+                    Err(_) => (Vec::new(), Vec::new(), false),
+                },
+            };
+            {
+                let mut state = receiver.0.lock().unwrap();
+                state.seen.push(Delivery {
+                    path,
+                    ids: ids.clone(),
+                    labels,
+                });
+                if state.failing.contains(&companion_key) {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
+                }
+            }
+            if bulk {
+                let response = mitos_protocol::ApplyBulkResponse {
+                    results: ids
+                        .iter()
+                        .map(|id| mitos_protocol::BulkEmissionResult {
+                            emission_id: *id,
+                            applied: true,
+                            error: None,
+                        })
+                        .collect(),
+                };
+                return (
+                    axum::http::StatusCode::OK,
+                    mitos_protocol::encode_apply_bulk_response(&response).unwrap(),
+                )
+                    .into_response();
+            }
+            (axum::http::StatusCode::OK, "ok").into_response()
+        }
+
+        struct Harness {
+            _tmp: tempfile::TempDir,
+            storage: ModuleStorage,
+            dialer: CompanionDialer,
+            receiver: Receiver,
+            url: String,
+            current: InstanceKey,
+        }
+
+        async fn harness() -> Harness {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = ModuleStorage::new(tmp.path());
+            let wasm = b"delivery fixture";
+            storage
+                .activate(
+                    &crate::companions::testing::manifest_for(MODULE, wasm),
+                    wasm,
+                )
+                .unwrap();
+            let current = storage.current_instance(MODULE).unwrap().unwrap();
+            let receiver = Receiver::default();
+            let url = receiver.serve().await;
+            Harness {
+                _tmp: tmp,
+                dialer: CompanionDialer::new(storage.clone(), crate::admin::AuthToken(None), None),
+                storage,
+                receiver,
+                url,
+                current,
+            }
+        }
+
+        impl Harness {
+            /// Register a companion — which is also what spawns the module's
+            /// drain task, exactly as a subscribe does.
+            async fn subscribe(&self, companion_key: &str) {
+                self.dialer
+                    .register(SubscribeRequest {
+                        targets: vec![SubscribeTarget::Module {
+                            name: MODULE.to_owned(),
+                        }],
+                        companion_key: companion_key.to_owned(),
+                        client_id: CLIENT.to_owned(),
+                        resume_from: None,
+                        interests: Vec::new(),
+                        dial_back: Some(mitos_protocol::DialBackOverride {
+                            url: Some(self.url.clone()),
+                            auth_header: None,
+                            auth_value: None,
+                        }),
+                        announced: Vec::new(),
+                    })
+                    .await;
+            }
+
+            fn plant(&self, wasm: &[u8]) -> InstanceKey {
+                let manifest = crate::companions::testing::manifest_for(MODULE, wasm);
+                self.storage.put_artifact(&manifest, wasm).unwrap();
+                let key = InstanceKey {
+                    module: ModuleId::parse(MODULE).unwrap(),
+                    wasm: Sha256Hex::parse(&crate::manifest::sha256_hex(wasm)).unwrap(),
+                    config: None,
+                };
+                self.storage.write_instance_marker(&key).unwrap();
+                key
+            }
+
+            /// Queue one row in an instance's store. `label` is the payload,
+            /// and the only thing that identifies the row across stores.
+            fn queue(&self, instance: &InstanceKey, companion_key: &str, label: &str) -> u64 {
+                self.append(
+                    instance,
+                    companion_key,
+                    label,
+                    crate::emissions::EmissionStatus::Queued,
+                )
+            }
+
+            fn append(
+                &self,
+                instance: &InstanceKey,
+                companion_key: &str,
+                label: &str,
+                status: crate::emissions::EmissionStatus,
+            ) -> u64 {
+                self.storage
+                    .emissions_store_at(instance)
+                    .unwrap()
+                    .append(
+                        companion_key,
+                        CLIENT,
+                        MODULE,
+                        mitos_protocol::ChainPoint::Slot(1),
+                        label.as_bytes().to_vec(),
+                        Vec::new(),
+                        status,
+                        "unix:0",
+                    )
+                    .unwrap()
+            }
+
+            fn place(&self, instance: &InstanceKey) {
+                use mitos_lifecycle::client_move::{ClientRow, Placement};
+                use mitos_lifecycle::ids::{ClientId, ClientKey, Namespace, Revision};
+                let row = ClientRow::adopt(
+                    ClientKey {
+                        namespace: Namespace::parse("prod").unwrap(),
+                        client: ClientId::parse(CLIENT).unwrap(),
+                    },
+                    ModuleId::parse(MODULE).unwrap(),
+                    Placement {
+                        instance: instance.clone(),
+                        revision: Revision(0),
+                    },
+                );
+                self.storage.write_row(MODULE, &row).unwrap();
+            }
+        }
+
+        /// Poll until `cond` holds, or fail. The drain ticks once a second,
+        /// so anything here is a few ticks; a fixed sleep would encode a
+        /// guess and read as a logic bug when the guess was wrong.
+        async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("timed out waiting for: {what}");
+        }
+
+        /// A few ticks' worth of "and then nothing else happened". Used only
+        /// for negative assertions, where there is nothing to poll on.
+        async fn settle() {
+            tokio::time::sleep(POLL_INTERVAL * 3).await;
+        }
+
+        /// **The baseline.** One instance, one companion: every queued row
+        /// arrives, in id order, exactly once. If this ever fails, a deploy
+        /// of the instance-addressed drain changes who receives what.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn with_one_instance_the_drain_delivers_as_it_always_did() {
+            let h = harness().await;
+            let ids: Vec<u64> = (0..5)
+                .map(|n| h.queue(&h.current, "policy_a", &format!("row-{n}")))
+                .collect();
+            h.subscribe("policy_a").await;
+
+            wait_for("every row to arrive", || {
+                h.receiver.ids().len() >= ids.len()
+            })
+            .await;
+            settle().await;
+
+            assert_eq!(h.receiver.ids(), ids, "delivered out of order, or twice");
+            assert_eq!(
+                h.receiver.labels(),
+                vec!["row-0", "row-1", "row-2", "row-3", "row-4"],
+            );
+        }
+
+        /// The whole point of WO-06's storage split, seen from the outside:
+        /// a second instance keeps its own emissions log, and nothing was
+        /// reading it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn rows_in_a_second_instances_store_are_delivered() {
+            let h = harness().await;
+            let second = h.plant(b"a second build");
+            // The client has moved onto the second instance, so that store is
+            // the one serving it.
+            h.place(&second);
+            for n in 0..3 {
+                h.queue(&second, "policy_a", &format!("second-{n}"));
+            }
+            h.subscribe("policy_a").await;
+
+            wait_for("the second instance's rows to arrive", || {
+                h.receiver.labels().len() >= 3
+            })
+            .await;
+            settle().await;
+
+            assert_eq!(
+                h.receiver.labels(),
+                vec!["second-0", "second-1", "second-2"],
+            );
+        }
+
+        /// Rows the instance a client has LEFT still owes it are older than
+        /// anything its new instance holds, so they go first. Asserted on the
+        /// ORDER the receiver saw, not the set.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn leftovers_are_sent_before_the_serving_instance_speaks() {
+            let h = harness().await;
+            let second = h.plant(b"a second build");
+            h.place(&second);
+            // Queued on the instance the client has left…
+            for n in 0..2 {
+                h.queue(&h.current, "policy_a", &format!("left-{n}"));
+            }
+            // …and on the one now serving it. The two stores number their
+            // rows independently — both start at 1 — so only the payload can
+            // say which instance a delivery came from.
+            for n in 0..2 {
+                h.queue(&second, "policy_a", &format!("serve-{n}"));
+            }
+            h.subscribe("policy_a").await;
+
+            wait_for("all four rows to arrive", || h.receiver.labels().len() >= 4).await;
+            settle().await;
+
+            assert_eq!(
+                h.receiver.labels(),
+                vec!["left-0", "left-1", "serve-0", "serve-1"],
+                "the new instance spoke before the old one had finished",
+            );
+        }
+
+        /// A companion whose leftovers failed is already backing off when its
+        /// serving batch would have been sent. Sending it anyway would put
+        /// rows the old instance still owed BEHIND rows the new one produced.
+        ///
+        /// Asserted with a receiver that fails FOREVER, so the property holds
+        /// over every tick in the window rather than racing one of them.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_companion_whose_leftovers_failed_is_not_sent_its_serving_batch_that_tick() {
+            let h = harness().await;
+            let second = h.plant(b"a second build");
+            h.place(&second);
+            h.queue(&h.current, "policy_a", "left");
+            h.queue(&second, "policy_a", "serve");
+            h.receiver.fail("policy_a");
+            h.subscribe("policy_a").await;
+
+            wait_for("the leftover to be attempted", || {
+                h.receiver.labels().iter().any(|l| l == "left")
+            })
+            .await;
+            settle().await;
+
+            assert!(
+                !h.receiver.labels().iter().any(|l| l == "serve"),
+                "the serving batch was sent while the leftovers were still failing: {:?}",
+                h.receiver.seen(),
+            );
+        }
+
+        /// An upload RENAMES the instance directory: `K1` disappears and `K2`
+        /// appears, with the same file behind it. The drain must notice, and
+        /// must not resend what `K1`'s writer had already acked.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_upload_mid_drain_keeps_delivering() {
+            let h = harness().await;
+            for n in 0..3 {
+                h.queue(&h.current, "policy_a", &format!("before-{n}"));
+            }
+            h.subscribe("policy_a").await;
+            wait_for("the pre-upload rows to arrive", || {
+                h.receiver.labels().len() >= 3
+            })
+            .await;
+
+            // K1 → K2. `write_config` is the same repoint `activate` does,
+            // without needing a second artifact.
+            h.storage.write_config(MODULE, b"\xa0").unwrap();
+            let after_key = h.storage.current_instance(MODULE).unwrap().unwrap();
+            assert_ne!(after_key, h.current);
+            for n in 0..3 {
+                h.queue(&after_key, "policy_a", &format!("after-{n}"));
+            }
+
+            wait_for("the post-upload rows to arrive", || {
+                h.receiver.labels().len() >= 6
+            })
+            .await;
+            settle().await;
+
+            assert_eq!(
+                h.receiver.labels(),
+                vec![
+                    "before-0", "before-1", "before-2", "after-0", "after-1", "after-2"
+                ],
+                "a row was resent across the rename, or lost",
+            );
+        }
+
+        /// `evict_instance` asks for this and waits: a status writer holding
+        /// a clone of the store is what makes the directory removal fail.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn releasing_an_instance_lets_its_directory_be_removed() {
+            let h = harness().await;
+            let doomed = h.plant(b"a second build");
+            h.subscribe("policy_a").await;
+            // Get the drain to open BOTH stores, so there is something to
+            // release — an unopened store would make this vacuous.
+            h.queue(&h.current, "policy_a", "on-current");
+            h.place(&doomed);
+            h.queue(&doomed, "policy_a", "on-doomed");
+            wait_for("both stores to be drained", || {
+                let labels = h.receiver.labels();
+                labels.iter().any(|l| l == "on-current") && labels.iter().any(|l| l == "on-doomed")
+            })
+            .await;
+
+            h.dialer.release_instance(&doomed).await;
+            h.storage.close_emissions_at(&doomed);
+            h.storage
+                .remove_instance_dir(&doomed)
+                .expect("the drain was still holding the store");
+            assert!(!h.storage.instance_dir(&doomed).is_dir());
+
+            // …and the sibling keeps being served. A release that took the
+            // whole drain down would pass every assertion above.
+            h.storage
+                .remove_row(
+                    MODULE,
+                    &mitos_lifecycle::ids::ClientId::parse(CLIENT).unwrap(),
+                )
+                .unwrap();
+            h.queue(&h.current, "policy_a", "after-release");
+            wait_for("the sibling to keep delivering", || {
+                h.receiver.labels().iter().any(|l| l == "after-release")
+            })
+            .await;
+        }
+
+        /// The requeue is crash recovery — "rows a PRIOR host process left
+        /// `Pending`" — so it runs once per store, on first sight. Every tick
+        /// would flip rows that THIS process has in flight back to `Queued`
+        /// and send them twice.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn pending_rows_are_requeued_once_per_store_not_once_per_tick() {
+            let h = harness().await;
+            // Left behind by a prior process.
+            h.append(
+                &h.current,
+                "policy_a",
+                "stale",
+                crate::emissions::EmissionStatus::Pending,
+            );
+            h.subscribe("policy_a").await;
+            wait_for("the stale Pending row to be requeued and sent", || {
+                h.receiver.labels().iter().any(|l| l == "stale")
+            })
+            .await;
+
+            // A row that goes Pending now belongs to this process's status
+            // writer. Nothing may take it back.
+            let in_flight = h.append(
+                &h.current,
+                "policy_a",
+                "in-flight",
+                crate::emissions::EmissionStatus::Pending,
+            );
+            settle().await;
+
+            assert!(
+                !h.receiver.labels().iter().any(|l| l == "in-flight"),
+                "a Pending row this process owns was requeued by a later tick",
+            );
+            assert_eq!(
+                h.storage
+                    .emissions_store_at(&h.current)
+                    .unwrap()
+                    .list_filtered(|r| r.id == in_flight)
+                    .unwrap()[0]
+                    .status,
+                crate::emissions::EmissionStatus::Pending,
+            );
+        }
+
+        /// Rows for a companion nobody registered sit where they are.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_unregistered_companions_rows_are_not_delivered() {
+            let h = harness().await;
+            h.queue(
+                &h.current,
+                crate::emissions::UNSUBSCRIBED_COMPANION_ID,
+                "sentinel",
+            );
+            h.queue(&h.current, "policy_a", "mine");
+            h.subscribe("policy_a").await;
+
+            wait_for("my row to arrive", || {
+                h.receiver.labels().iter().any(|l| l == "mine")
+            })
+            .await;
+            settle().await;
+
+            assert_eq!(h.receiver.labels(), vec!["mine"]);
+        }
     }
 }

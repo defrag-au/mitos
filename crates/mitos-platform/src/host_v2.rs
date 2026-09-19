@@ -34,6 +34,7 @@ use crate::bootstrap_v2::{interest_from_manifest, run_bootstrap};
 use crate::follower_v2::run_chain_follower_v2;
 use crate::host_fns::{DataPlaneFacade, emit, state_kv};
 use crate::registry_v2::{ModuleRegistryV2, ResourceBudget};
+use crate::rows::{RowCache, instance_dir_of};
 use crate::storage::ModuleStorage;
 use crate::{PlatformError, PlatformResult};
 
@@ -59,6 +60,27 @@ pub trait ModuleHostHandle: Send + Sync {
     /// instances of one module; this is what the instances admin route reads.
     /// Cheap and side-effect free.
     async fn running_instances(&self, module: &str) -> Vec<InstanceKey>;
+
+    /// Start ONE instance.
+    ///
+    /// The three calls below are what the `LifecycleManager` uses, and it
+    /// uses NOTHING else: it always knows the key it means, and a manager
+    /// that mixed the two addressings is how `facade_slots` came to exist.
+    /// `replace` / `stop` / `evict_module` remain for the `&str` operator
+    /// tools, which mean "the module's current instance".
+    async fn start_instance(&self, key: &InstanceKey) -> PlatformResult<()>;
+
+    async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()>;
+
+    /// Retire ONE instance: stop it, release the dialer's hold on its
+    /// emissions store, close its handles and remove its directory. When it
+    /// was the module's LAST instance this also does what `evict_module`
+    /// does at the module level, so reaping a module's only instance is
+    /// exactly today's evict.
+    ///
+    /// Returns the companion keys whose dial loops were cancelled — empty
+    /// unless the module went with it.
+    async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>>;
 
     /// Drive a coordinated state-rebuild for `id`. The protocol
     /// is in `docs/design/RECAPTURE.md`. v1 always targets every
@@ -1328,6 +1350,138 @@ where
         );
         Ok(cancelled)
     }
+
+    /// Retire ONE instance, leaving its siblings — and the module — alone.
+    ///
+    /// Unlike `evict_module`, this removes the directory itself: the
+    /// instance-scoped teardown has no equivalent of the admin handler that
+    /// used to do it, and splitting it would mean a caller that could forget.
+    pub async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>> {
+        let id: &str = key.module.as_str();
+        let before = self.storage.list_instances(&key.module)?;
+        if before.len() > 1 && self.storage.current_instance(id)?.as_ref() == Some(key) {
+            return Err(PlatformError::CurrentInstanceHasSiblings {
+                module: id.to_owned(),
+                instance: key.dir_name(),
+                siblings: before.len() - 1,
+            });
+        }
+
+        // 1. Stop the follower, and stop calling this the facade's slot if
+        //    that is what it was — otherwise a later `stop(id)` would try to
+        //    stop a key whose directory has gone.
+        self.stop_instance(key).await?;
+        {
+            let mut facade = self.facade_slots.lock().await;
+            if facade.get(id) == Some(key) {
+                facade.remove(id);
+            }
+        }
+
+        // 2. The dialer's drain holds this instance's emissions store for the
+        //    life of the process, through a status writer that owns a clone.
+        //    A live redb handle is exactly what makes `remove_dir_all` fail,
+        //    so ask it to let go and WAIT — `release_instance` drains the
+        //    writer's queue before it replies.
+        if let Some(dialer) = self.dialer.get() {
+            dialer.release_instance(key).await;
+        }
+
+        // 3. Whatever this instance still owed its companions dies with the
+        //    directory. Until WO-09 owns "what a departing instance still
+        //    owes", this line is the only trace that it did.
+        self.report_undelivered(key);
+
+        // 4. Close the cached handles and remove the directory. Handles
+        //    first: unlinking files under an open redb handle leaves a
+        //    writer addressing an inode nothing can reach.
+        self.storage.close_kv_at(key);
+        self.storage.close_emissions_at(key);
+        self.storage.close_cursor_at(key);
+        self.storage.close_watched_at(key);
+        self.storage.remove_instance_dir(key)?;
+
+        // 5. If that was the module's last instance, the module goes too —
+        //    the same teardown `evict_module` does, so reaping a module's
+        //    only instance is byte-for-byte today's evict.
+        if !self.storage.list_instances(&key.module)?.is_empty() {
+            tracing::info!(
+                module = %id,
+                instance = %key.dir_name(),
+                "instance evicted; the module and its siblings stand",
+            );
+            return Ok(Vec::new());
+        }
+        let cancelled = match self.dialer.get() {
+            Some(dialer) => dialer.unregister_module(id).await,
+            None => Vec::new(),
+        };
+        self.storage.close_kv(id);
+        self.storage.close_emissions(id);
+        self.storage.close_cursor(id);
+        self.storage.close_watched(id);
+        self.storage.remove_module_dir(id)?;
+        tracing::info!(
+            module = %id,
+            instance = %key.dir_name(),
+            cancelled_companions = cancelled.len(),
+            "module's last instance evicted; the module went with it",
+        );
+        Ok(cancelled)
+    }
+
+    /// Count what is still `Queued` in an instance's emissions store and say
+    /// so, loudly, before it is deleted. Best-effort: a store that will not
+    /// open is reported as unknown rather than failing the reap, because the
+    /// alternative is an instance that can never be retired.
+    fn report_undelivered(&self, key: &InstanceKey) {
+        let id: &str = key.module.as_str();
+        // Do not OPEN a store that was never written — `EmissionsStore::open`
+        // creates the file, and creating one to count zero rows in it,
+        // moments before deleting the directory, is silly.
+        if !self
+            .storage
+            .instance_dir(key)
+            .join("emissions.redb")
+            .exists()
+        {
+            return;
+        }
+        let queued = self
+            .storage
+            .emissions_store_at(key)
+            .and_then(|store| {
+                store
+                    .list_filtered(|r| matches!(r.status, crate::emissions::EmissionStatus::Queued))
+            })
+            .map(|rows| rows.len());
+        match queued {
+            Ok(0) => {}
+            Ok(queued) => {
+                tracing::warn!(
+                    module = %id,
+                    instance = %key.dir_name(),
+                    queued,
+                    "reaping an instance with undelivered emissions; they are being DELETED",
+                );
+                if let Some(ring) = self.event_ring.get() {
+                    ring.record(
+                        id,
+                        crate::events::EventKind::InstanceReapedWithQueuedRows {
+                            instance: key.dir_name(),
+                            queued,
+                        },
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                module = %id,
+                instance = %key.dir_name(),
+                error = %e,
+                "reaping an instance whose emissions store could not be counted",
+            ),
+        }
+    }
 }
 
 /// Drop-guard for a per-module in-flight set. Ensures the module is
@@ -1392,17 +1546,60 @@ pub(crate) mod testing {
     /// One recorded call. The lifecycle's whole job is deciding WHICH of
     /// these happen and when, so the assertions are almost always "was this
     /// module's follower touched, and how".
+    ///
+    /// The `&str` trio is the operator surface (`POST …/restart`, the CLI).
+    /// The instance trio is what the `LifecycleManager` uses, and after WO-07
+    /// it uses nothing else — `an_upload_never_uses_the_str_host_api` is the
+    /// test that holds that.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum HostCall {
         Replace(String),
         Stop(String),
         Evict(String),
+        StartInstance(InstanceKey),
+        StopInstance(InstanceKey),
+        EvictInstance(InstanceKey),
+    }
+
+    impl HostCall {
+        /// Which module this touched. Every `FakeHost` helper is
+        /// module-scoped — "was this module's follower started", not "which
+        /// of its instances" — so the ~26 assertions written against them
+        /// stand unchanged now that the manager addresses instances.
+        pub(crate) fn module(&self) -> &str {
+            match self {
+                HostCall::Replace(id) | HostCall::Stop(id) | HostCall::Evict(id) => id,
+                HostCall::StartInstance(key)
+                | HostCall::StopInstance(key)
+                | HostCall::EvictInstance(key) => key.module.as_str(),
+            }
+        }
+    }
+
+    /// What the fake believes is running.
+    ///
+    /// The `&str` API cannot name an instance — the fake resolves nothing —
+    /// so a module-addressed start records a module-addressed slot, and
+    /// `list_running` flattens both, which is all any `&str` caller asks.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum Slot {
+        Module(String),
+        Instance(InstanceKey),
+    }
+
+    impl Slot {
+        fn module(&self) -> &str {
+            match self {
+                Slot::Module(id) => id,
+                Slot::Instance(key) => key.module.as_str(),
+            }
+        }
     }
 
     #[derive(Default)]
     struct Inner {
         calls: Vec<HostCall>,
-        running: HashSet<String>,
+        running: HashSet<Slot>,
         /// Modules whose `replace` fails — an effect that fails must not roll
         /// the lifecycle record back.
         fail_replace: HashSet<String>,
@@ -1415,54 +1612,73 @@ pub(crate) mod testing {
         on_stop: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
-    #[derive(Clone, Default)]
-    pub(crate) struct FakeHost(Arc<StdMutex<Inner>>);
+    #[derive(Clone)]
+    pub(crate) struct FakeHost {
+        inner: Arc<StdMutex<Inner>>,
+        /// `evict_instance` REMOVES the instance directory on the real host —
+        /// that is why a reap whose teardown failed must leave it alone. A
+        /// fake that only recorded the call would make
+        /// `a_reap_that_could_not_finish_is_retried_on_the_next_tick` and
+        /// `an_abandoned_dev_only_instance_drains_stops_and_is_reaped` assert
+        /// nothing, so the fake does the storage half for real.
+        storage: ModuleStorage,
+    }
 
     impl FakeHost {
-        pub(crate) fn new() -> Self {
-            Self::default()
+        pub(crate) fn new(storage: ModuleStorage) -> Self {
+            Self {
+                inner: Arc::new(StdMutex::new(Inner::default())),
+                storage,
+            }
         }
 
         pub(crate) fn calls(&self) -> Vec<HostCall> {
-            self.0.lock().expect("fake host mutex").calls.clone()
+            self.inner.lock().expect("fake host mutex").calls.clone()
         }
 
-        /// True when `replace` was called for `module` at any point.
+        /// True when this module's follower was started, however addressed.
         pub(crate) fn started(&self, module: &str) -> bool {
-            self.calls()
-                .iter()
-                .any(|c| c == &HostCall::Replace(module.to_owned()))
+            self.saw(module, |c| {
+                matches!(c, HostCall::Replace(_) | HostCall::StartInstance(_))
+            })
         }
 
         pub(crate) fn stopped(&self, module: &str) -> bool {
-            self.calls()
-                .iter()
-                .any(|c| c == &HostCall::Stop(module.to_owned()))
+            self.saw(module, |c| {
+                matches!(c, HostCall::Stop(_) | HostCall::StopInstance(_))
+            })
         }
 
         pub(crate) fn evicted(&self, module: &str) -> bool {
+            self.saw(module, |c| {
+                matches!(c, HostCall::Evict(_) | HostCall::EvictInstance(_))
+            })
+        }
+
+        fn saw(&self, module: &str, which: impl Fn(&HostCall) -> bool) -> bool {
             self.calls()
                 .iter()
-                .any(|c| c == &HostCall::Evict(module.to_owned()))
+                .any(|call| call.module() == module && which(call))
         }
 
         pub(crate) fn clear(&self) {
-            self.0.lock().expect("fake host mutex").calls.clear();
+            self.inner.lock().expect("fake host mutex").calls.clear();
         }
 
-        /// Make `replace` fail for `module`, as a crash-looping follower does.
+        /// Make starting this module's follower fail, as a crash-looping one
+        /// does. Module-scoped, so it covers both addressings.
         pub(crate) fn fail_replace(&self, module: &str) {
-            self.0
+            self.inner
                 .lock()
                 .expect("fake host mutex")
                 .fail_replace
                 .insert(module.to_owned());
         }
 
-        /// Make `evict_module` fail for `module`, as a teardown that could not
-        /// close its redb handles does.
+        /// Make evicting this module — or any instance of it — fail, as a
+        /// teardown that could not close its redb handles does.
         pub(crate) fn fail_evict(&self, module: &str) {
-            self.0
+            self.inner
                 .lock()
                 .expect("fake host mutex")
                 .fail_evict
@@ -1470,12 +1686,12 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn on_stop(&self, observe: impl Fn() + Send + Sync + 'static) {
-            self.0.lock().expect("fake host mutex").on_stop = Some(Arc::new(observe));
+            self.inner.lock().expect("fake host mutex").on_stop = Some(Arc::new(observe));
         }
 
         /// The teardown that was failing now works.
         pub(crate) fn heal_evict(&self, module: &str) {
-            self.0
+            self.inner
                 .lock()
                 .expect("fake host mutex")
                 .fail_evict
@@ -1486,16 +1702,49 @@ pub(crate) mod testing {
         /// gone. This is the class the watchdog exists to close: a dispatch
         /// error killing the task, or a cancelled `start` inside a recapture
         /// leaving the slot empty (the 2026-06 holder-distribution outage).
+        ///
+        /// Every instance of the module, because the callers that predate
+        /// instances mean "this module's follower died".
         pub(crate) fn follower_died(&self, module: &str) {
-            self.0
+            self.inner
                 .lock()
                 .expect("fake host mutex")
                 .running
-                .remove(module);
+                .retain(|slot| slot.module() != module);
+        }
+
+        /// One instance's follower exited on its own, leaving its siblings
+        /// running.
+        pub(crate) fn instance_died(&self, key: &InstanceKey) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .remove(&Slot::Instance(key.clone()));
         }
 
         fn record(&self, call: HostCall) {
-            self.0.lock().expect("fake host mutex").calls.push(call);
+            self.inner.lock().expect("fake host mutex").calls.push(call);
+        }
+
+        /// `fail_*` sets are keyed by module: a test says "this module's
+        /// follower will not start", not "this digest's".
+        fn refuses(&self, which: impl Fn(&Inner) -> &HashSet<String>, module: &str) -> bool {
+            which(&self.inner.lock().expect("fake host mutex")).contains(module)
+        }
+
+        /// Drop the slots a stop covers, then run the `on_stop` observer —
+        /// OUTSIDE the mutex, because the observer reads the world (that is
+        /// what it is for) and one of its readers is this fake.
+        fn settle_stop(&self, covers: impl Fn(&Slot) -> bool) {
+            let observe = {
+                let mut inner = self.inner.lock().expect("fake host mutex");
+                inner.running.retain(|slot| !covers(slot));
+                inner.on_stop.clone()
+            };
+            if let Some(observe) = observe {
+                observe();
+            }
         }
     }
 
@@ -1503,45 +1752,107 @@ pub(crate) mod testing {
     impl ModuleHostHandle for FakeHost {
         async fn replace(&self, id: &str) -> PlatformResult<()> {
             self.record(HostCall::Replace(id.to_owned()));
-            let mut inner = self.0.lock().expect("fake host mutex");
-            if inner.fail_replace.contains(id) {
+            if self.refuses(|i| &i.fail_replace, id) {
                 return Err(PlatformError::Decode(format!("fake replace failure: {id}")));
             }
-            inner.running.insert(id.to_owned());
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .insert(Slot::Module(id.to_owned()));
             Ok(())
         }
 
         async fn stop(&self, id: &str) -> PlatformResult<()> {
             self.record(HostCall::Stop(id.to_owned()));
-            let observe = {
-                let mut inner = self.0.lock().expect("fake host mutex");
-                inner.running.remove(id);
-                inner.on_stop.clone()
-            };
-            if let Some(observe) = observe {
-                observe();
-            }
+            self.settle_stop(|slot| slot.module() == id);
             Ok(())
         }
 
         async fn stop_all(&self) {}
 
         async fn list_running(&self) -> Vec<String> {
-            self.0
+            let mut ids: Vec<String> = self
+                .inner
                 .lock()
                 .expect("fake host mutex")
                 .running
                 .iter()
-                .cloned()
+                .map(|slot| slot.module().to_owned())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        }
+
+        async fn running_instances(&self, module: &str) -> Vec<InstanceKey> {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .iter()
+                .filter_map(|slot| match slot {
+                    Slot::Instance(key) if key.module.as_str() == module => Some(key.clone()),
+                    // A `&str`-started slot names no instance, so it cannot
+                    // appear here. Nothing in the manager starts one after
+                    // WO-07; the operator routes still can.
+                    Slot::Instance(_) | Slot::Module(_) => None,
+                })
                 .collect()
         }
 
-        /// `FakeHost` is module-addressed — it exists for the lifecycle
-        /// watchdog, which stays module-addressed in WO-06. It has no notion
-        /// of a second instance, so it reports none. Tests about two
-        /// instances use a real `ModuleHostV2` (`tests/two_instances_v2.rs`).
-        async fn running_instances(&self, _module: &str) -> Vec<InstanceKey> {
-            Vec::new()
+        async fn start_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+            self.record(HostCall::StartInstance(key.clone()));
+            let id = key.module.as_str();
+            if self.refuses(|i| &i.fail_replace, id) {
+                return Err(PlatformError::Decode(format!("fake replace failure: {id}")));
+            }
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .insert(Slot::Instance(key.clone()));
+            Ok(())
+        }
+
+        async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+            self.record(HostCall::StopInstance(key.clone()));
+            self.settle_stop(|slot| slot == &Slot::Instance(key.clone()));
+            Ok(())
+        }
+
+        async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>> {
+            self.record(HostCall::EvictInstance(key.clone()));
+            let id = key.module.as_str();
+            // Both refusals BEFORE anything is touched — a reap that says no
+            // must leave the world exactly as it found it, which is the whole
+            // point of `CurrentInstanceHasSiblings`.
+            if self.refuses(|i| &i.fail_evict, id) {
+                return Err(PlatformError::Decode(format!("fake evict failure: {id}")));
+            }
+            let before = self.storage.list_instances(&key.module)?;
+            if before.len() > 1 && self.storage.current_instance(id)?.as_ref() == Some(key) {
+                return Err(PlatformError::CurrentInstanceHasSiblings {
+                    module: id.to_owned(),
+                    instance: key.dir_name(),
+                    siblings: before.len() - 1,
+                });
+            }
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .remove(&Slot::Instance(key.clone()));
+            // The storage half, for real — see the field comment.
+            self.storage.close_kv_at(key);
+            self.storage.close_emissions_at(key);
+            self.storage.close_cursor_at(key);
+            self.storage.close_watched_at(key);
+            self.storage.remove_instance_dir(key)?;
+            if self.storage.list_instances(&key.module)?.is_empty() {
+                self.storage.remove_module_dir(id)?;
+            }
+            Ok(Vec::new())
         }
 
         async fn recapture_module(
@@ -1568,11 +1879,14 @@ pub(crate) mod testing {
 
         async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
             self.record(HostCall::Evict(id.to_owned()));
-            let mut inner = self.0.lock().expect("fake host mutex");
-            if inner.fail_evict.contains(id) {
+            if self.refuses(|i| &i.fail_evict, id) {
                 return Err(PlatformError::Decode(format!("fake evict failure: {id}")));
             }
-            inner.running.remove(id);
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .retain(|slot| slot.module() != id);
             Ok(Vec::new())
         }
 
@@ -1618,6 +1932,17 @@ where
     }
     async fn running_instances(&self, module: &str) -> Vec<InstanceKey> {
         ModuleHostV2::running_instances_of(self, module).await
+    }
+    async fn start_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+        ModuleHostV2::start_instance(self, key, false)
+            .await
+            .map(drop)
+    }
+    async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+        ModuleHostV2::stop_instance(self, key).await
+    }
+    async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>> {
+        ModuleHostV2::evict_instance(self, key).await
     }
     async fn route_interest(
         &self,
@@ -1739,62 +2064,6 @@ pub(crate) async fn run_emit_drain(
                 }
             }
         }
-    }
-}
-
-/// Client rows, cached by path and refreshed on mtime change — exactly what
-/// `InterestCache` does for interest files, and for the same reason: the
-/// fan-out asks per emitted EVENT, and re-reading plus TOML-parsing a row
-/// per companion per event would be the loop's dominant cost.
-#[derive(Default)]
-pub(crate) struct RowCache {
-    entries: HashMap<String, CachedRow>,
-}
-
-struct CachedRow {
-    mtime: Option<std::time::SystemTime>,
-    row: Option<mitos_lifecycle::client_move::ClientRow>,
-}
-
-impl RowCache {
-    /// The client's row, or `None` — which covers three cases the fan-out
-    /// treats identically: no row, an unparseable one, and a directory name
-    /// that is not a `ClientId`. A row that cannot be read must never stop
-    /// delivery; `routing::fan_out` reads `None` as "follows the module's
-    /// current instance", which is what the client was doing anyway.
-    fn get(
-        &mut self,
-        storage: &ModuleStorage,
-        module: &str,
-        client_id: &str,
-    ) -> Option<&mitos_lifecycle::client_move::ClientRow> {
-        let Ok(client) = mitos_lifecycle::ids::ClientId::parse(client_id) else {
-            return None;
-        };
-        let path = storage
-            .module_dir_for_rows(module)
-            .join(format!("{client_id}.toml"));
-        let mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let key = path.to_string_lossy().into_owned();
-        let fresh = matches!(self.entries.get(&key), Some(e) if e.mtime == mtime);
-        if !fresh {
-            let row = match storage.read_row(module, &client) {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        module = %module,
-                        client_id = %client_id,
-                        error = %e,
-                        "client row unreadable; this client follows the module's current instance",
-                    );
-                    None
-                }
-            };
-            self.entries.insert(key.clone(), CachedRow { mtime, row });
-        }
-        self.entries.get(&key).and_then(|e| e.row.as_ref())
     }
 }
 
@@ -1969,13 +2238,7 @@ fn drain_one(
                             row_cache.get(storage, module_id, client_id),
                             instance,
                             current,
-                            |other| {
-                                if storage.instance_dir(other).is_dir() {
-                                    routing::InstanceDir::Present
-                                } else {
-                                    routing::InstanceDir::Gone
-                                }
-                            },
+                            |other| instance_dir_of(storage, other),
                         ),
                         // Nothing to compare against (an unactivated module):
                         // behave as v2 did and deliver.
@@ -2158,11 +2421,7 @@ fn fan_out_undo(
         if let Some(current) = module_current {
             let row = row_cache.get(storage, module_id, client_id);
             match routing::fan_out(row, instance, current, |other| {
-                if storage.instance_dir(other).is_dir() {
-                    routing::InstanceDir::Present
-                } else {
-                    routing::InstanceDir::Gone
-                }
+                instance_dir_of(storage, other)
             }) {
                 routing::FanOut::Deliver => {}
                 routing::FanOut::Skip => continue,

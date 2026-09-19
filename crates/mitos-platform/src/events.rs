@@ -119,6 +119,14 @@ pub enum EventKind {
     /// by the instance it is on — so this ring is where an operator finds out
     /// that a worker's new build is NOT the one running.
     MoveFailed { client_id: String, reason: String },
+    /// An instance was reaped while its emissions store still held `Queued`
+    /// rows — companions were owed those and will never receive them.
+    ///
+    /// Not an error: a reap is a decision the machine reached, and refusing
+    /// it would leave an instance that can never be retired. But it is the
+    /// ONLY trace that delivery was cut short, until WO-09 owns what a
+    /// departing instance still owes.
+    InstanceReapedWithQueuedRows { instance: String, queued: usize },
 }
 
 impl EventKind {
@@ -141,6 +149,7 @@ impl EventKind {
             EventKind::InstanceAlert { .. } => "instance_alert",
             EventKind::LifecycleEffectFailed { .. } => "lifecycle_effect_failed",
             EventKind::MoveFailed { .. } => "move_failed",
+            EventKind::InstanceReapedWithQueuedRows { .. } => "instance_reaped_with_queued_rows",
         }
     }
 }

@@ -625,7 +625,7 @@ mod tests {
         fn with_auth(auth: Arc<Authenticator>) -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let storage = ModuleStorage::new(tmp.path());
-            let host = FakeHost::new();
+            let host = FakeHost::new(storage.clone());
             let events = EventRing::new();
             let lifecycle = Arc::new(LifecycleManager::new(
                 storage.clone(),

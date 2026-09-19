@@ -171,6 +171,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn write_lifecycle_to(path: &Path, record: &LifecycleRecord) -> Result<(), StorageError> {
+    let toml = toml::to_string(record).map_err(|e| StorageError::Serialise {
+        what: "lifecycle record",
+        why: e.to_string(),
+    })?;
+    write_atomic(path, toml.as_bytes())
+}
+
 fn instance_key_toml(key: &InstanceKey) -> Result<String, StorageError> {
     toml::to_string(key).map_err(|e| StorageError::Serialise {
         what: "instance key",
@@ -1214,8 +1222,45 @@ impl ModuleStorage {
     /// `Ok(None)` means the instance predates lifecycle state — every module
     /// on the first v3 boot — and must be ADOPTED rather than defaulted.
     pub fn read_lifecycle(&self, id: &str) -> Result<Option<LifecycleRecord>, StorageError> {
-        let path = self.lifecycle_path(id)?;
-        let raw = match std::fs::read_to_string(&path) {
+        self.read_lifecycle_from(&self.lifecycle_path(id)?, id)
+    }
+
+    pub fn write_lifecycle(&self, id: &str, record: &LifecycleRecord) -> Result<(), StorageError> {
+        write_lifecycle_to(&self.lifecycle_path(id)?, record)
+    }
+
+    /// ONE instance's record. Like every other `*_at`, the directory must
+    /// already exist — WO-08 creates an instance and writes its first record
+    /// in one place, and nothing here may conjure a directory `activate` has
+    /// just renamed away.
+    fn lifecycle_path_at(&self, key: &InstanceKey) -> Result<PathBuf, StorageError> {
+        Ok(self.instance_state_dir(key)?.join(LIFECYCLE_RECORD))
+    }
+
+    /// `Ok(None)` means this instance has no record. For the module's CURRENT
+    /// instance that means "predates the lifecycle, adopt it"; for any OTHER
+    /// instance it means `Unmanaged` — see `LifecycleManager::instances`.
+    pub fn read_lifecycle_at(
+        &self,
+        key: &InstanceKey,
+    ) -> Result<Option<LifecycleRecord>, StorageError> {
+        self.read_lifecycle_from(&self.lifecycle_path_at(key)?, key.module.as_str())
+    }
+
+    pub fn write_lifecycle_at(
+        &self,
+        key: &InstanceKey,
+        record: &LifecycleRecord,
+    ) -> Result<(), StorageError> {
+        write_lifecycle_to(&self.lifecycle_path_at(key)?, record)
+    }
+
+    fn read_lifecycle_from(
+        &self,
+        path: &Path,
+        module: &str,
+    ) -> Result<Option<LifecycleRecord>, StorageError> {
+        let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -1223,19 +1268,38 @@ impl ModuleStorage {
         toml::from_str(&raw)
             .map(Some)
             .map_err(|e| StorageError::MalformedPointer {
-                module: id.to_owned(),
+                module: module.to_owned(),
                 file: LIFECYCLE_RECORD,
                 why: e.to_string(),
             })
     }
 
-    pub fn write_lifecycle(&self, id: &str, record: &LifecycleRecord) -> Result<(), StorageError> {
-        let path = self.lifecycle_path(id)?;
-        let toml = toml::to_string(record).map_err(|e| StorageError::Serialise {
-            what: "lifecycle record",
-            why: e.to_string(),
-        })?;
-        write_atomic(&path, toml.as_bytes())
+    /// Remove ONE instance directory, leaving the module — its pointer, its
+    /// `companions/`, its `rows/` and its siblings — alone.
+    ///
+    /// The instance-scoped half of [`Self::remove_module_dir`], and with the
+    /// same precondition: **close this instance's cached redb handles first**
+    /// (`close_kv_at`, `close_emissions_at`, `close_cursor_at`,
+    /// `close_watched_at`), because an open handle holds an OS file lock and
+    /// unlinking files underneath one leaves a writer addressing an inode
+    /// nothing can reach.
+    ///
+    /// Idempotent: a missing directory returns `Ok(())`.
+    pub fn remove_instance_dir(&self, key: &InstanceKey) -> Result<(), StorageError> {
+        // Under the repoint lock: `activate` renames this very directory, and
+        // removing it from under a rename would take the module's live state
+        // with it.
+        let _guard = self.repoint.write().expect("repoint lock");
+        let dir = self.instance_dir(key);
+        if !dir.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&dir).map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "remove instance dir {}: {e}",
+                dir.display()
+            )))
+        })
     }
 
     /// Per-module companions registration directory.

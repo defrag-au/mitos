@@ -9,6 +9,125 @@
 
 **Depends on:** WO-06. **Blocks:** WO-08 (an instance is created).
 
+## Implemented 2026-09-20 — notes for review
+
+Every acceptance item passes.
+
+| Acceptance | Result |
+|---|---|
+| 1. `cargo test -p mitos-platform -p mitos-core -p mitos-lifecycle` | `mitos-core` 28, `mitos-lifecycle` 95, `mitos-platform` lib **287**, + 14 integration — **0 failed** |
+| 1. `git diff --stat crates/mitos-platform/tests` | `two_instances_v2.rs \| 169 ++++` — **169 insertions, 0 deletions**, and no other file in the directory |
+| 2. clippy `--workspace --all-targets --all-features -D warnings` | 0 |
+| 2. `cargo check --workspace --all-targets` | 0 |
+| 2. `cargo fmt --check` | 0 diffs |
+| 3. Lifecycle (11 named tests) | all present, all pass |
+| 4. Dialer — planning (3 named) | pass, plus `an_unregistered_companion_is_not_planned` and `batches_from_two_instances_are_one_companions_work` |
+| 4. Dialer — delivery (6 named, one `axum` receiver on `127.0.0.1:0`) | pass, plus `an_unregistered_companions_rows_are_not_delivered` |
+| 5. `every_instances_store_is_compacted` | pass (`compaction.rs` had no tests at all before) |
+| 6. `a_second_instance_is_started_by_boot_and_revived_by_the_watchdog` | pass |
+| 7. Admin instances route + `reading_instances_writes_nothing` | pass |
+| 8. Goldens | **69/69**, after `cargo build --release --bin mitos-run` AND `mitos-build` over all 19 community modules |
+
+### The baseline passed BEFORE the change
+
+`with_one_instance_the_drain_delivers_as_it_always_did` was run against HEAD
+(`e6f2498 WO-07 prep`) in a throwaway tree — `git archive HEAD | tar -x -C
+/tmp/…`, read-only git, nothing in the working tree touched, because the
+drain rework was already written by the time I reached the test list and the
+README forbids `git stash` / `git checkout <path>`:
+
+```
+test with_one_instance_the_drain_delivers_as_it_always_did ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The same assertions — five rows, one companion, one instance, in id order,
+exactly once — now live in `dialer.rs`'s `delivery` module and still pass.
+In the baseline tree it had to be an integration test (the crate-private
+helpers the real one uses are not reachable from outside); that file existed
+only in `/tmp` and is gone.
+
+### Deviations
+
+1. **`FakeHost::new` takes a `ModuleStorage`.** `evict_instance` removes the
+   instance directory on the real host — unlike `evict_module`, whose CALLER
+   used to — and two existing tests assert exactly that
+   (`a_reap_that_could_not_finish_is_retried_on_the_next_tick` watches the
+   directory survive a failed teardown and vanish on the retry;
+   `an_abandoned_dev_only_instance_drains_stops_and_is_reaped` watches
+   `companions/` go). A fake that only recorded the call would make both
+   assert nothing, so the fake does the storage half for real. Three
+   construction sites updated; **no assertion edited**.
+2. **New file `crates/mitos-platform/src/rows.rs`.** The order says to lift
+   `RowCache` "to somewhere both can use it"; no existing module was a home
+   for it. It carries the shared `instance_dir_of` probe too, so the
+   follower's fan-out and the drain ask `routing` the same question with
+   literally the same call.
+3. **New `EventKind::InstanceReapedWithQueuedRows`.** §1 requires the
+   undelivered count "on the event ring WITH the count"; no existing variant
+   could carry it. (`events.rs` is outside the Files list for that reason
+   alone.)
+4. **`CompanionWork`: a companion's batches are grouped per pass and run in
+   SEQUENCE.** The order's shape is "the two ordered work lists out", which
+   leaves open what happens when one client is owed rows by two non-serving
+   instances — the naive list would hand the bounded-concurrency runner two
+   entries with the same `CompanionId` and POST to one companion twice at
+   once, which is the thing `DrainPass`'s doc says one-drain-per-module
+   exists to prevent. `plan_module_tick` also takes more than "stores +
+   registry + rows + `module_current`": it needs `storage` and the
+   `RowCache` to answer `drain_pass` at all.
+5. **`upload` no longer refuses when `current.toml` will not resolve.**
+   §1 replaces `host.stop(&module)` (a silent no-op on a broken tree) with
+   `current_instance(&module)? → stop_instance(K1)`, and the `?` would make
+   an upload fail on exactly the module an upload repairs. It is reported
+   through `effect_failed` and the upload proceeds.
+6. **`a_companion_whose_leftovers_failed_is_not_sent_its_serving_batch_that_tick`
+   asserts the stronger property.** "Not that tick" raced the 1s poll
+   interval; the test uses a receiver that fails forever, so the serving
+   batch must never be sent while the leftovers keep failing. Same claim, no
+   race.
+7. **Two tests beyond the list.**
+   `evicting_one_instance_removes_its_directory_and_leaves_the_module` in
+   `two_instances_v2.rs`, because after deviation 1 the REAL `evict_instance`
+   — including the `CurrentInstanceHasSiblings` refusal and the last-instance
+   teardown — had nothing but the fake vouching for it. And
+   `every_instances_store_is_compacted` is the first test `compaction.rs` has
+   ever had.
+
+### Found, NOT fixed
+
+- **`dialer.rs` — the per-instance status writers share the drain's
+  `CancellationToken`**, and `pool::spawn_status_writer`'s `select!` is
+  `biased` on cancellation, so `unregister_module` cancels them WITHOUT
+  draining. Queued status updates are dropped and those rows come back as
+  `Pending` for the next process to requeue. Pre-existing (one writer before,
+  N now) and harmless — the requeue covers it — but it means
+  `ReleaseInstance` is the only path that lets a writer finish, which is
+  precisely why `evict_instance` has to use it.
+- **Emission ids are unique per STORE, not per module.** Two instances both
+  number from 1. Nothing in production keys on an id across instances, but it
+  is why the delivery tests label rows by payload rather than by id, and
+  WO-09's Apply frame carrying the instance digest would close it properly.
+
+### Questions for the reviewer
+
+1. **`release_instance` waits on the world under the module lock.**
+   `Effect::Reap` → `evict_instance` → `dialer.release_instance().await`, and
+   the drain only handles control frames BETWEEN ticks — so a reap can hold
+   one module's lifecycle lock for up to one tick's in-flight sends (worst
+   case `REQUEST_TIMEOUT`, 30s). §4 mandates the await and gives the reason
+   (a status writer holding a store clone is what makes the directory removal
+   fail), and a reap fires once, after a 24h/72h retain window, so I
+   implemented it as written. But it is the shape the README's "an effect may
+   never WAIT ON THE WORLD" rule names, and the alternative — have the reap
+   issue the release and retry through `pending_cleanup` until the drain
+   confirms — is a design change, not an implementation choice.
+2. **A permanently-unreachable departed instance starves the live one.** By
+   the leftover rule a companion whose leftovers keep failing never receives
+   its serving batch. That is right while the old instance is merely slow and
+   indefinite if it is unreachable; nothing bounds it today. It looks like it
+   belongs with WO-09's "what a departing instance still owes".
+
 ## What this order does, and where it deliberately stops
 
 WO-06 let a second instance of a module RUN. Nothing can yet MANAGE one:

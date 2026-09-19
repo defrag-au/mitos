@@ -473,6 +473,175 @@ async fn an_interest_update_reaches_every_running_instance() {
     h.cleanup();
 }
 
+/// `evict_instance` on the REAL host: it stops the slot, releases the
+/// dialer's hold, closes the handles and removes the directory — and stops
+/// there, leaving the module and its sibling alone.
+///
+/// `FakeHost` does the storage half of this for the lifecycle's unit tests,
+/// so without a test here the real teardown would have nothing but the fake
+/// vouching for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evicting_one_instance_removes_its_directory_and_leaves_the_module() {
+    let Some(h) = Harness::build("two-instances-evict", |_| {}) else {
+        eprintln!("skipping: test-indexer wasm not built");
+        return;
+    };
+
+    h.host.start_instance(&h.first, false).await.expect("first");
+    h.host
+        .start_instance(&h.second, false)
+        .await
+        .expect("second");
+
+    // The module's CURRENT instance cannot be reaped while a sibling exists:
+    // `current.toml` would name nothing.
+    let refused = h
+        .host
+        .evict_instance(&h.first)
+        .await
+        .expect_err("reaping the current instance must be refused");
+    assert!(
+        matches!(
+            refused,
+            mitos_platform::PlatformError::CurrentInstanceHasSiblings { .. }
+        ),
+        "expected CurrentInstanceHasSiblings, got: {refused}",
+    );
+    assert!(h.storage.instance_dir(&h.first).is_dir());
+    assert_eq!(h.host.running_instances_of(MODULE).await.len(), 2);
+
+    // The sibling can.
+    h.host
+        .evict_instance(&h.second)
+        .await
+        .expect("evicting a non-current instance");
+
+    assert!(
+        !h.storage.instance_dir(&h.second).is_dir(),
+        "the reaped instance's directory survived",
+    );
+    assert!(h.storage.instance_dir(&h.first).is_dir());
+    assert_eq!(
+        h.storage.current_instance(MODULE).unwrap(),
+        Some(h.first.clone()),
+        "reaping a sibling moved the module's pointer",
+    );
+    assert_eq!(
+        h.host.running_instances_of(MODULE).await,
+        vec![h.first.clone()]
+    );
+
+    // …and now that it is the only one, reaping it takes the module, exactly
+    // as `evict_module` always did.
+    h.host
+        .evict_instance(&h.first)
+        .await
+        .expect("evicting the last instance");
+    assert!(h.storage.current_instance(MODULE).unwrap().is_none());
+    assert!(!h.storage.root().join(MODULE).exists());
+
+    h.host.stop_all().await;
+    h.cleanup();
+}
+
+/// Boot and the watchdog, per INSTANCE, through the real manager over a real
+/// host — `host.start_instance` is never called by this test, only by the
+/// lifecycle acting on the records.
+///
+/// The watchdog half is the one that could not be asserted before: with two
+/// instances, `list_running` says the module is up while one of its followers
+/// is dead, so a module-addressed watchdog leaves it dead for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_instance_is_started_by_boot_and_revived_by_the_watchdog() {
+    use mitos_lifecycle::instance::Instance;
+    use mitos_platform::admin::AuthToken;
+    use mitos_platform::auth::Authenticator;
+    use mitos_platform::dialer::CompanionDialer;
+    use mitos_platform::events::EventRing;
+    use mitos_platform::host_v2::ModuleHostHandle;
+    use mitos_platform::lifecycle::{LifecycleManager, system_clock};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    let Some(h) = Harness::build("two-instances-lifecycle", |_| {}) else {
+        eprintln!("skipping: test-indexer wasm not built");
+        return;
+    };
+    // Destructured rather than reshaped: the manager needs the host behind
+    // an `Arc<dyn ModuleHostHandle>`, and every other test in this file holds
+    // it by value.
+    let Harness {
+        dir,
+        storage,
+        host,
+        tx: _tx,
+        first,
+        second,
+    } = h;
+    let host = Arc::new(host);
+    let handle: Arc<dyn ModuleHostHandle> = host.clone();
+
+    // The second instance's FIRST record, written with its directory — the
+    // shape WO-08 will create. Without one it is `Unmanaged`, and the whole
+    // point of that is that boot leaves it alone.
+    storage
+        .write_lifecycle_at(
+            &second,
+            &Instance::adopt(second.clone(), &BTreeMap::new()).record(),
+        )
+        .expect("write the second instance's record");
+
+    let events = EventRing::new();
+    let manager = Arc::new(LifecycleManager::new(
+        storage.clone(),
+        handle.clone(),
+        Arc::new(Authenticator::legacy(Some("t".repeat(48)), None)),
+        events.clone(),
+        system_clock(),
+    ));
+
+    manager.boot().await;
+    let mut running = host.running_instances_of(MODULE).await;
+    running.sort_by_key(|key| key.dir_name());
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort_by_key(|key| key.dir_name());
+    assert_eq!(running, expected, "boot started only one of two instances");
+
+    // The second follower dies. The MODULE is still running as far as every
+    // `&str` caller is concerned, which is exactly the trap.
+    host.stop_instance(&second).await.expect("stop the second");
+    assert_eq!(host.list_running().await, vec![MODULE.to_owned()]);
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watchdog = mitos_platform::watchdog::spawn_with_config(
+        storage.clone(),
+        handle,
+        manager.clone(),
+        CompanionDialer::new(storage.clone(), AuthToken(None), None),
+        events,
+        cancel.clone(),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if host.running_instances_of(MODULE).await.len() == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watchdog left a dead second follower dead",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    cancel.cancel();
+    let _ = watchdog.await;
+    host.stop_all().await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Both operations were written when a module WAS an instance: recapture
 /// wipes the bootstrap flags and restarts, evict removes the module
 /// directory. Across two instances each would act on one and mean the other,

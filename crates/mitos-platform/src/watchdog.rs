@@ -10,9 +10,11 @@
 //! mutations).
 //!
 //! The watchdog closes the class: every tick it compares the set of
-//! modules that *should* be running against truthful liveness
-//! (`list_running`, which excludes finished follower tasks) and
-//! restarts the difference. After a revive it
+//! INSTANCES that *should* be running against truthful liveness
+//! (`running_instances`, which excludes finished follower tasks) and
+//! restarts the difference. Per instance, because a module with two of them
+//! reads as "running" while either lives, and the dead one would then stay
+//! dead for ever. After a revive it
 //! re-asserts the module's scan-interest from the persisted companion
 //! set (`CompanionDialer::reconcile_module_interest`) so a companion
 //! that subscribed while the module was dead — whose interest
@@ -48,6 +50,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use mitos_lifecycle::ids::InstanceKey;
 use mitos_lifecycle::instance::BootAction;
 
 use crate::dialer::CompanionDialer;
@@ -134,7 +137,6 @@ pub(crate) async fn sweep(
             return;
         }
     };
-    let running: HashSet<String> = host.list_running().await.into_iter().collect();
     let busy: HashSet<String> = host
         .recapture_in_flight()
         .await
@@ -143,50 +145,80 @@ pub(crate) async fn sweep(
         .collect();
 
     for id in modules {
-        if running.contains(&id) || busy.contains(&id) {
+        if busy.contains(&id) {
             continue;
         }
-        // The lifecycle decides, not a companion count. An instance an
-        // operator stopped stays stopped — that is the whole fix.
-        match lifecycle.expects_follower(&id) {
-            Ok(BootAction::StartFollower) => {}
-            Ok(BootAction::LeaveStopped) => continue,
+        // Per INSTANCE: a module with two instances is "running" as far as
+        // `list_running` is concerned when either of them is, so asking that
+        // would leave a dead second follower dead for ever.
+        let running: HashSet<InstanceKey> = host.running_instances(&id).await.into_iter().collect();
+        let instances = match lifecycle.instances(&id) {
+            Ok(instances) => instances,
             Err(e) => {
                 tracing::warn!(
                     module = %id,
                     error = %e,
-                    "watchdog: cannot read the lifecycle; leaving this module alone",
+                    "watchdog: cannot list this module's instances; leaving it alone",
                 );
                 continue;
             }
-        }
-        tracing::warn!(
-            module = %id,
-            "watchdog: module should be running but has no live follower; restarting"
-        );
-        let outcome = match host.replace(&id).await {
-            Ok(()) => {
-                // Re-assert scan-interest from the persisted
-                // companion set — subscribes that landed while the
-                // module was dead dropped their interest mutation.
-                dialer.reconcile_module_interest(&id).await;
-                tracing::info!(module = %id, "watchdog: module restarted");
-                "restarted"
-            }
-            Err(e) => {
-                tracing::error!(
-                    module = %id,
-                    error = %e,
-                    "watchdog: restart failed; will retry next tick"
-                );
-                "failed"
-            }
         };
-        events.record(
-            id.as_str(),
-            EventKind::WatchdogRestart {
-                outcome: outcome.to_owned(),
-            },
-        );
+
+        // ONCE per module per sweep, however many of its instances were
+        // revived. `reconcile_module_interest` routes the union to every
+        // running instance already, and the dialer's own comment warns that
+        // repeating it per companion re-triggers a module's cold-start
+        // machinery.
+        let mut revived = false;
+        for view in instances {
+            let key = view.key();
+            if running.contains(key) {
+                continue;
+            }
+            // The lifecycle decides, not a companion count. An instance an
+            // operator stopped stays stopped — that is the whole fix. An
+            // `Unmanaged` one is never started; nothing here made it.
+            match view.on_boot() {
+                BootAction::StartFollower => {}
+                BootAction::LeaveStopped => continue,
+            }
+            tracing::warn!(
+                module = %id,
+                instance = %key.dir_name(),
+                "watchdog: instance should be running but has no live follower; restarting"
+            );
+            let outcome = match host.start_instance(key).await {
+                Ok(()) => {
+                    revived = true;
+                    tracing::info!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        "watchdog: instance restarted",
+                    );
+                    "restarted"
+                }
+                Err(e) => {
+                    tracing::error!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "watchdog: restart failed; will retry next tick"
+                    );
+                    "failed"
+                }
+            };
+            events.record(
+                id.as_str(),
+                EventKind::WatchdogRestart {
+                    outcome: outcome.to_owned(),
+                },
+            );
+        }
+        if revived {
+            // Re-assert scan-interest from the persisted companion set —
+            // subscribes that landed while the module was dead dropped their
+            // interest mutation.
+            dialer.reconcile_module_interest(&id).await;
+        }
     }
 }

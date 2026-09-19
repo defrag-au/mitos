@@ -573,6 +573,27 @@ pub struct InstanceSummary {
     /// second instance that has not started yet reads exactly like one that
     /// has started and not yet reached a block.
     pub cursor: Option<u64>,
+    /// Phase, desired state and attached clients — or `unmanaged`.
+    pub lifecycle: InstanceLifecycle,
+}
+
+/// What governs an instance, as the admin API reports it.
+///
+/// An enum rather than an `Option<StatusLifecycle>`: "there is no record"
+/// and "it has no attached clients" are different answers, and a reader that
+/// saw `null` for both would conflate an instance the lifecycle is not
+/// managing with one it is managing and finding empty.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "state")]
+pub enum InstanceLifecycle {
+    Managed(StatusLifecycle),
+    /// An instance directory with no `lifecycle.toml` that is not the
+    /// module's current one. Not adopted, not started, not reaped — see
+    /// `crate::lifecycle::InstanceView`. An operator seeing this has a
+    /// directory here that no client move made.
+    Unmanaged,
+    /// The admin router has no lifecycle wired (artifact-only deployments).
+    Unknown,
 }
 
 /// Whether `current.toml` resolves to this instance.
@@ -625,6 +646,18 @@ async fn list_instances(
         Some(host) => host.running_instances(&id).await,
         None => Vec::new(),
     };
+    // One listing, matched by key below. Asking the lifecycle per instance
+    // would re-walk `companions/` per instance for the adoption it derives.
+    let governed = match state.lifecycle.as_ref() {
+        Some(lifecycle) => match lifecycle.instances(&id) {
+            Ok(views) => Some(views),
+            Err(e) => {
+                tracing::warn!(module = %id, error = %e, "instances: lifecycle unreadable");
+                None
+            }
+        },
+        None => None,
+    };
 
     let instances = state
         .storage
@@ -658,6 +691,19 @@ async fn list_instances(
                     None
                 })
                 .map(|c| c.slot()),
+            lifecycle: match governed.as_ref() {
+                None => InstanceLifecycle::Unknown,
+                Some(views) => match views.iter().find(|view| view.key() == &key) {
+                    Some(view) => match view.managed() {
+                        Some(instance) => InstanceLifecycle::Managed(instance.into()),
+                        None => InstanceLifecycle::Unmanaged,
+                    },
+                    // Listed by storage but not by the lifecycle: its record
+                    // would not read, and `instances` left it out rather than
+                    // hiding the rest.
+                    None => InstanceLifecycle::Unknown,
+                },
+            },
         })
         .collect::<Vec<_>>();
     Ok(Json(instances).into_response())
@@ -894,6 +940,7 @@ impl HandlerError {
             Self::ModuleNotFound(_) => "not_found",
             Self::Lifecycle(LifecycleError::NotRegistered(_)) => "not_found",
             Self::Lifecycle(LifecycleError::Rejected(_)) => "lifecycle_rejected",
+            Self::Lifecycle(LifecycleError::Unmanaged { .. }) => "instance_unmanaged",
             Self::Lifecycle(LifecycleError::Storage(_)) => "storage_io",
             Self::LifecycleUnavailable => "lifecycle_unavailable",
             Self::NotRunnable(_) => "not_runnable",
@@ -914,6 +961,10 @@ impl HandlerError {
             // evict safety check an operator overrides with `?force=true`.
             Self::Lifecycle(LifecycleError::Rejected(_)) => StatusCode::CONFLICT,
             Self::Lifecycle(LifecycleError::NotRegistered(_)) => StatusCode::NOT_FOUND,
+            // An instance nothing here governs, asked of by key. Unreachable
+            // from a `&str` route — they all mean the current instance, which
+            // is adopted if it has no record.
+            Self::Lifecycle(LifecycleError::Unmanaged { .. }) => StatusCode::CONFLICT,
             Self::Lifecycle(LifecycleError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::LifecycleUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotRunnable(_) => StatusCode::CONFLICT,
@@ -3112,7 +3163,7 @@ mod tests {
 
     fn wired(dir: &std::path::Path) -> Wired {
         let storage = ModuleStorage::new(dir);
-        let host = crate::host_v2::testing::FakeHost::new();
+        let host = crate::host_v2::testing::FakeHost::new(storage.clone());
         let handle: Arc<dyn crate::host_v2::ModuleHostHandle> = Arc::new(host.clone());
         let auth = Arc::new(configured_authenticator(
             OperatorTokenAsClient::AllowWithWarning,
@@ -3561,6 +3612,82 @@ mod tests {
             )
             .await,
             StatusCode::NOT_FOUND,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What an operator actually needs from this route once a module can
+    /// have more than one instance: what each one IS, what is WANTED of it,
+    /// and who is holding it open — or that nothing is governing it at all.
+    #[tokio::test]
+    async fn the_instances_route_reports_each_instances_lifecycle() {
+        let dir = tempdir("instances-lifecycle");
+        let w = wired(&dir);
+        let live = b"the live artifact";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", live), live)
+            .unwrap();
+        crate::lifecycle::testing::write_registration(
+            &w.storage,
+            "m",
+            crate::auth::testing::PROD_CLIENT,
+            "policy_a",
+        );
+
+        // A sibling with a directory and no record: `Unmanaged`. Adopting it
+        // would conclude Active + Pinned and it would follow the chain for
+        // ever, so the route's job is to make it VISIBLE instead.
+        let other_wasm = b"a second artifact";
+        let other_manifest = crate::companions::testing::manifest_for("m", other_wasm);
+        w.storage.put_artifact(&other_manifest, other_wasm).unwrap();
+        let other = mitos_lifecycle::ids::InstanceKey {
+            module: mitos_lifecycle::ids::ModuleId::parse("m").unwrap(),
+            wasm: mitos_lifecycle::ids::Sha256Hex::parse(&crate::manifest::sha256_hex(other_wasm))
+                .unwrap(),
+            config: None,
+        };
+        w.storage.write_instance_marker(&other).unwrap();
+
+        w.lifecycle.boot().await;
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/modules/m/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<InstanceSummary> = serde_json::from_slice(&body).unwrap();
+
+        let current = w.storage.current_instance("m").unwrap().unwrap();
+        let find = |key: &mitos_lifecycle::ids::InstanceKey| {
+            listed
+                .iter()
+                .find(|i| i.dir == key.dir_name())
+                .unwrap_or_else(|| panic!("{} missing", key.dir_name()))
+        };
+        match &find(&current).lifecycle {
+            InstanceLifecycle::Managed(status) => {
+                assert_eq!(status.phase, Phase::Active);
+                assert_eq!(status.desired, DesiredState::Running);
+                assert_eq!(status.attached, vec!["prod/ownership.cnft.dev"]);
+            }
+            other => panic!("the current instance is not managed: {other:?}"),
+        }
+        assert!(
+            matches!(find(&other).lifecycle, InstanceLifecycle::Unmanaged),
+            "a record-less sibling was reported as governed",
         );
 
         std::fs::remove_dir_all(&dir).ok();

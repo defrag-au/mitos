@@ -75,6 +75,7 @@ pub mod maestro_fallback_plane;
 pub mod manifest;
 pub mod moves;
 pub mod registry_v2;
+pub mod rows;
 pub mod storage;
 pub mod supervisor;
 pub mod trap_context;
@@ -160,6 +161,24 @@ pub enum PlatformError {
          operations and have no defined meaning across more than one"
     )]
     MultipleInstances { module: String, found: usize },
+
+    /// A reap asked for the instance `current.toml` points at, while the
+    /// module has others.
+    ///
+    /// Removing it would leave the pointer naming a directory that is gone
+    /// and every `&str`-addressed tool — the admin routes, the watchdog, the
+    /// operator CLI — resolving to whichever sibling the crash repair happens
+    /// to pick. Choosing a successor is part of the switch (WO-09); until
+    /// then the case cannot arise outside a test.
+    #[error(
+        "`{instance}` is module `{module}`'s current instance and it has {siblings} sibling(s); \
+         reaping it would leave current.toml pointing at nothing"
+    )]
+    CurrentInstanceHasSiblings {
+        module: String,
+        instance: String,
+        siblings: usize,
+    },
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;
