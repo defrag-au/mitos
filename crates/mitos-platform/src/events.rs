@@ -127,6 +127,19 @@ pub enum EventKind {
     /// ONLY trace that delivery was cut short, until WO-09 owns what a
     /// departing instance still owes.
     InstanceReapedWithQueuedRows { instance: String, queued: usize },
+    /// A client move created a staging instance by copying its parent's
+    /// state, with the PARENT'S FOLLOWER STOPPED for the duration.
+    ///
+    /// `millis` is that downtime, and it is the reason this is a first-class
+    /// event rather than a log line: the largest `kv.redb` on the box is
+    /// 1.3 GB, and "a dev worker's announcement paused prod's follower for N
+    /// seconds" is a question an operator asks after the fact.
+    StagingCopy {
+        instance: String,
+        parent: String,
+        bytes: u64,
+        millis: u64,
+    },
 }
 
 impl EventKind {
@@ -150,6 +163,7 @@ impl EventKind {
             EventKind::LifecycleEffectFailed { .. } => "lifecycle_effect_failed",
             EventKind::MoveFailed { .. } => "move_failed",
             EventKind::InstanceReapedWithQueuedRows { .. } => "instance_reaped_with_queued_rows",
+            EventKind::StagingCopy { .. } => "staging_copy",
         }
     }
 }

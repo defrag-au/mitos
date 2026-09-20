@@ -126,6 +126,10 @@ struct AdminState {
     /// directly, because the host has no idea what an operator wants.
     /// `None` in artifact-only routers, where there is no host either.
     lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    /// The client rows' manager, for the READ surfaces only: the catch-up
+    /// slot is in memory and this is the only thing that holds it. `None`
+    /// where no worker can announce, and then there is no queue to report.
+    moves: Option<Arc<crate::moves::MoveManager>>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -145,6 +149,7 @@ pub fn admin_router(storage: ModuleStorage, auth: Arc<Authenticator>) -> axum::R
         SystemTime::now(),
         crate::events::EventRing::new(),
         auth,
+        None,
         None,
     )
 }
@@ -173,6 +178,7 @@ pub fn admin_router_with_host(
     events: crate::events::EventRing,
     auth: Arc<Authenticator>,
     lifecycle: Arc<crate::lifecycle::LifecycleManager>,
+    moves: Arc<crate::moves::MoveManager>,
 ) -> axum::Router {
     admin_router_inner(
         storage,
@@ -183,6 +189,7 @@ pub fn admin_router_with_host(
         events,
         auth,
         Some(lifecycle),
+        Some(moves),
     )
 }
 
@@ -196,6 +203,7 @@ fn admin_router_inner(
     events: crate::events::EventRing,
     auth: Arc<Authenticator>,
     lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    moves: Option<Arc<crate::moves::MoveManager>>,
 ) -> axum::Router {
     let state = AdminState {
         storage,
@@ -206,6 +214,7 @@ fn admin_router_inner(
         events,
         auth: auth.clone(),
         lifecycle,
+        moves,
     };
 
     // Recapture is its OWN sub-router because it is the one admin route a
@@ -227,6 +236,7 @@ fn admin_router_inner(
         .route("/_admin/status", get(status))
         .route("/_admin/events", get(list_events))
         .route("/_admin/modules", get(list_modules))
+        .route("/_admin/catch-up", get(catch_up))
         .route(
             "/_admin/modules/{id}",
             get(get_module).post(upload_module).delete(delete_module),
@@ -504,6 +514,63 @@ pub struct RowPending {
     /// `None` while fetching — there is no plan until the upgrade ledger has
     /// been read off the artifact.
     pub phase: Option<MovePhase>,
+    /// Where this move stands in the host-wide catch-up queue.
+    pub slot: SlotStanding,
+    /// How far the staging instance has to go. `None` until it is catching
+    /// up — before that there is no staging cursor to compare.
+    pub catch_up: Option<CatchUpProgress>,
+}
+
+/// A move's standing in the host-wide catch-up queue.
+///
+/// One staging follower replays the chain at a time, so for most moves the
+/// interesting number is how many are ahead of it.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "slot")]
+pub enum SlotStanding {
+    /// This move holds the slot — it is the one catching up.
+    Holds,
+    Waiting {
+        /// Moves that will be granted before this one.
+        ahead: usize,
+    },
+    /// Not in the queue: still fetching, or not asked for yet.
+    Idle,
+}
+
+/// The gap a catching-up move still has to close, as an operator watches it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpProgress {
+    /// The staging instance's own cursor. `None` before its first block.
+    pub staging_slot: Option<u64>,
+    /// The instance still serving the client.
+    pub live_slot: Option<u64>,
+}
+
+/// `GET /_admin/catch-up` — the host-wide catch-up slot.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpView {
+    /// The one move catching up. `None` when nothing is.
+    pub holder: Option<CatchUpHolder>,
+    /// Everyone else, IN THE ORDER THEY WILL BE GRANTED — production before
+    /// development, then first come first served.
+    pub waiting: Vec<CatchUpWaiting>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpHolder {
+    /// `namespace/client`.
+    pub client: String,
+    pub module: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpWaiting {
+    pub client: String,
+    pub module: String,
+    pub tier: Tier,
+    /// Unix seconds when it asked.
+    pub queued_at: u64,
 }
 
 /// How far a pending move has got. The lifecycle crate's `Stage` carries the
@@ -528,31 +595,116 @@ async fn list_rows(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
+    // ONE snapshot for the whole listing: the slot is host-wide and taking it
+    // per row would show a different queue in each.
+    let slot = state.moves.as_ref().map(|moves| moves.catch_up());
     let rows = state
         .storage
         .list_rows(&id)?
         .into_iter()
-        .map(|row| RowSummary {
-            client: format!("{}/{}", row.client.namespace, row.client.client),
-            current: row.current.map(|p| RowPlacement {
-                instance: p.instance.dir_name(),
-                revision: p.revision,
-            }),
-            pending: row.pending.map(|p| RowPending {
-                target: p.target.instance.dir_name(),
-                revision: p.target.revision,
-                stage: match p.stage {
-                    Stage::Fetching => RowStage::Fetching,
-                    Stage::Planned { .. } => RowStage::Planned,
-                },
-                phase: match p.stage {
-                    Stage::Fetching => None,
-                    Stage::Planned { phase, .. } => Some(phase),
-                },
-            }),
+        .map(|row| {
+            let standing = standing_of(slot.as_ref(), &row.client, &row.module);
+            let live = row.current.as_ref().map(|p| p.instance.clone());
+            RowSummary {
+                client: format!("{}/{}", row.client.namespace, row.client.client),
+                current: row.current.map(|p| RowPlacement {
+                    instance: p.instance.dir_name(),
+                    revision: p.revision,
+                }),
+                pending: row.pending.map(|p| RowPending {
+                    target: p.target.instance.dir_name(),
+                    revision: p.target.revision,
+                    stage: match p.stage {
+                        Stage::Fetching => RowStage::Fetching,
+                        Stage::Planned { .. } => RowStage::Planned,
+                    },
+                    phase: match p.stage {
+                        Stage::Fetching => None,
+                        Stage::Planned { phase, .. } => Some(phase),
+                    },
+                    slot: standing,
+                    catch_up: match p.stage {
+                        Stage::Planned {
+                            phase: MovePhase::CatchingUp,
+                            ..
+                        } => Some(CatchUpProgress {
+                            staging_slot: cursor_slot(&state, &p.target.instance),
+                            live_slot: live.as_ref().and_then(|key| cursor_slot(&state, key)),
+                        }),
+                        _ => None,
+                    },
+                }),
+            }
         })
         .collect::<Vec<_>>();
     Ok(Json(rows).into_response())
+}
+
+/// One instance's cursor, as a slot number. A cursor that will not read is
+/// `None` — a read surface must not 500 because one instance is mid-anything.
+fn cursor_slot(state: &AdminState, key: &mitos_lifecycle::ids::InstanceKey) -> Option<u64> {
+    state
+        .storage
+        .read_cursor_at(key)
+        .ok()
+        .flatten()
+        .map(|point| point.slot())
+}
+
+fn standing_of(
+    slot: Option<&crate::moves::CatchUpSnapshot>,
+    client: &mitos_lifecycle::ids::ClientKey,
+    module: &mitos_lifecycle::ids::ModuleId,
+) -> SlotStanding {
+    // No move manager wired (an artifact-only router): there is no queue to
+    // stand in, which is what `Idle` says.
+    let Some(slot) = slot else {
+        return SlotStanding::Idle;
+    };
+    if slot.holder.as_ref() == Some(&(client.clone(), module.clone())) {
+        return SlotStanding::Holds;
+    }
+    match slot
+        .waiting
+        .iter()
+        .position(|m| &m.client == client && &m.module == module)
+    {
+        Some(ahead) => SlotStanding::Waiting { ahead },
+        None => SlotStanding::Idle,
+    }
+}
+
+/// `GET /_admin/catch-up` — who is catching up, and who is next.
+///
+/// Host-wide, not per module: ONE staging follower replays the chain at a
+/// time, so "why has my move not started" is a question about this queue and
+/// not about the module the operator happens to be looking at.
+async fn catch_up(State(state): State<AdminState>) -> Result<Response, HandlerError> {
+    let Some(moves) = state.moves.as_ref() else {
+        return Ok(Json(CatchUpView {
+            holder: None,
+            waiting: Vec::new(),
+        })
+        .into_response());
+    };
+    let slot = moves.catch_up();
+    Ok(Json(CatchUpView {
+        holder: slot.holder.map(|(client, module)| CatchUpHolder {
+            client: format!("{}/{}", client.namespace, client.client),
+            module: module.to_string(),
+        }),
+        waiting: slot
+            .waiting
+            .into_iter()
+            .map(|m| CatchUpWaiting {
+                client: format!("{}/{}", m.client.namespace, m.client.client),
+                module: m.module.to_string(),
+                tier: m.tier,
+                queued_at: m.queued_at.0,
+            })
+            .collect(),
+    })
+    .into_response())
 }
 
 /// One instance directory of a module.
@@ -3039,6 +3191,7 @@ mod tests {
         "/_admin/status",
         "/_admin/events",
         "/_admin/modules",
+        "/_admin/catch-up",
         "/_admin/modules/m",
         "/_admin/modules/m/companions",
         "/_admin/modules/m/rows",
@@ -3187,6 +3340,17 @@ mod tests {
             events.clone(),
             crate::lifecycle::system_clock(),
         ));
+        let moves = crate::moves::MoveManager::new(
+            storage.clone(),
+            Arc::new(crate::fetch::ArtifactPuller::new(
+                storage.clone(),
+                Arc::new(crate::fetch::testing::FakeFetcher::new()),
+            )),
+            auth.clone(),
+            lifecycle.clone(),
+            events.clone(),
+            crate::lifecycle::system_clock(),
+        );
         let router = admin_router_with_host(
             storage.clone(),
             handle,
@@ -3196,6 +3360,7 @@ mod tests {
             events.clone(),
             auth.clone(),
             lifecycle.clone(),
+            moves,
         );
         Wired {
             router,
@@ -3700,6 +3865,105 @@ mod tests {
             matches!(find(&other).lifecycle, InstanceLifecycle::Unmanaged),
             "a record-less sibling was reported as governed",
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `GET /_admin/catch-up` with nothing catching up. The shape is what an
+    /// operator polls while they wait, so "nothing is happening" has to be a
+    /// readable answer and not a 404.
+    #[tokio::test]
+    async fn the_catch_up_route_answers_when_the_queue_is_empty() {
+        let dir = tempdir("catch-up-empty");
+        let w = wired(&dir);
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/catch-up")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let view: CatchUpView = serde_json::from_slice(&body).unwrap();
+        assert!(view.holder.is_none());
+        assert!(view.waiting.is_empty());
+
+        // …and it is a READ route: a namespace token must not reach it, and
+        // the readonly operator must.
+        assert_eq!(
+            call(&w.router, Method::GET, "/_admin/catch-up", Some(READONLY)).await,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            call(&w.router, Method::GET, "/_admin/catch-up", Some(PROD)).await,
+            StatusCode::FORBIDDEN,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A row with no move is `Idle` in the queue and has no catch-up gap to
+    /// report. The populated shapes are exercised where the slot actually
+    /// moves — `moves.rs`'s slot tests.
+    #[tokio::test]
+    async fn a_row_with_no_move_stands_nowhere_in_the_queue() {
+        let dir = tempdir("rows-slot");
+        let w = wired(&dir);
+        let wasm = b"rows fixture";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        let key = w.storage.current_instance("m").unwrap().unwrap();
+        w.storage
+            .write_row(
+                "m",
+                &mitos_lifecycle::client_move::ClientRow::adopt(
+                    mitos_lifecycle::ids::ClientKey {
+                        namespace: mitos_lifecycle::ids::Namespace::parse("prod").unwrap(),
+                        client: mitos_lifecycle::ids::ClientId::parse(
+                            crate::auth::testing::PROD_CLIENT,
+                        )
+                        .unwrap(),
+                    },
+                    mitos_lifecycle::ids::ModuleId::parse("m").unwrap(),
+                    mitos_lifecycle::client_move::Placement {
+                        instance: key,
+                        revision: Revision(1),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/modules/m/rows")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<RowSummary> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].pending.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

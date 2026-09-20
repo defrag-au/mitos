@@ -1588,6 +1588,37 @@ pub(crate) mod testing {
         }
     }
 
+    /// An [`InterestRouter`] that records which modules had their
+    /// scan-interest re-asserted.
+    ///
+    /// A REBUILT instance starts with an empty KV, and the module's
+    /// scan-interest lives in that KV — so "starting one re-asserts it" is
+    /// load-bearing, and needs something that can say whether it happened.
+    #[derive(Default)]
+    pub(crate) struct RecordingRouter(StdMutex<Vec<String>>);
+
+    impl RecordingRouter {
+        pub(crate) fn routed(&self) -> Vec<String> {
+            self.0.lock().expect("recording router mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InterestRouter for RecordingRouter {
+        async fn route_interest(
+            &self,
+            module_id: &str,
+            _op: mitos_protocol::InterestOp,
+            _items: Vec<mitos_protocol::Interest>,
+        ) -> Result<(), InterestRouteError> {
+            self.0
+                .lock()
+                .expect("recording router mutex")
+                .push(module_id.to_owned());
+            Ok(())
+        }
+    }
+
     /// What the fake believes is running.
     ///
     /// The `&str` API cannot name an instance — the fake resolves nothing —
@@ -1830,6 +1861,15 @@ pub(crate) mod testing {
         async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
             self.record(HostCall::StopInstance(key.clone()));
             self.settle_stop(|slot| slot == &Slot::Instance(key.clone()));
+            // The storage half, as the real `stop_instance` does it: a
+            // follower that has stopped has let go of its redb handles.
+            // WITHOUT this, a test that copies a stopped parent's state would
+            // be copying a file whose writer is still open — which is exactly
+            // the thing `state_prep`'s rule 1 exists to prevent, and a fake
+            // that did not model it could not fail on it.
+            self.storage.close_kv_at(key);
+            self.storage.close_cursor_at(key);
+            self.storage.close_watched_at(key);
             Ok(())
         }
 

@@ -12,6 +12,139 @@
 
 **Depends on:** WO-05, 07. **Blocks:** WO-09 (the switch).
 
+## Implemented 2026-09-20 — notes for review
+
+Every acceptance item passes.
+
+| Acceptance | Result |
+|---|---|
+| 1. `cargo test -p mitos-platform -p mitos-core -p mitos-lifecycle` | `mitos-core` 28, `mitos-lifecycle` 102, `mitos-platform` lib **318**, + 15 integration — **0 failed** |
+| 1. `git diff --stat crates/mitos-platform/tests` | `two_instances_v2.rs \| 149 ++++` — **149 insertions, 0 deletions**, and no other file in the directory |
+| 2. clippy `--workspace --all-targets --all-features -D warnings` | 0 |
+| 2. `cargo check --workspace --all-targets` | 0 |
+| 2. `cargo fmt --check` | 0 diffs |
+| 3. Rebase (3 named) | pass |
+| 4. Slot (6 named) | pass |
+| 5. `create_staging` (12 named, incl. one per crash window) | pass, plus `a_parent_that_is_not_on_disk_is_refused_rather_than_copied_as_nothing` — see "Found and fixed" |
+| 6. `ReleaseStaging` (2 named) | pass |
+| 7. End to end | `an_announcement_creates_a_staging_instance_that_speaks_to_nobody` |
+| 8. Real host | `a_staging_instance_copied_from_a_running_parent_resumes_from_its_cursor` |
+| 9. Goldens | **69/69**, after `cargo build --release --bin mitos-run` AND `mitos-build` over all 19 community modules |
+
+Both sanctioned test edits were needed and nothing else was:
+`a_move_parks_at_queued_and_no_slot_is_ever_granted` →
+`a_move_parks_at_catching_up_and_nothing_feeds_caught_up` (phase `Queued` →
+`CatchingUp`; the order says its "the client's `current` has NOT moved"
+assertion stays as it is — there was not one, so it is ADDED, and it is the
+bar for this whole order), and `boot_refetches_a_row_that_was_fetching`
+relaxed to `Planned { .. }`.
+
+### The crash windows, one test each
+
+- **(a) partial built, parent still stopped** and **(b) partial complete, not
+  renamed** — `a_crash_mid_build_leaves_a_partial_that_boot_sweeps`. One
+  partial with only a state file, one with a full record: boot deletes both
+  and restarts the parent from its untouched record. They share a test
+  because they share a code path — a COMPLETE partial is still a partial, and
+  the only thing that makes one an instance is the rename.
+- **(c) renamed, follower not started** —
+  `a_crash_after_the_rename_starts_the_instance_it_finds`: `create_staging`
+  step 1, which is also what the move's `recover()` re-drives.
+- And the invariant under all three:
+  `nothing_sees_a_half_built_instance` walks `list_instances` and
+  `LifecycleManager::instances` after each file written into the partial.
+
+**The parent's downtime** is logged at `info` with bytes and milliseconds and
+recorded as `EventKind::StagingCopy { instance, parent, bytes, millis }`.
+
+### Deviations
+
+1. **`create_staging(key, parent)` takes no `governing`.** §3 names the
+   parameter and then says the record written is `Instance::staging(key)`'s
+   — which is `governing: None` by construction, so the argument would be
+   unused. Setting it instead would be the host deciding something
+   `instance.rs` decides: the profile is a high-water mark folded over
+   clients that have ATTACHED, and none has.
+2. **The parent is restarted only if its record says `StartFollower`.**
+   "ALWAYS restarted" is implemented as "on every path out of the copy,
+   success or failure" — which is what the sentence is guarding against. But
+   restarting an instance an OPERATOR had stopped is the v2 bug WO-03 exists
+   to fix, so the restart goes through the same `on_boot` check `upload`
+   makes. A stopped parent was never running, so the stop was a no-op and
+   there is nothing to put back.
+3. **`the_parent_is_stopped_for_the_copy_and_always_restarted` injects the
+   failure on the SOURCE file (`chmod 000`), not by making "the partial's
+   parent read-only".** A read-only instances directory fails
+   `begin_instance` — BEFORE the parent is ever stopped — so the test would
+   assert nothing at all. `#[cfg(unix)]`.
+4. **§8 proves "both followers advancing" with a ROLLBACK event, not a
+   second `Apply`.** `DriverV2` takes its cursor from the block it decoded
+   (`cursor_after = decoded.cursor`), and there is exactly one block fixture
+   — so re-applying it could not move either cursor and would have proved
+   nothing. `TipEvent::Undo` sets the cursor to the point it carries, which
+   each follower then flushes to its own file. (Found by writing the obvious
+   version first and watching the PARENT fail to advance.)
+5. **`StateFile` enum in `storage.rs`**, used by the copy AND by the four
+   existing store-open sites. "The files a `CopySet` can carry" and "the
+   files the stores open" must be the same set, and four string literals in
+   four functions is how they stop being.
+6. **`FakeHost::stop_instance` now closes the three `*_at` handles the real
+   one closes.** Without it every copy test would be copying a file whose
+   writer is still open — precisely what `state_prep`'s rule 1 forbids — and
+   the fake could not fail on it.
+7. **Signature changes the order implies but does not spell out:**
+   `MoveManager::new` takes a `Clock` (§2: "inject one, as `LifecycleManager`
+   does"), and `admin_router_with_host` takes the `MoveManager` (§5: the rows
+   route shows the slot, which lives in memory on that manager). Both call
+   sites are in `bundle.rs`.
+8. **`LifecycleManager::start_follower` extracted** from `execute`'s
+   `StartFollower` arm, so `create_staging` can report `StartFailed` while
+   `execute` keeps the "log it and let the watchdog close the gap" posture
+   every effect has. That IS §3.4's "the way the manager starts anything" —
+   one function, two callers, and the `dialer.reconcile_module_interest` is
+   inside it rather than beside it.
+9. **Files outside the list:** `events.rs` (the `StagingCopy` variant — §3
+   requires the downtime on the event ring and no existing variant could
+   carry it), `host_v2.rs` (deviation 6, plus a `RecordingRouter` so "the
+   scan-interest was re-asserted" is a fact and not a hope), and
+   `mitos-core/src/bundle.rs` (deviation 7, two lines).
+
+### Found and fixed
+
+**A `Carry::Copy` from a parent whose directory is GONE produced an empty
+instance, silently.** `PartialInstance::carry` returns `Ok(0)` for a file
+that is not there — which is right for `watched.redb`, often absent, and
+wrong for the whole parent directory. An un-rebased row naming an instance an
+upload renamed away would therefore have been given a REBUILD nobody planned,
+presented as a copy, with no error anywhere. `copy_from_parent` now refuses
+with `StagingError::ParentGone`; §1's rebase is the first lock on that door
+and this is the second.
+
+It also showed the rebase test was weak. It originally inferred "the parent
+was K2" from the staging instance merely EXISTING — which, before the fix,
+was true either way. It now writes a marker into K2's KV and asserts the
+staging instance's KV has it.
+
+### Questions for the reviewer
+
+1. **`ReleaseStaging` and `AttachTo`/`DetachFrom` take the MODULE lock from
+   under a ROW lock.** §2's table specifies both inline, and the ordering is
+   consistent everywhere (row then module; nothing takes a row lock while
+   holding a module one), so there is no deadlock. But the module lock is
+   held by `create_staging` for the length of a copy — 1.3 GB on the largest
+   module today — so an announcement for ANOTHER client of the same module
+   blocks for that long while holding its own row lock, and a subscribe waits
+   on it. That is the shape WO-07's review bounded with `DrainBusy`.
+   `reconcile` is a DIFF and the tick re-runs it, so a bounded attempt that
+   gives up would be safe by construction — but choosing that is a design
+   call, not an implementation one.
+2. **The slot is held from `SlotGranted` until a switch nothing in this order
+   performs.** The first announcement on a host takes the host-wide catch-up
+   slot and never gives it back, so every later move queues behind it for
+   ever. The deploy note says exactly this and gates mainnet on WO-09;
+   restating it because after this order it is real rather than hypothetical,
+   and `GET /_admin/catch-up` is now the place it is visible.
+
 ## What this order does, and where it deliberately stops
 
 Today an announcement for a new build ends at `Queued` (WO-05) and nothing

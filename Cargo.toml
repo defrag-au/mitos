@@ -183,6 +183,12 @@ memmap2 = "0.9"
 # it hands each chunk's pages back rather than evict the other services that
 # share the box's cache. Linux only, behind a cfg.
 libc = "0.2"
+# Copy-on-write file clone where the filesystem has one, a byte copy where it
+# does not. A client move copies a parent instance's `kv.redb` — 1.3 GB on the
+# largest module today — with that parent's follower STOPPED, so the copy IS
+# the downtime. Identical to `std::fs::copy` on the current box's ext4; a
+# metadata-only clone on the next one's XFS, which is chosen for exactly this.
+reflink-copy = "0.1"
 
 # Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
 # compiles sqlite from source (on-box build, no system dep).

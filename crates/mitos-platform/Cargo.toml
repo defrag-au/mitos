@@ -70,6 +70,12 @@ dolos-core = { workspace = true }
 # version the rest of the workspace uses.
 redb = { workspace = true }
 
+# A client move copies its parent instance's state files with the parent's
+# follower stopped, so the copy is measured downtime. `reflink_or_copy` is a
+# byte copy on today's ext4 and a metadata clone on a filesystem that supports
+# one — see the workspace entry.
+reflink-copy = { workspace = true }
+
 # Async runtime. Module dispatch + host I/O run on Tokio.
 tokio = { workspace = true }
 tokio-util = "0.7"

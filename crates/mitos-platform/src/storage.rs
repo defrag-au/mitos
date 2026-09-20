@@ -61,6 +61,10 @@ const INSTANCE_MARKER: &str = "instance.toml";
 const INSTANCES_DIR: &str = "instances";
 /// The instance's `LifecycleRecord` — see [`ModuleStorage::read_lifecycle`].
 const LIFECYCLE_RECORD: &str = "lifecycle.toml";
+/// What an instance directory is called while it is still being built. Not a
+/// valid `dir_name()` — those are two hex digests joined by `-` — so nothing
+/// that resolves a key can ever name one.
+const PARTIAL_SUFFIX: &str = ".partial";
 /// A client's row — see [`ModuleStorage::read_row`].
 const CLIENT_ROW: &str = "rows/<client>.toml";
 
@@ -169,6 +173,38 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// One of an instance's state files, by name.
+///
+/// An enum rather than four string literals because a client move COPIES
+/// three of them from its parent, and "the files the copy carries" and "the
+/// files the stores open" must be the same set. `mitos_lifecycle::state_prep`
+/// decides WHICH — [`CopySet`](mitos_lifecycle::state_prep::CopySet) has one
+/// field per copyable file — and this is how the host spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateFile {
+    Kv,
+    Cursor,
+    /// The watched-UTxO index. May be dropped on its own (`reset-watched`)
+    /// but is never carried without `Kv` and `Cursor` — it indexes UTxOs a
+    /// fresh KV would not know.
+    Watched,
+    /// The emissions log. NOT in a `CopySet` and never copied: it is the
+    /// largest file there is and every row in it is addressed to a client
+    /// that is still being served by the parent (D5).
+    Emissions,
+}
+
+impl StateFile {
+    pub fn file_name(self) -> &'static str {
+        match self {
+            StateFile::Kv => "kv.redb",
+            StateFile::Cursor => "cursor.redb",
+            StateFile::Watched => "watched.redb",
+            StateFile::Emissions => "emissions.redb",
+        }
+    }
 }
 
 fn write_lifecycle_to(path: &Path, record: &LifecycleRecord) -> Result<(), StorageError> {
@@ -316,7 +352,10 @@ impl ModuleStorage {
         if let Some(s) = cache.get(&addr) {
             return Ok(s.clone());
         }
-        let store = crate::vendored::balius::kv::RedbKv::try_new(dir.join("kv.redb"), cache_size)?;
+        let store = crate::vendored::balius::kv::RedbKv::try_new(
+            dir.join(StateFile::Kv.file_name()),
+            cache_size,
+        )?;
         cache.insert(addr, store.clone());
         Ok(store)
     }
@@ -379,7 +418,9 @@ impl ModuleStorage {
         if let Some(idx) = cache.get(&addr) {
             return idx.clone();
         }
-        let idx = match crate::watched_ref_index::WatchedRefIndex::open(dir.join("watched.redb")) {
+        let idx = match crate::watched_ref_index::WatchedRefIndex::open(
+            dir.join(StateFile::Watched.file_name()),
+        ) {
             Ok(idx) => Arc::new(idx),
             Err(e) => Self::watched_fallback(what, &e.to_string()),
         };
@@ -493,7 +534,8 @@ impl ModuleStorage {
         if let Some(s) = cache.get(&addr) {
             return Ok(s.clone());
         }
-        let store = crate::emissions::EmissionsStore::open(dir.join("emissions.redb"))?;
+        let store =
+            crate::emissions::EmissionsStore::open(dir.join(StateFile::Emissions.file_name()))?;
         cache.insert(addr, store.clone());
         Ok(store)
     }
@@ -547,7 +589,7 @@ impl ModuleStorage {
         if let Some(s) = cache.get(&addr) {
             return Ok(Some(s.clone()));
         }
-        let path = dir.join("cursor.redb");
+        let path = dir.join(StateFile::Cursor.file_name());
         if if_absent == IfAbsent::Leave && !path.exists() {
             return Ok(None);
         }
@@ -795,6 +837,84 @@ impl ModuleStorage {
             &dir.join(INSTANCE_MARKER),
             instance_key_toml(key)?.as_bytes(),
         )
+    }
+
+    /// Begin building a NEW instance directory, beside where it will live.
+    ///
+    /// The whole of it — the state files carried from a parent, the lifecycle
+    /// record, the marker — is written under `<dir_name>.partial` and RENAMED
+    /// into place by [`PartialInstance::commit`]. Two reasons, and both are
+    /// the README's "destination exists must mean destination is complete":
+    /// a `.partial` suffix is not a valid instance directory name, and
+    /// `list_instances` skips a directory with no `instance.toml` anyway — so
+    /// until the rename nothing on the host can see it, not the drain's store
+    /// scan, not the admin route, not `boot`.
+    ///
+    /// A leftover partial from a crash is REMOVED rather than resumed: half a
+    /// copied `kv.redb` is exactly the thing that must never be mistaken for
+    /// a finished one. `boot` sweeps them too ([`Self::sweep_partial_instances`]).
+    pub fn begin_instance(&self, key: &InstanceKey) -> Result<PartialInstance, StorageError> {
+        let dir = self.partial_instance_dir(key);
+        if dir.exists() {
+            tracing::warn!(
+                module = %key.module,
+                instance = %key.dir_name(),
+                "a partial instance directory was left behind by a crash; rebuilding it",
+            );
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        Ok(PartialInstance {
+            storage: self.clone(),
+            key: key.clone(),
+            dir,
+        })
+    }
+
+    fn partial_instance_dir(&self, key: &InstanceKey) -> PathBuf {
+        self.instances_root(&key.module)
+            .join(format!("{}{PARTIAL_SUFFIX}", key.dir_name()))
+    }
+
+    /// Delete every unfinished instance build under a module. Called at boot:
+    /// a partial is by construction a directory whose writer is gone.
+    ///
+    /// Returns how many were removed. One that will not delete is logged and
+    /// SKIPPED rather than failing the sweep — one stuck directory must not
+    /// stop the module from booting.
+    pub fn sweep_partial_instances(&self, module: &ModuleId) -> usize {
+        let Ok(entries) = std::fs::read_dir(self.instances_root(module)) else {
+            return 0;
+        };
+        let mut swept = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(PARTIAL_SUFFIX)
+            {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    swept += 1;
+                    tracing::warn!(
+                        module = %module,
+                        partial = %path.display(),
+                        "removed an unfinished instance build left by a crash",
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    module = %module,
+                    partial = %path.display(),
+                    error = %e,
+                    "an unfinished instance build could not be removed; leaving it",
+                ),
+            }
+        }
+        swept
     }
 
     /// Every instance of a module, read from the markers. Directories without
@@ -1622,6 +1742,90 @@ impl ModuleStorage {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+/// A new instance directory under construction. See
+/// [`ModuleStorage::begin_instance`].
+///
+/// Dropped without [`Self::commit`], the partial stays on disk for `boot` to
+/// sweep — deleting it in `Drop` would mean a best-effort filesystem
+/// operation running on a panic unwind, which is how one half-removed
+/// directory becomes two.
+pub struct PartialInstance {
+    storage: ModuleStorage,
+    key: InstanceKey,
+    dir: PathBuf,
+}
+
+impl PartialInstance {
+    pub fn key(&self) -> &InstanceKey {
+        &self.key
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Carry one state file across from `parent`. Returns the bytes copied.
+    ///
+    /// **The parent's follower must be stopped**, so that `kv`, `cursor` and
+    /// `watched` all describe the same block and redb has flushed — see
+    /// `mitos_lifecycle::state_prep`'s rule 1. This does not check it: only
+    /// the lifecycle manager, holding the module lock, can know.
+    ///
+    /// A file the parent never created is `Ok(0)`: starting without it is
+    /// exactly what starting with an empty one means, and a `watched.redb`
+    /// that was never opened is the ordinary case.
+    pub fn carry(&self, parent: &InstanceKey, file: StateFile) -> Result<u64, StorageError> {
+        let from = self.storage.instance_dir(parent).join(file.file_name());
+        if !from.is_file() {
+            return Ok(0);
+        }
+        let to = self.dir.join(file.file_name());
+        // `reflink_or_copy` — a metadata clone where the filesystem has one,
+        // a byte copy where it does not. NOT `std::fs::copy`: identical on
+        // today's ext4, and the difference between seconds and nothing on the
+        // next box's XFS, which is chosen for this.
+        reflink_copy::reflink_or_copy(&from, &to).map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "copy {} → {}: {e}",
+                from.display(),
+                to.display()
+            )))
+        })?;
+        Ok(std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0))
+    }
+
+    pub fn write_lifecycle(&self, record: &LifecycleRecord) -> Result<(), StorageError> {
+        write_lifecycle_to(&self.dir.join(LIFECYCLE_RECORD), record)
+    }
+
+    /// Write the marker LAST, then rename the whole directory into place.
+    ///
+    /// The marker last because it is what makes a directory an instance:
+    /// `list_instances` skips one without it. So a crash anywhere before this
+    /// line leaves something nothing can resolve, and a crash after the
+    /// rename leaves an instance that is complete.
+    ///
+    /// The rename never crosses a filesystem — the partial is a sibling of
+    /// its destination — which is what makes it atomic. Under the repoint
+    /// WRITE lock, because `activate`'s rename shares this parent directory.
+    pub fn commit(self) -> Result<(), StorageError> {
+        write_atomic(
+            &self.dir.join(INSTANCE_MARKER),
+            instance_key_toml(&self.key)?.as_bytes(),
+        )?;
+        let _guard = self.storage.repoint.write().expect("repoint lock");
+        let to = self.storage.instance_dir(&self.key);
+        if to.exists() {
+            return Err(StorageError::InstanceExists {
+                module: self.key.module.to_string(),
+                instance: self.key.dir_name(),
+            });
+        }
+        std::fs::rename(&self.dir, &to)?;
+        Ok(())
     }
 }
 

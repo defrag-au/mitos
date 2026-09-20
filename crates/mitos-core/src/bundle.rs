@@ -659,6 +659,7 @@ impl Bundle {
                 authenticator.clone(),
                 lifecycle.clone(),
                 event_ring.clone(),
+                mitos_platform::lifecycle::system_clock(),
             );
             // Re-issue whatever each row says is already in flight. STARTS
             // interrupted fetches; does not wait for them.
@@ -701,6 +702,7 @@ impl Bundle {
                 event_ring.clone(),
                 authenticator.clone(),
                 lifecycle.clone(),
+                moves.clone(),
             ));
 
             // Module watchdog — revives any module that has

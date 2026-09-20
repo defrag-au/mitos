@@ -34,10 +34,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use mitos_lifecycle::UnixSecs;
-use mitos_lifecycle::ids::{ClientId, ClientKey, InstanceKey};
+use mitos_lifecycle::ids::{ClientId, ClientKey, InstanceKey, Sha256Hex};
 use mitos_lifecycle::instance::{BootAction, Effect, Event, Instance, Rejected};
 use mitos_lifecycle::policy::NamespaceProfile;
 use mitos_lifecycle::routing::{self, Subscriber};
+use mitos_lifecycle::{state_prep, upgrade};
 
 use crate::auth::Authenticator;
 use crate::dialer::CompanionDialer;
@@ -45,7 +46,7 @@ use crate::events::{EventKind, EventRing};
 use crate::host_v2::ModuleHostHandle;
 use crate::manifest::Manifest;
 use crate::rows::instance_dir_of;
-use crate::storage::{ModuleStorage, StorageError};
+use crate::storage::{ModuleStorage, PartialInstance, StateFile, StorageError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
@@ -82,6 +83,39 @@ impl LifecycleError {
                 | LifecycleError::Storage(StorageError::NoSuchInstance { .. })
         )
     }
+}
+
+/// Why a staging instance could not be created. Every one of these fails the
+/// MOVE (`MoveFailure::StagingFailed`) and leaves the client exactly where it
+/// was being served.
+#[derive(Debug, thiserror::Error)]
+pub enum StagingError {
+    #[error("storage: {0}")]
+    Storage(#[from] StorageError),
+    #[error("lifecycle: {0}")]
+    Lifecycle(#[from] LifecycleError),
+    /// A directory is already there with no `lifecycle.toml`. Nothing here
+    /// made it, so nothing here will adopt whatever state is in it.
+    #[error("instance {0} has a directory but no record; refusing it as a move's target")]
+    Unmanaged(String),
+    #[error("no manifest in the content store for {0}")]
+    NoManifest(String),
+    /// Unreachable while the WIT has no `migrate` export — see
+    /// `create_staging`. Never "copy and hope".
+    #[error("the state plan needs a `migrate` export, and the host cannot run one")]
+    MigrateUnsupported,
+    /// `copy_set` asked to carry a file with no parent to carry it from —
+    /// a contradiction in the pure crate, not a state the host can reach.
+    #[error("the copy plan names files but the move has no parent instance")]
+    CopyWithoutParent,
+    /// The parent's directory is not there. An upload renamed it away and
+    /// the row naming it was not rebased first — copying from it would
+    /// silently produce an EMPTY instance, because a file that is not there
+    /// carries as zero bytes.
+    #[error("parent instance {0} is not on disk; refusing to copy nothing and call it a copy")]
+    ParentGone(String),
+    #[error("the staging instance was built but its follower did not start")]
+    StartFailed,
 }
 
 /// What [`LifecycleManager::revive`] did.
@@ -586,6 +620,35 @@ impl LifecycleManager {
         }
     }
 
+    /// Start ONE instance's follower — the only way anything in this manager
+    /// starts one.
+    ///
+    /// The dialer reconcile is half of it, not an extra: a subscribe that
+    /// landed while the module was down had its interest mutation dropped
+    /// with `NotRunning`, and a REBUILT instance has an empty KV, so the
+    /// module's scan-interest (which `update-interest` persists in that KV)
+    /// is gone with it. Without the re-assert such an instance would
+    /// bootstrap to tip having scanned for nothing.
+    ///
+    /// Returns the failure rather than logging it, so a caller that must
+    /// report it — `create_staging` — can, while `execute` keeps the "log it
+    /// and let the watchdog close the gap" posture every effect has.
+    async fn start_follower(&self, key: &InstanceKey) -> Result<(), String> {
+        self.host
+            .start_instance(key)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(dialer) = self.dialer.get() {
+            dialer.reconcile_module_interest(key.module.as_str()).await;
+        }
+        tracing::info!(
+            module = %key.module,
+            instance = %key.dir_name(),
+            "lifecycle: follower started",
+        );
+        Ok(())
+    }
+
     /// Every effect is idempotent (see the lifecycle crate's docs), so a
     /// failure here is logged and left for the watchdog rather than retried
     /// in place or rolled back.
@@ -597,22 +660,11 @@ impl LifecycleManager {
     async fn execute(&self, key: &InstanceKey, effect: Effect) {
         let module = key.module.as_str();
         match effect {
-            Effect::StartFollower => match self.host.start_instance(key).await {
-                Ok(()) => {
-                    // Exactly what the watchdog does after a revive: a
-                    // subscribe that landed while the module was down had its
-                    // interest mutation dropped with `NotRunning`.
-                    if let Some(dialer) = self.dialer.get() {
-                        dialer.reconcile_module_interest(module).await;
-                    }
-                    tracing::info!(
-                        module = %module,
-                        instance = %key.dir_name(),
-                        "lifecycle: follower started",
-                    );
+            Effect::StartFollower => {
+                if let Err(e) = self.start_follower(key).await {
+                    self.effect_failed(module, "start_follower", &e);
                 }
-                Err(e) => self.effect_failed(module, "start_follower", &e.to_string()),
-            },
+            }
             Effect::StopFollower => match self.host.stop_instance(key).await {
                 Ok(()) => tracing::info!(
                     module = %module,
@@ -730,6 +782,13 @@ impl LifecycleManager {
     async fn boot_module(&self, module: &str) -> Result<(), LifecycleError> {
         let lock = self.lock_for(module);
         let _guard = lock.lock().await;
+        // An unfinished instance build. Its writer died with the process, and
+        // "resume it" is not available: half a copied `kv.redb` looks exactly
+        // like a whole one. The move that wanted it re-queues (`recover`) and
+        // `create_staging` builds it again from scratch.
+        if let Ok(module_id) = mitos_lifecycle::ids::ModuleId::parse(module) {
+            self.storage.sweep_partial_instances(&module_id);
+        }
         self.reconcile_locked(module).await?;
         for view in self.instances(module)? {
             let key = view.key().clone();
@@ -882,6 +941,284 @@ impl LifecycleManager {
             .start_instance(&key)
             .await
             .map_err(|e| LifecycleError::Host(e.to_string()))
+    }
+
+    // -----------------------------------------------------------------
+    // Creating a staging instance — `client_move::Effect::EnsureInstance`
+    // -----------------------------------------------------------------
+
+    /// Make `key` exist, with its state prepared from `parent`, and follow.
+    ///
+    /// **Everything here runs under the MODULE's lifecycle lock**, because it
+    /// stops and starts a follower. WO-07's review is what happens when
+    /// something does that from outside: an unlocked sweep started the old
+    /// instance in the middle of its own upload, and the upload's start of
+    /// the new one then failed on redb "already open".
+    ///
+    /// The caller — `MoveManager` executing `EnsureInstance` — is holding a
+    /// ROW lock, so it must call this from a spawned task. The copy takes as
+    /// long as the parent's `kv.redb` is big.
+    pub async fn create_staging(
+        &self,
+        key: &InstanceKey,
+        parent: Option<&InstanceKey>,
+    ) -> Result<(), StagingError> {
+        let lock = self.lock_for(key.module.as_str());
+        let _guard = lock.lock().await;
+        self.create_staging_locked(key, parent).await
+    }
+
+    async fn create_staging_locked(
+        &self,
+        key: &InstanceKey,
+        parent: Option<&InstanceKey>,
+    ) -> Result<(), StagingError> {
+        // 1. ALREADY THERE. Both the recovery path (a crash after the rename,
+        //    re-driven by `ClientRow::recover`) and D4's "B already exists" —
+        //    a second client announcing the build a first one is moving to.
+        //    Its cursor is the whole point: it has been following, and
+        //    rebuilding it would throw that away.
+        if self.storage.instance_dir(key).is_dir() {
+            return match self.peek_at(key)? {
+                InstanceView::Managed(instance) => {
+                    if instance.on_boot() == BootAction::StartFollower
+                        && !self
+                            .host
+                            .running_instances(key.module.as_str())
+                            .await
+                            .contains(key)
+                    {
+                        self.start_follower(key)
+                            .await
+                            .map_err(|_| StagingError::StartFailed)?;
+                    }
+                    Ok(())
+                }
+                // A directory with no record is one nothing here made. Taking
+                // it as a move's target would adopt whatever state an
+                // operator left in it.
+                InstanceView::Unmanaged(key) => Err(StagingError::Unmanaged(key.dir_name())),
+            };
+        }
+
+        // 2. THE PLAN, from pure functions only.
+        let target = self.artifact_manifest(&key.wasm)?;
+        let parent_manifest = match parent {
+            Some(parent) => Some(self.artifact_manifest(&parent.wasm)?),
+            None => None,
+        };
+        let plan = state_prep::plan(
+            parent_manifest.as_ref().map(|m| m.lifecycle.state_schema),
+            target.lifecycle.state_schema,
+            // ALWAYS: there is no `migrate` export in the WIT yet (WO-04), so
+            // the host has no way to run one.
+            state_prep::MigrateExport::Absent,
+        );
+        if matches!(plan, state_prep::StatePlan::CopyThenMigrate { .. }) {
+            // Unreachable while `MigrateExport::Absent` is a constant. If it
+            // ever is reached, the copy would be at the parent's schema with
+            // nothing to bring it forward — refuse rather than copy and hope.
+            return Err(StagingError::MigrateUnsupported);
+        }
+        let instance_plan = upgrade::resolve_instance(
+            &target.lifecycle.upgrade,
+            parent_manifest.as_ref().map(|m| m.lifecycle.revision),
+            target.lifecycle.revision,
+        );
+        let carry = state_prep::copy_set(plan, instance_plan.watched);
+        tracing::info!(
+            module = %key.module,
+            instance = %key.dir_name(),
+            parent = parent.map(|p| p.dir_name()).unwrap_or_else(|| "-".to_owned()),
+            ?plan,
+            watched = ?instance_plan.watched,
+            "creating a staging instance",
+        );
+
+        // 3. BUILD UNDER A TEMP NAME. Nothing on the host can see a
+        //    `.partial`, so every crash window below leaves a tree that is
+        //    either complete or invisible.
+        let partial = self.storage.begin_instance(key)?;
+        let wanted: Vec<StateFile> = [
+            (StateFile::Kv, carry.kv),
+            (StateFile::Cursor, carry.cursor),
+            (StateFile::Watched, carry.watched),
+        ]
+        .into_iter()
+        .filter(|(_, carry)| *carry == state_prep::Carry::Copy)
+        .map(|(file, _)| file)
+        .collect();
+        if !wanted.is_empty() {
+            // `copy_set` only ever says `Copy` for a plan that HAS a parent
+            // (`Fresh` and `Rebuild` are `StartEmpty` throughout), so this is
+            // a contradiction in the pure crate rather than a host state.
+            let parent = parent.ok_or(StagingError::CopyWithoutParent)?;
+            self.copy_from_parent(&partial, parent, &wanted).await?;
+        }
+        // The record BEFORE the marker, and the marker inside `commit`: a
+        // directory is only an instance once it has both, and a managed one
+        // only once it has a record.
+        partial.write_lifecycle(&Instance::staging(key.clone()).record())?;
+        partial.commit()?;
+
+        // 4. Start it. A failure here leaves a complete, MANAGED, `Staging`
+        //    instance — so the watchdog will retry it, and `ReleaseStaging`
+        //    from the move this failure fails is what cleans it up.
+        self.start_follower(key).await.map_err(|e| {
+            self.effect_failed(key.module.as_str(), "start_staging", &e);
+            StagingError::StartFailed
+        })
+    }
+
+    /// Stop the parent's follower, carry its files across, and START IT AGAIN
+    /// — on every path out, success or failure.
+    ///
+    /// `stop_instance` awaits the block in flight and flushes the cursor, so
+    /// `kv`, `cursor` and `watched` all describe the same block; that is
+    /// `state_prep`'s rule 1, and it is also why the copy IS the parent's
+    /// downtime. The parent's RECORD is untouched — nobody decided it should
+    /// stop, exactly as in `upload` — so `on_boot` is what says whether to
+    /// put it back, and an operator's stop survives a move it knew nothing
+    /// about.
+    async fn copy_from_parent(
+        &self,
+        partial: &PartialInstance,
+        parent: &InstanceKey,
+        files: &[StateFile],
+    ) -> Result<(), StagingError> {
+        let module = parent.module.as_str();
+        // A parent whose directory is GONE — an upload renamed it away —
+        // would carry no files at all, because a file that is not there is
+        // `Ok(0)`: the move would silently get an EMPTY instance where it
+        // asked for a copy. `ClientRow::rebase` is what keeps this from
+        // happening (`moves.rs` §1), and this is the second lock on the
+        // door: a rebuild is a decision `state_prep` makes, never something
+        // a missing directory decides for it.
+        if !self.storage.instance_dir(parent).is_dir() {
+            return Err(StagingError::ParentGone(parent.dir_name()));
+        }
+
+        let started = std::time::Instant::now();
+        if let Err(e) = self.host.stop_instance(parent).await {
+            self.effect_failed(module, "quiesce_for_staging", &e.to_string());
+        }
+
+        let mut bytes = 0u64;
+        let mut outcome = Ok(());
+        for file in files {
+            match partial.carry(parent, *file) {
+                Ok(copied) => bytes += copied,
+                Err(e) => {
+                    outcome = Err(StagingError::Storage(e));
+                    break;
+                }
+            }
+        }
+
+        // ALWAYS, and before the `?`. Leaving a live client's instance
+        // stopped because a copy for somebody else's move failed would be
+        // the worst outcome this whole path has.
+        if matches!(
+            self.peek_at(parent).map(|view| view.on_boot()),
+            Ok(BootAction::StartFollower)
+        ) && let Err(e) = self.start_follower(parent).await
+        {
+            self.effect_failed(module, "restart_after_staging_copy", &e);
+        }
+
+        // The parent's downtime IS this number. The largest `kv.redb` today
+        // is 1.3 GB, and "a dev worker's announcement paused prod's follower
+        // for N seconds" is a thing an operator must be able to see after the
+        // fact — so it goes on the ring, not only in the journal.
+        let millis = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            module = %module,
+            parent = %parent.dir_name(),
+            instance = %partial.key().dir_name(),
+            bytes,
+            millis,
+            ok = outcome.is_ok(),
+            "staging copy finished; the parent's follower was stopped for its duration",
+        );
+        self.events.record(
+            module,
+            EventKind::StagingCopy {
+                instance: partial.key().dir_name(),
+                parent: parent.dir_name(),
+                bytes,
+                millis,
+            },
+        );
+        outcome
+    }
+
+    fn artifact_manifest(&self, wasm: &Sha256Hex) -> Result<Manifest, StagingError> {
+        self.storage
+            .read_artifact_manifest(wasm)?
+            .ok_or_else(|| StagingError::NoManifest(wasm.to_string()))
+    }
+
+    /// `client_move::Effect::ReleaseStaging` — this move no longer wants
+    /// `key`.
+    ///
+    /// TWO clients can be moving to one build (they announced the same one),
+    /// so one giving up must not take the instance the other is still
+    /// catching up on. The rows are the record of who wants it.
+    pub async fn release_staging(&self, key: &InstanceKey) -> Result<(), LifecycleError> {
+        let module = key.module.as_str();
+        let lock = self.lock_for(module);
+        let _guard = lock.lock().await;
+
+        if self.a_move_still_wants(key) {
+            tracing::debug!(
+                module = %module,
+                instance = %key.dir_name(),
+                "staging instance released by one move; another still wants it",
+            );
+            return Ok(());
+        }
+        match self.apply_at_locked(key, Event::StagingReleased).await {
+            Ok(_) => Ok(()),
+            // `StagingReleased` on an instance that has since become `Active`
+            // is REFUSED, and that is the point: a client attached to it
+            // between the release and now, so it is not staging any more.
+            Err(LifecycleError::Rejected(rejected)) => {
+                tracing::debug!(
+                    module = %module,
+                    instance = %key.dir_name(),
+                    rejected = %rejected,
+                    "staging release refused; the instance is no longer staging",
+                );
+                Ok(())
+            }
+            // The reap already finished and took it.
+            Err(e) if e.is_gone() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether ANY row of the module has a pending move targeting `key`.
+    ///
+    /// A row that will not read counts as WANTING it: refusing to reap is the
+    /// recoverable mistake, reaping an instance a client is catching up on is
+    /// not.
+    fn a_move_still_wants(&self, key: &InstanceKey) -> bool {
+        match self.storage.list_rows(key.module.as_str()) {
+            Ok(rows) => rows.iter().any(|row| {
+                row.pending
+                    .as_ref()
+                    .is_some_and(|p| &p.target.instance == key)
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    module = %key.module,
+                    instance = %key.dir_name(),
+                    error = %e,
+                    "cannot read this module's rows; keeping the staging instance",
+                );
+                true
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1050,6 +1387,21 @@ pub(crate) mod testing {
         client: &str,
         key: &str,
     ) {
+        write_registration_with_interest(storage, module, client, key, Vec::new());
+    }
+
+    /// As [`write_registration`], with a declared interest.
+    ///
+    /// `reconcile_module_interest` routes the UNION of what a module's
+    /// companions declare, so a registration with none is nothing to route —
+    /// which is invisible unless a test says what it wanted routed.
+    pub(crate) fn write_registration_with_interest(
+        storage: &ModuleStorage,
+        module: &str,
+        client: &str,
+        key: &str,
+        interests: Vec<mitos_protocol::Interest>,
+    ) {
         let dir = storage.module_dir_for_companions(module).join(client);
         std::fs::create_dir_all(&dir).expect("companion dir");
         let request = mitos_protocol::SubscribeRequest {
@@ -1059,7 +1411,7 @@ pub(crate) mod testing {
             companion_key: key.to_owned(),
             client_id: client.to_owned(),
             resume_from: None,
-            interests: vec![],
+            interests,
             dial_back: None,
             announced: Vec::new(),
         };
@@ -1274,6 +1626,136 @@ mod tests {
                 .snapshot(0, None, Some("instance_alert"), 512)
                 .len()
         }
+
+        /// Put an artifact in the CAS with a chosen `[lifecycle]`, and return
+        /// the key a move to it would target. NOT an instance:
+        /// `create_staging` is the only thing that makes one.
+        fn artifact(
+            &self,
+            module: &str,
+            wasm: &[u8],
+            revision: u32,
+            schema: u32,
+            upgrade: &[(u32, mitos_lifecycle::upgrade::UpgradeAction)],
+        ) -> InstanceKey {
+            use mitos_lifecycle::ids::Revision;
+            use mitos_lifecycle::state_prep::StateSchema;
+            use mitos_lifecycle::upgrade::UpgradeEntry;
+            let mut manifest = crate::companions::testing::manifest_for(module, wasm);
+            manifest.lifecycle.revision = Revision(revision);
+            manifest.lifecycle.state_schema = StateSchema(schema);
+            manifest.lifecycle.upgrade = upgrade
+                .iter()
+                .map(|(since, action)| UpgradeEntry {
+                    since: Revision(*since),
+                    actions: std::collections::BTreeSet::from([*action]),
+                })
+                .collect();
+            let wasm_sha = self
+                .storage
+                .put_artifact(&manifest, wasm)
+                .expect("put artifact");
+            InstanceKey {
+                module: mitos_lifecycle::ids::ModuleId::parse(module).expect("module id"),
+                wasm: wasm_sha,
+                config: None,
+            }
+        }
+
+        /// Activate `module` from an artifact with a chosen `[lifecycle]`, so
+        /// a move can be PLANNED from its current instance's manifest.
+        fn activate_at(
+            &self,
+            module: &str,
+            wasm: &[u8],
+            revision: u32,
+            schema: u32,
+        ) -> InstanceKey {
+            let key = self.artifact(module, wasm, revision, schema, &[]);
+            let manifest = self
+                .storage
+                .read_artifact_manifest(&key.wasm)
+                .unwrap()
+                .unwrap();
+            self.storage.activate(&manifest, wasm).expect("activate");
+            self.current(module)
+        }
+
+        /// Give an instance the three files a `CopySet` can carry.
+        fn fill_state(&self, key: &InstanceKey, marker: &str, slot: u64) {
+            self.kv_set(key, marker);
+            self.storage
+                .write_cursor_at(key, &mitos_data_plane::ChainPoint::Slot(slot))
+                .expect("write cursor");
+            self.storage
+                .watched_index_at(key)
+                .apply(&[watched_ref()], &[]);
+        }
+
+        fn kv_set(&self, key: &InstanceKey, marker: &str) {
+            self.storage
+                .kv_store_at(key, None)
+                .expect("kv")
+                .set_value(key.module.as_str(), "marker", marker.as_bytes().to_vec())
+                .expect("set marker");
+        }
+
+        fn kv_get(&self, key: &InstanceKey) -> Option<String> {
+            self.storage
+                .kv_store_at(key, None)
+                .ok()?
+                .get_value(key.module.as_str(), "marker")
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn has(&self, key: &InstanceKey, file: crate::storage::StateFile) -> bool {
+            self.storage
+                .instance_dir(key)
+                .join(file.file_name())
+                .is_file()
+        }
+
+        /// A client row that is MOVING from `parent` to `target` — what
+        /// `release_staging` reads to answer "does anyone still want this".
+        fn moving(&self, client: &str, parent: &InstanceKey, target: &InstanceKey) {
+            use mitos_lifecycle::client_move::{ClientRow, Move, Phase as MovePhase, Stage};
+            use mitos_lifecycle::ids::Revision;
+            use mitos_lifecycle::policy::RevisionPolicy;
+            use mitos_lifecycle::upgrade::{ClientPlan, MoveIntent};
+            let mut row = ClientRow::adopt(
+                self.manager
+                    .auth
+                    .registry()
+                    .client_key(&ClientId::parse(client).expect("client id"))
+                    .expect("a client some namespace owns"),
+                parent.module.clone(),
+                mitos_lifecycle::client_move::Placement {
+                    instance: parent.clone(),
+                    revision: Revision(1),
+                },
+            );
+            row.pending = Some(Move {
+                target: mitos_lifecycle::client_move::Placement {
+                    instance: target.clone(),
+                    revision: Revision(2),
+                },
+                manifest: target.wasm.clone(),
+                intent: MoveIntent::Announced,
+                revision_policy: RevisionPolicy::Allow,
+                stage: Stage::Planned {
+                    plan: ClientPlan::QUIET,
+                    phase: MovePhase::CatchingUp,
+                },
+            });
+            self.storage
+                .write_row(parent.module.as_str(), &row)
+                .expect("write row");
+        }
+    }
+
+    fn watched_ref() -> mitos_data_plane::OutputRef {
+        mitos_data_plane::OutputRef::from_bytes([7u8; 32], 0)
     }
 
     // -----------------------------------------------------------------
@@ -2405,6 +2887,548 @@ mod tests {
             str_addressed.is_empty(),
             "the manager reached for the `&str` host API: {str_addressed:?}",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Creating a staging instance.
+    // -----------------------------------------------------------------
+
+    use crate::storage::StateFile;
+    use mitos_lifecycle::upgrade::UpgradeAction;
+
+    /// The same schema either side: the parent's files are valid as they
+    /// stand, so `kv`, `cursor` and `watched` all travel — and `emissions`
+    /// never does. Every row in it is addressed to a client the PARENT is
+    /// still serving.
+    #[tokio::test]
+    async fn a_compatible_schema_copies_kv_cursor_and_watched_but_never_emissions() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 4242);
+        // An emissions log the parent owes its client.
+        h.storage.emissions_store_at(&parent).unwrap();
+        assert!(h.has(&parent, StateFile::Emissions));
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("staging created");
+
+        assert_eq!(h.kv_get(&target).as_deref(), Some("from the parent"));
+        assert_eq!(
+            h.storage.read_cursor_at(&target).unwrap().map(|c| c.slot()),
+            Some(4242),
+            "state without its cursor replays blocks the state has already absorbed",
+        );
+        assert!(h.storage.watched_index_at(&target).contains(&watched_ref()));
+        assert!(
+            !h.has(&target, StateFile::Emissions),
+            "the emissions log was copied; every row in it belongs to the parent's client",
+        );
+    }
+
+    /// `reset-watched` is the one action that drops a file on its own.
+    #[tokio::test]
+    async fn reset_watched_drops_only_the_watched_index() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+
+        let target = h.artifact(
+            MODULE,
+            b"the announced build",
+            2,
+            7,
+            &[(2, UpgradeAction::ResetWatched)],
+        );
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("staging created");
+
+        assert_eq!(h.kv_get(&target).as_deref(), Some("from the parent"));
+        assert_eq!(
+            h.storage.read_cursor_at(&target).unwrap().map(|c| c.slot()),
+            Some(99),
+        );
+        assert!(
+            !h.has(&target, StateFile::Watched),
+            "`reset-watched` must drop the index and nothing else",
+        );
+    }
+
+    /// A schema bump with no `migrate` export is a REBUILD, and a rebuild
+    /// copies nothing — so there is no reason to stop the parent at all.
+    #[tokio::test]
+    async fn a_schema_bump_rebuilds_from_empty_and_never_stops_the_parent() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+        h.host.clear();
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 8, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("staging created");
+
+        assert_eq!(h.kv_get(&target).as_deref(), None);
+        assert!(!h.has(&target, StateFile::Cursor));
+        assert!(!h.has(&target, StateFile::Watched));
+        assert_eq!(
+            h.host.calls(),
+            vec![crate::host_v2::testing::HostCall::StartInstance(
+                target.clone()
+            )],
+            "a rebuild copies nothing, so it has no reason to pause a live follower",
+        );
+    }
+
+    /// A REBUILT instance has an empty KV, and the module's scan-interest
+    /// lives in that KV (`update-interest` persists it there). Without the
+    /// re-assert it would bootstrap to tip having scanned for nothing.
+    #[tokio::test]
+    async fn a_rebuilt_instance_has_the_modules_scan_interest_reasserted() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        // A registration with a real interest: `reconcile_module_interest`
+        // routes the UNION of what the companions declare, and an empty
+        // union is nothing to route.
+        write_registration_with_interest(
+            &h.storage,
+            MODULE,
+            PROD_CLIENT,
+            "policy_a",
+            vec![mitos_protocol::Interest::any()],
+        );
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+
+        // A dialer with a recording interest router, so "the scan-interest
+        // was re-asserted" is a fact and not a hope.
+        let router = Arc::new(crate::host_v2::testing::RecordingRouter::default());
+        h.manager.set_dialer(crate::dialer::CompanionDialer::new(
+            h.storage.clone(),
+            crate::admin::AuthToken(None),
+            Some(router.clone()),
+        ));
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 8, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("staging created");
+
+        assert!(
+            router.routed().iter().any(|m| m == MODULE),
+            "starting a staging instance must re-assert the module's scan-interest",
+        );
+    }
+
+    /// The parent is a LIVE client's instance. Stopping it is how the copy
+    /// gets a consistent `kv` + `cursor` + `watched`; leaving it stopped
+    /// because somebody else's move failed would be the worst outcome here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_parent_is_stopped_for_the_copy_and_always_restarted() {
+        use crate::host_v2::testing::HostCall;
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+        let record = h.storage.instance_dir(&parent).join("lifecycle.toml");
+        let record_before = std::fs::read(&record).unwrap();
+        h.host.clear();
+
+        // The copy fails HALF-WAY: `kv` is the first file carried and it
+        // cannot be read. Injected on the source rather than the
+        // destination, because a read-only instances directory would fail
+        // `begin_instance` — before the parent is ever stopped, which is the
+        // one path this test is not about.
+        let source = h
+            .storage
+            .instance_dir(&parent)
+            .join(StateFile::Kv.file_name());
+        let readable = std::fs::metadata(&source).unwrap().permissions();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        let failed = h.manager.create_staging(&target, Some(&parent)).await;
+
+        std::fs::set_permissions(&source, readable).unwrap();
+
+        assert!(failed.is_err(), "the copy was supposed to fail");
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::StopInstance(parent.clone()),
+                HostCall::StartInstance(parent.clone())
+            ],
+            "the parent must be put back on EVERY path out of the copy",
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            record_before,
+            "the parent's record was touched; nobody decided it should stop",
+        );
+        assert!(
+            !h.storage.instance_dir(&target).is_dir(),
+            "a failed copy left an instance behind",
+        );
+    }
+
+    /// The copy must be taken AFTER the parent's follower has finished its
+    /// block, or `kv`, `cursor` and `watched` describe three different ones.
+    #[tokio::test]
+    async fn the_copy_is_taken_with_the_parent_stopped() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        h.fill_state(&parent, "before the stop", 99);
+
+        // What a follower writes as it finishes the block in flight. If the
+        // copy were taken first, this would not be in it.
+        let (storage, key) = (h.storage.clone(), parent.clone());
+        h.host.on_stop(move || {
+            storage
+                .kv_store_at(&key, None)
+                .expect("kv")
+                .set_value(key.module.as_str(), "marker", b"the last block".to_vec())
+                .expect("set marker");
+        });
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("staging created");
+
+        assert_eq!(
+            h.kv_get(&target).as_deref(),
+            Some("the last block"),
+            "the copy was taken before the parent had finished its block",
+        );
+    }
+
+    /// D4's "B already exists": a second client announces the build a first
+    /// one is moving to. Its cursor is the whole point — it has been
+    /// following, and rebuilding it would throw that away.
+    #[tokio::test]
+    async fn an_existing_staging_instance_is_found_not_rebuilt() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 10);
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("first move");
+        // It has been following since.
+        h.storage
+            .write_cursor_at(&target, &mitos_data_plane::ChainPoint::Slot(500))
+            .unwrap();
+        h.host.clear();
+
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("second move");
+
+        assert_eq!(
+            h.storage.read_cursor_at(&target).unwrap().map(|c| c.slot()),
+            Some(500),
+            "an existing staging instance was rebuilt, losing everything it had followed",
+        );
+        assert!(
+            !h.host.stopped(MODULE),
+            "finding an instance must not pause the parent: {:?}",
+            h.host.calls(),
+        );
+    }
+
+    /// A file that is not there carries as ZERO BYTES, so a copy from a
+    /// parent whose directory an upload renamed away would silently produce
+    /// an EMPTY instance — a rebuild nobody planned. `ClientRow::rebase` is
+    /// what stops it reaching here; this is the second lock on the door.
+    #[tokio::test]
+    async fn a_parent_that_is_not_on_disk_is_refused_rather_than_copied_as_nothing() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+
+        // What every operator upload does to the instance a stale row names.
+        let after = h.activate_at(MODULE, b"a whole new build", 2, 7);
+        assert_ne!(after, parent);
+        assert!(!h.storage.instance_dir(&parent).is_dir());
+        h.host.clear();
+
+        let target = h.artifact(MODULE, b"the announced build", 3, 7, &[]);
+        let refused = h
+            .manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect_err("a parent that is gone must be refused");
+
+        assert!(
+            matches!(refused, StagingError::ParentGone(_)),
+            "got {refused:?}",
+        );
+        assert!(
+            !h.storage.instance_dir(&target).is_dir(),
+            "an empty instance was built from a parent that is not there",
+        );
+        assert!(
+            h.host.calls().is_empty(),
+            "a refusal must not touch a follower: {:?}",
+            h.host.calls(),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmanaged_directory_is_refused() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        // A directory with no record: nothing here made it.
+        h.storage.write_instance_marker(&target).unwrap();
+
+        let refused = h
+            .manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect_err("an unmanaged directory must be refused");
+        assert!(
+            matches!(refused, StagingError::Unmanaged(_)),
+            "got {refused:?}",
+        );
+    }
+
+    /// Crash window (a): the partial was being built and the parent is still
+    /// stopped. Boot restarts the parent from its untouched record and
+    /// deletes every `*.partial` it finds.
+    ///
+    /// (b) is the same code path — a COMPLETE partial is still a partial, and
+    /// the only thing that makes one an instance is the rename.
+    #[tokio::test]
+    async fn a_crash_mid_build_leaves_a_partial_that_boot_sweeps() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+
+        // (a) half-built, and (b) complete but unrenamed — one has the
+        // marker, the other does not, and boot must take both.
+        let half = h.storage.begin_instance(&target).unwrap();
+        std::fs::write(half.path().join(StateFile::Kv.file_name()), b"half a file").unwrap();
+        let half_path = half.path().to_owned();
+        drop(half);
+
+        let other = h.artifact(MODULE, b"a third build", 3, 7, &[]);
+        let whole = h.storage.begin_instance(&other).unwrap();
+        whole
+            .write_lifecycle(&Instance::staging(other.clone()).record())
+            .unwrap();
+        let whole_path = whole.path().to_owned();
+        drop(whole);
+
+        // Nothing can SEE either of them.
+        assert!(half_path.is_dir() && whole_path.is_dir());
+        assert_eq!(
+            h.storage
+                .list_instances(&mitos_lifecycle::ids::ModuleId::parse(MODULE).unwrap())
+                .unwrap(),
+            vec![parent.clone()],
+            "a partial was listed as an instance",
+        );
+
+        h.host.clear();
+        h.restart().boot().await;
+
+        assert!(!half_path.exists(), "boot left a half-built instance");
+        assert!(!whole_path.exists(), "boot left an unrenamed instance");
+        assert!(
+            h.host.started(MODULE),
+            "boot must restart the parent from its untouched record",
+        );
+    }
+
+    /// Crash window (c): renamed, follower not started. `create_staging`
+    /// step 1 finds it and starts it — that is the same path the move's
+    /// `recover()` re-drives.
+    #[tokio::test]
+    async fn a_crash_after_the_rename_starts_the_instance_it_finds() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+
+        // Exactly what a crash between the rename and the start leaves.
+        let partial = h.storage.begin_instance(&target).unwrap();
+        partial
+            .write_lifecycle(&Instance::staging(target.clone()).record())
+            .unwrap();
+        partial.commit().unwrap();
+        h.host.clear();
+
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("the instance is found and started");
+
+        assert_eq!(
+            h.host.calls(),
+            vec![crate::host_v2::testing::HostCall::StartInstance(
+                target.clone()
+            )],
+        );
+    }
+
+    /// Between the first file and the rename, NOTHING on the host may see a
+    /// half-built instance — not the listing, not `boot`, not the drain's
+    /// store reconcile (which is `list_instances` too).
+    #[tokio::test]
+    async fn nothing_sees_a_half_built_instance() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        let module = mitos_lifecycle::ids::ModuleId::parse(MODULE).unwrap();
+
+        let partial = h.storage.begin_instance(&target).unwrap();
+        for step in ["kv", "lifecycle"] {
+            match step {
+                "kv" => {
+                    std::fs::write(partial.path().join(StateFile::Kv.file_name()), b"x").unwrap()
+                }
+                _ => partial
+                    .write_lifecycle(&Instance::staging(target.clone()).record())
+                    .unwrap(),
+            }
+            assert_eq!(
+                h.storage.list_instances(&module).unwrap(),
+                vec![parent.clone()],
+                "a partial was listed after writing {step}",
+            );
+            assert_eq!(
+                h.manager.instances(MODULE).unwrap().len(),
+                1,
+                "the lifecycle saw a partial after writing {step}",
+            );
+            assert!(!h.storage.instance_dir(&target).is_dir());
+        }
+
+        partial.commit().unwrap();
+        assert_eq!(h.storage.list_instances(&module).unwrap().len(), 2);
+    }
+
+    /// The same shape as WO-07's upload test, one order along: the watchdog
+    /// works from an unlocked snapshot, and a copy holds the parent stopped.
+    /// A revive landing inside it would start the parent under the copy — and
+    /// the copy would then be of a file with a live writer.
+    #[tokio::test]
+    async fn a_watchdog_revive_cannot_land_inside_a_copy() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+
+        // The gap, held open: the parent is stopped and the copy is running.
+        let (in_gap, mut wait_for_gap) = tokio::sync::mpsc::unbounded_channel();
+        h.host.on_stop(move || {
+            let _ = in_gap.send(());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+
+        // What the watchdog does once its snapshot says "the parent should be
+        // running and is not" — which, inside the gap, is exactly what it
+        // says. On its OWN task: `revive` waits for the module lock, and
+        // `create_staging` holds it for the whole copy.
+        let (manager, key) = (h.manager.clone(), parent.clone());
+        let watchdog = tokio::spawn(async move {
+            wait_for_gap.recv().await.expect("the copy reached its gap");
+            manager.revive(&key).await
+        });
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .expect("staging created");
+
+        assert_eq!(
+            watchdog.await.unwrap(),
+            Revival::NotNeeded,
+            "a revive acted inside the copy",
+        );
+        assert!(
+            h.host.running_instances(MODULE).await.contains(&parent),
+            "the parent must be running after the copy",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Releasing a staging instance.
+    // -----------------------------------------------------------------
+
+    /// Two clients can announce the same build, and both move to the one
+    /// instance. One giving up must not take it from the other.
+    #[tokio::test]
+    async fn a_staging_instance_two_clients_are_moving_to_survives_one_giving_up() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .unwrap();
+
+        // The second client is still moving to it.
+        h.moving(PROD_CLIENT, &parent, &target);
+
+        h.manager.release_staging(&target).await.unwrap();
+
+        assert!(
+            h.storage.instance_dir(&target).is_dir(),
+            "an instance another client is still catching up on was reaped",
+        );
+        assert_eq!(h.record_at(&target).map(|i| i.phase), Some(Phase::Staging),);
+    }
+
+    #[tokio::test]
+    async fn a_staging_instance_nobody_wants_is_stopped_and_reaped() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .unwrap();
+        h.host.clear();
+
+        h.manager.release_staging(&target).await.unwrap();
+
+        assert!(
+            !h.storage.instance_dir(&target).is_dir(),
+            "a staging instance nobody wants must be reaped",
+        );
+        assert!(h.storage.instance_dir(&parent).is_dir());
+        assert!(h.host.stopped(MODULE) && h.host.evicted(MODULE));
     }
 
     /// Legacy mode has one implicit namespace owning every client, so a

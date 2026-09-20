@@ -204,6 +204,24 @@ fn busiest_policy(cbor: &[u8]) -> String {
         .0
 }
 
+/// Wait until `n` followers have subscribed to the synthetic tip channel.
+///
+/// `broadcast::send` reaches the receivers that exist at that instant, and
+/// `start_instance` returns once the follower task is SPAWNED — it subscribes
+/// a moment later. A send in that gap is silently dropped, which reads as "a
+/// follower did not advance" and is nothing of the kind.
+async fn subscribed(tx: &tokio::sync::broadcast::Sender<TipEvent>, n: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tx.receiver_count() < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of {n} followers subscribed",
+            tx.receiver_count(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Place `client` on `instance` by writing its row — what a committed move
 /// leaves behind, and the only thing the fan-out reads.
 fn place(storage: &ModuleStorage, client: &str, instance: &InstanceKey) {
@@ -542,6 +560,137 @@ async fn evicting_one_instance_removes_its_directory_and_leaves_the_module() {
 
     h.host.stop_all().await;
     h.cleanup();
+}
+
+/// A staging instance built the way a client move builds one: a REAL copy of
+/// a REAL running parent's state, taken with that parent stopped, on a real
+/// `ModuleHostV2`.
+///
+/// The `FakeHost` tests say the right files are carried. Only this one says
+/// the copy is something a follower can actually resume from — that the
+/// parent's redb handles were let go before the bytes were taken, and that
+/// both followers advance afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staging_instance_copied_from_a_running_parent_resumes_from_its_cursor() {
+    use mitos_platform::auth::Authenticator;
+    use mitos_platform::events::EventRing;
+    use mitos_platform::host_v2::ModuleHostHandle;
+    use mitos_platform::lifecycle::{LifecycleManager, system_clock};
+
+    let Some(h) = Harness::build("two-instances-staging", |_| {}) else {
+        eprintln!("skipping: test-indexer wasm not built");
+        return;
+    };
+    let Some(cbor) = fixture_block_cbor() else {
+        eprintln!("skipping: tests/fixtures/186000000.block.cbor missing");
+        return;
+    };
+    let Harness {
+        dir,
+        storage,
+        host,
+        tx,
+        first,
+        second: _unused,
+    } = h;
+    let host = Arc::new(host);
+    let handle: Arc<dyn ModuleHostHandle> = host.clone();
+    let manager = Arc::new(LifecycleManager::new(
+        storage.clone(),
+        handle,
+        Arc::new(Authenticator::legacy(Some("t".repeat(48)), None)),
+        EventRing::new(),
+        system_clock(),
+    ));
+
+    // The parent, running and caught up to a block.
+    manager.boot().await;
+    assert_eq!(host.running_instances_of(MODULE).await, vec![first.clone()]);
+    // A `broadcast` reaches the receivers that exist AT SEND TIME, and
+    // `start_instance` returns once the follower task is spawned — the task
+    // subscribes a moment later. Waiting for the subscription is the test's
+    // own business; nothing about the host depends on it.
+    subscribed(&tx, 1).await;
+    tx.send(TipEvent::Apply(
+        ChainPoint::Slot(186_000_000).into(),
+        Arc::new(cbor.clone()),
+    ))
+    .expect("send the first block");
+    let parent_cursor = wait_for("the parent to reach the block", || {
+        storage.read_cursor_at(&first).ok().flatten()
+    })
+    .await;
+    assert_eq!(parent_cursor.slot(), 186_000_000);
+
+    // A target the harness did NOT plant — `create_staging` refuses a
+    // directory it did not make, and building one is the whole point here.
+    let target = InstanceKey {
+        module: ModuleId::parse(MODULE).unwrap(),
+        wasm: first.wasm.clone(),
+        config: Some(storage.put_config(b"\xa0").expect("put config")),
+    };
+    assert!(!storage.instance_dir(&target).is_dir());
+
+    manager
+        .create_staging(&target, Some(&first))
+        .await
+        .expect("the staging instance is built and started");
+
+    assert_eq!(
+        storage
+            .read_cursor_at(&target)
+            .unwrap()
+            .expect("the staging instance has a cursor")
+            .slot(),
+        186_000_000,
+        "the copy did not carry the parent's cursor",
+    );
+    assert!(
+        storage.instance_dir(&target).join("kv.redb").is_file(),
+        "the copy did not carry the parent's KV",
+    );
+
+    // BOTH follow from here. A copy taken with the parent's redb handles
+    // still open is the kind that opens and then fails on the first write —
+    // and a parent whose handles were not given back cannot restart at all.
+    let mut running = host.running_instances_of(MODULE).await;
+    running.sort_by_key(|key| key.dir_name());
+    let mut expected = vec![first.clone(), target.clone()];
+    expected.sort_by_key(|key| key.dir_name());
+    assert_eq!(running, expected, "one of the two followers is not running");
+
+    // One more chain event, and both write their OWN cursor from it.
+    //
+    // A rollback rather than another `Apply`: the driver takes its cursor
+    // from the BLOCK it decoded, and there is one block fixture — so
+    // re-applying it could not move either cursor and would prove nothing.
+    // `Undo` sets the cursor to the point it carries, which each follower
+    // must then flush to its own file.
+    subscribed(&tx, 2).await;
+    tx.send(TipEvent::Undo(
+        ChainPoint::Slot(185_999_000).into(),
+        Arc::new(cbor),
+    ))
+    .expect("send the rollback");
+    for key in [&first, &target] {
+        let cursor = wait_for(&format!("{} to move its cursor", key.dir_name()), || {
+            storage
+                .read_cursor_at(key)
+                .ok()
+                .flatten()
+                .filter(|c| c.slot() == 185_999_000)
+        })
+        .await;
+        assert_eq!(cursor.slot(), 185_999_000);
+    }
+    assert_eq!(
+        host.running_instances_of(MODULE).await.len(),
+        2,
+        "a follower died dispatching after the copy",
+    );
+
+    host.stop_all().await;
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Boot and the watchdog, per INSTANCE, through the real manager over a real
