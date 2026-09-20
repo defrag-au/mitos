@@ -82,6 +82,51 @@ pub fn plan(parent: Option<StateSchema>, target: StateSchema, migrate: MigrateEx
     }
 }
 
+/// What the host does with ONE of the parent's state files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    Copy,
+    /// The new instance starts without it.
+    StartEmpty,
+}
+
+/// Which of the parent's files a new instance starts from.
+///
+/// `emissions` is not here because it is NEVER copied (D5): it is the largest
+/// file there is, and every row in it is addressed to a client that is still
+/// being served by the parent.
+///
+/// `kv` and `cursor` always travel TOGETHER. A cursor without the state it
+/// describes resumes mid-chain on nothing; state without its cursor replays
+/// blocks the state has already absorbed. `watched` may be dropped on its own
+/// — that is what the `reset-watched` upgrade action means — but is never
+/// carried without them, since it indexes UTxOs the KV no longer knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopySet {
+    pub kv: Carry,
+    pub cursor: Carry,
+    pub watched: Carry,
+}
+
+pub fn copy_set(plan: StatePlan, watched: crate::upgrade::WatchedIndex) -> CopySet {
+    use crate::upgrade::WatchedIndex;
+    match plan {
+        StatePlan::Fresh | StatePlan::Rebuild { .. } => CopySet {
+            kv: Carry::StartEmpty,
+            cursor: Carry::StartEmpty,
+            watched: Carry::StartEmpty,
+        },
+        StatePlan::CopyCompatible | StatePlan::CopyThenMigrate { .. } => CopySet {
+            kv: Carry::Copy,
+            cursor: Carry::Copy,
+            watched: match watched {
+                WatchedIndex::Carry => Carry::Copy,
+                WatchedIndex::Reset => Carry::StartEmpty,
+            },
+        },
+    }
+}
+
 /// One call to the module's re-entrant `migrate` export. Same shape as
 /// `rebootstrap`, and for the same reason: one fuel budget cannot rewrite
 /// ~420K shards, so the host loops, refuelling between calls.
@@ -135,6 +180,39 @@ mod tests {
 
     const V1: StateSchema = StateSchema(1);
     const V2: StateSchema = StateSchema(2);
+
+    /// Over every plan and both watched choices: the KV and its cursor are
+    /// never separated, and `watched` is never carried without them.
+    #[test]
+    fn a_cursor_never_travels_without_the_state_it_describes() {
+        use crate::upgrade::WatchedIndex;
+        let plans = [
+            StatePlan::Fresh,
+            StatePlan::CopyCompatible,
+            StatePlan::CopyThenMigrate { from: V1 },
+            StatePlan::Rebuild {
+                reason: RebuildReason::NoMigrateExport,
+            },
+        ];
+        for plan in plans {
+            for watched in [WatchedIndex::Carry, WatchedIndex::Reset] {
+                let set = copy_set(plan, watched);
+                assert_eq!(set.kv, set.cursor, "{plan:?}");
+                if set.watched == Carry::Copy {
+                    assert_eq!(set.kv, Carry::Copy, "{plan:?}: watched carried alone");
+                }
+            }
+        }
+        assert_eq!(
+            copy_set(StatePlan::CopyCompatible, WatchedIndex::Reset),
+            CopySet {
+                kv: Carry::Copy,
+                cursor: Carry::Copy,
+                watched: Carry::StartEmpty,
+            },
+            "`reset-watched` drops the index and nothing else"
+        );
+    }
 
     #[test]
     fn the_three_cases_of_the_design_table() {

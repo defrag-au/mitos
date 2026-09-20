@@ -214,6 +214,12 @@ pub enum Event {
     Withdraw {
         cause: DetachCause,
     },
+    /// The instance ACTUALLY serving this client is `onto`, and the row says
+    /// otherwise. Fed by the host, under the row lock, before an announcement
+    /// is stepped — see [`ClientRow::rebase`].
+    Rebase {
+        onto: Placement,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +372,56 @@ impl ClientRow {
             } => self.announce(module_ref, intent, context),
             Event::Progress { target, step } => self.progress(target, step),
             Event::Withdraw { cause } => self.withdraw(cause),
+            Event::Rebase { onto } => self.rebase(onto),
         }
+    }
+
+    /// The row says the client is somewhere it is not.
+    ///
+    /// Two ways that happens, and neither is a fault. An operator upload
+    /// RENAMES the module's current instance directory, so a row written at
+    /// `K1` names an instance that no longer exists anywhere; and a row made
+    /// with [`Self::new`] before its client was being served says `None` of a
+    /// client that now is. [`crate::routing`] already serves both from the
+    /// module's current instance — derived on read, because a fan-out must
+    /// never write a row. This is the write, made by the holder of the row
+    /// lock, BEFORE a move is planned.
+    ///
+    /// It matters because a move is planned FROM `current`. `None` is a first
+    /// subscribe — no catch-up, no pause, no drain — so an unrebased row would
+    /// switch a client that IS being served with no hand-off at all. And a
+    /// `current` naming a directory that is gone would be handed to
+    /// `EnsureInstance` as the PARENT to copy state from.
+    ///
+    /// A pending move is abandoned rather than carried: its plan was resolved
+    /// from the revision the client was THOUGHT to be on. Every one of the
+    /// client's companions re-announces on its next wake, and that plans it
+    /// again from the truth.
+    fn rebase(&self, onto: Placement) -> Step {
+        if self.current.as_ref() == Some(&onto) {
+            return Ok(Transition::quiet(self.clone()));
+        }
+        if self.pending.as_ref().is_some_and(Move::committing) {
+            return Err(Rejected::CommitInFlight);
+        }
+        let mut next = self.clone();
+        let mut effects = match next.pending.take() {
+            Some(pending) => self.abandon(&pending),
+            None => vec![],
+        };
+        // Attach BEFORE detach, as on a commit. Both are idempotent, and for
+        // a rebase both are usually already true: `routing::attached_to` has
+        // been counting this client on `onto` all along. They are issued so
+        // that "the row moved" and "the instances were told" can never be two
+        // different sets of transitions.
+        effects.push(Effect::AttachTo(onto.instance.clone()));
+        if let Some(old) = next.current.replace(onto) {
+            effects.push(Effect::DetachFrom {
+                instance: old.instance,
+                cause: DetachCause::Moved,
+            });
+        }
+        Ok(Transition::with(next, effects))
     }
 
     /// The effects to re-issue for a row loaded from disk after a restart.
@@ -704,14 +759,27 @@ impl ClientRow {
                 },
                 Progress::CommitLost,
             ) => match self.live() {
-                // The pause did not survive whatever lost the commit.
+                // Back to catching up — and RESUME first. After a crash the
+                // pause is already gone and this is a no-op (every effect is
+                // idempotent). But a host can answer `CommitLost` with no
+                // crash at all — the commit write simply failed — and then
+                // both followers are still paused. Assuming the pause "did
+                // not survive" left them paused for ever; found by the
+                // exhaustive exploration once `Rebase` gave it a short path
+                // to a placed row.
                 Some(live) => advance(
                     Phase::CatchingUp,
                     *plan,
-                    vec![Effect::HoldAndDiff {
-                        staging,
-                        live: live.clone(),
-                    }],
+                    vec![
+                        Effect::ResumeFollowers {
+                            live: live.clone(),
+                            staging: staging.clone(),
+                        },
+                        Effect::HoldAndDiff {
+                            staging,
+                            live: live.clone(),
+                        },
+                    ],
                 ),
                 None => advance(
                     Phase::Preparing,
@@ -743,6 +811,88 @@ pub fn next_catch_up(waiting: &[QueuedMove]) -> Option<&QueuedMove> {
     waiting
         .iter()
         .min_by_key(|m| (m.tier, m.queued_at, &m.client, &m.module))
+}
+
+/// The host-wide catch-up slot: ONE staging follower catching up at a time.
+///
+/// A staging instance replays the chain from its parent's cursor (or from
+/// nothing) at full speed beside every live follower, on a box whose binding
+/// constraint is memory. One at a time keeps that cost bounded and known.
+///
+/// In memory only, deliberately. [`ClientRow::recover`] returns every planned
+/// move to `Queued` and re-issues [`Effect::RequestCatchUpSlot`], so after a
+/// restart the queue rebuilds itself from the rows — there is no second copy
+/// of "who is waiting" to disagree with them.
+///
+/// Both operations are idempotent, because both effects are: a request from
+/// the holder or from someone already waiting changes nothing, and a release
+/// by someone who holds nothing only takes them out of the queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatchUpSlot {
+    holder: Option<(ClientKey, ModuleId)>,
+    waiting: Vec<QueuedMove>,
+}
+
+/// Feed [`Progress::SlotGranted`] to this client's row for this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub client: ClientKey,
+    pub module: ModuleId,
+}
+
+impl CatchUpSlot {
+    pub fn holder(&self) -> Option<&(ClientKey, ModuleId)> {
+        self.holder.as_ref()
+    }
+
+    pub fn waiting(&self) -> &[QueuedMove] {
+        &self.waiting
+    }
+
+    /// [`Effect::RequestCatchUpSlot`].
+    pub fn request(&mut self, wanted: QueuedMove) -> Option<Grant> {
+        let who = (wanted.client.clone(), wanted.module.clone());
+        if self.holder.as_ref() == Some(&who) {
+            return None;
+        }
+        if !self
+            .waiting
+            .iter()
+            .any(|m| (&m.client, &m.module) == (&who.0, &who.1))
+        {
+            self.waiting.push(wanted);
+        }
+        self.grant_next()
+    }
+
+    /// [`Effect::ReleaseCatchUpSlot`] — by the holder, or by a move that was
+    /// only ever waiting.
+    pub fn release(&mut self, client: &ClientKey, module: &ModuleId) -> Option<Grant> {
+        self.waiting
+            .retain(|m| (&m.client, &m.module) != (client, module));
+        if self
+            .holder
+            .as_ref()
+            .is_some_and(|(c, m)| (c, m) == (client, module))
+        {
+            self.holder = None;
+        }
+        self.grant_next()
+    }
+
+    fn grant_next(&mut self) -> Option<Grant> {
+        if self.holder.is_some() {
+            return None;
+        }
+        let next = next_catch_up(&self.waiting)?.clone();
+        self.waiting
+            .retain(|m| (&m.client, &m.module) != (&next.client, &next.module));
+        self.holder = Some((next.client.clone(), next.module.clone()));
+        Some(Grant {
+            client: next.client,
+            module: next.module,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1165,12 +1315,197 @@ mod tests {
         );
         assert_eq!(committing.recover().effects, vec![Effect::ResolveCommit]);
         let (lost, effects) = run(committing, vec![progress("bb", Progress::CommitLost)]);
-        assert!(matches!(effects[..], [Effect::HoldAndDiff { .. }]));
+        // RESUME, then catch up again. A host may answer `CommitLost` without
+        // ever having restarted — the write just failed — and then both
+        // followers are still paused; `[HoldAndDiff]` alone, which this once
+        // asserted, left them so. (Changed with the operator's permission
+        // 2026-09-20; `invariants_hold_over_every_event_sequence` found it.)
+        assert!(
+            matches!(
+                effects[..],
+                [Effect::ResumeFollowers { .. }, Effect::HoldAndDiff { .. }]
+            ),
+            "{effects:?}"
+        );
         assert_eq!(
             lost.current.unwrap().instance,
             key("aa"),
             "still on the old one"
         );
+    }
+
+    fn rebase(byte: &str, revision: u32) -> Event {
+        Event::Rebase {
+            onto: module_ref(byte, revision).placement(&module()),
+        }
+    }
+
+    /// Every operator upload renames the module's current instance, so a row
+    /// written at `aa` names a directory that is gone. A move planned from it
+    /// would hand `EnsureInstance` a PARENT that does not exist to copy state
+    /// from. Rebased first, the move is planned from where the client is.
+    #[test]
+    fn a_move_is_planned_from_where_the_client_really_is() {
+        let (state, effects) = run(
+            settled("aa", 2),
+            vec![
+                rebase("bb", 3),
+                announce("cc", 4),
+                progress("cc", ready(&[])),
+                progress("cc", Progress::SlotGranted),
+            ],
+        );
+        assert_eq!(state.current.as_ref().unwrap().instance, key("bb"));
+        assert!(
+            effects.contains(&Effect::EnsureInstance {
+                key: key("cc"),
+                parent: Some(key("bb")),
+            }),
+            "{effects:?}"
+        );
+    }
+
+    /// `None` means FIRST subscribe: no catch-up, no pause, no drain. A row
+    /// made before its client was being served says `None` of a client that
+    /// now is — and its first move must still be a hand-off.
+    #[test]
+    fn an_unplaced_row_that_is_being_served_gets_a_real_hand_off() {
+        let (state, _) = run(
+            row(),
+            vec![
+                rebase("aa", 1),
+                announce("bb", 2),
+                progress("bb", ready(&[])),
+                progress("bb", Progress::SlotGranted),
+                progress("bb", Progress::InstanceReady),
+            ],
+        );
+        assert!(
+            matches!(
+                state.pending.as_ref().unwrap().stage,
+                Stage::Planned {
+                    phase: Phase::CatchingUp,
+                    ..
+                }
+            ),
+            "skipped the catch-up: {state:?}"
+        );
+    }
+
+    /// The pending plan was resolved from the revision the client was THOUGHT
+    /// to be on. It is dropped, with everything it held, and re-planned by
+    /// the client's next announcement.
+    #[test]
+    fn a_rebase_abandons_the_pending_move_and_releases_what_it_held() {
+        let (mid, _) = run(
+            settled("aa", 2),
+            vec![
+                announce("bb", 3),
+                progress("bb", ready(&[])),
+                progress("bb", Progress::SlotGranted),
+                progress("bb", Progress::InstanceReady),
+            ],
+        );
+        let t = mid.step(rebase("dd", 5)).unwrap();
+        assert!(t.next.pending.is_none());
+        assert_eq!(
+            t.effects,
+            vec![
+                Effect::ReleaseCatchUpSlot,
+                Effect::ReleaseStaging(key("bb")),
+                Effect::AttachTo(key("dd")),
+                Effect::DetachFrom {
+                    instance: key("aa"),
+                    cause: DetachCause::Moved,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rebase_waits_for_a_commit_in_flight_and_is_quiet_when_already_true() {
+        let t = settled("aa", 2).step(rebase("aa", 2)).unwrap();
+        assert!(t.effects.is_empty());
+
+        let (committing, _) = run(
+            settled("aa", 2),
+            vec![
+                announce("bb", 3),
+                progress("bb", ready(&[])),
+                progress("bb", Progress::SlotGranted),
+                progress("bb", Progress::InstanceReady),
+                progress("bb", Progress::CaughtUp),
+                progress(
+                    "bb",
+                    Progress::Quiesced {
+                        queue: ClientQueue::Empty,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            committing.step(rebase("dd", 5)),
+            Err(Rejected::CommitInFlight)
+        );
+    }
+
+    fn queued(host: &str, tier: Tier, at: u64) -> QueuedMove {
+        QueuedMove {
+            client: ClientKey {
+                namespace: Namespace::parse("ns").unwrap(),
+                client: ClientId::parse(host).unwrap(),
+            },
+            module: module(),
+            tier,
+            queued_at: UnixSecs(at),
+        }
+    }
+
+    /// One staging follower catches up at a time, host-wide — production
+    /// ahead of development however long development has been waiting.
+    #[test]
+    fn the_slot_goes_to_one_move_at_a_time_and_production_first() {
+        let mut slot = CatchUpSlot::default();
+        let dev_first = queued("a.dev.cnft.dev", Tier::Development, 10);
+        let dev_second = queued("b.dev.cnft.dev", Tier::Development, 20);
+        let prod_late = queued("a.cnft.dev", Tier::Production, 99);
+
+        let granted = slot.request(dev_first.clone()).unwrap();
+        assert_eq!(granted.client, dev_first.client);
+        assert_eq!(slot.request(dev_second.clone()), None);
+        assert_eq!(slot.request(prod_late.clone()), None);
+
+        let next = slot.release(&dev_first.client, &module()).unwrap();
+        assert_eq!(next.client, prod_late.client, "production jumps the queue");
+        let last = slot.release(&prod_late.client, &module()).unwrap();
+        assert_eq!(last.client, dev_second.client);
+        assert_eq!(slot.release(&dev_second.client, &module()), None);
+        assert_eq!(slot, CatchUpSlot::default(), "nothing may be left behind");
+    }
+
+    /// Both effects are re-issued after a crash, so both operations must be
+    /// safe to repeat: a second request is not a second place in the queue,
+    /// and a release by a move that was only WAITING must not free a slot
+    /// somebody else holds.
+    #[test]
+    fn the_slot_survives_every_effect_being_issued_twice() {
+        let mut slot = CatchUpSlot::default();
+        let holder = queued("a.cnft.dev", Tier::Production, 1);
+        let waiter = queued("b.cnft.dev", Tier::Production, 2);
+        assert!(slot.request(holder.clone()).is_some());
+        assert_eq!(slot.request(holder.clone()), None, "the holder asked again");
+        assert_eq!(slot.request(waiter.clone()), None);
+        assert_eq!(slot.request(waiter.clone()), None);
+        assert_eq!(slot.waiting().len(), 1);
+
+        // The waiter's move is abandoned.
+        assert_eq!(slot.release(&waiter.client, &module()), None);
+        assert_eq!(slot.holder().unwrap().0, holder.client);
+        assert!(slot.waiting().is_empty());
+
+        // A release by somebody who holds nothing and waits for nothing.
+        assert_eq!(slot.release(&waiter.client, &module()), None);
+        assert_eq!(slot.holder().unwrap().0, holder.client);
     }
 
     /// The row is all that survives a restart, so THROUGH DISK is the only
@@ -1385,6 +1720,13 @@ mod tests {
                 events.push(progress(byte, step));
             }
         }
+        // An operator upload renamed the module's current instance under the
+        // row — at any moment, including in the middle of a move.
+        for (byte, revision) in [("aa", 1), ("dd", 4)] {
+            events.push(Event::Rebase {
+                onto: module_ref(byte, revision).placement(&module()),
+            });
+        }
         events
     }
 
@@ -1416,7 +1758,8 @@ mod tests {
                         }
                     );
                     let is_withdraw = matches!(event, Event::Withdraw { .. });
-                    if !is_commit && !is_withdraw {
+                    let is_rebase = matches!(event, Event::Rebase { .. });
+                    if !is_commit && !is_withdraw && !is_rebase {
                         assert_eq!(t.next.current, state.current, "{event:?} moved the row");
                     }
                     let world = apply(world.clone(), &t.effects);
