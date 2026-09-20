@@ -231,10 +231,19 @@ impl Drop for Quiesced {
             self.staging.clone(),
             self.started,
         );
-        tokio::spawn(async move {
-            let _guard = guard;
-            manager.end_quiesce(&live, &staging, started).await;
-        });
+        // `try_current`, not `tokio::spawn`: that PANICS with no runtime, and
+        // a panic inside `Drop` during teardown is an abort. With no runtime
+        // the process is going down, the followers with it, and boot restarts
+        // them from their untouched records.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _guard = guard;
+                    manager.end_quiesce(&live, &staging, started).await;
+                });
+            }
+            Err(_) => drop(guard),
+        }
     }
 }
 

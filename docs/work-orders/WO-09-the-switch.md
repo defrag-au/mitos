@@ -144,6 +144,68 @@ cause is not the tick but the effect becoming reachable.
 So: is reshaping that assertion sanctioned, or should a first-subscribe commit
 be gated differently? Everything else in the order is green either way.
 
+## Review 2026-09-20 — the question answered: it was the FIXTURE, and behind it a gap
+
+Acceptance re-run independently and matches to the test (core 28, lifecycle
+110, platform lib 345 passed / 1 failed, `two_instances_v2` 9; clippy
+`--workspace -D warnings` 0). Scope matches "Files" plus `events.rs`,
+justified; `mitos-lifecycle` untouched; no `#[ignore]`; `tests/` additions
+only. After review: platform lib **348 passed, 0 failed**.
+
+Both "found and fixed" items are defects in MY ORDER, and the first is the
+most serious thing anyone has found in one: §2 hands back a guard holding the
+module lock and §1 feeds a `Progress` that every path of the machine resolves
+— except the path where the row write FAILS and the machine takes no path at
+all. The guard then holds the module lock with both followers stopped, and
+the next tick blocks on it for ever while holding a row lock. I specified a
+lock-holding value crossing a fallible step and never asked what happens when
+the step fails. Fixed correctly, with the timeout as the assertion. The second
+— "no quiesce in hand ⇒ `CommitLost`" is an endless loop for a first subscribe,
+which never quiesces — is the same kind of miss. All ten deviations agreed;
+3 and 4 corrected my expected values (a follower whose stop FAILED is still
+running, and starting it is the redb "already open" failure; a staging
+instance refuses operator commands).
+
+**The one question — neither option.** Leaving the test red and asking was
+exactly right. But the assertion is sound; it is the FIXTURE that is wrong,
+and it is mine. `write_a_row_stuck_fetching` built its row with
+`ClientRow::new` — `current: None`. Harmless while a move stopped at `Queued`;
+but since WO-08 every real row with a pending move has been REBASED onto an
+instance before its announcement was stepped, so what the fixture modelled was
+a FIRST SUBSCRIBE for a client that is being served — which this order, quite
+correctly, commits with no quiesce and no watermark. The fixture now adopts
+the row onto the module's current instance, as a real one is. No assertion in
+any test changed.
+
+**And the fixture was standing on a real gap.** `rebase_if_stale` ran only on
+an ANNOUNCEMENT, but `boot` and the moves tick advance moves too:
+- `boot` recovered a stale row as it stood. `current: None` for a served
+  client ⇒ recovered as a first subscribe ⇒ the client is cut over mid-stream,
+  with no hand-off, to an instance bootstrapping from nothing. (Reachable by a
+  row written by a pre-WO-08 host, or by hand. Exactly what the red test was
+  showing.)
+- The tick advanced a move whose `current` an operator UPLOAD had renamed away
+  mid-move: `CatchingUp` reads a cursor that no longer exists, calls it "still
+  behind" for ever, and holds the host's one catch-up slot until the client
+  happens to re-announce.
+Both now call the same `rebase_if_stale` first (`MoveManager::rebased`). A
+`Committing` move is passed through untouched — the machine refuses to rebase
+it, and skipping the row instead would mean nothing ever resolves that commit.
+Tests: `boot_rebases_an_unplaced_row_rather_than_committing_it_with_no_hand_off`
+and `the_tick_abandons_a_move_whose_instance_an_upload_renamed_away` (which
+also asserts the slot is freed).
+
+Small: `Quiesced::drop` used `tokio::spawn`, which panics with no runtime — a
+panic inside `Drop` during teardown is an abort. Now `Handle::try_current`;
+with no runtime the process is going down and boot restarts the followers
+from their untouched records.
+
+Read and agreed without change: `quiesce_pair`, `commit_switch` (it REFUSES to
+commit over unreadable watermarks, where the fan-out deliberately delivers —
+the right asymmetry: defaulting at the commit would drop another client's
+watermark), and the watermark ordering in `drain_event`. Every "the tick will
+retry it" in this order names the arm that does.
+
 ## What this order does, and where it deliberately stops
 
 WO-08 parks every move at `CatchingUp`, holding the host's one catch-up slot

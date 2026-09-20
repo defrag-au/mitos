@@ -412,6 +412,40 @@ impl MoveManager {
         Ok(transition.next)
     }
 
+    /// [`Self::rebase_if_stale`] for the paths that ADVANCE a move rather than
+    /// plan one — `boot` and `tick`. `None` means "leave this row alone this
+    /// round", with the reason logged.
+    ///
+    /// A move that is `Committing` is passed through untouched: the machine
+    /// refuses to rebase it (`CommitInFlight`), and skipping the row instead
+    /// would mean nothing ever resolves that commit — `recover` and the
+    /// tick's `Committing` arm are the only things that do.
+    async fn rebased(&self, module: &ModuleId, row: ClientRow) -> Option<ClientRow> {
+        let committing = matches!(
+            row.pending.as_ref().map(|p| &p.stage),
+            Some(Stage::Planned {
+                phase: Phase::Committing,
+                ..
+            })
+        );
+        if committing {
+            return Some(row);
+        }
+        let client = row.client.clone();
+        match self.rebase_if_stale(module, &client, row).await {
+            Ok(row) => Some(row),
+            Err(reason) => {
+                tracing::warn!(
+                    module = %module,
+                    client = %client,
+                    %reason,
+                    "could not rebase a stale client row; leaving it for the next round",
+                );
+                None
+            }
+        }
+    }
+
     /// Which instance is serving this client right now.
     ///
     /// The row's own `current` when that instance directory is still there,
@@ -1223,6 +1257,16 @@ impl MoveManager {
                 let client = row.client.client.clone();
                 let lock = self.lock_for(&module, &client);
                 let _guard = lock.lock().await;
+                // BEFORE recovering, for the same reason an announcement is
+                // rebased before it is stepped: `recover` re-issues a move
+                // planned from `current`. A row that says `None` of a client
+                // that IS being served would be carried forward as a FIRST
+                // SUBSCRIBE — committed with no quiesce and no watermark —
+                // and a row naming a renamed-away instance would hand
+                // `EnsureInstance` a parent that does not exist.
+                let Some(row) = self.rebased(&module_id, row).await else {
+                    continue;
+                };
                 let transition = row.recover();
                 if let Err(e) = self.storage.write_row(&module, &transition.next) {
                     tracing::error!(module = %module, client = %client, error = %e, "row recover failed");
@@ -1261,6 +1305,16 @@ impl MoveManager {
                 let lock = self.lock_for(&module, &client);
                 let _guard = lock.lock().await;
                 if attached.contains_key(&row.client) {
+                    // An operator upload can rename the instance a move was
+                    // planned FROM while that move is in flight. Every arm of
+                    // `advance` would then act on a directory that is gone —
+                    // `CatchingUp` reads a cursor that no longer exists and
+                    // calls it "still behind" for ever, holding the host's one
+                    // slot. The rebase abandons that move; the client's next
+                    // announcement plans it again from the truth.
+                    let Some(row) = self.rebased(&module_id, row).await else {
+                        continue;
+                    };
                     self.advance(&module_id, &client, row).await;
                 } else {
                     self.withdraw(&module_id, &client, row).await;
@@ -2268,12 +2322,28 @@ mod tests {
     /// an announce that returns has either finished its fetch or still has
     /// the task running — neither is a restart.
     fn write_a_row_stuck_fetching(h: &Harness, announced: &AnnouncedModule) {
-        let mut row = ClientRow::new(
+        // PLACED on the module's current instance, as every real row with a
+        // pending move is: an announcement is rebased before it is stepped
+        // (WO-08), so a move is never planned from `current: None` for a
+        // client that is being served. This fixture used `ClientRow::new`
+        // until WO-09's review — harmless while a move stopped at `Queued`,
+        // but once a commit became reachable it modelled a FIRST SUBSCRIBE,
+        // which switches with no hand-off at all.
+        let live = h
+            .storage
+            .current_instance(MODULE)
+            .unwrap()
+            .expect("activate the module before planting a row");
+        let mut row = ClientRow::adopt(
             ClientKey {
                 namespace: mitos_lifecycle::ids::Namespace::parse("prod").unwrap(),
                 client: ClientId::parse(PROD_CLIENT).unwrap(),
             },
             ModuleId::parse(MODULE).unwrap(),
+            Placement {
+                instance: live,
+                revision: Revision(1),
+            },
         );
         let transition = row
             .step(Event::Announce {
@@ -2326,6 +2396,94 @@ mod tests {
         );
         assert!(h.storage.artifact_path(&announced.wasm).exists());
         assert!(h.failures().is_empty(), "{:?}", h.failures());
+    }
+
+    /// A row that says `None` of a client that IS being served — written by a
+    /// host from before announcements were rebased, or by hand. Recovered as
+    /// it stands it is a FIRST SUBSCRIBE: committed with no quiesce and no
+    /// watermark, so the client is cut over mid-stream to an instance that
+    /// bootstraps from nothing. `boot` must rebase it first, which drops the
+    /// move; the client's next announcement plans it again as a hand-off.
+    #[tokio::test]
+    async fn boot_rebases_an_unplaced_row_rather_than_committing_it_with_no_hand_off() {
+        let h = Harness::new();
+        h.activate(&component(1), 1);
+        h.subscribe(PROD_CLIENT);
+        h.lifecycle.boot().await;
+        let live = h.storage.current_instance(MODULE).unwrap().unwrap();
+
+        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
+        let unplaced = ClientRow::new(
+            ClientKey {
+                namespace: mitos_lifecycle::ids::Namespace::parse("prod").unwrap(),
+                client: ClientId::parse(PROD_CLIENT).unwrap(),
+            },
+            ModuleId::parse(MODULE).unwrap(),
+        );
+        let fetching = unplaced
+            .step(Event::Announce {
+                module_ref: ModuleRef::announced_by(
+                    &ClientId::parse(PROD_CLIENT).unwrap(),
+                    &ModuleId::parse(MODULE).unwrap(),
+                    announced.wasm.clone(),
+                    announced.manifest.clone(),
+                    None,
+                    announced.revision,
+                )
+                .unwrap(),
+                intent: MoveIntent::Announced,
+                context: AnnounceContext {
+                    revision_policy: mitos_lifecycle::policy::RevisionPolicy::Allow,
+                    target: TargetInstance::Missing,
+                    live_instances: 1,
+                    max_instances: MAX_INSTANCES_PER_MODULE,
+                },
+            })
+            .unwrap()
+            .next;
+        h.storage.write_row(MODULE, &fetching).unwrap();
+
+        h.moves.boot().await;
+        h.moves.settle().await;
+
+        let after = h.row(PROD_CLIENT).unwrap();
+        assert_eq!(
+            after.current.as_ref().map(|p| &p.instance),
+            Some(&live),
+            "the client was cut over with no hand-off: {after:?}",
+        );
+        assert!(after.pending.is_none(), "{after:?}");
+    }
+
+    /// An operator upload RENAMES the instance a move was planned from, while
+    /// the move is in flight. Every later phase would act on a directory that
+    /// is gone — `CatchingUp` reads a cursor that no longer exists and calls
+    /// it "still behind" for ever, holding the host's ONE catch-up slot.
+    #[tokio::test]
+    async fn the_tick_abandons_a_move_whose_instance_an_upload_renamed_away() {
+        let h = Harness::new();
+        let (live, _staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 900).await;
+        assert!(h.moves.catch_up().holder.is_some(), "precondition");
+
+        let wasm = component(9);
+        let manifest = crate::companions::testing::manifest_for(MODULE, &wasm);
+        h.lifecycle
+            .upload(&manifest, &wasm, None)
+            .await
+            .expect("the operator's deploy");
+        let renamed = h.storage.current_instance(MODULE).unwrap().unwrap();
+        assert_ne!(renamed, live, "the upload should have renamed the instance");
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        let after = h.row(PROD_CLIENT).unwrap();
+        assert_eq!(after.current.as_ref().map(|p| &p.instance), Some(&renamed));
+        assert!(after.pending.is_none(), "{after:?}");
+        assert!(
+            h.moves.catch_up().holder.is_none(),
+            "the abandoned move still holds the host's catch-up slot",
+        );
     }
 
     /// The host restarts while a worker is down. `boot` must come back having
