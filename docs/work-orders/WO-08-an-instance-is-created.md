@@ -145,6 +145,73 @@ staging instance's KV has it.
    restating it because after this order it is real rather than hypothetical,
    and `GET /_admin/catch-up` is now the place it is visible.
 
+## Review 2026-09-20 — a false "the tick will retry it", and three fixes to the copy
+
+Acceptance re-run independently and matches (core 28, lifecycle 102, platform
+lib 318, `two_instances_v2` 8; clippy `--workspace -D warnings` 0). Scope
+matches "Files" plus `events.rs`, `host_v2.rs`, `bundle.rs`, each justified;
+`mitos-lifecycle` untouched; no `#[ignore]`; `tests/` shows additions only.
+After review: platform lib **321**.
+
+All nine deviations agreed. Three are better than the order: (2) the parent is
+restarted only if its record WANTS a follower — "ALWAYS" as I wrote it would
+have resurrected an operator's stop, the v2 bug WO-03 exists to fix; (4)
+proving "both followers advance" with a rollback, found by watching the
+obvious test fail to prove it; (6) a `FakeHost` whose `stop_instance` closes
+the handles, without which every copy test would have been copying a file
+under its writer. And "found and fixed" is the catch of the order: a
+`Carry::Copy` from a parent whose directory was GONE produced an empty
+instance SILENTLY — a rebuild nobody planned, reported as a copy — and the
+rebase test had been passing either way. Both now closed.
+
+**1. FALSE CLAIM — "releasing a staging instance failed; the tick will retry
+it".** Nothing on any tick called `release_staging`. And the hole was wider
+than a failed release: `ReleaseStaging` is issued ONCE, by a transition whose
+row is persisted BEFORE the effect runs and which leaves that row with no
+pending move — so a crash between the two leaves `recover()` with nothing to
+re-issue, and the staging instance follows the chain for ever, for nobody, on
+a box whose binding constraint is memory. (Same family as WO-03's "the next
+tick retries the reap".) Fix: `LifecycleManager::tick` now releases every
+`Staging` instance no move wants, through the same
+`release_staging_locked` the effect uses — the rule is the effect's own, so
+re-applying it is executing, not deciding; and a staging instance is never
+unwanted by accident, because its row is written before `EnsureInstance`
+creates it. Test: `the_tick_releases_a_staging_instance_whose_release_was_lost`
+(and that a tick leaves a WANTED one, and the parent, alone).
+
+**2. A parent that would not stop was copied anyway.** `copy_from_parent`
+logged a failed `stop_instance` and carried on, as `upload` does. `upload` can:
+a rename moves the files whole. A byte copy of redb files under a live writer
+is a torn `kv` beside a `cursor` from another block — `state_prep`'s rule 1 —
+and it does not fail at the copy but weeks later, as state that is quietly
+wrong. Now `StagingError::ParentWouldNotStop`, no copy, and no restart
+(nothing was stopped). Test: `a_parent_that_will_not_stop_is_never_copied`
+(`FakeHost::fail_stop_instance`).
+
+**3. A failed build left its `.partial` on disk** — up to a parent's worth,
+1.3 GB for the largest module — until the next boot's sweep, with the host
+still up. `PartialInstance::discard`, called on every failure of the build.
+Test: `a_build_that_fails_leaves_no_partial_behind`.
+
+**4. The copy ran on an async worker thread.** Synchronous `std::fs` work,
+seconds of it without reflink, on the runtime every follower dispatches on.
+Now `spawn_blocking`.
+
+**Q1 — leave it inline.** The row-then-module order is consistent, and the
+wait it adds is one the subscribe path ALREADY has: `subscribe_handler` calls
+`lifecycle.reconcile(module)` itself, before any announcement, so a subscribe
+to a module mid-copy waits on the module lock either way, and has since
+WO-06's `upload` began holding it across a quiesce. Bounding the second wait
+while the first stands would buy nothing. What bounds it in practice is the
+copy, which is logged with its duration; if that number is ever not small,
+the answer is reflink (the next box), not a timeout.
+**Q2 — yes, and it is the deploy gate.** Agreed as written.
+
+Noted for WO-09, not changed: `grant_slot` releases the slot on ANY error
+feeding `SlotGranted`, including a transient row-write failure — the move is
+then `Queued` with no place in the queue until a restart, because a
+re-announcement of the same target is (rightly) quiet.
+
 ## What this order does, and where it deliberately stops
 
 Today an announcement for a new build ends at `Queued` (WO-05) and nothing

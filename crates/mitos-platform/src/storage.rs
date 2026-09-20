@@ -1752,6 +1752,7 @@ impl ModuleStorage {
 /// sweep — deleting it in `Drop` would mean a best-effort filesystem
 /// operation running on a panic unwind, which is how one half-removed
 /// directory becomes two.
+#[derive(Clone)]
 pub struct PartialInstance {
     storage: ModuleStorage,
     key: InstanceKey,
@@ -1759,6 +1760,21 @@ pub struct PartialInstance {
 }
 
 impl PartialInstance {
+    /// Throw the build away. For a build that FAILED while the host is still
+    /// up: boot's sweep would get it eventually, but until then it is up to a
+    /// parent's worth of disk (1.3 GB for the largest module) that nothing
+    /// will ever use. Best-effort — the sweep is still there behind it.
+    pub fn discard(self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            tracing::warn!(
+                module = %self.key.module,
+                instance = %self.key.dir_name(),
+                error = %e,
+                "discarding a failed instance build failed; boot will sweep it",
+            );
+        }
+    }
+
     pub fn key(&self) -> &InstanceKey {
         &self.key
     }

@@ -499,7 +499,8 @@ impl MoveManager {
                         client = %client,
                         instance = %key.dir_name(),
                         error = %e,
-                        "releasing a staging instance failed; the tick will retry it",
+                        "releasing a staging instance failed; the lifecycle tick's sweep of unwanted \
+                         staging instances will release it",
                     );
                 }
             }

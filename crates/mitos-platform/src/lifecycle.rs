@@ -114,6 +114,10 @@ pub enum StagingError {
     /// carries as zero bytes.
     #[error("parent instance {0} is not on disk; refusing to copy nothing and call it a copy")]
     ParentGone(String),
+    /// The parent's follower could not be stopped, so its files cannot be
+    /// copied: a byte copy under a live writer is a torn one.
+    #[error("parent instance {0}'s follower would not stop; refusing to copy live state files")]
+    ParentWouldNotStop(String),
     #[error("the staging instance was built but its follower did not start")]
     StartFailed,
 }
@@ -858,6 +862,30 @@ impl LifecycleManager {
                     continue;
                 }
                 let key = view.key().clone();
+                // A `Staging` instance NO move wants is released here, every
+                // tick — not only by the `ReleaseStaging` effect. That effect
+                // is issued once, by a transition whose row is persisted
+                // BEFORE it runs and which leaves the row with no pending
+                // move: crash in between, or let the release fail, and
+                // `recover()` has nothing to re-issue. The instance would
+                // then follow the chain for ever with nobody to speak to, on
+                // a box whose binding constraint is memory. The rule is the
+                // effect's own ("still `Staging` and no move wants it"), so
+                // re-applying it is executing, not deciding — and a staging
+                // instance is never unwanted by accident: its row is written
+                // before `EnsureInstance` creates it.
+                if view
+                    .managed()
+                    .is_some_and(|i| i.phase == mitos_lifecycle::instance::Phase::Staging)
+                    && let Err(e) = self.release_staging_locked(&key).await
+                {
+                    tracing::warn!(
+                        module = %module,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "lifecycle tick: releasing an unwanted staging instance failed",
+                    );
+                }
                 match self.apply_at_locked(&key, Event::Tick).await {
                     Ok(_) | Err(LifecycleError::Rejected(_)) => {}
                     Err(e) => tracing::warn!(
@@ -1039,6 +1067,30 @@ impl LifecycleManager {
         //    `.partial`, so every crash window below leaves a tree that is
         //    either complete or invisible.
         let partial = self.storage.begin_instance(key)?;
+        if let Err(e) = self.build_partial(&partial, parent, carry).await {
+            // The host is still up, so do not leave a parent's worth of disk
+            // behind for boot's sweep to find.
+            partial.discard();
+            return Err(e);
+        }
+
+        // 4. Start it. A failure here leaves a complete, MANAGED, `Staging`
+        //    instance — so the watchdog will retry it, and `ReleaseStaging`
+        //    from the move this failure fails is what cleans it up.
+        self.start_follower(key).await.map_err(|e| {
+            self.effect_failed(key.module.as_str(), "start_staging", &e);
+            StagingError::StartFailed
+        })
+    }
+
+    /// Fill a partial and commit it. Split out so ONE caller can discard the
+    /// partial on any failure in here.
+    async fn build_partial(
+        &self,
+        partial: &PartialInstance,
+        parent: Option<&InstanceKey>,
+        carry: state_prep::CopySet,
+    ) -> Result<(), StagingError> {
         let wanted: Vec<StateFile> = [
             (StateFile::Kv, carry.kv),
             (StateFile::Cursor, carry.cursor),
@@ -1053,21 +1105,14 @@ impl LifecycleManager {
             // (`Fresh` and `Rebuild` are `StartEmpty` throughout), so this is
             // a contradiction in the pure crate rather than a host state.
             let parent = parent.ok_or(StagingError::CopyWithoutParent)?;
-            self.copy_from_parent(&partial, parent, &wanted).await?;
+            self.copy_from_parent(partial, parent, wanted).await?;
         }
         // The record BEFORE the marker, and the marker inside `commit`: a
         // directory is only an instance once it has both, and a managed one
         // only once it has a record.
-        partial.write_lifecycle(&Instance::staging(key.clone()).record())?;
-        partial.commit()?;
-
-        // 4. Start it. A failure here leaves a complete, MANAGED, `Staging`
-        //    instance — so the watchdog will retry it, and `ReleaseStaging`
-        //    from the move this failure fails is what cleans it up.
-        self.start_follower(key).await.map_err(|e| {
-            self.effect_failed(key.module.as_str(), "start_staging", &e);
-            StagingError::StartFailed
-        })
+        partial.write_lifecycle(&Instance::staging(partial.key().clone()).record())?;
+        partial.clone().commit()?;
+        Ok(())
     }
 
     /// Stop the parent's follower, carry its files across, and START IT AGAIN
@@ -1084,7 +1129,7 @@ impl LifecycleManager {
         &self,
         partial: &PartialInstance,
         parent: &InstanceKey,
-        files: &[StateFile],
+        files: Vec<StateFile>,
     ) -> Result<(), StagingError> {
         let module = parent.module.as_str();
         // A parent whose directory is GONE — an upload renamed it away —
@@ -1099,21 +1144,40 @@ impl LifecycleManager {
         }
 
         let started = std::time::Instant::now();
+        // If the follower will not stop, there is NO copy. `upload` can carry
+        // on past a failed quiesce because a rename moves the files whole; a
+        // byte copy of redb files with their writer still running is a torn
+        // `kv` beside a `cursor` from a different block, which is the one
+        // thing `state_prep`'s rule 1 exists to forbid — and it would not
+        // fail here but weeks later, as a module whose state is quietly
+        // wrong. Nothing was stopped, so there is nothing to restart.
         if let Err(e) = self.host.stop_instance(parent).await {
             self.effect_failed(module, "quiesce_for_staging", &e.to_string());
+            return Err(StagingError::ParentWouldNotStop(parent.dir_name()));
         }
 
-        let mut bytes = 0u64;
-        let mut outcome = Ok(());
-        for file in files {
-            match partial.carry(parent, *file) {
-                Ok(copied) => bytes += copied,
-                Err(e) => {
-                    outcome = Err(StagingError::Storage(e));
-                    break;
-                }
+        // Off the async workers: this is synchronous file IO, seconds of it
+        // for the largest module on a filesystem without reflink, and every
+        // follower on the host dispatches on the runtime it would block.
+        let (copier, from) = (partial.clone(), parent.clone());
+        let copied = tokio::task::spawn_blocking(move || {
+            let mut bytes = 0u64;
+            for file in files {
+                bytes += copier.carry(&from, file)?;
             }
-        }
+            Ok::<u64, StorageError>(bytes)
+        })
+        .await;
+        let (bytes, outcome) = match copied {
+            Ok(Ok(bytes)) => (bytes, Ok(())),
+            Ok(Err(e)) => (0, Err(StagingError::Storage(e))),
+            Err(join) => (
+                0,
+                Err(StagingError::Storage(StorageError::Io(
+                    std::io::Error::other(format!("staging copy task: {join}")),
+                ))),
+            ),
+        };
 
         // ALWAYS, and before the `?`. Leaving a live client's instance
         // stopped because a copy for somebody else's move failed would be
@@ -1165,10 +1229,15 @@ impl LifecycleManager {
     /// so one giving up must not take the instance the other is still
     /// catching up on. The rows are the record of who wants it.
     pub async fn release_staging(&self, key: &InstanceKey) -> Result<(), LifecycleError> {
-        let module = key.module.as_str();
-        let lock = self.lock_for(module);
+        let lock = self.lock_for(key.module.as_str());
         let _guard = lock.lock().await;
+        self.release_staging_locked(key).await
+    }
 
+    /// Caller holds the module lock. Shared with the tick's sweep, which is
+    /// what makes `ReleaseStaging` safe to lose — see `tick`.
+    async fn release_staging_locked(&self, key: &InstanceKey) -> Result<(), LifecycleError> {
+        let module = key.module.as_str();
         if self.a_move_still_wants(key) {
             tracing::debug!(
                 module = %module,
@@ -3085,6 +3154,83 @@ mod tests {
         );
     }
 
+    /// Every `*.partial` under the module's instances directory.
+    fn partials(h: &Harness, any_instance: &InstanceKey) -> Vec<String> {
+        let root = h.storage.instance_dir(any_instance);
+        std::fs::read_dir(root.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".partial"))
+            .collect()
+    }
+
+    /// `upload` can carry on past a failed quiesce: a rename moves the files
+    /// whole. A COPY cannot — bytes read from redb files under a live writer
+    /// are a torn `kv` beside a `cursor` from another block, and that does
+    /// not fail here but weeks later, as state that is quietly wrong.
+    #[tokio::test]
+    async fn a_parent_that_will_not_stop_is_never_copied() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+        h.host.clear();
+        h.host.fail_stop_instance(&parent);
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        let refused = h.manager.create_staging(&target, Some(&parent)).await;
+
+        assert!(
+            matches!(refused, Err(StagingError::ParentWouldNotStop(_))),
+            "{refused:?}"
+        );
+        assert!(!h.storage.instance_dir(&target).is_dir());
+        assert!(
+            partials(&h, &parent).is_empty(),
+            "{:?}",
+            partials(&h, &parent)
+        );
+        // Nothing was stopped, so nothing is restarted: a restart here would
+        // cycle a follower that never went away.
+        assert_eq!(h.host.calls(), vec![HostCall::StopInstance(parent)]);
+    }
+
+    /// The host is still up after a build fails, so the half-built directory
+    /// — up to a parent's worth of disk — must not wait for boot's sweep.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_build_that_fails_leaves_no_partial_behind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.manager.boot().await;
+        h.fill_state(&parent, "from the parent", 99);
+        // `cursor` is carried AFTER `kv`, so the partial already holds a file
+        // when this fails.
+        let source = h
+            .storage
+            .instance_dir(&parent)
+            .join(StateFile::Cursor.file_name());
+        let readable = std::fs::metadata(&source).unwrap().permissions();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        let failed = h.manager.create_staging(&target, Some(&parent)).await;
+        std::fs::set_permissions(&source, readable).unwrap();
+
+        assert!(failed.is_err(), "the copy was supposed to fail");
+        assert!(
+            partials(&h, &parent).is_empty(),
+            "{:?}",
+            partials(&h, &parent)
+        );
+    }
+
     /// The copy must be taken AFTER the parent's follower has finished its
     /// block, or `kv`, `cursor` and `watched` describe three different ones.
     #[tokio::test]
@@ -3429,6 +3575,47 @@ mod tests {
         );
         assert!(h.storage.instance_dir(&parent).is_dir());
         assert!(h.host.stopped(MODULE) && h.host.evicted(MODULE));
+    }
+
+    /// `ReleaseStaging` is issued ONCE, by a transition that leaves its row
+    /// with no pending move — so if the host dies between persisting that row
+    /// and executing the effect, `recover()` has nothing to re-issue. Without
+    /// a sweep the staging instance follows the chain for ever, for nobody.
+    #[tokio::test]
+    async fn the_tick_releases_a_staging_instance_whose_release_was_lost() {
+        let h = Harness::new();
+        let parent = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        let target = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&target, Some(&parent))
+            .await
+            .unwrap();
+
+        // While a move still wants it, a tick leaves it alone…
+        h.moving(PROD_CLIENT, &parent, &target);
+        h.manager.tick().await;
+        assert_eq!(h.record_at(&target).map(|i| i.phase), Some(Phase::Staging));
+
+        // …the move is abandoned, and the effect that should have followed
+        // never runs: the crash.
+        h.storage
+            .remove_row(MODULE, &ClientId::parse(PROD_CLIENT).unwrap())
+            .unwrap();
+
+        h.manager.tick().await;
+
+        assert!(
+            !h.storage.instance_dir(&target).is_dir(),
+            "an unwanted staging instance outlived the tick",
+        );
+        assert!(h.storage.instance_dir(&parent).is_dir());
+        assert_eq!(
+            h.record_at(&parent).map(|i| i.phase),
+            Some(Phase::Active),
+            "the sweep must never touch an instance that is not staging",
+        );
     }
 
     /// Legacy mode has one implicit namespace owning every client, so a

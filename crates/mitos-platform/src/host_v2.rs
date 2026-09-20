@@ -1649,6 +1649,9 @@ pub(crate) mod testing {
         /// Modules whose `evict_module` fails — a `Reap` whose host-side
         /// teardown failed must leave the directory alone and be retried.
         fail_evict: HashSet<String>,
+        /// Instances whose `stop_instance` fails and leaves the follower
+        /// RUNNING — so anything that needed it stopped must not proceed.
+        fail_stop: HashSet<InstanceKey>,
         /// Runs inside `stop`, so a test can record what the WORLD looked
         /// like at the moment a follower was stopped — an ordering against
         /// something that is not a host call.
@@ -1726,6 +1729,15 @@ pub(crate) mod testing {
                 .expect("fake host mutex")
                 .fail_evict
                 .insert(module.to_owned());
+        }
+
+        /// Make `stop_instance` fail for `key`, leaving its follower running.
+        pub(crate) fn fail_stop_instance(&self, key: &InstanceKey) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_stop
+                .insert(key.clone());
         }
 
         pub(crate) fn on_stop(&self, observe: impl Fn() + Send + Sync + 'static) {
@@ -1860,6 +1872,18 @@ pub(crate) mod testing {
 
         async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
             self.record(HostCall::StopInstance(key.clone()));
+            if self
+                .inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_stop
+                .contains(key)
+            {
+                return Err(PlatformError::Decode(format!(
+                    "fake stop failure: {}",
+                    key.dir_name()
+                )));
+            }
             self.settle_stop(|slot| slot == &Slot::Instance(key.clone()));
             // The storage half, as the real `stop_instance` does it: a
             // follower that has stopped has let go of its redb handles.
