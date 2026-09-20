@@ -41,6 +41,7 @@
 pub mod access;
 pub mod artifact;
 pub mod client_move;
+pub mod handoff;
 pub mod ids;
 pub mod instance;
 pub mod lease;

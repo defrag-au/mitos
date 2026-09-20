@@ -175,6 +175,39 @@ pub fn drain_pass(
     }
 }
 
+/// Whether `current.toml` should follow a client that has just moved.
+///
+/// The module's CURRENT instance is what every unplaced client, and every
+/// `&str`-addressed operator tool, means by "the module" — and it cannot be
+/// reaped while siblings exist, because that would leave the pointer naming
+/// nothing. So when the last client leaves it, the pointer has to leave too,
+/// or the emptied instance is refused its reap on every tick for ever.
+///
+/// It follows the client that emptied it: that instance is, by construction,
+/// live, caught up and serving somebody. An instance that still has ANY
+/// client — including the unplaced ones [`attached_to`] counts on it — keeps
+/// the pointer, so a dev client forking away from prod never drags "the
+/// module" along with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Succession {
+    Stays,
+    MovesTo(InstanceKey),
+}
+
+/// `still_attached_to_current` is [`attached_to`] for the current instance,
+/// evaluated AFTER the move's row was written.
+pub fn succession(
+    module_current: &InstanceKey,
+    still_attached_to_current: &BTreeMap<ClientKey, NamespaceProfile>,
+    moved_to: &InstanceKey,
+) -> Succession {
+    if moved_to == module_current || !still_attached_to_current.is_empty() {
+        Succession::Stays
+    } else {
+        Succession::MovesTo(moved_to.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +293,28 @@ mod tests {
             all.sort();
             assert_eq!(seen, all, "with current {module_current:?}");
         }
+    }
+
+    /// The pointer follows the client that EMPTIED the current instance, and
+    /// nobody else. A dev client forking away must not drag "the module" —
+    /// what every unplaced client and operator tool means — along with it.
+    #[test]
+    fn the_pointer_follows_only_the_client_that_empties_the_current_instance() {
+        use crate::policy::fixtures::prod;
+        let (current, elsewhere) = (key("aa"), key("bb"));
+        let nobody = BTreeMap::new();
+        let somebody = BTreeMap::from([(named("still-here.cnft.dev"), prod())]);
+
+        assert_eq!(
+            succession(&current, &somebody, &elsewhere),
+            Succession::Stays
+        );
+        assert_eq!(
+            succession(&current, &nobody, &elsewhere),
+            Succession::MovesTo(elsewhere.clone())
+        );
+        // A move ONTO the current instance leaves the pointer where it is.
+        assert_eq!(succession(&current, &nobody, &current), Succession::Stays);
     }
 
     /// A moved client may still be owed rows by the instance it left. They

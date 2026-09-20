@@ -121,16 +121,25 @@ A client row moves A → B:
 2. Resolve B: exists → attach path (step 5). Otherwise create it.
 3. Create B in `Staging`: fetch + verify artifact (D8), prepare state
    from PARENT A (D5), run instance-scoped upgrade actions (D6).
-4. B follows from its cursor to tip. Its emissions for the moving client
-   are HELD, and diffed against A's for the same blocks (D7).
-5. **Quiesce, then commit.** PAUSE BOTH followers at the same block
-   boundary. If the client's queue on A is empty (or the plan says
-   `purge-emissions`), commit: the row update and the delivery routing for
-   every companion of that client are ONE atomic write. If the queue is
-   not empty and the plan says drain, RESUME both and wait — two followers
-   are never held paused while a companion catches up on its reading.
-   From the commit on, ALL of B's emissions for that client are delivered.
-6. A's refcount drops. Zero → `Superseded` → D10.
+4. B follows from its cursor to tip, speaking to nobody
+   (`routing::fan_out` → `Skip`). The advisory diff of D7 is optional and
+   not needed for correctness.
+5. **Quiesce, then commit — with a WATERMARK, not an aligned pause.**
+   Stop B, then A (`stop_instance`: finishes the block in flight, flushes
+   the cursor). Require `S_B ≤ S_A`; if B got ahead, resume both and retry
+   later — never wait with two followers stopped. If the client's queue on
+   A is empty (or the plan says `purge-emissions`), commit: write B's
+   hand-off watermark "serve this client only AFTER `S_A`", then the row —
+   and since delivery routing is DERIVED from rows, that one row write is
+   the routing change for every companion of the client. If the queue is
+   not empty and the plan says drain, RESUME both and wait. After the
+   commit B replays `(S_B, S_A]` silently and delivers everything after;
+   A `Skip`s the client. A rollback below the watermark lowers it.
+   `mitos_lifecycle::handoff` is this step, with the exactly-once property
+   as a test.
+6. A's refcount drops. Zero → `Superseded` → D10. If A was the module's
+   CURRENT instance and the move emptied it, `current.toml` follows the
+   client out (`routing::succession`) — otherwise A could never be reaped.
 
 *Refined while coding (2026-09-19).* The first draft switched "at a block
 boundary both have processed", chosen ahead of time, and leaned on an
@@ -140,6 +149,13 @@ the commit is ordinary processing for both instances, one AFTER it is B's
 alone, and there is no "during". A first subscribe (no A) skips catch-up,
 pause and drain entirely.
 
+*Refined again (2026-09-20, WO-09).* "Pause BOTH at the same block
+boundary" assumed a primitive the host does not have: two followers hold two
+independent subscriptions, and nothing can pause one, let alone align two.
+The watermark needs only the quiesce `upload` already trusts, and it removes
+the HOLD as well — B never has to buffer what it might later need, because
+`S_B ≤ S_A` guarantees it has not yet produced anything A did not deliver.
+
 Rules: one Staging catch-up at a time host-wide, `prod` clients queued
 ahead of `dev`. A new digest arriving for a client whose staging is still
 catching up ABANDONS that staging and restarts — never queues. Max live
@@ -147,7 +163,7 @@ instances per module is configured (default 4); beyond it a fork is
 REFUSED with a typed error rather than silently costing dispatch.
 
 A move where B already exists and is `Active` skips 3–4's creation work
-but still holds + switches at a common block boundary.
+but still quiesces both and commits behind a watermark.
 
 ### D5 — State: compatible / migrate / rebuild
 Only 6 of 20 modules use `state-kv`. The manifest declares
