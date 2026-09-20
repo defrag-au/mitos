@@ -1859,6 +1859,117 @@ mod tests {
             assert_eq!(ids_of(&plan.serving), vec![vec![7, 8]]);
         }
 
+        /// A row with a pending move, still placed on `current`.
+        fn moving(storage: &ModuleStorage, from: &InstanceKey, to: &InstanceKey) {
+            use mitos_lifecycle::client_move::{
+                AnnounceContext, ClientRow, Event, ModuleRef, Placement, TargetInstance,
+            };
+            use mitos_lifecycle::ids::{ClientId, ClientKey, Namespace, Revision};
+            use mitos_lifecycle::upgrade::MoveIntent;
+
+            let client = ClientId::parse(CLIENT).unwrap();
+            let module = ModuleId::parse(MODULE).unwrap();
+            let row = ClientRow::adopt(
+                ClientKey {
+                    namespace: Namespace::parse("prod").unwrap(),
+                    client: client.clone(),
+                },
+                module.clone(),
+                Placement {
+                    instance: from.clone(),
+                    revision: Revision(1),
+                },
+            );
+            let manifest = storage.read_artifact_manifest(&to.wasm).unwrap().unwrap();
+            let next = row
+                .step(Event::Announce {
+                    module_ref: ModuleRef::announced_by(
+                        &client,
+                        &module,
+                        to.wasm.clone(),
+                        Sha256Hex::parse(&crate::manifest::sha256_hex(
+                            manifest.to_toml().unwrap().as_bytes(),
+                        ))
+                        .unwrap(),
+                        None,
+                        Revision(2),
+                    )
+                    .unwrap(),
+                    intent: MoveIntent::Announced,
+                    context: AnnounceContext {
+                        revision_policy: mitos_lifecycle::policy::RevisionPolicy::Allow,
+                        target: TargetInstance::Missing,
+                        live_instances: 1,
+                        max_instances: 2,
+                    },
+                })
+                .expect("a move is planned");
+            assert!(next.next.pending.is_some(), "the row must carry a move");
+            storage.write_row(MODULE, &next.next).unwrap();
+        }
+
+        /// **The row write IS the switch**, and `Committing` → committed is
+        /// two writes that can land inside one filesystem timestamp tick. The
+        /// dialer's row cache runs for the life of the process — unlike a
+        /// follower's, which is rebuilt every time its drain task starts — so
+        /// a cache keyed on mtime alone would keep sending this client from
+        /// the instance it has left. A committed row has LOST its `pending`
+        /// table, so its length always changes even when its mtime does not.
+        #[test]
+        fn a_row_committed_within_one_timestamp_tick_is_seen() {
+            let f = fixture();
+            let (_, dials) = dial();
+            let mut rows = RowCache::default();
+            let tick = |rows: &mut RowCache| {
+                plan_module_tick(
+                    &f.storage,
+                    MODULE,
+                    vec![scan(&f.current, &[1, 2])],
+                    &dials,
+                    Some(&f.current),
+                    &HashMap::new(),
+                    Instant::now(),
+                    rows,
+                    &f.client,
+                    LaneConfig::default(),
+                    pool::BulkConfig { max: 50 },
+                )
+            };
+
+            // Mid-move: the client is still served by `current`.
+            moving(&f.storage, &f.current, &f.other);
+            let path = f
+                .storage
+                .module_dir_for_rows(MODULE)
+                .join(format!("{CLIENT}.toml"));
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(ids_of(&tick(&mut rows).serving), vec![vec![1, 2]]);
+
+            // The commit — forced to the mtime the mid-move row had, which is
+            // what a write landing in the same timestamp tick looks like.
+            place(&f.storage, &f.other);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                mtime,
+                "precondition: the two writes must be indistinguishable by mtime",
+            );
+
+            let plan = tick(&mut rows);
+            assert_eq!(
+                ids_of(&plan.leftover),
+                vec![vec![1, 2]],
+                "the row cache missed the commit; this client is being sent from the \
+                 instance it has left",
+            );
+            assert!(plan.serving.is_empty());
+        }
+
         /// A companion inside its backoff window is skipped entirely — not
         /// moved to the other pass, which would send it anyway.
         #[test]

@@ -10,6 +10,18 @@
 //! two answers must agree. `routing::attached_to`'s doc comment is the same
 //! argument one level up: were "whose events do I write" and "who keeps me
 //! alive" computed two ways, they could disagree.
+//!
+//! # Why the cache must see a commit
+//!
+//! The row write IS the switch: from it on, `fan_out` says the new instance
+//! serves the client. A cache that missed it would keep delivering from the
+//! instance the client has left.
+//!
+//! The FOLLOWERS' caches are safe by construction — both are stopped across
+//! the commit (`LifecycleManager::quiesce_pair`) and each rebuilds its cache
+//! when its drain task starts. The DIALER's is not: one drain runs for the
+//! whole module and never stops. That is why freshness is keyed on
+//! `(mtime, len)` and not mtime alone.
 
 use std::collections::HashMap;
 
@@ -29,7 +41,13 @@ pub struct RowCache {
 }
 
 struct CachedRow {
-    mtime: Option<std::time::SystemTime>,
+    /// Mtime AND length. Mtime alone is not enough: a row goes
+    /// `Committing` → committed in two writes that can land inside one
+    /// timestamp tick, and the commit is the routing change — a cache that
+    /// missed it would keep delivering from the instance the client has
+    /// left. A committed row has lost its `pending` table, so its LENGTH
+    /// always changes even when its mtime does not.
+    stamp: Option<(std::time::SystemTime, u64)>,
     row: Option<ClientRow>,
 }
 
@@ -51,11 +69,11 @@ impl RowCache {
         let path = storage
             .module_dir_for_rows(module)
             .join(format!("{client_id}.toml"));
-        let mtime = std::fs::metadata(&path)
+        let stamp = std::fs::metadata(&path)
             .ok()
-            .and_then(|m| m.modified().ok());
+            .and_then(|m| m.modified().ok().map(|mtime| (mtime, m.len())));
         let key = path.to_string_lossy().into_owned();
-        let fresh = matches!(self.entries.get(&key), Some(e) if e.mtime == mtime);
+        let fresh = matches!(self.entries.get(&key), Some(e) if e.stamp == stamp);
         if !fresh {
             let row = match storage.read_row(module, &client) {
                 Ok(row) => row,
@@ -69,7 +87,7 @@ impl RowCache {
                     None
                 }
             };
-            self.entries.insert(key.clone(), CachedRow { mtime, row });
+            self.entries.insert(key.clone(), CachedRow { stamp, row });
         }
         self.entries.get(&key).and_then(|e| e.row.as_ref())
     }

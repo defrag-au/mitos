@@ -38,23 +38,25 @@
 //! directly — `load_or_adopt` writes, so only a holder of the row lock may
 //! call it. The admin read route and the tick's scan READ rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use mitos_lifecycle::access::Registry;
 use mitos_lifecycle::client_move::{
-    AnnounceContext, CatchUpSlot, ClientRow, Effect, Event, Grant, ModuleRef, MoveFailure,
-    Placement, Progress, QueuedMove, Rejected, TargetInstance, next_catch_up,
+    AnnounceContext, CatchUpSlot, ClientQueue, ClientRow, Effect, Event, Grant, ModuleRef,
+    MoveFailure, Phase, Placement, Progress, QueuedMove, Rejected, Stage, TargetInstance,
+    next_catch_up,
 };
-use mitos_lifecycle::ids::{ClientId, ClientKey, InstanceKey, ModuleId};
+use mitos_lifecycle::handoff::{self, Alignment, CatchUp};
+use mitos_lifecycle::ids::{ClientId, ClientKey, InstanceKey, ModuleId, Slot};
 use mitos_lifecycle::instance::DetachCause;
-use mitos_lifecycle::upgrade::MoveIntent;
+use mitos_lifecycle::upgrade::{MoveIntent, Refill};
 use mitos_protocol::{AnnounceResult, AnnouncedModule};
 
 use crate::auth::Authenticator;
 use crate::events::{EventKind, EventRing};
 use crate::fetch::{Announced, ArtifactPuller, Refusal};
-use crate::lifecycle::{Clock, LifecycleManager};
+use crate::lifecycle::{Clock, LifecycleManager, Quiesced};
 use crate::storage::{ModuleStorage, StorageError};
 
 /// How many live instances of one module the host will carry.
@@ -99,6 +101,18 @@ pub struct MoveManager {
     me: std::sync::Weak<Self>,
     /// Spawned work still running, so [`Self::settle`] can wait for it.
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Both followers of a switch, stopped, with the module locked.
+    ///
+    /// `PauseAtBoundary` puts one here and `CommitSwitch`,
+    /// `PurgeClientEmissions` and `ResumeFollowers` take it out. All of them
+    /// run back-to-back on ONE task inside one `execute_all`: the map exists
+    /// because they are separate effects, not because time passes between
+    /// them. Anything left in it is a bug the `Quiesced`'s own `Drop`
+    /// already recovers from.
+    quiesced: std::sync::Mutex<HashMap<RowKey, Quiesced>>,
+    /// Moves this process has already explained are waiting for WO-10, so
+    /// the reason is said once and not once a minute.
+    blocked_noted: std::sync::Mutex<HashSet<String>>,
 }
 
 /// `(module, client)` — which row a lock guards.
@@ -132,6 +146,8 @@ impl MoveManager {
             slot: std::sync::Mutex::new(CatchUpSlot::default()),
             me: me.clone(),
             tasks: std::sync::Mutex::new(Vec::new()),
+            quiesced: std::sync::Mutex::new(HashMap::new()),
+            blocked_noted: std::sync::Mutex::new(HashSet::new()),
         })
     }
 
@@ -518,11 +534,32 @@ impl MoveManager {
                     );
                 }
             }
-            // The staging instance already speaks to nobody: `fan_out` is
-            // `Skip` for every client until a row names it. HOLDING this
-            // client's emissions on it, and diffing them against the live
-            // instance's, is what WO-09 adds.
-            Effect::HoldAndDiff { .. } => {}
+            Effect::PauseAtBoundary { live, staging } => {
+                self.pause_at_boundary(module, client, live, staging).await;
+            }
+            Effect::PurgeClientEmissions { on } => {
+                self.purge_client_emissions(client, on);
+            }
+            Effect::CommitSwitch { from, to } => {
+                self.commit_switch(module, client, from.as_ref(), to).await;
+            }
+            // Only ever from `recover()`, and the answer is always the same.
+            // The commit IS the row write that clears the pending move, so a
+            // row that still says `Committing` is a commit that did not
+            // land. There is nothing to ask anyone.
+            Effect::ResolveCommit => {
+                self.feed(module, client, None, Progress::CommitLost).await;
+            }
+            Effect::ResumeFollowers { live, staging } => {
+                self.resume_followers(module, client, live, staging).await;
+            }
+            // The staging instance already speaks to nobody until the commit,
+            // and from the commit on the WATERMARK is what keeps the client
+            // from being sent a block twice. Holding this client's emissions
+            // on the staging instance and diffing them against the live
+            // instance's is the advisory diff (D7) — it is not load-bearing
+            // for the switch, and it is not built.
+            Effect::HoldAndDiff { .. } | Effect::FinishDiff => {}
             Effect::Alert(alert) => {
                 let reason = format!("{alert:?}");
                 tracing::error!(module = %module, client = %client, %reason, "move failed");
@@ -534,15 +571,389 @@ impl MoveManager {
                     },
                 );
             }
-            // Everything else is downstream of `CaughtUp`, which nothing
-            // feeds. Loud, but never fatal: a reducer that surprised the host
-            // is not a reason to take the host down.
+            // `RunRefill` only: §1 refuses to advance a move whose plan
+            // carries one past `CatchingUp`, so nothing can reach the
+            // transition that issues it. Loud, but never fatal: a reducer
+            // that surprised the host is not a reason to take the host down.
             other => tracing::error!(
                 module = %module,
                 client = %client,
                 effect = ?other,
-                "move effect is not reachable until the switch lands; ignoring",
+                "move effect is not reachable until the refill order lands; ignoring",
             ),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The switch
+    // -----------------------------------------------------------------
+
+    /// `(module, client)` — which row a `Quiesced` belongs to.
+    fn quiesce_key(module: &ModuleId, client: &ClientId) -> RowKey {
+        (module.to_string(), client.as_str().to_owned())
+    }
+
+    /// Stop both followers and keep the module locked until the commit.
+    ///
+    /// A failure is NOT a failed move: the row stays `Quiescing` and the
+    /// tick's `Quiescing` arm re-executes this effect — see `advance`.
+    async fn pause_at_boundary(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        live: &InstanceKey,
+        staging: &InstanceKey,
+    ) {
+        let Some(lifecycle) = self.me.upgrade().map(|me| me.lifecycle.clone()) else {
+            return;
+        };
+        match lifecycle.quiesce_pair(live, staging).await {
+            Ok(quiesced) => {
+                let after = quiesced.after();
+                // A second `PauseAtBoundary` for a row that already holds one
+                // would strand the first — and its `Drop` would resume the
+                // followers under the second's feet. Cannot happen (the
+                // effects of one transition run on one task) but the map is
+                // the place it WOULD happen, so it says so.
+                // Bound, so the `std::sync::Mutex` guard is dropped by the
+                // end of the statement: holding one across the `.await`
+                // below would make this whole future non-`Send`.
+                let stranded = self
+                    .quiesced
+                    .lock()
+                    .expect("quiesced mutex")
+                    .insert(Self::quiesce_key(module, client), quiesced);
+                if let Some(stranded) = stranded {
+                    tracing::error!(
+                        module = %module,
+                        client = %client,
+                        "a second quiesce replaced one still held; resuming the first",
+                    );
+                    stranded.resume().await;
+                    return;
+                }
+                let queue = self.client_queue(client, live);
+                tracing::info!(
+                    module = %module,
+                    client = %client,
+                    live = %live.dir_name(),
+                    staging = %staging.dir_name(),
+                    after = after.0,
+                    ?queue,
+                    "both followers quiesced; committing the switch",
+                );
+                // `progress_locked`, not `feed`, because THIS caller has to
+                // know whether the row moved. Every transition `Quiesced` can
+                // make takes the quiesce back out of the map — `Committing`
+                // through `CommitSwitch`, `WaitingForDrain` through
+                // `ResumeFollowers`. If the row does NOT move, nothing does:
+                // the quiesce is stranded holding the module lock with both
+                // followers stopped, and the next tick's `Quiescing` arm
+                // deadlocks on that lock inside `quiesce_pair` — taking the
+                // whole row tick with it.
+                if self
+                    .progress_locked(
+                        module,
+                        client,
+                        staging.clone(),
+                        Progress::Quiesced { queue },
+                    )
+                    .await
+                    .is_err()
+                {
+                    self.resume_followers(module, client, live, staging).await;
+                }
+            }
+            Err(e) => tracing::info!(
+                module = %module,
+                client = %client,
+                live = %live.dir_name(),
+                staging = %staging.dir_name(),
+                error = %e,
+                "the switch could not be quiesced; the moves tick's `Quiescing` arm retries it",
+            ),
+        }
+    }
+
+    /// Does this client have anything undelivered on the instance it is
+    /// leaving? `Pending` iff it has a `Queued` or `Pending` row there.
+    ///
+    /// `Pending` means a row the dialer has in flight — it is as undelivered
+    /// as a `Queued` one, and the plan's `Drain` is about both.
+    fn client_queue(&self, client: &ClientId, live: &InstanceKey) -> ClientQueue {
+        use crate::emissions::EmissionStatus;
+        let owed = self
+            .storage
+            .emissions_store_at(live)
+            .and_then(|store| {
+                store.list_filtered(|row| {
+                    row.client_id == client.as_str()
+                        && matches!(row.status, EmissionStatus::Queued | EmissionStatus::Pending)
+                })
+            })
+            .map(|rows| !rows.is_empty());
+        match owed {
+            Ok(false) => ClientQueue::Empty,
+            Ok(true) => ClientQueue::Pending,
+            // A store that will not open is treated as owing the client
+            // something: draining what turns out to be nothing costs a tick,
+            // and committing over rows that were there loses them.
+            Err(e) => {
+                tracing::warn!(
+                    client = %client,
+                    instance = %live.dir_name(),
+                    error = %e,
+                    "cannot count what this client is owed; treating it as undrained",
+                );
+                ClientQueue::Pending
+            }
+        }
+    }
+
+    /// Discard the moving client's undelivered rows on the instance it is
+    /// leaving — what `purge-emissions` in the upgrade ledger asks for, when
+    /// the old wire shape is not worth delivering.
+    ///
+    /// Its follower is stopped (the `Quiesced` is held), so nothing is
+    /// writing to that store while this runs.
+    fn purge_client_emissions(&self, client: &ClientId, on: &InstanceKey) {
+        let purged = self
+            .storage
+            .emissions_store_at(on)
+            .and_then(|store| store.purge(|row| row.client_id == client.as_str()));
+        match purged {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(
+                client = %client,
+                instance = %on.dir_name(),
+                count,
+                "purged the moving client's undelivered emissions, as its upgrade asked",
+            ),
+            Err(e) => tracing::warn!(
+                client = %client,
+                instance = %on.dir_name(),
+                error = %e,
+                "purging the moving client's emissions failed; they will be delivered",
+            ),
+        }
+    }
+
+    /// THE switch. Two writes, and the SECOND is the commit.
+    ///
+    /// 1. The watermark on the instance taking over: every block at or before
+    ///    the live instance's cursor was delivered by its predecessor, so the
+    ///    new one withholds them when it replays from its own (lower) cursor.
+    /// 2. `Progress::SwitchCommitted`, whose row `fan_out` reads. Persisting
+    ///    that row IS the routing change, at one instant, for every companion
+    ///    of the client.
+    ///
+    /// **The window between them is harmless.** A watermark for a client the
+    /// row does not place on this instance is never consulted — `fan_out`
+    /// sends that client's events from somewhere else entirely — and the next
+    /// commit overwrites it.
+    ///
+    /// A first subscribe (`from: None`) does only the second write.
+    async fn commit_switch(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        from: Option<&InstanceKey>,
+        to: &Placement,
+    ) {
+        // A FIRST subscribe (`from: None`) pauses NOTHING and owes no
+        // watermark: no instance is serving this client, so no follower was
+        // stopped and every block the new instance holds is one nobody
+        // delivered. It never enters the `quiesced` map, so its absence there
+        // must NOT be read as a lost commit — `Committing` is reached from
+        // `Preparing` in one step and `CommitLost` sends it straight back, so
+        // that reading is not a slow retry but an endless one.
+        let Some(from) = from else {
+            // A failure here leaves the row `Committing` and the tick asks
+            // again; there is nothing stopped to release.
+            let _ = self.commit_row(module, client, to).await;
+            return;
+        };
+        let held = self
+            .quiesced
+            .lock()
+            .expect("quiesced mutex")
+            .remove(&Self::quiesce_key(module, client));
+        let Some(quiesced) = held else {
+            // `from` names an instance that IS serving the client, and its
+            // follower is not stopped — the `Quiesced` went with the process
+            // that held it. This is the tick re-executing `CommitSwitch`
+            // after a restart, or after one of the writes below failed.
+            // Committing here would be a routing change over a running
+            // instance, which is WO-06's bug. `CommitLost` resumes (a no-op
+            // after a restart) and catches up again.
+            tracing::info!(
+                module = %module,
+                client = %client,
+                "commit re-issued with no quiesce in hand; the move goes back to catching up",
+            );
+            self.feed(
+                module,
+                client,
+                Some(to.instance.clone()),
+                Progress::CommitLost,
+            )
+            .await;
+            return;
+        };
+
+        let mut handoffs = match self.storage.read_handoffs_at(&to.instance) {
+            Ok(handoffs) => handoffs,
+            Err(e) => {
+                // Defaulting would drop ANOTHER client's watermark and
+                // re-deliver its blocks. The row is untouched, so the move
+                // stays `Committing` and the tick retries.
+                tracing::error!(
+                    module = %module,
+                    client = %client,
+                    instance = %to.instance.dir_name(),
+                    error = %e,
+                    "hand-off watermarks unreadable; the switch is not committed and the \
+                     moves tick's `Committing` arm will retry it",
+                );
+                quiesced.resume().await;
+                return;
+            }
+        };
+        handoffs.begin(client.clone(), quiesced.after());
+        if let Err(e) = self.storage.write_handoffs_at(&to.instance, &handoffs) {
+            tracing::error!(
+                module = %module,
+                client = %client,
+                instance = %to.instance.dir_name(),
+                error = %e,
+                "writing the hand-off watermark failed; the switch is not committed and \
+                 the moves tick's `Committing` arm will retry it",
+            );
+            quiesced.resume().await;
+            return;
+        }
+
+        // Back in the map so `ResumeFollowers` — the first effect of the
+        // commit below — finds it.
+        self.quiesced
+            .lock()
+            .expect("quiesced mutex")
+            .insert(Self::quiesce_key(module, client), quiesced);
+        if self.commit_row(module, client, to).await.is_err() {
+            // The row did not move, so the commit's `ResumeFollowers` never
+            // ran and the `Quiesced` is still in the map — holding the module
+            // lock with both followers stopped. Leaving it there would hold
+            // them until the write started working; the row still says
+            // `Committing`, so the tick re-executes this whole effect.
+            self.resume_followers(module, client, from, &to.instance)
+                .await;
+        }
+    }
+
+    /// THE row write, and the succession it causes.
+    ///
+    /// `progress_locked` persists the row and runs the effects the commit
+    /// returns — `ResumeFollowers` first — inside it, so by the time this
+    /// returns `Ok` the module lock is free again and `succeed` can take it.
+    async fn commit_row(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        to: &Placement,
+    ) -> Result<(), String> {
+        if let Err(e) = self
+            .progress_locked(
+                module,
+                client,
+                to.instance.clone(),
+                Progress::SwitchCommitted,
+            )
+            .await
+        {
+            tracing::error!(
+                module = %module,
+                client = %client,
+                instance = %to.instance.dir_name(),
+                rejected = %e,
+                "the switch was not committed; the moves tick's `Committing` arm retries it",
+            );
+            return Err(e);
+        }
+        // Succession, AFTER the reconcile `AttachTo`/`DetachFrom` did. If the
+        // client that just moved was the last one on the module's current
+        // instance, `current.toml` follows it — or that instance is refused
+        // its reap for ever. The lifecycle tick asks the same question for
+        // every module with more than one instance, because this effect is
+        // issued once by a transition that clears its own state.
+        if let Err(e) = self.lifecycle.succeed(module.as_str(), &to.instance).await {
+            tracing::warn!(
+                module = %module,
+                client = %client,
+                error = %e,
+                "the succession check failed; the lifecycle tick asks again every minute",
+            );
+        }
+        Ok(())
+    }
+
+    /// Release the quiesce. Idempotent: nothing held ⇒ nothing to do.
+    async fn resume_followers(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        live: &InstanceKey,
+        staging: &InstanceKey,
+    ) {
+        let held = self
+            .quiesced
+            .lock()
+            .expect("quiesced mutex")
+            .remove(&Self::quiesce_key(module, client));
+        match held {
+            Some(quiesced) => quiesced.resume().await,
+            None => tracing::debug!(
+                module = %module,
+                client = %client,
+                live = %live.dir_name(),
+                staging = %staging.dir_name(),
+                "resume with nothing quiesced; both followers are already running",
+            ),
+        }
+    }
+
+    /// Feed one `Progress`, taking the row lock unless the caller has it.
+    ///
+    /// `target: None` means "whatever this row's pending move targets" —
+    /// which is what `ResolveCommit` needs, since the effect carries no key.
+    async fn feed(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        target: Option<InstanceKey>,
+        step: Progress,
+    ) {
+        let target = match target {
+            Some(target) => target,
+            None => {
+                match self
+                    .storage
+                    .read_row(module.as_str(), client)
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.pending.map(|p| p.target.instance))
+                {
+                    Some(target) => target,
+                    None => return,
+                }
+            }
+        };
+        if let Err(e) = self.progress_locked(module, client, target, step).await {
+            tracing::debug!(
+                module = %module,
+                client = %client,
+                rejected = %e,
+                "progress refused; the move has moved on",
+            );
         }
     }
 
@@ -827,7 +1238,14 @@ impl MoveManager {
 
     /// A row whose client has no registration left for the module is
     /// withdrawn; a row with neither a current placement nor a pending move
-    /// is then removed.
+    /// is then removed. Every OTHER row's pending move is advanced.
+    ///
+    /// **Every phase of a move past `Preparing` is swept here**, because
+    /// every one of them is reached by an effect that is issued ONCE by a
+    /// transition whose row is persisted before it runs. `CatchingUp` waits
+    /// on the chain, `Quiescing` and `Committing` on work that can
+    /// legitimately decline, and `WaitingForDrain` on a companion. Nothing
+    /// else asks again.
     pub async fn tick(&self) {
         for module in self.storage.list_modules().unwrap_or_default() {
             let Ok(module_id) = ModuleId::parse(&module) else {
@@ -839,15 +1257,210 @@ impl MoveManager {
             };
             let attached = self.lifecycle.on_disk_clients(&module);
             for row in rows {
-                if attached.contains_key(&row.client) {
-                    continue;
-                }
                 let client = row.client.client.clone();
                 let lock = self.lock_for(&module, &client);
                 let _guard = lock.lock().await;
-                self.withdraw(&module_id, &client, row).await;
+                if attached.contains_key(&row.client) {
+                    self.advance(&module_id, &client, row).await;
+                } else {
+                    self.withdraw(&module_id, &client, row).await;
+                }
             }
         }
+    }
+
+    /// Carry one pending move to its next phase, if the world is ready.
+    ///
+    /// **Caller holds the row lock.** The row was read BEFORE the lock, so
+    /// every arm re-reads what it acts on through `feed` /
+    /// `progress_locked`, which load the row again under the lock.
+    async fn advance(&self, module: &ModuleId, client: &ClientId, row: ClientRow) {
+        let Some(pending) = row.pending.as_ref() else {
+            return;
+        };
+        let Stage::Planned { plan, phase } = &pending.stage else {
+            // `Fetching` — the pull owns it, and `boot` re-issues one that
+            // was interrupted.
+            return;
+        };
+        let staging = pending.target.instance.clone();
+        // Every phase from here needs the instance the client is being served
+        // BY. A row with no `current` is a first subscribe, which the machine
+        // commits without any of this.
+        let Some(live) = row.current.as_ref().map(|p| p.instance.clone()) else {
+            return;
+        };
+
+        match phase {
+            // The slot queue owns `Queued`; `create_staging`'s task owns
+            // `Preparing`, and `boot` re-queues both after a restart.
+            Phase::Queued | Phase::Preparing => {}
+
+            Phase::CatchingUp => {
+                // A move whose plan carries a refill is NOT advanced.
+                // `RunRefill` is issued once, by the transition that clears
+                // the pending move — so a crash between the row write and
+                // the effect loses it, and a lost `recapture` is a client
+                // whose projected state silently never got rebuilt. WO-10
+                // makes the debt durable and pays it; until then the move
+                // waits, visibly (`GET …/rows` reports it as blocked).
+                if plan.refill != Refill::None {
+                    self.note_blocked(module, client, &staging, plan.refill);
+                    return;
+                }
+                let Some((live_slot, staging_slot)) = self.cursors(&live, &staging) else {
+                    return;
+                };
+                // `match`, never `!=`: a third answer must arrive as a
+                // compile error.
+                match handoff::catch_up(live_slot, staging_slot) {
+                    CatchUp::StillBehind { by } => {
+                        tracing::debug!(
+                            module = %module,
+                            client = %client,
+                            staging = %staging.dir_name(),
+                            by,
+                            "staging is still behind; nothing to quiesce",
+                        );
+                        return;
+                    }
+                    CatchUp::CaughtUp => {}
+                }
+                if !self.worth_quiescing(module, client, live_slot, staging_slot) {
+                    return;
+                }
+                self.feed(module, client, Some(staging), Progress::CaughtUp)
+                    .await;
+            }
+
+            // Re-execute `PauseAtBoundary`. **This is the retry** the
+            // `quiesce_pair` failure paths are written for: the effect is
+            // issued once, and a staging instance that got a block ahead
+            // resumes both and comes back here.
+            Phase::Quiescing => {
+                let Some((live_slot, staging_slot)) = self.cursors(&live, &staging) else {
+                    return;
+                };
+                if !self.worth_quiescing(module, client, live_slot, staging_slot) {
+                    return;
+                }
+                self.execute(module, client, &Effect::PauseAtBoundary { live, staging })
+                    .await;
+            }
+
+            Phase::WaitingForDrain => {
+                // `Quiesced { queue: Pending }` with a `Drain` plan resumed
+                // both followers rather than hold them paused while a
+                // companion catches up on its reading. So this waits on the
+                // DIALER, and there is deliberately no timeout: a client
+                // whose companion is down keeps its move — and the host's
+                // one catch-up slot — until it recovers. That bound is the
+                // client lease's (WO-11).
+                match self.client_queue(client, &live) {
+                    ClientQueue::Pending => {}
+                    ClientQueue::Empty => {
+                        self.feed(module, client, Some(staging), Progress::QueueDrained)
+                            .await;
+                    }
+                }
+            }
+
+            // Re-execute `CommitSwitch`. With no `Quiesced` in hand it feeds
+            // `CommitLost`, which resumes and goes back to catching up — so
+            // this arm covers both a commit whose write failed and one
+            // interrupted by a restart.
+            Phase::Committing => {
+                self.execute(
+                    module,
+                    client,
+                    &Effect::CommitSwitch {
+                        from: Some(live),
+                        to: pending.target.clone(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Both cursors, or `None` if either is missing or unreadable.
+    ///
+    /// An instance with no cursor has followed no block, and one whose cursor
+    /// will not read might be anywhere. Both are "still behind": the move
+    /// waits, which costs a tick, where guessing costs a client its blocks.
+    fn cursors(&self, live: &InstanceKey, staging: &InstanceKey) -> Option<(Slot, Slot)> {
+        let read = |key: &InstanceKey| match self.storage.read_cursor_at(key) {
+            Ok(Some(cursor)) => Some(Slot(cursor.slot())),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    instance = %key.dir_name(),
+                    error = %e,
+                    "cursor unreadable; treating this move as still behind",
+                );
+                None
+            }
+        };
+        Some((read(live)?, read(staging)?))
+    }
+
+    /// Whether to attempt a quiesce at all.
+    ///
+    /// EVERY attempt stops the LIVE follower — a production client's — for as
+    /// long as its block in flight takes. So the cursors as they stand,
+    /// unlocked, must already say a commit is possible. It is a HINT, not the
+    /// decision: `quiesce_pair` reads both again with both stopped and is the
+    /// only thing that decides. Without it, a staging instance sitting a
+    /// block ahead would pause production's follower once a minute for as
+    /// long as it stayed there.
+    fn worth_quiescing(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        live: Slot,
+        staging: Slot,
+    ) -> bool {
+        match handoff::align(live, staging) {
+            Alignment::Commit { .. } => true,
+            Alignment::StagingAhead => {
+                tracing::debug!(
+                    module = %module,
+                    client = %client,
+                    live = live.0,
+                    staging = staging.0,
+                    "staging is ahead of live; not stopping anything this tick",
+                );
+                false
+            }
+        }
+    }
+
+    /// Say ONCE per move that it is waiting for the refill order — not once a
+    /// minute for as long as it waits.
+    fn note_blocked(
+        &self,
+        module: &ModuleId,
+        client: &ClientId,
+        staging: &InstanceKey,
+        refill: Refill,
+    ) {
+        let key = format!("{module}/{client}/{}", staging.dir_name());
+        if !self
+            .blocked_noted
+            .lock()
+            .expect("blocked_noted mutex")
+            .insert(key)
+        {
+            return;
+        }
+        tracing::info!(
+            module = %module,
+            client = %client,
+            staging = %staging.dir_name(),
+            ?refill,
+            "this move's upgrade needs a refill, which the host cannot yet make durable; the \
+             move waits at catching-up and the client stays on the instance it is on",
+        );
     }
 
     async fn withdraw(&self, module: &ModuleId, client: &ClientId, row: ClientRow) {
@@ -1016,8 +1629,22 @@ mod tests {
             wasm: &[u8],
             revision: u32,
         ) -> AnnouncedModule {
+            self.announcement_declaring(module, client, wasm, revision, &[])
+        }
+
+        /// As `announcement_in`, with an `[[lifecycle.upgrade]]` ledger — the
+        /// only way a move's `ClientPlan` comes out as anything but `QUIET`.
+        fn announcement_declaring(
+            &self,
+            module: &str,
+            client: &str,
+            wasm: &[u8],
+            revision: u32,
+            upgrade: &[mitos_lifecycle::upgrade::UpgradeEntry],
+        ) -> AnnouncedModule {
             let mut manifest = crate::companions::testing::manifest_for(module, wasm);
             manifest.lifecycle.revision = Revision(revision);
+            manifest.lifecycle.upgrade = upgrade.to_vec();
             let manifest_bytes = manifest.to_toml().unwrap();
             let announced = AnnouncedModule {
                 module: ModuleId::parse(module).unwrap(),
@@ -1168,19 +1795,40 @@ mod tests {
         );
     }
 
+    /// A move whose upgrade ledger asks for a `recapture` is the one kind
+    /// this order still parks. `RunRefill` is issued once, by the transition
+    /// that clears the pending move, so a crash between the row write and the
+    /// effect loses it — and a lost recapture is a client whose projected
+    /// state silently never got rebuilt. WO-10 makes the debt durable; until
+    /// then the move waits and the client stays where it is.
     #[tokio::test]
-    async fn a_move_parks_at_catching_up_and_nothing_feeds_caught_up() {
+    async fn a_move_with_a_refill_waits_at_catching_up_until_the_refill_order_lands() {
+        use mitos_lifecycle::upgrade::{UpgradeAction, UpgradeEntry};
+
         let h = Harness::new();
         h.activate(&component(1), 1);
         h.subscribe(PROD_CLIENT);
         h.lifecycle.boot().await;
         let live = h.storage.current_instance(MODULE).unwrap().unwrap();
 
-        let announced = h.announcement(PROD_CLIENT, &component(2), 2);
+        let announced = h.announcement_declaring(
+            MODULE,
+            PROD_CLIENT,
+            &component(2),
+            2,
+            &[UpgradeEntry {
+                since: Revision(2),
+                actions: [UpgradeAction::Recapture].into_iter().collect(),
+            }],
+        );
         assert_eq!(
             h.announce(PROD_CLIENT, &announced).await,
             AnnounceResult::Accepted
         );
+        // The tick is what carries every other move out of `CatchingUp`, so
+        // it has to run for this to be about the refill.
+        h.moves.tick().await;
+        h.moves.settle().await;
 
         let row = h.row(PROD_CLIENT).unwrap();
         let pending = row.pending.as_ref().expect("a move is pending");
@@ -1188,16 +1836,15 @@ mod tests {
             Stage::Planned { phase, .. } => assert_eq!(
                 phase,
                 Phase::CatchingUp,
-                "this order grants the slot and creates the instance, and stops there",
+                "a move carrying a refill may not advance past catching up",
             ),
             Stage::Fetching => panic!("the artifact should have been fetched"),
         }
-        // THE bar for this order: the client is still served by the instance
-        // it was on. Nothing feeds `CaughtUp`, so nothing switches.
+        // THE bar: the client is still served by the instance it was on.
         assert_eq!(
             row.current.as_ref().map(|p| &p.instance),
             Some(&live),
-            "the client was switched; nothing in this order may do that",
+            "the client was switched; a move whose refill cannot run may not switch",
         );
         // …and the artifact really is in the CAS.
         assert!(h.storage.artifact_path(&announced.wasm).exists());
@@ -2155,5 +2802,609 @@ mod tests {
             h.row(PROD_CLIENT).unwrap().pending.unwrap().stage,
             Stage::Planned { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // The switch
+    // -----------------------------------------------------------------
+
+    /// Move `key`'s cursor to `slot`. Every test below is about the two
+    /// cursors and nothing else, so they are written by hand rather than
+    /// driven through a chain.
+    fn cursor(h: &Harness, key: &InstanceKey, slot: u64) {
+        h.storage
+            .write_cursor_at(key, &mitos_data_plane::ChainPoint::Slot(slot))
+            .expect("cursor");
+    }
+
+    /// `deploy`, plus the two cursors that decide whether the move commits.
+    /// Returns `(live, staging)`.
+    async fn a_move_at_catching_up(
+        h: &Harness,
+        module: &str,
+        client: &str,
+        live_slot: u64,
+        staging_slot: u64,
+    ) -> (InstanceKey, InstanceKey) {
+        h.deploy(module, client, &component(2)).await;
+        assert_eq!(
+            h.phase(module, client),
+            Some(Phase::CatchingUp),
+            "precondition: the deploy must park at catching up",
+        );
+        let row = h.row_in(module, client).unwrap();
+        let live = row.current.expect("the client is being served").instance;
+        let staging = row.pending.expect("a move is pending").target.instance;
+        cursor(h, &live, live_slot);
+        cursor(h, &staging, staging_slot);
+        h.host.clear();
+        (live, staging)
+    }
+
+    /// The whole order, end to end: two cursors that agree, one tick, and
+    /// the client is served by the instance it announced.
+    #[tokio::test]
+    async fn a_caught_up_move_commits_and_the_client_is_served_by_the_new_instance() {
+        let h = Harness::new();
+        let (_live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+        // A second move, queued behind this one. The slot is host-wide, so
+        // "the commit released it" is only worth asserting if somebody was
+        // waiting for it.
+        h.clock.advance(1);
+        h.deploy(OTHER, PROD_CLIENT, &component(3)).await;
+        assert_eq!(
+            h.queue().0,
+            Some((PROD_CLIENT.to_owned(), MODULE.to_owned())),
+            "precondition: the move under test holds the slot",
+        );
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        let row = h.row(PROD_CLIENT).expect("the row survives the commit");
+        assert_eq!(
+            row.current.as_ref().map(|p| &p.instance),
+            Some(&staging),
+            "the client is still on the instance it was leaving",
+        );
+        assert!(row.pending.is_none(), "the move is not finished: {row:?}");
+        assert_eq!(
+            h.queue().0,
+            Some((PROD_CLIENT.to_owned(), OTHER.to_owned())),
+            "the commit must release the catch-up slot to whoever is next",
+        );
+        // The watermark the new instance took over at — `live`'s cursor.
+        assert_eq!(
+            h.storage
+                .read_handoffs_at(&staging)
+                .unwrap()
+                .watermark(&ClientId::parse(PROD_CLIENT).unwrap()),
+            Some(Slot(1_000)),
+        );
+        assert!(h.failures().is_empty(), "{:?}", h.failures());
+    }
+
+    /// The ordinary case for as long as a catch-up takes: nothing to do, and
+    /// — the point — nothing STOPPED. Every quiesce attempt pauses a
+    /// production client's follower.
+    #[tokio::test]
+    async fn a_staging_instance_still_behind_is_left_alone() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let (_live, _staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 900).await;
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        assert_eq!(h.phase(MODULE, PROD_CLIENT), Some(Phase::CatchingUp));
+        assert!(
+            !h.host
+                .calls()
+                .iter()
+                .any(|c| matches!(c, HostCall::StopInstance(_))),
+            "a move that cannot commit must stop nothing: {:?}",
+            h.host.calls(),
+        );
+    }
+
+    /// The unlocked cursors are only a HINT. Between the tick's read and the
+    /// stops, the staging follower can finish a block its predecessor never
+    /// reached — and then the commit would lose `(live, staging]` for every
+    /// OTHER client the old instance still serves. `quiesce_pair` refuses,
+    /// and the move stays where it is until live catches up.
+    #[tokio::test]
+    async fn staging_ahead_leaves_the_move_quiescing_and_the_next_tick_retries_it() {
+        let h = Harness::new();
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+
+        // The staging follower applies one more block while it is being
+        // stopped — the race the lock cannot close, because the stops
+        // themselves take time.
+        let fires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage = h.storage.clone();
+        let ahead = staging.clone();
+        let counter = fires.clone();
+        h.host.on_stop(move || {
+            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                storage
+                    .write_cursor_at(&ahead, &mitos_data_plane::ChainPoint::Slot(1_001))
+                    .expect("cursor");
+            }
+        });
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        assert_eq!(
+            h.phase(MODULE, PROD_CLIENT),
+            Some(Phase::Quiescing),
+            "a refused quiesce is not a failed move",
+        );
+        assert_eq!(
+            h.row(PROD_CLIENT).unwrap().current.map(|p| p.instance),
+            Some(live.clone()),
+            "nothing may switch while staging is ahead",
+        );
+
+        // Live catches up and passes it — which is the only way out, since a
+        // cursor never goes backwards except on a rollback.
+        cursor(&h, &live, 1_001);
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        let row = h.row(PROD_CLIENT).unwrap();
+        assert!(row.pending.is_none(), "the retry did not commit: {row:?}");
+        assert_eq!(row.current.map(|p| p.instance), Some(staging));
+    }
+
+    /// …and while the cursors as they stand say so, the tick does not even
+    /// try. Without this, a staging instance sitting a block ahead would
+    /// pause a production follower once a minute for as long as it stayed
+    /// there.
+    #[tokio::test]
+    async fn a_quiesce_is_not_attempted_while_the_running_cursors_say_staging_is_ahead() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let (_live, _staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_001).await;
+
+        for _ in 0..3 {
+            h.moves.tick().await;
+            h.moves.settle().await;
+        }
+
+        assert_eq!(h.phase(MODULE, PROD_CLIENT), Some(Phase::CatchingUp));
+        assert!(
+            !h.host
+                .calls()
+                .iter()
+                .any(|c| matches!(c, HostCall::StopInstance(_))),
+            "three ticks stopped a follower for a commit that could not happen: {:?}",
+            h.host.calls(),
+        );
+    }
+
+    /// Queue one emission for `client` on `on`, as the fan-out would.
+    fn owe_the_client_one(h: &Harness, on: &InstanceKey, client: &str) {
+        h.storage
+            .emissions_store_at(on)
+            .unwrap()
+            .append(
+                "policy_a",
+                client,
+                "1",
+                mitos_protocol::ChainPoint::Slot(999),
+                b"payload".to_vec(),
+                Vec::new(),
+                crate::emissions::EmissionStatus::Queued,
+                "2026-09-20T00:00:00Z",
+            )
+            .unwrap();
+    }
+
+    /// What `client` is still owed on `on`.
+    fn owed(h: &Harness, on: &InstanceKey, client: &str) -> usize {
+        h.storage
+            .emissions_store_at(on)
+            .unwrap()
+            .list_filtered(|row| row.client_id == client)
+            .unwrap()
+            .len()
+    }
+
+    /// The default hand-off. A client with a block still undelivered on the
+    /// instance it is leaving must be given it there — and the followers are
+    /// RESUMED while it reads, rather than held paused waiting on a companion
+    /// that may be down.
+    #[tokio::test]
+    async fn a_client_with_rows_still_queued_drains_before_it_switches() {
+        let h = Harness::new();
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+        owe_the_client_one(&h, &live, PROD_CLIENT);
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        assert_eq!(
+            h.phase(MODULE, PROD_CLIENT),
+            Some(Phase::WaitingForDrain),
+            "a client still owed a block must not be switched away from it",
+        );
+        assert_eq!(
+            h.row(PROD_CLIENT).unwrap().current.map(|p| p.instance),
+            Some(live.clone()),
+        );
+        assert_eq!(owed(&h, &live, PROD_CLIENT), 1, "nothing may be discarded");
+
+        // The dialer delivers it.
+        h.storage
+            .emissions_store_at(&live)
+            .unwrap()
+            .purge(|row| row.client_id == PROD_CLIENT)
+            .unwrap();
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        let row = h.row(PROD_CLIENT).unwrap();
+        assert!(
+            row.pending.is_none(),
+            "the drained move did not commit: {row:?}"
+        );
+        assert_eq!(row.current.map(|p| p.instance), Some(staging));
+    }
+
+    /// …and `purge-emissions` in the upgrade ledger is how an author says the
+    /// old wire shape is not worth delivering. Then there is nothing to wait
+    /// for and the switch happens in the same quiesce.
+    #[tokio::test]
+    async fn a_client_with_rows_still_queued_has_them_purged_when_the_plan_says_so() {
+        use mitos_lifecycle::upgrade::{UpgradeAction, UpgradeEntry};
+
+        let h = Harness::new();
+        h.activate(&component(1), 1);
+        h.subscribe(PROD_CLIENT);
+        h.lifecycle.boot().await;
+        let announced = h.announcement_declaring(
+            MODULE,
+            PROD_CLIENT,
+            &component(2),
+            2,
+            &[UpgradeEntry {
+                since: Revision(2),
+                actions: [UpgradeAction::PurgeEmissions].into_iter().collect(),
+            }],
+        );
+        assert_eq!(
+            h.announce(PROD_CLIENT, &announced).await,
+            AnnounceResult::Accepted
+        );
+        let row = h.row(PROD_CLIENT).unwrap();
+        let live = row.current.unwrap().instance;
+        let staging = row.pending.unwrap().target.instance;
+        cursor(&h, &live, 1_000);
+        cursor(&h, &staging, 1_000);
+        owe_the_client_one(&h, &live, PROD_CLIENT);
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+
+        let row = h.row(PROD_CLIENT).unwrap();
+        assert!(
+            row.pending.is_none(),
+            "a purging move has nothing to wait for: {row:?}",
+        );
+        assert_eq!(row.current.map(|p| p.instance), Some(staging));
+        assert_eq!(
+            owed(&h, &live, PROD_CLIENT),
+            0,
+            "the plan said purge; the rows are still there",
+        );
+    }
+
+    /// A second set of managers over the same storage, with a host that has
+    /// nothing running — a process restart.
+    struct Restarted {
+        lifecycle: Arc<LifecycleManager>,
+        moves: Arc<MoveManager>,
+        host: FakeHost,
+    }
+
+    impl Harness {
+        fn restart(&self) -> Restarted {
+            let host = FakeHost::new(self.storage.clone());
+            let lifecycle = Arc::new(LifecycleManager::new(
+                self.storage.clone(),
+                Arc::new(host.clone()),
+                self.auth.clone(),
+                self.events.clone(),
+                self.clock.clock(),
+            ));
+            let moves = MoveManager::new(
+                self.storage.clone(),
+                Arc::new(ArtifactPuller::new(
+                    self.storage.clone(),
+                    self.fetcher.clone(),
+                )),
+                self.auth.clone(),
+                lifecycle.clone(),
+                self.events.clone(),
+                self.clock.clock(),
+            );
+            Restarted {
+                lifecycle,
+                moves,
+                host,
+            }
+        }
+    }
+
+    /// The window between the two writes, from the wrong side: the watermark
+    /// is on disk and the row is not.
+    ///
+    /// **Modelled by state, not by an injected failure.** The two writes are
+    /// microseconds apart with nothing between them that a test can hook, and
+    /// every coarser injection — a read-only rows directory — fails the row
+    /// writes BEFORE the watermark too, which is a different window
+    /// (`a_row_write_that_fails_after_the_stops_does_not_strand_the_quiesce`
+    /// is that one). So this writes the orphan watermark by hand, which is
+    /// exactly what a crash in that window leaves behind.
+    #[tokio::test]
+    async fn a_crash_between_the_watermark_and_the_row_commits_nothing() {
+        let h = Harness::new();
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+
+        let mut handoffs = h.storage.read_handoffs_at(&staging).unwrap();
+        handoffs.begin(ClientId::parse(PROD_CLIENT).unwrap(), Slot(1_000));
+        h.storage.write_handoffs_at(&staging, &handoffs).unwrap();
+
+        // The row is what `fan_out` reads, so nothing has switched — and the
+        // orphan watermark changes nothing, because a watermark for a client
+        // the row does not place on that instance is never consulted.
+        let row = h.row(PROD_CLIENT).unwrap();
+        assert_eq!(
+            row.current.as_ref().map(|p| &p.instance),
+            Some(&live),
+            "the row is the switch; it did not happen",
+        );
+        assert_eq!(h.phase(MODULE, PROD_CLIENT), Some(Phase::CatchingUp));
+
+        // Boot, and the move catches up and commits again — over the top of
+        // the orphan watermark, at whatever live's cursor now is.
+        cursor(&h, &live, 1_100);
+        cursor(&h, &staging, 1_100);
+        let restarted = h.restart();
+        restarted.lifecycle.boot().await;
+        restarted.moves.boot().await;
+        restarted.moves.settle().await;
+        restarted.moves.tick().await;
+        restarted.moves.settle().await;
+
+        let row = h.row(PROD_CLIENT).unwrap();
+        assert!(
+            row.pending.is_none(),
+            "the move did not commit after boot: {row:?}",
+        );
+        assert_eq!(row.current.map(|p| p.instance), Some(staging.clone()));
+        assert_eq!(
+            h.storage
+                .read_handoffs_at(&staging)
+                .unwrap()
+                .watermark(&ClientId::parse(PROD_CLIENT).unwrap()),
+            Some(Slot(1_100)),
+            "the commit must overwrite the watermark the crash left",
+        );
+    }
+
+    /// Every transition `Progress::Quiesced` can make takes the quiesce back
+    /// out of the map. If the row write that carries it fails, NOTHING does —
+    /// and a stranded quiesce holds the module lock with both followers
+    /// stopped, so the next tick's `Quiescing` arm blocks on that lock inside
+    /// `quiesce_pair`, holding the row lock, taking the whole row tick with
+    /// it. **The timeout is the assertion.**
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_row_write_that_fails_after_the_stops_does_not_strand_the_quiesce() {
+        use crate::host_v2::testing::HostCall;
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new();
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+
+        // Injected on the DIRECTORY, because `write_row` writes a temporary
+        // file and renames — there is no file to make read-only. Flipped from
+        // inside `stop_instance` so the writes BEFORE the stops still land
+        // and the move really does reach the quiesce.
+        let rows_dir = h.storage.module_dir_for_rows(MODULE);
+        let restore = std::fs::metadata(&rows_dir).unwrap().permissions();
+        let readonly = rows_dir.clone();
+        h.host.on_stop(move || {
+            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500))
+                .expect("chmod");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..3 {
+                h.moves.tick().await;
+                h.moves.settle().await;
+            }
+        })
+        .await
+        .expect("a stranded quiesce deadlocked the row tick");
+
+        std::fs::set_permissions(&rows_dir, restore).unwrap();
+        // Nothing switched, and neither follower was left stopped.
+        assert_eq!(
+            h.row(PROD_CLIENT).unwrap().current.map(|p| p.instance),
+            Some(live.clone()),
+        );
+        let calls = h.host.calls();
+        for key in [&live, &staging] {
+            assert!(
+                matches!(
+                    calls.iter().rev().find(|c| matches!(
+                        c,
+                        HostCall::StopInstance(k) | HostCall::StartInstance(k) if k == key
+                    )),
+                    Some(HostCall::StartInstance(_))
+                ),
+                "{} was left stopped: {calls:?}",
+                key.dir_name(),
+            );
+        }
+    }
+
+    /// The other side of that window: the row IS written, so the switch
+    /// happened, and both followers are stopped because the resume was the
+    /// next thing the dead process was going to do. Boot is what brings them
+    /// back — and must not re-open a move the row says is finished.
+    #[tokio::test]
+    async fn a_crash_after_the_row_leaves_both_followers_restarted_by_boot() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        // TWO clients on the live instance, so it is still serving somebody
+        // after the move and boot has two followers to bring back.
+        h.subscribe(DEV_CLIENT);
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+        h.moves.tick().await;
+        h.moves.settle().await;
+        assert!(
+            h.row(PROD_CLIENT).unwrap().pending.is_none(),
+            "precondition"
+        );
+
+        let restarted = h.restart();
+        restarted.lifecycle.boot().await;
+        restarted.moves.boot().await;
+        restarted.moves.settle().await;
+
+        let started: Vec<_> = restarted
+            .host
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                HostCall::StartInstance(key) => Some(key),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            started.contains(&live) && started.contains(&staging),
+            "boot must bring BOTH followers back: {started:?}",
+        );
+        let row = h.row(PROD_CLIENT).unwrap();
+        assert!(
+            row.pending.is_none(),
+            "boot re-opened a move the row says is finished: {row:?}",
+        );
+        assert_eq!(row.current.map(|p| p.instance), Some(staging));
+    }
+
+    /// There is no such thing as mid-quiesce for an announcement: the tick
+    /// holds the ROW lock from the stops to the resume, and `announce` takes
+    /// the same lock. So an announcement that arrives while the followers are
+    /// stopped WAITS, and finds them running.
+    ///
+    /// That is the whole reason the `Quiesced` can live in a map keyed by row
+    /// rather than in the row itself. Without the row lock, this would
+    /// abandon the move that is holding two followers stopped and strand
+    /// them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_newer_announcement_mid_quiesce_resumes_both_followers() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+        let newer = h.announcement(PROD_CLIENT, &component(3), 3);
+
+        // Fired from inside `stop_instance`, so the announcement below is
+        // issued with both followers down. The sleep holds that window open
+        // long enough for it to be issued and to block on the row lock.
+        let quiescing = Arc::new(tokio::sync::Notify::new());
+        let signal = quiescing.clone();
+        h.host.on_stop(move || {
+            signal.notify_one();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let moves = h.moves.clone();
+        let client = ClientId::parse(PROD_CLIENT).unwrap();
+        let module = ModuleId::parse(MODULE).unwrap();
+        let announcing = tokio::spawn(async move {
+            quiescing.notified().await;
+            moves.announce(&client, &module, &newer).await
+        });
+
+        h.moves.tick().await;
+        h.moves.settle().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), announcing)
+            .await
+            .expect("the announcement never got the row lock")
+            .unwrap();
+        assert_eq!(result, AnnounceResult::Accepted);
+        h.moves.settle().await;
+
+        // Both followers were restarted, and neither was left stopped.
+        let calls = h.host.calls();
+        let last_of = |key: &InstanceKey| {
+            calls
+                .iter()
+                .rev()
+                .find(|c| {
+                    matches!(c, HostCall::StopInstance(k) | HostCall::StartInstance(k) if k == key)
+                })
+                .cloned()
+        };
+        assert!(
+            matches!(last_of(&live), Some(HostCall::StartInstance(_))),
+            "the live follower was left stopped: {calls:?}",
+        );
+        assert!(
+            matches!(last_of(&staging), Some(HostCall::StartInstance(_))),
+            "the staging follower was left stopped: {calls:?}",
+        );
+    }
+
+    /// Two clients moving to the SAME instance. The second commit must read
+    /// the watermark file before writing it, or it would drop the first
+    /// client's watermark and re-deliver every block below it.
+    #[tokio::test]
+    async fn two_clients_moving_to_one_instance_commit_one_after_the_other() {
+        let h = Harness::new();
+        h.subscribe(DEV_CLIENT);
+        let (live, staging) = a_move_at_catching_up(&h, MODULE, PROD_CLIENT, 1_000, 1_000).await;
+
+        // The same build, from the other client — one staging instance, two
+        // rows moving onto it. The catch-up slot is host-wide, so they cannot
+        // both be catching up at once.
+        h.clock.advance(1);
+        let announced = h.announcement(DEV_CLIENT, &component(2), 2);
+        assert_eq!(
+            h.announce(DEV_CLIENT, &announced).await,
+            AnnounceResult::Accepted
+        );
+
+        // Two ticks: one commit each, the second only once the first has let
+        // the slot go.
+        for _ in 0..2 {
+            cursor(&h, &live, 1_000);
+            cursor(&h, &staging, 1_000);
+            h.moves.tick().await;
+            h.moves.settle().await;
+        }
+
+        for client in [PROD_CLIENT, DEV_CLIENT] {
+            let row = h.row_in(MODULE, client).unwrap();
+            assert!(row.pending.is_none(), "{client} did not commit: {row:?}");
+            assert_eq!(row.current.map(|p| p.instance), Some(staging.clone()));
+        }
+        let handoffs = h.storage.read_handoffs_at(&staging).unwrap();
+        for client in [PROD_CLIENT, DEV_CLIENT] {
+            assert_eq!(
+                handoffs.watermark(&ClientId::parse(client).unwrap()),
+                Some(Slot(1_000)),
+                "{client}'s watermark was dropped by the other commit",
+            );
+        }
     }
 }

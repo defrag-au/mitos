@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use mitos_data_plane::ChainPoint;
 use mitos_lifecycle::client_move::ClientRow;
+use mitos_lifecycle::handoff::Handoffs;
 use mitos_lifecycle::ids::{ClientId, InstanceKey, ModuleId, Sha256Hex};
 use mitos_lifecycle::instance::LifecycleRecord;
 
@@ -61,6 +62,8 @@ const INSTANCE_MARKER: &str = "instance.toml";
 const INSTANCES_DIR: &str = "instances";
 /// The instance's `LifecycleRecord` — see [`ModuleStorage::read_lifecycle`].
 const LIFECYCLE_RECORD: &str = "lifecycle.toml";
+/// One instance's hand-off watermarks — see [`ModuleStorage::read_handoffs_at`].
+const HANDOFFS: &str = "handoffs.toml";
 /// What an instance directory is called while it is still being built. Not a
 /// valid `dir_name()` — those are two hex digests joined by `-` — so nothing
 /// that resolves a key can ever name one.
@@ -1373,6 +1376,55 @@ impl ModuleStorage {
         record: &LifecycleRecord,
     ) -> Result<(), StorageError> {
         write_lifecycle_to(&self.lifecycle_path_at(key)?, record)
+    }
+
+    fn handoffs_path_at(&self, key: &InstanceKey) -> Result<PathBuf, StorageError> {
+        Ok(self.instance_state_dir(key)?.join(HANDOFFS))
+    }
+
+    /// One instance's hand-off watermarks: for each client it took over, the
+    /// slot its predecessor had delivered up to.
+    ///
+    /// Absent ⇒ [`Handoffs::default`], which admits everything: an instance
+    /// nobody has been handed over to withholds nothing. A file that will NOT
+    /// PARSE is an error here, and its two callers answer it differently —
+    /// the commit refuses (overwriting would lose another client's watermark
+    /// and deliver its blocks twice), the drain delivers (see
+    /// `run_emit_drain`).
+    ///
+    /// **Exactly two writers, and they can never overlap.** The lifecycle
+    /// manager writes it at the commit, and only with that instance's
+    /// follower STOPPED; that follower's own emission drain writes it while
+    /// it runs. `stop_instance` awaits the drain task, so there is no instant
+    /// at which both could. Nothing else writes it — in particular no admin
+    /// route.
+    pub fn read_handoffs_at(&self, key: &InstanceKey) -> Result<Handoffs, StorageError> {
+        let path = self.handoffs_path_at(key)?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Handoffs::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        toml::from_str(&raw).map_err(|e| StorageError::MalformedPointer {
+            module: key.module.to_string(),
+            file: HANDOFFS,
+            why: e.to_string(),
+        })
+    }
+
+    pub fn write_handoffs_at(
+        &self,
+        key: &InstanceKey,
+        handoffs: &Handoffs,
+    ) -> Result<(), StorageError> {
+        let path = self.handoffs_path_at(key)?;
+        let toml = toml::to_string(handoffs).map_err(|e| StorageError::Serialise {
+            what: "hand-off watermarks",
+            why: e.to_string(),
+        })?;
+        write_atomic(&path, toml.as_bytes())
     }
 
     fn read_lifecycle_from(

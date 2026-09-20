@@ -2088,56 +2088,160 @@ pub(crate) async fn run_emit_drain(
     // …and the same shape for client rows, which the fan-out now consults
     // per emitted event.
     let mut row_cache = RowCache::default();
+    // The hand-off watermarks, OWNED by this task for as long as it runs.
+    //
+    // Its only other writer is the lifecycle manager at a commit, and only
+    // with this follower stopped — `stop_instance` awaits this very task, so
+    // the two can never overlap. Loading it once and keeping it is therefore
+    // not a cache that can go stale: while this task lives, nothing else
+    // touches the file.
+    //
+    // A file that will not parse is reported and treated as NO watermarks.
+    // That can deliver a block twice, which a companion tolerates (applies
+    // are chain-point-idempotent); refusing to start the drain would lose
+    // every block instead.
+    let mut handoffs = match storage.read_handoffs_at(&instance) {
+        Ok(handoffs) => handoffs,
+        Err(e) => {
+            tracing::error!(
+                module = %module_id,
+                instance = %instance.dir_name(),
+                error = %e,
+                "hand-off watermarks unreadable; this instance will withhold nothing, so a \
+                 client it took over may be re-sent blocks its predecessor already delivered",
+            );
+            mitos_lifecycle::handoff::Handoffs::default()
+        }
+    };
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             event = events_rx.recv() => {
                 let Some(event) = event else { return };
-                // Resolved per EVENT, not once per task: an upload moves the
-                // module's current instance under a running drain, and a row
-                // naming a renamed-away instance follows whatever it is NOW.
-                //
-                // An ERROR here is not "unactivated" — this task is running
-                // an instance, so the module plainly is. It fails OPEN, as
-                // the interest filter does: with one instance that is exactly
-                // v2, and with two it is a duplicate rather than silence. But
-                // it says so, per event, for as long as the pointer is broken.
-                let module_current = match storage.current_instance(&module_id) {
-                    Ok(current) => current,
-                    Err(e) => {
-                        tracing::warn!(
-                            module = %module_id,
-                            instance = %instance.dir_name(),
-                            error = %e,
-                            "cannot resolve the module's current instance; delivering to every \
-                             companion from this instance",
-                        );
-                        None
-                    }
-                };
-                if event.is_undo {
-                    // Chain rollback: broadcast an undo emission to every
-                    // subscribed companion (no interest filter — a reorg is
-                    // unconditional; each companion reverts its own state).
-                    fan_out_undo(
-                        &storage,
-                        &store,
-                        &instance,
-                        module_current.as_ref(),
-                        event,
-                        &mut row_cache,
-                    );
-                } else {
-                    drain_one(
-                        &storage,
-                        &store,
-                        &instance,
-                        module_current.as_ref(),
-                        event,
-                        &mut interest_cache,
-                        &mut row_cache,
-                    );
-                }
+                drain_event(
+                    &storage,
+                    &store,
+                    &instance,
+                    event,
+                    &mut interest_cache,
+                    &mut row_cache,
+                    &mut handoffs,
+                );
+            }
+        }
+    }
+}
+
+/// One emission, all the way through: watermarks, fan-out, watermarks again.
+///
+/// Its own function, and not the body of the `select!` arm, because the ORDER
+/// of the three steps is the whole of the watermark's correctness and it is
+/// the only part of the drain a test can reach without a chain.
+fn drain_event(
+    storage: &ModuleStorage,
+    store: &crate::emissions::EmissionsStore,
+    instance: &InstanceKey,
+    event: emit::EmittedEvent,
+    interest_cache: &mut InterestCache,
+    row_cache: &mut RowCache,
+    handoffs: &mut mitos_lifecycle::handoff::Handoffs,
+) {
+    let module_id = instance.module.as_str();
+    let at = slot_of(&event.chain_point);
+    // Resolved per EVENT, not once per task: an upload moves the module's
+    // current instance under a running drain, and a row naming a renamed-away
+    // instance follows whatever it is NOW.
+    //
+    // An ERROR here is not "unactivated" — this task is running an instance,
+    // so the module plainly is. It fails OPEN, as the interest filter does:
+    // with one instance that is exactly v2, and with two it is a duplicate
+    // rather than silence. But it says so, per event, for as long as the
+    // pointer is broken.
+    let module_current = match storage.current_instance(module_id) {
+        Ok(current) => current,
+        Err(e) => {
+            tracing::warn!(
+                module = %module_id,
+                instance = %instance.dir_name(),
+                error = %e,
+                "cannot resolve the module's current instance; delivering to every \
+                 companion from this instance",
+            );
+            None
+        }
+    };
+    if event.is_undo {
+        // BEFORE the fan-out. A reorg below a watermark voids what the
+        // client's PREVIOUS instance delivered on the abandoned fork, so the
+        // blocks that replace `(to, watermark]` are new blocks nobody has
+        // delivered — the watermark drops to the rollback point, and
+        // everything above it must be admitted from here on.
+        let changed = handoffs.rolled_back(at);
+        persist_handoffs(storage, instance, handoffs, changed);
+        // Chain rollback: broadcast an undo emission to every subscribed
+        // companion (no interest filter — a reorg is unconditional; each
+        // companion reverts its own state). An undo is NEVER withheld: it is
+        // about state the companion already applied, whoever delivered it.
+        fan_out_undo(
+            storage,
+            store,
+            instance,
+            module_current.as_ref(),
+            event,
+            row_cache,
+        );
+    } else {
+        drain_one(
+            storage,
+            store,
+            instance,
+            module_current.as_ref(),
+            event,
+            interest_cache,
+            row_cache,
+            handoffs,
+        );
+    }
+    // A watermark the chain has moved a whole stability window past can never
+    // be lowered and never withholds anything again — it is only a line in a
+    // file.
+    let changed = handoffs.settle(at);
+    persist_handoffs(storage, instance, handoffs, changed);
+}
+
+/// An emission's slot, as a hand-off watermark measures it.
+///
+/// `ChainPoint::Origin` is slot 0 — before every block — which is what both
+/// callers want: a forward emission at Origin is one the client's previous
+/// instance necessarily delivered, and a rollback to Origin voids everything.
+fn slot_of(point: &mitos_protocol::ChainPoint) -> mitos_lifecycle::ids::Slot {
+    mitos_lifecycle::ids::Slot(point.slot().unwrap_or(0))
+}
+
+/// Write the watermarks back when — and only when — they changed.
+///
+/// A failure is reported and carried past: the in-memory copy is what this
+/// task will go on using, and it is correct. What is lost is durability
+/// across a restart, which costs at most a re-delivery.
+fn persist_handoffs(
+    storage: &ModuleStorage,
+    instance: &InstanceKey,
+    handoffs: &mitos_lifecycle::handoff::Handoffs,
+    changed: mitos_lifecycle::handoff::Changed,
+) {
+    // `match`, never `== Yes`: a third answer would arrive as a compile
+    // error here rather than as a silent skip.
+    match changed {
+        mitos_lifecycle::handoff::Changed::No => {}
+        mitos_lifecycle::handoff::Changed::Yes => {
+            if let Err(e) = storage.write_handoffs_at(instance, handoffs) {
+                tracing::error!(
+                    module = %instance.module,
+                    instance = %instance.dir_name(),
+                    error = %e,
+                    "persisting hand-off watermarks failed; a restart may re-deliver blocks \
+                     this instance has already withheld",
+                );
             }
         }
     }
@@ -2228,8 +2332,10 @@ fn drain_one(
     event: emit::EmittedEvent,
     interest_cache: &mut InterestCache,
     row_cache: &mut RowCache,
+    handoffs: &mitos_lifecycle::handoff::Handoffs,
 ) {
     use crate::emissions::{EmissionStatus, UNSUBSCRIBED_COMPANION_ID};
+    use mitos_lifecycle::handoff::Admit;
     let module_id: &str = instance.module.as_str();
     let companions_dir = storage.module_dir_for_companions(module_id);
     let now = format!(
@@ -2320,6 +2426,18 @@ fn drain_one(
                         // behave as v2 did and deliver.
                         None => routing::FanOut::Deliver,
                     };
+                    // …and has this instance ALREADY had this block delivered
+                    // to this client, by the instance it took the client
+                    // over from? Asked per client, like `serves`, because a
+                    // watermark is per client.
+                    //
+                    // A client id that will not parse has no watermark it
+                    // could be under — `RowCache::get` reads the same name
+                    // the same way.
+                    let admits = match mitos_lifecycle::ids::ClientId::parse(client_id) {
+                        Ok(client) => handoffs.admits(&client, slot_of(&event.chain_point)),
+                        Err(_) => Admit::Deliver,
+                    };
                     let client_dir = entry.path();
                     let client_files = match std::fs::read_dir(&client_dir) {
                         Ok(r) => r,
@@ -2349,6 +2467,26 @@ fn drain_one(
                         match serves {
                             routing::FanOut::Deliver => {}
                             routing::FanOut::Skip => continue,
+                        }
+                        // Withheld for the same reason a `Skip` is: somebody
+                        // else has this client's copy of this block — there,
+                        // the instance it moved to; here, the instance it
+                        // moved FROM, before the switch. And for the same
+                        // reason it is checked AFTER `saw_companion`: the
+                        // companion is subscribed, so sentineling this event
+                        // would keep one that was in fact delivered (WO-06).
+                        match admits {
+                            Admit::Deliver => {}
+                            Admit::Withheld => {
+                                tracing::trace!(
+                                    module = %module_id,
+                                    instance = %instance.dir_name(),
+                                    client_id = %client_id,
+                                    slot = event.chain_point.slot(),
+                                    "withheld: the client's previous instance delivered this block",
+                                );
+                                continue;
+                            }
                         }
                         // Per-companion interest filter: skip companions
                         // whose declared interest doesn't cover this
@@ -2797,7 +2935,8 @@ mod fan_out_tests {
     use super::*;
     use crate::emissions::UNSUBSCRIBED_COMPANION_ID;
     use cardano_assets::PolicyId;
-    use mitos_lifecycle::ids::ClientId;
+    use mitos_lifecycle::handoff::Handoffs;
+    use mitos_lifecycle::ids::{ClientId, Slot};
     use mitos_protocol::{AssetSelector, Interest, SubscribeRequest, SubscribeTarget};
 
     const MODULE: &str = "ownership-indexer";
@@ -2915,6 +3054,7 @@ mod fan_out_tests {
             event(Some(POLICY_A)),
             &mut InterestCache::default(),
             &mut RowCache::default(),
+            &Handoffs::default(),
         );
         assert_eq!(
             rows(&store),
@@ -2937,6 +3077,7 @@ mod fan_out_tests {
             event(Some(POLICY_A)),
             &mut InterestCache::default(),
             &mut RowCache::default(),
+            &Handoffs::default(),
         );
         assert_eq!(
             rows(&store),
@@ -2990,15 +3131,27 @@ mod fan_out_tests {
     }
 
     fn drain(f: &Fixture, store: &crate::emissions::EmissionsStore, from: &InstanceKey) {
+        drain_at(f, store, from, &Handoffs::default(), event(Some(POLICY_A)));
+    }
+
+    /// As `drain`, with watermarks and an event of the caller's choosing.
+    fn drain_at(
+        f: &Fixture,
+        store: &crate::emissions::EmissionsStore,
+        from: &InstanceKey,
+        handoffs: &Handoffs,
+        event: emit::EmittedEvent,
+    ) {
         let current = f.storage.current_instance(MODULE).unwrap();
         drain_one(
             &f.storage,
             store,
             from,
             current.as_ref(),
-            event(Some(POLICY_A)),
+            event,
             &mut InterestCache::default(),
             &mut RowCache::default(),
+            handoffs,
         );
     }
 
@@ -3166,6 +3319,180 @@ mod fan_out_tests {
             rows(&second_store),
             vec![("ownership.cnft.dev".to_owned(), "policy_a".to_owned())],
             "the drain task must re-resolve current per event",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Hand-off watermarks
+    // -----------------------------------------------------------------
+
+    const CLIENT: &str = "ownership.cnft.dev";
+
+    fn client() -> ClientId {
+        ClientId::parse(CLIENT).unwrap()
+    }
+
+    /// A forward emission carrying a chosen slot.
+    fn at(slot: u64) -> emit::EmittedEvent {
+        emit::EmittedEvent {
+            chain_point: mitos_protocol::ChainPoint::Slot(slot),
+            ..event(Some(POLICY_A))
+        }
+    }
+
+    /// A rollback TO a chosen slot.
+    fn undo_to(slot: u64) -> emit::EmittedEvent {
+        emit::EmittedEvent {
+            is_undo: true,
+            ..at(slot)
+        }
+    }
+
+    /// The watermark's whole job. The instance taking a client over resumes
+    /// from its OWN cursor, which is at or below the one its predecessor had
+    /// reached, so it re-emits blocks the client has already been sent.
+    #[test]
+    fn blocks_at_or_before_the_watermark_are_withheld_and_later_ones_delivered() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        let second = second_instance(&f.storage, b"second instance wasm");
+        place(&f.storage, CLIENT, &second);
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+
+        let mut handoffs = Handoffs::default();
+        handoffs.begin(client(), Slot(100));
+
+        // AT the watermark, and below it.
+        drain_at(&f, &second_store, &second, &handoffs, at(100));
+        drain_at(&f, &second_store, &second, &handoffs, at(7));
+        assert!(
+            rows(&second_store).is_empty(),
+            "a block its predecessor delivered must not be delivered again",
+        );
+
+        // The first block PAST it.
+        drain_at(&f, &second_store, &second, &handoffs, at(101));
+        assert_eq!(
+            rows(&second_store),
+            vec![(CLIENT.to_owned(), "policy_a".to_owned())],
+        );
+    }
+
+    /// A withheld block is DELIVERED, by someone, and must not also be kept
+    /// for a future subscriber. The instance is the module's current one
+    /// here, which is the only case where `unclaimed` would keep anything —
+    /// so this is the case that can go wrong.
+    #[test]
+    fn a_withheld_block_is_not_kept_as_unclaimed() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        let store = f.storage.emissions_store(MODULE).unwrap();
+        assert_eq!(
+            f.storage.current_instance(MODULE).unwrap().as_ref(),
+            Some(&f.instance),
+            "precondition: only the CURRENT instance keeps an unclaimed event",
+        );
+
+        let mut handoffs = Handoffs::default();
+        handoffs.begin(client(), Slot(100));
+        drain_at(&f, &store, &f.instance, &handoffs, at(50));
+
+        assert!(
+            rows(&store).is_empty(),
+            "the only companion was withheld, not absent; a sentinel here would be \
+             handed to the next subscriber as a block nobody had had",
+        );
+    }
+
+    /// A reorg below a watermark voids what the PREVIOUS instance delivered
+    /// on the abandoned fork: the blocks that replace `(to, watermark]` are
+    /// new blocks nobody has sent. So the watermark drops — durably, because
+    /// the drain task does not survive a restart and the lowered watermark
+    /// must.
+    #[test]
+    fn a_rollback_below_the_watermark_lowers_it_and_is_itself_delivered() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        let store = f.storage.emissions_store(MODULE).unwrap();
+
+        let mut handoffs = Handoffs::default();
+        handoffs.begin(client(), Slot(100));
+        f.storage.write_handoffs_at(&f.instance, &handoffs).unwrap();
+
+        drain_event(
+            &f.storage,
+            &store,
+            &f.instance,
+            undo_to(50),
+            &mut InterestCache::default(),
+            &mut RowCache::default(),
+            &mut handoffs,
+        );
+
+        assert_eq!(handoffs.watermark(&client()), Some(Slot(50)));
+        assert_eq!(
+            f.storage
+                .read_handoffs_at(&f.instance)
+                .unwrap()
+                .watermark(&client()),
+            Some(Slot(50)),
+            "a lowered watermark that only lived in memory would re-withhold the \
+             replacement blocks after a restart",
+        );
+        assert_eq!(
+            rows(&store),
+            vec![(CLIENT.to_owned(), "policy_a".to_owned())],
+            "the rollback itself is never withheld",
+        );
+
+        // And the replacement blocks are now admitted.
+        drain_at(&f, &store, &f.instance, &handoffs, at(60));
+        assert_eq!(rows(&store).len(), 2);
+    }
+
+    /// The trade-off, pinned. A watermark file that will not parse is a
+    /// client that may be sent a block twice — which a companion tolerates,
+    /// because applies are chain-point-idempotent. Refusing to start the
+    /// drain would lose every block instead.
+    #[tokio::test]
+    async fn an_unreadable_watermark_file_delivers_rather_than_refusing_to_start() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        // `storage::HANDOFFS` is private; this is the name it holds.
+        std::fs::write(
+            f.storage.instance_dir(&f.instance).join("handoffs.toml"),
+            b"after = 3\n",
+        )
+        .unwrap();
+        assert!(
+            f.storage.read_handoffs_at(&f.instance).is_err(),
+            "precondition: the file must be unparseable",
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let drain = tokio::spawn(run_emit_drain(
+            f.storage.clone(),
+            f.instance.clone(),
+            rx,
+            cancel.clone(),
+        ));
+        tx.send(at(101)).unwrap();
+
+        let store = f.storage.emissions_store_at(&f.instance).unwrap();
+        for _ in 0..100 {
+            if !rows(&store).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+        drain.await.unwrap();
+
+        assert_eq!(
+            rows(&store),
+            vec![(CLIENT.to_owned(), "policy_a".to_owned())],
+            "an unreadable watermark file must withhold nothing, not stop the drain",
         );
     }
 }

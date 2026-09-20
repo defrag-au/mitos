@@ -843,3 +843,191 @@ async fn recapture_and_evict_refuse_a_module_with_two_instances() {
     h.host.stop_all().await;
     h.cleanup();
 }
+
+/// **The property the whole switch exists for**, on the real host: across a
+/// hand-off, every block reaches the moving client exactly once.
+///
+/// The instance taking a client over resumes from its OWN cursor, which is at
+/// or below the one its predecessor reached — so without a watermark it
+/// re-emits blocks the client has already had. With one, it withholds them,
+/// and a ROLLBACK below the watermark lowers it again, because the blocks
+/// that replace the abandoned fork are new blocks nobody has delivered.
+///
+/// The old follower stays RUNNING throughout, which is what makes "exactly
+/// once" mean anything: if the row were not the switch, it would keep writing
+/// the client's rows too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_block_reaches_a_moving_client_exactly_once() {
+    use mitos_lifecycle::ids::Slot;
+
+    /// Wait until a count stops changing.
+    ///
+    /// One block becomes several emissions, written one row at a time by the
+    /// drain task, and there is no single "this block is fully fanned out"
+    /// signal from out here — a cursor flush and a row write are independent.
+    /// Taking the first non-zero reading would capture a partial count.
+    async fn settled(what: &str, count: impl Fn() -> usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let before = count();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let after = count();
+            if after > 0 && before == after {
+                return after;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: the count never settled (last {after})",
+            );
+        }
+    }
+
+    const CLIENT: &str = "client-a";
+    const SLOT: u64 = 186_000_000;
+    /// Below the block — a rollback that voids it.
+    const ROLLED_BACK_TO: u64 = 185_999_000;
+
+    let Some(cbor) = fixture_block_cbor() else {
+        eprintln!("skipping: tests/fixtures/186000000.block.cbor missing");
+        return;
+    };
+    let watched = busiest_policy(&cbor);
+    let Some(h) = Harness::build("two-instances-exactly-once", |_| {}) else {
+        eprintln!("skipping: test-indexer wasm not built");
+        return;
+    };
+    common::write_companion_subscription(&h.storage, MODULE, CLIENT, "comp", vec![Interest::any()]);
+
+    let forward = |key: &InstanceKey| {
+        h.storage
+            .emissions_store_at(key)
+            .expect("emissions store")
+            .list_filtered(|row| row.client_id == CLIENT && !row.is_undo)
+            .expect("list")
+            .len()
+    };
+    let undos = |key: &InstanceKey| {
+        h.storage
+            .emissions_store_at(key)
+            .expect("emissions store")
+            .list_filtered(|row| row.client_id == CLIENT && row.is_undo)
+            .expect("list")
+            .len()
+    };
+    let apply = |tx: &tokio::sync::broadcast::Sender<TipEvent>| {
+        tx.send(TipEvent::Apply(
+            ChainPoint::Slot(SLOT).into(),
+            Arc::new(cbor.clone()),
+        ))
+        .expect("send the block");
+    };
+
+    // 1. THE watermark the commit writes — the live instance's cursor — put
+    //    on `second` BEFORE its follower starts, because the drain task loads
+    //    the watermarks once and owns them for as long as it runs. That is
+    //    exactly the guarantee `quiesce_pair` gives the real commit: both
+    //    followers are stopped across it.
+    let mut handoffs = h.storage.read_handoffs_at(&h.second).expect("watermarks");
+    handoffs.begin(ClientId::parse(CLIENT).unwrap(), Slot(SLOT));
+    h.storage
+        .write_handoffs_at(&h.second, &handoffs)
+        .expect("write the watermark");
+
+    // 2. Both followers, and the dynamic interest that is the only reason
+    //    either of them emits anything — routed with both RUNNING, so the
+    //    update reaches both.
+    h.host.start_instance(&h.first, false).await.expect("first");
+    h.host
+        .start_instance(&h.second, false)
+        .await
+        .expect("second");
+    let mut interest = Interest::any();
+    interest.asset = AssetSelector::Policy(PolicyId::new(watched).expect("valid policy"));
+    h.host
+        .route_interest(MODULE, InterestOp::Add, vec![interest])
+        .await
+        .expect("route_interest");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    subscribed(&h.tx, 2).await;
+
+    // 3. Before the switch: `client-a` has no row, so it follows the module's
+    //    current instance and `first` delivers the block. `second` serves
+    //    nobody and writes nothing — it is following, and that is all.
+    apply(&h.tx);
+    let delivered = settled("the first instance delivering the block", || {
+        forward(&h.first)
+    })
+    .await;
+    wait_for("the second instance to process the block", || {
+        h.storage
+            .read_cursor_at(&h.second)
+            .ok()
+            .flatten()
+            .filter(|c| c.slot() == SLOT)
+    })
+    .await;
+    assert_eq!(
+        forward(&h.second),
+        0,
+        "an instance nobody is placed on wrote a client's rows",
+    );
+
+    // 4. THE switch: the row write, which is the routing change.
+    place(&h.storage, CLIENT, &h.second);
+
+    // 5. The same block again — which is what the new instance replaying from
+    //    its own (lower) cursor looks like, and what the watermark exists to
+    //    withhold.
+    apply(&h.tx);
+    // No cursor to wait on: `second` is already at this slot. The rows are
+    // what must not appear, so give them every chance to.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        forward(&h.second),
+        0,
+        "the client was sent a block its previous instance had already delivered",
+    );
+    assert_eq!(
+        forward(&h.first),
+        delivered,
+        "the instance the client has LEFT is still writing its rows",
+    );
+
+    // 6. A rollback BELOW the watermark. It voids what `first` delivered on
+    //    the abandoned fork, so the watermark drops — and the rollback itself
+    //    is never withheld.
+    h.tx.send(TipEvent::Undo(
+        ChainPoint::Slot(ROLLED_BACK_TO).into(),
+        Arc::new(cbor.clone()),
+    ))
+    .expect("send the rollback");
+    wait_for("the second instance to deliver the rollback", || {
+        (undos(&h.second) > 0).then_some(())
+    })
+    .await;
+    assert_eq!(
+        undos(&h.first),
+        0,
+        "the instance the client has left delivered the rollback too",
+    );
+
+    // 7. …and the replacement blocks are new blocks nobody has delivered, so
+    //    the same block now arrives from the new instance.
+    apply(&h.tx);
+    let redelivered = settled("the second instance delivering the replacement", || {
+        forward(&h.second)
+    })
+    .await;
+    assert_eq!(
+        redelivered, delivered,
+        "the block that replaced the rolled-back one was partly withheld",
+    );
+    assert_eq!(
+        forward(&h.first),
+        delivered,
+        "the old instance delivered twice"
+    );
+
+    h.host.stop_all().await;
+    h.cleanup();
+}

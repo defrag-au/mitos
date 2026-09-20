@@ -34,7 +34,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use mitos_lifecycle::UnixSecs;
-use mitos_lifecycle::ids::{ClientId, ClientKey, InstanceKey, Sha256Hex};
+use mitos_lifecycle::handoff;
+use mitos_lifecycle::ids::{ClientId, ClientKey, InstanceKey, Sha256Hex, Slot};
 use mitos_lifecycle::instance::{BootAction, Effect, Event, Instance, Rejected};
 use mitos_lifecycle::policy::NamespaceProfile;
 use mitos_lifecycle::routing::{self, Subscriber};
@@ -120,6 +121,121 @@ pub enum StagingError {
     ParentWouldNotStop(String),
     #[error("the staging instance was built but its follower did not start")]
     StartFailed,
+}
+
+/// Why the two followers of a move could not be quiesced together.
+///
+/// None of these fails the MOVE: it stays `Quiescing` and `MoveManager::tick`
+/// tries again. Two followers at tip are on the same block almost always, so
+/// "try again in a minute" is the whole remedy.
+#[derive(Debug, thiserror::Error)]
+pub enum QuiesceError {
+    /// The staging instance got AHEAD of the live one. Committing here would
+    /// LOSE the blocks in `(live, staging]` — staging processed them serving
+    /// nobody, and the live instance never reached them. Both resumed.
+    #[error(
+        "staging {staging} is at slot {staging_slot}, ahead of live {live} at {live_slot}; \
+         both resumed"
+    )]
+    StagingAhead {
+        live: String,
+        staging: String,
+        live_slot: u64,
+        staging_slot: u64,
+    },
+    /// A follower would not stop. A commit over a follower that may still be
+    /// running is WO-06's bug, so nothing is quiesced — and whatever WAS
+    /// stopped is back.
+    #[error("instance {0} would not stop; nothing is quiesced")]
+    WouldNotStop(String),
+    /// A cursor that will not read, or an instance that has never written
+    /// one. There is no watermark to compute, and guessing `0` would withhold
+    /// the whole chain from a client. Both resumed.
+    #[error("instance {0} has no readable cursor; both resumed")]
+    NoCursor(String),
+    #[error("lifecycle: {0}")]
+    Lifecycle(#[from] LifecycleError),
+}
+
+/// Both followers of a move, STOPPED, with the module lock held.
+///
+/// It owns an `OwnedMutexGuard` on the module lock, so while it is alive no
+/// upload, revive, reap, `create_staging` or operator command can touch the
+/// module. That is the point: from here to the commit both followers must
+/// stay stopped, and the watchdog's `revive` is exactly the thing that would
+/// restart one.
+///
+/// [`Self::resume`] puts them back. So does `Drop`, on a spawned task,
+/// because a panic or an early `?` between the quiesce and the resume would
+/// otherwise leave a PRODUCTION follower stopped until the watchdog's next
+/// sweep.
+pub struct Quiesced {
+    /// `None` once [`Self::resume`] has taken it — which is what makes `Drop`
+    /// a no-op on the way out of a successful resume.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    manager: Arc<LifecycleManager>,
+    live: InstanceKey,
+    staging: InstanceKey,
+    /// The live instance's cursor: the watermark the commit writes. The
+    /// staging instance withholds every block at or before it.
+    after: Slot,
+    started: std::time::Instant,
+}
+
+impl Quiesced {
+    pub fn live(&self) -> &InstanceKey {
+        &self.live
+    }
+
+    pub fn staging(&self) -> &InstanceKey {
+        &self.staging
+    }
+
+    /// The watermark this commit writes — `handoff::align`'s answer.
+    pub fn after(&self) -> Slot {
+        self.after
+    }
+
+    /// Start each follower its record wants running, then release the module
+    /// lock.
+    pub async fn resume(mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        let manager = self.manager.clone();
+        manager
+            .end_quiesce(&self.live, &self.staging, self.started)
+            .await;
+        drop(guard);
+    }
+}
+
+impl Drop for Quiesced {
+    /// The safety net. `Drop` cannot await, so the resume goes on a task —
+    /// and the module GUARD goes with it, so the module stays locked until
+    /// both followers are back rather than being handed to whatever was
+    /// waiting on it while they are still stopped.
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        tracing::warn!(
+            module = %self.live.module,
+            live = %self.live.dir_name(),
+            staging = %self.staging.dir_name(),
+            "a quiesce was dropped without resuming; restarting both followers",
+        );
+        let (manager, live, staging, started) = (
+            self.manager.clone(),
+            self.live.clone(),
+            self.staging.clone(),
+            self.started,
+        );
+        tokio::spawn(async move {
+            let _guard = guard;
+            manager.end_quiesce(&live, &staging, started).await;
+        });
+    }
 }
 
 /// What [`LifecycleManager::revive`] did.
@@ -856,6 +972,21 @@ impl LifecycleManager {
                     continue;
                 }
             };
+            // The pointer, BEFORE anything is reaped. `succeed` is issued
+            // once, by the transition that commits a switch and clears its
+            // own pending move — the shape WO-08's review showed cannot be
+            // recovered — and an emptied current instance that keeps the
+            // pointer is refused its reap on every tick for ever. Only worth
+            // asking when there is somewhere else for it to go.
+            if instances.len() > 1
+                && let Err(e) = self.succeed_locked(&module, None)
+            {
+                tracing::warn!(
+                    module = %module,
+                    error = %e,
+                    "lifecycle tick: succession check failed",
+                );
+            }
             for view in instances {
                 // An `Unmanaged` instance has no machine to tick.
                 if view.managed().is_none() {
@@ -969,6 +1100,249 @@ impl LifecycleManager {
             .start_instance(&key)
             .await
             .map_err(|e| LifecycleError::Host(e.to_string()))
+    }
+
+    // -----------------------------------------------------------------
+    // The switch — `client_move::Effect::PauseAtBoundary`
+    // -----------------------------------------------------------------
+
+    /// Stop BOTH followers of a move and hold the module locked, so the row
+    /// can be committed with neither of them running.
+    ///
+    /// There is no "pause both at the same block boundary" — two followers
+    /// have two independent subscriptions and nothing in the host can align
+    /// them on a block. This is what replaced it: the quiesce `upload` and
+    /// `create_staging` already trust (`stop_instance`, which finishes the
+    /// block in flight and flushes the cursor), plus the one requirement that
+    /// makes a watermark sound — staging must not be AHEAD. See
+    /// `mitos_lifecycle::handoff`'s module doc.
+    ///
+    /// Returns HOLDING the module lock, inside the [`Quiesced`].
+    pub async fn quiesce_pair(
+        self: &Arc<Self>,
+        live: &InstanceKey,
+        staging: &InstanceKey,
+    ) -> Result<Quiesced, QuiesceError> {
+        let module = live.module.as_str();
+        let guard = self.lock_for(module).lock_owned().await;
+        let started = std::time::Instant::now();
+
+        // STAGING FIRST, so the live instance has every chance to be at or
+        // past it — `align` refuses the other way round, and each stop takes
+        // however long its block in flight does.
+        if let Err(e) = self.host.stop_instance(staging).await {
+            self.effect_failed(module, "quiesce_staging", &e.to_string());
+            // Nothing was stopped, so there is nothing to put back.
+            return Err(QuiesceError::WouldNotStop(staging.dir_name()));
+        }
+        if let Err(e) = self.host.stop_instance(live).await {
+            self.effect_failed(module, "quiesce_live", &e.to_string());
+            self.end_quiesce(live, staging, started).await;
+            drop(guard);
+            return Err(QuiesceError::WouldNotStop(live.dir_name()));
+        }
+
+        // Read AFTER both stops: a cursor read before them is a cursor that
+        // may still move.
+        let mut slots = Vec::with_capacity(2);
+        for key in [live, staging] {
+            match self.storage.read_cursor_at(key) {
+                Ok(Some(cursor)) => slots.push(Slot(cursor.slot())),
+                other => {
+                    if let Err(e) = other {
+                        tracing::warn!(
+                            module = %module,
+                            instance = %key.dir_name(),
+                            error = %e,
+                            "quiesce: cursor unreadable",
+                        );
+                    }
+                    self.end_quiesce(live, staging, started).await;
+                    drop(guard);
+                    return Err(QuiesceError::NoCursor(key.dir_name()));
+                }
+            }
+        }
+        let (live_slot, staging_slot) = (slots[0], slots[1]);
+
+        match handoff::align(live_slot, staging_slot) {
+            handoff::Alignment::Commit { after } => Ok(Quiesced {
+                guard: Some(guard),
+                manager: Arc::clone(self),
+                live: live.clone(),
+                staging: staging.clone(),
+                after,
+                started,
+            }),
+            // Do NOT wait for live to catch up with two followers stopped —
+            // that is waiting on the world, under a lock, with a production
+            // follower down. Resume and let the tick try again.
+            handoff::Alignment::StagingAhead => {
+                self.end_quiesce(live, staging, started).await;
+                drop(guard);
+                Err(QuiesceError::StagingAhead {
+                    live: live.dir_name(),
+                    staging: staging.dir_name(),
+                    live_slot: live_slot.0,
+                    staging_slot: staging_slot.0,
+                })
+            }
+        }
+    }
+
+    /// Put both followers back and say how long they were down.
+    ///
+    /// **Caller holds the module lock** and releases it AFTER this returns —
+    /// handing the lock on while a production follower is still stopped is
+    /// the whole thing `Quiesced` exists to prevent.
+    ///
+    /// The LIVE one first: it is the production follower and the sooner it is
+    /// back the better. Each is started only if its record wants it running,
+    /// so an operator's stop is not undone by a move that knew nothing about
+    /// it.
+    async fn end_quiesce(
+        &self,
+        live: &InstanceKey,
+        staging: &InstanceKey,
+        started: std::time::Instant,
+    ) {
+        for key in [live, staging] {
+            let wants = matches!(
+                self.peek_at(key).map(|view| view.on_boot()),
+                Ok(BootAction::StartFollower)
+            );
+            if !wants || !self.storage.instance_dir(key).is_dir() {
+                continue;
+            }
+            if self
+                .host
+                .running_instances(key.module.as_str())
+                .await
+                .contains(key)
+            {
+                continue;
+            }
+            if let Err(e) = self.start_follower(key).await {
+                self.effect_failed(key.module.as_str(), "resume_after_quiesce", &e);
+            }
+        }
+        // Both followers were stopped for this long — milliseconds of work,
+        // plus however long each took to finish its block in flight. Same
+        // reason `StagingCopy` is on the ring: an operator asks about it
+        // after the fact.
+        let millis = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            module = %live.module,
+            live = %live.dir_name(),
+            staging = %staging.dir_name(),
+            millis,
+            "the move's two followers were quiesced and are back",
+        );
+        self.events.record(
+            live.module.as_str(),
+            EventKind::QuiescePair {
+                live: live.dir_name(),
+                staging: staging.dir_name(),
+                millis,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Succession — `current.toml` follows the last client out
+    // -----------------------------------------------------------------
+
+    /// Move `current.toml` if a committed move has emptied the instance it
+    /// points at.
+    ///
+    /// Without this the emptied instance is refused its reap
+    /// (`CurrentInstanceHasSiblings`) on every tick for ever, because
+    /// removing the pointer's target would leave every `&str`-addressed tool
+    /// resolving to nothing.
+    pub async fn succeed(
+        &self,
+        module: &str,
+        moved_to: &InstanceKey,
+    ) -> Result<(), LifecycleError> {
+        let lock = self.lock_for(module);
+        let _guard = lock.lock().await;
+        self.succeed_locked(module, Some(moved_to))
+    }
+
+    /// `moved_to: None` — the tick, which has no particular move in hand and
+    /// asks whether ANY sibling should take the pointer.
+    fn succeed_locked(
+        &self,
+        module: &str,
+        moved_to: Option<&InstanceKey>,
+    ) -> Result<(), LifecycleError> {
+        let current = self.current_key(module)?;
+        let subscribers = self.subscribers_of(module);
+        let still = routing::attached_to(
+            &current,
+            &current,
+            subscribers.iter().map(|(client, profile, row)| Subscriber {
+                client: client.clone(),
+                profile: *profile,
+                row: row.as_ref(),
+            }),
+            |other| instance_dir_of(&self.storage, other),
+        );
+
+        // The candidates. From the commit there is exactly one — the instance
+        // the client moved to. From the tick there is no such instance, so
+        // every OTHER managed instance that is serving somebody is offered in
+        // a deterministic order; `succession` still decides, and it only ever
+        // says yes when the current instance has been left with nobody.
+        let candidates: Vec<InstanceKey> = match moved_to {
+            Some(key) => vec![key.clone()],
+            None => {
+                let mut others: Vec<InstanceKey> = self
+                    .instances(module)?
+                    .into_iter()
+                    .filter(|view| view.managed().is_some() && view.key() != &current)
+                    .map(|view| view.key().clone())
+                    .collect();
+                others.sort_by_key(|key| key.dir_name());
+                others
+            }
+        };
+
+        for candidate in candidates {
+            // A candidate the tick offers must be serving somebody — that is
+            // what `succession`'s doc means by "live, caught up and serving
+            // somebody", and from the commit it is true by construction.
+            if moved_to.is_none() {
+                let serves = routing::attached_to(
+                    &candidate,
+                    &current,
+                    subscribers.iter().map(|(client, profile, row)| Subscriber {
+                        client: client.clone(),
+                        profile: *profile,
+                        row: row.as_ref(),
+                    }),
+                    |other| instance_dir_of(&self.storage, other),
+                );
+                if serves.is_empty() {
+                    continue;
+                }
+            }
+            match routing::succession(&current, &still, &candidate) {
+                routing::Succession::Stays => continue,
+                routing::Succession::MovesTo(next) => {
+                    self.storage.set_current(&next)?;
+                    tracing::info!(
+                        module = %module,
+                        was = %current.dir_name(),
+                        now = %next.dir_name(),
+                        "the last client left the module's current instance; the pointer \
+                         followed it",
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -3575,6 +3949,328 @@ mod tests {
         );
         assert!(h.storage.instance_dir(&parent).is_dir());
         assert!(h.host.stopped(MODULE) && h.host.evicted(MODULE));
+    }
+
+    // -----------------------------------------------------------------
+    // The switch: quiescing both followers.
+    // -----------------------------------------------------------------
+
+    /// Set up a live instance and a staging one, both running, with cursors.
+    /// Returns `(live, staging)`.
+    async fn a_pair(h: &Harness, live_slot: u64, staging_slot: u64) -> (InstanceKey, InstanceKey) {
+        let live = h.activate_at(MODULE, b"the live build", 1, 7);
+        h.subscribe(MODULE, PROD_CLIENT);
+        h.manager.boot().await;
+        h.fill_state(&live, "from the parent", live_slot);
+        let staging = h.artifact(MODULE, b"the announced build", 2, 7, &[]);
+        h.manager
+            .create_staging(&staging, Some(&live))
+            .await
+            .expect("staging created");
+        h.storage
+            .write_cursor_at(&staging, &mitos_data_plane::ChainPoint::Slot(staging_slot))
+            .expect("staging cursor");
+        h.host.clear();
+        (live, staging)
+    }
+
+    /// STAGING first, so the live instance has every chance to be at or past
+    /// it — `align` refuses the other way round, and each stop takes however
+    /// long its block in flight does.
+    #[tokio::test]
+    async fn staging_is_stopped_before_live() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+
+        let quiesced = h
+            .manager
+            .quiesce_pair(&live, &staging)
+            .await
+            .expect("both quiesced");
+
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::StopInstance(staging.clone()),
+                HostCall::StopInstance(live.clone())
+            ],
+        );
+        assert_eq!(
+            quiesced.after(),
+            Slot(1_000),
+            "the watermark is LIVE's cursor"
+        );
+        quiesced.resume().await;
+    }
+
+    /// Committing with staging ahead would LOSE the blocks in
+    /// `(live, staging]` — staging processed them serving nobody, and live
+    /// never reached them. And the host does not WAIT for the order to come
+    /// right with two followers stopped.
+    #[tokio::test]
+    async fn staging_ahead_resumes_both_and_holds_nothing() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_020).await;
+
+        let refused = h
+            .manager
+            .quiesce_pair(&live, &staging)
+            .await
+            .err()
+            .expect("staging ahead must not commit");
+        assert!(
+            matches!(refused, QuiesceError::StagingAhead { .. }),
+            "got {refused:?}",
+        );
+
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::StopInstance(staging.clone()),
+                HostCall::StopInstance(live.clone()),
+                HostCall::StartInstance(live.clone()),
+                HostCall::StartInstance(staging.clone()),
+            ],
+            "both followers must be back",
+        );
+        // …and the module lock is free: a `Quiesced` that held it would make
+        // this wait for ever.
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.manager.revive(&live))
+            .await
+            .expect("the quiesce held the module lock after refusing");
+    }
+
+    /// A commit over a follower that may still be running is WO-06's bug, so
+    /// nothing is quiesced — and whatever WAS stopped is back.
+    #[tokio::test]
+    async fn a_follower_that_will_not_stop_aborts_the_quiesce_and_restarts_the_other() {
+        use crate::host_v2::testing::HostCall;
+
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+        h.host.fail_stop_instance(&live);
+
+        let refused = h
+            .manager
+            .quiesce_pair(&live, &staging)
+            .await
+            .err()
+            .expect("a follower that will not stop must abort the quiesce");
+        assert!(
+            matches!(refused, QuiesceError::WouldNotStop(_)),
+            "got {refused:?}",
+        );
+        // No `StartInstance(live)`: its stop FAILED, so it is still running,
+        // and the resume starts only what is not. Starting a running instance
+        // is what WO-07's review found breaks on redb "already open".
+        assert_eq!(
+            h.host.calls(),
+            vec![
+                HostCall::StopInstance(staging.clone()),
+                HostCall::StopInstance(live.clone()),
+                HostCall::StartInstance(staging.clone()),
+            ],
+            "the staging follower was stopped for a quiesce that did not happen",
+        );
+    }
+
+    /// From the quiesce to the commit both followers must STAY stopped. The
+    /// watchdog's revive is exactly the thing that would restart one, and an
+    /// upload would rename a directory out from under the commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nothing_else_can_touch_the_module_while_it_is_quiesced() {
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+
+        let quiesced = h
+            .manager
+            .quiesce_pair(&live, &staging)
+            .await
+            .expect("both quiesced");
+
+        // Each of the three waits — none may complete while the quiesce is
+        // held. A short timeout is the assertion: it must EXPIRE.
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+            tokio::join!(
+                h.manager.revive(&live),
+                h.manager.create_staging(&staging, Some(&live)),
+                h.manager.cycle_follower(MODULE),
+            )
+        })
+        .await;
+        assert!(
+            blocked.is_err(),
+            "something touched the module while both its followers were stopped",
+        );
+
+        // …and they all go through once it is released.
+        quiesced.resume().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.manager.revive(&live))
+            .await
+            .expect("the module lock was never released");
+    }
+
+    /// The safety net. A panic or an early `?` between the quiesce and the
+    /// resume would otherwise leave a PRODUCTION follower stopped until the
+    /// watchdog's next sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_quiesce_restarts_both_followers() {
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+
+        drop(
+            h.manager
+                .quiesce_pair(&live, &staging)
+                .await
+                .expect("both quiesced"),
+        );
+
+        // `Drop` cannot await, so the resume is on a task — poll for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let running = h.host.running_instances(MODULE).await;
+            if running.contains(&live) && running.contains(&staging) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a dropped quiesce left a follower stopped: {running:?}",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // …and the module lock went with it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.manager.revive(&live))
+            .await
+            .expect("a dropped quiesce kept the module locked");
+    }
+
+    /// A move knows nothing about an operator's stop, and must not undo one.
+    #[tokio::test]
+    async fn an_operator_stopped_instance_is_not_started_by_a_resume() {
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+        // It has to be `live`: a STAGING instance refuses every operator
+        // command but `Evict`, because it is controlled by its client move.
+        h.manager
+            .apply_at(&live, Event::Operator(OperatorCommand::Stop))
+            .await
+            .expect("operator stop");
+        h.host.clear();
+
+        let quiesced = h
+            .manager
+            .quiesce_pair(&live, &staging)
+            .await
+            .expect("both quiesced");
+        quiesced.resume().await;
+
+        let running = h.host.running_instances(MODULE).await;
+        assert!(
+            running.contains(&staging),
+            "the staging follower must be back",
+        );
+        assert!(
+            !running.contains(&live),
+            "a resume started an instance an operator had stopped",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Succession: which instance `current.toml` names.
+    // -----------------------------------------------------------------
+
+    /// The module's current instance cannot be reaped while siblings exist —
+    /// that would leave the pointer naming nothing. So when the last client
+    /// leaves it, the pointer has to leave too, or the emptied instance is
+    /// refused its reap on every tick for ever.
+    #[tokio::test]
+    async fn the_pointer_follows_the_last_client_out_and_the_old_instance_is_reaped() {
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+        assert_eq!(h.current(MODULE), live, "precondition");
+
+        // THE reap this unblocks: while `live` holds the pointer and has a
+        // sibling, removing its directory would leave every `&str`-addressed
+        // tool resolving to whichever sibling a repair happened to pick — so
+        // the host refuses, and retries on every tick for ever.
+        h.manager
+            .apply_at(
+                &live,
+                Event::Operator(OperatorCommand::Evict(EvictMode::Force)),
+            )
+            .await
+            .expect("the machine accepts it; the HOST is what refuses");
+        assert!(
+            h.storage.instance_dir(&live).is_dir(),
+            "precondition: the reap of a current instance with a sibling is refused",
+        );
+
+        // The committed row: the only client is now served by `staging`.
+        h.place(MODULE, PROD_CLIENT, &staging);
+        h.manager.succeed(MODULE, &staging).await.unwrap();
+
+        assert_eq!(
+            h.current(MODULE),
+            staging,
+            "the pointer must follow the last client out",
+        );
+
+        // …and the retry now takes.
+        h.manager.tick().await;
+        assert!(
+            !h.storage.instance_dir(&live).is_dir(),
+            "the emptied instance is still refused its reap: {:?}",
+            h.manager.instance_at(&live),
+        );
+        assert!(h.storage.instance_dir(&staging).is_dir());
+    }
+
+    /// An instance that still has ANY client keeps the pointer — including
+    /// the unplaced ones `attached_to` counts on it. Otherwise a dev client
+    /// forking away would drag "the module" — which is what every operator
+    /// tool and every unplaced client means — along with it.
+    #[tokio::test]
+    async fn a_dev_client_forking_away_does_not_move_the_pointer() {
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+        // Production stays where it is, with no row at all — which is what
+        // "follows the module's current instance" looks like on disk.
+        h.subscribe(MODULE, DEV_CLIENT);
+        h.place(MODULE, DEV_CLIENT, &staging);
+
+        h.manager.succeed(MODULE, &staging).await.unwrap();
+
+        assert_eq!(
+            h.current(MODULE),
+            live,
+            "a dev fork took the module's pointer with it",
+        );
+    }
+
+    /// The succession is an EFFECT of the commit, issued once by a transition
+    /// that clears the pending move — so a crash between the row write and
+    /// the effect loses it, and the emptied instance is then refused its reap
+    /// for ever. The tick asks the same question for every module carrying
+    /// more than one instance.
+    #[tokio::test]
+    async fn the_tick_repoints_a_module_whose_succession_effect_was_lost() {
+        let h = Harness::new();
+        let (live, staging) = a_pair(&h, 1_000, 1_000).await;
+        // The row committed; `succeed` never ran.
+        h.place(MODULE, PROD_CLIENT, &staging);
+        assert_eq!(h.current(MODULE), live, "precondition");
+
+        h.manager.tick().await;
+
+        assert_eq!(
+            h.current(MODULE),
+            staging,
+            "the tick must repoint a module whose succession was lost",
+        );
     }
 
     /// `ReleaseStaging` is issued ONCE, by a transition that leaves its row

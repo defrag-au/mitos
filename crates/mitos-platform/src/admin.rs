@@ -61,6 +61,7 @@ use mitos_lifecycle::instance::{
 };
 use mitos_lifecycle::policy::Tier;
 use mitos_lifecycle::state_prep::StateSchema;
+use mitos_lifecycle::upgrade::Refill;
 
 use crate::auth::{AuthMode, Authenticator};
 use crate::lifecycle::LifecycleError;
@@ -490,13 +491,19 @@ impl From<&Instance> for StatusLifecycle {
 pub struct RowSummary {
     /// `namespace/client`.
     pub client: String,
-    /// The instance serving it today. `None` before its first move commits —
-    /// which, until WO-06, is every row that was not adopted.
+    /// The instance serving it today. `None` only for a client that has
+    /// never been served — a first subscribe before its move commits.
     pub current: Option<RowPlacement>,
-    /// The move in flight. Until WO-06 grants a catch-up slot, one that got
-    /// past its fetch parks at `stage: planned`, `phase: queued` and stays
-    /// there.
+    /// The move in flight, if any.
     pub pending: Option<RowPending>,
+    /// The hand-off watermark on the instance serving this client: every
+    /// block at or before it was delivered by the instance it moved FROM, so
+    /// this one withholds them.
+    ///
+    /// `None` for a client that was never handed over, and for one whose
+    /// watermark the chain has moved a stability window past — after that it
+    /// can never be lowered and never withholds anything again.
+    pub watermark: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -519,6 +526,24 @@ pub struct RowPending {
     /// How far the staging instance has to go. `None` until it is catching
     /// up — before that there is no staging cursor to compare.
     pub catch_up: Option<CatchUpProgress>,
+    /// Why this move is not advancing, when the answer is not "the chain".
+    pub blocked: Option<MoveBlocked>,
+}
+
+/// Why a move that has everything it needs is still not advancing.
+///
+/// An enum, not a message: an operator asks "will this ever finish", and the
+/// answer is a named condition with a fix, not prose.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "blocked")]
+pub enum MoveBlocked {
+    /// The move's upgrade ledger asks for a refill — a `resync` or a
+    /// `recapture` of the client's projected state — and the host cannot yet
+    /// make that debt durable. `RunRefill` is issued once, by the transition
+    /// that clears the pending move, so a crash in between would lose it and
+    /// leave a client whose state was silently never rebuilt. The move waits
+    /// at `catching-up` and the client stays where it is.
+    AwaitingRefillSupport { refill: Refill },
 }
 
 /// A move's standing in the host-wide catch-up queue.
@@ -633,6 +658,28 @@ async fn list_rows(
                         }),
                         _ => None,
                     },
+                    // DERIVED, not stored: the same condition the moves tick
+                    // tests before it declines to advance, so the two cannot
+                    // drift.
+                    blocked: match p.stage {
+                        Stage::Planned {
+                            plan,
+                            phase: MovePhase::CatchingUp,
+                        } if plan.refill != Refill::None => {
+                            Some(MoveBlocked::AwaitingRefillSupport {
+                                refill: plan.refill,
+                            })
+                        }
+                        _ => None,
+                    },
+                }),
+                watermark: live.as_ref().and_then(|key| {
+                    state
+                        .storage
+                        .read_handoffs_at(key)
+                        .ok()?
+                        .watermark(&row.client.client)
+                        .map(|slot| slot.0)
                 }),
             }
         })
@@ -727,6 +774,21 @@ pub struct InstanceSummary {
     pub cursor: Option<u64>,
     /// Phase, desired state and attached clients — or `unmanaged`.
     pub lifecycle: InstanceLifecycle,
+    /// Every client this instance was HANDED OVER, and the slot its
+    /// predecessor had delivered up to. This instance withholds every block
+    /// at or before that slot from that client — see
+    /// `mitos_lifecycle::handoff`.
+    ///
+    /// Empty for an instance nobody moved onto, and for one whose watermarks
+    /// the chain has moved a stability window past.
+    pub watermarks: Vec<Watermark>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Watermark {
+    /// The client id, as the directory under `companions/` spells it.
+    pub client: String,
+    pub after_slot: u64,
 }
 
 /// What governs an instance, as the admin API reports it.
@@ -798,6 +860,14 @@ async fn list_instances(
         Some(host) => host.running_instances(&id).await,
         None => Vec::new(),
     };
+    // The module's clients, read ONCE — each instance's watermarks are asked
+    // per client rather than enumerated out of the file.
+    let clients: Vec<mitos_lifecycle::ids::ClientId> = state
+        .storage
+        .list_rows(&id)?
+        .into_iter()
+        .map(|row| row.client.client)
+        .collect();
     // One listing, matched by key below. Asking the lifecycle per instance
     // would re-walk `companions/` per instance for the adoption it derives.
     let governed = match state.lifecycle.as_ref() {
@@ -855,6 +925,36 @@ async fn list_instances(
                     // hiding the rest.
                     None => InstanceLifecycle::Unknown,
                 },
+            },
+            // Asked per CLIENT THE MODULE HAS, rather than by enumerating the
+            // file: `Handoffs` is deliberately a decision type with no
+            // iterator, and reading its map here would mean this route knew
+            // the file's shape — the drift that type exists to prevent. A
+            // watermark for a client that has since withdrawn is not shown,
+            // and `Handoffs::settle` is what eventually drops it.
+            //
+            // A file that will not parse reports NO watermarks, exactly as
+            // the drain treats it: one read surface must not tell a different
+            // story from the code it describes.
+            watermarks: match state.storage.read_handoffs_at(&key) {
+                Ok(handoffs) => clients
+                    .iter()
+                    .filter_map(|client| {
+                        handoffs.watermark(client).map(|after| Watermark {
+                            client: client.to_string(),
+                            after_slot: after.0,
+                        })
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "instances: hand-off watermarks unreadable",
+                    );
+                    Vec::new()
+                }
             },
         })
         .collect::<Vec<_>>();

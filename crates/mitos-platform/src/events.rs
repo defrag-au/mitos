@@ -140,6 +140,18 @@ pub enum EventKind {
         bytes: u64,
         millis: u64,
     },
+    /// A client's switch stopped BOTH of its followers — the live one and the
+    /// one it is moving to — so the row could be committed with neither
+    /// running. `millis` is how long they were down: milliseconds of work,
+    /// plus however long each took to finish its block in flight.
+    ///
+    /// On the ring for the same reason as `StagingCopy`: it is a pause of a
+    /// production follower, and an operator asks about those after the fact.
+    QuiescePair {
+        live: String,
+        staging: String,
+        millis: u64,
+    },
 }
 
 impl EventKind {
@@ -164,6 +176,7 @@ impl EventKind {
             EventKind::MoveFailed { .. } => "move_failed",
             EventKind::InstanceReapedWithQueuedRows { .. } => "instance_reaped_with_queued_rows",
             EventKind::StagingCopy { .. } => "staging_copy",
+            EventKind::QuiescePair { .. } => "quiesce_pair",
         }
     }
 }

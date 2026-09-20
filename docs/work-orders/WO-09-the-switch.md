@@ -12,6 +12,138 @@
 **Depends on:** WO-08. **Blocks:** WO-10 (the refill), and with it the mainnet
 gate.
 
+## Implemented 2026-09-20 — notes for review
+
+Every acceptance item passes, **except one unlisted test that is now false by
+design and that I have left failing rather than touch** — see "The one
+question" at the end. It is the only red thing in the workspace.
+
+| Acceptance | Result |
+|---|---|
+| 1. `cargo test -p mitos-platform -p mitos-core -p mitos-lifecycle --no-fail-fast` | `mitos-core` 28, `mitos-lifecycle` 110, `mitos-platform` lib **345 passed / 1 failed**, + all 10 integration targets green (`1, 2, 1, 1, 2, 9`, 1 ignored) |
+| 1. `git diff --numstat crates/mitos-platform/tests` | `188  0  two_instances_v2.rs` — **additions only**, and no other file in the directory |
+| 2. clippy `--workspace --all-targets --all-features -D warnings` | 0 |
+| 2. `cargo check --workspace --all-targets` | 0 errors, 0 warnings |
+| 2. `cargo fmt --all --check` | clean |
+| 3. `quiesce_pair` (6 named) | pass — two of the six needed their EXPECTATIONS corrected, see Deviations 3 and 4 |
+| 4. The switch (10 named) | pass, plus `a_row_write_that_fails_after_the_stops_does_not_strand_the_quiesce` — see "Found and fixed" |
+| 5. Fan-out watermarks (4 named) | pass — `fan_out_tests` 11 passed |
+| 6. Real host, end to end | `every_block_reaches_a_moving_client_exactly_once` |
+| 7. Succession (3 named) | pass |
+| 8. Dialer | `a_row_committed_within_one_timestamp_tick_is_seen` |
+| 9. Goldens | **69/69**, after `cargo build --release --bin mitos-run`; all 19 module artifacts verified newer than their sources |
+
+`run-golden-tests.sh` needs bash ≥ 4 (`nix develop -c bash -c …`). macOS's
+`/bin/bash` 3.2 dies at line 47 on `blocks[@]: unbound variable` after 12
+scenarios — which looks like a failure and is not one.
+
+### Found and fixed
+
+**1. A defect in the order's own design: a stranded quiesce deadlocks the
+whole row tick.** §2 hands back a `Quiesced` and §1 then feeds
+`Progress::Quiesced`. Every transition that step can make takes the quiesce
+back out of the map — `Committing` through `CommitSwitch`,
+`WaitingForDrain` through `ResumeFollowers` — so the map is emptied on every
+path the machine can take. But if the ROW WRITE fails, the machine takes no
+path at all, and nothing takes it out: the quiesce keeps holding the module
+lock with both followers stopped, and the next tick's `Quiescing` arm blocks
+for ever on that lock inside `quiesce_pair`, holding the row lock, stopping
+the tick's loop over every remaining module. `pause_at_boundary` now calls
+`progress_locked` rather than `feed` — the caller HAS to know whether the row
+moved — and resumes on `Err`. Same shape in `commit_switch`: `commit_row`
+returns `Result` and a failed commit resumes rather than leaving the pair
+paused until the write starts working. Regression test
+`a_row_write_that_fails_after_the_stops_does_not_strand_the_quiesce` (the
+timeout is the assertion), which injects a read-only rows directory from
+inside `FakeHost::stop_instance` so the writes BEFORE the stops still land.
+
+**2. A first subscribe (`from: None`) commits directly — reading its empty
+`Quiesced` slot as a lost commit is an ENDLESS loop, not a slow retry.** §3
+says "no quiesce in hand ⇒ feed `CommitLost`" and, separately, that a first
+subscribe writes no watermark. Taken together the natural implementation
+loops: `Preparing → Committing → CommitSwitch → CommitLost → Preparing`, with
+`create_staging` and a row write every time round, for ever — 300 samples a
+second in `sample(1)`. A first subscribe never enters the map, so its absence
+there means something different from a restart's. `commit_switch` now
+branches on `from` before it looks.
+
+### Deviations
+
+1. **`drain_event` extracted from `run_emit_drain`'s `select!` arm.** The
+   ORDER of the three steps — `rolled_back`, fan out, `settle` — is the whole
+   of the watermark's correctness, and it is the only part of the drain a test
+   can reach without a chain. §5's "assert the file on disk" needs it.
+2. **`a_crash_between_the_watermark_and_the_row_commits_nothing` is modelled
+   by STATE, not by an injected failure.** The two writes are microseconds
+   apart with nothing hookable between them, and every coarser injection (a
+   read-only rows directory) fails the row writes BEFORE the watermark too —
+   a different window, and the one "Found and fixed" 1 now covers. So the
+   test writes the orphan watermark by hand, which is exactly what a crash in
+   that window leaves, asserts nothing switched, and then boots and watches
+   the move catch up and commit over the top of it. The comment says so.
+3. **`a_follower_that_will_not_stop_aborts_the_quiesce_and_restarts_the_other`
+   asserts THREE host calls, not four.** A follower whose stop FAILED is
+   still running, and `end_quiesce` starts only what is not — starting a
+   running instance is the redb "already open" failure WO-07's review found.
+   My first expectation had a `StartInstance(live)` in it; the code was right.
+4. **`an_operator_stopped_instance_is_not_started_by_a_resume` stops `live`,
+   not `staging`.** A staging instance refuses every operator command but
+   `Evict` (`Rejected::StagingIsNotOperable`), so the test as I first wrote it
+   could not even set up.
+5. **§7's reap is asserted through the POINTER guard, not through
+   drain→grace→retain.** A production namespace is `eject: AlertOnly`, so an
+   emptied prod instance is never ejected and that route cannot reach a reap
+   at all. The test instead does what
+   `reaping_the_current_instance_with_a_sibling_is_refused_and_retried`
+   establishes: `Evict(Force)` is refused while the instance is current with a
+   sibling, and the tick's retry takes once `succeed` has moved the pointer.
+   That is the reap this order unblocks, named directly.
+6. **`a_newer_announcement_mid_quiesce_resumes_both_followers` is reframed:
+   there is no mid-quiesce for an announcement.** The tick holds the ROW lock
+   from the stops to the resume, and `announce` takes the same lock — so an
+   announcement issued while both followers are down (fired from inside
+   `stop_instance`) WAITS, and finds them running. The test pins that, under a
+   timeout. It is also the reason a `Quiesced` can live in a map keyed by row
+   rather than in the row itself, and the doc comment on that map says so.
+7. **§8's test lives in `dialer::tests::planning`.** The cache it is about is
+   `rows.rs`, which has no test module; the test drives `plan_module_tick`
+   twice over one `RowCache`, forcing the committed row's mtime back to the
+   mid-move row's with `File::set_modified`.
+8. **Two test helpers added:** `Harness::restart()` in `moves.rs` (a second
+   set of managers over the same storage with a host that has nothing
+   running — the process restart §4 needs twice), and
+   `announcement_declaring(…, upgrade)`, which is the only way a move's
+   `ClientPlan` comes out as anything but `QUIET`. The sanctioned rename uses
+   it for `recapture`; §4's purge test uses it for `purge-emissions`.
+9. **`events.rs` is outside the file list** — `EventKind::QuiescePair { live,
+   staging, millis }`, so the downtime of a production follower is on the
+   event ring and not only in the journal, as `StagingCopy` is for WO-08.
+10. **The doc section is new ground.** Nothing in
+    `HOWTO_CONSUMING_A_COMMUNITY_MODULE.md` mentioned announcements at all, so
+    "what a worker sees" is a new section rather than an edit: the
+    exactly-once guarantee stated as a guarantee, the drain-vs-purge choice,
+    the two timing caveats (a refill-blocked move waits; one host-wide
+    catch-up slot, production first), and the two admin routes to watch.
+
+### The one question — an UNLISTED test is now false by design
+
+**`boot_refetches_a_row_that_was_fetching`
+(`crates/mitos-platform/src/moves.rs:2303`).** Its row has no `current`, so it
+is a FIRST SUBSCRIBE — and this order makes `CommitSwitch` reachable, so the
+refetched move now runs all the way to a committed row (`pending: None`,
+`current` at revision 2) instead of parking at `Stage::Planned`. WO-08 relaxed
+this same assertion to `Planned { .. }` and its comment says "what this test
+is about is the REFETCH", so the fix is probably to assert the artifact landed
+and the row LEFT `Fetching` rather than to name a stage at all.
+
+**I have left it failing.** The order sanctions exactly one test change and
+says to stop and report on any other; its reasoning for why nothing else moves
+("nothing in `settle()` runs the tick") does not cover this one, because the
+cause is not the tick but the effect becoming reachable.
+
+So: is reshaping that assertion sanctioned, or should a first-subscribe commit
+be gated differently? Everything else in the order is green either way.
+
 ## What this order does, and where it deliberately stops
 
 WO-08 parks every move at `CatchingUp`, holding the host's one catch-up slot
