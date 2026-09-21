@@ -266,9 +266,41 @@ change nothing" — better proved there than on production.
 
 | # | Title | Depends on | Status |
 |---|---|---|---|
-| F1 | (in `infra`) Rebuild the ARM box by script — a typed `netcup` SCP client (`plan` sends nothing; `rebuild` is OPERATOR-ONLY), small ext4 root + XFS `reflink=1` data volume, aarch64 provisioning, slices with NO baked-in limits, no production credentials, `/etc/hosts` blackhole as the second lock on shadow delivery, the `smaps` sampler | — | **ready** — `infra/docs/work-orders/WO-F1-arm-mainnet-box.md` |
+| F1 | (in `infra`) Rebuild the ARM box by script — a typed `netcup` SCP client (`plan` sends nothing; `rebuild` is OPERATOR-ONLY), small ext4 root + XFS `reflink=1` data volume, aarch64 provisioning, slices with NO baked-in limits, no production credentials, the `smaps` sampler | — | **implemented, operator mid-provisioning; AMENDMENT A ready** (2026-09-21). The operator made the box a REAL mainnet server (workers register; shadow + blackhole dropped). Amendment A: Step 5 had ported the whole decommissioned dolos-DAEMON scaffolding incl. a 5-min cron calling a script nothing installs ⇒ binary only + idempotent undo; the chunk store's first FULL fetch scripted for the first time; `bootstrap.sh` imports from the shared store (`--skip-download --retain-snapshot` — without the last dolos DELETES the store) and stops passing `--force`, which WIPES the data dir; a tunnel hostname back, since a real server must be reachable |
 | F2 | Every redb cache is a named knob (kv asks for **10 GB** per module today; four other stores take redb's 1 GiB default) — defaults UNCHANGED; `MITOS_DELIVERY=shadow`: an isolated box has no companions, so its modules do no work and every number is fiction — it needs production's registrations, and must then be UNABLE to speak to production's DOs (four outbound paths, incl. the recapture WIPE and the indexer WebSocket) | — | **ready** — `WO-F2-cache-knobs-and-shadow-delivery.md` |
 | F3 | ARM mainnet at v3 HEAD + F2 to tip; registrations synced box-to-box and checked; the attribution table (footprint §5a); the §6 squeeze ladder AS A SCRIPT | F1, F2 | not written |
+| F5 | `mitos bootstrap` — a FAST FOLLOW, gates nothing. Today a fresh host needs a standalone `dolos` binary (used once; downloads ~217 G, imports, DELETES it) AND a `mithril-client` CLI that downloads the same ~217 G again into the shared chunk store — whose first full fetch is scripted nowhere. One fetch into the one store, verified (upstream's validation condition is INVERTED — do not port it), resumable import from library APIs mitos already links, never deletes the store; `mithril-client 0.12.2` is already in `Cargo.lock`. `mitos` with no subcommand still means "run" | — | **ready** — `WO-F5-mitos-bootstraps-itself.md` |
+
+### The install track — `docs/design/INSTALLABLE_MITOS.md` (PROPOSED)
+
+The goal behind the footprint track, stated: a stranger pastes four lines of
+cloud-init into a fresh Debian VPS and finds a node at tip; we can do the same
+for them through a provider's API. WO-F1 got a box built by script and still
+needed a person throughout — because mitos is source compiled on the box,
+driven over SSH from a laptop, configured by hand-written env files.
+
+**Executed as ONE plan, not as orders — and DRIVEN FROM `infra`:
+`infra/docs/work-orders/PLAN-I-installable-mitos.md`**, with its report
+beside it (2026-09-21). The plan lives there because `infra` is the
+operator's seat — where boxes are built and the end-to-end acceptance runs —
+even though most of the code it changes is here. Its path convention: anything
+not prefixed `infra/` is in THIS repo. The operator asked to stop the write → implement → review
+hand-off for this track. So the plan pre-makes every decision a review would
+have made (§3), lists the ONLY reasons to stop (§1), and puts the review
+INSIDE each phase as a separate "attack" pass with a checklist drawn from what
+review actually found in WO-01…09 (§5). Phases 1–4 (I1–I4) run end to end;
+Phase 5 (I5) stops for a proposal; I6 is out of it. Phase 4 decides what code
+a stranger's box executes and gets an independent security review regardless.
+The rows below are the plan's phases, not separate orders.
+
+| # | Title | Depends on | Status |
+|---|---|---|---|
+| I1 | Release CI — `mitos` + tools for x86_64 AND aarch64, checksums, signature, R2 mirror; our own `deploy.sh` installs the artifact | — | not written |
+| I2 | `mitos.toml` (genesis + Mithril constants EMBEDDED, dolos config derived); `mitos init` / `mitos doctor`; systemd units embedded in the binary | — | not written |
+| I3 | F5 + the `mitos-bootstrap` oneshot → `mitos` service chain + the four-line user-data. **Acceptance: `netcup rebuild` the ARM box, never SSH, find it at tip** | I2, F5 | not written |
+| I4 | Signed module catalogue, pulled through WO-05's `ArtifactPuller` | I2 | not written |
+| I5 | Published DATA snapshot (dolos data dir + tx-index) and `bootstrap --from-snapshot` — an hour instead of most of a day; trust difference stated | I3 | not written |
+| I6 | Provider adapters (`infra/tools/netcup` is the first) + heartbeat; the managed path | I1–I3 | not written |
 
 ## Writing a work order (for whoever writes the next one)
 

@@ -57,6 +57,10 @@ members = [
     # pure reducers — no tokio, no wasmtime, no redb. Every lifecycle DECISION
     # lives here; `mitos-platform` only executes the effects it returns.
     "crates/mitos-lifecycle",
+    # Node description (`mitos.toml`) + the derived dolos config + the
+    # signed-catalogue types. Pure: serde/toml/thiserror, no I/O, no dolos
+    # types. PLAN-I Phase 2; `mitos-core` adapts `DerivedDolos` to RootConfig.
+    "crates/mitos-config",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",

@@ -114,6 +114,15 @@ DOs, one of which is a recapture WIPE. See WO-F2, and WO-F1 §4 for the second
 lock. `mitos_shadow_suppressed_total` climbing is the proof the modules are
 working; if it is flat, stop measuring.
 
+*Decided 2026-09-21: the ARM box is a REAL mainnet server instead.* Workers
+register with it and it dials them back, which closes the same gap with real
+load rather than replayed registrations — and makes its numbers more honest,
+not less, since delivery is part of what a self-hoster's box does. Shadow
+delivery stays in WO-F2 as a tool (a second box, a dry run of a new build),
+but this box does not use it. The safety rule that remains: it holds its OWN
+auth token and NO Cloudflare credentials for the ledger tools. Whatever is
+pointed at it is pointed deliberately, by name.
+
 **Measure on the box, per process:**
 - `/proc/<pid>/smaps_rollup` sampled every 5 s through a full restart →
   `Rss`, `Anonymous`, `File`, `Swap`. The anon/file split is the first
@@ -223,13 +232,33 @@ Each is gated on §5 confirming the owner. Every one re-runs the §6 ladder.
 
 ## 10. Packaging prerequisites surfaced by this work
 
+**Now its own design: `docs/design/INSTALLABLE_MITOS.md`** (PROPOSED
+2026-09-21) — release binaries, one `mitos.toml`, `mitos init` / `doctor` /
+`bootstrap`, a module catalogue, the install as a systemd state machine, and a
+published data snapshot for time-to-tip. One finding there bears directly on
+THIS doc: mitos is compiled on the box today, so the real minimum spec may be
+`rustc`'s, not mitos's. Measure the build (`/usr/bin/time -v cargo build
+--release -p mitos` on the ARM box) alongside §5 — if its peak RSS is above
+the ladder's lowest passing rung, §6's numbers are not reachable by anyone
+until release binaries exist.
+
 Not in scope to solve, but this box is where they get found:
-- aarch64 availability of `mithril-client` (unverified; fallback is building
-  from source) and any other prebuilt dependency.
+- ~~aarch64 availability of `mithril-client`~~ — **answered 2026-09-21.** The
+  CRATE (`mithril-client 0.12.2`) is already in mitos's `Cargo.lock` via
+  dolos's default features, so it has been building on aarch64 since the
+  Appendix B benchmark. What is NOT yet self-contained is the first run: it
+  needs a standalone `dolos` binary (v1.2.0 does ship
+  `dolos-aarch64-unknown-linux-gnu`) AND a `mithril-client` CLI, which between
+  them download the ~217 G snapshot TWICE and delete one copy. **WO-F5**
+  (`mitos bootstrap`) makes it one fetch, one store, one binary.
 - Module WASM builds are not reproducible across machines — self-hosters must
   pull shared modules by digest, never build them.
 - A first-run path that does not need our operational knowledge: snapshot
-  fetch, index build, time-to-tip stated honestly per profile.
+  fetch, index build, time-to-tip stated honestly per profile. Two pieces of
+  exactly that knowledge found 2026-09-21: the chunk store's first FULL fetch
+  is scripted nowhere (`infra`'s `snapshot-refresh.sh` is incremental only and
+  refuses an empty store), and `dolos bootstrap mithril` deletes its download
+  directory unless told `--retain-snapshot`. WO-F5.
 
 ## 11. Order of work
 

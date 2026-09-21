@@ -1,0 +1,20 @@
+[package]
+name = "mitos-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "mitos.toml, the known-network table, and the module catalogue — pure types. No I/O, no dolos."
+
+# PURE, same discipline as mitos-lifecycle: this is where the node's
+# description is decided, so it is what gets the exhaustive tests. The host
+# (`mitos-core`) turns DerivedDolos into dolos's RootConfig and is the only
+# crate allowed to name a dolos type.
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+hex = { workspace = true }
+
+[dev-dependencies]
+sha2 = "0.10"
