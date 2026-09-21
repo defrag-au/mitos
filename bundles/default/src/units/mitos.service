@@ -1,0 +1,20 @@
+[Unit]
+Description=mitos
+Documentation=https://github.com/defrag-au/mitos
+After=network.target mitos-bootstrap.service
+Requires=mitos-bootstrap.service
+
+[Service]
+Type=simple
+Slice=mitos.slice
+OOMScoreAdjust=-500
+Environment=MITOS_CONFIG=__MITOS_CONFIG__
+ExecStart=__MITOS_EXEC__
+WorkingDirectory=__MITOS_DATA_DIR__
+Restart=always
+RestartSec=10
+TimeoutStopSec=90
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -25,8 +25,8 @@ pub use derive::{
 pub use digest::Sha256Hex;
 pub use error::Error;
 pub use file::{
-    CachesSection, FallbackGate, FallbackProvider, FallbackSection, MitosFile, ModulesSection,
-    NetworkId, Profile, TxIndexSection,
+    CachesSection, DEFAULT_AUTH_TOKEN_FILE, FallbackGate, FallbackProvider, FallbackSection,
+    MitosFile, ModulesSection, NetworkId, Profile, TxIndexSection,
 };
 pub use network::{DOLOS_SOURCE_TAG, GenesisFiles, NetworkSpec, spec};
 pub use resolve::{EnvLookup, Resolved, ResolvedFallback, TxIndexPaths, resolve};

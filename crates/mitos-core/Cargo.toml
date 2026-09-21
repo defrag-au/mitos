@@ -70,6 +70,10 @@ mitos-protocol = { path = "../mitos-protocol" }
 # wasmtime + the platform's storage/host/admin surface.
 mitos-platform = { path = "../mitos-platform" }
 
+# Node description. Pure; this crate is the adapter to dolos RootConfig.
+mitos-config = { path = "../mitos-config" }
+
 [dev-dependencies]
 # Sandbox dirs for community-modules auto-load tests.
 tempfile = "3"
+toml = "0.8"

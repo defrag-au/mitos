@@ -31,6 +31,17 @@ impl fmt::Display for NetworkId {
     }
 }
 
+impl std::str::FromStr for NetworkId {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mainnet" => Ok(Self::Mainnet),
+            "preprod" => Ok(Self::Preprod),
+            other => Err(Error::UnknownNetwork(other.to_owned())),
+        }
+    }
+}
+
 /// Footprint profiles. Only [`Profile::Full`] has behaviour; the others
 /// parse so a file that names them is valid, and are refused by resolve /
 /// doctor with "not implemented yet".
@@ -50,6 +61,20 @@ impl fmt::Display for Profile {
             Self::Standard => "standard",
             Self::Full => "full",
         })
+    }
+}
+
+impl std::str::FromStr for Profile {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "lean" => Ok(Self::Lean),
+            "standard" => Ok(Self::Standard),
+            "full" => Ok(Self::Full),
+            other => Err(Error::Parse(format!(
+                "unknown profile `{other}` (want lean, standard, or full)"
+            ))),
+        }
     }
 }
 
@@ -145,7 +170,30 @@ pub struct FallbackSection {
     pub koios_network: Option<String>,
 }
 
+/// Where `mitos init` puts the bearer token. Mode 0600, never in the TOML.
+pub const DEFAULT_AUTH_TOKEN_FILE: &str = "/etc/mitos/auth.token";
+
 impl MitosFile {
+    /// The file `mitos init` writes when none exists.
+    pub fn default_for(network: NetworkId, profile: Profile) -> Self {
+        let net = crate::network::spec(network);
+        Self {
+            network,
+            profile,
+            data_dir: Some(default_data_dir()),
+            listen: Some(net.default_listen.to_string()),
+            auth_token_file: Some(PathBuf::from(DEFAULT_AUTH_TOKEN_FILE)),
+            readonly_token_file: None,
+            namespaces_file: None,
+            koios_api_key_file: None,
+            chunk_store: None,
+            modules: ModulesSection::default(),
+            caches: CachesSection::default(),
+            tx_index: TxIndexSection::default(),
+            fallback: FallbackSection::default(),
+        }
+    }
+
     pub fn parse(text: &str) -> Result<Self, Error> {
         toml::from_str(text).map_err(|e| Error::from_toml("mitos.toml", e))
     }

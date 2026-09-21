@@ -1,0 +1,4 @@
+[Slice]
+# No limits baked in. WO-F3's ladder sets them at runtime with
+# `systemctl set-property --runtime`. A limit here would silently
+# cap the "unconstrained" baseline.

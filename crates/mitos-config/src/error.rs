@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("chunk store path `{0}` is empty")]
     EmptyChunkStore(PathBuf),
+
+    #[error("unknown network `{0}` (want mainnet or preprod)")]
+    UnknownNetwork(String),
 }
 
 impl Error {

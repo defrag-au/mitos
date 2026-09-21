@@ -12,71 +12,82 @@
 //! residual-pass coordinator (see
 //! `docs/design/DOMAIN_REFACTOR.md`).
 
+mod cli;
+mod doctor;
+mod init;
+
+use std::path::Path;
+
+use anyhow::Context;
 use axum::middleware::from_fn_with_state;
-use clap::Parser;
-use mitos_core::{Bundle, authenticate, require_read_chain};
+use clap::{CommandFactory, FromArgMatches};
+use mitos_core::{Bundle, ConfigMode, authenticate, require_read_chain};
 use none_match_indexer::NoneMatchIndexer;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-#[derive(Debug, Parser)]
-#[command(version, about = "mitos default bundle")]
-struct Args {
-    /// Path to the Dolos config file (same schema as stock dolos.toml).
-    /// The data dir referenced by this config must already be bootstrapped
-    /// (run `dolos bootstrap mithril ...` first).
-    #[arg(long, env = "DOLOS_CONFIG", default_value = "dolos.toml")]
-    config: String,
-
-    /// HTTP listen address for indexer routes.
-    #[arg(long, env = "BUNDLE_LISTEN", default_value = "127.0.0.1:8080")]
-    listen: std::net::SocketAddr,
-
-    /// Where mitos stores its own state. Independent of Dolos's
-    /// data dir. Currently used by platform-v2 hosting paths (the
-    /// emissions log + cursor checkpoint per wasm module live
-    /// under `--modules-dir`, which is a separate path).
-    #[arg(long, env = "BUNDLE_DATA_DIR", default_value = "./mitos-data")]
-    data_dir: std::path::PathBuf,
-
-    /// Wasm-module artifact storage. Setting this enables the
-    /// `/_admin/modules/*` admin surface + auto-resume of any
-    /// modules already registered under the path. Unset =
-    /// classic statically-composed bundle (today's behaviour).
-    /// See `docs/strategy/MITOS_PLATFORM_DEPLOYMENT.md`.
-    #[arg(long, env = "BUNDLE_MODULES_DIR")]
-    modules_dir: Option<std::path::PathBuf>,
-
-    /// Community-modules source tree. When set + `--modules-dir`
-    /// is enabled, the bundle activates any pre-built community
-    /// module under `<dir>/<name>/build/` whose sha differs from
-    /// the currently-active artifact in `--modules-dir`. Typical
-    /// value: `<mitos-checkout>/community-modules`. See
-    /// `docs/strategy/COMMUNITY_MODULES.md`.
-    #[arg(long, env = "BUNDLE_COMMUNITY_MODULES_DIR")]
-    community_modules_dir: Option<std::path::PathBuf>,
-
-    /// Print the loaded configuration to stdout, then exit 0
-    /// without starting the chain follower or HTTP server.
-    /// Useful for verifying env vars and paths before committing
-    /// to a long-running process.
-    #[arg(long)]
-    print_config_only: bool,
-}
+use cli::{Args, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
-    let args = Args::parse();
-    info!(config = %args.config, listen = %args.listen, "mitos starting");
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    match args.command.take() {
+        Some(Command::Init(init)) => init::run(init),
+        Some(Command::Doctor(doc)) => doctor::run(doc),
+        None => run_node(args, matches).await,
+    }
+}
 
-    let config = mitos_core::load_config(&args.config)?;
+async fn run_node(args: Args, matches: clap::ArgMatches) -> anyhow::Result<()> {
+    let overrides = cli::command_line_overrides(&matches);
+    let mode = mitos_core::select_mode(
+        args.config_file.as_deref(),
+        Path::new(&args.config),
+        mitos_core::default_mitos_toml_path(),
+        |p| p.exists(),
+    );
+
+    let (config, listen, data_dir, modules_dir, community_modules_dir) = match mode {
+        ConfigMode::Legacy { dolos_toml } => {
+            info!(config = %dolos_toml.display(), listen = %args.listen, "mitos starting (legacy dolos.toml)");
+            let config = mitos_core::load_legacy_dolos_toml(&dolos_toml)?;
+            (
+                config,
+                args.listen,
+                args.data_dir,
+                args.modules_dir,
+                args.community_modules_dir,
+            )
+        }
+        ConfigMode::Mitos { path } => {
+            info!(config = %path.display(), "mitos starting (mitos.toml)");
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let lookup = |k: &str| {
+                overrides
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.clone())
+                    .or_else(|| std::env::var(k).ok())
+            };
+            let loaded = mitos_core::load_mitos_toml(&text, &lookup)?;
+            (
+                loaded.root,
+                loaded.resolved.listen,
+                loaded.resolved.bundle_data_dir,
+                loaded.resolved.modules_dir,
+                loaded.resolved.community_modules_dir,
+            )
+        }
+    };
 
     // Early exit BEFORE opening data stores (which acquires the
     // WAL lock). Lets `--print-config-only` run safely against a
     // dir that's actively being used by another mitos instance.
     if args.print_config_only {
-        mitos_core::print_config_summary(&config, args.listen, &args.data_dir, &["none-match"])?;
+        mitos_core::print_config_summary(&config, listen, &data_dir, &["none-match"])?;
         return Ok(());
     }
 
@@ -93,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Fallible: this is where `MITOS_NAMESPACES_FILE` is loaded, and a host
     // that declares a security boundary it cannot enforce must not serve.
-    let mut bundle = Bundle::new(domain, config, args.listen, args.data_dir)?;
+    let mut bundle = Bundle::new(domain, config, listen, data_dir)?;
 
     // Residual pass: emits `Domain::AssetMovement` for asset
     // transfers no specific-domain indexer claimed (the chain-
@@ -106,10 +117,10 @@ async fn main() -> anyhow::Result<()> {
     let claim_coordinator = bundle.enable_residual_pass();
     bundle.add_indexer(NoneMatchIndexer::new(claim_coordinator));
 
-    if let Some(modules_dir) = args.modules_dir {
+    if let Some(modules_dir) = modules_dir {
         info!(modules_dir = %modules_dir.display(), "wasm-module hosting enabled");
         bundle.enable_modules(modules_dir);
-        if let Some(cm_dir) = args.community_modules_dir {
+        if let Some(cm_dir) = community_modules_dir {
             info!(
                 community_modules_dir = %cm_dir.display(),
                 "community-modules auto-load enabled"
@@ -118,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("wasm-module hosting disabled (set --modules-dir to enable)");
-        if args.community_modules_dir.is_some() {
+        if community_modules_dir.is_some() {
             tracing::warn!(
                 "--community-modules-dir set but --modules-dir is not; \
                  community-modules auto-load requires wasm-module hosting"
