@@ -40,7 +40,17 @@ pallas-addresses = { workspace = true }
 # claims for the same tx in parallel.
 dashmap = { workspace = true }
 pallas = { workspace = true }
+pallas-hardano = { workspace = true }
 cardano-assets = { workspace = true }
+libc = { workspace = true }
+# Same version AND features as dolos v1.2.0. Default features pull GMP
+# (`gmp-mpfr-sys`); `num-integer-backend` is the one that already compiles here.
+mithril-client = { version = "=0.12.2", default-features = false, features = [
+    "fs",
+    "num-integer-backend",
+    "rustls-tls",
+    "rustls-tls-webpki-roots",
+] }
 
 # Subscription scope payloads on the CF replication channel are CBOR;
 # the framework decodes once at the IndexerHandle boundary.

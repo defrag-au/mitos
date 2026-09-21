@@ -9,6 +9,8 @@
 mod adapt;
 mod atomic;
 mod auth;
+mod bootstrap;
+mod bootstrap_host;
 mod bundle;
 mod community_modules;
 mod coordinator;
@@ -31,6 +33,14 @@ pub use adapt::{GenesisPaths, materialise_genesis, to_root_config};
 pub use atomic::{WritePlan, atomic_write, write_unless_edited};
 pub use auth::{
     AuthToken, Authenticator, Resolution, authenticate, require_read_chain, require_submit_tx,
+};
+pub use bootstrap::{
+    BootstrapError, BootstrapPaths, DISK_HEADROOM_PERCENT, DataDir, Disk, Fetch, Importer, Refused,
+    SnapshotFetcher, Step, Store, classify_data_dir, inspect_store, needed_bytes, plan,
+    run as run_bootstrap, scratch_dir,
+};
+pub use bootstrap_host::{
+    DolosImporter, MithrilFetcher, UnixDisk, mithril_from_root, paths_for, store_tip_slot,
 };
 pub use bundle::{Bundle, print_config_summary};
 pub use coordinator::TxClaimCoordinator;

@@ -38,10 +38,9 @@ pub fn load_config(path: impl AsRef<Path>) -> anyhow::Result<RootConfig> {
 /// Open all data stores + initialize the Cardano chain logic + assemble
 /// a `DomainAdapter`. Replicates `setup_domain` from Dolos's binary.
 ///
-/// Requires the data dir to already exist (i.e. Dolos has been bootstrapped
-/// against this config). Mitos doesn't run the bootstrap itself yet —
-/// invoke `dolos bootstrap mithril ...` first, then point a bundle at the
-/// resulting data dir.
+/// Requires the data dir to already exist (i.e. it has been bootstrapped).
+/// `mitos bootstrap --chunk-store <dir>` is the first-run path; it imports
+/// from the shared Mithril chunk store and does not delete it.
 pub fn setup_domain(config: &RootConfig) -> anyhow::Result<DomainAdapter> {
     let stores = storage::open_data_stores::<dolos_cardano::CardanoDelta>(config)
         .map_err(|e| anyhow::anyhow!("opening data stores: {e}"))?;

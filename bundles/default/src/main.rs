@@ -12,6 +12,7 @@
 //! residual-pass coordinator (see
 //! `docs/design/DOMAIN_REFACTOR.md`).
 
+mod bootstrap;
 mod cli;
 mod doctor;
 mod init;
@@ -36,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     match args.command.take() {
         Some(Command::Init(init)) => init::run(init),
         Some(Command::Doctor(doc)) => doctor::run(doc),
+        Some(Command::Bootstrap(boot)) => bootstrap::run(&args, boot),
         None => run_node(args, matches).await,
     }
 }

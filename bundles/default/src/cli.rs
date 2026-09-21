@@ -14,8 +14,8 @@ pub struct Args {
     pub command: Option<Command>,
 
     /// Path to the Dolos config file (same schema as stock dolos.toml).
-    /// The data dir referenced by this config must already be bootstrapped
-    /// (run `dolos bootstrap mithril ...` first).
+    /// When `/etc/mitos/mitos.toml` is absent this is the legacy path.
+    /// `mitos bootstrap` imports into the data dir this file names.
     #[arg(long, env = "DOLOS_CONFIG", default_value = "dolos.toml")]
     pub config: String,
 
@@ -69,6 +69,9 @@ pub enum Command {
     /// Preflight + postflight. Every refusal names the number it wanted
     /// and the number it found.
     Doctor(DoctorArgs),
+    /// Fetch (if needed) and import a Mithril snapshot into the embedded
+    /// dolos data dir. Never deletes the chunk store.
+    Bootstrap(BootstrapArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -82,6 +85,29 @@ pub struct InitArgs {
     /// Prefix every filesystem path (tests). Nothing in the suite needs root.
     #[arg(long)]
     pub root: Option<PathBuf>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct BootstrapArgs {
+    /// Directory that CONTAINS `immutable/`. Env `MITOS_CHUNK_STORE`.
+    /// No default: guessing where 217 G goes is not a feature.
+    #[arg(long, env = "MITOS_CHUNK_STORE")]
+    pub chunk_store: Option<PathBuf>,
+    /// `if-empty` (default) fetches only when the store has no chunks.
+    /// `never` refuses if the store is empty.
+    #[arg(long, default_value = "if-empty", value_parser = parse_fetch)]
+    pub fetch: String,
+    #[arg(long, default_value_t = 500)]
+    pub chunk_size: usize,
+}
+
+fn parse_fetch(s: &str) -> Result<String, String> {
+    match s {
+        "if-empty" | "never" => Ok(s.to_owned()),
+        other => Err(format!(
+            "unknown --fetch `{other}` (want if-empty or never)"
+        )),
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -197,6 +223,26 @@ mod tests {
             env_name(&cmd, "community_modules_dir").as_deref(),
             Some("BUNDLE_COMMUNITY_MODULES_DIR")
         );
+    }
+
+    #[test]
+    fn bootstrap_is_an_optional_subcommand() {
+        let args = Args::try_parse_from([
+            "mitos",
+            "bootstrap",
+            "--chunk-store",
+            "/opt/market-ledger/snapshot-full/db",
+            "--fetch",
+            "never",
+        ])
+        .unwrap();
+        match args.command {
+            Some(super::Command::Bootstrap(b)) => {
+                assert_eq!(b.fetch, "never");
+                assert_eq!(b.chunk_size, 500);
+            }
+            other => panic!("expected Bootstrap, got {other:?}"),
+        }
     }
 
     #[test]

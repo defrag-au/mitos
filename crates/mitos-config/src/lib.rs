@@ -14,6 +14,7 @@ pub mod digest;
 pub mod env;
 pub mod error;
 pub mod file;
+pub mod install;
 pub mod network;
 pub mod resolve;
 
@@ -28,5 +29,6 @@ pub use file::{
     CachesSection, DEFAULT_AUTH_TOKEN_FILE, FallbackGate, FallbackProvider, FallbackSection,
     MitosFile, ModulesSection, NetworkId, Profile, TxIndexSection,
 };
+pub use install::{InstallPhase, InstallState, RecoverAction};
 pub use network::{DOLOS_SOURCE_TAG, GenesisFiles, NetworkSpec, spec};
 pub use resolve::{EnvLookup, Resolved, ResolvedFallback, TxIndexPaths, resolve};

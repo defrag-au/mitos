@@ -246,19 +246,22 @@ Not in scope to solve, but this box is where they get found:
 - ~~aarch64 availability of `mithril-client`~~ — **answered 2026-09-21.** The
   CRATE (`mithril-client 0.12.2`) is already in mitos's `Cargo.lock` via
   dolos's default features, so it has been building on aarch64 since the
-  Appendix B benchmark. What is NOT yet self-contained is the first run: it
-  needs a standalone `dolos` binary (v1.2.0 does ship
-  `dolos-aarch64-unknown-linux-gnu`) AND a `mithril-client` CLI, which between
-  them download the ~217 G snapshot TWICE and delete one copy. **WO-F5**
-  (`mitos bootstrap`) makes it one fetch, one store, one binary.
+  Appendix B benchmark.
+- **First-run path is one binary (`mitos bootstrap`).** It fetches (if the
+  store is empty) into a scratch dir, verifies certificate chain AND files
+  (unlike upstream dolos, which inverts the skip-validation condition),
+  renames into the chunk store, and imports. It never deletes the store.
+  **Still not in the binary:** the weekly incremental refresh
+  (`snapshot-refresh.sh` + mithril-client CLI 0.13.9 `--start N`). The crate
+  at 0.12.2 used here is the v1 `cardano_database()` API; ranged (`From(n)`)
+  download is a v2 (`cardano_database_v2` / `ImmutableFileRange`) surface
+  that 0.12.2 does not expose the way the 0.13.9 CLI does. Do not bump.
 - Module WASM builds are not reproducible across machines — self-hosters must
   pull shared modules by digest, never build them.
 - A first-run path that does not need our operational knowledge: snapshot
-  fetch, index build, time-to-tip stated honestly per profile. Two pieces of
-  exactly that knowledge found 2026-09-21: the chunk store's first FULL fetch
-  is scripted nowhere (`infra`'s `snapshot-refresh.sh` is incremental only and
-  refuses an empty store), and `dolos bootstrap mithril` deletes its download
-  directory unless told `--retain-snapshot`. WO-F5.
+  fetch, index build, time-to-tip stated honestly per profile. The first FULL
+  fetch + import is `mitos bootstrap`. Incremental refresh remains the
+  `mithril-client` CLI. Index build and time-to-tip are still WO-F3.
 
 ## 11. Order of work
 
