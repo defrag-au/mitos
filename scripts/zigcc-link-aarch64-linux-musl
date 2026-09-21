@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# rustc linker only. Forwards to cargo-zigbuild's zigcc after dropping
+# --fix-cortex-a53-843419 (zig 0.16 rejects it). C compiles keep using
+# cargo-zigbuild's own wrapper so we do not double-inject musl CRT.
+set -euo pipefail
+shopt -s nullglob
+wrappers=(
+    "$HOME/Library/Caches/cargo-zigbuild/"*/wrappers/*/zigcc-aarch64-unknown-linux-musl*.sh
+)
+if [[ ${#wrappers[@]} -eq 0 ]]; then
+    echo "zigcc-link: no cargo-zigbuild zigcc wrapper yet; run cargo zigbuild once first" >&2
+    exit 127
+fi
+WRAP="${wrappers[$((${#wrappers[@]} - 1))]}"
+filtered=()
+for a in "$@"; do
+    case "$a" in
+        *fix-cortex-a53-843419*) continue ;;
+    esac
+    filtered+=("$a")
+done
+exec "$WRAP" "${filtered[@]}"

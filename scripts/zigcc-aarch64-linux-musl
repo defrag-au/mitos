@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# cc/linker driver for aarch64-unknown-linux-musl via zig.
+#
+# rustc and cc-rs pass a mix of clang triples and GNU ld flags that zig 0.16
+# does not accept:
+#   --target=aarch64-unknown-linux-musl  →  -target aarch64-linux-musl
+#   -Wl,--fix-cortex-a53-843419          →  dropped
+set -euo pipefail
+
+out=()
+have_target=0
+skip_target_value=0
+
+for a in "$@"; do
+    if [[ "$skip_target_value" -eq 1 ]]; then
+        skip_target_value=0
+        case "$a" in
+            aarch64-unknown-linux-musl|aarch64-linux-musl)
+                out+=(-target aarch64-linux-musl)
+                ;;
+            aarch64-unknown-linux-gnu|aarch64-linux-gnu)
+                out+=(-target aarch64-linux-gnu)
+                ;;
+            *)
+                out+=(-target "$a")
+                ;;
+        esac
+        have_target=1
+        continue
+    fi
+    case "$a" in
+        *fix-cortex-a53-843419*)
+            continue
+            ;;
+        --target=aarch64-unknown-linux-musl|-target=aarch64-unknown-linux-musl)
+            out+=(-target aarch64-linux-musl)
+            have_target=1
+            continue
+            ;;
+        --target=aarch64-unknown-linux-gnu|-target=aarch64-unknown-linux-gnu)
+            out+=(-target aarch64-linux-gnu)
+            have_target=1
+            continue
+            ;;
+        -target|--target)
+            skip_target_value=1
+            continue
+            ;;
+    esac
+    out+=("$a")
+done
+
+if [[ "$have_target" -eq 0 ]]; then
+    out=(-target aarch64-linux-musl "${out[@]}")
+fi
+
+exec zig cc "${out[@]}"
