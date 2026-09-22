@@ -64,6 +64,7 @@ use clap::{Args, Parser, Subcommand};
 // The alias is what `chain-decode` expects to lose once call sites point there.
 use mitos_chain_walk::decode::decode_tx;
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
+use pallas_addresses::byron::AddressPayload;
 use pallas_codec::minicbor::Decoder;
 use pallas_primitives::conway::DatumOption;
 use pallas_primitives::{Hash, alonzo, babbage, conway};
@@ -786,6 +787,85 @@ fn feed_conway(
     }
 }
 
+/// CRC-32/ISO-HDLC — the checksum a Byron address carries over its own payload.
+///
+/// `pallas-addresses` keeps `crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC)` private,
+/// so this is that definition written out: reflected, polynomial `0xEDB88320`,
+/// initial and final XOR `0xFFFF_FFFF`. Twelve lines against a dependency the
+/// probe does not otherwise need. `crc_matches_its_check_vector` pins it.
+fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// A Byron address, checked against its own encoding before the book stores it.
+///
+/// pallas models a Byron address as an opaque tag-24 payload plus a CRC
+/// (`byron::Address { payload: TagWrap<ByteVec, 24>, crc }`) and `TagWrap`'s
+/// decoder reads a tag *without checking its number*, so nothing along the path
+/// validates that a payload is an address at all.
+///
+/// That is not academic, because a Byron address's size is whatever the chain
+/// says. Its attributes map is `{ * any => any}` — unconstrained — and mainnet
+/// really does carry multi-kilobyte addresses: over chunk 81, 4 of 16,013
+/// created outputs hold payloads of 502, 682, 828 and 7,678 B against a plain
+/// address's ~43 B, with attribute 1 carrying text (one is a hex-encoded JPEG).
+/// Early Byron had no metadata field, so the address was the data carrier.
+///
+/// So this is not a hunt for a mis-decode — it is the check that a row's address
+/// bytes are what they claim to be, which is the one thing the three
+/// whole-artifact identities structurally cannot do: they compare two
+/// implementations of the same live set over the same decode, so a
+/// wrong-but-consistent decode balances on all three.
+///
+/// The CRC is what makes it decisive rather than indicative. `AddrAttrProperty`
+/// bounds the attribute *keys* to 0, 1 and 2, but `DerivationPath(ByteVec)` and
+/// `NetworkTag(ByteVec)` are unbounded byte strings, so a garbage byte string
+/// can parse as a well-formed `AddressPayload` and consume exactly its length.
+/// The CRC is four bytes read from the *same* stream and cannot be satisfied by
+/// accident: a decode that took a length from the wrong offset fails it with
+/// probability 1 − 2⁻³².
+fn validate_byron_address(a: &pallas_primitives::byron::Address) -> Result<()> {
+    let payload: &[u8] = &a.payload.0;
+    let mut d = Decoder::new(payload);
+    let parsed: AddressPayload = d.decode().with_context(|| {
+        format!(
+            "a {}-byte Byron address payload does not parse as an AddressPayload",
+            payload.len()
+        )
+    })?;
+    if d.position() != payload.len() {
+        bail!(
+            "a {}-byte Byron address payload parses as an AddressPayload only for its first \
+             {} ({} bytes left over, addrtype {:?})",
+            payload.len(),
+            d.position(),
+            payload.len() - d.position(),
+            parsed.addrtype,
+        );
+    }
+    let crc = crc32_iso_hdlc(payload);
+    if crc != a.crc {
+        bail!(
+            "a {}-byte Byron address payload fails its own CRC (payload says {crc:#010x}, \
+             the address record says {:#010x}, addrtype {:?}, {} attribute(s)) — the decode \
+             read these bytes from the wrong offset",
+            payload.len(),
+            a.crc,
+            parsed.addrtype,
+            parsed.attributes.len(),
+        );
+    }
+    Ok(())
+}
+
 /// One output into the book, from a `MultiEraOutput` — the fallback walk's route.
 ///
 /// Byron and the epoch-boundary blocks do not decode into a `ShelleyBlock`, so
@@ -807,6 +887,11 @@ fn feed_multi_era(
     era: u8,
     o: &MultiEraOutput<'_>,
 ) -> Result<()> {
+    // Checked before the row is written, not after: pallas hands a Byron address
+    // over as an opaque payload, so this is the only place its shape is tested.
+    if let MultiEraOutput::Byron(b) = o {
+        validate_byron_address(&b.address)?;
+    }
     let addr = o
         .address()
         .map_err(|e| anyhow::anyhow!("address of {}#{}: {e}", oref.0, oref.1))?;
@@ -2162,6 +2247,18 @@ fn kb_field(text: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The standard check value for CRC-32/ISO-HDLC. Without this the check that
+    /// catches a mis-decoded Byron address could itself be wrong — and a CRC test
+    /// that is wrong in the safe direction fails nothing, which is the failure
+    /// mode this whole line of investigation has been about.
+    #[test]
+    fn crc_matches_its_check_vector() {
+        assert_eq!(crc32_iso_hdlc(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_iso_hdlc(b""), 0);
+        assert_eq!(crc32_iso_hdlc(b"a"), 0xE8B7_BE43);
+        assert_eq!(crc32_iso_hdlc(b"abc"), 0x3524_41C2);
+    }
 
     #[test]
     fn splits_concatenated_cbor_items() {

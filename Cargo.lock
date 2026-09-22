@@ -2176,6 +2176,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mitos-chain-walk",
+ "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",
  "pallas-primitives 1.4.0",
  "pallas-traverse 1.4.0",
