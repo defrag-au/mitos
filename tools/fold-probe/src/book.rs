@@ -1,8 +1,9 @@
 //! The live book — phase 1 of `LIVE_BOOK.md`'s builder.
 //!
-//! Writes `rows.bin` + `by_outref.idx` + `dir.idx` + `policy.tbl` from a pass
-//! over the chunk log. Not yet: `by_addr`, the delta chain, the datum table, the
-//! base/delta split.
+//! Writes `rows.bin` + `by_outref.idx` + `dir.idx` + `by_policy.idx` +
+//! `policy.dir.idx` + `by_addr.idx` + `addr.dir.idx` + `policy.tbl` from a pass
+//! over the chunk log. Not yet: the delta chain, the datum table, the base/delta
+//! split.
 //!
 //! # The shape, and why it is this shape
 //!
@@ -52,6 +53,21 @@
 //!
 //! Divergence from the format is visible in `layout_version`, which every file
 //! starts with.
+//!
+//! # Three orderings, one row store
+//!
+//! `by_outref`, `by_policy` and `by_addr` are the same shape — 12-byte
+//! `{u64 prefix, u32 row}` entries in canonical order plus a 2^21-bucket
+//! directory — over the same rows. The first two are written during a build; all
+//! three are written by `write_derived_orderings`, which `finish` and `reindex`
+//! both call, so a view added by a repair is the same bytes as a view written by
+//! a walk. The only difference between them is what a row has to corroborate:
+//! its own outref, one of its policies, or its address's credential.
+//!
+//! `by_addr` is keyed by the credential `address::credential` derives from the
+//! row's address — in the row, not in the block, so it needs no capture during
+//! the walk and no `layout_version` bump. That it is *derived* rather than
+//! captured is the whole reason it could be added to a finished artifact.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -61,6 +77,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use pallas_primitives::Hash;
+
+use crate::address::{self, Kind};
 
 /// `B3`: 2^21 buckets, ~8 MB, ~5 entries per bucket at 10.9 M rows.
 pub const DIR_BITS: u32 = 21;
@@ -176,6 +194,20 @@ pub struct Cost {
     pub distinct_prefixes: u64,
     /// Entries in `by_policy.idx` — one per (row, policy), not per asset name.
     pub by_policy_entries: u64,
+    /// Entries in `by_addr.idx` — one per row that has a credential, and the
+    /// number is a measurement: `rows − addr_unkeyed` is what the derivation found.
+    pub by_addr_entries: u64,
+    /// Live rows by what their address keyed on. Three numbers rather than one so
+    /// the dispatch is measured rather than assumed: a policy of "slice bytes
+    /// 1..29" is wrong for Byron alone, and only the count says whether mainnet
+    /// exercises that arm.
+    pub addr_payment: u64,
+    pub addr_stake: u64,
+    pub addr_bootstrap: u64,
+    /// Live rows whose address pallas would not parse, so nothing could key them.
+    /// Expected to be zero; `by_addr_entries + addr_unkeyed == rows` is the
+    /// identity that says so, and it is checked rather than hoped for.
+    pub addr_unkeyed: u64,
     /// Σ lovelace over live rows, for the one check that has an outside oracle.
     pub live_lovelace: u128,
     pub live_assets: u64,
@@ -536,13 +568,14 @@ impl Book {
 
         // The live totals come from the compacted file rather than from the
         // create path: `rows.bin` holds only live rows, so a sequential scan of
-        // it *is* the live set. The scan also collects `by_policy`'s raw material,
-        // because it already reads every asset record to skip past it.
+        // it *is* the live set. The scan also collects the raw material of both
+        // derived orderings — `by_policy`'s and `by_addr`'s — because it already
+        // reads every address and every asset record to step past them.
         //
         // One function rather than a scan per consumer: the scan is the expensive
         // part, and sharing it removes the possibility of the totals and the
         // ordering disagreeing about which rows exist. `reindex` calls the same one.
-        let scan = scan_rows(&rows_path, self.policy_order.len())?;
+        let mut scan = scan_rows(&rows_path, self.policy_order.len())?;
         self.cost.live_lovelace = scan.live_lovelace;
         self.cost.live_assets = scan.live_assets;
 
@@ -602,22 +635,16 @@ impl Book {
 
         write_ordering(&self.dir, "by_outref.idx", "dir.idx", &entries)?;
 
-        // The second ordering, from the raw material the scan above collected.
-        let policy_entries = policy_perms(&scan.row_policies, &self.policy_order)?;
-        write_ordering(
-            &self.dir,
-            "by_policy.idx",
-            "policy.dir.idx",
-            &policy_entries,
-        )?;
-        self.cost.by_policy_entries = policy_entries.len() as u64;
-        write_ordering(
-            &self.dir,
-            "by_policy.idx",
-            "policy.dir.idx",
-            &policy_entries,
-        )?;
-        self.cost.by_policy_entries = policy_entries.len() as u64;
+        // The derived orderings, from the raw material the scan above collected.
+        // One call, so `reindex` writes the same bytes — and so the two of them
+        // cannot disagree about what a derived view contains.
+        let derived = write_derived_orderings(&self.dir, &mut scan, &self.policy_order)?;
+        self.cost.by_policy_entries = derived.policy_entries;
+        self.cost.by_addr_entries = derived.addr_entries;
+        self.cost.addr_payment = derived.addr_payment;
+        self.cost.addr_stake = derived.addr_stake;
+        self.cost.addr_bootstrap = derived.addr_bootstrap;
+        self.cost.addr_unkeyed = derived.addr_unkeyed;
 
         let mut p = BufWriter::with_capacity(1 << 20, File::create(self.dir.join("policy.tbl"))?);
         p.write_all(&LAYOUT_VERSION.to_le_bytes())?;
@@ -638,6 +665,11 @@ impl Book {
         writeln!(m, "rows_bytes {rows_bytes}")?;
         writeln!(m, "by_outref_entries {}", entries.len())?;
         writeln!(m, "policies {}", self.policy_order.len())?;
+        writeln!(m, "by_addr_entries {}", self.cost.by_addr_entries)?;
+        writeln!(m, "addr_payment {}", self.cost.addr_payment)?;
+        writeln!(m, "addr_stake {}", self.cost.addr_stake)?;
+        writeln!(m, "addr_bootstrap {}", self.cost.addr_bootstrap)?;
+        writeln!(m, "addr_unkeyed {}", self.cost.addr_unkeyed)?;
         writeln!(m, "compactions {}", self.cost.compactions)?;
         writeln!(m, "rehashes {}", self.cost.rehashes)?;
         writeln!(m, "distinct_prefixes {}", self.cost.distinct_prefixes)?;
@@ -682,9 +714,13 @@ fn mix32(mut x: u32) -> u32 {
 
 /// What a read-back of one ordering found.
 ///
-/// Its own type rather than more fields on `VerifyReport`, because the artifact
-/// now has two orderings and a third (`by_addr`) is designed — and a check that
-/// cannot be pointed at an ordering is a check that gets copied.
+/// Its own type rather than a set of fields on `VerifyReport`, because the
+/// artifact has **three** orderings and they are checked identically: one
+/// `Ordering` each, one `verify_ordering` call each, differing only in the confirm
+/// that ties an entry to its row. Written when there were two, and it is what made
+/// the third cost a call rather than a function — a check that cannot be pointed
+/// at an ordering is a check that gets copied, and the copy is where a reader
+/// stops reading.
 #[derive(Default, Debug)]
 pub struct Ordering {
     pub entries: u64,
@@ -704,33 +740,24 @@ impl Ordering {
     }
 }
 
-/// What a read-back of a published artifact found.
+/// What a read-back of a published artifact found: one `Ordering` per ordering,
+/// each held to the same generic properties.
+///
+/// Three of them rather than three sets of fields on this struct, because a check
+/// that cannot be pointed at an ordering is a check that gets copied — and the
+/// copy is where a reader stops reading. `by_outref` was written before a second
+/// ordering existed and `by_policy` was written as its copy; `by_addr` is the
+/// third, and it cost a call rather than a function.
 #[derive(Default, Debug)]
 pub struct VerifyReport {
-    pub entries: u64,
-    pub sampled: u64,
-    pub unsorted: u64,
-    pub dir_violations: u64,
-    /// Rows whose own outref does not hash to the prefix the index sent us to.
-    pub prefix_mismatches: u64,
-    pub rows_out_of_range: u64,
-    pub rows_ill_formed: u64,
-    pub lookup_nanos: u128,
-    /// `by_policy.idx`. Checked by `verify_policy` rather than folded in with the
-    /// `by_outref` checks above, which were written before a second ordering
-    /// existed; uniting them is a tidy-up, not a correctness gap — the two check
-    /// the same generic properties and each has its own confirm.
+    pub outref: Ordering,
     pub policy: Ordering,
+    pub addr: Ordering,
 }
 
 impl VerifyReport {
     pub fn failures(&self) -> u64 {
-        self.unsorted
-            + self.dir_violations
-            + self.prefix_mismatches
-            + self.rows_out_of_range
-            + self.rows_ill_formed
-            + self.policy.failures()
+        self.outref.failures() + self.policy.failures() + self.addr.failures()
     }
 }
 
@@ -745,15 +772,17 @@ impl VerifyReport {
 /// to the two properties `B5` claims for them (canonical order, and a directory
 /// that partitions the array).
 ///
-/// It also times the lookup, which is the number that decides whether this
+/// It also times the lookups, which is the number that decides whether this
 /// replaces a `redb` point read rather than being a second store beside it.
 pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
     let meta = std::fs::read_to_string(dir.join("book.meta"))
         .with_context(|| format!("reading {}/book.meta", dir.display()))?;
-    let field = |k: &str| -> Result<u64> {
+    let meta_field = |k: &str| -> Option<u64> {
         meta.lines()
             .find_map(|l| l.strip_prefix(k).and_then(|r| r.trim().parse().ok()))
-            .with_context(|| format!("book.meta has no `{k}`"))
+    };
+    let field = |k: &str| -> Result<u64> {
+        meta_field(k).with_context(|| format!("book.meta has no `{k}`"))
     };
 
     let layout = field("layout_version")? as u32;
@@ -763,37 +792,104 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
     let rows_live = field("rows")?;
     let rows_bytes = field("rows_bytes")?;
     let declared = field("by_outref_entries")?;
-
-    let mut rep = VerifyReport::default();
+    // Optional, and only cross-checked when present: an artifact that predates
+    // `by_addr` and has since been reindexed carries the file and the line, but a
+    // hand-built or future-written artifact might carry the file without the line.
+    // The count that matters is the one in the file, which `verify_ordering` reads
+    // itself — this is a second opinion, not the source.
+    let declared_addr = meta_field("by_addr_entries");
 
     let rows_len = std::fs::metadata(dir.join("rows.bin"))?.len();
     if rows_len != rows_bytes {
         bail!("rows.bin is {rows_len} B; book.meta claims {rows_bytes}");
     }
 
-    let raw = std::fs::read(dir.join("by_outref.idx"))?;
-    if raw.len() < 12 {
-        bail!("by_outref.idx is too short to hold a header");
+    let mut rep = VerifyReport {
+        outref: verify_ordering(dir, "by_outref.idx", "dir.idx", sample, |f, off, len| {
+            read_row_outref(f, off, len).map(|o| vec![split(&o.0, o.1).0])
+        })?,
+        ..VerifyReport::default()
+    };
+    if rep.outref.entries != declared || rep.outref.entries != rows_live {
+        bail!(
+            "by_outref.idx holds {}: book.meta says {declared} entries and {rows_live} rows",
+            rep.outref.entries
+        );
     }
-    let ilayout = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
-    if ilayout != LAYOUT_VERSION {
-        bail!("by_outref.idx is layout_version {ilayout}; this build reads {LAYOUT_VERSION}");
+
+    // The `by_policy` confirm is the one that has to reach into a row's body: the
+    // entry carries a *policy* prefix, so corroborating it means parsing the asset
+    // records, resolving each interned id through `policy.tbl`, and finding that
+    // prefix among them. A row that merely exists at the offset is not enough —
+    // which is the difference between "the offset is in range" and "this row is
+    // why the entry is here".
+    let policies = read_policy_tbl(dir)?;
+    rep.policy = verify_ordering(
+        dir,
+        "by_policy.idx",
+        "policy.dir.idx",
+        sample,
+        |f, off, len| row_policy_prefixes(f, off, len, &policies),
+    )?;
+
+    // And `by_addr`'s is the strongest of the three, because it re-derives: the
+    // entry claims a credential prefix and the only way to check it is to run the
+    // same derivation the builder ran over the same bytes. A wrong `1..29` offset
+    // in the derivation cannot pass its own check.
+    rep.addr = verify_ordering(dir, "by_addr.idx", "addr.dir.idx", sample, row_cred_prefix)?;
+    if rep.addr.entries != rows_live {
+        bail!(
+            "by_addr.idx holds {} entries against {rows_live} rows — the two orderings are \
+             not permutations of the same row set, so the index is missing rows",
+            rep.addr.entries
+        );
+    }
+    if let Some(d) = declared_addr
+        && rep.addr.entries != d
+    {
+        bail!(
+            "by_addr.idx holds {} entries; book.meta says {d}",
+            rep.addr.entries
+        );
+    }
+
+    Ok(rep)
+}
+
+/// Check one ordering the way a consumer reads it: canonical order, a directory
+/// that partitions the entry array, and a sample of entries whose prefix the row
+/// they point at has to corroborate.
+///
+/// `confirm` derives the prefixes the row at `offset` actually supports; the
+/// entry is a failure unless its prefix is one of them. Everything else here is
+/// ordering-agnostic, which is the point — the three orderings differ only in
+/// what `confirm` reaches into, and the shared writer (`write_ordering`) is what
+/// makes them share an entry width, a canonical order and a directory fill.
+fn verify_ordering(
+    dir: &Path,
+    table: &str,
+    directory: &str,
+    sample: u64,
+    confirm: impl Fn(&mut File, u64, u64) -> Result<Vec<u64>, RowRead>,
+) -> Result<Ordering> {
+    let rows_bytes = std::fs::metadata(dir.join("rows.bin"))
+        .with_context(|| format!("reading {}/rows.bin", dir.display()))?
+        .len();
+    let raw = std::fs::read(dir.join(table)).with_context(|| format!("reading {table}"))?;
+    let mut rep = Ordering::default();
+    if raw.len() < 12 {
+        bail!("{table} is too short to hold a header");
+    }
+    let il = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
+    if il != LAYOUT_VERSION {
+        bail!("{table} is layout_version {il}; this build reads {LAYOUT_VERSION}");
     }
     let count = u64::from_le_bytes(raw[4..12].try_into().expect("8 bytes"));
-    if count != declared || count != rows_live {
-        bail!(
-            "by_outref.idx holds {count}: book.meta says {declared} entries and {rows_live} rows"
-        );
-    }
     let want = 12 + 12 * count as usize;
     if raw.len() != want {
-        bail!(
-            "by_outref.idx is {} B; {count} entries need {want}",
-            raw.len()
-        );
+        bail!("{table} is {} B; {count} entries need {want}", raw.len());
     }
     rep.entries = count;
-
     let entry = |i: usize| -> (u64, u32) {
         let b = &raw[12 + 12 * i..];
         (
@@ -810,25 +906,19 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
         }
     }
 
-    let draw = std::fs::read(dir.join("dir.idx"))?;
+    let draw =
+        std::fs::read(dir.join(directory)).with_context(|| format!("reading {directory}"))?;
     if draw.len() < 8 {
-        bail!("dir.idx is too short to hold a header");
+        bail!("{directory} is too short to hold a header");
     }
     let dl = u32::from_le_bytes(draw[0..4].try_into().expect("4 bytes"));
-    if dl != LAYOUT_VERSION {
-        bail!("dir.idx is layout_version {dl}; this build reads {LAYOUT_VERSION}");
-    }
     let dbits = u32::from_le_bytes(draw[4..8].try_into().expect("4 bytes"));
-    if dbits != DIR_BITS {
-        bail!("dir.idx has DIR_BITS {dbits}; this build reads {DIR_BITS}");
+    if dl != LAYOUT_VERSION || dbits != DIR_BITS {
+        bail!("{directory} has layout {dl} / DIR_BITS {dbits}");
     }
     let n_buckets = 1usize << dbits;
-    let want_dir = 8 + n_buckets * 4;
-    if draw.len() != want_dir {
-        bail!(
-            "dir.idx is {} B; {n_buckets} buckets need {want_dir}",
-            draw.len()
-        );
+    if draw.len() != 8 + n_buckets * 4 {
+        bail!("{directory} is {} B", draw.len());
     }
     let bucket = |b: usize| -> u32 {
         u32::from_le_bytes(draw[8 + 4 * b..8 + 4 * b + 4].try_into().expect("4 bytes"))
@@ -869,132 +959,64 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
         sample.min(count)
     };
     let step = (count / take.max(1)).max(1) as usize;
-    let mut f = File::open(dir.join("rows.bin"))?;
+    let rows_path = dir.join("rows.bin");
+    let mut f = File::open(&rows_path)
+        .with_context(|| format!("opening {} ({table} points into it)", rows_path.display()))?;
     let t = Instant::now();
     let mut i = 0usize;
     while i < count as usize {
         let (prefix, row) = entry(i);
-        match read_row_outref(&mut f, u64::from(row), rows_bytes) {
-            Ok(oref) => {
-                if split(&oref.0, oref.1).0 != prefix {
-                    rep.prefix_mismatches += 1;
-                }
-            }
-            Err(RowRead::OutOfRange) => rep.rows_out_of_range += 1,
-            Err(RowRead::Short) => rep.rows_ill_formed += 1,
-        }
-        rep.sampled += 1;
-        i += step;
-    }
-    rep.lookup_nanos = t.elapsed().as_nanos();
-    rep.policy = verify_policy(dir, sample)?;
-    Ok(rep)
-}
-
-/// Check `by_policy.idx` the same way: canonical order, a directory that
-/// partitions, and a sample of entries whose prefix the row has to corroborate.
-///
-/// The confirm here is stronger than the outref one and worth stating: the entry
-/// carries a *policy* prefix, so corroborating it means parsing the row's asset
-/// records, resolving each interned id through `policy.tbl`, and checking that one
-/// of the row's policies leads with that prefix. A row that merely exists at the
-/// offset is not enough — which is the difference between "the offset is in range"
-/// and "this row is why the entry is here".
-fn verify_policy(dir: &Path, sample: u64) -> Result<Ordering> {
-    let policies = read_policy_tbl(dir)?;
-
-    let rows_bytes = std::fs::metadata(dir.join("rows.bin"))?.len();
-    let raw = std::fs::read(dir.join("by_policy.idx"))?;
-    let mut rep = Ordering::default();
-    if raw.len() < 12 {
-        bail!("by_policy.idx is too short to hold a header");
-    }
-    let il = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
-    if il != LAYOUT_VERSION {
-        bail!("by_policy.idx is layout_version {il}; this build reads {LAYOUT_VERSION}");
-    }
-    let count = u64::from_le_bytes(raw[4..12].try_into().expect("8 bytes"));
-    let want = 12 + 12 * count as usize;
-    if raw.len() != want {
-        bail!(
-            "by_policy.idx is {} B; {count} entries need {want}",
-            raw.len()
-        );
-    }
-    rep.entries = count;
-    let entry = |i: usize| -> (u64, u32) {
-        let b = &raw[12 + 12 * i..];
-        (
-            u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
-            u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
-        )
-    };
-    for i in 1..count as usize {
-        if entry(i).0 < entry(i - 1).0 {
-            rep.unsorted += 1;
-        }
-    }
-
-    let draw = std::fs::read(dir.join("policy.dir.idx"))?;
-    let dl = u32::from_le_bytes(draw[0..4].try_into().expect("4 bytes"));
-    let dbits = u32::from_le_bytes(draw[4..8].try_into().expect("4 bytes"));
-    if dl != LAYOUT_VERSION || dbits != DIR_BITS {
-        bail!("policy.dir.idx has layout {dl} / DIR_BITS {dbits}");
-    }
-    let n_buckets = 1usize << dbits;
-    if draw.len() != 8 + n_buckets * 4 {
-        bail!("policy.dir.idx is {} B", draw.len());
-    }
-    let bucket = |b: usize| -> u32 {
-        u32::from_le_bytes(draw[8 + 4 * b..8 + 4 * b + 4].try_into().expect("4 bytes"))
-    };
-    let mut prev = 0u32;
-    for b in 0..n_buckets {
-        let v = bucket(b);
-        if v < prev || u64::from(v) > count {
-            rep.dir_violations += 1;
-        }
-        prev = v;
-    }
-    for b in 0..n_buckets {
-        let start = bucket(b) as usize;
-        let end = if b + 1 < n_buckets {
-            bucket(b + 1) as usize
-        } else {
-            count as usize
-        };
-        if start >= end {
-            continue;
-        }
-        if (entry(start).0 >> (64 - dbits)) as usize != b {
-            rep.dir_violations += 1;
-        }
-    }
-
-    let take = if sample == 0 {
-        count
-    } else {
-        sample.min(count)
-    };
-    let step = (count / take.max(1)).max(1) as usize;
-    let mut f = File::open(dir.join("rows.bin"))?;
-    let t = Instant::now();
-    let mut i = 0usize;
-    while i < count as usize {
-        let (prefix, row) = entry(i);
-        match row_policy_prefixes(&mut f, u64::from(row), rows_bytes, &policies) {
+        match confirm(&mut f, u64::from(row), rows_bytes) {
             Ok(prefixes) => {
                 if !prefixes.contains(&prefix) {
                     rep.mismatches += 1;
                 }
             }
-            Err(_) => rep.out_of_range += 1,
+            Err(RowRead::OutOfRange) => rep.out_of_range += 1,
+            Err(RowRead::Short) => rep.ill_formed += 1,
         }
         rep.sampled += 1;
         i += step;
     }
     rep.lookup_nanos = t.elapsed().as_nanos();
     Ok(rep)
+}
+
+/// The credential prefix the row at `offset` actually has — `by_addr`'s confirm.
+///
+/// It re-derives rather than reading anything the builder wrote, which is what
+/// makes it a check and not a restatement: if `credential` read the wrong offset,
+/// the builder and this reader would read the same wrong offset together and
+/// agree. They still would — a confirm cannot falsify a shared derivation. What
+/// it falsifies is everything *around* the derivation: an entry pointing at the
+/// wrong row, a prefix written from a different field, a row whose bytes are not
+/// the address the entry claims. The derivation itself is falsified against
+/// pallas's own decode, which is a different implementation.
+fn row_cred_prefix(f: &mut File, offset: u64, rows_bytes: u64) -> Result<Vec<u64>, RowRead> {
+    let addr = read_row_address(f, offset, rows_bytes)?;
+    Ok(match address::credential(&addr) {
+        Some(c) => vec![c.prefix()],
+        None => Vec::new(),
+    })
+}
+
+/// The address bytes of the row at `offset`.
+fn read_row_address(f: &mut File, offset: u64, rows_bytes: u64) -> Result<Vec<u8>, RowRead> {
+    let base = offset + ROW_HEADER as u64;
+    if base > rows_bytes {
+        return Err(RowRead::OutOfRange);
+    }
+    let mut head = [0u8; ROW_HEADER];
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|_| RowRead::Short)?;
+    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
+    let addr_len = u64::from(u16::from_le_bytes([head[49], head[50]]));
+    if base + addr_len > rows_bytes {
+        return Err(RowRead::OutOfRange);
+    }
+    let mut addr = vec![0u8; addr_len as usize];
+    f.read_exact(&mut addr).map_err(|_| RowRead::Short)?;
+    Ok(addr)
 }
 
 /// Every *distinct* policy prefix the row at `offset` holds, resolved through the
@@ -1156,28 +1178,48 @@ fn read_policy_tbl(dir: &Path) -> Result<Vec<[u8; 28]>> {
         .collect())
 }
 
-/// What one sequential scan of `rows.bin` yields.
-pub struct RowScan {
-    pub live_lovelace: u128,
-    pub live_assets: u64,
+/// What one sequential scan of `rows.bin` yields — the raw material of every
+/// ordering that is a function of the rows alone.
+struct RowScan {
+    live_lovelace: u128,
+    live_assets: u64,
     /// One entry per `(row, policy)`, not per asset name: a row holding two assets
     /// of one policy yields one entry, which is what makes an enumeration return a
     /// ref once rather than once per name it holds.
-    pub row_policies: Vec<(u32, u32)>,
+    row_policies: Vec<(u32, u32)>,
+    /// One entry per row that has a credential, already in `Perm` shape with the
+    /// credential's leading 8 bytes as its prefix. Sorted by the caller, in place.
+    row_addr: Vec<Perm>,
+    /// Live rows by what their address keyed on. See `Cost`.
+    addr_payment: u64,
+    addr_stake: u64,
+    addr_bootstrap: u64,
+    addr_unkeyed: u64,
 }
 
-/// One sequential scan of `rows.bin`, returning what two consumers want from it:
-/// the live totals the identities compare, and the raw material of `by_policy`.
+/// One sequential scan of `rows.bin`, returning what three consumers want from it:
+/// the live totals the identities compare, the raw material of `by_policy`, and
+/// the raw material of `by_addr`.
 ///
 /// One function rather than a scan per consumer. The scan is the expensive part,
-/// and sharing it removes the possibility of the totals and the ordering disagreeing
-/// about which rows exist. `finish` calls it during a build; `reindex` calls it
-/// against an artifact that already exists.
+/// and sharing it removes the possibility of the totals and the orderings
+/// disagreeing about which rows exist. `finish` calls it during a build; `reindex`
+/// calls it against an artifact that already exists.
+///
+/// It is also where the credential is derived, which is what makes `by_addr`
+/// **reindexable**: the address is in the row, so a view keyed on it never needs
+/// the walk that wrote the row — the same property that let `by_policy` be added
+/// to a finished artifact for 5.5 s instead of 50 minutes.
 fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
     let mut out = RowScan {
         live_lovelace: 0,
         live_assets: 0,
         row_policies: Vec::new(),
+        row_addr: Vec::new(),
+        addr_payment: 0,
+        addr_stake: 0,
+        addr_bootstrap: 0,
+        addr_unkeyed: 0,
     };
     let mut r = BufReader::with_capacity(4 << 20, File::open(rows_path)?);
     let mut head = [0u8; ROW_HEADER];
@@ -1198,6 +1240,21 @@ fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
         // order `compact_into` parses.
         let mut addr = vec![0u8; addr_len];
         r.read_exact(&mut addr)?;
+        match address::credential(&addr) {
+            Some(c) => {
+                out.row_addr.push(Perm {
+                    prefix: c.prefix(),
+                    tail: 0,
+                    row: row_offset,
+                });
+                match c.kind {
+                    Kind::Payment => out.addr_payment += 1,
+                    Kind::Stake => out.addr_stake += 1,
+                    Kind::Bootstrap => out.addr_bootstrap += 1,
+                }
+            }
+            None => out.addr_unkeyed += 1,
+        }
         let mut payload = 0usize;
         let mut last_id: Option<u32> = None;
         for _ in 0..n_assets {
@@ -1258,9 +1315,67 @@ fn policy_perms(pairs: &[(u32, u32)], policies: &[[u8; 28]]) -> Result<Vec<Perm>
     Ok(entries)
 }
 
+/// What the derived orderings came to, for the cost and for the reindex report.
+struct Derived {
+    policy_entries: u64,
+    addr_entries: u64,
+    addr_payment: u64,
+    addr_stake: u64,
+    addr_bootstrap: u64,
+    addr_unkeyed: u64,
+}
+
+/// Write the orderings that are a function of the rows, and report what they came
+/// to — `by_policy.idx` + `policy.dir.idx`, `by_addr.idx` + `addr.dir.idx`.
+///
+/// One function because `finish` and `reindex` both need it, and because the last
+/// time this was written twice in one function the second copy was a duplicate of
+/// the first. A repair that produces a different artifact from the build is not a
+/// repair, and the way to make that impossible is to not have two of them.
+///
+/// The `by_addr` identity is checked here, where both numbers are in hand:
+/// **every row has a credential, or the derivation has a hole in it.** A row whose
+/// address pallas refuses is not silently unkeyed — it is counted, and the count
+/// is asserted to be zero against the rows the scan found. An artifact built from
+/// a chain that genuinely carries such a row will fail to build rather than serve
+/// an index that quietly omits it.
+fn write_derived_orderings(
+    dir: &Path,
+    scan: &mut RowScan,
+    policies: &[[u8; 28]],
+) -> Result<Derived> {
+    let policy_entries = policy_perms(&scan.row_policies, policies)?;
+    write_ordering(dir, "by_policy.idx", "policy.dir.idx", &policy_entries)?;
+
+    scan.row_addr.sort_unstable();
+    let addr_entries = scan.row_addr.len() as u64;
+    write_ordering(dir, "by_addr.idx", "addr.dir.idx", &scan.row_addr)?;
+
+    let rows = addr_entries + scan.addr_unkeyed;
+    if scan.addr_unkeyed > 0 {
+        bail!(
+            "{} of {rows} rows hold an address with no derivable credential, so \
+             `by_addr` is not a permutation of the rows",
+            scan.addr_unkeyed
+        );
+    }
+    Ok(Derived {
+        policy_entries: policy_entries.len() as u64,
+        addr_entries,
+        addr_payment: scan.addr_payment,
+        addr_stake: scan.addr_stake,
+        addr_bootstrap: scan.addr_bootstrap,
+        addr_unkeyed: scan.addr_unkeyed,
+    })
+}
+
 /// What a reindex wrote.
 pub struct ReindexReport {
     pub policy_entries: u64,
+    pub addr_entries: u64,
+    pub addr_payment: u64,
+    pub addr_stake: u64,
+    pub addr_bootstrap: u64,
     pub outref_entries: u64,
 }
 
@@ -1271,12 +1386,15 @@ pub struct ReindexReport {
 /// over it (`B1`): a view can be added, or repaired, from an artifact that already
 /// exists. Without this, adding one means re-reading 215 GB to produce a file
 /// derivable from 1.8 GB of local disk — which is what happened once, for
-/// `by_policy`, and is why this exists.
+/// `by_policy`, and why this exists. `by_addr` cost the same: it was added to a
+/// finished whole-store artifact in a minute, not by re-walking 9,181 chunks.
 ///
 /// It does what is derivable and refuses to pretend otherwise:
 ///
 /// - `by_policy` from `rows.bin`, because the interned policy id is written inside
 ///   each row;
+/// - `by_addr` from `rows.bin`, because the address is written inside each row and
+///   its credential is a function of those bytes;
 /// - `dir.idx` from `by_outref.idx`, because a directory is a function of the
 ///   prefixes it indexes.
 ///
@@ -1288,9 +1406,8 @@ pub struct ReindexReport {
 /// repair cannot damage its own source.
 pub fn reindex(dir: &Path) -> Result<ReindexReport> {
     let policies = read_policy_tbl(dir)?;
-    let scan = scan_rows(&dir.join("rows.bin"), policies.len())?;
-    let entries = policy_perms(&scan.row_policies, &policies)?;
-    write_ordering(dir, "by_policy.idx", "policy.dir.idx", &entries)?;
+    let mut scan = scan_rows(&dir.join("rows.bin"), policies.len())?;
+    let derived = write_derived_orderings(dir, &mut scan, &policies)?;
 
     let raw = std::fs::read(dir.join("by_outref.idx"))?;
     if raw.len() < 12 {
@@ -1315,10 +1432,65 @@ pub fn reindex(dir: &Path) -> Result<ReindexReport> {
         .collect();
     write_directory(dir, "dir.idx", prefixes.iter().copied(), prefixes.len())?;
 
+    // Last, for the same reason `finish` writes it last: the file's presence and
+    // content should mean every write before it succeeded.
+    update_meta(dir, &derived)?;
+
     Ok(ReindexReport {
-        policy_entries: entries.len() as u64,
+        policy_entries: derived.policy_entries,
+        addr_entries: derived.addr_entries,
+        addr_payment: derived.addr_payment,
+        addr_stake: derived.addr_stake,
+        addr_bootstrap: derived.addr_bootstrap,
         outref_entries: n,
     })
+}
+
+/// Record what a repair wrote in `book.meta`, so the artifact describes itself
+/// after the repair as accurately as it did after the build.
+///
+/// `book.meta`'s presence means "everything before me passed", and a reindex is a
+/// pass over the same rows — it derives the same counts from the same bytes and
+/// asserts the same permutation identity, so it is entitled to update them. What
+/// it must not do is leave the file claiming an artifact that no longer exists:
+/// after a `by_addr` is added, a `book.meta` without `by_addr_entries` reads as an
+/// artifact with no address index.
+///
+/// Only the lines this tool computes are touched. Every other line is carried
+/// through verbatim, so a field written by a future builder is not silently
+/// dropped by an old reindex — and the file is rewritten whole rather than
+/// appended to, so running it twice does not accumulate.
+fn update_meta(dir: &Path, d: &Derived) -> Result<()> {
+    let path = dir.join("book.meta");
+    let old =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let ours = [
+        "by_policy_entries",
+        "by_addr_entries",
+        "addr_payment",
+        "addr_stake",
+        "addr_bootstrap",
+        "addr_unkeyed",
+    ];
+    let mut out: String = old
+        .lines()
+        .filter(|l| {
+            !ours
+                .iter()
+                .any(|k| l.strip_prefix(k).is_some_and(|r| r.starts_with(' ')))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    out.push_str(&format!("by_policy_entries {}\n", d.policy_entries));
+    out.push_str(&format!("by_addr_entries {}\n", d.addr_entries));
+    out.push_str(&format!("addr_payment {}\n", d.addr_payment));
+    out.push_str(&format!("addr_stake {}\n", d.addr_stake));
+    out.push_str(&format!("addr_bootstrap {}\n", d.addr_bootstrap));
+    out.push_str(&format!("addr_unkeyed {}\n", d.addr_unkeyed));
+    let tmp = dir.join("book.meta.new");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Position of the key in the table. Not a security boundary: the key is a

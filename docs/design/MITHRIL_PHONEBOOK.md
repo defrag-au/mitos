@@ -5,6 +5,13 @@ measured, on the ARM box, by `tools/fold-probe` — which is free to run there
 because the dolos import that was proving the node-shaped path was killed on
 2026-09-22. Everything outside §5b is still a sketch.
 
+*Two of the pieces this note argues for now exist, and they are documented where
+they live rather than here: `docs/design/LIVE_BOOK.md` is the artifact format
+(§B3a is the address credential, with the measured 384,625 Byron rows and 0
+reward addresses in the live set), and `docs/design/PHONEBOOK_COVERAGE.md` maps
+the module surface onto it and carries the whole-store verification figures. §3's
+"other phonebook volumes" are the ones still outstanding.*
+
 Owner: TBD
 Related:
 - `docs/design/FOOTPRINT_AND_MINIMUM_SPEC.md` — §7 “how far can dolos be

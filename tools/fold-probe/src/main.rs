@@ -73,6 +73,7 @@ use tx_index::extract::list_chunks;
 
 use crate::book::{Book, Datum};
 
+mod address;
 mod book;
 
 /// An outref: the key of the live set, and the thing a spend names.
@@ -149,9 +150,10 @@ struct FoldArgs {
     /// SipHash. Same run, one flag, so the difference is the hasher.
     #[arg(long, value_enum, default_value = "fx")]
     hasher: Hasher,
-    /// Build the live book (`rows.bin` + `by_outref.idx` + `dir.idx` +
-    /// `policy.tbl`, `LIVE_BOOK.md` phase 1) into this directory. Needs the
-    /// primitives walk, because the book wants addresses, values and datums.
+    /// Build the live book (`LIVE_BOOK.md` phase 1) into this directory: `rows.bin`,
+    /// `by_outref.idx` + `dir.idx`, `by_policy.idx` + `policy.dir.idx`,
+    /// `by_addr.idx` + `addr.dir.idx`, `policy.tbl`. Needs the primitives walk,
+    /// because the book wants addresses, values and datums.
     #[arg(long, value_name = "DIR")]
     book: Option<PathBuf>,
     /// Compact the book's scratch arena once it holds this many MiB of *dead*
@@ -1924,6 +1926,18 @@ fn fold(a: FoldArgs) -> Result<()> {
             cost.addrs_over_255,
             share(cost.addrs_over_255, cost.rows_live),
         );
+        // The by_addr distribution, per kind rather than per row: it is the only
+        // evidence that the dispatch is right for the shapes mainnet actually
+        // holds. A `by_addr` keyed on `address[1..29]` alone would be wrong for
+        // exactly one of these four numbers.
+        println!(
+            "  by_addr    {} entries — {} payment · {} stake · {} bootstrap · {} unkeyed",
+            cost.by_addr_entries,
+            cost.addr_payment,
+            cost.addr_stake,
+            cost.addr_bootstrap,
+            cost.addr_unkeyed,
+        );
         println!(
             "  against    the HashMap live set accounts {} for {} entries ({:.0} B/entry)",
             human_bytes(set.accounted_bytes() as u64),
@@ -1978,52 +1992,29 @@ fn fold(a: FoldArgs) -> Result<()> {
 fn verify(a: VerifyArgs) -> Result<()> {
     let rep = book::verify(&a.book, a.sample)?;
     println!("book verify — {}", a.book.display());
-    println!("  entries    {}", rep.entries);
-    println!(
-        "  sampled    {} entries resolved `dir.idx` → `by_outref.idx` → `rows.bin`",
-        rep.sampled
-    );
-    println!(
-        "  ordering   {} adjacent pairs out of canonical order",
-        rep.unsorted
-    );
-    println!(
-        "  directory  {} violations of the bucket partition",
-        rep.dir_violations
-    );
-    println!(
-        "  prefixes   {} rows whose own outref does not hash to the entry's prefix",
-        rep.prefix_mismatches
-    );
-    println!(
-        "  rows       {} pointing outside rows.bin · {} unreadable",
-        rep.rows_out_of_range, rep.rows_ill_formed
-    );
-    println!(
-        "  lookup     {:.0} ns · {:.1} s for {} samples",
-        rep.lookup_nanos as f64 / rep.sampled.max(1) as f64,
-        rep.lookup_nanos as f64 / 1e9,
-        rep.sampled,
-    );
-    let p = &rep.policy;
-    println!(
-        "  by_policy  {} entries resolved through policy.dir.idx",
-        p.entries
-    );
-    println!(
-        "             {} adjacent pairs out of canonical order · {} directory violations",
-        p.unsorted, p.dir_violations
-    );
-    println!(
-        "             {} rows that do not actually hold the policy the entry names",
-        p.mismatches
-    );
-    println!(
-        "             {} sampled · {:.0} ns · {} out of range",
-        p.sampled,
-        p.lookup_nanos as f64 / p.sampled.max(1) as f64,
-        p.out_of_range
-    );
+    // One line per ordering, from one check. The three differ in what a row has to
+    // corroborate and in nothing else, so printing them differently would be the
+    // reader inventing a distinction the verifier does not make.
+    for (name, o) in [
+        ("by_outref", &rep.outref),
+        ("by_policy", &rep.policy),
+        ("by_addr", &rep.addr),
+    ] {
+        println!("  {name:10} {} entries", o.entries);
+        println!(
+            "  {:10} {} out of canonical order · {} directory violations · {} entries whose \
+             row does not corroborate the prefix",
+            "", o.unsorted, o.dir_violations, o.mismatches
+        );
+        println!(
+            "  {:10} {} sampled · {:.0} ns · {} pointing outside rows.bin · {} unreadable",
+            "",
+            o.sampled,
+            o.lookup_nanos as f64 / o.sampled.max(1) as f64,
+            o.out_of_range,
+            o.ill_formed,
+        );
+    }
     if rep.failures() > 0 {
         bail!(
             "the artifact does not verify: {} failed checks",
@@ -2050,6 +2041,11 @@ fn reindex(a: ReindexArgs) -> Result<()> {
     println!(
         "  by_policy  {} entries → by_policy.idx + policy.dir.idx",
         rep.policy_entries
+    );
+    println!(
+        "  by_addr    {} entries → by_addr.idx + addr.dir.idx — {} payment · {} stake · \
+         {} bootstrap",
+        rep.addr_entries, rep.addr_payment, rep.addr_stake, rep.addr_bootstrap
     );
     println!(
         "  dir.idx    rebuilt over {} prefixes from by_outref.idx",
@@ -2376,9 +2372,18 @@ mod tests {
         let mut b = Book::create(&dir, 1 << 20).expect("create");
         // Two assets on the same policy in one row, plus a second policy, so the
         // (row, policy) dedup and the ordering are both exercised rather than
-        // assumed.
+        // assumed. The address is a real base address (57 bytes, header 0x01) whose
+        // payment credential varies per row — otherwise `by_addr`'s confirm would
+        // have nothing to reject, and a row whose address is three bytes long
+        // would make every row unkeyed.
         let pol_a = [0xAAu8; 28];
         let pol_b = [0xBBu8; 28];
+        let address = |i: u32| -> Vec<u8> {
+            let mut a = vec![0x01u8];
+            a.extend_from_slice(&[i as u8; 28]);
+            a.extend_from_slice(&[0xCD; 28]);
+            a
+        };
         for i in 0..64u32 {
             let h = Hash::<32>::from([i as u8; 32]);
             let v1: &[u8] = b"one";
@@ -2392,7 +2397,7 @@ mod tests {
                 (h, i % 3),
                 1,
                 1_000 * u64::from(i),
-                &[0x01, 0x02, 0x03][..],
+                &address(i),
                 Datum::None,
                 assets.into_iter(),
             )
@@ -2400,6 +2405,20 @@ mod tests {
         }
         let cost = b.finish().expect("finish");
         assert_eq!(cost.rows_live, 64);
+        assert_eq!(
+            cost.by_addr_entries, 64,
+            "one entry per row, and no row may be unkeyed"
+        );
+        assert_eq!(
+            (
+                cost.addr_payment,
+                cost.addr_stake,
+                cost.addr_bootstrap,
+                cost.addr_unkeyed
+            ),
+            (64, 0, 0, 0),
+            "every row here is a type-0 base address"
+        );
         // 32 rows carry both policies, 32 carry one: 96 (row, policy) pairs, and
         // *not* 160 — the two assets on `pol_a` in the same row are one entry.
         assert_eq!(
@@ -2409,8 +2428,40 @@ mod tests {
 
         let ok = book::verify(&dir, 0).expect("verify");
         assert_eq!(ok.failures(), 0, "a freshly built book must verify: {ok:?}");
-        assert_eq!(ok.sampled, 64);
+        assert_eq!(ok.outref.sampled, 64);
         assert_eq!(ok.policy.sampled, 96);
+        assert_eq!(ok.addr.sampled, 64);
+        assert_eq!(
+            ok.addr.entries, ok.outref.entries,
+            "`by_outref` and `by_addr` must be permutations of the same row set"
+        );
+        assert_eq!(
+            ok.addr.entries, 64,
+            "`by_addr` must hold one entry per live row — `book.meta` and the file agreeing \
+             on a smaller number would be the index quietly omitting rows"
+        );
+
+        // Phase 2a: point a `by_addr` entry at a row whose credential is different
+        // — the analogous targeted test, and the only check that can see it, since
+        // the prefix is untouched and the directory is still a partition.
+        let addr_path = dir.join("by_addr.idx");
+        let mut abytes = std::fs::read(&addr_path).expect("read by_addr.idx");
+        let original = abytes[12 + 8..12 + 12].to_vec();
+        // Row 1 begins at row 0's length: 56 header + 57 address + 3 assets × 16.
+        assert_eq!(
+            original,
+            0u32.to_le_bytes(),
+            "entry 0 is the row-0 credential"
+        );
+        abytes[12 + 8..12 + 12].copy_from_slice(&161u32.to_le_bytes());
+        std::fs::write(&addr_path, &abytes).expect("write by_addr.idx");
+        let bad_addr = book::verify(&dir, 0).expect("verify after credential swap");
+        assert!(
+            bad_addr.addr.mismatches > 0,
+            "an entry whose row carries a different credential must be caught: {bad_addr:?}"
+        );
+        abytes[12 + 8..12 + 12].copy_from_slice(&original);
+        std::fs::write(&addr_path, &abytes).expect("restore by_addr.idx");
 
         // Phase 2: point a `by_policy` entry at a row that does not hold that
         // policy. This is the targeted test of the confirm — the prefix is
@@ -2422,7 +2473,7 @@ mod tests {
         let pol_path = dir.join("by_policy.idx");
         let mut pbytes = std::fs::read(&pol_path).expect("read by_policy.idx");
         let original_row = pbytes[12 + 8..12 + 12].to_vec();
-        pbytes[12 + 8..12 + 12].copy_from_slice(&107u32.to_le_bytes());
+        pbytes[12 + 8..12 + 12].copy_from_slice(&161u32.to_le_bytes());
         std::fs::write(&pol_path, &pbytes).expect("write by_policy.idx");
         let bad_pol = book::verify(&dir, 0).expect("verify after row swap");
         assert!(
@@ -2463,12 +2514,17 @@ mod tests {
             let h = Hash::<32>::from([i as u8; 32]);
             let name: &[u8] = b"n";
             let assets: Vec<(&[u8], &[u8], u64)> = vec![(&pol, name, 1)];
-            b.create_output((h, i), 1, 5, &[0x01][..], Datum::None, assets.into_iter())
+            // A 29-byte enterprise address, so the shortest Shelley shape is also
+            // exercised rather than only the 57-byte one.
+            let mut addr = vec![0x61u8];
+            addr.extend_from_slice(&[i as u8; 28]);
+            b.create_output((h, i), 1, 5, &addr, Datum::None, assets.into_iter())
                 .expect("create_output");
         }
         b.finish().expect("finish");
 
         let built_policy = std::fs::read(dir.join("by_policy.idx")).expect("read built");
+        let built_addr = std::fs::read(dir.join("by_addr.idx")).expect("read built addr");
         let built_dir = std::fs::read(dir.join("dir.idx")).expect("read built dir");
 
         let rep = book::reindex(&dir).expect("reindex");
@@ -2477,9 +2533,18 @@ mod tests {
             "one entry per row, all on one policy"
         );
         assert_eq!(
+            rep.addr_entries, 32,
+            "one entry per row, one credential each"
+        );
+        assert_eq!(
             std::fs::read(dir.join("by_policy.idx")).expect("read"),
             built_policy,
             "reindex must reproduce the builder byte for byte"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("by_addr.idx")).expect("read"),
+            built_addr,
+            "and reproduce `by_addr`"
         );
         assert_eq!(
             std::fs::read(dir.join("dir.idx")).expect("read"),
@@ -2488,14 +2553,31 @@ mod tests {
         );
 
         // Damage the directory the way the old fill did — a bucket pointing past the
-        // one that follows it — then require the repair to fix it.
+        // one that follows it — then require the repair to fix it. The addr directory
+        // too, so the repair is exercised on an ordering that is not the first one.
         let mut d = std::fs::read(dir.join("dir.idx")).expect("read dir");
         d[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(dir.join("dir.idx"), &d).expect("write dir");
+        let mut ad = std::fs::read(dir.join("addr.dir.idx")).expect("read addr dir");
+        ad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(dir.join("addr.dir.idx"), &ad).expect("write addr dir");
         assert!(
             book::verify(&dir, 0).expect("verify").failures() > 0,
             "a bucket pointing past its successor must fail the partition check"
         );
+
+        // Strip the counts a repair records, so the repair has to put them back:
+        // `verify` must not require the line (the file's own header is the count),
+        // and `reindex` must not leave `book.meta` describing an artifact that no
+        // longer exists.
+        let meta_path = dir.join("book.meta");
+        let meta = std::fs::read_to_string(&meta_path).expect("read meta");
+        let stripped: String = meta
+            .lines()
+            .filter(|l| !l.starts_with("by_addr_") && !l.starts_with("addr_"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&meta_path, &stripped).expect("write meta");
 
         book::reindex(&dir).expect("reindex again");
         let after = book::verify(&dir, 0).expect("verify after repair");
@@ -2503,6 +2585,16 @@ mod tests {
             after.failures(),
             0,
             "the repair must satisfy the verifier: {after:?}"
+        );
+        let meta = std::fs::read_to_string(&meta_path).expect("read meta");
+        assert!(
+            meta.contains("by_addr_entries 32") && meta.contains("addr_payment 32"),
+            "reindex must record what it wrote: {meta}"
+        );
+        assert_eq!(
+            meta.matches("by_addr_entries").count(),
+            1,
+            "and running it again must not accumulate the line: {meta}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
