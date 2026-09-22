@@ -1995,6 +1995,25 @@ fn verify(a: VerifyArgs) -> Result<()> {
         rep.lookup_nanos as f64 / 1e9,
         rep.sampled,
     );
+    let p = &rep.policy;
+    println!(
+        "  by_policy  {} entries resolved through policy.dir.idx",
+        p.entries
+    );
+    println!(
+        "             {} adjacent pairs out of canonical order · {} directory violations",
+        p.unsorted, p.dir_violations
+    );
+    println!(
+        "             {} rows that do not actually hold the policy the entry names",
+        p.mismatches
+    );
+    println!(
+        "             {} sampled · {:.0} ns · {} out of range",
+        p.sampled,
+        p.lookup_nanos as f64 / p.sampled.max(1) as f64,
+        p.out_of_range
+    );
     if rep.failures() > 0 {
         bail!(
             "the artifact does not verify: {} failed checks",
@@ -2316,29 +2335,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut b = Book::create(&dir, 1 << 20).expect("create");
+        // Two assets on the same policy in one row, plus a second policy, so the
+        // (row, policy) dedup and the ordering are both exercised rather than
+        // assumed.
+        let pol_a = [0xAAu8; 28];
+        let pol_b = [0xBBu8; 28];
         for i in 0..64u32 {
             let h = Hash::<32>::from([i as u8; 32]);
+            let v1: &[u8] = b"one";
+            let v2: &[u8] = b"two";
+            let assets: Vec<(&[u8], &[u8], u64)> = if i % 2 == 0 {
+                vec![(&pol_a, v1, 1), (&pol_a, v2, 2), (&pol_b, v1, 3)]
+            } else {
+                vec![(&pol_b, v2, 4)]
+            };
             b.create_output(
                 (h, i % 3),
                 1,
                 1_000 * u64::from(i),
                 &[0x01, 0x02, 0x03][..],
                 Datum::None,
-                std::iter::empty::<(&[u8], &[u8], u64)>(),
+                assets.into_iter(),
             )
             .expect("create_output");
         }
         let cost = b.finish().expect("finish");
         assert_eq!(cost.rows_live, 64);
+        // 32 rows carry both policies, 32 carry one: 96 (row, policy) pairs, and
+        // *not* 160 — the two assets on `pol_a` in the same row are one entry.
+        assert_eq!(
+            cost.by_policy_entries, 96,
+            "one entry per (row, policy), not per asset name"
+        );
 
         let ok = book::verify(&dir, 0).expect("verify");
         assert_eq!(ok.failures(), 0, "a freshly built book must verify: {ok:?}");
         assert_eq!(ok.sampled, 64);
+        assert_eq!(ok.policy.sampled, 96);
 
-        // Flip the high byte of the first entry's prefix. That moves the entry out
-        // of the bucket the directory says it is in, so a reader that trusts the
-        // directory must notice — and a reader that only checks the row's own
-        // outref would not.
+        // Phase 2: point a `by_policy` entry at a row that does not hold that
+        // policy. This is the targeted test of the confirm — the prefix is
+        // untouched, so canonical order and the directory are both still valid and
+        // only the row-corroboration check can see it. Entry 0 is a `pol_a` entry
+        // (prefix sorted ascending, `0xAA…` < `0xBB…`); row 1 is an odd row, and
+        // odd rows hold only `pol_b`. Row 1's offset is row 0's length:
+        // 56 header + 3 address + 3 assets × (4 id + 1 name-len + 3 name + 8 qty).
+        let pol_path = dir.join("by_policy.idx");
+        let mut pbytes = std::fs::read(&pol_path).expect("read by_policy.idx");
+        let original_row = pbytes[12 + 8..12 + 12].to_vec();
+        pbytes[12 + 8..12 + 12].copy_from_slice(&107u32.to_le_bytes());
+        std::fs::write(&pol_path, &pbytes).expect("write by_policy.idx");
+        let bad_pol = book::verify(&dir, 0).expect("verify after row swap");
+        assert!(
+            bad_pol.policy.mismatches > 0,
+            "an entry naming a policy its row does not hold must be caught: {bad_pol:?}"
+        );
+        pbytes[12 + 8..12 + 12].copy_from_slice(&original_row);
+        std::fs::write(&pol_path, &pbytes).expect("restore by_policy.idx");
+
+        // Phase 3: the outref prefix, as before.
         let path = dir.join("by_outref.idx");
         let mut bytes = std::fs::read(&path).expect("read by_outref.idx");
         bytes[12] ^= 0xFF;

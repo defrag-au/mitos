@@ -101,6 +101,68 @@ impl Slot {
     }
 }
 
+/// One entry of a permutation: the 64-bit prefix a lookup matches, and the row it
+/// points at.
+///
+/// `tail` is the build's business — it is what makes the build index's key 96 bits
+/// wide and therefore confirm-free — and is deliberately **not** written to the
+/// artifact, where 64 bits plus a confirm against the row is the trade `B3` makes.
+/// That asymmetry is why this is a type rather than two tuples: every ordering
+/// hands the writer the same shape, so the entry width, the canonical order and
+/// the directory fill are written in one place.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Perm {
+    prefix: u64,
+    tail: u32,
+    row: u32,
+}
+
+/// Write one ordering: its `{u64 prefix, u32 row}` permutations in canonical
+/// order, plus a `2^21`-bucket directory over them.
+///
+/// Every ordering goes through here so they cannot disagree about the format, the
+/// canonical order, or the fill — and the fill is the part that was wrong. An
+/// empty bucket must carry the index of the next one that is not; filling with the
+/// entry count instead makes an empty bucket *precede* a non-empty one, so
+/// `buckets[b] > buckets[b + 1]`, the array stops being the partition `B5` claims,
+/// and a consumer reading the range as `end − start` underflows. `verify` catches
+/// it, and `a_book_round_trips_and_a_corrupted_entry_is_caught` guards the fix.
+fn write_ordering(dir: &Path, table: &str, directory: &str, entries: &[Perm]) -> Result<()> {
+    let mut w = BufWriter::with_capacity(4 << 20, File::create(dir.join(table))?);
+    w.write_all(&LAYOUT_VERSION.to_le_bytes())?;
+    w.write_all(&(entries.len() as u64).to_le_bytes())?;
+    for e in entries {
+        w.write_all(&e.prefix.to_le_bytes())?;
+        w.write_all(&e.row.to_le_bytes())?;
+    }
+    w.flush()?;
+
+    let n_buckets = 1usize << DIR_BITS;
+    let mut buckets = vec![EMPTY; n_buckets];
+    for (i, e) in entries.iter().enumerate() {
+        let b = (e.prefix >> (64 - DIR_BITS)) as usize;
+        if buckets[b] == EMPTY {
+            buckets[b] = i as u32;
+        }
+    }
+    let mut next = entries.len() as u32;
+    for b in (0..n_buckets).rev() {
+        if buckets[b] == EMPTY {
+            buckets[b] = next;
+        } else {
+            next = buckets[b];
+        }
+    }
+    let mut d = BufWriter::with_capacity(1 << 20, File::create(dir.join(directory))?);
+    d.write_all(&LAYOUT_VERSION.to_le_bytes())?;
+    d.write_all(&DIR_BITS.to_le_bytes())?;
+    for b in &buckets {
+        d.write_all(&b.to_le_bytes())?;
+    }
+    d.flush()?;
+    Ok(())
+}
+
 /// A datum as the walk sees it.
 pub enum Datum<'a> {
     None,
@@ -130,6 +192,8 @@ pub struct Cost {
     /// row read per candidate — and outputs of one transaction share their hash,
     /// and so their prefix, by construction. This is what a reader actually pays.
     pub distinct_prefixes: u64,
+    /// Entries in `by_policy.idx` — one per (row, policy), not per asset name.
+    pub by_policy_entries: u64,
     /// Σ lovelace over live rows, for the one check that has an outside oracle.
     pub live_lovelace: u128,
     pub live_assets: u64,
@@ -491,9 +555,16 @@ impl Book {
         // The live totals come from the compacted file rather than from the
         // create path: `rows.bin` holds only live rows, so a sequential scan of
         // it *is* the live set — and it is the same scan a verifier would run.
+        //
+        // `by_policy` is collected here for the same reason: this scan already
+        // reads every asset record to skip it, so the second ordering costs no
+        // extra I/O and no per-output work in the hot path. Deriving an ordering
+        // from the row store is also what `B1` says the orderings *are*.
+        let mut by_policy: Vec<(u32, u32)> = Vec::new();
         {
             let mut r = BufReader::with_capacity(4 << 20, File::open(&rows_path)?);
             let mut head = [0u8; ROW_HEADER];
+            let mut row_offset: u32 = 0;
             loop {
                 match r.read_exact(&mut head) {
                     Ok(()) => {}
@@ -511,6 +582,8 @@ impl Book {
                 // writer emits and the same order `compact_into` parses.
                 let mut addr = vec![0u8; addr_len];
                 r.read_exact(&mut addr)?;
+                let mut payload = 0usize;
+                let mut last_id: Option<u32> = None;
                 for _ in 0..n_assets {
                     let mut id = [0u8; 4];
                     r.read_exact(&mut id)?;
@@ -518,29 +591,56 @@ impl Book {
                     r.read_exact(&mut nl)?;
                     let mut name = vec![0u8; nl[0] as usize + 8];
                     r.read_exact(&mut name)?;
+                    payload += 4 + 1 + name.len();
+
+                    // Consecutive dedup is enough: a value's assets are grouped by
+                    // policy (it is a `BTreeMap` keyed by one), so a policy cannot
+                    // reappear later in the same row. One entry per (row, policy) is
+                    // what makes an enumeration return a ref once, not once per
+                    // asset name it holds.
+                    let id = u32::from_le_bytes(id);
+                    if last_id != Some(id) {
+                        if id as usize >= self.policy_order.len() {
+                            bail!(
+                                "row at {row_offset} names policy id {id}, but the table \
+                                 holds {}",
+                                self.policy_order.len()
+                            );
+                        }
+                        by_policy.push((id, row_offset));
+                        last_id = Some(id);
+                    }
                 }
                 let mut datum = vec![0u8; datum_len];
                 r.read_exact(&mut datum)?;
+                let row_len = ROW_HEADER + addr_len + payload + datum_len;
+                row_offset = row_offset
+                    .checked_add(u32::try_from(row_len).expect("row fits in u32"))
+                    .context("row offsets passed the u32 the directory addresses with")?;
             }
         }
 
         // The artifact index: 12-byte entries, canonical order. The build's key is
         // what decides whether the live set is correct, so two live rows on one
         // key is a hard failure rather than a print.
-        let mut entries: Vec<(u64, u32, u32)> = self
+        let mut entries: Vec<Perm> = self
             .slots
             .iter()
             .filter(|s| s.is_live())
-            .map(|s| (s.prefix, s.tail, s.row))
+            .map(|s| Perm {
+                prefix: s.prefix,
+                tail: s.tail,
+                row: s.row,
+            })
             .collect();
         entries.sort_unstable();
         for w in entries.windows(2) {
-            if w[0].0 == w[1].0 && w[0].1 == w[1].1 {
+            if w[0].prefix == w[1].prefix && w[0].tail == w[1].tail {
                 bail!(
                     "two live rows share a 96-bit key ({} / {}): the build index \
                      cannot tell them apart, so the live set it produced is wrong",
-                    w[0].0,
-                    w[0].1
+                    w[0].prefix,
+                    w[0].tail
                 );
             }
         }
@@ -552,7 +652,11 @@ impl Book {
         self.cost.distinct_prefixes = if entries.is_empty() {
             0
         } else {
-            entries.windows(2).filter(|w| w[0].0 != w[1].0).count() as u64 + 1
+            entries
+                .windows(2)
+                .filter(|w| w[0].prefix != w[1].prefix)
+                .count() as u64
+                + 1
         };
 
         // Settle the counts before anything is written, so a build whose two
@@ -570,44 +674,39 @@ impl Book {
             );
         }
 
-        let mut w =
-            BufWriter::with_capacity(4 << 20, File::create(self.dir.join("by_outref.idx"))?);
-        w.write_all(&LAYOUT_VERSION.to_le_bytes())?;
-        w.write_all(&(entries.len() as u64).to_le_bytes())?;
-        for (prefix, _tail, row) in &entries {
-            w.write_all(&prefix.to_le_bytes())?;
-            w.write_all(&row.to_le_bytes())?;
-        }
-        w.flush()?;
+        write_ordering(&self.dir, "by_outref.idx", "dir.idx", &entries)?;
 
-        let mut d = BufWriter::with_capacity(1 << 20, File::create(self.dir.join("dir.idx"))?);
-        d.write_all(&LAYOUT_VERSION.to_le_bytes())?;
-        d.write_all(&DIR_BITS.to_le_bytes())?;
-        let n_buckets = 1usize << DIR_BITS;
-        let mut buckets = vec![EMPTY; n_buckets];
-        for (i, (prefix, _t, _r)) in entries.iter().enumerate() {
-            let b = (prefix >> (64 - DIR_BITS)) as usize;
-            if buckets[b] == EMPTY {
-                buckets[b] = i as u32;
-            }
-        }
-        // Fill the gaps backwards, so an empty bucket carries the index of the next
-        // one that is not. That is what makes the array a partition (`B5`) — filling
-        // with `entries.len()` instead makes an empty bucket *precede* a non-empty
-        // one, so `buckets[b] > buckets[b + 1]`, the array is not monotone, and a
-        // consumer taking the range as `end − start` underflows.
-        let mut next = entries.len() as u32;
-        for b in (0..n_buckets).rev() {
-            if buckets[b] == EMPTY {
-                buckets[b] = next;
-            } else {
-                next = buckets[b];
-            }
-        }
-        for b in &buckets {
-            d.write_all(&b.to_le_bytes())?;
-        }
-        d.flush()?;
+        // The second ordering. Its prefix is the policy's leading 8 bytes — the same
+        // convention every ordering uses — and it needs no `tail`: a policy is
+        // exactly 28 bytes, so two distinct policies sharing a 64-bit prefix is
+        // 1.5e-9 at this cardinality, and the row confirm settles the rest.
+        //
+        // Note what the directory does and does not do here. Every row holding one
+        // policy shares its prefix, so they all land in a single bucket and the
+        // lookup is "find the run's start, then scan it" — which is exactly the
+        // query. Narrowing *within* a policy is the page cursor's job, not the
+        // directory's.
+        let mut policy_entries: Vec<Perm> = by_policy
+            .iter()
+            .map(|(id, row)| {
+                let policy = &self.policy_order[*id as usize];
+                let mut p = [0u8; 8];
+                p.copy_from_slice(&policy[0..8]);
+                Perm {
+                    prefix: u64::from_le_bytes(p),
+                    tail: 0,
+                    row: *row,
+                }
+            })
+            .collect();
+        policy_entries.sort_unstable();
+        write_ordering(
+            &self.dir,
+            "by_policy.idx",
+            "policy.dir.idx",
+            &policy_entries,
+        )?;
+        self.cost.by_policy_entries = policy_entries.len() as u64;
 
         let mut p = BufWriter::with_capacity(1 << 20, File::create(self.dir.join("policy.tbl"))?);
         p.write_all(&LAYOUT_VERSION.to_le_bytes())?;
@@ -631,6 +730,7 @@ impl Book {
         writeln!(m, "compactions {}", self.cost.compactions)?;
         writeln!(m, "rehashes {}", self.cost.rehashes)?;
         writeln!(m, "distinct_prefixes {}", self.cost.distinct_prefixes)?;
+        writeln!(m, "by_policy_entries {}", self.cost.by_policy_entries)?;
         writeln!(m, "max_addr_len {}", self.cost.max_addr_len)?;
         writeln!(m, "addrs_over_255 {}", self.cost.addrs_over_255)?;
         m.flush()?;
@@ -669,6 +769,30 @@ fn mix32(mut x: u32) -> u32 {
 
 // --------------------------------------------------------- reading it back
 
+/// What a read-back of one ordering found.
+///
+/// Its own type rather than more fields on `VerifyReport`, because the artifact
+/// now has two orderings and a third (`by_addr`) is designed — and a check that
+/// cannot be pointed at an ordering is a check that gets copied.
+#[derive(Default, Debug)]
+pub struct Ordering {
+    pub entries: u64,
+    pub sampled: u64,
+    pub unsorted: u64,
+    pub dir_violations: u64,
+    /// Entries whose prefix the row they point at does not corroborate.
+    pub mismatches: u64,
+    pub out_of_range: u64,
+    pub ill_formed: u64,
+    pub lookup_nanos: u128,
+}
+
+impl Ordering {
+    pub fn failures(&self) -> u64 {
+        self.unsorted + self.dir_violations + self.mismatches + self.out_of_range + self.ill_formed
+    }
+}
+
 /// What a read-back of a published artifact found.
 #[derive(Default, Debug)]
 pub struct VerifyReport {
@@ -681,6 +805,11 @@ pub struct VerifyReport {
     pub rows_out_of_range: u64,
     pub rows_ill_formed: u64,
     pub lookup_nanos: u128,
+    /// `by_policy.idx`. Checked by `verify_policy` rather than folded in with the
+    /// `by_outref` checks above, which were written before a second ordering
+    /// existed; uniting them is a tidy-up, not a correctness gap — the two check
+    /// the same generic properties and each has its own confirm.
+    pub policy: Ordering,
 }
 
 impl VerifyReport {
@@ -690,6 +819,7 @@ impl VerifyReport {
             + self.prefix_mismatches
             + self.rows_out_of_range
             + self.rows_ill_formed
+            + self.policy.failures()
     }
 }
 
@@ -846,7 +976,183 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
         i += step;
     }
     rep.lookup_nanos = t.elapsed().as_nanos();
+    rep.policy = verify_policy(dir, sample)?;
     Ok(rep)
+}
+
+/// Check `by_policy.idx` the same way: canonical order, a directory that
+/// partitions, and a sample of entries whose prefix the row has to corroborate.
+///
+/// The confirm here is stronger than the outref one and worth stating: the entry
+/// carries a *policy* prefix, so corroborating it means parsing the row's asset
+/// records, resolving each interned id through `policy.tbl`, and checking that one
+/// of the row's policies leads with that prefix. A row that merely exists at the
+/// offset is not enough — which is the difference between "the offset is in range"
+/// and "this row is why the entry is here".
+fn verify_policy(dir: &Path, sample: u64) -> Result<Ordering> {
+    let pt = std::fs::read(dir.join("policy.tbl"))?;
+    if pt.len() < 12 {
+        bail!("policy.tbl is too short to hold a header");
+    }
+    let pl = u32::from_le_bytes(pt[0..4].try_into().expect("4 bytes"));
+    if pl != LAYOUT_VERSION {
+        bail!("policy.tbl is layout_version {pl}; this build reads {LAYOUT_VERSION}");
+    }
+    let n_policies = u64::from_le_bytes(pt[4..12].try_into().expect("8 bytes"));
+    if pt.len() != 12 + 28 * n_policies as usize {
+        bail!(
+            "policy.tbl is {} B; {n_policies} policies need {}",
+            pt.len(),
+            12 + 28 * n_policies as usize
+        );
+    }
+    let policies: Vec<[u8; 28]> = (0..n_policies as usize)
+        .map(|i| {
+            let mut p = [0u8; 28];
+            p.copy_from_slice(&pt[12 + 28 * i..12 + 28 * i + 28]);
+            p
+        })
+        .collect();
+
+    let rows_bytes = std::fs::metadata(dir.join("rows.bin"))?.len();
+    let raw = std::fs::read(dir.join("by_policy.idx"))?;
+    let mut rep = Ordering::default();
+    if raw.len() < 12 {
+        bail!("by_policy.idx is too short to hold a header");
+    }
+    let il = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
+    if il != LAYOUT_VERSION {
+        bail!("by_policy.idx is layout_version {il}; this build reads {LAYOUT_VERSION}");
+    }
+    let count = u64::from_le_bytes(raw[4..12].try_into().expect("8 bytes"));
+    let want = 12 + 12 * count as usize;
+    if raw.len() != want {
+        bail!(
+            "by_policy.idx is {} B; {count} entries need {want}",
+            raw.len()
+        );
+    }
+    rep.entries = count;
+    let entry = |i: usize| -> (u64, u32) {
+        let b = &raw[12 + 12 * i..];
+        (
+            u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
+            u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
+        )
+    };
+    for i in 1..count as usize {
+        if entry(i).0 < entry(i - 1).0 {
+            rep.unsorted += 1;
+        }
+    }
+
+    let draw = std::fs::read(dir.join("policy.dir.idx"))?;
+    let dl = u32::from_le_bytes(draw[0..4].try_into().expect("4 bytes"));
+    let dbits = u32::from_le_bytes(draw[4..8].try_into().expect("4 bytes"));
+    if dl != LAYOUT_VERSION || dbits != DIR_BITS {
+        bail!("policy.dir.idx has layout {dl} / DIR_BITS {dbits}");
+    }
+    let n_buckets = 1usize << dbits;
+    if draw.len() != 8 + n_buckets * 4 {
+        bail!("policy.dir.idx is {} B", draw.len());
+    }
+    let bucket = |b: usize| -> u32 {
+        u32::from_le_bytes(draw[8 + 4 * b..8 + 4 * b + 4].try_into().expect("4 bytes"))
+    };
+    let mut prev = 0u32;
+    for b in 0..n_buckets {
+        let v = bucket(b);
+        if v < prev || u64::from(v) > count {
+            rep.dir_violations += 1;
+        }
+        prev = v;
+    }
+    for b in 0..n_buckets {
+        let start = bucket(b) as usize;
+        let end = if b + 1 < n_buckets {
+            bucket(b + 1) as usize
+        } else {
+            count as usize
+        };
+        if start >= end {
+            continue;
+        }
+        if (entry(start).0 >> (64 - dbits)) as usize != b {
+            rep.dir_violations += 1;
+        }
+    }
+
+    let take = if sample == 0 {
+        count
+    } else {
+        sample.min(count)
+    };
+    let step = (count / take.max(1)).max(1) as usize;
+    let mut f = File::open(dir.join("rows.bin"))?;
+    let t = Instant::now();
+    let mut i = 0usize;
+    while i < count as usize {
+        let (prefix, row) = entry(i);
+        match row_policy_prefixes(&mut f, u64::from(row), rows_bytes, &policies) {
+            Ok(prefixes) => {
+                if !prefixes.contains(&prefix) {
+                    rep.mismatches += 1;
+                }
+            }
+            Err(_) => rep.out_of_range += 1,
+        }
+        rep.sampled += 1;
+        i += step;
+    }
+    rep.lookup_nanos = t.elapsed().as_nanos();
+    Ok(rep)
+}
+
+/// Every *distinct* policy prefix the row at `offset` holds, resolved through the
+/// interning table. Consecutive dedup, for the same reason the builder uses it:
+/// a value's assets are grouped by policy, so one policy cannot reappear later in
+/// a row.
+fn row_policy_prefixes(
+    f: &mut File,
+    offset: u64,
+    rows_bytes: u64,
+    policies: &[[u8; 28]],
+) -> Result<Vec<u64>, RowRead> {
+    let base = offset + ROW_HEADER as u64;
+    if base > rows_bytes {
+        return Err(RowRead::OutOfRange);
+    }
+    let mut head = [0u8; ROW_HEADER];
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|_| RowRead::Short)?;
+    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
+    let addr_len = u64::from(u16::from_le_bytes([head[49], head[50]]));
+    let n_assets = u16::from_le_bytes([head[51], head[52]]);
+    f.seek(SeekFrom::Start(base + addr_len))
+        .map_err(|_| RowRead::Short)?;
+
+    let mut out: Vec<u64> = Vec::new();
+    let mut skip = Vec::new();
+    for _ in 0..n_assets {
+        let mut id = [0u8; 4];
+        f.read_exact(&mut id).map_err(|_| RowRead::Short)?;
+        let mut nl = [0u8; 1];
+        f.read_exact(&mut nl).map_err(|_| RowRead::Short)?;
+        skip.clear();
+        skip.resize(nl[0] as usize + 8, 0);
+        f.read_exact(&mut skip).map_err(|_| RowRead::Short)?;
+        let id = u32::from_le_bytes(id) as usize;
+        if id >= policies.len() {
+            return Err(RowRead::Short);
+        }
+        let mut p = [0u8; 8];
+        p.copy_from_slice(&policies[id][0..8]);
+        let prefix = u64::from_le_bytes(p);
+        if out.last() != Some(&prefix) {
+            out.push(prefix);
+        }
+    }
+    Ok(out)
 }
 
 enum RowRead {
