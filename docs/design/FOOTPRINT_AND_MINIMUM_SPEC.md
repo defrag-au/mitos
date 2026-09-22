@@ -11,6 +11,8 @@ Cross-references:
   benchmark + filesystem). This doc **absorbs W1e** and gives it pass criteria.
 - `docs/design/TX_INDEX_DATASOURCE.md`, `crates/tx-index/src/lib.rs` — the
   on-disk index format referred to in §3.
+- `docs/design/MITHRIL_PHONEBOOK.md` — why most of the dolos data dir is
+  not the phonebook we serve (sketch; not this phase).
 - `cnft.dev-workers/docs/operations/mitos-operations.md` — how the box is
   operated (no `nix develop` on the box; rsync, not push/pull).
 
@@ -188,6 +190,8 @@ Targets are filled in from measurement, not guessed here. Open per-profile
 questions this phase must answer:
 - How far can dolos be pruned? The archive (93 G) and index (39 G) are the
   bulk; which modules actually read history older than the 7-day aux window?
+  `docs/design/MITHRIL_PHONEBOOK.md` is the sketch that the live UTxO (~4 G
+  state) is the part we keep and the rest is a node-shaped extra.
 - What chunk window covers, say, 99% of input resolutions? Inputs skew young —
   measure the age distribution from resolution logs before picking a number.
 - What does `lean` trust? A remote resolver returns a body that the reader
