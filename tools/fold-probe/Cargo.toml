@@ -1,0 +1,28 @@
+# fold-probe — what a UTxO fold over the Mithril chunk log actually costs.
+#
+# A measurement tool, not a service. It depends on `tx-index` for
+# `list_chunks` (the one place that decides which chunks are complete) and on
+# `mitos-chain-walk` for `CHUNK_SLOTS`, so the windows it reports agree with
+# the walkers. No new external crates: every dependency below is already in
+# `[workspace.dependencies]`.
+[package]
+name = "fold-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Measure decode/apply split, same-chunk spend rate and live-set size for a UTxO fold over Mithril chunks"
+
+[[bin]]
+name = "fold-probe"
+path = "src/main.rs"
+
+[dependencies]
+tx-index = { path = "../../crates/tx-index" }
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+pallas-codec = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-traverse = { workspace = true }
+
+clap = { workspace = true }
+anyhow = { workspace = true }

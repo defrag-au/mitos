@@ -79,6 +79,11 @@ members = [
     "tools/wallet-sieve",
     "tools/wallet-trace",
     "tools/tx-index",
+    # Measures what a UTxO fold over the chunk log costs — decode/apply split,
+    # same-chunk spend rate, live-set size, peak anon RSS. A probe, not a
+    # service: it answers a question rather than serving one. See
+    # docs/design/MITHRIL_PHONEBOOK.md.
+    "tools/fold-probe",
     # Reads the chunk store, writes nothing: measures what a block-lottery
     # threshold would have selected over certified history.
     "tools/slotling-backtest",
