@@ -70,6 +70,10 @@ use pallas_primitives::{Hash, alonzo, babbage, conway};
 use pallas_traverse::{Era, MultiEraBlock, MultiEraOutput, MultiEraValue, OriginalHash};
 use tx_index::extract::list_chunks;
 
+use crate::book::{Book, Datum};
+
+mod book;
+
 /// An outref: the key of the live set, and the thing a spend names.
 type OutRef = (Hash<32>, u32);
 
@@ -123,6 +127,16 @@ struct FoldArgs {
     /// SipHash. Same run, one flag, so the difference is the hasher.
     #[arg(long, value_enum, default_value = "fx")]
     hasher: Hasher,
+    /// Build the live book (`rows.bin` + `by_outref.idx` + `dir.idx` +
+    /// `policy.tbl`, `LIVE_BOOK.md` phase 1) into this directory. Needs the
+    /// primitives walk, because the book wants addresses, values and datums.
+    #[arg(long, value_name = "DIR")]
+    book: Option<PathBuf>,
+    /// Compact the book's scratch arena once it holds this many MiB of *dead*
+    /// rows — rows the index no longer points at — so the `u32` row offset never
+    /// wraps. Small values force compactions, which is how that path is tested.
+    #[arg(long, default_value_t = 1024)]
+    book_compact_mb: u64,
 }
 
 #[derive(Args)]
@@ -354,14 +368,22 @@ fn split_blocks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
 /// is timed into `ChainStats`, never into `DecodeStats` — but it does sit inside
 /// the caller's `decode` timer, so a `--chain-decode` run reads the lean figure
 /// as `decode − chain`.
+///
+/// This is also the walk the book is fed from when a block is **not** a
+/// `ShelleyBlock`: Byron, whose spends are self-contained, and the epoch
+/// boundary. Feeding it here rather than in `plan_block_primitives` is not a
+/// preference — those blocks have no primitives representation to walk.
+#[allow(clippy::too_many_arguments)]
 fn plan_block(
     block: &MultiEraBlock<'_>,
     chunk: u16,
     plan: &mut BlockPlan,
     st: &mut DecodeStats,
     chain: Option<&mut ChainStats>,
-) {
+    mut book: Option<&mut Book>,
+) -> Result<()> {
     plan.clear();
+    let era_b = tx_index::format::era_to_u8(block.era());
     if !st.eras.contains(&block.era()) {
         st.eras.push(block.era());
     }
@@ -397,12 +419,18 @@ fn plan_block(
         let s0 = plan.spends.len() as u32;
         for inp in tx.consumes() {
             plan.spends.push((*inp.hash(), inp.index() as u32));
+            if let Some(bk) = book.as_deref_mut() {
+                bk.spend((*inp.hash(), inp.index() as u32));
+            }
         }
         let s1 = plan.spends.len() as u32;
 
         let c0 = plan.creates.len() as u32;
         for (i, o) in tx.outputs().iter().enumerate() {
             let f = classic_facts(&o.value(), o);
+            if let Some(bk) = book.as_deref_mut() {
+                feed_multi_era(bk, (hash, i as u32), era_b, o)?;
+            }
             note_output(st, plan, chunk, hash, i as u32, f);
         }
         let c1 = plan.creates.len() as u32;
@@ -413,6 +441,7 @@ fn plan_block(
         st.outputs += u64::from(c1 - c0);
     }
     st.blocks += 1;
+    Ok(())
 }
 
 // ------------------------------------------------- the primitives walk
@@ -693,6 +722,117 @@ fn decode_block_at(bytes: &[u8]) -> Result<(DecodedBlock<'_>, usize)> {
     Ok((blk, d.position()))
 }
 
+/// A post-Alonzo output's datum, as the book wants it. The bytes borrow from
+/// the option, so the returned `Datum` is tied to the reference, not to the
+/// `DatumOption`'s own lifetime.
+fn datum_of<'a, 'b>(d: Option<&'a DatumOption<'b>>) -> Datum<'a> {
+    match d {
+        Some(DatumOption::Hash(h)) => Datum::Hash(h.as_ref()),
+        Some(DatumOption::Data(w)) => Datum::Inline(w.0.raw_cbor()),
+        None => Datum::None,
+    }
+}
+
+/// One output into the book, from an Alonzo/Babbage value.
+fn feed_alonzo(
+    b: &mut Book,
+    oref: (Hash<32>, u32),
+    era: u8,
+    address: &[u8],
+    value: &alonzo::Value,
+    datum: Datum<'_>,
+) -> Result<()> {
+    match value {
+        alonzo::Value::Coin(c) => {
+            b.create_output(oref, era, *c, address, datum, std::iter::empty())
+        }
+        alonzo::Value::Multiasset(c, m) => b.create_output(
+            oref,
+            era,
+            *c,
+            address,
+            datum,
+            m.iter()
+                .flat_map(|(p, a)| a.iter().map(move |(n, q)| (p.as_slice(), n.as_slice(), *q))),
+        ),
+    }
+}
+
+/// One output into the book, from a Conway value. The only difference from the
+/// Alonzo shape is the quantity type, which is why they are two functions.
+fn feed_conway(
+    b: &mut Book,
+    oref: (Hash<32>, u32),
+    era: u8,
+    address: &[u8],
+    value: &conway::Value,
+    datum: Datum<'_>,
+) -> Result<()> {
+    match value {
+        conway::Value::Coin(c) => {
+            b.create_output(oref, era, *c, address, datum, std::iter::empty())
+        }
+        conway::Value::Multiasset(c, m) => b.create_output(
+            oref,
+            era,
+            *c,
+            address,
+            datum,
+            m.iter().flat_map(|(p, a)| {
+                a.iter()
+                    .map(move |(n, q)| (p.as_slice(), n.as_slice(), u64::from(q)))
+            }),
+        ),
+    }
+}
+
+/// One output into the book, from a `MultiEraOutput` — the fallback walk's route.
+///
+/// Byron and the epoch-boundary blocks do not decode into a `ShelleyBlock`, so
+/// they cannot ride `plan_block_primitives` and the book has to be fed through
+/// the generic accessors instead. That is the expensive route — an `Address`
+/// plus a re-serialisation for the bytes, a `Vec` per output for the assets —
+/// and it is paid over 208 of 9,181 chunks, which is **4.49 M blocks and 32% of
+/// the store's**. Worth knowing before optimising it: it is a third of the
+/// blocks and a small fraction of the bytes.
+///
+/// The value goes through `into_alonzo` rather than being re-derived, so the
+/// book receives exactly the arithmetic `feed_alonzo` already applies — one
+/// conversion, not two implementations. For Byron that conversion is
+/// `Coin(*u64)`: no clone and no allocation, which is the case that matters at
+/// this block count.
+fn feed_multi_era(
+    b: &mut Book,
+    oref: (Hash<32>, u32),
+    era: u8,
+    o: &MultiEraOutput<'_>,
+) -> Result<()> {
+    let addr = o
+        .address()
+        .map_err(|e| anyhow::anyhow!("address of {}#{}: {e}", oref.0, oref.1))?;
+    let addr_bytes = addr.to_vec();
+    let value = o.value().into_alonzo();
+    // Bound to a local, not matched in place: `datum()` returns an *owned*
+    // option, so a binding made in the scrutinee dies at the end of the match
+    // and cannot be lent to `create_output`.
+    let datum_opt = o.datum();
+    let datum = match &datum_opt {
+        Some(DatumOption::Hash(h)) => Datum::Hash(h.as_ref()),
+        Some(DatumOption::Data(w)) => Datum::Inline(w.0.raw_cbor()),
+        None => Datum::None,
+    };
+    feed_alonzo(b, oref, era, &addr_bytes, &value, datum).with_context(|| {
+        let head = &addr_bytes[..addr_bytes.len().min(16)];
+        format!(
+            "output {}#{} — era {era}, address {} B, typeid {}, head {head:02x?}",
+            oref.0,
+            oref.1,
+            addr_bytes.len(),
+            addr.typeid(),
+        )
+    })
+}
+
 /// The lean pull straight off the decoded primitives — no `MultiEraTx`, no
 /// `txs()` clone, no `Box` per output.
 ///
@@ -723,12 +863,15 @@ fn plan_block_primitives(
     plan: &mut BlockPlan,
     st: &mut DecodeStats,
     hashes: &mut Vec<Hash<32>>,
-) {
+    book: Option<&mut Book>,
+) -> Result<()> {
     plan.clear();
     let era = blk.era();
+    let era_b = tx_index::format::era_to_u8(era);
     if !st.eras.contains(&era) {
         st.eras.push(era);
     }
+    let mut book = book;
 
     match blk {
         ShelleyBlock::Alonzo(b, _) => {
@@ -744,11 +887,28 @@ fn plan_block_primitives(
                 let s0 = plan.spends.len() as u32;
                 for inp in body.inputs.iter() {
                     plan.spends.push((inp.transaction_id, inp.index as u32));
+                    if let Some(bk) = book.as_deref_mut() {
+                        bk.spend((inp.transaction_id, inp.index as u32));
+                    }
                 }
                 let s1 = plan.spends.len() as u32;
                 let c0 = plan.creates.len() as u32;
                 for (idx, o) in body.outputs.iter().enumerate() {
                     let f = legacy_facts(o);
+                    if let Some(bk) = book.as_deref_mut() {
+                        let datum = match &o.datum_hash {
+                            Some(h) => Datum::Hash(h.as_ref()),
+                            None => Datum::None,
+                        };
+                        feed_alonzo(
+                            bk,
+                            (hash, idx as u32),
+                            era_b,
+                            o.address.as_slice(),
+                            &o.amount,
+                            datum,
+                        )?;
+                    }
                     note_output(st, plan, chunk, hash, idx as u32, f);
                 }
                 let c1 = plan.creates.len() as u32;
@@ -771,6 +931,9 @@ fn plan_block_primitives(
                 let s0 = plan.spends.len() as u32;
                 for inp in body.inputs.iter() {
                     plan.spends.push((inp.transaction_id, inp.index as u32));
+                    if let Some(bk) = book.as_deref_mut() {
+                        bk.spend((inp.transaction_id, inp.index as u32));
+                    }
                 }
                 let s1 = plan.spends.len() as u32;
                 let c0 = plan.creates.len() as u32;
@@ -793,6 +956,32 @@ fn plan_block_primitives(
                             }
                         }
                     };
+                    if let Some(bk) = book.as_deref_mut() {
+                        match &**o {
+                            babbage::TransactionOutput::Legacy(x) => {
+                                let datum = match &x.datum_hash {
+                                    Some(h) => Datum::Hash(h.as_ref()),
+                                    None => Datum::None,
+                                };
+                                feed_alonzo(
+                                    bk,
+                                    (hash, idx as u32),
+                                    era_b,
+                                    x.address.as_slice(),
+                                    &x.amount,
+                                    datum,
+                                )?;
+                            }
+                            babbage::TransactionOutput::PostAlonzo(x) => feed_alonzo(
+                                bk,
+                                (hash, idx as u32),
+                                era_b,
+                                x.address.as_slice(),
+                                &x.value,
+                                datum_of(x.datum_option.as_deref()),
+                            )?,
+                        }
+                    }
                     note_output(st, plan, chunk, hash, idx as u32, f);
                 }
                 let c1 = plan.creates.len() as u32;
@@ -815,6 +1004,9 @@ fn plan_block_primitives(
                 let s0 = plan.spends.len() as u32;
                 for inp in body.inputs.iter() {
                     plan.spends.push((inp.transaction_id, inp.index as u32));
+                    if let Some(bk) = book.as_deref_mut() {
+                        bk.spend((inp.transaction_id, inp.index as u32));
+                    }
                 }
                 let s1 = plan.spends.len() as u32;
                 let c0 = plan.creates.len() as u32;
@@ -834,6 +1026,32 @@ fn plan_block_primitives(
                             }
                         }
                     };
+                    if let Some(bk) = book.as_deref_mut() {
+                        match o {
+                            conway::TransactionOutput::Legacy(x) => {
+                                let datum = match &x.datum_hash {
+                                    Some(h) => Datum::Hash(h.as_ref()),
+                                    None => Datum::None,
+                                };
+                                feed_alonzo(
+                                    bk,
+                                    (hash, idx as u32),
+                                    era_b,
+                                    x.address.as_slice(),
+                                    &x.amount,
+                                    datum,
+                                )?;
+                            }
+                            conway::TransactionOutput::PostAlonzo(x) => feed_conway(
+                                bk,
+                                (hash, idx as u32),
+                                era_b,
+                                x.address.as_slice(),
+                                &x.value,
+                                datum_of(x.datum_option.as_deref()),
+                            )?,
+                        }
+                    }
                     note_output(st, plan, chunk, hash, idx as u32, f);
                 }
                 let c1 = plan.creates.len() as u32;
@@ -842,15 +1060,10 @@ fn plan_block_primitives(
                 st.inputs += u64::from(s1 - s0);
                 st.outputs += u64::from(c1 - c0);
             }
-        } // Byron, its epoch-boundary block, and — since `MultiEraBlock` is
-          // `#[non_exhaustive]` — whatever a future pallas adds. All fall back:
-          // Byron's spends are self-contained (a `TxIn` embeds the output it
-          // spends) and its outrefs are computed rather than read, so it needs
-          // `MultiEraInput`'s machinery instead of a body walk. The caller decides
-          // this before calling here (`ShelleyBlock` has no such variant), so this
-          // arm is a compile-time impossibility rather than a runtime branch.
+        }
     }
     st.blocks += 1;
+    Ok(())
 }
 
 // ------------------------------------------------------------- the apply
@@ -957,6 +1170,17 @@ impl Live {
             Live::Std(m) => m.values().for_each(&mut add),
         }
         t
+    }
+
+    /// Accounts for what the live set itself holds, so a book's index can be
+    /// compared against it rather than against peak RSS (which includes the
+    /// chunk buffer, the plan, and the allocator's own slack).
+    fn accounted_bytes(&self) -> usize {
+        let per_slot = std::mem::size_of::<(OutRef, Entry)>() + 1;
+        match self {
+            Live::Fx(m) => m.capacity() * per_slot,
+            Live::Std(m) => m.capacity() * per_slot,
+        }
     }
 
     fn apply(&mut self, plan: &BlockPlan, chunk: u16, st: &mut ApplyStats) {
@@ -1095,6 +1319,17 @@ fn fold(a: FoldArgs) -> Result<()> {
     let mut dec_acc = DecodeStats::default();
     let mut chain_acc = ChainStats::default();
     let mut app_acc = ApplyStats::default();
+    let mut book = match &a.book {
+        Some(dir) => {
+            if !a.cursor && !a.primitives {
+                bail!(
+                    "--book needs --cursor or --primitives (it wants addresses, values and datums)"
+                );
+            }
+            Some(Book::create(dir, a.book_compact_mb * 1024 * 1024)?)
+        }
+        None => None,
+    };
     // Reused across chunks: `fs::read` allocates and frees ~25 MB per chunk, and
     // glibc serves that from mmap, so every chunk re-faults 6,400 pages. Keeping
     // the buffer mapped pays that once.
@@ -1132,13 +1367,20 @@ fn fold(a: FoldArgs) -> Result<()> {
                 let era;
                 if let Some(b) = blk.shelley() {
                     era = b.era();
-                    plan_block_primitives(b, chunk, &mut plan, &mut dec, &mut hashes);
+                    plan_block_primitives(
+                        b,
+                        chunk,
+                        &mut plan,
+                        &mut dec,
+                        &mut hashes,
+                        book.as_mut(),
+                    )?;
                 } else {
                     dec.fallback_blocks += 1;
                     let mb = MultiEraBlock::decode(&bytes[pos..end])
                         .with_context(|| format!("chunk {chunk}: byte {pos}"))?;
                     era = mb.era();
-                    plan_block(&mb, chunk, &mut plan, &mut dec, None);
+                    plan_block(&mb, chunk, &mut plan, &mut dec, None, book.as_mut())?;
                 }
                 dec.secs += t.elapsed().as_secs_f64();
 
@@ -1179,13 +1421,18 @@ fn fold(a: FoldArgs) -> Result<()> {
                     .with_context(|| format!("chunk {chunk}: decoding block {i}"))?;
                 if a.primitives {
                     match shelley_block_of(&block) {
-                        Some(b) => {
-                            plan_block_primitives(b, chunk, &mut plan, &mut dec, &mut hashes)
-                        }
+                        Some(b) => plan_block_primitives(
+                            b,
+                            chunk,
+                            &mut plan,
+                            &mut dec,
+                            &mut hashes,
+                            book.as_mut(),
+                        )?,
                         None => {
                             // Byron and the epoch boundary.
                             dec.fallback_blocks += 1;
-                            plan_block(&block, chunk, &mut plan, &mut dec, None);
+                            plan_block(&block, chunk, &mut plan, &mut dec, None, book.as_mut())?;
                         }
                     }
                 } else {
@@ -1195,7 +1442,8 @@ fn fold(a: FoldArgs) -> Result<()> {
                         &mut plan,
                         &mut dec,
                         a.chain_decode.then_some(&mut chain_acc),
-                    );
+                        book.as_mut(),
+                    )?;
                 }
                 dec.secs += t.elapsed().as_secs_f64();
 
@@ -1538,6 +1786,75 @@ fn fold(a: FoldArgs) -> Result<()> {
         "  txs        {} ({} invalid — collateral skipped with them)",
         dec_acc.txs, dec_acc.invalid_txs
     );
+
+    if let Some(b) = book.take() {
+        let cost = b.finish()?;
+        println!();
+        println!("book — phase 1: rows.bin + by_outref.idx + dir.idx + policy.tbl");
+        println!(
+            "  rows       {} live · {} created · {} spends resolved · {} missed",
+            cost.rows_live, cost.created, cost.spent_hits, cost.spent_misses
+        );
+        println!(
+            "  memory     index {} · rows {} on disk · {} rehashes · {} compactions",
+            human_bytes(cost.index_bytes),
+            human_bytes(cost.rows_bytes),
+            cost.rehashes,
+            cost.compactions,
+        );
+        println!(
+            "  artifact   {} × 12 B index entries · {} distinct prefixes · {:.2} row \
+             confirms per lookup",
+            cost.rows_live,
+            cost.distinct_prefixes,
+            cost.rows_live as f64 / cost.distinct_prefixes.max(1) as f64,
+        );
+        println!(
+            "  addresses  longest {} B · {} over 255 B ({:.2}% of rows) — `B2` gave \
+             `addr_len` one byte",
+            cost.max_addr_len,
+            cost.addrs_over_255,
+            share(cost.addrs_over_255, cost.rows_live),
+        );
+        println!(
+            "  against    the HashMap live set accounts {} for {} entries ({:.0} B/entry)",
+            human_bytes(set.accounted_bytes() as u64),
+            entries,
+            set.accounted_bytes() as f64 / entries.max(1) as f64,
+        );
+
+        // Three identities, each comparing two independent implementations of the
+        // same live set. Any of them failing means one of the two is wrong.
+        let fold_live = dec_acc.outputs.saturating_sub(app_acc.hit);
+        if cost.rows_live != fold_live {
+            bail!(
+                "book holds {} live rows, the fold's set holds {} (created {} − resolved {})",
+                cost.rows_live,
+                fold_live,
+                dec_acc.outputs,
+                app_acc.hit
+            );
+        }
+        if cost.live_lovelace != live_lovelace {
+            bail!(
+                "book holds {} ₳, the fold's set holds {} ₳",
+                cost.live_lovelace / 1_000_000,
+                live_lovelace / 1_000_000
+            );
+        }
+        if cost.live_assets != live_assets {
+            bail!(
+                "book holds {} asset entries, the fold's set holds {}",
+                cost.live_assets,
+                live_assets
+            );
+        }
+        println!(
+            "  identities rows = created − resolved · {} ₳ · {} asset entries — all three agree",
+            cost.live_lovelace / 1_000_000,
+            cost.live_assets
+        );
+    }
     Ok(())
 }
 
