@@ -1,9 +1,39 @@
-//! Pure block/tx decode → the pieces a walker's outref buffer + decode assembly
-//! need. Mirrors mitos-data-plane's `block_events::project_tx` on bare pallas
-//! (no dolos): canonical spend-redeemer ordering, witness-datum extraction, and
-//! per-output datum (hash + inline bytes). Keeping the exact pallas calls the
-//! live host uses is what makes a walker's `DecodeTx` byte-compatible with the
-//! modules' decode.
+//! Cardano chain bytes into the parts a fold or a walker needs: outputs with
+//! datums, inputs with canonical-order redeemers, witness datums, aux data.
+//!
+//! Pure decode → the pieces an outref buffer and a decode assembly need.
+//! Mirrors `mitos-data-plane`'s `block_events::project_tx` on bare pallas (no
+//! dolos): keeping the exact pallas calls the live host uses is what makes a
+//! walker's decode byte-compatible with the modules' decode.
+//!
+//! # Why its own crate
+//!
+//! Extracted from `tools/mitos-chain-walk/src/decode.rs` on 2026-09-22, for two
+//! reasons. Five crates share it today (`market-ledger`, `project-ledger`,
+//! `token-ledger`, `mitos-pool-observe`, and the walker itself), and it is the
+//! seam a hand-rolled, era-specialised decoder will replace — so it should be
+//! addressable on its own before that work starts rather than after.
+//!
+//! The extraction is a MOVE: the code below is byte-identical to the module it
+//! came from, and `mitos-chain-walk` re-exports this crate as `decode` so no
+//! call site moved. That alias is the thing to delete once call sites point
+//! here directly.
+//!
+//! # The boundary is already backend-agnostic
+//!
+//! Worth knowing before anyone reaches for a trait: [`DecodedTx`],
+//! [`DecodedOutput`] and [`DecodedInput`] are mitos types built from pallas
+//! *primitives* (`Hash<32>`, `String`, `u64`, `Vec<Asset>`) — not pallas
+//! traversal types. The only traversal coupling is [`decode_tx`]'s `&MultiEraTx`
+//! argument. A hand-rolled decoder therefore slots in beside this one by taking
+//! raw bytes plus an era, with no change to any consumer.
+//!
+//! # What this crate must never grow
+//!
+//! No I/O, no `Result` on the decode path, no runtime, no store, no notion of
+//! what a "watched" output is. That is what leaves it consumable from a worker,
+//! a game and the platform at once, and it is why the fixture reading in the
+//! tests is the only `std::fs` in the file.
 //!
 //! Derives on the types are the minimum a downstream walker needs to persist a
 //! buffered output or key a map: `Asset` is `Clone + PartialEq + Eq + Hash`

@@ -747,6 +747,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chain-decode"
+version = "0.0.1"
+dependencies = [
+ "pallas-codec 1.4.0",
+ "pallas-primitives 1.4.0",
+ "pallas-traverse 1.4.0",
+]
+
+[[package]]
 name = "chain-ledger"
 version = "0.1.0"
 source = "git+https://github.com/defrag-au/shared-crates?rev=f24eb7977a0627f53579182c2e8a7440e4630dd9#f24eb7977a0627f53579182c2e8a7440e4630dd9"
@@ -3651,6 +3660,7 @@ name = "mitos-chain-walk"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chain-decode",
  "clap",
  "hex",
  "pallas-codec 1.4.0",

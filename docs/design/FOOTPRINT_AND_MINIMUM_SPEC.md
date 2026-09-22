@@ -198,6 +198,50 @@ questions this phase must answer:
   re-hashes against the full requested tx hash (`tx-index` already does this),
   so a lying resolver can withhold but not forge. State that in the docs.
 
+### The stated minimum: VPS 1000 ARM G11 (2026-09-22)
+
+6 vCore aarch64 · **8 GB RAM** · 256 GB NVMe. This is the box the architecture
+has to fit, and it is not the box anything has been measured on (12 cores/24 G /
+768 GB). What it costs, from the measured figures:
+
+| | budget | note |
+|---|---|---|
+| **Disk** | 230.7 GB of chunks against ~238 GiB usable | the store alone leaves ~23 GiB for the OS, the artifacts and the next chunk. It fits only if nothing else lives there — and the other thing that would (dolos's 147 G data dir) does not |
+| **RAM** | 8 GB total, shared with the serving side | today's fold peaks at **3.10 GiB RSS / 2.17 GiB anon** for the live set alone (`fold-full.log`) |
+| **CPU** | 6 vCore, shared with the serving side | see below |
+
+**CPU is not the binding constraint, which reorders the work.** Consuming the
+store is 230.7 GB: at 100–125 MB/s (a 1 Gbit/s link) that is 31–38 minutes, and
+the folding fits inside it — the primitive walk decodes at 164–259 MB/s/core
+(`DECODE_SHAPE.md` §2.6), the apply is 459 s over the whole store (7.7 min at
+0.25 of a core), and the frame walk is 3.1 min. Call it **2–4 of 6 cores for
+the duration**, leaving 2+ for serving. So optimising decode speed buys
+*politeness* on this box, while two other things buy *feasibility*:
+
+1. **The log cannot be held.** 230.7 GB of chunks + artifacts + OS is over the
+disk, so the input is a **rolling window**: `mithril.rs` already drives
+   `mithril-client cardano-db download --start/--end`, so the box can hold a few
+   hundred chunks, fold them, and delete them. A 400-chunk window is ~10 GB.
+   That makes the log **not re-readable**, which promotes one-walk-N-artifacts
+   from an optimisation to a **requirement** (`MITHRIL_PHONEBOOK.md` §1).
+2. **The live set cannot be a `HashMap`.** 2.17 GiB anon on an 8 GB box, next to
+a serving side that needs its own headroom and a page cache that the kernel can
+   evict where it cannot — FOOTPRINT §4.1's measured point. The target is
+   **anon RSS ≤ 512 MB for the folder**, which the compact shape reaches: 12
+   bytes per row is 130 MB at 10.9 M rows (`LIVE_BOOK.md`), and the rows belong
+   in the artifact file rather than the heap.
+
+The rest of the goal set, so nothing is optimised at another's expense:
+
+- **first install** — bounded RSS, resumable, no 230 GB of scratch;
+- **refresh** — every ~6 h, incremental chunks, tiny;
+- **serve** — mmap'd artifacts, low anon RSS, must not be starved while folding;
+- **re-derive** — a schema change or a projection bug means re-reading history,
+  which without the log means re-downloading it. Expensive but *possible*, and
+  the reason the corpus harness matters more on this box than on the big one;
+- **co-tenancy** — all of the above on one 6-core/8 GB box, so the folder runs
+  `Nice`/`IOSchedulingClass=idle` and bounded, per §8.
+
 ## 8. Constraints on the unified walker (not a design)
 
 The index services currently cost ~8.5 G across separate processes. The
@@ -206,13 +250,48 @@ binary files and dbs — is out of scope here, but if it is built it must:
 - keep extractor output **mmap-friendly and file-backed** (the tx-index
   pattern), so its footprint is evictable page cache rather than anon heap;
 - run with a **bounded anon RSS independent of chain length** — streaming
-  extraction, no whole-chain in-memory maps; target stated after §5 measures
-  what today's extractors hold;
+  extraction, no whole-chain in-memory maps. **Target: ≤ 512 MB anon for the
+  folder**, against 2.17 GiB measured for today's live set (§7's stated
+  minimum); reachable because the index is 12 B/row and the rows are file-backed;
 - take `--threads` and run `Nice`/`IOSchedulingClass=idle` by default: it is a
   co-tenant of a tip-following process and must never starve it;
 - be resumable per chunk (chunks are immutable once complete), so a small box
   can build over hours without needing the peak of a one-shot run;
 - be optional: `lean` runs without it.
+
+### What a bigger box buys, in order (2026-09-22)
+
+The constraints above are the *floor*. They must not become a ceiling: a folder on
+a 768 GB box should be faster than the same folder on the 256 GB one, using the
+same artifact format. One knob (`max_memory_bytes`, already required for every
+profile by §9) and `--threads`; everything below is derived from those.
+
+| resource | buys | measured basis |
+|---|---|---|
+| **cores** | the whole wall time. `max(decode/P, apply)` | decode scales 7.5× at 8 threads (14.2 s → 1.9 s, 150 chunks); the applier is one core and is 7.7 min a pass |
+| **memory, a few tens of MB** | the decode pipeline itself | one plan per in-flight chunk: 1.7 MB on Conway, 6 MB on Babbage — a 16-deep queue is under 100 MB. **The fast path is nearly free** |
+| **memory, ~150 MB** | **mandatory**: the build index at 12 B/row | below this the folder cannot hold mainnet's live set. This is the one item that must fit |
+| **memory, GB** | page cache: the artifacts stay resident, and the read stage disappears | read is 2.8 min a pass and already page-cache-bound |
+| **memory, GB** | the choice to hold **the log** instead of windowing it — which is the only way re-derivation avoids a re-download | §7's disk budget |
+| **memory, GB** | more sinks built in one pass, each with its own resident state | one walk, N artifacts is a requirement, not an option |
+| **hugepages** | the one genuine memory-for-speed trade on the apply | 146 ns/op at 70 k entries → 787 at 10.9 M: DRAM + TLB, which `MADV_HUGEPAGE` on the index attacks where a bigger cache does not |
+
+**What memory does NOT buy**, so nobody buys more of it expecting this:
+
+- **bytes are bytes.** 230.7 GB must be read, hashed and decoded once. Memory
+  cannot reduce it, and hashing alone is a ~3-minute floor a pass.
+- **the applier is ordered.** Block N+1 needs N. More memory buys nothing here;
+  only the pipeline's depth helps, and its floor is the applier's own rate.
+- **no cache to size.** There is deliberately no working set larger than the
+  index: the log is the source of truth and everything else is an mmap'd
+  projection. A dolos-style `cache = 500 MB` has no analogue here, which is a
+  property of the design rather than an omission.
+
+**The rule that makes this safe: the artifact format never varies with the
+budget.** Only the folder's strategy does — queue depth, sink concurrency,
+window-vs-log, anon-vs-file-backed rows. A book built on the 768 GB box must be
+byte-identical to one built on the 256 GB box, or the small box cannot verify
+what the big one produced.
 
 ## 9. Optimisation levers, in expected value order
 

@@ -32,6 +32,11 @@ members = [
     "crates/mitos-launchpad-decode",
     "crates/mitos-marketplace-decode",
     "crates/chain-sieve",
+    # The shared block/tx decode, extracted from `tools/mitos-chain-walk` on
+    # 2026-09-22. Five crates and every walker consume it, and it is the seam a
+    # hand-rolled era-specialised decoder replaces — so it is addressable on its
+    # own before that work starts. `mitos-chain-walk` re-exports it as `decode`.
+    "crates/chain-decode",
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
     "crates/policy-archive",

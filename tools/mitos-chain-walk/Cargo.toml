@@ -9,6 +9,11 @@ description = "Shared plumbing for Mithril-snapshot walkers: bootstrap, immutabl
 path = "src/lib.rs"
 
 [dependencies]
+# The shared block/tx decode, moved to its own crate 2026-09-22 so the
+# hand-rolled decoder that replaces it has somewhere to live. Re-exported from
+# this crate's root as `decode`, so nothing downstream moved with it.
+chain-decode = { path = "../../crates/chain-decode" }
+
 # Immutable-DB chunk reader (Mithril snapshot → block CBOR) + block/tx/address
 # decode. The tx decode (canonical redeemer ordering, witness-datum extraction)
 # mirrors mitos-data-plane's `block_events::project_tx` — reimplemented on bare
