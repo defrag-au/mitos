@@ -93,6 +93,15 @@ enum Cmd {
     Count(CountArgs),
     /// Read a published book back the way a consumer would.
     Verify(VerifyArgs),
+    /// Rebuild the orderings derivable from the row store, without a refold.
+    Reindex(ReindexArgs),
+}
+
+#[derive(Args)]
+struct ReindexArgs {
+    /// The book directory to reindex, in place.
+    #[arg(long)]
+    book: PathBuf,
 }
 
 #[derive(Args)]
@@ -171,6 +180,7 @@ fn main() -> Result<()> {
         Cmd::Fold(a) => fold(a),
         Cmd::Count(a) => count(a),
         Cmd::Verify(a) => verify(a),
+        Cmd::Reindex(a) => reindex(a),
     }
 }
 
@@ -2024,6 +2034,35 @@ fn verify(a: VerifyArgs) -> Result<()> {
     Ok(())
 }
 
+/// Rebuild the orderings that do not need the chain, and say which those are.
+///
+/// Deliberately a subcommand, not a step in `fold`: the point is that a view can be
+/// derived from an artifact that already exists, so this must not require the walk
+/// that produced it.
+fn reindex(a: ReindexArgs) -> Result<()> {
+    let t = Instant::now();
+    let rep = book::reindex(&a.book)?;
+    println!(
+        "book reindex — {} in {:.1} s",
+        a.book.display(),
+        t.elapsed().as_secs_f64()
+    );
+    println!(
+        "  by_policy  {} entries → by_policy.idx + policy.dir.idx",
+        rep.policy_entries
+    );
+    println!(
+        "  dir.idx    rebuilt over {} prefixes from by_outref.idx",
+        rep.outref_entries
+    );
+    println!("  read only  rows.bin, by_outref.idx, policy.tbl — never written");
+    println!(
+        "  not here   anything whose key is in neither the rows nor the indexes:\n\
+         \x20            the mint ledger, witness datums, aux data. Those need the walk."
+    );
+    Ok(())
+}
+
 fn count(a: CountArgs) -> Result<()> {
     let all = list_chunks(&a.immutable)?;
     let mut todo = all.clone();
@@ -2403,6 +2442,67 @@ mod tests {
         assert!(
             bad.failures() > 0,
             "a corrupted prefix must be caught, not reported as {bad:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `reindex` must be **equivalent to the builder** on a fresh artifact, and it
+    /// must **repair a damaged one**. Both halves matter: the first is what lets a
+    /// new ordering skip the chain walk, the second is what lets an existing
+    /// artifact be fixed in place. Without the first, the reindex path would be a
+    /// second implementation of the ordering, which is the thing it exists to avoid.
+    #[test]
+    fn reindex_reproduces_the_builder_and_repairs_a_directory() {
+        let dir = std::env::temp_dir().join(format!("fold-probe-reindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut b = Book::create(&dir, 1 << 20).expect("create");
+        let pol = [0xCDu8; 28];
+        for i in 0..32u32 {
+            let h = Hash::<32>::from([i as u8; 32]);
+            let name: &[u8] = b"n";
+            let assets: Vec<(&[u8], &[u8], u64)> = vec![(&pol, name, 1)];
+            b.create_output((h, i), 1, 5, &[0x01][..], Datum::None, assets.into_iter())
+                .expect("create_output");
+        }
+        b.finish().expect("finish");
+
+        let built_policy = std::fs::read(dir.join("by_policy.idx")).expect("read built");
+        let built_dir = std::fs::read(dir.join("dir.idx")).expect("read built dir");
+
+        let rep = book::reindex(&dir).expect("reindex");
+        assert_eq!(
+            rep.policy_entries, 32,
+            "one entry per row, all on one policy"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("by_policy.idx")).expect("read"),
+            built_policy,
+            "reindex must reproduce the builder byte for byte"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("dir.idx")).expect("read"),
+            built_dir,
+            "and reproduce the outref directory"
+        );
+
+        // Damage the directory the way the old fill did — a bucket pointing past the
+        // one that follows it — then require the repair to fix it.
+        let mut d = std::fs::read(dir.join("dir.idx")).expect("read dir");
+        d[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(dir.join("dir.idx"), &d).expect("write dir");
+        assert!(
+            book::verify(&dir, 0).expect("verify").failures() > 0,
+            "a bucket pointing past its successor must fail the partition check"
+        );
+
+        book::reindex(&dir).expect("reindex again");
+        let after = book::verify(&dir, 0).expect("verify after repair");
+        assert_eq!(
+            after.failures(),
+            0,
+            "the repair must satisfy the verifier: {after:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
