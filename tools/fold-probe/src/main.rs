@@ -91,6 +91,18 @@ enum Cmd {
     Fold(FoldArgs),
     /// Count created/spent over every complete chunk with no set (parallel) — the exact live-set size.
     Count(CountArgs),
+    /// Read a published book back the way a consumer would.
+    Verify(VerifyArgs),
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// The book directory to read back.
+    #[arg(long)]
+    book: PathBuf,
+    /// Entries to resolve through the index into a row. 0 = every entry.
+    #[arg(long, default_value_t = 200_000)]
+    sample: u64,
 }
 
 #[derive(Args)]
@@ -158,6 +170,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Fold(a) => fold(a),
         Cmd::Count(a) => count(a),
+        Cmd::Verify(a) => verify(a),
     }
 }
 
@@ -1947,6 +1960,51 @@ fn fold(a: FoldArgs) -> Result<()> {
 /// set's entry count: every output a valid tx creates, minus every output a
 /// valid tx spends, with no ordering requirement anywhere in the pass — which
 /// is what makes it a thread pool rather than a fold.
+/// Read a published book back through its own indexes and report what breaks.
+///
+/// Deliberately a subcommand rather than a step inside `fold`: it reads an
+/// artifact that already exists, so a whole-store book can be checked in seconds
+/// instead of after another fifty-minute fold.
+fn verify(a: VerifyArgs) -> Result<()> {
+    let rep = book::verify(&a.book, a.sample)?;
+    println!("book verify — {}", a.book.display());
+    println!("  entries    {}", rep.entries);
+    println!(
+        "  sampled    {} entries resolved `dir.idx` → `by_outref.idx` → `rows.bin`",
+        rep.sampled
+    );
+    println!(
+        "  ordering   {} adjacent pairs out of canonical order",
+        rep.unsorted
+    );
+    println!(
+        "  directory  {} violations of the bucket partition",
+        rep.dir_violations
+    );
+    println!(
+        "  prefixes   {} rows whose own outref does not hash to the entry's prefix",
+        rep.prefix_mismatches
+    );
+    println!(
+        "  rows       {} pointing outside rows.bin · {} unreadable",
+        rep.rows_out_of_range, rep.rows_ill_formed
+    );
+    println!(
+        "  lookup     {:.0} ns · {:.1} s for {} samples",
+        rep.lookup_nanos as f64 / rep.sampled.max(1) as f64,
+        rep.lookup_nanos as f64 / 1e9,
+        rep.sampled,
+    );
+    if rep.failures() > 0 {
+        bail!(
+            "the artifact does not verify: {} failed checks",
+            rep.failures()
+        );
+    }
+    println!("  all checks pass");
+    Ok(())
+}
+
 fn count(a: CountArgs) -> Result<()> {
     let all = list_chunks(&a.immutable)?;
     let mut todo = all.clone();
@@ -2247,6 +2305,53 @@ fn kb_field(text: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The writer and the reader have to agree — and the reader has to notice when
+    /// the bytes have been meddled with. Both halves in one test, because the
+    /// second is only meaningful once the first passes: a verifier that accepts
+    /// everything would sail through the corrupt case too.
+    #[test]
+    fn a_book_round_trips_and_a_corrupted_entry_is_caught() {
+        let dir = std::env::temp_dir().join(format!("fold-probe-book-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut b = Book::create(&dir, 1 << 20).expect("create");
+        for i in 0..64u32 {
+            let h = Hash::<32>::from([i as u8; 32]);
+            b.create_output(
+                (h, i % 3),
+                1,
+                1_000 * u64::from(i),
+                &[0x01, 0x02, 0x03][..],
+                Datum::None,
+                std::iter::empty::<(&[u8], &[u8], u64)>(),
+            )
+            .expect("create_output");
+        }
+        let cost = b.finish().expect("finish");
+        assert_eq!(cost.rows_live, 64);
+
+        let ok = book::verify(&dir, 0).expect("verify");
+        assert_eq!(ok.failures(), 0, "a freshly built book must verify: {ok:?}");
+        assert_eq!(ok.sampled, 64);
+
+        // Flip the high byte of the first entry's prefix. That moves the entry out
+        // of the bucket the directory says it is in, so a reader that trusts the
+        // directory must notice — and a reader that only checks the row's own
+        // outref would not.
+        let path = dir.join("by_outref.idx");
+        let mut bytes = std::fs::read(&path).expect("read by_outref.idx");
+        bytes[12] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write by_outref.idx");
+
+        let bad = book::verify(&dir, 0).expect("verify after corruption");
+        assert!(
+            bad.failures() > 0,
+            "a corrupted prefix must be caught, not reported as {bad:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The standard check value for CRC-32/ISO-HDLC. Without this the check that
     /// catches a mis-decoded Byron address could itself be wrong — and a CRC test

@@ -55,8 +55,9 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use pallas_primitives::Hash;
@@ -590,9 +591,17 @@ impl Book {
                 buckets[b] = i as u32;
             }
         }
-        for b in buckets.iter_mut() {
-            if *b == EMPTY {
-                *b = entries.len() as u32;
+        // Fill the gaps backwards, so an empty bucket carries the index of the next
+        // one that is not. That is what makes the array a partition (`B5`) — filling
+        // with `entries.len()` instead makes an empty bucket *precede* a non-empty
+        // one, so `buckets[b] > buckets[b + 1]`, the array is not monotone, and a
+        // consumer taking the range as `end − start` underflows.
+        let mut next = entries.len() as u32;
+        for b in (0..n_buckets).rev() {
+            if buckets[b] == EMPTY {
+                buckets[b] = next;
+            } else {
+                next = buckets[b];
             }
         }
         for b in &buckets {
@@ -656,6 +665,229 @@ fn mix32(mut x: u32) -> u32 {
     x ^= x >> 15;
     x = x.wrapping_mul(0x846c_a68b);
     x ^ (x >> 16)
+}
+
+// --------------------------------------------------------- reading it back
+
+/// What a read-back of a published artifact found.
+#[derive(Default, Debug)]
+pub struct VerifyReport {
+    pub entries: u64,
+    pub sampled: u64,
+    pub unsorted: u64,
+    pub dir_violations: u64,
+    /// Rows whose own outref does not hash to the prefix the index sent us to.
+    pub prefix_mismatches: u64,
+    pub rows_out_of_range: u64,
+    pub rows_ill_formed: u64,
+    pub lookup_nanos: u128,
+}
+
+impl VerifyReport {
+    pub fn failures(&self) -> u64 {
+        self.unsorted
+            + self.dir_violations
+            + self.prefix_mismatches
+            + self.rows_out_of_range
+            + self.rows_ill_formed
+    }
+}
+
+/// Resolve an outref the way a consumer does: `dir.idx` to narrow, then
+/// `by_outref.idx` to find the row offset, then `rows.bin` for the row.
+///
+/// This is the first code in the tree that reads the format, and that is the
+/// whole point of it. The three identities `finish` checks compare the builder
+/// against the fold, and **both of those decode the same bytes** — so none of
+/// them tests the artifact as an artifact. This one does: it opens three files,
+/// believes nothing in `book.meta` that it cannot re-derive, and holds the entries
+/// to the two properties `B5` claims for them (canonical order, and a directory
+/// that partitions the array).
+///
+/// It also times the lookup, which is the number that decides whether this
+/// replaces a `redb` point read rather than being a second store beside it.
+pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
+    let meta = std::fs::read_to_string(dir.join("book.meta"))
+        .with_context(|| format!("reading {}/book.meta", dir.display()))?;
+    let field = |k: &str| -> Result<u64> {
+        meta.lines()
+            .find_map(|l| l.strip_prefix(k).and_then(|r| r.trim().parse().ok()))
+            .with_context(|| format!("book.meta has no `{k}`"))
+    };
+
+    let layout = field("layout_version")? as u32;
+    if layout != LAYOUT_VERSION {
+        bail!("book.meta is layout_version {layout}; this build reads {LAYOUT_VERSION}");
+    }
+    let rows_live = field("rows")?;
+    let rows_bytes = field("rows_bytes")?;
+    let declared = field("by_outref_entries")?;
+
+    let mut rep = VerifyReport::default();
+
+    let rows_len = std::fs::metadata(dir.join("rows.bin"))?.len();
+    if rows_len != rows_bytes {
+        bail!("rows.bin is {rows_len} B; book.meta claims {rows_bytes}");
+    }
+
+    let raw = std::fs::read(dir.join("by_outref.idx"))?;
+    if raw.len() < 12 {
+        bail!("by_outref.idx is too short to hold a header");
+    }
+    let ilayout = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
+    if ilayout != LAYOUT_VERSION {
+        bail!("by_outref.idx is layout_version {ilayout}; this build reads {LAYOUT_VERSION}");
+    }
+    let count = u64::from_le_bytes(raw[4..12].try_into().expect("8 bytes"));
+    if count != declared || count != rows_live {
+        bail!(
+            "by_outref.idx holds {count}: book.meta says {declared} entries and {rows_live} rows"
+        );
+    }
+    let want = 12 + 12 * count as usize;
+    if raw.len() != want {
+        bail!(
+            "by_outref.idx is {} B; {count} entries need {want}",
+            raw.len()
+        );
+    }
+    rep.entries = count;
+
+    let entry = |i: usize| -> (u64, u32) {
+        let b = &raw[12 + 12 * i..];
+        (
+            u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
+            u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
+        )
+    };
+
+    // `B5`: canonical order is the 96-bit build key, whose leading 64 bits are what
+    // the entry stores — so the array is ascending by prefix.
+    for i in 1..count as usize {
+        if entry(i).0 < entry(i - 1).0 {
+            rep.unsorted += 1;
+        }
+    }
+
+    let draw = std::fs::read(dir.join("dir.idx"))?;
+    if draw.len() < 8 {
+        bail!("dir.idx is too short to hold a header");
+    }
+    let dl = u32::from_le_bytes(draw[0..4].try_into().expect("4 bytes"));
+    if dl != LAYOUT_VERSION {
+        bail!("dir.idx is layout_version {dl}; this build reads {LAYOUT_VERSION}");
+    }
+    let dbits = u32::from_le_bytes(draw[4..8].try_into().expect("4 bytes"));
+    if dbits != DIR_BITS {
+        bail!("dir.idx has DIR_BITS {dbits}; this build reads {DIR_BITS}");
+    }
+    let n_buckets = 1usize << dbits;
+    let want_dir = 8 + n_buckets * 4;
+    if draw.len() != want_dir {
+        bail!(
+            "dir.idx is {} B; {n_buckets} buckets need {want_dir}",
+            draw.len()
+        );
+    }
+    let bucket = |b: usize| -> u32 {
+        u32::from_le_bytes(draw[8 + 4 * b..8 + 4 * b + 4].try_into().expect("4 bytes"))
+    };
+
+    // `B5`: the buckets partition the entry array — non-overlapping, contiguous,
+    // covering — so they are monotone and never address past the end.
+    let mut prev = 0u32;
+    for b in 0..n_buckets {
+        let v = bucket(b);
+        if v < prev || u64::from(v) > count {
+            rep.dir_violations += 1;
+        }
+        prev = v;
+    }
+    // And a bucket's entries really are in it: `[start, end)` is the range the
+    // directory claims, and the first entry of a non-empty range must carry that
+    // bucket's top bits. Emptiness is `start == end`, not `start == count` —
+    // which is exactly what the backward fill buys.
+    for b in 0..n_buckets {
+        let start = bucket(b) as usize;
+        let end = if b + 1 < n_buckets {
+            bucket(b + 1) as usize
+        } else {
+            count as usize
+        };
+        if start >= end {
+            continue;
+        }
+        if (entry(start).0 >> (64 - dbits)) as usize != b {
+            rep.dir_violations += 1;
+        }
+    }
+
+    let take = if sample == 0 {
+        count
+    } else {
+        sample.min(count)
+    };
+    let step = (count / take.max(1)).max(1) as usize;
+    let mut f = File::open(dir.join("rows.bin"))?;
+    let t = Instant::now();
+    let mut i = 0usize;
+    while i < count as usize {
+        let (prefix, row) = entry(i);
+        match read_row_outref(&mut f, u64::from(row), rows_bytes) {
+            Ok(oref) => {
+                if split(&oref.0, oref.1).0 != prefix {
+                    rep.prefix_mismatches += 1;
+                }
+            }
+            Err(RowRead::OutOfRange) => rep.rows_out_of_range += 1,
+            Err(RowRead::Short) => rep.rows_ill_formed += 1,
+        }
+        rep.sampled += 1;
+        i += step;
+    }
+    rep.lookup_nanos = t.elapsed().as_nanos();
+    Ok(rep)
+}
+
+enum RowRead {
+    /// The row does not fit inside `rows.bin`.
+    OutOfRange,
+    Short,
+}
+
+/// The outref the row at `offset` claims, or why it is not a row.
+///
+/// A mis-pointed offset has to survive three things: the row has to start inside
+/// the file, its variable-length parts have to fit inside the file, and — the
+/// caller's check — its outref has to hash back to the prefix that sent us here.
+///
+/// The middle one is deliberately a *lower bound* rather than a parse: every
+/// asset record is at least 4 (policy id) + 1 (name length) + 8 (quantity) bytes,
+/// so the arithmetic needs no name lengths read. Reading each record to its end
+/// would make this a full row parse, which is the caller's job, not a bound's.
+fn read_row_outref(f: &mut File, offset: u64, rows_bytes: u64) -> Result<(Hash<32>, u32), RowRead> {
+    let base = offset + ROW_HEADER as u64;
+    if base > rows_bytes {
+        return Err(RowRead::OutOfRange);
+    }
+    let mut head = [0u8; ROW_HEADER];
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|_| RowRead::Short)?;
+    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
+
+    let addr_len = u64::from(u16::from_le_bytes([head[49], head[50]]));
+    let n_assets = u64::from(u16::from_le_bytes([head[51], head[52]]));
+    let datum_len = u64::from(u16::from_le_bytes([head[54], head[55]]));
+    if base + addr_len + 13 * n_assets + datum_len > rows_bytes {
+        return Err(RowRead::OutOfRange);
+    }
+
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&head[0..32]);
+    Ok((
+        Hash::from(h),
+        u32::from_le_bytes(head[32..36].try_into().expect("4 bytes")),
+    ))
 }
 
 /// Position of the key in the table. Not a security boundary: the key is a
