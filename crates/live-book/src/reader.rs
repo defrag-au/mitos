@@ -252,6 +252,28 @@ impl Base {
     /// 36-byte outref is what decides, so a prefix collision cannot return
     /// somebody else's output.
     pub fn utxo(&self, tx: &[u8; 32], index: u32) -> Result<Option<Row<'_>>> {
+        Ok(self.find(tx, index).map(|(_, row)| row))
+    }
+
+    /// The `by_outref` entry a live output occupies — a **dense id** for the row,
+    /// in `0..rows()`.
+    ///
+    /// [`Base::row`] takes a byte offset into a variable-length arena, which is
+    /// not an index: two rows at neighbouring offsets may be thousands of bytes
+    /// apart. A caller that has to keep *one bit per base row* — a follower
+    /// marking what a later chunk has spent — needs the dense one. It is also the
+    /// more stable of the two, since it is derived from the row's own outref
+    /// rather than from where the row happened to be written.
+    pub fn outref_entry(&self, tx: &[u8; 32], index: u32) -> Option<u64> {
+        self.find(tx, index).map(|(entry, _)| entry)
+    }
+
+    /// The (entry index, row) of a live output, or `None`.
+    ///
+    /// No error case on purpose: a row that will not parse is skipped rather than
+    /// reported, which is what makes a prefix collision cost a read instead of
+    /// answering with somebody else's output.
+    fn find(&self, tx: &[u8; 32], index: u32) -> Option<(u64, Row<'_>)> {
         let (prefix, _) = split(tx, index);
         for i in self.outref.run(prefix) {
             let (p, offset) = self.outref.entry(i);
@@ -262,10 +284,10 @@ impl Base {
                 continue;
             };
             if row.outref() == (*tx, index) {
-                return Ok(Some(row));
+                return Some((i, row));
             }
         }
-        Ok(None)
+        None
     }
 
     /// Every live output at exactly this address.

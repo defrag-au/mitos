@@ -20,6 +20,12 @@ Related:
   an already-folded book
 - `docs/design/TX_INDEX_DATASOURCE.md`, `crates/tx-index/` — the projection
   pattern this note generalises
+- `docs/design/LIVE_BOOK.md` — the phonebook itself, as a built artifact
+- `docs/design/DELTA_CHAIN.md` — **the measurement that answers §3 and §6 of this
+  note**: what a follower holds (a 1.36 MB base bitmap plus ~3.3 MiB of delta a
+  chunk), what it costs (+31% on the walk that builds it), and the 100% resolution
+  rate for outputs that are no longer in the live set
+- `docs/work-orders/WO-F5-mitos-bootstraps-itself.md` — today’s importer *is* dolos `import_blocks`
 - `docs/work-orders/WO-F5-mitos-bootstraps-itself.md` — today’s importer
   *is* dolos `import_blocks`
 - `tools/fold-probe` — the tool §5b's figures come from (`count` for the
@@ -105,6 +111,13 @@ extractors) *can* skip order. They stay projections of the log. FOOTPRINT
 
 Workers never open a chunk. They ask the book and they subscribe to diffs
 (catalogue → R2/KV is already that pattern).
+
+**Both of those claims now have numbers** (`DELTA_CHAIN.md`, 2026-09-23): the fold
+is inherent and still hours, the phonebook fits an 8 GB box, and a follower at the
+tip holds **1.36 MB** of bitmap over the base plus **~3.3 MiB of delta a chunk** —
+measured, not estimated. The resolution question this section raises — *can the book
+find a UTxO that is no longer part of the current set* — is answered **100%**, at
+~240 ns an input, against a base that records no chain position of its own.
 
 ## 4. Keep / drop
 

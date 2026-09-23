@@ -2177,6 +2177,7 @@ dependencies = [
  "clap",
  "live-book",
  "mitos-chain-walk",
+ "mitos-meter",
  "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",
  "pallas-primitives 1.4.0",
@@ -3848,6 +3849,10 @@ dependencies = [
  "pallas-crypto 1.4.0",
  "pallas-primitives 1.4.0",
 ]
+
+[[package]]
+name = "mitos-meter"
+version = "0.0.1"
 
 [[package]]
 name = "mitos-module-kit"

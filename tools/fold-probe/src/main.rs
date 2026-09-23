@@ -49,9 +49,11 @@
 //! deliverable, and it is meant to be pasted whole.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::BuildHasher;
 use std::hash::BuildHasherDefault;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +67,7 @@ use clap::{Args, Parser, Subcommand};
 use live_book::row::Datum;
 use mitos_chain_walk::decode::decode_tx;
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
+use mitos_meter::{Meter, Op, Run, human};
 use pallas_addresses::byron::AddressPayload;
 use pallas_codec::minicbor::Decoder;
 use pallas_primitives::conway::DatumOption;
@@ -73,8 +76,10 @@ use pallas_traverse::{Era, MultiEraBlock, MultiEraOutput, MultiEraValue, Origina
 use tx_index::extract::list_chunks;
 
 use crate::book::Book;
+use crate::delta::Delta;
 
 mod book;
+mod delta;
 
 /// An outref: the key of the live set, and the thing a spend names.
 type OutRef = (Hash<32>, u32);
@@ -98,6 +103,70 @@ enum Cmd {
     Reindex(ReindexArgs),
     /// Ask a published book a question, through the reader a consumer uses.
     Lookup(LookupArgs),
+    /// Resolve a chunk's transaction inputs against a book, and classify what it
+    /// cannot answer. Answers "can the book find a UTxO that is no longer live".
+    ResolveInputs(ResolveArgs),
+    /// Follow chunks past a book's boundary with an in-memory delta: the structure
+    /// that resolves the inputs the book cannot, and what it costs to hold.
+    Follow(FollowArgs),
+}
+
+#[derive(Args)]
+struct FollowArgs {
+    /// The book the follower starts from — its boundary is where the delta begins.
+    #[arg(long)]
+    book: PathBuf,
+    /// The chunk whose boundary the book was built at. **Not in `book.meta`** — see
+    /// the report note — so it is passed in and recorded in the run context.
+    #[arg(long)]
+    base_chunk: u16,
+    /// The Mithril immutable directory.
+    #[arg(long)]
+    immutable: PathBuf,
+    /// First chunk to follow. Default: the chunk after the base boundary.
+    #[arg(long)]
+    from: Option<u16>,
+    /// How many chunks to follow.
+    #[arg(long, default_value_t = 10)]
+    chunks: u16,
+    /// The book was folded from a window rather than from genesis. Inputs created
+    /// before the window are invisible to it, so they land in `uncreated` and the
+    /// rate says nothing about the chain — recorded so the two are never confused.
+    #[arg(long)]
+    window_base: bool,
+    /// The control: the same chunks, the same walk, **no sink**. The difference
+    /// between this and a delta run is what the delta costs, on identical bytes —
+    /// the same A/B `fold` runs between `--primitives` and `--chain-decode`.
+    #[arg(long)]
+    bare: bool,
+    /// Write the meter's records here as one JSON object per line.
+    #[arg(long)]
+    jsonl: Option<PathBuf>,
+    /// Read this many delta rows back through the accessor a consumer uses, and
+    /// check each one resolves. 0 = off; larger than the delta means every row,
+    /// which is also how the cost of a linear scan over the delta is measured.
+    #[arg(long, default_value_t = 2_000)]
+    sample: u64,
+}
+
+#[derive(Args)]
+struct ResolveArgs {
+    /// The book to resolve against.
+    #[arg(long)]
+    book: PathBuf,
+    /// The chunk whose boundary the book was built at. **Not in `book.meta`** — see
+    /// the report note — so it is passed in and recorded in the run context.
+    #[arg(long)]
+    base_chunk: u16,
+    /// The Mithril immutable directory.
+    #[arg(long)]
+    immutable: PathBuf,
+    /// First chunk to resolve, inclusive.
+    #[arg(long)]
+    from: u16,
+    /// Last chunk to resolve, inclusive.
+    #[arg(long)]
+    to: u16,
 }
 
 #[derive(Args)]
@@ -221,6 +290,8 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => verify(a),
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
+        Cmd::ResolveInputs(a) => resolve_inputs(a),
+        Cmd::Follow(a) => follow(a),
     }
 }
 
@@ -444,7 +515,7 @@ fn plan_block(
     plan: &mut BlockPlan,
     st: &mut DecodeStats,
     chain: Option<&mut ChainStats>,
-    mut book: Option<&mut Book>,
+    mut sink: Option<&mut Sink<'_, '_>>,
 ) -> Result<()> {
     plan.clear();
     let era_b = tx_index::format::era_to_u8(block.era());
@@ -483,8 +554,8 @@ fn plan_block(
         let s0 = plan.spends.len() as u32;
         for inp in tx.consumes() {
             plan.spends.push((*inp.hash(), inp.index() as u32));
-            if let Some(bk) = book.as_deref_mut() {
-                bk.spend((*inp.hash(), inp.index() as u32));
+            if let Some(sk) = sink.as_deref_mut() {
+                sk.spend((*inp.hash(), inp.index() as u32));
             }
         }
         let s1 = plan.spends.len() as u32;
@@ -492,8 +563,8 @@ fn plan_block(
         let c0 = plan.creates.len() as u32;
         for (i, o) in tx.outputs().iter().enumerate() {
             let f = classic_facts(&o.value(), o);
-            if let Some(bk) = book.as_deref_mut() {
-                feed_multi_era(bk, (hash, i as u32), era_b, o)?;
+            if let Some(sk) = sink.as_deref_mut() {
+                feed_multi_era(sk, (hash, i as u32), era_b, o)?;
             }
             note_output(st, plan, chunk, hash, i as u32, f);
         }
@@ -509,6 +580,51 @@ fn plan_block(
 }
 
 // ------------------------------------------------- the primitives walk
+
+/// Where one walk's spends and creations go.
+///
+/// One walk, more than one artifact: the same decode feeds the published book (a
+/// byte-addressed arena of rows on disk, and three orderings over it) and the
+/// delta (the same rows in memory, for a follower whose questions are about
+/// transactions the book's boundary is behind). Both are written by `row`'s
+/// encoder, so a delta row and a book row are the same bytes — which is what lets
+/// one consumer read across them.
+///
+/// Byron and the epoch-boundary blocks reach this through `feed_multi_era`, the
+/// expensive route; the primitives walk reaches it through `feed_alonzo` and
+/// `feed_conway`, which is where every Shelley+ output goes.
+enum Sink<'a, 'b> {
+    Book(&'a mut Book),
+    Delta(&'a mut Delta<'b>),
+}
+
+impl Sink<'_, '_> {
+    fn spend(&mut self, outref: OutRef) {
+        match self {
+            Sink::Book(b) => {
+                b.spend(outref);
+            }
+            Sink::Delta(d) => {
+                d.spend(outref);
+            }
+        }
+    }
+
+    fn create_output<'e>(
+        &mut self,
+        outref: OutRef,
+        era: u8,
+        lovelace: u64,
+        address: &[u8],
+        datum: Datum<'_>,
+        assets: impl Iterator<Item = (&'e [u8], &'e [u8], u64)>,
+    ) -> Result<()> {
+        match self {
+            Sink::Book(b) => b.create_output(outref, era, lovelace, address, datum, assets),
+            Sink::Delta(d) => d.create_output(outref, era, lovelace, address, datum, assets),
+        }
+    }
+}
 
 /// One output's facts, in the form BOTH walks record them.
 ///
@@ -799,7 +915,7 @@ fn datum_of<'a, 'b>(d: Option<&'a DatumOption<'b>>) -> Datum<'a> {
 
 /// One output into the book, from an Alonzo/Babbage value.
 fn feed_alonzo(
-    b: &mut Book,
+    b: &mut Sink<'_, '_>,
     oref: (Hash<32>, u32),
     era: u8,
     address: &[u8],
@@ -825,7 +941,7 @@ fn feed_alonzo(
 /// One output into the book, from a Conway value. The only difference from the
 /// Alonzo shape is the quantity type, which is why they are two functions.
 fn feed_conway(
-    b: &mut Book,
+    b: &mut Sink<'_, '_>,
     oref: (Hash<32>, u32),
     era: u8,
     address: &[u8],
@@ -945,7 +1061,7 @@ fn validate_byron_address(a: &pallas_primitives::byron::Address) -> Result<()> {
 /// `Coin(*u64)`: no clone and no allocation, which is the case that matters at
 /// this block count.
 fn feed_multi_era(
-    b: &mut Book,
+    b: &mut Sink<'_, '_>,
     oref: (Hash<32>, u32),
     era: u8,
     o: &MultiEraOutput<'_>,
@@ -1011,7 +1127,7 @@ fn plan_block_primitives(
     plan: &mut BlockPlan,
     st: &mut DecodeStats,
     hashes: &mut Vec<Hash<32>>,
-    book: Option<&mut Book>,
+    sink: Option<&mut Sink<'_, '_>>,
 ) -> Result<()> {
     plan.clear();
     let era = blk.era();
@@ -1019,7 +1135,7 @@ fn plan_block_primitives(
     if !st.eras.contains(&era) {
         st.eras.push(era);
     }
-    let mut book = book;
+    let mut sink = sink;
 
     match blk {
         ShelleyBlock::Alonzo(b, _) => {
@@ -1035,7 +1151,7 @@ fn plan_block_primitives(
                 let s0 = plan.spends.len() as u32;
                 for inp in body.inputs.iter() {
                     plan.spends.push((inp.transaction_id, inp.index as u32));
-                    if let Some(bk) = book.as_deref_mut() {
+                    if let Some(bk) = sink.as_deref_mut() {
                         bk.spend((inp.transaction_id, inp.index as u32));
                     }
                 }
@@ -1043,7 +1159,7 @@ fn plan_block_primitives(
                 let c0 = plan.creates.len() as u32;
                 for (idx, o) in body.outputs.iter().enumerate() {
                     let f = legacy_facts(o);
-                    if let Some(bk) = book.as_deref_mut() {
+                    if let Some(bk) = sink.as_deref_mut() {
                         let datum = match &o.datum_hash {
                             Some(h) => Datum::Hash(h.as_ref()),
                             None => Datum::None,
@@ -1079,7 +1195,7 @@ fn plan_block_primitives(
                 let s0 = plan.spends.len() as u32;
                 for inp in body.inputs.iter() {
                     plan.spends.push((inp.transaction_id, inp.index as u32));
-                    if let Some(bk) = book.as_deref_mut() {
+                    if let Some(bk) = sink.as_deref_mut() {
                         bk.spend((inp.transaction_id, inp.index as u32));
                     }
                 }
@@ -1104,7 +1220,7 @@ fn plan_block_primitives(
                             }
                         }
                     };
-                    if let Some(bk) = book.as_deref_mut() {
+                    if let Some(bk) = sink.as_deref_mut() {
                         match &**o {
                             babbage::TransactionOutput::Legacy(x) => {
                                 let datum = match &x.datum_hash {
@@ -1152,7 +1268,7 @@ fn plan_block_primitives(
                 let s0 = plan.spends.len() as u32;
                 for inp in body.inputs.iter() {
                     plan.spends.push((inp.transaction_id, inp.index as u32));
-                    if let Some(bk) = book.as_deref_mut() {
+                    if let Some(bk) = sink.as_deref_mut() {
                         bk.spend((inp.transaction_id, inp.index as u32));
                     }
                 }
@@ -1174,7 +1290,7 @@ fn plan_block_primitives(
                             }
                         }
                     };
-                    if let Some(bk) = book.as_deref_mut() {
+                    if let Some(bk) = sink.as_deref_mut() {
                         match o {
                             conway::TransactionOutput::Legacy(x) => {
                                 let datum = match &x.datum_hash {
@@ -1504,6 +1620,11 @@ fn fold(a: FoldArgs) -> Result<()> {
         let mut chunk_peak_anon = 0u64;
         dec.bytes = bytes.len() as u64;
 
+        // One walk, one destination here — the probe's own `follow` is what feeds
+        // a delta. Rebuilt per chunk so the borrow of `book` ends with the
+        // iteration and the builder can be finished after the loop.
+        let mut sink = book.as_mut().map(Sink::Book);
+
         if a.cursor {
             let mut pos = 0usize;
             let mut i = 0usize;
@@ -1521,14 +1642,14 @@ fn fold(a: FoldArgs) -> Result<()> {
                         &mut plan,
                         &mut dec,
                         &mut hashes,
-                        book.as_mut(),
+                        sink.as_mut(),
                     )?;
                 } else {
                     dec.fallback_blocks += 1;
                     let mb = MultiEraBlock::decode(&bytes[pos..end])
                         .with_context(|| format!("chunk {chunk}: byte {pos}"))?;
                     era = mb.era();
-                    plan_block(&mb, chunk, &mut plan, &mut dec, None, book.as_mut())?;
+                    plan_block(&mb, chunk, &mut plan, &mut dec, None, sink.as_mut())?;
                 }
                 dec.secs += t.elapsed().as_secs_f64();
 
@@ -1575,12 +1696,12 @@ fn fold(a: FoldArgs) -> Result<()> {
                             &mut plan,
                             &mut dec,
                             &mut hashes,
-                            book.as_mut(),
+                            sink.as_mut(),
                         )?,
                         None => {
                             // Byron and the epoch boundary.
                             dec.fallback_blocks += 1;
-                            plan_block(&block, chunk, &mut plan, &mut dec, None, book.as_mut())?;
+                            plan_block(&block, chunk, &mut plan, &mut dec, None, sink.as_mut())?;
                         }
                     }
                 } else {
@@ -1590,7 +1711,7 @@ fn fold(a: FoldArgs) -> Result<()> {
                         &mut plan,
                         &mut dec,
                         a.chain_decode.then_some(&mut chain_acc),
-                        book.as_mut(),
+                        sink.as_mut(),
                     )?;
                 }
                 dec.secs += t.elapsed().as_secs_f64();
@@ -2390,6 +2511,643 @@ fn cross_check(book: &live_book::Base, sample: usize, limit: usize) -> Result<()
     Ok(())
 }
 
+/// Resolve one chunk's transaction inputs against a published book, and classify
+/// every input the book cannot answer.
+///
+/// This is the measurement behind "can the book find a UTxO that is no longer
+/// part of the current set" — the question a transaction landing at tip asks,
+/// because the outputs it spends were live one block ago and are not live now.
+///
+/// Three outcomes, and they are a **partition**, not a sample:
+///
+/// | outcome | where the answer is |
+/// |---|---|
+/// | **hit** | in the book — the output existed at the book's boundary and had not been spent before this chunk |
+/// | **same-chunk** | in this chunk's own blocks, so a follower processing the chunk has it in hand |
+/// | **never-created** | no transaction in the log ever created it: Byron's genesis distribution and redeem-style inputs, the `misresolved` class the fold reports |
+///
+/// `hits + same_chunk + gap + never_created == inputs` is asserted rather than
+/// hoped for, which is what makes this a measurement instead of an impression. An
+/// output has to exist before it is spent, so a miss was created in an earlier
+/// chunk, this chunk, or never — and "an earlier chunk" splits into **before the
+/// book's boundary** (which is a hit: the row is still in the base) or **after it**,
+/// which is the gap.
+///
+/// ⚠️ **What the last bucket means depends on the base.** For a book folded from
+/// genesis, `never_created` is `misresolved` — Byron's genesis distribution and
+/// redeem-style inputs that no transaction in the log ever created. For a book
+/// built from a *window*, it also swallows anything created before the window
+/// began, so a run against a window base reports a large bucket that says nothing
+/// about the chain. The run context records `base_chunk` so the two are never
+/// confused.
+///
+/// # What the three non-hit buckets are, in the design's terms
+///
+/// This is the point of the classification, and it is why the buckets are named
+/// the way they are:
+///
+/// | bucket | where the answer is, for a follower at this chunk |
+/// |---|---|
+/// | **hit** | the book's base — one lookup, no I/O |
+/// | **same-chunk** | the block being processed, already in hand |
+/// | **gap** | **the delta chain's working set** — created after the base and before this chunk |
+/// | **never-created** | nowhere: the log cannot answer it either |
+///
+/// So resolving a range at increasing lag gives the **staleness curve**, and the
+/// gap bucket at each lag is a direct measurement of what a delta chain would have
+/// to hold to keep the resolution rate at 100%.
+fn resolve_inputs(a: ResolveArgs) -> Result<()> {
+    let t = Instant::now();
+    let base = live_book::Base::open(&a.book)?;
+    let opened = t.elapsed();
+    let mut meter = Meter::new();
+    let run = Run::new("resolve-inputs")
+        .target(a.book.display().to_string())
+        .key("rows", base.rows())
+        .key("base_chunk", a.base_chunk)
+        .key("from", a.from)
+        .key("to", a.to);
+
+    println!("book resolve-inputs — {}", a.book.display());
+    println!(
+        "  base       {} rows · mapped in {:.3} s · boundary chunk {} (passed in, not recorded \
+         in `book.meta`)",
+        base.rows(),
+        opened.as_secs_f64(),
+        a.base_chunk,
+    );
+    println!(
+        "  {:<8} {:>6} {:>10} {:>10} {:>11} {:>11} {:>11} {:>9}",
+        "chunk", "lag", "inputs", "from book", "same-chunk", "gap", "uncreated", "ns/input"
+    );
+
+    // The gap: everything created after the book's boundary and before the chunk
+    // being resolved. A delta chain would hold exactly this set, so counting it
+    // separately is what makes the lag curve interpretable — without it those
+    // resolutions would be indistinguishable from ones the log cannot answer at
+    // all.
+    //
+    // It is rolled forward with the walk rather than computed once for the range:
+    // the gap for chunk N is `base+1..N`, so a single set built for the range's
+    // first chunk would leave every later chunk's recent creations in `uncreated`,
+    // where they look like inputs the log cannot answer. (Measured the hard way:
+    // 2,444 of chunk 1002's inputs were misclassified as never created before
+    // this was rolled.)
+    let mut gap: HashSet<[u8; 36]> = HashSet::new();
+    let mut gap_meter = Meter::new();
+    let gap_from = u32::from(a.base_chunk) + 1;
+    for chunk in gap_from..u32::from(a.from) {
+        collect_creations(
+            &a.immutable,
+            chunk as u16,
+            &mut gap,
+            &mut gap_meter,
+            &mut BlockPlan::default(),
+            &mut DecodeStats::default(),
+            &mut Vec::new(),
+        )?;
+    }
+    if !gap.is_empty() {
+        println!(
+            "  gap pass   chunks {gap_from}..{} · {} creations collected to classify the miss \
+             bucket (this is the set a delta chain would hold)",
+            a.from,
+            gap.len()
+        );
+    }
+
+    let (mut all_inputs, mut all_hits, mut all_same, mut all_gap, mut all_uncreated) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    for chunk in a.from..=a.to {
+        let path = chunk_path(&a.immutable, chunk);
+        let bytes = meter
+            .observe(Op::ChunkRead, || std::fs::read(&path))
+            .with_context(|| format!("reading {}", path.display()))?;
+
+        // One pass, because an output is always created before it is spent — even
+        // inside a block. So creations seen so far are exactly the creations that
+        // could have been spent so far, and no second pass is needed to attribute a
+        // miss to this chunk.
+        let mut created: HashSet<[u8; 36]> = HashSet::new();
+        let (mut inputs, mut hits, mut same, mut gap_hits, mut uncreated) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut at = 0usize;
+        let mut skipped = 0u64;
+        let mut plan = BlockPlan::default();
+        let mut stats = DecodeStats::default();
+        let mut hashes: Vec<Hash<32>> = Vec::new();
+        let t = Instant::now();
+        while at < bytes.len() {
+            let (decoded, len) =
+                meter.observe(Op::BlockDecode, || decode_block_at(&bytes[at..]))?;
+            if len == 0 {
+                bail!("chunk {chunk}: a block decoded to zero bytes at offset {at}");
+            }
+            at += len;
+            let Some(blk) = decoded.shelley() else {
+                // Byron and the epoch boundary. They are handled by the fold's own
+                // fallback path; here they are counted so a run over a Byron-era
+                // range cannot look complete when it is not.
+                skipped += 1;
+                continue;
+            };
+            meter.observe(Op::BlockApply, || {
+                plan_block_primitives(blk, chunk, &mut plan, &mut stats, &mut hashes, None)
+            })?;
+            for (oref, _) in &plan.creates {
+                created.insert(outref_key(oref));
+            }
+            for (hash, index) in &plan.spends {
+                inputs += 1;
+                let key = outref_key(&(*hash, *index));
+                let found = meter.observe(Op::BookUtxo, || {
+                    base.utxo(hash.as_ref().try_into().expect("32"), *index)
+                })?;
+                match found {
+                    Some(_) => hits += 1,
+                    None if created.contains(&key) => same += 1,
+                    None if gap.contains(&key) => gap_hits += 1,
+                    None => uncreated += 1,
+                }
+            }
+        }
+        let nanos = t.elapsed().as_nanos();
+        if skipped > 0 {
+            println!("  (chunk {chunk}: {skipped} blocks fell back and were not counted)");
+        }
+        println!(
+            "  {:<8} {:>6} {:>10} {:>9.2}% {:>10.2}% {:>10.2}% {:>11} {:>9}",
+            chunk,
+            i32::from(chunk) - i32::from(a.base_chunk),
+            inputs,
+            100.0 * hits as f64 / inputs.max(1) as f64,
+            100.0 * same as f64 / inputs.max(1) as f64,
+            100.0 * gap_hits as f64 / inputs.max(1) as f64,
+            uncreated,
+            nanos / u128::from(inputs.max(1)),
+        );
+        all_inputs += inputs;
+        all_hits += hits;
+        all_same += same;
+        all_gap += gap_hits;
+        all_uncreated += uncreated;
+
+        // This chunk's creations become gap for the chunk after it: created after
+        // the boundary, and no longer "this chunk" once we move on.
+        gap.extend(created);
+    }
+
+    if all_hits + all_same + all_gap + all_uncreated != all_inputs {
+        bail!(
+            "the classification does not partition: {} hits + {} same-chunk + {} gap + {} \
+             uncreated != {} inputs",
+            all_hits,
+            all_same,
+            all_gap,
+            all_uncreated,
+            all_inputs
+        );
+    }
+    let pct = |n: u64| 100.0 * n as f64 / all_inputs.max(1) as f64;
+    println!();
+    println!(
+        "  total      {all_inputs} inputs in chunks {}..{}",
+        a.from, a.to
+    );
+    println!(
+        "             {:.2}% from the book's base · {:.2}% from their own chunk · {:.2}% from the \
+         gap ({}) · {} never created in the log",
+        pct(all_hits),
+        pct(all_same),
+        pct(all_gap),
+        all_gap,
+        all_uncreated
+    );
+    if all_hits + all_same + all_gap == all_inputs {
+        println!(
+            "             base + chunk + gap is the whole answer: every input resolves without an \
+             archive"
+        );
+    }
+    println!();
+    print!("{}", meter.table(&run));
+    let o = meter.get(Op::BookUtxo);
+    println!(
+        "  book_utxo  {} mean · {} p99 over {} lookups ({:.1}% hit rate)",
+        human(o.mean_nanos()),
+        human(o.p99()),
+        o.count,
+        pct(all_hits),
+    );
+    Ok(())
+}
+
+/// Follow chunks past a published book's boundary, holding everything created
+/// since it in memory.
+///
+/// This is the other half of `resolve-inputs`. That command *classifies* a
+/// chunk's inputs into four buckets and shows that `base + same-chunk + gap` is
+/// the whole answer; this one **builds the gap and prices it**, so "can mitos
+/// answer a module about a transaction that just landed" stops being a design
+/// question and becomes a number.
+///
+/// The delta is one structure with three parts, and each is there because a
+/// different question needs it (see `delta.rs`):
+///
+/// - the **rows** created since the boundary — an input is answered with the
+///   output it spent, not with a yes;
+/// - a **spent bit per creation** — a follower's live set is `base ∪ delta −
+///   spent`, and a module asking for an address must not be handed a spent row;
+/// - a **spent bit per base row** — the book is a snapshot, so it does not know
+///   what the followed chunks spent, and that bitmap is **1.36 MB** over mainnet.
+///
+/// # What the numbers mean, and what they do not
+///
+/// `base`/`delta`/`uncreated` are a partition of the inputs by construction —
+/// every spend is handed to the delta once and returns exactly one tier — so the
+/// useful checks are the cross-checks against the walk: the delta must have seen
+/// every spend the planner counted, and hold every output it counted.
+///
+/// A base folded from a **window** rather than from genesis makes `uncreated`
+/// meaningless (everything created before the window is invisible to it), which
+/// is why `--window-base` records that in the run context. The delta's own size
+/// and cost are exact either way — they do not depend on the base's completeness
+/// — and that is what this command is for.
+fn follow(a: FollowArgs) -> Result<()> {
+    let base = live_book::Base::open(&a.book)?;
+    let mut delta = Delta::new(&base)?;
+    let from = a.from.unwrap_or_else(|| a.base_chunk.saturating_add(1));
+    let to = from.saturating_add(a.chunks.saturating_sub(1));
+    let mut meter = Meter::new();
+    let run = Run::new("follow")
+        .target(a.book.display().to_string())
+        .key("rows", base.rows())
+        .key("base_chunk", a.base_chunk)
+        .key("window_base", a.window_base)
+        .key("sink", !a.bare)
+        .key("from", from)
+        .key("to", to);
+
+    println!("delta follow — {} + chunks {from}..={to}", a.book.display());
+    if a.bare {
+        println!(
+            "  control    NO SINK — the same chunks and the same walk, so the difference from a \
+             delta run is what the delta costs"
+        );
+    }
+    println!(
+        "  base       {} live rows · {} policies · boundary chunk {}",
+        base.rows(),
+        base.policies().len(),
+        a.base_chunk,
+    );
+    if a.window_base {
+        println!(
+            "             FOLDED FROM A WINDOW: anything created before it is invisible, so \
+             `uncreated` is not the chain's number"
+        );
+    }
+    if !base.policies().is_empty() {
+        // Not the delta's own bytes: a production delta is written by the process
+        // that wrote the base, which holds this map already. A *reader* has to
+        // rebuild it, and that is worth seeing before it is designed away.
+        println!(
+            "             + {} to rebuild policy → id, which the artifact publishes only the \
+             other way round",
+            human_bytes(delta.policy_map_bytes() as u64),
+        );
+    }
+
+    let mut chunk_buf: Vec<u8> = Vec::new();
+    let mut hashes: Vec<Hash<32>> = Vec::new();
+    let mut plan = BlockPlan::default();
+    let mut stats = DecodeStats::default();
+    let started = Instant::now();
+
+    // The smallest non-zero step the clock can report — which is what bounds how
+    // much a per-observation figure can be trusted, and is not the same question as
+    // what one observation costs.
+    //
+    // ⚠ Both halves are load-bearing, and each was found the hard way. Written
+    // plainly, `Instant::now().elapsed()` folds to `Duration::ZERO` — it has no
+    // modelled side effects, so the measurement silently becomes a constant. And
+    // read through `black_box`, the **minimum is still 0** on this box: the ARM
+    // `arch_sys_counter` ticks at tens of nanoseconds, so two consecutive reads
+    // inside one tick are equal. Only the smallest non-zero step is real.
+    let clock_tick_nanos = {
+        let mut tick = u64::MAX;
+        let mut prev = std::hint::black_box(Instant::now());
+        for _ in 0..1_000_000 {
+            let now = std::hint::black_box(Instant::now());
+            let d = now.saturating_duration_since(prev).as_nanos() as u64;
+            if d > 0 {
+                tick = tick.min(d);
+            }
+            prev = now;
+        }
+        tick
+    };
+
+    println!();
+    println!(
+        "  {:<7} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "chunk", "creates", "delta", "delta MB", "base", "delta", "uncred", "ns/input", "ns/create"
+    );
+
+    let (mut all_inputs, mut all_base, mut all_delta, mut all_uncreated) = (0u64, 0u64, 0u64, 0u64);
+    let mut bytes_read = 0u64;
+    for chunk in from..=to {
+        let path = chunk_path(&a.immutable, chunk);
+        meter
+            .observe(Op::ChunkRead, || read_chunk_into(&mut chunk_buf, &path))
+            .with_context(|| format!("reading {}", path.display()))?;
+        bytes_read += chunk_buf.len() as u64;
+        let bytes = chunk_buf.as_slice();
+
+        let before = delta.stat();
+        let t = Instant::now();
+        {
+            // The delta is the sink for this chunk's walk — unless this run is the
+            // control, in which case the walk is identical and writes nowhere.
+            let mut sink = if a.bare {
+                None
+            } else {
+                Some(Sink::Delta(&mut delta))
+            };
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let (decoded, len) =
+                    meter.observe(Op::BlockDecode, || decode_block_at(&bytes[at..]))?;
+                if len == 0 {
+                    bail!("chunk {chunk}: a block decoded to zero bytes at offset {at}");
+                }
+                at += len;
+                let Some(blk) = decoded.shelley() else {
+                    // Byron and the epoch boundary have no primitives to walk, so
+                    // there is nothing to feed the delta from. Counted rather than
+                    // dropped quietly: those blocks' outputs are *not* in the delta.
+                    stats.fallback_blocks += 1;
+                    continue;
+                };
+                meter.observe(Op::BlockApply, || {
+                    plan_block_primitives(
+                        blk,
+                        chunk,
+                        &mut plan,
+                        &mut stats,
+                        &mut hashes,
+                        sink.as_mut(),
+                    )
+                })?;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let after = delta.stat();
+        let acc = delta.accounted();
+
+        let creates = after.created - before.created;
+        let (b, d, u) = (
+            after.spend_base - before.spend_base,
+            after.spend_delta - before.spend_delta,
+            after.spend_uncreated - before.spend_uncreated,
+        );
+        let inputs = b + d + u;
+        let probes = after.lookup_nanos - before.lookup_nanos;
+        let creating = after.create_nanos - before.create_nanos;
+        println!(
+            "  {:<7} {:>9} {:>9} {:>9.1} {:>7.1}% {:>7.1}% {:>8} {:>10} {:>10}",
+            chunk,
+            creates,
+            delta.stat().created,
+            acc.total() as f64 / (1024.0 * 1024.0),
+            100.0 * b as f64 / inputs.max(1) as f64,
+            100.0 * d as f64 / inputs.max(1) as f64,
+            u,
+            probes / inputs.max(1),
+            creating / creates.max(1),
+        );
+        let _ = secs;
+        all_inputs += inputs;
+        all_base += b;
+        all_delta += d;
+        all_uncreated += u;
+    }
+
+    // Not a partition check — that holds by construction. These are the two ways
+    // the sink could silently stop receiving what the walk counted, so they are
+    // checks on the delta rather than on the walk.
+    if !a.bare {
+        if all_inputs != stats.inputs {
+            bail!(
+                "the delta classified {all_inputs} spends; the walk counted {}",
+                stats.inputs
+            );
+        }
+        if delta.stat().created != stats.outputs {
+            bail!(
+                "the delta holds {} rows; the walk counted {} outputs",
+                delta.stat().created,
+                stats.outputs
+            );
+        }
+    }
+
+    let st = delta.stat();
+    let acc = delta.accounted();
+    let secs = started.elapsed().as_secs_f64();
+    let pct = |n: u64| 100.0 * n as f64 / all_inputs.max(1) as f64;
+    println!();
+    println!(
+        "  total      {all_inputs} inputs in chunks {from}..={to} · {:.1} s · {:.1} MiB/s",
+        secs,
+        bytes_read as f64 / (1024.0 * 1024.0) / secs.max(f64::MIN_POSITIVE),
+    );
+    println!(
+        "             {:.2}% from the base · {:.2}% from the delta · {} never created in the log",
+        pct(all_base),
+        pct(all_delta),
+        all_uncreated,
+    );
+    println!(
+        "             {} blocks · {} txs · {} outputs · {} blocks skipped (no primitives)",
+        stats.blocks, stats.txs, stats.outputs, stats.fallback_blocks
+    );
+    println!();
+    println!(
+        "  delta      {} creations · {} still live · {} spent",
+        st.created,
+        delta.live(),
+        st.delta_rows_spent
+    );
+    println!(
+        "             rows {} · probes {} · spent bits {} · policy tail {} = {}",
+        human_bytes(acc.arena as u64),
+        human_bytes(acc.probes as u64),
+        human_bytes(acc.spent_bits as u64),
+        human_bytes(acc.policy_tail as u64),
+        human_bytes(acc.total() as u64),
+    );
+    println!(
+        "             {} B per creation over {} · {} base rows spent ({} per chunk) · base bitmap {}",
+        acc.total() / st.created.max(1) as usize,
+        st.created,
+        st.base_rows_spent,
+        st.base_rows_spent / u64::from(to - from + 1),
+        human_bytes((base.rows() as usize).div_ceil(8) as u64),
+    );
+    println!(
+        "             {} policies the base never saw; their ids continue from its {}",
+        st.policies_new,
+        base.policies().len(),
+    );
+    println!();
+    println!(
+        "  probe      {} ns mean per input, over {} delta probes",
+        st.lookup_nanos / all_inputs.max(1),
+        all_inputs,
+    );
+    println!(
+        "  create     {} ns mean per creation, over {} creations",
+        st.create_nanos / st.created.max(1),
+        st.created,
+    );
+    println!(
+        "  clock      {clock_tick_nanos} ns is the smallest step this box's `arch_sys_counter` \
+         reports, so every per-op figure above carries up to that much quantisation; the timer's \
+         own cost is below it"
+    );
+    println!();
+    print!("{}", meter.table(&run));
+    if let Some(path) = &a.jsonl {
+        std::fs::write(path, meter.jsonl(&run))
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("  jsonl      {}", path.display());
+    }
+    if a.sample > 0 && !a.bare {
+        sample_delta(&base, &delta, a.sample)?;
+    }
+    Ok(())
+}
+
+/// Read a sample of the delta back the way a consumer would.
+///
+/// The point of the delta being *the same encoding as the book* is that one
+/// consumer reads across both, so this walks a sample of the creations and asks
+/// the delta for each one by outref — the accessor a module uses — and then
+/// resolves every asset id in the row through the base's `policy.tbl` plus the
+/// delta's own tail. An id that resolves through neither is a row no consumer
+/// could read, which is the failure the shared encoding is supposed to make
+/// impossible.
+fn sample_delta(base: &live_book::Base, delta: &Delta<'_>, sample: u64) -> Result<()> {
+    let base_len = base.policies().len();
+    let n = delta.stat().created;
+    if n == 0 {
+        println!("  sample     the delta is empty");
+        return Ok(());
+    }
+    let step = (n / sample.max(1)).max(1);
+    let (mut read, mut live, mut bad_ref, mut bad_policy, mut assets) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let started = Instant::now();
+    let mut ordinal = 0u64;
+    while ordinal < n {
+        let Some(row) = delta.row(ordinal as u32).ok() else {
+            bad_ref += 1;
+            ordinal += step;
+            continue;
+        };
+        read += 1;
+        if delta.is_live(ordinal as u32) {
+            live += 1;
+        }
+        let (tx, index) = row.outref();
+        match delta.utxo((Hash::from(tx), index)) {
+            Some(Ok(again)) if again.outref() == (tx, index) => {}
+            _ => bad_ref += 1,
+        }
+        for a in row.assets() {
+            assets += 1;
+            let id = a.policy as usize;
+            let readable = if id < base_len {
+                base.policies().get(a.policy).is_some()
+            } else {
+                id - base_len < delta.policy_tail().len()
+            };
+            if !readable {
+                bad_policy += 1;
+            }
+        }
+        ordinal += step;
+    }
+    let nanos = started.elapsed().as_nanos();
+    println!(
+        "  sample     {read} rows read back from {n} creations · {live} still live · {assets} asset \
+         records"
+    );
+    println!(
+        "             {bad_ref} refs that did not resolve · {bad_policy} asset ids unreadable"
+    );
+    // A delta *without* its own orderings can only answer `by_address` by reading
+    // every row, so this is the floor for the simplest enumeration a module could
+    // be given — and the number that argues for carrying the permutation instead.
+    println!(
+        "             {} ns per row · {} for a full scan of {n} rows ({} row per lookup)",
+        nanos / read.max(1) as u128,
+        human((nanos / read.max(1) as u128 * n as u128) as u64),
+        n / read.max(1),
+    );
+    if bad_ref + bad_policy > 0 {
+        bail!("the delta does not read back: {bad_ref} refs and {bad_policy} asset ids");
+    }
+    Ok(())
+}
+
+/// A chunk's created outputs, as membership keys.
+///
+/// Walks a chunk and keeps only the creations — the same decode as resolution, but
+/// with the book untouched. Used for the gap pass, which has to know what was
+/// created after the base boundary without resolving anything against it.
+fn collect_creations(
+    immutable: &Path,
+    chunk: u16,
+    out: &mut HashSet<[u8; 36]>,
+    meter: &mut Meter,
+    plan: &mut BlockPlan,
+    stats: &mut DecodeStats,
+    hashes: &mut Vec<Hash<32>>,
+) -> Result<()> {
+    let path = chunk_path(immutable, chunk);
+    let bytes = meter
+        .observe(Op::ChunkRead, || std::fs::read(&path))
+        .with_context(|| format!("reading {} (gap pass)", path.display()))?;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let (decoded, len) = meter.observe(Op::BlockDecode, || decode_block_at(&bytes[at..]))?;
+        if len == 0 {
+            bail!("chunk {chunk}: a block decoded to zero bytes at offset {at} (gap pass)");
+        }
+        at += len;
+        let Some(blk) = decoded.shelley() else {
+            continue;
+        };
+        meter.observe(Op::BlockApply, || {
+            plan_block_primitives(blk, chunk, plan, stats, hashes, None)
+        })?;
+        for (oref, _) in &plan.creates {
+            out.insert(outref_key(oref));
+        }
+    }
+    Ok(())
+}
+
+/// The 36-byte membership key for an outref: the hash then the index, packed.
+fn outref_key(oref: &OutRef) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(oref.0.as_ref());
+    key[32..].copy_from_slice(&oref.1.to_le_bytes());
+    key
+}
+
 fn hex_of(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -2768,6 +3526,117 @@ fn kb_field(text: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::Tier;
+
+    /// The delta is the gap, and the gap is exactly what the book cannot answer.
+    ///
+    /// Four claims, and each is a way the structure could be wrong rather than an
+    /// echo of the implementation: an output created after the boundary resolves
+    /// from the delta; a spend does **not** remove the row, because a consumer
+    /// analysing a landed transaction is asking about that transaction's inputs;
+    /// the spend is nevertheless visible as liveness, which is what a module
+    /// enumerating an address needs; and a spend of a *base* row is recorded
+    /// against the base's own bitmap, once.
+    #[test]
+    fn a_delta_answers_past_the_boundary_and_records_what_it_spends() {
+        let dir = std::env::temp_dir().join(format!("fold-probe-delta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A base of three live rows. Two assets on one policy so the delta's
+        // interning has something the base already knows, and a real base address
+        // (57 bytes, header 0x01) so the rows are keyed the way the artifact keys
+        // them.
+        let pol_a = [0xAAu8; 28];
+        let pol_b = [0xBBu8; 28];
+        let address = |i: u32| -> Vec<u8> {
+            let mut a = vec![0x01u8];
+            a.extend_from_slice(&[i as u8; 28]);
+            a.extend_from_slice(&[0xCD; 28]);
+            a
+        };
+        let mut b = Book::create(&dir, 1 << 20).expect("create");
+        for i in 0..3u32 {
+            let v: &[u8] = b"one";
+            let pol: &[u8] = &pol_a;
+            b.create_output(
+                (Hash::<32>::from([i as u8; 32]), 0),
+                1,
+                1_000,
+                &address(i),
+                Datum::None,
+                [(pol, v, 1u64)].into_iter(),
+            )
+            .expect("create_output");
+        }
+        b.finish().expect("finish");
+
+        let base = live_book::Base::open(&dir).expect("open");
+        assert_eq!(base.rows(), 3);
+        let mut delta = Delta::new(&base).expect("delta");
+
+        // A base row: answered, and marked spent once rather than per reference.
+        let base_ref = (Hash::<32>::from([1u8; 32]), 0);
+        assert_eq!(delta.spend(base_ref), Tier::Base);
+        assert_eq!(delta.spend(base_ref), Tier::Base);
+        assert_eq!(
+            delta.stat().base_rows_spent,
+            1,
+            "a row spent twice in one chunk is one spent row"
+        );
+
+        // Never created: Byron's genesis distribution and redeem-style inputs.
+        assert_eq!(
+            delta.spend((Hash::<32>::from([0xFFu8; 32]), 0)),
+            Tier::Uncreated
+        );
+
+        // Created after the boundary: only the delta can answer this one, and a
+        // second creation on a policy the base never saw must take an id that
+        // continues from the base's own table.
+        let new_ref = (Hash::<32>::from([9u8; 32]), 0);
+        let name: &[u8] = b"nine";
+        let pol: &[u8] = &pol_b;
+        delta
+            .create_output(
+                new_ref,
+                1,
+                7,
+                &address(9),
+                Datum::None,
+                [(pol, name, 5u64)].into_iter(),
+            )
+            .expect("create_output");
+        assert_eq!(delta.spend(new_ref), Tier::Delta);
+        assert_eq!(delta.stat().created, 1);
+        assert!(
+            !delta.is_live(0),
+            "the delta spent the only creation it holds"
+        );
+        assert_eq!(delta.live(), 0);
+
+        // Spending does not unmake the row: the transaction being analysed names
+        // this output as an input, and it has to be readable.
+        let row = delta
+            .utxo(new_ref)
+            .expect("a spent row is still a row")
+            .expect("parses");
+        assert_eq!(row.outref(), ([9u8; 32], 0));
+        assert_eq!(row.lovelace(), 7);
+        assert_eq!(row.address(), address(9).as_slice());
+        let asset = row.assets().next().expect("one asset");
+        assert_eq!(asset.name, name);
+        assert_eq!(asset.quantity, 5);
+        assert_eq!(
+            asset.policy as usize,
+            base.policies().len(),
+            "a policy the base never saw continues from the base's own count"
+        );
+        assert_eq!(delta.policy_tail(), &[pol_b]);
+        assert_eq!(
+            delta.policy_tail().len(),
+            delta.stat().policies_new as usize
+        );
+    }
 
     /// The writer and the reader have to agree — and the reader has to notice when
     /// the bytes have been meddled with. Both halves in one test, because the
