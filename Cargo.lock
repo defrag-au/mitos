@@ -3785,6 +3785,7 @@ dependencies = [
  "dolos-cardano",
  "dolos-core",
  "hex",
+ "live-book",
  "pallas",
  "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",

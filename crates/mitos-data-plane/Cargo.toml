@@ -21,6 +21,12 @@ license.workspace = true
 cardano-assets = { workspace = true }
 pipeline-types = { workspace = true }
 
+# The live book, for `BookDataPlane`. Light — memmap2, anyhow and pallas-addresses
+# — and deliberately narrower than the dolos half of this crate: the book-backed
+# plane exists so a consumer can serve the module surface without a node-shaped
+# store behind it.
+live-book = { path = "../live-book" }
+
 # Pallas types where unavoidable: PlutusData (typed; not heavy),
 # Hash<N>, address structs. We re-expose narrowed forms but keep
 # pallas as the underlying source of truth for fidelity.

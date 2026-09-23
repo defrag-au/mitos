@@ -46,7 +46,8 @@ pub use types::{
 };
 
 pub use impls::{
-    LocalDataPlane, UTXOS_BY_ADDRESS_HARD_CAP, extract_aux_cbor, project_typed_output,
+    BookDataPlane, LocalDataPlane, UTXOS_BY_ADDRESS_HARD_CAP, extract_aux_cbor,
+    project_typed_output,
 };
 
 use async_trait::async_trait;

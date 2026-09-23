@@ -76,6 +76,51 @@ impl Credential {
     }
 }
 
+/// What an address delegates its stake to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Delegation {
+    Key([u8; 28]),
+    Script([u8; 28]),
+}
+
+impl Delegation {
+    pub fn bytes(&self) -> &[u8; 28] {
+        match self {
+            Delegation::Key(b) | Delegation::Script(b) => b,
+        }
+    }
+}
+
+/// The delegation part of a Shelley address, or `None` when it has none.
+///
+/// Types 0–3 carry one at `[29..57]`, and the header says which kind: bit 5
+/// (`0x20`) is set when the delegation part is a script. Types 4–5 delegate via a
+/// **pointer** (a slot/tx/cert triple rather than a credential) and 6–7 have no
+/// delegation at all, so all four are `None`. Byron has no delegation part — a
+/// bootstrap address *is* the payment authority, and its `root` is recovery
+/// material rather than a stake credential.
+///
+/// Here rather than in a consumer for the same reason [`credential`] is: the
+/// header dispatch has one home, and two implementations of it would eventually
+/// disagree about which nibble means what.
+pub fn delegation(address: &[u8]) -> Option<Delegation> {
+    let header = *address.first()?;
+    if !matches!(header >> 4, 0..=3) {
+        return None;
+    }
+    let payload = address.get(1..)?;
+    if payload.len() < 56 {
+        return None;
+    }
+    let mut bytes = [0u8; 28];
+    bytes.copy_from_slice(&payload[28..56]);
+    Some(if header & 0x20 == 0 {
+        Delegation::Key(bytes)
+    } else {
+        Delegation::Script(bytes)
+    })
+}
+
 /// The credential `address` is keyed by, or `None` when pallas would not call the
 /// bytes an address at all.
 pub fn credential(address: &[u8]) -> Option<Credential> {
@@ -185,6 +230,37 @@ mod tests {
         let mut a = vec![0x91];
         a.extend_from_slice(&[0x11; 28]);
         assert!(credential(&a).is_none());
+    }
+
+    #[test]
+    fn delegation_is_the_second_credential_and_only_for_the_four_base_shapes() {
+        // Types 0–3 have one, at 29..57; bit 5 of the header says key or script.
+        for (header, script) in [(0x01u8, false), (0x11, false), (0x21, true), (0x31, true)] {
+            let mut a = vec![header];
+            a.extend_from_slice(&[0xAB; 28]); // payment
+            a.extend_from_slice(&[0xCD; 28]); // delegation
+            match delegation(&a) {
+                Some(Delegation::Script(b)) => {
+                    assert!(script, "header {header:#04x}");
+                    assert_eq!(b, [0xCD; 28]);
+                }
+                Some(Delegation::Key(b)) => {
+                    assert!(!script, "header {header:#04x}");
+                    assert_eq!(b, [0xCD; 28]);
+                }
+                None => panic!("header {header:#04x} must carry a delegation part"),
+            }
+        }
+        // Pointer (4–5), enterprise (6–7), reward (14–15) and Byron have none.
+        for header in [0x41u8, 0x51, 0x61, 0x71, 0xE1, 0xF1, 0x81] {
+            let mut a = vec![header];
+            a.extend_from_slice(&[0xAB; 28]);
+            a.extend_from_slice(&[0xCD; 28]);
+            assert!(delegation(&a).is_none(), "header {header:#04x}");
+        }
+        assert!(delegation(&[]).is_none());
+        // A truncated base address cannot supply a credential that is not there.
+        assert!(delegation(&base_address(0xAB, 0xCD)[..56]).is_none());
     }
 
     #[test]
