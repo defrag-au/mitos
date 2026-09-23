@@ -1,9 +1,13 @@
-//! The live book — phase 1 of `LIVE_BOOK.md`'s builder.
+//! The live book's **builder** and its audit — the probe's half of `LIVE_BOOK.md`.
+//!
+//! The artifact's layout, its writer and its reader live in `live-book`; this is
+//! what walks a chunk log into one (`Book`) and what reads one back
+//! (`verify`, `reindex`). Nothing here defines a byte offset.
 //!
 //! Writes `rows.bin` + `by_outref.idx` + `dir.idx` + `by_policy.idx` +
-//! `policy.dir.idx` + `by_addr.idx` + `addr.dir.idx` + `policy.tbl` from a pass
-//! over the chunk log. Not yet: the delta chain, the datum table, the base/delta
-//! split.
+//! `policy.dir.idx` + `by_addr.idx` + `addr.dir.idx` + `policy.tbl` + `book.meta`
+//! from a pass over the chunk log. Not yet: the delta chain, the datum table, the
+//! base/delta split.
 //!
 //! # The shape, and why it is this shape
 //!
@@ -12,15 +16,15 @@
 //! (`DECODE_SHAPE.md` §2.7). This replaces it with two structures that do
 //! different jobs:
 //!
-//! - **the rows**, appended to a file in `B2`'s encoding. Nothing reads them
+//! - **the rows**, appended to a file in the row format. Nothing reads them
 //!   during the build except a compaction scan, so they never need to be
 //!   resident; the page cache holds them and the kernel may take them back.
 //! - **the index**, in RAM, 16 bytes a slot: `u64 prefix ‖ u32 tail ‖ u32 row`.
-//!   `B3`'s *artifact* entry is 12 bytes — `u64 prefix ‖ u32 row` — and a prefix
-//!   hit is confirmed against the row; a build cannot afford that confirm per
-//!   spend (344 M of them), so the build index carries 96 bits of key and needs
-//!   no confirm at all. It is discarded at the end, and the artifact's 12-byte
-//!   index is derived from it.
+//!   The artifact's entry is 12 bytes — `u64 prefix ‖ u32 row` — and a prefix hit
+//!   is confirmed against the row; a build cannot afford that confirm per spend
+//!   (344 M of them), so the build index carries 96 bits of key and needs no
+//!   confirm at all. It is discarded at the end, and the artifact's 12-byte index
+//!   is derived from it.
 //!
 //!   Those 96 bits are 64 of the outref's hash and 32 more **mixed with the
 //!   output index**, because an outref is `(hash, index)` and a transaction's
@@ -31,21 +35,15 @@
 //!
 //! The bitmap `B4` describes is not needed here: a spend tombstones its slot, so
 //! the surviving index entries *are* the liveness mask, and compaction decides
-//! which rows to keep by probing each row's own outref (which `B2` guarantees is
-//! in the row).
+//! which rows to keep by probing each row's own outref (which the row format
+//! guarantees is in the row).
 //!
-//! # Deviations from `B2`, stated
+//! # Deviations from the format, stated
 //!
-//! - `B2` does not say where an inline datum's bytes live. Phase 1 puts them at
-//!   the end of their own row, with the length in the two bytes `B2` reserves —
-//!   inside the transaction size limit (16 KB), so a `u16` is enough. `datum_ref`
-//!   is therefore unused (0). A `datum.tbl` for dedup is phase 2.
-//! - `B2` gives `addr_len` one byte. Real mainnet data falsifies that: chunk 81
-//!   of 9,181 holds a 513-byte Byron address — `[#6.24(502-byte payload), crc32]`
-//!   with the payload reading `[root(28), attributes(~470), addrtype]`. It is
-//!   `u16` here, which costs nothing because the byte comes out of the header's
-//!   spare; the build records the longest address it saw, so the width stays a
-//!   measurement rather than a guess.
+//! - An inline datum's bytes live at the end of their own row, with the length in
+//!   the header's `datum_len` — inside the transaction size limit (16 KB), so a
+//!   `u16` is enough. `datum_ref` is therefore unused (0). A `datum.tbl` for dedup
+//!   is phase 2.
 //! - Hash-referenced datums (kind 2) store the 32-byte hash inline the same way
 //!   rather than through the table.
 //! - The scratch arena and `rows.bin` share the encoding exactly, so compaction
@@ -53,21 +51,6 @@
 //!
 //! Divergence from the format is visible in `layout_version`, which every file
 //! starts with.
-//!
-//! # Three orderings, one row store
-//!
-//! `by_outref`, `by_policy` and `by_addr` are the same shape — 12-byte
-//! `{u64 prefix, u32 row}` entries in canonical order plus a 2^21-bucket
-//! directory — over the same rows. The first two are written during a build; all
-//! three are written by `write_derived_orderings`, which `finish` and `reindex`
-//! both call, so a view added by a repair is the same bytes as a view written by
-//! a walk. The only difference between them is what a row has to corroborate:
-//! its own outref, one of its policies, or its address's credential.
-//!
-//! `by_addr` is keyed by the credential `address::credential` derives from the
-//! row's address — in the row, not in the block, so it needs no capture during
-//! the walk and no `layout_version` bump. That it is *derived* rather than
-//! captured is the whole reason it could be added to a finished artifact.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -76,29 +59,24 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use live_book::address::{self, Kind};
+use live_book::format::{
+    self, DIRECTORY_ADDR, DIRECTORY_OUTREF, DIRECTORY_POLICY, LAYOUT_VERSION, Meta, Perm,
+    PolicyTable, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY, policy_perms, split, write_directory,
+    write_ordering,
+};
+use live_book::row::{self, MIN_ASSET_RECORD, RowRead};
 use pallas_primitives::Hash;
 
-use crate::address::{self, Kind};
-
-/// `B3`: 2^21 buckets, ~8 MB, ~5 entries per bucket at 10.9 M rows.
-pub const DIR_BITS: u32 = 21;
-/// The only layout this code writes or reads.
-///
-/// 2: the build key folds the output index into its tail (version 1 omitted it,
-/// so a version-1 artifact has the outputs of each transaction merged).
-/// 3: `addr_len` is `u16`, not `u8` (version 2 could not hold a Byron address:
-/// real mainnet data falsifies the `u8` at chunk 81 of 9,181 with a 513-byte
-/// address). The header is still 56 bytes — the byte came out of the spare.
-pub const LAYOUT_VERSION: u32 = 3;
-/// `B2`'s fixed header is 56 bytes, 8-aligned.
-const ROW_HEADER: usize = 56;
-/// Sentinel `row` values. A real row offset never reaches these: the arena is
-/// capped below 4 GiB, which is the `u32` addressing limit `B2` names.
-const EMPTY: u32 = u32::MAX;
-const TOMB: u32 = u32::MAX - 1;
 /// The row-offset cap. Phase 1 bails here rather than wrapping an offset; the
 /// periodic compaction below keeps a whole-store build under it.
 const ARENA_LIMIT: u64 = 3 << 30;
+/// Sentinel `row` values in the build index. A real row offset never reaches
+/// these: the arena is capped below 4 GiB, which is the `u32` addressing limit
+/// the format names. `EMPTY` is deliberately the directory's own empty marker —
+/// both mean "no entry here".
+const EMPTY: u32 = u32::MAX;
+const TOMB: u32 = u32::MAX - 1;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Slot {
@@ -117,59 +95,6 @@ impl Slot {
     fn is_live(self) -> bool {
         self.row != EMPTY && self.row != TOMB
     }
-}
-
-/// One entry of a permutation: the 64-bit prefix a lookup matches, and the row it
-/// points at.
-///
-/// `tail` is the build's business — it is what makes the build index's key 96 bits
-/// wide and therefore confirm-free — and is deliberately **not** written to the
-/// artifact, where 64 bits plus a confirm against the row is the trade `B3` makes.
-/// That asymmetry is why this is a type rather than two tuples: every ordering
-/// hands the writer the same shape, so the entry width, the canonical order and
-/// the directory fill are written in one place.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Perm {
-    prefix: u64,
-    tail: u32,
-    row: u32,
-}
-
-/// Write one ordering: its `{u64 prefix, u32 row}` permutations in canonical
-/// order, plus a `2^21`-bucket directory over them.
-///
-/// Every ordering goes through here so they cannot disagree about the format, the
-/// canonical order, or the fill — and the fill is the part that was wrong. An
-/// empty bucket must carry the index of the next one that is not; filling with the
-/// entry count instead makes an empty bucket *precede* a non-empty one, so
-/// `buckets[b] > buckets[b + 1]`, the array stops being the partition `B5` claims,
-/// and a consumer reading the range as `end − start` underflows. `verify` catches
-/// it, and `a_book_round_trips_and_a_corrupted_entry_is_caught` guards the fix.
-fn write_ordering(dir: &Path, table: &str, directory: &str, entries: &[Perm]) -> Result<()> {
-    let mut w = BufWriter::with_capacity(4 << 20, File::create(dir.join(table))?);
-    w.write_all(&LAYOUT_VERSION.to_le_bytes())?;
-    w.write_all(&(entries.len() as u64).to_le_bytes())?;
-    for e in entries {
-        w.write_all(&e.prefix.to_le_bytes())?;
-        w.write_all(&e.row.to_le_bytes())?;
-    }
-    w.flush()?;
-
-    write_directory(
-        dir,
-        directory,
-        entries.iter().map(|e| e.prefix),
-        entries.len(),
-    )
-}
-
-/// A datum as the walk sees it.
-pub enum Datum<'a> {
-    None,
-    Inline(&'a [u8]),
-    /// Hash-referenced: the bytes are the 32-byte hash, and phase 1 keeps them
-    /// rather than pointing at a table.
-    Hash(&'a [u8]),
 }
 
 /// What the build cost, for the report and for the budget decision.
@@ -291,7 +216,7 @@ impl Book {
         era: u8,
         lovelace: u64,
         address: &[u8],
-        datum: Datum<'_>,
+        datum: row::Datum<'_>,
         assets: impl Iterator<Item = (&'a [u8], &'a [u8], u64)>,
     ) -> Result<()> {
         if address.len() > u16::MAX as usize {
@@ -305,16 +230,16 @@ impl Book {
         if addr_len > u8::MAX as u32 {
             self.cost.addrs_over_255 += 1;
         }
-        let (datum_kind, datum_bytes): (u8, &[u8]) = match datum {
-            Datum::None => (0, &[]),
-            Datum::Inline(b) => (1, b),
-            Datum::Hash(b) => (2, b),
-        };
-        if datum_bytes.len() > u16::MAX as usize {
-            bail!("datum of {} bytes exceeds the row's u16", datum_bytes.len());
+        if datum.payload().len() > u16::MAX as usize {
+            bail!(
+                "datum of {} bytes exceeds the row's u16",
+                datum.payload().len()
+            );
         }
 
         // Assets are written after the address, with policies interned to u32.
+        // The record's shape is the reader's, so it is written by the reader's
+        // own encoder rather than by a second copy of it here.
         let mut body: Vec<u8> = Vec::with_capacity(64);
         let mut n_assets: u16 = 0;
         for (policy, name, qty) in assets {
@@ -335,10 +260,7 @@ impl Book {
                     id
                 }
             };
-            body.extend_from_slice(&id.to_le_bytes());
-            body.push(name.len() as u8);
-            body.extend_from_slice(name);
-            body.extend_from_slice(&qty.to_le_bytes());
+            row::write_asset_record(&mut body, id, name, qty);
             n_assets = n_assets.saturating_add(1);
         }
 
@@ -346,21 +268,23 @@ impl Book {
             anyhow::anyhow!("book arena passed 4 GiB at offset {}", self.scratch_bytes)
         })?;
 
-        let mut head = [0u8; ROW_HEADER];
-        head[0..32].copy_from_slice(outref.0.as_ref());
-        head[32..36].copy_from_slice(&outref.1.to_le_bytes());
-        head[36..44].copy_from_slice(&lovelace.to_le_bytes());
-        // 44..48 datum_ref: unused in phase 1 (see the module header).
-        head[48] = datum_kind;
-        head[49..51].copy_from_slice(&(address.len() as u16).to_le_bytes());
-        head[51..53].copy_from_slice(&n_assets.to_le_bytes());
-        head[53] = era;
-        head[54..56].copy_from_slice(&(datum_bytes.len() as u16).to_le_bytes());
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(outref.0.as_ref());
+        let mut head = [0u8; row::ROW_HEADER];
+        row::write_header(
+            &mut head,
+            (&hash, outref.1),
+            era,
+            lovelace,
+            address.len() as u16,
+            n_assets,
+            &datum,
+        );
         self.scratch.write_all(&head)?;
         self.scratch.write_all(address)?;
         self.scratch.write_all(&body)?;
-        self.scratch.write_all(datum_bytes)?;
-        let row_len = (ROW_HEADER + address.len() + body.len() + datum_bytes.len()) as u64;
+        self.scratch.write_all(datum.payload())?;
+        let row_len = (row::ROW_HEADER + address.len() + body.len() + datum.payload().len()) as u64;
         self.scratch_bytes += row_len;
 
         self.cost.created += 1;
@@ -491,16 +415,16 @@ impl Book {
         let mut kept = 0u64;
         loop {
             row.clear();
-            let mut head = [0u8; ROW_HEADER];
+            let mut head = [0u8; row::ROW_HEADER];
             match r.read_exact(&mut head) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
             row.extend_from_slice(&head);
-            let addr_len = u16::from_le_bytes([head[49], head[50]]) as usize;
-            let n_assets = u16::from_le_bytes([head[51], head[52]]) as usize;
-            let datum_len = u16::from_le_bytes([head[54], head[55]]) as usize;
+            let addr_len = row::addr_len(&head) as usize;
+            let n_assets = row::n_assets(&head) as usize;
+            let datum_len = row::datum_len(&head) as usize;
             let mut addr_bytes = vec![0u8; addr_len];
             r.read_exact(&mut addr_bytes)?;
             row.extend_from_slice(&addr_bytes);
@@ -520,12 +444,17 @@ impl Book {
             r.read_exact(&mut datum)?;
             row.extend_from_slice(&datum);
 
-            // Live? Ask the index with the row's own outref — `B2` guarantees it
-            // is in the row, which is what makes a bitmap unnecessary.
+            // Live? Ask the index with the row's own outref — the format
+            // guarantees it is in the row, which is what makes a bitmap
+            // unnecessary.
             let mut hash = [0u8; 32];
-            hash.copy_from_slice(&head[0..32]);
-            let index = u32::from_le_bytes(head[32..36].try_into().expect("4 bytes"));
-            let (prefix, key_tail) = split(&Hash::from(hash), index);
+            hash.copy_from_slice(&head[row::OFF_OUTREF..row::OFF_OUTREF + 32]);
+            let index = u32::from_le_bytes(
+                head[row::OFF_OUT_INDEX..row::OFF_OUT_INDEX + 4]
+                    .try_into()
+                    .expect("4 bytes"),
+            );
+            let (prefix, key_tail) = split(&hash, index);
             if let Some(i) = self.find(prefix, key_tail) {
                 let new = u32::try_from(out)
                     .map_err(|_| anyhow::anyhow!("compacted arena passed 4 GiB at offset {out}"))?;
@@ -633,12 +562,19 @@ impl Book {
             );
         }
 
-        write_ordering(&self.dir, "by_outref.idx", "dir.idx", &entries)?;
+        write_ordering(&self.dir, TABLE_OUTREF, DIRECTORY_OUTREF, &entries)?;
+
+        // The interning table, before the orderings that need to resolve an id
+        // through it: one reader of `policy.tbl` (`PolicyTable`, a mapping), used
+        // by the build, by a repair and by a consumer, so an id resolves to the
+        // same 28 bytes in all three.
+        format::write_policy_tbl(&self.dir, &self.policy_order)?;
+        let policies = PolicyTable::open(&self.dir)?;
 
         // The derived orderings, from the raw material the scan above collected.
         // One call, so `reindex` writes the same bytes — and so the two of them
         // cannot disagree about what a derived view contains.
-        let derived = write_derived_orderings(&self.dir, &mut scan, &self.policy_order)?;
+        let derived = write_derived_orderings(&self.dir, &mut scan, &policies)?;
         self.cost.by_policy_entries = derived.policy_entries;
         self.cost.by_addr_entries = derived.addr_entries;
         self.cost.addr_payment = derived.addr_payment;
@@ -646,68 +582,37 @@ impl Book {
         self.cost.addr_bootstrap = derived.addr_bootstrap;
         self.cost.addr_unkeyed = derived.addr_unkeyed;
 
-        let mut p = BufWriter::with_capacity(1 << 20, File::create(self.dir.join("policy.tbl"))?);
-        p.write_all(&LAYOUT_VERSION.to_le_bytes())?;
-        p.write_all(&(self.policy_order.len() as u64).to_le_bytes())?;
-        for pol in &self.policy_order {
-            p.write_all(pol)?;
+        // The artifact describing itself, and it is `Meta` rather than `writeln!`s
+        // here: a reader that parses `book.meta` into fields and a writer that
+        // prints them ad hoc is exactly how a field ends up read under a name
+        // nobody writes. Last, so its presence means everything before it passed.
+        Meta {
+            layout_version: LAYOUT_VERSION,
+            rows: self.cost.rows_live,
+            created: self.cost.created,
+            spent_hits: self.cost.spent_hits,
+            spent_misses: self.cost.spent_misses,
+            live_lovelace: self.cost.live_lovelace,
+            live_assets: self.cost.live_assets,
+            rows_bytes,
+            by_outref_entries: entries.len() as u64,
+            policies: self.policy_order.len() as u64,
+            compactions: self.cost.compactions,
+            rehashes: self.cost.rehashes,
+            distinct_prefixes: self.cost.distinct_prefixes,
+            by_policy_entries: self.cost.by_policy_entries,
+            max_addr_len: self.cost.max_addr_len,
+            addrs_over_255: self.cost.addrs_over_255,
+            by_addr_entries: self.cost.by_addr_entries,
+            addr_payment: self.cost.addr_payment,
+            addr_stake: self.cost.addr_stake,
+            addr_bootstrap: self.cost.addr_bootstrap,
+            addr_unkeyed: self.cost.addr_unkeyed,
         }
-        p.flush()?;
-
-        let mut m = BufWriter::new(File::create(self.dir.join("book.meta"))?);
-        writeln!(m, "layout_version {LAYOUT_VERSION}")?;
-        writeln!(m, "rows {}", self.cost.rows_live)?;
-        writeln!(m, "created {}", self.cost.created)?;
-        writeln!(m, "spent_hits {}", self.cost.spent_hits)?;
-        writeln!(m, "spent_misses {}", self.cost.spent_misses)?;
-        writeln!(m, "live_lovelace {}", self.cost.live_lovelace)?;
-        writeln!(m, "live_assets {}", self.cost.live_assets)?;
-        writeln!(m, "rows_bytes {rows_bytes}")?;
-        writeln!(m, "by_outref_entries {}", entries.len())?;
-        writeln!(m, "policies {}", self.policy_order.len())?;
-        writeln!(m, "by_addr_entries {}", self.cost.by_addr_entries)?;
-        writeln!(m, "addr_payment {}", self.cost.addr_payment)?;
-        writeln!(m, "addr_stake {}", self.cost.addr_stake)?;
-        writeln!(m, "addr_bootstrap {}", self.cost.addr_bootstrap)?;
-        writeln!(m, "addr_unkeyed {}", self.cost.addr_unkeyed)?;
-        writeln!(m, "compactions {}", self.cost.compactions)?;
-        writeln!(m, "rehashes {}", self.cost.rehashes)?;
-        writeln!(m, "distinct_prefixes {}", self.cost.distinct_prefixes)?;
-        writeln!(m, "by_policy_entries {}", self.cost.by_policy_entries)?;
-        writeln!(m, "max_addr_len {}", self.cost.max_addr_len)?;
-        writeln!(m, "addrs_over_255 {}", self.cost.addrs_over_255)?;
-        m.flush()?;
+        .write(&self.dir)?;
 
         Ok(self.cost)
     }
-}
-
-/// The book's 96-bit key for a live row: 8 bytes of the outref's hash, then 4
-/// more mixed with the outref's output index.
-///
-/// The index has to be in the key. An outref is `(hash, index)`, a transaction's
-/// outputs all share its hash, and most transactions have more than one output —
-/// so a key taken from the hash alone collapses a whole transaction onto one
-/// entry, and the second output silences the first.
-fn split(h: &Hash<32>, index: u32) -> (u64, u32) {
-    let b = h.as_ref();
-    let mut p = [0u8; 8];
-    p.copy_from_slice(&b[0..8]);
-    let mut t = [0u8; 4];
-    t.copy_from_slice(&b[8..12]);
-    // Mixed rather than added or `xor`ed raw: consecutive indices would
-    // otherwise probe adjacent slots — index 0 and index 1 differ by one in the
-    // low bit — which is the clustering a linear probe is worst at.
-    (u64::from_le_bytes(p), u32::from_le_bytes(t) ^ mix32(index))
-}
-
-/// A 32-bit finaliser for the output index. See `split`.
-fn mix32(mut x: u32) -> u32 {
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846c_a68b);
-    x ^ (x >> 16)
 }
 
 // --------------------------------------------------------- reading it back
@@ -775,39 +680,35 @@ impl VerifyReport {
 /// It also times the lookups, which is the number that decides whether this
 /// replaces a `redb` point read rather than being a second store beside it.
 pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
-    let meta = std::fs::read_to_string(dir.join("book.meta"))
-        .with_context(|| format!("reading {}/book.meta", dir.display()))?;
-    let meta_field = |k: &str| -> Option<u64> {
-        meta.lines()
-            .find_map(|l| l.strip_prefix(k).and_then(|r| r.trim().parse().ok()))
-    };
-    let field = |k: &str| -> Result<u64> {
-        meta_field(k).with_context(|| format!("book.meta has no `{k}`"))
-    };
-
-    let layout = field("layout_version")? as u32;
-    if layout != LAYOUT_VERSION {
-        bail!("book.meta is layout_version {layout}; this build reads {LAYOUT_VERSION}");
+    let meta = Meta::open(dir)?;
+    if meta.layout_version != LAYOUT_VERSION {
+        bail!(
+            "book.meta is layout_version {}; this build reads {LAYOUT_VERSION}",
+            meta.layout_version
+        );
     }
-    let rows_live = field("rows")?;
-    let rows_bytes = field("rows_bytes")?;
-    let declared = field("by_outref_entries")?;
-    // Optional, and only cross-checked when present: an artifact that predates
-    // `by_addr` and has since been reindexed carries the file and the line, but a
-    // hand-built or future-written artifact might carry the file without the line.
-    // The count that matters is the one in the file, which `verify_ordering` reads
-    // itself — this is a second opinion, not the source.
-    let declared_addr = meta_field("by_addr_entries");
+    let rows_live = meta.rows;
+    let rows_bytes = meta.rows_bytes;
+    let declared = meta.by_outref_entries;
+    // Cross-checked rather than required: the count that matters is the one in the
+    // file, which `verify_ordering` reads itself. This is a second opinion.
+    let declared_addr = meta.by_addr_entries;
 
-    let rows_len = std::fs::metadata(dir.join("rows.bin"))?.len();
+    let rows_len = std::fs::metadata(dir.join("rows.bin"))
+        .with_context(|| format!("reading {}/rows.bin", dir.display()))?
+        .len();
     if rows_len != rows_bytes {
         bail!("rows.bin is {rows_len} B; book.meta claims {rows_bytes}");
     }
 
     let mut rep = VerifyReport {
-        outref: verify_ordering(dir, "by_outref.idx", "dir.idx", sample, |f, off, len| {
-            read_row_outref(f, off, len).map(|o| vec![split(&o.0, o.1).0])
-        })?,
+        outref: verify_ordering(
+            dir,
+            TABLE_OUTREF,
+            DIRECTORY_OUTREF,
+            sample,
+            |f, off, len| read_row_outref(f, off, len).map(|o| vec![split(&o.0, o.1).0]),
+        )?,
         ..VerifyReport::default()
     };
     if rep.outref.entries != declared || rep.outref.entries != rows_live {
@@ -823,11 +724,11 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
     // prefix among them. A row that merely exists at the offset is not enough —
     // which is the difference between "the offset is in range" and "this row is
     // why the entry is here".
-    let policies = read_policy_tbl(dir)?;
+    let policies = PolicyTable::open(dir)?;
     rep.policy = verify_ordering(
         dir,
-        "by_policy.idx",
-        "policy.dir.idx",
+        TABLE_POLICY,
+        DIRECTORY_POLICY,
         sample,
         |f, off, len| row_policy_prefixes(f, off, len, &policies),
     )?;
@@ -836,7 +737,7 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
     // entry claims a credential prefix and the only way to check it is to run the
     // same derivation the builder ran over the same bytes. A wrong `1..29` offset
     // in the derivation cannot pass its own check.
-    rep.addr = verify_ordering(dir, "by_addr.idx", "addr.dir.idx", sample, row_cred_prefix)?;
+    rep.addr = verify_ordering(dir, TABLE_ADDR, DIRECTORY_ADDR, sample, row_cred_prefix)?;
     if rep.addr.entries != rows_live {
         bail!(
             "by_addr.idx holds {} entries against {rows_live} rows — the two orderings are \
@@ -844,11 +745,9 @@ pub fn verify(dir: &Path, sample: u64) -> Result<VerifyReport> {
             rep.addr.entries
         );
     }
-    if let Some(d) = declared_addr
-        && rep.addr.entries != d
-    {
+    if rep.addr.entries != declared_addr {
         bail!(
-            "by_addr.idx holds {} entries; book.meta says {d}",
+            "by_addr.idx holds {} entries; book.meta says {declared_addr}",
             rep.addr.entries
         );
     }
@@ -875,28 +774,11 @@ fn verify_ordering(
     let rows_bytes = std::fs::metadata(dir.join("rows.bin"))
         .with_context(|| format!("reading {}/rows.bin", dir.display()))?
         .len();
-    let raw = std::fs::read(dir.join(table)).with_context(|| format!("reading {table}"))?;
+    let raw = format::read_file(dir, table)?;
     let mut rep = Ordering::default();
-    if raw.len() < 12 {
-        bail!("{table} is too short to hold a header");
-    }
-    let il = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
-    if il != LAYOUT_VERSION {
-        bail!("{table} is layout_version {il}; this build reads {LAYOUT_VERSION}");
-    }
-    let count = u64::from_le_bytes(raw[4..12].try_into().expect("8 bytes"));
-    let want = 12 + 12 * count as usize;
-    if raw.len() != want {
-        bail!("{table} is {} B; {count} entries need {want}", raw.len());
-    }
+    let count = format::check_array_header(&raw, table, 12)?;
     rep.entries = count;
-    let entry = |i: usize| -> (u64, u32) {
-        let b = &raw[12 + 12 * i..];
-        (
-            u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
-            u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
-        )
-    };
+    let entry = |i: usize| format::entry_at(&raw, i);
 
     // `B5`: canonical order is the 96-bit build key, whose leading 64 bits are what
     // the entry stores — so the array is ascending by prefix.
@@ -906,23 +788,20 @@ fn verify_ordering(
         }
     }
 
-    let draw =
-        std::fs::read(dir.join(directory)).with_context(|| format!("reading {directory}"))?;
+    let draw = format::read_file(dir, directory)?;
     if draw.len() < 8 {
         bail!("{directory} is too short to hold a header");
     }
     let dl = u32::from_le_bytes(draw[0..4].try_into().expect("4 bytes"));
     let dbits = u32::from_le_bytes(draw[4..8].try_into().expect("4 bytes"));
-    if dl != LAYOUT_VERSION || dbits != DIR_BITS {
+    if dl != LAYOUT_VERSION || dbits != format::DIR_BITS {
         bail!("{directory} has layout {dl} / DIR_BITS {dbits}");
     }
     let n_buckets = 1usize << dbits;
-    if draw.len() != 8 + n_buckets * 4 {
+    if draw.len() != format::directory_bytes() {
         bail!("{directory} is {} B", draw.len());
     }
-    let bucket = |b: usize| -> u32 {
-        u32::from_le_bytes(draw[8 + 4 * b..8 + 4 * b + 4].try_into().expect("4 bytes"))
-    };
+    let bucket = |b: usize| -> u32 { format::bucket_at(&draw, b) };
 
     // `B5`: the buckets partition the entry array — non-overlapping, contiguous,
     // covering — so they are monotone and never address past the end.
@@ -1001,22 +880,34 @@ fn row_cred_prefix(f: &mut File, offset: u64, rows_bytes: u64) -> Result<Vec<u64
 }
 
 /// The address bytes of the row at `offset`.
+///
+/// A seek and one `read_exact`, then the crate parses what was read: the offsets
+/// and the length arithmetic are `row`'s, and this is only the file access. The
+/// verifier deliberately does not go through `Row::parse`'s full bounds check for
+/// the *outref* below — see `read_row_outref` — but where it wants a value it
+/// wants the same value the reader hands a consumer.
 fn read_row_address(f: &mut File, offset: u64, rows_bytes: u64) -> Result<Vec<u8>, RowRead> {
-    let base = offset + ROW_HEADER as u64;
-    if base > rows_bytes {
-        return Err(RowRead::OutOfRange);
-    }
-    let mut head = [0u8; ROW_HEADER];
-    f.seek(SeekFrom::Start(offset))
-        .map_err(|_| RowRead::Short)?;
-    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
-    let addr_len = u64::from(u16::from_le_bytes([head[49], head[50]]));
+    let head = read_head(f, offset, rows_bytes)?;
+    let addr_len = u64::from(row::addr_len(&head));
+    let base = offset + row::ROW_HEADER as u64;
     if base + addr_len > rows_bytes {
         return Err(RowRead::OutOfRange);
     }
     let mut addr = vec![0u8; addr_len as usize];
     f.read_exact(&mut addr).map_err(|_| RowRead::Short)?;
     Ok(addr)
+}
+
+/// The 56-byte header at `offset`, or why there is not one.
+fn read_head(f: &mut File, offset: u64, rows_bytes: u64) -> Result<[u8; row::ROW_HEADER], RowRead> {
+    if offset + row::ROW_HEADER as u64 > rows_bytes {
+        return Err(RowRead::OutOfRange);
+    }
+    let mut head = [0u8; row::ROW_HEADER];
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|_| RowRead::Short)?;
+    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
+    Ok(head)
 }
 
 /// Every *distinct* policy prefix the row at `offset` holds, resolved through the
@@ -1027,19 +918,12 @@ fn row_policy_prefixes(
     f: &mut File,
     offset: u64,
     rows_bytes: u64,
-    policies: &[[u8; 28]],
+    policies: &PolicyTable,
 ) -> Result<Vec<u64>, RowRead> {
-    let base = offset + ROW_HEADER as u64;
-    if base > rows_bytes {
-        return Err(RowRead::OutOfRange);
-    }
-    let mut head = [0u8; ROW_HEADER];
-    f.seek(SeekFrom::Start(offset))
-        .map_err(|_| RowRead::Short)?;
-    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
-    let addr_len = u64::from(u16::from_le_bytes([head[49], head[50]]));
-    let n_assets = u16::from_le_bytes([head[51], head[52]]);
-    f.seek(SeekFrom::Start(base + addr_len))
+    let head = read_head(f, offset, rows_bytes)?;
+    let addr_len = u64::from(row::addr_len(&head));
+    let n_assets = row::n_assets(&head);
+    f.seek(SeekFrom::Start(offset + row::ROW_HEADER as u64 + addr_len))
         .map_err(|_| RowRead::Short)?;
 
     let mut out: Vec<u64> = Vec::new();
@@ -1052,24 +936,13 @@ fn row_policy_prefixes(
         skip.clear();
         skip.resize(nl[0] as usize + 8, 0);
         f.read_exact(&mut skip).map_err(|_| RowRead::Short)?;
-        let id = u32::from_le_bytes(id) as usize;
-        if id >= policies.len() {
-            return Err(RowRead::Short);
-        }
-        let mut p = [0u8; 8];
-        p.copy_from_slice(&policies[id][0..8]);
-        let prefix = u64::from_le_bytes(p);
+        let policy = policies.get(u32::from_le_bytes(id)).ok_or(RowRead::Short)?;
+        let prefix = live_book::Asset::prefix(policy);
         if out.last() != Some(&prefix) {
             out.push(prefix);
         }
     }
     Ok(out)
-}
-
-enum RowRead {
-    /// The row does not fit inside `rows.bin`.
-    OutOfRange,
-    Short,
 }
 
 /// The outref the row at `offset` claims, or why it is not a row.
@@ -1079,104 +952,33 @@ enum RowRead {
 /// caller's check — its outref has to hash back to the prefix that sent us here.
 ///
 /// The middle one is deliberately a *lower bound* rather than a parse: every
-/// asset record is at least 4 (policy id) + 1 (name length) + 8 (quantity) bytes,
-/// so the arithmetic needs no name lengths read. Reading each record to its end
-/// would make this a full row parse, which is the caller's job, not a bound's.
-fn read_row_outref(f: &mut File, offset: u64, rows_bytes: u64) -> Result<(Hash<32>, u32), RowRead> {
-    let base = offset + ROW_HEADER as u64;
-    if base > rows_bytes {
-        return Err(RowRead::OutOfRange);
-    }
-    let mut head = [0u8; ROW_HEADER];
-    f.seek(SeekFrom::Start(offset))
-        .map_err(|_| RowRead::Short)?;
-    f.read_exact(&mut head).map_err(|_| RowRead::Short)?;
-
-    let addr_len = u64::from(u16::from_le_bytes([head[49], head[50]]));
-    let n_assets = u64::from(u16::from_le_bytes([head[51], head[52]]));
-    let datum_len = u64::from(u16::from_le_bytes([head[54], head[55]]));
-    if base + addr_len + 13 * n_assets + datum_len > rows_bytes {
+/// asset record is at least `MIN_ASSET_RECORD` bytes, so the arithmetic needs no
+/// name lengths read. Reading each record to its end would make this a full row
+/// parse, which is the *reader's* job — this is an audit of the index, and a
+/// loose bound is the right instrument for it.
+fn read_row_outref(f: &mut File, offset: u64, rows_bytes: u64) -> Result<([u8; 32], u32), RowRead> {
+    let head = read_head(f, offset, rows_bytes)?;
+    let addr_len = u64::from(row::addr_len(&head));
+    let n_assets = u64::from(row::n_assets(&head));
+    let datum_len = u64::from(row::datum_len(&head));
+    let base = offset + row::ROW_HEADER as u64;
+    if base + addr_len + (MIN_ASSET_RECORD as u64) * n_assets + datum_len > rows_bytes {
         return Err(RowRead::OutOfRange);
     }
 
     let mut h = [0u8; 32];
-    h.copy_from_slice(&head[0..32]);
+    h.copy_from_slice(&head[row::OFF_OUTREF..row::OFF_OUTREF + 32]);
     Ok((
-        Hash::from(h),
-        u32::from_le_bytes(head[32..36].try_into().expect("4 bytes")),
+        h,
+        u32::from_le_bytes(
+            head[row::OFF_OUT_INDEX..row::OFF_OUT_INDEX + 4]
+                .try_into()
+                .expect("4 bytes"),
+        ),
     ))
 }
 
 // --------------------------------------------------------- rebuilding a view
-
-/// The `2^21`-bucket directory over an ordering's prefixes, which must arrive in
-/// canonical order.
-///
-/// Split out of `write_ordering` so `dir.idx` can be rebuilt on its own, from the
-/// prefixes `by_outref.idx` already holds, **without rewriting the entry array** —
-/// reconstructing that array here could not reproduce the builder's canonical
-/// order, because `tail` is not stored and two rows sharing a prefix could come
-/// back in the other order. A repair must not invent a second ordering.
-fn write_directory(
-    dir: &Path,
-    name: &str,
-    prefixes: impl Iterator<Item = u64>,
-    n: usize,
-) -> Result<()> {
-    let n_buckets = 1usize << DIR_BITS;
-    let mut buckets = vec![EMPTY; n_buckets];
-    for (i, prefix) in prefixes.enumerate() {
-        let b = (prefix >> (64 - DIR_BITS)) as usize;
-        if buckets[b] == EMPTY {
-            buckets[b] = i as u32;
-        }
-    }
-    // Backward fill: see `write_ordering`.
-    let mut next = n as u32;
-    for b in (0..n_buckets).rev() {
-        if buckets[b] == EMPTY {
-            buckets[b] = next;
-        } else {
-            next = buckets[b];
-        }
-    }
-    let mut d = BufWriter::with_capacity(1 << 20, File::create(dir.join(name))?);
-    d.write_all(&LAYOUT_VERSION.to_le_bytes())?;
-    d.write_all(&DIR_BITS.to_le_bytes())?;
-    for b in &buckets {
-        d.write_all(&b.to_le_bytes())?;
-    }
-    d.flush()?;
-    Ok(())
-}
-
-/// The interning table: `id -> 28-byte policy`, in the order the builder assigned
-/// the ids.
-fn read_policy_tbl(dir: &Path) -> Result<Vec<[u8; 28]>> {
-    let pt = std::fs::read(dir.join("policy.tbl"))?;
-    if pt.len() < 12 {
-        bail!("policy.tbl is too short to hold a header");
-    }
-    let pl = u32::from_le_bytes(pt[0..4].try_into().expect("4 bytes"));
-    if pl != LAYOUT_VERSION {
-        bail!("policy.tbl is layout_version {pl}; this build reads {LAYOUT_VERSION}");
-    }
-    let n = u64::from_le_bytes(pt[4..12].try_into().expect("8 bytes")) as usize;
-    if pt.len() != 12 + 28 * n {
-        bail!(
-            "policy.tbl is {} B; {n} policies need {}",
-            pt.len(),
-            12 + 28 * n
-        );
-    }
-    Ok((0..n)
-        .map(|i| {
-            let mut p = [0u8; 28];
-            p.copy_from_slice(&pt[12 + 28 * i..12 + 28 * i + 28]);
-            p
-        })
-        .collect())
-}
 
 /// What one sequential scan of `rows.bin` yields — the raw material of every
 /// ordering that is a function of the rows alone.
@@ -1222,7 +1024,7 @@ fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
         addr_unkeyed: 0,
     };
     let mut r = BufReader::with_capacity(4 << 20, File::open(rows_path)?);
-    let mut head = [0u8; ROW_HEADER];
+    let mut head = [0u8; row::ROW_HEADER];
     let mut row_offset: u32 = 0;
     loop {
         match r.read_exact(&mut head) {
@@ -1230,14 +1032,18 @@ fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
-        let lovelace = u64::from_le_bytes(head[36..44].try_into().expect("8 bytes"));
-        let addr_len = u16::from_le_bytes([head[49], head[50]]) as usize;
-        let n_assets = u16::from_le_bytes([head[51], head[52]]) as usize;
-        let datum_len = u16::from_le_bytes([head[54], head[55]]) as usize;
+        let lovelace = u64::from_le_bytes(
+            head[row::OFF_LOVELACE..row::OFF_LOVELACE + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        let addr_len = row::addr_len(&head) as usize;
+        let n_assets = row::n_assets(&head) as usize;
+        let datum_len = row::datum_len(&head) as usize;
         out.live_lovelace = out.live_lovelace.saturating_add(u128::from(lovelace));
         out.live_assets += n_assets as u64;
-        // File order is address, assets, datum — the order the writer emits and the
-        // order `compact_into` parses.
+        // File order is address, assets, datum — the order `row::write_header`'s
+        // caller emits and the order `Row::parse` walks.
         let mut addr = vec![0u8; addr_len];
         r.read_exact(&mut addr)?;
         match address::credential(&addr) {
@@ -1264,7 +1070,7 @@ fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
             r.read_exact(&mut nl)?;
             let mut name = vec![0u8; nl[0] as usize + 8];
             r.read_exact(&mut name)?;
-            payload += 4 + 1 + name.len();
+            payload += MIN_ASSET_RECORD + nl[0] as usize;
 
             // Consecutive dedup is enough: a value's assets are grouped by policy
             // (it is a `BTreeMap` keyed by one), so a policy cannot reappear later
@@ -1283,7 +1089,7 @@ fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
         }
         let mut datum = vec![0u8; datum_len];
         r.read_exact(&mut datum)?;
-        let row_len = ROW_HEADER + addr_len + payload + datum_len;
+        let row_len = row::ROW_HEADER + addr_len + payload + datum_len;
         row_offset = row_offset
             .checked_add(u32::try_from(row_len).expect("row fits in u32"))
             .context("row offsets passed the u32 the directory addresses with")?;
@@ -1291,31 +1097,7 @@ fn scan_rows(rows_path: &Path, n_policies: usize) -> Result<RowScan> {
     Ok(out)
 }
 
-/// `(id, row)` pairs into `by_policy`'s entries, in canonical order.
-///
-/// The prefix is the policy's leading 8 bytes — the same convention every ordering
-/// uses — and there is no `tail`: a policy is exactly 28 bytes, so two distinct
-/// policies sharing a 64-bit prefix is 1.5e-9 at this cardinality, and a lookup
-/// confirms the rest against the row.
-fn policy_perms(pairs: &[(u32, u32)], policies: &[[u8; 28]]) -> Result<Vec<Perm>> {
-    let mut entries: Vec<Perm> = Vec::with_capacity(pairs.len());
-    for (id, row) in pairs {
-        let policy = policies
-            .get(*id as usize)
-            .with_context(|| format!("policy id {id} is not in the table"))?;
-        let mut p = [0u8; 8];
-        p.copy_from_slice(&policy[0..8]);
-        entries.push(Perm {
-            prefix: u64::from_le_bytes(p),
-            tail: 0,
-            row: *row,
-        });
-    }
-    entries.sort_unstable();
-    Ok(entries)
-}
-
-/// What the derived orderings came to, for the cost and for the reindex report.
+/// The `by_policy` and `by_addr` orderings came to, for the cost and the report.
 struct Derived {
     policy_entries: u64,
     addr_entries: u64,
@@ -1342,14 +1124,14 @@ struct Derived {
 fn write_derived_orderings(
     dir: &Path,
     scan: &mut RowScan,
-    policies: &[[u8; 28]],
+    policies: &PolicyTable,
 ) -> Result<Derived> {
     let policy_entries = policy_perms(&scan.row_policies, policies)?;
-    write_ordering(dir, "by_policy.idx", "policy.dir.idx", &policy_entries)?;
+    write_ordering(dir, TABLE_POLICY, DIRECTORY_POLICY, &policy_entries)?;
 
     scan.row_addr.sort_unstable();
     let addr_entries = scan.row_addr.len() as u64;
-    write_ordering(dir, "by_addr.idx", "addr.dir.idx", &scan.row_addr)?;
+    write_ordering(dir, TABLE_ADDR, DIRECTORY_ADDR, &scan.row_addr)?;
 
     let rows = addr_entries + scan.addr_unkeyed;
     if scan.addr_unkeyed > 0 {
@@ -1405,36 +1187,36 @@ pub struct ReindexReport {
 /// `rows.bin`, `by_outref.idx` and `policy.tbl` are read and never written: a
 /// repair cannot damage its own source.
 pub fn reindex(dir: &Path) -> Result<ReindexReport> {
-    let policies = read_policy_tbl(dir)?;
+    let policies = PolicyTable::open(dir)?;
     let mut scan = scan_rows(&dir.join("rows.bin"), policies.len())?;
     let derived = write_derived_orderings(dir, &mut scan, &policies)?;
 
-    let raw = std::fs::read(dir.join("by_outref.idx"))?;
-    if raw.len() < 12 {
-        bail!("by_outref.idx is too short to hold a header");
-    }
-    let n = u64::from_le_bytes(raw[4..12].try_into().expect("8 bytes"));
-    if raw.len() != 12 + 12 * n as usize {
-        bail!(
-            "by_outref.idx is {} B; {n} entries need {}",
-            raw.len(),
-            12 + 12 * n as usize
-        );
-    }
+    let raw = format::read_file(dir, TABLE_OUTREF)?;
+    let n = format::check_array_header(&raw, TABLE_OUTREF, 12)?;
     let prefixes: Vec<u64> = (0..n as usize)
-        .map(|i| {
-            u64::from_le_bytes(
-                raw[12 + 12 * i..12 + 12 * i + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            )
-        })
+        .map(|i| format::entry_at(&raw, i).0)
         .collect();
-    write_directory(dir, "dir.idx", prefixes.iter().copied(), prefixes.len())?;
+    write_directory(
+        dir,
+        DIRECTORY_OUTREF,
+        prefixes.iter().copied(),
+        prefixes.len(),
+    )?;
 
-    // Last, for the same reason `finish` writes it last: the file's presence and
-    // content should mean every write before it succeeded.
-    update_meta(dir, &derived)?;
+    // Last, for the same reason `finish` writes it last: the file's content should
+    // mean every write before it succeeded. Only the lines a repair computes are
+    // rewritten — see `Meta::rewrite_derived`.
+    Meta::rewrite_derived(
+        dir,
+        &[
+            ("by_policy_entries", derived.policy_entries),
+            ("by_addr_entries", derived.addr_entries),
+            ("addr_payment", derived.addr_payment),
+            ("addr_stake", derived.addr_stake),
+            ("addr_bootstrap", derived.addr_bootstrap),
+            ("addr_unkeyed", derived.addr_unkeyed),
+        ],
+    )?;
 
     Ok(ReindexReport {
         policy_entries: derived.policy_entries,
@@ -1444,53 +1226,6 @@ pub fn reindex(dir: &Path) -> Result<ReindexReport> {
         addr_bootstrap: derived.addr_bootstrap,
         outref_entries: n,
     })
-}
-
-/// Record what a repair wrote in `book.meta`, so the artifact describes itself
-/// after the repair as accurately as it did after the build.
-///
-/// `book.meta`'s presence means "everything before me passed", and a reindex is a
-/// pass over the same rows — it derives the same counts from the same bytes and
-/// asserts the same permutation identity, so it is entitled to update them. What
-/// it must not do is leave the file claiming an artifact that no longer exists:
-/// after a `by_addr` is added, a `book.meta` without `by_addr_entries` reads as an
-/// artifact with no address index.
-///
-/// Only the lines this tool computes are touched. Every other line is carried
-/// through verbatim, so a field written by a future builder is not silently
-/// dropped by an old reindex — and the file is rewritten whole rather than
-/// appended to, so running it twice does not accumulate.
-fn update_meta(dir: &Path, d: &Derived) -> Result<()> {
-    let path = dir.join("book.meta");
-    let old =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let ours = [
-        "by_policy_entries",
-        "by_addr_entries",
-        "addr_payment",
-        "addr_stake",
-        "addr_bootstrap",
-        "addr_unkeyed",
-    ];
-    let mut out: String = old
-        .lines()
-        .filter(|l| {
-            !ours
-                .iter()
-                .any(|k| l.strip_prefix(k).is_some_and(|r| r.starts_with(' ')))
-        })
-        .map(|l| format!("{l}\n"))
-        .collect();
-    out.push_str(&format!("by_policy_entries {}\n", d.policy_entries));
-    out.push_str(&format!("by_addr_entries {}\n", d.addr_entries));
-    out.push_str(&format!("addr_payment {}\n", d.addr_payment));
-    out.push_str(&format!("addr_stake {}\n", d.addr_stake));
-    out.push_str(&format!("addr_bootstrap {}\n", d.addr_bootstrap));
-    out.push_str(&format!("addr_unkeyed {}\n", d.addr_unkeyed));
-    let tmp = dir.join("book.meta.new");
-    std::fs::write(&tmp, out)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
 }
 
 /// Position of the key in the table. Not a security boundary: the key is a

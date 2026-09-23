@@ -49,6 +49,12 @@ members = [
     "crates/cf-publish",
     "crates/none-match-indexer",
     "crates/tx-index",
+    # The live UTxO set as an immutable artifact — rows, three narrow orderings
+    # over them, and the reader that serves them. Extracted from
+    # `tools/fold-probe` on 2026-09-23, when mitos became the second consumer:
+    # the probe WRITES the book and the data plane reads it, and a binary crate
+    # cannot be depended on. `docs/design/LIVE_BOOK.md` is the spec.
+    "crates/live-book",
     # The mint-keyed companion to tx-index. A separate crate, but NOT a
     # separate extraction pass — it is pure over blocks tx-index already
     # decoded, which is what keeps it at the measured +1.8% rather than +100%.

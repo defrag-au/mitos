@@ -19,6 +19,12 @@ name = "fold-probe"
 path = "src/main.rs"
 
 [dependencies]
+# The artifact format and its reader. Extracted on 2026-09-23 because the second
+# consumer appeared: the probe WRITES the book and mitos wants to SERVE it. The
+# probe is now a client of the layout rather than its owner — the row offsets,
+# the entry shape, the directory fill and the policy table live there.
+live-book = { path = "../../crates/live-book" }
+
 tx-index = { path = "../../crates/tx-index" }
 mitos-chain-walk = { path = "../mitos-chain-walk" }
 

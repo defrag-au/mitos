@@ -1,0 +1,30 @@
+# live-book — the on-disk format of the live UTxO set, and a read-only view of it.
+#
+# Extracted from `tools/fold-probe/src/book.rs` on 2026-09-23, when the second
+# consumer appeared. The probe WRITES the artifact and mitos wants to SERVE it,
+# and a binary crate cannot be depended on — so the format and its reader get a
+# home of their own. The builder and the verifier are still the probe's for now;
+# they import this crate rather than keeping a second copy of the layout.
+#
+# Design: ../../docs/design/LIVE_BOOK.md.
+[package]
+name = "live-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The live UTxO set as an immutable artifact: the row store, its three narrow orderings, and a mapping reader over them"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The one arm of the credential derivation that is a parse rather than a slice.
+# Nothing else here needs pallas: a row's outref is a `[u8; 32]`, not pallas's
+# `Hash<32>`, so the format is independent of that type on purpose — whoever
+# holds a `Hash<32>` converts once at the boundary.
+pallas-addresses = { workspace = true }
+# Read-only mappings, as `tx-index` and `policy-index` map their bases. The
+# artifact is published whole and swapped by rename, so a mapping never observes
+# a write.
+memmap2 = { workspace = true }
+anyhow = { workspace = true }

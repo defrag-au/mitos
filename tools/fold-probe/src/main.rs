@@ -62,6 +62,7 @@ use clap::{Args, Parser, Subcommand};
 // Through the walker's re-export rather than a new `chain-decode` dependency:
 // it is the same symbol, and a probe should not be a reason to edit a manifest.
 // The alias is what `chain-decode` expects to lose once call sites point there.
+use live_book::row::Datum;
 use mitos_chain_walk::decode::decode_tx;
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
 use pallas_addresses::byron::AddressPayload;
@@ -71,9 +72,8 @@ use pallas_primitives::{Hash, alonzo, babbage, conway};
 use pallas_traverse::{Era, MultiEraBlock, MultiEraOutput, MultiEraValue, OriginalHash};
 use tx_index::extract::list_chunks;
 
-use crate::book::{Book, Datum};
+use crate::book::Book;
 
-mod address;
 mod book;
 
 /// An outref: the key of the live set, and the thing a spend names.
@@ -96,6 +96,43 @@ enum Cmd {
     Verify(VerifyArgs),
     /// Rebuild the orderings derivable from the row store, without a refold.
     Reindex(ReindexArgs),
+    /// Ask a published book a question, through the reader a consumer uses.
+    Lookup(LookupArgs),
+}
+
+#[derive(Args)]
+struct LookupArgs {
+    /// The book directory to open.
+    #[arg(long)]
+    book: PathBuf,
+    /// An outref to resolve: `<64 hex>` with an optional `#<index>` (default 0).
+    #[arg(long, group = "query")]
+    outref: Option<String>,
+    /// An address: bech32, or hex of its raw bytes.
+    #[arg(long, group = "query")]
+    address: Option<String>,
+    /// A 28-byte payment credential, hex — what `utxos_by_payment_cred` takes.
+    #[arg(long, group = "query")]
+    payment_cred: Option<String>,
+    /// A 28-byte policy id, hex.
+    #[arg(long, group = "query")]
+    policy: Option<String>,
+    /// Refs per page.
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    /// Keep asking for pages until the run is exhausted, counting as it goes.
+    #[arg(long)]
+    all: bool,
+    /// After enumerating, read every ref back and total what the rows hold. This is
+    /// the shape a module consumes the book in — enumerate, then read — so exercising
+    /// it is the point, and on an address with a known balance it is also the one
+    /// check here with an oracle outside this repository.
+    #[arg(long)]
+    sum: bool,
+    /// Sample this many policies and walk each one's holders through all three
+    /// orderings, requiring them to agree. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    cross_check: usize,
 }
 
 #[derive(Args)]
@@ -183,6 +220,7 @@ fn main() -> Result<()> {
         Cmd::Count(a) => count(a),
         Cmd::Verify(a) => verify(a),
         Cmd::Reindex(a) => reindex(a),
+        Cmd::Lookup(a) => lookup(a),
     }
 }
 
@@ -2057,6 +2095,377 @@ fn reindex(a: ReindexArgs) -> Result<()> {
          \x20            the mint ledger, witness datums, aux data. Those need the walk."
     );
     Ok(())
+}
+
+/// What a caller asked, parsed once so a paged loop can re-ask it. The three
+/// enumerations differ only in this, which is the point of the reader taking the
+/// confirm and not the caller.
+enum Query {
+    Outref([u8; 32], u32),
+    Address(Vec<u8>),
+    Cred([u8; 28]),
+    Policy([u8; 28]),
+}
+
+impl Query {
+    fn name(&self) -> &'static str {
+        match self {
+            Query::Outref(..) => "by_outref",
+            Query::Address(_) => "by_address",
+            Query::Cred(_) => "by_payment_cred",
+            Query::Policy(_) => "by_policy",
+        }
+    }
+
+    fn ask(
+        &self,
+        book: &live_book::Base,
+        after: Option<live_book::Cursor>,
+        limit: usize,
+    ) -> Result<live_book::Page> {
+        Ok(match self {
+            Query::Outref(..) => bail!("--outref is a point lookup, not an enumeration"),
+            Query::Address(a) => book.by_address(a, after, limit)?,
+            Query::Cred(c) => book.by_payment_cred(c, after, limit)?,
+            Query::Policy(p) => book.by_policy(p, after, limit)?,
+        })
+    }
+}
+
+/// Ask a published book a question.
+///
+/// This exists because `verify` proves the artifact is *correct* and nothing
+/// proved it was *usable*: it is the first caller that goes through `Base`, the
+/// reader a consumer gets, rather than through the audit path. Both matter — they
+/// check different things about the same bytes.
+fn lookup(a: LookupArgs) -> Result<()> {
+    let t = Instant::now();
+    let book = live_book::Base::open(&a.book)?;
+    let opened = t.elapsed();
+    println!("book lookup — {}", a.book.display());
+    println!(
+        "  opened     {} rows in {:.3} s · {} policies · layout_version {}",
+        book.rows(),
+        opened.as_secs_f64(),
+        book.policies().len(),
+        book.meta().layout_version,
+    );
+
+    if a.cross_check > 0 {
+        return cross_check(&book, a.cross_check, a.limit);
+    }
+
+    let query = if let Some(s) = &a.outref {
+        let (hash, index) = parse_outref(s)?;
+        Query::Outref(hash, index)
+    } else if let Some(s) = &a.address {
+        Query::Address(parse_address(s)?)
+    } else if let Some(s) = &a.payment_cred {
+        Query::Cred(parse_28(s, "--payment-cred")?)
+    } else if let Some(s) = &a.policy {
+        Query::Policy(parse_28(s, "--policy")?)
+    } else {
+        bail!("give one of --outref, --address, --payment-cred or --policy");
+    };
+
+    // A point lookup is one question with one answer, and the reader answers it
+    // with a single row read — the number to compare against a `redb` point read.
+    if let Query::Outref(hash, index) = &query {
+        let t = Instant::now();
+        let row = book.utxo(hash, *index)?;
+        let ns = t.elapsed().as_nanos();
+        match row {
+            Some(r) => {
+                println!(
+                    "  outref     {}#{index} is live — {} ₳ · {} B address · era {} · {} assets · \
+                     {ns} ns",
+                    hex_of(hash),
+                    r.lovelace(),
+                    r.address().len(),
+                    r.era(),
+                    r.n_assets(),
+                );
+                println!("  address    {}", hex_of(r.address()));
+            }
+            None => println!(
+                "  outref     {}#{index} is not in the live set · {ns} ns",
+                hex_of(hash)
+            ),
+        }
+        return Ok(());
+    }
+
+    // The paged shape: a caller keeps asking until `next` is `None`. Not until the
+    // page is short or empty — a page can confirm nothing and still have more, and
+    // that is the mistake the loop is here to make visible.
+    let t = Instant::now();
+    let mut pages = 0u64;
+    let mut refs = 0u64;
+    let mut first = Vec::new();
+    let mut after = None;
+    let mut exhausted = false;
+    loop {
+        let page = query.ask(&book, after, a.limit)?;
+        pages += 1;
+        refs += page.refs.len() as u64;
+        if first.is_empty() {
+            first = page
+                .refs
+                .iter()
+                .take(5)
+                .map(|(h, i)| format!("{}#{i}", hex_of(h)))
+                .collect();
+        }
+        match page.next {
+            Some(c) if a.all => after = Some(c),
+            Some(_) => break,
+            None => {
+                exhausted = true;
+                break;
+            }
+        }
+    }
+    let ns = t.elapsed().as_nanos();
+
+    println!(
+        "  {:<14} {refs} refs in {pages} page(s) of {} · {} ns/ref",
+        query.name(),
+        a.limit,
+        if refs > 0 { ns / refs as u128 } else { 0 },
+    );
+    if first.is_empty() {
+        println!("  first      —");
+    } else {
+        println!("  first      {}", first.join("\n             "));
+    }
+    println!(
+        "  exhausted  {}",
+        if exhausted {
+            "yes".to_string()
+        } else {
+            "no — pass --all to keep paging".to_string()
+        }
+    );
+
+    if a.sum {
+        let t = Instant::now();
+        let mut lovelace: u128 = 0;
+        let (mut rows, mut assets) = (0u64, 0u64);
+        let mut absent = 0u64;
+        let mut after = None;
+        loop {
+            let p = query.ask(&book, after, a.limit)?;
+            for (hash, index) in &p.refs {
+                match book.utxo(hash, *index)? {
+                    Some(row) => {
+                        rows += 1;
+                        lovelace += u128::from(row.lovelace());
+                        assets += row.n_assets() as u64;
+                    }
+                    None => absent += 1,
+                }
+            }
+            match p.next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        println!(
+            "  sum        {rows} rows read back in {:.1} s · {} ₳ · {assets} asset entries \
+             · {absent} refs the row store could not answer",
+            t.elapsed().as_secs_f64(),
+            lovelace / 1_000_000,
+        );
+    }
+    Ok(())
+}
+
+/// Cross-check the three orderings against each other, on the whole store.
+///
+/// The point is that `verify` audits *entries* and this walks *queries*: `verify`
+/// reads every entry of an array and confirms the row it points at, so it never
+/// exercises `Table::run` — the binary search inside a directory bucket, the thing
+/// a lookup actually does, and the one piece of the reader whose behaviour could
+/// differ on a run of ten thousand entries from a run of four.
+///
+/// Driven from `policy.tbl`, because that is the only key the reader hands back a
+/// list of and it needs no new API to enumerate. For each sampled policy:
+///
+/// 1. `by_policy` returns holders — their refs are the arms of the check.
+/// 2. `utxo(ref)` must find each one, and the row must resolve the id back to the
+///    policy asked for (so the confirm is not merely returning candidates).
+/// 3. `by_address(row.address())` must contain that same ref — two orderings, two
+///    searches, one row, which is "the views cannot disagree" checked at the
+///    reader rather than at the entry.
+///
+/// It also times step 2, over distinct keys spread across the store — the one
+/// figure a *serving* process cares about that nothing else here produces. It is
+/// timed over many keys rather than by repeating one, because a repeated lookup of
+/// the same row is an L1 hit and a compiler is free to hoist it entirely.
+fn cross_check(book: &live_book::Base, sample: usize, limit: usize) -> Result<()> {
+    let n_policies = book.policies().len();
+    if n_policies == 0 {
+        bail!("the artifact holds no policies to drive a cross-check from");
+    }
+    let stride = (n_policies / sample.max(1)).max(1);
+    let limit = limit.max(1_000);
+    let mut policies = 0u64;
+    let mut refs = 0u64;
+    let mut addr_checked = 0u64;
+    let mut missing_from_outref = 0u64;
+    let mut missing_from_addr = 0u64;
+    let mut policy_not_held = 0u64;
+    let mut utxo_nanos = 0u128;
+    let t = Instant::now();
+    let mut id = 0usize;
+    while id < n_policies {
+        let policy = *book.policies().get(id as u32).expect("in range");
+        policies += 1;
+        let mut after = None;
+        let mut checked_here = 0u64;
+        loop {
+            let page = book.by_policy(&policy, after, limit)?;
+            for (hash, index) in &page.refs {
+                refs += 1;
+                checked_here += 1;
+                let t = Instant::now();
+                let row = book.utxo(hash, *index)?;
+                utxo_nanos += t.elapsed().as_nanos();
+                let Some(row) = row else {
+                    missing_from_outref += 1;
+                    continue;
+                };
+                if !row
+                    .assets()
+                    .any(|a| book.policies().get(a.policy) == Some(&policy))
+                {
+                    policy_not_held += 1;
+                }
+                // A busy address can hold thousands of outputs, so the address
+                // check is sampled within the run rather than exhaustive — the
+                // property under test is "the search finds the row", not "the
+                // page is complete", which `verify` already covers.
+                if checked_here.is_multiple_of(64) {
+                    addr_checked += 1;
+                    let mut a_after = None;
+                    let mut found = false;
+                    loop {
+                        let page = book.by_address(row.address(), a_after, limit)?;
+                        found |= page.refs.contains(&(*hash, *index));
+                        match page.next {
+                            Some(c) if !found => a_after = Some(c),
+                            _ => break,
+                        }
+                    }
+                    if !found {
+                        missing_from_addr += 1;
+                    }
+                }
+            }
+            match page.next {
+                Some(c) if checked_here < 5_000 => after = Some(c),
+                _ => break,
+            }
+        }
+        id += stride;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "  cross      {policies} policies · {refs} refs in {secs:.1} s ({:.1}/s)",
+        refs as f64 / secs.max(f64::MIN_POSITIVE),
+    );
+    println!(
+        "  utxo       {} ns per point lookup over {refs} distinct refs",
+        utxo_nanos / refs.max(1) as u128
+    );
+    println!("             {addr_checked} refs also resolved through `by_addr`");
+    println!("             {missing_from_outref} not found by `utxo`");
+    println!("             {missing_from_addr} not found by `by_address`");
+    println!("             {policy_not_held} rows that do not resolve the policy back");
+    let failures = missing_from_outref + missing_from_addr + policy_not_held;
+    if failures > 0 {
+        bail!("the three orderings disagree about {failures} refs");
+    }
+    println!("  the three orderings agree on every ref sampled");
+    Ok(())
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble"));
+        s.push(char::from_digit(u32::from(b & 0xF), 16).expect("nibble"));
+    }
+    s
+}
+
+/// Hex to bytes.
+///
+/// Hand-rolled, like `crc32_iso_hdlc`: twenty lines against a dependency this
+/// probe does not otherwise need, and `hex_of` above is already here so the
+/// round trip is testable in the same place.
+fn parse_hex(s: &str, what: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        bail!("{what} `{s}` has an odd number of hex digits");
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char)
+            .to_digit(16)
+            .with_context(|| format!("{what} `{s}` is not hex"))?;
+        let lo = (b[i + 1] as char)
+            .to_digit(16)
+            .with_context(|| format!("{what} `{s}` is not hex"))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+fn parse_28(s: &str, what: &str) -> Result<[u8; 28]> {
+    let bytes = parse_hex(s, what)?;
+    bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "{what} must be 28 bytes (56 hex digits), got {}",
+            bytes.len()
+        )
+    })
+}
+
+/// `<64 hex>`, optionally `#<index>` — the shape a tx id and an outref are
+/// usually quoted in.
+fn parse_outref(s: &str) -> Result<([u8; 32], u32)> {
+    let (hash, index) = match s.split_once('#') {
+        Some((h, i)) => (
+            h,
+            i.parse::<u32>()
+                .with_context(|| format!("output index `{i}` is not a number"))?,
+        ),
+        None => (s, 0),
+    };
+    let bytes = parse_hex(hash, "--outref")?;
+    let h: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "--outref must be 32 bytes (64 hex digits), got {}",
+            bytes.len()
+        )
+    })?;
+    Ok((h, index))
+}
+
+/// An address as a human has it: bech32, or the raw bytes in hex.
+///
+/// bech32 first because that is the form the question arrives in — the wasm
+/// surface takes a string — and hex second so an address whose encoding is in
+/// doubt can be asked about exactly.
+fn parse_address(s: &str) -> Result<Vec<u8>> {
+    match pallas_addresses::Address::from_bech32(s) {
+        Ok(a) => Ok(a.to_vec()),
+        Err(e) => match parse_hex(s, "--address") {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => bail!("--address `{s}` is neither bech32 ({e:?}) nor hex"),
+        },
+    }
 }
 
 fn count(a: CountArgs) -> Result<()> {

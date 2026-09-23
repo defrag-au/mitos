@@ -2175,6 +2175,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "live-book",
  "mitos-chain-walk",
  "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",
@@ -3224,6 +3225,15 @@ name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+
+[[package]]
+name = "live-book"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "memmap2",
+ "pallas-addresses 1.4.0",
+]
 
 [[package]]
 name = "lock_api"
