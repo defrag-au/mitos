@@ -2904,6 +2904,11 @@ fn follow(a: FollowArgs) -> Result<()> {
     let run = Run::new("follow")
         .target(a.book.display().to_string())
         .key("rows", base.rows())
+        // Which base these figures are about. `--base-chunk` is the operator's
+        // claim; this is the artifact's own account of itself, so two runs can be
+        // compared without trusting that the same flag meant the same thing.
+        .key("base", delta.base_fingerprint().to_string())
+        .key("base_slot", base.meta().base_slot.unwrap_or_default())
         .key("base_chunk", a.base_chunk)
         .key("window_base", a.window_base)
         .key("sink", !a.bare)
@@ -2923,6 +2928,18 @@ fn follow(a: FollowArgs) -> Result<()> {
         base.policies().len(),
         a.base_chunk,
     );
+    match base.meta().base_slot {
+        Some(slot) => println!("             {} @ slot {slot}", delta.base_fingerprint()),
+        // Not fatal: `follow` measures what a delta costs, and that does not
+        // depend on the base knowing where it sits. But every figure below is
+        // about a gap whose start is `--base-chunk` and nothing else, so say so.
+        None => println!(
+            "             {} — ⚠️ no `base_slot`, so `--base-chunk {}` is unchecked \
+             (`fold-probe stamp-boundary` fills it in)",
+            delta.base_fingerprint(),
+            a.base_chunk
+        ),
+    }
     if a.window_base {
         println!(
             "             FOLDED FROM A WINDOW: anything created before it is invisible, so \

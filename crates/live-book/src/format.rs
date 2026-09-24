@@ -324,7 +324,49 @@ pub struct Meta {
     pub base_slot: Option<u64>,
 }
 
+/// Which base an artifact *is*, for deciding whether something else was built
+/// against it.
+///
+/// # Pairing, never integrity
+///
+/// A follower's delta is only meaningful against one base: its spend bitmap is
+/// indexed by the row's entry in `by_outref` (`Base::outref_entry`), so the same
+/// bit means a different output under a different base. Today `Delta` borrows
+/// its `&Base` and the borrow checker settles it. **A delta that is written down
+/// has no borrow**, and nothing else in the format can tell that a delta and a
+/// base belong together — the failure is not loud, it is a live output reported
+/// absent, which reads as data rather than corruption.
+///
+/// So this exists to answer one question: *is this the base that was there when
+/// the delta was built?* It is **not** a content hash and must never be used as
+/// one — it covers the metadata, not the 2.23 GB of rows and orderings beneath
+/// it. Integrity is a publish-time concern over the bytes themselves
+/// (`ARTIFACT_SHARDING.md` §8), and it is a different mechanism for a different
+/// threat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BaseFingerprint(u64, u64);
+
+impl std::fmt::Display for BaseFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let BaseFingerprint(a, b) = self;
+        write!(f, "{a:016x}{b:016x}")
+    }
+}
+
 impl Meta {
+    /// Fields describing **how the builder ran** rather than what it produced,
+    /// and therefore excluded from [`Meta::fingerprint`].
+    ///
+    /// `LIVE_BOOK.md` §Decided proves `rows.bin`, `by_outref.idx`, `dir.idx` and
+    /// `policy.tbl` are **byte-identical across runs at 0, 1 and 7
+    /// compactions** — the artifact does not depend on how the builder used its
+    /// memory. So two identical artifacts can carry different `compactions`
+    /// here, and a fingerprint including it would call them different bases.
+    /// `spent_hits` / `spent_misses` describe the fold's resolution path for the
+    /// same reason.
+    const BUILD_PATH_KEYS: [&'static str; 4] =
+        ["compactions", "rehashes", "spent_hits", "spent_misses"];
+
     /// The lines a repair recomputes, and the only ones it is allowed to rewrite.
     pub const DERIVED_KEYS: [&'static str; 6] = [
         "by_policy_entries",
@@ -438,6 +480,74 @@ impl Meta {
         tmp.flush()?;
         drop(tmp);
         swap_in(dir, META_FILE)
+    }
+
+    /// The lines the fingerprint is taken over — what the artifact **is**.
+    ///
+    /// Rendered rather than hashed field-by-field so the input is inspectable:
+    /// a fingerprint that disagrees can be explained by diffing two of these,
+    /// which is the difference between a debuggable mismatch and a mystery.
+    ///
+    /// Derived from [`Meta::write`]'s own rendering by dropping
+    /// [`Meta::DERIVED_KEYS`] (a repair may rewrite them without the rows
+    /// changing) and [`Meta::BUILD_PATH_KEYS`] (they record how the build ran).
+    /// An unknown `base_slot` is rendered explicitly rather than omitted — a
+    /// book that does not know where it sits is a different thing from one at
+    /// slot 0, and the fingerprint must not collapse them.
+    pub fn identity_text(&self) -> String {
+        let mut rendered = String::new();
+        {
+            let m = self;
+            let mut tmp = Vec::new();
+            let mut line = |k: &str, v: &dyn std::fmt::Display| {
+                tmp.push(format!("{k} {v}"));
+            };
+            line("layout_version", &m.layout_version);
+            line("rows", &m.rows);
+            line("created", &m.created);
+            line("live_lovelace", &m.live_lovelace);
+            line("live_assets", &m.live_assets);
+            line("rows_bytes", &m.rows_bytes);
+            line("by_outref_entries", &m.by_outref_entries);
+            line("policies", &m.policies);
+            line("distinct_prefixes", &m.distinct_prefixes);
+            line("max_addr_len", &m.max_addr_len);
+            line("addrs_over_255", &m.addrs_over_255);
+            match m.base_slot {
+                Some(slot) => line("base_slot", &slot),
+                None => line("base_slot", &"unknown"),
+            }
+            for l in tmp {
+                rendered.push_str(&l);
+                rendered.push('\n');
+            }
+        }
+        debug_assert!(
+            Self::DERIVED_KEYS
+                .iter()
+                .chain(Self::BUILD_PATH_KEYS.iter())
+                .all(|k| !rendered
+                    .lines()
+                    .any(|l| l.strip_prefix(k).is_some_and(|r| r.starts_with(' ')))),
+            "a repairable or build-path key reached the identity text"
+        );
+        rendered
+    }
+
+    /// A stable identity for this base — see [`BaseFingerprint`].
+    pub fn fingerprint(&self) -> BaseFingerprint {
+        let text = self.identity_text();
+        // Two lanes with different seeds over the same bytes. `mix` is the
+        // finaliser the build index already uses; this is a fingerprint for
+        // pairing, so a non-cryptographic mixer is the honest choice and keeps
+        // this crate's dependency list at three.
+        let mut a: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut b: u64 = 0xc2b2_ae3d_27d4_eb4f;
+        for byte in text.as_bytes() {
+            a = mix(a ^ u64::from(*byte));
+            b = mix(b.rotate_left(23) ^ a);
+        }
+        BaseFingerprint(a, b)
     }
 
     /// Record where the artifact sits on chain, as a line edit.

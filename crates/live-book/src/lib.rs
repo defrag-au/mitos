@@ -68,6 +68,6 @@ pub mod format;
 pub mod reader;
 pub mod row;
 
-pub use format::{LAYOUT_VERSION, Meta, PolicyTable};
+pub use format::{BaseFingerprint, LAYOUT_VERSION, Meta, PolicyTable};
 pub use reader::{Base, Cursor, MAX_PAGE, OutRef, Page};
 pub use row::{Asset, Assets, Datum, Row, RowRead};

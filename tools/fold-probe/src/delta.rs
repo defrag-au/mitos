@@ -35,8 +35,8 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
 use anyhow::{Result, bail};
-use live_book::Base;
 use live_book::row::{self, Datum, ROW_HEADER, Row, RowRead};
+use live_book::{Base, BaseFingerprint};
 
 use crate::{FxHasher, OutRef, outref_key};
 
@@ -78,6 +78,19 @@ pub struct Stat {
 /// The live set since a book's boundary.
 pub struct Delta<'a> {
     base: &'a Base,
+    /// Which base this was built against.
+    ///
+    /// Redundant *here* — `base` is a borrow, so the compiler already settles
+    /// it — and recorded anyway, because the moment a delta is written down the
+    /// borrow is gone and nothing else in the format can tell a delta and a base
+    /// apart. `base_spent` is indexed by `Base::outref_entry`, so under the wrong
+    /// base the same bit means a different output and the symptom is a live
+    /// output reported **absent**: data, not corruption.
+    ///
+    /// Capturing it at construction is what makes that a check a writer can
+    /// emit and a reader can enforce, rather than an invariant living in a
+    /// design doc. See `MITOS_AT_THE_EDGE.md` §7.4.
+    base_fingerprint: BaseFingerprint,
     /// The row arena, byte-addressed, in `row`'s encoding.
     arena: Vec<u8>,
     /// Creation ordinal → the row's offset in `arena`. An ordinal is dense and so
@@ -118,6 +131,7 @@ impl<'a> Delta<'a> {
         }
         Ok(Delta {
             base,
+            base_fingerprint: base.meta().fingerprint(),
             arena: Vec::new(),
             offsets: Vec::new(),
             by_outref: HashMap::default(),
@@ -128,6 +142,23 @@ impl<'a> Delta<'a> {
             body: Vec::with_capacity(64),
             stat: Stat::default(),
         })
+    }
+
+    /// Which base this delta belongs to.
+    ///
+    /// **The obligation a writer inherits.** A written delta must carry this,
+    /// and whoever reads one back must refuse a base whose
+    /// [`Meta::fingerprint`](live_book::Meta::fingerprint) differs — three lines,
+    /// and the reason they matter is that the failure without them is silent:
+    /// `base_spent` is indexed by `Base::outref_entry`, so under the wrong base
+    /// the same bit means a different output and a live output is reported
+    /// **absent**. That reads as data rather than corruption, which is why it
+    /// has to be checked rather than noticed.
+    ///
+    /// No such reader exists yet, so no check is written here — the identity is,
+    /// so it is available the moment one does. `MITOS_AT_THE_EDGE.md` §7.4.
+    pub fn base_fingerprint(&self) -> BaseFingerprint {
+        self.base_fingerprint
     }
 
     /// The bytes the reader-side policy map costs. Reported separately from

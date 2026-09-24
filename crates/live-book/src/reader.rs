@@ -636,6 +636,130 @@ mod tests {
         }
     }
 
+    /// A base's fingerprint answers "is this the base that delta was built
+    /// against", so the two properties that matter are what it **ignores**: a
+    /// repair, and how the builder happened to use its memory.
+    #[test]
+    fn fingerprint_ignores_repairs_and_the_build_path() {
+        let base = Meta {
+            layout_version: crate::format::LAYOUT_VERSION,
+            rows: 10_911_674,
+            rows_bytes: 1_808_876_205,
+            by_outref_entries: 10_911_674,
+            policies: 231_737,
+            base_slot: Some(197_899_197),
+            ..Meta::default()
+        };
+        let want = base.fingerprint();
+
+        // `LIVE_BOOK.md` §Decided: the artifact is byte-identical across runs at
+        // 0, 1 and 7 compactions. Two identical artifacts must not be called
+        // different bases because the builder compacted more often.
+        let mut noisy = base.clone();
+        noisy.compactions = 67;
+        noisy.rehashes = 202;
+        noisy.spent_hits = 344_578_541;
+        noisy.spent_misses = 14_098;
+        assert_eq!(
+            noisy.fingerprint(),
+            want,
+            "build-path fields must not change a base's identity"
+        );
+
+        // `reindex` rewrites the derived counts from the same rows. The rows did
+        // not move, so a delta built before the repair is still valid after it.
+        let mut repaired = base.clone();
+        repaired.by_policy_entries = 10_946_451;
+        repaired.by_addr_entries = 10_911_674;
+        repaired.addr_payment = 10_527_049;
+        repaired.addr_bootstrap = 384_625;
+        assert_eq!(
+            repaired.fingerprint(),
+            want,
+            "a repair must not change a base's identity"
+        );
+    }
+
+    /// The other half: anything that makes it a *different* live set must be
+    /// visible, and "does not know where it sits" is not slot 0.
+    #[test]
+    fn fingerprint_separates_different_bases() {
+        let base = Meta {
+            layout_version: crate::format::LAYOUT_VERSION,
+            rows: 10_911_674,
+            base_slot: Some(197_899_197),
+            ..Meta::default()
+        };
+
+        let mut later = base.clone();
+        later.base_slot = Some(197_899_198);
+        assert_ne!(later.fingerprint(), base.fingerprint(), "a later height");
+
+        let mut unstamped = base.clone();
+        unstamped.base_slot = None;
+        assert_ne!(
+            unstamped.fingerprint(),
+            base.fingerprint(),
+            "unknown position must not collapse onto a known one"
+        );
+
+        let mut shorter = base.clone();
+        shorter.rows -= 1;
+        assert_ne!(shorter.fingerprint(), base.fingerprint(), "a different set");
+
+        let mut relaid = base.clone();
+        relaid.rows_bytes += 1;
+        assert_ne!(
+            relaid.fingerprint(),
+            base.fingerprint(),
+            "a different arena"
+        );
+    }
+
+    /// A fingerprint nobody can explain is a mystery rather than a mismatch, so
+    /// the bytes it is taken over stay inspectable.
+    #[test]
+    fn identity_text_is_diffable_and_excludes_what_it_claims_to() {
+        let mut meta = Meta {
+            base_slot: None,
+            ..Meta::default()
+        };
+        meta.compactions = 67;
+        meta.addr_payment = 10_527_049;
+
+        let text = meta.identity_text();
+        assert!(text.contains("base_slot unknown"), "{text}");
+        for key in Meta::DERIVED_KEYS {
+            assert!(
+                !text.contains(&format!("{key} ")),
+                "derived key {key} reached the identity text"
+            );
+        }
+        for key in ["compactions", "rehashes", "spent_hits", "spent_misses"] {
+            assert!(
+                !text.contains(&format!("{key} ")),
+                "build-path key {key} reached the identity text"
+            );
+        }
+    }
+
+    /// An artifact on disk fingerprints the same read back as it did written —
+    /// the property every pairing check depends on.
+    #[test]
+    fn fingerprint_survives_a_round_trip_through_the_file() {
+        let (f, base) = fixture("fingerprint-round-trip");
+        let from_open = base.meta().fingerprint();
+        let reread = Meta::open(f.dir.as_path()).expect("reopen").fingerprint();
+        assert_eq!(from_open, reread);
+
+        // And a stamp is a real change of identity, because it is a real change
+        // of what the artifact claims to be.
+        Meta::stamp_base_slot(f.dir.as_path(), 12_345).expect("stamp");
+        let stamped = Meta::open(f.dir.as_path()).expect("reopen").fingerprint();
+        assert_ne!(stamped, from_open);
+        f.remove();
+    }
+
     /// Two rows sharing a payment credential but differing in their stake part,
     /// one row at a reward address whose stake credential *is* that same 28 bytes,
     /// and one unrelated row. The overlap is the whole point: it is the case a
