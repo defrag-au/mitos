@@ -308,6 +308,20 @@ pub struct Meta {
     pub addr_stake: u64,
     pub addr_bootstrap: u64,
     pub addr_unkeyed: u64,
+    /// The slot of the last block the build applied — where the artifact *is*.
+    ///
+    /// **The one optional field, and the exception is the point.** Every other field
+    /// is required because an absent one means the writer and this reader disagree
+    /// about the format. This one is absent for a different reason: a book built
+    /// before the field existed is a valid book that does not know where it sits,
+    /// and "unknown" has to be a state a reader can see rather than one to guess
+    /// past. A plane asked for a `tip` refuses instead of inventing one.
+    ///
+    /// Its absence is **not** a `layout_version` change: the rows and the three
+    /// orderings are the same bytes stamped or unstamped, which is what that version
+    /// describes. `fold-probe stamp-boundary` fills it in for an artifact built
+    /// before it existed, and a build writes it from the walk.
+    pub base_slot: Option<u64>,
 }
 
 impl Meta {
@@ -332,6 +346,22 @@ impl Meta {
                 .trim()
                 .parse()
                 .with_context(|| format!("book.meta `{k}` is not a number"))
+        };
+        // The one field allowed to be absent. An absent key is `None`; a key that is
+        // present and will not parse is still an error, so a typo cannot read as
+        // "unknown".
+        let opt_num = |k: &str| -> Result<Option<u64>> {
+            match text
+                .lines()
+                .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix(' ')))
+            {
+                None => Ok(None),
+                Some(v) => v
+                    .trim()
+                    .parse()
+                    .map(Some)
+                    .with_context(|| format!("book.meta `{k}` is not a number")),
+            }
         };
         Ok(Meta {
             layout_version: num("layout_version")? as u32,
@@ -358,6 +388,7 @@ impl Meta {
             addr_stake: num("addr_stake")?,
             addr_bootstrap: num("addr_bootstrap")?,
             addr_unkeyed: num("addr_unkeyed")?,
+            base_slot: opt_num("base_slot")?,
         })
     }
 
@@ -398,7 +429,36 @@ impl Meta {
             line("addr_stake", &m.addr_stake);
             line("addr_bootstrap", &m.addr_bootstrap);
             line("addr_unkeyed", &m.addr_unkeyed);
+            if let Some(slot) = m.base_slot {
+                line("base_slot", &slot);
+            }
         }
+        let mut tmp = temp_for(dir, META_FILE)?;
+        tmp.write_all(out.as_bytes())?;
+        tmp.flush()?;
+        drop(tmp);
+        swap_in(dir, META_FILE)
+    }
+
+    /// Record where the artifact sits on chain, as a line edit.
+    ///
+    /// An **observed** field rather than a derived one — it is not in
+    /// [`Meta::DERIVED_KEYS`], because no pass over the rows can recover it — but it
+    /// is written the same way, because a stamping run is a repair over an artifact
+    /// this binary may be older than and must not re-render.
+    pub fn stamp_base_slot(dir: &Path, slot: u64) -> Result<()> {
+        let path = dir.join(META_FILE);
+        let old = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let mut out: String = old
+            .lines()
+            .filter(|l| {
+                !l.strip_prefix("base_slot")
+                    .is_some_and(|r| r.starts_with(' '))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        out.push_str(&format!("base_slot {slot}\n"));
         let mut tmp = temp_for(dir, META_FILE)?;
         tmp.write_all(out.as_bytes())?;
         tmp.flush()?;
@@ -408,6 +468,12 @@ impl Meta {
 
     /// Rewrite only the lines this tool computes, carrying every other line
     /// through verbatim.
+    ///
+    /// **`counts` must name every key in [`Meta::DERIVED_KEYS`].** The derived set is
+    /// *replaced*, not merged: a key that is not handed in has its line dropped, and
+    /// the resulting file fails to open (`has no \`addr_payment\``) rather than
+    /// reading a stale one. That is the safer of the two failures and it is still a
+    /// silent one at the call site, so `reindex` — the only caller — passes all six.
     ///
     /// `book.meta`'s presence means "everything before me passed", and a reindex
     /// is a pass over the same rows — it derives the same counts from the same

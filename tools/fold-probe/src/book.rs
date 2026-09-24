@@ -168,6 +168,13 @@ pub struct Book {
     /// What the last compaction left behind: the live set's size at that moment,
     /// and so the floor the next trigger measures from.
     last_live_bytes: u64,
+    /// The slot of the last block the walk applied — written to `book.meta` by
+    /// [`Book::finish`].
+    ///
+    /// Recorded as the walk passes each block rather than handed to `finish`, because
+    /// the walk is the only place that has the block in hand — and it is the one fact
+    /// about a book that no transaction inside it carries.
+    base_slot: Option<u64>,
     cost: Cost,
 }
 
@@ -204,6 +211,7 @@ impl Book {
             policy_order: Vec::new(),
             compact_at,
             last_live_bytes: 0,
+            base_slot: None,
             cost: Cost::default(),
         })
     }
@@ -301,6 +309,12 @@ impl Book {
             );
         }
         Ok(())
+    }
+
+    /// Where the walk has got to, as the walk sees it. Called once per block, so it
+    /// is a field assignment rather than anything that looks at the slot.
+    pub fn set_base_slot(&mut self, slot: u64) {
+        self.base_slot = Some(slot);
     }
 
     /// One spend. `true` when the book held it.
@@ -608,6 +622,10 @@ impl Book {
             addr_stake: self.cost.addr_stake,
             addr_bootstrap: self.cost.addr_bootstrap,
             addr_unkeyed: self.cost.addr_unkeyed,
+            // `None` when the walk never said. A book built by a caller that never
+            // called `set_base_slot` does not know where it is, and a zero here would
+            // be a claim rather than an absence.
+            base_slot: self.base_slot,
         }
         .write(&self.dir)?;
 

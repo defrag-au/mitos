@@ -407,8 +407,88 @@ impl Base {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{Perm, write_ordering, write_policy_tbl};
+    use crate::format::{META_FILE, Perm, write_ordering, write_policy_tbl};
     use crate::row::{Asset, Datum, ROW_HEADER, write_asset_record, write_header};
+
+    /// `base_slot` is the one optional field in `book.meta`, and the three states it
+    /// has to keep apart are: **never written** (an artifact that does not know where
+    /// it is), **written** (a stamped one), and **written and then repaired** — a
+    /// `reindex` rewrites six derived lines and must carry the rest through, or a
+    /// plane that could answer `tip` before a repair silently stops being able to.
+    ///
+    /// The other half is that absence is not an error while a *typo* still is: a key
+    /// present but unparseable has to fail, or "unknown" and "corrupt" become the
+    /// same state.
+    #[test]
+    fn base_slot_is_optional_survives_a_repair_and_rejects_a_typo() {
+        let dir = std::env::temp_dir().join(format!("live-book-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create");
+
+        let all_zeros = Meta::default();
+        all_zeros.write(&dir).expect("write");
+        assert_eq!(
+            Meta::open(&dir).expect("open").base_slot,
+            None,
+            "a build that never saw a block must not claim a position"
+        );
+
+        Meta::stamp_base_slot(&dir, 197_899_197).expect("stamp");
+        let stamped = Meta::open(&dir).expect("open");
+        assert_eq!(stamped.base_slot, Some(197_899_197));
+        // Everything *else* is unchanged: a stamp is an insertion, not a re-render.
+        let mut without_position = stamped.clone();
+        without_position.base_slot = None;
+        assert_eq!(without_position, all_zeros);
+
+        // A second stamp replaces the line rather than appending one — two
+        // `base_slot` lines would leave the reader taking the stale first match.
+        Meta::stamp_base_slot(&dir, 42).expect("re-stamp");
+        let again = Meta::open(&dir).expect("open");
+        assert_eq!(again.base_slot, Some(42));
+
+        // Every derived key, because `rewrite_derived` **replaces** the derived set:
+        // a key it is not handed is a line that goes away, and `Meta::open` then fails
+        // on the missing field rather than on a wrong one. `reindex` passes all six;
+        // this mirrors it.
+        Meta::rewrite_derived(
+            &dir,
+            &[
+                ("by_policy_entries", 3),
+                ("by_addr_entries", 9),
+                ("addr_payment", 7),
+                ("addr_stake", 0),
+                ("addr_bootstrap", 2),
+                ("addr_unkeyed", 0),
+            ],
+        )
+        .expect("repair");
+        let repaired = Meta::open(&dir).expect("open");
+        assert_eq!(
+            repaired.base_slot,
+            Some(42),
+            "a repair must not drop the position"
+        );
+        assert_eq!(
+            repaired.addr_payment, 7,
+            "and must apply what it was asked to"
+        );
+
+        // A typo *in the line itself*, not a second line: `Meta::parse` takes the
+        // first match, so an appended duplicate would leave the valid one winning and
+        // this would test nothing. The `assert_ne` is the guard for that — the same
+        // silent-no-op the edit-tools rule exists for, one layer down.
+        let text = std::fs::read_to_string(dir.join(META_FILE)).expect("read");
+        let typo = text.replace("base_slot 42", "base_slot 12x");
+        assert_ne!(typo, text, "the fixture must actually have been changed");
+        std::fs::write(dir.join(META_FILE), typo).expect("write");
+        assert!(
+            Meta::open(&dir).is_err(),
+            "a `base_slot` that will not parse is corruption, not an unknown position"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// A base address (type 0): a payment credential and a stake credential.
     fn base_address(payment: u8, stake: u8) -> Vec<u8> {

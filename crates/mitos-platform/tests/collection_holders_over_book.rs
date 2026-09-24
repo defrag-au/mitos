@@ -64,33 +64,45 @@
 //! `policy.tbl` with at least [`MIN_ROWS`] live rows, which is deterministic and
 //! cheap.
 //!
-//! # It does not pass yet, and the reason is the point
+//! # It passes, and how it got there is the useful part
 //!
-//! **Observed 2026-09-23, book built locally from chunks 1848–1851, policy
-//! `4b9c44c5…` with 706 live refs, 839 asset names.** The host boots, the module
-//! loads and inits, dynamic interest routes, the onboard scope is shared from the
-//! live instance to the pump's disposable one, and then:
+//! **First run, 2026-09-23.** Everything ran except the module: the host booted, the
+//! artifact loaded, dynamic interest routed, the onboard scope was shared from the
+//! live instance to the pump's disposable one — and then the cold start **trapped on
+//! its first page scan, emitting nothing**:
 //!
 //! ```text
 //! backfill: rebootstrap trapped (non-retryable); refill may be partial
 //! emitted 0 begin · 0 chunk(s) · 0 end · 0 holding(s)
 //! ```
 //!
-//! The trap is one missing number. `HostStateV2::utxos_by_policy` freezes a fresh
+//! The cause was one missing number. `HostStateV2::utxos_by_policy` freezes a fresh
 //! scan as of a tip — `scan_anchor_slot` → `tip().slot()`
-//! (`host_fns_v2/chain_data.rs`) — and `BookDataPlane::tip` refuses, because
-//! **the artifact records no chain position**. The `?` turns that into a host-fn
-//! error and the guest's call traps, so the first page scan kills the whole cold
-//! start. The host's watched-UTxO seeding hits the same refusal through
-//! `search_utxos` a moment earlier, and logs it as a warning.
+//! (`host_fns_v2/chain_data.rs`) — and `BookDataPlane::tip` refused, because the
+//! artifact recorded no chain position. The `?` became a host-fn error the guest
+//! calls without a `Result` in front of it, so the first page scan killed the whole
+//! cold start.
 //!
-//! This is `PHONEBOOK_COVERAGE.md` §12 and `DELTA_CHAIN.md` §7 arriving exactly
-//! where they said they would: `ChainPoint` already has the representation for it
-//! (`ChainPoint::Slot(u64)`, "slot-only point"), the fold already walks the block
-//! that would supply the number, and one field in `book.meta` is the whole gap.
-//! Until it exists the pre-flight below fails this test in one line rather than
-//! letting it spin to a timeout, and the moment `tip()` answers the pre-flight
-//! stops firing and the run continues on its own.
+//! That was `PHONEBOOK_COVERAGE.md` §12's gap, and it closed the same day:
+//! `book.meta` gained an optional `base_slot`, a build writes it from the walk,
+//! `fold-probe stamp-boundary` fills it in for an artifact built before it existed,
+//! and `tip()` answers `ChainPoint::Slot`. **Observed after the fix, same book**
+//! (chunks 1848–1851, policy `4b9c44c5…`, 706 live refs):
+//!
+//! ```text
+//! backfill: rebootstrap pump complete utxos_ingested=706 steps=6 outcome="completed"
+//! emitted    1 begin · 1 chunk(s) · 1 end · 839 holding(s) · 839 asset names · 1.1 s
+//! ✓ 839 asset names · Σ 839 units · 839 (asset, holder) entries over 706 live refs
+//! ```
+//!
+//! 839 names from 706 refs — the policy puts more than one asset in some outputs, so
+//! the module's SUM merge across a page is exercised rather than assumed.
+//!
+//! One warning remains and it is a **different** gap, left open on purpose: the
+//! host's watched-UTxO seeding calls `search_utxos`, which the book still refuses for
+//! want of a predicate algebra and a `Page` cursor. Non-fatal here — the seed logs
+//! and carries on — but it is the next thing this test will notice when someone
+//! implements it.
 
 mod common;
 

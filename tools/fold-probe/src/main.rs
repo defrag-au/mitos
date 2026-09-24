@@ -103,6 +103,10 @@ enum Cmd {
     Reindex(ReindexArgs),
     /// Ask a published book a question, through the reader a consumer uses.
     Lookup(LookupArgs),
+    /// Record where a published book sits on chain, from the chunk it was built at.
+    /// A build writes `base_slot` itself; this is for an artifact built before the
+    /// field existed, so `tip()` can answer instead of refusing.
+    StampBoundary(StampArgs),
     /// Resolve a chunk's transaction inputs against a book, and classify what it
     /// cannot answer. Answers "can the book find a UTxO that is no longer live".
     ResolveInputs(ResolveArgs),
@@ -205,6 +209,21 @@ struct LookupArgs {
 }
 
 #[derive(Args)]
+struct StampArgs {
+    /// The book directory to stamp, in place.
+    #[arg(long)]
+    book: PathBuf,
+    /// The Mithril immutable directory.
+    #[arg(long)]
+    immutable: PathBuf,
+    /// The chunk whose boundary the book was built at. Its **last block's slot** is
+    /// what gets recorded — read from the log, never inferred from the chunk number,
+    /// because a chunk's end is not a slot.
+    #[arg(long)]
+    base_chunk: u16,
+}
+
+#[derive(Args)]
 struct ReindexArgs {
     /// The book directory to reindex, in place.
     #[arg(long)]
@@ -290,6 +309,7 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => verify(a),
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
+        Cmd::StampBoundary(a) => stamp_boundary(a),
         Cmd::ResolveInputs(a) => resolve_inputs(a),
         Cmd::Follow(a) => follow(a),
     }
@@ -523,6 +543,13 @@ fn plan_block(
         st.eras.push(block.era());
     }
 
+    // The artifact's own position. Here rather than in the primitives walk because
+    // this is the path Byron and the epoch boundary take, and `MultiEraBlock`
+    // carries a slot for both.
+    if let Some(sk) = sink.as_deref_mut() {
+        sk.set_slot(block.slot());
+    }
+
     // ⚠ `txs()` does NOT borrow the block. Pallas CLONES every transaction body
     // and every witness set out of it (`support::clone_conway_txs`), so this one
     // line is a second full materialisation of the block's contents on top of
@@ -599,6 +626,17 @@ enum Sink<'a, 'b> {
 }
 
 impl Sink<'_, '_> {
+    /// Where the walk has got to.
+    ///
+    /// The book records it; the delta does not, and the asymmetry is the design
+    /// rather than an omission — a delta is defined *relative to* a boundary, so it
+    /// has no position of its own to report (`DELTA_CHAIN.md` §7).
+    fn set_slot(&mut self, slot: u64) {
+        if let Sink::Book(b) = self {
+            b.set_base_slot(slot);
+        }
+    }
+
     fn spend(&mut self, outref: OutRef) {
         match self {
             Sink::Book(b) => {
@@ -816,6 +854,18 @@ impl ShelleyBlock<'_> {
             ShelleyBlock::Alonzo(_, e) => e,
             ShelleyBlock::Babbage(_) => Era::Babbage,
             ShelleyBlock::Conway(_) => Era::Conway,
+        }
+    }
+
+    /// The block's slot, which every era's header carries at the same path.
+    ///
+    /// On the block rather than in a `BlockPlan`, because it is the one thing an
+    /// artifact needs that no transaction in it carries: where the artifact *is*.
+    fn slot(self) -> u64 {
+        match self {
+            ShelleyBlock::Alonzo(b, _) => b.header.header_body.slot,
+            ShelleyBlock::Babbage(b) => b.header.header_body.slot,
+            ShelleyBlock::Conway(b) => b.header.header_body.slot,
         }
     }
 }
@@ -1136,6 +1186,13 @@ fn plan_block_primitives(
         st.eras.push(era);
     }
     let mut sink = sink;
+
+    // The artifact's own position, recorded as the walk passes each block — cheap
+    // enough per block rather than once at the end, which would need the last block
+    // decoded a second time.
+    if let Some(sk) = sink.as_deref_mut() {
+        sk.set_slot(blk.slot());
+    }
 
     match blk {
         ShelleyBlock::Alonzo(b, _) => {
@@ -1583,6 +1640,9 @@ fn fold(a: FoldArgs) -> Result<()> {
     let mut dec_acc = DecodeStats::default();
     let mut chain_acc = ChainStats::default();
     let mut app_acc = ApplyStats::default();
+    // Kept for the report: `finish` consumes the builder, and the report reads the
+    // boundary back out of the artifact rather than out of a variable.
+    let book_dir = a.book.clone();
     let mut book = match &a.book {
         Some(dir) => {
             if !a.cursor && !a.primitives {
@@ -2135,6 +2195,19 @@ fn fold(a: FoldArgs) -> Result<()> {
             cost.live_lovelace / 1_000_000,
             cost.live_assets
         );
+        // The one fact no transaction in the book carries, and the one a data plane
+        // needs before it can answer `tip`. Read back from the artifact rather than
+        // from the walk's own variable, so this line reports what was written.
+        if let Some(dir) = &book_dir {
+            match live_book::Meta::open(dir)?.base_slot {
+                Some(slot) => {
+                    println!("  position   slot {slot} — the boundary `tip()` answers from")
+                }
+                None => println!(
+                    "  position   NOT RECORDED — `tip()` will refuse; the walk saw no block"
+                ),
+            }
+        }
     }
     Ok(())
 }
@@ -2189,6 +2262,55 @@ fn verify(a: VerifyArgs) -> Result<()> {
 /// Deliberately a subcommand, not a step in `fold`: the point is that a view can be
 /// derived from an artifact that already exists, so this must not require the walk
 /// that produced it.
+/// Record where a published book sits on chain, from the chunk it was built at.
+///
+/// A build writes `base_slot` itself, from the walk. This exists for the artifacts
+/// built before the field did — an artifact that is otherwise complete and whose
+/// only gap is that it cannot say where it is, which is the one thing a data plane
+/// needs before it can answer `tip()`.
+///
+/// The slot is the **last block of `--base-chunk`**, read out of the log. It is not
+/// derived from the chunk number: a chunk ends where its last block says, and
+/// `chunk * 21_600` is a claim the log would have to contradict.
+fn stamp_boundary(a: StampArgs) -> Result<()> {
+    let path = chunk_path(&a.immutable, a.base_chunk);
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let blocks = split_blocks(&bytes)?;
+    let last = blocks
+        .last()
+        .with_context(|| format!("chunk {} holds no blocks", a.base_chunk))?;
+    let slot = MultiEraBlock::decode(last)
+        .with_context(|| format!("chunk {}: decoding its last block", a.base_chunk))?
+        .slot();
+
+    let before = live_book::Meta::open(&a.book)?;
+    println!("book stamp-boundary — {}", a.book.display());
+    println!(
+        "  chunk      {} · {} B · {} block(s) · last at slot {slot}",
+        a.base_chunk,
+        bytes.len(),
+        blocks.len(),
+    );
+    match before.base_slot {
+        Some(old) if old == slot => {
+            println!("  position   already slot {old} — nothing to do");
+            return Ok(());
+        }
+        Some(old) => println!("  position   was slot {old} — correcting to {slot}"),
+        None => println!("  position   was unrecorded"),
+    }
+    live_book::Meta::stamp_base_slot(&a.book, slot)?;
+
+    // Read back through the reader a consumer uses, so this reports the artifact and
+    // not the write.
+    let after = live_book::Meta::open(&a.book)?;
+    if after.base_slot != Some(slot) {
+        bail!("wrote base_slot {slot} but read back {:?}", after.base_slot);
+    }
+    println!("  stamped    base_slot {slot} — `tip()` now answers `ChainPoint::Slot({slot})`");
+    Ok(())
+}
+
 fn reindex(a: ReindexArgs) -> Result<()> {
     let t = Instant::now();
     let rep = book::reindex(&a.book)?;

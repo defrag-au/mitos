@@ -38,7 +38,9 @@
 //! unanswerable. That is not a gap in this adapter; it is a gap in the artifact,
 //! and it is the first thing `LIVE_BOOK.md` phase 4 has to close. Do not paper
 //! over it with `ChainTip::origin()`: `Origin` means genesis, and a module that
-//! believed it would conclude the chain had not started.
+//! believed it would conclude the chain had not started. It answers
+//! `ChainPoint::Slot(base_slot)` when the artifact records where it sits, and
+//! refuses when it does not.
 //!
 //! # What the trait's shape costs
 //!
@@ -64,9 +66,9 @@ use pallas_primitives::Hash;
 use crate::impls::UTXOS_BY_ADDRESS_HARD_CAP;
 use crate::types::ProtocolParameters;
 use crate::{
-    AssetEntry, ChainDataPlane, ChainTip, DataPlaneError, DataPlaneResult, DatumKind, DecodeLevel,
-    OutputRef, Page, PageRequest, Resolution, StakeCred, TypedDatum, TypedOutput, TypedScript,
-    UtxoPredicate,
+    AssetEntry, ChainDataPlane, ChainPoint, ChainTip, DataPlaneError, DataPlaneResult, DatumKind,
+    DecodeLevel, OutputRef, Page, PageRequest, Resolution, StakeCred, TypedDatum, TypedOutput,
+    TypedScript, UtxoPredicate,
 };
 
 /// A `ChainDataPlane` over a published live book.
@@ -260,12 +262,15 @@ impl ChainDataPlane for BookDataPlane {
         _decode: DecodeLevel,
         _page: PageRequest,
     ) -> DataPlaneResult<Page<(OutputRef, TypedOutput)>> {
-        // The three shapes the book can answer — `at_address`, `under_policy` and
-        // a payment credential — all go through the enumerations above. What this
-        // cannot do is wrap them in a `Page`, because `Page` carries a `ChainTip`
-        // and the artifact records no chain position (see the module docs).
+        // The three shapes the book can answer — `at_address`, `under_policy` and a
+        // payment credential — all go through the enumerations above, and a `Page`
+        // can now carry a tip (`tip()` answers from `base_slot`). What is still
+        // missing is the predicate algebra and the cursor discipline between
+        // requests; `PHONEBOOK_COVERAGE.md` §3 and §4a name the shapes callers use,
+        // which is where a first implementation should start.
         Err(DataPlaneError::NotYetImplemented(
-            "search_utxos returns a Page, and a Page carries a tip the book cannot supply",
+            "search_utxos: the book can answer `tip` now, but not a predicate algebra over \
+             utxos, nor the cursor a Page must carry between requests",
         ))
     }
 
@@ -387,10 +392,22 @@ impl ChainDataPlane for BookDataPlane {
         ))
     }
 
+    /// The boundary the artifact was built at, as a slot.
+    ///
+    /// `ChainPoint::Slot` is the variant for exactly this: a book knows the slot its
+    /// fold stopped at and does not carry the block hash — and it is the documented
+    /// shape for "the originating event source had only the slot", not a placeholder.
+    /// An unstamped artifact refuses rather than answering zero, because a tip of
+    /// genesis is a different claim to "this book does not know".
     async fn tip(&self) -> DataPlaneResult<ChainTip> {
-        Err(DataPlaneError::NotYetImplemented(
-            "the artifact records no chain position, so the plane cannot say what slot it is at",
-        ))
+        match self.base.meta().base_slot {
+            Some(slot) => Ok(ChainTip::at(ChainPoint::Slot(slot))),
+            None => Err(DataPlaneError::NotYetImplemented(
+                "tip: book.meta has no `base_slot`, so this artifact does not record where it \
+                 sits. A build writes it from the walk; an artifact built before the field \
+                 existed is stamped by `fold-probe stamp-boundary`.",
+            )),
+        }
     }
 
     async fn protocol_params(&self) -> DataPlaneResult<ProtocolParameters> {
