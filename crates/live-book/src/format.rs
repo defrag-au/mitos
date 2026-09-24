@@ -54,6 +54,19 @@ pub const ROWS_FILE: &str = "rows.bin";
 pub const POLICY_FILE: &str = "policy.tbl";
 pub const META_FILE: &str = "book.meta";
 
+/// A witnessed datum's key width, and the width `datum.tbl` stores it at.
+pub const DATUM_HASH_BYTES: usize = 32;
+
+/// One entry of `datum.tbl`: the hash, then where its bytes sit in `datum.bin`.
+pub const DATUM_ENTRY_BYTES: usize = 40;
+
+/// The table's header: `layout_version`, entry count, and the slot range the walk
+/// that captured it covered.
+pub const DATUM_HEADER: usize = 28;
+
+pub const DATUM_FILE: &str = "datum.tbl";
+pub const DATUM_BLOB: &str = "datum.bin";
+
 /// One entry of a permutation: the 64-bit prefix a lookup matches, and the row
 /// it points at.
 ///
@@ -276,6 +289,234 @@ pub fn mix(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     x ^ (x >> 33)
+}
+
+/// `datum.tbl` + `datum.bin` — the **witnessed datum bytes**, keyed by hash.
+///
+/// # Why this cannot be re-derived, and the hash path it closes
+///
+/// A datum attached to an output **by hash** carries no payload: the bytes are
+/// revealed only when that output is *spent*, in the spending transaction's witness
+/// set. So they exist in the block bodies and nowhere else, and the only way to hold
+/// them is to capture them on a walk — `rows.bin` and the three orderings cannot
+/// produce them, which is why `LIVE_BOOK.md` prices this table at "a full 215 GB
+/// re-read" for anyone who decides after the fact.
+///
+/// What it answers is `ChainDataPlane::read_output_datums`'s second arm.
+/// `BookDataPlane` already returns the **hash** for a hash-attached datum and no
+/// payload (see `mitos-data-plane/src/impls/book.rs`); this is the payload, and the
+/// two together are what a module reading a CIP-68 or metadata-carrying output
+/// needs.
+///
+/// One limit worth stating where it is enforced: a datum that has never been
+/// revealed cannot be in any table. An unspent output holding a hash-attached datum
+/// is unresolvable by every source, not just this one.
+///
+/// # The layout
+///
+/// Fixed 40-byte entries (`{hash: 32, offset: u32, len: u32}`) **strictly increasing
+/// by hash**, then the payloads concatenated in that same order. Sorted by the full
+/// 32-byte key, so a lookup needs no directory and no confirm — the two things
+/// `by_outref` pays for because its key is an 8-byte prefix, and a full hash is not
+/// a prefix of anything.
+///
+/// # One table per walk, and why the coverage is written down
+///
+/// The payload is `u32`-addressed, so one table holds under 4 GiB and a store-wide
+/// capture is a set of window-sized tables rather than one file. That is not a
+/// limitation to work around: measured, witness datums run 6–183 MiB per 100 mainnet
+/// chunks (`DECODE_SHAPE.md` §2.10), so windows shard this naturally, and shards are
+/// mergeable because the key is the datum's own hash — unlike a delta, nothing here
+/// pairs with a particular base.
+///
+/// What it does *not* have is a way to say "I looked and there was nothing". The
+/// header records the slot range the capturing walk covered, so absence is scoped:
+/// not found **in this range** rather than not on chain. That is the same
+/// distinction `POLICY_WALK_SCHEDULER.md` §1 draws between a range and a cursor — a
+/// cursor cannot express a hole.
+///
+/// # Pairing, and the check that the two files belong together
+///
+/// `datum.tbl`'s offsets address `datum.bin`. A blob from a different capture would
+/// not fail: it would answer with **wrong bytes**, which reads as data rather than as
+/// corruption — the failure mode `BaseFingerprint` exists to prevent for a delta.
+/// So `open` requires the entries to tile the blob exactly: entry 0 starts at 0,
+/// each entry starts where the last ended, and the last ends at the blob's length.
+/// A mismatched pair is then refused at open rather than answered with.
+pub fn write_datum_table(
+    dir: &Path,
+    coverage: (u64, u64),
+    datums: &[([u8; DATUM_HASH_BYTES], Vec<u8>)],
+) -> Result<()> {
+    if let Some(i) = (0..datums.len().saturating_sub(1)).find(|&i| datums[i].0 >= datums[i + 1].0) {
+        bail!(
+            "datum.tbl entries must be strictly increasing by hash: entry {i} is not \
+             below entry {} (sort before writing; the builder dedups, so a repeat is \
+             two entries for one hash)",
+            i + 1
+        );
+    }
+
+    let blob_len: u64 = datums.iter().map(|(_, b)| b.len() as u64).sum();
+    if blob_len > u32::MAX as u64 {
+        bail!(
+            "datum.tbl would need {blob_len} B of payload; one table holds {} — write \
+             one per walk window",
+            u32::MAX
+        );
+    }
+
+    let mut w = temp_for(dir, DATUM_FILE)?;
+    w.write_all(&LAYOUT_VERSION.to_le_bytes())?;
+    w.write_all(&(datums.len() as u64).to_le_bytes())?;
+    w.write_all(&coverage.0.to_le_bytes())?;
+    w.write_all(&coverage.1.to_le_bytes())?;
+    let mut off: u32 = 0;
+    for (hash, bytes) in datums {
+        w.write_all(hash)?;
+        w.write_all(&off.to_le_bytes())?;
+        w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        off += bytes.len() as u32;
+    }
+    w.flush()?;
+    drop(w);
+    swap_in(dir, DATUM_FILE)?;
+
+    let mut b = temp_for(dir, DATUM_BLOB)?;
+    for (_, bytes) in datums {
+        b.write_all(bytes)?;
+    }
+    b.flush()?;
+    drop(b);
+    swap_in(dir, DATUM_BLOB)
+}
+
+/// The witness-datum table as read-only mappings: `hash -> bytes`, resolved without
+/// an allocation, which is what lets a caller hand the payload on borrowed.
+///
+/// Nothing is copied at open. The entry array is scanned once to check that it tiles
+/// the blob (see [`write_datum_table`]), which touches pages the first lookup would
+/// have touched anyway.
+#[derive(Debug)]
+pub struct DatumTable {
+    entries: memmap2::Mmap,
+    /// `None` for an empty capture: `mmap` refuses a zero-length file, and there is
+    /// nothing to address anyway.
+    blob: Option<memmap2::Mmap>,
+    n: usize,
+    first_slot: u64,
+    last_slot: u64,
+}
+
+impl DatumTable {
+    pub fn open(dir: &Path) -> Result<DatumTable> {
+        let path = dir.join(DATUM_FILE);
+        let entries = map(&path)?;
+        if entries.len() < DATUM_HEADER {
+            bail!("{} is too short to hold a header", path.display());
+        }
+        let v = u32::from_le_bytes(entries[0..4].try_into().expect("4 bytes"));
+        if v != LAYOUT_VERSION {
+            bail!(
+                "{} is layout_version {v}; this build reads {LAYOUT_VERSION}",
+                path.display()
+            );
+        }
+        let n = u64::from_le_bytes(entries[4..12].try_into().expect("8 bytes")) as usize;
+        let first_slot = u64::from_le_bytes(entries[12..20].try_into().expect("8 bytes"));
+        let last_slot = u64::from_le_bytes(entries[20..28].try_into().expect("8 bytes"));
+        let want = DATUM_HEADER + DATUM_ENTRY_BYTES * n;
+        if entries.len() != want {
+            bail!(
+                "{} is {} B; {n} entries need {want}",
+                path.display(),
+                entries.len()
+            );
+        }
+
+        let blob = if n == 0 {
+            None
+        } else {
+            Some(map(&dir.join(DATUM_BLOB))?)
+        };
+        let blob_len = blob.as_ref().map_or(0usize, |b| b.len());
+
+        // The tiling check: a scan rather than a lookup, because a blob that belongs to
+        // a different capture answers with bytes instead of failing.
+        let table = DatumTable {
+            entries,
+            blob,
+            n,
+            first_slot,
+            last_slot,
+        };
+        let mut expect = 0usize;
+        for i in 0..n {
+            let (_, off, len) = table.entry(i);
+            if off as usize != expect {
+                bail!(
+                    "{} does not tile {}: entry {i} starts at {off}, {expect} expected — \
+                     the two files are not from the same capture",
+                    path.display(),
+                    DATUM_BLOB
+                );
+            }
+            expect += len as usize;
+        }
+        if expect != blob_len {
+            bail!(
+                "{} holds {blob_len} B; its {n} entries address {expect} — the two files are \
+                 not from the same capture",
+                DATUM_BLOB
+            );
+        }
+
+        Ok(table)
+    }
+
+    /// Entries in the table: one per **distinct** datum hash witnessed by the walk.
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// The inclusive slot range the capturing walk covered. A miss means "not
+    /// witnessed in this range", which is the only claim this table can make.
+    pub fn coverage(&self) -> (u64, u64) {
+        (self.first_slot, self.last_slot)
+    }
+
+    /// The datum's CBOR bytes, or `None` if the capturing walk never saw them.
+    pub fn get(&self, hash: &[u8; DATUM_HASH_BYTES]) -> Option<&[u8]> {
+        let (off, len) = self.entry_of(hash)?;
+        self.blob.as_ref().map(|b| &b[off..off + len])
+    }
+
+    fn entry(&self, i: usize) -> (&[u8], u32, u32) {
+        let b = &self.entries[DATUM_HEADER + DATUM_ENTRY_BYTES * i..];
+        (
+            &b[..DATUM_HASH_BYTES],
+            u32::from_le_bytes(b[32..36].try_into().expect("4 bytes")),
+            u32::from_le_bytes(b[36..40].try_into().expect("4 bytes")),
+        )
+    }
+
+    fn entry_of(&self, hash: &[u8; DATUM_HASH_BYTES]) -> Option<(usize, usize)> {
+        let (mut lo, mut hi) = (0usize, self.n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, off, len) = self.entry(mid);
+            match k.cmp(&hash[..]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some((off as usize, len as usize)),
+            }
+        }
+        None
+    }
 }
 
 /// `book.meta` — the artifact describing itself.
@@ -713,29 +954,51 @@ pub struct Directory {
     n_buckets: usize,
 }
 
-impl Directory {
-    pub fn open(dir: &Path, name: &str) -> Result<Directory> {
+impl Directory<crate::source::MmapSource> {
+    /// Open a directory from a file — the local path, unchanged.
+    pub fn open(dir: &Path, name: &str) -> Result<Directory<crate::source::MmapSource>> {
         let path = dir.join(name);
-        let bytes = map(&path)?;
-        if bytes.len() < 8 {
-            bail!("{name} is too short to hold a header");
+        Directory::from_source(crate::source::MmapSource::open(&path)?)
+            .with_context(|| format!("reading {name}"))
+    }
+}
+
+impl<S: Source> Directory<S> {
+    /// Validate the header and take ownership of the source.
+    pub fn from_source(src: S) -> Result<Directory<S>> {
+        if src.size() < 8 {
+            bail!("directory is too short to hold a header");
         }
-        let v = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
-        let dbits = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+        let head = src.read(0, 8)?;
+        let v = u32::from_le_bytes(head[0..4].try_into().expect("4 bytes"));
+        let dbits = u32::from_le_bytes(head[4..8].try_into().expect("4 bytes"));
         if v != LAYOUT_VERSION || dbits != DIR_BITS {
-            bail!("{name} has layout {v} / DIR_BITS {dbits}");
+            bail!("directory has layout {v} / DIR_BITS {dbits}");
         }
-        if bytes.len() != directory_bytes() {
-            bail!("{name} is {} B, not {}", bytes.len(), directory_bytes());
+        if src.size() != directory_bytes() as u64 {
+            bail!(
+                "directory is {} B, not {}",
+                src.size(),
+                directory_bytes()
+            );
         }
+        drop(head);
         Ok(Directory {
-            bytes,
+            src,
             n_buckets: 1usize << DIR_BITS,
         })
     }
 
-    pub fn bucket(&self, b: usize) -> u32 {
-        bucket_at(&self.bytes, b)
+    /// One bucket.
+    ///
+    /// ⚠️ **Fallible, and that is the point of the seam.** Over a mapping this
+    /// cannot fail — the length was checked at open — so it was infallible for as
+    /// long as a mapping was the only source. A remote read can fail, and a
+    /// reader that pretended otherwise would panic in a Worker rather than
+    /// return an error a caller can act on.
+    pub fn bucket(&self, b: usize) -> Result<u32> {
+        let bytes = self.src.read(8 + 4 * b as u64, 4)?;
+        Ok(u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")))
     }
 
     /// Check what `B5` claims: the buckets are monotone, never address past the
@@ -785,5 +1048,116 @@ impl Directory {
             usize::MAX
         };
         start..end
+    }
+}
+
+#[cfg(test)]
+mod datum_tests {
+    use super::*;
+
+    /// A directory of its own per test, as `reader.rs` does: these write real files,
+    /// and a published name is the thing under test.
+    fn scratch(what: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("live-book-datum-{}-{what}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create");
+        dir
+    }
+
+    fn entry(hash: u8, off: u32, len: u32) -> Vec<u8> {
+        let mut e = vec![hash; DATUM_HASH_BYTES];
+        e.extend_from_slice(&off.to_le_bytes());
+        e.extend_from_slice(&len.to_le_bytes());
+        e
+    }
+
+    fn table_bytes(coverage: (u64, u64), entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut t = LAYOUT_VERSION.to_le_bytes().to_vec();
+        t.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        t.extend_from_slice(&coverage.0.to_le_bytes());
+        t.extend_from_slice(&coverage.1.to_le_bytes());
+        for e in entries {
+            t.extend_from_slice(e);
+        }
+        t
+    }
+
+    /// The three states a lookup has to keep apart: present with bytes, present and
+    /// empty, and **absent** — where absent is scoped to the walk that filled the
+    /// table rather than to the chain.
+    #[test]
+    fn a_datum_table_answers_by_hash_and_scopes_its_misses() {
+        let dir = scratch("round-trip");
+        let a = ([0x11u8; 32], vec![0xA1u8, 0x01]);
+        let b = ([0x22u8; 32], vec![0xA1u8, 0x02, 0x03]);
+        // A zero-length payload: a witness entry with no bytes must read as empty
+        // rather than as absent, and the blob must not shift under it.
+        let c = ([0x33u8; 32], Vec::new());
+        write_datum_table(&dir, (100, 200), &[a.clone(), b.clone(), c.clone()]).expect("write");
+
+        let t = DatumTable::open(&dir).expect("open");
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.coverage(), (100, 200));
+        // First, middle and last: the binary search's three landings.
+        assert_eq!(t.get(&a.0), Some(&a.1[..]));
+        assert_eq!(t.get(&b.0), Some(&b.1[..]));
+        assert_eq!(t.get(&c.0), Some(&[][..]));
+        assert_eq!(
+            t.get(&[0x44; 32]),
+            None,
+            "a hash the walk never saw is absent, not empty"
+        );
+    }
+
+    #[test]
+    fn an_empty_capture_round_trips() {
+        let dir = scratch("empty");
+        write_datum_table(&dir, (500, 500), &[]).expect("write");
+        let t = DatumTable::open(&dir).expect("open");
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.coverage(), (500, 500));
+        assert_eq!(t.get(&[0x11; 32]), None);
+    }
+
+    #[test]
+    fn an_unsorted_array_is_refused_rather_than_written() {
+        let dir = scratch("unsorted");
+        let hi = ([0x33u8; 32], vec![1]);
+        let lo = ([0x11u8; 32], vec![2]);
+        let e = write_datum_table(&dir, (0, 1), &[hi, lo]).expect_err("descending");
+        assert!(e.to_string().contains("strictly increasing"), "{e}");
+        // Refused means nothing published: a half-written pair would open as a table
+        // that silently answers a miss for everything past the break.
+        assert!(!dir.join(DATUM_FILE).exists());
+        assert!(!dir.join(DATUM_BLOB).exists());
+    }
+
+    /// A blob from another capture does not fail a lookup — it answers with the wrong
+    /// bytes. Both arms of the tiling check are exercised here, because they catch
+    /// different mistakes: an offset that does not continue the run, and a blob that
+    /// is longer than the entries address.
+    #[test]
+    fn a_table_and_a_blob_from_different_captures_are_refused() {
+        let dir = scratch("pairing");
+
+        std::fs::write(
+            dir.join(DATUM_FILE),
+            table_bytes((0, 1), &[entry(0x11, 4, 8)]),
+        )
+        .expect("tbl");
+        std::fs::write(dir.join(DATUM_BLOB), vec![0u8; 12]).expect("blob");
+        let e = DatumTable::open(&dir).expect_err("entry does not start where the run began");
+        assert!(e.to_string().contains("does not tile"), "{e}");
+
+        std::fs::write(
+            dir.join(DATUM_FILE),
+            table_bytes((0, 1), &[entry(0x11, 0, 8)]),
+        )
+        .expect("tbl");
+        std::fs::write(dir.join(DATUM_BLOB), vec![0u8; 12]).expect("blob");
+        let e = DatumTable::open(&dir).expect_err("blob longer than the entries address");
+        assert!(e.to_string().contains("not from the same capture"), "{e}");
     }
 }

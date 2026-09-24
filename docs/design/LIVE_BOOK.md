@@ -473,6 +473,19 @@ tx-index with the book riding along. +1.8% is the number to beat and the number
 to verify; whichever way it lands, the result belongs in the extractor's own
 docs, because it is a property of the pass and not of any one artifact.
 
+**How deep the pass pays is now half-priced.** `DECODE_SHAPE.md` §2.10
+(2026-09-24, three 100-chunk windows) measures the rungs above tx-index's floor:
+decoding inputs and outputs through `MultiEraTx` instead of the one-pass
+primitives walk costs **~1.75–1.88×** on the decode stage (§2.6, §2.8), and
+carrying **witness datums and aux data** on top of that costs a further
+**+60–81% of the decode** (+55% store-wide — 18.4 min of a 90.6 min wall) for
+**+4 MB of peak RSS**. Those fields are produced by nobody today, so they force
+the eager projection, and with it the `MultiEraTx` walk: `--cursor` and
+`--chain-decode` cannot be combined, because `decode_tx` takes a `&MultiEraTx`.
+What is still unpriced is the join this section asks for — tx-index's own
+extractor alongside either rung — which is where +1.8% has to be verified or
+refuted.
+
 **Coverage is recorded as ranges, not a cursor** (`POLICY_WALK_SCHEDULER.md` §1),
 so a partial build is expressible, a gap is legible, and any chunk range can be
 re-run without invalidating the rest.
@@ -666,7 +679,7 @@ at a twentieth of the index's size.
 |---|---|---|
 | 1 | Builder emitting `rows.bin` + `by_outref.idx` + `dir.idx`, **riding an existing pass rather than starting one** (§B7); **measure, don't derive** the row size, the address cost, and the incremental cost of the extra decode depth | the ⚠️ figures above become real, and the +1.8% claim is verified or refuted |
 | 2 | `verify_structure` + `verify_sample`; the three whole-artifact assertions | a publish is checkable |
-| 3 | **`by_addr` ✓ (2026-09-23)** · policy interning · the datum/script table | the module-facing queries stop needing a fallback |
+| 3 | **`by_addr` ✓ (2026-09-23)** · policy interning · the datum table — **capture and reader ✓ (2026-09-24)**; the plane does not open it yet · the script table | the module-facing queries stop needing a fallback |
 | 4 | The delta chain + serving (snapshot swap, newest-first read) — **the read side is built** (`crates/live-book`, §B9), **and the delta chain now exists and is measured** (`tools/fold-probe follow`, `DELTA_CHAIN.md`): rows + two bitmaps, 100% of the inputs the base cannot answer, +31% on the walk that builds it. Still missing: the delta's own orderings, publishing it as `delta/NNNNN.dlt`, and the merge | the tip no longer rewrites the base |
 | 5 | Compaction, and I5's published book with a re-derivation check | a stranger can verify what they downloaded |
 
@@ -686,7 +699,19 @@ why those are separate phases:
 | the outref | already in RAM at `finish` | free |
 | **the address** (its credential is a function of bytes already in the row) | `rows.bin` | **4.8 s measured** |
 | a policy (inside the row's asset records) | `rows.bin` | 5.5 s measured |
-| witness datums, aux data, the mint — in **neither** the rows nor the indexes | the block bodies | **a full 215 GB re-read** |
+| witness datums, aux data, the mint — in **neither** the rows nor the indexes | the block bodies | **a full 215 GB re-read** — or a walk that is already running, for datums: see below |
+
+**The datum half is no longer "a full re-read".** `fold-probe fold --datum-tbl <dir>`
+writes `datum.tbl` + `datum.bin` from the deep pass's own
+`DecodedTx::witness_datums` — no second decode, no second read of the chunks, and
+the capture is a set keyed by hash rather than a log. Measured 2026-09-24 on three
+100-chunk windows (`DECODE_SHAPE.md` §2.10 carries the offered volumes): **34 KB per
+chunk at the Conway tip · 983 KB in Babbage · 969 KB in Alonzo**, i.e. a
+whole-history table in single-digit GB, against `rows.bin`'s 2.2 GB and the 215 GB
+corpus it comes from. Dedup by hash folds the offered bytes by 43–56%, and the
+table answers for **95–99%** of the hash-attached outputs created in the Babbage and
+Conway windows against 68% in Alonzo — the unrevealed tail is small, era-dependent,
+and that is the population a fallback is for.
 
 ## Decided
 

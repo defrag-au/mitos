@@ -24,7 +24,7 @@
 //! | `read_output_datums` / `output_datum_hashes` | ✅ | inline datums are in the row; hash-referenced ones yield the hash and no payload |
 //! | `tip` | ❌ | **the artifact records no chain position.** See below |
 //! | `search_utxos` | ❌ | it returns a `Page`, and a `Page` carries a tip |
-//! | `read_datum` | ❌ | needs `datum.tbl` — `LIVE_BOOK.md` phase 3, capture-side work |
+//! | `read_datum` | ❌ | the table exists now (`datum.tbl`, captured by the walk — see `LIVE_BOOK.md` phase 3); this adapter does not open it yet |
 //! | `read_script` | ❌ | the row has no `script_ref` column at all |
 //! | `tx_metadata` / `read_tx` / `slot_by_tx_hash` | ❌ | history, not live state: `tx-index` + the chunks |
 //! | `total_supply` / `asset_state` | ❌ | the mint ledger, a second fold |

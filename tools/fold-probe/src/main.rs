@@ -271,6 +271,15 @@ struct FoldArgs {
     /// mode because there is no separate frame walk.
     #[arg(long, conflicts_with = "chain_decode")]
     cursor: bool,
+    /// Capture the witness datums this walk reveals into a `datum.tbl` + `datum.bin`
+    /// pair in this directory — the table `live_book::format::DatumTable` reads, and
+    /// the payload `read_output_datums`/`read_datum` cannot answer without.
+    ///
+    /// Implies `--chain-decode`: the bytes exist only in the eager projection's
+    /// `DecodedTx::witness_datums`, so this rides the deep walk and therefore cannot
+    /// ride `--cursor`'s one-pass decode (the two flags are refused together).
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["cursor", "primitives"])]
+    datum_tbl: Option<PathBuf>,
     /// Which hasher the live set uses. `fx` is a hand-rolled FxHash, `std` is
     /// SipHash. Same run, one flag, so the difference is the hasher.
     #[arg(long, value_enum, default_value = "fx")]
@@ -414,6 +423,115 @@ struct DecodeStats {
     eras: Vec<Era>,
 }
 
+/// Witness datums captured for a `--datum-tbl` build, and what the capture measures
+/// on the way past.
+///
+/// The table's key is a commitment — pallas hashes the datum's own CBOR — so two
+/// entries can never share a key without sharing bytes, and this is a set keyed by
+/// hash rather than a log. What that makes measurable while it fills:
+///
+/// - how many *instances* were offered for how many *distinct* datums, which is the
+///   dedup ratio, and the ratio is what decides whether a store-wide table is GBs or
+///   tens of GBs;
+/// - how many outputs were created with a datum attached **by hash**, and how many of
+///   those the capture could already answer for. The second number is the interesting
+///   one: a hit is a *live* output a reader can resolve now, because the preimage was
+///   already public — and a miss is an output whose datum **no source can supply**
+///   until someone spends it.
+#[derive(Clone, Default)]
+struct DatumCapture {
+    dir: PathBuf,
+    by_hash: HashMap<Hash<32>, Vec<u8>>,
+    /// Instances offered, and their Σ bytes — before dedup.
+    seen: u64,
+    seen_bytes: u64,
+    /// Outputs created with a datum attached by hash and no inline payload.
+    hash_attached: u64,
+    /// ...of those, the ones whose hash this capture already held.
+    live_hits: u64,
+    first_slot: Option<u64>,
+    last_slot: u64,
+}
+
+/// What the capture left behind, for the report.
+struct DatumReport {
+    entries: u64,
+    payload_bytes: u64,
+    seen: u64,
+    seen_bytes: u64,
+    hash_attached: u64,
+    live_hits: u64,
+    first_slot: u64,
+    last_slot: u64,
+    wrote_secs: f64,
+}
+
+impl DatumCapture {
+    fn new(dir: PathBuf) -> DatumCapture {
+        DatumCapture {
+            dir,
+            ..Default::default()
+        }
+    }
+
+    /// The walk's own coordinate: the first block it saw and the last it applied,
+    /// which is the range a miss is scoped to.
+    fn set_slot(&mut self, slot: u64) {
+        self.first_slot.get_or_insert(slot);
+        self.last_slot = slot;
+    }
+
+    /// One valid tx. The witness set is absorbed **first**: a transaction may reveal a
+    /// datum and attach that same hash to an output it creates, which is exactly the
+    /// reuse the `live_hits` count is looking for.
+    fn absorb(&mut self, d: &mitos_chain_walk::decode::DecodedTx) {
+        for (hash, bytes) in &d.witness_datums {
+            self.seen += 1;
+            self.seen_bytes += bytes.len() as u64;
+            self.by_hash.entry(*hash).or_insert_with(|| bytes.clone());
+        }
+        for o in &d.outputs {
+            let (Some(hash), None) = (o.datum_hash.as_ref(), o.inline_datum.as_ref()) else {
+                continue;
+            };
+            self.hash_attached += 1;
+            if self.by_hash.contains_key(hash) {
+                self.live_hits += 1;
+            }
+        }
+    }
+
+    /// Sort, write both files, and hand the report its numbers.
+    fn finish(mut self) -> Result<DatumReport> {
+        let t = Instant::now();
+        let mut v: Vec<([u8; 32], Vec<u8>)> = self
+            .by_hash
+            .drain()
+            .map(|(h, bytes)| {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(h.as_ref());
+                (k, bytes)
+            })
+            .collect();
+        v.sort_by_key(|a| a.0);
+        let payload_bytes: u64 = v.iter().map(|(_, b)| b.len() as u64).sum();
+        let entries = v.len() as u64;
+        let first_slot = self.first_slot.unwrap_or(self.last_slot);
+        live_book::format::write_datum_table(&self.dir, (first_slot, self.last_slot), &v)?;
+        Ok(DatumReport {
+            entries,
+            payload_bytes,
+            seen: self.seen,
+            seen_bytes: self.seen_bytes,
+            hash_attached: self.hash_attached,
+            live_hits: self.live_hits,
+            first_slot,
+            last_slot: self.last_slot,
+            wrote_secs: t.elapsed().as_secs_f64(),
+        })
+    }
+}
+
 /// What the eager, fixed-policy projection materialises when the caller wanted
 /// only the fold's five facts (`chain-decode`'s `decode_tx`). Counted per field
 /// so a slower run can name the field it paid for instead of blaming "the
@@ -443,6 +561,9 @@ struct ChainStats {
     /// Summed over the payload so nothing above can be optimised away, and
     /// printed so a reader can see this pass did real work rather than none.
     checksum: u64,
+    /// Set when `--datum-tbl` asked for a table; the capture rides this pass, so the
+    /// projection's own cost is the whole of what it adds.
+    datum: Option<DatumCapture>,
 }
 
 impl ChainStats {
@@ -549,6 +670,13 @@ fn plan_block(
     if let Some(sk) = sink.as_deref_mut() {
         sk.set_slot(block.slot());
     }
+    // The capture's coverage is the same fact: the slot of the block being applied.
+    // The binding turns mutable here rather than just above the tx loop, because an
+    // `Option<&mut _>` parameter cannot be reborrowed and both places need it.
+    let mut chain = chain;
+    if let Some(c) = chain.as_deref_mut().and_then(|c| c.datum.as_mut()) {
+        c.set_slot(block.slot());
+    }
 
     // ⚠ `txs()` does NOT borrow the block. Pallas CLONES every transaction body
     // and every witness set out of it (`support::clone_conway_txs`), so this one
@@ -561,7 +689,6 @@ fn plan_block(
     let txs = block.txs();
     st.txs_secs += t.elapsed().as_secs_f64();
 
-    let mut chain = chain;
     for tx in &txs {
         // PHASE-2 FAILURE — the guard every walker in this workspace carries.
         // The block declares the tx invalid, so nothing it produces exists and
@@ -575,6 +702,9 @@ fn plan_block(
         if let Some(c) = chain.as_deref_mut() {
             let t = Instant::now();
             let d = decode_tx(tx);
+            if let Some(cap) = c.datum.as_mut() {
+                cap.absorb(&d);
+            }
             c.absorb(t.elapsed().as_secs_f64(), &d);
         }
 
@@ -1639,6 +1769,15 @@ fn fold(a: FoldArgs) -> Result<()> {
     let mut plan = BlockPlan::default();
     let mut dec_acc = DecodeStats::default();
     let mut chain_acc = ChainStats::default();
+    // `--datum-tbl` turns the deep pass on rather than sitting beside it: the witness
+    // datum bytes exist nowhere else in a decode, and a table silently built from a
+    // lean walk would be empty and would look like "no datums on chain".
+    if let Some(dir) = &a.datum_tbl {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating datum table dir {}", dir.display()))?;
+        chain_acc.datum = Some(DatumCapture::new(dir.clone()));
+    }
+    let deep = a.chain_decode || a.datum_tbl.is_some();
     let mut app_acc = ApplyStats::default();
     // Kept for the report: `finish` consumes the builder, and the report reads the
     // boundary back out of the artifact rather than out of a variable.
@@ -1770,7 +1909,7 @@ fn fold(a: FoldArgs) -> Result<()> {
                         chunk,
                         &mut plan,
                         &mut dec,
-                        a.chain_decode.then_some(&mut chain_acc),
+                        deep.then_some(&mut chain_acc),
                         sink.as_mut(),
                     )?;
                 }
@@ -1941,7 +2080,7 @@ fn fold(a: FoldArgs) -> Result<()> {
         );
     }
 
-    if a.chain_decode {
+    if deep {
         let lean = dec_secs.max(1e-9);
         println!();
         println!("chain-decode — the shared eager projection, over the SAME bytes");
@@ -1985,6 +2124,44 @@ fn fold(a: FoldArgs) -> Result<()> {
         println!(
             "             checksum {} (so the pass provably did the work)",
             chain_acc.checksum
+        );
+    }
+    // The capture's own report, written rather than reported: this is the artifact.
+    if let Some(cap) = chain_acc.datum.take() {
+        let d = cap.finish()?;
+        let tbl = std::fs::metadata(
+            a.datum_tbl
+                .as_ref()
+                .expect("set with the capture")
+                .join(live_book::format::DATUM_FILE),
+        )
+        .map(|m| m.len())?;
+        println!();
+        println!("datum table — the witness datums this walk revealed (`datum.tbl`)");
+        println!(
+            "  coverage   slots {}..={} · a miss means \"not revealed in this range\"",
+            d.first_slot, d.last_slot
+        );
+        println!(
+            "  entries    {} distinct hashes · {} payload · offered {} times in {} → {:.0}% dedup",
+            d.entries,
+            human_bytes(d.payload_bytes),
+            d.seen,
+            human_bytes(d.seen_bytes),
+            (1.0 - d.payload_bytes as f64 / d.seen_bytes.max(1) as f64) * 100.0,
+        );
+        println!(
+            "  attached   {} hash-attached outputs created · {} answerable at creation ({:.2}%) —\n\
+             the rest had no preimage on chain yet, and a reveal later in the range lands here",
+            d.hash_attached,
+            d.live_hits,
+            d.live_hits as f64 / d.hash_attached.max(1) as f64 * 100.0,
+        );
+        println!(
+            "  wrote      datum.tbl {} + datum.bin {} in {:.1} s",
+            human_bytes(tbl),
+            human_bytes(d.payload_bytes),
+            d.wrote_secs,
         );
     }
     println!();
