@@ -70,9 +70,12 @@ use mitos_chain_walk::mithril::CHUNK_SLOTS;
 use mitos_meter::{Meter, Op, Run, human};
 use pallas_addresses::byron::AddressPayload;
 use pallas_codec::minicbor::Decoder;
+use pallas_codec::utils::Nullable;
 use pallas_primitives::conway::DatumOption;
-use pallas_primitives::{Hash, alonzo, babbage, conway};
-use pallas_traverse::{Era, MultiEraBlock, MultiEraOutput, MultiEraValue, OriginalHash};
+use pallas_primitives::{Hash, Metadata, Metadatum, alonzo, babbage, conway};
+use pallas_traverse::{
+    Era, MultiEraBlock, MultiEraOutput, MultiEraTx, MultiEraValue, OriginalHash,
+};
 use tx_index::extract::list_chunks;
 
 use crate::book::Book;
@@ -97,6 +100,15 @@ enum Cmd {
     Fold(FoldArgs),
     /// Count created/spent over every complete chunk with no set (parallel) — the exact live-set size.
     Count(CountArgs),
+    /// Measure CIP-25: how big the mint metadata corpus is, and what it carries.
+    /// The searchable name of an asset is usually the metadata under label 721,
+    /// not its 32-byte on-chain name, so this sizes the other half of the search
+    /// corpus — bytes, assets declared, attributes, and per-collection trait
+    /// cardinality (the bitmap cap in the viewer's format is 512 pairs).
+    ///
+    /// A measurement, not the ingestion path: `cardano-assets` decodes the same
+    /// bytes properly and pays more for it.
+    Cip25(Cip25Args),
     /// Read a published book back the way a consumer would.
     Verify(VerifyArgs),
     /// Rebuild the orderings derivable from the row store, without a refold.
@@ -175,6 +187,22 @@ struct ResolveArgs {
     /// Last chunk to resolve, inclusive.
     #[arg(long)]
     to: u16,
+}
+
+#[derive(Args)]
+struct Cip25Args {
+    /// The Mithril immutable directory (holds `NNNNN.chunk`).
+    #[arg(long)]
+    immutable: PathBuf,
+    /// Visit every Nth complete chunk (1 = all of them).
+    #[arg(long, default_value_t = 1)]
+    stride: usize,
+    /// Stop after this many visited chunks (0 = no limit).
+    #[arg(long, default_value_t = 0)]
+    max_chunks: usize,
+    /// Worker threads; 0 = one per available core.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
 }
 
 #[derive(Args)]
@@ -347,6 +375,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Fold(a) => fold(a),
         Cmd::Count(a) => count(a),
+        Cmd::Cip25(a) => cip25(a),
         Cmd::Verify(a) => verify(a),
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
@@ -2642,6 +2671,332 @@ impl Query {
 /// proved it was *usable*: it is the first caller that goes through `Base`, the
 /// reader a consumer gets, rather than through the audit path. Both matter — they
 /// check different things about the same bytes.
+/// Per-policy distinct `(trait_type, value)` pairs — the shape the viewer's
+/// per-token bitmap is capped at 512 of.
+type TraitSets = HashMap<Vec<u8>, HashSet<(String, String)>>;
+
+fn cip25(a: Cip25Args) -> Result<()> {
+    let all = list_chunks(&a.immutable)?;
+    let stride = a.stride.max(1);
+    let mut todo: Vec<u16> = all.iter().copied().step_by(stride).collect();
+    if a.max_chunks > 0 {
+        todo.truncate(a.max_chunks);
+    }
+    if todo.is_empty() {
+        bail!("no complete chunks to measure");
+    }
+    let threads = if a.threads == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        a.threads
+    };
+
+    println!("fold-probe cip25 — what the mint metadata corpus costs");
+    println!("  immutable   {}", a.immutable.display());
+    println!(
+        "  chunks      {} of {} complete, every {stride}th",
+        todo.len(),
+        all.len()
+    );
+    println!("  threads     {threads}");
+    println!();
+
+    let queue: Mutex<VecDeque<u16>> = Mutex::new(todo.iter().copied().collect());
+    let done = AtomicU64::new(0);
+    let txs = AtomicU64::new(0);
+    let aux_txs = AtomicU64::new(0);
+    let aux_bytes = AtomicU64::new(0);
+    let md_txs = AtomicU64::new(0);
+    let md_assets = AtomicU64::new(0);
+    let md_bytes = AtomicU64::new(0);
+    let attr_pairs = AtomicU64::new(0);
+    let attr_hist: [AtomicU64; 16] = std::array::from_fn(|_| AtomicU64::new(0));
+    let policies: Mutex<HashSet<Vec<u8>>> = Mutex::new(HashSet::new());
+    let traits: Mutex<TraitSets> = Mutex::new(HashMap::new());
+    let trait_entries = AtomicU64::new(0);
+    let total = todo.len() as u64;
+    let started = Instant::now();
+    // A cap so a whole-store sample cannot exhaust memory on (policy, trait,
+    // value) triples; the run says so if it bites.
+    const TRAIT_CAP: u64 = 4_000_000;
+
+    std::thread::scope(|s| -> Result<()> {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| -> Result<()> {
+                    let mut l_txs = 0u64;
+                    let mut l_aux_txs = 0u64;
+                    let mut l_aux_bytes = 0u64;
+                    let mut l_md_txs = 0u64;
+                    let mut l_md_assets = 0u64;
+                    let mut l_md_bytes = 0u64;
+                    let mut l_pairs = 0u64;
+                    let mut l_hist = [0u64; 16];
+                    let mut l_policies: HashSet<Vec<u8>> = HashSet::new();
+                    let mut l_traits: Vec<(Vec<u8>, String, String)> = Vec::new();
+                    loop {
+                        let chunk = { queue.lock().expect("queue").pop_front() };
+                        let Some(chunk) = chunk else { break };
+                        let raw = std::fs::read(chunk_path(&a.immutable, chunk))
+                            .with_context(|| format!("reading chunk {chunk}"))?;
+                        for (i, raw_block) in split_blocks(&raw)?.iter().enumerate() {
+                            let block = MultiEraBlock::decode(raw_block)
+                                .with_context(|| format!("chunk {chunk}: decoding block {i}"))?;
+                            for tx in block.txs() {
+                                if !tx.is_valid() {
+                                    continue;
+                                }
+                                l_txs += 1;
+                                let Some(aux) = aux_of(&tx) else { continue };
+                                l_aux_txs += 1;
+                                l_aux_bytes += aux.len() as u64;
+                                let Ok(parsed) =
+                                    pallas_codec::minicbor::decode::<alonzo::AuxiliaryData>(aux)
+                                else {
+                                    continue;
+                                };
+                                let Some(md) = aux_metadata(&parsed) else {
+                                    continue;
+                                };
+                                let Some(Metadatum::Map(by_policy)) = md.get(&721u64) else {
+                                    continue;
+                                };
+                                l_md_txs += 1;
+                                for (policy_key, assets) in by_policy.iter() {
+                                    let policy = key_bytes(policy_key);
+                                    if !policy.is_empty() {
+                                        l_policies.insert(policy.clone());
+                                    }
+                                    let Metadatum::Map(by_asset) = assets else {
+                                        continue;
+                                    };
+                                    for (_, value) in by_asset.iter() {
+                                        l_md_assets += 1;
+                                        if let Ok(enc) = pallas_codec::minicbor::to_vec(value) {
+                                            l_md_bytes += enc.len() as u64;
+                                        }
+                                        let attrs = attributes(value);
+                                        l_pairs += attrs.len() as u64;
+                                        l_hist[attrs.len().min(15)] += 1;
+                                        for (t, v) in attrs {
+                                            if !policy.is_empty() {
+                                                l_traits.push((policy.clone(), t, v));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        {
+                            let mut p = policies.lock().expect("policies");
+                            p.extend(l_policies.drain());
+                        }
+                        {
+                            let mut tr = traits.lock().expect("traits");
+                            for (policy, t, v) in l_traits.drain(..) {
+                                if trait_entries.load(Ordering::Relaxed) >= TRAIT_CAP
+                                    && !tr.contains_key(&policy)
+                                {
+                                    continue;
+                                }
+                                let set = tr.entry(policy).or_default();
+                                if set.insert((t, v)) {
+                                    trait_entries.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        for (k, n) in l_hist.iter().enumerate() {
+                            if *n > 0 {
+                                attr_hist[k].fetch_add(*n, Ordering::Relaxed);
+                            }
+                        }
+                        l_hist = [0u64; 16];
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        txs.fetch_add(l_txs, Ordering::Relaxed);
+                        aux_txs.fetch_add(l_aux_txs, Ordering::Relaxed);
+                        aux_bytes.fetch_add(l_aux_bytes, Ordering::Relaxed);
+                        md_txs.fetch_add(l_md_txs, Ordering::Relaxed);
+                        md_assets.fetch_add(l_md_assets, Ordering::Relaxed);
+                        md_bytes.fetch_add(l_md_bytes, Ordering::Relaxed);
+                        attr_pairs.fetch_add(l_pairs, Ordering::Relaxed);
+                        l_txs = 0;
+                        l_aux_txs = 0;
+                        l_aux_bytes = 0;
+                        l_md_txs = 0;
+                        l_md_assets = 0;
+                        l_md_bytes = 0;
+                        l_pairs = 0;
+                        if d.is_multiple_of(50) || d == total {
+                            eprintln!(
+                                "  ... {d}/{total} chunks · {:.0}s",
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker")?;
+        }
+        Ok(())
+    })?;
+
+    let (t, aux, aux_b) = (
+        txs.load(Ordering::Relaxed),
+        aux_txs.load(Ordering::Relaxed),
+        aux_bytes.load(Ordering::Relaxed),
+    );
+    let (md_t, assets, md_b, pairs) = (
+        md_txs.load(Ordering::Relaxed),
+        md_assets.load(Ordering::Relaxed),
+        md_bytes.load(Ordering::Relaxed),
+        attr_pairs.load(Ordering::Relaxed),
+    );
+    let chunks = done.load(Ordering::Relaxed).max(1);
+    let n_policies = policies.lock().expect("policies").len();
+    let guard = traits.lock().expect("traits");
+    let mut per_policy: Vec<usize> = guard.values().map(|s| s.len()).collect();
+    per_policy.sort_unstable_by(|a, b| b.cmp(a));
+    let over_cap = per_policy.iter().filter(|n| **n > 512).count();
+    let mut top: Vec<(usize, String)> = guard.iter().map(|(p, s)| (s.len(), hex_of(p))).collect();
+    top.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+    let secs = started.elapsed().as_secs_f64();
+
+    println!();
+    println!("  walked     {chunks} chunks in {secs:.0}s · {t} txs");
+    println!(
+        "  aux        {aux} txs carry auxiliary data ({:.1}% of txs) · {:.2} GiB",
+        100.0 * aux as f64 / t.max(1) as f64,
+        aux_b as f64 / 2f64.powi(30)
+    );
+    println!(
+        "  label 721  {md_t} txs · {assets} assets declared · {n_policies} policies · {:.1} assets a tx",
+        assets as f64 / md_t.max(1) as f64
+    );
+    println!(
+        "  metadata   {:.1} MiB of CBOR ({:.0} B an asset) · {:.0} KiB a chunk · {:.1} GiB over all {}",
+        md_b as f64 / 2f64.powi(20),
+        md_b as f64 / assets.max(1) as f64,
+        md_b as f64 / chunks as f64 / 1024.0,
+        md_b as f64 / chunks as f64 * all.len() as f64 / 2f64.powi(30),
+        all.len()
+    );
+    println!(
+        "  attributes {pairs} trait pairs ({:.2} an asset)",
+        pairs as f64 / assets.max(1) as f64
+    );
+    let hist: Vec<String> = attr_hist
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.load(Ordering::Relaxed) > 0)
+        .map(|(k, n)| format!("{k}:{}", n.load(Ordering::Relaxed)))
+        .collect();
+    println!("             per asset: {}", hist.join(" · "));
+    println!(
+        "  traits     {} distinct (trait, value) pairs across {n_policies} collections{} · over the viewer's 512 cap: {over_cap}",
+        trait_entries.load(Ordering::Relaxed),
+        if trait_entries.load(Ordering::Relaxed) >= TRAIT_CAP {
+            " (CAPPED — a bigger sample needs more memory)"
+        } else {
+            ""
+        }
+    );
+    println!("             biggest collections by distinct pairs:");
+    for (n, policy) in top.iter().take(8) {
+        println!("               {policy}  {n} pairs");
+    }
+    Ok(())
+}
+
+/// The auxiliary data of a transaction, raw CBOR — the same extraction
+/// `chain-decode` does, done here so the probe does not depend on another crate
+/// to answer one question.
+fn aux_of<'a>(tx: &'a MultiEraTx<'_>) -> Option<&'a [u8]> {
+    match tx {
+        MultiEraTx::AlonzoCompatible(t, _) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor()),
+            _ => None,
+        },
+        MultiEraTx::Babbage(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor()),
+            _ => None,
+        },
+        MultiEraTx::Conway(t) => match &t.auxiliary_data {
+            Nullable::Some(kr) => Some(kr.raw_cbor()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The metadata map out of any era's auxiliary-data shape.
+fn aux_metadata(aux: &alonzo::AuxiliaryData) -> Option<&Metadata> {
+    match aux {
+        alonzo::AuxiliaryData::Shelley(m) => Some(m),
+        alonzo::AuxiliaryData::ShelleyMa(d) => Some(&d.transaction_metadata),
+        alonzo::AuxiliaryData::PostAlonzo(d) => d.metadata.as_ref(),
+    }
+}
+
+/// A metadata key as bytes — CIP-25 keys appear as text and as raw bytes.
+fn key_bytes(k: &Metadatum) -> Vec<u8> {
+    match k {
+        Metadatum::Text(s) => s.as_bytes().to_vec(),
+        Metadatum::Bytes(b) => b.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// A metadata value as a displayable string.
+fn value_text(v: &Metadatum) -> String {
+    match v {
+        Metadatum::Text(s) => s.clone(),
+        Metadatum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        Metadatum::Int(i) => i.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The `(trait_type, value)` pairs an asset's CIP-25 metadata carries.
+///
+/// Keys appear as text and as raw bytes in the wild (`cardano-assets` matches
+/// both, and so must this), and the shape is `attributes: [{trait_type, value}]`.
+fn attributes(value: &Metadatum) -> Vec<(String, String)> {
+    fn key_is(k: &Metadatum, want: &str) -> bool {
+        match k {
+            Metadatum::Text(s) => s == want,
+            Metadatum::Bytes(b) => b.as_slice() == want.as_bytes(),
+            _ => false,
+        }
+    }
+    let Metadatum::Map(pairs) = value else {
+        return Vec::new();
+    };
+    let Some(Metadatum::Array(items)) = pairs
+        .iter()
+        .find(|(k, _)| key_is(k, "attributes"))
+        .map(|(_, v)| v)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let Metadatum::Map(kv) = item else {
+                return None;
+            };
+            let get = |want: &str| {
+                kv.iter()
+                    .find(|(k, _)| key_is(k, want))
+                    .map(|(_, v)| value_text(v))
+            };
+            Some((get("trait_type")?, get("value")?))
+        })
+        .collect()
+}
+
 fn lookup(a: LookupArgs) -> Result<()> {
     let t = Instant::now();
     let book = live_book::Base::open(&a.book)?;
