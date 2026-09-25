@@ -2174,7 +2174,9 @@ name = "fold-probe"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "cardano-assets",
  "clap",
+ "hex",
  "live-book",
  "mitos-chain-walk",
  "mitos-meter",

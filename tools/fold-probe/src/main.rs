@@ -60,6 +60,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+// The platform's metadata decode, not a second one: `cip25_metadata_value` reads
+// the raw document out of the aux CBOR, and `asset_from_metadata_value` is the
+// v2 extractor the live modules and collection-ownership run — so the number
+// this probe reports is the number they will see.
+use cardano_assets::{asset_from_metadata_value, cip25_metadata_value};
 use clap::{Args, Parser, Subcommand};
 // Through the walker's re-export rather than a new `chain-decode` dependency:
 // it is the same symbol, and a probe should not be a reason to edit a manifest.
@@ -106,8 +111,9 @@ enum Cmd {
     /// corpus — bytes, assets declared, attributes, and per-collection trait
     /// cardinality (the bitmap cap in the viewer's format is 512 pairs).
     ///
-    /// A measurement, not the ingestion path: `cardano-assets` decodes the same
-    /// bytes properly and pays more for it.
+    /// Runs the platform's own decode — `cardano-assets` reads the raw document
+    /// and the v2 extractor turns it into traits — so the corpus figures and the
+    /// cost of that decode are what a real ingestion would see.
     Cip25(Cip25Args),
     /// Read a published book back the way a consumer would.
     Verify(VerifyArgs),
@@ -203,6 +209,17 @@ struct Cip25Args {
     /// Worker threads; 0 = one per available core.
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Stop collecting per-collection trait sets after this many pairs. The
+    /// sets answer the viewer's 512-pair bitmap question, so the cap only
+    /// needs to clear 512 × the collections you care about — raise it for an
+    /// uncapped store-wide count, at ~150 B of memory a pair.
+    #[arg(long, default_value_t = 4_000_000)]
+    trait_cap: u64,
+    /// Stop after `cardano-assets` has read the raw document: no v2 extractor,
+    /// no traits. The A/B that separates the crate's decode share of the pass
+    /// from the extractor's — same chunks, same walk, one fewer stage.
+    #[arg(long)]
+    skip_extract: bool,
 }
 
 #[derive(Args)]
@@ -2709,8 +2726,14 @@ fn cip25(a: Cip25Args) -> Result<()> {
     let md_txs = AtomicU64::new(0);
     let md_assets = AtomicU64::new(0);
     let md_bytes = AtomicU64::new(0);
+    let md_decoded = AtomicU64::new(0);
+    let md_missed = AtomicU64::new(0);
+    let md_undecodable = AtomicU64::new(0);
+    let key_unresolved = AtomicU64::new(0);
+    let trait_assets = AtomicU64::new(0);
     let attr_pairs = AtomicU64::new(0);
     let attr_hist: [AtomicU64; 16] = std::array::from_fn(|_| AtomicU64::new(0));
+    let unresolved_kind: Mutex<HashMap<String, (u64, String)>> = Mutex::new(HashMap::new());
     let policies: Mutex<HashSet<Vec<u8>>> = Mutex::new(HashSet::new());
     let traits: Mutex<TraitSets> = Mutex::new(HashMap::new());
     let trait_entries = AtomicU64::new(0);
@@ -2718,7 +2741,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
     let started = Instant::now();
     // A cap so a whole-store sample cannot exhaust memory on (policy, trait,
     // value) triples; the run says so if it bites.
-    const TRAIT_CAP: u64 = 4_000_000;
+    let trait_cap = a.trait_cap;
+    let skip_extract = a.skip_extract;
 
     std::thread::scope(|s| -> Result<()> {
         let handles: Vec<_> = (0..threads)
@@ -2730,10 +2754,16 @@ fn cip25(a: Cip25Args) -> Result<()> {
                     let mut l_md_txs = 0u64;
                     let mut l_md_assets = 0u64;
                     let mut l_md_bytes = 0u64;
+                    let mut l_decoded = 0u64;
+                    let mut l_missed = 0u64;
+                    let mut l_undecodable = 0u64;
+                    let mut l_unresolved = 0u64;
+                    let mut l_trait_assets = 0u64;
                     let mut l_pairs = 0u64;
                     let mut l_hist = [0u64; 16];
                     let mut l_policies: HashSet<Vec<u8>> = HashSet::new();
                     let mut l_traits: Vec<(Vec<u8>, String, String)> = Vec::new();
+                    let mut l_unresolved_kind: HashMap<String, (u64, String)> = HashMap::new();
                     loop {
                         let chunk = { queue.lock().expect("queue").pop_front() };
                         let Some(chunk) = chunk else { break };
@@ -2763,25 +2793,68 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                 };
                                 l_md_txs += 1;
                                 for (policy_key, assets) in by_policy.iter() {
-                                    let policy = key_bytes(policy_key);
-                                    if !policy.is_empty() {
-                                        l_policies.insert(policy.clone());
+                                    let policy_id = policy_bytes(policy_key);
+                                    if let Some(p) = &policy_id {
+                                        l_policies.insert(p.clone());
                                     }
                                     let Metadatum::Map(by_asset) = assets else {
                                         continue;
                                     };
-                                    for (_, value) in by_asset.iter() {
+                                    for (name_key, value) in by_asset.iter() {
                                         l_md_assets += 1;
                                         if let Ok(enc) = pallas_codec::minicbor::to_vec(value) {
                                             l_md_bytes += enc.len() as u64;
                                         }
-                                        let attrs = attributes(value);
-                                        l_pairs += attrs.len() as u64;
-                                        l_hist[attrs.len().min(15)] += 1;
-                                        for (t, v) in attrs {
-                                            if !policy.is_empty() {
-                                                l_traits.push((policy.clone(), t, v));
-                                            }
+                                        let (Some(policy), Some(name)) =
+                                            (&policy_id, key_bytes(name_key))
+                                        else {
+                                            l_unresolved += 1;
+                                            let (lost, example) = if policy_id.is_none() {
+                                                (
+                                                    format!("policy key {}", key_shape(policy_key)),
+                                                    example_of(policy_key),
+                                                )
+                                            } else {
+                                                (
+                                                    format!("name key {}", key_shape(name_key)),
+                                                    example_of(name_key),
+                                                )
+                                            };
+                                            let seen = l_unresolved_kind
+                                                .entry(lost)
+                                                .or_insert((0, example));
+                                            seen.0 += 1;
+                                            continue;
+                                        };
+                                        let Some(document) =
+                                            cip25_metadata_value(aux, policy, &name)
+                                        else {
+                                            l_missed += 1;
+                                            continue;
+                                        };
+                                        if skip_extract {
+                                            l_decoded += 1;
+                                            continue;
+                                        }
+                                        let Ok(asset) = asset_from_metadata_value(document) else {
+                                            l_undecodable += 1;
+                                            continue;
+                                        };
+                                        l_decoded += 1;
+                                        let pairs: Vec<(String, String)> = asset
+                                            .traits
+                                            .iter()
+                                            .flat_map(|(t, values)| {
+                                                values.iter().map(move |v| (t.clone(), v.clone()))
+                                            })
+                                            .collect();
+                                        if !pairs.is_empty() {
+                                            l_trait_assets += 1;
+                                        }
+                                        l_pairs += pairs.len() as u64;
+                                        l_hist[pairs.len().min(15)] += 1;
+                                        for (t, v) in pairs {
+                                            l_traits.push((policy.clone(), t, v));
                                         }
                                     }
                                 }
@@ -2794,7 +2867,7 @@ fn cip25(a: Cip25Args) -> Result<()> {
                         {
                             let mut tr = traits.lock().expect("traits");
                             for (policy, t, v) in l_traits.drain(..) {
-                                if trait_entries.load(Ordering::Relaxed) >= TRAIT_CAP
+                                if trait_entries.load(Ordering::Relaxed) >= trait_cap
                                     && !tr.contains_key(&policy)
                                 {
                                     continue;
@@ -2803,6 +2876,13 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                 if set.insert((t, v)) {
                                     trait_entries.fetch_add(1, Ordering::Relaxed);
                                 }
+                            }
+                        }
+                        if !l_unresolved_kind.is_empty() {
+                            let mut lost = unresolved_kind.lock().expect("unresolved kinds");
+                            for (k, (n, example)) in l_unresolved_kind.drain() {
+                                let seen = lost.entry(k).or_insert((0, example));
+                                seen.0 += n;
                             }
                         }
                         for (k, n) in l_hist.iter().enumerate() {
@@ -2818,6 +2898,11 @@ fn cip25(a: Cip25Args) -> Result<()> {
                         md_txs.fetch_add(l_md_txs, Ordering::Relaxed);
                         md_assets.fetch_add(l_md_assets, Ordering::Relaxed);
                         md_bytes.fetch_add(l_md_bytes, Ordering::Relaxed);
+                        md_decoded.fetch_add(l_decoded, Ordering::Relaxed);
+                        md_missed.fetch_add(l_missed, Ordering::Relaxed);
+                        md_undecodable.fetch_add(l_undecodable, Ordering::Relaxed);
+                        key_unresolved.fetch_add(l_unresolved, Ordering::Relaxed);
+                        trait_assets.fetch_add(l_trait_assets, Ordering::Relaxed);
                         attr_pairs.fetch_add(l_pairs, Ordering::Relaxed);
                         l_txs = 0;
                         l_aux_txs = 0;
@@ -2825,6 +2910,11 @@ fn cip25(a: Cip25Args) -> Result<()> {
                         l_md_txs = 0;
                         l_md_assets = 0;
                         l_md_bytes = 0;
+                        l_decoded = 0;
+                        l_missed = 0;
+                        l_undecodable = 0;
+                        l_unresolved = 0;
+                        l_trait_assets = 0;
                         l_pairs = 0;
                         if d.is_multiple_of(50) || d == total {
                             eprintln!(
@@ -2853,6 +2943,13 @@ fn cip25(a: Cip25Args) -> Result<()> {
         md_assets.load(Ordering::Relaxed),
         md_bytes.load(Ordering::Relaxed),
         attr_pairs.load(Ordering::Relaxed),
+    );
+    let (decoded, missed, undecodable, unresolved, trait_a) = (
+        md_decoded.load(Ordering::Relaxed),
+        md_missed.load(Ordering::Relaxed),
+        md_undecodable.load(Ordering::Relaxed),
+        key_unresolved.load(Ordering::Relaxed),
+        trait_assets.load(Ordering::Relaxed),
     );
     let chunks = done.load(Ordering::Relaxed).max(1);
     let n_policies = policies.lock().expect("policies").len();
@@ -2884,7 +2981,26 @@ fn cip25(a: Cip25Args) -> Result<()> {
         all.len()
     );
     println!(
-        "  attributes {pairs} trait pairs ({:.2} an asset)",
+        "  decode     {decoded} of {assets} assets through cardano-assets ({:.1}%)",
+        100.0 * decoded as f64 / assets.max(1) as f64
+    );
+    println!(
+        "             skipped    {unresolved} key unresolved · {missed} not found by the decoder · {undecodable} rejected by the v2 extractor"
+    );
+    let lost = unresolved_kind.into_inner().expect("unresolved kinds");
+    if !lost.is_empty() {
+        let mut rows: Vec<(String, (u64, String))> = lost.into_iter().collect();
+        rows.sort_unstable_by_key(|(k, (n, _))| (std::cmp::Reverse(*n), k.clone()));
+        let shown: Vec<String> = rows
+            .iter()
+            .take(6)
+            .map(|(k, (n, example))| format!("{k} ×{n} (e.g. \"{example}\")"))
+            .collect();
+        println!("             where      {}", shown.join(" · "));
+    }
+    println!(
+        "  traits     {trait_a} decoded assets carry traits ({:.1}%) · {pairs} pairs ({:.2} a declared asset)",
+        100.0 * trait_a as f64 / decoded.max(1) as f64,
         pairs as f64 / assets.max(1) as f64
     );
     let hist: Vec<String> = attr_hist
@@ -2893,11 +3009,11 @@ fn cip25(a: Cip25Args) -> Result<()> {
         .filter(|(_, n)| n.load(Ordering::Relaxed) > 0)
         .map(|(k, n)| format!("{k}:{}", n.load(Ordering::Relaxed)))
         .collect();
-    println!("             per asset: {}", hist.join(" · "));
+    println!("             pairs per decoded asset: {}", hist.join(" · "));
     println!(
-        "  traits     {} distinct (trait, value) pairs across {n_policies} collections{} · over the viewer's 512 cap: {over_cap}",
+        "  distinct   {} (trait, value) pairs across {n_policies} collections{} · over the viewer's 512 cap: {over_cap}",
         trait_entries.load(Ordering::Relaxed),
-        if trait_entries.load(Ordering::Relaxed) >= TRAIT_CAP {
+        if trait_entries.load(Ordering::Relaxed) >= trait_cap {
             " (CAPPED — a bigger sample needs more memory)"
         } else {
             ""
@@ -2940,61 +3056,50 @@ fn aux_metadata(aux: &alonzo::AuxiliaryData) -> Option<&Metadata> {
     }
 }
 
-/// A metadata key as bytes — CIP-25 keys appear as text and as raw bytes.
-fn key_bytes(k: &Metadatum) -> Vec<u8> {
+/// A metadata key as bytes — CIP-25 keys appear as text and as raw bytes, and
+/// anything else (an integer, an array) is not a key `cardano-assets` matches.
+fn key_bytes(k: &Metadatum) -> Option<Vec<u8>> {
     match k {
-        Metadatum::Text(s) => s.as_bytes().to_vec(),
-        Metadatum::Bytes(b) => b.to_vec(),
-        _ => Vec::new(),
+        Metadatum::Text(s) => Some(s.as_bytes().to_vec()),
+        Metadatum::Bytes(b) => Some(b.to_vec()),
+        _ => None,
     }
 }
 
-/// A metadata value as a displayable string.
-fn value_text(v: &Metadatum) -> String {
-    match v {
+/// A CIP-25 policy key as the 28 raw bytes `cardano-assets` matches on: a byte
+/// key already is that, and the text form is its hex. A key of any other length
+/// or encoding is not a policy id.
+fn policy_bytes(k: &Metadatum) -> Option<Vec<u8>> {
+    match k {
+        Metadatum::Bytes(b) => Some(b.to_vec()),
+        Metadatum::Text(s) if s.len() == 56 => hex::decode(s).ok(),
+        _ => None,
+    }
+}
+
+/// How a key was encoded, for a run that has to say *why* it skipped one — the
+/// shapes here are the ones `cardano-assets` cannot match either.
+fn key_shape(k: &Metadatum) -> String {
+    match k {
+        Metadatum::Text(s) => format!("text len {}", s.len()),
+        Metadatum::Bytes(b) => format!("bytes len {}", b.len()),
+        Metadatum::Int(_) => "int".to_string(),
+        Metadatum::Array(_) => "array".to_string(),
+        Metadatum::Map(_) => "map".to_string(),
+    }
+}
+
+/// A key that did not resolve, short enough to print — so a suspicious count
+/// can be looked up rather than guessed at.
+fn example_of(k: &Metadatum) -> String {
+    let text = match k {
         Metadatum::Text(s) => s.clone(),
         Metadatum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
-        Metadatum::Int(i) => i.to_string(),
-        _ => String::new(),
-    }
-}
-
-/// The `(trait_type, value)` pairs an asset's CIP-25 metadata carries.
-///
-/// Keys appear as text and as raw bytes in the wild (`cardano-assets` matches
-/// both, and so must this), and the shape is `attributes: [{trait_type, value}]`.
-fn attributes(value: &Metadatum) -> Vec<(String, String)> {
-    fn key_is(k: &Metadatum, want: &str) -> bool {
-        match k {
-            Metadatum::Text(s) => s == want,
-            Metadatum::Bytes(b) => b.as_slice() == want.as_bytes(),
-            _ => false,
-        }
-    }
-    let Metadatum::Map(pairs) = value else {
-        return Vec::new();
+        Metadatum::Int(i) => i128::from(*i).to_string(),
+        Metadatum::Array(_) => "<array>".to_string(),
+        Metadatum::Map(_) => "<map>".to_string(),
     };
-    let Some(Metadatum::Array(items)) = pairs
-        .iter()
-        .find(|(k, _)| key_is(k, "attributes"))
-        .map(|(_, v)| v)
-    else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let Metadatum::Map(kv) = item else {
-                return None;
-            };
-            let get = |want: &str| {
-                kv.iter()
-                    .find(|(k, _)| key_is(k, want))
-                    .map(|(_, v)| value_text(v))
-            };
-            Some((get("trait_type")?, get("value")?))
-        })
-        .collect()
+    text.chars().take(24).collect()
 }
 
 fn lookup(a: LookupArgs) -> Result<()> {
