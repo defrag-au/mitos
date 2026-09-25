@@ -24,14 +24,32 @@
 //! `LIVE_BOOK.md` §Decided rests on it: spend resolution confirms from memory,
 //! and over ~138 M resolutions the difference between a borrow and a re-read is
 //! **69 minutes versus 77 hours**. So [`Source::Bytes`] is a *borrow* rather than
-//! a `Vec`, and [`MmapSource`] returns `&[u8]` with no copy at all. A remote
+//! a `Vec`, and `MmapSource` returns `&[u8]` with no copy at all. A remote
 //! implementation pays a copy because it must; the local one must not pay for
 //! its existence.
+//!
+//! # `mmap` off, and why the default type parameter survives it
+//!
+//! `memmap2` does not build for `wasm32-unknown-unknown`, so the file-backed
+//! source is behind the `mmap` feature. But `Base`, `Table`, `Directory` and
+//! `PolicyTable` all *default* their source parameter, and eight call sites
+//! across mitos rely on that default. A `cfg` cannot be put on a default type
+//! parameter, and duplicating four struct definitions to vary it would be worse
+//! than the problem.
+//!
+//! So the default names [`DefaultSource`], which exists under both
+//! configurations: `MmapSource` with the feature on, and an **uninhabited** enum
+//! with it off. `Base<DefaultSource>` then still typechecks in a wasm build and
+//! is simply unconstructible — which is the honest answer, because a wasm
+//! consumer has to name its own source.
 
 use std::ops::Deref;
+#[cfg(feature = "mmap")]
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(feature = "mmap")]
+use anyhow::{Context, bail};
 
 /// A place bytes can be read from, by offset.
 pub trait Source {
@@ -57,6 +75,39 @@ pub trait Source {
     fn size(&self) -> u64;
 }
 
+/// What every source parameter in this crate defaults to. See the module header
+/// for why this is an alias rather than a `cfg` on the default itself.
+#[cfg(feature = "mmap")]
+pub type DefaultSource = MmapSource;
+
+/// The default with `mmap` off: **uninhabited**, so a `Base<DefaultSource>` is
+/// well-typed and cannot be built.
+///
+/// Deliberately not a unit struct that errors at runtime. A type with no values
+/// makes "there is no file-backed source in this build" a compile-time fact, and
+/// the `match *self {}` arms below are how the compiler is told the methods are
+/// unreachable rather than unimplemented.
+#[cfg(not(feature = "mmap"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultSource {}
+
+#[cfg(not(feature = "mmap"))]
+impl Source for DefaultSource {
+    type Bytes<'a> = &'a [u8];
+
+    fn read(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        match *self {}
+    }
+
+    fn read_upto(&self, _offset: u64, _max: usize) -> Result<&[u8]> {
+        match *self {}
+    }
+
+    fn size(&self) -> u64 {
+        match *self {}
+    }
+}
+
 /// A read-only mapping — the local case, and the one that must stay zero-copy.
 ///
 /// # Safety
@@ -65,10 +116,12 @@ pub trait Source {
 /// Everything this crate writes satisfies that by swapping rather than
 /// truncating, and a published artifact is moved into place by `rename`, so a
 /// mapping never observes a write (`format`'s header).
+#[cfg(feature = "mmap")]
 pub struct MmapSource {
     map: memmap2::Mmap,
 }
 
+#[cfg(feature = "mmap")]
 impl MmapSource {
     pub fn open(path: &Path) -> Result<MmapSource> {
         let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -83,6 +136,7 @@ impl MmapSource {
     }
 }
 
+#[cfg(feature = "mmap")]
 impl Source for MmapSource {
     type Bytes<'a> = &'a [u8];
 
@@ -115,7 +169,7 @@ impl Source for MmapSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mmap"))]
 mod tests {
     use super::*;
     use std::io::Write;

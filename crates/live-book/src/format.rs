@@ -132,7 +132,7 @@ pub fn write_directory(
     let n_buckets = 1usize << DIR_BITS;
     let mut buckets = vec![DIRECTORY_EMPTY; n_buckets];
     for (i, prefix) in prefixes.enumerate() {
-        let b = (prefix >> (64 - DIR_BITS)) as usize;
+        let b = bucket_index(prefix);
         if buckets[b] == DIRECTORY_EMPTY {
             buckets[b] = i as u32;
         }
@@ -174,11 +174,12 @@ pub fn write_policy_tbl(dir: &Path, policies: &[[u8; 28]]) -> Result<()> {
 /// The interning table as a read-only mapping: `id -> 28-byte policy`, resolved
 /// without an allocation, which is what lets a row's asset records be handed over
 /// borrowed.
-pub struct PolicyTable<S = crate::source::MmapSource> {
+pub struct PolicyTable<S = crate::source::DefaultSource> {
     src: S,
     n: usize,
 }
 
+#[cfg(feature = "mmap")]
 impl PolicyTable<crate::source::MmapSource> {
     pub fn open(dir: &Path) -> Result<PolicyTable<crate::source::MmapSource>> {
         let path = dir.join(POLICY_FILE);
@@ -258,6 +259,7 @@ impl<S: Source> PolicyTable<S> {
 /// One decision, one entry. A row holding two assets of one policy yields one
 /// entry, which is what makes an enumeration return a ref once rather than once
 /// per name.
+#[cfg(feature = "mmap")]
 pub fn policy_perms(pairs: &[(u32, u32)], policies: &PolicyTable) -> Result<Vec<Perm>> {
     let mut entries: Vec<Perm> = Vec::with_capacity(pairs.len());
     for (id, row) in pairs {
@@ -420,6 +422,11 @@ pub fn write_datum_table(
 /// Nothing is copied at open. The entry array is scanned once to check that it tiles
 /// the blob (see [`write_datum_table`]), which touches pages the first lookup would
 /// have touched anyway.
+/// ⚠️ **`mmap`-only, and not part of a published book.** `publish::PARTED` does
+/// not carry `datums.*`, so nothing remote resolves a datum through this. It is
+/// the box's table and holds its mappings concretely rather than through a
+/// [`Source`](crate::source::Source).
+#[cfg(feature = "mmap")]
 #[derive(Debug)]
 pub struct DatumTable {
     entries: memmap2::Mmap,
@@ -431,6 +438,7 @@ pub struct DatumTable {
     last_slot: u64,
 }
 
+#[cfg(feature = "mmap")]
 impl DatumTable {
     pub fn open(dir: &Path) -> Result<DatumTable> {
         let path = dir.join(DATUM_FILE);
@@ -614,6 +622,28 @@ impl std::fmt::Display for BaseFingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let BaseFingerprint(a, b) = self;
         write!(f, "{a:016x}{b:016x}")
+    }
+}
+
+/// The inverse of [`Display`](std::fmt::Display), so a fingerprint survives a
+/// round trip through a text manifest — which is the only way a *remote* reader
+/// ever receives one (`publish::Attestation`).
+///
+/// Strict about width: 32 hex digits exactly. A short string would parse as a
+/// different fingerprint rather than fail, and the whole job of this type is to
+/// answer "is this the base the delta was built against".
+impl std::str::FromStr for BaseFingerprint {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<BaseFingerprint> {
+        if s.len() != 32 {
+            bail!("a fingerprint is 32 hex digits; got {} in {s:?}", s.len());
+        }
+        let hi = u64::from_str_radix(&s[..16], 16)
+            .with_context(|| format!("the high half of {s:?} is not hex"))?;
+        let lo = u64::from_str_radix(&s[16..], 16)
+            .with_context(|| format!("the low half of {s:?} is not hex"))?;
+        Ok(BaseFingerprint(hi, lo))
     }
 }
 
@@ -893,6 +923,7 @@ pub fn directory_bytes() -> usize {
 /// the mapping. Everything this crate writes satisfies that by swapping rather
 /// than truncating (`swap_in`), and the base is published by `rename`, so a
 /// mapping held across a rebuild keeps addressing the inode it opened.
+#[cfg(feature = "mmap")]
 pub fn map(path: &Path) -> Result<memmap2::Mmap> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: see above — every writer in this crate swaps, never edits in place.
@@ -956,11 +987,8 @@ pub fn check_array_header_src<S: Source>(src: &S, what: &str, stride: usize) -> 
 
 /// One 12-byte `{u64 prefix, u32 row}` entry, read through a [`Source`].
 pub fn entry_at_src<S: Source>(src: &S, i: u64) -> Result<(u64, u32)> {
-    let b = src.read(ARRAY_HEADER as u64 + 12 * i, 12)?;
-    Ok((
-        u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
-        u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
-    ))
+    let b = src.read(entry_offset(i), ENTRY_BYTES)?;
+    Ok(entry_in_run(&b, 0))
 }
 
 pub fn check_array_header(bytes: &[u8], what: &str, stride: usize) -> Result<u64> {
@@ -979,20 +1007,61 @@ pub fn check_array_header(bytes: &[u8], what: &str, stride: usize) -> Result<u64
     Ok(n)
 }
 
-/// A `{u64 prefix, u32 row}` entry read out of a mapped table, by index.
-pub fn entry_at(bytes: &[u8], i: usize) -> (u64, u32) {
-    let b = &bytes[ARRAY_HEADER + 12 * i..];
+/// One 12-byte `{u64 prefix, u32 row}` entry.
+pub const ENTRY_BYTES: usize = 12;
+
+/// Buckets in a directory — `2^DIR_BITS`, and the count a reader needs to know
+/// that the *last* bucket has no successor to read its end from.
+pub const N_BUCKETS: usize = 1 << DIR_BITS;
+
+/// Where entry `i` of a table begins, from the start of the file.
+///
+/// Exists so a **remote** reader can ask the format where to look instead of
+/// rebuilding `ARRAY_HEADER + 12 * i` on the other side of a network, which is a
+/// second copy of the layout in the place it is hardest to notice going stale.
+pub fn entry_offset(i: u64) -> u64 {
+    ARRAY_HEADER as u64 + ENTRY_BYTES as u64 * i
+}
+
+/// Where bucket `b` of a directory begins, from the start of the file.
+///
+/// ⚠️ Buckets `b` and `b + 1` are **adjacent**, which is what lets a reader get a
+/// whole `[start, end)` range in one 8-byte read rather than two. The local reader
+/// makes two calls because over a mapping it costs nothing.
+pub fn bucket_offset(b: usize) -> u64 {
+    8 + 4 * b as u64
+}
+
+/// A `{u64 prefix, u32 row}` entry out of a **run** — a slice that begins at an
+/// entry boundary rather than at the file's header.
+///
+/// What a remote reader has in hand: it fetches `[entry_offset(start),
+/// entry_offset(end))` in one request, because a bucket's entries are contiguous,
+/// and then indexes within that.
+pub fn entry_in_run(run: &[u8], j: usize) -> (u64, u32) {
+    let b = &run[ENTRY_BYTES * j..];
     (
         u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
         u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
     )
 }
 
+/// A `{u64 prefix, u32 row}` entry read out of a mapped table, by index.
+pub fn entry_at(bytes: &[u8], i: usize) -> (u64, u32) {
+    entry_in_run(&bytes[ARRAY_HEADER..], i)
+}
+
 /// The bucket boundaries of a directory: `buckets[b]` is the first entry index
 /// whose prefix falls in bucket `b`, and the array is a partition (see
 /// `write_ordering`).
 pub fn bucket_at(bytes: &[u8], b: usize) -> u32 {
-    u32::from_le_bytes(bytes[8 + 4 * b..8 + 4 * b + 4].try_into().expect("4 bytes"))
+    let at = bucket_offset(b) as usize;
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+/// The bucket a prefix falls in — its top [`DIR_BITS`] bits.
+pub fn bucket_index(prefix: u64) -> usize {
+    (prefix >> (64 - DIR_BITS)) as usize
 }
 
 /// A directory as a sorted array of entry indices, validated once at open.
@@ -1000,11 +1069,12 @@ pub fn bucket_at(bytes: &[u8], b: usize) -> u32 {
 /// Read `bucket(b)` through the mapping rather than copied into a `Vec<u32>`:
 /// the array is 8 MB, it is the hot path of every lookup, and the page cache
 /// holds the one or two pages a lookup touches.
-pub struct Directory<S = crate::source::MmapSource> {
+pub struct Directory<S = crate::source::DefaultSource> {
     src: S,
     n_buckets: usize,
 }
 
+#[cfg(feature = "mmap")]
 impl Directory<crate::source::MmapSource> {
     /// Open a directory from a file — the local path, unchanged.
     pub fn open(dir: &Path, name: &str) -> Result<Directory<crate::source::MmapSource>> {
@@ -1044,7 +1114,7 @@ impl<S: Source> Directory<S> {
     /// reader that pretended otherwise would panic in a Worker rather than
     /// return an error a caller can act on.
     pub fn bucket(&self, b: usize) -> Result<u32> {
-        let bytes = self.src.read(8 + 4 * b as u64, 4)?;
+        let bytes = self.src.read(bucket_offset(b), 4)?;
         Ok(u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")))
     }
 
@@ -1084,7 +1154,7 @@ impl<S: Source> Directory<S> {
             if start >= end {
                 continue;
             }
-            if (prefixes(start)? >> (64 - DIR_BITS)) as usize != b {
+            if bucket_index(prefixes(start)?) != b {
                 bail!("directory bucket {b} starts at entry {start}, whose prefix is not in it");
             }
         }
@@ -1093,7 +1163,7 @@ impl<S: Source> Directory<S> {
 
     /// `[start, end)` for the bucket a prefix falls in.
     pub fn range_for(&self, prefix: u64) -> Result<std::ops::Range<usize>> {
-        let b = (prefix >> (64 - DIR_BITS)) as usize;
+        let b = bucket_index(prefix);
         let start = self.bucket(b)? as usize;
         let end = if b + 1 < self.n_buckets {
             self.bucket(b + 1)? as usize
@@ -1104,7 +1174,7 @@ impl<S: Source> Directory<S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mmap"))]
 mod datum_tests {
     use super::*;
 

@@ -17,6 +17,14 @@ description = "The live UTxO set as an immutable artifact: the row store, its th
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["mmap"]
+# The file-backed path: `MmapSource`, the `open(&Path)` constructors, and the
+# datum table. On for every native consumer, and it must be OFF for wasm —
+# `memmap2` cannot build for `wasm32-unknown-unknown`, and a Cloudflare Worker
+# serving a published book needs only the parsing, which is `&[u8]` throughout.
+mmap = ["dep:memmap2"]
+
 [dependencies]
 # The one arm of the credential derivation that is a parse rather than a slice.
 # Nothing else here needs pallas: a row's outref is a `[u8; 32]`, not pallas's
@@ -25,6 +33,6 @@ path = "src/lib.rs"
 pallas-addresses = { workspace = true }
 # Read-only mappings, as `tx-index` and `policy-index` map their bases. The
 # artifact is published whole and swapped by rename, so a mapping never observes
-# a write.
-memmap2 = { workspace = true }
+# a write. Optional because it does not build for wasm — see the `mmap` feature.
+memmap2 = { workspace = true, optional = true }
 anyhow = { workspace = true }

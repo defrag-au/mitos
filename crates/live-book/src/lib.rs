@@ -31,6 +31,18 @@
 //! the format: a row's outref is a `[u8; 32]`, and a caller holding pallas's
 //! `Hash<32>` converts once at its own boundary.
 //!
+//! # Native and wasm
+//!
+//! The `mmap` feature (**on by default**) carries the file-backed path:
+//! `MmapSource`, every `open(&Path)` constructor, and `DatumTable`. `memmap2`
+//! cannot build for `wasm32-unknown-unknown`, so a Cloudflare Worker serving a
+//! published book takes this crate with `default-features = false` and gets the
+//! parsing without the acquisition — `entry_at`, `bucket_at`, `split`,
+//! `Row::parse` and [`address`] are all `&[u8]` in and plain data out. It names
+//! its own [`Source`], or drives the reads itself; see [`publish`] for the part
+//! arithmetic and `MITOS_AT_THE_EDGE.md` for why a remote reader batches where
+//! the local one loops.
+//!
 //! # Using it
 //!
 //! ```no_run
@@ -65,6 +77,7 @@
 
 pub mod address;
 pub mod format;
+pub mod publish;
 pub mod reader;
 pub mod row;
 pub mod source;
@@ -72,4 +85,6 @@ pub mod source;
 pub use format::{BaseFingerprint, LAYOUT_VERSION, Meta, PolicyTable};
 pub use reader::{Base, Cursor, MAX_PAGE, OutRef, Page};
 pub use row::{Asset, Assets, Datum, Row, RowRead};
-pub use source::{MmapSource, Source};
+#[cfg(feature = "mmap")]
+pub use source::MmapSource;
+pub use source::{DefaultSource, Source};

@@ -107,6 +107,10 @@ enum Cmd {
     /// A build writes `base_slot` itself; this is for an artifact built before the
     /// field existed, so `tip()` can answer instead of refusing.
     StampBoundary(StampArgs),
+    /// Lay a published book out for upload: uniform 1 MiB parts plus an
+    /// attestation. Writes a directory and nothing else — no credentials, no
+    /// network, so the layout is inspectable before it is anywhere
+    Publish(PublishArgs),
     /// Resolve a chunk's transaction inputs against a book, and classify what it
     /// cannot answer. Answers "can the book find a UTxO that is no longer live".
     ResolveInputs(ResolveArgs),
@@ -216,6 +220,24 @@ struct LookupArgs {
     /// balance — this is the number a collection page shows.
     #[arg(long)]
     assets: bool,
+}
+
+#[derive(Args)]
+struct PublishArgs {
+    /// The book directory to publish from.
+    #[arg(long)]
+    book: PathBuf,
+    /// Where to write the part layout. Created if absent.
+    #[arg(long)]
+    out: PathBuf,
+    /// Skip the local open that produces the attestation's `validated` flag.
+    ///
+    /// ⚠️ The open is what proves each directory partitions its entry array, and a
+    /// remote reader cannot run that check itself (2^21 buckets, ~2.1 M round
+    /// trips). Skipping it publishes `validated false`, which a reader should
+    /// refuse. Only useful for laying out a book this binary is too old to open.
+    #[arg(long)]
+    skip_validate: bool,
 }
 
 #[derive(Args)]
@@ -329,6 +351,7 @@ fn main() -> Result<()> {
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
         Cmd::StampBoundary(a) => stamp_boundary(a),
+        Cmd::Publish(a) => publish(a),
         Cmd::ResolveInputs(a) => resolve_inputs(a),
         Cmd::Follow(a) => follow(a),
     }
@@ -2459,6 +2482,57 @@ fn verify(a: VerifyArgs) -> Result<()> {
 /// The slot is the **last block of `--base-chunk`**, read out of the log. It is not
 /// derived from the chunk number: a chunk ends where its last block says, and
 /// `chunk * 21_600` is a claim the log would have to contradict.
+/// Lay a book out as uniform parts plus an attestation, ready to upload.
+///
+/// **Opens the book first**, and that is the point rather than a precaution: the
+/// open is what runs `Directory::validate` over every bucket, which a remote
+/// reader cannot do. Its success is the only thing the attestation's `validated`
+/// flag is allowed to mean.
+fn publish(a: PublishArgs) -> Result<()> {
+    let validated = if a.skip_validate {
+        println!("⚠️  --skip-validate: publishing `validated false`, which a reader should refuse");
+        false
+    } else {
+        let base = live_book::Base::open(&a.book)
+            .with_context(|| format!("opening {} to validate it", a.book.display()))?;
+        println!(
+            "validated   {} live rows · {} · directories partition their arrays",
+            base.rows(),
+            base.meta().fingerprint(),
+        );
+        true
+    };
+
+    let att = live_book::publish::publish(&a.book, &a.out, validated)?;
+    let total: u64 = att.files.iter().map(|f| f.len).sum();
+    let parts: u64 = att.files.iter().map(|f| f.parts).sum();
+
+    println!("publish     {} → {}", a.book.display(), a.out.display());
+    println!(
+        "  layout    {} files · {parts} parts of {} · {}",
+        att.files.len(),
+        human_bytes(att.part_size),
+        human_bytes(total),
+    );
+    for f in &att.files {
+        println!(
+            "    {:<16} {:>10}  {:>5} part(s)",
+            f.name,
+            human_bytes(f.len),
+            f.parts
+        );
+    }
+    println!("  fingerprint {}", att.fingerprint);
+    println!(
+        "\nupload the whole directory, preserving paths, with:\n  \
+         Content-Type: application/octet-stream\n  \
+         Cache-Control: public, max-age=31536000, immutable\n\
+         …then flip the epoch pointer LAST, conditionally, so no reader ever sees\n\
+         a pointer naming parts that are not there yet."
+    );
+    Ok(())
+}
+
 fn stamp_boundary(a: StampArgs) -> Result<()> {
     let path = chunk_path(&a.immutable, a.base_chunk);
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;

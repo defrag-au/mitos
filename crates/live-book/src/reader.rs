@@ -42,15 +42,27 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "mmap")]
+use anyhow::Context;
+use anyhow::{Result, bail};
 
 use crate::address::{self, Kind};
+use crate::format::{self, Directory, Meta, PolicyTable, split};
+// The published file names are only needed by the `open(&Path)` constructors,
+// which are the mmap path. A remote reader gets them from `publish::PARTED`.
+#[cfg(feature = "mmap")]
 use crate::format::{
-    self, DIRECTORY_ADDR, DIRECTORY_OUTREF, DIRECTORY_POLICY, Directory, Meta, POLICY_FILE,
-    PolicyTable, ROWS_FILE, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY, split,
+    DIRECTORY_ADDR, DIRECTORY_OUTREF, DIRECTORY_POLICY, POLICY_FILE, ROWS_FILE, TABLE_ADDR,
+    TABLE_OUTREF, TABLE_POLICY,
 };
-use crate::row::{Row, RowRead};
-use crate::source::{MmapSource, Source};
+use crate::row::Row;
+// `RowRead` is the error of `Base::row`, which is the zero-copy borrow only
+// `MmapSource` can honour.
+#[cfg(feature = "mmap")]
+use crate::row::RowRead;
+#[cfg(feature = "mmap")]
+use crate::source::MmapSource;
+use crate::source::Source;
 
 /// An outref — a transaction hash and an output index. The live set's key, and
 /// the only thing an enumeration of it needs to return: a caller that wants the
@@ -89,9 +101,10 @@ pub struct Page {
 
 /// An immutable artifact, read through some [`Source`].
 ///
-/// Defaults to [`MmapSource`] so every existing caller — and the box's measured
-/// 1223 ns lookup — is unaffected by the seam existing.
-pub struct Base<S = MmapSource> {
+/// Defaults to [`DefaultSource`](crate::source::DefaultSource) — `MmapSource`
+/// with the `mmap` feature on — so every existing caller, and the box's measured
+/// 1223 ns lookup, is unaffected by the seam existing.
+pub struct Base<S = crate::source::DefaultSource> {
     dir: PathBuf,
     meta: Meta,
     rows: S,
@@ -101,12 +114,13 @@ pub struct Base<S = MmapSource> {
     policies: PolicyTable<S>,
 }
 
-struct Table<S = MmapSource> {
+struct Table<S = crate::source::DefaultSource> {
     entries: S,
     dir: Directory<S>,
     count: u64,
 }
 
+#[cfg(feature = "mmap")]
 impl Table<MmapSource> {
     fn open(dir: &Path, table: &str, directory: &str) -> Result<Table<MmapSource>> {
         let entries = MmapSource::open(&dir.join(table))?;
@@ -123,6 +137,11 @@ impl<S: Source> Table<S> {
     /// bucket — fine over a mapping at 73 ms, impossible remotely (§4.2). A
     /// remote reader must construct this some other way; the check has to move
     /// to publish time, which is what the attestation is for.
+    ///
+    /// Which is why this is `mmap`-gated rather than generic-and-unused: it is
+    /// the *local* constructor by definition, since the one thing it does beyond
+    /// reading a header is the check that only a mapping can afford.
+    #[cfg(feature = "mmap")]
     fn from_sources(entries: S, dir: Directory<S>, what: &str) -> Result<Table<S>> {
         let count = format::check_array_header_src(&entries, what, 12)?;
         dir.validate(
@@ -172,6 +191,7 @@ impl<S: Source> Table<S> {
     }
 }
 
+#[cfg(feature = "mmap")]
 impl Base<MmapSource> {
     /// Map an artifact. Validates what it can cheaply: every file's version, the
     /// counts each ordering claims against `book.meta`, and that each directory
