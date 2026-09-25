@@ -60,14 +60,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-// The platform's metadata decode, not a second one: `cip25_metadata_value` reads
-// the raw document out of the aux CBOR, and `asset_from_metadata_value` is the
-// v2 extractor the live modules and collection-ownership run — so the number
-// this probe reports is the number they will see.
-use cardano_assets::extract::{FieldClass, classify_field};
+// The platform's metadata decode and the walk that replaces it, both read from
+// the crate they live in: `cip25_metadata_value` / `asset_from_metadata_value`
+// are the document path the live modules and collection-ownership run, and
+// `decode_document` is the direct `Metadatum` walk. The comparison this probe
+// reports is between two readers of one crate, not between a crate and a copy.
 use cardano_assets::{
-    Asset, AssetId, DecodedAsset, Media, MediaRole, MediaType, Traits, asset_from_metadata_value,
-    cip25_metadata_value,
+    Asset, DecodedAsset, MediaRole, MediaType, Traits, asset_from_metadata_value,
+    cip25_metadata_value, decode_document,
 };
 use clap::{Args, Parser, Subcommand};
 // Through the walker's re-export rather than a new `chain-decode` dependency:
@@ -2892,7 +2892,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                             continue;
                                         };
                                         if extract == Extract::Fast {
-                                            let Some(walked) = fast_decoded(value, policy, &name)
+                                            let Some(walked) =
+                                                decode_document(policy, &name, value)
                                             else {
                                                 l_fast_skipped += 1;
                                                 continue;
@@ -2902,7 +2903,11 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                                 &mut l_media,
                                                 &mut l_media_none,
                                             );
-                                            tally_media_level(&walked, &mut l_census);
+                                            tally_media_level(
+                                                &walked.asset,
+                                                &walked.declarations,
+                                                &mut l_census,
+                                            );
                                             l_decoded += 1;
                                             tally_traits(
                                                 &walked.asset.traits,
@@ -2926,14 +2931,18 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                         }
                                         let asset = asset_from_metadata_value(document);
                                         if extract == Extract::Compare {
-                                            let fast = fast_decoded(value, policy, &name);
+                                            let fast = decode_document(policy, &name, value);
                                             if let Some(w) = &fast {
                                                 tally_media(
                                                     w.declared_media_type.as_deref(),
                                                     &mut l_media,
                                                     &mut l_media_none,
                                                 );
-                                                tally_media_level(w, &mut l_census);
+                                                tally_media_level(
+                                                    &w.asset,
+                                                    &w.declarations,
+                                                    &mut l_census,
+                                                );
                                             }
                                             let projected =
                                                 fast.as_ref().map(|w| project_asset(&w.asset));
@@ -2947,7 +2956,7 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                                     if a.media_type != f.media_type
                                                         && let Some(w) = &fast
                                                     {
-                                                        l_reasons.add(a, f, w);
+                                                        l_reasons.add(a, f, &w.asset);
                                                     }
                                                     if l_cmp_examples.len() < 4 {
                                                         l_cmp_examples.push(format!(
@@ -3230,8 +3239,9 @@ fn cip25(a: Cip25Args) -> Result<()> {
         println!("               src names nothing     {}", census.src_other);
         if !census.file_declared.is_empty() {
             let mut rows: Vec<(String, u64)> = census.file_declared.into_iter().collect();
+            rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
             println!("             files[], as declared:");
-            print_declared_types(&mut rows, "media");
+            print_declared_groups(&declared_groups(&rows));
         }
     }
     println!(
@@ -3926,10 +3936,10 @@ struct MediaTypeReasons {
 }
 
 impl MediaTypeReasons {
-    fn add(&mut self, platform: &Asset, projected: &Asset, walked: &Walked) {
+    fn add(&mut self, platform: &Asset, projected: &Asset, decoded: &DecodedAsset) {
         match (&platform.media_type, &projected.media_type) {
             (Some(p), Some(q)) if p != q => self.rewritten += 1,
-            (Some(_), None) if walked.asset.headline().is_some() => self.headline_not_a_type += 1,
+            (Some(_), None) if decoded.headline().is_some() => self.headline_not_a_type += 1,
             (Some(_), None) => self.no_headline += 1,
             _ => self.other += 1,
         }
@@ -4060,26 +4070,33 @@ fn type_bucket(media_type: &MediaType) -> usize {
 }
 
 /// Fold one asset's media into the per-medium census.
-fn tally_media_level(walked: &Walked, census: &mut MediaCensus) {
-    for m in &walked.media {
+///
+/// `declarations` is [`DecodedDocument::declarations`] — index-aligned with
+/// `asset.media`, and the one thing the asset itself cannot carry.
+fn tally_media_level(
+    decoded: &DecodedAsset,
+    declarations: &[Option<String>],
+    census: &mut MediaCensus,
+) {
+    for (m, declared) in decoded.media.iter().zip(declarations) {
         census.media += 1;
-        let bucket = type_bucket(&m.media.media_type);
-        match m.media.role {
+        let bucket = type_bucket(&m.media_type);
+        match m.role {
             MediaRole::Headline => {
                 census.headline[bucket] += 1;
-                if bucket == 2 && m.declared.is_none() {
+                if bucket == 2 && declared.is_none() {
                     census.headline_undeclared += 1;
                 }
             }
             MediaRole::File => {
                 census.file[bucket] += 1;
-                if let Some(declared) = &m.declared {
+                if let Some(declared) = declared {
                     *census.file_declared.entry(declared.clone()).or_default() += 1;
                 }
             }
         }
         if bucket == 2 {
-            match src_shape(&m.media.src) {
+            match src_shape(&m.src) {
                 SrcShape::Extension(ext) => {
                     *census.src_ext.entry(ext.to_ascii_lowercase()).or_default() += 1;
                 }
@@ -4134,46 +4151,26 @@ fn is_cid(s: &str) -> bool {
                 .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)))
 }
 
-/// The catalogued/custom/undefined split of a declared-type histogram, and every
-/// declared spelling under each — printed for the document's declared type and
-/// for `files[]` alike, because both resolve through the same `MediaType::of`.
-fn print_declared_types(rows: &mut [(String, u64)], unit: &str) {
-    rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
-    // Which declared values the catalogue resolves, and what is left: the
-    // promotion list (`custom`) and the corpus saying "nothing here"
-    // (`undefined`). Counted through the same `MediaType::of` a consumer
-    // uses, so the report cannot disagree with the type.
-    let mut catalogued: Vec<(&str, u64)> = Vec::new();
-    let mut custom: Vec<(&str, u64)> = Vec::new();
-    let mut undefined: Vec<(&str, u64)> = Vec::new();
-    for (declared, n) in rows.iter() {
-        match MediaType::of(declared) {
-            MediaType::Mime(_) => catalogued.push((declared, *n)),
-            MediaType::Custom(_) => custom.push((declared, *n)),
-            MediaType::Undefined => undefined.push((declared, *n)),
-        }
+/// The catalogued/custom/undefined split of a declared-type histogram, in that
+/// order — through the same `MediaType::of` a consumer uses, so a count in the
+/// report cannot disagree with the type.
+fn declared_groups(rows: &[(String, u64)]) -> [Vec<(&str, u64)>; 3] {
+    let mut groups: [Vec<(&str, u64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (declared, n) in rows {
+        let group = match MediaType::of(declared) {
+            MediaType::Mime(_) => 0,
+            MediaType::Custom(_) => 1,
+            MediaType::Undefined => 2,
+        };
+        groups[group].push((declared, *n));
     }
-    let count = |rows: &[(&str, u64)]| rows.iter().map(|(_, n)| n).sum::<u64>();
-    for (label, rows, note) in [
-        (
-            "catalogued",
-            &catalogued,
-            "a catalogue type, however spelled",
-        ),
-        ("custom", &custom, "type-shaped, not yet named"),
-        ("undefined", &undefined, "not a type at all"),
-    ] {
-        println!(
-            "             {label:<10} {} {unit} in {} spellings ({note})",
-            count(rows),
-            rows.len()
-        );
-    }
-    for (label, rows, _) in [
-        ("catalogued", &catalogued, ""),
-        ("custom", &custom, ""),
-        ("undefined", &undefined, ""),
-    ] {
+    groups
+}
+
+/// Every declared spelling under each bucket — the list the alias table and the
+/// promotion list are chosen from.
+fn print_declared_groups(groups: &[Vec<(&str, u64)>; 3]) {
+    for (label, rows) in ["catalogued", "custom", "undefined"].iter().zip(groups) {
         println!("             {label}, as declared:");
         for chunk in rows.chunks(4) {
             let line: Vec<String> = chunk
@@ -4183,6 +4180,32 @@ fn print_declared_types(rows: &mut [(String, u64)], unit: &str) {
             println!("               {}", line.join(" · "));
         }
     }
+}
+
+/// The split with the totals that name it: what the catalogue resolves, the
+/// promotion list (`custom`), and the corpus saying "nothing here"
+/// (`undefined`). Printed for the document's declared type and for `files[]`
+/// alike, because both resolve through the same `MediaType::of`.
+fn print_declared_types(rows: &mut [(String, u64)], unit: &str) {
+    rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
+    let groups = declared_groups(rows);
+    let count = |rows: &[(&str, u64)]| rows.iter().map(|(_, n)| n).sum::<u64>();
+    for (label, rows, note) in [
+        (
+            "catalogued",
+            &groups[0],
+            "a catalogue type, however spelled",
+        ),
+        ("custom", &groups[1], "type-shaped, not yet named"),
+        ("undefined", &groups[2], "not a type at all"),
+    ] {
+        println!(
+            "             {label:<10} {} {unit} in {} spellings ({note})",
+            count(rows),
+            rows.len()
+        );
+    }
+    print_declared_groups(&groups);
 }
 
 /// A declared value for the report: quoted when it is not already trimmed, so a
@@ -5809,7 +5832,7 @@ mod tests {
     fn the_projection_back_to_asset_is_the_old_shape() {
         let policy = [0xab; 28];
         let doc = map(vec![("Class", text("Archer"))]);
-        let asset = project_asset(&fast_decoded(&doc, &policy, b"x").expect("an asset").asset);
+        let asset = project_asset(&decode_document(&policy, b"x", &doc).expect("an asset").asset);
         assert_eq!(asset.name, "");
         assert_eq!(asset.image, "");
         assert_eq!(asset.media_type, None);
@@ -5842,9 +5865,9 @@ mod tests {
                 ]),
             ),
         ]);
-        let walked = fast_decoded(&doc, &policy, b"x").expect("an asset");
+        let walked = decode_document(&policy, b"x", &doc).expect("an asset");
         let mut census = MediaCensus::default();
-        tally_media_level(&walked, &mut census);
+        tally_media_level(&walked.asset, &walked.declarations, &mut census);
 
         assert_eq!(census.media, 3);
         assert_eq!(census.headline, [0, 0, 1], "no declaration at all");
@@ -5888,7 +5911,7 @@ mod tests {
     #[test]
     fn the_media_type_reasons_are_counted_not_derived() {
         let policy = [0xab; 28];
-        let walk = |doc: Metadatum| fast_decoded(&doc, &policy, b"x").expect("an asset");
+        let walk = |doc: Metadatum| decode_document(&policy, b"x", &doc).expect("an asset");
         let platform = |image: &str, media_type: &str, traits: Traits| Asset {
             name: String::new(),
             image: image.to_string(),
@@ -5907,7 +5930,7 @@ mod tests {
         reasons.add(
             &platform("ipfs://x", "image/jpg", spelled.asset.traits.clone()),
             &project_asset(&spelled.asset),
-            &spelled,
+            &spelled.asset,
         );
         assert_eq!(reasons.rewritten, 1);
 
@@ -5920,7 +5943,7 @@ mod tests {
         reasons.add(
             &platform("ipfs://x", "Video", declared.asset.traits.clone()),
             &project_asset(&declared.asset),
-            &declared,
+            &declared.asset,
         );
         assert_eq!(reasons.headline_not_a_type, 1);
 
@@ -5930,7 +5953,7 @@ mod tests {
         reasons.add(
             &platform("", "image/png", headless.asset.traits.clone()),
             &project_asset(&headless.asset),
-            &headless,
+            &headless.asset,
         );
         assert_eq!(reasons.no_headline, 1);
     }
