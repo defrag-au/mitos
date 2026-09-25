@@ -77,6 +77,7 @@
 
 pub mod address;
 pub mod format;
+pub mod plan;
 pub mod publish;
 pub mod reader;
 pub mod row;

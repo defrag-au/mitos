@@ -7,25 +7,31 @@
 //! inspectable before it is anywhere, and that nothing here can leak a key. It
 //! also means the same output serves R2, a second region, or a file server.
 //!
-//! # Why parts at all, and why 1 MiB
+//! # Why parts at all, and why the size is a parameter
 //!
 //! Measured 2026-09-25 against never-read objects
 //! (`cnft.dev-workers/docs/design/EDGE_PROBE_PLAN.md`): a cold read through
 //! Cloudflare costs a **~650 ms floor plus ~35 ms per MiB of depth** to the byte
-//! asked for, and **concurrent reads are close to free**. So the cost of a read is
-//! set by how deep into an object it reaches, and splitting a 1.69 GiB arena into
-//! small objects caps that depth.
+//! asked for. So the cost of a read is set by how deep into an object it reaches,
+//! and splitting a 1.69 GiB arena into smaller objects caps that depth. That
+//! argument chose 1 MiB, and it is now [`DEFAULT_PART`] rather than a constant of
+//! the format.
 //!
-//! [`PART`] is **1 MiB** and **uniform**, which matters for two separate reasons:
+//! ⚠️ **It stopped being the whole story once the reader started batching.**
+//! Multi-range works only *within* one object, so part size decides whether
+//! [`crate::plan`] has anything to coalesce: a 1,055-row wallet query over the
+//! mainnet arena plans to **1,061 requests at 1 MiB and 27 at 64 MiB**, for the
+//! same 8.6 MB. `MITOS_AT_THE_EDGE.md` §4.8f has the table. Larger parts buy fewer
+//! requests and pay cold depth; which way that trades depends on the substrate,
+//! which is exactly why `publish` takes the size rather than owning it.
 //!
-//! - 1 MiB is the knee. 4 MiB costs ~105 ms more per cold read; below 1 MiB the
-//!   floor dominates (650 of 685 ms) and the object count doubles for ~18 ms.
-//! - Uniform makes `offset -> (part, offset within part)` arithmetic. A mixed
-//!   layout would need a table consulted on every read.
+//! **Uniform** is not negotiable, whatever the size: it makes
+//! `offset -> (part, offset within part)` arithmetic, where a mixed layout would
+//! need a table consulted on every read.
 //!
 //! ⚠️ **A run can straddle a boundary** — a 332 KB clustered read does so about a
 //! third of the time at 1 MiB — so a reader must be able to stitch two parts.
-//! Concurrency being free makes that an extra request rather than extra latency.
+//! [`crate::plan::Located`] carries the segments in order for exactly this.
 //!
 //! # The attestation, and what it is not
 //!
@@ -53,8 +59,29 @@ use crate::format::{
     POLICY_FILE, ROWS_FILE, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY,
 };
 
-/// The part size every reader assumes. See the module header for why 1 MiB.
-pub const PART: u64 = 1 << 20;
+/// The part size a publisher uses unless told otherwise.
+///
+/// ⚠️ **A default, not a constant of the format.** A reader takes the real value
+/// from the attestation's `part_size`, so an artifact can be published at any size
+/// without a reader change — which `ARTIFACT_SHARDING.md` §6 calls for, because the
+/// right size is a property of the *substrate*, not of the book.
+///
+/// See the module header for why 1 MiB was the first answer and §4.8f of
+/// `MITOS_AT_THE_EDGE.md` for why it is no longer obviously the right one: at 1 MiB
+/// a wallet's rows land one per object, and multi-range — which works only *within*
+/// an object — has nothing to coalesce.
+pub const DEFAULT_PART: u64 = 1 << 20;
+
+/// The extension every part key carries.
+///
+/// ⚠️ **Not cosmetic — it is what makes a part CDN-cacheable.** Measured
+/// 2026-09-25: Cloudflare's default cache eligibility is **extension-based**, so a
+/// key like `rows.bin/00000` returns `cf-cache-status: DYNAMIC` forever and **a
+/// multi-range request against it fails with 400**, because multi-range is served
+/// off the cache path. The identical object named `…/00000.bin` caches and serves
+/// multipart. One control, one variable, and it cost the whole client-direct design
+/// until it was found.
+pub const PART_EXT: &str = "bin";
 
 /// The files a published book is made of, in the order a reader needs them.
 ///
@@ -257,9 +284,9 @@ impl Attestation {
     }
 }
 
-/// How many parts a file of `len` bytes becomes.
-pub fn part_count(len: u64) -> u64 {
-    len.div_ceil(PART)
+/// How many parts a file of `len` bytes becomes at `part_size`.
+pub fn part_count(len: u64, part_size: u64) -> u64 {
+    len.div_ceil(part_size)
 }
 
 /// The part a logical offset falls in, and where it sits inside that part.
@@ -267,18 +294,23 @@ pub fn part_count(len: u64) -> u64 {
 /// The arithmetic uniform parts exist for. A reader resolving a row offset calls
 /// this and fetches one object; if the row runs past the part's end it stitches
 /// the next one (see the module header's straddling note).
-pub fn locate(offset: u64) -> (u64, u64) {
-    (offset / PART, offset % PART)
+pub fn locate(offset: u64, part_size: u64) -> (u64, u64) {
+    (offset / part_size, offset % part_size)
 }
 
 /// The object key for one part — zero-padded so a lexical listing is also the
-/// numeric order, which is what makes a prune or a diff legible.
+/// numeric order, which is what makes a prune or a diff legible, and suffixed with
+/// [`PART_EXT`] because that is what makes it cacheable.
+///
+/// ⚠️ **The one definition.** A reader that builds this string itself is a second
+/// copy of the key format, and the extension is exactly the kind of detail that
+/// gets left out of the copy.
 pub fn part_key(name: &str, part: u64) -> String {
-    format!("{name}/{part:05}")
+    format!("{name}/{part:05}.{PART_EXT}")
 }
 
-/// Split one file into `PART`-sized objects under `out/<name>/NNNNN`.
-fn split_file(src: &Path, out: &Path, name: &str) -> Result<PartedFile> {
+/// Split one file into `part_size` objects under `out/<name>/NNNNN.bin`.
+fn split_file(src: &Path, out: &Path, name: &str, part_size: u64) -> Result<PartedFile> {
     let mut f = File::open(src).with_context(|| format!("opening {}", src.display()))?;
     let len = f
         .metadata()
@@ -287,14 +319,16 @@ fn split_file(src: &Path, out: &Path, name: &str) -> Result<PartedFile> {
     let dir = out.join(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    let mut buf = vec![0u8; PART as usize];
+    let mut buf = vec![0u8; part_size as usize];
     let mut part = 0u64;
     let mut written = 0u64;
     while written < len {
-        let want = (len - written).min(PART) as usize;
+        let want = (len - written).min(part_size) as usize;
         f.read_exact(&mut buf[..want])
             .with_context(|| format!("reading {} at {written}", src.display()))?;
-        let key = dir.join(format!("{part:05}"));
+        // Through `part_key` so the layout on disk is the layout in the bucket —
+        // including the extension, which is load-bearing.
+        let key = out.join(part_key(name, part));
         let mut w = BufWriter::new(
             File::create(&key).with_context(|| format!("creating {}", key.display()))?,
         );
@@ -306,10 +340,10 @@ fn split_file(src: &Path, out: &Path, name: &str) -> Result<PartedFile> {
 
     // Belt and braces: the reader's offset arithmetic depends on this identity, so
     // assert it here rather than discover a short file over a network.
-    if part != part_count(len) {
+    if part != part_count(len, part_size) {
         bail!(
-            "{name} split into {part} parts; {len} B at {PART} B implies {}",
-            part_count(len)
+            "{name} split into {part} parts; {len} B at {part_size} B implies {}",
+            part_count(len, part_size)
         );
     }
     Ok(PartedFile {
@@ -319,12 +353,19 @@ fn split_file(src: &Path, out: &Path, name: &str) -> Result<PartedFile> {
     })
 }
 
-/// Lay a book out for upload: `out/<file>/NNNNN` plus `out/attestation`.
+/// Lay a book out for upload: `out/<file>/NNNNN.bin` plus `out/attestation`.
 ///
 /// `validated` should be the result of actually opening the book locally — the
 /// caller does that, because opening it is what proves the directories partition
 /// their arrays and this module must not claim a check it did not run.
-pub fn publish(book: &Path, out: &Path, validated: bool) -> Result<Attestation> {
+///
+/// `part_size` is a **publish-time parameter** ([`DEFAULT_PART`] is only a default):
+/// the right size depends on how the artifact will be read, not on what it
+/// contains. A reader takes it from the attestation.
+pub fn publish(book: &Path, out: &Path, validated: bool, part_size: u64) -> Result<Attestation> {
+    if !part_size.is_power_of_two() {
+        bail!("part_size {part_size} is not a power of two; offset arithmetic assumes it is");
+    }
     let meta_path = book.join(META_FILE);
     let meta_text = std::fs::read_to_string(&meta_path)
         .with_context(|| format!("reading {}", meta_path.display()))?;
@@ -340,7 +381,7 @@ pub fn publish(book: &Path, out: &Path, validated: bool) -> Result<Attestation> 
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
     let mut files = Vec::with_capacity(PARTED.len());
     for name in PARTED {
-        files.push(split_file(&book.join(name), out, name)?);
+        files.push(split_file(&book.join(name), out, name, part_size)?);
     }
 
     // The one cross-check worth making here: the row arena's published length must
@@ -359,7 +400,7 @@ pub fn publish(book: &Path, out: &Path, validated: bool) -> Result<Attestation> 
 
     let att = Attestation {
         fingerprint: meta.fingerprint(),
-        part_size: PART,
+        part_size,
         files,
         meta: meta_text,
         validated,
@@ -384,29 +425,57 @@ pub fn keys(att: &Attestation) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    const PART: u64 = DEFAULT_PART;
+
     #[test]
     fn locate_is_the_inverse_of_part_layout() {
-        assert_eq!(locate(0), (0, 0));
-        assert_eq!(locate(PART - 1), (0, PART - 1));
-        assert_eq!(locate(PART), (1, 0));
-        assert_eq!(locate(PART * 3 + 17), (3, 17));
+        assert_eq!(locate(0, PART), (0, 0));
+        assert_eq!(locate(PART - 1, PART), (0, PART - 1));
+        assert_eq!(locate(PART, PART), (1, 0));
+        assert_eq!(locate(PART * 3 + 17, PART), (3, 17));
+    }
+
+    #[test]
+    fn locate_follows_the_part_size_it_is_given() {
+        // The property that makes part size a publish-time parameter: the same
+        // offset resolves differently under a different layout, and a reader that
+        // used a compiled-in size against an artifact published at another would
+        // read the right bytes from the wrong object.
+        let big = 64 << 20;
+        assert_eq!(locate(PART, big), (0, PART));
+        assert_eq!(locate(big + 17, big), (1, 17));
     }
 
     #[test]
     fn part_count_is_ceiling_not_floor() {
         // A file one byte over a boundary needs another part; getting this wrong
         // truncates the last row of the arena.
-        assert_eq!(part_count(0), 0);
-        assert_eq!(part_count(1), 1);
-        assert_eq!(part_count(PART), 1);
-        assert_eq!(part_count(PART + 1), 2);
+        assert_eq!(part_count(0, PART), 0);
+        assert_eq!(part_count(1, PART), 1);
+        assert_eq!(part_count(PART, PART), 1);
+        assert_eq!(part_count(PART + 1, PART), 2);
     }
 
     #[test]
     fn keys_are_zero_padded_so_lexical_order_is_numeric() {
         let mut ks = vec![part_key("rows.bin", 10), part_key("rows.bin", 9)];
         ks.sort();
-        assert_eq!(ks, vec!["rows.bin/00009", "rows.bin/00010"]);
+        assert_eq!(ks, vec!["rows.bin/00009.bin", "rows.bin/00010.bin"]);
+    }
+
+    #[test]
+    fn a_part_key_carries_the_extension_that_makes_it_cacheable() {
+        // Not cosmetic: without an extension Cloudflare never caches the object,
+        // and a multi-range request against an uncached object is a 400. This
+        // assertion is the guard on a property nothing else in the type system
+        // expresses.
+        assert!(part_key("rows.bin", 0).ends_with(".bin"));
+        assert!(
+            keys(&sample())
+                .iter()
+                .skip(1)
+                .all(|k| k.to_string_lossy().ends_with(".bin"))
+        );
     }
 
     #[test]

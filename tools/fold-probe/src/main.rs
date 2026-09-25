@@ -65,7 +65,10 @@ use anyhow::{Context, Result, bail};
 // v2 extractor the live modules and collection-ownership run — so the number
 // this probe reports is the number they will see.
 use cardano_assets::extract::{FieldClass, classify_field};
-use cardano_assets::{Traits, asset_from_metadata_value, cip25_metadata_value};
+use cardano_assets::{
+    Asset, AssetId, DecodedAsset, Media, MediaRole, MediaType, Traits, asset_from_metadata_value,
+    cip25_metadata_value,
+};
 use clap::{Args, Parser, Subcommand};
 // Through the walker's re-export rather than a new `chain-decode` dependency:
 // it is the same symbol, and a probe should not be a reason to edit a manifest.
@@ -308,6 +311,16 @@ struct PublishArgs {
     /// refuse. Only useful for laying out a book this binary is too old to open.
     #[arg(long)]
     skip_validate: bool,
+    /// Part size in MiB. A **publish-time parameter**, not a property of the book:
+    /// a reader takes the real value from the attestation.
+    ///
+    /// ⚠️ It decides whether multi-range can do anything. Multi-range works only
+    /// *within* one object, so at 1 MiB a wallet's rows land roughly one per part
+    /// and there is nothing to coalesce; at 64 MiB the same rows land tens per
+    /// part and a whole query collapses into a handful of requests. Larger parts
+    /// cost cold *depth* (~35 ms/MiB measured) in exchange.
+    #[arg(long, default_value_t = 1)]
+    part_mib: u64,
 }
 
 #[derive(Args)]
@@ -2574,7 +2587,11 @@ fn publish(a: PublishArgs) -> Result<()> {
         true
     };
 
-    let att = live_book::publish::publish(&a.book, &a.out, validated)?;
+    let part_size = a
+        .part_mib
+        .checked_mul(1 << 20)
+        .context("--part-mib overflows")?;
+    let att = live_book::publish::publish(&a.book, &a.out, validated, part_size)?;
     let total: u64 = att.files.iter().map(|f| f.len).sum();
     let parts: u64 = att.files.iter().map(|f| f.parts).sum();
 
@@ -2763,6 +2780,11 @@ fn cip25(a: Cip25Args) -> Result<()> {
     let cmp_skipped = AtomicU64::new(0);
     let cmp_both = AtomicU64::new(0);
     let cmp_examples: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let differ_fields: Mutex<FieldDiff> = Mutex::new(FieldDiff::default());
+    // The media-type distribution, which is what decides whether `MediaType`
+    // names its variants or leaves them all to `Custom`.
+    let media_types: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+    let media_none = AtomicU64::new(0);
     let trait_assets = AtomicU64::new(0);
     let attr_pairs = AtomicU64::new(0);
     let attr_hist: [AtomicU64; 16] = std::array::from_fn(|_| AtomicU64::new(0));
@@ -2794,6 +2816,9 @@ fn cip25(a: Cip25Args) -> Result<()> {
                     let mut l_fast_skipped = 0u64;
                     let mut l_cmp = [0u64; 5];
                     let mut l_cmp_examples: Vec<String> = Vec::new();
+                    let mut l_diff = FieldDiff::default();
+                    let mut l_media: HashMap<String, u64> = HashMap::new();
+                    let mut l_media_none = 0u64;
                     let mut l_trait_assets = 0u64;
                     let mut l_pairs = 0u64;
                     let mut l_hist = [0u64; 16];
@@ -2863,13 +2888,19 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                             continue;
                                         };
                                         if extract == Extract::Fast {
-                                            let Some(fast) = fast_metadatum_traits(value) else {
+                                            let Some(walked) = fast_decoded(value, policy, &name)
+                                            else {
                                                 l_fast_skipped += 1;
                                                 continue;
                                             };
+                                            tally_media(
+                                                walked.declared_media_type.as_deref(),
+                                                &mut l_media,
+                                                &mut l_media_none,
+                                            );
                                             l_decoded += 1;
                                             tally_traits(
-                                                &fast,
+                                                &walked.asset.traits,
                                                 policy,
                                                 &mut l_pairs,
                                                 &mut l_hist,
@@ -2890,21 +2921,28 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                         }
                                         let asset = asset_from_metadata_value(document);
                                         if extract == Extract::Compare {
-                                            let fast = fast_metadatum_traits(value);
+                                            let fast = fast_decoded(value, policy, &name);
+                                            if let Some(w) = &fast {
+                                                tally_media(
+                                                    w.declared_media_type.as_deref(),
+                                                    &mut l_media,
+                                                    &mut l_media_none,
+                                                );
+                                            }
+                                            let fast = fast.map(|w| project_asset(&w.asset));
                                             match (&asset, &fast) {
-                                                (Ok(a), Some(f))
-                                                    if a.traits.inner() == f.inner() =>
-                                                {
+                                                (Ok(a), Some(f)) if same_asset(a, f) => {
                                                     l_cmp[0] += 1;
                                                 }
                                                 (Ok(a), Some(f)) => {
                                                     l_cmp[1] += 1;
+                                                    l_diff.add(a, f);
                                                     if l_cmp_examples.len() < 4 {
                                                         l_cmp_examples.push(format!(
                                                             "{}/{} {}",
                                                             hex_of(policy),
                                                             display_name(&name),
-                                                            trait_diff(&a.traits, f)
+                                                            asset_diff(a, f)
                                                         ));
                                                     }
                                                 }
@@ -2955,12 +2993,25 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                 seen.0 += n;
                             }
                         }
+                        if !l_media.is_empty() || l_media_none > 0 {
+                            let mut media = media_types.lock().expect("media types");
+                            for (k, n) in l_media.drain() {
+                                *media.entry(k).or_default() += n;
+                            }
+                            media_none.fetch_add(l_media_none, Ordering::Relaxed);
+                            l_media_none = 0;
+                        }
                         if !l_cmp_examples.is_empty() {
                             let mut ex = cmp_examples.lock().expect("examples");
                             if ex.len() < 8 {
                                 ex.extend(l_cmp_examples.drain(..));
                             }
                             l_cmp_examples.clear();
+                        }
+                        {
+                            let mut diff = differ_fields.lock().expect("differ fields");
+                            diff.merge(l_diff);
+                            l_diff = FieldDiff::default();
                         }
                         for (k, n) in l_hist.iter().enumerate() {
                             if *n > 0 {
@@ -3045,6 +3096,7 @@ fn cip25(a: Cip25Args) -> Result<()> {
         cmp_both.load(Ordering::Relaxed),
     );
     let comparisons = cmp_examples.into_inner().expect("examples");
+    let differ = differ_fields.into_inner().expect("differ fields");
     let chunks = done.load(Ordering::Relaxed).max(1);
     let n_policies = policies.lock().expect("policies").len();
     let guard = traits.lock().expect("traits");
@@ -3108,6 +3160,62 @@ fn cip25(a: Cip25Args) -> Result<()> {
         .map(|(k, n)| format!("{k}:{}", n.load(Ordering::Relaxed)))
         .collect();
     println!("             pairs per decoded asset: {}", hist.join(" · "));
+    let media = media_types.into_inner().expect("media types");
+    let mut media_rows: Vec<(String, u64)> = media.into_iter().collect();
+    media_rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
+    let media_none = media_none.load(Ordering::Relaxed);
+    let media_total: u64 = media_rows.iter().map(|(_, n)| n).sum::<u64>() + media_none;
+    if media_total > 0 {
+        println!(
+            "  media type {} distinct · {media_none} of {media_total} no declared type ({:.1}%)",
+            media_rows.len(),
+            100.0 * media_none as f64 / media_total as f64
+        );
+        // Which declared values the catalogue resolves, and what is left: the
+        // promotion list (`custom`) and the corpus saying "nothing here"
+        // (`undefined`). Counted through the same `MediaType::of` a consumer
+        // uses, so the report cannot disagree with the type.
+        let mut catalogued: Vec<(&str, u64)> = Vec::new();
+        let mut custom: Vec<(&str, u64)> = Vec::new();
+        let mut undefined: Vec<(&str, u64)> = Vec::new();
+        for (declared, n) in &media_rows {
+            match MediaType::of(declared) {
+                MediaType::Mime(_) => catalogued.push((declared, *n)),
+                MediaType::Custom(_) => custom.push((declared, *n)),
+                MediaType::Undefined => undefined.push((declared, *n)),
+            }
+        }
+        let assets = |rows: &[(&str, u64)]| rows.iter().map(|(_, n)| n).sum::<u64>();
+        for (label, rows, note) in [
+            (
+                "catalogued",
+                &catalogued,
+                "a catalogue type, however spelled",
+            ),
+            ("custom", &custom, "type-shaped, not yet named"),
+            ("undefined", &undefined, "not a type at all"),
+        ] {
+            println!(
+                "             {label:<10} {} assets in {} spellings ({note})",
+                assets(rows),
+                rows.len()
+            );
+        }
+        for (label, rows, _) in [
+            ("catalogued", &catalogued, ""),
+            ("custom", &custom, ""),
+            ("undefined", &undefined, ""),
+        ] {
+            println!("             {label}, as declared:");
+            for chunk in rows.chunks(4) {
+                let line: Vec<String> = chunk
+                    .iter()
+                    .map(|(k, n)| format!("{} ×{n}", show_declared(k)))
+                    .collect();
+                println!("               {}", line.join(" · "));
+            }
+        }
+    }
     println!(
         "  distinct   {} (trait, value) pairs across {n_policies} collections{} · over the viewer's 512 cap: {over_cap}",
         trait_entries.load(Ordering::Relaxed),
@@ -3126,6 +3234,10 @@ fn cip25(a: Cip25Args) -> Result<()> {
         for line in &comparisons {
             println!("             differ     {line}");
         }
+        println!(
+            "             fields     name {} · image {} · media_type {} · rarity/tags {} · traits {}",
+            differ.name, differ.image, differ.media_type, differ.other, differ.traits
+        );
     }
     println!("             biggest collections by distinct pairs:");
     for (n, policy) in top.iter().take(8) {
@@ -3494,6 +3606,327 @@ fn fast_metadatum_traits(value: &Metadatum) -> Option<Traits> {
         }
     }
     Some(traits)
+}
+
+/// One `files[]` entry, as `AssetFile` reads it.
+struct FileEntry {
+    media_type: String,
+    name: Option<String>,
+    src: String,
+}
+
+/// The envelope as `DecodedAsset` wants it: a name that can say "no name", and
+/// the media list — headline first, one entry per medium.
+struct Envelope {
+    name: Option<String>,
+    media: Vec<Media>,
+    /// The headline's type as the document declared it, *before* `MediaType::of`
+    /// normalised it — which is what the alias decision has to see.
+    declared_media_type: Option<String>,
+}
+
+/// `AssetEnvelope::into_decoded_asset`, over a `Metadatum`.
+///
+/// `None` where serde would fail on the same document — a known field carrying a
+/// type it does not take, or two of one field's aliases present — because the
+/// crate errors there too, and a fast path that accepted it would be inventing an
+/// asset the platform path cannot produce.
+fn envelope(pairs: &KeyValuePairs<Metadatum, Metadatum>) -> Option<Envelope> {
+    let mut name = None;
+    let mut image = None;
+    let mut media = None;
+    let mut files: Vec<FileEntry> = Vec::new();
+    for (k, v) in pairs.iter() {
+        match json_key(k).as_str() {
+            "name" | "Name" | "title" => {
+                if name.is_some() {
+                    return None;
+                }
+                name = Some(json_string_value(v)?);
+            }
+            "image" => {
+                if image.is_some() {
+                    return None;
+                }
+                image = Some(dechunked(v)?);
+            }
+            "media_type" | "mediaType" | "mediatype" => {
+                if media.is_some() {
+                    return None;
+                }
+                media = Some(json_string_value(v)?);
+            }
+            "files" => files = file_entries(v)?,
+            _ => {}
+        }
+    }
+    // `resolve_media_type`: the top-level `mediaType`, else the media type of the
+    // file whose (dechunked) `src` is the image.
+    let resolved = media.or_else(|| {
+        let image = image.as_deref().unwrap_or_default();
+        files
+            .iter()
+            .find(|f| f.src == image)
+            .map(|f| f.media_type.clone())
+    });
+    // The file the headline's own source points at is the headline, not a second
+    // medium: folded in, never listed twice.
+    let consumed = image
+        .as_ref()
+        .and_then(|src| files.iter().position(|f| &f.src == src));
+    let mut out = Vec::new();
+    if let Some(src) = image {
+        out.push(Media {
+            src,
+            media_type: MediaType::of(resolved.as_deref().unwrap_or_default()),
+            name: consumed
+                .and_then(|i| files.get(i))
+                .and_then(|f| f.name.clone()),
+            role: MediaRole::Headline,
+        });
+    }
+    for (i, f) in files.iter().enumerate() {
+        if Some(i) == consumed {
+            continue;
+        }
+        out.push(Media {
+            src: f.src.clone(),
+            media_type: MediaType::of(&f.media_type),
+            name: f.name.clone(),
+            role: MediaRole::File,
+        });
+    }
+    Some(Envelope {
+        name,
+        media: out,
+        declared_media_type: resolved,
+    })
+}
+
+/// `PrimitiveOrList<String>` + `dechunked()`: a string as itself, or CIP-25's
+/// >64-byte chunking as an array concatenated in order.
+fn dechunked(v: &Metadatum) -> Option<String> {
+    match v {
+        Metadatum::Text(_) | Metadatum::Bytes(_) => json_string_value(v),
+        Metadatum::Array(items) => items
+            .iter()
+            .map(json_string_value)
+            .collect::<Option<Vec<String>>>()
+            .map(|chunks| chunks.concat()),
+        _ => None,
+    }
+}
+
+/// `files` as `AssetFile` reads it: `mediaType` (or `mediatype`) and `src`
+/// required, `name` optional but a string when present, everything else ignored.
+/// `None` when an entry is not that shape — the document the crate's deserialize
+/// would fail on.
+fn file_entries(v: &Metadatum) -> Option<Vec<FileEntry>> {
+    let Metadatum::Array(items) = v else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let Metadatum::Map(kv) = item else {
+            return None;
+        };
+        let mut media_type = None;
+        let mut src = None;
+        let mut name = None;
+        for (k, v) in kv.iter() {
+            match json_key(k).as_str() {
+                "mediaType" | "mediatype" => {
+                    if media_type.is_some() {
+                        return None;
+                    }
+                    media_type = Some(json_string_value(v)?);
+                }
+                "src" => {
+                    if src.is_some() {
+                        return None;
+                    }
+                    src = Some(dechunked(v)?);
+                }
+                "name" => {
+                    if name.is_some() {
+                        return None;
+                    }
+                    name = Some(json_string_value(v)?);
+                }
+                _ => {}
+            }
+        }
+        out.push(FileEntry {
+            media_type: media_type?,
+            name,
+            src: src?,
+        });
+    }
+    Some(out)
+}
+
+/// What the walk produced, and the one thing `DecodedAsset` cannot carry: the
+/// headline's type as declared, for the corpus histogram the alias table is
+/// chosen from.
+struct Walked {
+    asset: DecodedAsset,
+    declared_media_type: Option<String>,
+}
+
+/// The whole asset, off the `Metadatum`: the same `DecodedAsset` the crate's
+/// `AssetEnvelope::into_decoded_asset` produces, including the id its JSON form
+/// cannot carry — the walk holds the policy and the on-chain name, which is
+/// exactly what an `AssetId` is made of.
+///
+/// `None` = declined: the `unsigs` shape, a document serde would reject, or an id
+/// the crate's own `AssetId` validation refuses.
+fn fast_decoded(value: &Metadatum, policy: &[u8], name: &[u8]) -> Option<Walked> {
+    let Metadatum::Map(pairs) = value else {
+        return None;
+    };
+    let env = envelope(pairs)?;
+    let traits = fast_metadatum_traits(value)?;
+    let id = AssetId::new(hex::encode(policy), hex::encode(name)).ok()?;
+    Some(Walked {
+        asset: DecodedAsset {
+            id,
+            name: env.name,
+            media: env.media,
+            traits,
+        },
+        declared_media_type: env.declared_media_type,
+    })
+}
+
+/// The edge projection: what the `Asset` a consumer reads today would say about
+/// a `DecodedAsset`. Written here rather than in the crate because it models the
+/// *old* shape — replacing it at the API edge is its own decision.
+fn project_asset(decoded: &DecodedAsset) -> Asset {
+    Asset {
+        name: decoded.name.clone().unwrap_or_default(),
+        image: decoded.image().unwrap_or_default().to_string(),
+        media_type: decoded.media_type().as_str().map(str::to_string),
+        traits: decoded.traits.clone(),
+        rarity_rank: None,
+        tags: Vec::new(),
+    }
+}
+
+/// Whether two `Asset`s are the same asset as a consumer sees one. Field by
+/// field rather than by JSON: a `Traits` map's iteration order is not stable, so
+/// comparing serialized forms would report differences that are not differences.
+fn same_asset(a: &Asset, b: &Asset) -> bool {
+    a.name == b.name
+        && a.image == b.image
+        && a.media_type == b.media_type
+        && a.rarity_rank == b.rarity_rank
+        && a.tags == b.tags
+        && a.traits.inner() == b.traits.inner()
+}
+
+/// How many compared assets differed on each field — so "1,640 differ" arrives
+/// with where they differed, rather than with four examples and an extrapolation.
+#[derive(Default, Clone, Copy)]
+struct FieldDiff {
+    name: u64,
+    image: u64,
+    media_type: u64,
+    other: u64,
+    traits: u64,
+}
+
+impl FieldDiff {
+    fn add(&mut self, platform: &Asset, fast: &Asset) {
+        self.name += u64::from(platform.name != fast.name);
+        self.image += u64::from(platform.image != fast.image);
+        self.media_type += u64::from(platform.media_type != fast.media_type);
+        self.other +=
+            u64::from(platform.rarity_rank != fast.rarity_rank || platform.tags != fast.tags);
+        self.traits += u64::from(platform.traits.inner() != fast.traits.inner());
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.name += other.name;
+        self.image += other.image;
+        self.media_type += other.media_type;
+        self.other += other.other;
+        self.traits += other.traits;
+    }
+}
+
+/// How two assets differ — the field names, then the values for the short
+/// fields, because `media_type differs` on 1,640 assets is a report and
+/// `platform "image/png" vs <none>` is an answer.
+fn asset_diff(platform: &Asset, fast: &Asset) -> String {
+    fn show(value: Option<&str>) -> String {
+        match value {
+            Some(v) => format!("\"{}\"", v.chars().take(40).collect::<String>()),
+            None => "<none>".to_string(),
+        }
+    }
+    let mut fields: Vec<&str> = Vec::new();
+    let mut values: Vec<String> = Vec::new();
+    if platform.name != fast.name {
+        fields.push("name");
+        values.push(format!(
+            "name {} vs {}",
+            show(Some(&platform.name)),
+            show(Some(&fast.name))
+        ));
+    }
+    if platform.image != fast.image {
+        fields.push("image");
+        values.push(format!(
+            "image {} vs {}",
+            show(Some(&platform.image)),
+            show(Some(&fast.image))
+        ));
+    }
+    if platform.media_type != fast.media_type {
+        fields.push("media_type");
+        values.push(format!(
+            "media_type {} vs {}",
+            show(platform.media_type.as_deref()),
+            show(fast.media_type.as_deref())
+        ));
+    }
+    if platform.rarity_rank != fast.rarity_rank {
+        fields.push("rarity_rank");
+    }
+    if platform.tags != fast.tags {
+        fields.push("tags");
+    }
+    let mut out = Vec::new();
+    if !fields.is_empty() {
+        out.push(format!("fields {}", fields.join(",")));
+    }
+    out.extend(values);
+    if platform.traits.inner() != fast.traits.inner() {
+        out.push(trait_diff(&platform.traits, &fast.traits));
+    }
+    out.join(" · ")
+}
+
+/// Fold one asset's declared media type into the run's histogram.
+fn tally_media(media: Option<&str>, histogram: &mut HashMap<String, u64>, none: &mut u64) {
+    match media {
+        Some(m) => *histogram.entry(m.to_string()).or_default() += 1,
+        None => *none += 1,
+    }
+}
+
+/// A declared value for the report: quoted when it is not already trimmed, so a
+/// row that is `image/png ` with a trailing space cannot be read as `image/png`.
+/// The corpus has rows like that, and they are the reason the distinct count is
+/// higher than the number of *types*.
+fn show_declared(declared: &str) -> String {
+    if declared.is_empty() {
+        "(empty)".to_string()
+    } else if declared == declared.trim() {
+        declared.to_string()
+    } else {
+        format!("{declared:?}")
+    }
 }
 
 /// Fold one asset's traits into the run's counters and per-collection sets.
@@ -5047,6 +5480,152 @@ mod tests {
             ),
         ]);
         assert!(fast_metadatum_traits(&doc).is_none());
+    }
+
+    /// The walk produces the whole `DecodedAsset`: the id the JSON path has no
+    /// way to carry, the media list the old flatten dropped, and the image
+    /// chunk-joined the way CIP-25 demands.
+    #[test]
+    fn fast_decoded_builds_an_id_and_a_media_list() {
+        let policy = [0xab; 28];
+        let chunks = || Metadatum::Array(vec![text("ipfs://Qm"), text("abcdef")]);
+        let doc = map(vec![
+            ("name", text("Luffy")),
+            ("image", chunks()),
+            (
+                "files",
+                Metadatum::Array(vec![
+                    map(vec![
+                        ("mediaType", text("image/png")),
+                        ("name", text("the still")),
+                        ("src", chunks()),
+                    ]),
+                    map(vec![
+                        ("mediaType", text("video/mp4")),
+                        ("src", text("ipfs://Qmvideo")),
+                    ]),
+                ]),
+            ),
+            ("Class", text("Archer")),
+        ]);
+        let walked = fast_decoded(&doc, &policy, b"Luffy").expect("an asset");
+        let asset = &walked.asset;
+        assert_eq!(asset.id.policy_id, hex::encode(policy));
+        assert_eq!(asset.id.asset_name_hex, hex::encode(b"Luffy"));
+        assert_eq!(asset.name.as_deref(), Some("Luffy"));
+        assert_eq!(asset.image(), Some("ipfs://Qmabcdef"));
+        // The media type is not at the top level, so it comes from the file whose
+        // (dechunked) `src` is the image — which is consumed by the headline...
+        assert_eq!(asset.media_type().as_str(), Some("image/png"));
+        // ...and the declared spelling survives beside it, which is what the
+        // alias table is chosen from.
+        assert_eq!(walked.declared_media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            asset.headline().and_then(|m| m.name.as_deref()),
+            Some("the still")
+        );
+        // ...and is not repeated as a second medium. The video is a file.
+        let files: Vec<&Media> = asset.files().collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].src, "ipfs://Qmvideo");
+        assert_eq!(files[0].media_type.as_str(), Some("video/mp4"));
+        assert_eq!(asset.traits.get_single("Class").as_deref(), Some("Archer"));
+    }
+
+    /// The projection back to the shape consumers read today: a missing name and
+    /// a missing headline render the way `Asset` always did, so swapping in a
+    /// `DecodedAsset` is not a data change for anyone still reading `Asset`.
+    #[test]
+    fn the_projection_back_to_asset_is_the_old_shape() {
+        let policy = [0xab; 28];
+        let doc = map(vec![("Class", text("Archer"))]);
+        let asset = project_asset(&fast_decoded(&doc, &policy, b"x").expect("an asset").asset);
+        assert_eq!(asset.name, "");
+        assert_eq!(asset.image, "");
+        assert_eq!(asset.media_type, None);
+        assert_eq!(asset.traits.get_single("Class").as_deref(), Some("Archer"));
+    }
+
+    /// A known field carrying the wrong type, a duplicated alias, a file without
+    /// its required fields, or an empty on-chain name: each is something the
+    /// platform path cannot produce, so the walk declines instead of inventing
+    /// an asset.
+    #[test]
+    fn fast_decoded_declines_what_the_platform_path_cannot_produce() {
+        let policy = [0xab; 28];
+        let bad_name = map(vec![("name", int(7)), ("Class", text("Archer"))]);
+        assert!(fast_decoded(&bad_name, &policy, b"x").is_none());
+        let duplicate = map(vec![("name", text("a")), ("Name", text("b"))]);
+        assert!(fast_decoded(&duplicate, &policy, b"x").is_none());
+        let bad_file = map(vec![(
+            "files",
+            Metadatum::Array(vec![map(vec![("src", text("ipfs://x"))])]),
+        )]);
+        assert!(fast_decoded(&bad_file, &policy, b"x").is_none());
+        let plain = map(vec![("Class", text("Archer"))]);
+        assert!(fast_decoded(&plain, &policy, b"").is_none());
+    }
+
+    /// The one `name` difference in 11.1 M assets: the same asset declared twice
+    /// under its policy. `cardano-assets` finds metadata with `find_in_map`,
+    /// which stops at the first declaration; this walk enumerates the document
+    /// as written, so it reads both. Both cannot be right about one asset — and
+    /// the corpus says the case is one asset in eleven million.
+    #[test]
+    fn a_duplicated_declaration_is_read_twice_here_and_once_upstream() {
+        use std::collections::BTreeMap;
+
+        let policy = [0xab; 28];
+        let declaration =
+            |name: &str| Metadatum::Map(KeyValuePairs::Def(vec![(text("name"), text(name))]));
+        let doc = Metadatum::Map(KeyValuePairs::Def(vec![
+            (
+                text("LoveForCrypto1of25"),
+                declaration("LoveForCrypto 1 of 25"),
+            ),
+            (
+                text("LoveForCrypto1of25"),
+                declaration("LoveForCrypto 25 of 25"),
+            ),
+        ]));
+
+        // Upstream sees the first declaration, whichever one you ask about.
+        let mut metadata: Metadata = BTreeMap::new();
+        metadata.insert(
+            721u64,
+            Metadatum::Map(KeyValuePairs::Def(vec![(
+                Metadatum::Bytes(policy.to_vec().into()),
+                doc.clone(),
+            )])),
+        );
+        let cbor = pallas_codec::minicbor::to_vec(alonzo::AuxiliaryData::Shelley(metadata))
+            .expect("encodes");
+        let found = cip25_metadata_value(&cbor, &policy, b"LoveForCrypto1of25").expect("found");
+        assert_eq!(
+            found.get("name").and_then(|v| v.as_str()),
+            Some("LoveForCrypto 1 of 25")
+        );
+
+        // This walk sees both, which is where the difference comes from.
+        let Metadatum::Map(entries) = &doc else {
+            panic!("a map")
+        };
+        let names: Vec<Option<String>> = entries
+            .iter()
+            .map(|(_, v)| {
+                fast_decoded(v, &policy, b"LoveForCrypto1of25")
+                    .expect("an asset")
+                    .asset
+                    .name
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("LoveForCrypto 1 of 25".to_string()),
+                Some("LoveForCrypto 25 of 25".to_string())
+            ]
+        );
     }
 
     /// A `721`-level key that is not a policy id is not a policy — and the two
