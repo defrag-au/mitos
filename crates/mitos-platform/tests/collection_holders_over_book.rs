@@ -235,7 +235,7 @@ async fn pick_policy(plane: &BookDataPlane) -> ([u8; 28], Vec<OutputRef>) {
 
     let table = plane.base().policies();
     for id in 0..table.len().min(MAX_POLICY_CANDIDATES) {
-        let policy = *table.get(id as u32).expect("id in range");
+        let policy = table.get(id as u32).expect("read").expect("id in range");
         let refs = ChainDataPlane::utxos_by_policy(plane, &policy)
             .await
             .expect("utxos_by_policy");

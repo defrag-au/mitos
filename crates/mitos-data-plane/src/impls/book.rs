@@ -128,12 +128,22 @@ impl BookDataPlane {
     fn assets(&self, row: &Row<'_>) -> DataPlaneResult<Vec<AssetEntry>> {
         let mut out = Vec::with_capacity(row.n_assets());
         for a in row.assets() {
-            let policy = self.base.policies().get(a.policy).ok_or_else(|| {
-                DataPlaneError::Decode(format!(
-                    "row names policy id {} absent from policy.tbl",
-                    a.policy
-                ))
-            })?;
+            let policy = self
+                .base
+                .policies()
+                .get(a.policy)
+                // A read that failed and an id that is absent are different
+                // faults; both are decode failures to this caller, but the
+                // message says which.
+                .map_err(|e| {
+                    DataPlaneError::Decode(format!("reading policy id {}: {e}", a.policy))
+                })?
+                .ok_or_else(|| {
+                    DataPlaneError::Decode(format!(
+                        "row names policy id {} absent from policy.tbl",
+                        a.policy
+                    ))
+                })?;
             // `PolicyId` is a validated hex string, so this is two allocations
             // per asset entry. The artifact stores 4 bytes and the table holds
             // the 28 — the hexing is the trait's shape, not the book's.

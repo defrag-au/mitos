@@ -127,7 +127,7 @@ impl<'a> Delta<'a> {
             BuildHasherDefault::<FxHasher>::default(),
         );
         for (id, policy) in base.policies().ids().enumerate() {
-            policies.insert(*policy, id as u32);
+            policies.insert(policy?, id as u32);
         }
         Ok(Delta {
             base,
@@ -257,9 +257,14 @@ impl<'a> Delta<'a> {
             return Tier::Delta;
         }
 
+        // A failed base read is counted as uncreated rather than propagated: this
+        // is a hot per-input path with no error channel, and over a mapping the
+        // read cannot fail. ⚠️ A remote-sourced delta would need a real error
+        // path here rather than a silent reclassification.
         match self
             .base
             .outref_entry(outref.0.as_ref().try_into().expect("32"), outref.1)
+            .unwrap_or(None)
         {
             Some(entry) => {
                 if self.mark_base_spent(entry) {

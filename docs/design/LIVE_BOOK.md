@@ -148,19 +148,30 @@ by `u32` offset, so the arena is capped at 4 GiB (10.9 M rows × ~150 B = 1.6 GB
 comfortable, but the cap is a `layout_version`-visible property, not an
 accident).
 
+**Vocabulary: the key is an output reference.** `OutRef` is `live-book`'s alias
+`([u8; 32], u32)` — a transaction hash and an output index — and the same pair
+is spelled differently at each boundary: `OutputRef` on the data-plane, protocol
+and WIT (`output-ref`) surfaces, `TxoRef` at the dolos boundary and in pallas,
+`TransactionInput` when it is the input side of a transaction. Nothing about the
+pair changes when the output is spent; only the name does — which is why the
+orderings are named for the dimension they are keyed by (`by_outref`,
+`by_policy`, `by_addr`), and why the unqualified `dir.idx` is `by_outref`'s
+directory while the other two qualify themselves.
+
 ```
 offset  size  field
      0    36  outref        — tx hash (32) ‖ output index (u32 LE)
     36     8  lovelace
-    44     4  datum_ref
-    48     1  datum_kind    — 0 none · 1 inline (ref = offset ‖ len in this file) · 2 hash (ref = datum table)
-    49     1  addr_len      — 29..57
-    50     2  n_assets
-    52     1  era
-    53     3  reserved      — zero, so the header is 8-aligned
+    44     4  datum_ref     — reserved; unused in phase 1
+    48     1  datum_kind    — 0 none · 1 inline · 2 hash; an unknown kind reads as none
+    49     2  addr_len      — u16 since `layout_version` 3; 29..57 B typical, 22,600 B longest
+    51     2  n_assets
+    53     1  era
+    54     2  datum_len     — the datum bytes below; 0 when the kind is none
   ----   56  fixed header
     56  addr_len   address bytes, raw
        ...         n_assets × { u32 policy_id, u8 name_len, name bytes, u64 quantity }
+       ...         datum_len  datum bytes, raw — the inline datum, or a hash's 32 bytes
 ```
 
 **The outref is 36 bytes, not a prefix.** This is the one place the family's

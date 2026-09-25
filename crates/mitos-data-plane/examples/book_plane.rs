@@ -30,12 +30,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut policies = 100usize;
     let mut limit = 1_000usize;
     let mut with_datum = true;
+    let mut only: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dir" => dir = PathBuf::from(args.next().expect("--dir needs a path")),
             "--policies" => policies = args.next().expect("value").parse()?,
             "--limit" => limit = args.next().expect("value").parse()?,
+            // One named policy, priced end to end: the shape a front-end actually
+            // asks for, and a fixed point the uniform stride never lands on.
+            "--policy" => only = Some(args.next().expect("--policy needs a hex id")),
             // The decode level is the one axis a caller controls, and it is also
             // how the projection's cost is attributed: the difference between the
             // two runs *is* datum resolution.
@@ -78,7 +82,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if n_policies == 0 {
         return Err("the artifact holds no policies".into());
     }
-    let stride = (n_policies / policies.max(1)).max(1);
+    // Either one named policy or a uniform stride across the table. The stride
+    // spreads a sample over the whole live set; a named policy is the case where
+    // the sample *is* the workload, and the two price differently.
+    let visit: Vec<usize> = if let Some(h) = &only {
+        let want = hex::decode(h)?;
+        let id = (0..n_policies)
+            .find(|i| {
+                base.policies()
+                    .get(*i as u32)
+                    .expect("read")
+                    .expect("in range")
+                    .as_slice()
+                    == want.as_slice()
+            })
+            .ok_or_else(|| format!("policy {h} is not in this artifact's policy table"))?;
+        vec![id]
+    } else {
+        let stride = (n_policies / policies.max(1)).max(1);
+        (0..n_policies).step_by(stride).collect()
+    };
 
     let (mut outputs, mut assets, mut datums, mut inline_datums) = (0u64, 0u64, 0u64, 0u64);
     let (mut byref_nanos, mut read_nanos) = (0u128, 0u128);
@@ -92,9 +115,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen: HashSet<[u8; 36]> = HashSet::new();
 
     let t = Instant::now();
-    let mut id = 0usize;
-    while id < n_policies {
-        let policy_bytes = *base.policies().get(id as u32).expect("in range");
+    for id in visit.iter().copied() {
+        let policy_bytes = base
+            .policies()
+            .get(id as u32)
+            .expect("read")
+            .expect("in range");
         let t = Instant::now();
         let refs = plane.utxos_by_policy(&policy_bytes).await?;
         byref_nanos += t.elapsed().as_nanos();
@@ -126,14 +152,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        id += stride;
     }
     let secs = t.elapsed().as_secs_f64();
 
     println!(
         "  sampled    {} of {n_policies} policies · {policy_refs} refs enumerated · \
          {} unique outputs read in {secs:.1} s",
-        policies.min(n_policies),
+        visit.len(),
         seen.len(),
     );
     println!(

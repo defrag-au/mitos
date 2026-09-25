@@ -43,15 +43,14 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use memmap2::Mmap;
 
 use crate::address::{self, Kind};
 use crate::format::{
     self, DIRECTORY_ADDR, DIRECTORY_OUTREF, DIRECTORY_POLICY, Directory, Meta, POLICY_FILE,
-    PolicyTable, ROWS_FILE, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY, check_array_header, entry_at,
-    split,
+    PolicyTable, ROWS_FILE, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY, split,
 };
 use crate::row::{Row, RowRead};
+use crate::source::{MmapSource, Source};
 
 /// An outref — a transaction hash and an output index. The live set's key, and
 /// the only thing an enumeration of it needs to return: a caller that wants the
@@ -88,38 +87,57 @@ pub struct Page {
     pub next: Option<Cursor>,
 }
 
-/// An immutable artifact, mapped read-only.
-pub struct Base {
+/// An immutable artifact, read through some [`Source`].
+///
+/// Defaults to [`MmapSource`] so every existing caller — and the box's measured
+/// 1223 ns lookup — is unaffected by the seam existing.
+pub struct Base<S = MmapSource> {
     dir: PathBuf,
     meta: Meta,
-    rows: Mmap,
-    outref: Table,
-    policy: Table,
-    addr: Table,
-    policies: PolicyTable,
+    rows: S,
+    outref: Table<S>,
+    policy: Table<S>,
+    addr: Table<S>,
+    policies: PolicyTable<S>,
 }
 
-struct Table {
-    entries: Mmap,
-    dir: Directory,
+struct Table<S = MmapSource> {
+    entries: S,
+    dir: Directory<S>,
     count: u64,
 }
 
-impl Table {
-    fn open(dir: &Path, table: &str, directory: &str) -> Result<Table> {
-        let entries = format::map(&dir.join(table))?;
-        let count = check_array_header(&entries, table, 12)?;
+impl Table<MmapSource> {
+    fn open(dir: &Path, table: &str, directory: &str) -> Result<Table<MmapSource>> {
+        let entries = MmapSource::open(&dir.join(table))?;
         let dir_map = Directory::open(dir, directory)?;
-        dir_map.validate(|i| entry_at(&entries, i).0, count)?;
+        Table::from_sources(entries, dir_map, table)
+    }
+}
+
+impl<S: Source> Table<S> {
+    /// Take the entry array and its directory, and check the directory really
+    /// partitions the array (`B5`).
+    ///
+    /// ⚠️ `validate` reads all 2^21 buckets and probes the array per non-empty
+    /// bucket — fine over a mapping at 73 ms, impossible remotely (§4.2). A
+    /// remote reader must construct this some other way; the check has to move
+    /// to publish time, which is what the attestation is for.
+    fn from_sources(entries: S, dir: Directory<S>, what: &str) -> Result<Table<S>> {
+        let count = format::check_array_header_src(&entries, what, 12)?;
+        dir.validate(
+            |i| format::entry_at_src(&entries, i as u64).map(|e| e.0),
+            count,
+        )?;
         Ok(Table {
             entries,
-            dir: dir_map,
+            dir,
             count,
         })
     }
 
-    fn entry(&self, i: u64) -> (u64, u32) {
-        entry_at(&self.entries, i as usize)
+    fn entry(&self, i: u64) -> Result<(u64, u32)> {
+        format::entry_at_src(&self.entries, i)
     }
 
     /// The entries carrying `prefix`, as a contiguous range.
@@ -128,38 +146,38 @@ impl Table {
     /// entries on average, but a busy wallet's credential can be tens of
     /// thousands all sharing one prefix, and those are a page to return rather
     /// than five entries to skip past.
-    fn run(&self, prefix: u64) -> Range<u64> {
-        let bucket = self.dir.range_for(prefix);
+    fn run(&self, prefix: u64) -> Result<Range<u64>> {
+        let bucket = self.dir.range_for(prefix)?;
         let end = (bucket.end as u64).min(self.count);
         let start = (bucket.start as u64).min(end);
-        let first_at_or_after = |key: u64| {
+        let first_at_or_after = |key: u64| -> Result<u64> {
             let (mut a, mut b) = (start, end);
             while a < b {
                 let m = a + (b - a) / 2;
-                if self.entry(m).0 < key {
+                if self.entry(m)?.0 < key {
                     a = m + 1;
                 } else {
                     b = m;
                 }
             }
-            a
+            Ok(a)
         };
-        let lo = first_at_or_after(prefix);
+        let lo = first_at_or_after(prefix)?;
         let hi = if prefix == u64::MAX {
             end
         } else {
-            first_at_or_after(prefix + 1)
+            first_at_or_after(prefix + 1)?
         };
-        lo..hi.max(lo)
+        Ok(lo..hi.max(lo))
     }
 }
 
-impl Base {
+impl Base<MmapSource> {
     /// Map an artifact. Validates what it can cheaply: every file's version, the
     /// counts each ordering claims against `book.meta`, and that each directory
     /// partitions its array. A corrupt artifact is refused here rather than
     /// answering wrongly later.
-    pub fn open(dir: &Path) -> Result<Base> {
+    pub fn open(dir: &Path) -> Result<Base<MmapSource>> {
         let meta = Meta::open(dir)?;
         if meta.layout_version != format::LAYOUT_VERSION {
             bail!(
@@ -169,12 +187,12 @@ impl Base {
             );
         }
         let rows_path = dir.join(ROWS_FILE);
-        let rows = format::map(&rows_path)?;
-        if rows.len() as u64 != meta.rows_bytes {
+        let rows = MmapSource::open(&rows_path)?;
+        if rows.size() != meta.rows_bytes {
             bail!(
                 "{} is {} B; book.meta claims {}",
                 rows_path.display(),
-                rows.len(),
+                rows.size(),
                 meta.rows_bytes
             );
         }
@@ -220,6 +238,39 @@ impl Base {
         })
     }
 
+    /// The row at a byte offset, **borrowed from the mapping**.
+    ///
+    /// Only sound here, and that is the whole reason the concrete impl exists:
+    /// `MmapSource::Bytes<'a>` *is* `&'a [u8]`, so the borrow outlives the call.
+    /// Over any other source the bytes live in a guard that dies with the call,
+    /// which is why the generic surface is [`Base::with_row`].
+    ///
+    /// Keeping this is not a convenience. `LIVE_BOOK.md` §Decided rests on spend
+    /// resolution confirming from memory — over ~138 M resolutions the difference
+    /// between a borrow and a copy is **69 minutes versus 77 hours** — so the box
+    /// must not pay for the seam existing.
+    pub fn row(&self, offset: u32) -> Result<Row<'_>, RowRead> {
+        let at = offset as usize;
+        let bytes = self.rows.bytes();
+        if at >= bytes.len() {
+            return Err(RowRead::OutOfRange);
+        }
+        Row::parse(&bytes[at..])
+    }
+
+    /// Is this output live, and what does it say — zero-copy.
+    ///
+    /// The generic equivalent is [`Base::with_utxo`]; see [`Base::row`] for why
+    /// this one can hand the row back.
+    pub fn utxo(&self, tx: &[u8; 32], index: u32) -> Result<Option<Row<'_>>> {
+        match self.find_entry(tx, index)? {
+            Some((_, offset)) => Ok(self.row(offset).ok()),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<S: Source> Base<S> {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -233,26 +284,55 @@ impl Base {
         self.meta.rows
     }
 
-    pub fn policies(&self) -> &PolicyTable {
+    pub fn policies(&self) -> &PolicyTable<S> {
         &self.policies
     }
 
-    /// The row at a byte offset in `rows.bin`.
-    pub fn row(&self, offset: u32) -> Result<Row<'_>, RowRead> {
-        let at = offset as usize;
-        if at >= self.rows.len() {
-            return Err(RowRead::OutOfRange);
+    /// The row at a byte offset, handed to `f` while borrowed.
+    ///
+    /// `Ok(None)` means the bytes there are not a row — a prefix collision that
+    /// pointed somewhere useless, which every confirm treats as "not a match".
+    /// `Err` means the *read* failed, which is a different thing and must not be
+    /// mistaken for it.
+    ///
+    /// ⚠️ **`MAX_ROW` is a speculative over-read, not a limit on the format.**
+    /// A row's length is inside its header, so a remote source cannot know how
+    /// much to fetch without two dependent round trips. §4.5 measures the median
+    /// row at 166 B and the longest in the whole store at 7,689 B, so 8 KiB
+    /// covers every row mainnet holds with room to spare — and `Row::parse`
+    /// still refuses a row that runs past what it was given, so a fixture that
+    /// exceeded it would fail loudly rather than truncate.
+    pub fn with_row<T>(&self, offset: u32, f: impl FnOnce(Row<'_>) -> T) -> Result<Option<T>> {
+        const MAX_ROW: usize = 8 * 1024;
+        if u64::from(offset) >= self.rows.size() {
+            return Ok(None);
         }
-        Row::parse(&self.rows[at..])
+        let bytes = self.rows.read_upto(u64::from(offset), MAX_ROW)?;
+        Ok(Row::parse(&bytes).ok().map(f))
     }
 
-    /// Is this output live, and what does it say?
+    /// Is this output live, and what does it say — handed to `f` while borrowed.
     ///
-    /// One directory page, one entry page, one row read — and the row's own
+    /// One directory read, one entry read, one row read, and the row's own
     /// 36-byte outref is what decides, so a prefix collision cannot return
     /// somebody else's output.
-    pub fn utxo(&self, tx: &[u8; 32], index: u32) -> Result<Option<Row<'_>>> {
-        Ok(self.find(tx, index).map(|(_, row)| row))
+    ///
+    /// ⚠️ **Scoped rather than returning `Row<'_>`, and that is forced.** Over a
+    /// mapping the row is a borrow of something that outlives the call; over any
+    /// remote source it is a borrow of a guard that dies with it. A signature
+    /// that returned the row could only ever have been honest for one
+    /// implementation. `Base<MmapSource>::utxo` keeps the zero-copy shape for the
+    /// box, where §Decided's 69-minutes-versus-77-hours argument lives.
+    pub fn with_utxo<T>(
+        &self,
+        tx: &[u8; 32],
+        index: u32,
+        f: impl FnOnce(Row<'_>) -> T,
+    ) -> Result<Option<T>> {
+        match self.find_entry(tx, index)? {
+            Some((_, offset)) => self.with_row(offset, f),
+            None => Ok(None),
+        }
     }
 
     /// The `by_outref` entry a live output occupies — a **dense id** for the row,
@@ -264,30 +344,32 @@ impl Base {
     /// marking what a later chunk has spent — needs the dense one. It is also the
     /// more stable of the two, since it is derived from the row's own outref
     /// rather than from where the row happened to be written.
-    pub fn outref_entry(&self, tx: &[u8; 32], index: u32) -> Option<u64> {
-        self.find(tx, index).map(|(entry, _)| entry)
+    pub fn outref_entry(&self, tx: &[u8; 32], index: u32) -> Result<Option<u64>> {
+        Ok(self.find_entry(tx, index)?.map(|(entry, _)| entry))
     }
 
-    /// The (entry index, row) of a live output, or `None`.
+    /// The (entry index, row offset) of a live output, or `None`.
     ///
-    /// No error case on purpose: a row that will not parse is skipped rather than
+    /// Returns the *offset* rather than the row so the borrow ends here — see
+    /// [`Base::with_utxo`]. A row that will not parse is skipped rather than
     /// reported, which is what makes a prefix collision cost a read instead of
-    /// answering with somebody else's output.
-    fn find(&self, tx: &[u8; 32], index: u32) -> Option<(u64, Row<'_>)> {
+    /// answering with somebody else's output; a read that *fails* is an error,
+    /// because that is a different thing.
+    fn find_entry(&self, tx: &[u8; 32], index: u32) -> Result<Option<(u64, u32)>> {
         let (prefix, _) = split(tx, index);
-        for i in self.outref.run(prefix) {
-            let (p, offset) = self.outref.entry(i);
+        for i in self.outref.run(prefix)? {
+            let (p, offset) = self.outref.entry(i)?;
             if p != prefix {
                 break;
             }
-            let Ok(row) = self.row(offset) else {
-                continue;
-            };
-            if row.outref() == (*tx, index) {
-                return Some((i, row));
+            if self
+                .with_row(offset, |row| row.outref() == (*tx, index))?
+                .unwrap_or(false)
+            {
+                return Ok(Some((i, offset)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Every live output at exactly this address.
@@ -305,7 +387,7 @@ impl Base {
             return Ok(Page::default());
         };
         self.enumerate(&self.addr, cred.prefix(), after, limit, |row| {
-            row.address() == address
+            Ok(row.address() == address)
         })
     }
 
@@ -327,10 +409,10 @@ impl Base {
     ) -> Result<Page> {
         let prefix = u64::from_le_bytes(cred[0..8].try_into().expect("8 bytes"));
         self.enumerate(&self.addr, prefix, after, limit, |row| {
-            matches!(
+            Ok(matches!(
                 address::credential(row.address()),
                 Some(c) if c.kind == Kind::Payment && c.bytes() == cred
-            )
+            ))
         })
     }
 
@@ -349,8 +431,14 @@ impl Base {
     ) -> Result<Page> {
         let prefix = u64::from_le_bytes(policy[0..8].try_into().expect("8 bytes"));
         self.enumerate(&self.policy, prefix, after, limit, |row| {
-            row.assets()
-                .any(|a| self.policies.get(a.policy) == Some(policy))
+            // Not `.any()`: resolving an interned id is a read, so it can fail,
+            // and a failure must propagate rather than read as "no match".
+            for a in row.assets() {
+                if self.policies.get(a.policy)? == Some(*policy) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         })
     }
 
@@ -361,15 +449,22 @@ impl Base {
     /// The cursor is an entry index, so a page that confirmed nothing still moves
     /// forward — which is what stops a caller paging over a long run of rejected
     /// candidates from looping on the same page forever.
+    /// The shared shape of the three enumerations.
+    ///
+    /// `confirm` is **fallible** because one of the three needs it to be:
+    /// `by_policy` resolves the row's interned id through `policy.tbl`, which is
+    /// a read and can therefore fail. Collapsing that into `false` would report a
+    /// failed read as "this row does not hold that policy" — a wrong answer
+    /// wearing the shape of a right one.
     fn enumerate(
         &self,
-        table: &Table,
+        table: &Table<S>,
         prefix: u64,
         after: Option<Cursor>,
         limit: usize,
-        confirm: impl Fn(Row<'_>) -> bool,
+        confirm: impl Fn(Row<'_>) -> Result<bool>,
     ) -> Result<Page> {
-        let run = table.run(prefix);
+        let run = table.run(prefix)?;
         let mut at = match after {
             Some(c) => {
                 if c.prefix != prefix {
@@ -382,7 +477,7 @@ impl Base {
         let limit = limit.min(MAX_PAGE);
         let mut refs = Vec::new();
         while at < run.end && refs.len() < limit {
-            let (p, offset) = table.entry(at);
+            let (p, offset) = table.entry(at)?;
             at += 1;
             if p != prefix {
                 // The bucket held a neighbouring prefix: the run is over, and the
@@ -390,13 +485,13 @@ impl Base {
                 at = run.end;
                 break;
             }
-            match self.row(offset) {
-                Ok(row) => {
-                    if confirm(row) {
-                        refs.push(row.outref());
-                    }
-                }
-                Err(RowRead::OutOfRange | RowRead::Short) => continue,
+            // A row that will not parse is skipped; a read or a confirm that
+            // FAILS propagates. `with_row` keeps the borrow inside the call.
+            let hit = self.with_row(offset, |row| {
+                confirm(row).map(|ok| ok.then(|| row.outref()))
+            })?;
+            if let Some(outref) = hit.transpose()?.flatten() {
+                refs.push(outref);
             }
         }
         let next = (at < run.end).then_some(Cursor { prefix, at });

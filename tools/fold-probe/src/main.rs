@@ -206,6 +206,16 @@ struct LookupArgs {
     /// orderings, requiring them to agree. 0 = off.
     #[arg(long, default_value_t = 0)]
     cross_check: usize,
+    /// Count distinct addresses behind the run. This is `holder_count` as the
+    /// module path defines it — per *address*, not per output — measured over the
+    /// whole run rather than the trait's capped first page.
+    #[arg(long)]
+    holders: bool,
+    /// Count the policy's own assets: distinct names, and how many entries carry
+    /// them. `--sum` totals every asset in each row, which is the holder's whole
+    /// balance — this is the number a collection page shows.
+    #[arg(long)]
+    assets: bool,
 }
 
 #[derive(Args)]
@@ -2697,6 +2707,79 @@ fn lookup(a: LookupArgs) -> Result<()> {
             lovelace / 1_000_000,
         );
     }
+
+    // The most expensive query shape, and the one a holder-distribution view is:
+    // distinct *addresses*, which means every row has to come back. Measured
+    // separately from `--sum` because it is a different question, and over the
+    // whole run rather than the trait's first page — `holder_count` on a policy
+    // past the walk cap answers a lower bound, and the gap is the point.
+    if a.holders {
+        let t = Instant::now();
+        let mut addresses: HashSet<&[u8]> = HashSet::new();
+        let mut rows = 0u64;
+        let mut after = None;
+        loop {
+            let p = query.ask(&book, after, a.limit)?;
+            for (hash, index) in &p.refs {
+                if let Some(row) = book.utxo(hash, *index)? {
+                    rows += 1;
+                    addresses.insert(row.address());
+                }
+            }
+            match p.next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        let bytes: usize = addresses.iter().map(|a| a.len()).sum();
+        println!(
+            "  holders    {} distinct addresses behind {rows} rows in {:.2} s · {:.1} B mean \
+             address",
+            addresses.len(),
+            t.elapsed().as_secs_f64(),
+            bytes as f64 / addresses.len().max(1) as f64,
+        );
+    }
+
+    // The collection's own size, as distinct asset names. `--sum`'s asset count
+    // is every entry of every row the query returned, so for a policy query it
+    // counts the *holders'* balances — a row holding twenty other tokens adds
+    // twenty. This is the number a page shows above the grid, and it is what a
+    // per-collection projection has to carry one row per.
+    if a.assets {
+        let Query::Policy(policy) = &query else {
+            bail!("--assets counts the assets of a policy; give --policy");
+        };
+        let t = Instant::now();
+        let mut names: HashSet<&[u8]> = HashSet::new();
+        let mut entries = 0u64;
+        let mut rows = 0u64;
+        let mut after = None;
+        loop {
+            let p = query.ask(&book, after, a.limit)?;
+            for (hash, index) in &p.refs {
+                let Some(row) = book.utxo(hash, *index)? else {
+                    continue;
+                };
+                rows += 1;
+                for asset in row.assets() {
+                    if book.policies().get(asset.policy)? == Some(*policy) {
+                        entries += 1;
+                        names.insert(asset.name);
+                    }
+                }
+            }
+            match p.next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        println!(
+            "  assets     {} distinct names in {entries} entries over {rows} rows in {:.2} s",
+            names.len(),
+            t.elapsed().as_secs_f64(),
+        );
+    }
     Ok(())
 }
 
@@ -2739,7 +2822,11 @@ fn cross_check(book: &live_book::Base, sample: usize, limit: usize) -> Result<()
     let t = Instant::now();
     let mut id = 0usize;
     while id < n_policies {
-        let policy = *book.policies().get(id as u32).expect("in range");
+        let policy = book
+            .policies()
+            .get(id as u32)
+            .expect("read")
+            .expect("in range");
         policies += 1;
         let mut after = None;
         let mut checked_here = 0u64;
@@ -2757,7 +2844,7 @@ fn cross_check(book: &live_book::Base, sample: usize, limit: usize) -> Result<()
                 };
                 if !row
                     .assets()
-                    .any(|a| book.policies().get(a.policy) == Some(&policy))
+                    .any(|a| book.policies().get(a.policy).ok().flatten() == Some(policy))
                 {
                     policy_not_held += 1;
                 }
@@ -3385,7 +3472,7 @@ fn sample_delta(base: &live_book::Base, delta: &Delta<'_>, sample: u64) -> Resul
             assets += 1;
             let id = a.policy as usize;
             let readable = if id < base_len {
-                base.policies().get(a.policy).is_some()
+                base.policies().get(a.policy).is_ok_and(|p| p.is_some())
             } else {
                 id - base_len < delta.policy_tail().len()
             };

@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::source::Source;
+
 /// `B3`: 2^21 buckets, ~8 MB, ~5 entries per bucket at 10.9 M rows.
 pub const DIR_BITS: u32 = 21;
 
@@ -172,35 +174,39 @@ pub fn write_policy_tbl(dir: &Path, policies: &[[u8; 28]]) -> Result<()> {
 /// The interning table as a read-only mapping: `id -> 28-byte policy`, resolved
 /// without an allocation, which is what lets a row's asset records be handed over
 /// borrowed.
-pub struct PolicyTable {
-    mmap: memmap2::Mmap,
+pub struct PolicyTable<S = crate::source::MmapSource> {
+    src: S,
     n: usize,
 }
 
-impl PolicyTable {
-    pub fn open(dir: &Path) -> Result<PolicyTable> {
+impl PolicyTable<crate::source::MmapSource> {
+    pub fn open(dir: &Path) -> Result<PolicyTable<crate::source::MmapSource>> {
         let path = dir.join(POLICY_FILE);
-        let mmap = map(&path)?;
-        if mmap.len() < 12 {
-            bail!("{} is too short to hold a header", path.display());
+        PolicyTable::from_source(crate::source::MmapSource::open(&path)?)
+            .with_context(|| format!("reading {}", path.display()))
+    }
+}
+
+impl<S: Source> PolicyTable<S> {
+    pub fn from_source(src: S) -> Result<PolicyTable<S>> {
+        if src.size() < 12 {
+            bail!("policy table is too short to hold a header");
         }
-        let pl = u32::from_le_bytes(mmap[0..4].try_into().expect("4 bytes"));
+        let head = src.read(0, 12)?;
+        let pl = u32::from_le_bytes(head[0..4].try_into().expect("4 bytes"));
         if pl != LAYOUT_VERSION {
+            bail!("policy table is layout_version {pl}; this build reads {LAYOUT_VERSION}");
+        }
+        let n = u64::from_le_bytes(head[4..12].try_into().expect("8 bytes")) as usize;
+        if src.size() != (12 + POLICY_ID_BYTES * n) as u64 {
             bail!(
-                "{} is layout_version {pl}; this build reads {LAYOUT_VERSION}",
-                path.display()
+                "policy table is {} B; {n} policies need {}",
+                src.size(),
+                12 + POLICY_ID_BYTES * n
             );
         }
-        let n = u64::from_le_bytes(mmap[4..12].try_into().expect("8 bytes")) as usize;
-        if mmap.len() != 12 + 28 * n {
-            bail!(
-                "{} is {} B; {n} policies need {}",
-                path.display(),
-                mmap.len(),
-                12 + 28 * n
-            );
-        }
-        Ok(PolicyTable { mmap, n })
+        drop(head);
+        Ok(PolicyTable { src, n })
     }
 
     pub fn len(&self) -> usize {
@@ -211,20 +217,37 @@ impl PolicyTable {
         self.n == 0
     }
 
-    pub fn get(&self, id: u32) -> Option<&[u8; 28]> {
+    /// One policy, **by value**.
+    ///
+    /// ⚠️ It used to hand back `&[u8; 28]` borrowed from the mapping, and the
+    /// crate's header called that "resolved without an allocation". That cannot
+    /// survive a remote source: the bytes live in a guard that dies with the
+    /// call, so the borrow would dangle. 28 bytes copied is noise against the
+    /// measured 1223 ns lookup it accompanies, and most call sites already
+    /// dereferenced it.
+    ///
+    /// `Ok(None)` is out of range; `Err` is a read that failed. Two different
+    /// things, kept apart, because collapsing them would make a network error
+    /// read as "no such policy".
+    pub fn get(&self, id: u32) -> Result<Option<[u8; POLICY_ID_BYTES]>> {
         let id = id as usize;
         if id >= self.n {
-            return None;
+            return Ok(None);
         }
-        self.mmap[12 + 28 * id..12 + 28 * id + 28].try_into().ok()
+        let at = (12 + POLICY_ID_BYTES * id) as u64;
+        let bytes = self.src.read(at, POLICY_ID_BYTES)?;
+        Ok(Some(
+            bytes[..POLICY_ID_BYTES]
+                .try_into()
+                .expect("POLICY_ID_BYTES bytes"),
+        ))
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = &[u8; 28]> {
-        let bytes = &self.mmap;
+    /// Every policy in id order. Fallible per item, because each is a read.
+    pub fn ids(&self) -> impl Iterator<Item = Result<[u8; POLICY_ID_BYTES]>> + '_ {
         (0..self.n).map(move |i| {
-            bytes[12 + 28 * i..12 + 28 * i + 28]
-                .try_into()
-                .expect("28 bytes")
+            self.get(i as u32)?
+                .with_context(|| format!("policy id {i} is within len but did not read"))
         })
     }
 }
@@ -239,7 +262,7 @@ pub fn policy_perms(pairs: &[(u32, u32)], policies: &PolicyTable) -> Result<Vec<
     let mut entries: Vec<Perm> = Vec::with_capacity(pairs.len());
     for (id, row) in pairs {
         let policy = policies
-            .get(*id)
+            .get(*id)?
             .with_context(|| format!("policy id {id} is not in the table"))?;
         let mut p = [0u8; 8];
         p.copy_from_slice(&policy[0..8]);
@@ -912,6 +935,34 @@ pub const ARRAY_HEADER: usize = 12;
 
 /// Read and check a table's 12-byte header, returning `(count, stride)`, where
 /// `stride` is 12 for an index table and 28 for the policy table.
+/// The same check against a [`Source`], reading only the header rather than
+/// requiring the whole array in hand — which a remote source cannot give.
+pub fn check_array_header_src<S: Source>(src: &S, what: &str, stride: usize) -> Result<u64> {
+    if src.size() < ARRAY_HEADER as u64 {
+        bail!("{what} is too short to hold a header");
+    }
+    let head = src.read(0, ARRAY_HEADER)?;
+    let v = u32::from_le_bytes(head[0..4].try_into().expect("4 bytes"));
+    if v != LAYOUT_VERSION {
+        bail!("{what} is layout_version {v}; this build reads {LAYOUT_VERSION}");
+    }
+    let n = u64::from_le_bytes(head[4..12].try_into().expect("8 bytes"));
+    let want = ARRAY_HEADER as u64 + stride as u64 * n;
+    if src.size() != want {
+        bail!("{what} is {} B; {n} entries need {want}", src.size());
+    }
+    Ok(n)
+}
+
+/// One 12-byte `{u64 prefix, u32 row}` entry, read through a [`Source`].
+pub fn entry_at_src<S: Source>(src: &S, i: u64) -> Result<(u64, u32)> {
+    let b = src.read(ARRAY_HEADER as u64 + 12 * i, 12)?;
+    Ok((
+        u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
+        u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
+    ))
+}
+
 pub fn check_array_header(bytes: &[u8], what: &str, stride: usize) -> Result<u64> {
     if bytes.len() < ARRAY_HEADER {
         bail!("{what} is too short to hold a header");
@@ -949,8 +1000,8 @@ pub fn bucket_at(bytes: &[u8], b: usize) -> u32 {
 /// Read `bucket(b)` through the mapping rather than copied into a `Vec<u32>`:
 /// the array is 8 MB, it is the hot path of every lookup, and the page cache
 /// holds the one or two pages a lookup touches.
-pub struct Directory {
-    bytes: memmap2::Mmap,
+pub struct Directory<S = crate::source::MmapSource> {
+    src: S,
     n_buckets: usize,
 }
 
@@ -976,11 +1027,7 @@ impl<S: Source> Directory<S> {
             bail!("directory has layout {v} / DIR_BITS {dbits}");
         }
         if src.size() != directory_bytes() as u64 {
-            bail!(
-                "directory is {} B, not {}",
-                src.size(),
-                directory_bytes()
-            );
+            bail!("directory is {} B, not {}", src.size(), directory_bytes());
         }
         drop(head);
         Ok(Directory {
@@ -1012,26 +1059,32 @@ impl<S: Source> Directory<S> {
     /// is deliberate rather than duplicated logic: one protects a serving path
     /// and only needs to refuse, the other audits an artifact and wants a number
     /// to report. They share `bucket_at` and nothing else needs to.
-    pub fn validate(&self, prefixes: impl Fn(usize) -> u64, entries: u64) -> Result<()> {
+    /// ⚠️ **Do not call this over a remote source.** It reads all 2^21 buckets
+    /// twice and probes the entry array per non-empty bucket — 73 ms over a
+    /// mapping, and *derived* ~2.1 M round trips remotely, which
+    /// `MITOS_AT_THE_EDGE.md` §4.2 calls impossible rather than slow. A remote
+    /// reader trusts a publish-time attestation instead; this stays for the box,
+    /// where it is the check that makes a lookup's range trustworthy.
+    pub fn validate(&self, prefixes: impl Fn(usize) -> Result<u64>, entries: u64) -> Result<()> {
         let mut prev = 0u32;
         for b in 0..self.n_buckets {
-            let v = self.bucket(b);
+            let v = self.bucket(b)?;
             if v < prev || u64::from(v) > entries {
                 bail!("directory is not a partition: bucket {b} is {v}, previous {prev}");
             }
             prev = v;
         }
         for b in 0..self.n_buckets {
-            let start = self.bucket(b) as usize;
+            let start = self.bucket(b)? as usize;
             let end = if b + 1 < self.n_buckets {
-                self.bucket(b + 1) as usize
+                self.bucket(b + 1)? as usize
             } else {
                 entries as usize
             };
             if start >= end {
                 continue;
             }
-            if (prefixes(start) >> (64 - DIR_BITS)) as usize != b {
+            if (prefixes(start)? >> (64 - DIR_BITS)) as usize != b {
                 bail!("directory bucket {b} starts at entry {start}, whose prefix is not in it");
             }
         }
@@ -1039,15 +1092,15 @@ impl<S: Source> Directory<S> {
     }
 
     /// `[start, end)` for the bucket a prefix falls in.
-    pub fn range_for(&self, prefix: u64) -> std::ops::Range<usize> {
+    pub fn range_for(&self, prefix: u64) -> Result<std::ops::Range<usize>> {
         let b = (prefix >> (64 - DIR_BITS)) as usize;
-        let start = self.bucket(b) as usize;
+        let start = self.bucket(b)? as usize;
         let end = if b + 1 < self.n_buckets {
-            self.bucket(b + 1) as usize
+            self.bucket(b + 1)? as usize
         } else {
             usize::MAX
         };
-        start..end
+        Ok(start..end)
     }
 }
 

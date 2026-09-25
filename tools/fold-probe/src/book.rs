@@ -954,8 +954,11 @@ fn row_policy_prefixes(
         skip.clear();
         skip.resize(nl[0] as usize + 8, 0);
         f.read_exact(&mut skip).map_err(|_| RowRead::Short)?;
-        let policy = policies.get(u32::from_le_bytes(id)).ok_or(RowRead::Short)?;
-        let prefix = live_book::Asset::prefix(policy);
+        let policy = policies
+            .get(u32::from_le_bytes(id))
+            .map_err(|_| RowRead::Short)?
+            .ok_or(RowRead::Short)?;
+        let prefix = live_book::Asset::prefix(&policy);
         if out.last() != Some(&prefix) {
             out.push(prefix);
         }
