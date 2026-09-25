@@ -31,11 +31,13 @@ mitos-meter = { path = "../../crates/mitos-meter" }
 tx-index = { path = "../../crates/tx-index" }
 mitos-chain-walk = { path = "../mitos-chain-walk" }
 
-# The platform's metadata decode, so the probe measures the pipeline that will
-# actually run: `cip25_metadata_value` reads the raw document out of the aux
-# CBOR and `asset_from_metadata_value` is the v2 extractor the live modules and
-# collection-ownership already run. Both are in `[workspace.dependencies]`, so
-# the "no new external crates" rule above still holds.
+# The metadata readers, both of them: `cip25_metadata_value` /
+# `asset_from_metadata_value` are the document path the live modules and
+# collection-ownership run, and `decode_document` is the direct `Metadatum` walk
+# that replaced the probe's own copy of it. The comparison is between two readers
+# of one crate rather than between a crate and a probe, which is what made the
+# move worth doing. In `[workspace.dependencies]`, so the "no new external
+# crates" rule above still holds.
 cardano-assets = { workspace = true }
 hex = { workspace = true }
 

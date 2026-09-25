@@ -72,6 +72,19 @@ use crate::format::{
 /// an object — has nothing to coalesce.
 pub const DEFAULT_PART: u64 = 1 << 20;
 
+/// The manifest's object key.
+///
+/// ⚠️ **Carries [`PART_EXT`] for exactly the same reason the parts do**, and it was
+/// missed when they gained it: Cloudflare's cache eligibility is extension-based, so
+/// a key of plain `attestation` returns `cf-cache-status: DYNAMIC` forever and every
+/// read of it is an origin round trip. Measured 2026-09-25 — it was the **most
+/// expensive hop** in a client-direct query, not an average one: taking it off the
+/// critical path saved 266 ms where the other hops cost ~110 ms each.
+///
+/// A zone Cache Rule over `book/*` would fix this and any future file more
+/// generally; naming is what a publisher can do on its own.
+pub const ATTESTATION_FILE: &str = "attestation.bin";
+
 /// The extension every part key carries.
 ///
 /// ⚠️ **Not cosmetic — it is what makes a part CDN-cacheable.** Measured
@@ -353,7 +366,7 @@ fn split_file(src: &Path, out: &Path, name: &str, part_size: u64) -> Result<Part
     })
 }
 
-/// Lay a book out for upload: `out/<file>/NNNNN.bin` plus `out/attestation`.
+/// Lay a book out for upload: `out/<file>/NNNNN.bin` plus the manifest.
 ///
 /// `validated` should be the result of actually opening the book locally — the
 /// caller does that, because opening it is what proves the directories partition
@@ -405,14 +418,14 @@ pub fn publish(book: &Path, out: &Path, validated: bool, part_size: u64) -> Resu
         meta: meta_text,
         validated,
     };
-    let path = out.join("attestation");
+    let path = out.join(ATTESTATION_FILE);
     std::fs::write(&path, att.render()).with_context(|| format!("writing {}", path.display()))?;
     Ok(att)
 }
 
 /// Every object key a published book consists of, for an uploader to walk.
 pub fn keys(att: &Attestation) -> Vec<PathBuf> {
-    let mut out = vec![PathBuf::from("attestation")];
+    let mut out = vec![PathBuf::from(ATTESTATION_FILE)];
     for f in &att.files {
         for p in 0..f.parts {
             out.push(PathBuf::from(part_key(&f.name, p)));
