@@ -64,7 +64,8 @@ use anyhow::{Context, Result, bail};
 // the raw document out of the aux CBOR, and `asset_from_metadata_value` is the
 // v2 extractor the live modules and collection-ownership run — so the number
 // this probe reports is the number they will see.
-use cardano_assets::{asset_from_metadata_value, cip25_metadata_value};
+use cardano_assets::extract::{FieldClass, classify_field};
+use cardano_assets::{Traits, asset_from_metadata_value, cip25_metadata_value};
 use clap::{Args, Parser, Subcommand};
 // Through the walker's re-export rather than a new `chain-decode` dependency:
 // it is the same symbol, and a probe should not be a reason to edit a manifest.
@@ -75,7 +76,7 @@ use mitos_chain_walk::mithril::CHUNK_SLOTS;
 use mitos_meter::{Meter, Op, Run, human};
 use pallas_addresses::byron::AddressPayload;
 use pallas_codec::minicbor::Decoder;
-use pallas_codec::utils::Nullable;
+use pallas_codec::utils::{KeyValuePairs, Nullable};
 use pallas_primitives::conway::DatumOption;
 use pallas_primitives::{Hash, Metadata, Metadatum, alonzo, babbage, conway};
 use pallas_traverse::{
@@ -215,11 +216,35 @@ struct Cip25Args {
     /// uncapped store-wide count, at ~150 B of memory a pair.
     #[arg(long, default_value_t = 4_000_000)]
     trait_cap: u64,
-    /// Stop after `cardano-assets` has read the raw document: no v2 extractor,
-    /// no traits. The A/B that separates the crate's decode share of the pass
-    /// from the extractor's — same chunks, same walk, one fewer stage.
-    #[arg(long)]
-    skip_extract: bool,
+    /// Which trait walk to run. `compare` runs both walks on every asset and
+    /// counts the disagreements — slower than either, and the evidence that
+    /// decides whether the direct walk can replace the JSON one.
+    #[arg(long, value_enum, default_value_t = Extract::Platform)]
+    extract: Extract,
+}
+
+/// Which trait walk `cip25` runs.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Extract {
+    /// `cardano-assets` end to end: raw document → `AssetEnvelope` → traits.
+    Platform,
+    /// The crate's value decode alone, no extractor — isolates the raw decode.
+    Value,
+    /// Traits straight off the `Metadatum`, no JSON document at all.
+    Fast,
+    /// Both walks on every asset, compared asset by asset.
+    Compare,
+}
+
+impl Extract {
+    fn name(self) -> &'static str {
+        match self {
+            Extract::Platform => "platform (cardano-assets, JSON path)",
+            Extract::Value => "value (the crate's raw decode, no extractor)",
+            Extract::Fast => "fast (direct Metadatum walk)",
+            Extract::Compare => "compare (both walks, asset by asset)",
+        }
+    }
 }
 
 #[derive(Args)]
@@ -2716,6 +2741,7 @@ fn cip25(a: Cip25Args) -> Result<()> {
         all.len()
     );
     println!("  threads     {threads}");
+    println!("  extract     {}", a.extract.name());
     println!();
 
     let queue: Mutex<VecDeque<u16>> = Mutex::new(todo.iter().copied().collect());
@@ -2730,6 +2756,13 @@ fn cip25(a: Cip25Args) -> Result<()> {
     let md_missed = AtomicU64::new(0);
     let md_undecodable = AtomicU64::new(0);
     let key_unresolved = AtomicU64::new(0);
+    let fast_skipped = AtomicU64::new(0);
+    let cmp_equal = AtomicU64::new(0);
+    let cmp_differ = AtomicU64::new(0);
+    let cmp_rejected = AtomicU64::new(0);
+    let cmp_skipped = AtomicU64::new(0);
+    let cmp_both = AtomicU64::new(0);
+    let cmp_examples: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let trait_assets = AtomicU64::new(0);
     let attr_pairs = AtomicU64::new(0);
     let attr_hist: [AtomicU64; 16] = std::array::from_fn(|_| AtomicU64::new(0));
@@ -2742,7 +2775,7 @@ fn cip25(a: Cip25Args) -> Result<()> {
     // A cap so a whole-store sample cannot exhaust memory on (policy, trait,
     // value) triples; the run says so if it bites.
     let trait_cap = a.trait_cap;
-    let skip_extract = a.skip_extract;
+    let extract = a.extract;
 
     std::thread::scope(|s| -> Result<()> {
         let handles: Vec<_> = (0..threads)
@@ -2758,6 +2791,9 @@ fn cip25(a: Cip25Args) -> Result<()> {
                     let mut l_missed = 0u64;
                     let mut l_undecodable = 0u64;
                     let mut l_unresolved = 0u64;
+                    let mut l_fast_skipped = 0u64;
+                    let mut l_cmp = [0u64; 5];
+                    let mut l_cmp_examples: Vec<String> = Vec::new();
                     let mut l_trait_assets = 0u64;
                     let mut l_pairs = 0u64;
                     let mut l_hist = [0u64; 16];
@@ -2826,36 +2862,70 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                             seen.0 += 1;
                                             continue;
                                         };
+                                        if extract == Extract::Fast {
+                                            let Some(fast) = fast_metadatum_traits(value) else {
+                                                l_fast_skipped += 1;
+                                                continue;
+                                            };
+                                            l_decoded += 1;
+                                            tally_traits(
+                                                &fast,
+                                                policy,
+                                                &mut l_pairs,
+                                                &mut l_hist,
+                                                &mut l_trait_assets,
+                                                &mut l_traits,
+                                            );
+                                            continue;
+                                        }
                                         let Some(document) =
                                             cip25_metadata_value(aux, policy, &name)
                                         else {
                                             l_missed += 1;
                                             continue;
                                         };
-                                        if skip_extract {
+                                        if extract == Extract::Value {
                                             l_decoded += 1;
                                             continue;
                                         }
-                                        let Ok(asset) = asset_from_metadata_value(document) else {
+                                        let asset = asset_from_metadata_value(document);
+                                        if extract == Extract::Compare {
+                                            let fast = fast_metadatum_traits(value);
+                                            match (&asset, &fast) {
+                                                (Ok(a), Some(f))
+                                                    if a.traits.inner() == f.inner() =>
+                                                {
+                                                    l_cmp[0] += 1;
+                                                }
+                                                (Ok(a), Some(f)) => {
+                                                    l_cmp[1] += 1;
+                                                    if l_cmp_examples.len() < 4 {
+                                                        l_cmp_examples.push(format!(
+                                                            "{}/{} {}",
+                                                            hex_of(policy),
+                                                            display_name(&name),
+                                                            trait_diff(&a.traits, f)
+                                                        ));
+                                                    }
+                                                }
+                                                (Err(_), Some(_)) => l_cmp[2] += 1,
+                                                (Ok(_), None) => l_cmp[3] += 1,
+                                                (Err(_), None) => l_cmp[4] += 1,
+                                            }
+                                        }
+                                        let Ok(asset) = asset else {
                                             l_undecodable += 1;
                                             continue;
                                         };
                                         l_decoded += 1;
-                                        let pairs: Vec<(String, String)> = asset
-                                            .traits
-                                            .iter()
-                                            .flat_map(|(t, values)| {
-                                                values.iter().map(move |v| (t.clone(), v.clone()))
-                                            })
-                                            .collect();
-                                        if !pairs.is_empty() {
-                                            l_trait_assets += 1;
-                                        }
-                                        l_pairs += pairs.len() as u64;
-                                        l_hist[pairs.len().min(15)] += 1;
-                                        for (t, v) in pairs {
-                                            l_traits.push((policy.clone(), t, v));
-                                        }
+                                        tally_traits(
+                                            &asset.traits,
+                                            policy,
+                                            &mut l_pairs,
+                                            &mut l_hist,
+                                            &mut l_trait_assets,
+                                            &mut l_traits,
+                                        );
                                     }
                                 }
                             }
@@ -2885,6 +2955,13 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                 seen.0 += n;
                             }
                         }
+                        if !l_cmp_examples.is_empty() {
+                            let mut ex = cmp_examples.lock().expect("examples");
+                            if ex.len() < 8 {
+                                ex.extend(l_cmp_examples.drain(..));
+                            }
+                            l_cmp_examples.clear();
+                        }
                         for (k, n) in l_hist.iter().enumerate() {
                             if *n > 0 {
                                 attr_hist[k].fetch_add(*n, Ordering::Relaxed);
@@ -2902,6 +2979,12 @@ fn cip25(a: Cip25Args) -> Result<()> {
                         md_missed.fetch_add(l_missed, Ordering::Relaxed);
                         md_undecodable.fetch_add(l_undecodable, Ordering::Relaxed);
                         key_unresolved.fetch_add(l_unresolved, Ordering::Relaxed);
+                        fast_skipped.fetch_add(l_fast_skipped, Ordering::Relaxed);
+                        cmp_equal.fetch_add(l_cmp[0], Ordering::Relaxed);
+                        cmp_differ.fetch_add(l_cmp[1], Ordering::Relaxed);
+                        cmp_rejected.fetch_add(l_cmp[2], Ordering::Relaxed);
+                        cmp_skipped.fetch_add(l_cmp[3], Ordering::Relaxed);
+                        cmp_both.fetch_add(l_cmp[4], Ordering::Relaxed);
                         trait_assets.fetch_add(l_trait_assets, Ordering::Relaxed);
                         attr_pairs.fetch_add(l_pairs, Ordering::Relaxed);
                         l_txs = 0;
@@ -2914,6 +2997,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
                         l_missed = 0;
                         l_undecodable = 0;
                         l_unresolved = 0;
+                        l_fast_skipped = 0;
+                        l_cmp = [0u64; 5];
                         l_trait_assets = 0;
                         l_pairs = 0;
                         if d.is_multiple_of(50) || d == total {
@@ -2951,6 +3036,15 @@ fn cip25(a: Cip25Args) -> Result<()> {
         key_unresolved.load(Ordering::Relaxed),
         trait_assets.load(Ordering::Relaxed),
     );
+    let (fast_skip, cmp_e, cmp_d, cmp_r, cmp_s, cmp_b) = (
+        fast_skipped.load(Ordering::Relaxed),
+        cmp_equal.load(Ordering::Relaxed),
+        cmp_differ.load(Ordering::Relaxed),
+        cmp_rejected.load(Ordering::Relaxed),
+        cmp_skipped.load(Ordering::Relaxed),
+        cmp_both.load(Ordering::Relaxed),
+    );
+    let comparisons = cmp_examples.into_inner().expect("examples");
     let chunks = done.load(Ordering::Relaxed).max(1);
     let n_policies = policies.lock().expect("policies").len();
     let guard = traits.lock().expect("traits");
@@ -2980,12 +3074,16 @@ fn cip25(a: Cip25Args) -> Result<()> {
         md_b as f64 / chunks as f64 * all.len() as f64 / 2f64.powi(30),
         all.len()
     );
+    let walk = match extract {
+        Extract::Fast => "by the direct Metadatum walk",
+        _ => "through cardano-assets",
+    };
     println!(
-        "  decode     {decoded} of {assets} assets through cardano-assets ({:.1}%)",
+        "  decode     {decoded} of {assets} assets {walk} ({:.1}%)",
         100.0 * decoded as f64 / assets.max(1) as f64
     );
     println!(
-        "             skipped    {unresolved} key unresolved · {missed} not found by the decoder · {undecodable} rejected by the v2 extractor"
+        "             skipped    {unresolved} key unresolved · {missed} not found by the decoder · {undecodable} rejected by the v2 extractor · {fast_skip} declined by the walk"
     );
     let lost = unresolved_kind.into_inner().expect("unresolved kinds");
     if !lost.is_empty() {
@@ -3019,6 +3117,16 @@ fn cip25(a: Cip25Args) -> Result<()> {
             ""
         }
     );
+    if extract == Extract::Compare {
+        let compared = cmp_e + cmp_d + cmp_r + cmp_s + cmp_b;
+        println!(
+            "  compare    {cmp_e} equal ({:.1}%) · {cmp_d} differ · {cmp_r} the crate rejected what the walk extracted · {cmp_s} the walk declined · {cmp_b} both rejected",
+            100.0 * cmp_e as f64 / compared.max(1) as f64
+        );
+        for line in &comparisons {
+            println!("             differ     {line}");
+        }
+    }
     println!("             biggest collections by distinct pairs:");
     for (n, policy) in top.iter().take(8) {
         println!("               {policy}  {n} pairs");
@@ -3100,6 +3208,355 @@ fn example_of(k: &Metadatum) -> String {
         Metadatum::Map(_) => "<map>".to_string(),
     };
     text.chars().take(24).collect()
+}
+
+// ---------------------------------------------------------------------------
+// The fast trait walk
+//
+// `cardano-assets`' v2 extractor is applied to a `serde_json::Value`: the aux
+// CBOR is decoded per asset, rendered to a document, and deserialized back into
+// `AssetEnvelope`. The classification itself — which fields are envelope, facet,
+// provenance or trait — is the crate's, and this walk takes it from the crate's
+// own [`classify_field`] so it cannot drift. What is mirrored here is the *shape*
+// dispatch and the value coercion (`extract::extract_traits` at rev `f24eb797`),
+// applied to the `Metadatum` the walk already holds.
+// ---------------------------------------------------------------------------
+
+/// Slot key order, as the crate's `SLOT_KEYS` declares it: the first key in this
+/// order that exists *and* has a recognised shape wins, and one that exists with
+/// an unrecognised shape falls through to the next.
+const SLOT_KEYS: [&str; 3] = ["traits", "attributes", "properties"];
+
+/// The keys `AssetEnvelope` consumes before trait extraction — field names and
+/// aliases, matched case-sensitively as serde matches them.
+const ENVELOPE_CONSUMED: [&str; 8] = [
+    "name",
+    "Name",
+    "title",
+    "image",
+    "media_type",
+    "mediaType",
+    "mediatype",
+    "files",
+];
+
+/// `extract_traits`' registry filter: unknown fields are visual traits, facets
+/// only when surfaced (rarity/tier), envelope and provenance never.
+fn trait_eligible(key: &str) -> bool {
+    match classify_field(key) {
+        None => true,
+        Some(FieldClass::Facet { surface }) => surface,
+        Some(FieldClass::Envelope | FieldClass::Provenance) => false,
+    }
+}
+
+/// The slot shapes `classify_slot` recognises, on a `Metadatum` this time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotShape {
+    Map,
+    Codified,
+    ObjectArray,
+    ColonDelimited,
+}
+
+fn classify_slot(value: &Metadatum) -> Option<SlotShape> {
+    match value {
+        Metadatum::Map(_) => Some(SlotShape::Map),
+        Metadatum::Array(items) if !items.is_empty() => {
+            if items.iter().all(|i| matches!(i, Metadatum::Map(_))) {
+                let codified = items.iter().all(|i| {
+                    let Metadatum::Map(kv) = i else {
+                        return false;
+                    };
+                    let has = |want: &str| kv.iter().any(|(k, _)| json_key(k) == want);
+                    has("value") && (has("trait_type") || has("name"))
+                });
+                Some(if codified {
+                    SlotShape::Codified
+                } else {
+                    SlotShape::ObjectArray
+                })
+            } else if items.iter().all(is_json_string) {
+                let any_colon = items
+                    .iter()
+                    .any(|i| json_string_value(i).is_some_and(|s| s.contains(':')));
+                any_colon.then_some(SlotShape::ColonDelimited)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The document path renders text and bytes as JSON strings; the shape tests
+/// care which.
+fn is_json_string(m: &Metadatum) -> bool {
+    matches!(m, Metadatum::Text(_) | Metadatum::Bytes(_))
+}
+
+/// A JSON string value as the document path sees it — text as itself, bytes as
+/// UTF-8 or `0x…` hex.
+fn json_string_value(m: &Metadatum) -> Option<String> {
+    match m {
+        Metadatum::Text(s) => Some(s.clone()),
+        Metadatum::Bytes(b) => Some(rendered_bytes(b)),
+        _ => None,
+    }
+}
+
+/// A metadata key as the document path renders it (`metadatum_key`) — that
+/// string is what the registry is matched against, so it is what this walk uses.
+fn json_key(k: &Metadatum) -> String {
+    match k {
+        Metadatum::Text(s) => s.clone(),
+        Metadatum::Bytes(b) => rendered_bytes(b),
+        Metadatum::Int(i) => i128::from(*i).to_string(),
+        Metadatum::Array(_) | Metadatum::Map(_) => "<complex-key>".to_string(),
+    }
+}
+
+/// Bytes as the document path renders them: UTF-8 when they are, `0x…` if not.
+fn rendered_bytes(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) => s.to_owned(),
+        Err(_) => format!("0x{}", hex::encode(b)),
+    }
+}
+
+/// `json_to_strings`: scalars to one trimmed string, arrays to their scalar
+/// elements, objects and empties to nothing.
+fn json_strings(v: &Metadatum) -> Vec<String> {
+    match v {
+        Metadatum::Text(s) => trimmed(s),
+        Metadatum::Bytes(b) => trimmed(&rendered_bytes(b)),
+        Metadatum::Int(i) => vec![i128::from(*i).to_string()],
+        Metadatum::Array(items) => items
+            .iter()
+            .flat_map(|item| match item {
+                Metadatum::Text(s) => trimmed(s),
+                Metadatum::Bytes(b) => trimmed(&rendered_bytes(b)),
+                Metadatum::Int(i) => vec![i128::from(*i).to_string()],
+                _ => Vec::new(),
+            })
+            .collect(),
+        Metadatum::Map(_) => Vec::new(),
+    }
+}
+
+fn trimmed(s: &str) -> Vec<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        Vec::new()
+    } else {
+        vec![t.to_string()]
+    }
+}
+
+/// `insert_if_present`: a trait goes in only when the value coerces to something.
+fn insert_if_present(traits: &mut Traits, key: String, value: &Metadatum) {
+    let values = json_strings(value);
+    if !values.is_empty() {
+        traits.insert_vec(key, values);
+    }
+}
+
+/// The first structured slot's value, or `None` for the flat path.
+fn slot_value(pairs: &KeyValuePairs<Metadatum, Metadatum>) -> Option<&Metadatum> {
+    for slot in SLOT_KEYS {
+        if let Some(v) = pairs
+            .iter()
+            .find(|(k, _)| json_key(k).to_lowercase() == slot)
+            .map(|(_, v)| v)
+            && classify_slot(v).is_some()
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// `flat_all`: every top-level field the envelope did not consume.
+fn flat_all(pairs: &KeyValuePairs<Metadatum, Metadatum>) -> Traits {
+    let mut traits = Traits::new();
+    for (k, v) in pairs.iter() {
+        let key = json_key(k);
+        if !ENVELOPE_CONSUMED.contains(&key.as_str()) {
+            insert_if_present(&mut traits, key, v);
+        }
+    }
+    traits
+}
+
+/// `extract_slot`, over a `Metadatum`.
+fn extract_slot(value: &Metadatum) -> Traits {
+    let mut traits = Traits::new();
+    match classify_slot(value) {
+        Some(SlotShape::Map) => {
+            if let Metadatum::Map(map) = value {
+                for (k, v) in map.iter() {
+                    insert_if_present(&mut traits, json_key(k), v);
+                }
+            }
+        }
+        Some(SlotShape::Codified) => {
+            if let Metadatum::Array(items) = value {
+                for item in items.iter() {
+                    let Metadatum::Map(kv) = item else { continue };
+                    let find = |want: &str| kv.iter().find(|(k, _)| json_key(k) == want);
+                    // `trait_type` wins if present, and the key must be a JSON
+                    // string — exactly what `.as_str()` demands upstream.
+                    let key = find("trait_type")
+                        .or_else(|| find("name"))
+                        .and_then(|(_, v)| json_string_value(v));
+                    let (Some(key), Some((_, val))) = (key, find("value")) else {
+                        continue;
+                    };
+                    insert_if_present(&mut traits, key, val);
+                }
+            }
+        }
+        Some(SlotShape::ObjectArray) => {
+            if let Metadatum::Array(items) = value {
+                for item in items.iter() {
+                    let Metadatum::Map(kv) = item else { continue };
+                    for (k, v) in kv.iter() {
+                        insert_if_present(&mut traits, json_key(k), v);
+                    }
+                }
+            }
+        }
+        Some(SlotShape::ColonDelimited) => {
+            if let Metadatum::Array(items) = value {
+                for item in items.iter() {
+                    let Some(s) = json_string_value(item) else {
+                        continue;
+                    };
+                    let Some((key, val)) = s.split_once(':') else {
+                        continue;
+                    };
+                    let (key, val) = (key.trim(), val.trim());
+                    if !key.is_empty() && !val.is_empty() {
+                        traits.insert_single(key.to_string(), val.to_string());
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    traits
+}
+
+/// Whether `unsigs` is the structure the crate's bespoke branch takes
+/// (`UnsigData` = index, num_props, properties). Declining on the key alone
+/// would mis-handle any collection that uses the name for something else; a
+/// wrong decline here is counted by `--extract compare`, not silent.
+fn unsig_shaped(v: &Metadatum) -> bool {
+    let Metadatum::Map(kv) = v else {
+        return false;
+    };
+    let has = |want: &str| kv.iter().any(|(k, _)| json_key(k) == want);
+    has("index") && has("num_props") && has("properties")
+}
+
+/// The v2 trait walk, straight off the `Metadatum`: no document, no per-asset
+/// re-decode. `None` = declined, which is the unsigned_algorithms shape the
+/// crate handles bespoke.
+///
+/// A prototype with a witness: `--extract compare` runs this and the platform
+/// decoder over every asset and counts the disagreements, so replacing the JSON
+/// path is a decision about a number rather than about this comment.
+fn fast_metadatum_traits(value: &Metadatum) -> Option<Traits> {
+    let Metadatum::Map(pairs) = value else {
+        return None;
+    };
+    if pairs
+        .iter()
+        .any(|(k, v)| json_key(k) == "unsigs" && unsig_shaped(v))
+    {
+        return None;
+    }
+    let mut traits = match slot_value(pairs) {
+        Some(v) => extract_slot(v),
+        None => flat_all(pairs),
+    };
+    traits.inner_mut().retain(|k, _| trait_eligible(k));
+
+    // Facet surfacing (rarity/tier) — `extract_traits`' second pass.
+    for (k, v) in pairs.iter() {
+        let key = json_key(k);
+        if matches!(
+            classify_field(&key),
+            Some(FieldClass::Facet { surface: true })
+        ) && !traits.contains_key(&key)
+        {
+            insert_if_present(&mut traits, key, v);
+        }
+    }
+    Some(traits)
+}
+
+/// Fold one asset's traits into the run's counters and per-collection sets.
+fn tally_traits(
+    traits: &Traits,
+    policy: &[u8],
+    pairs: &mut u64,
+    hist: &mut [u64; 16],
+    trait_assets: &mut u64,
+    rows: &mut Vec<(Vec<u8>, String, String)>,
+) {
+    let mut n = 0u64;
+    for (t, values) in traits.iter() {
+        for v in values {
+            *pairs += 1;
+            n += 1;
+            rows.push((policy.to_vec(), t.clone(), v.clone()));
+        }
+    }
+    if n > 0 {
+        *trait_assets += 1;
+    }
+    hist[(n as usize).min(15)] += 1;
+}
+
+/// An asset name for a report line: UTF-8 when it is, hex when it is not.
+fn display_name(name: &[u8]) -> String {
+    match std::str::from_utf8(name) {
+        Ok(s) => s.to_owned(),
+        Err(_) => format!("0x{}", hex::encode(name)),
+    }
+}
+
+/// How two walks' trait sets differ — key names, because a key that should not
+/// be a trait at all is the usual failure.
+fn trait_diff(platform: &Traits, fast: &Traits) -> String {
+    fn list(keys: &[&str]) -> String {
+        let shown: Vec<&str> = keys.iter().copied().take(5).collect();
+        let more = if keys.len() > shown.len() { ",…" } else { "" };
+        format!("[{}{more}]", shown.join(","))
+    }
+    let only_platform: Vec<&str> = platform
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !fast.contains_key(k))
+        .collect();
+    let only_fast: Vec<&str> = fast
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !platform.contains_key(k))
+        .collect();
+    let differing: Vec<&str> = platform
+        .inner()
+        .iter()
+        .filter(|(k, v)| fast.inner().get(*k).is_some_and(|fv| fv != *v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    format!(
+        "platform-only {} · fast-only {} · values differ {}",
+        list(&only_platform),
+        list(&only_fast),
+        list(&differing)
+    )
 }
 
 fn lookup(a: LookupArgs) -> Result<()> {
@@ -4464,6 +4921,149 @@ fn kb_field(text: &str, key: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::delta::Tier;
+
+    fn text(s: &str) -> Metadatum {
+        Metadatum::Text(s.to_string())
+    }
+
+    fn map(pairs: Vec<(&str, Metadatum)>) -> Metadatum {
+        Metadatum::Map(KeyValuePairs::Def(
+            pairs.into_iter().map(|(k, v)| (text(k), v)).collect(),
+        ))
+    }
+
+    /// A CBOR small integer (`0x00`..`0x17` are 0..23), so a test can carry an
+    /// integer value without reaching for pallas's `Int` constructor.
+    fn int(n: u8) -> Metadatum {
+        assert!(n < 24, "small ints only");
+        pallas_codec::minicbor::decode::<Metadatum>(&[n]).expect("small int decodes")
+    }
+
+    /// The fast walk classifies through the crate's own registry, so the fields
+    /// that are never traits stay out of the set.
+    #[test]
+    fn fast_walk_applies_the_registry() {
+        let doc = map(vec![
+            ("name", text("Luffy")),
+            ("image", text("ipfs://x")),
+            ("description", text("a pirate")),
+            ("id", text("42")),
+            ("Background", text("Frost Realm")),
+            ("Class", text("Archer")),
+            ("Rarity", text("Epic")),
+        ]);
+        let traits = fast_metadatum_traits(&doc).expect("flat map");
+        assert_eq!(
+            traits.get_single("Background").as_deref(),
+            Some("Frost Realm")
+        );
+        assert_eq!(traits.get_single("Class").as_deref(), Some("Archer"));
+        assert_eq!(traits.get_single("Rarity").as_deref(), Some("Epic"));
+        assert!(!traits.contains_key("name"));
+        assert!(!traits.contains_key("image"));
+        assert!(!traits.contains_key("description"));
+        assert!(!traits.contains_key("id"));
+    }
+
+    /// A recognised slot wins over the flat fields, and the codified shape reads
+    /// `trait_type` (or `name`) with `value`.
+    #[test]
+    fn fast_walk_reads_a_codified_slot_and_ignores_flat_fields() {
+        let doc = map(vec![
+            ("name", text("N")),
+            (
+                "attributes",
+                Metadatum::Array(vec![
+                    map(vec![
+                        ("trait_type", text("Class")),
+                        ("value", text("Archer")),
+                    ]),
+                    map(vec![("name", text("Eyes")), ("value", text("Red"))]),
+                ]),
+            ),
+            ("Stray", text("not a trait, a slot won")),
+        ]);
+        let traits = fast_metadatum_traits(&doc).expect("slot");
+        assert_eq!(traits.get_single("Class").as_deref(), Some("Archer"));
+        assert_eq!(traits.get_single("Eyes").as_deref(), Some("Red"));
+        assert!(!traits.contains_key("Stray"));
+    }
+
+    /// A `properties`/`traits` slot of colon-delimited strings, trimmed on both
+    /// sides, with the non-conforming entry simply not a trait.
+    #[test]
+    fn fast_walk_reads_a_colon_delimited_slot() {
+        let doc = map(vec![(
+            "properties",
+            Metadatum::Array(vec![
+                text("State: Delusional"),
+                text("Mood:  Calm "),
+                text("no colon"),
+            ]),
+        )]);
+        let traits = fast_metadatum_traits(&doc).expect("slot");
+        assert_eq!(traits.get_single("State").as_deref(), Some("Delusional"));
+        assert_eq!(traits.get_single("Mood").as_deref(), Some("Calm"));
+        assert_eq!(traits.keys().count(), 2);
+    }
+
+    /// Values coerce the way the document path coerces them: an integer is a
+    /// decimal string, an array is multi-valued and trims, and an empty string
+    /// or a nested object is not a trait at all.
+    #[test]
+    fn fast_walk_coerces_values_like_the_document() {
+        let doc = map(vec![
+            ("Level", int(15)),
+            ("Empty", text("")),
+            ("Nested", map(vec![("Inner", text("dropped"))])),
+            (
+                "Layers",
+                Metadatum::Array(vec![text(" A "), text(""), text("B")]),
+            ),
+        ]);
+        let traits = fast_metadatum_traits(&doc).expect("flat map");
+        assert_eq!(traits.get_single("Level").as_deref(), Some("15"));
+        assert_eq!(
+            traits.get("Layers"),
+            Some(&vec!["A".to_string(), "B".to_string()])
+        );
+        assert!(!traits.contains_key("Empty"));
+        assert!(!traits.contains_key("Nested"));
+    }
+
+    /// The unsigned_algorithms shape is the crate's bespoke branch, so the walk
+    /// declines rather than guessing — and says so, because `compare` counts it.
+    #[test]
+    fn fast_walk_declines_the_unsig_shape() {
+        let doc = map(vec![
+            ("series", text("Series 1")),
+            (
+                "unsigs",
+                map(vec![
+                    ("index", int(1)),
+                    ("num_props", int(3)),
+                    ("properties", map(vec![("Colour", text("Red"))])),
+                ]),
+            ),
+        ]);
+        assert!(fast_metadatum_traits(&doc).is_none());
+    }
+
+    /// A `721`-level key that is not a policy id is not a policy — and the two
+    /// forms of a real one must canonicalise to the same 28 bytes, or a
+    /// collection is counted twice.
+    #[test]
+    fn policy_keys_canonicalise_and_reject() {
+        let raw = [0xab; 28];
+        assert_eq!(
+            policy_bytes(&Metadatum::Bytes(raw.to_vec().into())),
+            Some(raw.to_vec())
+        );
+        assert_eq!(policy_bytes(&text(&hex::encode(raw))), Some(raw.to_vec()));
+        assert_eq!(policy_bytes(&text("asset")), None);
+        assert_eq!(policy_bytes(&text(&hex::encode(raw)[..54])), None);
+        assert_eq!(policy_bytes(&int(7)), None);
+    }
 
     /// The delta is the gap, and the gap is exactly what the book cannot answer.
     ///
