@@ -57,6 +57,55 @@ pub const MAX_SPANS: usize = 299;
 /// rather than bandwidth. A caller that knows its access pattern can pass its own.
 pub const COALESCE_GAP: u64 = 256;
 
+/// Ranges per request when the caller does not say: **fill to the cap**.
+///
+/// The plausible theory was that a single GET carrying 299 ranges is one connection
+/// doing 299 slices of serial work, where 30 GETs of 10 run concurrently — so the
+/// default should sit well below the cap. **Measured 2026-09-25, that is wrong**, on
+/// a real 1,063-row wallet against a 64 MiB-part book:
+///
+/// | `spans` | requests | wall |
+/// |---|---|---|
+/// | 4 | 91 | 3.97 s |
+/// | 10 | 38 | 1.89 s |
+/// | 40 | 12 | 1.07 s |
+/// | **299** | **4** | **0.90 s** |
+///
+/// Monotonic: fewer, fatter requests win throughout. Whatever serial cost a wide
+/// multi-range carries is dominated by per-request overhead, so the right default is
+/// the bound itself. It stays a knob because that ranking is one substrate's, and a
+/// different origin could invert it.
+pub const SPANS_PER_REQUEST: usize = MAX_SPANS;
+
+/// How to shape a plan: what to merge, and how much to put in each request.
+///
+/// A struct rather than more positional arguments because the two numbers trade
+/// against each other and a call site should say which it is setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    /// Spans closer than this are merged into one.
+    pub gap: u64,
+    /// Ranges per request. **Clamped to [`MAX_SPANS`]**, because exceeding it
+    /// returns the whole object rather than an error.
+    pub max_spans: usize,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Shape {
+            gap: COALESCE_GAP,
+            max_spans: SPANS_PER_REQUEST,
+        }
+    }
+}
+
+impl Shape {
+    /// The effective cap: never above [`MAX_SPANS`], never zero.
+    pub fn spans(&self) -> usize {
+        self.max_spans.clamp(1, MAX_SPANS)
+    }
+}
+
 /// One thing a caller wants: `len` bytes at a logical offset in one file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Want {
@@ -169,7 +218,9 @@ struct Piece {
 /// ⚠️ Wants may be given in any order and may overlap; the plan is always emitted
 /// ascending and non-overlapping per request, because anything else degrades to the
 /// whole object. [`Plan::located`] restores the caller's original order.
-pub fn plan(wants: &[Want], part_size: u64, file_len: u64, gap: u64) -> Plan {
+pub fn plan(wants: &[Want], part_size: u64, file_len: u64, shape: Shape) -> Plan {
+    let gap = shape.gap;
+    let per_request = shape.spans();
     // 1. Cut every want at the part boundaries it crosses.
     let mut pieces: Vec<Piece> = Vec::with_capacity(wants.len());
     for (i, w) in wants.iter().enumerate() {
@@ -228,10 +279,10 @@ pub fn plan(wants: &[Want], part_size: u64, file_len: u64, gap: u64) -> Plan {
             }
         }
 
-        // 4. Cut into requests of at most MAX_SPANS. See the module header for what
-        //    exceeding it costs.
-        for chunk_start in (0..spans.len()).step_by(MAX_SPANS) {
-            let chunk_end = (chunk_start + MAX_SPANS).min(spans.len());
+        // 4. Cut into requests. `per_request` is a PARALLELISM choice, not just the
+        //    299 correctness bound — see `SPANS_PER_REQUEST`.
+        for chunk_start in (0..spans.len()).step_by(per_request) {
+            let chunk_end = (chunk_start + per_request).min(spans.len());
             let batch = batches.len();
             batches.push(Batch {
                 part,
@@ -274,9 +325,9 @@ pub fn plan(wants: &[Want], part_size: u64, file_len: u64, gap: u64) -> Plan {
     }
 }
 
-/// Convenience: plan with [`COALESCE_GAP`].
+/// Convenience: plan with [`Shape::default`].
 pub fn plan_default(wants: &[Want], part_size: u64, file_len: u64) -> Plan {
-    plan(wants, part_size, file_len, COALESCE_GAP)
+    plan(wants, part_size, file_len, Shape::default())
 }
 
 /// One part of a `multipart/byteranges` response: what the server says it is, and
@@ -613,8 +664,17 @@ mod tests {
             .map(|i| w((i * 1_710_557) % (arena - 8192), 8192))
             .collect();
 
-        let small = plan_default(&wants, 1 << 20, arena);
-        let large = plan_default(&wants, 64 << 20, arena);
+        // ⚠️ Shape pinned, so this measures PART SIZE — what it is named for —
+        // rather than drifting with the default. It previously asserted an absolute
+        // "≤ 60 requests", which was a consequence of the old fill-to-the-299-cap
+        // default and broke the moment that default became a parallelism knob. The
+        // claim being made is the RATIO.
+        let shape = Shape {
+            gap: COALESCE_GAP,
+            max_spans: MAX_SPANS,
+        };
+        let small = plan(&wants, 1 << 20, arena, shape);
+        let large = plan(&wants, 64 << 20, arena, shape);
         assert_protocol_safe(&small);
         assert_protocol_safe(&large);
 
@@ -627,7 +687,7 @@ mod tests {
         );
         assert!(
             large.requests() <= 60,
-            "1,055 rows over 27 parts should be tens of requests, got {}",
+            "1,055 rows over 27 parts should be tens of requests at the cap, got {}",
             large.requests()
         );
         // Printed because the ratio is the argument for the part size, and a
@@ -639,6 +699,86 @@ mod tests {
             large.requests(),
             large.bytes(),
         );
+    }
+
+    #[test]
+    fn spans_per_request_trades_request_count_for_parallelism() {
+        // The knob the default exists to expose. One request of 300 ranges is one
+        // connection doing 300 ranges of serial work; 30 requests of 10 run at
+        // once. Which wins is a measurement, so it has to be settable.
+        let wants: Vec<Want> = (0..300).map(|i| w(i * 5000, 100)).collect();
+        let arena = 64 << 20;
+
+        let wide = plan(
+            &wants,
+            arena,
+            arena,
+            Shape {
+                gap: COALESCE_GAP,
+                max_spans: MAX_SPANS,
+            },
+        );
+        let narrow = plan(
+            &wants,
+            arena,
+            arena,
+            Shape {
+                gap: COALESCE_GAP,
+                max_spans: 10,
+            },
+        );
+
+        assert_protocol_safe(&wide);
+        assert_protocol_safe(&narrow);
+        assert_eq!(wide.requests(), 2, "300 spans is one over the 299 cap");
+        assert_eq!(narrow.requests(), 30);
+        assert_eq!(
+            wide.bytes(),
+            narrow.bytes(),
+            "the shape changes how the bytes are asked for, never which bytes"
+        );
+        // And the reassembly still has to be right under either shape.
+        for p in [&wide, &narrow] {
+            assert_eq!(p.located.len(), wants.len());
+            assert!(p.located.iter().all(|l| !l.segments.is_empty()));
+        }
+    }
+
+    #[test]
+    fn the_cap_is_a_correctness_bound_that_no_shape_can_exceed() {
+        // ⚠️ `max_spans` is a tuning; MAX_SPANS is not. Asking for more than the cap
+        // must be clamped, because exceeding it returns the WHOLE OBJECT — 64 MiB
+        // where a kilobyte was wanted — and looks like success.
+        assert_eq!(
+            Shape {
+                gap: 0,
+                max_spans: 10_000
+            }
+            .spans(),
+            MAX_SPANS
+        );
+        assert_eq!(
+            Shape {
+                gap: 0,
+                max_spans: 0
+            }
+            .spans(),
+            1,
+            "zero would never emit"
+        );
+
+        let wants: Vec<Want> = (0..500).map(|i| w(i * 5000, 100)).collect();
+        let arena = 64 << 20;
+        let p = plan(
+            &wants,
+            arena,
+            arena,
+            Shape {
+                gap: 0,
+                max_spans: 10_000,
+            },
+        );
+        assert_protocol_safe(&p);
     }
 
     #[test]

@@ -2785,6 +2785,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
     // names its variants or leaves them all to `Custom`.
     let media_types: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
     let media_none = AtomicU64::new(0);
+    let media_census: Mutex<MediaCensus> = Mutex::new(MediaCensus::default());
+    let differ_reasons: Mutex<MediaTypeReasons> = Mutex::new(MediaTypeReasons::default());
     let trait_assets = AtomicU64::new(0);
     let attr_pairs = AtomicU64::new(0);
     let attr_hist: [AtomicU64; 16] = std::array::from_fn(|_| AtomicU64::new(0));
@@ -2819,6 +2821,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
                     let mut l_diff = FieldDiff::default();
                     let mut l_media: HashMap<String, u64> = HashMap::new();
                     let mut l_media_none = 0u64;
+                    let mut l_census = MediaCensus::default();
+                    let mut l_reasons = MediaTypeReasons::default();
                     let mut l_trait_assets = 0u64;
                     let mut l_pairs = 0u64;
                     let mut l_hist = [0u64; 16];
@@ -2898,6 +2902,7 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                                 &mut l_media,
                                                 &mut l_media_none,
                                             );
+                                            tally_media_level(&walked, &mut l_census);
                                             l_decoded += 1;
                                             tally_traits(
                                                 &walked.asset.traits,
@@ -2928,15 +2933,22 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                                     &mut l_media,
                                                     &mut l_media_none,
                                                 );
+                                                tally_media_level(w, &mut l_census);
                                             }
-                                            let fast = fast.map(|w| project_asset(&w.asset));
-                                            match (&asset, &fast) {
+                                            let projected =
+                                                fast.as_ref().map(|w| project_asset(&w.asset));
+                                            match (&asset, &projected) {
                                                 (Ok(a), Some(f)) if same_asset(a, f) => {
                                                     l_cmp[0] += 1;
                                                 }
                                                 (Ok(a), Some(f)) => {
                                                     l_cmp[1] += 1;
                                                     l_diff.add(a, f);
+                                                    if a.media_type != f.media_type
+                                                        && let Some(w) = &fast
+                                                    {
+                                                        l_reasons.add(a, f, w);
+                                                    }
                                                     if l_cmp_examples.len() < 4 {
                                                         l_cmp_examples.push(format!(
                                                             "{}/{} {}",
@@ -3001,6 +3013,10 @@ fn cip25(a: Cip25Args) -> Result<()> {
                             media_none.fetch_add(l_media_none, Ordering::Relaxed);
                             l_media_none = 0;
                         }
+                        if l_census.media > 0 {
+                            let mut census = media_census.lock().expect("media census");
+                            census.merge(std::mem::take(&mut l_census));
+                        }
                         if !l_cmp_examples.is_empty() {
                             let mut ex = cmp_examples.lock().expect("examples");
                             if ex.len() < 8 {
@@ -3012,6 +3028,11 @@ fn cip25(a: Cip25Args) -> Result<()> {
                             let mut diff = differ_fields.lock().expect("differ fields");
                             diff.merge(l_diff);
                             l_diff = FieldDiff::default();
+                        }
+                        {
+                            let mut reasons = differ_reasons.lock().expect("differ reasons");
+                            reasons.merge(l_reasons);
+                            l_reasons = MediaTypeReasons::default();
                         }
                         for (k, n) in l_hist.iter().enumerate() {
                             if *n > 0 {
@@ -3097,6 +3118,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
     );
     let comparisons = cmp_examples.into_inner().expect("examples");
     let differ = differ_fields.into_inner().expect("differ fields");
+    let census = media_census.into_inner().expect("media census");
+    let reasons = differ_reasons.into_inner().expect("differ reasons");
     let chunks = done.load(Ordering::Relaxed).max(1);
     let n_policies = policies.lock().expect("policies").len();
     let guard = traits.lock().expect("traits");
@@ -3162,58 +3185,53 @@ fn cip25(a: Cip25Args) -> Result<()> {
     println!("             pairs per decoded asset: {}", hist.join(" · "));
     let media = media_types.into_inner().expect("media types");
     let mut media_rows: Vec<(String, u64)> = media.into_iter().collect();
-    media_rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
     let media_none = media_none.load(Ordering::Relaxed);
     let media_total: u64 = media_rows.iter().map(|(_, n)| n).sum::<u64>() + media_none;
     if media_total > 0 {
+        media_rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
         println!(
             "  media type {} distinct · {media_none} of {media_total} no declared type ({:.1}%)",
             media_rows.len(),
             100.0 * media_none as f64 / media_total as f64
         );
-        // Which declared values the catalogue resolves, and what is left: the
-        // promotion list (`custom`) and the corpus saying "nothing here"
-        // (`undefined`). Counted through the same `MediaType::of` a consumer
-        // uses, so the report cannot disagree with the type.
-        let mut catalogued: Vec<(&str, u64)> = Vec::new();
-        let mut custom: Vec<(&str, u64)> = Vec::new();
-        let mut undefined: Vec<(&str, u64)> = Vec::new();
-        for (declared, n) in &media_rows {
-            match MediaType::of(declared) {
-                MediaType::Mime(_) => catalogued.push((declared, *n)),
-                MediaType::Custom(_) => custom.push((declared, *n)),
-                MediaType::Undefined => undefined.push((declared, *n)),
-            }
-        }
-        let assets = |rows: &[(&str, u64)]| rows.iter().map(|(_, n)| n).sum::<u64>();
-        for (label, rows, note) in [
-            (
-                "catalogued",
-                &catalogued,
-                "a catalogue type, however spelled",
-            ),
-            ("custom", &custom, "type-shaped, not yet named"),
-            ("undefined", &undefined, "not a type at all"),
-        ] {
-            println!(
-                "             {label:<10} {} assets in {} spellings ({note})",
-                assets(rows),
-                rows.len()
-            );
-        }
-        for (label, rows, _) in [
-            ("catalogued", &catalogued, ""),
-            ("custom", &custom, ""),
-            ("undefined", &undefined, ""),
-        ] {
-            println!("             {label}, as declared:");
-            for chunk in rows.chunks(4) {
-                let line: Vec<String> = chunk
-                    .iter()
-                    .map(|(k, n)| format!("{} ×{n}", show_declared(k)))
-                    .collect();
-                println!("               {}", line.join(" · "));
-            }
+        print_declared_types(&mut media_rows, "assets");
+    }
+    if census.media > 0 {
+        let [h_cat, h_cus, h_und] = census.headline;
+        let [f_cat, f_cus, f_und] = census.file;
+        let undeclared = census.headline_undeclared;
+        let named: u64 = census.src_ext.values().sum();
+        println!(
+            "  per medium {} media · headline {} · files[] {}",
+            census.media,
+            h_cat + h_cus + h_und,
+            f_cat + f_cus + f_und
+        );
+        println!(
+            "             headline   catalogued {h_cat} · custom {h_cus} · undefined {h_und} ({undeclared} declared nothing at all)"
+        );
+        println!("             files[]    catalogued {f_cat} · custom {f_cus} · undefined {f_und}");
+        println!(
+            "             no type    {} media (headline {h_und} · files[] {f_und})",
+            h_und + f_und
+        );
+        let mut exts: Vec<(String, u64)> = census.src_ext.into_iter().collect();
+        exts.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
+        let shown: Vec<String> = exts
+            .iter()
+            .take(12)
+            .map(|(k, n)| format!("{k} ×{n}"))
+            .collect();
+        println!(
+            "               src names its format {named} ({})",
+            shown.join(" · ")
+        );
+        println!("               src is a bare CID     {}", census.src_cid);
+        println!("               src names nothing     {}", census.src_other);
+        if !census.file_declared.is_empty() {
+            let mut rows: Vec<(String, u64)> = census.file_declared.into_iter().collect();
+            println!("             files[], as declared:");
+            print_declared_types(&mut rows, "media");
         }
     }
     println!(
@@ -3237,6 +3255,10 @@ fn cip25(a: Cip25Args) -> Result<()> {
         println!(
             "             fields     name {} · image {} · media_type {} · rarity/tags {} · traits {}",
             differ.name, differ.image, differ.media_type, differ.other, differ.traits
+        );
+        println!(
+            "             reason     rewritten {} · declared not a type {} · no headline {} · other {}",
+            reasons.rewritten, reasons.headline_not_a_type, reasons.no_headline, reasons.other
         );
     }
     println!("             biggest collections by distinct pairs:");
@@ -3615,13 +3637,30 @@ struct FileEntry {
     src: String,
 }
 
+/// One medium as the walk resolved it, with the declaration it was resolved
+/// from.
+///
+/// `DecodedAsset` keeps only the resolution, and the census has to tell "the
+/// document declared nothing" from "the document declared something that is not
+/// a type" — and read a `files[]` entry's declared spelling beside the type it
+/// catalogued to.
+struct WalkedMedia {
+    media: Media,
+    /// This medium's declaration, before `MediaType::of` normalised it. `None`
+    /// only where the document carried none — which only a headline can, because
+    /// a `files[]` entry without `mediaType` declines the whole document.
+    declared: Option<String>,
+}
+
 /// The envelope as `DecodedAsset` wants it: a name that can say "no name", and
 /// the media list — headline first, one entry per medium.
 struct Envelope {
     name: Option<String>,
-    media: Vec<Media>,
-    /// The headline's type as the document declared it, *before* `MediaType::of`
-    /// normalised it — which is what the alias decision has to see.
+    media: Vec<WalkedMedia>,
+    /// What `resolve_media_type` returned for the *document*: the top-level
+    /// `mediaType`, else the matching file's type. Not the headline's own
+    /// declaration — a document with no image still declares one, and the corpus
+    /// histogram is a count of documents.
     declared_media_type: Option<String>,
 }
 
@@ -3676,24 +3715,30 @@ fn envelope(pairs: &KeyValuePairs<Metadatum, Metadatum>) -> Option<Envelope> {
         .and_then(|src| files.iter().position(|f| &f.src == src));
     let mut out = Vec::new();
     if let Some(src) = image {
-        out.push(Media {
-            src,
-            media_type: MediaType::of(resolved.as_deref().unwrap_or_default()),
-            name: consumed
-                .and_then(|i| files.get(i))
-                .and_then(|f| f.name.clone()),
-            role: MediaRole::Headline,
+        out.push(WalkedMedia {
+            media: Media {
+                src,
+                media_type: MediaType::of(resolved.as_deref().unwrap_or_default()),
+                name: consumed
+                    .and_then(|i| files.get(i))
+                    .and_then(|f| f.name.clone()),
+                role: MediaRole::Headline,
+            },
+            declared: resolved.clone(),
         });
     }
     for (i, f) in files.iter().enumerate() {
         if Some(i) == consumed {
             continue;
         }
-        out.push(Media {
-            src: f.src.clone(),
-            media_type: MediaType::of(&f.media_type),
-            name: f.name.clone(),
-            role: MediaRole::File,
+        out.push(WalkedMedia {
+            media: Media {
+                src: f.src.clone(),
+                media_type: MediaType::of(&f.media_type),
+                name: f.name.clone(),
+                role: MediaRole::File,
+            },
+            declared: Some(f.media_type.clone()),
         });
     }
     Some(Envelope {
@@ -3765,11 +3810,15 @@ fn file_entries(v: &Metadatum) -> Option<Vec<FileEntry>> {
     Some(out)
 }
 
-/// What the walk produced, and the one thing `DecodedAsset` cannot carry: the
-/// headline's type as declared, for the corpus histogram the alias table is
-/// chosen from.
+/// What the walk produced, plus the two things `DecodedAsset` cannot carry: the
+/// per-medium declarations the media census reads beside the resolutions, and the
+/// document's resolved type, for the corpus histogram the alias table is chosen
+/// from.
 struct Walked {
     asset: DecodedAsset,
+    /// The same media as `asset.media`, in the same order, each with the
+    /// declaration behind it.
+    media: Vec<WalkedMedia>,
     declared_media_type: Option<String>,
 }
 
@@ -3784,17 +3833,23 @@ fn fast_decoded(value: &Metadatum, policy: &[u8], name: &[u8]) -> Option<Walked>
     let Metadatum::Map(pairs) = value else {
         return None;
     };
-    let env = envelope(pairs)?;
+    let Envelope {
+        name: declared_name,
+        media,
+        declared_media_type,
+    } = envelope(pairs)?;
     let traits = fast_metadatum_traits(value)?;
     let id = AssetId::new(hex::encode(policy), hex::encode(name)).ok()?;
+    let asset_media = media.iter().map(|m| m.media.clone()).collect();
     Some(Walked {
         asset: DecodedAsset {
             id,
-            name: env.name,
-            media: env.media,
+            name: declared_name,
+            media: asset_media,
             traits,
         },
-        declared_media_type: env.declared_media_type,
+        media,
+        declared_media_type,
     })
 }
 
@@ -3851,6 +3906,40 @@ impl FieldDiff {
         self.media_type += other.media_type;
         self.other += other.other;
         self.traits += other.traits;
+    }
+}
+
+/// Why a `media_type` differs — the field count says how many, this says which of
+/// the three mechanisms produced them.
+#[derive(Default, Clone, Copy)]
+struct MediaTypeReasons {
+    /// Both sides name a type and they are the same type: the walk's is the
+    /// canonical spelling.
+    rewritten: u64,
+    /// The declared type is not one the catalogue carries, so the walk projects
+    /// `Undefined` where `Asset` carried the string.
+    headline_not_a_type: u64,
+    /// The document declared a type and materialised no headline to attach it to.
+    no_headline: u64,
+    /// Anything else — kept so an unclassified case cannot hide in a subtotal.
+    other: u64,
+}
+
+impl MediaTypeReasons {
+    fn add(&mut self, platform: &Asset, projected: &Asset, walked: &Walked) {
+        match (&platform.media_type, &projected.media_type) {
+            (Some(p), Some(q)) if p != q => self.rewritten += 1,
+            (Some(_), None) if walked.asset.headline().is_some() => self.headline_not_a_type += 1,
+            (Some(_), None) => self.no_headline += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.rewritten += other.rewritten;
+        self.headline_not_a_type += other.headline_not_a_type;
+        self.no_headline += other.no_headline;
+        self.other += other.other;
     }
 }
 
@@ -3912,6 +4001,187 @@ fn tally_media(media: Option<&str>, histogram: &mut HashMap<String, u64>, none: 
     match media {
         Some(m) => *histogram.entry(m.to_string()).or_default() += 1,
         None => *none += 1,
+    }
+}
+
+/// The per-medium census: what each medium's type resolves to, by role, and — for
+/// the media with no usable type — whether the `src` names a format or leaves the
+/// bytes to answer.
+///
+/// The histogram above counts *documents* by their declared type; this counts the
+/// media a consumer of `Media` actually sees, headline and `files[]` alike.
+#[derive(Default)]
+struct MediaCensus {
+    /// Media counted, so an empty per-chunk local can skip the merge.
+    media: u64,
+    /// `[catalogued, custom, undefined]`, per role.
+    headline: [u64; 3],
+    file: [u64; 3],
+    /// Of the undefined headlines: the document declared nothing at all, as
+    /// opposed to declaring something that is not a type.
+    headline_undeclared: u64,
+    /// The `files[]` declarations, through the same catalogue as the document's —
+    /// the bucket and the spellings, so files get the same treatment.
+    file_declared: HashMap<String, u64>,
+    /// `src` shapes, for the media with no usable type.
+    src_ext: HashMap<String, u64>,
+    src_cid: u64,
+    src_other: u64,
+}
+
+impl MediaCensus {
+    fn merge(&mut self, other: Self) {
+        self.media += other.media;
+        for (mine, theirs) in self.headline.iter_mut().zip(other.headline) {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self.file.iter_mut().zip(other.file) {
+            *mine += theirs;
+        }
+        self.headline_undeclared += other.headline_undeclared;
+        for (k, n) in other.file_declared {
+            *self.file_declared.entry(k).or_default() += n;
+        }
+        for (k, n) in other.src_ext {
+            *self.src_ext.entry(k).or_default() += n;
+        }
+        self.src_cid += other.src_cid;
+        self.src_other += other.src_other;
+    }
+}
+
+/// Where a resolved type sits in a census row.
+fn type_bucket(media_type: &MediaType) -> usize {
+    match media_type {
+        MediaType::Mime(_) => 0,
+        MediaType::Custom(_) => 1,
+        MediaType::Undefined => 2,
+    }
+}
+
+/// Fold one asset's media into the per-medium census.
+fn tally_media_level(walked: &Walked, census: &mut MediaCensus) {
+    for m in &walked.media {
+        census.media += 1;
+        let bucket = type_bucket(&m.media.media_type);
+        match m.media.role {
+            MediaRole::Headline => {
+                census.headline[bucket] += 1;
+                if bucket == 2 && m.declared.is_none() {
+                    census.headline_undeclared += 1;
+                }
+            }
+            MediaRole::File => {
+                census.file[bucket] += 1;
+                if let Some(declared) = &m.declared {
+                    *census.file_declared.entry(declared.clone()).or_default() += 1;
+                }
+            }
+        }
+        if bucket == 2 {
+            match src_shape(&m.media.src) {
+                SrcShape::Extension(ext) => {
+                    *census.src_ext.entry(ext.to_ascii_lowercase()).or_default() += 1;
+                }
+                SrcShape::Cid => census.src_cid += 1,
+                SrcShape::Other => census.src_other += 1,
+            }
+        }
+    }
+}
+
+/// What a `src` says about a medium's format where the declaration did not.
+///
+/// Deliberately coarse — a shape test, not a parser — because its only job is to
+/// size the population where the bytes are the only answer. Every bucket it
+/// produces is printed, so a wrong guess here is visible rather than assumed.
+#[derive(Debug, PartialEq, Eq)]
+enum SrcShape<'a> {
+    /// The last path segment ends in 1–5 alphanumerics after a dot. As written;
+    /// the census lowercases it, because an extension is a hint rather than a
+    /// declaration and case is not information.
+    Extension(&'a str),
+    /// No extension, and the path is an IPFS CID — `ipfs://Qm…`, `/ipfs/bafy…`.
+    Cid,
+    /// Neither: an extensionless path, a host with no path, a data URI.
+    Other,
+}
+
+fn src_shape(src: &str) -> SrcShape<'_> {
+    let path = src.split(['?', '#']).next().unwrap_or(src);
+    let last = path.rsplit('/').next().unwrap_or(path);
+    if let Some((stem, ext)) = last.rsplit_once('.')
+        && !stem.is_empty()
+        && (1..=5).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return SrcShape::Extension(ext);
+    }
+    if src.starts_with("ipfs://") || path.contains("/ipfs/") || is_cid(last) {
+        return SrcShape::Cid;
+    }
+    SrcShape::Other
+}
+
+/// `Qm…` (CIDv0, base58, 46) or `b…` (CIDv1, base32, 56+) — the two shapes an
+/// IPFS `src` carries with no filename beside them. A shape test: the report only
+/// needs "this URL does not name a format".
+fn is_cid(s: &str) -> bool {
+    (s.starts_with("Qm") && s.len() == 46)
+        || (s.len() >= 56
+            && s.starts_with('b')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)))
+}
+
+/// The catalogued/custom/undefined split of a declared-type histogram, and every
+/// declared spelling under each — printed for the document's declared type and
+/// for `files[]` alike, because both resolve through the same `MediaType::of`.
+fn print_declared_types(rows: &mut [(String, u64)], unit: &str) {
+    rows.sort_unstable_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
+    // Which declared values the catalogue resolves, and what is left: the
+    // promotion list (`custom`) and the corpus saying "nothing here"
+    // (`undefined`). Counted through the same `MediaType::of` a consumer
+    // uses, so the report cannot disagree with the type.
+    let mut catalogued: Vec<(&str, u64)> = Vec::new();
+    let mut custom: Vec<(&str, u64)> = Vec::new();
+    let mut undefined: Vec<(&str, u64)> = Vec::new();
+    for (declared, n) in rows.iter() {
+        match MediaType::of(declared) {
+            MediaType::Mime(_) => catalogued.push((declared, *n)),
+            MediaType::Custom(_) => custom.push((declared, *n)),
+            MediaType::Undefined => undefined.push((declared, *n)),
+        }
+    }
+    let count = |rows: &[(&str, u64)]| rows.iter().map(|(_, n)| n).sum::<u64>();
+    for (label, rows, note) in [
+        (
+            "catalogued",
+            &catalogued,
+            "a catalogue type, however spelled",
+        ),
+        ("custom", &custom, "type-shaped, not yet named"),
+        ("undefined", &undefined, "not a type at all"),
+    ] {
+        println!(
+            "             {label:<10} {} {unit} in {} spellings ({note})",
+            count(rows),
+            rows.len()
+        );
+    }
+    for (label, rows, _) in [
+        ("catalogued", &catalogued, ""),
+        ("custom", &custom, ""),
+        ("undefined", &undefined, ""),
+    ] {
+        println!("             {label}, as declared:");
+        for chunk in rows.chunks(4) {
+            let line: Vec<String> = chunk
+                .iter()
+                .map(|(k, n)| format!("{} ×{n}", show_declared(k)))
+                .collect();
+            println!("               {}", line.join(" · "));
+        }
     }
 }
 
@@ -5544,6 +5814,125 @@ mod tests {
         assert_eq!(asset.image, "");
         assert_eq!(asset.media_type, None);
         assert_eq!(asset.traits.get_single("Class").as_deref(), Some("Archer"));
+    }
+
+    /// The census counts media, not documents: a headline with no declaration and
+    /// each `files[]` entry land in their own row, and the type-less ones are
+    /// shaped by their `src` — which is the size of the population where the bytes
+    /// are the only answer.
+    #[test]
+    fn the_media_census_counts_headline_and_files_apart() {
+        let policy = [0xab; 28];
+        let doc = map(vec![
+            ("image", text("https://gateway/pic")),
+            (
+                "files",
+                Metadatum::Array(vec![
+                    map(vec![
+                        ("mediaType", text("image/jpg")),
+                        ("src", text("https://x/thing.png")),
+                    ]),
+                    map(vec![
+                        ("mediaType", text("Video")),
+                        (
+                            "src",
+                            text("ipfs://QmYwAPJzv5CZsnAzt8auVZRn5UuT8oSpMArRm3W2Qn8y4xN"),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        let walked = fast_decoded(&doc, &policy, b"x").expect("an asset");
+        let mut census = MediaCensus::default();
+        tally_media_level(&walked, &mut census);
+
+        assert_eq!(census.media, 3);
+        assert_eq!(census.headline, [0, 0, 1], "no declaration at all");
+        assert_eq!(census.headline_undeclared, 1);
+        assert_eq!(census.file, [1, 0, 1], "one catalogued, one not a type");
+        assert_eq!(census.src_cid, 1);
+        assert_eq!(census.src_other, 1);
+        assert!(
+            census.src_ext.is_empty(),
+            "a file the catalogue resolved is not shaped by its src"
+        );
+        assert_eq!(census.file_declared.get("image/jpg"), Some(&1));
+        assert_eq!(census.file_declared.get("Video"), Some(&1));
+    }
+
+    /// The `src` shape test, and the two things it must not claim: a query string
+    /// is not part of the filename, and a path with no extension is not a format.
+    #[test]
+    fn a_src_names_its_format_only_where_it_does() {
+        assert_eq!(src_shape("https://x/a.PNG?w=1"), SrcShape::Extension("PNG"));
+        assert_eq!(
+            src_shape("https://x/a.jpg#frag"),
+            SrcShape::Extension("jpg")
+        );
+        assert_eq!(
+            src_shape("ipfs://QmYwAPJzv5CZsnAzt8auVZRn5UuT8oSpMArRm3W2Qn8y4xN"),
+            SrcShape::Cid
+        );
+        assert_eq!(
+            src_shape(
+                "https://ipfs.io/ipfs/bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+            ),
+            SrcShape::Cid
+        );
+        assert_eq!(src_shape("https://gateway/pic"), SrcShape::Other);
+        assert_eq!(src_shape("data:image/png;base64,AAAA"), SrcShape::Other);
+    }
+
+    /// `media_type` differs for three different reasons and the field count cannot
+    /// tell them apart: each is counted where it is produced.
+    #[test]
+    fn the_media_type_reasons_are_counted_not_derived() {
+        let policy = [0xab; 28];
+        let walk = |doc: Metadatum| fast_decoded(&doc, &policy, b"x").expect("an asset");
+        let platform = |image: &str, media_type: &str, traits: Traits| Asset {
+            name: String::new(),
+            image: image.to_string(),
+            media_type: Some(media_type.to_string()),
+            traits,
+            rarity_rank: None,
+            tags: Vec::new(),
+        };
+
+        // The same type, spelled the way the document spelled it.
+        let spelled = walk(map(vec![
+            ("image", text("ipfs://x")),
+            ("mediaType", text("image/jpg")),
+        ]));
+        let mut reasons = MediaTypeReasons::default();
+        reasons.add(
+            &platform("ipfs://x", "image/jpg", spelled.asset.traits.clone()),
+            &project_asset(&spelled.asset),
+            &spelled,
+        );
+        assert_eq!(reasons.rewritten, 1);
+
+        // Declared, and not a type any catalogue carries.
+        let declared = walk(map(vec![
+            ("image", text("ipfs://x")),
+            ("mediaType", text("Video")),
+        ]));
+        let mut reasons = MediaTypeReasons::default();
+        reasons.add(
+            &platform("ipfs://x", "Video", declared.asset.traits.clone()),
+            &project_asset(&declared.asset),
+            &declared,
+        );
+        assert_eq!(reasons.headline_not_a_type, 1);
+
+        // Declared, with no image to attach it to.
+        let headless = walk(map(vec![("mediaType", text("image/png"))]));
+        let mut reasons = MediaTypeReasons::default();
+        reasons.add(
+            &platform("", "image/png", headless.asset.traits.clone()),
+            &project_asset(&headless.asset),
+            &headless,
+        );
+        assert_eq!(reasons.no_headline, 1);
     }
 
     /// A known field carrying the wrong type, a duplicated alias, a file without
