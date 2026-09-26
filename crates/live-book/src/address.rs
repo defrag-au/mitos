@@ -55,6 +55,15 @@ pub enum Kind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Credential {
     pub kind: Kind,
+    /// Whether those 28 bytes are a **script hash** rather than a key hash.
+    ///
+    /// ⚠️ **The difference between a holder and a contract**, and it is invisible in
+    /// the bytes — both are 28-byte Blake2b-224 digests, so nothing downstream can
+    /// recover it once the header is gone. A consumer that ranks "holders" without
+    /// this reports an escrow contract as the largest one: measured 2026-09-26, the
+    /// top SpaceBudz "holder" was `addr1wyxzp0hu…`, an enterprise **script** address
+    /// holding 5,684 of 8,792 listed assets — 64.6%, and not a wallet at all.
+    script: bool,
     bytes: [u8; 28],
 }
 
@@ -63,6 +72,12 @@ impl Credential {
     /// them: the entry narrows by prefix, and this is what makes the answer exact.
     pub fn bytes(&self) -> &[u8; 28] {
         &self.bytes
+    }
+
+    /// `true` when the credential is a script hash — i.e. the address is spent by a
+    /// validator, not by a key. See the field for why this is load-bearing.
+    pub fn is_script(&self) -> bool {
+        self.script
     }
 
     /// The 64-bit prefix `by_addr`'s entries carry — the same leading-8-of-a-hash
@@ -126,24 +141,37 @@ pub fn delegation(address: &[u8]) -> Option<Delegation> {
 pub fn credential(address: &[u8]) -> Option<Credential> {
     let header = *address.first()?;
     let payload = address.get(1..)?;
-    match header >> 4 {
-        0..=7 => slice_credential(payload, Kind::Payment),
-        14 | 15 => slice_credential(payload, Kind::Stake),
+    let ty = header >> 4;
+    // ⚠️ **Bit 0 of the type nibble is the script bit for the leading credential**,
+    // per CIP-19: types 1/3/5/7 carry a script *payment* part and 15 a script stake
+    // part, where 0/2/4/6 and 14 carry key hashes. The two are indistinguishable once
+    // the header is dropped, which is exactly why this is decided here and not by a
+    // consumer counting nibbles for itself.
+    let script = ty & 1 == 1;
+    match ty {
+        0..=7 => slice_credential(payload, Kind::Payment, script),
+        14 | 15 => slice_credential(payload, Kind::Stake, script),
+        // Byron predates scripts: a bootstrap address is spent by a key.
         8 => byron_root(address).map(|bytes| Credential {
             kind: Kind::Bootstrap,
+            script: false,
             bytes,
         }),
         _ => None,
     }
 }
 
-fn slice_credential(payload: &[u8], kind: Kind) -> Option<Credential> {
+fn slice_credential(payload: &[u8], kind: Kind, script: bool) -> Option<Credential> {
     if payload.len() < 28 {
         return None;
     }
     let mut bytes = [0u8; 28];
     bytes.copy_from_slice(&payload[..28]);
-    Some(Credential { kind, bytes })
+    Some(Credential {
+        kind,
+        script,
+        bytes,
+    })
 }
 
 /// The `root` of a Byron address's payload.
@@ -267,5 +295,66 @@ mod tests {
     fn the_prefix_is_the_leading_eight_bytes() {
         let c = credential(&base_address(0xAB, 0xCD)).expect("keys");
         assert_eq!(c.prefix(), u64::from_le_bytes([0xAB; 8]));
+    }
+
+    #[test]
+    fn the_script_bit_is_bit_zero_of_the_type_nibble() {
+        // CIP-19. The odd types carry a script hash where the even ones carry a key
+        // hash, and the 28 bytes look identical either way — so a consumer that
+        // cannot ask this reports a contract as a wallet.
+        for (header, script) in [
+            (0x01u8, false), // base, payment key
+            (0x11, true),    // base, payment SCRIPT
+            (0x21, false),   // base, payment key, stake script
+            (0x31, true),    // base, payment SCRIPT, stake script
+            (0x41, false),   // pointer, payment key
+            (0x51, true),    // pointer, payment SCRIPT
+            (0x61, false),   // enterprise, payment key
+            (0x71, true),    // enterprise, payment SCRIPT
+            (0xE1, false),   // reward, stake key
+            (0xF1, true),    // reward, stake SCRIPT
+        ] {
+            let mut a = vec![header];
+            a.extend_from_slice(&[0xAB; 28]);
+            a.extend_from_slice(&[0xCD; 28]);
+            let c = credential(&a).expect("a credential");
+            assert_eq!(c.is_script(), script, "header {header:#04x}");
+            // Whichever it is, the bytes are the same — which is the point.
+            assert_eq!(c.bytes(), &[0xAB; 28]);
+        }
+    }
+
+    #[test]
+    fn the_real_spacebudz_escrow_address_reads_as_a_script() {
+        // `addr1wyxzp0hufcllp5emldfrtcvlev4uj2g6huqq9wfhn7efw5q3zdavq` — the SpaceBudz
+        // marketplace contract, observed 2026-09-26 holding 5,684 of 8,792 live
+        // assets. It ranked as the largest "holder" of the collection until this bit
+        // was readable. Header 0x71: enterprise, payment part a script.
+        let mut a = vec![0x71u8];
+        a.extend_from_slice(&[
+            0x0c, 0x20, 0xbe, 0xfc, 0x4e, 0x3f, 0xf0, 0xd3, 0x3b, 0xfb, 0x52, 0x35, 0xe1, 0x9f,
+            0xcb, 0x2b, 0xc9, 0x29, 0x1a, 0xbf, 0x00, 0x02, 0xb9, 0x37, 0x9f, 0xb2, 0x97, 0x50,
+        ]);
+        let c = credential(&a).expect("a credential");
+        assert!(c.is_script(), "an escrow contract is not a wallet");
+        assert_eq!(c.kind, Kind::Payment);
+        assert!(
+            delegation(&a).is_none(),
+            "an enterprise address has no stake part"
+        );
+    }
+
+    #[test]
+    fn a_byron_root_is_never_a_script() {
+        // Byron predates scripts. Reporting one as a contract would be a claim the
+        // format cannot support.
+        for header in [0x01u8, 0x11] {
+            let mut a = vec![header];
+            a.extend_from_slice(&[0xAB; 28]);
+            a.extend_from_slice(&[0xCD; 28]);
+            // (the Shelley control — the Byron path needs a real payload, covered by
+            // the parse tests above)
+            assert_eq!(credential(&a).expect("cred").kind, Kind::Payment);
+        }
     }
 }
