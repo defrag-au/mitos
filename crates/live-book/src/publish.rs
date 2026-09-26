@@ -58,6 +58,7 @@ use crate::format::{
     self, BaseFingerprint, DIRECTORY_ADDR, DIRECTORY_OUTREF, DIRECTORY_POLICY, META_FILE, Meta,
     POLICY_FILE, ROWS_FILE, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY,
 };
+use crate::plan::PartSize;
 
 /// The part size a publisher uses unless told otherwise.
 ///
@@ -70,7 +71,7 @@ use crate::format::{
 /// `MITOS_AT_THE_EDGE.md` for why it is no longer obviously the right one: at 1 MiB
 /// a wallet's rows land one per object, and multi-range — which works only *within*
 /// an object — has nothing to coalesce.
-pub const DEFAULT_PART: u64 = 1 << 20;
+pub const DEFAULT_PART: PartSize = PartSize(1 << 20);
 
 /// The manifest's object key.
 ///
@@ -126,7 +127,7 @@ pub struct PartedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attestation {
     pub fingerprint: BaseFingerprint,
-    pub part_size: u64,
+    pub part_size: PartSize,
     pub files: Vec<PartedFile>,
     /// `book.meta`'s own text, carried verbatim rather than re-rendered — the
     /// publisher must not reword what the builder wrote.
@@ -194,10 +195,10 @@ impl Attestation {
                     )
                 }
                 "part_size" => {
-                    part_size = Some(
+                    part_size = Some(PartSize(
                         rest.parse::<u64>()
                             .with_context(|| format!("line {lineno}: part_size"))?,
-                    )
+                    ))
                 }
                 "validated" => match rest {
                     "true" => validated = Some(true),
@@ -249,12 +250,13 @@ impl Attestation {
         // A manifest written by a publisher with a different `PART` is the failure
         // this catches, and it would otherwise read as scrambled rows.
         for f in &files {
-            let want = f.len.div_ceil(part_size);
+            let want = part_count(f.len, part_size);
             if f.parts != want {
                 bail!(
-                    "{}: {} B at {part_size} B implies {want} parts, manifest says {}",
+                    "{}: {} B at {} B implies {want} parts, manifest says {}",
                     f.name,
                     f.len,
+                    part_size.get(),
                     f.parts
                 );
             }
@@ -281,7 +283,7 @@ impl Attestation {
         let mut out = String::new();
         out.push_str(&format!("attestation_version {ATTESTATION_VERSION}\n"));
         out.push_str(&format!("fingerprint {}\n", self.fingerprint));
-        out.push_str(&format!("part_size {}\n", self.part_size));
+        out.push_str(&format!("part_size {}\n", self.part_size.get()));
         out.push_str(&format!("validated {}\n", self.validated));
         for f in &self.files {
             out.push_str(&format!("file {} {} {}\n", f.name, f.len, f.parts));
@@ -298,8 +300,12 @@ impl Attestation {
 }
 
 /// How many parts a file of `len` bytes becomes at `part_size`.
-pub fn part_count(len: u64, part_size: u64) -> u64 {
-    len.div_ceil(part_size)
+///
+/// Both arguments are byte counts, which is why the second one is a [`PartSize`]
+/// and not a `u64`: `part_count(part_size, len)` used to compile and return a
+/// plausible-looking number.
+pub fn part_count(len: u64, part_size: PartSize) -> u64 {
+    len.div_ceil(part_size.get())
 }
 
 /// The part a logical offset falls in, and where it sits inside that part.
@@ -307,8 +313,8 @@ pub fn part_count(len: u64, part_size: u64) -> u64 {
 /// The arithmetic uniform parts exist for. A reader resolving a row offset calls
 /// this and fetches one object; if the row runs past the part's end it stitches
 /// the next one (see the module header's straddling note).
-pub fn locate(offset: u64, part_size: u64) -> (u64, u64) {
-    (offset / part_size, offset % part_size)
+pub fn locate(offset: u64, part_size: PartSize) -> (u64, u64) {
+    (offset / part_size.get(), offset % part_size.get())
 }
 
 /// The object key for one part — zero-padded so a lexical listing is also the
@@ -323,7 +329,7 @@ pub fn part_key(name: &str, part: u64) -> String {
 }
 
 /// Split one file into `part_size` objects under `out/<name>/NNNNN.bin`.
-fn split_file(src: &Path, out: &Path, name: &str, part_size: u64) -> Result<PartedFile> {
+fn split_file(src: &Path, out: &Path, name: &str, part_size: PartSize) -> Result<PartedFile> {
     let mut f = File::open(src).with_context(|| format!("opening {}", src.display()))?;
     let len = f
         .metadata()
@@ -332,11 +338,11 @@ fn split_file(src: &Path, out: &Path, name: &str, part_size: u64) -> Result<Part
     let dir = out.join(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    let mut buf = vec![0u8; part_size as usize];
+    let mut buf = vec![0u8; part_size.get() as usize];
     let mut part = 0u64;
     let mut written = 0u64;
     while written < len {
-        let want = (len - written).min(part_size) as usize;
+        let want = (len - written).min(part_size.get()) as usize;
         f.read_exact(&mut buf[..want])
             .with_context(|| format!("reading {} at {written}", src.display()))?;
         // Through `part_key` so the layout on disk is the layout in the bucket —
@@ -355,7 +361,8 @@ fn split_file(src: &Path, out: &Path, name: &str, part_size: u64) -> Result<Part
     // assert it here rather than discover a short file over a network.
     if part != part_count(len, part_size) {
         bail!(
-            "{name} split into {part} parts; {len} B at {part_size} B implies {}",
+            "{name} split into {part} parts; {len} B at {} B implies {}",
+            part_size.get(),
             part_count(len, part_size)
         );
     }
@@ -375,9 +382,17 @@ fn split_file(src: &Path, out: &Path, name: &str, part_size: u64) -> Result<Part
 /// `part_size` is a **publish-time parameter** ([`DEFAULT_PART`] is only a default):
 /// the right size depends on how the artifact will be read, not on what it
 /// contains. A reader takes it from the attestation.
-pub fn publish(book: &Path, out: &Path, validated: bool, part_size: u64) -> Result<Attestation> {
-    if !part_size.is_power_of_two() {
-        bail!("part_size {part_size} is not a power of two; offset arithmetic assumes it is");
+pub fn publish(
+    book: &Path,
+    out: &Path,
+    validated: bool,
+    part_size: PartSize,
+) -> Result<Attestation> {
+    if !part_size.get().is_power_of_two() {
+        bail!(
+            "part_size {} is not a power of two; offset arithmetic assumes it is",
+            part_size.get()
+        );
     }
     let meta_path = book.join(META_FILE);
     let meta_text = std::fs::read_to_string(&meta_path)
@@ -438,14 +453,16 @@ pub fn keys(att: &Attestation) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    const PART: u64 = DEFAULT_PART;
+    const PART: PartSize = DEFAULT_PART;
+    /// The same number as a plain byte count, for the offsets a test computes.
+    const P: u64 = PART.get();
 
     #[test]
     fn locate_is_the_inverse_of_part_layout() {
         assert_eq!(locate(0, PART), (0, 0));
-        assert_eq!(locate(PART - 1, PART), (0, PART - 1));
-        assert_eq!(locate(PART, PART), (1, 0));
-        assert_eq!(locate(PART * 3 + 17, PART), (3, 17));
+        assert_eq!(locate(P - 1, PART), (0, P - 1));
+        assert_eq!(locate(P, PART), (1, 0));
+        assert_eq!(locate(P * 3 + 17, PART), (3, 17));
     }
 
     #[test]
@@ -454,9 +471,9 @@ mod tests {
         // offset resolves differently under a different layout, and a reader that
         // used a compiled-in size against an artifact published at another would
         // read the right bytes from the wrong object.
-        let big = 64 << 20;
-        assert_eq!(locate(PART, big), (0, PART));
-        assert_eq!(locate(big + 17, big), (1, 17));
+        let big = PartSize(64 << 20);
+        assert_eq!(locate(P, big), (0, P));
+        assert_eq!(locate(big.get() + 17, big), (1, 17));
     }
 
     #[test]
@@ -465,8 +482,8 @@ mod tests {
         // truncates the last row of the arena.
         assert_eq!(part_count(0, PART), 0);
         assert_eq!(part_count(1, PART), 1);
-        assert_eq!(part_count(PART, PART), 1);
-        assert_eq!(part_count(PART + 1, PART), 2);
+        assert_eq!(part_count(P, PART), 1);
+        assert_eq!(part_count(P + 1, PART), 2);
     }
 
     #[test]
@@ -498,7 +515,7 @@ mod tests {
             part_size: PART,
             files: vec![PartedFile {
                 name: "rows.bin".into(),
-                len: PART + 10,
+                len: P + 10,
                 parts: 2,
             }],
             meta: "layout_version 3\nrows 7\n".into(),

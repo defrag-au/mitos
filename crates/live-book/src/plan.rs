@@ -106,6 +106,23 @@ impl Shape {
     }
 }
 
+/// How large each part of a published book is.
+///
+/// ⚠️ **A newtype because the alternative was two adjacent bare `u64`s.**
+/// `plan(wants, part_size, file_len, …)` took both as plain numbers, so swapping
+/// them compiled cleanly and produced a plan that read *plausible bytes from the
+/// wrong offsets* — rows that parse into other rows, which nothing downstream can
+/// detect. Argument order that the compiler cannot check is a type that is not
+/// defined well enough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PartSize(pub u64);
+
+impl PartSize {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// One thing a caller wants: `len` bytes at a logical offset in one file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Want {
@@ -218,7 +235,8 @@ struct Piece {
 /// ⚠️ Wants may be given in any order and may overlap; the plan is always emitted
 /// ascending and non-overlapping per request, because anything else degrades to the
 /// whole object. [`Plan::located`] restores the caller's original order.
-pub fn plan(wants: &[Want], part_size: u64, file_len: u64, shape: Shape) -> Plan {
+pub fn plan(wants: &[Want], part_size: PartSize, file_len: u64, shape: Shape) -> Plan {
+    let part_size = part_size.get();
     let gap = shape.gap;
     let per_request = shape.spans();
     // 1. Cut every want at the part boundaries it crosses.
@@ -326,7 +344,7 @@ pub fn plan(wants: &[Want], part_size: u64, file_len: u64, shape: Shape) -> Plan
 }
 
 /// Convenience: plan with [`Shape::default`].
-pub fn plan_default(wants: &[Want], part_size: u64, file_len: u64) -> Plan {
+pub fn plan_default(wants: &[Want], part_size: PartSize, file_len: u64) -> Plan {
     plan(wants, part_size, file_len, Shape::default())
 }
 
@@ -499,7 +517,7 @@ mod tests {
 
     #[test]
     fn one_want_is_one_request_of_one_span() {
-        let p = plan_default(&[w(100, 50)], P, 10 * P);
+        let p = plan_default(&[w(100, 50)], PartSize(P), 10 * P);
         assert_eq!(p.requests(), 1);
         assert_eq!(p.batches[0].part, 0);
         assert_eq!(
@@ -517,7 +535,7 @@ mod tests {
     fn near_wants_coalesce_into_one_span() {
         // 40 bytes apart: cheaper as one range than as two, and it saves one of
         // the 299.
-        let p = plan_default(&[w(100, 50), w(190, 50)], P, 10 * P);
+        let p = plan_default(&[w(100, 50), w(190, 50)], PartSize(P), 10 * P);
         assert_eq!(p.requests(), 1);
         assert_eq!(
             p.batches[0].spans,
@@ -531,7 +549,7 @@ mod tests {
 
     #[test]
     fn distant_wants_stay_separate_spans_in_one_request() {
-        let p = plan_default(&[w(100, 50), w(900_000, 50)], P, 10 * P);
+        let p = plan_default(&[w(100, 50), w(900_000, 50)], PartSize(P), 10 * P);
         assert_eq!(p.requests(), 1, "same part ⇒ one request");
         assert_eq!(p.batches[0].spans.len(), 2);
         assert_protocol_safe(&p);
@@ -541,7 +559,7 @@ mod tests {
     fn different_parts_are_different_requests() {
         // Multi-range cannot span objects. This is the property that makes part
         // size decide how well the whole scheme works.
-        let p = plan_default(&[w(100, 50), w(P + 100, 50)], P, 10 * P);
+        let p = plan_default(&[w(100, 50), w(P + 100, 50)], PartSize(P), 10 * P);
         assert_eq!(p.requests(), 2);
         assert_eq!(p.batches[0].part, 0);
         assert_eq!(p.batches[1].part, 1);
@@ -550,7 +568,7 @@ mod tests {
 
     #[test]
     fn a_want_straddling_a_boundary_becomes_two_ordered_segments() {
-        let p = plan_default(&[w(P - 10, 20)], P, 10 * P);
+        let p = plan_default(&[w(P - 10, 20)], PartSize(P), 10 * P);
         assert_eq!(p.requests(), 2);
         let segs = &p.located[0].segments;
         assert_eq!(segs.len(), 2);
@@ -567,7 +585,7 @@ mod tests {
         // 300 spans would return the whole object, which at 64 MiB parts is a
         // 64 MiB download that looks like success.
         let wants: Vec<Want> = (0..700).map(|i| w(i * 1000, 10)).collect();
-        let p = plan_default(&wants, P, 10 * P);
+        let p = plan_default(&wants, PartSize(P), 10 * P);
         assert!(p.requests() >= 3, "700 spans cannot fit in two requests");
         assert_protocol_safe(&p);
     }
@@ -576,7 +594,7 @@ mod tests {
     fn a_want_past_the_end_of_the_file_is_clamped_not_rejected() {
         // The speculative over-read for a row near the end of the arena asks for
         // more than exists; the server would reject an unsatisfiable range.
-        let p = plan_default(&[w(10 * P - 5, 8192)], P, 10 * P);
+        let p = plan_default(&[w(10 * P - 5, 8192)], PartSize(P), 10 * P);
         assert_protocol_safe(&p);
         assert_eq!(p.bytes(), 5);
     }
@@ -585,7 +603,11 @@ mod tests {
     fn overlapping_wants_do_not_produce_overlapping_spans() {
         // Two rows pointing at the same place — a prefix collision resolving to one
         // row twice. Overlapping ranges degrade to the whole object.
-        let p = plan_default(&[w(500, 100), w(520, 100), w(500, 100)], P, 10 * P);
+        let p = plan_default(
+            &[w(500, 100), w(520, 100), w(500, 100)],
+            PartSize(P),
+            10 * P,
+        );
         assert_protocol_safe(&p);
         assert_eq!(p.requests(), 1);
     }
@@ -593,7 +615,7 @@ mod tests {
     #[test]
     fn unsorted_wants_are_planned_ascending_but_located_in_input_order() {
         let wants = [w(900_000, 10), w(100, 10), w(500_000, 10)];
-        let p = plan_default(&wants, P, 10 * P);
+        let p = plan_default(&wants, PartSize(P), 10 * P);
         assert_protocol_safe(&p);
         // Located is in the caller's order, whatever the fetch order was.
         let b = &p.batches[0];
@@ -619,7 +641,7 @@ mod tests {
             })
             .collect();
 
-        let p = plan_default(&wants, P, file_len);
+        let p = plan_default(&wants, PartSize(P), file_len);
         assert_protocol_safe(&p);
 
         // "Fetch": each span's bytes, straight out of the synthetic file.
@@ -673,8 +695,8 @@ mod tests {
             gap: COALESCE_GAP,
             max_spans: MAX_SPANS,
         };
-        let small = plan(&wants, 1 << 20, arena, shape);
-        let large = plan(&wants, 64 << 20, arena, shape);
+        let small = plan(&wants, PartSize(1 << 20), arena, shape);
+        let large = plan(&wants, PartSize(64 << 20), arena, shape);
         assert_protocol_safe(&small);
         assert_protocol_safe(&large);
 
@@ -711,7 +733,9 @@ mod tests {
 
         let wide = plan(
             &wants,
-            arena,
+            // One part covering the whole file: the same number, two meanings,
+            // which the newtype now forces the call site to distinguish.
+            PartSize(arena),
             arena,
             Shape {
                 gap: COALESCE_GAP,
@@ -720,7 +744,9 @@ mod tests {
         );
         let narrow = plan(
             &wants,
-            arena,
+            // One part covering the whole file: the same number, two meanings,
+            // which the newtype now forces the call site to distinguish.
+            PartSize(arena),
             arena,
             Shape {
                 gap: COALESCE_GAP,
@@ -771,7 +797,9 @@ mod tests {
         let arena = 64 << 20;
         let p = plan(
             &wants,
-            arena,
+            // One part covering the whole file: the same number, two meanings,
+            // which the newtype now forces the call site to distinguish.
+            PartSize(arena),
             arena,
             Shape {
                 gap: 0,
@@ -783,7 +811,7 @@ mod tests {
 
     #[test]
     fn the_range_header_is_what_cloudflare_expects() {
-        let p = plan_default(&[w(10, 5), w(1000, 5)], P, 10 * P);
+        let p = plan_default(&[w(10, 5), w(1000, 5)], PartSize(P), 10 * P);
         assert_eq!(p.batches[0].range_header(), "bytes=10-14, 1000-1004");
     }
 
@@ -862,7 +890,7 @@ mod tests {
 
     #[test]
     fn check_refuses_a_response_that_does_not_match_what_was_asked() {
-        let p = plan_default(&[w(10, 5), w(1000, 5)], P, 10 * P);
+        let p = plan_default(&[w(10, 5), w(1000, 5)], PartSize(P), 10 * P);
         let b = &p.batches[0];
         let good = [
             Received {
@@ -893,7 +921,7 @@ mod tests {
         let wants: Vec<Want> = (0..120)
             .map(|i| w((i * 15_013) % (file_len - 300), 40 + (i % 200)))
             .collect();
-        let p = plan_default(&wants, P, file_len);
+        let p = plan_default(&wants, PartSize(P), file_len);
 
         let bodies: Vec<Vec<u8>> = p
             .batches

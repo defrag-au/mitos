@@ -2587,10 +2587,11 @@ fn publish(a: PublishArgs) -> Result<()> {
         true
     };
 
-    let part_size = a
-        .part_mib
-        .checked_mul(1 << 20)
-        .context("--part-mib overflows")?;
+    let part_size = live_book::plan::PartSize(
+        a.part_mib
+            .checked_mul(1 << 20)
+            .context("--part-mib overflows")?,
+    );
     let att = live_book::publish::publish(&a.book, &a.out, validated, part_size)?;
     let total: u64 = att.files.iter().map(|f| f.len).sum();
     let parts: u64 = att.files.iter().map(|f| f.parts).sum();
@@ -2599,7 +2600,7 @@ fn publish(a: PublishArgs) -> Result<()> {
     println!(
         "  layout    {} files · {parts} parts of {} · {}",
         att.files.len(),
-        human_bytes(att.part_size),
+        human_bytes(att.part_size.get()),
         human_bytes(total),
     );
     for f in &att.files {
