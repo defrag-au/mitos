@@ -1,0 +1,64 @@
+# Validates an unpacked Mithril snapshot, and publishes it to R2.
+#
+# It exists for one rule, and the rule is not ours: cardano-node keeps appending to
+# the highest-numbered immutable file until the next one seals, so that file is not
+# immutable while a node is running. Mithril expresses that rule RELATIVE TO THE
+# DIRECTORY — `ImmutableFile::list_completed_in_dir` is
+# `filter(|f| f.number < last_number)` — so it names a different file in every tree.
+# `pallas-hardano` and `chain-sieve` both replicate it on the READ side, correctly:
+# a reader of a running node must not touch the file being written.
+#
+# It is the wrong rule for a published tree. A snapshot is `0..=beacon`, the beacon
+# is signed, and the aggregator applied the drop-the-last rule before archiving. So
+# "hold back the highest local number" takes a sealed chunk off a restored snapshot
+# rather than protecting against an unsealed one, and it has no fixed point.
+#
+# The boundary therefore comes from Mithril itself.
+# `/artifact/cardano-database/digests` publishes a SHA-256 per immutable file, and a
+# local part is publishable exactly when that map names it. `verify` reconciles
+# against it; `publish` excludes against it. That is why this crate is no longer
+# offline-only, and why it needs an HTTP client and a hash.
+[package]
+name = "mithril-snapshot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Validate an unpacked Mithril snapshot and publish it to R2"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+# The same version AND features as `crates/mitos-core` — i.e. dolos v1.2.0's — so the
+# lock keeps exactly ONE `mithril-client`. Default features would pull GMP
+# (`gmp-mpfr-sys`); `num-integer-backend` is the one that already compiles here.
+# `fs` is what gates `download_unpack`, `ImmutableFileRange` and the proving API.
+# The same version AND features as `crates/mitos-core` — i.e. dolos v1.2.0's — so the
+# lock keeps exactly ONE `mithril-client`. Default features would pull GMP
+# (`gmp-mpfr-sys`); `num-integer-backend` is the one that already compiles here.
+#
+# `fs` gates the download/proving API; `unstable` is NOT optional and NOT a
+# misconfiguration — in 0.12.2 the whole v2 `cardano_database_client` module
+# (`ImmutableFileRange`, `download_unpack`, `compute_merkle_proof`) sits behind
+# `cfg_unstable!` (`mithril-client/src/lib.rs` L104/L124). The CLI 0.13.20 has the same
+# API default-on, which is why `--backend v2` is its default. Measured 2026-09-26:
+# enabling it adds NO packages to the lock (its optional deps are already pulled in by
+# `fs`), and neither GMP nor OpenSSL appears in the tree. It does mean the one
+# `mithril-client` the workspace compiles has that feature on for `mitos-core` too,
+# whose code does not call into it.
+mithril-client = { version = "=0.12.2", default-features = false, features = [
+    "fs",
+    "num-integer-backend",
+    "rustls-tls",
+    "rustls-tls-webpki-roots",
+    "unstable",
+] }
+reqwest = { workspace = true, features = ["blocking", "json"] }
+serde = { workspace = true }
+sha2 = "0.10"
+# Only `sync` needs a runtime: `mithril-client`'s download and proving APIs are
+# async. Everything else here is blocking on purpose, so a runtime is created for
+# that one step rather than wrapping `main`.
+tokio = { workspace = true }

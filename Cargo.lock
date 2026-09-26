@@ -3590,6 +3590,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mithril-snapshot"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "mithril-client",
+ "reqwest",
+ "serde",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "mithril-stm"
 version = "0.3.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"

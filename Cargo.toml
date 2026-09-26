@@ -47,6 +47,15 @@ members = [
     # catalogue's. Only the generic half moved; the ORDER each artifact
     # publishes in stays with the artifact.
     "crates/cf-publish",
+    # Validates an unpacked Mithril snapshot, and publishes it to R2. The rule is
+    # Mithril's, and it is published rather than inferred: Mithril keeps appending
+    # to the highest-numbered immutable file until the next one seals, and
+    # `pallas-hardano` / `chain-sieve` drop that file on READ — correct for a
+    # running node, wrong for a snapshot, whose top file the aggregator already
+    # signed. So the boundary comes from `/artifact/cardano-database/digests`, and a
+    # local part is publishable when that map names it and canonical when its
+    # SHA-256 matches. Same set goes to R2 that readers serve.
+    "crates/mithril-snapshot",
     "crates/none-match-indexer",
     "crates/tx-index",
     # The live UTxO set as an immutable artifact — rows, three narrow orderings
