@@ -125,6 +125,10 @@ enum Cmd {
     Reindex(ReindexArgs),
     /// Ask a published book a question, through the reader a consumer uses.
     Lookup(LookupArgs),
+    /// Measure the per-policy counts a collection catalogue would carry — live
+    /// assets and holders, over every policy in the book. The measurement that
+    /// decides whether the exact columns are affordable, and what they hold.
+    Catalogue(CatalogueArgs),
     /// Record where a published book sits on chain, from the chunk it was built at.
     /// A build writes `base_slot` itself; this is for an artifact built before the
     /// field existed, so `tip()` can answer instead of refusing.
@@ -296,6 +300,23 @@ struct LookupArgs {
 }
 
 #[derive(Args)]
+struct CatalogueArgs {
+    /// The book directory to measure.
+    #[arg(long)]
+    book: PathBuf,
+    /// Refs per page while walking a policy's run. The reader clamps to its own
+    /// `MAX_PAGE`, so a larger number here is not a way past it.
+    #[arg(long, default_value_t = 100_000)]
+    limit: usize,
+    /// Write one line per policy, tab-separated:
+    /// `<policy hex>\t<refs>\t<holders>\t<credentials>\t<names>\t<entries>`.
+    /// The whole per-policy distribution, so the threshold table below can be
+    /// redrawn without another pass.
+    #[arg(long)]
+    dump: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct PublishArgs {
     /// The book directory to publish from.
     #[arg(long)]
@@ -434,6 +455,7 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => verify(a),
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
+        Cmd::Catalogue(a) => catalogue(a),
         Cmd::StampBoundary(a) => stamp_boundary(a),
         Cmd::Publish(a) => publish(a),
         Cmd::ResolveInputs(a) => resolve_inputs(a),
@@ -4263,6 +4285,228 @@ fn lookup(a: LookupArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Measure the per-policy counts a collection catalogue would carry.
+///
+/// The two columns the catalogue needs beyond a name — **live assets** and
+/// **holders** — are both *distinct counts per policy*, and neither is in the
+/// artifact. `by_policy`'s entry count is one entry per `(row, policy)`, so a row
+/// holding three assets of a policy counts once, and it says nothing about
+/// distinctness at all. So this walks every policy's run and dedups what it finds:
+/// distinct names for the asset column, distinct addresses and distinct
+/// credentials for the holder column.
+///
+/// **Why there is no spill file.** The obvious shape for a store-wide distinct
+/// count is an external sort of every `(policy, key)` record — ~18 M keys, and the
+/// reason `COLLECTION_CATALOGUE` §5 proposed one. It is not needed: `by_policy`
+/// groups by policy already, so one policy can be deduped at a time and the peak is
+/// the *largest single policy's* set rather than the store's. That peak is what
+/// `largest` reports, and it is the number that decides whether an exact pass fits
+/// a small box.
+///
+/// ⚠️ **It reads each row twice, because that is what today's API costs.** Once
+/// inside `by_policy`, which confirms the policy by reading the row and then throws
+/// it away, and once through `utxo` to get the address and the assets out. A fused
+/// `by_policy` that handed the row to its caller would halve the row traffic; the
+/// meter is what would show it, so the two are deliberately kept apart here.
+fn catalogue(a: CatalogueArgs) -> Result<()> {
+    use std::io::Write;
+
+    let t = Instant::now();
+    let book = live_book::Base::open(&a.book)?;
+    let opened = t.elapsed();
+    let mut meter = Meter::new();
+    let run = Run::new("catalogue")
+        .target(a.book.display().to_string())
+        .key("rows", book.rows())
+        .key("policies", book.policies().len() as u64);
+
+    println!("book catalogue — the per-policy counts, measured");
+    println!(
+        "  opened     {} rows in {:.3} s · {} policies · layout_version {}",
+        book.rows(),
+        opened.as_secs_f64(),
+        book.policies().len(),
+        book.meta().layout_version,
+    );
+    println!();
+
+    let policies = book.policies().len();
+    let mut dump = match &a.dump {
+        Some(path) => Some(std::io::BufWriter::new(
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => None,
+    };
+
+    // What the two columns would hold, store-wide.
+    let mut refs = 0u64;
+    let mut rows = 0u64;
+    let mut absent = 0u64;
+    let mut entries = 0u64;
+    let mut names = 0u64;
+    let mut holders = 0u64;
+    let mut creds = 0u64;
+    let mut scripts = 0u64;
+    // The peak set an exact pass has to hold — the largest policy's holder set and
+    // its name set — and which policy each is.
+    let mut most_holders = (0u64, 0u32);
+    let mut most_names = (0u64, 0u32);
+    // The distribution the "cap it or not" decision needs.
+    const THRESHOLDS: [u64; 6] = [100, 1_000, 10_000, 50_000, 100_000, 1_000_000];
+    let mut over = [0u64; THRESHOLDS.len()];
+
+    let started = Instant::now();
+    for id in 0..policies as u32 {
+        let Some(policy) = book.policies().get(id)? else {
+            continue;
+        };
+        let mut here_holders: HashSet<&[u8]> = HashSet::new();
+        let mut here_creds: HashSet<[u8; 28]> = HashSet::new();
+        let mut here_scripts: HashSet<[u8; 28]> = HashSet::new();
+        let mut here_names: HashSet<&[u8]> = HashSet::new();
+        let mut here_refs = 0u64;
+        let mut here_absent = 0u64;
+        let mut here_entries = 0u64;
+        let mut after = None;
+        loop {
+            let page =
+                meter.observe(Op::BookEnumerate, || book.by_policy(&policy, after, a.limit))?;
+            for (hash, index) in &page.refs {
+                here_refs += 1;
+                // Timed by hand rather than through `observe`: the row borrows the
+                // mapping, and the borrow has to outlive this statement — the sets
+                // below hold slices of it — so the call stays a plain one.
+                let read = Instant::now();
+                let had = book.utxo(hash, *index)?;
+                meter.record(Op::BookUtxo, read.elapsed().as_nanos() as u64);
+                let Some(row) = had else {
+                    here_absent += 1;
+                    continue;
+                };
+                here_holders.insert(row.address());
+                if let Some(cred) = meter
+                    .observe(Op::AddressCodec, || {
+                        live_book::address::credential(row.address())
+                    })
+                {
+                    let bytes = *cred.bytes();
+                    if cred.is_script() {
+                        here_scripts.insert(bytes);
+                    }
+                    here_creds.insert(bytes);
+                }
+                for asset in row.assets() {
+                    // `asset.policy` indexes this artifact's own table, so equality
+                    // with the id being walked is exact and free; only a row holding
+                    // a *different* policy under the same 8-byte prefix pays a read,
+                    // and that read is what keeps the count exact rather than
+                    // prefix-approximate.
+                    let mut mine = asset.policy == id;
+                    if !mine {
+                        mine = meter
+                            .observe(Op::TableLookup, || book.policies().get(asset.policy))?
+                            == Some(policy);
+                    }
+                    if mine {
+                        here_entries += 1;
+                        here_names.insert(asset.name);
+                    }
+                }
+            }
+            match page.next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+
+        refs += here_refs;
+        rows += here_refs - here_absent;
+        absent += here_absent;
+        entries += here_entries;
+        names += here_names.len() as u64;
+        holders += here_holders.len() as u64;
+        creds += here_creds.len() as u64;
+        scripts += here_scripts.len() as u64;
+        for (i, threshold) in THRESHOLDS.iter().enumerate() {
+            if here_holders.len() as u64 >= *threshold {
+                over[i] += 1;
+            }
+        }
+        if here_holders.len() as u64 > most_holders.0 {
+            most_holders = (here_holders.len() as u64, id);
+        }
+        if here_names.len() as u64 > most_names.0 {
+            most_names = (here_names.len() as u64, id);
+        }
+        if let Some(out) = dump.as_mut() {
+            writeln!(
+                out,
+                "{}\t{here_refs}\t{}\t{}\t{}\t{here_entries}",
+                hex::encode(policy),
+                here_holders.len(),
+                here_creds.len(),
+                here_names.len(),
+            )?;
+        }
+        if id > 0 && id % 10_000 == 0 {
+            println!(
+                "  ... {id}/{policies} policies · {rows} rows · {:.1} M entries · {:.0}s",
+                entries as f64 / 1e6,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    let secs = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+
+    println!();
+    println!(
+        "  walked     {policies} policies · {refs} refs · {rows} rows read back · {absent} unreadable"
+    );
+    println!("  entries    {entries} asset entries · {names} distinct (policy, name)");
+    println!(
+        "  holders    {holders} distinct (policy, address) · {creds} distinct (policy, credential)"
+    );
+    println!("             {scripts} of those credentials are script hashes");
+    let (top_holders, holder_policy) = most_holders;
+    let (top_names, name_policy) = most_names;
+    // Guarded so a degenerate artifact (no policy holds anything) fails nothing:
+    // there is no `largest` to name, rather than a policy id to invent.
+    if top_holders > 0 || top_names > 0 {
+        println!(
+            "  largest    {top_holders} holders on one policy ({}) · {top_names} names ({})",
+            policy_hex(&book, holder_policy)?,
+            policy_hex(&book, name_policy)?,
+        );
+    }
+    for (i, threshold) in THRESHOLDS.iter().enumerate() {
+        println!(
+            "  over       {:>6} policies have {threshold} or more holders",
+            over[i]
+        );
+    }
+    println!();
+    println!(
+        "  wall       {secs:.1} s · {:.0} policies/s · {:.2} M refs/s",
+        policies as f64 / secs,
+        refs as f64 / secs / 1e6,
+    );
+    print!("{}", meter.table(&run));
+    if let (Some(mut out), Some(path)) = (dump, &a.dump) {
+        out.flush()?;
+        println!("  dump       {}", path.display());
+    }
+    Ok(())
+}
+
+/// A policy id as hex, or an error: an id that was just walked and is not in the
+/// table means the artifact disagrees with itself, which is not a blank to print.
+fn policy_hex(book: &live_book::Base, id: u32) -> Result<String> {
+    match book.policies().get(id)? {
+        Some(policy) => Ok(hex::encode(policy)),
+        None => bail!("policy id {id} is not in the table after it was walked"),
+    }
 }
 
 /// Cross-check the three orderings against each other, on the whole store.

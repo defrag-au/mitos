@@ -593,9 +593,13 @@ What the book answers:
   the old inode alive (`B5`), which is also why the writers are not allowed to
   edit a published file in place.
 - `read_utxos` / `read_utxo` (live set), `utxos_by_address`,
-  `utxos_by_payment_cred`, `utxos_by_policy`, and `holder_count` from the entry
-  count of a run. `AssetState`-style facts only if a sibling projection supplies
-  them — the book is a set of outputs, not the entity graph.
+  `utxos_by_payment_cred`, `utxos_by_policy`, and `holder_count` — ⚠️ **not** the
+  entry count of a run, which counts *outputs*: it is a per-address dedup over every
+  row the run returns (`impls/book.rs`), so it costs a row read per ref. Measured
+  2026-09-26: ADA Handle's run is 170,062 refs and **74,129** holders
+  (`LARGE_POLICY_VIEWS.md` §7, `COLLECTION_CATALOGUE.md` §5). `AssetState`-style
+  facts only if a sibling projection supplies them — the book is a set of outputs,
+  not the entity graph.
 - **`read_script`** is `NotYetImplemented` in the data plane today. The book's
   datum table is the natural home for a script table too — the same hash →
   payload shape, the same refcounted store — which would close that gap as a side
