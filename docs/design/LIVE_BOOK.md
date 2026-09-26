@@ -656,7 +656,8 @@ Two figures the phase-1 gate asked for by name:
   is `[#6.24(payload), crc32]` and its **attributes map is `{* any => any}`** —
   unconstrained — so mainnet carries addresses of arbitrary length. Over chunk 81,
   4 of 16,013 created outputs hold payloads of **502, 682, 828 and 7,678 B**
-  (`rows.bin`'s longest row is 7,689 B), against a plain address's ~43 B. They are
+  (chunk 81's longest row is 7,689 B; store-wide it is **22,656 B**, §4.5's
+  correction), against a plain address's ~43 B. They are
   authentic, not a decode artefact: each parses as an `AddressPayload` consuming
   exactly its bytes *and* satisfies its own CRC. Their attribute 1 carries text —
   Bible verses in plain ASCII, and one a hex-encoded JPEG. Early Byron had no

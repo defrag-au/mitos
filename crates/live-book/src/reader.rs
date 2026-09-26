@@ -56,9 +56,8 @@ use crate::format::{
     TABLE_OUTREF, TABLE_POLICY,
 };
 use crate::row::Row;
-// `RowRead` is the error of `Base::row`, which is the zero-copy borrow only
-// `MmapSource` can honour.
-#[cfg(feature = "mmap")]
+// `RowRead` is what the row read has to tell apart — "not a row" from "needs more
+// bytes" — and that distinction lives in `with_row`, which is not mmap-only.
 use crate::row::RowRead;
 #[cfg(feature = "mmap")]
 use crate::source::MmapSource;
@@ -290,6 +289,53 @@ impl Base<MmapSource> {
     }
 }
 
+/// The row read, over any source: the speculation window, its growth, and what each
+/// [`RowRead`] means to a caller.
+///
+/// Free-standing rather than a method so the growth can be tested against a source
+/// that is not a file, and because it is the one place the window logic exists.
+///
+/// ⚠️ **A row's length is not in its header.** The asset records are variable-length
+/// (`4 + 1 + name_len + 8` each), so the header gives a *bound* and not a length, and
+/// the only way to know where a row ends is to walk it — which needs the records, so
+/// the walk cannot happen before the read. Hence a window that **grows when a row
+/// demonstrably needs more**, rather than treating "longer than I guessed" as "not a
+/// row": that reading is how 630 rows over 8 KiB — 1,786 `by_policy` entries, the
+/// HOSKY and ADA Handle whale rows — came to be skipped by every enumeration
+/// (`LARGE_POLICY_VIEWS.md` §0).
+///
+/// Growth is geometric, so a 23 KB row costs two more reads locally and two more
+/// round trips remotely, while the median 166 B row still costs one. A header that
+/// claims more than the source holds ends as `Ok(None)` — it is not a row — and so
+/// does a read that was given everything there is.
+fn with_row_from<S: Source, T>(
+    rows: &S,
+    offset: u32,
+    f: impl FnOnce(Row<'_>) -> T,
+) -> Result<Option<T>> {
+    /// The first window: §4.5's median row is 166 B, so this covers all but a
+    /// handful of rows in the store without a second read.
+    const SPECULATION: usize = 8 * 1024;
+    if u64::from(offset) >= rows.size() {
+        return Ok(None);
+    }
+    let mut window = SPECULATION;
+    loop {
+        let bytes = rows.read_upto(u64::from(offset), window)?;
+        match Row::parse(&bytes) {
+            Ok(row) => return Ok(Some(f(row))),
+            // Fewer bytes than a header: not a row at all.
+            Err(RowRead::Short) => return Ok(None),
+            // The row needs more than the window — the only case worth another read.
+            Err(RowRead::OutOfRange) if bytes.len() == window => {
+                window = window.saturating_mul(2);
+            }
+            // It claims more than the source holds.
+            Err(RowRead::OutOfRange) => return Ok(None),
+        }
+    }
+}
+
 impl<S: Source> Base<S> {
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -315,20 +361,10 @@ impl<S: Source> Base<S> {
     /// `Err` means the *read* failed, which is a different thing and must not be
     /// mistaken for it.
     ///
-    /// ⚠️ **`MAX_ROW` is a speculative over-read, not a limit on the format.**
-    /// A row's length is inside its header, so a remote source cannot know how
-    /// much to fetch without two dependent round trips. §4.5 measures the median
-    /// row at 166 B and the longest in the whole store at 7,689 B, so 8 KiB
-    /// covers every row mainnet holds with room to spare — and `Row::parse`
-    /// still refuses a row that runs past what it was given, so a fixture that
-    /// exceeded it would fail loudly rather than truncate.
+    /// A row longer than the first window is still a row: see [`with_row_from`] for
+    /// why the window grows rather than the row being skipped.
     pub fn with_row<T>(&self, offset: u32, f: impl FnOnce(Row<'_>) -> T) -> Result<Option<T>> {
-        const MAX_ROW: usize = 8 * 1024;
-        if u64::from(offset) >= self.rows.size() {
-            return Ok(None);
-        }
-        let bytes = self.rows.read_upto(u64::from(offset), MAX_ROW)?;
-        Ok(Row::parse(&bytes).ok().map(f))
+        with_row_from(&self.rows, offset, f)
     }
 
     /// Is this output live, and what does it say — handed to `f` while borrowed.
@@ -980,6 +1016,146 @@ mod tests {
         let page = base.by_policy(&absent, None, 100).expect("by policy");
         assert!(page.refs.is_empty());
         f.remove();
+    }
+
+    /// A row longer than the first window is **still a row**.
+    ///
+    /// Before the window grew, the read took 8 KiB once and mapped a refusal to
+    /// `Ok(None)` — "not a row" — so a longer row was silently absent from every
+    /// enumeration: 630 rows store-wide, 1,786 `by_policy` entries, the HOSKY and
+    /// ADA Handle whale rows among them, and the failure mode was a plausible
+    /// *smaller* page rather than an error (`LARGE_POLICY_VIEWS.md` §0).
+    ///
+    /// The row here is 20,481 B — over **two** windows, so one doubling would not
+    /// be enough and the loop is what gets pinned, not a single retry.
+    #[test]
+    fn a_row_longer_than_the_first_window_is_still_a_row() {
+        let mut f = Fixture::new("long-row");
+        f.push(
+            0xA1,
+            0,
+            1_000,
+            &base_address(0x11, 0x22),
+            &[(0, b"small", 1)],
+        );
+        // 76 records at the 255-byte name cap — 76 × (4 + 1 + 255 + 8) = 20,368 B
+        // of records, plus the 56-byte header and a 57-byte address. That is the
+        // shape a whale row takes: one output holding a whole policy.
+        let names: Vec<[u8; 255]> = (0..76u8).map(|i| [i; 255]).collect();
+        let assets: Vec<(u32, &[u8], u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (1, name.as_slice(), i as u64 + 1))
+            .collect();
+        let big = f.push(0xA2, 1, 2_000, &base_address(0x33, 0x44), &assets);
+        let policies = {
+            let mut p0 = [0u8; 28];
+            p0[0] = 0xC1;
+            let mut p1 = [0u8; 28];
+            p1[0] = 0xC2;
+            [p0, p1]
+        };
+        let base = f.finish(&policies);
+
+        // Read back whole, not as a prefix.
+        let (n, last_name) = base
+            .with_row(big, |row| {
+                (row.n_assets(), row.assets().last().map(|a| a.name.len()))
+            })
+            .expect("read")
+            .expect("a row");
+        assert_eq!((n, last_name), (76, Some(255)));
+
+        // And the enumeration a policy page is built from finds it.
+        let mut p1 = [0u8; 28];
+        p1[0] = 0xC2;
+        let page = base.by_policy(&p1, None, 100).expect("by policy");
+        assert_eq!(page.refs.len(), 1, "the long row holds this policy");
+        assert_eq!(page.refs[0].1, 1, "and this is the row that holds it");
+        f.remove();
+    }
+
+    /// The window grows **geometrically**, and the read count is the property that
+    /// matters: a local read is nearly free, a remote one is a round trip, so "did
+    /// it grow as far as it needed and no further" is a different question from
+    /// "did the row come back".
+    ///
+    /// Driven against a byte slice rather than a file, which is what the free
+    /// function exists for — see [`with_row_from`].
+    #[test]
+    fn the_row_window_grows_geometrically_and_stops() {
+        struct Counted {
+            bytes: Vec<u8>,
+            reads: std::cell::Cell<usize>,
+        }
+        impl Source for Counted {
+            type Bytes<'a> = &'a [u8];
+
+            fn read(&self, offset: u64, len: usize) -> Result<&[u8]> {
+                let at = offset as usize;
+                assert!(at + len <= self.bytes.len(), "read past the end");
+                Ok(&self.bytes[at..at + len])
+            }
+
+            fn read_upto(&self, offset: u64, max: usize) -> Result<&[u8]> {
+                self.reads.set(self.reads.get() + 1);
+                let at = offset as usize;
+                let end = at.saturating_add(max).min(self.bytes.len());
+                Ok(&self.bytes[at..end])
+            }
+
+            fn size(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+        }
+
+        let small = encode_row(
+            [0xA1; 32],
+            0,
+            1_000,
+            &base_address(0x11, 0x22),
+            &[(0, b"small", 1)],
+        );
+        let names: Vec<[u8; 255]> = (0..76u8).map(|i| [i; 255]).collect();
+        let assets: Vec<(u32, &[u8], u64)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (1, name.as_slice(), i as u64 + 1))
+            .collect();
+        let big = encode_row([0xA2; 32], 1, 2_000, &base_address(0x33, 0x44), &assets);
+        let big_at = small.len() as u32;
+        let mut bytes = small;
+        bytes.extend_from_slice(&big);
+        let source = Counted {
+            bytes,
+            reads: std::cell::Cell::new(0),
+        };
+
+        // A median-shaped row: one speculative read, no growth.
+        let n = with_row_from(&source, 0, |row| row.n_assets())
+            .expect("read")
+            .expect("a row");
+        assert_eq!((n, source.reads.get()), (1, 1));
+
+        // A row over two windows: 8 KiB → 16 KiB → 32 KiB, then it stops.
+        source.reads.set(0);
+        let n = with_row_from(&source, big_at, |row| row.n_assets())
+            .expect("read")
+            .expect("a row");
+        assert_eq!((n, source.reads.get()), (76, 3));
+
+        // A row claiming more than the source holds is not a row, and the read
+        // stops rather than growing into the rest of the file forever.
+        let truncated = Counted {
+            bytes: big[..big.len() - 100].to_vec(),
+            reads: std::cell::Cell::new(0),
+        };
+        assert!(
+            with_row_from(&truncated, 0, |row| row.n_assets())
+                .expect("read")
+                .is_none()
+        );
+        assert_eq!(truncated.reads.get(), 3);
     }
 
     #[test]

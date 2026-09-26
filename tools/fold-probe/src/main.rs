@@ -67,7 +67,7 @@ use anyhow::{Context, Result, bail};
 // reports is between two readers of one crate, not between a crate and a copy.
 use cardano_assets::{
     Asset, DecodedAsset, MediaRole, MediaType, Traits, asset_from_metadata_value,
-    cip25_metadata_value, decode_document,
+    cip25_metadata_value, decode_document, document_fields,
 };
 use clap::{Args, Parser, Subcommand};
 // Through the walker's re-export rather than a new `chain-decode` dependency:
@@ -2788,6 +2788,10 @@ fn cip25(a: Cip25Args) -> Result<()> {
     let media_none = AtomicU64::new(0);
     let media_census: Mutex<MediaCensus> = Mutex::new(MediaCensus::default());
     let differ_reasons: Mutex<MediaTypeReasons> = Mutex::new(MediaTypeReasons::default());
+    let collections: Mutex<HashMap<Vec<u8>, CollectionNames>> = Mutex::new(HashMap::new());
+    // A walked asset that yields no display name at all — declared or on-chain — so
+    // the census's denominator is counted rather than assumed.
+    let names_skipped = AtomicU64::new(0);
     let trait_assets = AtomicU64::new(0);
     let attr_pairs = AtomicU64::new(0);
     let attr_hist: [AtomicU64; 16] = std::array::from_fn(|_| AtomicU64::new(0));
@@ -2824,6 +2828,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
                     let mut l_media_none = 0u64;
                     let mut l_census = MediaCensus::default();
                     let mut l_reasons = MediaTypeReasons::default();
+                    let mut l_collections: HashMap<Vec<u8>, CollectionNames> = HashMap::new();
+                    let mut l_names_skipped = 0u64;
                     let mut l_trait_assets = 0u64;
                     let mut l_pairs = 0u64;
                     let mut l_hist = [0u64; 16];
@@ -2909,6 +2915,17 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                                 &walked.declarations,
                                                 &mut l_census,
                                             );
+                                            if let Some(display) = display_of(&walked.asset, &name)
+                                            {
+                                                tally_names(
+                                                    policy,
+                                                    value,
+                                                    &display,
+                                                    &mut l_collections,
+                                                );
+                                            } else {
+                                                l_names_skipped += 1;
+                                            }
                                             l_decoded += 1;
                                             tally_traits(
                                                 &walked.asset.traits,
@@ -2944,6 +2961,16 @@ fn cip25(a: Cip25Args) -> Result<()> {
                                                     &w.declarations,
                                                     &mut l_census,
                                                 );
+                                                if let Some(display) = display_of(&w.asset, &name) {
+                                                    tally_names(
+                                                        policy,
+                                                        value,
+                                                        &display,
+                                                        &mut l_collections,
+                                                    );
+                                                } else {
+                                                    l_names_skipped += 1;
+                                                }
                                             }
                                             let projected =
                                                 fast.as_ref().map(|w| project_asset(&w.asset));
@@ -3027,6 +3054,16 @@ fn cip25(a: Cip25Args) -> Result<()> {
                             let mut census = media_census.lock().expect("media census");
                             census.merge(std::mem::take(&mut l_census));
                         }
+                        if !l_collections.is_empty() {
+                            let mut all = collections.lock().expect("collections");
+                            for (policy, names) in l_collections.drain() {
+                                all.entry(policy)
+                                    .or_insert_with(CollectionNames::new)
+                                    .merge(names);
+                            }
+                        }
+                        names_skipped.fetch_add(l_names_skipped, Ordering::Relaxed);
+                        l_names_skipped = 0;
                         if !l_cmp_examples.is_empty() {
                             let mut ex = cmp_examples.lock().expect("examples");
                             if ex.len() < 8 {
@@ -3130,6 +3167,8 @@ fn cip25(a: Cip25Args) -> Result<()> {
     let differ = differ_fields.into_inner().expect("differ fields");
     let census = media_census.into_inner().expect("media census");
     let reasons = differ_reasons.into_inner().expect("differ reasons");
+    let collections = collections.into_inner().expect("collections");
+    let names_skipped = names_skipped.load(Ordering::Relaxed);
     let chunks = done.load(Ordering::Relaxed).max(1);
     let n_policies = policies.lock().expect("policies").len();
     let guard = traits.lock().expect("traits");
@@ -3244,6 +3283,9 @@ fn cip25(a: Cip25Args) -> Result<()> {
             println!("             files[], as declared:");
             print_declared_groups(&declared_groups(&rows));
         }
+    }
+    if !collections.is_empty() {
+        print_collections(&collections, names_skipped);
     }
     println!(
         "  distinct   {} (trait, value) pairs across {n_policies} collections{} · over the viewer's 512 cap: {over_cap}",
@@ -3422,6 +3464,8 @@ struct MediaTypeReasons {
     /// `Undefined` where `Asset` carried the string.
     headline_not_a_type: u64,
     /// The document declared a type and materialised no headline to attach it to.
+    /// Accepted as the one projection loss — `DecodedDocument::declared_media_type`
+    /// still carries the declaration — and counted here rather than estimated.
     no_headline: u64,
     /// Anything else — kept so an unclassified case cannot hide in a subtotal.
     other: u64,
@@ -3599,6 +3643,167 @@ fn tally_media_level(
     }
 }
 
+/// The document fields that name the thing a policy holds, measured rather than
+/// assumed. The registry classifies every one of these as a capture-only facet,
+/// so none is a trait and none is visible in `Traits` — `document_fields` is the
+/// way to read them.
+const COLLECTION_KEYS: [&str; 6] = [
+    "collection",
+    "collection name",
+    "project",
+    "series",
+    "publisher",
+    "vendor",
+];
+
+/// A tally of small strings that stays bounded: at most `CAP` values are kept
+/// and the rest are counted, so a policy whose assets never repeat a name cannot
+/// grow the accumulator without limit. `over` is the visible price of the cap.
+#[derive(Default, Clone)]
+struct CappedTally {
+    values: Vec<(String, u64)>,
+    over: u64,
+}
+
+impl CappedTally {
+    const CAP: usize = 4;
+
+    fn add(&mut self, value: &str) {
+        if let Some(slot) = self.values.iter_mut().find(|(v, _)| v == value) {
+            slot.1 += 1;
+        } else if self.values.len() < Self::CAP {
+            self.values.push((value.to_string(), 1));
+        } else {
+            self.over += 1;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (value, n) in other.values {
+            match self.values.iter().position(|(v, _)| *v == value) {
+                Some(index) => self.values[index].1 += n,
+                None if self.values.len() < Self::CAP => self.values.push((value, n)),
+                None => self.over += n,
+            }
+        }
+        self.over += other.over;
+    }
+
+    /// The most frequent value kept, and its count — `None` where the cap ate
+    /// everything, which the report counts rather than hides.
+    ///
+    /// Ties break on the value, so a report of a corpus full of one-off names is
+    /// the same on two runs: `max_by_key` alone returns whichever tied element the
+    /// merge order happened to leave last, which is chunk scheduling.
+    fn top(&self) -> Option<(&str, u64)> {
+        self.values
+            .iter()
+            .max_by_key(|(v, n)| (*n, std::cmp::Reverse(v.as_str())))
+            .map(|(v, n)| (v.as_str(), *n))
+    }
+
+    fn total(&self) -> u64 {
+        self.values.iter().map(|(_, n)| n).sum::<u64>() + self.over
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.over == 0
+    }
+}
+
+/// What the corpus calls one policy.
+struct CollectionNames {
+    /// Typed documents seen under this policy.
+    documents: u64,
+    /// Per [`COLLECTION_KEYS`] position: what the documents declared there.
+    declared: [CappedTally; COLLECTION_KEYS.len()],
+    /// What the assets' display names imply, edition marker removed.
+    derived: CappedTally,
+}
+
+impl CollectionNames {
+    fn new() -> Self {
+        Self {
+            documents: 0,
+            declared: std::array::from_fn(|_| CappedTally::default()),
+            derived: CappedTally::default(),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.documents += other.documents;
+        for (mine, theirs) in self.declared.iter_mut().zip(other.declared) {
+            mine.merge(theirs);
+        }
+        self.derived.merge(other.derived);
+    }
+
+    /// The one name that covers most of the policy's assets, and that share —
+    /// `None` where nothing was derived at all.
+    fn candidate(&self) -> Option<(&str, f64)> {
+        let (name, top) = self.derived.top()?;
+        let total = self.derived.total();
+        (total > 0).then(|| (name, top as f64 / total as f64))
+    }
+}
+
+/// What the corpus calls one asset: the document's own display name, else the
+/// on-chain name when it is text — which is what a wallet shows for a document
+/// that declares none.
+fn display_of(asset: &DecodedAsset, onchain_name: &[u8]) -> Option<String> {
+    asset
+        .name
+        .clone()
+        .or_else(|| std::str::from_utf8(onchain_name).ok().map(str::to_string))
+}
+
+/// The collection-ish name a display name implies: the edition marker off the
+/// end. `FamousWolfClub6366` → `FamousWolfClub`, `Luffy #123` → `Luffy`, while
+/// `3DArt` keeps its leading digit, because an edition is a *trailing* marker and
+/// a name that starts with one is a name.
+///
+/// Deliberately a heuristic, and it is measured rather than trusted: the report
+/// prints the share of a policy's assets its top candidate covers, so a rule that
+/// is wrong shows up as a low share rather than as a confidently wrong name.
+fn display_name_candidate(display: &str) -> String {
+    // Separators first, then the edition, then separators again: `Luffy #123 `,
+    // `Luffy-123` and `Luffy 123` are the same marker, and a trailing space must
+    // not hide the digits from the strip.
+    let cut = trim_markers(trim_markers(display).trim_end_matches(|c: char| c.is_ascii_digit()));
+    if cut.chars().count() >= 3 {
+        cut.to_string()
+    } else {
+        // `#123`, `42`, `#`: nothing left to name a collection with, so the
+        // display name stands rather than becoming empty.
+        display.trim().to_string()
+    }
+}
+
+/// What separates a name from its edition marker. An item rather than a closure,
+/// so it keeps the borrow it is handed — `|s: &str| …` cannot.
+fn trim_markers(s: &str) -> &str {
+    s.trim_end_matches([' ', '#', '-', '_', '.', ':'])
+}
+
+/// Fold one declared asset's name evidence into the collections census.
+fn tally_names(
+    policy: &[u8],
+    document: &Metadatum,
+    display: &str,
+    census: &mut HashMap<Vec<u8>, CollectionNames>,
+) {
+    let entry = census
+        .entry(policy.to_vec())
+        .or_insert_with(CollectionNames::new);
+    entry.documents += 1;
+    for (key, value) in document_fields(document, &COLLECTION_KEYS) {
+        if let Some(index) = COLLECTION_KEYS.iter().position(|k| *k == key) {
+            entry.declared[index].add(&value);
+        }
+    }
+    entry.derived.add(&display_name_candidate(display));
+}
+
 /// What a `src` says about a medium's format where the declaration did not.
 ///
 /// Deliberately coarse — a shape test, not a parser — because its only job is to
@@ -3698,6 +3903,74 @@ fn print_declared_types(rows: &mut [(String, u64)], unit: &str) {
         );
     }
     print_declared_groups(&groups);
+}
+
+/// The collections census: what the corpus calls each policy, and how much of it
+/// one name covers.
+///
+/// The two sources are counted apart because they are different claims.
+/// `declared` is the metadata naming itself — a capture-only facet the trait walk
+/// drops on purpose — and `derived` is the display names implying it. A catalogue
+/// takes the declared value where there is one and the candidate otherwise, and
+/// this report is what says how often that is true.
+fn print_collections(census: &HashMap<Vec<u8>, CollectionNames>, skipped: u64) {
+    let documents: u64 = census.values().map(|c| c.documents).sum();
+    println!(
+        "  collections {} policies · {documents} typed documents · {skipped} with no display name",
+        census.len()
+    );
+    let declared: Vec<String> = COLLECTION_KEYS
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let policies = census
+                .values()
+                .filter(|c| !c.declared[i].is_empty())
+                .count();
+            format!("{key} ×{policies}")
+        })
+        .collect();
+    let any_declared = census
+        .values()
+        .filter(|c| c.declared.iter().any(|tally| !tally.is_empty()))
+        .count();
+    println!(
+        "             declared    {} (any field: {any_declared})",
+        declared.join(" · ")
+    );
+    let (mut high, mut mid, mut low, mut none, mut capped) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for names in census.values() {
+        match names.candidate() {
+            Some((_, share)) if share >= 0.9 => high += 1,
+            Some((_, share)) if share >= 0.5 => mid += 1,
+            Some(_) => low += 1,
+            None => none += 1,
+        }
+        if names.derived.over > 0 {
+            capped += 1;
+        }
+    }
+    println!(
+        "             candidate   one name covers ≥90% of a policy: {high} · 50–90%: {mid} · <50%: {low} · none: {none} (capped: {capped})"
+    );
+    let mut rows: Vec<(&Vec<u8>, &CollectionNames)> = census.iter().collect();
+    rows.sort_unstable_by_key(|(policy, names)| (std::cmp::Reverse(names.documents), *policy));
+    for (policy, names) in rows.iter().take(12) {
+        let (name, share) = names.candidate().unwrap_or(("—", 0.0));
+        let declared = names
+            .declared
+            .iter()
+            .find_map(|tally| tally.top().map(|(value, _)| value.to_string()))
+            .unwrap_or_else(|| "—".to_string());
+        println!(
+            "               {}  {:>8} docs  {:>3.0}%  {}  declared: {}",
+            &hex_of(policy.as_slice())[..8],
+            names.documents,
+            share * 100.0,
+            name,
+            declared
+        );
+    }
 }
 
 /// A declared value for the report: quoted when it is not already trimmed, so a
@@ -5156,6 +5429,49 @@ mod tests {
     fn int(n: u8) -> Metadatum {
         assert!(n < 24, "small ints only");
         pallas_codec::minicbor::decode::<Metadatum>(&[n]).expect("small int decodes")
+    }
+
+    /// The edition marker comes off the end and nothing else does: a leading
+    /// digit is part of a name, and a name that is nothing but a marker stands.
+    #[test]
+    fn an_edition_marker_is_what_comes_off_a_display_name() {
+        for (display, want) in [
+            ("FamousWolfClub6366", "FamousWolfClub"),
+            ("Luffy #123", "Luffy"),
+            ("Luffy-0007", "Luffy"),
+            ("Unsig 12", "Unsig"),
+            // A trailing space before the edition — the shape the first cut of
+            // this rule got wrong, which the report's share column caught.
+            ("Unbounded.Earth 8 ", "Unbounded.Earth"),
+            ("3DArt", "3DArt"),
+            ("#123", "#123"),
+            ("n/a", "n/a"),
+        ] {
+            assert_eq!(display_name_candidate(display), want, "{display:?}");
+        }
+    }
+
+    /// The tally stays bounded and says so: past the cap a value is counted, not
+    /// kept, so a policy that never repeats a name cannot grow the accumulator.
+    #[test]
+    fn a_capped_tally_counts_what_it_stops_keeping() {
+        let mut tally = CappedTally::default();
+        for value in ["a", "b", "c", "d", "e", "f"] {
+            tally.add(value);
+        }
+        assert_eq!(tally.values.len(), CappedTally::CAP);
+        assert_eq!(tally.over, 2, "the two past the cap are counted, not kept");
+        assert_eq!(tally.total(), 6);
+        tally.add("a");
+        assert_eq!(tally.top(), Some(("a", 2)));
+        assert_eq!(tally.total(), 7);
+        // A tie breaks on the value, so two runs of one corpus agree on the name
+        // they report — the alternative is chunk scheduling choosing it.
+        let tied = CappedTally {
+            values: vec![("zulu".into(), 1), ("alpha".into(), 1)],
+            over: 0,
+        };
+        assert_eq!(tied.top(), Some(("alpha", 1)));
     }
 
     /// The projection back to the shape consumers read today: a missing name and

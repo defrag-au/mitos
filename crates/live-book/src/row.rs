@@ -244,6 +244,20 @@ impl<'a> Row<'a> {
             at: 0,
         }
     }
+
+    /// How many bytes this row occupies — the offset of the row that follows it.
+    ///
+    /// ⚠️ **The number a walker needs, and why it belongs here rather than at the
+    /// call site.** Rows in a run are back to back: a clustered arena is one, and so
+    /// is a response carrying rows with no offset table. Following either means
+    /// advancing by each row's own length. A caller could re-derive it —
+    /// `ROW_HEADER + addr_len + Σ(5 + name_len) + datum_len` — but that is this
+    /// layout written down a second time, on the far side of a network, where it
+    /// would go stale without anything noticing. [`Row::parse`] already computed the
+    /// figure to find the datum; this exposes it.
+    pub fn encoded_len(&self) -> usize {
+        ROW_HEADER + self.address.len() + self.assets.len() + datum_len(self.head) as usize
+    }
 }
 
 /// One asset record: an interned policy id, a name and a quantity.
@@ -380,6 +394,30 @@ mod tests {
         assert_eq!(assets[0].quantity, 5);
         assert_eq!(assets[1].name, b"two");
         assert_eq!(assets[1].quantity, 6);
+    }
+
+    #[test]
+    fn a_row_says_where_the_next_one_starts() {
+        let first = a_row();
+        assert_eq!(
+            Row::parse(&first).expect("parses").encoded_len(),
+            first.len()
+        );
+
+        // The second row differs only in its outref index, so a walk that lands a
+        // byte out reads a *plausible* row carrying the wrong output rather than
+        // failing — which is the whole reason the advance has to be exact.
+        let mut second = first.clone();
+        second[OFF_OUT_INDEX..OFF_OUT_INDEX + 4].copy_from_slice(&8u32.to_le_bytes());
+
+        let mut run = first.clone();
+        run.extend_from_slice(&second);
+
+        let one = Row::parse(&run).expect("the first parses");
+        assert_eq!(one.outref().1, 7);
+        let two = Row::parse(&run[one.encoded_len()..]).expect("the second parses");
+        assert_eq!(two.outref().1, 8);
+        assert_eq!(one.encoded_len() + two.encoded_len(), run.len());
     }
 
     #[test]
