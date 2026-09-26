@@ -56,6 +56,11 @@ members = [
     # local part is publishable when that map names it and canonical when its
     # SHA-256 matches. Same set goes to R2 that readers serve.
     "crates/mithril-snapshot",
+    # Reads a Mithril snapshot's immutable files over HTTP range requests, so a
+    # reader can consume the R2 mirror with no local copy of the database. Split
+    # from `mithril-snapshot` because that crate validates and PUBLISHES and so
+    # links `mithril-client` + `tokio`, which an indexer must not inherit.
+    "crates/mithril-source",
     "crates/none-match-indexer",
     "crates/tx-index",
     # The live UTxO set as an immutable artifact — rows, three narrow orderings
@@ -176,10 +181,10 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -274,12 +279,10 @@ strip = "symbols"
 # Both states are verified to build: ACTIVE (local paths) and COMMENTED (the
 # pinned git revs). Keep it that way — the commented state is what CI sees.
 [patch."https://github.com/defrag-au/shared-crates"]
-cardano-assets = { path = "../shared-crates/cardano-assets" }
-pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
-chain-ledger = { path = "../shared-crates/chain-ledger" }
-# address-registry re-added 2026-08-21: project-ledger's classify consumes it
-# again (workspace.dependencies entry above), so it belongs in the block.
-address-registry = { path = "../shared-crates/address-registry" }
+# cardano-assets = { path = "../shared-crates/cardano-assets" }
+# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+# chain-ledger = { path = "../shared-crates/chain-ledger" }
+# address-registry = { path = "../shared-crates/address-registry" }
 
 # `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which
 # returns None for an output stored in an earlier era — and a resolved UTxO

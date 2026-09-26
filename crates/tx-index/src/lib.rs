@@ -37,17 +37,38 @@
 //! An entry stores only the first 8 bytes of the hash. The read side fetches
 //! the located body, re-hashes it and compares to the FULL requested hash, so
 //! a prefix collision costs one wasted read and never a wrong answer.
+//!
+//! # Native and wasm
+//!
+//! The `mmap` feature (**on by default**) carries everything that touches a
+//! filesystem: the chunk extractor, the per-chunk segments, the compacted
+//! [`base`], and the reader that maps them. `memmap2` cannot build for
+//! `wasm32-unknown-unknown` and [`reader`] reaches for `std::os::unix`, so a
+//! Cloudflare Worker takes this crate with `default-features = false` and gets
+//! the half a locator needs — [`format`] (the 64-byte base header, the fence
+//! directory, the 24-byte entry) and [`decode`], both `&[u8]` in and plain data
+//! out. It drives the reads itself; `MITOS_AT_THE_EDGE.md` §7.6 is what it is
+//! reading them *for*.
 
-pub mod base;
-pub mod compact;
+// The parsing half: `&[u8]` in, plain data out. Built for wasm.
 pub mod decode;
-pub mod extract;
 pub mod format;
-pub mod reader;
-pub mod segment;
 pub mod wire;
 
+// The storage half: chunk files, segments, a mapped base. Native only.
+#[cfg(feature = "mmap")]
+pub mod base;
+#[cfg(feature = "mmap")]
+pub mod compact;
+#[cfg(feature = "mmap")]
+pub mod extract;
+#[cfg(feature = "mmap")]
+pub mod reader;
+#[cfg(feature = "mmap")]
+pub mod segment;
+
 pub use format::{AuxSpan, Entry, Location, prefix_of};
+#[cfg(feature = "mmap")]
 pub use reader::{AuxLookup, Coverage, Index, IndexHandle, Located, Resolution, TxBody};
 
 /// The tx hash of a body: blake2b-256 over its bytes. The one computation

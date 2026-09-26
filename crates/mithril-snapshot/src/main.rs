@@ -120,6 +120,18 @@ enum Cmd {
         /// Execute instead of printing: the fetch if `--sync` was given, then rclone.
         #[arg(long)]
         run: bool,
+        /// Concurrent object transfers (rclone `--transfers`).
+        ///
+        /// Lower it when the network path is the problem rather than the volume:
+        /// every new connection is another DNS lookup, and a resolver that fails one
+        /// fails that object's transfer. Measured on this store 2026-09-26: 16
+        /// transfers against a flaky resolver produced intermittent
+        /// `dial tcp: lookup … no such host` failures at ~2.3 MiB/s.
+        #[arg(long, default_value_t = 16)]
+        transfers: usize,
+        /// Concurrent checkers (rclone `--checkers`).
+        #[arg(long, default_value_t = 16)]
+        checkers: usize,
         /// Aggregator endpoint.
         #[arg(long)]
         aggregator: Option<String>,
@@ -153,8 +165,10 @@ fn main() -> Result<()> {
             dest,
             sync,
             run,
+            transfers,
+            checkers,
             aggregator,
-        } => publish(&dir, &dest, sync, run, aggregator),
+        } => publish(&dir, &dest, sync, run, transfers, checkers, aggregator),
     }
 }
 
@@ -564,6 +578,8 @@ fn publish(
     dest: &str,
     sync_first: bool,
     run: bool,
+    transfers: usize,
+    checkers: usize,
     aggregator: Option<String>,
 ) -> Result<()> {
     if sync_first {
@@ -628,7 +644,7 @@ fn publish(
     }
     println!();
 
-    let argv = rclone_argv(&immutable, dest, &hold_back);
+    let argv = rclone_argv(&immutable, dest, &hold_back, transfers, checkers);
     println!("{}", shell_line(&argv));
     println!();
     println!("note  R2 does not implement version-qualified HEAD, and rclone verifies with");
@@ -700,8 +716,22 @@ fn short(hash: &str) -> String {
 /// The proven R2 invocation: three file types, all binary, all immutable.
 ///
 /// `--s3-chunk-size` is part of the contract rather than tuning — rclone can only
-/// re-compute a multipart ETag if this matches what the upload used.
-fn rclone_argv(dir: &Path, dest: &str, excludes: &[&str]) -> Vec<String> {
+/// re-compute a multipart ETag if this matches what the upload used. It does not
+/// feature in practice here: the largest chunk on this store is under 128 MiB, below
+/// rclone's 200 MiB `upload_cutoff`, so every object is a single PUT — which is also
+/// why R2's ETag is the object's MD5 and `rclone check` can verify content.
+///
+/// `--s3-no-check-bucket` is passed even though the remote is configured with
+/// `no_check_bucket`, because a bucket-scoped R2 token cannot perform that check and
+/// depending on a config key for it makes the tool fail confusingly on someone else's
+/// machine.
+fn rclone_argv(
+    dir: &Path,
+    dest: &str,
+    excludes: &[&str],
+    transfers: usize,
+    checkers: usize,
+) -> Vec<String> {
     let mut argv = vec!["rclone".to_string(), "copy".to_string()];
     argv.push(dir.display().to_string());
     argv.push(dest.to_string());
@@ -717,14 +747,20 @@ fn rclone_argv(dir: &Path, dest: &str, excludes: &[&str]) -> Vec<String> {
         "Content-Type: application/octet-stream",
         "--header-upload",
         "Cache-Control: public, max-age=31536000, immutable",
-        "--transfers",
-        "16",
-        "--checkers",
-        "16",
+    ] {
+        argv.push(arg.to_string());
+    }
+    argv.push("--transfers".to_string());
+    argv.push(transfers.to_string());
+    argv.push("--checkers".to_string());
+    argv.push(checkers.to_string());
+
+    for arg in [
+        "--s3-no-check-bucket",
         // A newer snapshot is a SUPERSET of sealed chunks, byte-identical
         // (`ARTIFACT_SHARDING.md` §1), so a file already at the destination is
         // the file we would upload. Skipping it by name is both faster and
-        // stricter than rclone's size+modtime comparison.
+        // stricter than rclone's size+modtime comparison — and it needs no HEAD.
         "--ignore-existing",
         "--s3-chunk-size",
         "16M",

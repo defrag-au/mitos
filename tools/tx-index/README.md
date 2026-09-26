@@ -42,10 +42,11 @@ tx-index serve --immutable <db/immutable> --index-dir <dir> [--reload-secs 30]
                        rebuilt whole (tmp + rename) after a refresh
 ```
 
-Entry = 16 bytes: 8-byte hash prefix, chunk `u16`, body offset `u32`, body
-length `u16`. Era is per chunk (segment header / base era table). A hit is
-always verified by re-hashing the body against the full requested hash, so
-the 8-byte prefix can never yield a wrong answer, only a wasted read.
+Entry = **24 bytes**: 8-byte hash prefix, chunk `u16`, body offset `u32`, body
+length `u16`, aux-data offset `u32`, aux-data length `u16` (`0` = this tx
+carries none), 2 reserved. Era is per chunk (segment header / base era table).
+A hit is always verified by re-hashing the body against the full requested
+hash, so the 8-byte prefix can never yield a wrong answer, only a wasted read.
 
 The newest chunk file is never indexed — Mithril keeps appending to it
 until the next one seals — so a hash newer than the last sealed chunk is

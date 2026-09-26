@@ -29,6 +29,10 @@ description = "Validate an unpacked Mithril snapshot and publish it to R2"
 
 [dependencies]
 anyhow = { workspace = true }
+# To implement `mithril_client::feedback::FeedbackReceiver`, whose `handle_event` is an
+# `async fn` — the trait is declared with `#[async_trait]`, so an implementation has to
+# be too. Already in the workspace and used by most crates here.
+async-trait = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 # The same version AND features as `crates/mitos-core` — i.e. dolos v1.2.0's — so the

@@ -19,6 +19,17 @@ description = "tx hash → (chunk, body offset) locator over a Mithril immutable
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["mmap"]
+# Everything that touches a filesystem: the chunk extractor, the per-chunk
+# segments, the compacted base, and the mmap reader over them. Same split, and
+# the same name and reason, as `live-book`'s — `memmap2` cannot build for
+# `wasm32-unknown-unknown` and `reader` reaches for `std::os::unix`, so a
+# Cloudflare Worker serving a locator takes this crate with
+# `default-features = false` and gets `format` and `decode`, which are `&[u8]` in
+# and plain data out. See `MITOS_AT_THE_EDGE.md` §7.6.
+mmap = ["dep:memmap2"]
+
 [dependencies]
 # Block/tx decode straight from chunk bytes (no pallas-hardano: the extractor
 # splits CBOR items itself so it knows every byte offset it records).
@@ -28,7 +39,9 @@ pallas-codec = { workspace = true }
 # blake2b-256 — the tx hash, computed at extraction and re-verified on read.
 pallas-crypto = { workspace = true }
 
-memmap2 = { workspace = true }
+# Maps `base.idx`. Optional because it does not build for wasm — see the `mmap`
+# feature.
+memmap2 = { workspace = true, optional = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }

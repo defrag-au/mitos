@@ -33,12 +33,22 @@ young, so that order is also the cheap one.
 
 MEASURED: 123,602,296 entries, 3.03 GB base, ~9,130 chunks on mainnet.
 
+## Native and wasm
+
+`mmap` (**on by default**) carries the chunk extractor, the segments, the base
+and the reader over it. It is off for wasm — `memmap2` cannot build for
+`wasm32-unknown-unknown` — so a Worker takes this crate with
+`default-features = false` and gets `format` and `decode`: the 64-byte base
+header, the fence directory and the 24-byte entry, `&[u8]` in and plain data
+out. That is what a locator reads a *hosted* base with
+(`MITOS_AT_THE_EDGE.md` §7.6).
+
 ## 🔑 An entry stores only 8 bytes of the hash
 
 The read side fetches the located body, **re-hashes it, and compares against
 the full requested hash** — so a prefix collision costs one wasted read and
-never a wrong answer. That confirmation is not optional; it is what makes the
-16-byte-class entry sound.
+never a wrong answer. That confirmation is not optional; it is what makes an
+entry carrying only 8 bytes of the hash sound.
 
 ## 🔑 The extraction pass is a shared resource
 

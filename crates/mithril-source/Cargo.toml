@@ -1,0 +1,41 @@
+# Reads a Mithril snapshot's immutable files — the `NNNNN.chunk` corpus and the
+# node's own `.primary`/`.secondary` slot index — over HTTP range requests, so a
+# reader can consume the R2 mirror without a local copy of the database.
+#
+# It is READ-ONLY and addresses bytes. It does not know what a block is; the
+# consumers (tx-index, the book builders, a Worker) decode what it hands over.
+#
+# Separate from `mithril-snapshot` on purpose. That crate validates and PUBLISHES,
+# and therefore links `mithril-client` + `tokio`; an indexer must not inherit
+# either. This one links neither.
+#
+# No artifact is derived to make a block addressable: cardano-node writes
+# `.primary`/`.secondary` beside every chunk, Mithril ships them in the snapshot,
+# so they are already on the mirror. See `src/sidecar.rs` for the layouts.
+[package]
+name = "mithril-source"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Read a Mithril snapshot's immutable files over HTTP range requests"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+# CRC32 of the whole block is one of the two per-block checks the `.secondary`
+# sidecar carries — the other is the header hash, from `pallas-crypto`. Both are
+# what make a range read self-verifying with no local copy to compare against.
+# Already in the lock as a transitive dependency, so naming it here adds no
+# package.
+crc32fast = "1"
+hex = { workspace = true }
+pallas-crypto = { workspace = true }
+# Decoding is only used by the `check` command, which has to prove the bytes it
+# ranged for are blocks and not an offset arithmetic error. Same pin as tx-index.
+pallas-traverse = { workspace = true }
+# The mirror is HTTP. Blocking rather than async so this crate composes with the
+# synchronous readers that consume it (`tx-index`'s extractor is `fn`, not
+# `async fn`) — the same call `mithril-snapshot` makes for its non-`sync` paths.
+reqwest = { workspace = true, features = ["blocking"] }
