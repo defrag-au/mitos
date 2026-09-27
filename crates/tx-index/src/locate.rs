@@ -194,6 +194,29 @@ pub fn shard_fence_span(bucket: u64) -> Span {
     }
 }
 
+/// Where a shard's first entry index lives in the base's directory.
+///
+/// ⚠️ **Read from the directory, not from the shard's own fence table.** The table a shard
+/// carries holds the same numbers rebased on zero, which is what lets a shard be
+/// self-contained — and which means it cannot say where the shard starts in the base.
+/// A reader that wants the pair from the directory (batched, several to a request) needs
+/// this value to convert; a reader that wants it from the shard needs [`shard_fence_span`]
+/// instead.
+pub fn shard_base_span(header: &BaseHeader, shard: u64) -> Span {
+    Span {
+        offset: header.dir_off + shard * SHARD_BUCKETS * FENCE_BYTES,
+        len: FENCE_BYTES,
+    }
+}
+
+/// The entry index a shard starts at, from the 4 bytes [`shard_base_span`] asked for.
+pub fn shard_base(bytes: &[u8]) -> Result<u32> {
+    if bytes.len() < FENCE_BYTES as usize {
+        bail!("a shard base is {FENCE_BYTES} bytes, got {}", bytes.len());
+    }
+    Ok(u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")))
+}
+
 /// Where a bucket's entries live **inside its own shard**, from the pair
 /// [`shard_fence_span`] returned.
 ///
@@ -205,6 +228,25 @@ pub fn shard_entries_span(lo: u32, hi: u32) -> Span {
         offset: SHARD_FENCE_BYTES + u64::from(lo) * ENTRY_BYTES as u64,
         len: entries_span_len(lo, hi),
     }
+}
+
+/// Where a bucket's entries live inside its shard, from the **global** pair a read of the
+/// directory returns.
+///
+/// ⚠️ **The one subtraction in this module that a wrong input makes plausible rather than
+/// broken.** `base` is the shard's own first entry index; get it wrong and the span still
+/// lands inside the object, still returns bytes, and still looks like a run — while
+/// carrying another bucket's entries. The 8-byte prefix check catches some of that and
+/// not all of it. So an underflow is refused rather than wrapped, and a reader that
+/// cannot say where its shard starts must not take this path.
+pub fn shard_entries_span_from(lo: u32, hi: u32, base: u32) -> Result<Span> {
+    if hi < lo {
+        bail!("entry range {lo}..{hi} is inverted");
+    }
+    let local = lo
+        .checked_sub(base)
+        .ok_or_else(|| anyhow::anyhow!("entry {lo} precedes its shard's first entry {base}"))?;
+    Ok(shard_entries_span(local, hi - base))
 }
 
 /// The length of a shard whose fence table ends at `local_count`: the table, then the
@@ -235,7 +277,10 @@ pub fn shards_bytes(n_buckets: u64, count: u64) -> u64 {
 pub fn rebase_fences(global: &[u32]) -> Result<Vec<u32>> {
     let want = SHARD_BUCKETS as usize + 1;
     if global.len() != want {
-        bail!("a shard's fence table is {want} values, got {}", global.len());
+        bail!(
+            "a shard's fence table is {want} values, got {}",
+            global.len()
+        );
     }
     let first = global[0];
     global
@@ -464,7 +509,13 @@ mod tests {
 
         // A reader asks for bucket 64 — the 65th boundary pair — and gets (0, 6).
         let span = shard_fence_span(64);
-        assert_eq!(span, Span { offset: 256, len: 8 });
+        assert_eq!(
+            span,
+            Span {
+                offset: 256,
+                len: 8
+            }
+        );
         let mut pair = [0u8; 8];
         pair[0..4].copy_from_slice(&local[64].to_le_bytes());
         pair[4..8].copy_from_slice(&local[65].to_le_bytes());
@@ -522,6 +573,74 @@ mod tests {
         assert_eq!(shard_bytes(7), 2_052 + 7 * 24);
         // The published base's own average: 124,020,199 entries over 32,768 shards.
         assert_eq!(shard_bytes(3_785), 92_892);
+    }
+
+    /// The other way to reach a shard's entries: the pair read from the base's DIRECTORY.
+    /// Those values are global, so the shard's own first entry has to be subtracted — and
+    /// the byte span has to come out identical to the shard-local route.
+    #[test]
+    fn a_global_pair_addresses_the_same_run_as_a_local_one() {
+        let h = published_header();
+        // Bucket 64 is in shard 0, and shard 0 starts at entry 0 on this base.
+        let base = shard_base(&0u32.to_le_bytes()).unwrap();
+        assert_eq!(base, 0);
+        let span = shard_entries_span_from(LO, HI, base).unwrap();
+        assert_eq!(span, shard_entries_span(LO, HI));
+        assert_eq!(span.len, 144);
+
+        // A later shard, where the two routes differ: bucket 700 of shard 1 starts at
+        // global entry 6,000 and the shard starts at 5,900, so the run begins 100 entries
+        // in — 2,400 bytes past the fence table.
+        let span = shard_entries_span_from(6_000, 6_100, 5_900).unwrap();
+        assert_eq!(
+            span,
+            Span {
+                offset: SHARD_FENCE_BYTES + 2_400,
+                len: 2_400
+            }
+        );
+        assert_eq!(
+            span,
+            shard_entries_span(100, 200),
+            "the same run, addressed from either end"
+        );
+    }
+
+    /// ⚠️ A shard base that does not bound the entry index must FAIL. Wrapped, it would
+    /// return bytes from the far end of the shard under the name of this bucket — which is
+    /// a silent wrong answer, not a short read.
+    #[test]
+    fn a_shard_base_that_does_not_bound_the_entry_is_refused() {
+        let err = shard_entries_span_from(100, 200, 5_000).unwrap_err().to_string();
+        assert!(err.contains("precedes"), "{err}");
+        let err = shard_entries_span_from(200, 100, 0).unwrap_err().to_string();
+        assert!(err.contains("inverted"), "{err}");
+        assert!(shard_base(&[1, 2]).is_err());
+    }
+
+    #[test]
+    fn a_shard_base_is_addressed_off_the_directory() {
+        let h = published_header();
+        // Shard 0's base is the directory's first slot; 512 buckets to a shard, 4 bytes each.
+        assert_eq!(
+            shard_base_span(&h, 0),
+            Span {
+                offset: h.dir_off,
+                len: 4
+            }
+        );
+        assert_eq!(
+            shard_base_span(&h, 1),
+            Span {
+                offset: h.dir_off + 2_048,
+                len: 4
+            }
+        );
+        // The last shard's base is one shard-width before the sentinel — fence[512 · 32,767],
+        // with the (2²⁴ + 1)th value bounding the final bucket.
+        let last = shard_base_span(&h, 32_767);
+        assert_eq!(last.offset, h.dir_off + (1 << 24) * 4 - SHARD_BUCKETS * FENCE_BYTES);
+        assert!(last.offset + last.len <= h.entries_off);
     }
 
     #[test]

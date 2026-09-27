@@ -225,8 +225,7 @@ pub fn run(a: PublishArgs) -> Result<()> {
 
     // Only now, with every object read back and agreed: the shards are reproducible from the
     // base, so keeping them would just fill the disk the next build needs.
-    std::fs::remove_dir_all(&staging)
-        .with_context(|| format!("clearing {}", staging.display()))?;
+    std::fs::remove_dir_all(&staging).with_context(|| format!("clearing {}", staging.display()))?;
 
     println!();
     println!("published   {base_dest} · {landed} bytes");
@@ -312,7 +311,8 @@ fn cut_shards(base: &Path, staging: &Path, header: &BaseHeader) -> Result<Cut> {
             .with_context(|| format!("reading shard {shard} of {}", base.display()))?;
 
         let path = entries_dir.join(format!("{shard:05}.bin"));
-        let mut file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        let mut file =
+            File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         file.write_all(&out)
             .with_context(|| format!("writing {}", path.display()))?;
         count += 1;
@@ -769,14 +769,16 @@ mod tests {
         assert_eq!(argv[1], "copy");
         assert_eq!(argv[2], "/s/entries");
         assert_eq!(
-            argv[3],
-            "r2:mithril-snapshots/index/tx/v1/09201-ab12cd34ef56/entries/",
+            argv[3], "r2:mithril-snapshots/index/tx/v1/09201-ab12cd34ef56/entries/",
             "the trailing slash is what makes this a directory copy"
         );
         let joined = argv.join(" ");
         assert!(joined.contains("Cache-Control: public, max-age=31536000, immutable"));
         assert!(joined.contains("--ignore-existing"));
-        assert!(joined.contains("--transfers 16"), "raised from the base's 8");
+        assert!(
+            joined.contains("--transfers 16"),
+            "raised from the base's 8"
+        );
         assert!(
             !joined.contains("--s3-chunk-size"),
             "93 KiB is one PUT per object; multipart would be per-part billing for nothing"
@@ -901,7 +903,10 @@ mod tests {
         let (lo, hi) = locate::fence_pair(&shard[756..764]).unwrap();
         assert_eq!((lo, hi), (1, 3));
         let run = locate::shard_entries_span(lo, hi);
-        assert_eq!(run.len, 48, "two entries, and the run is fetched at its true length");
+        assert_eq!(
+            run.len, 48,
+            "two entries, and the run is fetched at its true length"
+        );
         let found = locate::search(
             entries[1].prefix,
             lo,
