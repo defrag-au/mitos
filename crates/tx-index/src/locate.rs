@@ -21,6 +21,14 @@
 //!
 //! Then one more per located body, at the entry's own `chunk` + `offset`.
 //!
+//! # …or two, against a shard
+//!
+//! The base addresses a lookup as `fence → run` in one object, which is right when
+//! that object is a local file and wrong when it is a 2.83 GiB R2 object the CDN will
+//! not cache. [`SHARD_BUCKETS`] splits the entry region into objects small enough to
+//! *be* cached — see the shard section at the foot of this module for the arithmetic
+//! and the measurements behind the size.
+//!
 //! # Nothing here is a guess
 //!
 //! The fence pair bounds the bucket **exactly**, so the run is fetched once at
@@ -129,6 +137,114 @@ pub fn search(prefix: u64, lo: u32, hi: u32, bytes: &[u8]) -> Result<Vec<Entry>>
 
 fn entries_span_len(lo: u32, hi: u32) -> u64 {
     u64::from(hi.saturating_sub(lo)) * ENTRY_BYTES as u64
+}
+
+// ── entry shards: the same lookup, addressed into an object the CDN keeps ──────
+
+/// Buckets per entry shard.
+///
+/// ⚠️ **512 is a hosting number, and what it fixes is the shard COUNT, not the shard
+/// size.** A hosted lookup is one request per range, and a cold object costs the edge a
+/// fixed latency that barely moves with size — measured 2026-09-27 against the published
+/// mirror: a never-read 252-byte pointer **343 ms**, a never-read 4 MiB chunk **626–816
+/// ms**. What IS proportional is bytes, and a cold reader's total pull is `shards_touched
+/// × shard_size`: 2²⁴ / 512 = 32,768 shards of ~93 KiB, so a 300-transaction wallet pulls
+/// **~27 MB** against a cold cache — and ~3 GB if the same bytes were a few dozen large
+/// objects, because 300 scattered lookups touch ~300 distinct shards however the entries
+/// are grouped.
+///
+/// ⚠️ **A shard carries its own fence table.** The pair that bounds a bucket is the same
+/// pair the base's directory holds, so it could be read from there — but that object is
+/// 64 MiB, and a cold range read of it makes the edge pull all 64 MiB before it can
+/// answer. Self-contained shards mean a reader never touches, or warms, the directory.
+pub const SHARD_BUCKETS: u64 = 512;
+
+/// The fence table at the head of every shard: one u32 per boundary, so
+/// [`SHARD_BUCKETS`] + 1 of them. The values are LOCAL to the shard — the shard's own
+/// first fence value is subtracted out — so a reader addressing a bucket inside a shard
+/// needs to know nothing about where that shard sits in the base.
+pub const SHARD_FENCE_BYTES: u64 = (SHARD_BUCKETS + 1) * FENCE_BYTES;
+
+/// Which shard holds `bucket`'s entries.
+pub fn shard_of(bucket: u64) -> u64 {
+    bucket / SHARD_BUCKETS
+}
+
+/// How many shards a bucket space of `n_buckets` divides into. The last one is short
+/// when `n_buckets` is not a multiple of [`SHARD_BUCKETS`], which mainnet's 2²⁴ is and a
+/// hypothetical narrower directory would not be.
+pub fn shard_count(n_buckets: u64) -> u64 {
+    n_buckets.div_ceil(SHARD_BUCKETS)
+}
+
+/// The first bucket a shard covers.
+pub fn shard_first_bucket(shard: u64) -> u64 {
+    shard * SHARD_BUCKETS
+}
+
+/// Where a bucket's fence pair lives **inside its own shard**.
+///
+/// The same pair [`fence_span`] names in the base's directory — one read, because the
+/// pair is contiguous and the pair is what bounds the bucket — but at a shard-local
+/// offset and, when it comes back, in shard-local values.
+pub fn shard_fence_span(bucket: u64) -> Span {
+    Span {
+        offset: (bucket - shard_first_bucket(shard_of(bucket))) * FENCE_BYTES,
+        len: FENCE_PAIR_BYTES,
+    }
+}
+
+/// Where a bucket's entries live **inside its own shard**, from the pair
+/// [`shard_fence_span`] returned.
+///
+/// ⚠️ `lo` and `hi` must be the SHARD-LOCAL indices that pair carried, not the base's.
+/// The layout is the same one [`entries_span`] addresses, shifted by the fence table that
+/// now precedes it.
+pub fn shard_entries_span(lo: u32, hi: u32) -> Span {
+    Span {
+        offset: SHARD_FENCE_BYTES + u64::from(lo) * ENTRY_BYTES as u64,
+        len: entries_span_len(lo, hi),
+    }
+}
+
+/// The length of a shard whose fence table ends at `local_count`: the table, then the
+/// entries that value counts.
+pub fn shard_bytes(local_count: u32) -> u64 {
+    SHARD_FENCE_BYTES + u64::from(local_count) * ENTRY_BYTES as u64
+}
+
+/// Every shard's bytes together, for a directory of `n_buckets` over `count` entries.
+///
+/// A property of the header alone, which is the point of it: a publisher writes this many
+/// bytes and a verifier compares the mirror against this number, without either holding
+/// the shards.
+pub fn shards_bytes(n_buckets: u64, count: u64) -> u64 {
+    shard_count(n_buckets) * SHARD_FENCE_BYTES + count * ENTRY_BYTES as u64
+}
+
+/// One shard's fence table, rebased on its own first value.
+///
+/// `global` is `fence[shard·SHARD_BUCKETS ..= (shard+1)·SHARD_BUCKETS]` — the same
+/// `SHARD_BUCKETS + 1` values a reader of the base would use, spanning the shard's
+/// buckets and the boundary after them.
+///
+/// Here rather than in the publisher because it is the *inverse* of what a reader does:
+/// the reader adds the table's own offsets to the shard's base, so a publisher that
+/// rebased differently would produce shards that read as every bucket starting at zero.
+/// That is a silent wrong answer, not a failure.
+pub fn rebase_fences(global: &[u32]) -> Result<Vec<u32>> {
+    let want = SHARD_BUCKETS as usize + 1;
+    if global.len() != want {
+        bail!("a shard's fence table is {want} values, got {}", global.len());
+    }
+    let first = global[0];
+    global
+        .iter()
+        .map(|v| {
+            v.checked_sub(first)
+                .ok_or_else(|| anyhow::anyhow!("fence {v} precedes the shard's own {first}"))
+        })
+        .collect()
 }
 
 /// Where the era byte of `chunk` lives. `None` when the base does not cover
@@ -315,6 +431,97 @@ mod tests {
         bytes[0..4].copy_from_slice(&9u32.to_le_bytes());
         bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
         assert!(fence_pair(&bytes).is_err());
+    }
+
+    /// The shard arithmetic against the published base: 2²⁴ buckets at 512 to a shard.
+    #[test]
+    fn every_bucket_lands_in_exactly_one_shard() {
+        let n_buckets = 1u64 << 24;
+        assert_eq!(shard_count(n_buckets), 32_768);
+        assert_eq!(shard_of(0), 0);
+        assert_eq!(shard_of(511), 0);
+        assert_eq!(shard_of(512), 1);
+        assert_eq!(shard_of(n_buckets - 1), 32_767);
+        // The boundary is a multiple, so nothing is short; a narrower directory would
+        // leave a last shard holding only the buckets that exist.
+        assert_eq!(shard_count(n_buckets * 4), n_buckets * 4 / 512);
+        assert_eq!(shard_count(513), 2);
+    }
+
+    /// ⚠️ The one arithmetic that a publisher and a reader must agree on, because
+    /// disagreeing produces a plausible wrong answer rather than a failure: the reader
+    /// adds a shard's local offsets to the shard's own base, so a table that was not
+    /// rebased reads as every bucket starting at zero.
+    #[test]
+    fn the_shard_round_trips_through_its_own_fence_table() {
+        // Bucket 64 is the shard's 65th, and it holds entries 522..528 globally.
+        let mut global = vec![522u32; SHARD_BUCKETS as usize + 1];
+        global[65] = 528;
+        let local = rebase_fences(&global).unwrap();
+        assert_eq!(local[0], 0, "the shard's own first value is the origin");
+        assert_eq!(local[64], 0);
+        assert_eq!(local[65], 6);
+
+        // A reader asks for bucket 64 — the 65th boundary pair — and gets (0, 6).
+        let span = shard_fence_span(64);
+        assert_eq!(span, Span { offset: 256, len: 8 });
+        let mut pair = [0u8; 8];
+        pair[0..4].copy_from_slice(&local[64].to_le_bytes());
+        pair[4..8].copy_from_slice(&local[65].to_le_bytes());
+        let (lo, hi) = fence_pair(&pair).unwrap();
+        assert_eq!((lo, hi), (0, 6));
+
+        // …and the run those bound is the real bucket 64, at the fence table's end.
+        assert_eq!(
+            shard_entries_span(lo, hi),
+            Span {
+                offset: SHARD_FENCE_BYTES,
+                len: 144
+            }
+        );
+        let found = search(REFERENCE, lo, hi, &bucket_64()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].loc.chunk, 9150);
+        assert_eq!(found[0].loc.offset, 3_426_006);
+    }
+
+    /// A bucket in a later shard is rebased on THAT shard's first value, not on zero —
+    /// which is the whole reason the table is local.
+    #[test]
+    fn a_later_shard_is_rebased_on_its_own_first_value() {
+        let bucket = shard_first_bucket(3) + 2;
+        let mut global = vec![900_000u32; SHARD_BUCKETS as usize + 1];
+        global[3] = 900_121;
+        let local = rebase_fences(&global).unwrap();
+        assert_eq!(local[2], 0);
+        assert_eq!(local[3], 121);
+        let span = shard_fence_span(bucket);
+        assert_eq!(span, Span { offset: 8, len: 8 }, "shard-local, not global");
+        assert_eq!(
+            shard_entries_span(0, 121),
+            Span {
+                offset: SHARD_FENCE_BYTES,
+                len: 2_904
+            }
+        );
+    }
+
+    #[test]
+    fn a_fence_table_that_is_not_a_shard_is_refused() {
+        assert!(rebase_fences(&[1, 2, 3]).is_err());
+        let mut descending = vec![10u32; SHARD_BUCKETS as usize + 1];
+        descending[0] = 20;
+        let err = rebase_fences(&descending).unwrap_err().to_string();
+        assert!(err.contains("precedes"), "{err}");
+    }
+
+    #[test]
+    fn a_shard_is_its_fence_table_plus_the_entries_it_counts() {
+        assert_eq!(SHARD_FENCE_BYTES, 2_052);
+        assert_eq!(shard_bytes(0), 2_052);
+        assert_eq!(shard_bytes(7), 2_052 + 7 * 24);
+        // The published base's own average: 124,020,199 entries over 32,768 shards.
+        assert_eq!(shard_bytes(3_785), 92_892);
     }
 
     #[test]
