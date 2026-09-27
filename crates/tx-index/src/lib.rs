@@ -53,6 +53,8 @@
 // The parsing half: `&[u8]` in, plain data out. Built for wasm.
 pub mod decode;
 pub mod format;
+pub mod hosted;
+pub mod locate;
 pub mod wire;
 
 // The storage half: chunk files, segments, a mapped base. Native only.
@@ -68,6 +70,7 @@ pub mod reader;
 pub mod segment;
 
 pub use format::{AuxSpan, Entry, Location, prefix_of};
+pub use locate::Span;
 #[cfg(feature = "mmap")]
 pub use reader::{AuxLookup, Coverage, Index, IndexHandle, Located, Resolution, TxBody};
 

@@ -46,3 +46,8 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The `hosted` pointer's JSON keys are a contract with a Worker that parses them, so a test
+# asserts them. Dev-only: a wasm consumer of this crate must not inherit serde_json.
+serde_json = { workspace = true }

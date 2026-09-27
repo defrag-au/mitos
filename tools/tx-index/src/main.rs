@@ -7,10 +7,12 @@
 //!   entries: proof the recorded offsets are right, on real chunk bytes.
 //! - `lookup` — one hash (optionally one output) as JSON.
 //! - `stats` — what the index covers.
+//! - `publish` — put `base.idx` and its pointer in R2, where a locator ranges them.
 //! - `serve` — the loopback HTTP read surface.
 //!
 //! Design: cnft.dev-workers docs/design/TX_INDEX.md.
 
+mod publish;
 mod serve;
 mod verify;
 
@@ -41,6 +43,8 @@ enum Cmd {
     Stats(DirArgs),
     /// Re-hash sampled bodies against their entries.
     Verify(verify::VerifyArgs),
+    /// Put base.idx and its pointer where a reader can range them.
+    Publish(publish::PublishArgs),
     /// Loopback HTTP read surface.
     Serve(serve::ServeArgs),
 }
@@ -159,6 +163,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Verify(a) => verify::run(a),
+        Cmd::Publish(a) => publish::run(a),
         Cmd::Serve(a) => serve::run(a),
     }
 }

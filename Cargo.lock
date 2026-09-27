@@ -7029,6 +7029,7 @@ dependencies = [
  "pallas-primitives 1.4.0",
  "pallas-traverse 1.4.0",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -7043,6 +7044,7 @@ dependencies = [
  "policy-index",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower-http 0.6.6",
  "tracing",

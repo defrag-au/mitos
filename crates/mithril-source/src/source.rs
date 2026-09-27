@@ -9,14 +9,20 @@
 //! what both a directory and an object store address the file by. There is no
 //! path: a chunk is a flat name in the bucket, which is what the mirror is.
 
+#[cfg(feature = "native")]
 use std::collections::HashMap;
+#[cfg(feature = "native")]
 use std::path::PathBuf;
+#[cfg(feature = "native")]
 use std::sync::RwLock;
+#[cfg(feature = "native")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "native")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(feature = "native")]
 use crate::multipart;
 
 /// The largest single range this crate will ask for.
@@ -85,10 +91,16 @@ pub trait RangeSource: Send + Sync {
 
 /// A directory of `NNNNN.chunk` / `.primary` / `.secondary` — a local snapshot,
 /// the shape [`mithril-snapshot`](../../mithril-snapshot) validates.
+///
+/// Native only, and not by convention: the positional read is `std::os::unix`, so
+/// this does not build for wasm at all. It sits behind the `native` feature with
+/// [`HttpMirror`], leaving the addressing half of this crate buildable anywhere.
+#[cfg(feature = "native")]
 pub struct LocalDir {
     dir: PathBuf,
 }
 
+#[cfg(feature = "native")]
 impl LocalDir {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -99,6 +111,7 @@ impl LocalDir {
     }
 }
 
+#[cfg(feature = "native")]
 impl RangeSource for LocalDir {
     fn len(&self, name: &str) -> Result<u64> {
         let p = self.dir.join(name);
@@ -129,6 +142,7 @@ impl RangeSource for LocalDir {
 /// `len` is probed with `bytes=0-0` and cached. A `HEAD` would answer too, but R2's
 /// version-qualified `HEAD` is the request that 501s under rclone, and the ranged
 /// `GET` also warms the object's first cache line.
+#[cfg(feature = "native")]
 pub struct HttpMirror {
     base: String,
     client: reqwest::blocking::Client,
@@ -138,6 +152,7 @@ pub struct HttpMirror {
     requests: AtomicU64,
 }
 
+#[cfg(feature = "native")]
 impl HttpMirror {
     /// `base` is the directory prefix, e.g. `https://mithril.defrag.cc/mainnet`.
     pub fn new(base: impl Into<String>) -> Result<Self> {
@@ -245,6 +260,7 @@ impl HttpMirror {
     }
 }
 
+#[cfg(feature = "native")]
 impl RangeSource for HttpMirror {
     fn len(&self, name: &str) -> Result<u64> {
         if let Some(n) = self.lengths.read().expect("lengths lock").get(name) {
@@ -333,7 +349,12 @@ impl RangeSource for HttpMirror {
 }
 
 /// Refuse a span set Cloudflare would answer with a whole object instead.
-fn validate_batch(spans: &[(u64, u64)]) -> Result<()> {
+///
+/// Public because it is a law of the transport, not a detail of [`HttpMirror`]:
+/// any source that sends a multi-range request — a browser fetch, a Worker, a
+/// future Durable Object — must obey the same three rules, and the failure mode
+/// for ignoring one is a silent whole-object `200` rather than an error.
+pub fn validate_batch(spans: &[(u64, u64)]) -> Result<()> {
     for (offset, len) in spans {
         if *len == 0 {
             bail!("a zero-length range cannot be requested (at {offset})");
@@ -359,7 +380,11 @@ fn validate_batch(spans: &[(u64, u64)]) -> Result<()> {
 
 /// Split into the runs that fit one request, never producing an empty or oversized
 /// one. A single span past [`MAX_BATCH_BYTES`] becomes a batch of its own.
-fn batches(spans: &[(u64, u64)]) -> Vec<&[(u64, u64)]> {
+///
+/// Public for the same reason as [`validate_batch`]: the 299-range cap and the byte
+/// budget are properties of the transport, and a source that re-derived them would
+/// be one more place for them to drift.
+pub fn batches(spans: &[(u64, u64)]) -> Vec<&[(u64, u64)]> {
     let mut out = Vec::new();
     let mut start = 0usize;
     while start < spans.len() {

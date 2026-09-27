@@ -21,9 +21,21 @@ license.workspace = true
 publish = false
 description = "Read a Mithril snapshot's immutable files over HTTP range requests"
 
+[features]
+default = ["native"]
+# The sources that need a runtime: a local snapshot directory (`std::os::unix`
+# positional reads) and the HTTP mirror (`reqwest`, blocking).
+#
+# OFF, what is left is the addressing half — the [`RangeSource`] contract, the
+# batching laws, the `multipart/byteranges` parser and the sidecar layouts. That
+# half is pure `&[u8]` and builds for `wasm32-unknown-unknown`, which is what a
+# browser or a Worker needs: it supplies its own source and reads the same bytes
+# through the same readers.
+native = ["dep:clap", "dep:pallas-traverse", "dep:reqwest"]
+
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, optional = true }
 # CRC32 of the whole block is one of the two per-block checks the `.secondary`
 # sidecar carries — the other is the header hash, from `pallas-crypto`. Both are
 # what make a range read self-verifying with no local copy to compare against.
@@ -34,8 +46,17 @@ hex = { workspace = true }
 pallas-crypto = { workspace = true }
 # Decoding is only used by the `check` command, which has to prove the bytes it
 # ranged for are blocks and not an offset arithmetic error. Same pin as tx-index.
-pallas-traverse = { workspace = true }
+pallas-traverse = { workspace = true, optional = true }
 # The mirror is HTTP. Blocking rather than async so this crate composes with the
 # synchronous readers that consume it (`tx-index`'s extractor is `fn`, not
 # `async fn`) — the same call `mithril-snapshot` makes for its non-`sync` paths.
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking"], optional = true }
+
+[[bin]]
+# The CLI (`check`, `walk`, `span`, `batch`) is a native tool — its source argument
+# is a directory or an `https://` URL. `required-features` is what keeps a wasm
+# build from trying to link it; without this, `--no-default-features` would
+# still try to compile `main.rs` and fail on `clap`.
+name = "mithril-source"
+path = "src/main.rs"
+required-features = ["native"]

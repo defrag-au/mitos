@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 
-use crate::format::{BaseHeader, ENTRY_BYTES, Entry, bucket_of};
+use crate::format::{BaseHeader, ENTRY_BYTES, Entry};
+use crate::locate::{Span, entries_span, era_span, fence_pair, fence_span, search};
 
 pub const BASE_FILE: &str = "base.idx";
 
@@ -53,16 +54,12 @@ impl BaseFile {
 
     /// Era byte of a chunk the base covers.
     pub fn era_of(&self, chunk: u16) -> Option<u8> {
-        if chunk < self.header.first_chunk || chunk > self.header.last_chunk {
-            return None;
-        }
-        let at = self.header.era_off as usize + usize::from(chunk - self.header.first_chunk);
-        Some(self.mmap[at])
+        let span = era_span(&self.header, chunk)?;
+        Some(self.mmap[span.offset as usize])
     }
 
-    fn fence(&self, bucket: usize) -> usize {
-        let at = self.header.dir_off as usize + bucket * 4;
-        u32::from_le_bytes(self.mmap[at..at + 4].try_into().expect("4 bytes")) as usize
+    fn span_bytes(&self, span: Span) -> &[u8] {
+        span.of(&self.mmap)
     }
 
     fn raw(&self, i: usize) -> &[u8] {
@@ -77,20 +74,16 @@ impl BaseFile {
     /// Every entry whose prefix equals `prefix`. Entries within a bucket are
     /// sorted, so the scan stops at the first larger prefix. Returns whole
     /// entries so the caller can reach the aux span without a second read.
+    ///
+    /// The offsets come from [`crate::locate`], so a reader over the network
+    /// and this one over the mapping are locating with the same arithmetic.
     pub fn find(&self, prefix: u64) -> Vec<Entry> {
-        let b = bucket_of(prefix, self.header.dir_bits);
-        let (lo, hi) = (self.fence(b), self.fence(b + 1));
-        let mut out = Vec::new();
-        for i in lo..hi {
-            let p = Entry::prefix_at(self.raw(i));
-            if p < prefix {
-                continue;
-            }
-            if p > prefix {
-                break;
-            }
-            out.push(Entry::read(self.raw(i)));
-        }
-        out
+        let (lo, hi) = fence_pair(self.span_bytes(fence_span(&self.header, prefix)))
+            .expect("a mapped base's fence pair is 8 bytes");
+        let run = self.span_bytes(entries_span(&self.header, lo, hi));
+        // The mapping holds the whole run, so the truncation guard in `search`
+        // — which exists for callers that fetched, and may have fetched short —
+        // cannot fire here.
+        search(prefix, lo, hi, run).expect("the mapping holds every entry of the run")
     }
 }
