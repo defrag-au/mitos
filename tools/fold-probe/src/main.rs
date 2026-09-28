@@ -55,6 +55,7 @@ use std::hash::BuildHasher;
 use std::hash::BuildHasherDefault;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -137,6 +138,10 @@ enum Cmd {
     /// attestation. Writes a directory and nothing else — no credentials, no
     /// network, so the layout is inspectable before it is anywhere
     Publish(PublishArgs),
+    /// Hand a datum layout to R2: prints the two `rclone` invocations and, with
+    /// `--run`, executes them. Windows first, the catalogue last — a reader starts
+    /// at the catalogue and must never see one naming objects that are not there
+    DatumPush(DatumPushArgs),
     /// Resolve a chunk's transaction inputs against a book, and classify what it
     /// cannot answer. Answers "can the book find a UTxO that is no longer live".
     ResolveInputs(ResolveArgs),
@@ -345,6 +350,22 @@ struct PublishArgs {
 }
 
 #[derive(Args)]
+struct DatumPushArgs {
+    /// The layout root a capture wrote — the directory holding `datum/v1/`.
+    #[arg(long)]
+    layout: PathBuf,
+    /// `remote:bucket/prefix`: where the `datum/v1/...` keys go.
+    #[arg(long)]
+    dest: String,
+    /// Run the commands instead of printing them. They are printed either way.
+    #[arg(long)]
+    run: bool,
+    /// Parallel transfers for the window objects.
+    #[arg(long, default_value_t = 8)]
+    transfers: usize,
+}
+
+#[derive(Args)]
 struct StampArgs {
     /// The book directory to stamp, in place.
     #[arg(long)]
@@ -414,8 +435,20 @@ struct FoldArgs {
     /// Implies `--chain-decode`: the bytes exist only in the eager projection's
     /// `DecodedTx::witness_datums`, so this rides the deep walk and therefore cannot
     /// ride `--cursor`'s one-pass decode (the two flags are refused together).
+    ///
+    /// The **pushable set** is written beside it: see `--datum-chunks` and
+    /// `docs/HOWTO_DATUM_CAPTURE_AND_PUSH.md`.
     #[arg(long, value_name = "DIR", conflicts_with_all = ["cursor", "primitives"])]
     datum_tbl: Option<PathBuf>,
+    /// Chunks per PUBLISHED datum window: the capture is closed, written and laid out
+    /// for upload every N chunks, and a fresh one starts, so a whole-store run holds
+    /// one window in memory rather than the chain.
+    ///
+    /// 0 = one window for the whole run, which is only sane for a small `--chunks`:
+    /// a table's offsets are `u32`, so a store-wide single window is refused by the
+    /// writer rather than silently truncated — after the walk has already happened.
+    #[arg(long, value_name = "N", default_value_t = 100)]
+    datum_chunks: usize,
     /// Which hasher the live set uses. `fx` is a hand-rolled FxHash, `std` is
     /// SipHash. Same run, one flag, so the difference is the hasher.
     #[arg(long, value_enum, default_value = "fx")]
@@ -458,6 +491,7 @@ fn main() -> Result<()> {
         Cmd::Catalogue(a) => catalogue(a),
         Cmd::StampBoundary(a) => stamp_boundary(a),
         Cmd::Publish(a) => publish(a),
+        Cmd::DatumPush(a) => datum_push(a),
         Cmd::ResolveInputs(a) => resolve_inputs(a),
         Cmd::Follow(a) => follow(a),
     }
@@ -577,9 +611,15 @@ struct DecodeStats {
 ///   one: a hit is a *live* output a reader can resolve now, because the preimage was
 ///   already public — and a miss is an output whose datum **no source can supply**
 ///   until someone spends it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct DatumCapture {
     dir: PathBuf,
+    /// The window this capture covers, in the walker's own coordinate: the first chunk
+    /// it saw and the last. **Counted, not configured** — a rolled-over window names
+    /// what it walked, so its name can never be wider than its contents.
+    first_chunk: Option<u16>,
+    last_chunk: u16,
+    chunks: u64,
     by_hash: HashMap<Hash<32>, Vec<u8>>,
     /// Instances offered, and their Σ bytes — before dedup.
     seen: u64,
@@ -603,14 +643,42 @@ struct DatumReport {
     first_slot: u64,
     last_slot: u64,
     wrote_secs: f64,
+    /// The window as the catalogue now records it: the objects' keys, lengths and
+    /// digests, and how many windows the set holds.
+    published: live_book::publish::DatumEntry,
+    catalogue_windows: usize,
 }
 
 impl DatumCapture {
     fn new(dir: PathBuf) -> DatumCapture {
         DatumCapture {
             dir,
-            ..Default::default()
+            first_chunk: None,
+            last_chunk: 0,
+            chunks: 0,
+            by_hash: HashMap::new(),
+            seen: 0,
+            seen_bytes: 0,
+            hash_attached: 0,
+            live_hits: 0,
+            first_slot: None,
+            last_slot: 0,
         }
+    }
+
+    /// One block, and the chunk it came from. Called per block rather than per chunk so
+    /// the coverage is a fact about the walk; `chunks` counts DISTINCT chunk numbers,
+    /// which is what the rollover check needs.
+    fn set_chunk(&mut self, chunk: u16) {
+        match self.first_chunk {
+            None => {
+                self.first_chunk = Some(chunk);
+                self.chunks = 1;
+            }
+            Some(_) if chunk != self.last_chunk => self.chunks += 1,
+            Some(_) => {}
+        }
+        self.last_chunk = chunk;
     }
 
     /// The walk's own coordinate: the first block it saw and the last it applied,
@@ -657,6 +725,20 @@ impl DatumCapture {
         let entries = v.len() as u64;
         let first_slot = self.first_slot.unwrap_or(self.last_slot);
         live_book::format::write_datum_table(&self.dir, (first_slot, self.last_slot), &v)?;
+        // The pushable set: the same bytes again under content-addressed keys, plus
+        // the catalogue naming every window published so far. Written by the same
+        // command as the table, so the layout cannot describe a capture other than
+        // the one just written — and re-read here, so the sink fails on a catalogue
+        // it cannot itself parse.
+        let publish_root = self.dir.join("publish");
+        let window = live_book::publish::DatumWindow {
+            first_chunk: self.first_chunk.unwrap_or(self.last_chunk),
+            last_chunk: self.last_chunk,
+        };
+        let published = live_book::publish::publish_datums(&self.dir, &publish_root, window)?;
+        let catalogue = live_book::publish::DatumCatalogue::load(
+            &publish_root.join(live_book::publish::datum_catalogue_key()),
+        )?;
         Ok(DatumReport {
             entries,
             payload_bytes,
@@ -667,6 +749,8 @@ impl DatumCapture {
             first_slot,
             last_slot: self.last_slot,
             wrote_secs: t.elapsed().as_secs_f64(),
+            published,
+            catalogue_windows: catalogue.windows().len(),
         })
     }
 }
@@ -815,6 +899,10 @@ fn plan_block(
     let mut chain = chain;
     if let Some(c) = chain.as_deref_mut().and_then(|c| c.datum.as_mut()) {
         c.set_slot(block.slot());
+        // The window is counted from the chunks the walk actually visited, per block
+        // (the same chunk number many times over), because a rolled-over window names
+        // what it holds rather than what the operator asked for.
+        c.set_chunk(chunk);
     }
 
     // ⚠ `txs()` does NOT borrow the block. Pallas CLONES every transaction body
@@ -1905,6 +1993,7 @@ fn fold(a: FoldArgs) -> Result<()> {
     );
 
     let mut set = Live::new(a.hasher);
+    let mut datum_run = DatumRun::default();
     let mut plan = BlockPlan::default();
     let mut dec_acc = DecodeStats::default();
     let mut chain_acc = ChainStats::default();
@@ -2110,6 +2199,28 @@ fn fold(a: FoldArgs) -> Result<()> {
 
         merge_decode(&mut dec_acc, &dec);
         accumulate_apply(&mut app_acc, app);
+
+        // One window per `--datum-chunks`, closed HERE so a window is never split
+        // across a chunk boundary. `finish` writes the pair, lays out the pushable set
+        // and merges the catalogue; printing it now rather than at the end is what
+        // makes a long run observable — the first window is on disk, and uploadable,
+        // while the rest of the store is still being walked.
+        if a.datum_chunks > 0
+            && chain_acc
+                .datum
+                .as_ref()
+                .is_some_and(|c| c.chunks >= a.datum_chunks as u64)
+        {
+            let cap = chain_acc.datum.take().expect("just checked");
+            let d = cap.finish()?;
+            datum_run.windows += 1;
+            datum_run.bytes += d.published.table.len + d.published.blob.len;
+            print_datum_window(&a, &d, datum_run.windows)?;
+            chain_acc.datum = a
+                .datum_tbl
+                .as_ref()
+                .map(|dir| DatumCapture::new(dir.clone()));
+        }
     }
 
     let n = window.len() as f64;
@@ -2267,40 +2378,37 @@ fn fold(a: FoldArgs) -> Result<()> {
     }
     // The capture's own report, written rather than reported: this is the artifact.
     if let Some(cap) = chain_acc.datum.take() {
-        let d = cap.finish()?;
-        let tbl = std::fs::metadata(
-            a.datum_tbl
-                .as_ref()
-                .expect("set with the capture")
-                .join(live_book::format::DATUM_FILE),
-        )
-        .map(|m| m.len())?;
-        println!();
-        println!("datum table — the witness datums this walk revealed (`datum.tbl`)");
+        // ⚠️ A capture that never saw a chunk has nothing to say, and publishing it would
+        // put `chunks 0..=0` in the catalogue — a window a reader would take as coverage
+        // of chunk 0. This is what `--datum-chunks` leaves behind when its last rollover
+        // lands exactly on the last chunk, which is the common case for a `--chunks` that
+        // is a multiple of it.
+        if cap.first_chunk.is_some() {
+            let d = cap.finish()?;
+            datum_run.windows += 1;
+            datum_run.bytes += d.published.table.len + d.published.blob.len;
+            print_datum_window(&a, &d, datum_run.windows)?;
+        }
+    }
+    if let Some(dir) = &a.datum_tbl {
+        // The operator's real question at the end of a long run: how much of the store
+        // does the set now cover? Read back from the catalogue rather than accumulated
+        // in a variable, because the catalogue is what a reader will see.
+        let root = dir.join("publish");
+        let catalogue = live_book::publish::DatumCatalogue::load(
+            &root.join(live_book::publish::datum_catalogue_key()),
+        )?;
+        let objects: u64 = catalogue
+            .windows()
+            .iter()
+            .map(|w| w.table.len + w.blob.len)
+            .sum();
         println!(
-            "  coverage   slots {}..={} · a miss means \"not revealed in this range\"",
-            d.first_slot, d.last_slot
-        );
-        println!(
-            "  entries    {} distinct hashes · {} payload · offered {} times in {} → {:.0}% dedup",
-            d.entries,
-            human_bytes(d.payload_bytes),
-            d.seen,
-            human_bytes(d.seen_bytes),
-            (1.0 - d.payload_bytes as f64 / d.seen_bytes.max(1) as f64) * 100.0,
-        );
-        println!(
-            "  attached   {} hash-attached outputs created · {} answerable at creation ({:.2}%) —\n\
-             the rest had no preimage on chain yet, and a reveal later in the range lands here",
-            d.hash_attached,
-            d.live_hits,
-            d.live_hits as f64 / d.hash_attached.max(1) as f64 * 100.0,
-        );
-        println!(
-            "  wrote      datum.tbl {} + datum.bin {} in {:.1} s",
-            human_bytes(tbl),
-            human_bytes(d.payload_bytes),
-            d.wrote_secs,
+            "  run        {} window(s) written this run · the set holds {} window(s) · {} · {}",
+            datum_run.windows,
+            catalogue.windows().len(),
+            human_bytes(objects),
+            root.display(),
         );
     }
     println!();
@@ -4371,8 +4479,9 @@ fn catalogue(a: CatalogueArgs) -> Result<()> {
         let mut here_entries = 0u64;
         let mut after = None;
         loop {
-            let page =
-                meter.observe(Op::BookEnumerate, || book.by_policy(&policy, after, a.limit))?;
+            let page = meter.observe(Op::BookEnumerate, || {
+                book.by_policy(&policy, after, a.limit)
+            })?;
             for (hash, index) in &page.refs {
                 here_refs += 1;
                 // Timed by hand rather than through `observe`: the row borrows the
@@ -4386,11 +4495,9 @@ fn catalogue(a: CatalogueArgs) -> Result<()> {
                     continue;
                 };
                 here_holders.insert(row.address());
-                if let Some(cred) = meter
-                    .observe(Op::AddressCodec, || {
-                        live_book::address::credential(row.address())
-                    })
-                {
+                if let Some(cred) = meter.observe(Op::AddressCodec, || {
+                    live_book::address::credential(row.address())
+                }) {
                     let bytes = *cred.bytes();
                     if cred.is_script() {
                         here_scripts.insert(bytes);
@@ -5507,8 +5614,19 @@ fn pick_window(all: &[u16], start: Option<u16>, chunks: usize) -> Result<Vec<u16
     let Some(&first) = all.first() else {
         bail!("no complete chunks");
     };
+    // `chunks == 0` is "to the end", NOT "from the beginning": with a `--start` the two
+    // readings differ by hours, and a resume that silently re-walked the store would
+    // look like it was working.
     if chunks == 0 {
-        return Ok(all.to_vec());
+        return match start {
+            None => Ok(all.to_vec()),
+            Some(s) => {
+                if s < first {
+                    bail!("--start {s} is below the first complete chunk {first}");
+                }
+                Ok(all.iter().copied().skip_while(|c| *c < s).collect())
+            }
+        };
     }
     let window = match start {
         None => {
@@ -5650,6 +5768,265 @@ fn kb_field(text: &str, key: &str) -> Option<u64> {
             .parse()
             .ok()
     })
+}
+
+/// What a run has published, for the closing summary.
+#[derive(Default)]
+struct DatumRun {
+    windows: u64,
+    bytes: u64,
+}
+
+/// Hand a datum layout to R2: two `rclone` invocations, and the reasoning for each.
+///
+/// ⚠️ **Windows before the catalogue, always.** A reader starts at
+/// `datum/v1/current` and then fetches the window it names, so pushing the pointer
+/// first would open a window — however briefly — in which the catalogue names objects
+/// that are not there yet.
+///
+/// The window objects are content-addressed, so `--ignore-existing` is safe and makes a
+/// re-run cheap: an object already at a key **is** the bytes that key names. The
+/// catalogue is the one object that changes, so it is the one object that is always
+/// uploaded and never cached for long.
+fn datum_push(a: DatumPushArgs) -> Result<()> {
+    split_dest(&a.dest)?;
+    let catalogue_path = a.layout.join(live_book::publish::datum_catalogue_key());
+    let catalogue = live_book::publish::DatumCatalogue::load(&catalogue_path)?;
+    if catalogue.windows().is_empty() {
+        bail!(
+            "{} names no windows — run a capture with --datum-tbl first, and point --layout \
+             at the publish directory it wrote",
+            catalogue_path.display()
+        );
+    }
+
+    // What is about to be pushed, and the one check worth making locally: every object
+    // the catalogue names is on disk at its key, at the length the catalogue claims.
+    let mut objects = 0u64;
+    let mut bytes = 0u64;
+    for w in catalogue.windows() {
+        for o in [&w.table, &w.blob] {
+            let path = a.layout.join(&o.key);
+            let len = std::fs::metadata(&path)
+                .with_context(|| {
+                    format!(
+                        "the catalogue names {}, which is not in the layout — push a complete \
+                         layout, not one that has been pruned",
+                        path.display()
+                    )
+                })?
+                .len();
+            if len != o.len {
+                bail!(
+                    "{} is {len} B; the catalogue says {} — the layout does not match it",
+                    path.display(),
+                    o.len
+                );
+            }
+            objects += 1;
+            bytes += o.len;
+        }
+    }
+
+    println!("datum push");
+    println!("  layout      {}", a.layout.display());
+    println!("  dest        {}", a.dest);
+    println!(
+        "  set         {} window(s) · {objects} objects · {} · catalogue {}",
+        catalogue.windows().len(),
+        human_bytes(bytes),
+        live_book::publish::datum_catalogue_key(),
+    );
+
+    let windows = rclone_datums(
+        &a.dest,
+        &a.layout.join(live_book::publish::DATUM_PREFIX),
+        a.transfers,
+    );
+    let pointer = rclone_catalogue(&a.dest, &catalogue_path);
+    for argv in [&windows, &pointer] {
+        println!("\n{}", shell_line(argv));
+        if a.run {
+            run_rclone(argv)?;
+        }
+    }
+    if !a.run {
+        println!(
+            "\nprinted only — pass --run to execute, or paste the lines above into a shell on \
+             the box that holds the bucket's credentials"
+        );
+    }
+    Ok(())
+}
+
+/// `remote:bucket` or `remote:bucket/prefix`.
+///
+/// ⚠️ The prefix is **optional** here, unlike `tx-index`'s destination: the datum keys
+/// already carry their own namespace (`datum/v1/...`), so `remote:bucket` puts the set
+/// at the bucket's `datum/v1` and a prefix would only nest it deeper.
+fn split_dest(dest: &str) -> Result<(String, String, String)> {
+    let (remote, path) = dest.split_once(':').with_context(|| {
+        format!("dest {dest:?} must be `remote:bucket` or `remote:bucket/prefix`")
+    })?;
+    let (bucket, prefix) = match path.split_once('/') {
+        Some((bucket, prefix)) => (bucket, prefix),
+        None => (path, ""),
+    };
+    if remote.is_empty() || bucket.is_empty() {
+        bail!("dest {dest:?} must name a remote and a bucket");
+    }
+    Ok((
+        remote.to_string(),
+        bucket.to_string(),
+        prefix.trim_matches('/').to_string(),
+    ))
+}
+
+/// The window objects: one `copy` of the layout's `datum/v1` tree, everything but the
+/// catalogue.
+///
+/// ⚠️ `--exclude current` rather than an include pattern, so the line carries no glob
+/// and survives a copy-paste into a shell unchanged — and a superseded window object
+/// still on disk is pushed too, which is harmless (its key is its digest) and heals a
+/// bucket that lost one.
+fn rclone_datums(dest: &str, from: &Path, transfers: usize) -> Vec<String> {
+    let mut argv = vec![
+        "rclone".to_string(),
+        "copy".to_string(),
+        from.display().to_string(),
+        format!("{dest}/{}", live_book::publish::DATUM_PREFIX),
+    ];
+    for arg in [
+        "--exclude",
+        "current",
+        "--header-upload",
+        "Content-Type: application/octet-stream",
+        "--header-upload",
+        "Cache-Control: public, max-age=31536000, immutable",
+        "--s3-no-check-bucket",
+        "--ignore-existing",
+        "--retries",
+        "5",
+    ] {
+        argv.push(arg.to_string());
+    }
+    argv.push("--transfers".to_string());
+    argv.push(transfers.to_string());
+    argv.push("--checkers".to_string());
+    argv.push(transfers.to_string());
+    argv
+}
+
+/// The catalogue: `copyto` — one object at an exact key — with no `--ignore-existing`
+/// (this is the object that changes) and a TTL measured in seconds rather than a year.
+fn rclone_catalogue(dest: &str, file: &Path) -> Vec<String> {
+    let mut argv = vec![
+        "rclone".to_string(),
+        "copyto".to_string(),
+        file.display().to_string(),
+        format!("{dest}/{}", live_book::publish::datum_catalogue_key()),
+    ];
+    for arg in [
+        "--header-upload",
+        "Content-Type: text/plain",
+        "--header-upload",
+        "Cache-Control: public, max-age=60",
+        "--s3-no-check-bucket",
+        "--retries",
+        "5",
+    ] {
+        argv.push(arg.to_string());
+    }
+    argv
+}
+
+/// Quote only what a shell would otherwise split or expand, so an argument holding a
+/// space (`Cache-Control: …`) or a glob survives a copy-paste into a shell.
+fn shell_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg.contains(' ') || arg.contains('*') || arg.contains('?') {
+                format!("\"{arg}\"")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_rclone(argv: &[String]) -> Result<()> {
+    let status = Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .with_context(|| format!("running {}", argv[0]))?;
+    if !status.success() {
+        bail!("rclone exited with {status}");
+    }
+    Ok(())
+}
+
+/// One published window, in full: what it holds, what it cost, and the keys it must be
+/// uploaded to.
+///
+/// A function rather than an inline block because a rolled-over run prints this once per
+/// window: the first window is on disk and uploadable while the rest of the store is
+/// still being walked, and an operator watching a multi-hour run needs to see that.
+fn print_datum_window(a: &FoldArgs, d: &DatumReport, index: u64) -> Result<()> {
+    let dir = a.datum_tbl.as_ref().expect("called with a capture");
+    let tbl = std::fs::metadata(dir.join(live_book::format::DATUM_FILE)).map(|m| m.len())?;
+    println!();
+    println!(
+        "datum window {index} — chunks {}..={} (the witness datums this walk revealed)",
+        d.published.first_chunk, d.published.last_chunk,
+    );
+    println!(
+        "  coverage   slots {}..={} · a miss means \"not revealed in this range\"",
+        d.first_slot, d.last_slot
+    );
+    println!(
+        "  entries    {} distinct hashes · {} payload · offered {} times in {} → {:.0}% dedup",
+        d.entries,
+        human_bytes(d.payload_bytes),
+        d.seen,
+        human_bytes(d.seen_bytes),
+        (1.0 - d.payload_bytes as f64 / d.seen_bytes.max(1) as f64) * 100.0,
+    );
+    println!(
+        "  attached   {} hash-attached outputs created · {} answerable at creation ({:.2}%) —\n\
+             the rest had no preimage on chain yet, and a reveal later in the range lands here",
+        d.hash_attached,
+        d.live_hits,
+        d.live_hits as f64 / d.hash_attached.max(1) as f64 * 100.0,
+    );
+    println!(
+        "  wrote      datum.tbl {} + datum.bin {} in {:.1} s",
+        human_bytes(tbl),
+        human_bytes(d.payload_bytes),
+        d.wrote_secs,
+    );
+    // What to upload, and where. The layout mirrors the bucket — each object's path
+    // under `publish` IS its key — so an uploader walks the directory; the keys are
+    // printed here because the digests are the whole point of them.
+    let root = dir.join("publish");
+    println!(
+        "  publish    {}  (paths under it are the object keys)",
+        root.display()
+    );
+    for (what, o) in [("table", &d.published.table), ("blob ", &d.published.blob)] {
+        println!(
+            "    {what}      {}  {}  blake2b-256 {}",
+            o.key,
+            human_bytes(o.len),
+            o.digest
+        );
+    }
+    println!(
+        "    catalogue  {}  · {} window(s) in the set",
+        live_book::publish::datum_catalogue_key(),
+        d.catalogue_windows
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6280,9 +6657,105 @@ mod tests {
         assert!(pick_window(&all, Some(9), 1).is_err());
     }
 
+    /// `--chunks 0` with a `--start` is "from there to the end" — the resume path. Read
+    /// the other way it would re-walk the store, which is hours of work that looks like
+    /// progress.
+    #[test]
+    fn an_open_ended_window_starts_where_it_is_told() {
+        let all: Vec<u16> = vec![10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            pick_window(&all, Some(13), 0).expect("to the end"),
+            vec![13, 14, 15]
+        );
+        assert_eq!(pick_window(&all, None, 0).expect("the store"), all);
+        assert!(pick_window(&all, Some(9), 0).is_err(), "below the store");
+    }
+
+    /// The rollover's arithmetic: distinct chunks counted once each, however many blocks
+    /// a chunk holds, and the window naming what the walk actually saw rather than what
+    /// the operator asked for.
+    #[test]
+    fn a_datum_capture_counts_distinct_chunks_and_names_what_it_saw() {
+        let mut cap = DatumCapture::new(PathBuf::from("/nowhere"));
+        assert_eq!(cap.chunks, 0, "nothing walked, so nothing to publish yet");
+        // Many blocks, one chunk: the count must not move, or a rollover fires early.
+        cap.set_chunk(7);
+        cap.set_chunk(7);
+        cap.set_chunk(7);
+        assert_eq!(cap.chunks, 1);
+        cap.set_chunk(8);
+        assert_eq!(cap.chunks, 2);
+        assert_eq!(cap.first_chunk, Some(7));
+        assert_eq!(cap.last_chunk, 8);
+    }
+
     #[test]
     fn share_is_zero_not_nan_on_an_empty_denominator() {
         assert_eq!(share(0, 0), 0.0);
         assert_eq!(share(1, 4), 25.0);
+    }
+
+    /// The two cache postures, pinned. The window objects are content-addressed and get
+    /// a year; the catalogue is the one mutable object and gets a minute — and swapping
+    /// them pins a stale set for a year or re-downloads every window.
+    #[test]
+    fn the_datum_push_lines_pin_the_cache_posture() {
+        let windows = rclone_datums("r2:book", Path::new("/lay/datum/v1"), 8);
+        assert_eq!(&windows[..2], ["rclone", "copy"]);
+        assert_eq!(windows[3], "r2:book/datum/v1");
+        let line = shell_line(&windows);
+        assert!(
+            line.contains("\"Cache-Control: public, max-age=31536000, immutable\""),
+            "the window objects are immutable: {line}"
+        );
+        assert!(
+            line.contains("--ignore-existing"),
+            "re-runs must skip: {line}"
+        );
+        assert!(
+            line.contains("--exclude current"),
+            "the catalogue is pushed by its own line, never as a window: {line}"
+        );
+
+        let pointer = rclone_catalogue("r2:book", Path::new("/lay/datum/v1/current"));
+        assert_eq!(&pointer[..2], ["rclone", "copyto"]);
+        assert_eq!(pointer[3], "r2:book/datum/v1/current");
+        let line = shell_line(&pointer);
+        assert!(
+            line.contains("\"Cache-Control: public, max-age=60\""),
+            "{line}"
+        );
+        assert!(
+            !line.contains("--ignore-existing"),
+            "the catalogue must always be uploaded: {line}"
+        );
+    }
+
+    /// A destination names a remote and a bucket; a prefix is optional, because the
+    /// datum keys are already namespaced under `datum/v1`.
+    #[test]
+    fn a_dest_needs_a_bucket_and_may_carry_a_prefix() {
+        assert_eq!(
+            split_dest("r2:book/datum").expect("a full dest"),
+            ("r2".to_string(), "book".to_string(), "datum".to_string())
+        );
+        assert_eq!(
+            split_dest("r2:book").expect("the set lands at the bucket's datum/v1"),
+            ("r2".to_string(), "book".to_string(), String::new())
+        );
+        assert!(split_dest("book/datum").is_err(), "no remote");
+        assert!(split_dest("r2:").is_err(), "no bucket");
+        assert!(split_dest("r2:/datum").is_err(), "no bucket");
+    }
+
+    /// Only arguments a shell would otherwise split or expand get quoted, so the printout
+    /// stays copy-pasteable rather than uniformly escaped.
+    #[test]
+    fn only_a_shell_hostile_argument_is_quoted() {
+        let argv: Vec<String> = ["rclone", "copyto", "a b", "plain", "g*lob"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(shell_line(&argv), "rclone copyto \"a b\" plain \"g*lob\"");
     }
 }

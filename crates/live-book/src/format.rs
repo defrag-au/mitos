@@ -316,6 +316,47 @@ pub fn mix(mut x: u64) -> u64 {
     x ^ (x >> 33)
 }
 
+/// What `datum.tbl`'s header says, without mapping anything.
+///
+/// The slot range is the *observed* range the capturing walk covered, which is why
+/// the publish path names an object from this rather than from the walk's nominal
+/// window: the file is the authority on what it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatumHeader {
+    pub layout_version: u32,
+    pub entries: u64,
+    pub first_slot: u64,
+    pub last_slot: u64,
+}
+
+/// Read `datum.tbl`'s header from disk — 28 bytes, no `mmap`, so this works on a box
+/// (and in a build) that cannot map files.
+pub fn read_datum_header(path: &Path) -> Result<DatumHeader> {
+    let mut b = [0u8; DATUM_HEADER];
+    let mut f = File::open(path).with_context(|| format!("opening {}'s header", path.display()))?;
+    f.read_exact(&mut b)
+        .with_context(|| format!("reading {}'s header", path.display()))?;
+    parse_datum_header(&b, &path.display().to_string())
+}
+
+/// The header out of its bytes. `what` names the file in errors, so a caller with a
+/// mapped table and one with a fresh read report the same way.
+pub fn parse_datum_header(b: &[u8], what: &str) -> Result<DatumHeader> {
+    if b.len() < DATUM_HEADER {
+        bail!("{what} is too short to hold a header");
+    }
+    let layout_version = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+    if layout_version != LAYOUT_VERSION {
+        bail!("{what} is layout_version {layout_version}; this build reads {LAYOUT_VERSION}");
+    }
+    Ok(DatumHeader {
+        layout_version,
+        entries: u64::from_le_bytes(b[4..12].try_into().expect("8 bytes")),
+        first_slot: u64::from_le_bytes(b[12..20].try_into().expect("8 bytes")),
+        last_slot: u64::from_le_bytes(b[20..28].try_into().expect("8 bytes")),
+    })
+}
+
 /// `datum.tbl` + `datum.bin` — the **witnessed datum bytes**, keyed by hash.
 ///
 /// # Why this cannot be re-derived, and the hash path it closes
@@ -443,19 +484,9 @@ impl DatumTable {
     pub fn open(dir: &Path) -> Result<DatumTable> {
         let path = dir.join(DATUM_FILE);
         let entries = map(&path)?;
-        if entries.len() < DATUM_HEADER {
-            bail!("{} is too short to hold a header", path.display());
-        }
-        let v = u32::from_le_bytes(entries[0..4].try_into().expect("4 bytes"));
-        if v != LAYOUT_VERSION {
-            bail!(
-                "{} is layout_version {v}; this build reads {LAYOUT_VERSION}",
-                path.display()
-            );
-        }
-        let n = u64::from_le_bytes(entries[4..12].try_into().expect("8 bytes")) as usize;
-        let first_slot = u64::from_le_bytes(entries[12..20].try_into().expect("8 bytes"));
-        let last_slot = u64::from_le_bytes(entries[20..28].try_into().expect("8 bytes"));
+        let header = parse_datum_header(&entries, &path.display().to_string())?;
+        let n = header.entries as usize;
+        let (first_slot, last_slot) = (header.first_slot, header.last_slot);
         let want = DATUM_HEADER + DATUM_ENTRY_BYTES * n;
         if entries.len() != want {
             bail!(

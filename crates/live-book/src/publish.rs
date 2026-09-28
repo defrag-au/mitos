@@ -53,6 +53,10 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+// The digest a content-addressed datum object's key is made of. Blake2b-256, the
+// same hash a datum's own key is, so the layout's integrity check and the chain's
+// are one computation.
+use pallas_crypto::hash::Hasher;
 
 use crate::format::{
     self, BaseFingerprint, DIRECTORY_ADDR, DIRECTORY_OUTREF, DIRECTORY_POLICY, META_FILE, Meta,
@@ -449,6 +453,392 @@ pub fn keys(att: &Attestation) -> Vec<PathBuf> {
     out
 }
 
+// ── The datum set: `hash → preimage`, published additively ─────────────────────────
+//
+// Design: `docs/design/DATUM_RESOLVER_FORMAT.md`. This is the artifact a
+// hash-attached output needs: the output carries no payload, and the bytes exist
+// only in the witness set of some transaction — which is a *capture*, not somewhere
+// a reader can walk to, because a block keeps its bodies and its witness sets in
+// separate arrays (design §2, measured).
+//
+// The unit is one **closed window pair** — `datum.tbl` + `datum.bin`, exactly as the
+// builder wrote them — plus one catalogue naming every published window:
+//
+//     datum/v1/w-<first_slot>-<last_slot>-<digest>.tbl
+//     datum/v1/w-<first_slot>-<last_slot>-<digest>.bin
+//     datum/v1/current
+//
+// ⚠️ **A window pair is content-addressed.** The digest in the key is the file's own
+// blake2b-256, so a re-capture that finds the same datums lands on the same keys and
+// uploads nothing, and a reader can check what it fetched against the key it asked
+// for. The catalogue is the ONE object that is ever rewritten — which is also why it
+// is the one object that must be uploaded with a short TTL, never with the windows'
+// cache posture.
+//
+// ⚠️ **No parts, unlike [`PARTED`].** A lookup ranges into the entry array and then
+// into the blob, and multi-range works only *within* one object, so splitting a
+// window would cost every lookup its batching. A table big enough to want splitting
+// is split by hash prefix instead — one pair per prefix — which is the design's
+// second tier (§6.4), and then each object is small again.
+
+/// Every published datum object lives under this prefix.
+pub const DATUM_PREFIX: &str = "datum/v1";
+
+/// The catalogue — the one mutable object in the set.
+pub const DATUM_CATALOGUE_FILE: &str = "current";
+
+/// The catalogue's own layout, so a reader can refuse one it does not understand
+/// before it has fetched a table.
+pub const DATUM_CATALOGUE_VERSION: u32 = 1;
+
+/// The catalogue's object key.
+pub fn datum_catalogue_key() -> String {
+    format!("{DATUM_PREFIX}/{DATUM_CATALOGUE_FILE}")
+}
+
+/// The key of one window's entry array.
+///
+/// ⚠️ **The one definition.** Both sides of this — the writer naming an object and a
+/// reader deriving where to range — call these, because a second copy of the key
+/// format is how an extension or a separator silently diverges.
+pub fn datum_table_key(first_slot: u64, last_slot: u64, digest: &str) -> String {
+    format!("{DATUM_PREFIX}/w-{first_slot}-{last_slot}-{digest}.tbl")
+}
+
+/// The key of one window's payload blob.
+pub fn datum_blob_key(first_slot: u64, last_slot: u64, digest: &str) -> String {
+    format!("{DATUM_PREFIX}/w-{first_slot}-{last_slot}-{digest}.bin")
+}
+
+/// The walk a capture covered, in the walker's own coordinate.
+///
+/// ⚠️ The slot range and the entry count are deliberately NOT here: they come from
+/// the table's own header, so a name or a catalogue line cannot describe a table
+/// that is not the one on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatumWindow {
+    pub first_chunk: u16,
+    pub last_chunk: u16,
+}
+
+/// One object in the set, as the catalogue records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatumObject {
+    pub key: String,
+    pub len: u64,
+    /// Blake2b-256 of the object's bytes, lower-case hex — the component of `key`
+    /// that makes the object rewrite-proof.
+    pub digest: String,
+}
+
+/// One window, as the catalogue records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatumEntry {
+    pub first_chunk: u16,
+    pub last_chunk: u16,
+    pub first_slot: u64,
+    pub last_slot: u64,
+    pub entries: u64,
+    /// The table format the pair is written in — a reader refuses a version it does
+    /// not read rather than ranging into offsets it cannot interpret.
+    pub layout_version: u32,
+    pub table: DatumObject,
+    pub blob: DatumObject,
+}
+
+/// Every window published so far.
+///
+/// Flat text, one line per window, in the same doctrine as `book.meta`: every field
+/// is required, a missing or extra one is an error rather than a default, and the
+/// rendering is byte-stable so re-publishing the same set is not a diff.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DatumCatalogue {
+    /// Sorted by `(first_chunk, last_chunk)` — the order a chunk-anchored reader
+    /// walks, and the order the rendering is pinned to.
+    windows: Vec<DatumEntry>,
+}
+
+impl DatumCatalogue {
+    pub fn windows(&self) -> &[DatumEntry] {
+        &self.windows
+    }
+
+    /// The window covering `chunk`, if one is published. The reader's anchor is a
+    /// chunk — that is what the index answers a transaction with.
+    pub fn covering(&self, chunk: u16) -> Option<&DatumEntry> {
+        self.windows
+            .iter()
+            .find(|w| chunk >= w.first_chunk && chunk <= w.last_chunk)
+    }
+
+    pub fn parse(text: &str) -> Result<DatumCatalogue> {
+        let mut lines = text.lines();
+        let first = lines
+            .next()
+            .context("an empty catalogue: the version line is missing")?;
+        let mut version = first.split_whitespace();
+        let (Some("catalogue_version"), Some(v), None) =
+            (version.next(), version.next(), version.next())
+        else {
+            bail!("line 1: expected `catalogue_version <n>`, got {first:?}");
+        };
+        let v: u32 = v.parse().context("line 1: catalogue_version")?;
+        if v != DATUM_CATALOGUE_VERSION {
+            bail!("the catalogue is version {v}; this build reads {DATUM_CATALOGUE_VERSION}");
+        }
+
+        let mut windows = Vec::new();
+        for (at, line) in lines.enumerate() {
+            let lineno = at + 2;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let ["window", fc, lc, fs, ls, n, lv, tl, td, bl, bd] = f.as_slice() else {
+                bail!(
+                    "line {lineno}: a window is `window <first_chunk> <last_chunk> \
+                     <first_slot> <last_slot> <entries> <layout_version> <tbl_len> \
+                     <tbl_digest> <bin_len> <bin_digest>`, got {line:?}"
+                );
+            };
+            let num = |s: &str, what: &str| -> Result<u64> {
+                s.parse().with_context(|| format!("line {lineno}: {what}"))
+            };
+            let first_slot = num(fs, "first_slot")?;
+            let last_slot = num(ls, "last_slot")?;
+            windows.push(DatumEntry {
+                first_chunk: num(fc, "first_chunk")? as u16,
+                last_chunk: num(lc, "last_chunk")? as u16,
+                first_slot,
+                last_slot,
+                entries: num(n, "entries")?,
+                layout_version: num(lv, "layout_version")? as u32,
+                table: DatumObject {
+                    key: datum_table_key(first_slot, last_slot, td),
+                    len: num(tl, "table len")?,
+                    digest: td.to_string(),
+                },
+                blob: DatumObject {
+                    key: datum_blob_key(first_slot, last_slot, bd),
+                    len: num(bl, "blob len")?,
+                    digest: bd.to_string(),
+                },
+            });
+        }
+        Ok(DatumCatalogue { windows })
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = format!("catalogue_version {DATUM_CATALOGUE_VERSION}\n");
+        for w in &self.windows {
+            out.push_str(&format!(
+                "window {} {} {} {} {} {} {} {} {} {}\n",
+                w.first_chunk,
+                w.last_chunk,
+                w.first_slot,
+                w.last_slot,
+                w.entries,
+                w.layout_version,
+                w.table.len,
+                w.table.digest,
+                w.blob.len,
+                w.blob.digest,
+            ));
+        }
+        out
+    }
+
+    /// The catalogue on disk, or an empty one — absent is a first publish, not an
+    /// error.
+    pub fn load(path: &Path) -> Result<DatumCatalogue> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => DatumCatalogue::parse(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DatumCatalogue::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    pub fn store(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, self.render()).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Add a window, replacing any entry for the same chunk range — a re-capture of
+    /// a window supersedes its own entry and leaves every other window alone.
+    /// Superseded objects stay in the layout (and in the bucket): correctness never
+    /// depends on deleting them, only on which catalogue a reader was handed.
+    pub fn upsert(&mut self, entry: DatumEntry) {
+        let at = self
+            .windows
+            .iter()
+            .position(|w| w.first_chunk == entry.first_chunk && w.last_chunk == entry.last_chunk);
+        match at {
+            Some(i) => self.windows[i] = entry,
+            None => self.windows.push(entry),
+        }
+        self.windows
+            .sort_by_key(|w| (w.first_chunk, w.last_chunk, w.first_slot));
+    }
+}
+
+/// Lay one window's capture out for upload, and merge it into the catalogue.
+///
+/// Reads the window's slot range and entry count from `dir/datum.tbl`'s own header —
+/// the file is the authority — checks the pair before it can be published (see
+/// [`check_datum_pair`]), copies both files to their content-addressed keys under
+/// `out`, and updates `out/datum/v1/current`.
+///
+/// Returns the entry, so a caller can print or assert the keys it just laid out.
+pub fn publish_datums(dir: &Path, out: &Path, window: DatumWindow) -> Result<DatumEntry> {
+    let table_src = dir.join(crate::format::DATUM_FILE);
+    let blob_src = dir.join(crate::format::DATUM_BLOB);
+
+    let table =
+        std::fs::read(&table_src).with_context(|| format!("reading {}", table_src.display()))?;
+    let header = crate::format::parse_datum_header(&table, &table_src.display().to_string())?;
+    let blob_len = std::fs::metadata(&blob_src)
+        .with_context(|| format!("statting {}", blob_src.display()))?
+        .len();
+    let entries = check_datum_pair(&table, blob_len)?;
+    if entries != header.entries {
+        bail!(
+            "{} has {} entries; the pair tiles to {entries}",
+            table_src.display(),
+            header.entries
+        );
+    }
+
+    let (tbl_digest, tbl_len) = digest_file(&table_src)?;
+    let (bin_digest, bin_len) = digest_file(&blob_src)?;
+    let entry = DatumEntry {
+        first_chunk: window.first_chunk,
+        last_chunk: window.last_chunk,
+        first_slot: header.first_slot,
+        last_slot: header.last_slot,
+        entries,
+        layout_version: header.layout_version,
+        table: DatumObject {
+            key: datum_table_key(header.first_slot, header.last_slot, &tbl_digest),
+            len: tbl_len,
+            digest: tbl_digest,
+        },
+        blob: DatumObject {
+            key: datum_blob_key(header.first_slot, header.last_slot, &bin_digest),
+            len: bin_len,
+            digest: bin_digest,
+        },
+    };
+
+    for (src, object) in [(&table_src, &entry.table), (&blob_src, &entry.blob)] {
+        let dst = out.join(&object.key);
+        let wrote = copy_object(src, &dst)?;
+        if wrote != object.len {
+            bail!(
+                "{} copied {wrote} B; it is {} B — the object does not describe itself",
+                src.display(),
+                object.len
+            );
+        }
+    }
+
+    let catalogue_path = out.join(datum_catalogue_key());
+    let mut catalogue = DatumCatalogue::load(&catalogue_path)?;
+    catalogue.upsert(entry.clone());
+    catalogue.store(&catalogue_path)?;
+    Ok(entry)
+}
+
+/// A file's blake2b-256, lower-case hex, and its length.
+///
+/// Streamed: the largest legitimate pair is `u32`-addressed (under 4 GiB, see
+/// [`crate::format::write_datum_table`]) and a whole-chain capture is many windows
+/// rather than one large one, but materialising a window to hash it is a cost with
+/// no reader waiting on it.
+fn digest_file(path: &Path) -> Result<(String, u64)> {
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Hasher::<256>::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len = 0u64;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.input(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((hasher.finalize().to_string(), len))
+}
+
+/// Copy one object into the layout, creating its directory, and report the bytes
+/// written.
+fn copy_object(src: &Path, dst: &Path) -> Result<u64> {
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut from = File::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let mut to = File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
+    let wrote = std::io::copy(&mut from, &mut to)
+        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+    to.flush()
+        .with_context(|| format!("flushing {}", dst.display()))?;
+    Ok(wrote)
+}
+
+/// The invariant [`crate::format::DatumTable::open`] enforces, applied *before* a
+/// publish.
+///
+/// ⚠️ Both halves matter and neither is optional. A pair that does not tile would
+/// answer with **wrong bytes** instead of failing — the worst shape of error a
+/// reader can meet — and a pair whose entries are not strictly increasing by hash
+/// makes the reader's binary search return the wrong row for a *correct* key.
+/// Returns the entry count.
+fn check_datum_pair(table: &[u8], blob_len: u64) -> Result<u64> {
+    let header = crate::format::parse_datum_header(table, "datum.tbl")?;
+    let entries = header.entries;
+    let want =
+        crate::format::DATUM_HEADER as u64 + crate::format::DATUM_ENTRY_BYTES as u64 * entries;
+    if table.len() as u64 != want {
+        bail!(
+            "datum.tbl is {} B; {entries} entries need {want}",
+            table.len()
+        );
+    }
+    let mut expect = 0u64;
+    let mut previous: Option<[u8; 32]> = None;
+    for i in 0..entries {
+        let at = crate::format::DATUM_HEADER + crate::format::DATUM_ENTRY_BYTES * i as usize;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&table[at..at + 32]);
+        if let Some(prev) = previous
+            && hash <= prev
+        {
+            bail!("datum.tbl entry {i} is not above its predecessor; the sort is broken");
+        }
+        previous = Some(hash);
+        let off = u32::from_le_bytes(table[at + 32..at + 36].try_into().expect("4 bytes"));
+        let len = u32::from_le_bytes(table[at + 36..at + 40].try_into().expect("4 bytes"));
+        if u64::from(off) != expect {
+            bail!(
+                "datum.tbl entry {i} starts at {off} in datum.bin; {expect} expected — the \
+                 pair is not from one capture"
+            );
+        }
+        expect += u64::from(len);
+    }
+    if expect != blob_len {
+        bail!(
+            "datum.tbl's {entries} entries address {expect} B; datum.bin is {blob_len} B — the \
+             pair is not from one capture"
+        );
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +846,241 @@ mod tests {
     const PART: PartSize = DEFAULT_PART;
     /// The same number as a plain byte count, for the offsets a test computes.
     const P: u64 = PART.get();
+
+    /// A directory of its own per test, as `format.rs`'s datum tests do: these read
+    /// and write real files, and a published key is the thing under test.
+    fn datum_scratch(what: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("live-book-publish-{}-{what}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create");
+        dir
+    }
+
+    /// A capture directory with two datums in it, written by the real writer.
+    fn captured(dir: &Path, coverage: (u64, u64)) {
+        let a = ([0x11u8; 32], vec![0xA1u8, 0x01]);
+        let b = ([0x22u8; 32], vec![0xA1u8, 0x02, 0x03]);
+        crate::format::write_datum_table(dir, coverage, &[a, b]).expect("write datum table");
+    }
+
+    #[test]
+    fn a_datum_window_names_its_objects_by_slot_range_and_digest() {
+        let dir = datum_scratch("naming");
+        let out = dir.join("publish");
+        captured(&dir, (100, 200));
+
+        let e = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect("publish");
+        assert_eq!((e.first_chunk, e.last_chunk), (7, 9));
+        assert_eq!((e.first_slot, e.last_slot), (100, 200));
+        assert_eq!(e.entries, 2);
+        assert_eq!(e.layout_version, crate::format::LAYOUT_VERSION);
+        // The digest is in the key, and it is the FILE's own — so the key a reader
+        // asked for is the check it can run on what came back.
+        assert_eq!(e.table.key, datum_table_key(100, 200, &e.table.digest),);
+        assert_eq!(e.blob.key, datum_blob_key(100, 200, &e.blob.digest));
+        assert!(e.table.key.ends_with(".tbl"), "{} ", e.table.key);
+        assert!(e.blob.key.ends_with(".bin"), "{} ", e.blob.key);
+        // Both files are on disk at exactly those keys, with exactly those bytes.
+        for object in [&e.table, &e.blob] {
+            let bytes = std::fs::read(out.join(&object.key)).expect("the object is at its key");
+            assert_eq!(bytes.len() as u64, object.len);
+            assert_eq!(
+                digest_file(&out.join(&object.key)).unwrap().0,
+                object.digest
+            );
+        }
+        // And the catalogue a reader fetches first describes that window.
+        let c = DatumCatalogue::load(&out.join(datum_catalogue_key())).expect("catalogue");
+        assert_eq!(c.windows(), &[e]);
+    }
+
+    /// Re-publishing the same window is not a diff and not a second object: the
+    /// digest names the bytes, so a re-capture that found the same datums lands on
+    /// the same keys. This is what makes the set safe to publish additively.
+    #[test]
+    fn re_publishing_a_window_lands_on_the_same_keys() {
+        let dir = datum_scratch("idempotent");
+        let out = dir.join("publish");
+        captured(&dir, (100, 200));
+        let first = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect("first publish");
+        let before = std::fs::read(out.join(datum_catalogue_key())).expect("catalogue");
+
+        let after = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect("second publish");
+        let again = std::fs::read(out.join(datum_catalogue_key())).expect("catalogue");
+        assert_eq!(first, after);
+        assert_eq!(before, again, "the catalogue is byte-stable for one window");
+        assert_eq!(
+            DatumCatalogue::load(&out.join(datum_catalogue_key()))
+                .expect("catalogue")
+                .windows()
+                .len(),
+            1,
+            "a re-publish of one window is one entry, not two"
+        );
+    }
+
+    /// Windows accumulate, and a reader anchored on a chunk finds the one that
+    /// covers it — the whole point of carrying the chunk range rather than only the
+    /// slot range.
+    #[test]
+    fn windows_accumulate_and_a_chunk_finds_its_window() {
+        let dir = datum_scratch("accumulate");
+        let out = dir.join("publish");
+        captured(&dir, (100, 200));
+        let a = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect("a");
+        captured(&dir, (300, 400));
+        let b = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 10,
+                last_chunk: 12,
+            },
+        )
+        .expect("b");
+
+        let c = DatumCatalogue::load(&out.join(datum_catalogue_key())).expect("catalogue");
+        assert_eq!(c.windows(), &[a, b]);
+        assert_eq!(c.covering(8).map(|w| w.first_slot), Some(100));
+        assert_eq!(c.covering(11).map(|w| w.first_slot), Some(300));
+        assert_eq!(
+            c.covering(6),
+            None,
+            "a chunk no window covers is a scoped miss"
+        );
+        // A second window's capture rewrote datum.tbl/datum.bin, and the FIRST
+        // window's objects are still on disk — nothing about adding is a rewrite.
+        assert!(out.join(&c.windows()[0].table.key).exists());
+        assert!(out.join(&c.windows()[1].table.key).exists());
+    }
+
+    /// A catalogue survives a round trip through its own text, and refuses one that
+    /// does not say what it means — the `book.meta` doctrine, where a missing field
+    /// is an error rather than a default.
+    #[test]
+    fn a_catalogue_round_trips_and_refuses_a_broken_line() {
+        let dir = datum_scratch("catalogue-text");
+        let out = dir.join("publish");
+        captured(&dir, (100, 200));
+        let e = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect("publish");
+        let text = DatumCatalogue::load(&out.join(datum_catalogue_key()))
+            .expect("catalogue")
+            .render();
+        let back = DatumCatalogue::parse(&text).expect("parses");
+        assert_eq!(back.windows(), &[e]);
+        assert_eq!(back.render(), text, "rendering is byte-stable");
+
+        let short = text.replace(" 2 3 ", " 2 ");
+        assert!(
+            DatumCatalogue::parse(&short).is_err(),
+            "a window line missing its layout version must not parse"
+        );
+        assert!(DatumCatalogue::parse("").is_err(), "no version line");
+        assert!(DatumCatalogue::parse("catalogue_version 99\n").is_err());
+    }
+
+    /// The pair check runs before anything is published: a blob that belongs to a
+    /// different capture would answer with WRONG BYTES rather than fail, so it must
+    /// not reach a bucket. Both halves of the invariant are exercised.
+    #[test]
+    fn a_pair_that_does_not_tile_is_refused_before_it_is_published() {
+        let dir = datum_scratch("tiling");
+        let out = dir.join("publish");
+        captured(&dir, (100, 200));
+        let blob = dir.join(crate::format::DATUM_BLOB);
+        let good = std::fs::read(&blob).expect("blob");
+
+        // A blob one byte too long: every offset still resolves, and the last one
+        // now points past the data a reader would get.
+        std::fs::write(&blob, [&good[..], &[0u8]].concat()).expect("write");
+        let err = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect_err("a non-tiling pair must be refused")
+        .to_string();
+        assert!(err.contains("address"), "{err}");
+        assert!(
+            !out.join(datum_catalogue_key()).exists(),
+            "nothing is published when the pair does not check out"
+        );
+    }
+
+    /// A table whose entries are out of order is refused too: a binary search over
+    /// it can return a row that is not the key asked for, which reads as data.
+    #[test]
+    fn a_table_out_of_hash_order_is_refused() {
+        let dir = datum_scratch("order");
+        let out = dir.join("publish");
+        captured(&dir, (100, 200));
+        let tbl = dir.join(crate::format::DATUM_FILE);
+        let mut bytes = std::fs::read(&tbl).expect("table");
+        // Swap the two entries' HASHES and nothing else: tiling still holds (their
+        // offsets and lengths stay where they are), so this isolates the ordering
+        // rule from the pairing one — the pair the tiling check alone would pass.
+        let (a, b) = (bytes[28..60].to_vec(), bytes[68..100].to_vec());
+        bytes[28..60].copy_from_slice(&b);
+        bytes[68..100].copy_from_slice(&a);
+        std::fs::write(&tbl, &bytes).expect("write");
+
+        let err = publish_datums(
+            &dir,
+            &out,
+            DatumWindow {
+                first_chunk: 7,
+                last_chunk: 9,
+            },
+        )
+        .expect_err("an unsorted table must be refused")
+        .to_string();
+        assert!(err.contains("sort"), "{err}");
+        assert!(!out.join(datum_catalogue_key()).exists());
+    }
 
     #[test]
     fn locate_is_the_inverse_of_part_layout() {

@@ -31,3 +31,9 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+# `examples/offer_datums.rs` compares an output's PAYMENT credential against an
+# offer contract's. The walker itself never parses an address — its decode hands
+# back bech32 — so this is the example's cost, not the library's.
+pallas-addresses = { workspace = true }

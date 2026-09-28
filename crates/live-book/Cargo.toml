@@ -31,6 +31,13 @@ mmap = ["dep:memmap2"]
 # `Hash<32>`, so the format is independent of that type on purpose — whoever
 # holds a `Hash<32>` converts once at the boundary.
 pallas-addresses = { workspace = true }
+# Blake2b-256, for the content-addressed name of a published datum object: the
+# digest in the key is what makes a re-capture that finds the same datums land on
+# the same object and upload nothing, and what lets a reader check what it fetched
+# against the key it asked for. Already in this crate's graph through
+# `pallas-addresses`, so this is a direct declaration and not a new crate in the
+# build; the format stays keyed on `[u8; 32]` rather than on a pallas type.
+pallas-crypto = { workspace = true }
 # Read-only mappings, as `tx-index` and `policy-index` map their bases. The
 # artifact is published whole and swapped by rename, so a mapping never observes
 # a write. Optional because it does not build for wasm — see the `mmap` feature.
