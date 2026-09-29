@@ -310,6 +310,56 @@ mod tests {
         );
     }
 
+    /// ⚠️ **The reading a run's rows turn on.** Thirteen requests issued together, each about
+    /// half a second: the span is the slowest of them and the Σ is all thirteen. A row whose
+    /// two numbers are equal ran alone; a row whose Σ dwarfs its span is that purpose's own
+    /// requests overlapping — which is the whole point of dispatching them as one group.
+    #[test]
+    fn requests_issued_together_have_a_span_of_the_slowest_not_the_sum() {
+        let mut ledger = Ledger::new();
+        for i in 0..13 {
+            ledger.dispatch();
+            ledger.record(P::Index, 3_760, 490.0 + i as f64, 1_000.0);
+        }
+        let row = ledger.rows().next().expect("one row").1;
+        assert_eq!(row.requests, 13);
+        assert_eq!(
+            row.millis, 6_448.0,
+            "490 + 491 + … + 502: thirteen requests of about half a second"
+        );
+        assert_eq!(row.worst_ms, 502.0);
+        assert_eq!(
+            row.span_ms(),
+            502.0,
+            "issued together: the span is the slowest, not the sum"
+        );
+    }
+
+    /// ⚠️ **A roll-up's span is a superset of the rows it keeps**, so an arm can never read
+    /// smaller than one of its own rows. When a screen shows a purpose whose span exceeds the
+    /// leg built from it, the row is where to look — the merge is min-of-issues to
+    /// max-of-settles and cannot lose an interval.
+    #[test]
+    fn a_merged_span_contains_every_row_span_it_keeps() {
+        let mut ledger = Ledger::new();
+        row(&mut ledger, P::Index, 1, 22.0, 100.0);
+        row(&mut ledger, P::Set, 1, 500.0, 1_000.0);
+        row(&mut ledger, P::Index, 1, 30.0, 1_600.0);
+
+        let index = ledger.total_of(|p| *p == P::Index);
+        assert_eq!(index.span_ms(), 1_530.0, "100 → 1630");
+        let all = ledger.total_of(|_| true);
+        assert_eq!(all.span_ms(), 1_530.0, "100 → 1630");
+        for (purpose, row) in ledger.rows() {
+            assert!(
+                all.span_ms() >= row.span_ms(),
+                "the whole contains {purpose:?}: {} vs {}",
+                all.span_ms(),
+                row.span_ms()
+            );
+        }
+    }
+
     /// A queue driven by hand, with every request accounted for — the reading that must
     /// hold in a run, so that a non-zero difference in one means something.
     #[test]
