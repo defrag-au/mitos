@@ -53,6 +53,22 @@
 //! not plan either — [`live_book::plan`] does, and is driven here rather than
 //! reimplemented, so the 299-range cap exists in one place.
 //!
+//! # The cost table comes with it
+//!
+//! A concurrent reader cannot be measured in intervals — see [`Ledger`] for why, and
+//! for the sum-over-requests shape that replaces them. Take a [`Settled`] and hand it to
+//! [`Ledger::settled`], and the table a run is read from is written as the run goes.
+//!
+//! ```text
+//!   for request in queue.take() {
+//!       ledger.dispatched();                       // the transport was handed a request
+//!       let outcome = fetch(&request).await;       // …the caller's own transport…
+//!       let settled = queue.settle(request)?;
+//!       ledger.settled(purpose_of(&settled), &settled);
+//!       // …and the continuations, which push more wants…
+//!   }
+//! ```
+//!
 //! # Geometry
 //!
 //! Wants are in **file** coordinates. A storage handle may be one object or many parts
@@ -90,6 +106,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use live_book::plan::{Batch, PartSize, Shape, Want, plan};
+
+mod ledger;
+
+pub use ledger::{Ledger, Tally};
 
 /// Identifies one want, so a returned range can be placed back in the caller's own
 /// state without this crate knowing anything about that state.
@@ -200,6 +220,11 @@ pub struct Settled<K> {
     pub bytes: u64,
     /// Dispatch → settle, from the injected [`Clock`].
     pub millis: f64,
+    /// When it went out, from the same [`Clock`] — the run's own timeline, so a caller
+    /// can place two requests relative to each other. [`Ledger`] is what wants this:
+    /// `issued_at` plus `millis` is when the request settled, and a purpose's span is the
+    /// distance between the first of its issues and the last of its settles.
+    pub issued_at: f64,
     /// Where each ticket's bytes are.
     pub shares: Vec<Share>,
 }
@@ -471,6 +496,7 @@ impl<K: Ord + Clone> Queue<K> {
             part: request.batch.part,
             bytes: request.batch.bytes(),
             millis,
+            issued_at: request.issued_at,
             shares: request.shares,
         })
     }
