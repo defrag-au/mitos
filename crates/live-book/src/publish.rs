@@ -566,9 +566,19 @@ impl DatumCatalogue {
     /// The window covering `chunk`, if one is published. The reader's anchor is a
     /// chunk — that is what the index answers a transaction with.
     pub fn covering(&self, chunk: u16) -> Option<&DatumEntry> {
+        self.covering_index(chunk).map(|at| &self.windows[at])
+    }
+
+    /// Where that window sits in [`windows`](Self::windows).
+    ///
+    /// ⚠️ **The predicate lives here and nowhere else.** A caller that needs to *name* the
+    /// window — a reader that asks for an array once and files the answers under it — would
+    /// otherwise write the interval test a second time, and two copies of "is this chunk in
+    /// this window" is how a lookup lands on the wrong array.
+    pub fn covering_index(&self, chunk: u16) -> Option<usize> {
         self.windows
             .iter()
-            .find(|w| chunk >= w.first_chunk && chunk <= w.last_chunk)
+            .position(|w| chunk >= w.first_chunk && chunk <= w.last_chunk)
     }
 
     pub fn parse(text: &str) -> Result<DatumCatalogue> {
@@ -981,6 +991,16 @@ mod tests {
             None,
             "a chunk no window covers is a scoped miss"
         );
+        // ⚠️ **The index and the entry must agree**, because a reader that files an array's
+        // answers under a window asks for the index and then reads the entry at it. Two
+        // copies of the interval test is how those two would come apart.
+        assert_eq!(c.covering_index(8), Some(0));
+        assert_eq!(c.covering_index(11), Some(1));
+        assert_eq!(c.covering_index(6), None);
+        for chunk in [7u16, 9, 10, 12] {
+            let at = c.covering_index(chunk).expect("a covered chunk");
+            assert_eq!(c.covering(chunk), Some(&c.windows()[at]));
+        }
         // A second window's capture rewrote datum.tbl/datum.bin, and the FIRST
         // window's objects are still on disk — nothing about adding is a rewrite.
         assert!(out.join(&c.windows()[0].table.key).exists());

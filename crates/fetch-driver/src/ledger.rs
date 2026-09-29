@@ -218,7 +218,10 @@ mod tests {
         let tally = ledger.rows().next().expect("one row").1;
         assert_eq!(tally.requests, 3);
         assert_eq!(tally.bytes, 60);
-        assert_eq!(tally.millis, 500.0, "the sum over requests, not an interval");
+        assert_eq!(
+            tally.millis, 500.0,
+            "the sum over requests, not an interval"
+        );
         assert_eq!(tally.worst_ms, 400.0, "the straggler, not the sum");
         assert_eq!(tally.span_ms(), 400.0, "first dispatch to last settle");
         assert!(
@@ -239,7 +242,11 @@ mod tests {
         }
         let tally = ledger.rows().next().expect("one row").1;
         assert_eq!(tally.millis, 400.0);
-        assert_eq!(tally.span_ms(), 130.0, "0 → 30 dispatched, the last settling at 130");
+        assert_eq!(
+            tally.span_ms(),
+            130.0,
+            "0 → 30 dispatched, the last settling at 130"
+        );
     }
 
     #[test]
@@ -263,7 +270,11 @@ mod tests {
         assert_eq!(index.requests, 2);
         assert_eq!(index.bytes, 3);
         assert_eq!(index.millis, 50.0);
-        assert_eq!(index.span_ms(), 110.0, "0 → 40 dispatched, the second settling at 110");
+        assert_eq!(
+            index.span_ms(),
+            110.0,
+            "0 → 40 dispatched, the second settling at 110"
+        );
 
         let set = ledger.total_of(|p| *p == P::Set);
         assert_eq!(set.requests, 1);
@@ -305,7 +316,15 @@ mod tests {
     fn a_driven_queue_leaves_nothing_unattributed() {
         let mut queue: Queue<P> = Queue::new(4, Shape::default(), || 0.0);
         queue.declare(P::Index, Geometry::whole(4_096)).unwrap();
-        let ticket = queue.push(P::Index, Want { offset: 0, len: 100 }).unwrap();
+        let ticket = queue
+            .push(
+                P::Index,
+                Want {
+                    offset: 0,
+                    len: 100,
+                },
+            )
+            .unwrap();
 
         let mut ledger = Ledger::new();
         for request in queue.take() {
