@@ -69,6 +69,12 @@ members = [
     # the probe WRITES the book and the data plane reads it, and a binary crate
     # cannot be depended on. `docs/design/LIVE_BOOK.md` is the spec.
     "crates/live-book",
+    # Readiness-driven dispatch for ranged reads: the wants a reader discovers as
+    # bytes arrive, planned into the fewest in-flight requests instead of awaited
+    # one phase at a time. Pure — no I/O, no async, no clock — so the browser, a
+    # Worker and a scripted test drive the same core. Depend on `live-book` for the
+    # planning half; it does not reimplement it.
+    "crates/fetch-driver",
     # Structured timing for the operations mitos does repeatedly: a closed
     # vocabulary of operation names, bounded-memory percentiles, and a report that
     # two runs can be diffed. Zero dependencies, so every tool can link it.
