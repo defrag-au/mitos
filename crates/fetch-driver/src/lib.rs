@@ -27,9 +27,24 @@
 //!   that goes out when a slot frees carries everything that became ready meanwhile.
 //!   Batching is a **dispatch-time** decision, never a creation-time one.
 //!
-//! That is why there is no timer here, and must not be: `Instant::now` does not exist
-//! on `wasm32-unknown-unknown`, and a timer would buy nothing that dispatch-on-a-free-
-//! slot does not already give.
+//! That is why there is no timer here, and must not be: a flush-on-timeout would need
+//! one, and a timer buys nothing that dispatch-on-a-free-slot does not already give.
+//!
+//! # The budget is in-flight **requests**, and it is exact
+//!
+//! `budget` bounds requests taken and not yet settled, never wants: a group that needs
+//! more requests than the slots free is **cut at the budget**, and the wants the cut
+//! carried are re-queued with their tickets still attached. So a cut want comes back
+//! across the requests it was cut into — as does one that crosses a part boundary — and
+//! a caller assembles a ticket by collecting its pieces and ordering them by `part`.
+//!
+//! # The clock is injected, because no source works everywhere
+//!
+//! `Instant::now` does not exist on `wasm32-unknown-unknown`; a Worker and a test have
+//! their own answers; and a wall clock read inside a queue is a test that cannot be
+//! written deterministically. So the caller passes a [`Clock`], and the only thing it
+//! is used for is the dispatch→settle time carried on [`Settled`] — which is what the
+//! per-purpose cost table is built from.
 //!
 //! # What this crate does not do
 //!
@@ -51,7 +66,8 @@
 //!
 //! # fn main() -> Result<(), fetch_driver::Error> {
 //! let len = 4_096;
-//! let mut queue = Queue::new(8, Shape::default());
+//! // The clock is the caller's: this one never moves, which is all a doctest needs.
+//! let mut queue = Queue::new(8, Shape::default(), || 0.0);
 //! queue.declare("rows.bin", Geometry::whole(len))?;
 //!
 //! let ticket = queue.push("rows.bin", Want { offset: 1_024, len: 166 })?;
@@ -60,7 +76,7 @@
 //!     // `request.key` and `request.batch.part` name the object; this is what to send.
 //!     let _range = request.range_header();
 //!     // …fetch it, then give the slot back and read where the bytes landed…
-//!     for share in queue.settle(request) {
+//!     for share in queue.settle(request)?.shares {
 //!         assert_eq!(share.ticket, ticket);
 //!         let _ = share.pieces;
 //!     }
@@ -137,15 +153,22 @@ pub struct Share {
 /// The caller supplies the address; this crate does not know how a key and a part
 /// become a URL, which is what keeps it usable by a reader of the book, a reader of
 /// the chunk mirror, and a test.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// ⚠️ **Deliberately not `Clone`.** [`Queue::settle`] consumes a request, and one that
+/// could be copied would be two slots returned for one take — so the compiler is what
+/// stops a request being settled twice, and the in-flight count cannot drift below
+/// what was handed out.
+#[derive(Debug, PartialEq)]
 pub struct Request<K> {
     pub key: K,
     /// What to ask for. `batch.part` is the storage handle, `batch.spans` the ranges.
     pub batch: Batch,
     /// One entry per ticket this request carries, in the order the wants were pushed.
-    /// A ticket appears in more than one request only when its want crossed a part
-    /// boundary.
+    /// A ticket appears in more than one request when its want crossed a part boundary,
+    /// or when the budget cut the group it was in.
     pub shares: Vec<Share>,
+    /// When it went out, from the injected clock.
+    issued_at: f64,
 }
 
 impl<K> Request<K> {
@@ -159,6 +182,44 @@ impl<K> Request<K> {
     /// Bytes this request will return, excluding multipart framing.
     pub fn bytes(&self) -> u64 {
         self.batch.bytes()
+    }
+}
+
+/// What one settled request cost, and what it carried.
+///
+/// ⚠️ **This is the record a cost table is built from**: one per request, naming the
+/// object it went to, the bytes it asked for, and how long the wire held the slot. The
+/// caller adds its own purpose (it knows why it wanted those bytes) and the transport's
+/// own outcome (status, framing, received bytes).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settled<K> {
+    pub key: K,
+    /// Which storage handle — with `key`, the object that was addressed.
+    pub part: u64,
+    /// Bytes asked for, excluding multipart framing.
+    pub bytes: u64,
+    /// Dispatch → settle, from the injected [`Clock`].
+    pub millis: f64,
+    /// Where each ticket's bytes are.
+    pub shares: Vec<Share>,
+}
+
+/// Where the queue's clock comes from.
+///
+/// Injected because no one source works everywhere: `Instant` does not exist on
+/// `wasm32-unknown-unknown`, a browser's answer is `performance.now()`, a Worker's is
+/// its own, and a test's is a number the test moves. Any `Fn() -> f64` is a clock, so
+/// the common cases are a closure: `|| api::now_ms()`.
+///
+/// Units are milliseconds and the origin is the caller's business; the queue only ever
+/// subtracts two readings.
+pub trait Clock {
+    fn now_ms(&self) -> f64;
+}
+
+impl<F: Fn() -> f64> Clock for F {
+    fn now_ms(&self) -> f64 {
+        self()
     }
 }
 
@@ -184,6 +245,11 @@ pub enum Error {
     /// The key was declared again with a different geometry. Two readers disagreeing
     /// about where a part ends is a wrong-bytes bug, not a reconfiguration.
     Redeclared,
+    /// A request was settled into a queue that never issued it. ⚠️ The one hole the type
+    /// system cannot close: tying `Request` to its queue by lifetime makes the natural
+    /// loop — take several, await them, settle them one by one — uncomputable, because
+    /// the requests hold the borrow that `settle` needs. See [`Queue::settle`].
+    ForeignRequest,
 }
 
 impl fmt::Display for Error {
@@ -195,6 +261,10 @@ impl fmt::Display for Error {
             Error::Redeclared => {
                 write!(f, "the object was declared again with a different geometry")
             }
+            Error::ForeignRequest => write!(
+                f,
+                "the request was settled into a queue that had nothing in flight"
+            ),
         }
     }
 }
@@ -202,7 +272,11 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A queue of wants, and the budget of requests the caller allows in flight.
-#[derive(Clone, Debug)]
+///
+/// ⚠️ **Deliberately not `Clone`.** A copy would hand out the same tickets twice, from
+/// two in-flight counts, which is the whole guarantee this type exists to keep. `Debug`
+/// is written out rather than derived so a log line is the state of the run and not
+/// every want in it.
 pub struct Queue<K> {
     objects: BTreeMap<K, Geometry>,
     /// Wants waiting to be dispatched, per key, **in push order** — the order the
@@ -212,18 +286,23 @@ pub struct Queue<K> {
     budget: usize,
     in_flight: usize,
     next_ticket: u64,
+    clock: Box<dyn Clock>,
 }
 
 impl<K: Ord + Clone> Queue<K> {
-    /// `budget` is how many requests may be in flight at once — the caller's fan-out,
-    /// which is a property of the transport (a browser multiplexes differently from a
-    /// Worker) rather than of this crate.
+    /// `budget` is how many **requests** may be in flight at once — the caller's
+    /// fan-out, which is a property of the transport (a browser multiplexes differently
+    /// from a Worker) rather than of this crate. It is a bound, and it is respected
+    /// exactly: see [`Queue::take`].
     ///
     /// `shape` is the batching policy handed to [`live_book::plan`]: the coalescing gap
     /// and the ranges-per-request cap. [`Shape::default`] fills to the protocol's 299
     /// because that was measured fastest on this substrate; it stays a knob because that
     /// ranking belongs to one origin.
-    pub fn new(budget: usize, shape: Shape) -> Queue<K> {
+    ///
+    /// `clock` is the caller's — see [`Clock`]. The queue only reads it to time a
+    /// request, and never to schedule.
+    pub fn new(budget: usize, shape: Shape, clock: impl Clock + 'static) -> Queue<K> {
         Queue {
             objects: BTreeMap::new(),
             ready: BTreeMap::new(),
@@ -231,6 +310,7 @@ impl<K: Ord + Clone> Queue<K> {
             budget: budget.max(1),
             in_flight: 0,
             next_ticket: 0,
+            clock: Box::new(clock),
         }
     }
 
@@ -275,18 +355,19 @@ impl<K: Ord + Clone> Queue<K> {
         Ok(ticket)
     }
 
-    /// Every request the caller may start now, for every slot it has free.
+    /// Every request the caller may start now, for every slot it has free — and never
+    /// more than it has free, because the budget is in-flight **requests**.
     ///
     /// Groups are dispatched **largest first** — by the bytes still wanted for the key
     /// — because with a bounded number of slots the choice is which group is worth the
     /// wire; a tie is broken by key so a run is reproducible.
     ///
-    /// ⚠️ **A group is dispatched whole, so a `take` may exceed the budget by the width
-    /// of the last group.** A group is one plan, and a want that crosses a part boundary
-    /// has a piece in two of its batches: issuing half a group would hand the caller a
-    /// ticket whose bytes are split across a request it has not been given. So the budget
-    /// bounds **how many groups start**, not the last group's width — and in practice a
-    /// group is one batch, because parts are large and rows are not.
+    /// ⚠️ **A group that needs more requests than there are free slots is cut at the
+    /// budget, and the wants the cut carried go back on the queue with their tickets
+    /// still attached.** They keep their place in the run: a ticket the cut touched comes
+    /// back across the requests it was cut into, exactly as one that crossed a part
+    /// boundary does, and the caller assembles it by ordering its pieces by `part`. The
+    /// alternative — issuing the group whole — is what makes a budget stop being one.
     pub fn take(&mut self) -> Vec<Request<K>> {
         let mut out = Vec::new();
         while self.in_flight < self.budget {
@@ -298,9 +379,34 @@ impl<K: Ord + Clone> Queue<K> {
             let wants: Vec<Want> = waiting.iter().map(|(_, want)| *want).collect();
 
             let planned = plan(&wants, geometry.part_size, geometry.file_len, self.shape);
-            self.in_flight += planned.batches.len();
+            // How many of this group's requests the budget has room for. At least one:
+            // the loop only gets here with a slot free, and an empty `take` while work is
+            // ready and a slot is free is the one state this queue exists to avoid.
+            let free = self.budget - self.in_flight;
+            let cut = free.min(planned.batches.len());
 
-            for (at, batch) in planned.batches.iter().enumerate() {
+            // Whatever the cut left behind goes back, trimmed to the ranges that were
+            // not dispatched — the issued half of a straddling want is already on its way
+            // to the caller, so re-queuing the whole want would fetch it twice.
+            let put_back = &planned.located;
+            self.in_flight += cut;
+            for (i, (ticket, _)) in waiting.iter().enumerate() {
+                for segment in put_back[i].segments.iter().filter(|seg| seg.batch >= cut) {
+                    let batch = &planned.batches[segment.batch];
+                    let span = batch.spans[segment.span];
+                    self.ready.entry(key.clone()).or_default().push((
+                        *ticket,
+                        Want {
+                            offset: batch.part * geometry.part_size.get()
+                                + span.start
+                                + segment.within,
+                            len: segment.len,
+                        },
+                    ));
+                }
+            }
+
+            for (at, batch) in planned.batches.iter().enumerate().take(cut) {
                 let shares = waiting
                     .iter()
                     .enumerate()
@@ -326,29 +432,50 @@ impl<K: Ord + Clone> Queue<K> {
                     key: key.clone(),
                     batch: batch.clone(),
                     shares,
+                    issued_at: self.clock.now_ms(),
                 });
             }
         }
         out
     }
 
-    /// Give a slot back and take the request apart.
+    /// Give a slot back and take the request apart, with what it cost.
     ///
     /// One call for both, because a slot that came back without its shares is a request
     /// whose bytes nobody looked at. A read that **failed** settles too — the slot is the
     /// caller's either way — and the caller reports the tickets it could not fill from
     /// [`Share::ticket`] rather than leaving them unaccounted for.
-    pub fn settle(&mut self, request: Request<K>) -> Vec<Share> {
-        // The debug assertion is the tripwire for settling one queue's request into
-        // another, which the type system does not prevent: tying `Request` to the queue
-        // by lifetime would forbid reading the counters while requests are out, and a
-        // progress display needs those.
-        debug_assert!(self.in_flight > 0, "settled more requests than were taken");
-        self.in_flight = self.in_flight.saturating_sub(1);
-        request.shares
+    ///
+    /// The wall clock comes from the injected [`Clock`] and is measured here rather than
+    /// by the caller so a caller cannot forget it, and so the same number is the one the
+    /// cost table shows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ForeignRequest`] when nothing is in flight, which is a request that came
+    /// from somewhere else. ⚠️ **Settling a request into a *busy* queue it did not come
+    /// from is not caught** — the count is decremented one too many and the budget is off
+    /// by one for the rest of the run. That residue is the price of the loop shape this
+    /// crate exists for; the alternative, a queue-session with an invariant brand, cannot
+    /// be held across an `.await`.
+    pub fn settle(&mut self, request: Request<K>) -> Result<Settled<K>, Error> {
+        if self.in_flight == 0 {
+            return Err(Error::ForeignRequest);
+        }
+        let millis = self.clock.now_ms() - request.issued_at;
+        // No underflow and no guard: `Request` is not `Clone`, so this queue handed out
+        // each of its slots at most once and `in_flight` counts exactly what is out.
+        self.in_flight -= 1;
+        Ok(Settled {
+            key: request.key,
+            part: request.batch.part,
+            bytes: request.batch.bytes(),
+            millis,
+            shares: request.shares,
+        })
     }
 
-    /// Wants queued and not yet dispatched.
+    /// Wants queued and not yet dispatched — including the ones a cut put back.
     pub fn waiting(&self) -> usize {
         self.ready.values().map(Vec::len).sum()
     }
@@ -356,6 +483,11 @@ impl<K: Ord + Clone> Queue<K> {
     /// Requests taken and not yet settled.
     pub fn in_flight(&self) -> usize {
         self.in_flight
+    }
+
+    /// The bound `in_flight` is held to.
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 
     /// Nothing ready and nothing out: the run is over, so a driver's loop can stop.
@@ -379,11 +511,42 @@ impl<K: Ord + Clone> Queue<K> {
     }
 }
 
+impl<K: Ord + Clone> fmt::Debug for Queue<K> {
+    /// The state of the run, not every want in it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Queue")
+            .field("objects", &self.objects.len())
+            .field("waiting", &self.waiting())
+            .field("in_flight", &self.in_flight)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use live_book::plan::MAX_SPANS;
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    /// A clock the test drives, so a timing assertion is a number the test wrote rather
+    /// than one the runner happened to produce.
+    #[derive(Clone, Default)]
+    struct Script(Rc<Cell<f64>>);
+
+    impl Script {
+        fn advance(&self, ms: f64) {
+            self.0.set(self.0.get() + ms);
+        }
+
+        /// The `impl Clock` a queue takes: a closure over the same cell.
+        fn clock(&self) -> impl Clock + 'static {
+            let hand = self.0.clone();
+            move || hand.get()
+        }
+    }
 
     /// A file whose byte at `i` is `i % 251`, so a range of bytes says where it came
     /// from without a fixture anyone has to trust.
@@ -423,7 +586,7 @@ mod tests {
     impl Harness {
         fn new(budget: usize, shape: Shape) -> Harness {
             Harness {
-                queue: Queue::new(budget, shape),
+                queue: Queue::new(budget, shape, Script::default().clock()),
                 files: BTreeMap::new(),
                 part_sizes: BTreeMap::new(),
                 answers: BTreeMap::new(),
@@ -455,58 +618,83 @@ mod tests {
             self.queue.push(key, want).expect("a declared object")
         }
 
-        /// Run to idle exactly as a caller's loop would: take, fetch, settle.
+        /// One turn of a caller's loop: take what is free, fetch it, settle it, keep the
+        /// bytes. Returns how many requests went out, so a caller can assert on the turn.
+        fn step(&mut self) -> usize {
+            let requests = self.queue.take();
+            assert!(
+                self.queue.in_flight() <= self.queue.budget(),
+                "{} requests in flight against a budget of {}",
+                self.queue.in_flight(),
+                self.queue.budget()
+            );
+            assert!(
+                !requests.is_empty(),
+                "nothing was taken while work was ready and slots were free, so the \
+                 loop would spin: waiting={} in_flight={}",
+                self.queue.waiting(),
+                self.queue.in_flight()
+            );
+            let started = requests.len();
+            self.deliver(requests);
+            started
+        }
+
+        /// Fetch these requests and settle them: the transport, with the wire replaced by
+        /// a `Vec`, plus the checks a real server would punish.
+        fn deliver(&mut self, requests: Vec<Request<&'static str>>) {
+            for request in requests {
+                self.check(&request);
+                let bytes = self.files[request.key].clone();
+                let part_size = self.part_sizes[request.key];
+                // What the wire would return, in span order: the bytes of each range.
+                let returned: Vec<Vec<u8>> = request
+                    .batch
+                    .spans
+                    .iter()
+                    .map(|span| {
+                        let start = (request.batch.part * part_size + span.start) as usize;
+                        let end = (request.batch.part * part_size + span.end) as usize;
+                        bytes[start..=end].to_vec()
+                    })
+                    .collect();
+                self.requests.push(Issued {
+                    key: request.key,
+                    part: request.batch.part,
+                    spans: request
+                        .batch
+                        .spans
+                        .iter()
+                        .map(|span| (span.start, span.end))
+                        .collect(),
+                });
+                for share in self
+                    .queue
+                    .settle(request)
+                    .expect("a settle from this queue")
+                    .shares
+                {
+                    for piece in &share.pieces {
+                        let slice = &returned[piece.span];
+                        let from = piece.within as usize;
+                        let to = from + piece.len as usize;
+                        assert!(to <= slice.len(), "a piece past the range it came from");
+                        self.answers
+                            .entry(share.ticket)
+                            .or_default()
+                            .push((piece.part, slice[from..to].to_vec()));
+                    }
+                }
+            }
+        }
+
+        /// Run to idle exactly as a caller's loop would.
         fn run(&mut self) {
             let mut guard = 0;
             while !self.queue.is_idle() {
                 guard += 1;
                 assert!(guard < 10_000, "the driver never drained");
-                let requests = self.queue.take();
-                assert!(
-                    !requests.is_empty(),
-                    "nothing was taken while work was ready and slots were free, so the \
-                     loop would spin: waiting={} in_flight={}",
-                    self.queue.waiting(),
-                    self.queue.in_flight()
-                );
-                for request in requests {
-                    self.check(&request);
-                    let bytes = self.files[request.key].clone();
-                    let part_size = self.part_sizes[request.key];
-                    // What the wire would return, in span order: the bytes of each range.
-                    let returned: Vec<Vec<u8>> = request
-                        .batch
-                        .spans
-                        .iter()
-                        .map(|span| {
-                            let start = (request.batch.part * part_size + span.start) as usize;
-                            let end = (request.batch.part * part_size + span.end) as usize;
-                            bytes[start..=end].to_vec()
-                        })
-                        .collect();
-                    self.requests.push(Issued {
-                        key: request.key,
-                        part: request.batch.part,
-                        spans: request
-                            .batch
-                            .spans
-                            .iter()
-                            .map(|span| (span.start, span.end))
-                            .collect(),
-                    });
-                    for share in self.queue.settle(request) {
-                        for piece in &share.pieces {
-                            let slice = &returned[piece.span];
-                            let from = piece.within as usize;
-                            let to = from + piece.len as usize;
-                            assert!(to <= slice.len(), "a piece past the range it came from");
-                            self.answers
-                                .entry(share.ticket)
-                                .or_default()
-                                .push((piece.part, slice[from..to].to_vec()));
-                        }
-                    }
-                }
+                let _ = self.step();
             }
         }
 
@@ -672,7 +860,7 @@ mod tests {
         assert!(h.queue.take().is_empty());
         assert_eq!(h.queue.waiting(), 0);
         for request in taken {
-            h.queue.settle(request);
+            h.queue.settle(request).expect("this queue issued it");
         }
         assert!(h.queue.is_idle());
     }
@@ -695,7 +883,7 @@ mod tests {
         assert!(h.queue.take().is_empty(), "no slot, no request");
 
         for request in first {
-            h.queue.settle(request);
+            h.queue.settle(request).expect("this queue issued it");
         }
         let second = h.queue.take();
         assert_eq!(second.len(), 1, "one request for the three of them");
@@ -749,8 +937,77 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_bounds_requests_in_flight_not_wants() {
+        // One range per request, so the group is five requests wide against a budget of
+        // two — the case a whole-group dispatch would blow through.
+        let shape = Shape {
+            gap: 0,
+            max_spans: 1,
+        };
+        let mut h = Harness::new(2, shape);
+        h.object("rows.bin", 1_000_000, 0);
+        let tickets: Vec<Ticket> = (0..5)
+            .map(|i| h.push("rows.bin", want(i * 10_000, 16)))
+            .collect();
+
+        let first = h.queue.take();
+        assert_eq!(first.len(), 2, "only the slots that were free");
+        assert_eq!(h.queue.in_flight(), 2);
+        assert_eq!(
+            h.queue.waiting(),
+            3,
+            "and the rest are still queued, not dropped"
+        );
+        h.deliver(first);
+        h.run();
+        for (i, ticket) in tickets.iter().enumerate() {
+            let start = i * 10_000;
+            assert_eq!(
+                h.bytes(*ticket),
+                file(1_000_000)[start..start + 16].to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn a_want_the_budget_cut_comes_back_across_the_requests_it_was_cut_into() {
+        // The same straddling want as above, but with one slot: the budget cuts the
+        // group between its parts, and the ticket must still assemble — which is what
+        // re-queuing the untouched remainder is for.
+        let mut h = Harness::new(1, Shape::default());
+        h.object("rows.bin", 4_096, 1_000);
+        let straddler = h.push("rows.bin", want(950, 100));
+        h.run();
+        let parts: Vec<u64> = h.requests.iter().map(|issued| issued.part).collect();
+        assert_eq!(parts, vec![0, 1]);
+        assert_eq!(
+            h.bytes(straddler),
+            file(4_096)[950..1_050].to_vec(),
+            "a cut is not a lost piece"
+        );
+    }
+
+    #[test]
+    fn a_request_reports_the_wall_clock_between_dispatch_and_settle() {
+        let script = Script::default();
+        let mut queue: Queue<&str> = Queue::new(1, Shape::default(), script.clock());
+        queue.declare("rows.bin", Geometry::whole(1_000)).unwrap();
+        queue.push("rows.bin", want(0, 10)).unwrap();
+
+        let request = queue.take().pop().expect("one want, one slot, one request");
+        script.advance(37.0);
+        let settled = queue.settle(request).expect("this queue issued it");
+
+        assert_eq!(settled.key, "rows.bin");
+        assert_eq!(settled.part, 0);
+        assert_eq!(settled.bytes, 10);
+        assert_eq!(settled.millis, 37.0, "the injected clock, not a real one");
+        assert_eq!(settled.shares.len(), 1);
+    }
+
+    #[test]
     fn declaring_the_same_object_twice_is_a_no_op_but_moving_it_is_not() {
-        let mut queue: Queue<&str> = Queue::new(1, Shape::default());
+        let mut queue: Queue<&str> = Queue::new(1, Shape::default(), || 0.0);
         queue.declare("rows.bin", Geometry::whole(1_000)).unwrap();
         queue
             .declare("rows.bin", Geometry::whole(1_000))
