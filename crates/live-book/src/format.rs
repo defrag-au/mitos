@@ -23,6 +23,9 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+// The digest a published object's key is made of, and the check a reader runs before it
+// believes a payload it fetched — see [`datum_digest`].
+use pallas_crypto::hash::Hasher;
 
 use crate::source::Source;
 
@@ -355,6 +358,76 @@ pub fn parse_datum_header(b: &[u8], what: &str) -> Result<DatumHeader> {
         first_slot: u64::from_le_bytes(b[12..20].try_into().expect("8 bytes")),
         last_slot: u64::from_le_bytes(b[20..28].try_into().expect("8 bytes")),
     })
+}
+
+/// Where entry `i` of a `datum.tbl` sits in the file.
+///
+/// The half of the layout a **ranged** reader needs. A window's entry array is not small —
+/// a 100-chunk Alonzo window is ~30 MB of entries — so a lookup binary-searches it by
+/// reading 40 bytes at a time instead of fetching the array, and this is the arithmetic
+/// that turns an index into an object offset. One definition, so a reader cannot drift
+/// from the writer's stride.
+pub fn datum_entry_offset(i: u64) -> u64 {
+    DATUM_HEADER as u64 + DATUM_ENTRY_BYTES as u64 * i
+}
+
+/// One entry out of its own 40 bytes: the hash, where its payload starts in the blob, and
+/// how long it is.
+pub fn datum_entry_from_bytes(b: &[u8]) -> Result<([u8; DATUM_HASH_BYTES], u32, u32)> {
+    if b.len() < DATUM_ENTRY_BYTES {
+        bail!(
+            "a datum entry is {DATUM_ENTRY_BYTES} bytes; got {}",
+            b.len()
+        );
+    }
+    let mut hash = [0u8; DATUM_HASH_BYTES];
+    hash.copy_from_slice(&b[..DATUM_HASH_BYTES]);
+    Ok((
+        hash,
+        u32::from_le_bytes(b[32..36].try_into().expect("4 bytes")),
+        u32::from_le_bytes(b[36..40].try_into().expect("4 bytes")),
+    ))
+}
+
+/// A whole entry array, searched by full hash: `Some((offset, len))`, or `None` for a hash
+/// the capture never saw.
+///
+/// This is what a reader does over a table it has already fetched, and the ranged reader
+/// is the same binary search with [`datum_entry_offset`] deciding what each probe costs.
+/// ⚠️ The hash is a full 32 bytes, so a hit needs **no confirm** — unlike the book's
+/// 8-byte-prefix orderings, where a probe is a candidate until the row agrees.
+pub fn datum_lookup(table: &[u8], hash: &[u8; DATUM_HASH_BYTES]) -> Result<Option<(u32, u32)>> {
+    let header = parse_datum_header(table, "datum.tbl")?;
+    let want = DATUM_HEADER as u64 + DATUM_ENTRY_BYTES as u64 * header.entries;
+    if table.len() as u64 != want {
+        bail!(
+            "datum.tbl is {} B; {} entries need {want}",
+            table.len(),
+            header.entries
+        );
+    }
+    let (mut lo, mut hi) = (0u64, header.entries);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let at = datum_entry_offset(mid) as usize;
+        let (key, off, len) = datum_entry_from_bytes(&table[at..at + DATUM_ENTRY_BYTES])?;
+        match key.cmp(hash) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok(Some((off, len))),
+        }
+    }
+    Ok(None)
+}
+
+/// The blake2b-256 of some bytes, lower-case hex — the digest a published object's key is
+/// made of, and the check a reader runs before it believes a payload it fetched.
+///
+/// ⚠️ This is what makes an **additive** store safe: a window is captured by whichever walk
+/// produced it, and captures from different walks can only ever disagree by being *wrong*.
+/// Re-hashing against the hash that was asked for catches that at the consumer.
+pub fn datum_digest(bytes: &[u8]) -> String {
+    Hasher::<256>::hash(bytes).to_string()
 }
 
 /// `datum.tbl` + `datum.bin` — the **witnessed datum bytes**, keyed by hash.
@@ -1235,6 +1308,52 @@ mod datum_tests {
             t.extend_from_slice(e);
         }
         t
+    }
+
+    /// The ranged reader's arithmetic: the offset of an entry, one entry parsed out of its
+    /// own bytes, and a whole-array search that must agree with `DatumTable::get`.
+    #[test]
+    fn a_datum_entry_can_be_addressed_and_searched_by_hash_alone() {
+        let dir = scratch("ranged");
+        let a = ([0x11u8; 32], vec![0xA1u8, 0x01]);
+        let b = ([0x22u8; 32], vec![0xA1u8, 0x02, 0x03]);
+        write_datum_table(&dir, (100, 200), &[a.clone(), b.clone()]).expect("write");
+        let table = std::fs::read(dir.join(DATUM_FILE)).expect("table");
+
+        // Entry 0 begins right after the header, and 40 bytes later is entry 1.
+        assert_eq!(datum_entry_offset(0), DATUM_HEADER as u64);
+        assert_eq!(datum_entry_offset(1), DATUM_HEADER as u64 + 40);
+        assert_eq!(datum_entry_offset(1) - datum_entry_offset(0), 40);
+
+        // Parsed straight out of the ranged bytes a fetcher would have asked for.
+        let at = datum_entry_offset(1) as usize;
+        let (hash, off, len) = datum_entry_from_bytes(&table[at..at + 40]).expect("entry 1");
+        assert_eq!(hash, b.0);
+        assert_eq!((off, len), (2, 3), "b's payload starts after a's");
+        assert!(
+            datum_entry_from_bytes(&table[at..at + 39]).is_err(),
+            "short read"
+        );
+
+        // And the whole-array search agrees with the mapping reader on both landings and
+        // on a miss: the two must not disagree about what the format means.
+        let mapped = DatumTable::open(&dir).expect("open");
+        let blob = std::fs::read(dir.join(DATUM_BLOB)).expect("blob");
+        for (key, bytes) in [&a, &b] {
+            let (off, len) = datum_lookup(&table, key).expect("lookup").expect("hit");
+            assert_eq!(mapped.get(key), Some(&bytes[..]));
+            assert_eq!(len as usize, bytes.len());
+            // The offset addresses datum.bin, not the entry array: what a ranged reader
+            // does next with the pair it just looked up.
+            assert_eq!(&blob[off as usize..off as usize + len as usize], &bytes[..]);
+        }
+        assert_eq!(datum_lookup(&table, &[0x44; 32]).expect("miss"), None);
+        // A digest of the bytes is the key they must hash to — the check a reader runs.
+        assert_eq!(
+            datum_digest(&b.1),
+            Hasher::<256>::hash(&b.1).to_string(),
+            "the helper is the same computation the writer keys with"
+        );
     }
 
     /// The three states a lookup has to keep apart: present with bytes, present and
