@@ -63,6 +63,7 @@ use crate::format::{
     POLICY_FILE, ROWS_FILE, TABLE_ADDR, TABLE_OUTREF, TABLE_POLICY,
 };
 use crate::plan::PartSize;
+use crate::reader::OutRef;
 
 /// The part size a publisher uses unless told otherwise.
 ///
@@ -849,6 +850,673 @@ fn check_datum_pair(table: &[u8], blob_len: u64) -> Result<u64> {
     Ok(entries)
 }
 
+// ── The offer index: what a bidder holds at the venues, one snapshot ───────────────
+//
+// Design: `docs/design/OFFER_INDEX_FORMAT.md`. A reader asking "what has this holder
+// offered" cannot ask the book: the book's orderings are attributes of an output, and a
+// bidder is a meaning that only a venue decoder can produce. Answered as a scan, the
+// question costs the whole venue population — 151,880 rows and 65.23 MB measured
+// 2026-09-30, to keep 879 offers — and no cache posture moves it, because those bytes
+// are the client's own last mile.
+//
+// So the decode happens where the decoders already live, at fold time, and what is
+// published is the association itself:
+//
+//     offers/v1/current                    ← the only mutable object
+//     offers/v1/s-<base_slot>-<digest>.tbl
+//     offers/v1/s-<base_slot>-<digest>.bin
+//
+// ⚠️ **One snapshot, replaced — not a set appended to.** The datum set is additive
+// because a datum never changes; an offer is *spent*, so "live now" is a snapshot. A
+// publication writes new keys and flips `current`. Superseded objects stay in the
+// bucket: correctness depends only on which catalogue a reader was handed.
+
+/// Every object in the offer index lives under this prefix.
+pub const OFFER_PREFIX: &str = "offers/v1";
+
+/// The catalogue — the one mutable object in the set.
+pub const OFFER_CATALOGUE_FILE: &str = "current";
+
+/// The catalogue's own layout, so a reader can refuse one it does not understand before
+/// it has fetched a table.
+pub const OFFER_INDEX_VERSION: u32 = 1;
+
+/// The catalogue's object key.
+pub fn offer_catalogue_key() -> String {
+    format!("{OFFER_PREFIX}/{OFFER_CATALOGUE_FILE}")
+}
+
+/// The key of a snapshot's credential table.
+///
+/// ⚠️ **The one definition.** The writer naming an object and the reader deriving where to
+/// range both call these; a second copy of the key format is how an extension or a
+/// separator silently diverges.
+///
+/// ⚠️ **The extensions are load-bearing, exactly as [`PART_EXT`]'s note says.** Cloudflare's
+/// cache eligibility is extension-based, and a key that is never cached cannot be read
+/// with multi-range at all. `.tbl` is covered by the zone's Cache Rule — proven by
+/// `cf-cache-status: HIT` on `datum/v1`'s pairs — and `.bin` is eligible by default.
+pub fn offer_table_key(base_slot: u64, digest: &str) -> String {
+    format!("{OFFER_PREFIX}/s-{base_slot}-{digest}.tbl")
+}
+
+/// The key of a snapshot's entry blob.
+pub fn offer_blob_key(base_slot: u64, digest: &str) -> String {
+    format!("{OFFER_PREFIX}/s-{base_slot}-{digest}.bin")
+}
+
+/// One object in the set, as the catalogue records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferObject {
+    pub key: String,
+    pub len: u64,
+    /// Blake2b-256 of the object's bytes, lower-case hex — the component of `key` that
+    /// makes the object rewrite-proof.
+    pub digest: String,
+}
+
+/// One snapshot, as the catalogue records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferSnapshot {
+    /// Associations in the blob.
+    pub entries: u64,
+    /// Distinct credentials in the table — what the table's own length is checked
+    /// against.
+    pub credentials: u64,
+    /// The table's layout version. A reader refuses one it does not read rather than
+    /// ranging into offsets it cannot interpret.
+    pub layout_version: u32,
+    pub table: OfferObject,
+    pub blob: OfferObject,
+}
+
+/// The published index: one snapshot, and the book boundary it is consistent with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferCatalogue {
+    /// The book this snapshot's outrefs are meaningful in.
+    ///
+    /// ⚠️ **The consistency clause.** Associations name rows by outref, and those rows
+    /// come from the book. An index built against a newer boundary than the book in hand
+    /// would name offers that are not there; against an older one it would name spent
+    /// offers. A reader that finds them disagreeing falls back to the scan.
+    pub book_fingerprint: String,
+    /// The book's base slot — the boundary, and the snapshot's own name.
+    pub base_slot: u64,
+    pub snapshot: OfferSnapshot,
+}
+
+impl OfferCatalogue {
+    /// Flat text, three lines, every field required — [`DatumCatalogue`]'s doctrine.
+    ///
+    /// ⚠️ **The fingerprint and the digests are checked, not merely carried.** Each is a
+    /// component of a key, so a malformed one builds a key that 404s — which reads as
+    /// "not published" rather than as the typo it is.
+    ///
+    /// ⚠️ **The `snapshot` line must follow the `book` line**, because the snapshot's key
+    /// is made of the boundary it belongs to. A text that inverts them is refused with
+    /// that reason rather than being parsed into a key built from nothing.
+    pub fn parse(text: &str) -> Result<OfferCatalogue> {
+        let mut version = None;
+        let mut book = None;
+        let mut snapshot = None;
+        for (at, line) in text.lines().enumerate() {
+            let lineno = at + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.as_slice() {
+                ["index_version", v] => {
+                    let v: u32 = v
+                        .parse()
+                        .with_context(|| format!("line {lineno}: index_version"))?;
+                    if v != OFFER_INDEX_VERSION {
+                        bail!("the index is version {v}; this build reads {OFFER_INDEX_VERSION}");
+                    }
+                    if version.replace(v).is_some() {
+                        bail!("line {lineno}: a second `index_version` line");
+                    }
+                }
+                ["book", fingerprint, base_slot] => {
+                    if book.is_some() {
+                        bail!("line {lineno}: a second `book` line");
+                    }
+                    let fingerprint = hex_field(fingerprint, 32, "fingerprint", lineno)?;
+                    let base_slot = base_slot
+                        .parse()
+                        .with_context(|| format!("line {lineno}: base_slot"))?;
+                    book = Some((fingerprint, base_slot));
+                }
+                ["snapshot", n, c, lv, tl, td, bl, bd] => {
+                    if snapshot.is_some() {
+                        bail!("line {lineno}: a second `snapshot` line");
+                    }
+                    let (_, base_slot) = book.as_ref().context(
+                        "the `snapshot` line comes before the `book` line: a snapshot's key \
+                         is made of the boundary it belongs to",
+                    )?;
+                    let num = |s: &str, what: &str| -> Result<u64> {
+                        s.parse().with_context(|| format!("line {lineno}: {what}"))
+                    };
+                    let td = hex_field(td, 64, "table digest", lineno)?;
+                    let bd = hex_field(bd, 64, "blob digest", lineno)?;
+                    snapshot = Some(OfferSnapshot {
+                        entries: num(n, "entries")?,
+                        credentials: num(c, "credentials")?,
+                        layout_version: num(lv, "layout_version")? as u32,
+                        table: OfferObject {
+                            key: offer_table_key(*base_slot, &td),
+                            len: num(tl, "table len")?,
+                            digest: td,
+                        },
+                        blob: OfferObject {
+                            key: offer_blob_key(*base_slot, &bd),
+                            len: num(bl, "blob len")?,
+                            digest: bd,
+                        },
+                    });
+                }
+                _ => bail!(
+                    "line {lineno}: expected `index_version <n>`, `book <fingerprint> \
+                     <base_slot>` or `snapshot <entries> <credentials> <layout_version> \
+                     <tbl_len> <tbl_digest> <bin_len> <bin_digest>`, got {line:?}"
+                ),
+            }
+        }
+        if version.is_none() {
+            bail!("the version line is missing");
+        }
+        let (book_fingerprint, base_slot) =
+            book.context("no `book` line: the catalogue does not say which boundary it is for")?;
+        let snapshot = snapshot.context("no `snapshot` line: the catalogue names no set")?;
+        Ok(OfferCatalogue {
+            book_fingerprint,
+            base_slot,
+            snapshot,
+        })
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "index_version {OFFER_INDEX_VERSION}\n\
+             book {} {}\n\
+             snapshot {} {} {} {} {} {} {}\n",
+            self.book_fingerprint,
+            self.base_slot,
+            self.snapshot.entries,
+            self.snapshot.credentials,
+            self.snapshot.layout_version,
+            self.snapshot.table.len,
+            self.snapshot.table.digest,
+            self.snapshot.blob.len,
+            self.snapshot.blob.digest,
+        )
+    }
+
+    /// The catalogue on disk, or `None` when the set has never been published.
+    ///
+    /// ⚠️ **Absent is not an error and not an empty index.** The set is a snapshot, so
+    /// "nothing published" has to stay distinguishable from "published and empty": a
+    /// reader that finds none falls back to the scan.
+    pub fn load(path: &Path) -> Result<Option<OfferCatalogue>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => OfferCatalogue::parse(&text).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    pub fn store(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, self.render()).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// `digits` lower-case hex characters, or a refusal.
+///
+/// Lower-case on purpose: the writer emits lower-case, so requiring it here makes
+/// `render`/`parse` an exact round trip rather than a normalising one.
+fn hex_field(s: &str, digits: usize, what: &str, lineno: usize) -> Result<String> {
+    let ok = s.len() == digits && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !ok {
+        bail!("line {lineno}: {what} wants {digits} lower-case hex digits, got {s:?}");
+    }
+    Ok(s.to_owned())
+}
+
+// ── The pair's layout ─────────────────────────────────────────────────────────────
+//
+// `.tbl`, layout_version 1:
+//
+//     0     layout_version  u32
+//     4     entries         u32  — the associations in the blob
+//     8     credentials     u32  — the records in this table
+//     12    256 × u32            — bucket starts: the record index of the first credential
+//                                  whose first byte is at least the bucket number
+//     1036 … credentials × 36  — credential [28] · first entry u32 · count u32
+//
+// `.bin`  entries × 36 — the outrefs, contiguous per credential in table order.
+//
+// ⚠️ **The directory is checked, not trusted.** A bucket start that disagrees with the
+// records makes a lookup miss entries the table holds — an answer, not an error — so
+// [`check_offer_table`] rebuilds the directory from the records before anything is
+// written, and every reader that holds the whole table runs the same check.
+
+/// The pair's layout version. A reader refuses one it does not read rather than ranging
+/// into offsets it cannot interpret.
+pub const OFFER_LAYOUT_VERSION: u32 = 1;
+
+/// Buckets in the table's directory — one per first byte of a credential.
+///
+/// ⚠️ A guess until measured against a real snapshot (`OFFER_INDEX_FORMAT.md` §8): it sets
+/// the header's own size against how many records one lookup has to search.
+pub const OFFER_BUCKETS: usize = 256;
+
+/// One credential's record in the table: `credential [28] · first u32 · count u32`.
+pub const OFFER_RECORD_BYTES: usize = 36;
+
+/// One association in the blob — an outref in [`crate::row`]'s encoding.
+pub const OFFER_ENTRY_BYTES: usize = 36;
+
+/// The table's fixed prefix: the three counts, then the directory.
+pub const OFFER_HEADER: usize = 12 + OFFER_BUCKETS * 4;
+
+/// The bucket a credential is filed under.
+pub fn offer_bucket(credential: &[u8; 28]) -> usize {
+    credential[0] as usize
+}
+
+/// Where record `i` sits in the table.
+///
+/// The half of the layout a **ranged** reader needs: a lookup fetches the header, one
+/// bucket and the run it names, and this is the arithmetic that turns an index into an
+/// object offset. One definition, so a reader cannot drift from the writer's stride.
+pub fn offer_record_offset(i: u32) -> u64 {
+    OFFER_HEADER as u64 + OFFER_RECORD_BYTES as u64 * u64::from(i)
+}
+
+/// Where entry `i` sits in the blob.
+pub fn offer_entry_offset(i: u32) -> u64 {
+    OFFER_ENTRY_BYTES as u64 * u64::from(i)
+}
+
+/// One record out of its own bytes.
+pub fn offer_record_from_bytes(b: &[u8]) -> Result<([u8; 28], u32, u32)> {
+    if b.len() < OFFER_RECORD_BYTES {
+        bail!(
+            "a credential record is {OFFER_RECORD_BYTES} bytes; got {}",
+            b.len()
+        );
+    }
+    let mut credential = [0u8; 28];
+    credential.copy_from_slice(&b[..28]);
+    Ok((
+        credential,
+        u32::from_le_bytes(b[28..32].try_into().expect("4 bytes")),
+        u32::from_le_bytes(b[32..36].try_into().expect("4 bytes")),
+    ))
+}
+
+/// One entry out of its own bytes: the outref it names.
+pub fn offer_entry_from_bytes(b: &[u8]) -> Result<OutRef> {
+    if b.len() < OFFER_ENTRY_BYTES {
+        bail!(
+            "an offer entry is {OFFER_ENTRY_BYTES} bytes; got {}",
+            b.len()
+        );
+    }
+    let mut tx = [0u8; 32];
+    tx.copy_from_slice(&b[..32]);
+    Ok((
+        tx,
+        u32::from_le_bytes(b[32..36].try_into().expect("4 bytes")),
+    ))
+}
+
+/// The table's header: its counts and its bucket directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferHeader {
+    /// Associations in the blob.
+    pub entries: u32,
+    /// Records in this table.
+    pub credentials: u32,
+    /// Bucket `b`'s first record — the count of credentials whose first byte is below `b`.
+    pub buckets: [u32; OFFER_BUCKETS],
+}
+
+impl OfferHeader {
+    /// Bucket `b`'s records, as a half-open range.
+    pub fn bucket_records(&self, b: usize) -> std::ops::Range<u32> {
+        let end = if b + 1 < OFFER_BUCKETS {
+            self.buckets[b + 1]
+        } else {
+            self.credentials
+        };
+        self.buckets[b]..end
+    }
+}
+
+/// The header out of its bytes. `what` names the file in errors, so a caller with the
+/// whole table and one ranging into an object report the same way.
+pub fn parse_offer_header(b: &[u8], what: &str) -> Result<OfferHeader> {
+    if b.len() < OFFER_HEADER {
+        bail!("{what} is too short to hold a header");
+    }
+    let layout_version = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+    if layout_version != OFFER_LAYOUT_VERSION {
+        bail!("{what} is layout_version {layout_version}; this build reads {OFFER_LAYOUT_VERSION}");
+    }
+    let mut buckets = [0u32; OFFER_BUCKETS];
+    for (bucket, slot) in buckets.iter_mut().enumerate() {
+        let at = 12 + bucket * 4;
+        *slot = u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"));
+    }
+    Ok(OfferHeader {
+        entries: u32::from_le_bytes(b[4..8].try_into().expect("4 bytes")),
+        credentials: u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
+        buckets,
+    })
+}
+
+// ── Publishing one snapshot ────────────────────────────────────────────────────────
+
+/// One association: the credential a venue's decoder named, and the offer it named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfferAssociation {
+    /// The credential the venue's decoder named — jpg's payment key, Wayup's stake
+    /// credential. **Not** the credential of the address the output sits at.
+    pub credential: [u8; 28],
+    /// The offer's outref, in [`crate::row`]'s encoding.
+    pub outref: OutRef,
+}
+
+/// Lay a snapshot out for upload: the pair under its content-addressed keys, and the
+/// flipped catalogue. Returns what the catalogue records.
+///
+/// ⚠️ **The input may arrive in any order, and duplicates are dropped.** The writer sorts
+/// by `(credential, outref)`, so the same set always lands on the same bytes — and the
+/// digest is the key, so a writer that let order through would re-publish the world on
+/// every run.
+pub fn publish_offers(
+    out: &Path,
+    book_fingerprint: &str,
+    base_slot: u64,
+    associations: &[OfferAssociation],
+) -> Result<OfferSnapshot> {
+    if book_fingerprint.len() != 32
+        || !book_fingerprint
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!(
+            "the book fingerprint wants 32 lower-case hex digits, got {book_fingerprint:?} — a \
+             catalogue this writer emits has to be one its own parser accepts"
+        );
+    }
+    let (table, blob) = lay_out_offers(associations)?;
+    let header = check_offer_table(&table)?;
+    check_offer_blob(&header, blob.len())?;
+
+    let table_digest = Hasher::<256>::hash(&table).to_string();
+    let blob_digest = Hasher::<256>::hash(&blob).to_string();
+    let snapshot = OfferSnapshot {
+        entries: u64::from(header.entries),
+        credentials: u64::from(header.credentials),
+        layout_version: OFFER_LAYOUT_VERSION,
+        table: OfferObject {
+            key: offer_table_key(base_slot, &table_digest),
+            len: table.len() as u64,
+            digest: table_digest,
+        },
+        blob: OfferObject {
+            key: offer_blob_key(base_slot, &blob_digest),
+            len: blob.len() as u64,
+            digest: blob_digest,
+        },
+    };
+    write_object(&table, &out.join(&snapshot.table.key))?;
+    write_object(&blob, &out.join(&snapshot.blob.key))?;
+    OfferCatalogue {
+        book_fingerprint: book_fingerprint.to_owned(),
+        base_slot,
+        snapshot: snapshot.clone(),
+    }
+    .store(&out.join(offer_catalogue_key()))?;
+    Ok(snapshot)
+}
+
+/// The pair's bytes: records sorted by credential, runs tiling the blob.
+fn lay_out_offers(associations: &[OfferAssociation]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut sorted = associations.to_vec();
+    sorted.sort_unstable_by(|a, b| {
+        a.credential
+            .cmp(&b.credential)
+            .then(a.outref.cmp(&b.outref))
+    });
+    sorted.dedup();
+    if sorted.len() > u32::MAX as usize {
+        bail!(
+            "{} associations; the layout addresses them with a u32",
+            sorted.len()
+        );
+    }
+
+    let mut records: Vec<([u8; 28], u32, u32)> = Vec::new();
+    let mut blob = Vec::with_capacity(sorted.len() * OFFER_ENTRY_BYTES);
+    for a in &sorted {
+        let first = (blob.len() / OFFER_ENTRY_BYTES) as u32;
+        match records.last_mut() {
+            Some((credential, _, count)) if *credential == a.credential => *count += 1,
+            _ => records.push((a.credential, first, 1)),
+        }
+        blob.extend_from_slice(&a.outref.0);
+        blob.extend_from_slice(&a.outref.1.to_le_bytes());
+    }
+
+    let mut table = Vec::with_capacity(OFFER_HEADER + records.len() * OFFER_RECORD_BYTES);
+    table.extend_from_slice(&OFFER_LAYOUT_VERSION.to_le_bytes());
+    table.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    table.extend_from_slice(&(records.len() as u32).to_le_bytes());
+
+    // The directory: bucket `b` starts at the first record whose credential's first byte
+    // is at least `b`. Linear, because `next` only ever moves forward.
+    let mut next = 0usize;
+    for b in 0..OFFER_BUCKETS {
+        while next < records.len() && offer_bucket(&records[next].0) < b {
+            next += 1;
+        }
+        table.extend_from_slice(&(next as u32).to_le_bytes());
+    }
+    for (credential, first, count) in &records {
+        table.extend_from_slice(credential);
+        table.extend_from_slice(&first.to_le_bytes());
+        table.extend_from_slice(&count.to_le_bytes());
+    }
+    Ok((table, blob))
+}
+
+/// The invariant every reader enforces, applied *before* a publish.
+///
+/// ⚠️ Each half matters and none is optional. Records out of order make a lookup's binary
+/// search return the wrong record for a *correct* credential; runs that do not tile make
+/// it read the wrong entry's bytes; and a directory that disagrees with the records makes
+/// a bucket's range miss entries the table holds — an answer, not an error, which is the
+/// worst shape a reader can meet.
+fn check_offer_table(table: &[u8]) -> Result<OfferHeader> {
+    let header = parse_offer_header(table, "offers.tbl")?;
+    let want = OFFER_HEADER + OFFER_RECORD_BYTES * header.credentials as usize;
+    if table.len() != want {
+        bail!(
+            "offers.tbl is {} B; {} records need {want}",
+            table.len(),
+            header.credentials
+        );
+    }
+
+    let (records, rest) = table[OFFER_HEADER..].as_chunks::<OFFER_RECORD_BYTES>();
+    if !rest.is_empty() {
+        bail!("offers.tbl is not a whole number of {OFFER_RECORD_BYTES}-byte records");
+    }
+    let mut previous: Option<[u8; 28]> = None;
+    let mut expect = 0u32;
+    for (i, record) in records.iter().enumerate() {
+        let (credential, first, count) = offer_record_from_bytes(record)?;
+        if let Some(previous) = previous
+            && credential <= previous
+        {
+            bail!("offers.tbl record {i} is not above its predecessor; the sort is broken");
+        }
+        if count == 0 {
+            bail!("offers.tbl record {i} claims no entries");
+        }
+        if first != expect {
+            bail!(
+                "offers.tbl record {i} starts at entry {first}; {expect} expected — the runs do \
+                 not tile the blob"
+            );
+        }
+        expect = expect
+            .checked_add(count)
+            .with_context(|| format!("offers.tbl record {i}'s run overflows a u32"))?;
+        previous = Some(credential);
+    }
+    if expect != header.entries {
+        bail!(
+            "offers.tbl's {} records address {expect} entries; the header says {}",
+            header.credentials,
+            header.entries
+        );
+    }
+
+    // Rebuild the directory and compare: a reader uses it to find a bucket, so a wrong one
+    // has to be a refusal here rather than a miss there.
+    let mut rebuilt = [0u32; OFFER_BUCKETS];
+    let mut next = 0usize;
+    for (b, slot) in rebuilt.iter_mut().enumerate() {
+        while next < header.credentials as usize {
+            let at = OFFER_HEADER + OFFER_RECORD_BYTES * next;
+            if (table[at] as usize) < b {
+                next += 1;
+            } else {
+                break;
+            }
+        }
+        *slot = next as u32;
+    }
+    if rebuilt != header.buckets {
+        bail!(
+            "offers.tbl's directory does not match its records — a bucket would miss the \
+             credentials it holds"
+        );
+    }
+    Ok(header)
+}
+
+/// The blob's whole length against the table's claim.
+fn check_offer_blob(header: &OfferHeader, blob_len: usize) -> Result<()> {
+    let want = OFFER_ENTRY_BYTES * header.entries as usize;
+    if blob_len != want {
+        bail!(
+            "offers.tbl's {} entries address {want} B; offers.bin is {blob_len} B — the pair \
+             is not from one snapshot",
+            header.entries
+        );
+    }
+    Ok(())
+}
+
+/// Write one object into the layout, creating its directory.
+fn write_object(bytes: &[u8], dst: &Path) -> Result<()> {
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(dst, bytes).with_context(|| format!("writing {}", dst.display()))
+}
+
+// ── Reading one ────────────────────────────────────────────────────────────────────
+
+/// A credential table, held whole.
+///
+/// ⚠️ **A ranged reader does not need this type** — it needs [`parse_offer_header`],
+/// [`offer_record_offset`] and [`offer_entry_offset`], which are the same arithmetic this
+/// reader uses. The type is for a caller that already has the bytes: the fold's own
+/// checks, the tests, a colo that fetched the object.
+pub struct OfferTable<'a> {
+    header: OfferHeader,
+    records: &'a [u8],
+}
+
+impl<'a> OfferTable<'a> {
+    /// Check a table and read its header.
+    pub fn open(bytes: &'a [u8]) -> Result<OfferTable<'a>> {
+        let header = check_offer_table(bytes)?;
+        Ok(OfferTable {
+            header,
+            records: &bytes[OFFER_HEADER..],
+        })
+    }
+
+    /// Associations in the blob.
+    pub fn entries(&self) -> u32 {
+        self.header.entries
+    }
+
+    /// Records in the table.
+    pub fn credentials(&self) -> u32 {
+        self.header.credentials
+    }
+
+    pub fn header(&self) -> &OfferHeader {
+        &self.header
+    }
+
+    /// The run of blob entries for `credential`, or `None` when it has none.
+    pub fn run(&self, credential: &[u8; 28]) -> Result<Option<(u32, u32)>> {
+        let range = self.header.bucket_records(offer_bucket(credential));
+        let mut lo = range.start as usize;
+        let mut hi = range.end as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (found, first, count) = offer_record_from_bytes(self.record(mid))?;
+            match found.cmp(credential) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(Some((first, count))),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The offers published for `credential`, out of the blob.
+    pub fn lookup(&self, blob: &[u8], credential: &[u8; 28]) -> Result<Option<Vec<OutRef>>> {
+        let Some((first, count)) = self.run(credential)? else {
+            return Ok(None);
+        };
+        check_offer_blob(&self.header, blob.len())?;
+        let at = offer_entry_offset(first) as usize;
+        let end = at + OFFER_ENTRY_BYTES * count as usize;
+        let run = blob
+            .get(at..end)
+            .context("a credential's run is not inside the blob")?;
+        let (entries, rest) = run.as_chunks::<OFFER_ENTRY_BYTES>();
+        if !rest.is_empty() {
+            bail!("a credential's run is not a whole number of entries");
+        }
+        entries
+            .iter()
+            .map(|entry| offer_entry_from_bytes(entry.as_slice()))
+            .collect::<Result<Vec<OutRef>>>()
+            .map(Some)
+    }
+
+    fn record(&self, i: usize) -> &'a [u8] {
+        let at = i * OFFER_RECORD_BYTES;
+        &self.records[at..at + OFFER_RECORD_BYTES]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,7 +1527,7 @@ mod tests {
 
     /// A directory of its own per test, as `format.rs`'s datum tests do: these read
     /// and write real files, and a published key is the thing under test.
-    fn datum_scratch(what: &str) -> PathBuf {
+    fn scratch(what: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("live-book-publish-{}-{what}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -876,7 +1544,7 @@ mod tests {
 
     #[test]
     fn a_datum_window_names_its_objects_by_slot_range_and_digest() {
-        let dir = datum_scratch("naming");
+        let dir = scratch("naming");
         let out = dir.join("publish");
         captured(&dir, (100, 200));
 
@@ -918,7 +1586,7 @@ mod tests {
     /// the same keys. This is what makes the set safe to publish additively.
     #[test]
     fn re_publishing_a_window_lands_on_the_same_keys() {
-        let dir = datum_scratch("idempotent");
+        let dir = scratch("idempotent");
         let out = dir.join("publish");
         captured(&dir, (100, 200));
         let first = publish_datums(
@@ -959,7 +1627,7 @@ mod tests {
     /// slot range.
     #[test]
     fn windows_accumulate_and_a_chunk_finds_its_window() {
-        let dir = datum_scratch("accumulate");
+        let dir = scratch("accumulate");
         let out = dir.join("publish");
         captured(&dir, (100, 200));
         let a = publish_datums(
@@ -1012,7 +1680,7 @@ mod tests {
     /// is an error rather than a default.
     #[test]
     fn a_catalogue_round_trips_and_refuses_a_broken_line() {
-        let dir = datum_scratch("catalogue-text");
+        let dir = scratch("catalogue-text");
         let out = dir.join("publish");
         captured(&dir, (100, 200));
         let e = publish_datums(
@@ -1045,7 +1713,7 @@ mod tests {
     /// not reach a bucket. Both halves of the invariant are exercised.
     #[test]
     fn a_pair_that_does_not_tile_is_refused_before_it_is_published() {
-        let dir = datum_scratch("tiling");
+        let dir = scratch("tiling");
         let out = dir.join("publish");
         captured(&dir, (100, 200));
         let blob = dir.join(crate::format::DATUM_BLOB);
@@ -1075,7 +1743,7 @@ mod tests {
     /// it can return a row that is not the key asked for, which reads as data.
     #[test]
     fn a_table_out_of_hash_order_is_refused() {
-        let dir = datum_scratch("order");
+        let dir = scratch("order");
         let out = dir.join("publish");
         captured(&dir, (100, 200));
         let tbl = dir.join(crate::format::DATUM_FILE);
@@ -1283,5 +1951,284 @@ mod tests {
         att.validated = false;
         let back = Attestation::parse(&att.render()).expect("parses");
         assert!(!back.validated);
+    }
+
+    // ── the offer index's catalogue ─────────────────────────────────────────────
+
+    const TABLE_DIGEST: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const BLOB_DIGEST: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+
+    fn offer_catalogue() -> OfferCatalogue {
+        OfferCatalogue {
+            book_fingerprint: "c423c896bb41c43f8e3b6fd2fb7b4177".into(),
+            base_slot: 198_590_382,
+            snapshot: OfferSnapshot {
+                entries: 151_880,
+                credentials: 100_000,
+                layout_version: 1,
+                table: OfferObject {
+                    key: offer_table_key(198_590_382, TABLE_DIGEST),
+                    len: 3_600_000,
+                    digest: TABLE_DIGEST.into(),
+                },
+                blob: OfferObject {
+                    key: offer_blob_key(198_590_382, BLOB_DIGEST),
+                    len: 5_620_000,
+                    digest: BLOB_DIGEST.into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn a_rendered_offer_catalogue_round_trips_byte_for_byte() {
+        let c = offer_catalogue();
+        let text = c.render();
+        let back = OfferCatalogue::parse(&text).expect("round trip");
+        assert_eq!(back, c);
+        assert_eq!(
+            back.render(),
+            text,
+            "a re-publish of the same set is not a diff"
+        );
+        assert!(text.contains("book c423c896bb41c43f8e3b6fd2fb7b4177 198590382"));
+    }
+
+    #[test]
+    fn the_offer_keys_are_made_of_the_boundary_and_the_digest() {
+        let c = offer_catalogue();
+        assert_eq!(
+            c.snapshot.table.key,
+            format!("offers/v1/s-198590382-{TABLE_DIGEST}.tbl")
+        );
+        assert_eq!(
+            c.snapshot.blob.key,
+            format!("offers/v1/s-198590382-{BLOB_DIGEST}.bin")
+        );
+    }
+
+    #[test]
+    fn an_offer_catalogue_that_is_not_whole_is_refused_rather_than_guessed() {
+        let version = format!("index_version {OFFER_INDEX_VERSION}\n");
+        let book = "book c423c896bb41c43f8e3b6fd2fb7b4177 198590382\n";
+        let snapshot =
+            format!("snapshot 151880 100000 1 3600000 {TABLE_DIGEST} 5620000 {BLOB_DIGEST}\n");
+        let good = format!("{version}{book}{snapshot}");
+        assert!(
+            OfferCatalogue::parse(&good).is_ok(),
+            "the cases below differ from this one only in the way named"
+        );
+
+        for (what, text) in [
+            ("empty", String::new()),
+            ("no version line", format!("{book}{snapshot}")),
+            (
+                "a version from the future",
+                format!("index_version 2\n{book}{snapshot}"),
+            ),
+            ("no book line", format!("{version}{snapshot}")),
+            ("no snapshot line", format!("{version}{book}")),
+            (
+                "a second book line",
+                format!("{version}{book}{book}{snapshot}"),
+            ),
+            (
+                "a second snapshot line",
+                format!("{version}{book}{snapshot}{snapshot}"),
+            ),
+            (
+                "a line from another format",
+                format!("{version}window 1 2\n{book}{snapshot}"),
+            ),
+            (
+                "a short fingerprint",
+                format!("{version}book c423c896 198590382\n{snapshot}"),
+            ),
+            (
+                "an upper-case digest",
+                format!(
+                    "{version}{book}snapshot 151880 100000 1 3600000 {} 5620000 {BLOB_DIGEST}\n",
+                    TABLE_DIGEST.to_uppercase()
+                ),
+            ),
+            (
+                "a truncated digest",
+                format!(
+                    "{version}{book}snapshot 151880 100000 1 3600000 {} 5620000 {BLOB_DIGEST}\n",
+                    &TABLE_DIGEST[..62]
+                ),
+            ),
+        ] {
+            assert!(
+                OfferCatalogue::parse(&text).is_err(),
+                "{what} must be refused, not guessed past"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_precedes_its_boundary_is_refused_with_the_reason() {
+        // A snapshot's key is made of the boundary, so this order cannot be parsed into
+        // a key at all — and the refusal has to say that rather than read as a missing
+        // line somewhere else.
+        let text = format!(
+            "index_version {OFFER_INDEX_VERSION}\nsnapshot 151880 100000 1 3600000 \
+             {TABLE_DIGEST} 5620000 {BLOB_DIGEST}\nbook c423c896bb41c43f8e3b6fd2fb7b4177 \
+             198590382\n"
+        );
+        let err = OfferCatalogue::parse(&text).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("before the `book` line"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_absent_offer_catalogue_is_a_none_and_not_an_error() {
+        let path = Path::new("/nonexistent/live-book/offers/v1/current");
+        let found = OfferCatalogue::load(path).expect("an absent set is not an error");
+        assert!(found.is_none());
+    }
+
+    // ── the offer index's pair ──────────────────────────────────────────────────
+
+    const FINGERPRINT: &str = "c423c896bb41c43f8e3b6fd2fb7b4177";
+
+    fn association(c: u8, tx: u8, index: u32) -> OfferAssociation {
+        OfferAssociation {
+            credential: [c; 28],
+            outref: ([tx; 32], index),
+        }
+    }
+
+    /// Five associations over three credentials, out of order, with a duplicate — what a
+    /// fold's pass hands the writer.
+    fn sample_associations() -> Vec<OfferAssociation> {
+        vec![
+            association(0x11, 0xaa, 1),
+            association(0xf0, 0xcc, 3),
+            association(0x22, 0xbb, 7),
+            association(0x11, 0xaa, 0),
+            association(0x11, 0xaa, 0),
+        ]
+    }
+
+    #[test]
+    fn an_offer_snapshot_publishes_and_reads_back_by_credential() {
+        let dir = scratch("offer-round-trip");
+        let snapshot = publish_offers(&dir, FINGERPRINT, 198_590_382, &sample_associations())
+            .expect("publish");
+        assert_eq!(
+            snapshot.entries, 4,
+            "the duplicate is dropped, not counted twice"
+        );
+        assert_eq!(snapshot.credentials, 3);
+
+        // The catalogue on disk says what the publish returned.
+        let catalogue = OfferCatalogue::load(&dir.join(offer_catalogue_key()))
+            .expect("load")
+            .expect("a published catalogue");
+        assert_eq!(catalogue.snapshot, snapshot);
+        assert_eq!(catalogue.book_fingerprint, FINGERPRINT);
+
+        // The digest in each key is the file's own — the key a reader asked for is the
+        // key it can check against.
+        assert_eq!(
+            digest_file(&dir.join(&snapshot.table.key)).expect("hash").0,
+            snapshot.table.digest
+        );
+        assert_eq!(
+            digest_file(&dir.join(&snapshot.blob.key)).expect("hash").0,
+            snapshot.blob.digest
+        );
+
+        // And the pair answers the question.
+        let table = std::fs::read(dir.join(&snapshot.table.key)).expect("table");
+        let blob = std::fs::read(dir.join(&snapshot.blob.key)).expect("blob");
+        let offers = OfferTable::open(&table).expect("open");
+        assert_eq!(offers.entries(), 4);
+        assert_eq!(offers.credentials(), 3);
+        assert_eq!(
+            offers.lookup(&blob, &[0x11; 28]).expect("lookup"),
+            Some(vec![([0xaa; 32], 0), ([0xaa; 32], 1)]),
+            "a credential's offers come back in outref order"
+        );
+        assert_eq!(
+            offers.lookup(&blob, &[0x22; 28]).expect("lookup"),
+            Some(vec![([0xbb; 32], 7)])
+        );
+        assert_eq!(offers.lookup(&blob, &[0x33; 28]).expect("lookup"), None);
+
+        // The same set re-published lands on the same keys.
+        let again = publish_offers(&dir, FINGERPRINT, 198_590_382, &sample_associations())
+            .expect("publish");
+        assert_eq!(again, snapshot);
+    }
+
+    #[test]
+    fn an_empty_snapshot_is_a_snapshot() {
+        let dir = scratch("offer-empty");
+        let snapshot = publish_offers(&dir, FINGERPRINT, 1, &[]).expect("publish");
+        assert_eq!(snapshot.entries, 0);
+        assert_eq!(snapshot.credentials, 0);
+        let table = std::fs::read(dir.join(&snapshot.table.key)).expect("table");
+        let blob = std::fs::read(dir.join(&snapshot.blob.key)).expect("blob");
+        let offers = OfferTable::open(&table).expect("open");
+        assert_eq!(offers.entries(), 0);
+        assert_eq!(offers.lookup(&blob, &[0x11; 28]).expect("lookup"), None);
+    }
+
+    #[test]
+    fn an_offer_pair_that_is_not_whole_is_refused_before_it_is_written() {
+        let (table, blob) = lay_out_offers(&sample_associations()).expect("lay out");
+        let header = check_offer_table(&table).expect("a laid-out pair checks");
+        assert!(check_offer_blob(&header, blob.len()).is_ok());
+
+        // A directory that disagrees with the records: a bucket would miss entries.
+        let mut lying = table.clone();
+        lying[12..16].copy_from_slice(&1u32.to_le_bytes());
+        let err = check_offer_table(&lying).expect_err("a lying directory must be refused");
+        assert!(
+            err.to_string().contains("directory"),
+            "unhelpful error: {err}"
+        );
+
+        // A record below its predecessor: the binary search would return the wrong one.
+        let mut unsorted = table.clone();
+        unsorted[OFFER_HEADER] = 0xf0;
+        let err = check_offer_table(&unsorted).expect_err("out-of-order records must be refused");
+        assert!(
+            err.to_string().contains("not above its predecessor"),
+            "unhelpful error: {err}"
+        );
+
+        // A run that does not tile the blob.
+        let mut untiled = table.clone();
+        let count_at = OFFER_HEADER + 32;
+        untiled[count_at..count_at + 4].copy_from_slice(&9u32.to_le_bytes());
+        let err = check_offer_table(&untiled).expect_err("a run that does not tile is refused");
+        assert!(err.to_string().contains("tile"), "unhelpful error: {err}");
+
+        // A blob that is not the table's.
+        let err = check_offer_blob(&header, blob.len() + OFFER_ENTRY_BYTES)
+            .expect_err("a foreign blob must be refused");
+        assert!(
+            err.to_string().contains("not from one snapshot"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_our_own_parser_would_refuse_is_not_written() {
+        let dir = scratch("offer-fingerprint");
+        let err = publish_offers(&dir, "c423c896", 1, &[]).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("32 lower-case hex digits"),
+            "{err}"
+        );
+        assert!(
+            !dir.join(offer_catalogue_key()).exists(),
+            "a refused publish writes nothing"
+        );
     }
 }
