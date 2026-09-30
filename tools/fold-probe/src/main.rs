@@ -122,6 +122,10 @@ enum Cmd {
     /// and the v2 extractor turns it into traits — so the corpus figures and the
     /// cost of that decode are what a real ingestion would see.
     Cip25(Cip25Args),
+    /// Measure the top-level metadata-label histogram — which labels exist, how
+    /// many txs carry each, and what an index over them would cost. Values are
+    /// sized, never interpreted: it prices an access structure, not a domain.
+    Labels(LabelsArgs),
     /// Read a published book back the way a consumer would.
     Verify(VerifyArgs),
     /// Rebuild the orderings derivable from the row store, without a refold.
@@ -259,6 +263,31 @@ impl Extract {
             Extract::Compare => "compare (both walks, asset by asset)",
         }
     }
+}
+
+#[derive(Args)]
+struct LabelsArgs {
+    /// The Mithril immutable directory (holds `NNNNN.chunk`).
+    #[arg(long)]
+    immutable: PathBuf,
+    /// Visit every Nth complete chunk (1 = all of them).
+    #[arg(long, default_value_t = 1)]
+    stride: usize,
+    /// Stop after this many visited chunks (0 = no limit).
+    #[arg(long, default_value_t = 0)]
+    max_chunks: usize,
+    /// First chunk to visit, inclusive.
+    #[arg(long)]
+    from: Option<u16>,
+    /// Last chunk to visit, inclusive.
+    #[arg(long)]
+    to: Option<u16>,
+    /// Worker threads; 0 = one per available core.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// Labels to print in the histogram, biggest by hits first (0 = all).
+    #[arg(long, default_value_t = 30)]
+    top: usize,
 }
 
 #[derive(Args)]
@@ -487,6 +516,7 @@ fn main() -> Result<()> {
         Cmd::Fold(a) => fold(a),
         Cmd::Count(a) => count(a),
         Cmd::Cip25(a) => cip25(a),
+        Cmd::Labels(a) => labels(a),
         Cmd::Verify(a) => verify(a),
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
@@ -2715,6 +2745,10 @@ fn fold(a: FoldArgs) -> Result<()> {
                 offers.candidates, offers.decoded, offers.unreadable, offers.not_offers,
             );
             println!(
+                "  offers     {} of those read off the output, {} from a reveal",
+                offers.from_output, offers.from_revealed,
+            );
+            println!(
                 "  offers     {} association(s), {} live at the boundary → {} · {} witness datum(s), {} kept",
                 offers.decoded,
                 live_offers.len(),
@@ -2834,53 +2868,19 @@ fn publish(a: PublishArgs) -> Result<()> {
     }
     println!("  fingerprint {}", att.fingerprint);
 
-    // The offer index: the associations this book's fold collected, laid out against
-    // the boundary just published. ⚠️ **Derived here rather than at the fold** so that
-    // re-laying a book out — a different part size, a repair — cannot leave a set
-    // behind a boundary that did not move. The keys are `offers/v1/…` and belong at
-    // the bucket's root, not under the book's prefix: the set versions on its own.
-    match live_book::publish::read_offer_associations(&a.book)? {
-        None => println!(
-            "  offers     none collected — no {} in the book directory, so the view keeps its scan",
-            live_book::publish::OFFER_ASSOCIATIONS_FILE
-        ),
-        Some(associations) => match live_book::Meta::open(&a.book)?.base_slot {
-            None => println!(
-                "  offers     NOT PUBLISHED — the book records no base_slot, and a snapshot's \
-                 key is made of the boundary"
-            ),
-            Some(base_slot) => {
-                let snapshot = live_book::publish::publish_offers(
-                    &a.out,
-                    &att.fingerprint.to_string(),
-                    base_slot,
-                    &associations,
-                )?;
-                println!(
-                    "  offers     {} association(s) over {} credential(s) · {} + {} · slot {base_slot}",
-                    snapshot.entries,
-                    snapshot.credentials,
-                    human_bytes(snapshot.table.len),
-                    human_bytes(snapshot.blob.len),
-                );
-                println!("             {}", snapshot.table.key);
-                println!("             {}", snapshot.blob.key);
-                println!("             {}", live_book::publish::offer_catalogue_key());
-            }
-        },
-    }
+    // ⚠️ **The offer index is deliberately not published from here.** `offers.assoc`
+    // in the book directory is a *domain* materialisation — its keys are a marketplace
+    // decoder's output, and its completeness leans on one venue's off-chain metadata
+    // convention — so it is not an R2 dataset. The bucket holds chain facts (`book`,
+    // `datum/v1`, `index/tx/v1` over the chunk mirror), and a consumer composes them;
+    // `OFFER_INDEX_FORMAT.md` §7 has the measurement that settled it.
 
     println!(
-        "\nupload the book's files, preserving paths, with:\n  \
+        "\nupload the whole directory, preserving paths, with:\n  \
          Content-Type: application/octet-stream\n  \
          Cache-Control: public, max-age=31536000, immutable\n\
          …then flip the epoch pointer LAST, conditionally, so no reader ever sees\n\
-         a pointer naming parts that are not there yet.\n\n\
-         ⚠️ Two destinations, not one: everything except `offers/` goes under the\n\
-         book prefix, and `offers/` goes to the bucket's ROOT — the set versions on\n\
-         its own. Its `offers/v1/current` is the only mutable object in the layout,\n\
-         so it goes up with `Cache-Control: public, max-age=60`, never `immutable`,\n\
-         or the flip caches for a year."
+         a pointer naming parts that are not there yet."
     );
     Ok(())
 }
@@ -3580,6 +3580,291 @@ fn cip25(a: Cip25Args) -> Result<()> {
     println!("             biggest collections by distinct pairs:");
     for (n, policy) in top.iter().take(8) {
         println!("               {policy}  {n} pairs");
+    }
+    Ok(())
+}
+
+/// One label's census: how many txs carry it, and the CBOR bytes under it.
+#[derive(Clone, Copy, Default)]
+struct LabelStat {
+    hits: u64,
+    bytes: u64,
+}
+
+/// How many labels, biggest first, it takes to reach `target` hits in total —
+/// a cumulative prefix of the sorted table, which is the order a label
+/// directory would be read in.
+fn labels_to_cover(rows: &[(u64, LabelStat)], target: u64) -> usize {
+    let mut cum = 0u64;
+    for (i, (_, stat)) in rows.iter().enumerate() {
+        cum += stat.hits;
+        if cum >= target {
+            return i + 1;
+        }
+    }
+    rows.len()
+}
+
+/// `(labels, hits)` at or above a hit count — the shape a hot-set split needs,
+/// where the answer is a band of the sorted table rather than a prefix.
+fn labels_at_or_above(rows: &[(u64, LabelStat)], floor: u64) -> (usize, u64) {
+    rows.iter()
+        .filter(|(_, stat)| stat.hits >= floor)
+        .fold((0, 0), |(n, e), (_, stat)| (n + 1, e + stat.hits))
+}
+
+/// The top-level label histogram of every metadata map in the walk, and what an
+/// index over it would cost.
+///
+/// The values are sized and never read: this says which labels exist and how
+/// much sits under each, not what any of it means. That is what would let such
+/// an index be published as a chain fact rather than a domain's reading of one
+/// — and why the arithmetic, not the semantics, is what the command prints.
+///
+/// The labels are the chain's own, not pallas's: the ledger reads an untagged
+/// map as Shelley-form metadata and only `tag(259)` as the post-Alonzo structure
+/// (`Cardano.Ledger.Alonzo.TxAuxData.decodeTxAuxDataByTokenType`), and pallas
+/// draws the same line. A small integer label is a label, not a structure key.
+fn labels(a: LabelsArgs) -> Result<()> {
+    let all = list_chunks(&a.immutable)?;
+    let stride = a.stride.max(1);
+    let mut todo: Vec<u16> = all
+        .iter()
+        .copied()
+        .filter(|c| a.from.is_none_or(|f| *c >= f))
+        .filter(|c| a.to.is_none_or(|t| *c <= t))
+        .step_by(stride)
+        .collect();
+    if a.max_chunks > 0 {
+        todo.truncate(a.max_chunks);
+    }
+    if todo.is_empty() {
+        bail!("no complete chunks to measure");
+    }
+    let threads = if a.threads == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        a.threads
+    };
+
+    println!("fold-probe labels — what a metadata-label index would cost");
+    println!("  immutable   {}", a.immutable.display());
+    println!(
+        "  chunks      {} of {} complete, every {stride}th",
+        todo.len(),
+        all.len()
+    );
+    println!("  threads     {threads}");
+    println!();
+
+    let queue: Mutex<VecDeque<u16>> = Mutex::new(todo.iter().copied().collect());
+    let done = AtomicU64::new(0);
+    let txs = AtomicU64::new(0);
+    let invalid = AtomicU64::new(0);
+    let aux_txs = AtomicU64::new(0);
+    let aux_bytes = AtomicU64::new(0);
+    let aux_undecodable = AtomicU64::new(0);
+    let aux_no_md = AtomicU64::new(0);
+    let md_txs = AtomicU64::new(0);
+    let by_label: Mutex<HashMap<u64, LabelStat>> = Mutex::new(HashMap::new());
+    let total = todo.len() as u64;
+    let started = Instant::now();
+
+    std::thread::scope(|s| -> Result<()> {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| -> Result<()> {
+                    let mut l_txs = 0u64;
+                    let mut l_invalid = 0u64;
+                    let mut l_aux_txs = 0u64;
+                    let mut l_aux_bytes = 0u64;
+                    let mut l_undecodable = 0u64;
+                    let mut l_no_md = 0u64;
+                    let mut l_md_txs = 0u64;
+                    let mut l_labels: HashMap<u64, LabelStat> = HashMap::new();
+                    loop {
+                        let chunk = { queue.lock().expect("queue").pop_front() };
+                        let Some(chunk) = chunk else { break };
+                        let raw = std::fs::read(chunk_path(&a.immutable, chunk))
+                            .with_context(|| format!("reading chunk {chunk}"))?;
+                        for (i, raw_block) in split_blocks(&raw)?.iter().enumerate() {
+                            let block = MultiEraBlock::decode(raw_block)
+                                .with_context(|| format!("chunk {chunk}: decoding block {i}"))?;
+                            for tx in block.txs() {
+                                if !tx.is_valid() {
+                                    l_invalid += 1;
+                                    continue;
+                                }
+                                l_txs += 1;
+                                let Some(aux) = aux_of(&tx) else { continue };
+                                l_aux_txs += 1;
+                                l_aux_bytes += aux.len() as u64;
+                                let Ok(parsed) =
+                                    pallas_codec::minicbor::decode::<alonzo::AuxiliaryData>(aux)
+                                else {
+                                    l_undecodable += 1;
+                                    continue;
+                                };
+                                let Some(md) = aux_metadata(&parsed) else {
+                                    l_no_md += 1;
+                                    continue;
+                                };
+                                l_md_txs += 1;
+                                for (label, value) in md.iter() {
+                                    let stat = l_labels.entry(*label).or_default();
+                                    stat.hits += 1;
+                                    if let Ok(enc) = pallas_codec::minicbor::to_vec(value) {
+                                        stat.bytes += enc.len() as u64;
+                                    }
+                                }
+                            }
+                        }
+                        if !l_labels.is_empty() {
+                            let mut merged = by_label.lock().expect("labels");
+                            for (label, stat) in l_labels.drain() {
+                                let entry = merged.entry(label).or_default();
+                                entry.hits += stat.hits;
+                                entry.bytes += stat.bytes;
+                            }
+                        }
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        txs.fetch_add(l_txs, Ordering::Relaxed);
+                        invalid.fetch_add(l_invalid, Ordering::Relaxed);
+                        aux_txs.fetch_add(l_aux_txs, Ordering::Relaxed);
+                        aux_bytes.fetch_add(l_aux_bytes, Ordering::Relaxed);
+                        aux_undecodable.fetch_add(l_undecodable, Ordering::Relaxed);
+                        aux_no_md.fetch_add(l_no_md, Ordering::Relaxed);
+                        md_txs.fetch_add(l_md_txs, Ordering::Relaxed);
+                        l_txs = 0;
+                        l_invalid = 0;
+                        l_aux_txs = 0;
+                        l_aux_bytes = 0;
+                        l_undecodable = 0;
+                        l_no_md = 0;
+                        l_md_txs = 0;
+                        if d.is_multiple_of(50) || d == total {
+                            eprintln!(
+                                "  ... {d}/{total} chunks · {:.0}s",
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker")?;
+        }
+        Ok(())
+    })?;
+
+    let t = txs.load(Ordering::Relaxed);
+    let inv = invalid.load(Ordering::Relaxed);
+    let aux = aux_txs.load(Ordering::Relaxed);
+    let aux_b = aux_bytes.load(Ordering::Relaxed);
+    let undec = aux_undecodable.load(Ordering::Relaxed);
+    let no_md = aux_no_md.load(Ordering::Relaxed);
+    let md_t = md_txs.load(Ordering::Relaxed);
+    let chunks = done.load(Ordering::Relaxed).max(1);
+    let secs = started.elapsed().as_secs_f64();
+
+    let mut rows: Vec<(u64, LabelStat)> =
+        by_label.into_inner().expect("labels").into_iter().collect();
+    let n_labels = rows.len() as u64;
+    let hits: u64 = rows.iter().map(|(_, s)| s.hits).sum();
+    let value_bytes: u64 = rows.iter().map(|(_, s)| s.bytes).sum();
+    rows.sort_unstable_by(|a, b| b.1.hits.cmp(&a.1.hits).then_with(|| a.0.cmp(&b.0)));
+
+    println!();
+    println!("  walked     {chunks} chunks in {secs:.0}s · {t} txs · {inv} invalid skipped");
+    println!(
+        "  aux        {aux} txs carry auxiliary data ({:.1}% of txs) · {}",
+        100.0 * aux as f64 / t.max(1) as f64,
+        human_bytes(aux_b)
+    );
+    println!(
+        "  metadata   {md_t} of {aux} aux txs carry a metadata map ({:.1}%) · {n_labels} distinct labels · {hits} (label, tx) hits ({:.2} a tx)",
+        100.0 * md_t as f64 / aux.max(1) as f64,
+        hits as f64 / md_t.max(1) as f64
+    );
+    println!("             {undec} aux failed to decode · {no_md} decoded with no metadata map");
+    println!(
+        "  values     {} of CBOR under labels ({:.0} B a hit)",
+        human_bytes(value_bytes),
+        value_bytes as f64 / hits.max(1) as f64
+    );
+
+    let show = if a.top == 0 {
+        rows.len()
+    } else {
+        a.top.min(rows.len())
+    };
+    println!();
+    println!("  labels by (label, tx) hits — top {show} of {n_labels}:");
+    println!(
+        "    {:>10}  {:>12}  {:>8}  {:>10}  {:>9}",
+        "label", "hits", "share", "bytes", "B a hit"
+    );
+    for (label, stat) in rows.iter().take(show) {
+        println!(
+            "    {label:>10}  {:>12}  {:>7.2}%  {:>10}  {:>9.0}",
+            stat.hits,
+            100.0 * stat.hits as f64 / hits.max(1) as f64,
+            human_bytes(stat.bytes),
+            stat.bytes as f64 / stat.hits.max(1) as f64
+        );
+    }
+
+    let once = rows.iter().filter(|(_, s)| s.hits == 1).count();
+    println!();
+    println!(
+        "  coverage   {} labels cover 50% of hits · {} cover 90% · {} cover 99% · {once} appear exactly once",
+        labels_to_cover(&rows, (hits * 50).div_ceil(100)),
+        labels_to_cover(&rows, (hits * 90).div_ceil(100)),
+        labels_to_cover(&rows, (hits * 99).div_ceil(100)),
+    );
+    println!();
+    println!("  bands      labels at or above a hit count — the cut a hot-set split would use");
+    for floor in [1_000_000u64, 100_000, 10_000, 1_000] {
+        let (n, e) = labels_at_or_above(&rows, floor);
+        println!(
+            "             ≥{floor:>9}  {n:>5} labels · {e:>12} entries ({:>5.1}% of hits)",
+            100.0 * e as f64 / hits.max(1) as f64
+        );
+    }
+    let (above, above_hits) = labels_at_or_above(&rows, 1_000);
+    println!(
+        "             below      {:>5} labels · {:>12} entries ({:>5.1}% of hits)",
+        rows.len() - above,
+        hits - above_hits,
+        100.0 * (hits - above_hits) as f64 / hits.max(1) as f64
+    );
+
+    println!();
+    println!("  index      one entry per (label, tx) hit, grouped by label");
+    println!(
+        "             u32 ordinal into tx-index   {:>9}  ({hits} entries × 4 B)",
+        human_bytes(hits * 4)
+    );
+    println!(
+        "             24 B tx-index entry         {:>9}  ({hits} entries × 24 B)",
+        human_bytes(hits * 24)
+    );
+    println!(
+        "             label directory             {:>9}  ({n_labels} labels × 16 B)",
+        human_bytes(n_labels * 16)
+    );
+    println!(
+        "             a 4 B entry reads tx-index once for the offsets; a 24 B entry carries them"
+    );
+    if todo.len() < all.len() {
+        println!(
+            "  sample     {}/{} chunks — scale the entries by ×{:.2} for the whole store",
+            todo.len(),
+            all.len(),
+            all.len() as f64 / todo.len() as f64
+        );
     }
     Ok(())
 }
@@ -6228,6 +6513,46 @@ mod tests {
         assert_eq!(tied.top(), Some(("alpha", 1)));
     }
 
+    /// The coverage answer is a cumulative prefix of the sorted table, not a
+    /// count of labels that individually clear the bar — and the sorted order
+    /// is what the caller passes, so this measures the table, not a re-sort.
+    #[test]
+    fn a_label_coverage_count_is_a_cumulative_prefix() {
+        let rows = vec![
+            (721u64, LabelStat { hits: 10, bytes: 0 }),
+            (674u64, LabelStat { hits: 6, bytes: 0 }),
+            (1447u64, LabelStat { hits: 3, bytes: 0 }),
+            (50u64, LabelStat { hits: 1, bytes: 0 }),
+        ];
+        assert_eq!(labels_to_cover(&rows, 10), 1);
+        assert_eq!(labels_to_cover(&rows, 11), 2);
+        assert_eq!(labels_to_cover(&rows, 16), 2);
+        assert_eq!(labels_to_cover(&rows, 17), 3);
+        assert_eq!(labels_to_cover(&rows, 20), 4);
+        assert_eq!(
+            labels_to_cover(&rows, 21),
+            4,
+            "past the total is the whole table"
+        );
+        assert_eq!(labels_to_cover(&[], 1), 0, "an empty table covers nothing");
+    }
+
+    /// A band counts labels and their hits at or above a floor, not a prefix of
+    /// the table — the two answers differ the moment a band skips a label.
+    #[test]
+    fn a_band_counts_labels_and_hits_at_or_above_its_floor() {
+        let rows = vec![
+            (1u64, LabelStat { hits: 10, bytes: 0 }),
+            (2u64, LabelStat { hits: 6, bytes: 0 }),
+            (3u64, LabelStat { hits: 1, bytes: 0 }),
+        ];
+        assert_eq!(labels_at_or_above(&rows, 10), (1, 10));
+        assert_eq!(labels_at_or_above(&rows, 5), (2, 16));
+        assert_eq!(labels_at_or_above(&rows, 2), (2, 16));
+        assert_eq!(labels_at_or_above(&rows, 0), (3, 17));
+        assert_eq!(labels_at_or_above(&rows, 11), (0, 0));
+    }
+
     /// The projection back to the shape consumers read today: a missing name and
     /// a missing headline render the way `Asset` always did, so swapping in a
     /// `DecodedAsset` is not a data change for anyone still reading `Asset`.
@@ -6790,13 +7115,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The publisher lays the fold's associations out beside the book, keyed by the
-    /// boundary the book records — and the catalogue's consistency clause is the book's
-    /// own fingerprint, read back from the artifact rather than taken on trust.
+    /// ⚠️ **The publisher must not lay a domain set out beside the book.** `offers.assoc`
+    /// is a fold-side materialisation whose keys are a marketplace decoder's output, and
+    /// the published layout is chain facts only — so a book that carries the file still
+    /// publishes a layout with no `offers/` tree in it. `OFFER_INDEX_FORMAT.md` §9 records
+    /// why; this is the assertion that keeps it from creeping back in.
     #[test]
-    fn publish_lays_the_collected_associations_out_beside_the_book() {
-        use live_book::publish::{OfferCatalogue, offer_catalogue_key};
-
+    fn publish_never_writes_the_offer_set_into_the_layout() {
         let dir =
             std::env::temp_dir().join(format!("fold-probe-offer-publish-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6817,19 +7142,14 @@ mod tests {
         .expect("create_output");
         b.set_base_slot(198_590_382);
         b.finish().expect("finish");
-
-        // Before the pass has run: absent, and the publisher must say so rather than
-        // write an empty snapshot that claims the question was asked.
-        assert_eq!(
-            live_book::publish::read_offer_associations(&dir).expect("read"),
-            None
-        );
-
-        let associations = [live_book::publish::OfferAssociation {
-            credential: [0x11u8; 28],
-            outref: ([0xABu8; 32], 3),
-        }];
-        live_book::publish::write_offer_associations(&dir, &associations).expect("write");
+        live_book::publish::write_offer_associations(
+            &dir,
+            &[live_book::publish::OfferAssociation {
+                credential: [0x11u8; 28],
+                outref: ([0xABu8; 32], 3),
+            }],
+        )
+        .expect("write");
 
         let out = dir.join("layout");
         publish(PublishArgs {
@@ -6840,26 +7160,15 @@ mod tests {
         })
         .expect("publish");
 
-        let catalogue = OfferCatalogue::load(&out.join(offer_catalogue_key()))
-            .expect("load")
-            .expect("the publisher wrote one");
-        assert_eq!(catalogue.base_slot, 198_590_382);
-        assert_eq!(catalogue.snapshot.entries, 1);
-        assert_eq!(
-            catalogue.book_fingerprint,
-            live_book::Meta::open(&dir)
-                .expect("meta")
-                .fingerprint()
-                .to_string(),
-            "the catalogue names the boundary it was laid out against"
+        assert!(
+            out.join(live_book::publish::ATTESTATION_FILE).exists(),
+            "the book itself must publish"
         );
-        for object in [&catalogue.snapshot.table, &catalogue.snapshot.blob] {
-            assert!(
-                out.join(&object.key).exists(),
-                "{} is not at its key",
-                object.key
-            );
-        }
+        assert!(
+            !out.join("offers").exists(),
+            "a domain set must not reach the published layout"
+        );
+        assert!(!out.join(live_book::publish::offer_catalogue_key()).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

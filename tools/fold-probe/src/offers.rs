@@ -212,6 +212,11 @@ pub struct OfferPass {
     pub decoded: u64,
     pub unreadable: u64,
     pub not_offers: u64,
+    /// Of [`Self::decoded`]: how many read the datum off the output itself, and how
+    /// many needed the reveal index. The split is the whole argument for keeping that
+    /// index in memory — see the run report.
+    pub from_output: u64,
+    pub from_revealed: u64,
     /// Witness datums the walk passed, and how many were kept as offer-shaped.
     pub revelations: u64,
     pub retained: u64,
@@ -234,6 +239,8 @@ impl OfferPass {
             decoded: 0,
             unreadable: 0,
             not_offers: 0,
+            from_output: 0,
+            from_revealed: 0,
             revelations: 0,
             retained: 0,
         }
@@ -259,10 +266,10 @@ impl OfferPass {
             return;
         };
         self.candidates += 1;
-        let bytes = match datum {
-            Datum::Inline(b) => b,
+        let (bytes, read_from) = match datum {
+            Datum::Inline(b) => (b, &mut self.from_output),
             Datum::Hash(h) => match hash_of(h).and_then(|h| self.revealed.get(&h)) {
-                Some(b) => b.as_slice(),
+                Some(b) => (b.as_slice(), &mut self.from_revealed),
                 None => {
                     self.unreadable += 1;
                     return;
@@ -281,6 +288,7 @@ impl OfferPass {
             self.not_offers += 1;
             return;
         };
+        *read_from += 1;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(outref.0.as_ref());
         self.decoded += 1;
@@ -439,6 +447,7 @@ mod tests {
         assert_eq!(pass.candidates, 1);
         assert_eq!(pass.decoded, 1);
         assert_eq!(pass.unreadable, 0);
+        assert_eq!((pass.from_revealed, pass.from_output), (1, 0));
         assert_eq!(pass.associations.len(), 1);
         assert_eq!(pass.associations[0].credential, [0x11; 28]);
         assert_eq!(pass.associations[0].outref, ([0xAB; 32], 7));
@@ -464,6 +473,7 @@ mod tests {
             Datum::Inline(&cbor),
         );
         assert_eq!(pass.decoded, 1);
+        assert_eq!((pass.from_output, pass.from_revealed), (1, 0));
         assert_eq!(pass.live(|_| true).len(), 1);
         assert!(pass.live(|_| false).is_empty());
     }
