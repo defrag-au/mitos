@@ -288,6 +288,11 @@ struct LabelsArgs {
     /// Labels to print in the histogram, biggest by hits first (0 = all).
     #[arg(long, default_value_t = 30)]
     top: usize,
+    /// The chain partition a published run would cover, in chunks — used only by
+    /// the windowing report, which counts the labels each partition's directory
+    /// would have to name.
+    #[arg(long, default_value_t = 1024)]
+    partition: u16,
 }
 
 #[derive(Args)]
@@ -3667,6 +3672,8 @@ fn labels(a: LabelsArgs) -> Result<()> {
     let aux_no_md = AtomicU64::new(0);
     let md_txs = AtomicU64::new(0);
     let by_label: Mutex<HashMap<u64, LabelStat>> = Mutex::new(HashMap::new());
+    let windows: Mutex<HashMap<u16, HashSet<u64>>> = Mutex::new(HashMap::new());
+    let partition_chunks = a.partition.max(1);
     let total = todo.len() as u64;
     let started = Instant::now();
 
@@ -3682,6 +3689,7 @@ fn labels(a: LabelsArgs) -> Result<()> {
                     let mut l_no_md = 0u64;
                     let mut l_md_txs = 0u64;
                     let mut l_labels: HashMap<u64, LabelStat> = HashMap::new();
+                    let mut l_windows: HashMap<u16, HashSet<u64>> = HashMap::new();
                     loop {
                         let chunk = { queue.lock().expect("queue").pop_front() };
                         let Some(chunk) = chunk else { break };
@@ -3710,12 +3718,14 @@ fn labels(a: LabelsArgs) -> Result<()> {
                                     continue;
                                 };
                                 l_md_txs += 1;
+                                let partition = chunk / partition_chunks;
                                 for (label, value) in md.iter() {
                                     let stat = l_labels.entry(*label).or_default();
                                     stat.hits += 1;
                                     if let Ok(enc) = pallas_codec::minicbor::to_vec(value) {
                                         stat.bytes += enc.len() as u64;
                                     }
+                                    l_windows.entry(partition).or_default().insert(*label);
                                 }
                             }
                         }
@@ -3725,6 +3735,12 @@ fn labels(a: LabelsArgs) -> Result<()> {
                                 let entry = merged.entry(label).or_default();
                                 entry.hits += stat.hits;
                                 entry.bytes += stat.bytes;
+                            }
+                        }
+                        if !l_windows.is_empty() {
+                            let mut merged = windows.lock().expect("windows");
+                            for (part, seen) in l_windows.drain() {
+                                merged.entry(part).or_default().extend(seen);
                             }
                         }
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3840,6 +3856,29 @@ fn labels(a: LabelsArgs) -> Result<()> {
         hits - above_hits,
         100.0 * (hits - above_hits) as f64 / hits.max(1) as f64
     );
+
+    let windows = windows.into_inner().expect("windows");
+    let pairs: u64 = windows.values().map(|s| s.len() as u64).sum();
+    let mut per_partition: Vec<usize> = windows.values().map(HashSet::len).collect();
+    per_partition.sort_unstable();
+    if let (Some(min), Some(median), Some(max)) = (
+        per_partition.first(),
+        per_partition.get(per_partition.len() / 2),
+        per_partition.last(),
+    ) {
+        println!();
+        println!(
+            "  windows    partition {partition_chunks} chunks · {} partitions · {pairs} (partition, label) pairs",
+            windows.len()
+        );
+        println!(
+            "             labels a partition's directory names: min {min} · median {median} · max {max}"
+        );
+        println!(
+            "             directory at 20 B a pair              {}",
+            human_bytes(pairs * 20)
+        );
+    }
 
     println!();
     println!("  index      one entry per (label, tx) hit, grouped by label");
