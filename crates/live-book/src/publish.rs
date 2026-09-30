@@ -1435,6 +1435,97 @@ fn write_object(bytes: &[u8], dst: &Path) -> Result<()> {
     std::fs::write(dst, bytes).with_context(|| format!("writing {}", dst.display()))
 }
 
+// ── What the fold hands the publisher ──────────────────────────────────────────────
+
+/// The associations a fold collected, before there is a boundary to name them.
+///
+/// ⚠️ **An interchange file, not an artifact.** A snapshot's keys carry the book's
+/// base slot and the objects' digests, and neither exists until the book is finished —
+/// so the walk writes the associations flat, into the book directory, and
+/// [`publish_offers`] lays them out against the boundary afterwards. Nothing uploads
+/// it and nothing but `publish` reads it; absent means "this book was built without
+/// the offer pass", which is not an error.
+pub const OFFER_ASSOCIATIONS_FILE: &str = "offers.assoc";
+
+/// The interchange file's layout, refused when a reader does not know it.
+const OFFER_ASSOCIATIONS_LAYOUT: u32 = 1;
+
+/// `layout_version u32 | count u64 | count × 64 B`.
+///
+/// ⚠️ **Twice `OFFER_ENTRY_BYTES` minus the header**, and that is not a coincidence
+/// worth exploiting: an association is the credential **and** the outref, where the
+/// blob holds only the second half. One layout function each way, in one file, so the
+/// two cannot disagree about where a record ends.
+const OFFER_ASSOCIATION_BYTES: usize = 64;
+const OFFER_ASSOCIATIONS_HEADER: usize = 12;
+
+/// Write the associations the fold collected into the book directory.
+pub fn write_offer_associations(dir: &Path, associations: &[OfferAssociation]) -> Result<()> {
+    let mut out = Vec::with_capacity(
+        OFFER_ASSOCIATIONS_HEADER + OFFER_ASSOCIATION_BYTES * associations.len(),
+    );
+    out.extend_from_slice(&OFFER_ASSOCIATIONS_LAYOUT.to_le_bytes());
+    out.extend_from_slice(&(associations.len() as u64).to_le_bytes());
+    for a in associations {
+        out.extend_from_slice(&a.credential);
+        out.extend_from_slice(&a.outref.0);
+        out.extend_from_slice(&a.outref.1.to_le_bytes());
+    }
+    write_object(&out, &dir.join(OFFER_ASSOCIATIONS_FILE))
+}
+
+/// The associations the fold collected, or `None` when the book carries none.
+///
+/// ⚠️ **Absent is not an empty index**, exactly as the catalogue's rule has it: a book
+/// built without the pass is a book whose offers are read by the scan, and a published
+/// `snapshot 0 …` would claim the question had been asked and answered.
+pub fn read_offer_associations(dir: &Path) -> Result<Option<Vec<OfferAssociation>>> {
+    let path = dir.join(OFFER_ASSOCIATIONS_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if bytes.len() < OFFER_ASSOCIATIONS_HEADER {
+        bail!(
+            "{} is {} B — too short for a header",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let version = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+    if version != OFFER_ASSOCIATIONS_LAYOUT {
+        bail!(
+            "{} is layout version {version}; this build writes {OFFER_ASSOCIATIONS_LAYOUT}",
+            path.display()
+        );
+    }
+    let count = u64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes"));
+    let want = OFFER_ASSOCIATIONS_HEADER as u64 + count * OFFER_ASSOCIATION_BYTES as u64;
+    if bytes.len() as u64 != want {
+        bail!(
+            "{} holds {} B; {count} associations need {want}",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let (records, rest) = bytes[OFFER_ASSOCIATIONS_HEADER..].as_chunks::<OFFER_ASSOCIATION_BYTES>();
+    if !rest.is_empty() {
+        bail!("{} is not a whole number of records", path.display());
+    }
+    let mut out = Vec::with_capacity(records.len());
+    for r in records {
+        let credential: [u8; 28] = r[..28].try_into().expect("28 bytes");
+        let hash: [u8; 32] = r[28..60].try_into().expect("32 bytes");
+        let index = u32::from_le_bytes(r[60..64].try_into().expect("4 bytes"));
+        out.push(OfferAssociation {
+            credential,
+            outref: (hash, index),
+        });
+    }
+    Ok(Some(out))
+}
+
 // ── Reading one ────────────────────────────────────────────────────────────────────
 
 /// A credential table, held whole.
@@ -2229,6 +2320,49 @@ mod tests {
         assert!(
             !dir.join(offer_catalogue_key()).exists(),
             "a refused publish writes nothing"
+        );
+    }
+
+    // ── what the fold hands the publisher ───────────────────────────────────────
+
+    #[test]
+    fn the_folds_associations_round_trip_and_an_absent_file_is_not_an_empty_index() {
+        let dir = scratch("offer-associations");
+        assert_eq!(
+            read_offer_associations(&dir).expect("an absent file is not an error"),
+            None,
+            "a book with no pass behind it must say so, not answer `none yet`"
+        );
+
+        let written = sample_associations();
+        write_offer_associations(&dir, &written).expect("write");
+        let read = read_offer_associations(&dir)
+            .expect("read")
+            .expect("the file is there now");
+        // Byte-for-byte, duplicates and order included: the writer's sort is the
+        // publisher's, not the interchange file's.
+        assert_eq!(read, written);
+    }
+
+    #[test]
+    fn a_truncated_or_future_associations_file_is_refused_rather_than_half_read() {
+        let dir = scratch("offer-associations-bad");
+        write_offer_associations(&dir, &sample_associations()).expect("write");
+        let path = dir.join(OFFER_ASSOCIATIONS_FILE);
+        let good = std::fs::read(&path).expect("read");
+
+        let truncated = &good[..good.len() - 8];
+        std::fs::write(&path, truncated).expect("write");
+        let err = read_offer_associations(&dir).expect_err("a short file is refused");
+        assert!(err.to_string().contains("need"), "unhelpful error: {err}");
+
+        let mut future = good.clone();
+        future[..4].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, &future).expect("write");
+        let err = read_offer_associations(&dir).expect_err("a future layout is refused");
+        assert!(
+            err.to_string().contains("layout version 99"),
+            "unhelpful error: {err}"
         );
     }
 }

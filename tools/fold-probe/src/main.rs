@@ -90,9 +90,11 @@ use tx_index::extract::list_chunks;
 
 use crate::book::Book;
 use crate::delta::Delta;
+use crate::offers::OfferPass;
 
 mod book;
 mod delta;
+mod offers;
 
 /// An outref: the key of the live set, and the thing a spend names.
 type OutRef = (Hash<32>, u32);
@@ -978,7 +980,12 @@ fn plan_block(
 /// expensive route; the primitives walk reaches it through `feed_alonzo` and
 /// `feed_conway`, which is where every Shelley+ output goes.
 enum Sink<'a, 'b> {
-    Book(&'a mut Book),
+    /// The published book, and the offer pass riding the same walk.
+    ///
+    /// ⚠️ **The pass is here rather than inside [`Book`]** so the artifact's writer
+    /// never learns what a marketplace is: the decode crate stays out of `book.rs`,
+    /// and what crosses the boundary is a credential and an outref.
+    Book(&'a mut Book, &'a mut OfferPass),
     Delta(&'a mut Delta<'b>),
 }
 
@@ -989,19 +996,26 @@ impl Sink<'_, '_> {
     /// rather than an omission — a delta is defined *relative to* a boundary, so it
     /// has no position of its own to report (`DELTA_CHAIN.md` §7).
     fn set_slot(&mut self, slot: u64) {
-        if let Sink::Book(b) = self {
+        if let Sink::Book(b, _) = self {
             b.set_base_slot(slot);
         }
     }
 
     fn spend(&mut self, outref: OutRef) {
         match self {
-            Sink::Book(b) => {
+            Sink::Book(b, _) => {
                 b.spend(outref);
             }
             Sink::Delta(d) => {
                 d.spend(outref);
             }
+        }
+    }
+
+    /// One datum a transaction revealed, offered to the offer pass.
+    fn witness(&mut self, hash: Hash<32>, cbor: &[u8]) {
+        if let Sink::Book(_, offers) = self {
+            offers.reveal(hash, cbor);
         }
     }
 
@@ -1015,7 +1029,10 @@ impl Sink<'_, '_> {
         assets: impl Iterator<Item = (&'e [u8], &'e [u8], u64)>,
     ) -> Result<()> {
         match self {
-            Sink::Book(b) => b.create_output(outref, era, lovelace, address, datum, assets),
+            Sink::Book(b, offers) => {
+                offers.output(outref, address, datum);
+                b.create_output(outref, era, lovelace, address, datum, assets)
+            }
             Sink::Delta(d) => d.create_output(outref, era, lovelace, address, datum, assets),
         }
     }
@@ -1320,6 +1337,47 @@ fn datum_of<'a, 'b>(d: Option<&'a DatumOption<'b>>) -> Datum<'a> {
     }
 }
 
+/// This block's revealed Plutus datums, offered to the sink's offer pass.
+///
+/// ⚠️ **The whole block is fed before any of its outputs are created**, and that is
+/// the point rather than a convenience: a reveal is matched to an output by datum
+/// **hash**, so which transaction in the block revealed a preimage does not change
+/// what the hash names — and one pass over the block's witness sets costs less than
+/// a check per transaction. A transaction that spends an offer and recreates it
+/// lands both in one block, and the recreate resolves against the spend.
+///
+/// Byron and the epoch boundary have no witness set — they reach the walk through
+/// `plan_block` — and no offer output either, so they never call this. The era's
+/// shapes differ (Conway wraps the same list in a `KeepRaw` set), which is why this
+/// is three arms and not one iterator.
+fn feed_witnesses(blk: ShelleyBlock<'_>, sink: &mut Sink<'_, '_>) {
+    match blk {
+        ShelleyBlock::Alonzo(b, _) => {
+            for ws in &b.transaction_witness_sets {
+                for d in ws.plutus_data.iter().flatten() {
+                    sink.witness(d.original_hash(), d.raw_cbor());
+                }
+            }
+        }
+        ShelleyBlock::Babbage(b) => {
+            for ws in &b.transaction_witness_sets {
+                for d in ws.plutus_data.iter().flatten() {
+                    sink.witness(d.original_hash(), d.raw_cbor());
+                }
+            }
+        }
+        ShelleyBlock::Conway(b) => {
+            for ws in &b.transaction_witness_sets {
+                if let Some(set) = ws.plutus_data.as_ref() {
+                    for d in set.iter() {
+                        sink.witness(d.original_hash(), d.raw_cbor());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One output into the book, from an Alonzo/Babbage value.
 fn feed_alonzo(
     b: &mut Sink<'_, '_>,
@@ -1549,6 +1607,9 @@ fn plan_block_primitives(
     // decoded a second time.
     if let Some(sk) = sink.as_deref_mut() {
         sk.set_slot(blk.slot());
+        // Before the outputs: an offer created in this block may commit to a hash this
+        // same block reveals. See `feed_witnesses`.
+        feed_witnesses(blk, sk);
     }
 
     match blk {
@@ -2021,6 +2082,11 @@ fn fold(a: FoldArgs) -> Result<()> {
         }
         None => None,
     };
+    // The offer pass rides the book: its associations name book rows, and the
+    // catalogue that publishes them pins the book's boundary. It is constructed
+    // either way — `--book` is what makes it reachable from the walk, and an inert
+    // pass costs one registry walk.
+    let mut offers = OfferPass::new();
     // Reused across chunks: `fs::read` allocates and frees ~25 MB per chunk, and
     // glibc serves that from mmap, so every chunk re-faults 6,400 pages. Keeping
     // the buffer mapped pays that once.
@@ -2050,7 +2116,7 @@ fn fold(a: FoldArgs) -> Result<()> {
         // One walk, one destination here — the probe's own `follow` is what feeds
         // a delta. Rebuilt per chunk so the borrow of `book` ends with the
         // iteration and the builder can be finished after the loop.
-        let mut sink = book.as_mut().map(Sink::Book);
+        let mut sink = book.as_mut().map(|b| Sink::Book(b, &mut offers));
 
         if a.cursor {
             let mut pos = 0usize;
@@ -2541,6 +2607,10 @@ fn fold(a: FoldArgs) -> Result<()> {
     );
 
     if let Some(b) = book.take() {
+        // The offer pass is filtered against the book's own index **before** the
+        // builder is consumed: an association names a row, and an offer spent inside
+        // the walk names nothing.
+        let live_offers = offers.live(|(hash, index)| b.is_live((Hash::from(*hash), *index)));
         let cost = b.finish()?;
         println!();
         println!("book — phase 1: rows.bin + by_outref.idx + dir.idx + policy.tbl");
@@ -2631,6 +2701,27 @@ fn fold(a: FoldArgs) -> Result<()> {
                     "  position   NOT RECORDED — `tip()` will refuse; the walk saw no block"
                 ),
             }
+            // The offer index's half of the run: what the pass read, and the
+            // interchange file `publish` lays out against this boundary.
+            live_book::publish::write_offer_associations(dir, &live_offers)?;
+            let venues = offers
+                .venues()
+                .iter()
+                .map(|v| v.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  offers     {} candidate(s) at {venues} · {} decoded · {} unreadable · {} not offers",
+                offers.candidates, offers.decoded, offers.unreadable, offers.not_offers,
+            );
+            println!(
+                "  offers     {} association(s), {} live at the boundary → {} · {} witness datum(s), {} kept",
+                offers.decoded,
+                live_offers.len(),
+                live_book::publish::OFFER_ASSOCIATIONS_FILE,
+                offers.revelations,
+                offers.retained,
+            );
         }
     }
     Ok(())
@@ -2742,12 +2833,54 @@ fn publish(a: PublishArgs) -> Result<()> {
         );
     }
     println!("  fingerprint {}", att.fingerprint);
+
+    // The offer index: the associations this book's fold collected, laid out against
+    // the boundary just published. ⚠️ **Derived here rather than at the fold** so that
+    // re-laying a book out — a different part size, a repair — cannot leave a set
+    // behind a boundary that did not move. The keys are `offers/v1/…` and belong at
+    // the bucket's root, not under the book's prefix: the set versions on its own.
+    match live_book::publish::read_offer_associations(&a.book)? {
+        None => println!(
+            "  offers     none collected — no {} in the book directory, so the view keeps its scan",
+            live_book::publish::OFFER_ASSOCIATIONS_FILE
+        ),
+        Some(associations) => match live_book::Meta::open(&a.book)?.base_slot {
+            None => println!(
+                "  offers     NOT PUBLISHED — the book records no base_slot, and a snapshot's \
+                 key is made of the boundary"
+            ),
+            Some(base_slot) => {
+                let snapshot = live_book::publish::publish_offers(
+                    &a.out,
+                    &att.fingerprint.to_string(),
+                    base_slot,
+                    &associations,
+                )?;
+                println!(
+                    "  offers     {} association(s) over {} credential(s) · {} + {} · slot {base_slot}",
+                    snapshot.entries,
+                    snapshot.credentials,
+                    human_bytes(snapshot.table.len),
+                    human_bytes(snapshot.blob.len),
+                );
+                println!("             {}", snapshot.table.key);
+                println!("             {}", snapshot.blob.key);
+                println!("             {}", live_book::publish::offer_catalogue_key());
+            }
+        },
+    }
+
     println!(
-        "\nupload the whole directory, preserving paths, with:\n  \
+        "\nupload the book's files, preserving paths, with:\n  \
          Content-Type: application/octet-stream\n  \
          Cache-Control: public, max-age=31536000, immutable\n\
          …then flip the epoch pointer LAST, conditionally, so no reader ever sees\n\
-         a pointer naming parts that are not there yet."
+         a pointer naming parts that are not there yet.\n\n\
+         ⚠️ Two destinations, not one: everything except `offers/` goes under the\n\
+         book prefix, and `offers/` goes to the bucket's ROOT — the set versions on\n\
+         its own. Its `offers/v1/current` is the only mutable object in the layout,\n\
+         so it goes up with `Cache-Control: public, max-age=60`, never `immutable`,\n\
+         or the flip caches for a year."
     );
     Ok(())
 }
@@ -6594,6 +6727,139 @@ mod tests {
             1,
             "and running it again must not accumulate the line: {meta}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The walk's two halves reach the offer pass through [`Sink`], in the walk's own
+    /// order — the block's reveals first, then the outputs they name — and the book is
+    /// what decides which of the answers a publisher may write.
+    ///
+    /// ⚠️ The era dispatch that *feeds* this (`feed_witnesses`) needs a decoded block,
+    /// and the chunk store that would supply one lives on the arm box; what is covered
+    /// here is everything downstream of it, which is where the pass's own rules run.
+    #[test]
+    fn a_sink_feeds_the_offer_pass_and_a_spent_offer_is_not_published() {
+        use crate::offers::{self, OfferPass};
+
+        let dir = std::env::temp_dir().join(format!("fold-probe-offers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A candidate sits at a real venue: jpg's collection-offer address, taken from
+        // the registry, so a change there cannot leave this test asserting a string.
+        let venue = offers::venues()
+            .into_iter()
+            .find(|v| v.address.is_some())
+            .expect("an address-shaped venue is registered");
+        let address = venue.address.clone().expect("it has one");
+
+        let (cbor, hash) = offers::offer_datum([0x77; 28]);
+        let still_open = (Hash::<32>::from([7u8; 32]), 3);
+        let cancelled = (Hash::<32>::from([8u8; 32]), 1);
+
+        let mut book = Book::create(&dir, 1 << 20).expect("create");
+        let mut pass = OfferPass::new();
+        {
+            let mut sink = Sink::Book(&mut book, &mut pass);
+            sink.witness(hash, &cbor);
+            for outref in [still_open, cancelled] {
+                sink.create_output(
+                    outref,
+                    6,
+                    5_000_000,
+                    &address,
+                    Datum::Hash(hash.as_ref()),
+                    std::iter::empty(),
+                )
+                .expect("create_output");
+            }
+            sink.spend(cancelled);
+        }
+
+        assert_eq!((pass.candidates, pass.decoded), (2, 2));
+        // …and liveness is the book's, not the pass's.
+        let publishable = pass.live(|(h, i)| book.is_live((Hash::from(*h), *i)));
+        assert_eq!(publishable.len(), 1, "a spent offer names no row");
+        assert_eq!(publishable[0].outref, ([7u8; 32], 3));
+
+        // A candidate whose datum the walk never saw is counted, not guessed at.
+        let mut cold = OfferPass::over(vec![venue]);
+        cold.output(cancelled, &address, Datum::Hash(hash.as_ref()));
+        assert_eq!((cold.decoded, cold.unreadable), (0, 1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The publisher lays the fold's associations out beside the book, keyed by the
+    /// boundary the book records — and the catalogue's consistency clause is the book's
+    /// own fingerprint, read back from the artifact rather than taken on trust.
+    #[test]
+    fn publish_lays_the_collected_associations_out_beside_the_book() {
+        use live_book::publish::{OfferCatalogue, offer_catalogue_key};
+
+        let dir =
+            std::env::temp_dir().join(format!("fold-probe-offer-publish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut b = Book::create(&dir, 1 << 20).expect("create");
+        let pol: &[u8] = &[0xCDu8; 28];
+        let name: &[u8] = b"n";
+        let mut addr = vec![0x61u8];
+        addr.extend_from_slice(&[0x11u8; 28]);
+        b.create_output(
+            (Hash::<32>::from([1u8; 32]), 0),
+            1,
+            5,
+            &addr,
+            Datum::None,
+            [(pol, name, 1u64)].into_iter(),
+        )
+        .expect("create_output");
+        b.set_base_slot(198_590_382);
+        b.finish().expect("finish");
+
+        // Before the pass has run: absent, and the publisher must say so rather than
+        // write an empty snapshot that claims the question was asked.
+        assert_eq!(
+            live_book::publish::read_offer_associations(&dir).expect("read"),
+            None
+        );
+
+        let associations = [live_book::publish::OfferAssociation {
+            credential: [0x11u8; 28],
+            outref: ([0xABu8; 32], 3),
+        }];
+        live_book::publish::write_offer_associations(&dir, &associations).expect("write");
+
+        let out = dir.join("layout");
+        publish(PublishArgs {
+            book: dir.clone(),
+            out: out.clone(),
+            skip_validate: false,
+            part_mib: 1,
+        })
+        .expect("publish");
+
+        let catalogue = OfferCatalogue::load(&out.join(offer_catalogue_key()))
+            .expect("load")
+            .expect("the publisher wrote one");
+        assert_eq!(catalogue.base_slot, 198_590_382);
+        assert_eq!(catalogue.snapshot.entries, 1);
+        assert_eq!(
+            catalogue.book_fingerprint,
+            live_book::Meta::open(&dir)
+                .expect("meta")
+                .fingerprint()
+                .to_string(),
+            "the catalogue names the boundary it was laid out against"
+        );
+        for object in [&catalogue.snapshot.table, &catalogue.snapshot.blob] {
+            assert!(
+                out.join(&object.key).exists(),
+                "{} is not at its key",
+                object.key
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

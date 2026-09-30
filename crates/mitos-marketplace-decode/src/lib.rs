@@ -22,6 +22,7 @@ pub mod listings;
 pub mod metadata_datum;
 pub mod offer_datum;
 pub mod offer_lifecycle;
+pub mod offer_venues;
 pub mod offers;
 pub mod sales;
 
@@ -32,6 +33,7 @@ pub use metadata_datum::{
 };
 pub use offer_datum::{DecodedOffer, decode_jpg_offer_datum, decode_wayup_offer_datum};
 pub use offer_lifecycle::{decode_jpg_offer_lifecycle, decode_wayup_offer_lifecycle};
+pub use offer_venues::{OfferDecode, OfferKey};
 pub use offers::{
     WayupOfferConfig, classify_jpg_offer_address, decode_jpg_offer_accepts,
     decode_wayup_offer_accepts,

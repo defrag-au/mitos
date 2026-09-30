@@ -187,10 +187,15 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "8deb21747bd8c9fe78574eda3511692d49a5562c" }
+#
+# ⚠️ BUMPED (2026-09-30) for `all_known_credentials`: the registry now enumerates its
+# payment credentials rather than only looking one up by hex, and the fold's offer
+# pass needs the whole set — Wayup's offer contract has no address anywhere in the
+# registry, so a consumer that can only ask by credential cannot name it at all.
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -262,9 +267,9 @@ strip = "symbols"
 
 # --- Patch overrides ---
 #
-# CURRENTLY ACTIVE (2026-08-16) — consuming the sibling tree at
-# `../shared-crates`.
-# **RE-COMMENT THE WHOLE BLOCK BEFORE COMMIT** so CI uses the git revs.
+# **COMMENTED (2026-09-30)** — the workspace builds from the pinned git revs above,
+# which is what CI and the arm box see. Un-comment to develop against the sibling
+# tree at `../shared-crates` instead; **re-comment the WHOLE BLOCK BEFORE COMMIT**.
 #
 # Toggle the block as a UNIT, never line by line: a selective edit either
 # duplicates a key (if a line ends up both active and commented) or breaks an

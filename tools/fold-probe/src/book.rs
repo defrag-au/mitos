@@ -340,6 +340,16 @@ impl Book {
         }
     }
 
+    /// Whether the book holds this outref as a live row.
+    ///
+    /// Asked by the offer pass at the boundary, and the only thing that knows: an
+    /// output created and spent inside the walk leaves a tombstone, not a row, so a
+    /// list of candidate associations is not the live book's answer.
+    pub fn is_live(&self, outref: (Hash<32>, u32)) -> bool {
+        let (prefix, tail) = split(&outref.0, outref.1);
+        self.find(prefix, tail).is_some()
+    }
+
     // ---- the index ----
 
     fn find(&self, prefix: u64, tail: u32) -> Option<usize> {

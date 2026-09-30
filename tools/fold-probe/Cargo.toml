@@ -24,6 +24,12 @@ path = "src/main.rs"
 # probe is now a client of the layout rather than its owner — the row offsets,
 # the entry shape, the directory fill and the policy table live there.
 live-book = { path = "../../crates/live-book" }
+# The offer pass's two registries of truth: which marketplace contracts carry
+# collection offers (the registry, shared with the frontend and the ledger tool)
+# and how each venue's datum reads (the decode crate, shared with the backfill).
+# `OFFER_INDEX_FORMAT.md` §7 step 3 is what they are here for.
+address-registry = { workspace = true }
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
 # Structured timing, so a number this tool prints can be compared with one another
 # tool prints — one vocabulary of operation names, one report shape.
 mitos-meter = { path = "../../crates/mitos-meter" }
