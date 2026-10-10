@@ -28,18 +28,20 @@
 //! prices them at the measured bytes, which is an estimate. The written
 //! artifact is fixture material, not a publishable build.
 //!
-//! # CIP-68: the inline datum, read from the output
+//! # CIP-68: the reference-token datum, three ways
 //!
 //! A CIP-68 asset's metadata lives on its reference token (`000643b0` + the
-//! asset's suffix) as a Plutus datum, in the minting transaction's output —
-//! not in the aux span. The sampler walks the body's outputs generically (no
-//! era guess) and takes the inline datum where there is one; the record's
-//! headline fields come from the platform's own `decode_cip68_datum`, so the
-//! index cannot disagree with a live consumer about what a datum means. A
-//! hash-attached datum's preimage needs the datum capture and is counted,
-//! not guessed at; a user token minted apart from its reference token is
-//! counted too (`ref not in this tx`) — the origin chase for that tail is
-//! unwritten.
+//! asset's suffix) as a Plutus datum, in a transaction's output — not in the
+//! aux span. The sampler walks the minting body's outputs generically (no
+//! era guess) and resolves the datum by whichever of the three routes the
+//! chain used: an **inline** datum (unwrapped from the ledger's
+//! `#6.24(bytes .cbor plutus_data)` envelope), a **hash-attached** datum (the
+//! preimage looked up in the published capture, `--datum-set`), or a user
+//! token minted apart from its reference token (the **origin chase**: the
+//! reference token is itself an indexed mint, so its own record leads back
+//! to the datum). The record's headline fields come from the platform's own
+//! `decode_cip68_datum`, so the index cannot disagree with a live consumer
+//! about what a datum means.
 //!
 //! # The payload
 //!
@@ -55,17 +57,20 @@
 //! cargo run --release --example resolve_sample -- \
 //!     --index-dir /opt/policy-index \
 //!     --immutable /opt/market-ledger/snapshot-full/db/immutable \
-//!     --out /opt/scratchpad/ami-sample
+//!     --out /opt/scratchpad/ami-sample \
+//!     --datum-set /srv/data/datum-set/publish
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use asset_metadata_index as ami;
 use cardano_assets::{Asset, decode_cip68_datum, decode_document};
+use live_book::format::DatumTable;
+use live_book::publish::{DatumCatalogue, datum_catalogue_key};
 use pallas_codec::minicbor;
 use pallas_codec::minicbor::data::Type;
 use pallas_crypto::hash::Hasher;
@@ -126,9 +131,17 @@ struct Stats {
     cip25_records: u64,
     cip25_declined: u64,
     cip68_records: u64,
-    cip68_hash_blocked: u64,
+    cip68_inline: u64,
+    cip68_hash_in_window: u64,
+    cip68_hash_by_sweep: u64,
+    cip68_hash_missed: u64,
     cip68_no_datum: u64,
+    cip68_unknown_datum: u64,
     cip68_pair_absent: u64,
+    cip68_chases: u64,
+    cip68_origin_resolved: u64,
+    cip68_own_token: u64,
+    cip68_chase_read_failures: u64,
     cip68_decode_declined: u64,
     cip68_shape_declined: u64,
     cip68_scan_failures: u64,
@@ -255,10 +268,13 @@ struct ScannedOutput {
 
 /// What an output's datum option was.
 enum ScannedDatum {
-    /// The inline datum — raw Plutus-data CBOR, the payload itself.
+    /// The inline datum — Plutus-data CBOR, already unwrapped from the
+    /// ledger's `#6.24` envelope.
     Inline(Vec<u8>),
-    /// A hash-attached (or unrecognised) option: the preimage is elsewhere.
-    Hash,
+    /// A hash-attached datum: the preimage needs the capture.
+    Hash([u8; 32]),
+    /// A datum option this walk did not recognise.
+    Unknown,
 }
 
 /// Is there another entry in a possibly-indefinite container?
@@ -408,8 +424,11 @@ fn scan_datum(d: &mut minicbor::Decoder<'_>, body: &[u8], scan: &mut ScannedOutp
                     scan.datum = Some(ScannedDatum::Inline(body[vstart..d.position()].to_vec()));
                 }
             } else {
-                scan.datum = Some(ScannedDatum::Hash);
-                d.skip().ok()?;
+                let h = d.bytes().ok()?;
+                scan.datum = Some(match <[u8; 32]>::try_from(h) {
+                    Ok(hash) => ScannedDatum::Hash(hash),
+                    Err(_) => ScannedDatum::Unknown,
+                });
             }
             // Drain any trailing element (definite encodings carry none).
             let mut extra = 2u64;
@@ -419,41 +438,125 @@ fn scan_datum(d: &mut minicbor::Decoder<'_>, body: &[u8], scan: &mut ScannedOutp
             }
         }
         Type::Bytes => {
-            d.skip().ok()?;
-            scan.datum = Some(ScannedDatum::Hash);
+            let b = d.bytes().ok()?;
+            scan.datum = Some(match <[u8; 32]>::try_from(b) {
+                Ok(hash) => ScannedDatum::Hash(hash),
+                Err(_) => ScannedDatum::Unknown,
+            });
         }
         _ => {
             d.skip().ok()?;
-            scan.datum = Some(ScannedDatum::Hash);
+            scan.datum = Some(ScannedDatum::Unknown);
         }
     }
     Some(())
 }
 
-/// The inline datum a labelled mint's asset promises, when this transaction
-/// carries it.
+/// The published datum capture — every window pair, opened up front.
 ///
-/// CIP-68 puts the metadata on the reference token — `000643b0` + the same
-/// suffix, whatever form the asset's own name takes — and the token is
-/// usually minted in the same transaction as the user token it describes.
-/// When it is not, this returns `None` and the miss is counted
-/// (`cip68_pair_absent`); the origin chase for that tail is unwritten.
+/// The windows are the fold's chunk ranges (`DatumCatalogue::covering_index`
+/// is the one definition of "which window holds this chunk"); a hash that is
+/// not in the covering window is swept for across the rest, because a
+/// hash-attached datum's preimage is only guaranteed to have been *witnessed*
+/// somewhere in the capture — a spend may have revealed it later than the
+/// mint that committed to it.
+struct DatumSet {
+    catalogue: DatumCatalogue,
+    tables: Vec<DatumTable>,
+}
+
+/// Where a hash-attached preimage was found.
+#[derive(Clone, Copy)]
+enum DatumFound {
+    /// The window covering the chunk the datum option was seen in.
+    Window,
+    /// Another window — the preimage was revealed later (or earlier) than
+    /// the committing transaction.
+    Sweep,
+}
+
+impl DatumSet {
+    /// Open the set rooted at the publish directory (the one holding
+    /// `datum/v1/`).
+    fn open(root: &Path) -> Result<DatumSet> {
+        let catalogue = DatumCatalogue::load(&root.join(datum_catalogue_key()))?;
+        let mut tables = Vec::with_capacity(catalogue.windows().len());
+        for entry in catalogue.windows() {
+            tables.push(DatumTable::open_pair(
+                &root.join(&entry.table.key),
+                &root.join(&entry.blob.key),
+            )?);
+        }
+        Ok(DatumSet { catalogue, tables })
+    }
+
+    fn get(&self, chunk: u16, hash: &[u8; 32]) -> Option<(&[u8], DatumFound)> {
+        if let Some(at) = self.catalogue.covering_index(chunk)
+            && let Some(bytes) = self.tables[at].get(hash)
+        {
+            return Some((bytes, DatumFound::Window));
+        }
+        for table in self.tables.iter().rev() {
+            if let Some(bytes) = table.get(hash) {
+                return Some((bytes, DatumFound::Sweep));
+            }
+        }
+        None
+    }
+
+    /// `(windows, distinct datums, first slot, last slot)` for the report.
+    fn summary(&self) -> (usize, u64, u64, u64) {
+        let windows = &self.catalogue.windows();
+        (
+            self.tables.len(),
+            windows.iter().map(|w| w.entries).sum(),
+            windows.iter().map(|w| w.first_slot).min().unwrap_or(0),
+            windows.iter().map(|w| w.last_slot).max().unwrap_or(0),
+        )
+    }
+}
+
+/// What one transaction's outputs said about an asset's output.
+enum RefDatum {
+    /// The datum's bytes, and where they came from.
+    Resolved(Vec<u8>, Venue),
+    /// An output was found; its datum did not resolve.
+    Missing(MissWhy),
+    /// No output held the name — the token lives elsewhere.
+    Absent,
+}
+
+/// How a datum was read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Venue {
+    Inline,
+    HashInWindow,
+    HashBySweep,
+}
+
+/// Why a datum did not resolve.
+#[derive(Clone, Copy)]
+enum MissWhy {
+    HashMissed,
+    NoDatum,
+    Unknown,
+}
+
+/// Resolve the datum an output commits to for `wanted`, from one body's
+/// outputs.
 ///
-/// `None` also covers a hash-attached datum (the preimage needs the datum
-/// capture), an output with no datum, or an unreadable body — the counters
-/// tell those apart, the record cannot, and it stays `Family::None` until one
-/// of them resolves.
-fn cip68_datum(
+/// Counts no outcome — the caller owns the outcome counter, so an entry that
+/// tries several routes is still counted once. The one counter here is the
+/// scan metric: how often a body would not scan at all.
+fn datum_in(
     body: &[u8],
     outputs: &mut Option<Option<Vec<ScannedOutput>>>,
     policy: &[u8],
-    name: &[u8],
+    wanted: &[u8],
+    chunk: u16,
+    datums: Option<&DatumSet>,
     stats: &mut Stats,
-) -> Option<Vec<u8>> {
-    let mut ref_name = Vec::with_capacity(name.len());
-    ref_name.extend_from_slice(&REFERENCE_LABEL);
-    ref_name.extend_from_slice(&name[4..]);
-
+) -> RefDatum {
     let scanned = outputs.get_or_insert_with(|| {
         let scanned = scan_outputs(body);
         if scanned.is_none() {
@@ -461,25 +564,143 @@ fn cip68_datum(
         }
         scanned
     });
-    let outputs = scanned.as_ref()?;
+    let Some(outputs) = scanned.as_ref() else {
+        return RefDatum::Absent;
+    };
     for out in outputs {
-        if !out.names.iter().any(|(p, n)| p == policy && n == &ref_name) {
+        if !out.names.iter().any(|(p, n)| p == policy && n == wanted) {
             continue;
         }
         return match &out.datum {
-            Some(ScannedDatum::Inline(datum)) => Some(datum.clone()),
-            Some(ScannedDatum::Hash) => {
-                stats.cip68_hash_blocked += 1;
-                None
-            }
-            None => {
-                stats.cip68_no_datum += 1;
-                None
-            }
+            Some(ScannedDatum::Inline(datum)) => RefDatum::Resolved(datum.clone(), Venue::Inline),
+            Some(ScannedDatum::Hash(hash)) => match datums.and_then(|d| d.get(chunk, hash)) {
+                Some((bytes, DatumFound::Window)) => {
+                    RefDatum::Resolved(bytes.to_vec(), Venue::HashInWindow)
+                }
+                Some((bytes, DatumFound::Sweep)) => {
+                    RefDatum::Resolved(bytes.to_vec(), Venue::HashBySweep)
+                }
+                None => RefDatum::Missing(MissWhy::HashMissed),
+            },
+            Some(ScannedDatum::Unknown) => RefDatum::Missing(MissWhy::Unknown),
+            None => RefDatum::Missing(MissWhy::NoDatum),
         };
     }
-    stats.cip68_pair_absent += 1;
-    None
+    RefDatum::Absent
+}
+
+/// Count one resolved datum's venue.
+fn count_venue(stats: &mut Stats, venue: Venue) {
+    match venue {
+        Venue::Inline => stats.cip68_inline += 1,
+        Venue::HashInWindow => stats.cip68_hash_in_window += 1,
+        Venue::HashBySweep => stats.cip68_hash_by_sweep += 1,
+    }
+}
+
+/// Count one entry's miss reason.
+fn count_miss(stats: &mut Stats, why: MissWhy) {
+    match why {
+        MissWhy::HashMissed => stats.cip68_hash_missed += 1,
+        MissWhy::NoDatum => stats.cip68_no_datum += 1,
+        MissWhy::Unknown => stats.cip68_unknown_datum += 1,
+    }
+}
+
+/// The datum a labelled mint's asset promises, resolved by whichever route
+/// the chain used:
+///
+/// 1. the reference token (`000643b0` + the suffix) among the minting
+///    transaction's own outputs;
+/// 2. the reference token's own origin — a user token minted apart from its
+///    reference token still finds the datum where the pair was created;
+/// 3. the entry's **own** output, for the dialect that mints no reference
+///    token and puts the datum on the token itself.
+///
+/// Exactly one outcome is counted per entry, whatever number of routes it
+/// took.
+#[allow(clippy::too_many_arguments)]
+fn cip68_datum(
+    reader: &mut ChunkReader,
+    base: &Base,
+    datums: Option<&DatumSet>,
+    body: &[u8],
+    outputs: &mut Option<Option<Vec<ScannedOutput>>>,
+    policy: &[u8],
+    name: &[u8],
+    here: (u16, u32),
+    stats: &mut Stats,
+) -> Option<Vec<u8>> {
+    let mut ref_name = Vec::with_capacity(name.len());
+    ref_name.extend_from_slice(&REFERENCE_LABEL);
+    ref_name.extend_from_slice(&name[4..]);
+
+    // 1. The reference token, here.
+    match datum_in(body, outputs, policy, &ref_name, here.0, datums, stats) {
+        RefDatum::Resolved(datum, venue) => {
+            count_venue(stats, venue);
+            return Some(datum);
+        }
+        RefDatum::Missing(why) => {
+            // A reference output exists here; its datum is the asset's answer.
+            count_miss(stats, why);
+            return None;
+        }
+        RefDatum::Absent => {}
+    }
+
+    // 2. The reference token's origin — it is itself an indexed mint, so its
+    // own record leads back to the transaction that created the datum.
+    stats.cip68_chases += 1;
+    if let Some(origin) = base.origin(
+        policy_index::policy_prefix(policy),
+        policy_index::name_prefix(&ref_name),
+    ) && (origin.chunk, origin.offset) != here
+    {
+        match reader.span(origin.chunk, origin.offset, origin.len) {
+            Some(origin_body) => {
+                let mut origin_outputs = Some(scan_outputs(&origin_body));
+                match datum_in(
+                    &origin_body,
+                    &mut origin_outputs,
+                    policy,
+                    &ref_name,
+                    origin.chunk,
+                    datums,
+                    stats,
+                ) {
+                    RefDatum::Resolved(datum, venue) => {
+                        stats.cip68_origin_resolved += 1;
+                        count_venue(stats, venue);
+                        return Some(datum);
+                    }
+                    RefDatum::Missing(why) => {
+                        count_miss(stats, why);
+                        return None;
+                    }
+                    RefDatum::Absent => {}
+                }
+            }
+            None => stats.cip68_chase_read_failures += 1,
+        }
+    }
+
+    // 3. The dialect with no reference token: the entry's own output.
+    match datum_in(body, outputs, policy, name, here.0, datums, stats) {
+        RefDatum::Resolved(datum, venue) => {
+            stats.cip68_own_token += 1;
+            count_venue(stats, venue);
+            Some(datum)
+        }
+        RefDatum::Missing(why) => {
+            count_miss(stats, why);
+            None
+        }
+        RefDatum::Absent => {
+            stats.cip68_pair_absent += 1;
+            None
+        }
+    }
 }
 
 /// A resolved CIP-68 record's headline fields, via the platform's own decode —
@@ -541,7 +762,14 @@ fn sample_txs(records: &[IndexRecord], cap: usize) -> Vec<&IndexRecord> {
 type AssetMaps<'a> = Vec<(Vec<u8>, Option<HashMap<Vec<u8>, &'a Metadatum>>)>;
 
 /// Resolve one sampled minting transaction into records.
-fn resolve_tx(reader: &mut ChunkReader, build: &mut Build, stats: &mut Stats, r: &IndexRecord) {
+fn resolve_tx(
+    reader: &mut ChunkReader,
+    base: &Base,
+    datums: Option<&DatumSet>,
+    build: &mut Build,
+    stats: &mut Stats,
+    r: &IndexRecord,
+) {
     stats.txs_read += 1;
     let Some(body) = reader.span(r.chunk, r.offset, r.len) else {
         stats.body_missing += 1;
@@ -675,7 +903,17 @@ fn resolve_tx(reader: &mut ChunkReader, build: &mut Build, stats: &mut Stats, r:
                 // a CIP-67-labelled name whose reference token's datum this
                 // transaction carries.
                 let datum = if cip67_labelled(name) {
-                    cip68_datum(&body, &mut outputs, policy, name, stats)
+                    cip68_datum(
+                        reader,
+                        base,
+                        datums,
+                        &body,
+                        &mut outputs,
+                        policy,
+                        name,
+                        (r.chunk, r.offset),
+                        stats,
+                    )
                 } else {
                     None
                 };
@@ -789,6 +1027,7 @@ struct Args {
     txs_per_policy: usize,
     limit_policies: usize,
     min_first_chunk: u16,
+    datum_set: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -798,6 +1037,7 @@ fn parse_args() -> Result<Args> {
     let mut txs_per_policy = TXS_PER_POLICY;
     let mut limit_policies = 0usize;
     let mut min_first_chunk = 0u16;
+    let mut datum_set = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -822,6 +1062,7 @@ fn parse_args() -> Result<Args> {
                     .context("--min-first-chunk needs a value")?
                     .parse()?
             }
+            "--datum-set" => datum_set = it.next().map(PathBuf::from),
             other => bail!("unknown argument {other}"),
         }
     }
@@ -832,6 +1073,7 @@ fn parse_args() -> Result<Args> {
         txs_per_policy,
         limit_policies,
         min_first_chunk,
+        datum_set,
     })
 }
 
@@ -853,6 +1095,16 @@ fn main() -> Result<()> {
     let mut files = ChunkReader::new(&args.immutable);
     let mut build = Build::default();
     let mut stats = Stats::default();
+
+    let datums = match &args.datum_set {
+        Some(root) => {
+            let set = DatumSet::open(root)?;
+            let (windows, entries, first, last) = set.summary();
+            eprintln!("datum set: {windows} windows, {entries} datums, slots {first}..={last}");
+            Some(set)
+        }
+        None => None,
+    };
 
     // Exact slice counts from the full index — every record, not the sample —
     // and the full build's read set: one read per distinct mint/burn span.
@@ -889,7 +1141,14 @@ fn main() -> Result<()> {
         }
         for r in spans {
             stats.txs_sampled += 1;
-            resolve_tx(&mut files, &mut build, &mut stats, r);
+            resolve_tx(
+                &mut files,
+                &base,
+                datums.as_ref(),
+                &mut build,
+                &mut stats,
+                r,
+            );
         }
         if seen.is_multiple_of(5000) {
             eprintln!(
@@ -996,6 +1255,16 @@ fn main() -> Result<()> {
     ));
     line(format!("immutable   {}", args.immutable.display()));
     line(format!("out         {}", args.out.display()));
+    if let Some(root) = &args.datum_set {
+        let (windows, entries, first, last) = datums
+            .as_ref()
+            .map(DatumSet::summary)
+            .unwrap_or((0, 0, 0, 0));
+        line(format!(
+            "datum set   {} ({windows} windows, {entries} datums, slots {first}..={last})",
+            root.display()
+        ));
+    }
     line(format!(
         "sample      {} of {} policies (strided at ≤{} txs), {} with no mint event",
         stats.policies,
@@ -1065,12 +1334,22 @@ fn main() -> Result<()> {
         stats.cip25_declined, stats.cip68_decode_declined, stats.cip68_shape_declined
     ));
     line(format!(
-        "  cip68     resolved inline {} | hash-attached {} | no datum {} | ref not in this tx {} | scan failed {}",
-        stats.cip68_records,
-        stats.cip68_hash_blocked,
+        "  cip68     {} inline | {} hash in-window | {} hash by sweep | {} via origin chase ({} chases) | {} own-token dialect",
+        stats.cip68_inline,
+        stats.cip68_hash_in_window,
+        stats.cip68_hash_by_sweep,
+        stats.cip68_origin_resolved,
+        stats.cip68_chases,
+        stats.cip68_own_token
+    ));
+    line(format!(
+        "  cip68-miss hash {} | no datum {} | unknown {} | no ref origin {} | scan failed {} | chase read failed {}",
+        stats.cip68_hash_missed,
         stats.cip68_no_datum,
+        stats.cip68_unknown_datum,
         stats.cip68_pair_absent,
-        stats.cip68_scan_failures
+        stats.cip68_scan_failures,
+        stats.cip68_chase_read_failures
     ));
     line(format!(
         "  unresolved by label  ref {}, nft {}, ft {}, rft {}, bare {}",

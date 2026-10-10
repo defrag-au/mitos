@@ -4890,6 +4890,7 @@ dependencies = [
  "asset-metadata-index",
  "cardano-assets",
  "hex",
+ "live-book",
  "memmap2",
  "pallas-codec 1.4.0",
  "pallas-crypto 1.4.0",

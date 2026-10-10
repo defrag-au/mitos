@@ -52,6 +52,8 @@ serde_json = { workspace = true }
 # ASSET_METADATA_INDEX.md). DEV-only on both counts: the mint-keyed index
 # itself must not grow an opinion about the resolved format or its decoder.
 # `cip68` because the sampler reads the reference-token datum — the workspace
-# dep enables only cip14+cip25.
+# dep enables only cip14+cip25 — and `live-book` for `DatumTable`, the
+# published datum capture hash-attached preimages come from.
 asset-metadata-index = { path = "../../../shared-crates/asset-metadata-index" }
 cardano-assets = { workspace = true, features = ["cip68"] }
+live-book = { path = "../live-book" }

@@ -555,25 +555,28 @@ pub struct DatumTable {
 #[cfg(feature = "mmap")]
 impl DatumTable {
     pub fn open(dir: &Path) -> Result<DatumTable> {
-        let path = dir.join(DATUM_FILE);
-        let entries = map(&path)?;
-        let header = parse_datum_header(&entries, &path.display().to_string())?;
+        Self::open_pair(&dir.join(DATUM_FILE), &dir.join(DATUM_BLOB))
+    }
+
+    /// Open a pair by its own file paths — the published set names windows
+    /// `w-<first_slot>-<last_slot>-<digest>.tbl|.bin` (`publish.rs`'s keys), so a
+    /// reader of the publish tree opens them by the names the catalogue lists
+    /// rather than by the working directory's `datum.tbl|datum.bin` convention.
+    pub fn open_pair(table_path: &Path, blob_path: &Path) -> Result<DatumTable> {
+        let entries = map(table_path)?;
+        let header = parse_datum_header(&entries, &table_path.display().to_string())?;
         let n = header.entries as usize;
         let (first_slot, last_slot) = (header.first_slot, header.last_slot);
         let want = DATUM_HEADER + DATUM_ENTRY_BYTES * n;
         if entries.len() != want {
             bail!(
                 "{} is {} B; {n} entries need {want}",
-                path.display(),
+                table_path.display(),
                 entries.len()
             );
         }
 
-        let blob = if n == 0 {
-            None
-        } else {
-            Some(map(&dir.join(DATUM_BLOB))?)
-        };
+        let blob = if n == 0 { None } else { Some(map(blob_path)?) };
         let blob_len = blob.as_ref().map_or(0usize, |b| b.len());
 
         // The tiling check: a scan rather than a lookup, because a blob that belongs to
@@ -592,8 +595,8 @@ impl DatumTable {
                 bail!(
                     "{} does not tile {}: entry {i} starts at {off}, {expect} expected — \
                      the two files are not from the same capture",
-                    path.display(),
-                    DATUM_BLOB
+                    table_path.display(),
+                    blob_path.display()
                 );
             }
             expect += len as usize;
@@ -602,7 +605,7 @@ impl DatumTable {
             bail!(
                 "{} holds {blob_len} B; its {n} entries address {expect} — the two files are \
                  not from the same capture",
-                DATUM_BLOB
+                blob_path.display()
             );
         }
 
