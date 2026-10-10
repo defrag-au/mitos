@@ -192,10 +192,10 @@ pallas-network = "1.4.0"
 # payment credentials rather than only looking one up by hex, and the fold's offer
 # pass needs the whole set — Wayup's offer contract has no address anywhere in the
 # registry, so a consumer that can only ask by credential cannot name it at all.
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "697a3d32ebb8f77cb71a4aeb59648f6cacee0caa" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "0475149fbd76770bfd07a87ea100806314d0bc9b", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "0475149fbd76770bfd07a87ea100806314d0bc9b" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "0475149fbd76770bfd07a87ea100806314d0bc9b" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "0475149fbd76770bfd07a87ea100806314d0bc9b" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
