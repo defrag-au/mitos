@@ -189,6 +189,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "asset-metadata-index"
+version = "0.1.0"
+
+[[package]]
 name = "async-compression"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4883,6 +4887,8 @@ name = "policy-index"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "asset-metadata-index",
+ "cardano-assets",
  "hex",
  "memmap2",
  "pallas-codec 1.4.0",

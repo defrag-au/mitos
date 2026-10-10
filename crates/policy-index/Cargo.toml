@@ -48,3 +48,10 @@ tx-index = { path = "../tx-index" }
 # same reason as tx-index: an example's output format is not the crate's.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `examples/resolve_sample.rs` — the sampled resolved build (gate 2 of
+# ASSET_METADATA_INDEX.md). DEV-only on both counts: the mint-keyed index
+# itself must not grow an opinion about the resolved format or its decoder.
+# `cip68` because the sampler reads the reference-token datum — the workspace
+# dep enables only cip14+cip25.
+asset-metadata-index = { path = "../../../shared-crates/asset-metadata-index" }
+cardano-assets = { workspace = true, features = ["cip68"] }
