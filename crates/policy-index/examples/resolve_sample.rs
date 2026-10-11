@@ -1,5 +1,6 @@
-//! `resolve_sample` — the SAMPLED RESOLVED BUILD, gate 2 of
-//! `cnft.dev-workers/docs/design/ASSET_METADATA_INDEX.md`.
+//! `resolve_sample` — the resolved build, sampled by default and full with
+//! `--include-burns` plus an unbounded `--txs-per-policy` (gate 2 of
+//! `cnft.dev-workers/docs/design/ASSET_METADATA_INDEX.md`).
 //!
 //! For every policy in the policy index: take a stride sample of up to
 //! `--txs-per-policy` minting transactions, read each one's body + auxiliary
@@ -17,16 +18,56 @@
 //! - build wall time for the tx-sampled work (the backfill's unit cost);
 //! - the busiest chunks' segment sizes.
 //!
-//! # ⚠️ Sampled, never a backfill
+//! # ⚠️ Sampled by default
 //!
-//! Each policy contributes at most `--txs-per-policy` transactions, so a
-//! segment written here holds the sampled transactions' assets only. The
-//! per-record shape is real, and the worst-case slice is present whenever it
-//! lives in a single transaction (the first transaction of every policy is
-//! kept unconditionally); the totals are not. The slice report therefore
-//! counts events from the FULL policy index — the counts are exact — and
-//! prices them at the measured bytes, which is an estimate. The written
-//! artifact is fixture material, not a publishable build.
+//! Each policy contributes at most `--txs-per-policy` transactions, so the
+//! default artifact holds the sampled transactions' assets only — fixture
+//! material, not a publishable build. The per-record shape is real, and the
+//! worst-case slice is present whenever it lives in a single transaction (the
+//! first transaction of every policy is kept unconditionally); the totals are
+//! not. The slice report therefore counts events from the FULL policy index —
+//! the counts are exact — and prices them at the measured bytes.
+//!
+//! # The full build
+//!
+//! Two flags turn the sampler into the builder: a `--txs-per-policy` larger
+//! than any policy's transaction count removes the stride, and
+//! `--include-burns` emits an `Event::Burn` record for every negative-quantity
+//! entry. Together the artifact holds every mint and burn event of the corpus,
+//! once. The `v1-test` fixture was written without `--include-burns`; the
+//! production build must not be.
+//!
+//! # The incremental build — the daily sweep's first step
+//!
+//! `--min-chunk <n>` restricts every policy's events to chunks ≥ n, so only
+//! what the previous run had not covered is resolved and written. The
+//! pointer is merged rather than rewritten: `built_through` advances to the
+//! newest segment on disk, `records` is summed from the segment headers of
+//! the newly covered range (a re-run cannot double-count, a resumed run
+//! cannot under-count), and **`directory_through` stays put** — the
+//! directory sweep (`derive_directory delta`) advances it once the shards
+//! actually list the new chunks; moving it here would let a reader skip the
+//! frontier scan for chunks no shard covers yet.
+//!
+//! `--min-chunk` requires `--full` (no stride, burns included): an
+//! incremental window must hold every event, or a later window would have to
+//! rewrite a segment the directory had already folded — which the delta
+//! derivation refuses, by design (`RebuiltSegment`). A chunk whose segment
+//! already exists is not re-resolved, so an interrupted run resumes.
+//!
+//! The upper bound needs no flag: the policy index never covers the chunk
+//! store's newest file — the newest immutable chunk is still being appended
+//! to until the next one seals, and `tx-index::extract::list_chunks`
+//! excludes it — so "what the index covers" is always sealed ground.
+//!
+//! ```text
+//! cargo run --release --example resolve_sample -- \
+//!     --index-dir /opt/policy-index \
+//!     --immutable /opt/market-ledger/snapshot-full/db/immutable \
+//!     --out /opt/policy-index/full \
+//!     --datum-set /srv/data/datum-set/publish \
+//!     --min-chunk 9254 --full
+//! ```
 //!
 //! # CIP-68: the reference-token datum, three ways
 //!
@@ -63,6 +104,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -115,6 +157,7 @@ struct Stats {
     policies: u64,
     policies_empty: u64,
     txs_sampled: u64,
+    txs_resumed: u64,
     txs_read: u64,
     body_bytes: u64,
     aux_bytes: u64,
@@ -128,6 +171,7 @@ struct Stats {
     policy_absent_from_721: u64,
     burn_entries_skipped: u64,
     records: u64,
+    burn_records: u64,
     cip25_records: u64,
     cip25_declined: u64,
     cip68_records: u64,
@@ -735,17 +779,25 @@ fn cip68_fields(datum: &[u8], stats: &mut Stats) -> (Vec<u8>, Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Up to `cap` transaction spans for a policy — profile's stride, verbatim.
+/// With `include_burns`, burn spans stay in the list too (the full build).
 ///
 /// ⚠️ STRIDE, not the first N. A dated sub-series puts one series in a
 /// policy's opening transactions, so head-anchored sampling sees a prefix the
 /// collection as a whole does not share — MEASURED on "Cardano Kidz". The
 /// first transaction is kept unconditionally: it is the one every
 /// implementation is certain to hold.
-fn sample_txs(records: &[IndexRecord], cap: usize) -> Vec<&IndexRecord> {
-    let mut spans: Vec<&IndexRecord> = records.iter().filter(|r| !r.burned).collect();
+fn sample_txs(records: &[IndexRecord], cap: usize, include_burns: bool) -> Vec<&IndexRecord> {
+    let mut spans: Vec<&IndexRecord> = records
+        .iter()
+        .filter(|r| include_burns || !r.burned)
+        .collect();
     spans.sort_by_key(|r| (r.chunk, r.offset));
     spans.dedup_by_key(|r| (r.chunk, r.offset));
-    let stride = spans.len().div_ceil(cap.max(1)).max(1);
+    let stride = if spans.len() <= cap.max(1) {
+        1
+    } else {
+        spans.len().div_ceil(cap.max(1))
+    };
     let mut out: Vec<&IndexRecord> = spans
         .first()
         .copied()
@@ -768,6 +820,7 @@ fn resolve_tx(
     datums: Option<&DatumSet>,
     build: &mut Build,
     stats: &mut Stats,
+    include_burns: bool,
     r: &IndexRecord,
 ) {
     stats.txs_read += 1;
@@ -828,6 +881,32 @@ fn resolve_tx(
     let mut outputs: Option<Option<Vec<ScannedOutput>>> = None;
 
     for (policy, name, qty) in mine {
+        if *qty < 0 && include_burns {
+            let Ok(policy_id) = PolicyId::try_from(policy.as_slice()) else {
+                stats.malformed_policy += 1;
+                continue;
+            };
+            let record = ami::Record {
+                family: ami::Family::None,
+                event: ami::Event::Burn,
+                policy_id,
+                provenance: ami::Provenance {
+                    chunk: r.chunk,
+                    body_offset: r.offset,
+                    body_len: r.len,
+                    aux_offset: r.aux_offset,
+                    aux_len: r.aux_len,
+                },
+                name: name.clone(),
+                image: Vec::new(),
+                media_type: Vec::new(),
+                media: Vec::new(),
+                payload: Vec::new(),
+            };
+            stats.burn_records += 1;
+            push_record(build, stats, policy_id, r.chunk, record);
+            continue;
+        }
         if *qty <= 0 {
             stats.burn_entries_skipped += 1;
             continue;
@@ -944,10 +1023,6 @@ fn resolve_tx(
             }
         };
 
-        let media_link_bytes: u64 = media
-            .iter()
-            .map(|m| (6 + m.src.len() + m.media_type.len() + m.name.len()) as u64)
-            .sum();
         let record = ami::Record {
             family,
             event: ami::Event::Mint,
@@ -966,29 +1041,39 @@ fn resolve_tx(
             payload,
         };
 
-        stats.records += 1;
-        let len = record.encoded_len() as u64;
-        stats.record_bytes += len;
-        stats.name_bytes += record.name.len() as u64;
-        stats.image_bytes += record.image.len() as u64;
-        stats.media_type_bytes += record.media_type.len() as u64;
-        stats.media_link_bytes += media_link_bytes;
-        stats.payload_bytes += record.payload.len() as u64;
-        stats.record_lens.push(len);
-
-        build
-            .segments
-            .entry(r.chunk)
-            .or_default()
-            .entry(policy_id)
-            .or_default()
-            .push(record);
-        build
-            .directory
-            .entry(policy_id)
-            .or_default()
-            .insert(r.chunk);
+        push_record(build, stats, policy_id, r.chunk, record);
     }
+}
+
+/// Bookkeep one record and file it into the build.
+fn push_record(
+    build: &mut Build,
+    stats: &mut Stats,
+    policy_id: PolicyId,
+    chunk: u16,
+    record: ami::Record,
+) {
+    stats.records += 1;
+    let len = record.encoded_len() as u64;
+    stats.record_bytes += len;
+    stats.name_bytes += record.name.len() as u64;
+    stats.image_bytes += record.image.len() as u64;
+    stats.media_type_bytes += record.media_type.len() as u64;
+    stats.media_link_bytes += record
+        .media
+        .iter()
+        .map(|m| (6 + m.src.len() + m.media_type.len() + m.name.len()) as u64)
+        .sum::<u64>();
+    stats.payload_bytes += record.payload.len() as u64;
+    stats.record_lens.push(len);
+    build
+        .segments
+        .entry(chunk)
+        .or_default()
+        .entry(policy_id)
+        .or_default()
+        .push(record);
+    build.directory.entry(policy_id).or_default().insert(chunk);
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,7 +1112,9 @@ struct Args {
     txs_per_policy: usize,
     limit_policies: usize,
     min_first_chunk: u16,
+    min_chunk: u16,
     datum_set: Option<PathBuf>,
+    include_burns: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -1037,7 +1124,10 @@ fn parse_args() -> Result<Args> {
     let mut txs_per_policy = TXS_PER_POLICY;
     let mut limit_policies = 0usize;
     let mut min_first_chunk = 0u16;
+    let mut min_chunk = 0u16;
+    let mut full = false;
     let mut datum_set = None;
+    let mut include_burns = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1062,9 +1152,19 @@ fn parse_args() -> Result<Args> {
                     .context("--min-first-chunk needs a value")?
                     .parse()?
             }
+            "--min-chunk" => min_chunk = it.next().context("--min-chunk needs a value")?.parse()?,
+            "--full" => full = true,
             "--datum-set" => datum_set = it.next().map(PathBuf::from),
+            "--include-burns" => include_burns = true,
             other => bail!("unknown argument {other}"),
         }
+    }
+    if full {
+        txs_per_policy = usize::MAX;
+        include_burns = true;
+    }
+    if min_chunk > 0 && !full {
+        bail!("--min-chunk builds must be complete — pass --full (no stride, burns included)");
     }
     Ok(Args {
         index_dir: index_dir.context("--index-dir is required")?,
@@ -1073,8 +1173,32 @@ fn parse_args() -> Result<Args> {
         txs_per_policy,
         limit_policies,
         min_first_chunk,
+        min_chunk,
         datum_set,
+        include_burns,
     })
+}
+
+/// The chunks already built under `segments_dir`, and the newest of them.
+fn built_segments(segments_dir: &Path) -> Result<(HashSet<u16>, Option<u16>)> {
+    let mut chunks = HashSet::new();
+    if segments_dir.is_dir() {
+        for entry in fs::read_dir(segments_dir)? {
+            let path = entry?.path();
+            if !path.extension().is_some_and(|extension| extension == "bin") {
+                continue;
+            }
+            if let Some(chunk) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u16>().ok())
+            {
+                chunks.insert(chunk);
+            }
+        }
+    }
+    let present = chunks.iter().copied().max();
+    Ok((chunks, present))
 }
 
 fn main() -> Result<()> {
@@ -1095,6 +1219,13 @@ fn main() -> Result<()> {
     let mut files = ChunkReader::new(&args.immutable);
     let mut build = Build::default();
     let mut stats = Stats::default();
+
+    // What is already built. The incremental build resumes from these
+    // segments, and the pointer merge counts records from the artifacts on
+    // disk — never from this run's own tally — so a re-run cannot
+    // double-count and a resumed run cannot under-count.
+    let segments_dir = args.out.join("segments");
+    let (existing_segments, present_before) = built_segments(&segments_dir)?;
 
     let datums = match &args.datum_set {
         Some(root) => {
@@ -1120,12 +1251,16 @@ fn main() -> Result<()> {
         if run.first_chunk < args.min_first_chunk {
             continue;
         }
+        let mut records = base.records_of(run.policy_prefix);
+        records.retain(|r| r.chunk >= args.min_chunk);
+        if records.is_empty() {
+            continue;
+        }
         if args.limit_policies > 0 && seen >= args.limit_policies {
             break;
         }
         seen += 1;
         stats.policies += 1;
-        let records = base.records_of(run.policy_prefix);
         for r in &records {
             tx_spans.insert((r.chunk, r.offset));
             let slice = slices.entry((r.chunk, run.policy_prefix)).or_default();
@@ -1135,7 +1270,20 @@ fn main() -> Result<()> {
                 slice.mints += 1;
             }
         }
-        let spans = sample_txs(&records, args.txs_per_policy);
+        let spans = sample_txs(&records, args.txs_per_policy, args.include_burns);
+        let sampled = spans.len();
+        // An incremental run resumes: a chunk whose segment already exists is
+        // immutable ground and is not re-resolved (its records reach the
+        // pointer through the artifact scan at the merge).
+        let spans: Vec<&IndexRecord> = if args.min_chunk > 0 {
+            spans
+                .into_iter()
+                .filter(|r| !existing_segments.contains(&r.chunk))
+                .collect()
+        } else {
+            spans
+        };
+        stats.txs_resumed += (sampled - spans.len()) as u64;
         if spans.is_empty() {
             stats.policies_empty += 1;
         }
@@ -1147,6 +1295,7 @@ fn main() -> Result<()> {
                 datums.as_ref(),
                 &mut build,
                 &mut stats,
+                args.include_burns,
                 r,
             );
         }
@@ -1163,10 +1312,7 @@ fn main() -> Result<()> {
 
     // ── write the artifact ────────────────────────────────────────────────
     let encode_started = Instant::now();
-    let segments_dir = args.out.join("segments");
-    let directory_dir = args.out.join("directory");
     fs::create_dir_all(&segments_dir)?;
-    fs::create_dir_all(&directory_dir)?;
 
     let mut segment_sizes: Vec<(u16, usize, u32, u32)> = Vec::new();
     let mut segment_bytes_total: u64 = 0;
@@ -1197,44 +1343,105 @@ fn main() -> Result<()> {
         segment_sizes.push((chunk, bytes.len(), record_count, index_count));
     }
 
+    // The v1 directory is a full-build artifact: an incremental window would
+    // write a shard set holding only the window's entries. The live path is
+    // the v2 directory plus the delta sweep; full builds keep emitting v1 for
+    // the reconciliation flow.
     let mut shard_sizes: Vec<(u8, usize)> = Vec::new();
     let directory_through = max_chunk;
-    for shard in 0u8..=255 {
-        let entries: Vec<ami::DirectoryEntry> = build
-            .directory
-            .iter()
-            .filter(|(p, _)| p[0] == shard)
-            .map(|(p, chunks)| ami::DirectoryEntry {
-                policy_id: *p,
-                chunks: chunks.iter().copied().collect(),
-            })
-            .collect();
-        if entries.is_empty() {
-            continue;
+    if args.min_chunk == 0 {
+        let directory_dir = args.out.join("directory");
+        fs::create_dir_all(&directory_dir)?;
+        for shard in 0u8..=255 {
+            let entries: Vec<ami::DirectoryEntry> = build
+                .directory
+                .iter()
+                .filter(|(p, _)| p[0] == shard)
+                .map(|(p, chunks)| ami::DirectoryEntry {
+                    policy_id: *p,
+                    candidates: chunks
+                        .iter()
+                        .map(|chunk| ami::DirectoryCandidate {
+                            chunk: *chunk,
+                            filter: Vec::new(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let bytes = ami::DirectoryShard {
+                version: ami::DIRECTORY_V1,
+                network: ami::NETWORK_MAINNET,
+                shard,
+                directory_through_chunk: directory_through,
+                entries,
+            }
+            .encode()?;
+            fs::write(directory_dir.join(format!("{shard:02x}.bin")), &bytes)?;
+            shard_sizes.push((shard, bytes.len()));
         }
-        let bytes = ami::DirectoryShard {
-            network: ami::NETWORK_MAINNET,
-            shard,
-            directory_through_chunk: directory_through,
-            entries,
-        }
-        .encode()?;
-        fs::write(directory_dir.join(format!("{shard:02x}.bin")), &bytes)?;
-        shard_sizes.push((shard, bytes.len()));
     }
 
     let published_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let pointer = ami::Pointer {
-        network: ami::NETWORK_MAINNET,
-        built_through_chunk: max_chunk,
-        directory_through_chunk: directory_through,
-        record_count: stats.records,
-        published_at,
+    let pointer_path = args.out.join("current");
+    let pointer = if args.min_chunk > 0 {
+        let old =
+            ami::Pointer::parse_str(&fs::read_to_string(&pointer_path).with_context(|| {
+                format!(
+                    "--min-chunk merges the existing pointer, and {} does not read",
+                    pointer_path.display()
+                )
+            })?)
+            .context("the existing pointer does not parse")?;
+        let present = present_before.unwrap_or(0).max(max_chunk);
+        if present > last_chunk {
+            bail!(
+                "built segments reach chunk {present}, beyond the index's coverage ({last_chunk})"
+            );
+        }
+        if old.built_through_chunk > present {
+            bail!(
+                "the pointer claims built_through {} but the newest segment is {present} — refusing to merge over a broken build",
+                old.built_through_chunk
+            );
+        }
+        let built_through = old.built_through_chunk.max(present);
+        // Records accumulate from the segment headers of the newly covered
+        // range: every chunk in it that has a segment is counted exactly
+        // once, whether this run wrote it or a previous attempt did.
+        let mut merged_records = old.record_count;
+        for chunk in (old.built_through_chunk + 1)..=built_through {
+            let path = segments_dir.join(format!("{chunk:05}.bin"));
+            let Ok(mut file) = fs::File::open(&path) else {
+                continue; // a chunk with no records has no segment
+            };
+            let mut head = [0u8; ami::SEGMENT_HEADER_LEN];
+            file.read_exact(&mut head)
+                .with_context(|| format!("{}: shorter than a segment header", path.display()))?;
+            merged_records += u64::from(ami::SegmentHeader::parse(&head)?.record_count);
+        }
+        ami::Pointer {
+            network: old.network,
+            built_through_chunk: built_through,
+            directory_through_chunk: old.directory_through_chunk,
+            record_count: merged_records,
+            published_at,
+        }
+    } else {
+        ami::Pointer {
+            network: ami::NETWORK_MAINNET,
+            built_through_chunk: max_chunk,
+            directory_through_chunk: directory_through,
+            record_count: stats.records,
+            published_at,
+        }
     };
-    fs::write(args.out.join("current"), pointer.encode())?;
+    fs::write(&pointer_path, pointer.encode())?;
     let encode_secs = encode_started.elapsed().as_secs_f64();
 
     // ── report ────────────────────────────────────────────────────────────
@@ -1245,7 +1452,12 @@ fn main() -> Result<()> {
         report.push('\n');
     };
 
-    line("resolve_sample — the sampled resolved build (ASSET_METADATA_INDEX.md, gate 2)".into());
+    let title = if args.min_chunk > 0 {
+        "resolve_sample — the incremental build (ASSET_METADATA_INDEX.md)"
+    } else {
+        "resolve_sample — the sampled resolved build (ASSET_METADATA_INDEX.md, gate 2)"
+    };
+    line(title.into());
     line(String::new());
     line(format!("index       {}", args.index_dir.display()));
     line(format!(
@@ -1265,11 +1477,20 @@ fn main() -> Result<()> {
             root.display()
         ));
     }
+    let mode = match (args.min_chunk > 0, args.include_burns) {
+        (true, _) => "incremental",
+        (false, true) => "full",
+        _ => "sample",
+    };
+    let cap = if args.txs_per_policy == usize::MAX {
+        "unbounded".to_string()
+    } else {
+        format!("≤{}", args.txs_per_policy)
+    };
     line(format!(
-        "sample      {} of {} policies (strided at ≤{} txs), {} with no mint event",
+        "{mode:<11} {} of {} policies (strided at {cap} txs), {} with no event",
         stats.policies,
         runs.len(),
-        args.txs_per_policy,
         stats.policies_empty
     ));
     if args.min_first_chunk > 0 {
@@ -1278,12 +1499,22 @@ fn main() -> Result<()> {
             args.min_first_chunk
         ));
     }
+    if args.min_chunk > 0 {
+        line(format!(
+            "  window    events from chunk {} up; directory_through left for the sweep",
+            args.min_chunk
+        ));
+    }
+    line(format!(
+        "pointer     built_through {} · directory_through {} · records {}",
+        pointer.built_through_chunk, pointer.directory_through_chunk, pointer.record_count
+    ));
     line(String::new());
 
     line(format!("read        {read_secs:.1}s"));
     line(format!(
-        "  txs       {} sampled, {} resolved, {} records",
-        stats.txs_sampled, stats.txs_read, stats.records
+        "  txs       {} sampled, {} resolved, {} records, {} resumed",
+        stats.txs_sampled, stats.txs_read, stats.records, stats.txs_resumed
     ));
     let tx_skips = stats.body_missing
         + stats.body_decode_failures
@@ -1323,11 +1554,12 @@ fn main() -> Result<()> {
     line(String::new());
 
     line(format!(
-        "records     {}  ({} CIP-25, {} CIP-68, {} unresolved)",
+        "records     {}  ({} CIP-25, {} CIP-68, {} unresolved, {} burn)",
         stats.records,
         stats.cip25_records + stats.cip25_declined,
         stats.cip68_records,
-        stats.unresolved_records
+        stats.unresolved_records,
+        stats.burn_records
     ));
     line(format!(
         "  declined  decode_document {} of CIP-25; CIP-68 framing {} + asset shape {} (payloads kept)",
@@ -1460,31 +1692,42 @@ fn main() -> Result<()> {
 
     segment_sizes.sort_by_key(|(_, len, _, _)| std::cmp::Reverse(*len));
     let segment_files = segment_sizes.len();
-    line(format!(
-        "segments    {} files (chunks {min_chunk}..={max_chunk}), {} total, mean {}, max {}",
-        segment_files,
-        bytes(segment_bytes_total),
-        bytes(segment_bytes_total / segment_files.max(1) as u64),
-        bytes(segment_sizes.first().map_or(0, |(_, l, _, _)| *l as u64))
-    ));
-    for (chunk, len, records, policies) in segment_sizes.iter().take(5) {
+    if segment_files == 0 {
+        line("segments    none built (every window chunk already on disk)".into());
+    } else {
         line(format!(
-            "  chunk {chunk:05}  {}  ({records} records, {policies} policies)",
-            bytes(*len as u64)
+            "segments    {} files (chunks {min_chunk}..={max_chunk}), {} total, mean {}, max {}",
+            segment_files,
+            bytes(segment_bytes_total),
+            bytes(segment_bytes_total / segment_files as u64),
+            bytes(segment_sizes.first().map_or(0, |(_, l, _, _)| *l as u64))
         ));
+        for (chunk, len, records, policies) in segment_sizes.iter().take(5) {
+            line(format!(
+                "  chunk {chunk:05}  {}  ({records} records, {policies} policies)",
+                bytes(*len as u64)
+            ));
+        }
     }
-    let shard_total: u64 = shard_sizes.iter().map(|(_, l)| *l as u64).sum();
-    shard_sizes.sort_by_key(|(_, l)| std::cmp::Reverse(*l));
-    line(format!(
-        "directory   {} shards, {} total, max {} (shard {:02x})",
-        shard_sizes.len(),
-        bytes(shard_total),
-        bytes(shard_sizes.first().map_or(0, |(_, l)| *l as u64)),
-        shard_sizes.first().map_or(0, |(s, _)| *s)
-    ));
-    line(format!(
-        "encode      {encode_secs:.1}s (segments + hash + directory + pointer)"
-    ));
+    if args.min_chunk == 0 {
+        let shard_total: u64 = shard_sizes.iter().map(|(_, l)| *l as u64).sum();
+        shard_sizes.sort_by_key(|(_, l)| std::cmp::Reverse(*l));
+        line(format!(
+            "directory   {} shards, {} total, max {} (shard {:02x})",
+            shard_sizes.len(),
+            bytes(shard_total),
+            bytes(shard_sizes.first().map_or(0, |(_, l)| *l as u64)),
+            shard_sizes.first().map_or(0, |(s, _)| *s)
+        ));
+    } else {
+        line("directory   untouched — the v2 delta sweep folds this window next".into());
+    }
+    let encoded = if args.min_chunk == 0 {
+        "segments + hash + directory + pointer"
+    } else {
+        "segments + hash + pointer"
+    };
+    line(format!("encode      {encode_secs:.1}s ({encoded})"));
     line(String::new());
 
     // The self-check the format's own arithmetic affords: the records region
@@ -1503,10 +1746,12 @@ fn main() -> Result<()> {
         bytes(stats.record_bytes)
     ));
 
-    fs::write(args.out.join("summary.txt"), &report)?;
-    eprintln!(
-        "wrote summary to {}",
-        args.out.join("summary.txt").display()
-    );
+    let summary = if args.min_chunk == 0 {
+        args.out.join("summary.txt")
+    } else {
+        args.out.join("summary-incremental.txt")
+    };
+    fs::write(&summary, &report)?;
+    eprintln!("wrote summary to {}", summary.display());
     Ok(())
 }
