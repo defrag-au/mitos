@@ -66,8 +66,8 @@ pub mod source;
 pub use chunk::{Block, Blocks, Chunk, ChunkFile, Span};
 pub use multipart::Part;
 pub use sidecar::{Entry, Primary, SECONDARY_ENTRY_LEN, parse_primary, read_entries};
+#[cfg(feature = "native")]
+pub use source::{HttpMirror, LocalDir};
 pub use source::{
     MAX_BATCH_BYTES, MAX_BATCH_RANGES, MAX_RANGE, RangeSource, batches, validate_batch,
 };
-#[cfg(feature = "native")]
-pub use source::{HttpMirror, LocalDir};

@@ -611,9 +611,13 @@ mod tests {
     /// a silent wrong answer, not a short read.
     #[test]
     fn a_shard_base_that_does_not_bound_the_entry_is_refused() {
-        let err = shard_entries_span_from(100, 200, 5_000).unwrap_err().to_string();
+        let err = shard_entries_span_from(100, 200, 5_000)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("precedes"), "{err}");
-        let err = shard_entries_span_from(200, 100, 0).unwrap_err().to_string();
+        let err = shard_entries_span_from(200, 100, 0)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("inverted"), "{err}");
         assert!(shard_base(&[1, 2]).is_err());
     }
@@ -639,7 +643,10 @@ mod tests {
         // The last shard's base is one shard-width before the sentinel — fence[512 · 32,767],
         // with the (2²⁴ + 1)th value bounding the final bucket.
         let last = shard_base_span(&h, 32_767);
-        assert_eq!(last.offset, h.dir_off + (1 << 24) * 4 - SHARD_BUCKETS * FENCE_BYTES);
+        assert_eq!(
+            last.offset,
+            h.dir_off + (1 << 24) * 4 - SHARD_BUCKETS * FENCE_BYTES
+        );
         assert!(last.offset + last.len <= h.entries_off);
     }
 

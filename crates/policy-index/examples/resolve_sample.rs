@@ -55,6 +55,20 @@
 //! derivation refuses, by design (`RebuiltSegment`). A chunk whose segment
 //! already exists is not re-resolved, so an interrupted run resumes.
 //!
+//! # The collection listings
+//!
+//! Alongside the segments, the same run folds one collection listing per
+//! touched policy (`collections/{policy}.bin` — `ASSET_METADATA_INDEX.md`
+//! §Formats): every standing asset, name-sorted. The fold reads the
+//! **segments on disk** over the newly covered window — the same range the
+//! pointer's record count walks — never this run's in-memory records, so a
+//! resumed run still folds exactly what the pointer is about to claim. A
+//! policy with no records in the window keeps its bytes and its
+//! `built_through`; a fold that changes nothing writes nothing.
+//! `--fold-only` seeds the back-catalogue in one pass — every segment under
+//! `out/segments` folded, nothing resolved — which is how policies that have
+//! not minted since listings landed get their object.
+//!
 //! The upper bound needs no flag: the policy index never covers the chunk
 //! store's newest file — the newest immutable chunk is still being appended
 //! to until the next one seals, and `tx-index::extract::list_chunks`
@@ -104,7 +118,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -889,6 +903,7 @@ fn resolve_tx(
             let record = ami::Record {
                 family: ami::Family::None,
                 event: ami::Event::Burn,
+                qty: *qty,
                 policy_id,
                 provenance: ami::Provenance {
                     chunk: r.chunk,
@@ -1026,6 +1041,7 @@ fn resolve_tx(
         let record = ami::Record {
             family,
             event: ami::Event::Mint,
+            qty: *qty,
             policy_id,
             provenance: ami::Provenance {
                 chunk: r.chunk,
@@ -1115,6 +1131,7 @@ struct Args {
     min_chunk: u16,
     datum_set: Option<PathBuf>,
     include_burns: bool,
+    fold_only: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -1128,6 +1145,7 @@ fn parse_args() -> Result<Args> {
     let mut full = false;
     let mut datum_set = None;
     let mut include_burns = false;
+    let mut fold_only = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1156,6 +1174,7 @@ fn parse_args() -> Result<Args> {
             "--full" => full = true,
             "--datum-set" => datum_set = it.next().map(PathBuf::from),
             "--include-burns" => include_burns = true,
+            "--fold-only" => fold_only = true,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -1166,16 +1185,34 @@ fn parse_args() -> Result<Args> {
     if min_chunk > 0 && !full {
         bail!("--min-chunk builds must be complete — pass --full (no stride, burns included)");
     }
+    let out = out.context("--out is required")?;
+    // `--fold-only` reads only `--out`: it seeds the listings from the
+    // segments already on disk and needs neither the index nor the chunks.
+    if fold_only {
+        return Ok(Args {
+            index_dir: index_dir.unwrap_or_default(),
+            immutable: immutable.unwrap_or_default(),
+            out,
+            txs_per_policy,
+            limit_policies,
+            min_first_chunk,
+            min_chunk,
+            datum_set,
+            include_burns,
+            fold_only,
+        });
+    }
     Ok(Args {
         index_dir: index_dir.context("--index-dir is required")?,
         immutable: immutable.context("--immutable is required")?,
-        out: out.context("--out is required")?,
+        out,
         txs_per_policy,
         limit_policies,
         min_first_chunk,
         min_chunk,
         datum_set,
         include_burns,
+        fold_only,
     })
 }
 
@@ -1201,8 +1238,178 @@ fn built_segments(segments_dir: &Path) -> Result<(HashSet<u16>, Option<u16>)> {
     Ok((chunks, present))
 }
 
+/// One run's listing-fold tally.
+#[derive(Default)]
+struct FoldStats {
+    /// Chunks whose segments were folded.
+    chunks: usize,
+    /// Policy listings the fold touched.
+    policies: u64,
+    /// Listings whose bytes changed and were written.
+    written: u64,
+    /// Bytes written across those listings.
+    bytes: u64,
+}
+
+/// Fold the segments in `from..=through` into the per-policy collection
+/// listings under `out/collections`.
+///
+/// The state lives in the files: a policy's listing is read, the window's
+/// records applied in recency order (a burn decrements its name's supply and
+/// clears it only at the last accounted copy, a mint or update replaces the
+/// metadata in force), and the file rewritten only when the bytes changed. A
+/// policy with no records in the window is not touched, so its listing keeps
+/// both its bytes and its `built_through`.
+///
+/// Reading the segments — not this run's records — is what makes an
+/// interrupted run safe to resume: a chunk whose segment already exists is
+/// not re-resolved, and the fold still covers it. Re-folding an overlapping
+/// window is also safe: a listing records the chunk it folded through
+/// (`built_through`), a chunk it has already folded is skipped, and quantities
+/// are therefore summed exactly once — a replay leaves the bytes untouched.
+fn fold_listings(out: &Path, from: u16, through: u16) -> Result<FoldStats> {
+    fs::create_dir_all(out.join("collections"))?;
+    let mut stats = FoldStats::default();
+    for chunk in from..=through {
+        let path = out.join("segments").join(format!("{chunk:05}.bin"));
+        let Ok(bytes) = fs::read(&path) else {
+            continue; // a chunk with no records has no segment
+        };
+        let view = ami::SegmentView::parse(&bytes)
+            .with_context(|| format!("{}: does not parse as a segment", path.display()))?;
+        stats.chunks += 1;
+        for entry in view.entries()? {
+            let policy = hex::encode(entry.policy_id);
+            let Some(slice) = view.slice(&entry.policy_id)? else {
+                bail!(
+                    "{policy}: the index entry has no slice in {}",
+                    path.display()
+                );
+            };
+            let records =
+                decode_records(slice).with_context(|| format!("{}: {policy}", path.display()))?;
+            fold_policy(out, chunk, &entry.policy_id, records, &mut stats)?;
+        }
+    }
+    Ok(stats)
+}
+
+/// Decode every record of a segment's per-policy slice, strictly: a record
+/// that refuses fails the run rather than under-folding silently (the
+/// `Records` iterator stops at a refusal; a listing must not).
+fn decode_records(slice: &[u8]) -> Result<Vec<ami::Record>> {
+    let mut records = Vec::new();
+    let mut at = 0usize;
+    while at < slice.len() {
+        let (record, consumed) = ami::Record::decode(&slice[at..])?;
+        records.push(record);
+        at += consumed;
+    }
+    Ok(records)
+}
+
+/// Apply one policy's window records to its listing file.
+fn fold_policy(
+    out: &Path,
+    chunk: u16,
+    policy_id: &PolicyId,
+    records: Vec<ami::Record>,
+    stats: &mut FoldStats,
+) -> Result<()> {
+    let path = out.join(ami::listing_key("", policy_id));
+    let existing = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut entries = match &existing {
+        Some(bytes) => {
+            let view = ami::ListingView::parse(bytes)
+                .with_context(|| format!("{}: does not parse as a listing", path.display()))?;
+            // Quantities sum, so a chunk this listing already folded must not
+            // be applied again: a replayed window — a crashed run, or the
+            // `--fold-only` reseed over listings a daily run wrote — leaves
+            // the bytes exactly as they are.
+            if view.header.built_through >= chunk {
+                return Ok(());
+            }
+            view.entries()?
+        }
+        None => Vec::new(),
+    };
+    for record in &records {
+        apply_record(&mut entries, record);
+    }
+    let bytes = ami::ListingBuilder {
+        network: ami::NETWORK_MAINNET,
+        policy_id: *policy_id,
+        built_through: chunk,
+        entries,
+    }
+    .encode()
+    .with_context(|| format!("encoding the listing for {}", hex::encode(policy_id)))?;
+    stats.policies += 1;
+    if existing.as_deref() == Some(bytes.as_slice()) {
+        return Ok(()); // the fold left the bytes identical — nothing to rewrite
+    }
+    // Temp + rename: a torn listing would otherwise block the next run's
+    // read-modify-write, and a listing is rewritten in place (segments are
+    // write-once, so they do not need this).
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming {}", tmp.display()))?;
+    stats.written += 1;
+    stats.bytes += bytes.len() as u64;
+    Ok(())
+}
+
+/// One record applied to a policy's standing entries: the entry's own supply
+/// arithmetic ([`ami::ListingEntry::apply`]) with a mint inserting a name the
+/// listing does not hold yet. Entries stay name-sorted throughout — the binary
+/// search rides it, and the listing format requires it.
+fn apply_record(entries: &mut Vec<ami::ListingEntry>, record: &ami::Record) {
+    match entries.binary_search_by(|entry| entry.name.as_slice().cmp(record.name.as_slice())) {
+        Ok(at) => {
+            if !entries[at].apply(record) {
+                entries.remove(at);
+            }
+        }
+        // Nothing standing to decrement: a burn floors at zero rather than
+        // going negative, and an update has no metadata to replace.
+        Err(_) if record.qty <= 0 => {}
+        Err(at) => {
+            let supply = u64::try_from(record.qty)
+                .expect("the guard above admits only a mint's positive quantity");
+            entries.insert(at, ami::ListingEntry::from_record(record, supply));
+        }
+    }
+}
+
+/// The one-time seed (`--fold-only`): fold every segment under
+/// `out/segments` into the listings, resolving nothing. The daily runs fold
+/// only their window; this is how the back-catalogue — every policy that has
+/// not minted since the listings landed — gets its object.
+fn fold_whole_tree(out: &Path) -> Result<()> {
+    let (_, present) = built_segments(&out.join("segments"))?;
+    let present = present.context("--fold-only needs a built tree under --out")?;
+    let started = Instant::now();
+    let stats = fold_listings(out, 1, present)?;
+    eprintln!(
+        "folded {} policies over {} chunks (through {present}), {} written, {}, {:.1}s",
+        stats.policies,
+        stats.chunks,
+        stats.written,
+        bytes(stats.bytes),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = parse_args()?;
+    if args.fold_only {
+        return fold_whole_tree(&args.out);
+    }
     let base = Base::open(&base_path(&args.index_dir))?;
     let (first_chunk, last_chunk) = base.covers();
     eprintln!(
@@ -1389,16 +1596,21 @@ fn main() -> Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let pointer_path = args.out.join("current");
-    let pointer = if args.min_chunk > 0 {
-        let old =
+    let old_pointer = if args.min_chunk > 0 {
+        Some(
             ami::Pointer::parse_str(&fs::read_to_string(&pointer_path).with_context(|| {
                 format!(
                     "--min-chunk merges the existing pointer, and {} does not read",
                     pointer_path.display()
                 )
             })?)
-            .context("the existing pointer does not parse")?;
-        let present = present_before.unwrap_or(0).max(max_chunk);
+            .context("the existing pointer does not parse")?,
+        )
+    } else {
+        None
+    };
+    let present = present_before.unwrap_or(0).max(max_chunk);
+    if let Some(old) = &old_pointer {
         if present > last_chunk {
             bail!(
                 "built segments reach chunk {present}, beyond the index's coverage ({last_chunk})"
@@ -1410,6 +1622,20 @@ fn main() -> Result<()> {
                 old.built_through_chunk
             );
         }
+    }
+
+    // ── the collection listings ───────────────────────────────────────────
+    // The window the pointer below claims, folded from the segments on disk
+    // — never from this run's memory, so a run that resumes from existing
+    // segments still folds them.
+    let listings_started = Instant::now();
+    let through_before = old_pointer
+        .as_ref()
+        .map_or(0, |old| old.built_through_chunk);
+    let listings = fold_listings(&args.out, through_before + 1, present)?;
+    let listings_secs = listings_started.elapsed().as_secs_f64();
+
+    let pointer = if let Some(old) = old_pointer {
         let built_through = old.built_through_chunk.max(present);
         // Records accumulate from the segment headers of the newly covered
         // range: every chunk in it that has a segment is counted exactly
@@ -1722,10 +1948,17 @@ fn main() -> Result<()> {
     } else {
         line("directory   untouched — the v2 delta sweep folds this window next".into());
     }
+    line(format!(
+        "listings    {listings_secs:.1}s — {} policies folded over {} chunks, {} written, {}",
+        listings.policies,
+        listings.chunks,
+        listings.written,
+        bytes(listings.bytes)
+    ));
     let encoded = if args.min_chunk == 0 {
-        "segments + hash + directory + pointer"
+        "segments + hash + directory + listings + pointer"
     } else {
-        "segments + hash + pointer"
+        "segments + hash + listings + pointer"
     };
     line(format!("encode      {encode_secs:.1}s ({encoded})"));
     line(String::new());
@@ -1754,4 +1987,357 @@ fn main() -> Result<()> {
     fs::write(&summary, &report)?;
     eprintln!("wrote summary to {}", summary.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ami::{Event, Family, Provenance};
+    use tempfile::TempDir;
+
+    fn policy(byte: u8) -> PolicyId {
+        [byte; ami::POLICY_ID_LEN]
+    }
+
+    fn record_qty(
+        event: Event,
+        qty: i64,
+        policy_id: PolicyId,
+        chunk: u16,
+        body_offset: u32,
+        name: &[u8],
+        image: &[u8],
+    ) -> ami::Record {
+        ami::Record {
+            family: Family::Cip25,
+            event,
+            qty,
+            policy_id,
+            provenance: Provenance {
+                chunk,
+                body_offset,
+                body_len: 100,
+                aux_offset: 0,
+                aux_len: 0,
+            },
+            name: name.to_vec(),
+            image: image.to_vec(),
+            media_type: b"image/png".to_vec(),
+            media: Vec::new(),
+            payload: Vec::new(),
+        }
+    }
+
+    /// The single-copy event — the chain's common shape: a mint adds one copy,
+    /// a burn removes one, an update moves none.
+    fn record(
+        event: Event,
+        policy_id: PolicyId,
+        chunk: u16,
+        body_offset: u32,
+        name: &[u8],
+        image: &[u8],
+    ) -> ami::Record {
+        let qty = match event {
+            Event::Mint => 1,
+            Event::Burn => -1,
+            Event::Update => 0,
+        };
+        record_qty(event, qty, policy_id, chunk, body_offset, name, image)
+    }
+
+    fn put_segment(out: &Path, chunk: u16, entries: Vec<(PolicyId, Vec<ami::Record>)>) {
+        let bytes = ami::SegmentBuilder {
+            network: ami::NETWORK_MAINNET,
+            chunk,
+            entries,
+        }
+        .encode()
+        .expect("encodes");
+        fs::create_dir_all(out.join("segments")).expect("mkdir");
+        fs::write(out.join(format!("segments/{chunk:05}.bin")), bytes).expect("writes");
+    }
+
+    /// The listing's `built_through` and entries, materialised.
+    fn listing(out: &Path, policy_id: &PolicyId) -> (u16, Vec<ami::ListingEntry>) {
+        let bytes = fs::read(out.join(ami::listing_key("", policy_id))).expect("reading listing");
+        let view = ami::ListingView::parse(&bytes).expect("parses");
+        (view.header.built_through, view.entries().expect("entries"))
+    }
+
+    #[test]
+    fn the_fold_sums_quantities_and_a_burn_of_the_last_copy_clears() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let p = policy(0x02);
+        put_segment(
+            out,
+            100,
+            vec![(
+                p,
+                vec![
+                    record(Event::Mint, p, 100, 10, b"B", b"ipfs://b1"),
+                    record(Event::Mint, p, 100, 20, b"A", b"ipfs://a1"),
+                ],
+            )],
+        );
+        put_segment(
+            out,
+            101,
+            vec![(
+                p,
+                vec![record(Event::Update, p, 101, 10, b"A", b"ipfs://a2")],
+            )],
+        );
+        put_segment(
+            out,
+            102,
+            vec![(p, vec![record(Event::Burn, p, 102, 10, b"B", b"")])],
+        );
+
+        let stats = fold_listings(out, 100, 102).expect("folds");
+        assert_eq!(stats.chunks, 3);
+        assert_eq!(stats.written, 3);
+        let (built_through, entries) = listing(out, &p);
+        assert_eq!(built_through, 102);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"A");
+        assert_eq!(entries[0].supply, 1);
+        assert_eq!(entries[0].image, b"ipfs://a2");
+    }
+
+    /// The CIP-25 dynamic-update trick, across the window boundary that used
+    /// to erase it: the replacement mint folds in one day, the burn of the
+    /// previous copy the next. The entry stands, at one copy, with the
+    /// replacement's metadata.
+    #[test]
+    fn a_dynamic_update_across_windows_stays_standing() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let p = policy(0x05);
+        put_segment(
+            out,
+            100,
+            vec![(
+                p,
+                vec![record(Event::Mint, p, 100, 10, b"A", b"ipfs://season-1")],
+            )],
+        );
+        put_segment(
+            out,
+            101,
+            vec![(
+                p,
+                vec![record(Event::Mint, p, 101, 10, b"A", b"ipfs://season-2")],
+            )],
+        );
+        put_segment(
+            out,
+            102,
+            vec![(p, vec![record(Event::Burn, p, 102, 10, b"A", b"")])],
+        );
+
+        fold_listings(out, 100, 101).expect("folds day one");
+        assert_eq!(listing(out, &p).1[0].supply, 2);
+        fold_listings(out, 102, 102).expect("folds day two");
+
+        let (built_through, entries) = listing(out, &p);
+        assert_eq!(built_through, 102);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].supply, 1);
+        assert_eq!(entries[0].image, b"ipfs://season-2");
+    }
+
+    /// A native token: the supply decrements across windows and the entry
+    /// leaves only when the last copy does.
+    #[test]
+    fn a_multi_copy_supply_decrements_across_windows() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let p = policy(0x06);
+        put_segment(
+            out,
+            100,
+            vec![(
+                p,
+                vec![record_qty(Event::Mint, 5, p, 100, 10, b"CNT", b"ipfs://t")],
+            )],
+        );
+        put_segment(
+            out,
+            101,
+            vec![(
+                p,
+                vec![record_qty(Event::Burn, -2, p, 101, 10, b"CNT", b"")],
+            )],
+        );
+        put_segment(
+            out,
+            102,
+            vec![(
+                p,
+                vec![record_qty(Event::Burn, -3, p, 102, 10, b"CNT", b"")],
+            )],
+        );
+
+        fold_listings(out, 100, 100).expect("folds the mint");
+        assert_eq!(listing(out, &p).1[0].supply, 5);
+        fold_listings(out, 101, 101).expect("folds the first burn");
+        let (_, entries) = listing(out, &p);
+        assert_eq!(entries[0].supply, 3);
+        assert_eq!(entries[0].image, b"ipfs://t");
+        fold_listings(out, 102, 102).expect("folds the last burn");
+        assert!(listing(out, &p).1.is_empty());
+    }
+
+    /// A burn with no minted copy behind it — the mint predates the build's
+    /// coverage — floors at zero, so a re-mint after it still stands.
+    #[test]
+    fn a_burn_with_no_minted_copy_cannot_erase_a_later_mint() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let p = policy(0x07);
+        put_segment(
+            out,
+            100,
+            vec![(p, vec![record(Event::Burn, p, 100, 10, b"A", b"")])],
+        );
+        put_segment(
+            out,
+            101,
+            vec![(p, vec![record(Event::Mint, p, 101, 10, b"A", b"ipfs://a")])],
+        );
+
+        fold_whole_tree(out).expect("folds");
+        let (built_through, entries) = listing(out, &p);
+        assert_eq!(built_through, 101);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].supply, 1);
+    }
+
+    /// A re-fold of the same window leaves every byte identical — the resume
+    /// story: what is on disk, not what was in memory, is the state.
+    #[test]
+    fn replaying_a_window_rewrites_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let p = policy(0x02);
+        put_segment(
+            out,
+            100,
+            vec![(p, vec![record(Event::Mint, p, 100, 10, b"A", b"ipfs://a")])],
+        );
+        let first = fold_listings(out, 100, 100).expect("folds");
+        assert_eq!(first.written, 1);
+        // The replay skips the chunk the listing already folded — quantities
+        // sum, so applying it again would count its mints twice. Untouched,
+        // and not even read for its entries: `policies` counts what the fold
+        // applied to.
+        let second = fold_listings(out, 100, 100).expect("folds");
+        assert_eq!(second.written, 0);
+        assert_eq!(second.policies, 0);
+    }
+
+    /// A superset replay — what the `--fold-only` reseed does over listings a
+    /// daily run already folded — lands on the same bytes a fresh fold would.
+    #[test]
+    fn a_superset_replay_matches_a_fresh_fold() {
+        let build = |out: &Path| {
+            let p = policy(0x04);
+            put_segment(
+                out,
+                100,
+                vec![(p, vec![record(Event::Mint, p, 100, 10, b"A", b"ipfs://a1")])],
+            );
+            put_segment(
+                out,
+                101,
+                vec![(p, vec![record(Event::Mint, p, 101, 10, b"B", b"ipfs://b")])],
+            );
+            put_segment(
+                out,
+                102,
+                vec![(
+                    p,
+                    vec![record(Event::Update, p, 102, 10, b"A", b"ipfs://a2")],
+                )],
+            );
+            put_segment(
+                out,
+                103,
+                vec![(p, vec![record(Event::Burn, p, 103, 10, b"B", b"")])],
+            );
+        };
+        let replayed = TempDir::new().expect("tempdir");
+        let fresh = TempDir::new().expect("tempdir");
+        build(replayed.path());
+        build(fresh.path());
+        // A day's window folded, then the reseed replaying everything.
+        fold_listings(replayed.path(), 100, 101).expect("folds");
+        fold_listings(replayed.path(), 1, 103).expect("replays");
+        // The oracle: one fresh fold of the whole tree.
+        fold_listings(fresh.path(), 1, 103).expect("folds");
+        let p = policy(0x04);
+        let replayed_bytes = fs::read(replayed.path().join(ami::listing_key("", &p)))
+            .expect("reads the replayed listing");
+        let fresh_bytes =
+            fs::read(fresh.path().join(ami::listing_key("", &p))).expect("reads the fresh listing");
+        assert_eq!(replayed_bytes, fresh_bytes);
+    }
+
+    /// A policy the window does not hold is not rewritten — its bytes and its
+    /// `built_through` are its own.
+    #[test]
+    fn an_untouched_policy_keeps_its_bytes() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let a = policy(0x01);
+        let b = policy(0x02);
+        put_segment(
+            out,
+            100,
+            vec![(a, vec![record(Event::Mint, a, 100, 10, b"A", b"ipfs://a")])],
+        );
+        put_segment(
+            out,
+            101,
+            vec![(b, vec![record(Event::Mint, b, 101, 10, b"B", b"ipfs://b")])],
+        );
+
+        fold_listings(out, 100, 100).expect("folds");
+        let before = fs::read(out.join(ami::listing_key("", &a))).expect("reads");
+        fold_listings(out, 101, 101).expect("folds");
+        let after = fs::read(out.join(ami::listing_key("", &a))).expect("reads");
+        assert_eq!(before, after);
+        assert_eq!(listing(out, &a).0, 100);
+        assert_eq!(listing(out, &b).0, 101);
+    }
+
+    /// `--fold-only`'s path: the whole tree in one pass, through the newest
+    /// segment present.
+    #[test]
+    fn fold_only_seeds_the_whole_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = dir.path();
+        let p = policy(0x03);
+        put_segment(
+            out,
+            100,
+            vec![(p, vec![record(Event::Mint, p, 100, 10, b"A", b"ipfs://a")])],
+        );
+        put_segment(
+            out,
+            105,
+            vec![(
+                p,
+                vec![record(Event::Update, p, 105, 10, b"A", b"ipfs://a2")],
+            )],
+        );
+        fold_whole_tree(out).expect("folds");
+        let (built_through, entries) = listing(out, &p);
+        assert_eq!(built_through, 105);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].supply, 1);
+        assert_eq!(entries[0].image, b"ipfs://a2");
+    }
 }
