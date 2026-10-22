@@ -1132,6 +1132,149 @@ fn price_of(
     ))
 }
 
+/// One pool, as the archive last saw it.
+///
+/// The per-pool rows behind [`PolicyPriceResponse`], which only sums them. A
+/// caller that must SPEND a pool — a fast buy naming the exact pool UTxO —
+/// needs to know which pools exist, not how deep they are together.
+///
+/// ⚠️ Discovery, not a quote. The reserves are the last sighting, and a pool is
+/// only sighted when touched while holding the asset; a caller pricing a trade
+/// reads the pool from chain at the moment it trades.
+#[derive(Serialize)]
+pub struct PoolDto {
+    /// `splash`, `cswap`, `minswap`, … — as the decoder named it.
+    pub venue: String,
+    /// The pool script address, bech32. One address can host many pools, so
+    /// this alone is not an identity.
+    pub address: String,
+    /// The pool INSTANCE: the asset that identifies it among its neighbours —
+    /// Splash's pool NFT, CSwap's LP token. Hex.
+    pub key_policy: String,
+    pub key_name: String,
+    /// `priced`, `off-model`, `stale` or `unusable` — the same judgement the
+    /// price applies (`policy_archive::view::Bucket`). Only `priced` pools are
+    /// in its sum.
+    pub bucket: &'static str,
+    pub last_seen_slot: u64,
+    /// The hash of the transaction that produced the last sighting.
+    pub last_tx: String,
+    /// The watched policy's reserve, raw, as a string (see `PairDepthDto`).
+    pub base: String,
+    /// The far side's reserve, raw. Absent when the venue does not publish it —
+    /// which is not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+    /// What the asset is paired WITH, hex; empty policy and name mean ADA.
+    /// Absent when the pair is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_name: Option<String>,
+    pub ada_paired: bool,
+    /// ADA-paired with at least the depth floor on the ADA side: worth quoting
+    /// on its own.
+    pub above_floor: bool,
+    /// The pricing model the decoder claimed (`constant-product`, …).
+    pub pricing: String,
+}
+
+/// `GET /policy/{p}/pools` — every pool the archive has seen holding the asset.
+#[derive(Serialize)]
+pub struct PolicyPoolsResponse {
+    pub policy: String,
+    pub cached: bool,
+    /// The newest slot in the archive: what `bucket` was judged AT.
+    pub at_slot: u64,
+    pub stale_after_slots: u64,
+    pub depth_floor_lovelace: i64,
+    /// Priceable first, deepest ADA side first; then off-model, stale and
+    /// unusable.
+    pub pools: Vec<PoolDto>,
+    /// Script outputs that held the asset and that no decoder recognised. Not
+    /// pools anyone can name — counted so an empty list is never mistaken for
+    /// "there is nothing here".
+    pub unrecognised: usize,
+}
+
+pub async fn pools(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+) -> Result<Json<PolicyPoolsResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let view = policy_archive::view::PolicyView::from_observations(&rows);
+    let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    Ok(Json(pools_of(policy, manifest.is_some(), &view, at)))
+}
+
+/// The pool table, projected off the same fold the price reads.
+fn pools_of(
+    policy: String,
+    cached: bool,
+    view: &policy_archive::view::PolicyView,
+    at: u64,
+) -> PolicyPoolsResponse {
+    use policy_archive::view::{Bucket, Projection};
+    let projection = Projection::default();
+    let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
+    let mut rows: Vec<(Bucket, i64, PoolDto)> = view
+        .pools()
+        .map(|(key, pool)| {
+            let bucket = pool.bucket(at, &projection);
+            let ada_paired = pool.quote_unit.as_ref().is_some_and(|u| u.is_ada());
+            let ada_side = if ada_paired {
+                pool.quote.unwrap_or(0)
+            } else {
+                0
+            };
+            let dto = PoolDto {
+                venue: pool.venue.clone(),
+                address: key.address.clone(),
+                key_policy: hex::encode(&key.key_policy),
+                key_name: hex::encode(&key.key_name),
+                bucket: bucket.label(),
+                last_seen_slot: pool.slot,
+                last_tx: hex::encode(&pool.tx_hash),
+                base: pool.base.to_string(),
+                quote: pool.quote.map(|q| q.to_string()),
+                quote_policy: pool.quote_unit.as_ref().map(|u| hex::encode(&u.policy)),
+                quote_name: pool.quote_unit.as_ref().map(|u| hex::encode(&u.name)),
+                ada_paired,
+                above_floor: ada_paired && ada_side >= floor,
+                pricing: pool.pricing.clone(),
+            };
+            (bucket, ada_side, dto)
+        })
+        .collect();
+    // Bucket order is the enum's: priced, off-model, stale, unusable. Within a
+    // bucket the deepest ADA side first, then the key, so the order is stable
+    // whatever order the fold's map yields.
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.2.address.cmp(&b.2.address))
+            .then_with(|| a.2.key_policy.cmp(&b.2.key_policy))
+            .then_with(|| a.2.key_name.cmp(&b.2.key_name))
+    });
+    PolicyPoolsResponse {
+        policy,
+        cached,
+        at_slot: at,
+        stale_after_slots: projection.stale_after,
+        depth_floor_lovelace: floor,
+        pools: rows.into_iter().map(|(_, _, dto)| dto).collect(),
+        unrecognised: view.candidates(),
+    }
+}
+
 /// `GET /policy/{p}/trades` — the fold, over the newest page of movements.
 ///
 /// This is the answer to "why does this token show lots of transfers rather
@@ -2268,6 +2411,9 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         // The interpretive tiers — what the movements MEAN. Present in the
         // archive since 2026-09-08 and unreachable over HTTP until now.
         .route("/policy/{policy}/price", get(price))
+        // The pools behind the price, one row each: which pools EXIST, for a
+        // caller that has to spend one rather than read their sum.
+        .route("/policy/{policy}/pools", get(pools))
         .route("/policy/{policy}/live", get(live))
         .route("/policy/{policy}/holders", get(holders))
         .route("/policy/{policy}/trades", get(trades))
@@ -2280,6 +2426,126 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         .route("/policy/{policy}/seek", post(seek))
         .route("/policy/{policy}/events", get(events))
         .with_state(hub)
+}
+
+#[cfg(test)]
+mod pools_tests {
+    use super::*;
+    use policy_archive::observation::{Decoded, Observation, pricing};
+    use policy_archive::view::PolicyView;
+
+    const DAY: u64 = 86_400;
+
+    /// One pool sighting. `quote` is lovelace when `ada`, else a token.
+    fn seen(
+        slot: u64,
+        addr: &str,
+        nft: &[u8],
+        base: i64,
+        quote: Option<i64>,
+        ada: bool,
+    ) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![(slot % 251) as u8; 32],
+            address: addr.into(),
+            lovelace: 2_000_000,
+            unit_name: b"PERP COIN".to_vec(),
+            unit_amount: base,
+            datum: None,
+            decoded: Some(Decoded {
+                venue: "splash".into(),
+                key_policy: vec![0xab; 28],
+                key_name: nft.to_vec(),
+                key_basis: "datum".into(),
+                base_reserve: base,
+                quote_policy: Some(if ada { Vec::new() } else { vec![7; 28] }),
+                quote_name: Some(if ada { Vec::new() } else { b"USD".to_vec() }),
+                quote_reserve: quote,
+                fee_bps: None,
+                total_lp: None,
+                reserve_source: "value".into(),
+                pricing: pricing::CONSTANT_PRODUCT.into(),
+            }),
+        }
+    }
+
+    fn table(rows: &[Observation]) -> PolicyPoolsResponse {
+        let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+        pools_of("p".into(), true, &PolicyView::from_observations(rows), at)
+    }
+
+    /// Each pool once, at its newest sighting, deepest priceable pool first,
+    /// and a pool untouched past the horizon judged stale rather than summed.
+    #[test]
+    fn pools_are_listed_once_deepest_first_with_stale_last() {
+        let now = 100 * DAY;
+        let rows = vec![
+            // The same pool seen twice: only the newer state is listed.
+            seen(
+                now - 10,
+                "addr1pool",
+                b"deep",
+                1_000,
+                Some(10_000_000_000),
+                true,
+            ),
+            seen(now, "addr1pool", b"deep", 900, Some(26_000_000_000), true),
+            seen(
+                now - 5,
+                "addr1pool",
+                b"shallow",
+                50,
+                Some(500_000_000),
+                true,
+            ),
+            // Withdrawn long ago: its last state is real but no longer counts.
+            seen(
+                now - 60 * DAY,
+                "addr1pool",
+                b"gone",
+                5_000,
+                Some(90_000_000_000),
+                true,
+            ),
+            // Paired with a token, so it cannot be quoted in ADA on its own.
+            seen(now - 1, "addr1other", b"tok", 70, Some(9_000), false),
+        ];
+        let t = table(&rows);
+        let got: Vec<(String, &str)> = t
+            .pools
+            .iter()
+            .map(|p| (p.key_name.clone(), p.bucket))
+            .collect();
+        let want: Vec<(String, &str)> = [
+            ("deep", "priced"),
+            ("shallow", "priced"),
+            ("tok", "priced"),
+            ("gone", "stale"),
+        ]
+        .into_iter()
+        .map(|(name, bucket)| (hex::encode(name), bucket))
+        .collect();
+        assert_eq!(got, want);
+        let deep = &t.pools[0];
+        assert_eq!(
+            deep.quote.as_deref(),
+            Some("26000000000"),
+            "the newest state"
+        );
+        assert!(deep.ada_paired && deep.above_floor);
+        assert_eq!(deep.quote_policy.as_deref(), Some(""), "empty means ADA");
+        assert!(!t.pools[2].ada_paired && !t.pools[2].above_floor);
+    }
+
+    /// An archive with nothing in it says so, rather than erroring.
+    #[test]
+    fn no_rows_is_an_empty_table() {
+        let t = table(&[]);
+        assert!(t.pools.is_empty());
+        assert_eq!(t.unrecognised, 0);
+    }
 }
 
 #[cfg(test)]
