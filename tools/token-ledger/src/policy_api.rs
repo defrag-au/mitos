@@ -1104,7 +1104,8 @@ fn price_of(
         Some(m) => crate::archive::read_observations(&dir, m)?,
         None => Vec::new(),
     };
-    let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    // Judged at the coverage ceiling, as the pool table is: see `judged_at`.
+    let at = judged_at(manifest.as_ref().and_then(|m| m.walk_to()), &rows);
     // ONE fold; the response and anything else asked of this policy this
     // request are projections off it.
     let view = policy_archive::view::PolicyView::from_observations(&rows);
@@ -1180,11 +1181,28 @@ pub struct PoolDto {
 }
 
 /// `GET /policy/{p}/pools` — every pool the archive has seen holding the asset.
+///
+/// # Reading an empty list
+///
+/// An empty `pools` is three different answers, and the walk fields say which:
+///
+/// | `cached` | `walking` | meaning |
+/// | --- | --- | --- |
+/// | false | false | never walked: nothing is known, and nothing will be until a `POST /refresh` |
+/// | false | true | the first walk is queued or running: wait, and read again |
+/// | true | either | walked to `walked_to`, and no pool was seen there |
+///
+/// A read never starts a walk (see the module header), so the first row is a
+/// caller's cue to ask for one, not a promise one is coming.
 #[derive(Serialize)]
 pub struct PolicyPoolsResponse {
     pub policy: String,
+    /// An archive exists for this policy: some pass has landed.
     pub cached: bool,
-    /// The newest slot in the archive: what `bucket` was judged AT.
+    /// What `bucket` was judged AT: the top of the archive's coverage, or the
+    /// newest sighting when that is higher. Not the newest sighting alone —
+    /// a policy whose pools went quiet would then judge them against their
+    /// own last sighting and never call any of them stale.
     pub at_slot: u64,
     pub stale_after_slots: u64,
     pub depth_floor_lovelace: i64,
@@ -1195,6 +1213,78 @@ pub struct PolicyPoolsResponse {
     /// pools anyone can name — counted so an empty list is never mistaken for
     /// "there is nothing here".
     pub unrecognised: usize,
+    /// The same outputs by address, most first, at most
+    /// [`UNRECOGNISED_ADDRESSES`]. Counted once per transaction per output,
+    /// so a busy order escrow (an order script holding the asset between
+    /// placement and fill) can dwarf a single unread pool: the address says
+    /// which one a decoder should claim next.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unrecognised_by_address: Vec<UnrecognisedDto>,
+    /// A walk is wanted or running for this policy — the first one, or a
+    /// top-up of an archive that exists.
+    pub walking: bool,
+    /// The archive's coverage, from its manifest. Absent until a pass lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walked_from: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walked_to: Option<u64>,
+    /// `complete` | `partial` | `unrecorded`, as on `GET /policy/{p}`.
+    pub completeness: &'static str,
+    /// The running or last job, when this process has one for the policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<PolicyJob>,
+}
+
+/// How many addresses `unrecognised_by_address` names.
+pub const UNRECOGNISED_ADDRESSES: usize = 10;
+
+/// Unrecognised outputs at one script address.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct UnrecognisedDto {
+    pub address: String,
+    /// Outputs seen there holding the asset, one per transaction per output.
+    pub outputs: usize,
+    pub last_seen_slot: u64,
+}
+
+/// The unrecognised outputs grouped by address: most outputs first, then the
+/// address, so the order is stable.
+fn unrecognised_by_address(rows: &[policy_archive::Observation]) -> Vec<UnrecognisedDto> {
+    let mut by: HashMap<&str, (usize, u64)> = HashMap::new();
+    for o in rows.iter().filter(|o| o.decoded.is_none()) {
+        let entry = by.entry(o.address.as_str()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.max(o.slot);
+    }
+    let mut out: Vec<UnrecognisedDto> = by
+        .into_iter()
+        .map(|(address, (outputs, last_seen_slot))| UnrecognisedDto {
+            address: address.to_string(),
+            outputs,
+            last_seen_slot,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.outputs
+            .cmp(&a.outputs)
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    out.truncate(UNRECOGNISED_ADDRESSES);
+    out
+}
+
+/// The slot a pool's staleness is judged at: the top of what the archive has
+/// READ, not the newest thing it SAW.
+///
+/// The difference is the whole point. A policy whose pools are all quiet has
+/// a newest sighting that IS each pool's own last sighting, so judged there
+/// none of them is ever stale, however long ago that was — while the tip
+/// follower has read every block since and seen nothing. The sighting still
+/// wins when it is higher, which only an archive whose coverage lags a
+/// running pass's rows can produce.
+fn judged_at(walked_to: Option<u64>, rows: &[policy_archive::Observation]) -> u64 {
+    let newest = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    walked_to.map_or(newest, |w| w.max(newest))
 }
 
 pub async fn pools(
@@ -1211,8 +1301,21 @@ pub async fn pools(
         None => Vec::new(),
     };
     let view = policy_archive::view::PolicyView::from_observations(&rows);
-    let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
-    Ok(Json(pools_of(policy, manifest.is_some(), &view, at)))
+    let walked_to = manifest.as_ref().and_then(|m| m.walk_to());
+    let at = judged_at(walked_to, &rows);
+    let mut table = pools_of(policy.clone(), manifest.is_some(), &view, at);
+    table.unrecognised_by_address = unrecognised_by_address(&rows);
+    table.walking = hub.walking(&policy);
+    table.walked_from = manifest.as_ref().and_then(|m| m.walk_from());
+    table.walked_to = walked_to;
+    table.completeness = manifest
+        .as_ref()
+        .map_or(policy_archive::Completeness::Unrecorded, |m| {
+            m.completeness()
+        })
+        .as_wire();
+    table.job = hub.get(&policy);
+    Ok(Json(table))
 }
 
 /// The pool table, projected off the same fold the price reads.
@@ -1272,6 +1375,14 @@ fn pools_of(
         depth_floor_lovelace: floor,
         pools: rows.into_iter().map(|(_, _, dto)| dto).collect(),
         unrecognised: view.candidates(),
+        // The walk and coverage fields are the handler's: this is the table,
+        // projected off the fold, and knows nothing of jobs or manifests.
+        unrecognised_by_address: Vec::new(),
+        walking: false,
+        walked_from: None,
+        walked_to: None,
+        completeness: policy_archive::Completeness::Unrecorded.as_wire(),
+        job: None,
     }
 }
 
@@ -2474,6 +2585,69 @@ mod pools_tests {
     fn table(rows: &[Observation]) -> PolicyPoolsResponse {
         let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
         pools_of("p".into(), true, &PolicyView::from_observations(rows), at)
+    }
+
+    /// A policy whose only pool went quiet: judged at its own last sighting
+    /// the pool looks current forever. Judged at what the archive has READ —
+    /// forty days past it, every block of them seen and empty — it is stale.
+    #[test]
+    fn a_quiet_pool_is_judged_at_the_coverage_not_its_own_sighting() {
+        let seen_at = 100 * DAY;
+        let rows = vec![seen(
+            seen_at,
+            "addr1pool",
+            b"quiet",
+            1_000,
+            Some(5_000_000_000),
+            true,
+        )];
+        assert_eq!(
+            judged_at(None, &rows),
+            seen_at,
+            "nothing read: the sighting"
+        );
+        let read_to = seen_at + 40 * DAY;
+        let at = judged_at(Some(read_to), &rows);
+        assert_eq!(at, read_to);
+        let t = pools_of("p".into(), true, &PolicyView::from_observations(&rows), at);
+        assert_eq!(t.pools[0].bucket, "stale");
+        assert_eq!(
+            judged_at(Some(seen_at - DAY), &rows),
+            seen_at,
+            "a sighting above the coverage still counts"
+        );
+    }
+
+    /// Unrecognised outputs are named by address, busiest first, so a busy
+    /// order escrow and an unread pool can be told apart.
+    #[test]
+    fn unrecognised_outputs_are_grouped_by_address() {
+        let unread = |slot: u64, addr: &str| Observation {
+            decoded: None,
+            ..seen(slot, addr, b"x", 1, None, true)
+        };
+        let rows = vec![
+            unread(10, "addr1escrow"),
+            unread(30, "addr1escrow"),
+            unread(20, "addr1escrow"),
+            unread(15, "addr1unread"),
+            seen(40, "addr1pool", b"deep", 900, Some(26_000_000_000), true),
+        ];
+        assert_eq!(
+            unrecognised_by_address(&rows),
+            vec![
+                UnrecognisedDto {
+                    address: "addr1escrow".into(),
+                    outputs: 3,
+                    last_seen_slot: 30,
+                },
+                UnrecognisedDto {
+                    address: "addr1unread".into(),
+                    outputs: 1,
+                    last_seen_slot: 15,
+                },
+            ]
+        );
     }
 
     /// Each pool once, at its newest sighting, deepest priceable pool first,
