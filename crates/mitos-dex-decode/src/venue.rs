@@ -209,9 +209,37 @@ pub const SITES: [Site; 13] = [
     },
 ];
 
+/// The registered contract an output sat at, if any: by its full `address`
+/// for the venues keyed that way, else by its payment `cred`.
+///
+/// The caller supplies the credential (`None` for an address that has none)
+/// so this crate keeps out of address parsing.
+pub fn site_of(address: &str, cred: Option<&[u8; 28]>) -> Option<&'static Site> {
+    SITES.iter().find(|s| match s.key {
+        SiteKey::Address(a) => a == address,
+        SiteKey::Cred(c) => cred == Some(&c),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An order contract and a pool contract are found by credential, CSwap's
+    /// pool by its one address, and anything else is nobody's.
+    #[test]
+    fn a_site_is_found_by_its_own_key() {
+        let order = site_of("addr1-any-stake-variant", Some(&crate::splash::ORDER_CRED))
+            .expect("splash order");
+        assert_eq!((order.venue, order.role), (SPLASH, SiteRole::Order));
+        let pool = site_of(crate::cswap::POOL_SCRIPT_ADDR, None).expect("cswap pool");
+        assert_eq!((pool.venue, pool.role), (CSWAP, SiteRole::Pool));
+        assert!(site_of("addr1elsewhere", Some(&[0u8; 28])).is_none());
+        assert!(
+            site_of("addr1elsewhere", None).is_none(),
+            "no credential, no address match: nobody's"
+        );
+    }
 
     /// ⚠️ Two venues sharing a name would silently merge their pools, their
     /// liquidity and their fills into one row.

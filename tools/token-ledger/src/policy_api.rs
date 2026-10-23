@@ -1234,17 +1234,11 @@ pub struct PolicyPoolsResponse {
     /// Priceable first, deepest ADA side first; then off-model, stale and
     /// unusable.
     pub pools: Vec<PoolDto>,
-    /// Script outputs that held the asset and that no decoder recognised. Not
-    /// pools anyone can name — counted so an empty list is never mistaken for
-    /// "there is nothing here".
-    pub unrecognised: usize,
-    /// The same outputs by address, most first, at most
-    /// [`UNRECOGNISED_ADDRESSES`]. Counted once per transaction per output,
-    /// so a busy order escrow (an order script holding the asset between
-    /// placement and fill) can dwarf a single unread pool: the address says
-    /// which one a decoder should claim next.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unrecognised_by_address: Vec<UnrecognisedDto>,
+    /// Script outputs that held the asset and that no decoder recognised —
+    /// counted so an empty list is never mistaken for "there is nothing
+    /// here", and CLASSIFIED, because most of them are not a gap at all. See
+    /// [`UnrecognisedDto`]; the full list is `GET /policy/{p}/unrecognised`.
+    pub unrecognised: UnrecognisedDto,
     /// Where the policy's walk stands, and so what the list can be trusted to
     /// say.
     pub status: WalkStatus,
@@ -1298,42 +1292,263 @@ fn walk_status(cached: bool, wanted: bool, job: Option<&PolicyJob>) -> WalkStatu
     }
 }
 
-/// How many addresses `unrecognised_by_address` names.
-pub const UNRECOGNISED_ADDRESSES: usize = 10;
+/// How many scripts `/pools` names in `unrecognised.top`. The full list is
+/// `GET /policy/{p}/unrecognised`.
+pub const UNRECOGNISED_TOP: usize = 10;
 
-/// Unrecognised outputs at one script address.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+/// What an unrecognised script output is, judged against everything this
+/// workspace can name: the DEX venue registry (`mitos_dex_decode::venue`),
+/// the launchpad (`mitos_launchpad_decode`), the lock platforms
+/// (`mitos_vesting_decode`) and the burn sinks (through `mitos_cohort`).
+///
+/// Declared in PRIORITY order — the order a list sorts by — because the kinds
+/// are not equally interesting. The first two are gaps: a pool missing from
+/// the table, and a script nobody has registered. The rest are KNOWN and
+/// expected to hold the asset without being a pool: an order waiting for its
+/// batcher, tokens locked on a lock platform, and tokens burned.
+///
+/// Measured on $ALIENS: classified against the DEX registry alone, a snek.fun
+/// order contract (66 users, 144 outputs), the CrowdLock and snek.fun lock
+/// platforms and the registered burn sink all read as unknown scripts — 202
+/// "unknown" outputs, of which only 46 were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnrecognisedKind {
+    /// A REGISTERED pool contract whose output no decoder claimed: a datum
+    /// shape the decoder does not read. A real gap — a pool not in the table.
+    UndecodedPool,
+    /// A script in no registry: perhaps a venue nobody has registered.
+    UnknownScript,
+    /// A registered ORDER contract — a DEX's or the launchpad's: an escrow
+    /// between placement and fill. Expected; not a gap.
+    Order,
+    /// A lock platform (CrowdLock — the cnft.tools lock — or snek.fun's):
+    /// tokens locked by their holder. Expected; not a gap.
+    Lock,
+    /// A registered burn sink: provably unspendable. Expected; not a gap.
+    Burn,
+}
+
+impl UnrecognisedKind {
+    /// The kind of an output at `address`, and who runs the contract when
+    /// that is known: a venue, the launchpad, or a lock platform.
+    ///
+    /// Burn first, as `mitos_cohort::classify` orders it: provably gone
+    /// outranks every claim about what a script is FOR.
+    fn of(address: &str, cred: Option<&[u8; 28]>) -> (Self, Option<&'static str>) {
+        use mitos_dex_decode::venue::{SNEK_FUN, SiteRole, site_of};
+        if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Burn {
+            return (UnrecognisedKind::Burn, None);
+        }
+        if let Some(site) = site_of(address, cred) {
+            return match site.role {
+                SiteRole::Pool => (UnrecognisedKind::UndecodedPool, Some(site.venue)),
+                SiteRole::Order => (UnrecognisedKind::Order, Some(site.venue)),
+            };
+        }
+        let Some(cred) = cred else {
+            return (UnrecognisedKind::UnknownScript, None);
+        };
+        if mitos_launchpad_decode::is_snek_fun_curve(cred) {
+            // The bonding curve IS decoded as a pool; one that was not is the
+            // same gap as any other undecoded pool.
+            (UnrecognisedKind::UndecodedPool, Some(SNEK_FUN))
+        } else if mitos_launchpad_decode::is_snek_fun_order(cred) {
+            (UnrecognisedKind::Order, Some(SNEK_FUN))
+        } else if mitos_vesting_decode::crowd_lock::is_crowd_lock(cred) {
+            (UnrecognisedKind::Lock, Some("crowdlock"))
+        } else if mitos_vesting_decode::snek_fun::is_snek_fun(cred) {
+            (UnrecognisedKind::Lock, Some(SNEK_FUN))
+        } else {
+            (UnrecognisedKind::UnknownScript, None)
+        }
+    }
+}
+
+/// Unrecognised outputs, by what they are — `PolicyPoolsResponse::unrecognised`.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct UnrecognisedDto {
+    /// Every unrecognised output, once per transaction per output.
+    pub outputs: usize,
+    /// The same outputs by kind; they sum to `outputs`.
+    pub by_kind: UnrecognisedKinds,
+    /// The first [`UNRECOGNISED_TOP`] scripts, priority first: undecoded
+    /// pools, unknown scripts, then orders; busiest first within a kind.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<UnrecognisedScriptDto>,
+}
+
+/// Unrecognised outputs per kind.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UnrecognisedKinds {
+    pub undecoded_pool: usize,
+    pub unknown_script: usize,
+    pub order: usize,
+    pub lock: usize,
+    pub burn: usize,
+}
+
+/// Unrecognised outputs at one script.
+///
+/// One entry per PAYMENT CREDENTIAL, not per address. An order script pairs
+/// its credential with each user's stake key, so the same script appears
+/// under one address per user — grouped by address, Splash's order script
+/// alone filled eight of ten slots on $ALIENS. The credential is the script;
+/// the address is only somewhere it was seen.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct UnrecognisedScriptDto {
+    pub kind: UnrecognisedKind,
+    /// Who runs the contract, when that is known: a DEX venue or the
+    /// launchpad for a pool or order, the platform for a lock (`crowdlock`,
+    /// `snek.fun`). Absent for a burn sink and an unknown script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venue: Option<&'static str>,
+    /// The payment credential, hex. Absent for an address that has none (not
+    /// Shelley), which is then its own entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    /// The address of the newest output, for a reader to look up.
     pub address: String,
-    /// Outputs seen there holding the asset, one per transaction per output.
+    /// Distinct addresses the outputs sat at: the stake variants of one
+    /// script.
+    pub addresses: usize,
+    /// Outputs seen holding the asset, one per transaction per output.
     pub outputs: usize,
     pub last_seen_slot: u64,
 }
 
-/// The unrecognised outputs grouped by address: most outputs first, then the
-/// address, so the order is stable.
-fn unrecognised_by_address(rows: &[policy_archive::Observation]) -> Vec<UnrecognisedDto> {
-    let mut by: HashMap<&str, (usize, u64)> = HashMap::new();
-    for o in rows.iter().filter(|o| o.decoded.is_none()) {
-        let entry = by.entry(o.address.as_str()).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 = entry.1.max(o.slot);
+/// Every unrecognised output grouped by script and classified, in priority
+/// order: kind, then most outputs, then credential and address, so the order
+/// is stable.
+fn unrecognised_scripts(rows: &[policy_archive::Observation]) -> Vec<UnrecognisedScriptDto> {
+    struct Seen<'a> {
+        kind: UnrecognisedKind,
+        venue: Option<&'static str>,
+        credential: Option<String>,
+        outputs: usize,
+        newest: (u64, &'a str),
+        addresses: HashSet<&'a str>,
     }
-    let mut out: Vec<UnrecognisedDto> = by
-        .into_iter()
-        .map(|(address, (outputs, last_seen_slot))| UnrecognisedDto {
-            address: address.to_string(),
-            outputs,
-            last_seen_slot,
+    let mut by: HashMap<String, Seen> = HashMap::new();
+    for o in rows.iter().filter(|o| o.decoded.is_none()) {
+        let cred = mitos_cohort::payment_cred(&o.address);
+        let credential = cred.map(hex::encode);
+        // Keyed by credential; an address with none keys on itself.
+        let key = credential.clone().unwrap_or_else(|| o.address.clone());
+        let seen = by.entry(key).or_insert_with(|| {
+            let (kind, venue) = UnrecognisedKind::of(&o.address, cred.as_ref());
+            Seen {
+                kind,
+                venue,
+                credential,
+                outputs: 0,
+                newest: (0, ""),
+                addresses: HashSet::new(),
+            }
+        });
+        seen.outputs += 1;
+        seen.addresses.insert(o.address.as_str());
+        if (o.slot, o.address.as_str()) > seen.newest {
+            seen.newest = (o.slot, o.address.as_str());
+        }
+    }
+    let mut out: Vec<UnrecognisedScriptDto> = by
+        .into_values()
+        .map(|s| UnrecognisedScriptDto {
+            kind: s.kind,
+            venue: s.venue,
+            credential: s.credential,
+            address: s.newest.1.to_string(),
+            addresses: s.addresses.len(),
+            outputs: s.outputs,
+            last_seen_slot: s.newest.0,
         })
         .collect();
     out.sort_by(|a, b| {
-        b.outputs
-            .cmp(&a.outputs)
+        a.kind
+            .cmp(&b.kind)
+            .then(b.outputs.cmp(&a.outputs))
+            .then_with(|| a.credential.cmp(&b.credential))
             .then_with(|| a.address.cmp(&b.address))
     });
-    out.truncate(UNRECOGNISED_ADDRESSES);
     out
+}
+
+/// Every script's outputs, in all and per kind.
+fn unrecognised_totals(scripts: &[UnrecognisedScriptDto]) -> (usize, UnrecognisedKinds) {
+    let mut by_kind = UnrecognisedKinds::default();
+    for s in scripts {
+        *match s.kind {
+            UnrecognisedKind::UndecodedPool => &mut by_kind.undecoded_pool,
+            UnrecognisedKind::UnknownScript => &mut by_kind.unknown_script,
+            UnrecognisedKind::Order => &mut by_kind.order,
+            UnrecognisedKind::Lock => &mut by_kind.lock,
+            UnrecognisedKind::Burn => &mut by_kind.burn,
+        } += s.outputs;
+    }
+    (scripts.iter().map(|s| s.outputs).sum(), by_kind)
+}
+
+/// The summary `/pools` carries: totals by kind and the first scripts.
+fn unrecognised_summary(mut scripts: Vec<UnrecognisedScriptDto>) -> UnrecognisedDto {
+    let (outputs, by_kind) = unrecognised_totals(&scripts);
+    scripts.truncate(UNRECOGNISED_TOP);
+    UnrecognisedDto {
+        outputs,
+        by_kind,
+        top: scripts,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UnrecognisedQuery {
+    /// Only this kind's scripts. The totals are always over every kind.
+    pub kind: Option<UnrecognisedKind>,
+}
+
+/// `GET /policy/{p}/unrecognised?kind=` — EVERY unrecognised script, the
+/// list `/pools` summarises in its first ten.
+#[derive(Serialize)]
+pub struct PolicyUnrecognisedResponse {
+    pub policy: String,
+    pub cached: bool,
+    pub status: WalkStatus,
+    /// Every unrecognised output, whatever `kind` filtered.
+    pub outputs: usize,
+    pub by_kind: UnrecognisedKinds,
+    /// Priority order, as `/pools`'s `top`; only `kind`'s when one was asked
+    /// for.
+    pub scripts: Vec<UnrecognisedScriptDto>,
+}
+
+pub async fn unrecognised(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+    Query(q): Query<UnrecognisedQuery>,
+) -> Result<Json<PolicyUnrecognisedResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let mut scripts = unrecognised_scripts(&rows);
+    let (outputs, by_kind) = unrecognised_totals(&scripts);
+    if let Some(kind) = q.kind {
+        scripts.retain(|s| s.kind == kind);
+    }
+    let job = hub.get(&policy);
+    Ok(Json(PolicyUnrecognisedResponse {
+        status: walk_status(manifest.is_some(), hub.walking(&policy), job.as_ref()),
+        cached: manifest.is_some(),
+        policy,
+        outputs,
+        by_kind,
+        scripts,
+    }))
 }
 
 /// The slot a pool's staleness is judged at: the top of what the archive has
@@ -1367,7 +1582,7 @@ pub async fn pools(
     let walked_to = manifest.as_ref().and_then(|m| m.walk_to());
     let at = judged_at(walked_to, &rows);
     let mut table = pools_of(policy.clone(), manifest.is_some(), &view, at);
-    table.unrecognised_by_address = unrecognised_by_address(&rows);
+    table.unrecognised = unrecognised_summary(unrecognised_scripts(&rows));
     let job = hub.get(&policy);
     table.status = walk_status(manifest.is_some(), hub.walking(&policy), job.as_ref());
     table.walked_from = manifest.as_ref().and_then(|m| m.walk_from());
@@ -1438,10 +1653,14 @@ fn pools_of(
         stale_after_slots: projection.stale_after,
         depth_floor_lovelace: floor,
         pools: rows.into_iter().map(|(_, _, dto)| dto).collect(),
-        unrecognised: view.candidates(),
-        // The walk and coverage fields are the handler's: this is the table,
-        // projected off the fold, and knows nothing of jobs or manifests.
-        unrecognised_by_address: Vec::new(),
+        // The count is the fold's; classifying it needs the rows, which the
+        // handler has. As are the walk and coverage fields: this is the
+        // table, projected off the fold, and knows nothing of jobs or
+        // manifests.
+        unrecognised: UnrecognisedDto {
+            outputs: view.candidates(),
+            ..UnrecognisedDto::default()
+        },
         status: walk_status(cached, false, None),
         walked_from: None,
         walked_to: None,
@@ -2591,6 +2810,7 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         // The pools behind the price, one row each: which pools EXIST, for a
         // caller that has to spend one rather than read their sum.
         .route("/policy/{policy}/pools", get(pools))
+        .route("/policy/{policy}/unrecognised", get(unrecognised))
         .route("/policy/{policy}/live", get(live))
         .route("/policy/{policy}/holders", get(holders))
         .route("/policy/{policy}/trades", get(trades))
@@ -2730,35 +2950,175 @@ mod pools_tests {
         }
     }
 
-    /// Unrecognised outputs are named by address, busiest first, so a busy
-    /// order escrow and an unread pool can be told apart.
-    #[test]
-    fn unrecognised_outputs_are_grouped_by_address() {
-        let unread = |slot: u64, addr: &str| Observation {
+    /// A mainnet address: script payment credential `script`, staked to
+    /// `stake` — how an order script appears once per user.
+    fn script_at(script: [u8; 28], stake: u8) -> String {
+        use pallas_addresses::{
+            Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+        };
+        ShelleyAddress::new(
+            Network::Mainnet,
+            ShelleyPaymentPart::Script(script.into()),
+            ShelleyDelegationPart::Key([stake; 28].into()),
+        )
+        .to_bech32()
+        .expect("bech32")
+    }
+
+    fn unread(slot: u64, addr: &str) -> Observation {
+        Observation {
             decoded: None,
             ..seen(slot, addr, b"x", 1, None, true)
-        };
+        }
+    }
+
+    /// Unrecognised outputs are named by SCRIPT and classified against the
+    /// venue registry, in priority order: a registered pool nothing decoded,
+    /// then unknown scripts, then order escrows — busiest first within each.
+    ///
+    /// One order script under three users' stake keys is ONE entry: the
+    /// $ALIENS table had Splash's order script in eight of its ten slots when
+    /// this grouped by address. And it sorts LAST however busy it is, because
+    /// an order waiting for its batcher is expected, not a gap.
+    #[test]
+    fn unrecognised_outputs_are_grouped_by_script_and_classified() {
+        use mitos_dex_decode::{cswap, splash};
+        let order = splash::ORDER_CRED;
+        let (alice, bob, carol) = (
+            script_at(order, 0xa1),
+            script_at(order, 0xb2),
+            script_at(order, 0xc3),
+        );
+        let unknown = script_at([2; 28], 0xa1);
         let rows = vec![
-            unread(10, "addr1escrow"),
-            unread(30, "addr1escrow"),
-            unread(20, "addr1escrow"),
-            unread(15, "addr1unread"),
+            unread(10, &alice),
+            unread(30, &bob),
+            unread(20, &carol),
+            unread(25, &alice),
+            unread(12, &unknown),
+            unread(15, "not-a-shelley-address"),
+            unread(5, cswap::POOL_SCRIPT_ADDR),
             seen(40, "addr1pool", b"deep", 900, Some(26_000_000_000), true),
         ];
         assert_eq!(
-            unrecognised_by_address(&rows),
+            unrecognised_scripts(&rows),
             vec![
-                UnrecognisedDto {
-                    address: "addr1escrow".into(),
-                    outputs: 3,
-                    last_seen_slot: 30,
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::UndecodedPool,
+                    venue: Some("cswap"),
+                    credential: mitos_cohort::payment_cred(cswap::POOL_SCRIPT_ADDR)
+                        .map(hex::encode),
+                    address: cswap::POOL_SCRIPT_ADDR.into(),
+                    addresses: 1,
+                    outputs: 1,
+                    last_seen_slot: 5,
                 },
-                UnrecognisedDto {
-                    address: "addr1unread".into(),
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::UnknownScript,
+                    venue: None,
+                    credential: None,
+                    address: "not-a-shelley-address".into(),
+                    addresses: 1,
                     outputs: 1,
                     last_seen_slot: 15,
                 },
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::UnknownScript,
+                    venue: None,
+                    credential: Some(hex::encode([2u8; 28])),
+                    address: unknown.clone(),
+                    addresses: 1,
+                    outputs: 1,
+                    last_seen_slot: 12,
+                },
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::Order,
+                    venue: Some("splash"),
+                    credential: Some(hex::encode(order)),
+                    address: bob.clone(),
+                    addresses: 3,
+                    outputs: 4,
+                    last_seen_slot: 30,
+                },
             ]
+        );
+    }
+
+    /// The $ALIENS scripts that read as unknown against the DEX registry
+    /// alone, each by its REAL address: snek.fun's order contract, the
+    /// CrowdLock (cnft.tools) and snek.fun lock platforms, and the registered
+    /// burn sink. All four are known to this workspace; none is a gap.
+    #[test]
+    fn launchpad_orders_locks_and_burns_are_known_not_unknown() {
+        let cases = [
+            (
+                // snek.fun's order contract, one of its per-user addresses.
+                "addr1z8v3gwkxx3emz73pt5dhfpxlk6kxkjsqqkltpcn2djsze9s6xsg7kr5gjfvugzp3vjwhdnnm270eqgely8fq5v4k5eksgs9scy",
+                UnrecognisedKind::Order,
+                Some("snek.fun"),
+            ),
+            (
+                // CrowdLock, one locker's address.
+                "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w",
+                UnrecognisedKind::Lock,
+                Some("crowdlock"),
+            ),
+            (
+                "addr1w8wma0rzvdexhnqrty6t8dcur7c5ffu2rjau2ayec3d3azg5qp35x",
+                UnrecognisedKind::Lock,
+                Some("snek.fun"),
+            ),
+            (
+                "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4",
+                UnrecognisedKind::Burn,
+                None,
+            ),
+            (
+                // Shaped like the sink, registered nowhere: still unknown.
+                "addr1w8n8kq3j96v03a3znqqy9f54prt8uf6s4lyj7nuf2cvg2ucnwhs68",
+                UnrecognisedKind::UnknownScript,
+                None,
+            ),
+        ];
+        for (address, kind, by) in cases {
+            let cred = mitos_cohort::payment_cred(address);
+            assert_eq!(
+                UnrecognisedKind::of(address, cred.as_ref()),
+                (kind, by),
+                "{address}"
+            );
+        }
+    }
+
+    /// `/pools` carries the totals by kind over EVERY script and only the
+    /// first [`UNRECOGNISED_TOP`]; the totals add up to the whole.
+    #[test]
+    fn the_summary_totals_every_script_and_names_the_first_ten() {
+        let mut rows: Vec<Observation> = (0..15u8)
+            .map(|i| unread(u64::from(i), &script_at([i + 10; 28], 0xa1)))
+            .collect();
+        let order = mitos_dex_decode::splash::ORDER_CRED;
+        rows.push(unread(99, &script_at(order, 0xa1)));
+        rows.push(unread(98, &script_at(order, 0xb2)));
+        let summary = unrecognised_summary(unrecognised_scripts(&rows));
+        assert_eq!(summary.outputs, 17);
+        assert_eq!(
+            summary.by_kind,
+            UnrecognisedKinds {
+                undecoded_pool: 0,
+                unknown_script: 15,
+                order: 2,
+                lock: 0,
+                burn: 0,
+            }
+        );
+        assert_eq!(summary.top.len(), UNRECOGNISED_TOP);
+        assert!(
+            summary
+                .top
+                .iter()
+                .all(|s| s.kind == UnrecognisedKind::UnknownScript),
+            "fifteen unknown scripts outrank the order however busy it is"
         );
     }
 
@@ -2830,7 +3190,7 @@ mod pools_tests {
     fn no_rows_is_an_empty_table() {
         let t = table(&[]);
         assert!(t.pools.is_empty());
-        assert_eq!(t.unrecognised, 0);
+        assert_eq!(t.unrecognised.outputs, 0);
     }
 }
 
