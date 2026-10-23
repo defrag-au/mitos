@@ -1184,16 +1184,9 @@ pub struct PoolDto {
 ///
 /// # Reading an empty list
 ///
-/// An empty `pools` is three different answers, and the walk fields say which:
-///
-/// | `cached` | `walking` | meaning |
-/// | --- | --- | --- |
-/// | false | false | never walked: nothing is known, and nothing will be until a `POST /refresh` |
-/// | false | true | the first walk is queued or running: wait, and read again |
-/// | true | either | walked to `walked_to`, and no pool was seen there |
-///
-/// A read never starts a walk (see the module header), so the first row is a
-/// caller's cue to ask for one, not a promise one is coming.
+/// An empty `pools` is several different answers, and `status` says which —
+/// see [`WalkStatus`]. A read never starts a walk (see the module header), so
+/// `unwalked` is a caller's cue to ask for one, not a promise one is coming.
 #[derive(Serialize)]
 pub struct PolicyPoolsResponse {
     pub policy: String,
@@ -1220,9 +1213,9 @@ pub struct PolicyPoolsResponse {
     /// which one a decoder should claim next.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unrecognised_by_address: Vec<UnrecognisedDto>,
-    /// A walk is wanted or running for this policy — the first one, or a
-    /// top-up of an archive that exists.
-    pub walking: bool,
+    /// Where the policy's walk stands, and so what the list can be trusted to
+    /// say.
+    pub status: WalkStatus,
     /// The archive's coverage, from its manifest. Absent until a pass lands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub walked_from: Option<u64>,
@@ -1233,6 +1226,44 @@ pub struct PolicyPoolsResponse {
     /// The running or last job, when this process has one for the policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job: Option<PolicyJob>,
+}
+
+/// Where a policy's walk stands, as a reader of what it found needs to know.
+///
+/// Not a `walking: bool`: "wanted but not started", "running", "failed" and
+/// "an archive exists and is being topped up" are four different things to a
+/// caller deciding whether to wait, retry or trust the answer, and a boolean
+/// folds them together. The job's own progress, or its error, is beside this
+/// in `job`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalkStatus {
+    /// No archive, and no walk wanted: nothing is known until a refresh.
+    Unwalked,
+    /// No archive yet; a walk is wanted and waiting for a slot.
+    Queued,
+    /// No archive yet; the first walk is running.
+    Walking,
+    /// No archive, and the last walk failed. Its error is in `job`.
+    Failed,
+    /// An archive, and nothing running: the answer as of `walked_to`.
+    Walked,
+    /// An archive, with a top-up wanted or running: the answer as of
+    /// `walked_to`, about to move.
+    Refreshing,
+}
+
+/// The status, from the three things that decide it: is there an archive,
+/// does the scheduler want a walk, and what did this process's last job say.
+fn walk_status(cached: bool, wanted: bool, job: Option<&PolicyJob>) -> WalkStatus {
+    match (cached, wanted, job) {
+        (true, true, _) => WalkStatus::Refreshing,
+        (true, false, _) => WalkStatus::Walked,
+        (false, true, Some(PolicyJob::Running { .. })) => WalkStatus::Walking,
+        (false, true, _) => WalkStatus::Queued,
+        (false, false, Some(PolicyJob::Failed { .. })) => WalkStatus::Failed,
+        (false, false, _) => WalkStatus::Unwalked,
+    }
 }
 
 /// How many addresses `unrecognised_by_address` names.
@@ -1305,7 +1336,8 @@ pub async fn pools(
     let at = judged_at(walked_to, &rows);
     let mut table = pools_of(policy.clone(), manifest.is_some(), &view, at);
     table.unrecognised_by_address = unrecognised_by_address(&rows);
-    table.walking = hub.walking(&policy);
+    let job = hub.get(&policy);
+    table.status = walk_status(manifest.is_some(), hub.walking(&policy), job.as_ref());
     table.walked_from = manifest.as_ref().and_then(|m| m.walk_from());
     table.walked_to = walked_to;
     table.completeness = manifest
@@ -1314,7 +1346,7 @@ pub async fn pools(
             m.completeness()
         })
         .as_wire();
-    table.job = hub.get(&policy);
+    table.job = job;
     Ok(Json(table))
 }
 
@@ -1378,7 +1410,7 @@ fn pools_of(
         // The walk and coverage fields are the handler's: this is the table,
         // projected off the fold, and knows nothing of jobs or manifests.
         unrecognised_by_address: Vec::new(),
-        walking: false,
+        status: walk_status(cached, false, None),
         walked_from: None,
         walked_to: None,
         completeness: policy_archive::Completeness::Unrecorded.as_wire(),
@@ -2616,6 +2648,52 @@ mod pools_tests {
             seen_at,
             "a sighting above the coverage still counts"
         );
+    }
+
+    /// Every combination of archive, wanted walk and last job lands on the
+    /// status a caller would act on.
+    #[test]
+    fn the_walk_status_names_what_a_caller_should_do() {
+        let running = PolicyJob::Running {
+            fraction: 0.5,
+            floor: 1,
+            date: "2026-10-23".into(),
+            chunks_done: 1,
+            chunks_total: 2,
+            written: 3,
+            updated: Vec::new(),
+            unresolved: 0,
+        };
+        let failed = PolicyJob::Failed {
+            error: "koios".into(),
+        };
+        let done = PolicyJob::Done {
+            written: 1,
+            backfilled: 0,
+            unresolved: 0,
+            secs: 1.0,
+        };
+        use WalkStatus::*;
+        let cases = [
+            ((false, false, None), Unwalked),
+            ((false, true, None), Queued),
+            ((false, true, Some(&PolicyJob::Queued)), Queued),
+            ((false, true, Some(&running)), Walking),
+            ((false, false, Some(&failed)), Failed),
+            // A retry wanted after a failure is queued again, not failed.
+            ((false, true, Some(&failed)), Queued),
+            ((true, false, None), Walked),
+            ((true, false, Some(&failed)), Walked),
+            ((true, false, Some(&done)), Walked),
+            ((true, true, Some(&running)), Refreshing),
+        ];
+        for ((cached, wanted, job), want) in cases {
+            assert_eq!(
+                walk_status(cached, wanted, job),
+                want,
+                "cached {cached}, wanted {wanted}, job {job:?}"
+            );
+        }
     }
 
     /// Unrecognised outputs are named by address, busiest first, so a busy
