@@ -248,6 +248,11 @@ impl Live {
 struct View<'a> {
     archive: Option<PolicyArchive>,
     lives: Vec<std::sync::MutexGuard<'a, Live>>,
+    /// A pass has LANDED: the manifest exists. Not `archive.is_some()`, which
+    /// a first walk's segments make true before anything has landed — and
+    /// "first walk running" and "archive being topped up" are different
+    /// statuses.
+    landed: bool,
 }
 
 fn view<'a>(hub: &PolicyHub, policy: &str, jobs: &'a [Arc<Mutex<Live>>]) -> Result<View<'a>> {
@@ -269,7 +274,11 @@ fn view<'a>(hub: &PolicyHub, policy: &str, jobs: &'a [Arc<Mutex<Live>>]) -> Resu
     let segments: Vec<(PathBuf, archive::FileKind)> =
         lives.iter().flat_map(|l| l.segments.clone()).collect();
     let archive = PolicyArchive::open_with(&dir, &segments)?;
-    Ok(View { archive, lives })
+    Ok(View {
+        archive,
+        lives,
+        landed: manifest.is_some(),
+    })
 }
 
 pub struct PolicyHub {
@@ -526,8 +535,15 @@ impl PolicyHub {
 
 /// Coverage as a reader sees it: the archive's, widened by whatever the
 /// running jobs have reached. Nothing for either is a policy nobody has
-/// touched.
-fn merged_coverage(archive: Option<&PolicyArchive>, lives: &[&Live], walking: bool) -> CoverageDto {
+/// touched. `status` is judged from `landed`, a walk being `wanted`, and the
+/// last `job` — see [`walk_status`].
+fn merged_coverage(
+    archive: Option<&PolicyArchive>,
+    lives: &[&Live],
+    landed: bool,
+    wanted: bool,
+    job: Option<&PolicyJob>,
+) -> CoverageDto {
     let cov = archive.map(|a| a.coverage());
     let live_floor = lives
         .iter()
@@ -563,7 +579,7 @@ fn merged_coverage(archive: Option<&PolicyArchive>, lives: &[&Live], walking: bo
             .map(|l| l.pending as u64)
             .max()
             .unwrap_or_else(|| cov.as_ref().map_or(0, |c| c.unresolved)),
-        walking,
+        status: walk_status(landed, wanted, job),
         // While a job runs the verdict is not in yet; the archive's stands
         // until the job lands and the manifest is rederived.
         completeness: cov
@@ -682,8 +698,10 @@ pub struct CoverageDto {
     /// progressive walk and must reach the screen — a feed that hides it
     /// presents a partial history as a whole one.
     pub unresolved: u64,
-    /// A pass is running and coverage is still moving.
-    pub walking: bool,
+    /// Where the walk stands: whether a pass has landed, and whether one is
+    /// queued, running or failed. See [`WalkStatus`]; coverage is still
+    /// moving while it is `queued`, `walking` or `refreshing`.
+    pub status: WalkStatus,
     /// `complete` | `partial` | `unrecorded` — whether these numbers are
     /// holdings, a window of movement, or unknown.
     ///
@@ -899,7 +917,7 @@ pub async fn feed(
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
     let job = hub.get(&policy);
-    let walking = hub.walking(&policy);
+    let wanted = hub.walking(&policy);
     let limit = q.limit.unwrap_or(200).clamp(0, 5_000);
     let before = q.before_slot.unwrap_or(u64::MAX);
 
@@ -908,7 +926,11 @@ pub async fn feed(
     // folded once, so a correction a live job found for an archived
     // transaction lands on it.
     let jobs = hub.sched.inflight_for(&policy);
-    let View { mut archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View {
+        mut archive,
+        lives,
+        landed,
+    } = view(&hub, &policy, &jobs).map_err(internal)?;
     let mut rows: Vec<Movement> = match archive.as_mut() {
         Some(a) if limit > 0 => a.movements_page(limit, q.before_slot).map_err(internal)?,
         _ => Vec::new(),
@@ -920,7 +942,7 @@ pub async fn feed(
         }
     }
     let live_refs: Vec<&Live> = lives.iter().map(|g| &**g).collect();
-    let coverage = merged_coverage(archive.as_ref(), &live_refs, walking);
+    let coverage = merged_coverage(archive.as_ref(), &live_refs, landed, wanted, job.as_ref());
     let mut folded = crate::archive::fold_rows(rows);
     folded.truncate(limit as usize);
     Ok(Json(PolicyFeedResponse {
@@ -944,7 +966,11 @@ pub async fn density(
     // request for the raw rows, which is the feed's job.
     let bucket_secs = q.bucket.unwrap_or(86_400).clamp(3_600, 31 * 86_400);
     let jobs = hub.sched.inflight_for(&policy);
-    let View { archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View {
+        archive,
+        lives,
+        landed,
+    } = view(&hub, &policy, &jobs).map_err(internal)?;
     // The footers' histogram — segments included — plus every buffer's.
     let from_archive = archive
         .as_ref()
@@ -953,7 +979,13 @@ pub async fn density(
         crate::archive::merge_density(acc, l.buffered_density(bucket_secs))
     });
     let live_refs: Vec<&Live> = lives.iter().map(|g| &**g).collect();
-    let coverage = merged_coverage(archive.as_ref(), &live_refs, hub.walking(&policy));
+    let coverage = merged_coverage(
+        archive.as_ref(),
+        &live_refs,
+        landed,
+        hub.walking(&policy),
+        hub.get(&policy).as_ref(),
+    );
     let buckets = crate::archive::merge_density(from_archive, from_live)
         .into_iter()
         .map(|b| DensityBucketDto {
@@ -2440,7 +2472,9 @@ pub async fn row_at(
             )
         })?;
     let jobs = hub.sched.inflight_for(&policy);
-    let View { mut archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View {
+        mut archive, lives, ..
+    } = view(&hub, &policy, &jobs).map_err(internal)?;
     let mut rows = match archive.as_mut() {
         Some(a) => a.movements_of(&raw).map_err(internal)?,
         None => Vec::new(),
