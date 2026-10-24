@@ -328,6 +328,27 @@ impl Archive {
         // The data range only. Asking for the filters here would demand
         // bytes a window read never fetched.
         let reader = self.file_reader(bytes, BloomRead::Skip)?;
+        Self::read_group_with(&reader, group)
+    }
+
+    /// A reader over `bytes`, for a caller decoding MORE THAN ONE group.
+    ///
+    /// ⚠️ Constructing one parses the file's footer and EVERY row group's
+    /// thrift metadata, so a caller that reads N groups through
+    /// [`Self::read_group`] pays that N times over. Invisible on a small file
+    /// and dominant on a large one — measured on a 38 MB movements archive.
+    ///
+    /// ⚠️ The reader owns a SNAPSHOT of `bytes`: fetch every range it will read
+    /// before building it, or the read fails on a hole.
+    pub fn reader(&self, bytes: &SparseBytes) -> Result<SerializedFileReader<SparseBytes>> {
+        self.file_reader(bytes, BloomRead::Skip)
+    }
+
+    /// Decode one group through an already-built [`Self::reader`].
+    pub fn read_group_with(
+        reader: &SerializedFileReader<SparseBytes>,
+        group: usize,
+    ) -> Result<Vec<Movement>> {
         let rg = reader.get_row_group(group)?;
         let n = rg.metadata().num_rows() as usize;
 

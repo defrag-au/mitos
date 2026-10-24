@@ -60,6 +60,8 @@
 /// wrong shape for tens of thousands of events and the module says why.
 pub mod wire;
 
+use std::collections::HashMap;
+
 use crate::feed::FeedRow;
 use crate::observation::{Observation, pricing};
 use crate::trade::{Event, Party, Roles, fold};
@@ -503,6 +505,19 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
     let mut events: Vec<StoryEvent> = Vec::new();
     let mut pools: Vec<PoolIdent> = Vec::new();
 
+    // ⚠️ INDEXED, not scanned. [`direction_of`] is asked once per unit a
+    // transaction moved, so finding the row by scan is O(rows × units) — and
+    // `build_series` deliberately hands `build` a WHOLE archive paged into one
+    // `rows`, which on the widest policy here is 38 MB of movements. That
+    // product is what pinned a worker for minutes on 2026-10-24.
+    //
+    // `or_insert` keeps the FIRST row for a transaction, which is exactly what
+    // `rows.iter().find(..)` returned.
+    let mut by_tx: HashMap<&[u8], &FeedRow> = HashMap::with_capacity(rows.len());
+    for r in rows {
+        by_tx.entry(r.tx_hash.as_slice()).or_insert(r);
+    }
+
     // ⚠️ A trade event carries the venue's CREDENTIAL; a pool observation
     // carries its NAME. Resolve here so both sides of the stream speak the
     // same vocabulary — otherwise a consumer grouping by venue sees `splash`
@@ -560,7 +575,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 amount: *amount,
             },
             // A plain movement: the direction the rows themselves support.
-            Event::Transfer => match direction_of(rows, &f.tx_hash, &f.unit) {
+            Event::Transfer => match direction_of(&by_tx, &f.tx_hash, &f.unit) {
                 Some(k) => k,
                 None => continue,
             },
@@ -672,14 +687,9 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
 /// Reuses [`crate::feed::direction`] so the stream and the feed cannot
 /// disagree about the same transaction — the one place a second
 /// implementation would be invisible.
-fn direction_of(rows: &[FeedRow], tx: &[u8], unit: &[u8]) -> Option<Kind> {
+fn direction_of(by_tx: &HashMap<&[u8], &FeedRow>, tx: &[u8], unit: &[u8]) -> Option<Kind> {
     use crate::feed::Direction;
-    let u = rows
-        .iter()
-        .find(|r| r.tx_hash == tx)?
-        .units
-        .iter()
-        .find(|u| u.name == unit)?;
+    let u = by_tx.get(tx)?.units.iter().find(|u| u.name == unit)?;
     let amount = u.parties.iter().map(|p| p.amount.abs()).max().unwrap_or(0);
     Some(match crate::feed::direction(u) {
         Direction::Mint { to } => Kind::Mint {

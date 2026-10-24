@@ -2061,38 +2061,28 @@ pub async fn live(
         }
         None => BucketTally::default(),
     };
-    // ⚠️ CACHED — see `PolicyHub::holders`. This document is rebuilt by every
-    // policy DO every 150 s and the fold pages every movement row, so it is
-    // memoised against the archive's `updated_unix` and recomputed only when
-    // the archive has actually moved.
+    // ⚠️ CACHED, and now built from ONE decode — see `live_folds`. This
+    // document is rebuilt by every policy DO every 150 s and both of these are
+    // whole-history folds, so they are memoised against the archive's
+    // `updated_unix` and recomputed only when the archive has actually moved.
     //
     // Fail-soft: a burn total we could not compute is 0 and `circulating`
     // falls back to `minted`, which is the figure we published before this
     // existed — never a failed document.
-    let burned = match holders_of(&hub, &policy) {
-        Ok(fold) => burn_split(&fold).0,
+    let (burned, stats) = match live_folds(&hub, &policy) {
+        Ok((fold, series)) => (
+            burn_split(&fold).0,
+            Some(StatsDto::from(series.stats(crate::reverse::now_unix()))),
+        ),
         Err(e) => {
-            tracing::warn!("policy {policy} live: burn total unreadable: {e:#}");
-            unreadable.push(format!("burned: {e:#}"));
-            0
+            tracing::warn!("policy {policy} live: history folds unreadable: {e:#}");
+            unreadable.push(format!("burned, stats: {e:#}"));
+            (0, None)
         }
     };
     let circulating = supply
         .as_ref()
         .map(|s| (s.minted - burned).max(0).to_string());
-
-    // ⚠️ Evaluated at the WALL CLOCK, not at the archive's tip. "24-hour
-    // volume" means the last 24 hours of the world; measuring from the tip
-    // would silently widen the window by however far behind the archive is and
-    // report a day of volume as if it were today's.
-    let stats = match series_of(&hub, &policy) {
-        Ok(s) => Some(StatsDto::from(s.stats(crate::reverse::now_unix()))),
-        Err(e) => {
-            tracing::warn!("policy {policy} live: series unreadable: {e:#}");
-            unreadable.push(format!("stats: {e:#}"));
-            None
-        }
-    };
 
     let price = priced.map(|(p, _)| p);
     Ok(Json(PolicyLiveResponse {
@@ -2200,23 +2190,74 @@ fn holders_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<policy_archive::h
     Ok(fold)
 }
 
-/// The price + volume series, memoised against the archive's `updated_unix`.
-fn series_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<Arc<policy_archive::series::Series>> {
+/// The holder table and the price series — from ONE decode of the archive.
+///
+/// ⚠️ One, not two. Both are whole-history folds and both are cached against
+/// the archive's `updated_unix`, so they go stale TOGETHER; each used to open
+/// the archive and decode every movement on its own, which on the widest
+/// archive here was two passes over 38 MB of parquet for a single `/live`.
+/// [`crate::archive::PolicyArchive::all_movements`] is what makes the sharing
+/// real, and it is why `holders_from`/`series_from` exist beside the
+/// `build_*` pair the other routes still use.
+fn live_folds(
+    hub: &PolicyHub,
+    policy: &str,
+) -> anyhow::Result<(
+    policy_archive::holders::Fold,
+    Arc<policy_archive::series::Series>,
+)> {
     let dir = hub.policy_dir(policy);
-    let version = archive::load_manifest(&dir)?
-        .map(|m| m.updated_unix)
-        .unwrap_or(0);
-    if let Some((at, s)) = hub.series.lock().expect("series cache").get(policy)
-        && *at == version
-    {
-        return Ok(Arc::clone(s));
+    let manifest = archive::load_manifest(&dir)?;
+    let version = manifest.as_ref().map(|m| m.updated_unix).unwrap_or(0);
+
+    let held = hub
+        .holders
+        .lock()
+        .expect("holders cache")
+        .get(policy)
+        .filter(|(at, _)| *at == version)
+        .map(|(_, fold)| fold.clone());
+    let series = hub
+        .series
+        .lock()
+        .expect("series cache")
+        .get(policy)
+        .filter(|(at, _)| *at == version)
+        .map(|(_, s)| Arc::clone(s));
+    if let (Some(held), Some(series)) = (held, series) {
+        return Ok((held, series));
     }
-    let built = Arc::new(crate::archive::build_series(&dir)?.unwrap_or_default());
+
+    let observations = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m)?,
+        None => Vec::new(),
+    };
+    let (held, series) = match crate::archive::History::open(&dir)? {
+        Some(mut h) => {
+            let held = crate::archive::holders_from(&mut h)?;
+            let series = Arc::new(crate::archive::series_from(&mut h, &observations)?);
+            (held, series)
+        }
+        None => (
+            policy_archive::holders::Fold {
+                holders: Vec::new(),
+                held: 0,
+                rows: 0,
+                negative: 0,
+            },
+            Arc::new(policy_archive::series::Series::default()),
+        ),
+    };
+
+    hub.holders
+        .lock()
+        .expect("holders cache")
+        .insert(policy.to_string(), (version, held.clone()));
     hub.series
         .lock()
         .expect("series cache")
-        .insert(policy.to_string(), (version, Arc::clone(&built)));
-    Ok(built)
+        .insert(policy.to_string(), (version, Arc::clone(&series)));
+    Ok((held, series))
 }
 
 /// Σ held at registered burn sinks, and what that leaves circulating.

@@ -778,10 +778,20 @@ impl PolicyArchive {
                 RangeKind::Volatile => continue,
             }
             let volatile = self.files[i].range == RangeKind::Volatile;
-            for g in 0..self.files[i].archive.num_groups() {
-                let f = &mut self.files[i];
-                f.fetch_group(g)?;
-                for m in f.archive.read_group(&f.bytes, g)?.iter() {
+            // ⚠️ Fetch the file's groups ONCE and decode them through ONE
+            // reader. `read_group` builds a `SerializedFileReader` per call,
+            // which re-parses the parquet footer and EVERY row group's thrift
+            // metadata — per group, per pass. Measured as a real share of a
+            // `/live` on a 38 MB archive (2026-10-24), and this is the one fold
+            // that reads every group of both movements and corrections files.
+            let groups = self.files[i].archive.num_groups();
+            for g in 0..groups {
+                self.files[i].fetch_group(g)?;
+            }
+            let f = &self.files[i];
+            let reader = f.archive.reader(&f.bytes)?;
+            for g in 0..groups {
+                for m in Archive::read_group_with(&reader, g)?.iter() {
                     if !(include_plumbing || is_user_unit(&m.unit_name)) {
                         continue;
                     }
@@ -1394,6 +1404,58 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
     }))
 }
 
+/// An open archive plus the WHOLE-HISTORY decode it can hand out once.
+///
+/// ⚠️ Why this exists at all. A holder balance and an all-time price series are
+/// both cumulative folds over every movement, so each opened the archive and
+/// decoded all of it separately — twice over 38 MB of movements parquet for a
+/// single `/live` on the widest archive here. The rows are the same rows; only
+/// the fold differs, so the decode is done once and lent to both.
+///
+/// The walk is [`PolicyArchive::movements_page`] driven to exhaustion, which is
+/// exactly what each fold did on its own, so nothing about the row set changes.
+pub struct History {
+    archive: PolicyArchive,
+    all: Option<Vec<Movement>>,
+}
+
+impl History {
+    /// `None` when no pass has ever run for this policy.
+    pub fn open(dir: &Path) -> Result<Option<Self>> {
+        Ok(PolicyArchive::open(dir)?.map(|archive| Self { archive, all: None }))
+    }
+
+    /// Every movement in the archive, decoded ONCE.
+    ///
+    /// ⚠️ The WHOLE archive, not a window: a balance is cumulative over all
+    /// history, and a page of it is not a smaller version of the answer, it is
+    /// a different and wrong one — see [`build_holders`].
+    pub fn all_movements(&mut self) -> Result<&[Movement]> {
+        if self.all.is_none() {
+            let mut all: Vec<Movement> = Vec::new();
+            let mut before: Option<u64> = None;
+            const PAGE: u32 = 5_000;
+            loop {
+                let page = self.archive.movements_page(PAGE, before)?;
+                let Some(oldest) = page.iter().map(|m| m.slot).min() else {
+                    break;
+                };
+                all.extend(page);
+                let next = Some(oldest);
+                // A page that does not advance ends the walk — which also
+                // guards the pathological case of one slot holding more rows
+                // than a page.
+                if next == before {
+                    break;
+                }
+                before = next;
+            }
+            self.all = Some(all);
+        }
+        Ok(self.all.as_deref().unwrap_or(&[]))
+    }
+}
+
 /// Fold every movement in an archive into a holder table.
 ///
 /// ⚠️ Pages the WHOLE archive, newest-first, exactly as [`build_graph`] does —
@@ -1404,27 +1466,20 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
 /// archive rather more. That is why the result is worth caching upstream and
 /// why the route below takes a `limit` on the OUTPUT rather than the input.
 pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>> {
-    let Some(mut a) = PolicyArchive::open(dir)? else {
+    let Some(mut h) = History::open(dir)? else {
         return Ok(None);
     };
-    let mut all: Vec<policy_archive::Movement> = Vec::new();
-    let mut before: Option<u64> = None;
-    const PAGE: u32 = 5_000;
-    loop {
-        let page = a.movements_page(PAGE, before)?;
-        let Some(oldest) = page.iter().map(|m| m.slot).min() else {
-            break;
-        };
-        all.extend(page);
-        let next = Some(oldest);
-        // A page that does not advance ends the walk — which also guards the
-        // pathological case of one slot holding more rows than a page.
-        if next == before {
-            break;
-        }
-        before = next;
-    }
-    Ok(Some(policy_archive::holders::fold(all.into_iter())))
+    Ok(Some(holders_from(&mut h)?))
+}
+
+/// [`build_holders`] against an ALREADY-OPEN [`History`].
+///
+/// Split out so a caller that also wants the series shares ONE decode of the
+/// history: `/live` asks for both, and each used to walk the archive alone.
+pub fn holders_from(h: &mut History) -> Result<policy_archive::holders::Fold> {
+    Ok(policy_archive::holders::fold(
+        h.all_movements()?.iter().cloned(),
+    ))
 }
 
 /// Fold a policy's WHOLE archive into the price + volume series.
@@ -1435,36 +1490,22 @@ pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>
 /// Built from the STORY rather than from movements and observations
 /// separately, so the merge onto one slot spine — and the intra-slot ordering
 /// that values a trade at the PRE-swap price — has exactly one definition.
-pub fn build_series(dir: &Path) -> Result<Option<policy_archive::series::Series>> {
-    let Some(mut a) = PolicyArchive::open(dir)? else {
-        return Ok(None);
-    };
-    let Some(manifest) = load_manifest(dir)? else {
-        return Ok(None);
-    };
-    let observations = read_observations(dir, &manifest)?;
-
-    let mut rows: Vec<policy_archive::FeedRow> = Vec::new();
-    let mut before: Option<u64> = None;
-    const PAGE: u32 = 5_000;
-    loop {
-        let page = a.feed_rows(PAGE, before)?;
-        let Some(oldest) = page.iter().map(|r| r.slot).min() else {
-            break;
-        };
-        rows.extend(page);
-        let next = Some(oldest);
-        if next == before {
-            break;
-        }
-        before = next;
-    }
-
-    let story = policy_archive::story::build(&rows, &observations, &venue_roles_for(&observations));
-    Ok(Some(policy_archive::series::fold(
+///
+/// Takes an ALREADY-OPEN [`History`] and observations, and the rows come from
+/// [`History::all_movements`]: `/live` needs this and the holder table
+/// together, and each used to open the archive and decode every movement on
+/// its own. One decode of a 38 MB archive instead of two is the difference
+/// that made `/live` finish.
+pub fn series_from(
+    h: &mut History,
+    observations: &[policy_archive::Observation],
+) -> Result<policy_archive::series::Series> {
+    let rows = fold_rows(h.all_movements()?.to_vec());
+    let story = policy_archive::story::build(&rows, observations, &venue_roles_for(observations));
+    Ok(policy_archive::series::fold(
         &story,
         &policy_archive::view::Projection::default(),
-    )))
+    ))
 }
 
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
