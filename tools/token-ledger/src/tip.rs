@@ -190,6 +190,13 @@ fn refresh(hub: &PolicyHub, spool: &Path, publishing: &crate::scheduler::Publish
             index.as_deref(),
         ) {
             // Only republish when the tail actually holds something new.
+            //
+            // ⚠️ THE DERIVED SERIES IS NO LONGER WRITTEN HERE. It carries the
+            // fold's state at a boundary, and a reader continues it through
+            // the tail — so a tail rebuild changes what a reader folds, not
+            // what the artifact says. Writing it here re-folded the WHOLE
+            // archive for all 31 policies every cycle (163 s -> 236 s of a
+            // 300 s interval) and would have grown with the archive.
             Ok(Wrote::Tail) => publishing.publish(hub.policy_dir(policy), policy),
             Ok(Wrote::Nothing) => {}
             Err(e) => {

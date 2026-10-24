@@ -2190,6 +2190,28 @@ fn holders_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<policy_archive::h
     Ok(fold)
 }
 
+/// Whether the archive's coverage reaches continuously down to `settled_to`.
+///
+/// ⚠️ This guard is the difference between "the tail continues where the
+/// artefact stopped" and "there is a stretch the artefact never saw and no
+/// pass holds". The second fails SILENTLY: folding above the boundary returns
+/// a shorter series with no error, and every volume figure reads low.
+///
+/// ⚠️ EVERY pass is considered, not just the volatile ones. Rows above the
+/// boundary can arrive in an immutable pass too — a walk lands them, and the
+/// artefact is only rewritten once that walk completes.
+fn tail_is_continuous(manifest: &archive::Manifest, settled_to: u64) -> bool {
+    manifest
+        .passes
+        .iter()
+        .filter(|p| p.ceiling > settled_to)
+        .map(|p| p.floor)
+        .min()
+        // Nothing reaches above the boundary: there is no tail to fold, so any
+        // boundary is continuous with it.
+        .is_none_or(|floor| floor <= settled_to + 1)
+}
+
 /// The holder table and the price series — from ONE decode of the archive.
 ///
 /// ⚠️ One, not two. Both are whole-history folds and both are cached against
@@ -2208,7 +2230,18 @@ fn live_folds(
 )> {
     let dir = hub.policy_dir(policy);
     let manifest = archive::load_manifest(&dir)?;
+    // Two different keys, and they answer different questions.
+    //
+    // `version` (`updated_unix`) invalidates the IN-MEMORY folds: a balance
+    // moves whenever the tail moves, so the holder table really is stale every
+    // 300 s. `immutable` invalidates the WRITTEN series, which knows about the
+    // tail only through `settled_to` and is continued on read — keying that on
+    // `updated_unix` made it stale every five minutes for no reason.
     let version = manifest.as_ref().map(|m| m.updated_unix).unwrap_or(0);
+    let immutable = manifest
+        .as_ref()
+        .map(crate::archive::immutable_to)
+        .unwrap_or(0);
 
     let held = hub
         .holders
@@ -2228,14 +2261,59 @@ fn live_folds(
         return Ok((held, series));
     }
 
-    let observations = match &manifest {
-        Some(m) => crate::archive::read_observations(&dir, m)?,
-        None => Vec::new(),
+    let written = match crate::archive::read_series(&dir, immutable) {
+        Ok(carry) => carry,
+        Err(e) => {
+            tracing::warn!(
+                policy,
+                error = %format!("{e:#}"),
+                "policy: series artifact unreadable, folding instead"
+            );
+            None
+        }
     };
+
     let (held, series) = match crate::archive::History::open(&dir)? {
         Some(mut h) => {
             let held = crate::archive::holders_from(&mut h)?;
-            let series = Arc::new(crate::archive::series_from(&mut h, &observations)?);
+            // The carried series, continued through whatever has happened
+            // since its boundary. This is the whole point of the artifact:
+            // the fold is proportional to the TAIL, not to the history.
+            let continued = written.filter(|carry| match &manifest {
+                // ⚠️ A GAP would be silent — see `tail_series`. If the
+                // archive's coverage does not reach from the boundary to the
+                // tail, folding above the boundary drops every row in
+                // between and the series loses a stretch of trades without
+                // saying so.
+                Some(m) => tail_is_continuous(m, carry.settled_to),
+                None => false,
+            });
+            let series = match continued {
+                Some(carry) => match &manifest {
+                    Some(m) => Arc::new(crate::archive::tail_series(&mut h, &dir, m, &carry)?),
+                    None => Arc::new(carry.series),
+                },
+                None => {
+                    let observations = match &manifest {
+                        Some(m) => crate::archive::read_observations(&dir, m)?,
+                        None => Vec::new(),
+                    };
+                    let carry = crate::archive::carry_from(&mut h, &observations)?;
+                    // ⚠️ Record the fold that just happened. The publisher
+                    // rewrites this when a walk lands; writing it here is what
+                    // covers a box that has just restarted and a reader on a
+                    // policy nothing else is publishing. A failure is the next
+                    // reader's fold, not this one's error.
+                    if let Err(e) = crate::archive::store_series(&dir, immutable, &carry) {
+                        tracing::warn!(
+                            policy,
+                            error = %format!("{e:#}"),
+                            "policy: series artifact not written"
+                        );
+                    }
+                    Arc::new(carry.series)
+                }
+            };
             (held, series)
         }
         None => (

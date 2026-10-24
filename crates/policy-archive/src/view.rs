@@ -42,6 +42,8 @@
 //! way a spine already does. Until then the box folds observations here and
 //! the browser gets a projection, never the fold.
 
+use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 
 use crate::observation::{Observation, pricing};
@@ -58,7 +60,7 @@ use crate::story::{Kind, PoolIdent, Story, StoryEvent};
 /// - **Instance key alone** merges every pool on a venue that publishes no key
 ///   at all, where `key_name` is empty for all of them, and merges pools across
 ///   venues that happen to reuse a key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PoolKey {
     /// The script address, bech32, as the rows spell it.
     pub address: String,
@@ -72,7 +74,7 @@ pub struct PoolKey {
 /// pool's UTxO is touched **while holding the asset**, so a pool that is
 /// drained stops being observed at the moment *before* it emptied and its final
 /// full reserves sit here for ever. That is what [`Bucket::Stale`] is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pool {
     pub venue: String,
     /// Slot of the last sighting.
@@ -193,7 +195,7 @@ impl Pool {
 /// Fold forward only. To answer for an EARLIER position, re-fold from a
 /// checkpoint — do not ask this one backwards, and [`PolicyView::spot`] will
 /// say so in a debug build if you do.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyView {
     pools: HashMap<PoolKey, Pool>,
     ceiling: Option<u64>,

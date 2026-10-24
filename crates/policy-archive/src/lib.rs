@@ -96,6 +96,7 @@ pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
 pub use profile::{Class, Profile};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
+pub use series::{SERIES, SERIES_FORMAT, SeriesError, SeriesFile};
 pub use story::{Kind as StoryKind, PoolState, Story, StoryEvent, Trader};
 pub use supply::{Balance, Because, Diagnose, Offender, Reconciler, Verdict};
 pub use writer::{ArchiveWriter, Written};

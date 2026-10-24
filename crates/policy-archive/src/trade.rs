@@ -40,6 +40,8 @@
 //! there. Those become [`Event::BatchedFill`], counted and named, never
 //! decomposed.
 
+use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 
 use crate::feed::{FeedRow, UnitMove};
@@ -49,7 +51,7 @@ use crate::feed::{FeedRow, UnitMove};
 /// Supplied by the caller rather than looked up here: this crate is read by
 /// consumers that must not link a decode stack, and the same seam already
 /// works for `mitos_cohort::classify`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Pool,
     /// A DEX order/escrow contract.
@@ -60,7 +62,7 @@ pub enum Role {
 }
 
 /// Whether an order contract encodes its customer in the address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderKeying {
     /// The stake part is the CUSTOMER's, so the trader falls out of the fill.
     CustomerStake,
@@ -70,7 +72,7 @@ pub enum OrderKeying {
 }
 
 /// Roles by payment credential, hex, lower case.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Roles {
     pub roles: HashMap<String, Role>,
     /// How each ORDER credential keys its customer. Absent means
@@ -115,6 +117,26 @@ impl Roles {
         let cred = cred_hex.into();
         self.roles.insert(cred.clone(), role);
         self.names.insert(cred, venue.to_string());
+    }
+
+    /// Add every entry of `other` this set does not already hold.
+    ///
+    /// ⚠️ **`self` WINS.** Used to widen a table carried from the settled
+    /// archive with the credentials a tail's own observations discovered. A
+    /// carried entry was folded from more history than the tail can see, so a
+    /// disagreement is not something a read should silently revise.
+    pub fn merge_missing(&mut self, other: &Roles) {
+        for (cred, role) in &other.roles {
+            self.roles.entry(cred.clone()).or_insert(*role);
+        }
+        for (cred, keying) in &other.keying {
+            self.keying.entry(cred.clone()).or_insert(*keying);
+        }
+        for (cred, name) in &other.names {
+            self.names
+                .entry(cred.clone())
+                .or_insert_with(|| name.clone());
+        }
     }
 }
 

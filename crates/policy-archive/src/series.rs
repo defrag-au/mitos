@@ -29,13 +29,16 @@
 //!    well would double every figure. `BatchedFill` counts its amount ONCE and
 //!    is never decomposed.
 
+use serde::{Deserialize, Serialize};
+
 use crate::price::Unit;
 use crate::story::{Kind, Story};
+use crate::trade::Roles;
 use crate::view::{PolicyView, Projection};
 
 /// The price at one moment. Points exist only where the price CHANGED — a
 /// piecewise-constant series, the same shape the archive itself has.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub slot: u64,
     pub unix: u64,
@@ -45,7 +48,7 @@ pub struct Point {
 }
 
 /// One trade, valued.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
     pub slot: u64,
     pub unix: u64,
@@ -60,7 +63,7 @@ pub struct Trade {
 }
 
 /// The folded series.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Series {
     /// Slot-ascending, one per price change.
     pub points: Vec<Point>,
@@ -76,12 +79,44 @@ pub struct Series {
 ///
 /// The story must be slot-ascending — [`crate::story::build`] guarantees it.
 pub fn fold(story: &Story, p: &Projection) -> Series {
-    let mut view = PolicyView::default();
-    let mut out = Series::default();
+    fold_onto(story, p, &Carry::default()).0
+}
+
+/// What a fold needs to RESUME where an earlier one stopped.
+///
+/// ⚠️ Not just the last price. A [`Point`] is the aggregate spot, which is a
+/// function of EVERY pool's last reserves — so a series that resumed from its
+/// own last point would value the next trade at a price that never existed.
+/// The view is the thing that has to travel.
+///
+/// `roles` travels for a different reason: a fill is classified by its venue's
+/// credential, and a credential discovered below `settled_to` is not visible in
+/// the rows above it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Carry {
+    /// Complete through `settled_to`.
+    pub series: Series,
+    /// Every pool's last state at `settled_to`.
+    pub view: PolicyView,
+    /// Who was trading, as established by everything up to `settled_to`.
+    pub roles: Roles,
+    /// The slot the series is complete through. Everything above is folded on
+    /// read.
+    pub settled_to: u64,
+}
+
+/// Fold a story ONTO a carried state, returning the widened series and view.
+///
+/// The story must be slot-ascending and must begin ABOVE `carry.settled_to`;
+/// [`crate::story::build`] guarantees the first, the caller the second.
+pub fn fold_onto(story: &Story, p: &Projection, carry: &Carry) -> (Series, PolicyView) {
+    let mut view = carry.view.clone();
+    let mut out = carry.series.clone();
     // The last price pushed, so a repeated sighting at an unchanged rate does
     // not become a point. A pool is re-observed on every touch, and most
-    // touches do not move the aggregate.
-    let mut last: Option<f64> = None;
+    // touches do not move the aggregate. Carried, or the first tail sighting
+    // repeats a price the series already ends on.
+    let mut last: Option<f64> = out.points.last().map(|point| point.spot);
 
     for e in &story.events {
         match &e.kind {
@@ -118,7 +153,7 @@ pub fn fold(story: &Story, p: &Projection) -> Series {
             _ => {}
         }
     }
-    out
+    (out, view)
 }
 
 impl Series {
@@ -237,6 +272,81 @@ pub struct Stats {
 /// token-paired series exists.
 pub fn quote_unit() -> Unit {
     Unit::ada()
+}
+
+/// On-disk name of the DERIVED series, beside `graph.bin` and `bundle.bin`.
+///
+/// ⚠️ An ARTEFACT, not truth. It is folded from the archive and can be deleted
+/// at any time; a reader that cannot use it must fall back to [`fold`], never
+/// to an empty series.
+pub const SERIES: &str = "series.bin";
+
+/// Bumped when [`Point`], [`Trade`], [`Series`] or [`Carry`] changes shape.
+///
+/// ⚠️ A STALE file and a BROKEN one are different answers, which is why this
+/// is checked on byte zero before anything is deserialized: postcard writes
+/// `format` first and unencoded, while an older shape fails deep inside as
+/// "hit the end of buffer, expected more data" — reading as corruption when
+/// the truth is that a publisher has not rewritten it yet. Same argument, and
+/// the same shape, as [`crate::GRAPH_FORMAT`].
+///
+/// 2 carries the fold's [`Carry`], so a reader continues the series from the
+/// boundary instead of re-folding the archive.
+pub const SERIES_FORMAT: u8 = 2;
+
+/// What `series.bin` holds: the series, the state it stopped at, and the
+/// archive it describes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesFile {
+    pub format: u8,
+    /// The archive's IMMUTABLE coverage ceiling when this was folded.
+    ///
+    /// ⚠️ NOT `updated_unix`, and the difference is the whole point. The tail
+    /// rebuild moves `updated_unix` every 300 s, but a tail rebuild changes
+    /// nothing at or below [`Carry::settled_to`] — those rows are folded on top
+    /// at read time. Keying on it made the artefact stale every five minutes,
+    /// which is exactly the cost it exists to remove.
+    ///
+    /// What DOES invalidate it is the immutable coverage growing: a new pass
+    /// adds rows at or below the boundary, and those are not in the artefact.
+    pub immutable_to: u64,
+    /// The series AND everything a reader needs to continue it — see
+    /// [`Carry`].
+    pub carry: Carry,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SeriesError {
+    #[error(
+        "series is format {found}, this build reads {expected} — a stale copy, \
+         not a broken one"
+    )]
+    Version { found: u8, expected: u8 },
+    #[error("series is empty")]
+    Empty,
+    #[error("decoding the series: {0}")]
+    Decode(#[from] postcard::Error),
+}
+
+impl SeriesFile {
+    pub fn encode(&self) -> Result<Vec<u8>, SeriesError> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// Version-checked decode, on byte zero before anything else is trusted.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SeriesError> {
+        match bytes.first() {
+            Some(&SERIES_FORMAT) => {}
+            Some(&found) => {
+                return Err(SeriesError::Version {
+                    found,
+                    expected: SERIES_FORMAT,
+                });
+            }
+            None => return Err(SeriesError::Empty),
+        }
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 #[cfg(test)]
@@ -411,5 +521,101 @@ mod tests {
         assert_eq!(s.volume_since(base + 25), (2_000, 1));
         // Nothing.
         assert_eq!(s.volume_since(base + 100), (0, 0));
+    }
+
+    /// ⚠️ THE TEST THIS WHOLE SHAPE EXISTS FOR.
+    ///
+    /// Folding a story in two — carrying the view across the join — must equal
+    /// folding it in one. If this fails, an incremental series is not a series.
+    #[test]
+    fn a_fold_split_at_a_slot_equals_a_fold_in_one() {
+        let story = story_of(vec![
+            ev(10, pool(1_000, 10_000)),
+            ev(20, fill(100, true)),
+            ev(30, pool(900, 11_000)),
+            // The SAME reserves again: no price moved, so no point. This is the
+            // event that catches a fold resuming without `last` — it would push
+            // a point the whole fold does not have.
+            ev(35, pool(900, 11_000)),
+            ev(40, fill(50, true)),
+            ev(50, pool(1_000, 11_000)),
+            ev(60, fill(25, false)),
+        ]);
+        let whole = fold(&story, &Projection::default());
+
+        // Split immediately after a POOL sighting, which is the awkward case:
+        // the second half opens on a sighting that has to be priced against
+        // state folded in the first, and on a price that must not be repeated.
+        let mut first = story.clone();
+        first.events.retain(|e| e.slot <= 30);
+        let mut second = story.clone();
+        second.events.retain(|e| e.slot > 30);
+
+        let (series, view) = fold_onto(&first, &Projection::default(), &Carry::default());
+        let carry = Carry {
+            series,
+            view,
+            roles: Roles::default(),
+            settled_to: 30,
+        };
+        let (split, _) = fold_onto(&second, &Projection::default(), &carry);
+
+        assert_eq!(split, whole);
+        assert!(
+            !split.points.is_empty(),
+            "the split fold must actually carry points, or this proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_series_file_round_trips_and_carries_its_archive_version() {
+        let file = SeriesFile {
+            format: SERIES_FORMAT,
+            immutable_to: 1_700_000_099,
+            carry: Carry {
+                series: Series {
+                    points: vec![Point {
+                        slot: 10,
+                        unix: 1_700_000_000,
+                        spot: 0.000_002,
+                    }],
+                    trades: vec![Trade {
+                        slot: 10,
+                        unix: 1_700_000_000,
+                        units: 5,
+                        lovelace: 10_000,
+                        sold: true,
+                    }],
+                    unvalued: 2,
+                },
+                view: PolicyView::default(),
+                roles: Roles::default(),
+                settled_to: 10,
+            },
+        };
+        let bytes = file.encode().unwrap();
+        // The version must be readable WITHOUT deserializing — that is the
+        // whole point of checking it on byte zero.
+        assert_eq!(bytes[0], SERIES_FORMAT);
+        assert_eq!(SeriesFile::decode(&bytes).unwrap(), file);
+    }
+
+    #[test]
+    fn a_series_from_another_build_is_stale_not_broken() {
+        let mut bytes = SeriesFile {
+            format: SERIES_FORMAT,
+            immutable_to: 1,
+            carry: Carry::default(),
+        }
+        .encode()
+        .unwrap();
+        bytes[0] = SERIES_FORMAT + 1;
+        match SeriesFile::decode(&bytes) {
+            Err(SeriesError::Version { found, expected }) => {
+                assert_eq!((found, expected), (SERIES_FORMAT + 1, SERIES_FORMAT));
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
+        assert!(matches!(SeriesFile::decode(&[]), Err(SeriesError::Empty)));
     }
 }

@@ -1454,6 +1454,48 @@ impl History {
         }
         Ok(self.all.as_deref().unwrap_or(&[]))
     }
+
+    /// Every movement ABOVE `slot`, decoded — the tail half of a carried fold.
+    ///
+    /// ⚠️ Skips whole row groups by their recorded slot range, so the cost is
+    /// proportional to what is above `slot` rather than to the archive. That is
+    /// the entire point: the archive grows, and the tail does not.
+    ///
+    /// Corrections are attached exactly as [`PolicyArchive::movements_page`]
+    /// attaches them, because a correction is where a later pass records the
+    /// source it finally resolved — reading movements alone would report those
+    /// rows as unresolved again.
+    pub fn movements_above(&mut self, slot: u64) -> Result<Vec<Movement>> {
+        let mut candidates: Vec<(usize, usize, u64)> = Vec::new();
+        for (i, f) in self.archive.files.iter().enumerate() {
+            if f.kind != FileKind::Movements {
+                continue;
+            }
+            for g in 0..f.archive.num_groups() {
+                if let Some((_, hi)) = f.archive.slot_range(g)
+                    && hi > slot
+                {
+                    candidates.push((i, g, hi));
+                }
+            }
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
+
+        let mut rows: Vec<Movement> = Vec::new();
+        let mut txs: HashSet<Vec<u8>> = HashSet::new();
+        for (i, g, _) in candidates {
+            let f = &mut self.archive.files[i];
+            f.fetch_group(g)?;
+            for m in f.archive.read_group(&f.bytes, g)? {
+                if m.slot > slot {
+                    txs.insert(m.tx_hash.clone());
+                    rows.push(m);
+                }
+            }
+        }
+        self.archive.attach_corrections(&mut rows, &txs)?;
+        Ok(rows)
+    }
 }
 
 /// Fold every movement in an archive into a holder table.
@@ -1482,7 +1524,8 @@ pub fn holders_from(h: &mut History) -> Result<policy_archive::holders::Fold> {
     ))
 }
 
-/// Fold a policy's WHOLE archive into the price + volume series.
+/// Fold a policy's WHOLE archive into the series, and keep what a later fold
+/// needs to continue it.
 ///
 /// ⚠️ The whole archive, not a window. An all-time high over the last 5,000
 /// movements is not an all-time high, and a 30-day change needs 30 days.
@@ -1491,21 +1534,153 @@ pub fn holders_from(h: &mut History) -> Result<policy_archive::holders::Fold> {
 /// separately, so the merge onto one slot spine — and the intra-slot ordering
 /// that values a trade at the PRE-swap price — has exactly one definition.
 ///
-/// Takes an ALREADY-OPEN [`History`] and observations, and the rows come from
-/// [`History::all_movements`]: `/live` needs this and the holder table
-/// together, and each used to open the archive and decode every movement on
-/// its own. One decode of a 38 MB archive instead of two is the difference
-/// that made `/live` finish.
-pub fn series_from(
+/// `settled_to` is the highest slot EITHER tier reached, because a tail fold
+/// resumes above it: taking the movements' tip when an observation sat higher
+/// would drop that observation from every read.
+pub fn carry_from(
     h: &mut History,
     observations: &[policy_archive::Observation],
-) -> Result<policy_archive::series::Series> {
-    let rows = fold_rows(h.all_movements()?.to_vec());
-    let story = policy_archive::story::build(&rows, observations, &venue_roles_for(observations));
-    Ok(policy_archive::series::fold(
+) -> Result<policy_archive::series::Carry> {
+    let movements = h.all_movements()?.to_vec();
+    let settled_to = movements
+        .iter()
+        .map(|m| m.slot)
+        .chain(observations.iter().map(|o| o.slot))
+        .max()
+        .unwrap_or(0);
+    let roles = venue_roles_for(observations);
+    let story = policy_archive::story::build(&fold_rows(movements), observations, &roles);
+    let (series, view) = policy_archive::series::fold_onto(
         &story,
         &policy_archive::view::Projection::default(),
-    ))
+        &policy_archive::series::Carry::default(),
+    );
+    Ok(policy_archive::series::Carry {
+        series,
+        view,
+        roles,
+        settled_to,
+    })
+}
+
+/// Continue a carried series through everything ABOVE its boundary.
+///
+/// This is the read that replaced folding the whole archive: the rows are the
+/// ones above `carry.settled_to`, which the archive keeps in its volatile
+/// files, and the group walk skips any row group whose recorded slot range
+/// ends below it. Cost is proportional to the tail, not to the history.
+///
+/// ⚠️ A GAP would be silent. If the archive's own coverage does not reach
+/// continuously from `settled_to` to the tail, a fold here would simply not
+/// see the rows in between, and the series would lose a stretch of trades
+/// without saying so. The caller checks that and folds the whole archive
+/// instead — see `policy_api::live_folds`.
+pub fn tail_series(
+    h: &mut History,
+    dir: &Path,
+    manifest: &Manifest,
+    carry: &policy_archive::series::Carry,
+) -> Result<policy_archive::series::Series> {
+    let observations = read_observations_above(dir, manifest, carry.settled_to)?;
+    let movements = h.movements_above(carry.settled_to)?;
+    // The tail's own observations can name a venue the settled half never saw
+    // (a launch that happened since). The carried table wins where they
+    // disagree — see `Roles::merge_missing`.
+    let mut roles = carry.roles.clone();
+    roles.merge_missing(&venue_roles_for(&observations));
+    let story = policy_archive::story::build(&fold_rows(movements), &observations, &roles);
+    Ok(policy_archive::series::fold_onto(
+        &story,
+        &policy_archive::view::Projection::default(),
+        carry,
+    )
+    .0)
+}
+
+/// Fold the WHOLE archive into the price + volume series and write it beside
+/// the graph, as [`policy_archive::SERIES`].
+///
+/// ⚠️ This exists to keep the fold OFF the request path. `/live` folded the
+/// whole archive on every cache miss — 6.6 s of a 10.3 s document on the widest
+/// archive here — and it misses every time the tail rebuild moves the archive,
+/// which is every 300 s. Writing it where the archive is already published
+/// moves that cost into the publisher, which does the same work for
+/// `graph.bin`.
+///
+/// Written through a RENAME: `/live` reads this while the scheduler writes it,
+/// and half a postcard stream decodes as corruption rather than as "not yet".
+pub fn write_series(dir: &Path) -> Result<Option<usize>> {
+    let Some(manifest) = load_manifest(dir)? else {
+        return Ok(None);
+    };
+    let observations = read_observations(dir, &manifest)?;
+    let Some(mut history) = History::open(dir)? else {
+        return Ok(None);
+    };
+    let carry = carry_from(&mut history, &observations)?;
+    Ok(Some(store_series(dir, immutable_to(&manifest), &carry)?))
+}
+
+/// The archive's IMMUTABLE coverage ceiling — what invalidates a written
+/// series.
+///
+/// ⚠️ Not `updated_unix`: the tail rebuild moves that every 300 s without
+/// changing a single row at or below the carried boundary. What does
+/// invalidate the artefact is immutable coverage growing, because those rows
+/// are below every reader's start point and only a re-fold includes them.
+pub fn immutable_to(m: &Manifest) -> u64 {
+    m.passes
+        .iter()
+        .filter(|p| p.kind == RangeKind::Immutable)
+        .map(|p| p.ceiling)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Write an ALREADY-FOLDED series as [`policy_archive::SERIES`].
+///
+/// Split from [`write_series`] so a reader that has just paid for the fold can
+/// record it: `/live` builds the series on a cache miss anyway, and writing it
+/// there is what makes the artefact exist for a policy the publisher has not
+/// rewritten since the last restart.
+///
+/// Written through a RENAME: `/live` reads this while the scheduler writes it,
+/// and half a postcard stream decodes as corruption rather than as "not yet".
+pub fn store_series(
+    dir: &Path,
+    immutable_to: u64,
+    carry: &policy_archive::series::Carry,
+) -> Result<usize> {
+    let raw = policy_archive::SeriesFile {
+        format: policy_archive::SERIES_FORMAT,
+        immutable_to,
+        carry: carry.clone(),
+    }
+    .encode()
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let path = dir.join(policy_archive::SERIES);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::SERIES));
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(raw.len())
+}
+
+/// The written series, when it describes the archive version in hand.
+///
+/// `Ok(None)` is the ordinary answer for an archive a publisher has not
+/// rewritten yet — the caller folds instead, which is what every read did
+/// before this existed. `Err` means the file is there and unusable, which is
+/// worth saying out loud rather than silently paying for the fold again.
+pub fn read_series(dir: &Path, immutable_to: u64) -> Result<Option<policy_archive::series::Carry>> {
+    let path = dir.join(policy_archive::SERIES);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let file = policy_archive::SeriesFile::decode(&bytes)?;
+    Ok((file.immutable_to == immutable_to).then_some(file.carry))
 }
 
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
@@ -2068,6 +2243,51 @@ pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive:
             )
         })?;
         rows.extend(policy_archive::read_all(&bytes)?);
+    }
+    Ok(rows)
+}
+
+/// Every observation ABOVE `slot` — the tail half of a carried fold.
+///
+/// Reads the VOLATILE passes, plus any pass whose ceiling is above `slot`.
+/// Everything at or below `slot` is already in the carried series, and an
+/// immutable pass normally cannot hold a row above it — `settled_to` is the
+/// maximum slot EITHER tier reached when the artefact was written.
+///
+/// ⚠️ The `ceiling > slot` arm is not decoration. A walk can land new
+/// immutable rows above an artefact written before it, and the artefact is
+/// only rewritten once that walk completes. Reading volatile passes alone in
+/// that window would return a series with no pool state for the new stretch —
+/// a price that silently stops moving rather than an error.
+///
+/// The slot filter stays on both arms as a second check, because being wrong
+/// here would double-count a trade rather than fail.
+pub fn read_observations_above(
+    dir: &Path,
+    m: &Manifest,
+    slot: u64,
+) -> Result<Vec<policy_archive::Observation>> {
+    let mut rows: Vec<policy_archive::Observation> = Vec::new();
+    for p in &m.passes {
+        if p.kind != RangeKind::Volatile && p.ceiling <= slot {
+            continue;
+        }
+        let Some(rel) = p.observations_path() else {
+            continue;
+        };
+        let path = dir.join(&rel);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "pass {} names {rel} and it is not there — the archive is \
+                 incomplete and needs re-walking, not reading",
+                p.seq,
+            )
+        })?;
+        rows.extend(
+            policy_archive::read_all(&bytes)?
+                .into_iter()
+                .filter(|o| o.slot > slot),
+        );
     }
     Ok(rows)
 }

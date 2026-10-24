@@ -754,6 +754,14 @@ fn worker(hub: Arc<PolicyHub>, publish: Option<crate::publish::Targets>, kind: J
                         ) {
                             tracing::warn!(policy, error = %format!("{e:#}"), "policy: movement graph not built");
                         }
+                        // THE DERIVED SERIES, on the graph's cadence and for
+                        // the same reason: it is a full read of the archive,
+                        // and `/live` reads the result instead of folding one
+                        // on the request path. A failure is logged and never
+                        // blocks the archive — `/live` falls back to folding.
+                        if let Err(e) = crate::archive::write_series(&hub.policy_dir(&policy)) {
+                            tracing::warn!(policy, error = %format!("{e:#}"), "policy: series not built");
+                        }
                         publishing.publish(hub.policy_dir(&policy), &policy);
                     }
                     continue;

@@ -35,12 +35,14 @@
 //!    NOT monotonic, so the rule is to withhold a thin pool's quote, never to
 //!    correct it.
 
+use serde::{Deserialize, Serialize};
+
 use crate::observation::Observation;
 use crate::view::{PolicyView, Projection};
 
 /// A unit, as the observation rows spell it. ADA is the empty policy with the
 /// empty name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Unit {
     pub policy: Vec<u8>,
     pub name: Vec<u8>,
