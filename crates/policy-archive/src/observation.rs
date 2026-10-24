@@ -99,10 +99,42 @@ pub const MESSAGE_TYPE: &str = "
 pub mod pricing {
     /// `x·y = k` over the recorded reserves. Every DEX pool here.
     pub const CONSTANT_PRODUCT: &str = "constant-product";
+    /// `x·y = k` over the curve's **EFFECTIVE** sides: a virtual offset added
+    /// to both reserves, so the recorded `base`/`quote` are what the price and
+    /// the impact are computed from, not the balances the UTxO holds.
+    ///
+    /// The distinction is load-bearing in two directions. A curve with a
+    /// virtual offset is NOT off-model — pricing it as a plain pool would
+    /// understate its depth by the offset — and pricing it from the RAW
+    /// balances would understate it differently. What a reader must not do is
+    /// present these reserves as `lovelace in the pool`; `reserve_source` on
+    /// the same row says `datum-plus-virtual` for exactly that reason.
+    ///
+    /// Cliff: LumpFun v5. A row carrying this is still a launch curve —
+    /// [`is_curve`] says so — and the launch timeline is selected with that,
+    /// not by this string.
+    pub const CONSTANT_PRODUCT_VIRTUAL: &str = "constant-product-virtual";
     /// A launchpad bonding curve. Real reserves, real supply, and a price this
     /// crate deliberately does not know how to compute — see
     /// `SNEK_FUN_LAUNCH_LIFECYCLE.md`.
     pub const BONDING_CURVE: &str = "bonding-curve";
+
+    /// Whether this model picks a point on a launch curve — the launch
+    /// timeline's selector, and the test [`crate::story::markers`] uses.
+    ///
+    /// ⚠️ Not the same question as [`is_priceable`]: a curve may be evaluable
+    /// (LumpFun v5) or deliberately not (snek.fun), and collapsing the two
+    /// puts a curve's reserves into a pool aggregate or hides the launch.
+    pub fn is_curve(pricing: &str) -> bool {
+        matches!(pricing, BONDING_CURVE | CONSTANT_PRODUCT_VIRTUAL)
+    }
+
+    /// Whether a rate can be computed from the recorded reserves at all.
+    /// An EMPTY model is not priceable — not known to be constant-product is
+    /// not the same as known to be otherwise.
+    pub fn is_priceable(pricing: &str) -> bool {
+        matches!(pricing, CONSTANT_PRODUCT | CONSTANT_PRODUCT_VIRTUAL)
+    }
 }
 
 /// What a decoder made of an output. Absent on a candidate nothing claimed.

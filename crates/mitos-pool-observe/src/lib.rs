@@ -61,6 +61,12 @@ pub enum ReserveSource {
     /// WingRiders' `treasuryA`/`treasuryB`, SundaeSwap V3's `protocol_fees`.
     /// Both publish what they owe rather than what they hold.
     ValueMinusTreasury,
+    /// Published in the datum, plus a virtual offset recovered from that same
+    /// state. The reserves are EFFECTIVE — what the curve prices against, not
+    /// what the UTxO holds. LumpFun v5 is the only venue here that needs it:
+    /// both offsets are fixed per pool, and one state is enough to recover
+    /// them (see `mitos_launchpad_decode::LumpFunCurve`).
+    DatumPlusVirtual,
 }
 
 impl ReserveSource {
@@ -69,6 +75,7 @@ impl ReserveSource {
             ReserveSource::Value => "value",
             ReserveSource::Datum => "datum",
             ReserveSource::ValueMinusTreasury => "value-minus-treasury",
+            ReserveSource::DatumPlusVirtual => "datum-plus-virtual",
         }
     }
 }

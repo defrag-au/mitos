@@ -413,12 +413,16 @@ pub fn markers(
         });
     }
 
+    // ⚠️ CURVES ARE SELECTED BY MODEL, NOT BY VENUE, and `is_curve` covers
+    // both the evaluable sort (LumpFun v5, constant-product over effective
+    // reserves) and the deliberately unpriceable one (snek.fun). A second
+    // launchpad lands here without touching this function.
     let mut curve: Vec<&Observation> = all
         .iter()
         .filter(|o| {
             o.decoded
                 .as_ref()
-                .is_some_and(|d| d.pricing == pricing::BONDING_CURVE)
+                .is_some_and(|d| pricing::is_curve(&d.pricing))
         })
         .collect();
     curve.sort_by_key(|o| o.slot);
@@ -435,12 +439,23 @@ pub fn markers(
     // venue happened afterwards. A curve still being traded is not a
     // graduation, and calling it one would put a finish line on a token that
     // never crossed it.
-    if let Some(last) = curve.last() {
+    //
+    // ⚠️ **Only for a curve whose graduation this crate can recognise.** That
+    // is snek.fun, where trading moving to another venue IS the finish line.
+    // LumpFun v5 graduates IN PLACE — same address, same pool, a datum that
+    // flips to AMM mode — and nothing here reads that flip yet, so a marker
+    // inferred from "traded elsewhere" would be a guess about a token that may
+    // simply have found a second venue while still bonding.
+    if let Some(last) = curve.last().filter(|o| {
+        o.decoded
+            .as_ref()
+            .is_some_and(|d| d.pricing == pricing::BONDING_CURVE)
+    }) {
         let traded_elsewhere_after = all.iter().any(|o| {
             o.slot > last.slot
                 && o.decoded
                     .as_ref()
-                    .is_some_and(|d| d.pricing != pricing::BONDING_CURVE)
+                    .is_some_and(|d| !pricing::is_curve(&d.pricing))
         });
         if traded_elsewhere_after {
             out.push(Marker {
@@ -590,6 +605,15 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 amount: o.unit_amount,
                 has_datum: o.datum.is_some(),
             },
+            // ⚠️ Only a curve whose price this crate CANNOT compute is a
+            // `CurveState`. `CurveState` carries the raw balances — lovelace in
+            // the UTxO and units actually on the curve — because that is what
+            // the launch timeline plots. A curve that IS priceable (LumpFun v5)
+            // needs its EFFECTIVE reserves to travel with the event, or the
+            // story fold and the observation fold price it differently; it is a
+            // `PoolState` for that reason. The launch timeline still finds it,
+            // through `pricing::is_curve` in [`markers`] and in the `/launch`
+            // route.
             Some(d) if d.pricing == pricing::BONDING_CURVE => Kind::CurveState {
                 pool: intern_pool(&mut pools, o, d),
                 lovelace: o.lovelace,

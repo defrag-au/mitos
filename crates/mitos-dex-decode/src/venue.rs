@@ -50,9 +50,23 @@ pub const WINGRIDERS_V2: &str = "wingriders-v2";
 /// snek.fun's bonding curve. ⚠️ Not a constant-product pool — its reserves are
 /// real and its rate is NOT `quote / base`.
 pub const SNEK_FUN: &str = "snek.fun";
+/// LumpFun's bonding curve, cohort `v5` (`"ada-order"`).
+///
+/// ⚠️ **A DIFFERENT PROTOCOL FROM LUMPPAD**, which shares the lumpfun.com
+/// domain family. The version is part of the identity because LumpFun's
+/// earlier cohorts publish different reserves: v1/v2 drain to a Minswap pool
+/// at graduation and v3 trades on a real-reserve curve, while v5 prices over
+/// **effective** reserves (a virtual offset on both sides) and graduates in
+/// place. One slug for all of them would present numbers computed by three
+/// different rules as one venue.
+///
+/// A v5 curve IS constant-product on its effective sides, so unlike
+/// [`SNEK_FUN`] it is priceable — see `mitos-launchpad-decode`'s
+/// `LumpFunCurve`.
+pub const LUMPFUN_V5: &str = "lumpfun-v5";
 
 /// Every venue this workspace can name.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 10] = [
     SPLASH,
     CSWAP,
     MINSWAP_V1,
@@ -62,6 +76,7 @@ pub const ALL: [&str; 9] = [
     WINGRIDERS_V1,
     WINGRIDERS_V2,
     SNEK_FUN,
+    LUMPFUN_V5,
 ];
 
 /// What a contract DOES, as far as a trade fold is concerned.

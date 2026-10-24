@@ -384,6 +384,54 @@ pub struct Coverage {
     pub completeness: Completeness,
 }
 
+/// Where a supply reconciliation's rows came from — the axis that decides
+/// whether a total is final.
+///
+/// ⚠️ NOT the launch lifecycle. `/launch` already reports `bonding` vs
+/// `graduated`, and the two axes are independent: a token can be bonded and
+/// still carry `Tail` supply on the day it graduates, and a token still on its
+/// curve can be fully `Snapshot` once a Mithril snapshot covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupplyBasis {
+    /// Certified Mithril history. The default and the normal case.
+    #[default]
+    Snapshot,
+    /// Includes the chain-tail spool above the last complete chunk, and at
+    /// least one MINT or BURN came from it. A rollback can retract those rows
+    /// until the next snapshot certifies them, so the supply figure is not
+    /// final.
+    ///
+    /// Transfers from the tail are always counted into `moved`; they do not
+    /// change `minted` and therefore do not, on their own, make the supply
+    /// provisional.
+    Tail,
+}
+
+impl SupplyBasis {
+    /// The wire default: a standard token carries no `basis` field at all.
+    pub fn is_snapshot(&self) -> bool {
+        matches!(self, Self::Snapshot)
+    }
+}
+
+/// A supply reconciliation over the current view.
+pub struct Reconciliation {
+    pub reconciler: policy_archive::Reconciler,
+    pub basis: SupplyBasis,
+}
+
+/// Whether a unit is part of what a supply figure counts, as opposed to
+/// plumbing that shares the policy — a CIP-67 reference twin, a CIP-27 royalty
+/// token, or a launchpad pool's state NFT.
+///
+/// The same rule `segments` uses for the unit count, from the same crate: two
+/// definitions of "what is a unit" would let the header and the supply total
+/// disagree.
+pub(crate) fn is_user_unit(name: &[u8]) -> bool {
+    cardano_assets::AssetRole::of_bytes(name).standing() == cardano_assets::UnitStanding::Unit
+}
+
 /// One policy's archive, opened to its footers.
 pub struct PolicyArchive {
     pub manifest: Manifest,
@@ -598,7 +646,7 @@ impl PolicyArchive {
         Ok(rows)
     }
 
-    /// The supply invariant over the WHOLE archive — see
+    /// The supply invariant over the IMMUTABLE archive — see
     /// [`policy_archive::supply`].
     ///
     /// Streams every group through the reconciler rather than collecting rows,
@@ -609,11 +657,114 @@ impl PolicyArchive {
     /// later pass records the source it finally resolved, so reconciling
     /// movements alone reports every one of those as still below the floor —
     /// a gap that shrinks to zero only if you read the files that closed it.
+    ///
+    /// ⚠️ IMMUTABLE FILES ONLY, and this is a correctness requirement rather
+    /// than a performance one. The volatile tail is a projection of the last
+    /// few hours that is REPLACED WHOLE on every refresh, and a top-up walk
+    /// that climbs into a stretch the tail also covers must write its own rows
+    /// anyway ("or the next refresh shrinks the tail out from under them" — see
+    /// `reverse.rs`). So for a window, the same transaction legitimately has
+    /// rows in both.
+    ///
+    /// A total across both then double-counts AMOUNTS while counting `net_mint`
+    /// once per `(tx, unit)` — which reads as `moved > minted`, i.e. a positive
+    /// gap, i.e. exactly the shape of a real fault. MEASURED 2026-09-09: this
+    /// produced RECONCILIATION FAILED on 7 of 23 live policies (`units=229
+    /// gap=1` and similar) whose archives were, on direct inspection, perfectly
+    /// balanced.
+    ///
+    /// 🔑 A check that cries wolf is worse than no check: it gets muted, and
+    /// then it is not there for the real one.
     pub fn reconcile(
         &mut self,
         diagnose: policy_archive::Diagnose,
     ) -> Result<policy_archive::Reconciler> {
+        self.reconcile_files(diagnose, false, true)
+            .map(|(reconciler, _)| reconciler)
+    }
+
+    /// The supply invariant over the CURRENT view, including the volatile tail
+    /// when it cannot double-count.
+    ///
+    /// [`Self::reconcile`] is the right answer for a landed pass: it grades the
+    /// immutable archive on its own. This is the right answer for a READER, and
+    /// the distinction is not cosmetic — a token launched after the last
+    /// Mithril snapshot has its ENTIRE history in the tail, so the immutable
+    /// reconcile reports `minted: 0` for it and the site shows a zero market
+    /// cap until the next weekly refresh.
+    ///
+    /// The tail is counted only when its floor is at or above every immutable
+    /// pass's ceiling: then the two stretches are disjoint and no transaction
+    /// can be in both. After a snapshot refresh a top-up writes immutable rows
+    /// into the stretch the tail still covers, the ranges overlap, and the tail
+    /// is skipped exactly as [`Self::reconcile`] always does.
+    ///
+    /// Only USER units are reconciled. CIP-67 reference twins and royalty
+    /// tokens are plumbing: they share the policy, they are not what the supply
+    /// is a count of, and a launchpad pool's state NFT under the token's own
+    /// policy would otherwise inflate a 1,000,000,000 mint to 1,000,000,002.
+    /// `segments` applies the same rule to the unit count, from the same crate.
+    pub fn reconcile_current(
+        &mut self,
+        diagnose: policy_archive::Diagnose,
+    ) -> Result<Reconciliation> {
+        let basis = match self.volatile_is_separate() {
+            true => SupplyBasis::Tail,
+            false => SupplyBasis::Snapshot,
+        };
+        let (reconciler, volatile_mint) =
+            self.reconcile_files(diagnose, basis == SupplyBasis::Tail, false)?;
+        Ok(Reconciliation {
+            reconciler,
+            // A tail with transfers only does not move supply. The ordinary
+            // case — a live token with recent trades but no new mint — stays
+            // `snapshot`, which is the default a reader should see.
+            basis: match volatile_mint {
+                true => SupplyBasis::Tail,
+                false => SupplyBasis::Snapshot,
+            },
+        })
+    }
+
+    /// Whether the volatile tail sits entirely ABOVE the immutable coverage.
+    ///
+    /// Conservative in the only direction that matters: a manifest with no pass
+    /// entries — a hand-built archive, or one written before coverage was
+    /// recorded — cannot prove separation, so the answer is `false`.
+    fn volatile_is_separate(&self) -> bool {
+        let Some(volatile_floor) = self
+            .manifest
+            .passes
+            .iter()
+            .filter(|p| p.kind == RangeKind::Volatile)
+            .map(|p| p.floor)
+            .min()
+        else {
+            return false;
+        };
+        let Some(max_immutable) = self
+            .manifest
+            .passes
+            .iter()
+            .filter(|p| p.kind == RangeKind::Immutable)
+            .map(|p| p.ceiling)
+            .max()
+        else {
+            // The tail is the only pass: every row is volatile, and there is
+            // no immutable row for it to double-count.
+            return true;
+        };
+        volatile_floor >= max_immutable
+    }
+
+    fn reconcile_files(
+        &mut self,
+        diagnose: policy_archive::Diagnose,
+        include_volatile: bool,
+        include_plumbing: bool,
+    ) -> Result<(policy_archive::Reconciler, bool)> {
         let mut r = policy_archive::Reconciler::new(diagnose);
+        let mut volatile_mint = false;
         for i in 0..self.files.len() {
             match self.files[i].kind {
                 FileKind::Movements | FileKind::Corrections => {}
@@ -621,37 +772,30 @@ impl PolicyArchive {
                 // exact mistake `kind_of` is ordered to prevent.
                 FileKind::Observations => continue,
             }
-            // ⚠️ IMMUTABLE FILES ONLY, and this is a correctness requirement
-            // rather than a performance one.
-            //
-            // The supply invariant is a claim about the IMMUTABLE archive. The
-            // volatile tail is a projection of the last few hours that is
-            // REPLACED WHOLE on every refresh, and a top-up walk that climbs
-            // into a stretch the tail also covers must write its own rows
-            // anyway ("or the next refresh shrinks the tail out from under
-            // them" — see `reverse.rs`). So for a window, the same transaction
-            // legitimately has rows in both.
-            //
-            // A total across both then double-counts AMOUNTS while counting
-            // `net_mint` once per `(tx, unit)` — which reads as `moved >
-            // minted`, i.e. a positive gap, i.e. exactly the shape of a real
-            // fault. MEASURED 2026-09-09: this produced RECONCILIATION FAILED
-            // on 7 of 23 live policies (`units=229 gap=1` and similar) whose
-            // archives were, on direct inspection, perfectly balanced.
-            //
-            // 🔑 A check that cries wolf is worse than no check: it gets muted,
-            // and then it is not there for the real one.
             match self.files[i].range {
                 RangeKind::Immutable => {}
+                RangeKind::Volatile if include_volatile => {}
                 RangeKind::Volatile => continue,
             }
+            let volatile = self.files[i].range == RangeKind::Volatile;
             for g in 0..self.files[i].archive.num_groups() {
                 let f = &mut self.files[i];
                 f.fetch_group(g)?;
-                r.observe_all(f.archive.read_group(&f.bytes, g)?.iter());
+                for m in f.archive.read_group(&f.bytes, g)?.iter() {
+                    if !(include_plumbing || is_user_unit(&m.unit_name)) {
+                        continue;
+                    }
+                    // \u26a0\ufe0f `net_mint`, not `amount`: a transfer in the tail
+                    // changes `moved` and not supply, so it must not mark the
+                    // supply provisional.
+                    if volatile && m.net_mint != 0 {
+                        volatile_mint = true;
+                    }
+                    r.observe(m);
+                }
             }
         }
-        Ok(r)
+        Ok((r, volatile_mint))
     }
 
     /// Every row of one transaction, unfolded — see [`Self::movements_page`].
@@ -1316,7 +1460,7 @@ pub fn build_series(dir: &Path) -> Result<Option<policy_archive::series::Series>
         before = next;
     }
 
-    let story = policy_archive::story::build(&rows, &observations, &venue_roles());
+    let story = policy_archive::story::build(&rows, &observations, &venue_roles_for(&observations));
     Ok(Some(policy_archive::series::fold(
         &story,
         &policy_archive::view::Projection::default(),
@@ -1581,7 +1725,8 @@ fn report_supply(a: &mut PolicyArchive) -> Result<()> {
     let completeness = a.manifest.completeness();
     // Named offenders: `inspect` is the diagnostic surface, and a total with
     // no transaction behind it is not actionable.
-    let r = a.reconcile(Diagnose::PerTransaction)?;
+    let current = a.reconcile_current(Diagnose::PerTransaction)?;
+    let r = current.reconciler;
     let balances = r.balances();
     if balances.is_empty() {
         return Ok(());
@@ -1591,6 +1736,15 @@ fn report_supply(a: &mut PolicyArchive) -> Result<()> {
     println!(
         "supply      Σ net_mint={minted} Σ amounts={moved} over {} unit(s)",
         balances.len()
+    );
+    println!(
+        "  basis: {}",
+        match current.basis {
+            SupplyBasis::Snapshot => "certified Mithril history",
+            SupplyBasis::Tail => {
+                "includes the volatile chain tail — provisional until the next snapshot"
+            }
+        }
     );
     match r.verdict(completeness) {
         Verdict::Balanced => println!("  reconciled: the archive balances"),
@@ -1658,7 +1812,7 @@ fn unit_label(name: &[u8]) -> String {
     }
 }
 
-fn report_trades(a: &mut PolicyArchive) -> Result<()> {
+fn report_trades(a: &mut PolicyArchive, dir: &Path) -> Result<()> {
     use policy_archive::trade::{Event, Party};
     use std::collections::BTreeMap;
 
@@ -1668,7 +1822,11 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    let roles = venue_roles();
+    let observations = match load_manifest(dir)? {
+        Some(m) => read_observations(dir, &m)?,
+        None => Vec::new(),
+    };
+    let roles = venue_roles_for(&observations);
     let folded = policy_archive::trade::fold(&rows, &roles);
 
     let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1780,6 +1938,52 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
         Role::Order,
         venue::SNEK_FUN,
     );
+    // LumpFun's ORDER contract IS shared across every launch — one address for
+    // every trader, no stake part — so a movement through it cannot name who
+    // placed the order. Its curve is per-launch and is registered by
+    // [`venue_roles_for`], from the observations that found it.
+    r.register(
+        hex(&mitos_launchpad_decode::LUMPFUN_ORDER_CRED),
+        Role::Order,
+        venue::LUMPFUN_V5,
+    );
+    r.keying.insert(
+        hex(&mitos_launchpad_decode::LUMPFUN_ORDER_CRED),
+        OrderKeying::Shared,
+    );
+    r
+}
+
+/// [`venue_roles`], plus the per-launch LumpFun curves these observations
+/// found.
+///
+/// ⚠️ **A per-launch credential cannot live in a static table.** LumpFun
+/// parameterises its curve validator with the token, so every pool has its own
+/// script hash; the only place a complete set exists is the observation tier,
+/// which recognised each curve by its state NFT. Registering them here is what
+/// turns a buy's `curve → wallet` movement into a [`policy_archive::trade::Event::Fill`]
+/// instead of a plain transfer — the same failure `venue::SITES` was created to
+/// end, in the one shape a registry cannot hold.
+///
+/// The curve takes `Role::Curve`, not `Role::Pool`: a fill against it is a
+/// trade, and it is not a DEX pool for any other purpose.
+pub fn venue_roles_for(
+    observations: &[policy_archive::Observation],
+) -> policy_archive::trade::Roles {
+    use mitos_dex_decode::venue;
+    use policy_archive::trade::Role;
+
+    let mut r = venue_roles();
+    for o in observations {
+        let Some(d) = &o.decoded else { continue };
+        if d.venue != venue::LUMPFUN_V5 {
+            continue;
+        }
+        let Some((cred, _)) = policy_archive::trade::address_parts(&o.address) else {
+            continue;
+        };
+        r.register(cred, Role::Curve, venue::LUMPFUN_V5);
+    }
     r
 }
 
@@ -2085,7 +2289,7 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
 
     report_observations(&dir, m)?;
     report_supply(&mut a)?;
-    report_trades(&mut a)?;
+    report_trades(&mut a, &dir)?;
 
     let density = a.density(86_400);
     println!("density     {} daily buckets", density.len());
@@ -2163,15 +2367,16 @@ fn print_row(row: &FeedRow) {
 mod tests {
     use super::*;
 
-    fn mv(tx: u8, unit: &str, addr: &str, amount: i64, net_mint: i64) -> Movement {
+    fn mv(tx: u8, unit: impl AsRef<[u8]>, addr: &str, amount: i64, net_mint: i64) -> Movement {
         Movement {
             slot: 100 + tx as u64,
             block_time: 1_700_000_000 + tx as u64,
             tx_hash: vec![tx; 32],
-            unit_name: unit.as_bytes().to_vec(),
+            unit_name: unit.as_ref().to_vec(),
             address: addr.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
     }
 
@@ -2185,6 +2390,151 @@ mod tests {
             covered_to: 999,
             sealed_unix: 0,
         }
+    }
+
+    /// A pass entry for the separation test — only `kind`, `floor` and
+    /// `ceiling` are read by `volatile_is_separate`.
+    fn pass(seq: u32, kind: RangeKind, floor: u64, ceiling: u64) -> PassEntry {
+        PassEntry {
+            seq,
+            dir: PassEntry::dir_name(seq),
+            ceiling,
+            floor,
+            windows: Vec::new(),
+            kind,
+            rolled_up: false,
+            movements: None,
+            corrections: None,
+            observations: None,
+            segments: Vec::new(),
+            pending: 0,
+            found: 0,
+            written: 0,
+            backfilled: 0,
+            units: 0,
+            secs: 0.0,
+            written_unix: 0,
+        }
+    }
+
+    /// A tail TRANSFER is counted into `moved` but does not make the supply
+    /// figure provisional: it changes no mint. A live token with recent trades
+    /// and no new mint therefore stays on the ordinary `snapshot` answer.
+    #[test]
+    fn a_disjoint_volatile_transfer_is_counted_without_marking_supply() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+        let immutable = vec![mv(1, "A", "alice", 10, 10)];
+        let tail = vec![mv(2, "A", "alice", -10, 0), mv(2, "A", "bob", 10, 0)];
+        let mv_path = dir.path().join("movements.parquet");
+        let tail_path = dir.path().join("tail.parquet");
+        crate::segments::write_file(&mv_path, &stamp, immutable).unwrap();
+        crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+
+        let mut manifest = Manifest::new("aa");
+        manifest.passes.push(pass(0, RangeKind::Immutable, 0, 200));
+        manifest.passes.push(pass(1, RangeKind::Volatile, 200, 400));
+        let mut archive = PolicyArchive {
+            manifest,
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        let current = archive
+            .reconcile_current(policy_archive::Diagnose::Totals)
+            .unwrap();
+        assert_eq!(
+            current.basis,
+            SupplyBasis::Snapshot,
+            "a tail transfer does not move supply"
+        );
+        assert_eq!(current.reconciler.balances()[0].minted, 10);
+        assert_eq!(
+            current.reconciler.verdict(Completeness::Complete),
+            policy_archive::Verdict::Balanced,
+            "the tail continues the immutable history; it does not duplicate it"
+        );
+
+        // With no recorded coverage, separation cannot be proven, so the tail is
+        // left out. That is the conservative default, and the reason the
+        // existing overlap test keeps passing.
+        let mut blind = PolicyArchive {
+            manifest: Manifest::new("aa"),
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        assert_eq!(
+            blind
+                .reconcile_current(policy_archive::Diagnose::Totals)
+                .unwrap()
+                .basis,
+            SupplyBasis::Snapshot
+        );
+    }
+
+    /// A token launched after the last Mithril snapshot has its MINT in the
+    /// tail. The immutable reconcile reports zero for it — the reader's answer
+    /// must include the tail and say the supply is not yet certified.
+    #[test]
+    fn a_tail_mint_marks_the_supply_as_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+        let immutable = vec![mv(1, "A", "alice", 10, 10)];
+        let tail = vec![mv(2, "A", "bob", 5, 5)];
+        let mv_path = dir.path().join("movements.parquet");
+        let tail_path = dir.path().join("tail.parquet");
+        crate::segments::write_file(&mv_path, &stamp, immutable).unwrap();
+        crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+
+        let mut manifest = Manifest::new("aa");
+        manifest.passes.push(pass(0, RangeKind::Immutable, 0, 200));
+        manifest.passes.push(pass(1, RangeKind::Volatile, 200, 400));
+        let mut archive = PolicyArchive {
+            manifest,
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        let current = archive
+            .reconcile_current(policy_archive::Diagnose::Totals)
+            .unwrap();
+        assert_eq!(current.basis, SupplyBasis::Tail);
+        assert_eq!(current.reconciler.balances()[0].minted, 15);
+        assert_eq!(
+            current.reconciler.verdict(Completeness::Complete),
+            policy_archive::Verdict::Balanced
+        );
+    }
+
+    /// A launchpad pool's state NFT shares the token's policy. Before this
+    /// filter, $BUNNY's 1,000,000,000 mint reconciled as 1,000,000,002 — the
+    /// state NFT and one other CIP-67 unit were counted as supply.
+    #[test]
+    fn plumbing_units_are_not_part_of_supply() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+        let mut nft = vec![0x00, 0x06, 0x43, 0xb0];
+        nft.extend_from_slice(b"POOL");
+        let rows = vec![
+            mv(1, "BUNNY", "alice", 1_000_000_000, 1_000_000_000),
+            mv(1, nft.as_slice(), "pool", 1, 1),
+        ];
+        let path = dir.path().join("movements.parquet");
+        crate::segments::write_file(&path, &stamp, rows).unwrap();
+        let mut archive = PolicyArchive {
+            manifest: Manifest::new("aa"),
+            files: vec![OpenFile::open(&path, FileKind::Movements, RangeKind::Immutable).unwrap()],
+        };
+        let current = archive
+            .reconcile_current(policy_archive::Diagnose::Totals)
+            .unwrap();
+        let balances = current.reconciler.balances();
+        assert_eq!(balances.len(), 1, "the state NFT is not a user unit");
+        assert_eq!(balances[0].minted, 1_000_000_000);
     }
 
     /// ⚠️ THE FALSE ALARM THIS GUARD EXISTS FOR.
@@ -2569,5 +2919,96 @@ mod tests {
         );
         assert_eq!(roles.name_of(&order), Some(venue::SNEK_FUN));
         assert_ne!(order, curve, "the order is not the curve");
+    }
+
+    /// ⚠️ A LumpFun curve is parameterised per launch, so its credential cannot
+    /// be in the static table. If the observation tier's discoveries are not
+    /// folded into the roles, every buy of the token reads as a plain transfer
+    /// — the $DONUT failure, in the one shape a registry cannot hold.
+    #[test]
+    fn a_discovered_lumpfun_curve_turns_a_curve_payment_into_a_fill() {
+        use policy_archive::Observation;
+        use policy_archive::feed::{FeedRow, PartyMove, UnitMove};
+        use policy_archive::observation::Decoded;
+        use policy_archive::trade::{Event, Party, Role};
+
+        // The Dust Bunny pool and the wallet that received the sample buy's
+        // tokens (`1f7e8e57…`).
+        const POOL: &str = "addr1wyj2cxrm7pkfz0sx6j6lgueg8035yrs4ry9xupcvcxlrg6cywmqny";
+        const BUYER: &str = "addr1q99qpegypskhugq6nss8gjkwvjlj35wd54venfynreqxjgkt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksl0yc60";
+
+        let obs = Observation {
+            slot: 201_233_716,
+            block_time: 1_792_800_007,
+            tx_hash: vec![0x1f; 32],
+            address: POOL.into(),
+            lovelace: 1_562_000_000,
+            unit_name: b"BUNNY".to_vec(),
+            unit_amount: 733_043_488,
+            datum: None,
+            decoded: Some(Decoded {
+                venue: mitos_dex_decode::venue::LUMPFUN_V5.to_string(),
+                key_policy: hex::decode("a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293")
+                    .unwrap(),
+                key_name: mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec(),
+                key_basis: "datum".into(),
+                base_reserve: 858_381_090,
+                quote_policy: Some(Vec::new()),
+                quote_name: Some(Vec::new()),
+                quote_reserve: Some(1_555_000_000 + 5_000_000_130),
+                fee_bps: None,
+                total_lp: None,
+                reserve_source: "datum-plus-virtual".into(),
+                pricing: policy_archive::observation::pricing::CONSTANT_PRODUCT_VIRTUAL.into(),
+            }),
+        };
+
+        let roles = venue_roles_for(std::slice::from_ref(&obs));
+        let (curve, _) = policy_archive::trade::address_parts(POOL).unwrap();
+        assert_eq!(roles.role_of(&curve), Some(Role::Curve));
+        assert_eq!(
+            roles.name_of(&curve),
+            Some(mitos_dex_decode::venue::LUMPFUN_V5)
+        );
+
+        // A buy: the tokens leave the curve into the buyer's wallet.
+        let rows = vec![FeedRow {
+            tx_hash: vec![0x1f; 32],
+            slot: 201_233_716,
+            block_time: 1_792_800_007,
+            units: vec![UnitMove {
+                name: b"BUNNY".to_vec(),
+                net_mint: 0,
+                parties: vec![
+                    PartyMove {
+                        address: POOL.into(),
+                        amount: -27_014_353,
+                    },
+                    PartyMove {
+                        address: BUYER.into(),
+                        amount: 27_014_353,
+                    },
+                ],
+            }],
+        }];
+        let folded = policy_archive::trade::fold(&rows, &roles);
+        assert_eq!(folded.len(), 1);
+        match &folded[0].event {
+            Event::Fill {
+                venue_cred,
+                party,
+                amount,
+                into_pool,
+            } => {
+                assert_eq!(venue_cred, &curve);
+                assert_eq!(party, &Party::Wallet(BUYER.into()));
+                assert_eq!(*amount, 27_014_353);
+                assert!(!into_pool, "a buy takes the asset OUT of the curve");
+            }
+            other => panic!("expected a Fill, got {other:?}"),
+        }
+
+        // And the static table alone cannot know it — the discovery is what did.
+        assert!(venue_roles().role_of(&curve).is_none());
     }
 }

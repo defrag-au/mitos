@@ -163,6 +163,7 @@ mod tests {
             address: addr.into(),
             amount,
             net_mint: 0,
+            tx_index: 0,
         }
     }
 

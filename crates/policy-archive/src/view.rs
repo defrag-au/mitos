@@ -96,10 +96,11 @@ pub struct Pool {
 /// cost a wrong number on the page. See each variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Bucket {
-    /// Summed into the price: constant-product, seen recently, with a measured
-    /// pair and reserves on both sides.
+    /// Summed into the price: a priceable model, seen recently, with a measured
+    /// pair and reserves on both sides. [`pricing::is_priceable`] decides — a
+    /// plain constant product, or one over a curve's effective reserves.
     Priced,
-    /// Real reserves under a model this crate does not evaluate — a launchpad
+    /// Real reserves under a model this crate does not evaluate — snek.fun's
     /// bonding curve, whose rate is **not** `quote / base`. Needs a FORMULA.
     ///
     /// A row with an empty `pricing` lands here too: not known to be
@@ -180,9 +181,9 @@ impl Pool {
         if at.saturating_sub(self.slot) > p.stale_after {
             return Bucket::Stale;
         }
-        match self.pricing.as_str() {
-            pricing::CONSTANT_PRODUCT => Bucket::Priced,
-            _ => Bucket::OffModel,
+        match pricing::is_priceable(&self.pricing) {
+            true => Bucket::Priced,
+            false => Bucket::OffModel,
         }
     }
 }
@@ -288,9 +289,14 @@ impl PolicyView {
             // ⚠️ A CURVE IS A POOL HERE. `story::build` splits bonding curves
             // into their own kind because they are the launch timeline — but
             // their reserves are real, and the observation fold counts them
-            // (as `Bucket::OffModel`, never priced). Skipping them here would
-            // make the two folds disagree on exactly the liquidity
-            // `Spot::unpriceable` and `Spot::stale` exist to report.
+            // (as `Bucket::OffModel` unless the model is evaluable). Skipping
+            // them here would make the two folds disagree on exactly the
+            // liquidity `Spot::unpriceable` and `Spot::stale` exist to report.
+            //
+            // A curve the crate CAN price (LumpFun v5) is a `PoolState` in the
+            // stream, not a `CurveState`: its effective reserves have to ride
+            // with the event, and `CurveState` carries only the raw balances.
+            // The launch timeline is selected by `pricing::is_curve` instead.
             Kind::CurveState {
                 pool,
                 lovelace,
@@ -669,6 +675,56 @@ mod tests {
         // common case.
         pool.pricing = String::new();
         assert_eq!(pool.bucket(10, &p), Bucket::OffModel);
+    }
+
+    /// A curve whose model IS evaluable is priced over its EFFECTIVE reserves,
+    /// while snek.fun's unpriceable one still is not. The two must not be
+    /// collapsed: one is a formula this crate can compute, the other is a
+    /// formula it deliberately refuses.
+    #[test]
+    fn a_priceable_curve_is_priced_over_its_effective_reserves() {
+        let mut d = decoded(
+            "lumpfun-v5",
+            b"POOL",
+            858_381_090,
+            Some(6_555_000_130),
+            true,
+        );
+        d.pricing = pricing::CONSTANT_PRODUCT_VIRTUAL.into();
+        let o = Observation {
+            slot: 10,
+            block_time: 10,
+            tx_hash: vec![1],
+            address: "addr_curve".into(),
+            lovelace: 1_562_000_000,
+            unit_name: b"BUNNY".to_vec(),
+            unit_amount: 733_043_488,
+            datum: None,
+            decoded: Some(d),
+        };
+        let view = PolicyView::from_observations(&[o]);
+        let spot = view.spot(10, &Projection::default());
+        let ada = spot.ada.expect("a priceable curve sets the ADA price");
+        assert_eq!(ada.base, 858_381_090);
+        assert_eq!(ada.quote, 6_555_000_130);
+        assert_eq!(ada.pools, 1);
+        assert!(spot.unpriceable.is_empty());
+        // 6,555,000,130 / 858,381,090 — LumpFun's own priceLovelace is 7,636,468
+        // when scaled by 1e6.
+        assert!((ada.rate().unwrap() - 7.636_468).abs() < 1e-5);
+    }
+
+    /// The two questions are different, and the helpers say so.
+    #[test]
+    fn curve_and_priceable_are_separate_questions() {
+        assert!(pricing::is_curve(pricing::BONDING_CURVE));
+        assert!(pricing::is_curve(pricing::CONSTANT_PRODUCT_VIRTUAL));
+        assert!(!pricing::is_curve(pricing::CONSTANT_PRODUCT));
+
+        assert!(pricing::is_priceable(pricing::CONSTANT_PRODUCT));
+        assert!(pricing::is_priceable(pricing::CONSTANT_PRODUCT_VIRTUAL));
+        assert!(!pricing::is_priceable(pricing::BONDING_CURVE));
+        assert!(!pricing::is_priceable(""), "unknown is not priceable");
     }
 
     #[test]

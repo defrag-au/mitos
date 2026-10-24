@@ -338,6 +338,7 @@ impl Archive {
         let mut address: Vec<ByteArray> = Vec::with_capacity(n);
         let mut amount = Vec::with_capacity(n);
         let mut net_mint = Vec::with_capacity(n);
+        let mut tx_index = Vec::with_capacity(n);
 
         macro_rules! read_i64 {
             ($col:expr, $into:expr) => {{
@@ -360,6 +361,15 @@ impl Archive {
         read_bytes!(Column::Address, address);
         read_i64!(Column::Amount, amount);
         read_i64!(Column::NetMint, net_mint);
+        // ADDITIVE COLUMN. A file written before `tx_index` existed has no
+        // column 7, and asking for it would fail the whole read; 0 is the
+        // honest answer — the order was never recorded, and the feed falls
+        // back to file order for those rows.
+        if rg.metadata().num_columns() > Column::TxIndex.index() {
+            read_i64!(Column::TxIndex, tx_index);
+        } else {
+            tx_index = vec![0; n];
+        }
 
         Ok((0..n)
             .map(|i| Movement {
@@ -370,6 +380,7 @@ impl Archive {
                 address: String::from_utf8_lossy(address[i].data()).into_owned(),
                 amount: amount[i],
                 net_mint: net_mint[i],
+                tx_index: tx_index[i] as u32,
             })
             .collect())
     }

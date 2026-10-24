@@ -127,6 +127,178 @@ pub fn is_snek_fun_order(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &ORDER_CRED
 }
 
+// ============================================================================
+// LumpFun — the v5 "ada-order" cohort
+// ============================================================================
+//
+// ⚠️ **NOT LumpPad.** Both sit under the lumpfun.com domain family
+// (`lumppad.lumpfun.com` is LumpPad), and they are different protocols: LumpPad
+// quotes in LUMP and publishes a `Constr 2` pool datum with eleven fields,
+// while LumpFun quotes in ADA and publishes a `Constr 3` curve datum with six.
+// Nothing here decodes a LumpPad pool and nothing in `LUMPPAD_INTEGRATION.md`
+// applies to it. See `cnft.dev-workers/docs/design/LUMPFUN_V5.md`.
+//
+// The curve validator is parameterised PER LAUNCH (policy, name, creator, fee
+// bps, treasury, fee routing, graduation threshold), so — unlike snek.fun — it
+// has no shared credential to match on. What identifies a curve is its STATE
+// NFT, `<policy>.000643b0504f4f4c` under the launched token's own policy.
+
+/// The supply every LumpFun launch mints, exactly once, with 0 decimals.
+///
+/// Load-bearing rather than decorative: [`LumpFunCurve::virtual_ada`] recovers
+/// the curve's compiled-in ADA offset from one state by measuring how far the
+/// token side has come from this figure. A cohort that minted a different
+/// supply would derive a different offset — silently, because the arithmetic
+/// stays self-consistent. It is pinned by the one-shot mint policy, which is
+/// verifiable from any launch transaction.
+pub const LUMPFUN_SUPPLY: i64 = 1_000_000_000;
+
+/// The lovelace a LumpFun pool always holds that is NOT on the curve: the pool
+/// UTxO's own min-ADA. Observed on the launch, on buys and on a sell:
+/// `lovelace == LUMPFUN_POOL_MIN_LOVELACE + ada_reserve + platform + creator`.
+pub const LUMPFUN_POOL_MIN_LOVELACE: i64 = 3_000_000;
+
+/// The state NFT's asset name: CIP-67 label 100 (`000643b0`) + `POOL`.
+/// One per pool, under the token's policy.
+pub const LUMPFUN_STATE_NFT_NAME: [u8; 8] = [0x00, 0x06, 0x43, 0xb0, b'P', b'O', b'O', b'L'];
+
+/// Payment credential of LumpFun's shared order contract — where a buy or sell
+/// waits for the settler that spends it into the curve.
+///
+/// ⚠️ **One address for every trader.** The order datum names the owner, but
+/// the address's payment part is this script and it has no stake part, so a
+/// movement through it cannot name who placed the order. Register it as a
+/// shared order contract, never as a per-customer one.
+///
+/// MEASURED: every v5 trade found on the Dust Bunny pool (`a1b085f4…`) spends
+/// this contract alongside the curve. `POST /api/tx/build` with `action:buy`
+/// answers `"order": true` for a v5 token, and `order-buy` is rejected as
+/// unsupported — so a v5 buy is an order placement, not a direct spend.
+pub const LUMPFUN_ORDER_CRED: [u8; 28] = [
+    0x23, 0xc8, 0x70, 0xa9, 0x6e, 0xf1, 0x34, 0x3a, 0x38, 0xc6, 0x1a, 0x0d, 0x56, 0x6c, 0x9d, 0x39,
+    0xd1, 0x30, 0xd5, 0x3e, 0xaa, 0x15, 0x17, 0xca, 0x92, 0xf6, 0x0e, 0xb4,
+];
+
+pub fn is_lumpfun_order(payment_cred: &[u8; 28]) -> bool {
+    payment_cred == &LUMPFUN_ORDER_CRED
+}
+
+/// A LumpFun curve, as its pool datum publishes it.
+///
+/// `Constr 3` with exactly six fields. All six are MEASURED on chain — the
+/// launch, two buys and a sell — rather than inferred from a bundle:
+///
+/// ```text
+/// Constr 3 [ policy, name, ada_reserve, token_reserve,
+///            platform_accrued, creator_accrued ]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LumpFunCurve {
+    pub policy: Vec<u8>,
+    pub name: Vec<u8>,
+    /// Lovelace on the curve, net of [`LUMPFUN_POOL_MIN_LOVELACE`] and of both
+    /// fee buckets.
+    pub ada_reserve: i64,
+    /// The curve's TOKEN side. ⚠️ **Virtual**: it includes tokens the curve
+    /// prices against but does not hold, so it is larger than the pool UTxO's
+    /// token quantity by a constant that is fixed per launch. The difference is
+    /// what [`Self::virtual_tokens`] returns.
+    pub token_reserve: i64,
+    /// Platform fees accrued inside the pool UTxO and not yet claimed.
+    pub platform_accrued: i64,
+    /// Creator fees accrued inside the pool UTxO and not yet claimed.
+    pub creator_accrued: i64,
+}
+
+impl LumpFunCurve {
+    /// Tokens the curve prices against but does not hold.
+    ///
+    /// Exact, from one output: the datum's token side minus the quantity the
+    /// pool UTxO actually holds. MEASURED on Dust Bunny: 125,337,602 at every
+    /// state inspected.
+    pub fn virtual_tokens(&self, held: i64) -> Option<i64> {
+        ((0..=LUMPFUN_SUPPLY).contains(&held) && self.token_reserve >= held)
+            .then(|| self.token_reserve - held)
+    }
+
+    /// The curve's virtual ADA offset, recovered from ONE state.
+    ///
+    /// The curve is a constant product over `(ada_reserve + V, token_reserve)`
+    /// and it begins at `(0, LUMPFUN_SUPPLY + virtual_tokens)`. For any state,
+    /// then:
+    ///
+    /// ```text
+    /// V * (supply + virtual_tokens) = (ada_reserve + V) * token_reserve
+    /// V * (supply - held)           = ada_reserve * token_reserve
+    /// ```
+    ///
+    /// because `token_reserve = held + virtual_tokens` and `supply - held` is
+    /// everything the curve has sold. That is the whole derivation: no cohort
+    /// constant, no history, and no dependence on a second observation.
+    ///
+    /// ⚠️ **Recovered, not exact.** The validator floors every trade, so the
+    /// state sits a little off the exact curve and the recovered value is a
+    /// little above the compiled one. MEASURED on Dust Bunny: 5,000,000,130
+    /// from the fill state and 5,000,000,482 from the launch state, against the
+    /// 5,000,000,000 the cohort compiled in. The price is accurate to ~1e-8
+    /// relative — far below a hundredth of a token at these sizes — but code
+    /// that BUILDS A TRANSACTION must use the compiled value, because the
+    /// validator recomputes the quote with it.
+    pub fn virtual_ada(&self, held: i64) -> Option<i64> {
+        self.virtual_tokens(held)?;
+        let sold = LUMPFUN_SUPPLY - held;
+        if self.ada_reserve <= 0 || sold <= 0 {
+            return None;
+        }
+        let v = (self.ada_reserve as i128) * (self.token_reserve as i128) / (sold as i128);
+        let v = i64::try_from(v).ok()?;
+        (v > 0).then_some(v)
+    }
+
+    /// The curve's EFFECTIVE sides for `x·y = k`: `(tokens, lovelace)`.
+    ///
+    /// These are the numbers a constant-product price and a price-impact
+    /// figure are computed from. They are not the pool UTxO's balances — see
+    /// [`Self::virtual_tokens`] and [`Self::virtual_ada`] — which is why a
+    /// consumer that reports them must say so.
+    ///
+    /// `None` before the curve's first buy: with `ada_reserve == 0` there is no
+    /// offset to recover and therefore no price. That is undefined, not zero.
+    pub fn effective(&self, held: i64) -> Option<(i64, i64)> {
+        let virtual_ada = self.virtual_ada(held)?;
+        Some((
+            self.token_reserve,
+            self.ada_reserve.checked_add(virtual_ada)?,
+        ))
+    }
+}
+
+/// Decode a LumpFun curve datum.
+///
+/// Returns `None` on anything that is not `Constr 3` with six fields, rather
+/// than reading a different constructor positionally — the way a decoder starts
+/// returning confident nonsense. A LumpPad pool datum (`Constr 2`, eleven
+/// fields) is declined here by design.
+pub fn decode_lumpfun_datum(datum_cbor: &[u8]) -> Option<LumpFunCurve> {
+    let pd: PlutusData = minicbor::decode(datum_cbor).ok()?;
+    let c = match &pd {
+        PlutusData::Constr(c)
+            if c.fields.len() == 6 && (c.any_constructor == Some(3) || c.tag == 124) =>
+        {
+            c
+        }
+        _ => return None,
+    };
+    Some(LumpFunCurve {
+        policy: bytes(c.fields.first()?)?,
+        name: bytes(c.fields.get(1)?)?,
+        ada_reserve: int(c.fields.get(2)?)?,
+        token_reserve: int(c.fields.get(3)?)?,
+        platform_accrued: int(c.fields.get(4)?)?,
+        creator_accrued: int(c.fields.get(5)?)?,
+    })
+}
+
 /// An asset as the bonding datum spells it. ADA is the empty policy with the
 /// empty name — the same convention every DEX datum here uses.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -390,5 +562,168 @@ mod tests {
         assert_ne!(BONDING_CURVE_CRED, ORDER_CRED);
         assert!(is_snek_fun_curve(&BONDING_CURVE_CRED) && !is_snek_fun_order(&BONDING_CURVE_CRED));
         assert!(is_snek_fun_order(&ORDER_CRED) && !is_snek_fun_curve(&ORDER_CRED));
+    }
+
+    // ------------------------------------------------------------------------
+    // LumpFun — golden states from the Dust Bunny pool `a1b085f4…`
+    // ------------------------------------------------------------------------
+
+    /// The pool's inline datum in the sample buy `1f7e8e57…`, copied from the
+    /// chain (Koios `datum_info`, hash `aaaff6e9…`). Never retyped: a
+    /// hand-transcribed byte once shifted a WingRiders treasury by 512 and only
+    /// a golden test caught it.
+    const BUNNY_AFTER: &str = "d87c9f581ca1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba2934542554e4e591a5caf6ac01a3329db221a001e84801a001e8480ff";
+
+    /// The pool's inline datum in the launch transaction `b8f6252d…`, with the
+    /// creator's 25 ADA first buy already applied (hash `27024edb…`).
+    const BUNNY_LAUNCH: &str = "d87c9f581ca1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba2934542554e4e591a017d78401a42bddc1c1a0003d0901a0003d090ff";
+
+    /// How much of the token the pool UTxO held at that state — read from the
+    /// output, not from the datum.
+    const BUNNY_HELD: i64 = 733_043_488;
+    const BUNNY_HELD_AT_LAUNCH: i64 = 994_401_306;
+
+    fn bunny() -> LumpFunCurve {
+        decode_lumpfun_datum(&hex::decode(BUNNY_AFTER).unwrap()).expect("a live curve datum")
+    }
+
+    #[test]
+    fn the_curve_datum_names_the_token_and_all_six_fields() {
+        let c = bunny();
+        assert_eq!(
+            hex::encode(&c.policy),
+            "a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293"
+        );
+        assert_eq!(c.name, b"BUNNY");
+        assert_eq!(c.ada_reserve, 1_555_000_000);
+        assert_eq!(c.token_reserve, 858_381_090);
+        assert_eq!(c.platform_accrued, 2_000_000);
+        assert_eq!(c.creator_accrued, 2_000_000);
+        // The invariant every LumpFun pool state satisfies.
+        assert_eq!(
+            LUMPFUN_POOL_MIN_LOVELACE + c.ada_reserve + c.platform_accrued + c.creator_accrued,
+            1_562_000_000,
+            "the pool UTxO's lovelace"
+        );
+    }
+
+    /// The token side is virtual by a fixed amount — the same at the launch and
+    /// three trades later — and that constant is recoverable from one output.
+    #[test]
+    fn the_virtual_token_offset_is_constant_across_states() {
+        assert_eq!(bunny().virtual_tokens(BUNNY_HELD), Some(125_337_602));
+        let launch = decode_lumpfun_datum(&hex::decode(BUNNY_LAUNCH).unwrap()).unwrap();
+        assert_eq!(
+            launch.virtual_tokens(BUNNY_HELD_AT_LAUNCH),
+            Some(125_337_602)
+        );
+    }
+
+    /// The ADA offset the cohort compiled in, recovered from each state alone.
+    ///
+    /// ⚠️ It is NOT exact to the lovelace, and this test says so rather than
+    /// pretending otherwise: the validator floors every trade, so each state
+    /// sits a little off the exact curve. The tolerance here is 1,000 lovelace
+    /// against an offset of 5 billion — one part in five million.
+    #[test]
+    fn the_virtual_ada_offset_is_recovered_from_one_state() {
+        let launch = decode_lumpfun_datum(&hex::decode(BUNNY_LAUNCH).unwrap()).unwrap();
+        for (curve, held, want) in [
+            (bunny(), BUNNY_HELD, 5_000_000_130),
+            (launch, BUNNY_HELD_AT_LAUNCH, 5_000_000_482),
+        ] {
+            let got = curve.virtual_ada(held).expect("a state with a first buy");
+            assert_eq!(got, want, "held={held}");
+            assert!(
+                (got - 5_000_000_000).abs() < 1_000,
+                "{got} is more than 1,000 lovelace from the compiled 5,000,000,000"
+            );
+        }
+    }
+
+    /// The price the curve shows, against the one LumpFun's own API reported
+    /// for the same state: `priceLovelace` 7,636,468 (scaled by 1e6).
+    #[test]
+    fn the_effective_reserves_price_the_token_the_way_the_venue_does() {
+        let c = bunny();
+        let (base, quote) = c.effective(BUNNY_HELD).expect("priceable after a buy");
+        assert_eq!(base, 858_381_090);
+        assert_eq!(quote, 1_555_000_000 + c.virtual_ada(BUNNY_HELD).unwrap());
+        let scaled = (quote as i128) * 1_000_000 / (base as i128);
+        assert_eq!(scaled as i64, 7_636_468);
+    }
+
+    /// And the quote it produces, against the one `/api/tx/build` handed back
+    /// for a 5 ADA buy of the same state: 654,253 tokens.
+    #[test]
+    fn a_five_ada_buy_quotes_the_venues_own_number() {
+        let c = bunny();
+        let (base, _) = c.effective(BUNNY_HELD).unwrap();
+        let effective = c.ada_reserve as i128 + c.virtual_ada(BUNNY_HELD).unwrap() as i128;
+        let amount_in: i128 = 5_000_000;
+        let out = (base as i128) * amount_in / (effective + amount_in);
+        assert_eq!(out as i64, 654_253);
+    }
+
+    /// A launch with no first buy has `ada_reserve == 0`: the price is
+    /// undefined, not zero, and the decoder says so by declining to price it.
+    #[test]
+    fn a_curve_with_no_first_buy_is_not_priced() {
+        let c = LumpFunCurve {
+            policy: vec![0xaa; 28],
+            name: b"NEW".to_vec(),
+            ada_reserve: 0,
+            token_reserve: LUMPFUN_SUPPLY + 125_000_000,
+            platform_accrued: 0,
+            creator_accrued: 0,
+        };
+        assert_eq!(c.virtual_tokens(LUMPFUN_SUPPLY), Some(125_000_000));
+        assert_eq!(c.virtual_ada(LUMPFUN_SUPPLY), None);
+        assert_eq!(c.effective(LUMPFUN_SUPPLY), None);
+    }
+
+    /// A state whose numbers cannot describe THIS supply is refused rather than
+    /// made to fit: held above supply, or a token side below what the pool
+    /// holds, is a decoder-reading-the-wrong-thing bug.
+    #[test]
+    fn an_inconsistent_state_is_not_made_to_fit() {
+        let c = bunny();
+        assert_eq!(c.virtual_tokens(LUMPFUN_SUPPLY + 1), None);
+        assert_eq!(c.virtual_tokens(-1), None);
+        assert_eq!(c.virtual_tokens(c.token_reserve + 1), None);
+    }
+
+    /// Only the six-field `Constr 3` shape decodes. A LumpPad pool datum, a
+    /// snek.fun bonding datum and the order datum all decline — the whole point
+    /// of two protocols sharing a brand is that they must not be confused.
+    #[test]
+    fn another_protocols_datum_is_declined() {
+        assert!(decode_lumpfun_datum(&[]).is_none());
+        // The order datum from `2dcc4d22…#0`: Constr 0, eight fields.
+        let order = "d8799f581c4a00e5040c2d7e201a9c20744ace64bf28d1cda55999a4931e406922d8799f581ccba51a2e5b5b802a0402a87b762d2ecc6b1a9b6d0dd708daf07b82adff581ca1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba2934542554e4e59d879801a0bebc2001a018798941a0006ddd0ff";
+        assert!(decode_lumpfun_datum(&hex::decode(order).unwrap()).is_none());
+        assert!(decode_lumpfun_datum(&hex::decode(RIDDLE_DATUM).unwrap()).is_none());
+    }
+
+    /// Both LumpFun credentials pinned as hex, for the same reason the snek.fun
+    /// ones are: an explorer is the only way anyone will ever verify them.
+    #[test]
+    fn the_lumpfun_order_credential_is_pinned() {
+        assert_eq!(
+            hex::encode(LUMPFUN_ORDER_CRED),
+            "23c870a96ef1343a38c61a0d566c9d39d130d53eaa1517ca92f60eb4",
+        );
+        assert!(is_lumpfun_order(&LUMPFUN_ORDER_CRED));
+        assert!(!is_lumpfun_order(&ORDER_CRED));
+        assert!(!is_snek_fun_order(&LUMPFUN_ORDER_CRED));
+        assert_ne!(LUMPFUN_ORDER_CRED, ORDER_CRED);
+    }
+
+    /// The state NFT's name is CIP-67 label 100 + "POOL", which is how the
+    /// observer finds a curve whose validator is parameterised per launch.
+    #[test]
+    fn the_state_nft_name_is_label_100_pool() {
+        assert_eq!(&LUMPFUN_STATE_NFT_NAME[..4], &[0x00, 0x06, 0x43, 0xb0]);
+        assert_eq!(&LUMPFUN_STATE_NFT_NAME[4..], b"POOL");
     }
 }

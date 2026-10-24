@@ -86,10 +86,14 @@ impl OutputObserver for LaunchpadObserver {
         &self,
         out: &DecodedOutput,
         qty: i64,
-        _watched_policy: &[u8],
-        _watched_name: &[u8],
+        watched_policy: &[u8],
+        watched_name: &[u8],
         datum: Option<&[u8]>,
     ) -> Option<Decoded> {
+        if let Some(decoded) = lumpfun(out, qty, watched_policy, watched_name, datum) {
+            return Some(decoded);
+        }
+
         let cred = mitos_cohort::payment_cred(&out.address)?;
         if !mitos_launchpad_decode::is_snek_fun_curve(&cred) {
             return None;
@@ -139,6 +143,87 @@ impl OutputObserver for LaunchpadObserver {
     }
 }
 
+/// LumpFun's curve, recognised by its STATE NFT rather than by a credential.
+///
+/// ⚠️ **A per-launch validator means there is no shared credential.** snek.fun
+/// ships one curve script for every token, so `is_snek_fun_curve` is a
+/// credential test; LumpFun parameterises the validator with the policy, the
+/// token name, the creator, the fee bps and the graduation threshold, so every
+/// pool has its own script hash. What is shared is the STATE NFT's name under
+/// the launched token's own policy — one per pool, minted at launch — and that
+/// is what this matches.
+///
+/// The curve is a constant product over **effective** reserves (a virtual
+/// offset on both sides). The offsets are recovered from the pool's own state:
+/// the token side's is `datum.token_reserve - held`, and the ADA side's follows
+/// from the curve having begun at `(0, supply + virtual_tokens)` — see
+/// `LumpFunCurve::virtual_ada`. Both are exact enough to price with, and
+/// neither is a configured constant.
+///
+/// A curve with no first buy has no recoverable ADA offset. It is still a
+/// curve, so it is recorded as one — under `bonding-curve`, which is the honest
+/// "real reserves, no formula" answer this crate already has — and it becomes
+/// priceable the moment the first buy lands.
+fn lumpfun(
+    out: &DecodedOutput,
+    qty: i64,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+    datum: Option<&[u8]>,
+) -> Option<Decoded> {
+    let state_nft = out.assets.iter().any(|a| {
+        a.policy == watched_policy && a.name == mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME
+    });
+    if !state_nft {
+        return None;
+    }
+    let curve = mitos_launchpad_decode::decode_lumpfun_datum(datum?)?;
+    // The pool holds the token whose curve it is. A datum naming another unit
+    // means the walk handed this observer a different sighting — a bug, not a
+    // pool — and claiming it would make one token's curve price another's.
+    if curve.policy != watched_policy || curve.name != watched_name {
+        return None;
+    }
+
+    let (base_reserve, quote_reserve, source, pricing) = match curve.effective(qty) {
+        Some((base, quote)) => (
+            base,
+            Some(quote),
+            "datum-plus-virtual",
+            policy_archive::observation::pricing::CONSTANT_PRODUCT_VIRTUAL,
+        ),
+        // No first buy: `ada_reserve` is zero, the offsets cannot be recovered
+        // and the price is undefined. Report the raw balances, so this row and
+        // the story's `CurveState` for it agree to the lovelace.
+        None => (
+            qty,
+            Some(out.lovelace as i64),
+            "value",
+            policy_archive::observation::pricing::BONDING_CURVE,
+        ),
+    };
+
+    Some(Decoded {
+        venue: mitos_dex_decode::venue::LUMPFUN_V5.to_string(),
+        key_policy: watched_policy.to_vec(),
+        key_name: mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec(),
+        key_basis: "datum".to_string(),
+        base_reserve,
+        quote_policy: Some(Vec::new()),
+        quote_name: Some(Vec::new()),
+        quote_reserve,
+        // ⚠️ Deliberately absent. LumpFun's 2% is charged on the ADA LEG (1%
+        // platform + 1% creator) and paid on top; the curve itself nets
+        // nothing. Reporting 200 bps would make a consumer net it a second
+        // time, which is the classic way a quote comes out just under the
+        // chain's.
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: source.to_string(),
+        pricing: pricing.to_string(),
+    })
+}
+
 /// Every observer, tried in order; the first to claim the output wins.
 ///
 /// Order matters only where two could claim one output, which cannot happen
@@ -160,4 +245,125 @@ pub fn observe_all(
     observers
         .iter()
         .find_map(|o| o.observe(out, qty, watched_policy, watched_name, datum))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mitos_chain_walk::decode::Asset;
+    use policy_archive::observation::pricing;
+
+    /// Dust Bunny (`a1b085f4…`), the first LumpFun v5 launch.
+    const POLICY: &str = "a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293";
+    /// Its curve — a per-launch address, which is why the state NFT is the key.
+    const POOL: &str = "addr1wyj2cxrm7pkfz0sx6j6lgueg8035yrs4ry9xupcvcxlrg6cywmqny";
+    /// Tokens the pool UTxO actually held, read from the output.
+    const HELD: i64 = 733_043_488;
+
+    /// The pool's inline datum in the sample buy `1f7e8e57…`, copied from the
+    /// chain (Koios `datum_info`, hash `aaaff6e9…`).
+    const DATUM: &str = "d87c9f581ca1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba2934542554e4e591a5caf6ac01a3329db221a001e84801a001e8480ff";
+
+    fn policy() -> Vec<u8> {
+        hex::decode(POLICY).unwrap()
+    }
+
+    fn output(lovelace: u64, assets: Vec<Asset>) -> DecodedOutput {
+        DecodedOutput {
+            address: POOL.to_string(),
+            lovelace,
+            assets,
+            index: 0,
+            datum_hash: None,
+            inline_datum: None,
+            min_utxo: 1_500_000,
+        }
+    }
+
+    fn pool_output() -> DecodedOutput {
+        output(
+            1_562_000_000,
+            vec![
+                Asset::nft(
+                    policy(),
+                    mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec(),
+                ),
+                Asset::new(policy(), b"BUNNY".to_vec(), HELD as u64),
+            ],
+        )
+    }
+
+    fn observe(out: &DecodedOutput, name: &[u8]) -> Option<Decoded> {
+        let datum = hex::decode(DATUM).unwrap();
+        observe_all(
+            &default_observers(),
+            out,
+            HELD,
+            &policy(),
+            name,
+            Some(&datum),
+        )
+    }
+
+    /// The whole point: a per-launch curve has no shared credential, so it is
+    /// found by its state NFT — and priced over the EFFECTIVE reserves the
+    /// datum and the held quantity together recover.
+    #[test]
+    fn a_lumpfun_curve_is_recognised_by_its_state_nft_and_priced() {
+        let d = observe(&pool_output(), b"BUNNY").expect("a curve the observer must claim");
+        assert_eq!(d.venue, mitos_dex_decode::venue::LUMPFUN_V5);
+        assert_eq!(d.pricing, pricing::CONSTANT_PRODUCT_VIRTUAL);
+        assert_eq!(d.reserve_source, "datum-plus-virtual");
+        assert_eq!(d.key_basis, "datum");
+        assert_eq!(
+            d.key_name,
+            mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec()
+        );
+        assert_eq!(
+            d.base_reserve, 858_381_090,
+            "the curve's virtual token side"
+        );
+        let effective_quote = d.quote_reserve.expect("a state with a first buy");
+        assert_eq!(effective_quote, 1_555_000_000 + 5_000_000_130);
+        assert_eq!(
+            d.fee_bps, None,
+            "the 2% is charged on the ADA leg, not netted by the curve"
+        );
+        // 7.636468 lovelace per whole unit — LumpFun's own priceLovelace is
+        // 7,636,468 when scaled by 1e6.
+        let price = effective_quote as f64 / d.base_reserve as f64;
+        assert!((price - 7.636_468).abs() < 1e-5, "{price}");
+    }
+
+    /// The state NFT is a unit of the same policy and sits in the same output.
+    /// The walk hands the observer every unit in turn, so a claim under the
+    /// NFT's own name would record a curve sighting whose `unit_amount` is 1.
+    #[test]
+    fn the_state_nft_unit_is_not_a_second_curve_sighting() {
+        assert!(
+            observe(
+                &pool_output(),
+                &mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME
+            )
+            .is_none()
+        );
+    }
+
+    /// A datum naming a different token is not this pool's — claiming it would
+    /// let one launch's curve price another.
+    #[test]
+    fn a_curve_that_names_another_token_is_not_claimed() {
+        assert!(observe(&pool_output(), b"OTHER").is_none());
+    }
+
+    /// The same address without the state NFT is somebody paying tokens into
+    /// the script, not a pool state. An address alone is not a pool.
+    #[test]
+    fn an_output_without_the_state_nft_is_not_a_pool() {
+        let out = output(
+            1_562_000_000,
+            vec![Asset::new(policy(), b"BUNNY".to_vec(), HELD as u64)],
+        );
+        assert!(observe(&out, b"BUNNY").is_none());
+    }
 }

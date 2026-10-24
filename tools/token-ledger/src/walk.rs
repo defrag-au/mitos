@@ -164,6 +164,68 @@ pub(crate) fn units_in_output(
     units.into_iter().collect()
 }
 
+/// LumpFun v5: a pool the DEX recogniser cannot see.
+///
+/// The curve validator is parameterised per launch, so there is no shared
+/// credential to match — a pool is identified by the state NFT under the
+/// launched token's own policy. `mitos_pool_observe::recognise` is DEX-only,
+/// so without this arm the forward walk (and every artifact built from it)
+/// never observes a LumpFun curve, while the reverse archive does.
+///
+/// The reserves published are the EFFECTIVE ones [`LumpFunCurve::effective`]
+/// recovers: the token side already includes the curve's virtual offset, and
+/// the ADA side adds its own. A reader that prices `quote / base` gets the
+/// curve's spot, which is why this can join the spine's constant-product
+/// aggregates at all.
+///
+/// A curve with no first buy has no recoverable ADA offset and therefore no
+/// price. It is declined rather than recorded with a zero quote — the spine has
+/// no pricing model to carry "not yet", and a zero would price the token at
+/// zero. The launch is still in the archive, whose observation tier has that
+/// distinction (`bonding-curve`); only the forward spine waits for a buy.
+///
+/// [`LumpFunCurve::effective`]: mitos_launchpad_decode::LumpFunCurve::effective
+fn lumpfun_observation(
+    out: &DecodedOutput,
+    qty: i64,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+    datum: Option<&[u8]>,
+) -> Option<pools::PoolObservation> {
+    use mitos_launchpad_decode as launchpad;
+    use pools::{KeyBasis, PoolObservation, ReserveSource, Side};
+
+    let state_nft = out
+        .assets
+        .iter()
+        .any(|a| a.policy == watched_policy && a.name == launchpad::LUMPFUN_STATE_NFT_NAME);
+    if !state_nft {
+        return None;
+    }
+    let curve = launchpad::decode_lumpfun_datum(datum?)?;
+    // A datum naming another unit is not this pool's; claiming it would let one
+    // launch's curve price another.
+    if curve.policy != watched_policy || curve.name != watched_name {
+        return None;
+    }
+    let (base, quote) = curve.effective(qty)?;
+
+    Some(PoolObservation {
+        dex: mitos_dex_decode::venue::LUMPFUN_V5,
+        address: out.address.clone(),
+        key_policy: watched_policy.to_vec(),
+        key_name: launchpad::LUMPFUN_STATE_NFT_NAME.to_vec(),
+        key_basis: KeyBasis::Datum,
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base),
+        quote: Some(Side::ada(quote)),
+        // ⚠️ Deliberately absent — the 2% is charged on the ADA leg and paid
+        // on top, so netting it here would net it twice.
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: ReserveSource::DatumPlusVirtual,
+    })
+}
+
 /// `(address, unit) → (stake, amount)`: one transaction's deltas, keyed the way
 /// the conservation check reads them.
 pub(crate) type PartyUnitDeltas = HashMap<(String, Vec<u8>), (Option<String>, i64)>;
@@ -583,6 +645,11 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 let mut pool_hit = false;
                 for (name, qty) in &units {
                     if let Some(obs) = pools::recognise(out, *qty, &policy, name, witness_datum) {
+                        pool_obs.push(obs);
+                        pool_hit = true;
+                    } else if let Some(obs) =
+                        lumpfun_observation(out, *qty, &policy, name, witness_datum)
+                    {
                         pool_obs.push(obs);
                         pool_hit = true;
                     }
@@ -1762,6 +1829,114 @@ mod tests {
         assert!(w.matches(A));
         assert!(w.matches(B));
         assert!(w.matches(b""));
+    }
+
+    // ── LumpFun: a pool with no shared credential ──────────────────────────
+
+    /// Dust Bunny (`$BUNNY`), the first LumpFun v5 launch.
+    const LUMPFUN_POLICY: &str = "a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293";
+    /// The pool UTxO in the sample fill `1f7e8e57…`, copied from chain.
+    const LUMPFUN_POOL: &str = "addr1wyj2cxrm7pkfz0sx6j6lgueg8035yrs4ry9xupcvcxlrg6cywmqny";
+    const LUMPFUN_HELD: i64 = 733_043_488;
+    /// The same state's inline datum, from Koios `datum_info`.
+    const LUMPFUN_DATUM: &str = "d87c9f581ca1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba2934542554e4e591a5caf6ac01a3329db221a001e84801a001e8480ff";
+
+    fn lumpfun_output(held: i64) -> DecodedOutput {
+        let policy = hex::decode(LUMPFUN_POLICY).unwrap();
+        DecodedOutput {
+            address: LUMPFUN_POOL.to_string(),
+            lovelace: 1_562_000_000,
+            assets: vec![
+                mitos_chain_walk::decode::Asset::nft(
+                    policy.clone(),
+                    mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec(),
+                ),
+                mitos_chain_walk::decode::Asset::new(policy, b"BUNNY".to_vec(), held as u64),
+            ],
+            index: 0,
+            datum_hash: None,
+            inline_datum: None,
+            min_utxo: 1_500_000,
+        }
+    }
+
+    /// THE GAP THIS ARM CLOSES. `pools::recognise` is DEX-only and a LumpFun
+    /// curve has no shared credential, so before this the forward walk never
+    /// observed one — while the reverse archive did. The reserves it publishes
+    /// are the EFFECTIVE ones, because that is what the curve prices against.
+    #[test]
+    fn the_forward_walk_observes_a_lumpfun_curve_over_effective_reserves() {
+        let out = lumpfun_output(LUMPFUN_HELD);
+        let datum = hex::decode(LUMPFUN_DATUM).unwrap();
+        let obs = lumpfun_observation(
+            &out,
+            LUMPFUN_HELD,
+            &hex::decode(LUMPFUN_POLICY).unwrap(),
+            b"BUNNY",
+            Some(&datum),
+        )
+        .expect("the forward walk must see this pool");
+
+        assert_eq!(obs.dex, mitos_dex_decode::venue::LUMPFUN_V5);
+        assert_eq!(obs.key_basis, pools::KeyBasis::Datum);
+        assert_eq!(
+            obs.key_name,
+            mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec()
+        );
+        assert_eq!(
+            obs.base.reserve,
+            Some(858_381_090),
+            "the curve's virtual token side"
+        );
+        assert_eq!(
+            obs.quote_reserve(),
+            Some(6_555_000_130),
+            "1,555 ADA on the curve plus the recovered 5,000,000 ADA offset"
+        );
+        assert_eq!(obs.reserve_source, pools::ReserveSource::DatumPlusVirtual);
+        assert_eq!(
+            obs.fee_bps, None,
+            "the 2% is charged on the ADA leg, not netted by the curve"
+        );
+        assert!(obs.ada_paired());
+    }
+
+    /// No tokens sold yet means no `sold` quantity, so the ADA offset cannot be
+    /// recovered and the price is undefined. Declined rather than emitted with
+    /// a zero quote, which the spine would price as zero.
+    #[test]
+    fn the_forward_walk_declines_a_curve_with_no_price_yet() {
+        let out = lumpfun_output(mitos_launchpad_decode::LUMPFUN_SUPPLY);
+        let datum = hex::decode(LUMPFUN_DATUM).unwrap();
+        assert!(
+            lumpfun_observation(
+                &out,
+                mitos_launchpad_decode::LUMPFUN_SUPPLY,
+                &hex::decode(LUMPFUN_POLICY).unwrap(),
+                b"BUNNY",
+                Some(&datum),
+            )
+            .is_none()
+        );
+    }
+
+    /// The state NFT is a unit of the same policy and the observer is handed
+    /// every watched name, so a claim under the NFT's own name would record a
+    /// pool whose base reserve is 1.
+    #[test]
+    fn the_state_nft_unit_is_not_a_second_curve_sighting() {
+        let out = lumpfun_output(LUMPFUN_HELD);
+        let datum = hex::decode(LUMPFUN_DATUM).unwrap();
+        assert!(
+            lumpfun_observation(
+                &out,
+                LUMPFUN_HELD,
+                &hex::decode(LUMPFUN_POLICY).unwrap(),
+                &mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME,
+                Some(&datum),
+            )
+            .is_none()
+        );
     }
 
     /// A unit watch takes exactly its own name. The empty-named asset is a real

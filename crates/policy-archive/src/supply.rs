@@ -333,6 +333,7 @@ mod tests {
             address: address.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
     }
 

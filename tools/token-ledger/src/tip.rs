@@ -360,6 +360,17 @@ fn write_tail(
         secs: 0.0,
         written_unix: sealed_unix,
     });
+    // MERGE the profile, exactly as a landed immutable pass does. Without
+    // this a token launched above the last complete chunk has no profile at
+    // all: `/supply` reports `class: unknown`, and the site refuses it a
+    // market cap for want of a scale the tail can actually see. Plumbing is
+    // excluded at the scan, so a launchpad pool's state NFT cannot flip a
+    // fungible token to `mixed`.
+    let mut prof = manifest.profile.take().unwrap_or_default();
+    prof.units_seen = prof.units_seen.max(out.profile.units_seen);
+    prof.fungible_units = prof.fungible_units.max(out.profile.fungible_units);
+    prof.single_units = prof.single_units.max(out.profile.single_units);
+    manifest.profile = Some(prof);
     manifest.updated_unix = sealed_unix;
     archive::store_manifest(&dir, &manifest)?;
     archive::store_bundle(&dir, &manifest)?;

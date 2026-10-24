@@ -83,11 +83,18 @@ pub fn direction(unit: &UnitMove) -> Direction {
 /// that net to nothing, drops a unit whose parties all netted out and that
 /// was neither minted nor burned (the asset rode through as change), keeps a
 /// unit with no parties when a placeholder said it was minted or burned, and
-/// orders newest-first.
+/// orders newest block first.
+///
+/// ⚠️ **Within one block the order is the chain's, not the hash's.** Every row
+/// of a block shares a slot and a block time, so ordering them by hash was
+/// arbitrary: on $BUNNY it put a sell's fill above the placement that created
+/// it, and the explorer read as "order placed" AFTER the sale. `tx_index` is
+/// the position in the block; it sorts a placement before the fill it enables.
 pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
     struct Acc {
         slot: u64,
         block_time: u64,
+        tx_index: u32,
         units: BTreeMap<Vec<u8>, (i64, BTreeMap<String, i64>)>,
     }
     let mut by_tx: HashMap<Vec<u8>, Acc> = HashMap::new();
@@ -95,6 +102,7 @@ pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
         let acc = by_tx.entry(m.tx_hash.clone()).or_insert_with(|| Acc {
             slot: m.slot,
             block_time: m.block_time,
+            tx_index: m.tx_index,
             units: BTreeMap::new(),
         });
         let unit = acc.units.entry(m.unit_name.clone()).or_default();
@@ -105,7 +113,7 @@ pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
             *unit.1.entry(m.address.clone()).or_insert(0) += m.amount;
         }
     }
-    let mut out: Vec<FeedRow> = by_tx
+    let mut out: Vec<(u32, FeedRow)> = by_tx
         .into_iter()
         .filter_map(|(tx_hash, acc)| {
             let units: Vec<UnitMove> = acc
@@ -122,16 +130,26 @@ pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
                 })
                 .filter(|u| !u.parties.is_empty() || u.net_mint != 0)
                 .collect();
-            (!units.is_empty()).then_some(FeedRow {
-                tx_hash,
-                slot: acc.slot,
-                block_time: acc.block_time,
-                units,
-            })
+            (!units.is_empty()).then_some((
+                acc.tx_index,
+                FeedRow {
+                    tx_hash,
+                    slot: acc.slot,
+                    block_time: acc.block_time,
+                    units,
+                },
+            ))
         })
         .collect();
-    out.sort_by(|a, b| b.slot.cmp(&a.slot).then_with(|| b.tx_hash.cmp(&a.tx_hash)));
-    out
+    out.sort_by(|(ai, a), (bi, b)| {
+        b.slot
+            .cmp(&a.slot)
+            // ASCENDING within a slot: the placement, then the fill. Hash stays
+            // the final tiebreak so the order is total and deterministic.
+            .then_with(|| ai.cmp(bi))
+            .then_with(|| b.tx_hash.cmp(&a.tx_hash))
+    });
+    out.into_iter().map(|(_, row)| row).collect()
 }
 
 #[cfg(test)]
@@ -147,6 +165,7 @@ mod tests {
             address: addr.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
     }
 
@@ -188,6 +207,35 @@ mod tests {
         let out = fold_rows(vec![mv(2, "A", "", 0, -1)]);
         assert_eq!(out[0].units[0].net_mint, -1);
         assert!(out[0].units[0].parties.is_empty());
+    }
+
+    /// Within one block the chain's order wins, not the hash's. On $BUNNY a
+    /// sell's fill sorted above the placement that created it because its hash
+    /// happened to be larger; here the LATER transaction deliberately carries
+    /// the LARGER hash, so a hash-ordered fold returns the fill first and this
+    /// test fails.
+    #[test]
+    fn a_block_orders_by_transaction_position_not_hash() {
+        let row = |hash: u8, tx_index: u32, address: &str, amount: i64| Movement {
+            slot: 200,
+            block_time: 1_700_000_200,
+            tx_hash: vec![hash; 32],
+            unit_name: b"U".to_vec(),
+            address: address.into(),
+            amount,
+            net_mint: 0,
+            tx_index,
+        };
+        let out = fold_rows(vec![
+            // Second in the block, larger hash: the fill.
+            row(0xff, 1, "curve", 10),
+            row(0xff, 1, "buyer", -10),
+            // First in the block, smaller hash: the placement it settles.
+            row(0x01, 0, "buyer", -10),
+            row(0x01, 0, "order", 10),
+        ]);
+        let order: Vec<u8> = out.iter().map(|r| r.tx_hash[0]).collect();
+        assert_eq!(order, vec![0x01, 0xff], "placement, then the fill");
     }
 
     #[test]

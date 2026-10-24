@@ -1726,7 +1726,15 @@ pub async fn trades(
     };
     let limit = q.limit.unwrap_or(2_000).clamp(1, 5_000);
     let rows = a.feed_rows(limit, None).map_err(internal)?;
-    let folded = policy_archive::trade::fold(&rows, &crate::archive::venue_roles());
+    // The per-launch LumpFun curves come from the observation tier — see
+    // `venue_roles_for` for why a static table cannot carry them.
+    let dir = hub.policy_dir(&policy);
+    let observations = match archive::load_manifest(&dir).map_err(internal)? {
+        Some(m) => crate::archive::read_observations(&dir, &m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let folded =
+        policy_archive::trade::fold(&rows, &crate::archive::venue_roles_for(&observations));
 
     let mut r = PolicyTradesResponse {
         policy,
@@ -1794,6 +1802,16 @@ pub struct PolicySupplyResponse {
     pub class: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub units_seen: Option<u64>,
+    /// Where `minted`/`moved` came from, and therefore whether the total is
+    /// final.
+    ///
+    /// ⚠️ Omitted for the normal case: a reader MUST treat an absent field as
+    /// `snapshot`. `tail` means rows above the last complete Mithril chunk
+    /// were counted — a token launched since the last snapshot has its ENTIRE
+    /// history there, so the immutable-only answer would be `minted: 0` and
+    /// the site would draw a zero market cap until the next weekly refresh.
+    #[serde(skip_serializing_if = "crate::archive::SupplyBasis::is_snapshot")]
+    pub basis: crate::archive::SupplyBasis,
 }
 
 pub async fn supply(
@@ -1824,11 +1842,13 @@ fn supply_of(hub: &PolicyHub, policy: String) -> anyhow::Result<PolicySupplyResp
             because: None,
             class: None,
             units_seen: None,
+            basis: crate::archive::SupplyBasis::Snapshot,
         });
     };
     let completeness = a.manifest.completeness();
     let profile = a.manifest.profile.clone();
-    let r = a.reconcile(policy_archive::Diagnose::Totals)?;
+    let current = a.reconcile_current(policy_archive::Diagnose::Totals)?;
+    let r = current.reconciler;
     let balances = r.balances();
     let (verdict, gap, gap_units, because) = match r.verdict(completeness) {
         Verdict::Balanced => ("balanced", 0, 0, None),
@@ -1852,6 +1872,7 @@ fn supply_of(hub: &PolicyHub, policy: String) -> anyhow::Result<PolicySupplyResp
         because,
         class: profile.as_ref().map(|p| p.class().as_str()),
         units_seen: profile.as_ref().map(|p| p.units_seen),
+        basis: current.basis,
     })
 }
 
@@ -2410,15 +2431,16 @@ pub async fn launch(
         None => Vec::new(),
     };
 
-    // Curve sightings, oldest first. The observer tags them `BONDING_CURVE`
-    // rather than by venue name, because "not constant-product" is the
-    // property that matters and a second launchpad would share it.
+    // Curve sightings, oldest first. The observer tags them by PRICING MODEL
+    // rather than by venue name — `is_curve` covers both the unpriceable
+    // (snek.fun) and the priceable (LumpFun v5) sorts — so a third launchpad
+    // lands here without this filter learning its name.
     let mut curve: Vec<&policy_archive::Observation> = rows
         .iter()
         .filter(|o| {
             o.decoded
                 .as_ref()
-                .is_some_and(|d| d.pricing == policy_archive::observation::pricing::BONDING_CURVE)
+                .is_some_and(|d| policy_archive::observation::pricing::is_curve(&d.pricing))
         })
         .collect();
     // ⚠️ SLOT, then CURVE POSITION — and the second key is not a tiebreak for
@@ -2457,7 +2479,7 @@ pub async fn launch(
         .iter()
         .filter(|o| last_curve_slot.is_some_and(|s| o.slot > s))
         .filter_map(|o| o.decoded.as_ref())
-        .filter(|d| d.pricing != policy_archive::observation::pricing::BONDING_CURVE)
+        .filter(|d| !policy_archive::observation::pricing::is_curve(&d.pricing))
         .map(|d| d.venue.clone())
         .collect();
     venues_after.sort();
@@ -2590,6 +2612,12 @@ pub async fn story(
         Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
         None => Vec::new(),
     };
+    // ⚠️ Built from the observations BEFORE the clip below, and that is not
+    // bookkeeping: a LumpFun curve's credential is per-launch, so the only
+    // complete set of them is the one the observation tier found. Building the
+    // roles from a clipped window would leave fills outside it classified as
+    // transfers.
+    let roles = crate::archive::venue_roles_for(&observations);
 
     let jobs = hub.sched.inflight_for(&policy);
     let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
@@ -2641,8 +2669,7 @@ pub async fn story(
         .filter(|o| o.slot >= floor && o.slot <= ceiling)
         .collect();
 
-    let built = policy_archive::story::build(&rows, &obs, &crate::archive::venue_roles())
-        .with_markers(marks);
+    let built = policy_archive::story::build(&rows, &obs, &roles).with_markers(marks);
     let lo = built.events.first().map(|e| e.slot).unwrap_or(from);
     let hi = built.events.last().map(|e| e.slot).unwrap_or(from);
     let complete = manifest
@@ -3332,6 +3359,7 @@ mod tests {
             address: addr.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
     }
 

@@ -59,8 +59,16 @@ pub const SEGMENT_CHUNKS: u64 = 200;
 
 pub use crate::archive::kind_of;
 
-/// The writer's order: block time, then transaction, then unit, then party —
-/// the order the merge in [`compact`] relies on.
+/// The writer's order: block time, transaction hash, unit, party — the order
+/// the merge in [`compact`] relies on.
+///
+/// ⚠️ NOT `tx_index`. A correction row is attached to its transaction by hash
+/// and carries `tx_index = 0` (see `Pending::resolve`), so ordering by position
+/// would sort corrections away from the rows they correct whenever another
+/// transaction occupied a position between them — and a rollup, which merges
+/// corrections with movements, would then emit the same `(transaction, unit)`
+/// as two groups instead of summing it. The chain's position is carried as a
+/// VALUE and applied by `fold_rows`, which is where a feed is ordered.
 pub fn sort_for_writer(rows: &mut [Movement]) {
     rows.sort_by(|a, b| {
         a.block_time
@@ -241,7 +249,8 @@ impl Cursor {
     }
 }
 
-/// The merge key: writer order — block time, transaction, unit, party.
+/// The merge key: writer order — block time, transaction hash, unit, party.
+/// `tx_index` is deliberately absent; see [`sort_for_writer`].
 type Key = (u64, Vec<u8>, Vec<u8>, String);
 
 fn key(m: &Movement) -> Key {
@@ -766,6 +775,7 @@ struct Group {
     unit: Vec<u8>,
     slot: u64,
     block_time: u64,
+    tx_index: u32,
     net_mint: i64,
     parties: BTreeMap<String, i64>,
     placeholder: bool,
@@ -778,6 +788,7 @@ impl Group {
             unit: m.unit_name.clone(),
             slot: m.slot,
             block_time: m.block_time,
+            tx_index: m.tx_index,
             net_mint: 0,
             parties: BTreeMap::new(),
             placeholder: false,
@@ -785,6 +796,14 @@ impl Group {
     }
 
     fn add(&mut self, m: &Movement) {
+        // A correction row carries `tx_index = 0` because it is attached to its
+        // transaction by hash, not ordered against it. A known position must
+        // not be erased by that unknown: a rollup folds corrections into the
+        // group they correct, and would otherwise stamp the transaction with
+        // position 0 and put it back at the top of its block.
+        if self.tx_index == 0 {
+            self.tx_index = m.tx_index;
+        }
         if m.net_mint != 0 {
             self.net_mint = m.net_mint;
         }
@@ -806,6 +825,7 @@ impl Group {
             address,
             amount,
             net_mint: self.net_mint,
+            tx_index: self.tx_index,
         };
         let moved: Vec<Movement> = self
             .parties
@@ -904,6 +924,7 @@ mod tests {
             address: addr.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
     }
 
@@ -993,7 +1014,50 @@ mod tests {
             address: addr.to_string(),
             amount,
             net_mint: 0,
+            tx_index: tx as u32,
         }
+    }
+
+    /// ⚠️ THE ORDERING FIX LIVES IN `fold_rows`, NOT HERE. The writer keeps a
+    /// transaction's rows together by hash — the merge needs that, because a
+    /// correction row carries no position and would otherwise sort away from
+    /// the rows it corrects. What the writer must NOT do is lose the position
+    /// it was given.
+    #[test]
+    fn a_corrections_unknown_position_does_not_erase_the_transactions() {
+        let mut group = Group::start(&mv(100, 1, "A", "source", -5, 0));
+        group.add(&mv(100, 1, "A", "buyer", 5, 0));
+        // A later pass resolves the source: same transaction, `tx_index = 0`
+        // because a resolution is attached by hash.
+        let mut correction = mv(100, 1, "A", "source", -5, 0);
+        correction.tx_index = 0;
+        group.add(&correction);
+        let rows = group.rows();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|r| r.tx_index == 1),
+            "the transaction keeps its position in its block: {rows:?}"
+        );
+    }
+
+    /// The merge key is the writer's order, so a file the writer produced is
+    /// already in the order the k-way merge assumes — and a correction row is
+    /// adjacent to the rows it corrects, because both are keyed by hash.
+    #[test]
+    fn the_writer_order_keeps_a_correction_beside_its_transaction() {
+        let mut rows = vec![mv(100, 2, "A", "bob", 1, 0), mv(100, 1, "A", "alice", 1, 0)];
+        rows[0].tx_hash = vec![0xff; 32];
+        // Same transaction as `rows[1]`, position unknown.
+        let mut correction = mv(100, 1, "A", "alice", -1, 0);
+        correction.tx_index = 0;
+        rows.push(correction);
+        sort_for_writer(&mut rows);
+        // Same first byte means same transaction (`mv` fills the hash with the
+        // tx byte): the correction is rows[1], beside the row it corrects, and
+        // the other transaction is after both of them.
+        assert_eq!(rows[0].tx_hash[0], 0x01);
+        assert_eq!(rows[1].tx_hash[0], 0x01);
+        assert_eq!(rows[2].tx_hash[0], 0xff);
     }
 
     /// A POLICY'S ASSET LIST IS NOT ITS SUPPLY.

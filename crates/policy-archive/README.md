@@ -54,6 +54,15 @@ filter per row group.
 - ⚠️ **Corrections are a separate `FileKind`.** A later pass records the source
   it finally resolved there. Anything that reconciles over movements alone
   reports every one of those as still below the floor.
+- ⚠️ **A FEED's within-block order is `tx_index`; a FILE's order is by hash.**
+  They differ on purpose. `tx_index` is the transaction's position in its block,
+  carried from the walk, and `fold_rows` sorts by it — a sell's placement then
+  reads above the fill that settles it instead of below, which is what a hash
+  order did on $BUNNY. The file itself stays hash-ordered because a correction
+  row knows no position (`tx_index = 0`) and must still sort beside the rows it
+  corrects; putting position in the merge key separates them, and a rollup then
+  writes one `(transaction, unit)` as two groups instead of summing it. A file
+  written before the column existed reads as `0`, so it keeps hash order there.
 - ⚠️ **`net_mint` is assigned, not added.** Every row of a mint carries the
   transaction's figure, so summing them multiplies the mint by its output
   count. Amounts *are* summed — that is how corrections apply. Getting either

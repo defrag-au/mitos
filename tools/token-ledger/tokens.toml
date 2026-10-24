@@ -94,3 +94,19 @@ name = "nikepig"
 policy = "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c"
 asset_name = "4e696b65"                # "Nike" — mints under a different name than it displays
 decimals = 0                           # registry: 0 dp, ticker NIKEPIG
+
+# The first LumpFun v5 launch (2026-10-23 22:50:03 UTC), and the launchpad test
+# case: an ADA-quoted curve over VIRTUAL reserves, identified by its state NFT
+# rather than by a shared credential. `mitos-launchpad-decode::LumpFunCurve`
+# recovers both offsets from one state, so the curve is priceable without a
+# cohort constant.
+#
+# No `decimals` line on purpose. Koios `asset_info` returns
+# `token_registry_metadata: null` for this unit (checked 2026-10-24) and
+# decimals are not on chain, so there is no sourced claim to record. An
+# omitted value is not the same as zero.
+[[token]]
+name = "bunny"
+policy = "a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293"
+asset_name = "42554e4e59"              # "BUNNY"
+floor_slot = 201_229_506               # launch tx absolute slot; immutable file 9316

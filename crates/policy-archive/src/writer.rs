@@ -154,6 +154,10 @@ impl<W: Write + Send> ArchiveWriter<W> {
                     let v: Vec<i64> = rows.iter().map(|r| r.net_mint).collect();
                     w.typed::<Int64Type>().write_batch(&v, None, None)?;
                 }
+                Column::TxIndex => {
+                    let v: Vec<i64> = rows.iter().map(|r| r.tx_index as i64).collect();
+                    w.typed::<Int64Type>().write_batch(&v, None, None)?;
+                }
             }
             w.close()?;
             col += 1;
@@ -237,6 +241,7 @@ pub(crate) mod fixtures {
                         address: addr(seq % 37),
                         amount: -1,
                         net_mint: mint,
+                        tx_index: (seq % 7) as u32,
                     });
                 }
                 rows.push(Movement {
@@ -247,6 +252,7 @@ pub(crate) mod fixtures {
                     address: addr((seq + 1) % 37),
                     amount: 1,
                     net_mint: mint,
+                    tx_index: (seq % 7) as u32,
                 });
             }
         }
@@ -261,8 +267,9 @@ pub(crate) mod fixtures {
             address: String::new(),
             amount: 0,
             net_mint: -1,
+            tx_index: 0,
         });
-        rows.sort_by_key(|r| (r.block_time, r.tx_hash.clone()));
+        rows.sort_by_key(|r| (r.block_time, r.tx_index, r.tx_hash.clone()));
         rows
     }
 }
