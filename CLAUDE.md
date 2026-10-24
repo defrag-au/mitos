@@ -134,20 +134,27 @@ Options must be **specific** — name the crates, say what each costs. "We could
 or write it ourselves" is not a set of options.
 
 
-## Git history is mine — do not commit, push, merge or branch
+## Git state is mine — do not commit, push, merge or stage
 <!-- rule: rules/core/git-is-the-users-domain -->
 
-- Do not run `git commit`, `push`, `merge`, `rebase`, `tag` or anything else that mutates
-  history or a remote unless I specifically ask. Leave changes staged or unstaged for me to
-  review and commit myself.
-- Read-only git is always fine: `status`, `diff`, `log`, `show`, `blame`. Use `--no-pager` on
-  all of them.
+- Do not run `git add`, `git reset`, `git restore --staged`, `git stash`, `git commit`, `push`,
+  `merge`, `rebase`, `tag` or anything else that changes the index, history or a remote unless I
+  specifically ask. The same prohibition covers discarding working-tree changes — `git restore
+  --source`, `git checkout -- <paths>`, `git apply --reverse`, `git clean` — because the working
+  tree is mine to review too. Leave the index exactly as you found it; do not stage or unstage
+  anything.
+- For reads, `at-recall` and `at-peek` are the default, not the alternative. An agent shell may
+  not inherit the devshell; if `which at-recall` is empty, reach it as `direnv exec . at-recall …`
+  (and the same for `at-peek`). A bare `git status`, `git diff` or `git log` is a last resort:
+  only after that invocation fails, and say which one you tried. `git show` and `git blame` have
+  no `at-recall` verb yet — say so rather than widening the habit silently. Use `--no-pager` for
+  any git read that remains.
 - Branching for work is fine when it helps. Creating a branch rewrites nothing I have to
   unpick.
-- Also: no `[skip ci]`, `--no-verify` or bypassing hooks without asking · no amend,
-  force-push or reset · do not commit artefacts `.gitignore` excludes, even when they are up
-  to date · do not write a commit message and leave it staged in a way that suggests it was
-  committed.
+- If you change the index by accident, undo exactly that and say so.
+- Also: no `[skip ci]`, `--no-verify` or bypassing hooks without asking · no amend or
+  force-push · do not commit artefacts `.gitignore` excludes, even when they are up to date ·
+  do not write a commit message and leave it staged in a way that suggests it was committed.
 
 
 ## Edit files with the editor tools, never with a shell script
@@ -389,15 +396,21 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
 ## Read code and history with the agent tools, not with the shell
 <!-- rule: rules/org/defrag/agent-tools -->
 
-- Reading code with `rg`, `grep`, `sed`, `cat`, `head` or `wc` → use `at-peek`. Reading history or
-  working-tree state with `git status`, `git diff`, `git log` or `git show` → use `at-recall`. Both
-  are read-only, bounded by construction, and say what they did not show.
+- Reading code with `rg`, `grep`, `sed`, `cat`, `head` or `wc` → use `at-peek`. Reading installed
+  crate source or build-script output with `grep`, `sed` or `find` under `~/.cargo` or
+  `target/…/build` → use `at-crate`. Reading history or working-tree state with `git status`,
+  `git diff` or `git log` → use `at-recall`. All three are read-only, bounded by construction, and
+  say what they did not show. `git show` and `git blame` have no `at-recall` verb yet — say so
+  rather than reaching for them silently.
 
 | Instead of | Use |
 | --- | --- |
 | `rg`, `grep` | `at-peek search <pattern> [path…]` |
 | `sed -n '40,60p' <file>`, `head`, `cat` | `at-peek slice <file>:40-60` |
 | `wc -l`, `ls -l`, `stat` | `at-peek stat <path>…` |
+| `grep -rn … ~/.cargo/registry/src`, `sed -n … <crate>/src/…`, `find ~/.cargo/registry` | `at-crate search <pattern> <crate>` · `at-crate slice <crate>/<path>:40-60` · `at-crate where <crate>` |
+| `cargo info <crate>`, `ls ~/.cargo/registry/src/…` | `at-crate where <crate>` · `at-crate installed [<crate>]` |
+| `head target/…/build/<crate>-*/out/…`, `grep … target/…/build/…/out/…` | `at-crate out <crate>` · `at-crate slice <crate>/<path> --build` · `at-crate search <pattern> <crate> --build` |
 | `git status`, `git status --porcelain` | `at-recall state` |
 | `git diff`, `git diff --stat` | `at-recall diff [<rev>] [<path>…]` — add `--patch` for the hunks |
 | `git log`, `git log --oneline` | `at-recall log [<rev>] [<path>…]` |
@@ -406,8 +419,14 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
 
 - The exact lines · every mention · how many · which files → `at-peek slice <file>:40-60` ·
   `at-peek search <pat>` · `at-peek search <pat> --count` · `at-peek search <pat> --files-only`.
-- `which at-peek` empty → `direnv exec . at-peek <verb>`. An agent's spawned shell does not
-  inherit the devshell environment; an interactive one does.
+  For installed crate source the same three are `at-crate slice <crate>/<path>:40-60`,
+  `at-crate search <pat> <crate>` and `--count`.
+- `which at-peek` empty → `direnv exec . at-peek <verb>` (and the same for `at-recall`, `at-crate`
+  and `at-describe`). An agent's spawned shell does not inherit the devshell environment; an
+  interactive one does.
+- `at-crate` resolves a crate through the nearest `Cargo.lock`, not through memory or "latest". A
+  crate named twice in the lock, or a file present in more than one build-script `out`, is an error
+  naming the flag that chooses — never a guess. `--version` and `--build-dir` are those flags.
 - Output that was cut says so, and so does anything that would make it wrong. Repeat both when
   you report the finding: `# 50 of 143` is the difference between a fact and a guess.
 - A `# next:` line is the next question, already spelled as a command. Run it as printed rather
@@ -418,8 +437,9 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
   read, and the bound is the part that makes the answer reportable.
 - The tools are for understanding, not for preparing an edit. Read the file with the editor tools
   before editing it.
-- `at-peek` runs nothing at all; `at-recall` runs `git` and nothing else. That difference is why
-  they are separate binaries, and why they are separate approvals if I have tiered them.
+- `at-peek` and `at-crate` run nothing at all; `at-recall` runs `git` and nothing else. That
+  difference is why they are separate binaries, and why they are separate approvals if I have
+  tiered them.
 - A **recipe** is one verb that composes the reads its sibling verbs use, so a count cannot disagree
   with the listing beside it: `at-recall pr` answers "write me a PR description" with the base, the
   branch's commits and the diffstat by kind, and a caveat naming tracked files that have changed
@@ -430,7 +450,8 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
   description: why a change exists is not in the repository.
 - `at-recall` answers `state`, `log`, `diff` and the `pr` recipe. `blame`, `show` and `churn`, and the
   `review` and `release` recipes, are designed and not written — ask for the one you want rather than
-  reaching for `git`, and name the question, because that is what turns it into a verb.
+  reaching for `git`, and name the question, because that is what turns it into a verb. `at-crate`
+  answers `where`, `installed`, `files`, `slice`, `search` and `out`.
 
 
 ## Toggle local [patch] blocks as a unit

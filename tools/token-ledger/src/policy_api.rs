@@ -324,6 +324,30 @@ pub struct PolicyHub {
     /// observations merged with every movement. Keyed on the archive's own
     /// version, so it is recomputed when the archive moves and not before.
     series: Mutex<HashMap<String, (u64, Arc<policy_archive::series::Series>)>>,
+    /// policy → the pool view folded from its observations.
+    ///
+    /// ⚠️ Not an artefact on disk, deliberately. The VIEW is tiny — a handful of
+    /// pools — while what costs ~1 s on the widest archive here is READING AND
+    /// DECODING the observation tier. So the thing worth keeping is the fold,
+    /// in memory, where it can be refreshed by delta.
+    ///
+    /// Keyed on the archive's IMMUTABLE ceiling, not `updated_unix`: the tail
+    /// writes observations every 300 s, and re-reading 40 MB to pick up a
+    /// handful of rows is the mistake the series artefact already made once.
+    /// Between immutable changes the view is refreshed above its own ceiling,
+    /// which [`policy_archive::view::PolicyView::apply`] allows because it keeps
+    /// the NEWEST sighting of each pool.
+    views: Mutex<HashMap<String, CachedView>>,
+}
+
+/// A policy's pool view, and what it cost to fold.
+#[derive(Clone)]
+struct CachedView {
+    /// The archive's immutable ceiling when this was last folded from scratch.
+    immutable_to: u64,
+    view: Arc<policy_archive::view::PolicyView>,
+    /// Observation rows folded. `/price` reports it.
+    observations: usize,
 }
 
 /// What a [`PolicyHub`] is built from.
@@ -417,6 +441,7 @@ impl PolicyHub {
             bearer,
             holders: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
         });
         crate::scheduler::spawn(Arc::clone(&hub), pool, publish);
         hub
@@ -1129,18 +1154,17 @@ pub async fn price(
 fn price_of(
     hub: &PolicyHub,
     policy: String,
-) -> anyhow::Result<(PolicyPriceResponse, policy_archive::view::PolicyView)> {
+) -> anyhow::Result<(PolicyPriceResponse, Arc<policy_archive::view::PolicyView>)> {
     let dir = hub.policy_dir(&policy);
     let manifest = archive::load_manifest(&dir)?;
-    let rows = match &manifest {
-        Some(m) => crate::archive::read_observations(&dir, m)?,
-        None => Vec::new(),
-    };
+    let (view, observations) = view_of(hub, &policy)?;
     // Judged at the coverage ceiling, as the pool table is: see `judged_at`.
-    let at = judged_at(manifest.as_ref().and_then(|m| m.walk_to()), &rows);
+    let at = judged_to(
+        manifest.as_ref().and_then(|m| m.walk_to()),
+        view.ceiling().unwrap_or(0),
+    );
     // ONE fold; the response and anything else asked of this policy this
     // request are projections off it.
-    let view = policy_archive::view::PolicyView::from_observations(&rows);
     let spot = view.spot(at, &policy_archive::view::Projection::default());
     let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
     Ok((
@@ -1159,10 +1183,80 @@ fn price_of(
             unpriceable: spot.unpriceable.iter().map(depth_dto).collect(),
             stale: spot.stale.iter().map(depth_dto).collect(),
             stale_after_slots: policy_archive::price::DEFAULT_STALE_AFTER_SLOTS,
-            observations: rows.len(),
+            observations,
         },
         view,
     ))
+}
+
+/// The policy's pool view — folded once, refreshed by delta.
+///
+/// ⚠️ The observations tier is the most expensive read in this API (40 MB on
+/// the widest archive here), and `/price` and `/live` each re-read and re-folded
+/// all of it to answer a question whose answer is a handful of pools. The view
+/// is order-independent — [`policy_archive::view::PolicyView::apply`] keeps the
+/// newest sighting and tracks its ceiling — so a refresh applies only what has
+/// arrived since the last one.
+fn view_of(
+    hub: &PolicyHub,
+    policy: &str,
+) -> anyhow::Result<(Arc<policy_archive::view::PolicyView>, usize)> {
+    let dir = hub.policy_dir(policy);
+    let manifest = archive::load_manifest(&dir)?;
+    let immutable = manifest
+        .as_ref()
+        .map(crate::archive::immutable_to)
+        .unwrap_or(0);
+    let held = hub.views.lock().expect("views cache").get(policy).cloned();
+
+    if let Some(cached) = held
+        && cached.immutable_to == immutable
+    {
+        let above = match &manifest {
+            Some(m) => crate::archive::read_observations_above(
+                &dir,
+                m,
+                cached.view.ceiling().unwrap_or(0),
+            )?,
+            None => Vec::new(),
+        };
+        if above.is_empty() {
+            return Ok((cached.view, cached.observations));
+        }
+        let mut view = (*cached.view).clone();
+        for o in &above {
+            view.apply(o);
+        }
+        let observations = cached.observations + above.len();
+        let view = Arc::new(view);
+        hub.views.lock().expect("views cache").insert(
+            policy.to_string(),
+            CachedView {
+                immutable_to: immutable,
+                view: Arc::clone(&view),
+                observations,
+            },
+        );
+        return Ok((view, observations));
+    }
+
+    // Cold, or the IMMUTABLE coverage moved — which can add rows BELOW the
+    // ceiling (a top-up walk reaches older slots), so a delta is not enough.
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m)?,
+        None => Vec::new(),
+    };
+    let view = Arc::new(policy_archive::view::PolicyView::from_observations(&rows));
+    let observations = rows.len();
+    hub.views.lock().expect("views cache").insert(
+        policy.to_string(),
+        CachedView {
+            immutable_to: immutable,
+            view: Arc::clone(&view),
+            observations,
+        },
+    );
+    Ok((view, observations))
 }
 
 /// One pool, as the archive last saw it.
@@ -1561,7 +1655,12 @@ pub async fn unrecognised(
 /// wins when it is higher, which only an archive whose coverage lags a
 /// running pass's rows can produce.
 fn judged_at(walked_to: Option<u64>, rows: &[policy_archive::Observation]) -> u64 {
-    let newest = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    judged_to(walked_to, rows.iter().map(|o| o.slot).max().unwrap_or(0))
+}
+
+/// The slot a document describes: the walk's ceiling, or the newest row when
+/// that is higher.
+fn judged_to(walked_to: Option<u64>, newest: u64) -> u64 {
     walked_to.map_or(newest, |w| w.max(newest))
 }
 
@@ -2272,12 +2371,25 @@ fn live_folds(
             None
         }
     };
+    let written_holders = match crate::archive::read_holders(&dir, immutable) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!(
+                policy,
+                error = %format!("{e:#}"),
+                "policy: holders artifact unreadable, folding instead"
+            );
+            None
+        }
+    };
 
     let (held, series) = match crate::archive::History::open(&dir)? {
         Some(mut h) => {
-            let held = crate::archive::holders_from(&mut h)?;
+            // ⚠️ The SERIES first: its carry is the one that knows the boundary,
+            // and the balance table resumes above the SAME slot, so a reader
+            // that has to build both folds one tail for the pair.
             // The carried series, continued through whatever has happened
-            // since its boundary. This is the whole point of the artifact:
+            // since its boundary. This is the whole point of the artifacts:
             // the fold is proportional to the TAIL, not to the history.
             let continued = written.filter(|carry| match &manifest {
                 // ⚠️ A GAP would be silent — see `tail_series`. If the
@@ -2288,10 +2400,19 @@ fn live_folds(
                 Some(m) => tail_is_continuous(m, carry.settled_to),
                 None => false,
             });
-            let series = match continued {
+            let (series, settled_to) = match continued {
                 Some(carry) => match &manifest {
-                    Some(m) => Arc::new(crate::archive::tail_series(&mut h, &dir, m, &carry)?),
-                    None => Arc::new(carry.series),
+                    Some(m) => {
+                        let settled_to = carry.settled_to;
+                        (
+                            crate::archive::tail_series(&mut h, &dir, m, &carry)?,
+                            settled_to,
+                        )
+                    }
+                    None => {
+                        let settled_to = carry.settled_to;
+                        (carry.series, settled_to)
+                    }
                 },
                 None => {
                     let observations = match &manifest {
@@ -2299,6 +2420,7 @@ fn live_folds(
                         None => Vec::new(),
                     };
                     let carry = crate::archive::carry_from(&mut h, &observations)?;
+                    let settled_to = carry.settled_to;
                     // ⚠️ Record the fold that just happened. The publisher
                     // rewrites this when a walk lands; writing it here is what
                     // covers a box that has just restarted and a reader on a
@@ -2311,10 +2433,28 @@ fn live_folds(
                             "policy: series artifact not written"
                         );
                     }
-                    Arc::new(carry.series)
+                    (carry.series, settled_to)
                 }
             };
-            (held, series)
+
+            let held = match &written_holders {
+                // The published table, continued through the same tail.
+                Some(file) => crate::archive::holders_tail(&mut h, &file.carry, file.settled_to)?,
+                None => {
+                    let carry = crate::archive::holders_carry_from(&mut h)?;
+                    if let Err(e) =
+                        crate::archive::store_holders(&dir, immutable, settled_to, &carry)
+                    {
+                        tracing::warn!(
+                            policy,
+                            error = %format!("{e:#}"),
+                            "policy: holders artifact not written"
+                        );
+                    }
+                    policy_archive::holders::publish(&carry)
+                }
+            };
+            (held, Arc::new(series))
         }
         None => (
             policy_archive::holders::Fold {
@@ -2336,6 +2476,28 @@ fn live_folds(
         .expect("series cache")
         .insert(policy.to_string(), (version, Arc::clone(&series)));
     Ok((held, series))
+}
+
+/// Warm the per-policy folds a reader would otherwise pay for.
+///
+/// Called by the tip after it writes a tail — the one place that already knows
+/// "this policy's archive moved". The caches are keyed on `updated_unix`, so
+/// this rebuilds exactly the entries the change invalidated, and the artefacts
+/// turn each rebuild into a boundary plus the tail rather than a whole-archive
+/// fold.
+///
+/// ⚠️ This must stay O(new rows). The tip writes a tail for most policies every
+/// cycle, so anything proportional to the archive here would put the whole
+/// archive's fold back into the 300 s window — which is what took the cycle
+/// from 155 s to 236 s once already.
+pub(crate) fn warm(hub: &PolicyHub, policy: &str) {
+    // An optimisation: a failure here is the next reader's cost, not an error.
+    if let Err(e) = live_folds(hub, policy) {
+        tracing::debug!(policy, error = %format!("{e:#}"), "tip: fold warm failed");
+    }
+    if let Err(e) = view_of(hub, policy) {
+        tracing::debug!(policy, error = %format!("{e:#}"), "tip: view warm failed");
+    }
 }
 
 /// Σ held at registered burn sinks, and what that leaves circulating.

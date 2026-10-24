@@ -833,4 +833,36 @@ mod tests {
         // 10, it just could not read what it saw.
         assert_eq!(view.ceiling(), Some(20));
     }
+
+    /// ⚠️ THE PROPERTY AN INCREMENTAL VIEW DEPENDS ON.
+    ///
+    /// A reader refreshes a cached view by applying only the observations that
+    /// arrived ABOVE its ceiling. That is only sound if applying a suffix gives
+    /// the same view as folding the whole — including a pool whose newest
+    /// sighting is in the first batch, whose reserves must survive the second.
+    #[test]
+    fn applying_a_suffix_equals_folding_the_whole() {
+        let all = vec![
+            obs(10, "a", b"K", 100, Some(1_000)),
+            obs(20, "b", b"K", 50, Some(500)),
+            obs(30, "a", b"K", 90, Some(1_100)),
+            obs(40, "b", b"K", 40, Some(600)),
+            obs(50, "a", b"K", 80, Some(1_200)),
+        ];
+        let whole = PolicyView::from_observations(&all);
+
+        // Refresh after slot 20, the way `view_of` does: carry the view, apply
+        // only what sits above its ceiling.
+        let mut split = PolicyView::from_observations(&all[..2]);
+        let ceiling = split.ceiling().unwrap();
+        for o in all.iter().filter(|o| o.slot > ceiling) {
+            split.apply(o);
+        }
+
+        assert_eq!(split.ceiling(), whole.ceiling());
+        assert_eq!(split.claimed(), whole.claimed());
+        let at = whole.ceiling().unwrap();
+        let p = Projection::default();
+        assert_eq!(split.spot(at, &p), whole.spot(at, &p));
+    }
 }

@@ -1609,16 +1609,84 @@ pub fn tail_series(
 ///
 /// Written through a RENAME: `/live` reads this while the scheduler writes it,
 /// and half a postcard stream decodes as corruption rather than as "not yet".
-pub fn write_series(dir: &Path) -> Result<Option<usize>> {
+/// Write BOTH derived artefacts — `series.bin` and `holders.bin` — from ONE
+/// read of the archive.
+///
+/// ⚠️ One decode, not two. Each fold walks every movement row and the walk is
+/// the expensive half; [`History`] memoises it, so the second fold is nearly
+/// free. They also share a boundary, so a reader folds one tail for the pair.
+pub fn write_derived(dir: &Path) -> Result<()> {
     let Some(manifest) = load_manifest(dir)? else {
-        return Ok(None);
+        return Ok(());
     };
     let observations = read_observations(dir, &manifest)?;
     let Some(mut history) = History::open(dir)? else {
-        return Ok(None);
+        return Ok(());
     };
-    let carry = carry_from(&mut history, &observations)?;
-    Ok(Some(store_series(dir, immutable_to(&manifest), &carry)?))
+    let series = carry_from(&mut history, &observations)?;
+    let held = holders_carry_from(&mut history)?;
+    let settled_to = series.settled_to;
+    let key = immutable_to(&manifest);
+    store_series(dir, key, &series)?;
+    store_holders(dir, key, settled_to, &held)?;
+    Ok(())
+}
+
+/// The balance state at the archive's tip, for writing as an artefact.
+pub fn holders_carry_from(h: &mut History) -> Result<policy_archive::holders::Carry> {
+    Ok(policy_archive::holders::carry(
+        h.all_movements()?.iter().cloned(),
+    ))
+}
+
+/// Continue a carried balance table through every movement ABOVE `settled_to`.
+///
+/// Cheap by construction: [`History::movements_above`] skips whole row groups by
+/// their recorded slot range, so this reads the tail rather than the history.
+pub fn holders_tail(
+    h: &mut History,
+    carry: &policy_archive::holders::Carry,
+    settled_to: u64,
+) -> Result<policy_archive::holders::Fold> {
+    Ok(policy_archive::holders::fold_onto(
+        h.movements_above(settled_to)?.into_iter(),
+        carry,
+    ))
+}
+
+/// Write an ALREADY-FOLDED balance table as [`policy_archive::HOLDERS`].
+pub fn store_holders(
+    dir: &Path,
+    immutable_to: u64,
+    settled_to: u64,
+    carry: &policy_archive::holders::Carry,
+) -> Result<usize> {
+    let raw = policy_archive::HoldersFile {
+        format: policy_archive::HOLDERS_FORMAT,
+        immutable_to,
+        settled_to,
+        carry: carry.clone(),
+    }
+    .encode()
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let path = dir.join(policy_archive::HOLDERS);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::HOLDERS));
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(raw.len())
+}
+
+/// The written balance table, when it describes the archive version in hand.
+pub fn read_holders(dir: &Path, immutable_to: u64) -> Result<Option<policy_archive::HoldersFile>> {
+    let path = dir.join(policy_archive::HOLDERS);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let file = policy_archive::HoldersFile::decode(&bytes)?;
+    Ok((file.immutable_to == immutable_to).then_some(file))
 }
 
 /// The archive's IMMUTABLE coverage ceiling — what invalidates a written

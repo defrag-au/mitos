@@ -197,7 +197,15 @@ fn refresh(hub: &PolicyHub, spool: &Path, publishing: &crate::scheduler::Publish
             // what the artifact says. Writing it here re-folded the WHOLE
             // archive for all 31 policies every cycle (163 s -> 236 s of a
             // 300 s interval) and would have grown with the archive.
-            Ok(Wrote::Tail) => publishing.publish(hub.policy_dir(policy), policy),
+            Ok(Wrote::Tail) => {
+                // WARM what a reader will ask for next. This is the one place
+                // that knows this policy's archive moved, and both caches are
+                // keyed on the version this write just changed — so the next
+                // `/live` finds them current instead of paying for the folds.
+                // The artefacts make the rebuild a boundary plus the tail.
+                crate::policy_api::warm(hub, policy);
+                publishing.publish(hub.policy_dir(policy), policy)
+            }
             Ok(Wrote::Nothing) => {}
             Err(e) => {
                 tracing::warn!(policy, error = %format!("{e:#}"), "tip: could not write the tail")

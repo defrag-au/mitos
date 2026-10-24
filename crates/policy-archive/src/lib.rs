@@ -87,6 +87,7 @@ pub use graph::{
     Edge, GRAPH, GRAPH_FORMAT, Movement as PartyMovement, MovementGraph, Moves, NOBODY, PartyKey,
 };
 pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
+pub use holders::{HOLDERS, HOLDERS_FORMAT, HoldersError, HoldersFile};
 pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
 pub use observation::{
