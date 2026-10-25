@@ -49,6 +49,7 @@ use std::time::Duration;
 use anyhow::Result;
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -346,6 +347,15 @@ pub struct PolicyHub {
     /// which [`policy_archive::view::PolicyView::apply`] allows because it keeps
     /// the NEWEST sighting of each pool.
     views: Mutex<HashMap<String, CachedView>>,
+    /// policy → unix second this service last served it.
+    ///
+    /// The tip warms the folds above after it writes a tail, and that warm is
+    /// 56% of the tick's cost (2,014 ms of 3,614 MEASURED 2026-10-25) because
+    /// it re-folds a cache keyed on `updated_unix`, which every tail write
+    /// moves. A policy nobody is asking for is warmed for nobody — `/live`
+    /// falls back to folding on the miss — and a COMPLETE archive is read from
+    /// KV at the edge without reaching this process at all.
+    reads: Mutex<HashMap<String, u64>>,
 }
 
 /// A policy's pool view, and what it cost to fold.
@@ -447,6 +457,7 @@ impl PolicyHub {
             holders: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
         });
         crate::scheduler::spawn(Arc::clone(&hub), pool);
         hub
@@ -534,6 +545,31 @@ impl PolicyHub {
     /// writer of the same file.
     pub(crate) fn landing_lock(&self, policy: &str) -> Arc<Mutex<()>> {
         self.sched.lock_for(policy)
+    }
+
+    /// Record that this service served `policy`, so the tip knows whether
+    /// warming its folds is for a reader or for nobody.
+    ///
+    /// ⚠️ Capped. The path this is called from is public, so an unbounded map
+    /// keyed by a caller-supplied hex string is a memory leak with extra steps.
+    /// Past the cap a NEW key is simply not tracked, and an untracked policy is
+    /// warmed never — that costs a reader one fold, not the box its memory.
+    pub(crate) fn touch(&self, policy: &str) {
+        const TRACK_LIMIT: usize = 1024;
+        let mut reads = self.reads.lock().expect("reads");
+        if reads.len() >= TRACK_LIMIT && !reads.contains_key(policy) {
+            return;
+        }
+        reads.insert(policy.to_string(), unix_now());
+    }
+
+    /// Has anything asked for `policy` within `window`?
+    pub(crate) fn recently_read(&self, policy: &str, window: Duration) -> bool {
+        let reads = self.reads.lock().expect("reads");
+        let Some(last) = reads.get(policy) else {
+            return false;
+        };
+        unix_now().saturating_sub(*last) <= window.as_secs()
     }
 
     /// The snapshot's tip: the first slot of the chunk after the newest on
@@ -2522,6 +2558,14 @@ fn burn_split(fold: &policy_archive::holders::Fold) -> (i64, i64) {
     (burned, fold.held - burned)
 }
 
+/// Unix seconds, for the read timestamps [`PolicyHub::touch`] records.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Is this address a registered burn sink?
 fn is_burn_sink(address: &str) -> bool {
     let Some((pay, _)) = policy_archive::trade::address_parts(address) else {
         return false;
@@ -3153,7 +3197,38 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         .route("/policy/{policy}/refresh", post(refresh))
         .route("/policy/{policy}/seek", post(seek))
         .route("/policy/{policy}/events", get(events))
+        // Every route above is a demand signal for the tip's warm pass — see
+        // [`PolicyHub::touch`]. `route_layer`, so only a MATCHED policy route
+        // is recorded and a 404 costs nothing.
+        .route_layer(middleware::from_fn_with_state(hub.clone(), touch_read))
         .with_state(hub)
+}
+
+/// Note which policy a request is about, for the tip's demand-based warm.
+///
+/// ⚠️ Ahead of the handler and ahead of `gate`, deliberately: whether an
+/// unauthenticated probe counts as demand is a judgement, and the answer here
+/// is yes — a 401 still means something asked for that policy.
+async fn touch_read(
+    State(hub): State<Arc<PolicyHub>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if let Some(policy) = policy_in_path(req.uri().path()) {
+        hub.touch(&policy);
+    }
+    next.run(req).await
+}
+
+/// `/policy/<56 hex>/...` → `<56 hex>`, validated.
+///
+/// ⚠️ Validated rather than trimmed: the map this feeds is bounded by count,
+/// not by length, and a caller-supplied string is exactly what not to key a
+/// cache on without looking at it.
+fn policy_in_path(path: &str) -> Option<String> {
+    let policy = path.strip_prefix("/policy/")?.split('/').next()?;
+    let ok = policy.len() == 56 && policy.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then(|| policy.to_ascii_lowercase())
 }
 
 #[cfg(test)]

@@ -79,6 +79,13 @@ pub const DEFAULT_REFRESH_SECS: u64 = 300;
 /// than a row that arrives five minutes late.
 const SAFETY_DEPTH_SLOTS: u64 = 300;
 
+/// How long after a read a policy still counts as one somebody is watching.
+///
+/// Three ticks: long enough that a reader between two ticks keeps its warm
+/// cache, short enough that a policy abandoned this morning stops being
+/// re-folded every five minutes.
+const WARM_SECS: Duration = Duration::from_secs(900);
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct TipArgs {
     /// wallet-sieve's chain-tail spool, READ-ONLY: raw block CBOR from the
@@ -297,18 +304,39 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
         .collect();
     let needles =
         chain_sieve::Needles::new(&watched.iter().map(|(_, b)| b.clone()).collect::<Vec<_>>())?;
-    let blocks = load(&conn, floor, ceiling, &needles)?;
+    let (blocks, touches) = load(&conn, floor, ceiling, &needles)?;
     let scanned = started.elapsed();
+
+    // ONE decode per block per policy it actually touches. `blocks` is shared;
+    // each policy gets the subset the sieve named, so a quiet policy costs one
+    // `memmem` rather than a decode of the whole window — and the deep clone
+    // of all 519 candidates that every policy used to take is now one clone
+    // per block per touching policy.
+    let mut owned: Vec<Vec<(u64, Vec<u8>)>> = vec![Vec::new(); watched.len()];
+    for ((slot, cbor), hits) in blocks.iter().zip(&touches) {
+        for &n in hits {
+            owned[n].push((*slot, cbor.clone()));
+        }
+    }
+    // Counted BEFORE the loop: each visit takes its vector, so afterwards every
+    // policy looks untouched.
+    let untouched = owned.iter().filter(|b| b.is_empty()).count();
 
     let index = hub.index.as_ref().map(|h| h.get());
     let mut with_rows = Phases::default();
     let mut without_rows = Phases::default();
-    for (policy, bytes) in &watched {
+    let mut skipped = 0u64;
+    for (n, (policy, bytes)) in watched.iter().enumerate() {
+        // Nothing in the window touches this policy. Not even a scan: the
+        // sieve already answered, which is the whole reason it reports which.
+        if owned[n].is_empty() {
+            continue;
+        }
         match write_tail(
             hub,
             policy,
             bytes,
-            &blocks,
+            std::mem::take(&mut owned[n]),
             floor,
             ceiling,
             index.as_deref(),
@@ -319,23 +347,25 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
             // what the artifact says. Writing it here re-folded the WHOLE
             // archive for all 31 policies every cycle (163 s -> 236 s of a
             // 300 s interval) and would have grown with the archive.
-            //
-            // The archive moved, so R2 is now behind: `sync` republishes this
-            // policy from `published.json` versus the manifest. What happens
-            // HERE is only the in-process cache — this is the one place that
-            // knows the archive changed, and both caches are keyed on the
-            // version this write just changed, so the next `/live` finds them
-            // current instead of paying for the folds.
             Ok(Wrote::Tail { mut phases, landed }) => {
-                let warming = Instant::now();
-                crate::policy_api::warm(hub, policy);
-                phases.warm = warming.elapsed();
+                // WARM ONLY WHAT A READER WILL ASK FOR. This is 56% of the
+                // tick's cost (2,014 ms of 3,614 measured), it re-folds a
+                // cache keyed on `updated_unix`, and `/live` already falls
+                // back to folding on the miss. A policy nobody has asked this
+                // service for is warmed for nobody — and a COMPLETE archive is
+                // read from KV at the edge without touching this process at
+                // all.
+                if landed && hub.recently_read(policy, WARM_SECS) {
+                    let warming = Instant::now();
+                    crate::policy_api::warm(hub, policy);
+                    phases.warm = warming.elapsed();
+                }
                 match landed {
                     true => with_rows.add(phases),
                     false => without_rows.add(phases),
                 }
             }
-            Ok(Wrote::Nothing) => {}
+            Ok(Wrote::Nothing) => skipped += 1,
             Err(e) => {
                 tracing::warn!(policy, error = %format!("{e:#}"), "tip: could not write the tail")
             }
@@ -347,12 +377,15 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
         spool_blocks = ext.blocks,
         candidates = blocks.len(),
         policies = watched.len(),
+        untouched_policies = untouched,
         read_secs = format!("{:.1}", scanned.as_secs_f64()),
-        // Where the tick goes. `moved` is the work a reader needed; `quiet`
-        // is a pass that wrote a file, a manifest and a bundle for no rows —
-        // the share a real `Wrote::Nothing` would give back.
+        // Where the tick goes. `moved` is the work a reader needed; `quiet` is
+        // a pass that ran, found nothing it could write, and left the manifest
+        // alone; `skipped` never ran at all because no block since the last
+        // pass touched the policy — the one that makes a SHORT poll affordable.
         moved_policies = with_rows.count,
         quiet_policies = without_rows.count,
+        skipped_policies = skipped,
         moved_ms = with_rows.ms(),
         quiet_ms = without_rows.ms(),
         lock_ms = with_rows.lock.as_millis(),
@@ -367,28 +400,42 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
 }
 
 /// Every spool block in `[floor, ceiling)` that touches ANY watched policy,
-/// NEWEST FIRST — the order the reverse scan reads in.
+/// NEWEST FIRST — the order the reverse scan reads in — each with the indices
+/// of the watched policies it touches.
 ///
 /// Streams the whole range through sqlite and keeps only the hits, so what
 /// stays in memory is a policy's activity rather than a day of chain.
+///
+/// ⚠️ **The indices are the point.** Without them every policy's pass is handed
+/// every candidate block and decodes it to discover it is somebody else's:
+/// MEASURED 2026-10-25, 519 candidates × 32 policies = 16,608 block decodes a
+/// tick for ~550 that belonged to any policy at all.
+/// The spool window: blocks NEWEST FIRST, and for each block the indices of
+/// the watched policies it touches — the routing that makes one decode enough.
+type Window = (Vec<(u64, Vec<u8>)>, Vec<Vec<usize>>);
+
 fn load(
     conn: &Connection,
     floor: u64,
     ceiling: u64,
     needles: &chain_sieve::Needles<'_>,
-) -> Result<Vec<(u64, Vec<u8>)>> {
+) -> Result<Window> {
     let mut stmt = conn.prepare(
         "SELECT slot, cbor FROM tail_blocks WHERE slot >= ?1 AND slot < ?2 ORDER BY slot DESC",
     )?;
     let mut rows = stmt.query(rusqlite::params![floor, ceiling])?;
     let mut out = Vec::new();
+    let mut touches = Vec::new();
     while let Some(r) = rows.next()? {
         let cbor: Vec<u8> = r.get(1)?;
-        if needles.hit(&cbor) {
-            out.push((r.get(0)?, cbor));
+        let hits = needles.hits(&cbor);
+        if hits.is_empty() {
+            continue;
         }
+        out.push((r.get(0)?, cbor));
+        touches.push(hits);
     }
-    Ok(out)
+    Ok((out, touches))
 }
 
 /// Did this policy get a tail file?
@@ -439,7 +486,7 @@ fn write_tail(
     hub: &PolicyHub,
     policy: &str,
     policy_bytes: &[u8],
-    blocks: &[(u64, Vec<u8>)],
+    blocks: Vec<(u64, Vec<u8>)>,
     floor: u64,
     ceiling: u64,
     index: Option<&tx_index::Index>,
@@ -456,6 +503,40 @@ fn write_tail(
         // No archive yet — nothing to hang a tail off.
         return Ok(Wrote::Nothing);
     };
+
+    // ⚠️ NOTHING NEW FOR THIS POLICY — do not rebuild it.
+    //
+    // `write_tail` re-derives the WHOLE volatile window, so "the pass has
+    // rows" is not the same as "the pass gained rows": a policy with one
+    // trade this morning has rows on every poll and would rewrite its tail on
+    // every poll. MEASURED 2026-10-25 at a 30 s poll: 16 policies rewriting
+    // every 30 s, the same 16, for ~40× the work of the 300 s tick.
+    //
+    // `blocks` is already filtered to this policy's blocks, so the test is a
+    // slot comparison against the ceiling the last pass reached. A skipped
+    // stretch is not lost — the next write still derives from `floor`, so it
+    // covers everything since.
+    let last_ceiling = manifest
+        .passes
+        .iter()
+        .filter(|p| p.kind == RangeKind::Volatile)
+        .map(|p| p.ceiling)
+        .max()
+        .unwrap_or(floor);
+    let has_new = blocks.iter().any(|(slot, _)| *slot >= last_ceiling);
+
+    // A snapshot refresh raises the tail's floor, and the volatile pass below
+    // the new floor is now ALSO covered by the immutable archive — leaving it
+    // in place double-counts its rows under the sum rule. That write is the
+    // one pass that is not for a reader, and it is why `has_new` alone cannot
+    // decide.
+    let floor_moved = manifest
+        .passes
+        .iter()
+        .any(|p| p.kind == RangeKind::Volatile && p.floor < floor);
+    if !has_new && !floor_moved {
+        return Ok(Wrote::Nothing);
+    }
     // From the scheduler's allocator, not the manifest: a walk job may
     // already hold the number `manifest.next_seq()` would hand out.
     let seq = hub.next_pass_seq(policy);
@@ -477,7 +558,7 @@ fn write_tail(
     let mut observations: Vec<policy_archive::Observation> = Vec::new();
     let scanning = Instant::now();
     let out = reverse::scan_blocks(
-        blocks.to_vec(),
+        blocks,
         policy_bytes,
         // An ARCHIVE is per policy id, never per unit: the manifest is keyed
         // by the policy and the feed shows every unit under it.
@@ -523,8 +604,34 @@ fn write_tail(
     // merge folds them and drops what nets to nothing, exactly as a landed
     // range's compaction does.
     let compacted = segments::compact(&tip_dir, &segments, u64::MAX, &stamp)?;
-    let landed = compacted.written > 0;
+    // ⚠️ OBSERVATIONS COUNT. A pass can carry pool state without a movement
+    // row, and throwing those away is exactly the mistake that left the newest
+    // pool state 31.7 hours behind the newest fill on $PERP — see the
+    // `scan_blocks` header.
+    let landed = compacted.written > 0 || observations_entry.is_some();
     phases.parquet = parcelling.elapsed();
+
+    // NOTHING LANDED — leave the manifest alone.
+    //
+    // The previous volatile pass still describes the range it covered, so a
+    // reader folds exactly what it folded before. This cannot make an archive
+    // claim more than it holds: `completeness()` reads IMMUTABLE passes only
+    // (`manifest.rs:333`). The cost is that `walk_to` under-reports by one
+    // tick for a quiet policy, which is the safe direction — and cheaper than
+    // a manifest write, a `bundle.bin` rewrite and a publish carrying no rows.
+    //
+    // `floor_moved` was decided above: if it did move, this write is the one
+    // that must happen even with nothing to show.
+    if !landed && !floor_moved {
+        // The pass directory goes: nothing would name it, and a quiet policy
+        // would leave one behind every tick.
+        let _ = std::fs::remove_dir_all(&tip_dir);
+        phases.count = 1;
+        return Ok(Wrote::Tail {
+            phases,
+            landed: false,
+        });
+    }
 
     // AT MOST ONE volatile entry, replaced whole. Never summed with the last
     // one: that stretch can roll back, and rewriting it is what makes the

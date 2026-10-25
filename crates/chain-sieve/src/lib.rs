@@ -110,6 +110,37 @@ impl Needles<'_> {
             Needles::Automaton(ac) => ac.is_match(haystack),
         }
     }
+
+    /// WHICH needles appear in `haystack`, by their index in the set given to
+    /// [`new`] — ascending, deduplicated.
+    ///
+    /// [`hit`](Self::hit) answers "any"; this answers "which", which is what
+    /// lets one block be routed to the policies that actually touch it instead
+    /// of being decoded once per watched policy. MEASURED on the volatile tail:
+    /// 519 candidate blocks against 32 policies was 16,608 block decodes a tick
+    /// for ~550 blocks that were genuinely any policy's.
+    ///
+    /// The automaton reports every match in one pass; the finder path tests
+    /// each pattern, which is why [`new`](Self::new) switches over past three.
+    pub fn hits(&self, haystack: &[u8]) -> Vec<usize> {
+        match self {
+            Needles::Finders(fs) => fs
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.find(haystack).is_some())
+                .map(|(n, _)| n)
+                .collect(),
+            Needles::Automaton(ac) => {
+                let mut out: Vec<usize> = ac
+                    .find_iter(haystack)
+                    .map(|m| m.pattern().as_usize())
+                    .collect();
+                out.sort_unstable();
+                out.dedup();
+                out
+            }
+        }
+    }
 }
 
 /// Find the EARLIEST chunk containing any needle — floor discovery for a
@@ -285,4 +316,48 @@ where
     }
     stats.wall_secs = started.elapsed().as_secs_f64();
     Ok((found, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `hits` is what lets one block be routed to the policies it touches, so
+    /// it must agree with `hit` and name the RIGHT index — a wrong index
+    /// silently attributes another policy's rows.
+    ///
+    /// Both arms are covered on purpose: `new` picks SIMD finders for three or
+    /// fewer patterns and the Aho-Corasick automaton past that, and they are
+    /// separate implementations of the same question.
+    #[test]
+    fn hits_names_every_matching_needle_by_index_in_both_backings() {
+        let a = b"alpha-policy-bytes".to_vec();
+        let b = b"beta-policy-bytes".to_vec();
+        let haystack = b"..alpha-policy-bytes..beta-policy-bytes..";
+
+        let wide = Needles::new(&[
+            a.clone(),
+            b.clone(),
+            b"\x00\x01".to_vec(),
+            b"\xff\xfe".to_vec(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(wide, Needles::Automaton(_)),
+            "4 patterns is the wide path"
+        );
+        assert_eq!(wide.hits(haystack), vec![0, 1]);
+        assert!(wide.hit(haystack));
+        assert!(wide.hits(b"..nothing..").is_empty());
+        assert!(!wide.hit(b"..nothing.."));
+
+        let narrow = Needles::new(&[a, b]).unwrap();
+        assert!(
+            matches!(narrow, Needles::Finders(_)),
+            "2 patterns is the finder path"
+        );
+        assert_eq!(narrow.hits(haystack), vec![0, 1]);
+        assert_eq!(narrow.hits(b"..beta-policy-bytes.."), vec![1]);
+        assert!(narrow.hit(b"..beta-policy-bytes.."));
+    }
 }
