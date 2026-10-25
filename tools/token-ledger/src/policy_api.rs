@@ -303,6 +303,10 @@ pub struct PolicyHub {
     /// `None` without `--policy-index-dir`, and the walk then falls back to
     /// Koios exactly as before.
     pub(crate) policy_index: Option<policy_index::Floors>,
+    /// Where that index lives, so the tail can extend its floor sidecar.
+    ///
+    /// `None` without `--policy-index-dir`, and then nothing tries.
+    pub(crate) policy_index_dir: Option<PathBuf>,
     /// The pool: walk jobs, seek jobs, what is in flight. See
     /// `scheduler.rs`.
     pub(crate) sched: crate::scheduler::Scheduler,
@@ -365,9 +369,6 @@ pub struct HubConfig {
     pub data_dir: PathBuf,
     pub tokens: PathBuf,
     pub archive_dir: PathBuf,
-    /// Where a landed archive goes — R2 and the KV bundle — or `None` to
-    /// leave it on disk. See `publish.rs`.
-    pub publish: Option<crate::publish::Targets>,
     /// A tx-index over the same snapshot, for seeks.
     pub tx_index_dir: Option<PathBuf>,
     /// A policy-index over the same snapshot, for first mints at admission.
@@ -383,7 +384,6 @@ impl PolicyHub {
             data_dir,
             tokens,
             archive_dir,
-            publish,
             tx_index_dir,
             policy_index_dir,
             pool,
@@ -407,7 +407,7 @@ impl PolicyHub {
                 }
             }
         });
-        let policy_index = policy_index_dir.and_then(|dir| {
+        let policy_index = policy_index_dir.clone().and_then(|dir| {
             match policy_index::Floors::open(&dir) {
                 Ok(Some(f)) => {
                     let (from, to) = f.covers();
@@ -434,9 +434,6 @@ impl PolicyHub {
                 }
             }
         });
-        if let Some(t) = &publish {
-            tracing::info!(targets = %t.describe(), "policy: publishing landed archives");
-        }
         let hub = Arc::new(Self {
             data_dir,
             tokens,
@@ -444,13 +441,14 @@ impl PolicyHub {
             jobs: Mutex::new(HashMap::new()),
             index,
             policy_index,
+            policy_index_dir,
             sched: crate::scheduler::Scheduler::new(),
             bearer,
             holders: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
         });
-        crate::scheduler::spawn(Arc::clone(&hub), pool, publish);
+        crate::scheduler::spawn(Arc::clone(&hub), pool);
         hub
     }
 

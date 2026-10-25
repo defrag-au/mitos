@@ -59,13 +59,6 @@ pub struct ServeArgs {
     #[arg(long)]
     pub push_script: Option<PathBuf>,
 
-    /// Publish every landed policy archive — Parquet and manifest to R2,
-    /// the bundle to Workers KV — from the environment the unit loads
-    /// (`R2_*`, `CF_KV_TOKEN`, `KV_NAMESPACE_IDS`). In process, with a
-    /// per-step record; see `publish.rs`. Omit to keep archives local.
-    #[arg(long)]
-    pub publish_archive: bool,
-
     /// A tx-index over the same snapshot (`base.idx` + `segments/`). With
     /// it, a SEEK — the window a reader asked for — resolves its inputs on
     /// the spot; without it those rows arrive as arrivals and the descent
@@ -192,7 +185,6 @@ pub fn run(args: ServeArgs) -> Result<()> {
         data_dir: args.data_dir.clone(),
         tokens: args.tokens.clone(),
         archive_dir: args.archive_dir.clone(),
-        publish: args.publish_archive.then(crate::publish::Targets::from_env),
         tx_index_dir: args.tx_index_dir.clone(),
         policy_index_dir: args.policy_index_dir.clone(),
         pool: crate::scheduler::Pool {
@@ -204,11 +196,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // THE VOLATILE TAIL, from the box's chain-tail spool. No-op without
     // `--tail-db`; token-ledger follows nothing itself.
-    crate::tip::spawn(
-        Arc::clone(&policy_hub),
-        args.tip.clone(),
-        args.publish_archive.then(crate::publish::Targets::from_env),
-    );
+    crate::tip::spawn(Arc::clone(&policy_hub), args.tip.clone());
 
     let listen = args.listen.clone();
     // Each half resolves its OWN state before the merge — the two hubs are

@@ -53,10 +53,13 @@ impl Mints {
     /// Returns whether anything was minted — the caller uses it only for
     /// counting; a non-minting transaction is not an error.
     pub fn push_tx(&mut self, block: &MultiEraBlock<'_>, index: usize, spans: TxSpans) -> bool {
-        if is_invalid(block, index) {
+        // ⚠️ Validity first, and before the size gate: a transaction the block
+        // voided produced no record at all, and counting it as an oversize skip
+        // would report the wrong reason.
+        let Some(assets) = minted_assets(block, index) else {
             self.invalid_skipped += 1;
             return false;
-        }
+        };
         let Ok(body_len) = u16::try_from(spans.body_len) else {
             self.oversize_skipped += 1;
             return false;
@@ -66,7 +69,7 @@ impl Mints {
             return false;
         };
         let before = self.records.len();
-        for (policy, name, burned) in minted_assets(block, index) {
+        for (policy, name, burned) in assets {
             self.records.push(Record {
                 policy_prefix: policy_prefix(&policy),
                 name_prefix: name_prefix(&name),
@@ -111,22 +114,32 @@ fn is_invalid(block: &MultiEraBlock<'_>, index: usize) -> bool {
     }
 }
 
+/// One asset a transaction minted or burned: `(policy, asset_name, burned)`.
+///
+/// `burned` is carried rather than filtered because "the first mint" is the
+/// origin, and a re-mint after a burn cannot be told from a first mint without
+/// the burn in the record too.
+pub type AssetMint = (Vec<u8>, Vec<u8>, bool);
+
 /// `(policy, asset_name, burned)` for every asset transaction `index` minted
-/// or burned.
+/// or burned — `None` when the block VOIDED the transaction.
 ///
 /// The body is ALREADY DECODED by the extraction pass, so this reads a field
 /// and walks a small map — it is not a parse. That is the whole reason the
 /// measured cost is 1.8% and does not grow with mint density.
-fn minted_assets(block: &MultiEraBlock<'_>, index: usize) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
+///
+/// Public for a caller that has block BYTES and no chunk file — the volatile
+/// tail, which can state a policy but not a record's byte spans. The validity
+/// rule travels with the function so there is one copy of it.
+pub fn minted_assets(block: &MultiEraBlock<'_>, index: usize) -> Option<Vec<AssetMint>> {
+    if is_invalid(block, index) {
+        return None;
+    }
     let mut out = Vec::new();
     macro_rules! walk {
         ($b:expr, $neg:expr) => {{
-            let Some(body) = $b.transaction_bodies.get(index) else {
-                return out;
-            };
-            let Some(mint) = body.mint.as_ref() else {
-                return out;
-            };
+            let body = $b.transaction_bodies.get(index)?;
+            let mint = body.mint.as_ref()?;
             for (policy, assets) in mint.iter() {
                 for (name, qty) in assets.iter() {
                     out.push((policy.to_vec(), name.to_vec(), $neg(qty)));
@@ -143,7 +156,29 @@ fn minted_assets(block: &MultiEraBlock<'_>, index: usize) -> Vec<(Vec<u8>, Vec<u
         }
         _ => {}
     }
-    out
+    Some(out)
+}
+
+/// Every policy a raw block mints or burns, as prefixes — the question the
+/// VOLATILE TAIL can ask, where there is a block and no chunk file.
+///
+/// ⚠️ Same validity rule as [`Mints::push_tx`], because it is the same function:
+/// a phase-2 failed transaction mints nothing, and a `mint` field that decodes
+/// perfectly is exactly how that got miscounted before.
+///
+/// `Err` only when the block will not decode at all.
+pub fn mints_in_block(cbor: &[u8]) -> anyhow::Result<Vec<u64>> {
+    let block = MultiEraBlock::decode(cbor)?;
+    let mut out = Vec::new();
+    for index in 0..block.txs().len() {
+        let Some(assets) = minted_assets(&block, index) else {
+            continue;
+        };
+        for (policy, _name, _burned) in assets {
+            out.push(policy_prefix(&policy));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -158,6 +193,31 @@ mod tests {
             aux_offset: 2000,
             aux_len: 300,
         }
+    }
+
+    /// A REAL mainnet block, read from BYTES the way the volatile tail has it:
+    /// no chunk, no spans, just CBOR. The tail's whole premise is that a block's
+    /// mints are readable from the body already in hand — this is that premise,
+    /// checked against a block whose mint is known.
+    #[test]
+    fn a_real_block_yields_the_policy_it_mints() {
+        let cbor = include_bytes!(
+            "../../../community-modules/cip-25-mint/tests/fixtures/perp-policy/186913993.block.cbor"
+        );
+        let minted = mints_in_block(cbor).expect("a mainnet block");
+        let perp = hex::decode("e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0")
+            .expect("a policy id");
+        assert!(
+            minted.contains(&policy_prefix(&perp)),
+            "the Perp mint is not among {minted:?}"
+        );
+    }
+
+    /// "Cannot read this block" and "this block mints nothing" must not read the
+    /// same: the tail pass counts the first and ignores the second.
+    #[test]
+    fn a_block_that_will_not_decode_is_an_error_not_an_empty_answer() {
+        assert!(mints_in_block(b"not a block").is_err());
     }
 
     /// ⚠️ A body larger than `u16` is DROPPED AND COUNTED, never truncated.

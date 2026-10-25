@@ -49,6 +49,7 @@
 //! chunks now cover, a top-up job reads that stretch from the chunks, and
 //! the tail moves up to sit above the new tip.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -91,8 +92,24 @@ pub struct TipArgs {
     pub tip_refresh_secs: u64,
 }
 
+/// How often the FLOOR sidecar is extended from the tail.
+///
+/// The spool is re-read every tick anyway; what this gate protects is the
+/// sidecar, which is one sorted array rewritten whole — 3.6 MiB at 232,745
+/// policies. Hourly that is ~86 MiB a day; every tick it would be ~1 GB a day for
+/// the same information. A launch is therefore at most an hour invisible to
+/// admission, which is finer than the six-hour chunk the index itself is built
+/// from.
+pub const FLOOR_SECS: u64 = 3_600;
+
 /// Start the tail thread. Nothing without `--tail-db`.
-pub fn spawn(hub: Arc<PolicyHub>, args: TipArgs, publish: Option<crate::publish::Targets>) {
+///
+/// ⚠️ **It does not publish.** Landing a tail leaves the archive's
+/// `published.json` stale, and `token-ledger sync` — a separate process — is
+/// what makes R2 match disk. That split is why a slow or failing publish can no
+/// longer delay the next tick: publishing was 206 s of a 300 s interval, against
+/// 0.1 s of reading.
+pub fn spawn(hub: Arc<PolicyHub>, args: TipArgs) {
     let Some(spool) = args.tail_db.clone() else {
         return;
     };
@@ -100,16 +117,121 @@ pub fn spawn(hub: Arc<PolicyHub>, args: TipArgs, publish: Option<crate::publish:
     std::thread::Builder::new()
         .name("tip".into())
         .spawn(move || {
-            let publishing = crate::scheduler::Publishing::new(publish);
-            tracing::info!(spool = %spool.display(), secs = every.as_secs(), "tip: reading the chain-tail spool");
+            tracing::info!(spool = %spool.display(), secs = every.as_secs(), floor_secs = FLOOR_SECS, "tip: reading the chain-tail spool");
+            let mut floors_at: Option<Instant> = None;
             loop {
                 std::thread::sleep(every);
-                if let Err(e) = refresh(&hub, &spool, &publishing) {
+                if let Err(e) = refresh(&hub, &spool) {
                     tracing::warn!(error = %format!("{e:#}"), "tip: could not refresh the tail");
+                }
+                if floors_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(FLOOR_SECS)) {
+                    if let Err(e) = refresh_floors(&hub, &spool) {
+                        tracing::warn!(error = %format!("{e:#}"), "floor: could not extend the policy index");
+                    }
+                    floors_at = Some(Instant::now());
                 }
             }
         })
         .expect("spawn tip thread");
+}
+
+/// One tick of the floor sidecar: the policies minted since the last complete
+/// chunk, written into `runs.pidx`.
+///
+/// ⚠️ **This is the only way such a policy gets a floor at all.** `policy-index`
+/// is built from complete chunks, so a launch younger than the last one is absent
+/// from it — and absent means admission REFUSES rather than reading every chunk
+/// back to genesis (MEASURED on $BUNNY: 229.5 s, 234 of its 235 passes empty).
+fn refresh_floors(hub: &PolicyHub, spool: &Path) -> Result<()> {
+    if hub.policy_index_dir.is_none() {
+        return Ok(());
+    }
+    let conn = open_ro(spool)?;
+    let Some(ext) = extent(&conn)? else {
+        return Ok(());
+    };
+    // The same window the tail is derived over: the settled coverage's end to the
+    // spool's tip, less the rollback depth.
+    let floor = hub.tip_slot();
+    let ceiling = ext.tip.saturating_sub(SAFETY_DEPTH_SLOTS) + 1;
+    if ceiling <= floor {
+        return Ok(());
+    }
+    extend_floors(hub, &conn, floor, ceiling)
+}
+
+/// Stream the tail's blocks and hand `policy-index` the policies it has not seen.
+///
+/// One block at a time: the whole tail is ~34,000 blocks and holding them decoded
+/// would be hundreds of MB for a set of floors that is a few dozen rows.
+fn extend_floors(hub: &PolicyHub, conn: &Connection, floor: u64, ceiling: u64) -> Result<()> {
+    let Some(dir) = hub.policy_index_dir.as_deref() else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let mut stmt = conn.prepare(
+        "SELECT slot, cbor FROM tail_blocks WHERE slot >= ?1 AND slot < ?2 ORDER BY slot DESC",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![floor, ceiling])?;
+
+    let mut first: HashMap<u64, u16> = HashMap::new();
+    let mut blocks = 0u64;
+    let mut undecodable = 0u64;
+    let mut mints = 0u64;
+    while let Some(r) = rows.next()? {
+        let slot: u64 = r.get(0)?;
+        let cbor: Vec<u8> = r.get(1)?;
+        let policies = match policy_index::mints_in_block(&cbor) {
+            Ok(p) => p,
+            Err(_) => {
+                undecodable += 1;
+                continue;
+            }
+        };
+        // THE VOLATILE TAIL HAS NO CHUNK FILES. A slot's chunk is
+        // `slot / CHUNK_SLOTS` by construction, so the floor this produces is the
+        // chunk that WILL hold the mint once the snapshot reaches it — and, as
+        // always, its first slot sits at or below the mint itself.
+        let chunk = (slot / crate::registry::CHUNK_SLOTS) as u16;
+        for prefix in policies {
+            first
+                .entry(prefix)
+                .and_modify(|c| *c = (*c).min(chunk))
+                .or_insert(chunk);
+            mints += 1;
+        }
+        blocks += 1;
+    }
+
+    let candidates: Vec<policy_index::FloorRun> = first
+        .into_iter()
+        .map(|(policy_prefix, first_chunk)| policy_index::FloorRun {
+            policy_prefix,
+            first_chunk,
+        })
+        .collect();
+    if candidates.is_empty() {
+        tracing::debug!(blocks, "floor: no mint in this stretch of the tail");
+        return Ok(());
+    }
+    match policy_index::add_floors(dir, &candidates)? {
+        Some(added) => tracing::info!(
+            blocks,
+            undecodable,
+            mints,
+            seen = candidates.len(),
+            added = added.added,
+            held = added.held,
+            covers = format!("{}..={}", added.covers.0, added.covers.1),
+            secs = format!("{:.1}", started.elapsed().as_secs_f64()),
+            "floor: tail extended the policy index"
+        ),
+        None => tracing::info!(
+            dir = %dir.display(),
+            "floor: no policy index to extend — a sidecar alone would answer \"not found\" for every older policy"
+        ),
+    }
+    Ok(())
 }
 
 fn open_ro(path: &Path) -> Result<Connection> {
@@ -141,7 +263,7 @@ fn extent(conn: &Connection) -> Result<Option<Extent>> {
 
 /// One tick: read the spool once, gate it once, and re-derive every
 /// archived policy's tail from the same blocks.
-fn refresh(hub: &PolicyHub, spool: &Path, publishing: &crate::scheduler::Publishing) -> Result<()> {
+fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
     let policies = hub.archived_policies();
     if policies.is_empty() {
         return Ok(());
@@ -189,23 +311,20 @@ fn refresh(hub: &PolicyHub, spool: &Path, publishing: &crate::scheduler::Publish
             ceiling,
             index.as_deref(),
         ) {
-            // Only republish when the tail actually holds something new.
-            //
-            // ⚠️ THE DERIVED SERIES IS NO LONGER WRITTEN HERE. It carries the
+            // ⚠️ THE DERIVED SERIES IS STILL NOT WRITTEN HERE. It carries the
             // fold's state at a boundary, and a reader continues it through
             // the tail — so a tail rebuild changes what a reader folds, not
             // what the artifact says. Writing it here re-folded the WHOLE
             // archive for all 31 policies every cycle (163 s -> 236 s of a
             // 300 s interval) and would have grown with the archive.
-            Ok(Wrote::Tail) => {
-                // WARM what a reader will ask for next. This is the one place
-                // that knows this policy's archive moved, and both caches are
-                // keyed on the version this write just changed — so the next
-                // `/live` finds them current instead of paying for the folds.
-                // The artefacts make the rebuild a boundary plus the tail.
-                crate::policy_api::warm(hub, policy);
-                publishing.publish(hub.policy_dir(policy), policy)
-            }
+            //
+            // The archive moved, so R2 is now behind: `sync` republishes this
+            // policy from `published.json` versus the manifest. What happens
+            // HERE is only the in-process cache — this is the one place that
+            // knows the archive changed, and both caches are keyed on the
+            // version this write just changed, so the next `/live` finds them
+            // current instead of paying for the folds.
+            Ok(Wrote::Tail) => crate::policy_api::warm(hub, policy),
             Ok(Wrote::Nothing) => {}
             Err(e) => {
                 tracing::warn!(policy, error = %format!("{e:#}"), "tip: could not write the tail")

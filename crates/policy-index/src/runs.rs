@@ -192,9 +192,10 @@ pub fn write(
     last_chunk: u16,
     runs: &mut Vec<FloorRun>,
 ) -> Result<u64> {
-    // Sorted because the reader binary-searches; deduped because a policy's
-    // floor is one row and two would make `len` disagree with the base.
-    runs.sort_unstable_by_key(|r| r.policy_prefix);
+    // Sorted because the reader binary-searches — and by (prefix, CHUNK), so a
+    // duplicate keeps the LOWEST: a floor too low costs reading, a floor too
+    // high truncates an archive and lets it call itself complete.
+    runs.sort_unstable_by_key(|r| (r.policy_prefix, r.first_chunk));
     runs.dedup_by_key(|r| r.policy_prefix);
 
     let tmp = path.with_extension("pidx.tmp");
@@ -284,6 +285,20 @@ impl Floors {
         }
     }
 
+    /// Every floor, in prefix order — what a merge reads.
+    pub fn all(&self) -> Vec<FloorRun> {
+        match self {
+            Floors::Runs(r) => r.runs().collect(),
+            Floors::Base(b) => b
+                .runs()
+                .map(|r| FloorRun {
+                    policy_prefix: r.policy_prefix,
+                    first_chunk: r.first_chunk,
+                })
+                .collect(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -299,9 +314,66 @@ pub fn from_policy_runs(runs: &[PolicyRun]) -> Vec<FloorRun> {
             first_chunk: r.first_chunk,
         })
         .collect();
-    out.sort_unstable_by_key(|r| r.policy_prefix);
+    out.sort_unstable_by_key(|r| (r.policy_prefix, r.first_chunk));
     out.dedup_by_key(|r| r.policy_prefix);
     out
+}
+
+/// What [`add_floors`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Added {
+    /// Policies the table did not hold before this call.
+    pub added: usize,
+    /// Policies it holds now.
+    pub held: usize,
+    /// The extended chunk range.
+    pub covers: (u16, u16),
+}
+
+/// Add floors for policies the table does not hold yet, and leave every existing
+/// answer alone.
+///
+/// # ⚠️ INSERT-ONLY, and that is correctness rather than tidiness
+///
+/// A caller seeing a policy for the first time in the VOLATILE TAIL cannot know
+/// whether an earlier mint sits in a complete chunk — an NFT drop mints for
+/// months. The TABLE can know: it was built from every complete chunk, so a
+/// policy absent from it had no mint or burn there, and the tail's event really
+/// is the first one.
+///
+/// Overwriting would let a burn above the mint become the floor. A floor too HIGH
+/// truncates an archive AND lets it call itself complete, which is the one
+/// failure direction this crate refuses to produce.
+///
+/// `Ok(None)` when there is no table to extend. A sidecar built from the tail
+/// alone would answer "not found" for every policy older than the volatile
+/// range, and would then shadow a base that arrives later — so this refuses to
+/// invent one.
+pub fn add_floors(index_dir: &Path, candidates: &[FloorRun]) -> Result<Option<Added>> {
+    let Some(floors) = Floors::open(index_dir)? else {
+        return Ok(None);
+    };
+    let mut all = floors.all();
+    let (mut from, mut to) = floors.covers();
+
+    let mut held: std::collections::HashSet<u64> = all.iter().map(|r| r.policy_prefix).collect();
+    let before = all.len();
+    for c in candidates {
+        if held.insert(c.policy_prefix) {
+            all.push(*c);
+            from = from.min(c.first_chunk);
+            to = to.max(c.first_chunk);
+        }
+    }
+    let added = all.len() - before;
+    if added > 0 {
+        write(&runs_path(index_dir), from, to, &mut all)?;
+    }
+    Ok(Some(Added {
+        added,
+        held: all.len(),
+        covers: (from, to),
+    }))
 }
 
 /// The size of one sidecar row, in bytes — 8 of prefix and 2 of chunk, against
@@ -429,5 +501,73 @@ mod tests {
         assert_eq!(floors.first_chunk_of(20), Some(7));
         assert_eq!(floors.len(), 3);
         assert_eq!(floors.covers(), (0, 12));
+    }
+
+    #[test]
+    fn adding_floors_refuses_to_invent_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(runs_path(dir.path()).parent().unwrap()).unwrap();
+        assert_eq!(add_floors(dir.path(), &rows()).unwrap(), None);
+        assert!(
+            !runs_path(dir.path()).exists(),
+            "a tail-only table would answer \"not found\" for every older policy"
+        );
+    }
+
+    /// The tail's question: a policy the table has never seen gets a floor; the
+    /// ones it has keep the answer they had.
+    #[test]
+    fn adding_floors_is_insert_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = runs_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut r = rows();
+        write(&path, 0, 12, &mut r).unwrap();
+
+        let added = add_floors(
+            dir.path(),
+            &[
+                // A policy the table does not hold, minted in the volatile tail.
+                FloorRun {
+                    policy_prefix: 40,
+                    first_chunk: 9_400,
+                },
+                // One it does — with a chunk ABOVE the real floor, as a burn
+                // seen in the tail would give. It must not win.
+                FloorRun {
+                    policy_prefix: 10,
+                    first_chunk: 9_500,
+                },
+            ],
+        )
+        .unwrap()
+        .expect("a table");
+
+        assert_eq!(added.added, 1);
+        assert_eq!(added.held, 4);
+        assert_eq!(added.covers, (0, 9_400));
+
+        let floors = Floors::open(dir.path()).unwrap().unwrap();
+        assert_eq!(floors.first_chunk_of(40), Some(9_400), "the new one");
+        assert_eq!(floors.first_chunk_of(10), Some(0), "unchanged, not 9,500");
+    }
+
+    #[test]
+    fn adding_the_same_floors_again_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = runs_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut r = rows();
+        write(&path, 0, 12, &mut r).unwrap();
+        let fresh = [FloorRun {
+            policy_prefix: 40,
+            first_chunk: 9_400,
+        }];
+        assert_eq!(add_floors(dir.path(), &fresh).unwrap().unwrap().added, 1);
+        assert_eq!(
+            add_floors(dir.path(), &fresh).unwrap().unwrap().added,
+            0,
+            "a tick with no new policy must not rewrite the file"
+        );
     }
 }

@@ -31,7 +31,7 @@
 //! to `published.json` beside the manifest and logged, so "landed" and
 //! "published" are two facts, not one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -361,27 +361,35 @@ impl Publisher {
     }
 
     async fn upload_files(&self, policy: &str, wanted: &[(String, PathBuf)]) -> Result<Uploaded> {
+        // ONE listing answers "what does R2 already hold?" for every file the
+        // manifest names. The per-file HEAD this replaced cost a round trip per
+        // file, so a long-lived policy's publish grew with its own history:
+        // 114 segment files meant 114 HEADs before a single byte moved.
+        let prefix = ObjPath::from(format!("{PREFIX}/{policy}"));
+        let landed = self.cf.sizes_under(&prefix).await?;
+
+        let mut files: Vec<(ObjPath, u64)> = Vec::with_capacity(wanted.len());
+        for (rel, path) in wanted {
+            let len = std::fs::metadata(path)
+                .with_context(|| format!("stat {}", path.display()))?
+                .len();
+            files.push((Self::key(policy, rel), len));
+        }
+
         let mut out = Uploaded {
             uploaded: 0,
             skipped: 0,
             bytes: 0,
         };
-        for (rel, path) in wanted {
-            let len = std::fs::metadata(path)
-                .with_context(|| format!("stat {}", path.display()))?
-                .len();
-            let key = Self::key(policy, rel);
-            // Immutable objects never reuse a name, so size is identity
-            // enough to skip the upload.
-            if self.cf.size_of(&key).await? == Some(len) {
-                out.skipped += 1;
-                continue;
-            }
+        for n in to_upload(&files, &landed) {
+            let (key, len) = &files[n];
+            let (_, path) = &wanted[n];
             let body = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            self.cf.put(&key, body, immutable_attributes()).await?;
+            self.cf.put(key, body, immutable_attributes()).await?;
             out.uploaded += 1;
             out.bytes += len;
         }
+        out.skipped = files.len() - out.uploaded;
         Ok(out)
     }
 
@@ -392,6 +400,21 @@ impl Publisher {
     }
 }
 
+/// Which of `files` — `(key, size)` — R2 does not already hold, by index.
+///
+/// Size is identity for an IMMUTABLE object: the key names the bytes, so the
+/// same key at the same size is the same file. A key the listing does not
+/// mention is uploaded, and that is the only safe direction — a stale or
+/// partial listing costs an upload, never a skipped file.
+fn to_upload(files: &[(ObjPath, u64)], landed: &BTreeMap<ObjPath, u64>) -> Vec<usize> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, (key, len))| landed.get(key) != Some(len))
+        .map(|(n, _)| n)
+        .collect()
+}
+
 #[derive(Serialize)]
 struct BundleMetadata {
     updated_unix: u64,
@@ -400,8 +423,8 @@ struct BundleMetadata {
 // ── CLI ──────────────────────────────────────────────────────────────────
 
 /// `token-ledger publish` — publish one policy's archive by hand, from the
-/// same environment the service uses. What the landing path does after
-/// every pass; this is for archives it has not touched, and for looking.
+/// same environment the `sync` service uses. For archives it has not touched,
+/// and for looking.
 #[derive(clap::Args, Debug)]
 pub struct PublishArgs {
     /// Archive root (`<root>/<policy_hex>/manifest.json`).
@@ -476,5 +499,27 @@ mod tests {
         assert!(r.summary().contains("prune skipped"));
         let back: Record = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.manifest, r.manifest);
+    }
+
+    /// The listing is the whole answer to "what is already in R2?", so the
+    /// failure that matters is a key ABSENT from it being read as "skip" —
+    /// that would leave a manifest naming an object nothing ever uploaded.
+    #[test]
+    fn the_upload_set_comes_from_one_listing_and_never_skips_what_is_absent() {
+        let k = |rel: &str| ObjPath::from(format!("policy-archive/ab/{rel}"));
+        let landed = BTreeMap::from([
+            (k("observations-0000.parquet"), 8_625),
+            (k("observations-0001.parquet"), 1),
+        ]);
+        let files = vec![
+            (k("observations-0000.parquet"), 8_625),
+            (k("observations-0001.parquet"), 9_192),
+            (k("observations-0002.parquet"), 1),
+        ];
+        assert_eq!(
+            to_upload(&files, &landed),
+            vec![1, 2],
+            "same key and size is landed; a different size and a missing key both upload"
+        );
     }
 }

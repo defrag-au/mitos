@@ -27,6 +27,7 @@ mod scheduler;
 mod segments;
 mod serve;
 mod store;
+mod sync;
 mod tip;
 mod walk;
 
@@ -83,9 +84,15 @@ enum Command {
     /// KV — from its manifest. Landing writes one; this backfills.
     Bundle(archive::BundleArgs),
     /// Publish one policy's archive — R2 and the KV bundle — by hand, from
-    /// the same environment `serve --publish-archive` uses, and print the
-    /// per-step record.
+    /// the same environment `sync` uses, and print the per-step record.
     Publish(publish::PublishArgs),
+    /// Keep R2 and Workers KV level with the archives on disk.
+    ///
+    /// Runs as its own service rather than inside `serve`, so a slow upload
+    /// cannot delay the tail refresh and the two can be restarted apart. A
+    /// pass publishes every archive whose `published.json` does not name its
+    /// manifest's current version, so it is safe to interrupt and re-run.
+    Sync(sync::SyncArgs),
     /// Derived balances at tip — the reconciliation surface.
     Stats {
         #[arg(long)]
@@ -167,6 +174,7 @@ fn main() -> Result<()> {
         Command::RepairObservations(args) => segments::run_repair_observations(args),
         Command::Bundle(args) => archive::bundle(args),
         Command::Publish(args) => publish::run(args),
+        Command::Sync(args) => sync::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),

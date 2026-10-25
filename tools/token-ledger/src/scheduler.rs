@@ -44,11 +44,16 @@
 //!
 //! Every job lands under the policy's lock: reload the manifest, append the
 //! range, write, and — when this was the last job in flight and no walk is
-//! wanted — publish. The lock is held for the manifest write and the
-//! compaction, never across a chunk read.
+//! wanted — build the derived artifacts. The lock is held for the manifest
+//! write and the compaction, never across a chunk read.
+//!
+//! ⚠️ Landing does NOT publish. It leaves `published.json` behind the
+//! manifest, and `token-ledger sync` — a separate process — publishes what is
+//! stale. That separation is what keeps an upload off this thread: publishing
+//! was 206 s of a 300 s interval, and every one of those seconds was a landing
+//! it could have been doing instead.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -332,8 +337,9 @@ impl Scheduler {
             .unwrap_or_default()
     }
 
-    /// Is anything queued, running or wanted for this policy? Publishing
-    /// waits until nothing is.
+    /// Is anything queued, running or wanted for this policy? The derived
+    /// artifacts — the movement graph and the series — wait until nothing is,
+    /// because each is a full read of an archive being written.
     fn busy(&self, policy: &str) -> bool {
         self.walking(policy)
             || self
@@ -636,9 +642,9 @@ fn sweeper(hub: Arc<PolicyHub>) {
     }
 }
 
-/// Start the pool. Each worker owns a runtime and a publisher, so a landed
-/// archive is published from the thread that landed it.
-pub fn spawn(hub: Arc<PolicyHub>, pool: Pool, publish: Option<crate::publish::Targets>) {
+/// Start the pool. Workers land archives; nothing here publishes them —
+/// `token-ledger sync` does, from `published.json` against the manifest.
+pub fn spawn(hub: Arc<PolicyHub>, pool: Pool) {
     let sweep = Arc::clone(&hub);
     std::thread::Builder::new()
         .name("sweep".into())
@@ -646,18 +652,16 @@ pub fn spawn(hub: Arc<PolicyHub>, pool: Pool, publish: Option<crate::publish::Ta
         .expect("spawn sweeper");
     for n in 0..pool.walk_workers {
         let hub = Arc::clone(&hub);
-        let publish = publish.clone();
         std::thread::Builder::new()
             .name(format!("walk-{n}"))
-            .spawn(move || worker(hub, publish, JobKind::Walk))
+            .spawn(move || worker(hub, JobKind::Walk))
             .expect("spawn walk worker");
     }
     for n in 0..pool.seek_workers {
         let hub = Arc::clone(&hub);
-        let publish = publish.clone();
         std::thread::Builder::new()
             .name(format!("seek-{n}"))
-            .spawn(move || worker(hub, publish, JobKind::Seek))
+            .spawn(move || worker(hub, JobKind::Seek))
             .expect("spawn seek worker");
     }
     tracing::info!(
@@ -667,47 +671,7 @@ pub fn spawn(hub: Arc<PolicyHub>, pool: Pool, publish: Option<crate::publish::Ta
     );
 }
 
-pub(crate) struct Publishing {
-    runtime: tokio::runtime::Runtime,
-    publisher: Option<crate::publish::Publisher>,
-}
-
-impl Publishing {
-    pub(crate) fn new(targets: Option<crate::publish::Targets>) -> Self {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("publish runtime");
-        let publisher = targets.and_then(|t| match crate::publish::Publisher::new(t) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "policy: publisher not built — archives stay local");
-                None
-            }
-        });
-        Self { runtime, publisher }
-    }
-
-    pub(crate) fn publish(&self, dir: PathBuf, policy: &str) {
-        let Some(p) = &self.publisher else {
-            return;
-        };
-        match self.runtime.block_on(p.publish(&dir, policy)) {
-            Ok(rec) if rec.all_done() => {
-                tracing::info!(policy, outcome = %rec.summary(), "policy: archive published")
-            }
-            Ok(rec) => {
-                tracing::warn!(policy, outcome = %rec.summary(), "policy: publish INCOMPLETE")
-            }
-            Err(e) => {
-                tracing::warn!(policy, error = %format!("{e:#}"), "policy: publish failed")
-            }
-        }
-    }
-}
-
-fn worker(hub: Arc<PolicyHub>, publish: Option<crate::publish::Targets>, kind: JobKind) {
-    let publishing = Publishing::new(publish);
+fn worker(hub: Arc<PolicyHub>, kind: JobKind) {
     loop {
         let job = match kind {
             JobKind::Seek => hub.sched.next_seek(),
@@ -764,7 +728,6 @@ fn worker(hub: Arc<PolicyHub>, publish: Option<crate::publish::Targets>, kind: J
                         if let Err(e) = crate::archive::write_derived(&hub.policy_dir(&policy)) {
                             tracing::warn!(policy, error = %format!("{e:#}"), "policy: derived artifacts not written");
                         }
-                        publishing.publish(hub.policy_dir(&policy), &policy);
                     }
                     continue;
                 }
@@ -790,11 +753,6 @@ fn worker(hub: Arc<PolicyHub>, publish: Option<crate::publish::Targets>, kind: J
             }
         }
         hub.sched.job_finished(&job, &live, outcome.as_ref().ok());
-        // A seek that landed on a policy nobody is walking is the only
-        // reason a seek worker publishes.
-        if job.kind == JobKind::Seek && outcome.is_ok() && !hub.sched.busy(&job.policy) {
-            publishing.publish(hub.policy_dir(&job.policy), &job.policy);
-        }
     }
 }
 

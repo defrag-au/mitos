@@ -47,16 +47,20 @@ token-ledger graph --archive-dir <dir> --policy <policy> --by-stake --write
 
 token-ledger rollup    # fold a policy's passes into one file
 token-ledger bundle    # manifest + every footer, one blob for KV
-token-ledger publish   # R2 + KV, by hand, with a per-step record
+token-ledger publish   # R2 + KV, one policy, by hand, with a per-step record
+token-ledger sync      # keep R2 + KV level with the archives on disk (its own service)
 token-ledger export    # the artifacts a frontend loads
 token-ledger stats     # derived balances at tip — the reconciliation surface
 token-ledger classify  # cohort a set of addresses
 token-ledger probe     # what a policy looks like before committing to a walk
 
 # The hosted surface: any token on demand, behind a poll endpoint.
-token-ledger serve --data-dir <db> --archive-dir <dir> [--publish-archive] \
+token-ledger serve --data-dir <db> --archive-dir <dir> \
     [--tx-index-dir <dir>] [--policy-index-dir <dir>] [--tail-db <spool>] \
     [--walk-workers 4] [--seek-workers 20]
+
+# Publishing is NOT part of serve: a slow upload cannot delay the tail refresh.
+token-ledger sync --archive-dir <dir> [--interval 15] [--concurrency 8] [--once]
 ```
 
 ## Serve surface

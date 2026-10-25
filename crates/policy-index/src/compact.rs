@@ -230,10 +230,44 @@ pub fn compact(index_dir: &Path) -> Result<CompactStats> {
 
     // The floor sidecar: the same policy table, 16 bytes a row, and the only part
     // the floor probe reads. Written from the array already in hand, so it cannot
-    // disagree with the base beside it — and a tail pass can append to it later
-    // without rewriting the 668 MiB base.
+    // disagree with the base beside it.
     let mut floors = crate::runs::from_policy_runs(&runs);
-    crate::runs::write(&crate::runs::runs_path(index_dir), first, last, &mut floors)
+    // ⚠️ KEEP WHAT THE VOLATILE TAIL ADDED — and take the LOWER of the two.
+    //
+    // The tail sees mints the segments do not. MEASURED on cardano-infra
+    // 2026-10-25: 25 policies in `runs.pidx` that no segment carries, at chunks
+    // the base already claims to cover — so a rule that preserved only entries
+    // ABOVE `last_chunk` would drop them here, and the tail might not run again
+    // for an hour.
+    //
+    // `min` rather than "keep if absent" because a floor must never move UP:
+    // too low costs reading, too high truncates an archive and lets it call
+    // itself complete. It also means a genuinely earlier mint found by a later
+    // extraction lowers the floor rather than being ignored.
+    let mut to = last;
+    if let Ok(Some(existing)) = crate::runs::Floors::open(index_dir) {
+        let mut by_prefix: std::collections::HashMap<u64, u16> = floors
+            .iter()
+            .map(|f| (f.policy_prefix, f.first_chunk))
+            .collect();
+        for f in existing.all() {
+            by_prefix
+                .entry(f.policy_prefix)
+                .and_modify(|c| *c = (*c).min(f.first_chunk))
+                .or_insert(f.first_chunk);
+        }
+        floors = by_prefix
+            .into_iter()
+            .map(|(policy_prefix, first_chunk)| crate::runs::FloorRun {
+                policy_prefix,
+                first_chunk,
+            })
+            .collect();
+    }
+    if let Some(top) = floors.iter().map(|f| f.first_chunk).max() {
+        to = to.max(top);
+    }
+    crate::runs::write(&crate::runs::runs_path(index_dir), first, to, &mut floors)
         .context("writing the floor sidecar")?;
 
     Ok(CompactStats {
@@ -335,6 +369,51 @@ mod tests {
             );
         }
         assert_eq!(runs.floor_of(999), None, "and the same silence");
+    }
+
+    /// A floor the VOLATILE TAIL added must survive the next compaction — even
+    /// when its chunk sits INSIDE the segments' coverage, which is the case
+    /// MEASURED on cardano-infra 2026-10-25: 25 policies in `runs.pidx` that no
+    /// segment carries, at chunks the base already claims to cover.
+    #[test]
+    fn a_tail_floor_survives_recompaction() {
+        let (dir, _) = build(&[(0, vec![rec(7, 1, 0)]), (1, vec![rec(9, 2, 1)])]);
+        let tail = crate::runs::FloorRun {
+            policy_prefix: 42,
+            first_chunk: 1,
+        };
+        let added = crate::runs::add_floors(dir.path(), &[tail])
+            .unwrap()
+            .expect("a table");
+        assert_eq!(added.added, 1);
+
+        compact(dir.path()).unwrap();
+        let floors = crate::runs::Floors::open(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            floors.first_chunk_of(42),
+            Some(1),
+            "not dropped: no segment has it"
+        );
+        assert_eq!(floors.first_chunk_of(7), Some(0));
+        assert_eq!(floors.first_chunk_of(9), Some(1));
+        assert_eq!(floors.covers().1, 1, "as wide as its highest floor");
+    }
+
+    /// A tail entry must never RAISE a floor the segments already know. `min` is
+    /// the whole guarantee: too low costs reading, too high truncates.
+    #[test]
+    fn a_tail_floor_never_raises_a_segment_floor() {
+        let (dir, _) = build(&[(0, vec![rec(7, 1, 0)])]);
+        let path = crate::runs::runs_path(dir.path());
+        let mut forged = vec![crate::runs::FloorRun {
+            policy_prefix: 7,
+            first_chunk: 9,
+        }];
+        crate::runs::write(&path, 0, 9, &mut forged).unwrap();
+
+        compact(dir.path()).unwrap();
+        let floors = crate::runs::Floors::open(dir.path()).unwrap().unwrap();
+        assert_eq!(floors.first_chunk_of(7), Some(0), "the segment's answer wins");
     }
 
     /// With no sidecar, `Floors` must fall back to the base and answer identically

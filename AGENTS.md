@@ -6,12 +6,6 @@ Generated from `.playbook/project.conf` + `models/zed`.
 Each rule's source file is named in the comment above its heading.
 To change a rule, change the rule — not this block.
 
-## Non-negotiable
-
-The lead of each rule below, repeated so it is read first. Full text follows in place.
-
-- **Read code and history with the agent tools, not with the shell** — Reading code with `rg`, `grep`, `sed`, `cat`, `head` or `wc` → use `at-peek`. Reading installed crate source or build-script output with `grep`, `sed` or `find` under `~/.cargo` or `target/…/build` → use `at-crate`. Reading history or working-tree state with `git status`, `git diff` or `git log` → use `at-recall`. All three are read-only, bounded by construction, and say what they did not show. `git show` and `git blame` have no `at-recall` verb yet — say so rather than reaching for them silently.
-
 ## Do not report success you have not observed
 <!-- rule: rules/core/verify-before-claiming -->
 
