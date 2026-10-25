@@ -118,12 +118,7 @@ fn accumulate(mut carry: Carry, movements: impl Iterator<Item = Movement>) -> Ca
             continue;
         }
         *rows += 1;
-        // Stake-keyed, so one wallet is one row however many payment addresses
-        // it rotates through. An enterprise address has no stake part and keys
-        // by itself.
-        let key = crate::trade::address_parts(&m.address)
-            .and_then(|(_, stake)| stake)
-            .unwrap_or_else(|| m.address.clone());
+        let key = key_of(&m.address);
         let e = parties.entry(key).or_insert_with(|| Party {
             address: m.address.clone(),
             amount: 0,
@@ -138,6 +133,16 @@ fn accumulate(mut carry: Carry, movements: impl Iterator<Item = Movement>) -> Ca
     }
 
     carry
+}
+
+/// The key one party is folded under: its stake part, so one wallet is one
+/// row however many payment addresses it rotates through. An enterprise
+/// address has no stake part and keys by itself. Shared with
+/// [`crate::summary`], whose checkpoints must name the same parties.
+pub fn key_of(address: &str) -> String {
+    crate::trade::address_parts(address)
+        .and_then(|(_, stake)| stake)
+        .unwrap_or_else(|| address.to_string())
 }
 
 fn finalise(carry: Carry) -> Fold {

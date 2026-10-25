@@ -21,6 +21,7 @@ mod export;
 mod observer;
 mod policy_api;
 mod publish;
+mod pull;
 mod registry;
 mod reverse;
 mod scheduler;
@@ -72,6 +73,10 @@ enum Command {
     /// distinct edges, not rows. The measurement that decides whether the
     /// graph is one fetch or six hundred paged requests.
     Graph(archive::GraphArgs),
+    /// Fold a policy's whole life into its summary — candles, holder days,
+    /// the distribution and balance checkpoints — and say what is in it. A
+    /// completed walk writes one; this forces it.
+    Summary(archive::SummaryArgs),
     /// Fold a policy's passes into ONE file at its root — fewer footers per
     /// read, one object per policy for R2. Runs on its own after every few
     /// passes; this forces it.
@@ -86,6 +91,10 @@ enum Command {
     /// Publish one policy's archive — R2 and the KV bundle — by hand, from
     /// the same environment `sync` uses, and print the per-step record.
     Publish(publish::PublishArgs),
+    /// Pull one policy's published archive from R2 into a local archive
+    /// directory — the mirror of `publish`, for working on folds without the
+    /// box. A read-only R2 token is enough, and the safer one to hold.
+    Pull(pull::PullArgs),
     /// Keep R2 and Workers KV level with the archives on disk.
     ///
     /// Runs as its own service rather than inside `serve`, so a slow upload
@@ -170,10 +179,12 @@ fn main() -> Result<()> {
         Command::Reverse(args) => reverse::run(args),
         Command::Archive(args) => archive::inspect(args),
         Command::Graph(args) => archive::graph(args),
+        Command::Summary(args) => archive::summary(args),
         Command::Rollup(args) => segments::run_rollup(args),
         Command::RepairObservations(args) => segments::run_repair_observations(args),
         Command::Bundle(args) => archive::bundle(args),
         Command::Publish(args) => publish::run(args),
+        Command::Pull(args) => pull::run(args),
         Command::Sync(args) => sync::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),

@@ -71,6 +71,9 @@ pub mod series;
 /// merged onto a single spine, so every visualisation is a FOLD over it rather
 /// than a join across endpoints.
 pub mod story;
+/// The whole life folded ONCE into what a chart, a holder map and a far
+/// rewind need: candles, holder days, the distribution and checkpoints.
+pub mod summary;
 /// The archive's own reconciliation — `Σ amounts == Σ net_mint`, graded by how
 /// far the walk reached. Both sides come out of the same file.
 pub mod supply;
@@ -102,6 +105,9 @@ pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
 pub use series::{SERIES, SERIES_FORMAT, SeriesError, SeriesFile};
 pub use story::{Kind as StoryKind, PoolState, Story, StoryEvent, Trader};
+pub use summary::{
+    CHECKPOINT_FORMAT, CHECKPOINTS, Checkpoint, SUMMARY, SUMMARY_FORMAT, Summary, SummaryError,
+};
 pub use supply::{Balance, Because, Diagnose, Offender, Reconciler, Verdict};
 pub use writer::{ArchiveWriter, Written};
 

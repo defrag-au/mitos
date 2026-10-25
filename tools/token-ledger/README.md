@@ -45,9 +45,21 @@ token-ledger archive --archive-dir <dir> --policy <policy> [--density]
 # Party-to-party movement graph. --by-stake is usually what you want.
 token-ledger graph --archive-dir <dir> --policy <policy> --by-stake --write
 
+# The whole life, folded once for the edge: daily and hourly candles, holders
+# per day, the distribution by share band and role, the top 500 holders, and
+# balance checkpoints every ~25k movements (complete archives only). Written
+# beside the series when a walk completes; `publish` carries summary.bin and
+# checkpoints/ to R2. This forces a fold and prints what is in it. $NIKEPIG:
+# 4.6 s, a 184 KB summary, 28 checkpoints totalling 14.6 MB.
+token-ledger summary --archive-dir <dir> --policy <policy>
+
 token-ledger rollup    # fold a policy's passes into one file
 token-ledger bundle    # manifest + every footer, one blob for KV
 token-ledger publish   # R2 + KV, one policy, by hand, with a per-step record
+token-ledger pull      # one policy's published archive from R2 into --archive-dir
+                       # (--derived adds summary, checkpoints, graph). The local-dev
+                       # source for fold work: what the Worker reads, no box needed.
+                       # Same R2_* variables as publish; use a READ-ONLY token.
 token-ledger sync      # keep R2 + KV level with the archives on disk (its own service)
 token-ledger export    # the artifacts a frontend loads
 token-ledger stats     # derived balances at tip — the reconciliation surface

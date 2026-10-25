@@ -75,6 +75,14 @@ pub struct Record {
     /// What it weighed on the wire — gzipped when that measurably paid.
     #[serde(default)]
     pub graph_bytes: u64,
+    /// The SUMMARY and its checkpoint files, when one has been written.
+    #[serde(default = "Outcome::not_attempted")]
+    pub summary: Outcome,
+    #[serde(default)]
+    pub summary_bytes: u64,
+    /// Checkpoint files uploaded this time; the rest were already in R2.
+    #[serde(default)]
+    pub checkpoints_uploaded: usize,
     #[serde(default)]
     pub kv: Vec<KvOutcome>,
     pub prune: Outcome,
@@ -92,7 +100,7 @@ impl Record {
 
     pub fn summary(&self) -> String {
         format!(
-            "{} ({} up, {} same, {} B); {}; {}; {} ({} B); {} ({} pruned); {:.1}s",
+            "{} ({} up, {} same, {} B); {}; {}; {} ({} B); {} ({} B, {} checkpoints up); {} ({} pruned); {:.1}s",
             self.files.describe("files"),
             self.uploaded,
             self.skipped,
@@ -101,6 +109,9 @@ impl Record {
             self.bundle.describe("bundle"),
             self.graph.describe("graph"),
             self.graph_bytes,
+            self.summary.describe("summary"),
+            self.summary_bytes,
+            self.checkpoints_uploaded,
             self.prune.describe("prune"),
             self.pruned,
             self.secs
@@ -176,6 +187,9 @@ impl Publisher {
             bundle: Outcome::NotAttempted,
             graph: Outcome::NotAttempted,
             graph_bytes: 0,
+            summary: Outcome::NotAttempted,
+            summary_bytes: 0,
+            checkpoints_uploaded: 0,
             kv: Vec::new(),
             prune: Outcome::NotAttempted,
             pruned: 0,
@@ -248,6 +262,28 @@ impl Publisher {
             Err(e) => record.graph = Outcome::failed(e),
         }
 
+        // 3b. The SUMMARY and its checkpoints, likewise derived and after the
+        // flip. Checkpoints FIRST, so a summary in R2 never names a file that
+        // is not there yet. Read once here so the prune below keeps exactly
+        // the files this summary names.
+        let summary = match crate::archive::read_summary(dir) {
+            Ok(s) => s,
+            Err(e) => {
+                record.summary = Outcome::failed(e);
+                None
+            }
+        };
+        if let Some(s) = &summary {
+            match self.put_summary(policy, dir, s).await {
+                Ok((bytes, uploaded)) => {
+                    record.summary = Outcome::Done;
+                    record.summary_bytes = bytes;
+                    record.checkpoints_uploaded = uploaded;
+                }
+                Err(e) => record.summary = Outcome::failed(e),
+            }
+        }
+
         // 4. The bundle, to every namespace.
         match self.cf.kv() {
             None => record.bundle = Outcome::NotConfigured,
@@ -299,7 +335,17 @@ impl Publisher {
             .chain([
                 Self::key(policy, policy_archive::GRAPH),
                 Self::key(policy, &format!("{}.gz", policy_archive::GRAPH)),
+                Self::key(policy, policy_archive::SUMMARY),
             ])
+            // Every checkpoint the summary names; the ones it no longer names
+            // (superseded by a correction, or off the grid after it doubled)
+            // are exactly what this prune is for.
+            .chain(
+                summary
+                    .iter()
+                    .flat_map(|s| s.files())
+                    .map(|rel| Self::key(policy, &rel)),
+            )
             .collect();
         match self.prune(policy, &keep).await {
             Ok(n) => {
@@ -362,6 +408,54 @@ impl Publisher {
         let n = body.len() as u64;
         self.cf.put(&Self::key(policy, &rel), body, attrs).await?;
         Ok(Some(n))
+    }
+
+    /// The summary, and every checkpoint file it names that R2 does not hold.
+    /// Returns the summary's size and how many checkpoints went up.
+    ///
+    /// Both RAW: the flow explorer's Worker decodes them itself, and an R2
+    /// binding hands back the stored bytes whatever their `Content-Encoding`,
+    /// so a gzipped body would need an inflater in the Worker's bundle.
+    ///
+    /// A checkpoint is named by its content, so presence is identity and it
+    /// takes the files' immutable cache posture. The summary changes with
+    /// every walk and takes the graph's.
+    async fn put_summary(
+        &self,
+        policy: &str,
+        dir: &Path,
+        summary: &policy_archive::Summary,
+    ) -> Result<(u64, usize)> {
+        let prefix = ObjPath::from(format!("{PREFIX}/{policy}/{}", policy_archive::CHECKPOINTS));
+        let landed = self.cf.sizes_under(&prefix).await?;
+        let mut uploaded = 0usize;
+        for rel in summary.checkpoints.iter().map(|c| &c.rel) {
+            let key = Self::key(policy, rel);
+            if landed.contains_key(&key) {
+                continue;
+            }
+            let path = dir.join(rel);
+            let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            self.cf.put(&key, body, immutable_attributes()).await?;
+            uploaded += 1;
+        }
+
+        let path = dir.join(policy_archive::SUMMARY);
+        let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let n = body.len() as u64;
+        let mut attrs = Attributes::new();
+        attrs.insert(
+            object_store::Attribute::CacheControl,
+            "public, max-age=300".into(),
+        );
+        attrs.insert(
+            object_store::Attribute::ContentType,
+            "application/octet-stream".into(),
+        );
+        self.cf
+            .put(&Self::key(policy, policy_archive::SUMMARY), body, attrs)
+            .await?;
+        Ok((n, uploaded))
     }
 
     async fn upload_files(&self, policy: &str, wanted: &[(String, PathBuf)]) -> Result<Uploaded> {
@@ -491,6 +585,9 @@ mod tests {
             // No graph generated for this policy — a step that never ran.
             graph: Outcome::NotAttempted,
             graph_bytes: 0,
+            summary: Outcome::NotAttempted,
+            summary_bytes: 0,
+            checkpoints_uploaded: 0,
             kv: Vec::new(),
             prune: Outcome::Done,
             pruned: 0,

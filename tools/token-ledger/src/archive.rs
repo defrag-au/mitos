@@ -1633,6 +1633,215 @@ pub fn write_derived(dir: &Path) -> Result<()> {
     let key = immutable_to(&manifest);
     store_series(dir, key, &series)?;
     store_holders(dir, key, settled_to, &held)?;
+    // THE SUMMARY, from the same decode and the same series: the third reader
+    // of these rows, so it costs a sort and a fold, never another read.
+    let complete = manifest.completeness() == Completeness::Complete;
+    let policy = policy_of(dir);
+    let (summary, checkpoints) = policy_archive::summary::build(&policy_archive::summary::Inputs {
+        policy: &policy,
+        series: &series.series,
+        movements: history.all_movements()?,
+        immutable_to: key,
+        complete,
+        classify: &classify_holder,
+    });
+    store_summary(dir, &summary, &checkpoints)?;
+    Ok(())
+}
+
+/// The policy a directory holds: its name, as [`policy_dir`] builds it.
+fn policy_of(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// What kind of holder an address is, by what the address registry can state.
+///
+/// The same order the flow explorer's arena uses (`story::role_of`), so the
+/// summary's counts and the arena's sea agree on who is a person: a burn sink,
+/// then the registry's script categories by payment credential and then by
+/// address, then a known exchange or marketplace stake key. A script nobody
+/// named, with no stake part, is a contract. The label is the holders route's.
+pub fn classify_holder(address: &str) -> (policy_archive::summary::Role, Option<String>) {
+    use address_registry::registry::{
+        AddressCategory as AC, RegistryNetwork, ScriptCategory as SC, lookup_address_match,
+        lookup_payment_credential, lookup_stake,
+    };
+    use policy_archive::summary::Role;
+
+    let parts = policy_archive::trade::address_parts(address);
+    let by_credential = parts
+        .as_ref()
+        .and_then(|(pay, _)| lookup_payment_credential(pay))
+        .map(|e| (&e.category, e.category.to_string()));
+    let by_address = || {
+        lookup_address_match(address, RegistryNetwork::Mainnet)
+            .map(|(cat, _)| (cat, cat.to_string()))
+    };
+    if let Some((category, label)) = by_credential.or_else(by_address) {
+        let role = match category {
+            AC::Script(SC::Burn { .. }) => Some(Role::Burn),
+            AC::Script(SC::Vesting { .. }) => Some(Role::Lock),
+            AC::Script(SC::Staking { .. }) => Some(Role::Staking),
+            AC::Marketplace(_) | AC::Script(_) => Some(Role::Venue),
+            AC::Unknown => None,
+        };
+        if let Some(role) = role {
+            return (role, Some(label));
+        }
+    }
+    let stake = parts.as_ref().and_then(|(_, stake)| stake.as_deref());
+    if let Some(service) = stake.and_then(stake_bech32).and_then(|s| lookup_stake(&s)) {
+        return (Role::Venue, Some(service.label.to_string()));
+    }
+    let script = address_registry::registry::payment_credential_is_script(address);
+    match (script, stake) {
+        (true, None) => (Role::Contract, None),
+        _ => (Role::Person, None),
+    }
+}
+
+/// A stake credential's mainnet stake address, as the registry keys services.
+fn stake_bech32(credential_hex: &str) -> Option<String> {
+    use pallas_addresses::{Network, StakeAddress, StakeKeyHash, StakePayload};
+    let hash: StakeKeyHash = credential_hex.parse().ok()?;
+    StakeAddress::new(Network::Mainnet, StakePayload::Stake(hash))
+        .to_bech32()
+        .ok()
+}
+
+/// Write the summary and its checkpoint files, and remove checkpoint files it
+/// no longer names.
+///
+/// The summary through a RENAME, as the series is: a reader can open it while
+/// this writes. A checkpoint file is named by its content
+/// ([`policy_archive::summary::checkpoint_rel`]), so one already on disk is
+/// left alone, and the publisher uploads only the new ones.
+pub fn store_summary(
+    dir: &Path,
+    summary: &policy_archive::Summary,
+    checkpoints: &[policy_archive::Checkpoint],
+) -> Result<usize> {
+    let cp_dir = dir.join(policy_archive::CHECKPOINTS);
+    std::fs::create_dir_all(&cp_dir).with_context(|| format!("creating {}", cp_dir.display()))?;
+    for cp in checkpoints {
+        let raw = cp.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = dir.join(policy_archive::summary::checkpoint_rel(cp.slot, &raw));
+        if path.exists() {
+            continue;
+        }
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming into {}", path.display()))?;
+    }
+    let named = summary.files();
+    for entry in std::fs::read_dir(&cp_dir)? {
+        let entry = entry?;
+        let rel = format!(
+            "{}/{}",
+            policy_archive::CHECKPOINTS,
+            entry.file_name().to_string_lossy()
+        );
+        if !named.contains(&rel) {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("removing {}", entry.path().display()))?;
+        }
+    }
+
+    let raw = summary.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let path = dir.join(policy_archive::SUMMARY);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::SUMMARY));
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    tracing::info!(
+        policy = summary.policy,
+        bytes = raw.len(),
+        days = summary.daily.len(),
+        people = summary.distribution.people,
+        checkpoints = checkpoints.len(),
+        "policy: summary written"
+    );
+    Ok(raw.len())
+}
+
+/// The written summary, whatever archive version it describes. `Ok(None)` when
+/// there is none.
+pub fn read_summary(dir: &Path) -> Result<Option<policy_archive::Summary>> {
+    let path = dir.join(policy_archive::SUMMARY);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(Some(
+        policy_archive::Summary::decode(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?,
+    ))
+}
+
+/// `token-ledger summary` — fold and write one policy's summary by hand, and
+/// say what is in it.
+#[derive(clap::Args, Debug)]
+pub struct SummaryArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+}
+
+pub fn summary(args: SummaryArgs) -> Result<()> {
+    let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let started = std::time::Instant::now();
+    write_derived(&dir)?;
+    let Some(s) = read_summary(&dir)? else {
+        bail!("no archive at {}", dir.display());
+    };
+    let d = &s.distribution;
+    println!(
+        "{}: folded in {:.1}s, complete {}, {} days, {} hourly, {} unvalued trades",
+        s.policy,
+        started.elapsed().as_secs_f64(),
+        s.complete,
+        s.daily.len(),
+        s.hourly.len(),
+        s.unvalued
+    );
+    println!(
+        "held {} burned {} circulating {}; {} parties, {} people, {} negative",
+        d.held, d.burned, d.circulating, d.parties, d.people, d.negative
+    );
+    println!(
+        "top 1 / 10 / 100: {:.2}% / {:.2}% / {:.2}%",
+        d.top1_ppm as f64 / 1e4,
+        d.top10_ppm as f64 / 1e4,
+        d.top100_ppm as f64 / 1e4
+    );
+    for b in &d.bands {
+        println!(
+            "  band ≥{:>7.3}%: {:>6} people, {}",
+            b.floor_ppm as f64 / 1e4,
+            b.people,
+            b.amount
+        );
+    }
+    for r in &d.roles {
+        println!("  {:?}: {} parties, {}", r.role, r.parties, r.amount);
+    }
+    let bytes: u64 = s
+        .checkpoints
+        .iter()
+        .filter_map(|c| std::fs::metadata(dir.join(&c.rel)).ok())
+        .map(|m| m.len())
+        .sum();
+    println!(
+        "{} checkpoints, {} bytes; summary {} bytes",
+        s.checkpoints.len(),
+        bytes,
+        std::fs::metadata(dir.join(policy_archive::SUMMARY)).map_or(0, |m| m.len())
+    );
     Ok(())
 }
 
