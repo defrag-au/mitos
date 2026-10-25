@@ -1,0 +1,66 @@
+{
+  "source": "https://analytics.snek.fun/v1/pools-feed/initial/state?asset=16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7.416c69656e73",
+  "fetched": "2026-10-25",
+  "note": "Verbatim. This is the pool AT GRADUATION, with the pool's lifetime aggregates beside it — not a price series.",
+  "pool": {
+    "id": "63f947b8d9535bc4e4ce6919e3dc056547e8d30ada12f29aa5f8268.db771df5d7a373744c3312a2274550f518a85a681d9de7e8d8b1c2b89bed630e",
+    "x": {
+      "asset": ".",
+      "amount": "18188400000"
+    },
+    "y": {
+      "asset": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7.416c69656e73",
+      "amount": "263536754"
+    },
+    "outputId": {
+      "transactionId": "c55954d0ed201777e9446d3ee6b5799f01a0740c3fac1f3564567824fb6fce4d",
+      "transactionIndex": 1
+    },
+    "aNum": 122525779519,
+    "bNum": 2545182,
+    "adaCapThreshold": 18188400000,
+    "poolAuthor": "e7a67e756814422d939369170c4f8b2d73ceedccced123a867a47492",
+    "launchType": "",
+    "createdOn": 1771128940,
+    "permittedExecutor": "e865941988edcca559268b57b7ee939974fd42fd26c7e1acd7a50678",
+    "cpmmPoolId": "d8eb52caf3289a2880288b23141ce3d2a7025dcf76f26fd5659add06.835c345cfdee0f40c5661636b46ca944d3e267b8a41129af6e7d6d4497eb20a7",
+    "version": "v1",
+    "timestamp": 1771713914
+  },
+  "metrics": {
+    "marketCap": 33286652246,
+    "totalVolumeAda": 470940945036,
+    "totalTxCount": 1953,
+    "crowned": 1771620652,
+    "sequentialOrderingEnabled": false,
+    "locks": [
+      {
+        "amount": "2031754",
+        "deadline": "1782137725379"
+      },
+      {
+        "amount": "2031754",
+        "deadline": "1787321724821"
+      }
+    ]
+  },
+  "info": {
+    "asset": "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7.416c69656e73",
+    "ticker": "Aliens",
+    "logoCID": "bafkreifn37k3yzlf5v7pyf3t7vofnrt5733t4wpgylwmisa45re46l65ea",
+    "description": "They are Among Us",
+    "launchType": 0,
+    "poolAuthor": {
+      "pkh": "2683baeb48ef632517ec939b2439885ba569e36cfac4401800c4417a",
+      "skh": "e7a67e756814422d939369170c4f8b2d73ceedccced123a867a47492"
+    },
+    "socials": {
+      "twitter": "https://x.com/CardanoAliens",
+      "telegram": null,
+      "discord": "https://discord.gg/yYFHHRuXy8",
+      "website": "https://www.theyexist.xyz/"
+    },
+    "outputId": "3edbc267ecac1c153527f11b7e982d39bb61ab93c589fe5ff768191d7e3d6ce0:0",
+    "assetType": "Meme"
+  }
+}

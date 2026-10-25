@@ -2,7 +2,7 @@
 
 # Agent rules
 
-Generated from agent-playbook (`projects/mitos` + `models/claude-code`).
+Generated from `.playbook/project.conf` + `models/claude-code`.
 Each rule's source file is named in the comment above its heading.
 To change a rule, change the rule — not this block.
 

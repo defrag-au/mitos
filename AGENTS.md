@@ -2,7 +2,7 @@
 
 # Agent rules
 
-Generated from agent-playbook (`projects/mitos` + `models/zed`).
+Generated from `.playbook/project.conf` + `models/zed`.
 Each rule's source file is named in the comment above its heading.
 To change a rule, change the rule — not this block.
 

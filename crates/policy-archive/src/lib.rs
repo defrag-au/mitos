@@ -42,6 +42,9 @@
 //! doc measured rather than the 2.5 MB the convenient API costs.
 
 pub mod bundle;
+/// A bonding curve's REALISED price — the delta between two sightings, which
+/// needs no curve formula, and the steps that are not trades at all.
+pub mod curve;
 pub mod density;
 pub mod feed;
 pub mod graph;

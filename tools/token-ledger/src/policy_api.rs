@@ -293,12 +293,16 @@ pub struct PolicyHub {
     pub(crate) index: Option<tx_index::IndexHandle>,
     /// (policy → its first mint's chunk) over the same snapshot. Held OPEN
     /// rather than opened per lookup: the answer is a binary search over a
-    /// resident table, so opening a 666 MiB mapping each time would cost
-    /// orders of magnitude more than the lookup it serves.
+    /// Where the policy's first mint is known from — the `runs.pidx` sidecar
+    /// when the build wrote one, else `base.pidx`.
+    ///
+    /// MEASURED: the sidecar is 16 bytes a policy (3.7 MiB at 232,745), against
+    /// 668 MiB for the whole base. Admission asks exactly one question of it, so
+    /// it stays mapped for the life of the process.
     ///
     /// `None` without `--policy-index-dir`, and the walk then falls back to
     /// Koios exactly as before.
-    pub(crate) policy_index: Option<policy_index::Base>,
+    pub(crate) policy_index: Option<policy_index::Floors>,
     /// The pool: walk jobs, seek jobs, what is in flight. See
     /// `scheduler.rs`.
     pub(crate) sched: crate::scheduler::Scheduler,
@@ -404,25 +408,28 @@ impl PolicyHub {
             }
         });
         let policy_index = policy_index_dir.and_then(|dir| {
-            let path = policy_index::base_path(&dir);
-            match policy_index::Base::open(&path) {
-                Ok(b) => {
-                    let (from, to) = b.covers();
+            match policy_index::Floors::open(&dir) {
+                Ok(Some(f)) => {
+                    let (from, to) = f.covers();
                     tracing::info!(
-                        path = %path.display(),
-                        records = b.len(),
-                        policies = b.policies(),
+                        dir = %dir.display(),
+                        source = f.source(),
+                        policies = f.len(),
                         covers = format!("{from}..={to}"),
                         "policy: policy-index open — first mints resolve locally"
                     );
-                    Some(b)
+                    Some(f)
+                }
+                Ok(None) => {
+                    tracing::warn!(dir = %dir.display(), "policy: no policy-index under this directory — first mints fall back to koios");
+                    None
                 }
                 Err(e) => {
                     // A warning, not a failure: the floor probe falls back to
                     // Koios, and a walk with no floor is slow rather than
                     // wrong. Refusing to start over a missing index would make
                     // an optimisation load-bearing.
-                    tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "policy: policy-index NOT open — first mints fall back to koios");
+                    tracing::warn!(dir = %dir.display(), error = %format!("{e:#}"), "policy: policy-index NOT open — first mints fall back to koios");
                     None
                 }
             }
@@ -464,15 +471,15 @@ impl PolicyHub {
     /// newly-minted policy the snapshot predates, and precisely why the Koios
     /// fallback still earns its place.
     pub(crate) fn first_mint_from_index(&self, policy_hex: &str) -> Option<u64> {
-        let base = self.policy_index.as_ref()?;
+        let index = self.policy_index.as_ref()?;
         let policy = hex::decode(policy_hex).ok()?;
-        let chunk = base.first_chunk_of(policy_index::policy_prefix(&policy))?;
+        let chunk = index.first_chunk_of(policy_index::policy_prefix(&policy))?;
         let slot = u64::from(chunk) * crate::registry::CHUNK_SLOTS;
         tracing::info!(
             policy = policy_hex,
             slot,
             chunk,
-            source = "policy-index",
+            source = index.source(),
             "policy: first mint at admission"
         );
         Some(slot)
@@ -3039,12 +3046,30 @@ pub async fn refresh(
     {
         return Ok(Json(state));
     }
-    hub.set(&policy, PolicyJob::Queued);
-    // The CALLER's `?to_slot=` first — it is an assertion by whoever asked and
-    // may be better informed than the snapshot. The index only answers when
-    // nothing said, which used to mean walking to genesis.
     let first_mint = q.to_slot.or_else(|| hub.first_mint_from_index(&policy));
-    hub.sched.want_walk(&policy, first_mint);
+    // ⚠️ NO FLOOR IS REFUSED, not defaulted to genesis.
+    //
+    // A walk asked for without a floor reads every chunk back to slot 0. MEASURED
+    // on $BUNNY, whose first mint sits at slot 201,229,506 of 201.3M: 235 passes,
+    // 229.5 s of walk-worker time, **234 of them empty**, ~9,320 chunk files read
+    // to find 53 rows. The index was 3 hours behind that mint — the snapshot
+    // cannot cover a policy minted since the last immutable chunk, which is
+    // exactly the policy somebody wants to ingest.
+    //
+    // So say which source of truth is missing instead of paying for the guess.
+    // `?to_slot=0` still reads from genesis when that is what the caller means.
+    let Some(first_mint) = first_mint else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "no floor for {policy}: the policy index has not reached it (it covers \
+                 complete chunks only), and no ?to_slot= was given. Pass the first mint slot, \
+                 or ?to_slot=0 to read from genesis deliberately."
+            ),
+        ));
+    };
+    hub.set(&policy, PolicyJob::Queued);
+    hub.sched.want_walk(&policy, Some(first_mint));
     Ok(Json(PolicyJob::Queued))
 }
 

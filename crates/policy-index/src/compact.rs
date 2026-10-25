@@ -228,6 +228,14 @@ pub fn compact(index_dir: &Path) -> Result<CompactStats> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
 
+    // The floor sidecar: the same policy table, 16 bytes a row, and the only part
+    // the floor probe reads. Written from the array already in hand, so it cannot
+    // disagree with the base beside it — and a tail pass can append to it later
+    // without rewriting the 668 MiB base.
+    let mut floors = crate::runs::from_policy_runs(&runs);
+    crate::runs::write(&crate::runs::runs_path(index_dir), first, last, &mut floors)
+        .context("writing the floor sidecar")?;
+
     Ok(CompactStats {
         segments: chunks.len(),
         first_chunk: first,
@@ -301,6 +309,53 @@ mod tests {
         let (dir, _) = build(&[(0, vec![rec(7, 1, 0)])]);
         let base = Base::open(&base_path(dir.path())).unwrap();
         assert_eq!(base.first_chunk_of(999), None);
+    }
+
+    /// The sidecar `compact` writes beside the base must answer EVERY policy the
+    /// same way the base's own table does, or `Floors` would change an answer by
+    /// choosing a different file.
+    #[test]
+    fn the_floor_sidecar_agrees_with_the_base_for_every_policy() {
+        let (dir, _) = build(&[
+            (0, vec![rec(7, 1, 0), rec(3, 9, 0)]),
+            (1, vec![rec(7, 2, 1), rec(11, 4, 1)]),
+            (2, vec![rec(3, 5, 2), rec(7, 3, 2), rec(11, 6, 2)]),
+        ]);
+        let base = Base::open(&base_path(dir.path())).unwrap();
+        let runs = crate::runs::Runs::open(&crate::runs::runs_path(dir.path())).unwrap();
+
+        assert_eq!(runs.len(), base.policies(), "one row a policy");
+        assert_eq!(runs.covers(), base.covers(), "the same chunk range");
+        for run in base.runs() {
+            assert_eq!(
+                runs.floor_of(run.policy_prefix),
+                Some(run.first_chunk),
+                "prefix {}",
+                run.policy_prefix
+            );
+        }
+        assert_eq!(runs.floor_of(999), None, "and the same silence");
+    }
+
+    /// With no sidecar, `Floors` must fall back to the base and answer identically
+    /// — that is the state every index on the box is in until its next compaction.
+    #[test]
+    fn floors_fall_back_to_the_base_when_there_is_no_sidecar() {
+        let (dir, _) = build(&[
+            (0, vec![rec(7, 1, 0), rec(3, 9, 0)]),
+            (1, vec![rec(11, 4, 1)]),
+        ]);
+        let sidecar = crate::runs::runs_path(dir.path());
+        std::fs::remove_file(&sidecar).unwrap();
+
+        let floors = crate::runs::Floors::open(dir.path())
+            .unwrap()
+            .expect("a base");
+        assert_eq!(floors.source(), "base.pidx");
+        assert_eq!(floors.first_chunk_of(7), Some(0));
+        assert_eq!(floors.first_chunk_of(11), Some(1));
+        assert_eq!(floors.first_chunk_of(999), None);
+        assert_eq!(floors.covers(), (0, 1));
     }
 
     /// Records group by policy and sort by asset within it — the ordering the

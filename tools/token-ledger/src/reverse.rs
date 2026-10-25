@@ -739,24 +739,27 @@ fn probe_first_mint(policy_hex: &str, index_dir: Option<&Path>) -> Option<u64> {
 /// built over, and a policy first minted after that is exactly the case a
 /// stale index would otherwise answer wrongly.
 fn probe_via_index(policy_hex: &str, dir: &Path) -> Option<u64> {
-    let path = policy_index::base_path(dir);
-    let base = match policy_index::Base::open(&path) {
-        Ok(b) => b,
+    let floors = match policy_index::Floors::open(dir) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            tracing::warn!(dir = %dir.display(), "probe: no policy index; trying koios");
+            return None;
+        }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "probe: no policy index; trying koios");
+            tracing::warn!(error = %e, dir = %dir.display(), "probe: unreadable policy index; trying koios");
             return None;
         }
     };
     let policy = hex::decode(policy_hex).ok()?;
     let prefix = policy_index::policy_prefix(&policy);
-    let chunk = base.first_chunk_of(prefix)?;
+    let chunk = floors.first_chunk_of(prefix)?;
     let slot = u64::from(chunk) * crate::registry::CHUNK_SLOTS;
-    let (from, to) = base.covers();
+    let (from, to) = floors.covers();
     tracing::info!(
         slot,
         chunk,
         index_covers = format!("{from}..={to}"),
-        source = "policy-index/first_chunk",
+        source = floors.source(),
         "probe: first mint"
     );
     Some(slot)

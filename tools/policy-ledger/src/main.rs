@@ -25,6 +25,7 @@
 mod build;
 mod classify;
 mod curated;
+mod floor;
 mod inspect;
 mod publish;
 
@@ -51,6 +52,15 @@ enum Command {
     /// The collection catalogue: build, publish, inspect.
     #[command(subcommand)]
     Catalogue(CatalogueCommand),
+    /// Ask the policy index one question — no walk, no network.
+    #[command(subcommand)]
+    Policy(PolicyCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// The chunk holding this policy's earliest mint.
+    FirstMint(floor::FirstMintArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -68,5 +78,6 @@ fn main() -> Result<()> {
         Command::Catalogue(CatalogueCommand::Build(a)) => build::run(a),
         Command::Catalogue(CatalogueCommand::Publish(a)) => publish::run(a),
         Command::Catalogue(CatalogueCommand::Inspect(a)) => inspect::run(a),
+        Command::Policy(PolicyCommand::FirstMint(a)) => floor::first_mint(a),
     }
 }

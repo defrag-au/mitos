@@ -71,6 +71,10 @@ pub mod format;
 /// Shared by `examples/profile` (the survey instrument) and the catalogue
 /// builder, so the two cannot derive different names from the same bytes.
 pub mod profile;
+/// The policy table ON ITS OWN — `prefix → first chunk`, 0.8% of `base.pidx`
+/// and the only part the floor probe reads. Insert-only, so a frequent writer
+/// can keep it current without recompacting 668 MiB.
+pub mod runs;
 pub mod segment;
 /// Re-derivation from the chunks — the half of `verify` that can catch a
 /// faithfully stored wrong answer.
@@ -84,5 +88,6 @@ pub use format::{
     policy_prefix,
 };
 pub use profile::{ChunkReader, Cip67Shape, PolicyEvidence, QtyShape, profile_policy};
+pub use runs::{FLOOR_BYTES, FloorRun, Floors, RUNS_FILE, Runs, runs_path};
 pub use segment::{Segment, list_segments, segment_path, segments_dir, write_segment};
 pub use verify::{Failure, Fault, VerifyStats, verify_sample};
