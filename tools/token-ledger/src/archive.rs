@@ -123,9 +123,14 @@ pub fn store_manifest(dir: &Path, m: &Manifest) -> Result<()> {
 }
 
 /// The manifest plus every file's footer, as one blob beside the manifest —
-/// what the push script puts in KV so a Worker opens the archive in ONE read
-/// instead of a manifest and two tails per file. Written AFTER the manifest,
-/// from the files it names, and replaced whole.
+/// what `publish` puts in KV so a Worker opens the archive in ONE read instead
+/// of a manifest and two tails per file.
+///
+/// ⚠️ **`publish` is the only automatic writer.** Every other manifest write —
+/// a landed walk, a rollup, a tail — leaves the bundle stale on purpose: it is
+/// derived, nothing local reads it, and rebuilding it there re-read a footer
+/// per file for a blob the next publish regenerates. A bundle on disk that a
+/// `published.json` has not yet caught up with is normal.
 pub fn store_bundle(dir: &Path, m: &Manifest) -> Result<PathBuf> {
     use policy_archive::reader::{FOOTER_HINT, footer_length, footer_request};
     let mut files = Vec::new();
@@ -174,8 +179,7 @@ pub fn store_bundle(dir: &Path, m: &Manifest) -> Result<PathBuf> {
 }
 
 /// `token-ledger bundle` — (re)write a policy's bundle from its manifest.
-/// The landing path writes one itself; this is for archives from before the
-/// bundle existed.
+/// `publish` writes one; this is for backfilling an archive and for looking.
 #[derive(clap::Args, Debug)]
 pub struct BundleArgs {
     /// Archive root (`<root>/<policy_hex>/manifest.json`).

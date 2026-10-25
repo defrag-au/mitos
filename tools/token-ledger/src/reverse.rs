@@ -659,9 +659,11 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         written_unix: sealed_unix,
     });
     // LAST. A reader that opens the manifest sees a pass whose files exist.
+    //
+    // The KV bundle is NOT written here: it is derived, only `publish` reads
+    // it, and `publish` rebuilds it from the manifest it flips. Writing it here
+    // re-read every footer for a blob the next publish regenerates anyway.
     archive::store_manifest(dir, manifest)?;
-    // And the bundle the push puts in KV, from the files that manifest names.
-    archive::store_bundle(dir, manifest)?;
 
     // ROLLUP, once enough passes have piled up: every reader pays a footer
     // per file, and a satellite publishing to R2 wants one object per

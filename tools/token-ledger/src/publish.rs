@@ -152,12 +152,16 @@ impl Publisher {
         let started = Instant::now();
         let manifest = crate::archive::load_manifest(dir)?
             .with_context(|| format!("no archive at {}", dir.display()))?;
-        // The bundle is written at landing; an archive from before it
-        // existed gets one here, so a publish always carries it.
+        // THE BUNDLE IS BUILT HERE, from the manifest this publish is about to
+        // flip. It is DERIVED — the manifest plus every footer the Worker needs
+        // to open the archive in one read — so it is built once, at the rate a
+        // publish happens, rather than on every landing and every tail write.
+        //
+        // ⚠️ Unconditionally, not "only when absent". A stale bundle is worse
+        // than none: the Worker opens the archive from it and would read a
+        // manifest the R2 flip has already replaced.
         let bundle_path = dir.join(policy_archive::BUNDLE);
-        if !bundle_path.exists() {
-            crate::archive::store_bundle(dir, &manifest)?;
-        }
+        crate::archive::store_bundle(dir, &manifest)?;
 
         let mut record = Record {
             policy: policy.to_string(),

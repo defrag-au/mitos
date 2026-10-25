@@ -410,8 +410,8 @@ pub fn rollup(
     manifest.rollup_seq = rollup_seq;
     manifest.pending = Some(crate::archive::PENDING.to_string());
     manifest.updated_unix = sealed_unix;
+    // The bundle is derived and `publish` rebuilds it — see `reverse::land`.
     crate::archive::store_manifest(dir, manifest)?;
-    crate::archive::store_bundle(dir, manifest)?;
 
     // Prune: the files the new manifest no longer names.
     for p in &inputs {

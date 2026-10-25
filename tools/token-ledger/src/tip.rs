@@ -253,17 +253,20 @@ fn open_ro(path: &Path) -> Result<Connection> {
 struct Extent {
     /// Newest slot it holds.
     tip: u64,
-    blocks: u64,
 }
 
+/// The spool's newest slot.
+///
+/// ⚠️ **No `COUNT(*)`.** It was here for a log field and MEASURED at 0.144 s
+/// against 162k blocks — more than the entire rest of a poll once the tail got
+/// cheap. The row count is not worth 1% of a core at a 30 s cadence; the tip is
+/// what decides whether there is anything to do.
 fn extent(conn: &Connection) -> Result<Option<Extent>> {
-    let row: Option<(Option<u64>, u64)> = conn
-        .query_row("SELECT MAX(slot), COUNT(*) FROM tail_blocks", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    let row: Option<Option<u64>> = conn
+        .query_row("SELECT MAX(slot) FROM tail_blocks", [], |r| r.get(0))
         .ok();
     Ok(match row {
-        Some((Some(tip), blocks)) => Some(Extent { tip, blocks }),
+        Some(Some(tip)) => Some(Extent { tip }),
         _ => None,
     })
 }
@@ -271,6 +274,10 @@ fn extent(conn: &Connection) -> Result<Option<Extent>> {
 /// One tick: read the spool once, gate it once, and re-derive every
 /// archived policy's tail from the same blocks.
 fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
+    // The WHOLE pass, including the spool open, the extent probe and the
+    // chunk listing — those are outside `read_secs` and were 0.2 s of a poll
+    // nobody was counting.
+    let ticking = Instant::now();
     let policies = hub.archived_policies();
     if policies.is_empty() {
         return Ok(());
@@ -374,7 +381,7 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
     tracing::info!(
         floor,
         ceiling,
-        spool_blocks = ext.blocks,
+        spool_tip = ext.tip,
         candidates = blocks.len(),
         policies = watched.len(),
         untouched_policies = untouched,
@@ -393,7 +400,9 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
         parquet_ms = with_rows.parquet.as_millis(),
         manifest_ms = with_rows.manifest.as_millis(),
         warm_ms = with_rows.warm.as_millis(),
-        total_secs = format!("{:.1}", started.elapsed().as_secs_f64()),
+        // Read, probe and chunk-listing, before the window is touched.
+        head_ms = started.saturating_duration_since(ticking).as_millis(),
+        total_secs = format!("{:.2}", ticking.elapsed().as_secs_f64()),
         "tip: tail refreshed"
     );
     Ok(())
@@ -683,7 +692,11 @@ fn write_tail(
     manifest.updated_unix = sealed_unix;
     let writing = Instant::now();
     archive::store_manifest(&dir, &manifest)?;
-    archive::store_bundle(&dir, &manifest)?;
+    // ⚠️ NOT the bundle. It is DERIVED — the manifest plus every footer a
+    // Worker needs to open the archive in one read — and the only thing that
+    // reads it is `publish`, which rebuilds it from the manifest it is about
+    // to flip. Writing it here re-read a footer per file (~64 KB each) and
+    // rewrote 28–82 KB on every tail write, for a file nothing local reads.
     phases.manifest = writing.elapsed();
     // Only once the manifest names the new one.
     for prev in previous {

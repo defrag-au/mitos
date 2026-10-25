@@ -70,10 +70,22 @@ lost: the next write still derives from `floor`, so it covers everything since.
 `floor_moved` still forces the write, because a snapshot refresh puts the old
 pass below the immutable archive and the sum rule would double-count it.
 
-After the gate, a quiet poll is `total_secs=0.1` — the window read and nothing
-else — with 27 policies skipped and 0 written. Publishing follows: 2 publishes
-in 5 measured minutes, against 16 per tick before, because a policy that was
-never written has no stale `published.json`.
+After the gate, a quiet poll is **0.12 s** — `head_ms=8` for the spool open, the
+`MAX(slot)` probe and the chunk listing, plus `read_secs=0.1` for the window —
+with 27 policies skipped and 0 written. Two of the fixed costs were only
+visible once the rest got cheap:
+
+- `extent()` selected `MAX(slot), COUNT(*)`; the count was for a log field and
+  is a full scan of 162k block rows — **0.144 s on its own**, more than the
+  entire rest of the poll. Dropped.
+- `tip_slot()` lists **27,954** entries, not the "nine thousand" the comment
+  claimed. 8 ms measured, so it stays.
+
+`total_secs` now covers the whole pass. It did not before, which is how the
+cheaper-than-measured number survived two rounds of reporting.
+
+Publishing follows: 2 publishes in 5 measured minutes, against 16 per tick
+before, because a policy that was never written has no stale `published.json`.
 
 ## What a tick does now
 
