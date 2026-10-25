@@ -301,6 +301,8 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
     let scanned = started.elapsed();
 
     let index = hub.index.as_ref().map(|h| h.get());
+    let mut with_rows = Phases::default();
+    let mut without_rows = Phases::default();
     for (policy, bytes) in &watched {
         match write_tail(
             hub,
@@ -324,7 +326,15 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
             // knows the archive changed, and both caches are keyed on the
             // version this write just changed, so the next `/live` finds them
             // current instead of paying for the folds.
-            Ok(Wrote::Tail) => crate::policy_api::warm(hub, policy),
+            Ok(Wrote::Tail { mut phases, landed }) => {
+                let warming = Instant::now();
+                crate::policy_api::warm(hub, policy);
+                phases.warm = warming.elapsed();
+                match landed {
+                    true => with_rows.add(phases),
+                    false => without_rows.add(phases),
+                }
+            }
             Ok(Wrote::Nothing) => {}
             Err(e) => {
                 tracing::warn!(policy, error = %format!("{e:#}"), "tip: could not write the tail")
@@ -338,6 +348,18 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
         candidates = blocks.len(),
         policies = watched.len(),
         read_secs = format!("{:.1}", scanned.as_secs_f64()),
+        // Where the tick goes. `moved` is the work a reader needed; `quiet`
+        // is a pass that wrote a file, a manifest and a bundle for no rows —
+        // the share a real `Wrote::Nothing` would give back.
+        moved_policies = with_rows.count,
+        quiet_policies = without_rows.count,
+        moved_ms = with_rows.ms(),
+        quiet_ms = without_rows.ms(),
+        lock_ms = with_rows.lock.as_millis(),
+        scan_ms = with_rows.scan.as_millis(),
+        parquet_ms = with_rows.parquet.as_millis(),
+        manifest_ms = with_rows.manifest.as_millis(),
+        warm_ms = with_rows.warm.as_millis(),
         total_secs = format!("{:.1}", started.elapsed().as_secs_f64()),
         "tip: tail refreshed"
     );
@@ -371,8 +393,46 @@ fn load(
 
 /// Did this policy get a tail file?
 enum Wrote {
-    Tail,
+    /// A pass was written. `landed` is whether it holds any rows — the
+    /// distinction that decides whether the archive changed for a reader, and
+    /// therefore whether it needs publishing at all.
+    Tail {
+        phases: Phases,
+        landed: bool,
+    },
     Nothing,
+}
+
+/// Where one policy's pass spent its time.
+///
+/// ⚠️ MEASUREMENT, not decoration. The tick costs ~165 ms per policy and the
+/// split between the scan, the Parquet write and the bundle decides which
+/// optimisation is worth doing — see `docs/design/TAIL_REFRESH.md`. `landed`
+/// separates the work that has to happen from the work a zero-row pass is
+/// doing for nothing.
+#[derive(Debug, Default, Clone, Copy)]
+struct Phases {
+    lock: Duration,
+    scan: Duration,
+    parquet: Duration,
+    manifest: Duration,
+    warm: Duration,
+    count: u64,
+}
+
+impl Phases {
+    fn add(&mut self, other: Self) {
+        self.lock += other.lock;
+        self.scan += other.scan;
+        self.parquet += other.parquet;
+        self.manifest += other.manifest;
+        self.warm += other.warm;
+        self.count += other.count;
+    }
+
+    fn ms(&self) -> u128 {
+        (self.lock + self.scan + self.parquet + self.manifest + self.warm).as_millis()
+    }
 }
 
 fn write_tail(
@@ -385,10 +445,13 @@ fn write_tail(
     index: Option<&tx_index::Index>,
 ) -> Result<Wrote> {
     let dir = hub.policy_dir(policy);
+    let mut phases = Phases::default();
     // UNDER THE POLICY'S LANDING LOCK: a walk job may be landing a range of
     // its own right now, and both are a read-modify-write of one manifest.
+    let waiting = Instant::now();
     let lock = hub.landing_lock(policy);
     let _held = lock.lock().expect("landing lock");
+    phases.lock = waiting.elapsed();
     let Some(mut manifest) = archive::load_manifest(&dir)? else {
         // No archive yet — nothing to hang a tail off.
         return Ok(Wrote::Nothing);
@@ -412,6 +475,7 @@ fn write_tail(
     };
     let mut writer = SegmentWriter::new(&tip_dir, stamp.clone())?;
     let mut observations: Vec<policy_archive::Observation> = Vec::new();
+    let scanning = Instant::now();
     let out = reverse::scan_blocks(
         blocks.to_vec(),
         policy_bytes,
@@ -424,6 +488,8 @@ fn write_tail(
         index,
         &mut observations,
     )?;
+    phases.scan = scanning.elapsed();
+    let parcelling = Instant::now();
     let segments = writer.finish()?;
 
     // Sorted by slot so the footer's statistics can be seeked on, exactly as
@@ -457,6 +523,8 @@ fn write_tail(
     // merge folds them and drops what nets to nothing, exactly as a landed
     // range's compaction does.
     let compacted = segments::compact(&tip_dir, &segments, u64::MAX, &stamp)?;
+    let landed = compacted.written > 0;
+    phases.parquet = parcelling.elapsed();
 
     // AT MOST ONE volatile entry, replaced whole. Never summed with the last
     // one: that stretch can roll back, and rewriting it is what makes the
@@ -506,8 +574,10 @@ fn write_tail(
     prof.single_units = prof.single_units.max(out.profile.single_units);
     manifest.profile = Some(prof);
     manifest.updated_unix = sealed_unix;
+    let writing = Instant::now();
     archive::store_manifest(&dir, &manifest)?;
     archive::store_bundle(&dir, &manifest)?;
+    phases.manifest = writing.elapsed();
     // Only once the manifest names the new one.
     for prev in previous {
         let _ = std::fs::remove_dir_all(dir.join(prev));
@@ -524,5 +594,6 @@ fn write_tail(
             "tip: tail written"
         );
     }
-    Ok(Wrote::Tail)
+    phases.count = 1;
+    Ok(Wrote::Tail { phases, landed })
 }
