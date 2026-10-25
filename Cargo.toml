@@ -187,10 +187,11 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "4f7a9165b01ce37ed7b53868bd35fd9a484794e7", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "4f7a9165b01ce37ed7b53868bd35fd9a484794e7" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "4f7a9165b01ce37ed7b53868bd35fd9a484794e7" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "4f7a9165b01ce37ed7b53868bd35fd9a484794e7" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "7b2a9c5d5e637b4a96b8b18983e5a18096867e04", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "7b2a9c5d5e637b4a96b8b18983e5a18096867e04" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "7b2a9c5d5e637b4a96b8b18983e5a18096867e04" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "7b2a9c5d5e637b4a96b8b18983e5a18096867e04" }
+asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "7b2a9c5d5e637b4a96b8b18983e5a18096867e04" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
