@@ -4588,7 +4588,9 @@ fn tally_traits(
         for v in values {
             *pairs += 1;
             n += 1;
-            rows.push((policy.to_vec(), t.clone(), v.clone()));
+            // The value as the market shows it: an altered one as
+            // `"<value> (<alteration>)"`, its form anywhere outside the crate.
+            rows.push((policy.to_vec(), t.clone(), v.rendered()));
         }
     }
     if n > 0 {
