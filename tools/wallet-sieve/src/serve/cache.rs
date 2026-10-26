@@ -160,7 +160,7 @@ fn publish(path: &Path, stats: &db::CacheStats, budget: u64, evictions: u64) -> 
     Ok(())
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
