@@ -27,6 +27,7 @@ mod reverse;
 mod scheduler;
 mod segments;
 mod serve;
+mod shared_fills;
 mod store;
 mod sync;
 mod tip;

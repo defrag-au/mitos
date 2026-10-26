@@ -54,6 +54,32 @@ pub fn outputs(era: Era, body: &[u8]) -> Result<Vec<ResolvedOutput>> {
     }
 }
 
+/// Body → the outrefs it spends, `(tx hash, output index)`, in body order.
+///
+/// Shelley-family bodies only: a Byron input is a different shape, and
+/// nothing that asks for inputs (following a DEX order back to whoever
+/// placed it) reaches back before Shelley.
+pub fn inputs(era: Era, body: &[u8]) -> Result<Vec<([u8; 32], u32)>> {
+    let decode_err = |e: minicbor::decode::Error| anyhow!("decoding {era} body: {e}");
+    let of = |i: &alonzo::TransactionInput| (*i.transaction_id, i.index as u32);
+    match era {
+        Era::Byron => Err(anyhow!("Byron inputs are not decoded")),
+        Era::Shelley | Era::Allegra | Era::Mary | Era::Alonzo => {
+            let b: alonzo::TransactionBody = minicbor::decode(body).map_err(decode_err)?;
+            Ok(b.inputs.iter().map(of).collect())
+        }
+        Era::Babbage => {
+            let b: babbage::TransactionBody = minicbor::decode(body).map_err(decode_err)?;
+            Ok(b.inputs.iter().map(of).collect())
+        }
+        Era::Conway => {
+            let b: conway::TransactionBody = minicbor::decode(body).map_err(decode_err)?;
+            Ok(b.inputs.iter().map(of).collect())
+        }
+        other => Err(anyhow!("era {other} is newer than this build of tx-index")),
+    }
+}
+
 fn convert(index: usize, o: &MultiEraOutput<'_>) -> ResolvedOutput {
     let address = o
         .address()
@@ -88,5 +114,38 @@ fn convert(index: usize, o: &MultiEraOutput<'_>) -> ResolvedOutput {
         inline_datum,
         has_script_ref: o.script_ref().is_some(),
         cbor: hex::encode(o.encode()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smallest body each era accepts: `{0: [[hash, 1], [hash', 7]], 1: [], 2: 0}`
+    /// (inputs, no outputs, no fee).
+    fn body(a: [u8; 32], b: [u8; 32]) -> Vec<u8> {
+        let mut out = vec![0xa3, 0x00, 0x82];
+        for (h, ix) in [(a, 1u8), (b, 7u8)] {
+            out.extend([0x82, 0x58, 0x20]);
+            out.extend(h);
+            out.push(ix);
+        }
+        out.extend([0x01, 0x80, 0x02, 0x00]);
+        out
+    }
+
+    #[test]
+    fn a_body_lists_the_outrefs_it_spends() {
+        let (a, b) = ([0x11; 32], [0x22; 32]);
+        for era in [Era::Alonzo, Era::Babbage, Era::Conway] {
+            let got = inputs(era, &body(a, b)).unwrap_or_else(|e| panic!("{era}: {e}"));
+            let mut want = vec![(a, 1), (b, 7)];
+            // A Conway input SET is canonical-ordered; compare as a set.
+            let mut got = got;
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{era}");
+        }
+        assert!(inputs(Era::Byron, &body(a, b)).is_err());
     }
 }

@@ -2999,7 +2999,30 @@ pub async fn story(
         .filter(|o| o.slot >= floor && o.slot <= ceiling)
         .collect();
 
-    let built = policy_archive::story::build(&rows, &obs, &roles).with_markers(marks);
+    let mut built = policy_archive::story::build(&rows, &obs, &roles).with_markers(marks);
+    // A sell on a shared order address (CSwap) names nobody in its own
+    // movement; the chain says who placed the order it spent. Without the
+    // index, or for a fill in the volatile tip, it stays anonymous and a
+    // reader pairs it with its placement itself. See `shared_fills`.
+    if let Some(index) = &hub.index {
+        let index = index.get();
+        let started = std::time::Instant::now();
+        let n = crate::shared_fills::name_shared_fills(
+            &mut built.events,
+            &policy,
+            &roles,
+            &mut crate::shared_fills::IndexChain::new(&index),
+        );
+        if n.named + n.unnamed > 0 {
+            tracing::info!(
+                policy,
+                named = n.named,
+                unnamed = n.unnamed,
+                ms = started.elapsed().as_millis() as u64,
+                "story: shared-order fills named from the chain"
+            );
+        }
+    }
     let lo = built.events.first().map(|e| e.slot).unwrap_or(from);
     let hi = built.events.last().map(|e| e.slot).unwrap_or(from);
     let complete = manifest

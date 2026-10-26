@@ -287,9 +287,16 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
             amount: to.amount,
             into_pool: false,
         },
-        // wallet → order: the placement.
+        // wallet → order: the placement. On a SHARED order address the
+        // order's stake is the venue's, so the trader is the wallet the asset
+        // left: the one leg that names them (MEASURED: 34 of $PERP's 35 CSwap
+        // sells reached the arena as "someone" while this said nobody could
+        // tell). A customer-keyed address still names them by its stake.
         (None, Some((Role::Order, cred, stake))) => Event::Placement {
-            party: party_from_order(&cred, &stake),
+            party: match roles.keying_of(&cred) {
+                OrderKeying::Shared => Party::Wallet(from.address.clone()),
+                OrderKeying::CustomerStake => party_from_order(&cred, &stake),
+            },
             venue_cred: cred,
             amount: to.amount,
         },
@@ -417,24 +424,29 @@ mod tests {
         ));
     }
 
-    /// CSwap shares ONE order address, so the trader is genuinely not in this
-    /// transaction. It must say so rather than attribute every CSwap trade to
-    /// the same stake.
+    /// CSwap shares ONE order address, so the trader is genuinely not in the
+    /// FILL. It must say so rather than attribute every CSwap trade to the
+    /// same stake.
     #[test]
-    fn a_shared_order_address_refuses_to_name_a_trader() {
+    fn a_shared_order_address_refuses_to_name_a_trader_in_the_fill() {
         let e = classify_move(&mv(&[(CSWAP_ORDER, -1_000), (CSWAP_POOL, 1_000)]), &roles());
         match e {
             Event::Fill { party, .. } => assert_eq!(party, Party::NotEncodedByVenue),
             other => panic!("expected a Fill, got {other:?}"),
         }
-        // And the placement leg, which DOES name them, is where to look.
-        assert!(matches!(
-            classify_move(&mv(&[(WALLET, -1_000), (CSWAP_ORDER, 1_000)]), &roles()),
-            Event::Placement {
-                party: Party::NotEncodedByVenue,
-                ..
+    }
+
+    /// …and the PLACEMENT is where they are: the wallet the asset left. This
+    /// said "not encoded" too, so a CSwap sell had no trader anywhere.
+    #[test]
+    fn a_shared_order_address_names_the_trader_in_the_placement() {
+        match classify_move(&mv(&[(WALLET, -1_000), (CSWAP_ORDER, 1_000)]), &roles()) {
+            Event::Placement { party, amount, .. } => {
+                assert_eq!(party, Party::Wallet(WALLET.to_string()));
+                assert_eq!(amount, 1_000);
             }
-        ));
+            other => panic!("expected a Placement, got {other:?}"),
+        }
     }
 
     /// Several orders into one pool. "The largest mover is the trader" is

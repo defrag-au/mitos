@@ -1656,17 +1656,23 @@ fn policy_of(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// What kind of holder an address is, by what the address registry can state.
+/// What kind of holder an address is, by what the address registry can state
+/// about the ADDRESS: a burn sink, then the registry's script categories by
+/// payment credential and then by address. A script nobody named, with no
+/// stake part, is a contract. Everything else is a person.
 ///
-/// The same order the flow explorer's arena uses (`story::role_of`), so the
-/// summary's counts and the arena's sea agree on who is a person: a burn sink,
-/// then the registry's script categories by payment credential and then by
-/// address, then a known exchange or marketplace stake key. A script nobody
-/// named, with no stake part, is a contract. The label is the holders route's.
+/// WHAT, never WHO. A service run from an ordinary wallet (an exchange's hot
+/// wallet, a minting provider, a staking programme) is a claim about people,
+/// kept in the published stake-service table (`address_registry::published`)
+/// and applied by whoever DRAWS the summary, so a correction reaches every
+/// screen without rewriting a summary. This used to name such wallets from
+/// the compiled stake table and store them as venues, which put a person's
+/// wallet (listed once as Wayup) in summaries as a venue, and would have
+/// stored `$perpstaking` as one too.
 pub fn classify_holder(address: &str) -> (policy_archive::summary::Role, Option<String>) {
     use address_registry::registry::{
         AddressCategory as AC, RegistryNetwork, ScriptCategory as SC, lookup_address_match,
-        lookup_payment_credential, lookup_stake,
+        lookup_payment_credential,
     };
     use policy_archive::summary::Role;
 
@@ -1692,23 +1698,11 @@ pub fn classify_holder(address: &str) -> (policy_archive::summary::Role, Option<
         }
     }
     let stake = parts.as_ref().and_then(|(_, stake)| stake.as_deref());
-    if let Some(service) = stake.and_then(stake_bech32).and_then(|s| lookup_stake(&s)) {
-        return (Role::Venue, Some(service.label.to_string()));
-    }
     let script = address_registry::registry::payment_credential_is_script(address);
     match (script, stake) {
         (true, None) => (Role::Contract, None),
         _ => (Role::Person, None),
     }
-}
-
-/// A stake credential's mainnet stake address, as the registry keys services.
-fn stake_bech32(credential_hex: &str) -> Option<String> {
-    use pallas_addresses::{Network, StakeAddress, StakeKeyHash, StakePayload};
-    let hash: StakeKeyHash = credential_hex.parse().ok()?;
-    StakeAddress::new(Network::Mainnet, StakePayload::Stake(hash))
-        .to_bech32()
-        .ok()
 }
 
 /// Write the summary and its checkpoint files, and remove checkpoint files it
@@ -2908,6 +2902,47 @@ fn print_row(row: &FeedRow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wallet address under `stake`, with an arbitrary key payment part.
+    fn wallet_under(stake: &str) -> String {
+        use pallas_addresses::{
+            Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+            StakePayload,
+        };
+        let Ok(Address::Stake(s)) = Address::from_bech32(stake) else {
+            panic!("{stake} is a stake address");
+        };
+        let StakePayload::Stake(hash) = s.payload() else {
+            panic!("{stake} is a key stake credential");
+        };
+        let payment = ShelleyPaymentPart::key_hash([7u8; 28].into());
+        Address::Shelley(ShelleyAddress::new(
+            Network::Mainnet,
+            payment,
+            ShelleyDelegationPart::key_hash(*hash),
+        ))
+        .to_bech32()
+        .expect("encodes")
+    }
+
+    /// WHO stays out of the summary. `$perpstaking` is named by the stake
+    /// table as PERP staking, and the wallet once listed as Wayup is a
+    /// person's; the summary stores both as what their addresses are, a
+    /// wallet, with no label, and a screen applies the published table.
+    #[test]
+    fn a_wallet_run_service_is_stored_as_what_its_address_is() {
+        for stake in [
+            "stake1uxw8pmwq7my926m9xuk5zpy83at8hyzqla4qxs843sfjznsgtwgxy",
+            "stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr",
+            "stake1uxwcw3rr36r8q9e5egy3e74cmazpjvx4t5ajsq50xhm568celda4g",
+        ] {
+            assert_eq!(
+                classify_holder(&wallet_under(stake)),
+                (policy_archive::summary::Role::Person, None),
+                "{stake}"
+            );
+        }
+    }
 
     fn mv(tx: u8, unit: impl AsRef<[u8]>, addr: &str, amount: i64, net_mint: i64) -> Movement {
         Movement {
