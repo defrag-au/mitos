@@ -1475,10 +1475,15 @@ impl UnrecognisedKind {
         if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Burn {
             return (UnrecognisedKind::Burn, None);
         }
-        if let Some(site) = site_of(address, cred) {
+        let stake = mitos_cohort::stake_cred(address);
+        if let Some(site) = site_of(address, cred, stake.as_ref()) {
             return match site.role {
                 SiteRole::Pool => (UnrecognisedKind::UndecodedPool, Some(site.venue)),
-                SiteRole::Order => (UnrecognisedKind::Order, Some(site.venue)),
+                // An order book's resting orders and its escrows hold
+                // traders' assets, as an order contract does: not a gap.
+                SiteRole::Order | SiteRole::Book | SiteRole::Escrow => {
+                    (UnrecognisedKind::Order, Some(site.venue))
+                }
             };
         }
         let Some(cred) = cred else {

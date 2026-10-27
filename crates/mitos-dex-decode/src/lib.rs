@@ -14,9 +14,12 @@
 //! "the decode library is the genuine reuse unit; composition
 //! over coordination."
 
+pub mod axo;
 pub mod cswap;
+pub mod dexhunter;
 pub mod minswap;
 pub mod originator;
+pub mod saturnswap;
 pub mod splash;
 pub mod sundae;
 /// The canonical venue vocabulary — one spelling per venue, as symbols, so a
@@ -26,6 +29,27 @@ pub mod vyfi;
 pub mod wingriders;
 
 use pallas_primitives::{BigInt, PlutusData};
+
+/// A 28-byte credential from its 56 lower-case hex characters, at compile
+/// time: a typo in a constant fails the build instead of naming nobody.
+pub(crate) const fn cred(hex: &str) -> [u8; 28] {
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("a credential is lower-case hex"),
+        }
+    }
+    let b = hex.as_bytes();
+    assert!(b.len() == 56, "a credential is 56 hex characters");
+    let mut out = [0u8; 28];
+    let mut i = 0;
+    while i < 28 {
+        out[i] = (nibble(b[2 * i]) << 4) | nibble(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
 
 /// Non-negative `u64` out of a `PlutusData` integer.
 ///

@@ -616,7 +616,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
         // reserves for a later decoder to re-read.
         if o.decoded.is_none()
             && crate::trade::address_parts(&o.address)
-                .is_some_and(|(cred, _)| roles.role_of(&cred).is_some())
+                .is_some_and(|(cred, stake)| roles.role_at(&cred, stake.as_deref()).is_some())
         {
             continue;
         }

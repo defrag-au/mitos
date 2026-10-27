@@ -63,10 +63,15 @@ fn mitos_contracts() -> Vec<(String, [u8; 28], Want)> {
             SiteKey::Cred(c) => c,
             SiteKey::Address(a) => mitos_cohort::payment_cred(a)
                 .unwrap_or_else(|| panic!("{} site address {a} has no credential", site.venue)),
+            // A venue known by its stake has no one payment credential to
+            // check; its stake is the registry's stake table's to name.
+            SiteKey::Stake(_) => continue,
         };
         let role = match site.role {
             SiteRole::Pool => "pool",
             SiteRole::Order => "order",
+            SiteRole::Book => "order book",
+            SiteRole::Escrow => "escrow",
         };
         out.push((format!("{} {role}", site.venue), cred, Want::Exchange));
     }

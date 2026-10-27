@@ -35,6 +35,10 @@ pub struct AmbiguousArgs {
     /// spread across the token's life, and stop.
     #[arg(long)]
     pub script: Option<String>,
+    /// List the script credentials no venue claims, by transactions touching
+    /// them, with the stake parts they appear under, and stop.
+    #[arg(long)]
+    pub scripts: bool,
 }
 
 /// What an ambiguous movement turns out to be.
@@ -90,9 +94,74 @@ pub fn ambiguous(args: AmbiguousArgs) -> Result<()> {
     let rows = fold_rows(history.all_movements()?.to_vec());
     let is_venue = |address: &str| {
         address_parts(address)
-            .and_then(|(cred, _)| roles.role_of(&cred))
-            .is_some_and(|r| matches!(r, Role::Pool | Role::Order | Role::Curve))
+            .and_then(|(cred, stake)| roles.role_at(&cred, stake.as_deref()))
+            .is_some()
     };
+    if args.scripts {
+        // A Shelley address's payment part is a script when the character
+        // after `addr1` is `z`, `x` or `w` (header types 1, 3 and 7).
+        let is_script = |a: &str| {
+            a.strip_prefix("addr1")
+                .and_then(|r| r.chars().next())
+                .is_some_and(|c| matches!(c, 'z' | 'x' | 'w'))
+        };
+        // cred → (transactions, units in, units out, stake parts → count, an
+        // address, a transaction)
+        type Seen = (usize, u128, u128, BTreeMap<String, usize>, String, String);
+        let mut by: HashMap<String, Seen> = HashMap::new();
+        for row in &rows {
+            let mut touched: HashSet<String> = HashSet::new();
+            for u in &row.units {
+                for p in &u.parties {
+                    if !is_script(&p.address) {
+                        continue;
+                    }
+                    let Some((cred, stake)) = address_parts(&p.address) else {
+                        continue;
+                    };
+                    if roles.role_at(&cred, stake.as_deref()).is_some() {
+                        continue;
+                    }
+                    let e = by.entry(cred.clone()).or_insert_with(|| {
+                        (
+                            0,
+                            0,
+                            0,
+                            BTreeMap::new(),
+                            p.address.clone(),
+                            hex::encode(&row.tx_hash),
+                        )
+                    });
+                    if p.amount > 0 {
+                        e.1 += u128::from(p.amount.unsigned_abs());
+                    } else {
+                        e.2 += u128::from(p.amount.unsigned_abs());
+                    }
+                    *e.3.entry(stake.map_or("-".to_string(), |s| s[..8].to_string()))
+                        .or_default() += 1;
+                    if touched.insert(cred.clone()) {
+                        e.0 += 1;
+                    }
+                }
+            }
+        }
+        let mut by: Vec<_> = by.into_iter().collect();
+        by.sort_by_key(|(_, s)| std::cmp::Reverse(s.0));
+        for (cred, (txs, units_in, units_out, stakes, address, tx)) in
+            by.iter().take(args.examples)
+        {
+            let mut top: Vec<_> = stakes.iter().collect();
+            top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+            let top: Vec<String> = top.iter().take(4).map(|(s, n)| format!("{s}×{n}")).collect();
+            println!(
+                "{cred} {txs} txs, in {units_in} out {units_out}, {} stake parts [{}]\n    \
+                 {address}\n    tx {tx}",
+                stakes.len(),
+                top.join(" ")
+            );
+        }
+        return Ok(());
+    }
     let shown: Vec<&policy_archive::feed::FeedRow> = match &args.script {
         Some(script) => {
             let touching: Vec<_> = rows
@@ -124,9 +193,12 @@ pub fn ambiguous(args: AmbiguousArgs) -> Result<()> {
             for u in &row.units {
                 for p in &u.parties {
                     let (cred, stake) = address_parts(&p.address).unwrap_or_default();
-                    let role = roles
-                        .role_of(&cred)
-                        .map(|r| format!("{r:?} {}", roles.name_of(&cred).unwrap_or("?")));
+                    let role = roles.role_at(&cred, stake.as_deref()).map(|r| {
+                        let name = roles
+                            .name_of(&cred)
+                            .or_else(|| stake.as_deref().and_then(|s| roles.name_of(s)));
+                        format!("{r:?} {}", name.unwrap_or("?"))
+                    });
                     println!(
                         "    {:>14} {} stake {} {}",
                         p.amount,
@@ -163,7 +235,7 @@ pub fn ambiguous(args: AmbiguousArgs) -> Result<()> {
             let mut has_order = false;
             for p in &u.parties {
                 if address_parts(&p.address)
-                    .and_then(|(cred, _)| roles.role_of(&cred))
+                    .and_then(|(cred, stake)| roles.role_at(&cred, stake.as_deref()))
                     .is_some_and(|r| r == Role::Order)
                 {
                     has_order = true;

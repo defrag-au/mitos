@@ -184,7 +184,7 @@ struct Fill<'a> {
 }
 
 fn role(address: &str, roles: &Roles) -> Option<Role> {
-    address_parts(address).and_then(|(cred, _)| roles.role_of(&cred))
+    address_parts(address).and_then(|(cred, stake)| roles.role_at(&cred, stake.as_deref()))
 }
 
 /// The wallet that placed the order `fill` spent, if the chain says.

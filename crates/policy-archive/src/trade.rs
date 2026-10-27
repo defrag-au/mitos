@@ -63,6 +63,13 @@ pub enum Role {
     /// A launchpad bonding curve — trades happen against it directly, with no
     /// order leg.
     Curve,
+    /// An order traded against IN PLACE, by a taker's wallet or another such
+    /// order, rather than spent into a pool: Axo's strategies, SaturnSwap's
+    /// exchange, DexHunter's DCA. Its owner is its address's stake, unless
+    /// that stake is a venue's own ([`Roles::is_venue_stake`]).
+    Book,
+    /// A filled order's proceeds awaiting collection: SaturnSwap's escrows.
+    Escrow,
 }
 
 /// Whether an order contract encodes its customer in the address.
@@ -91,12 +98,41 @@ pub struct Roles {
     ///
     /// Only the decode crate knows this mapping, which is why it is supplied
     /// with the roles rather than guessed at downstream.
+    ///
+    /// A venue registered by STAKE ([`Roles::register_stake`]) is named under
+    /// its stake credential here too.
     pub names: HashMap<String, String>,
+    /// Roles by STAKE credential, hex, for a venue whose scripts share only
+    /// that: SaturnSwap's escrows. Consulted only where the payment
+    /// credential has no role of its own. Also how a venue's own stake is
+    /// known, so an order under it is not taken to name an owner.
+    #[serde(default)]
+    pub stakes: HashMap<String, Role>,
 }
 
 impl Roles {
     pub fn role_of(&self, cred_hex: &str) -> Option<Role> {
         self.roles.get(cred_hex).copied()
+    }
+
+    /// The role of an address with this payment credential and stake: the
+    /// credential's own, else its stake's.
+    pub fn role_at(&self, cred_hex: &str, stake_hex: Option<&str>) -> Option<Role> {
+        self.role_of(cred_hex)
+            .or_else(|| stake_hex.and_then(|s| self.stakes.get(s).copied()))
+    }
+
+    /// Whether `stake_hex` is a venue's own stake rather than a customer's.
+    pub fn is_venue_stake(&self, stake_hex: &str) -> bool {
+        self.stakes.contains_key(stake_hex)
+    }
+
+    /// Register a venue by its STAKE credential: every script under it that
+    /// has no role of its own takes `role`.
+    pub fn register_stake(&mut self, stake_hex: impl Into<String>, role: Role, venue: &str) {
+        let stake = stake_hex.into();
+        self.stakes.insert(stake.clone(), role);
+        self.names.insert(stake, venue.to_string());
     }
     pub fn keying_of(&self, cred_hex: &str) -> OrderKeying {
         self.keying
@@ -152,6 +188,9 @@ impl Roles {
         }
         for (cred, keying) in &other.keying {
             self.keying.entry(cred.clone()).or_insert(*keying);
+        }
+        for (stake, role) in &other.stakes {
+            self.stakes.entry(stake.clone()).or_insert(*role);
         }
         for (cred, name) in &other.names {
             self.names
@@ -266,7 +305,9 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
 
     let role_at = |addr: &str| -> Option<(Role, String, Option<String>)> {
         let (cred, stake) = address_parts(addr)?;
-        roles.role_of(&cred).map(|r| (r, cred, stake))
+        roles
+            .role_at(&cred, stake.as_deref())
+            .map(|r| (r, cred, stake))
     };
 
     // A batched fill: several order contracts into one pool. Recognised BEFORE
@@ -374,7 +415,8 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
 /// 2,872 M units) and 333 of the second were outside every stream.
 pub fn classify_moves(unit: &UnitMove, roles: &Roles) -> Vec<Event> {
     match classify_move(unit, roles) {
-        Event::Transfer => venue_trades(unit, roles)
+        Event::Transfer => book_trades(unit, roles)
+            .or_else(|| venue_trades(unit, roles))
             .or_else(|| batch_trades(unit, roles))
             .or_else(|| one_source(unit, roles))
             .or_else(|| exact_transfers(unit, roles))
@@ -398,11 +440,13 @@ fn venue_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
     let mut wallets: HashMap<String, (i64, &str, i64)> = HashMap::new();
     for p in &unit.parties {
         let (cred, stake) = address_parts(&p.address)?;
-        match roles.role_of(&cred) {
+        match roles.role_at(&cred, stake.as_deref()) {
             Some(Role::Order) => {
                 orders.entry(p.address.as_str()).or_insert((cred, 0)).1 += p.amount
             }
             Some(Role::Pool | Role::Curve) => *venues.entry(cred).or_default() += p.amount,
+            // An order book's movements are `book_trades`' to read.
+            Some(Role::Book | Role::Escrow) => return None,
             None => {
                 let id = stake.unwrap_or_else(|| p.address.clone());
                 let w = wallets.entry(id).or_insert((0, p.address.as_str(), 0));
@@ -525,6 +569,9 @@ struct Side<'a> {
     role: Option<Role>,
     cred: String,
     stake: Option<String>,
+    /// What names its venue: the credential, or the stake for a venue
+    /// registered by stake ([`Roles::register_stake`]).
+    venue: String,
     /// The address it moved the most through, to stand for it.
     address: &'a str,
     most: i64,
@@ -665,6 +712,179 @@ fn one_source(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
     Some(events)
 }
 
+/// A movement through an order book traded in place ([`Role::Book`]) or its
+/// escrows ([`Role::Escrow`]). Every event is one party's own leg, stated by
+/// the chain; who traded against whom inside the transaction is not claimed.
+///
+/// MEASURED on $NikePig, by decoding the transactions behind each shape:
+///
+/// - **orders only** (Axo, `"Axo: Trade"`): two strategies swap ADA and the
+///   token in place. A fill for each owner, sold by the one that lost units
+///   and bought by the one that gained them;
+/// - **orders paying wallets** (SaturnSwap): a taker spending sell orders.
+///   A buy by each wallet and a sell by each order's owner. Where every
+///   wallet is the owner of an order paying it, the owner collecting (an Axo
+///   order closing, a SaturnSwap cancel): movements, not trades. An order
+///   with no owner on its address paying out (DexHunter's DCA delivering) is
+///   a movement too;
+/// - **wallets paying orders**: a placement each, named by the order's
+///   owner, else by the wallet;
+/// - **wallets paying escrows** (SaturnSwap): a taker's sell into buy orders.
+///   A sell by each wallet; the makers are not on the escrow's address;
+/// - **escrows paying orders**: proceeds relisted, a placement by the order's
+///   owner;
+/// - **an order routing into another venue** (DexHunter's DCA paying Sundae,
+///   Minswap and VyFi orders): a placement at that venue, named as it names
+///   its owner, and a sell for what went straight into a pool;
+/// - anything else, where one side is a single party: a movement per leg.
+fn book_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
+    if unit.net_mint != 0 {
+        return None;
+    }
+    let sides = group(unit, roles);
+    if !sides
+        .iter()
+        .any(|s| matches!(s.role, Some(Role::Book | Role::Escrow)))
+    {
+        return None;
+    }
+    let by_size = |a: &&Side, b: &&Side| {
+        b.net
+            .unsigned_abs()
+            .cmp(&a.net.unsigned_abs())
+            .then(a.address.cmp(b.address))
+    };
+    let mut losers: Vec<&Side> = sides.iter().filter(|s| s.net < 0).collect();
+    let mut gainers: Vec<&Side> = sides.iter().filter(|s| s.net > 0).collect();
+    losers.sort_by(by_size);
+    gainers.sort_by(by_size);
+    if losers.is_empty() || gainers.is_empty() {
+        return None;
+    }
+    let is = |want: fn(Option<Role>) -> bool| move |s: &&Side| want(s.role);
+    let book = is(|r| r == Some(Role::Book));
+    let escrow = is(|r| r == Some(Role::Escrow));
+    let wallet = is(|r| r.is_none());
+    let elsewhere = is(|r| matches!(r, Some(Role::Order | Role::Pool | Role::Curve)));
+    // An order's owner: its stake, unless that stake is a venue's own.
+    let owner = |s: &Side| s.stake.clone().filter(|k| !roles.is_venue_stake(k));
+    let party_of = |s: &Side| owner(s).map_or(Party::NotEncodedByVenue, Party::Stake);
+    let fill = |s: &Side, party: Party, sold: bool| Event::Fill {
+        venue_cred: s.venue.clone(),
+        party,
+        amount: s.net.abs(),
+        into_pool: sold,
+    };
+    let placement = |at: &Side, party: Party| Event::Placement {
+        venue_cred: at.venue.clone(),
+        party,
+        amount: at.net,
+    };
+    let moved = |from: &Side, to: &Side, amount: i64| Event::Moved {
+        from: from.address.to_string(),
+        to: to.address.to_string(),
+        amount,
+    };
+    let moves = || match (losers.as_slice(), gainers.as_slice()) {
+        ([from], to) => Some(to.iter().map(|t| moved(from, t, t.net)).collect()),
+        (from, [to]) => Some(from.iter().map(|f| moved(f, to, -f.net)).collect()),
+        _ => None,
+    };
+    let all = |v: &[&Side], f: &dyn Fn(&&Side) -> bool| v.iter().all(f);
+
+    // Orders trading against each other in place.
+    if all(&losers, &book) && all(&gainers, &book) {
+        let mut owners: Vec<Option<String>> =
+            losers.iter().chain(&gainers).map(|s| owner(s)).collect();
+        owners.sort();
+        owners.dedup();
+        if owners.len() == 1 {
+            // One owner moving between their own orders: nobody traded.
+            return moves();
+        }
+        let sells = losers.iter().map(|s| fill(s, party_of(s), true));
+        let buys = gainers.iter().map(|s| fill(s, party_of(s), false));
+        return Some(sells.chain(buys).collect());
+    }
+    // Orders paying wallets.
+    if all(&losers, &book) && all(&gainers, &wallet) {
+        let owns = |w: &Side| {
+            losers
+                .iter()
+                .any(|b| owner(b).is_some() && owner(b) == w.stake)
+        };
+        if gainers.iter().all(|w| owns(w)) || losers.iter().any(|b| owner(b).is_none()) {
+            return moves();
+        }
+        if gainers.iter().any(|w| owns(w)) {
+            return None;
+        }
+        let at = losers[0].venue.clone();
+        let buys = gainers.iter().map(|w| Event::Fill {
+            venue_cred: at.clone(),
+            party: Party::Wallet(w.address.to_string()),
+            amount: w.net,
+            into_pool: false,
+        });
+        let sells = losers.iter().map(|b| fill(b, party_of(b), true));
+        return Some(buys.chain(sells).collect());
+    }
+    // Wallets funding orders.
+    if all(&losers, &wallet) && all(&gainers, &book) {
+        let funder = match losers.as_slice() {
+            [one] => Party::Wallet(one.address.to_string()),
+            _ => Party::NotEncodedByVenue,
+        };
+        return Some(
+            gainers
+                .iter()
+                .map(|b| {
+                    let party = owner(b).map_or_else(|| funder.clone(), Party::Stake);
+                    placement(b, party)
+                })
+                .collect(),
+        );
+    }
+    // Wallets paying escrows: a taker's sell each.
+    if all(&losers, &wallet) && all(&gainers, &escrow) {
+        let at = gainers[0].venue.clone();
+        return Some(
+            losers
+                .iter()
+                .map(|w| Event::Fill {
+                    venue_cred: at.clone(),
+                    party: Party::Wallet(w.address.to_string()),
+                    amount: -w.net,
+                    into_pool: true,
+                })
+                .collect(),
+        );
+    }
+    // Escrows relisting proceeds into orders.
+    if all(&losers, &escrow) && all(&gainers, &book) {
+        return Some(gainers.iter().map(|b| placement(b, party_of(b))).collect());
+    }
+    // An order routing into other venues' orders and pools.
+    if all(&losers, &book) && all(&gainers, &elsewhere) {
+        let source = match losers.as_slice() {
+            [one] => party_of(one),
+            _ => Party::NotEncodedByVenue,
+        };
+        return Some(
+            gainers
+                .iter()
+                .map(|g| match g.role {
+                    Some(Role::Order) => {
+                        placement(g, order_party(roles, &g.cred, &g.stake))
+                    }
+                    _ => fill(g, source.clone(), true),
+                })
+                .collect(),
+        );
+    }
+    moves()
+}
+
 /// No venue among the parties, and ONE sender or ONE receiver once addresses
 /// are grouped into wallets: a [`Event::Moved`] per leg, every amount stated
 /// by the chain.
@@ -730,9 +950,15 @@ fn group<'a>(unit: &'a UnitMove, roles: &Roles) -> Vec<Side<'a>> {
     let mut sides: HashMap<String, Side> = HashMap::new();
     for p in &unit.parties {
         let (cred, stake) = address_parts(&p.address).unwrap_or_default();
-        let role = roles.role_of(&cred);
+        let role = roles.role_at(&cred, stake.as_deref());
+        // Named by its own credential, or by the stake it was recognised by.
+        let venue = match (roles.role_of(&cred), &stake) {
+            (None, Some(s)) if role.is_some() => s.clone(),
+            _ => cred.clone(),
+        };
         let id = match role {
-            Some(Role::Order) => p.address.clone(),
+            // Each order, book and escrow output is its own party.
+            Some(Role::Order | Role::Book | Role::Escrow) => p.address.clone(),
             Some(_) => cred.clone(),
             None => stake.clone().unwrap_or_else(|| p.address.clone()),
         };
@@ -741,6 +967,7 @@ fn group<'a>(unit: &'a UnitMove, roles: &Roles) -> Vec<Side<'a>> {
             role,
             cred,
             stake,
+            venue,
             address: &p.address,
             most: 0,
         });

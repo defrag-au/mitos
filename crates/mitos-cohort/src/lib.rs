@@ -119,6 +119,19 @@ pub fn payment_cred(address: &str) -> Option<[u8; 28]> {
     }
 }
 
+/// The 28-byte stake credential of a Shelley address, if it carries one
+/// directly (a pointer or an enterprise address has none).
+pub fn stake_cred(address: &str) -> Option<[u8; 28]> {
+    match Address::from_bech32(address).ok()? {
+        Address::Shelley(sh) => match sh.delegation() {
+            pallas_addresses::ShelleyDelegationPart::Key(h)
+            | pallas_addresses::ShelleyDelegationPart::Script(h) => Some(**h),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether the address's PAYMENT part is a script.
 ///
 /// Read through pallas rather than by bech32 prefix: `addr1z` covers two

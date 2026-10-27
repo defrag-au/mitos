@@ -2393,6 +2393,8 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
         let role = match site.role {
             SiteRole::Pool => Role::Pool,
             SiteRole::Order => Role::Order,
+            SiteRole::Book => Role::Book,
+            SiteRole::Escrow => Role::Escrow,
         };
         let cred = match site.key {
             SiteKey::Cred(c) => Some(hex(&c)),
@@ -2400,6 +2402,12 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
             // matches on the payment part, and deriving it here is what every
             // other consumer must do too.
             SiteKey::Address(a) => policy_archive::trade::address_parts(a).map(|(c, _)| c),
+            // A stake-keyed site (SaturnSwap's escrows) registers by stake,
+            // which also marks that stake as the venue's own, not a customer's.
+            SiteKey::Stake(s) => {
+                r.register_stake(hex(&s), role, site.venue);
+                continue;
+            }
         };
         let Some(cred) = cred else {
             continue;
