@@ -3012,6 +3012,7 @@ pub async fn story(
             &policy,
             &roles,
             &mut crate::shared_fills::IndexChain::new(&index),
+            crate::shared_fills::MAX_FILLS,
         );
         if n.named + n.unnamed > 0 {
             tracing::info!(

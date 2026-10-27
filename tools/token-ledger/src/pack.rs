@@ -55,6 +55,15 @@ pub struct PackArgs {
     pub handles_dir: Option<PathBuf>,
     #[arg(long, default_value = crate::names::HANDLE_POLICY)]
     pub handle_policy: String,
+    /// A tx-index over the chain, for naming the trader behind a fill on a
+    /// SHARED order address from the placement it spent. Without one those
+    /// fills stay anonymous.
+    #[arg(long, requires = "data_dir")]
+    pub tx_index_dir: Option<PathBuf>,
+    /// The node database the tx-index reads bodies from (its `immutable/` is
+    /// what is opened), as for `serve`.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 }
 
 /// The largest holders listed in `active.bin` and `opening.bin` whether or
@@ -202,8 +211,31 @@ pub fn pack(args: PackArgs) -> Result<()> {
     let rows = movements.len();
     // Numbered from the rows, before any interpretation of them.
     let mut parties = Parties::number(&movements);
-    let story = policy_archive::story::build(&fold_rows(movements.clone()), &observations, &roles);
+    let mut story =
+        policy_archive::story::build(&fold_rows(movements.clone()), &observations, &roles);
     let read = started.elapsed();
+    // A fill on a shared order address names nobody in its own movement; the
+    // chain says who placed the order it spent. Every fill, not the story
+    // route's capped page: a pack is built once, not while someone waits.
+    if let (Some(index_dir), Some(data_dir)) = (&args.tx_index_dir, &args.data_dir) {
+        let index = tx_index::IndexHandle::open(index_dir, &data_dir.join("immutable"))
+            .with_context(|| format!("opening the tx-index at {}", index_dir.display()))?;
+        let index = index.get();
+        let at = std::time::Instant::now();
+        let n = crate::shared_fills::name_shared_fills(
+            &mut story.events,
+            &policy,
+            &roles,
+            &mut crate::shared_fills::IndexChain::new(&index),
+            usize::MAX,
+        );
+        println!(
+            "shared-order fills: {} named from the chain, {} not, in {:.1}s",
+            n.named,
+            n.unnamed,
+            at.elapsed().as_secs_f64()
+        );
+    }
 
     // The unit the history is of: the one most events are about. A policy
     // of many units is a collection, and not this format's job yet.

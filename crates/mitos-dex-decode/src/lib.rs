@@ -22,6 +22,7 @@ pub mod sundae;
 /// The canonical venue vocabulary — one spelling per venue, as symbols, so a
 /// second consumer cannot invent its own and fail to join.
 pub mod venue;
+pub mod vyfi;
 pub mod wingriders;
 
 use pallas_primitives::{BigInt, PlutusData};

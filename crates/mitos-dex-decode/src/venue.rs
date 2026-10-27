@@ -47,6 +47,8 @@ pub const SUNDAE_V1: &str = "sundae-v1";
 pub const SUNDAE_V3: &str = "sundae-v3";
 pub const WINGRIDERS_V1: &str = "wingriders-v1";
 pub const WINGRIDERS_V2: &str = "wingriders-v2";
+/// VyFi. Recognised by credential; its pool reserves are not decoded yet.
+pub const VYFI: &str = "vyfi";
 /// snek.fun's bonding curve. ⚠️ Not a constant-product pool — its reserves are
 /// real and its rate is NOT `quote / base`.
 pub const SNEK_FUN: &str = "snek.fun";
@@ -66,7 +68,7 @@ pub const SNEK_FUN: &str = "snek.fun";
 pub const LUMPFUN_V5: &str = "lumpfun-v5";
 
 /// Every venue this workspace can name.
-pub const ALL: [&str; 10] = [
+pub const ALL: [&str; 11] = [
     SPLASH,
     CSWAP,
     MINSWAP_V1,
@@ -75,6 +77,7 @@ pub const ALL: [&str; 10] = [
     SUNDAE_V3,
     WINGRIDERS_V1,
     WINGRIDERS_V2,
+    VYFI,
     SNEK_FUN,
     LUMPFUN_V5,
 ];
@@ -138,7 +141,7 @@ pub struct Site {
 ///
 /// A venue added here reaches both halves. A venue added to only one of them
 /// is the bug above.
-pub const SITES: [Site; 17] = [
+pub const SITES: [Site; 19] = [
     Site {
         key: SiteKey::Cred(crate::splash::POOL_CRED_A),
         venue: SPLASH,
@@ -247,6 +250,18 @@ pub const SITES: [Site; 17] = [
         venue: WINGRIDERS_V2,
         role: SiteRole::Order,
         shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::vyfi::POOL_CRED),
+        venue: VYFI,
+        role: SiteRole::Pool,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::vyfi::ORDER_CRED),
+        venue: VYFI,
+        role: SiteRole::Order,
+        shared: true,
     },
 ];
 

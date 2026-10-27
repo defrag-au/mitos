@@ -552,7 +552,7 @@ fn batch_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
     if unit.net_mint != 0 {
         return None;
     }
-    let sides = group(unit, roles)?;
+    let sides = group(unit, roles);
     let mut pools = sides
         .iter()
         .filter(|s| matches!(s.role, Some(Role::Pool | Role::Curve)));
@@ -605,7 +605,7 @@ fn one_source(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
     if unit.net_mint != 0 {
         return None;
     }
-    let sides = group(unit, roles)?;
+    let sides = group(unit, roles);
     let losers: Vec<&Side> = sides.iter().filter(|s| s.net < 0).collect();
     let [source] = losers.as_slice() else {
         return None;
@@ -687,7 +687,7 @@ fn exact_transfers(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
     {
         return None;
     }
-    let sides = group(unit, roles)?;
+    let sides = group(unit, roles);
     if sides.iter().any(|s| s.role.is_some()) {
         return None;
     }
@@ -707,6 +707,10 @@ fn exact_transfers(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
         amount,
     };
     match (losers.as_slice(), gainers.as_slice()) {
+        // Every wallet nets to nothing: one wallet moving its own between
+        // its addresses. Nothing changed hands, so there is nothing to say.
+        // MEASURED on $NikePig: 406 of these were reported as ambiguous.
+        ([], []) => Some(Vec::new()),
         ([from], to) if !to.is_empty() => Some(to.iter().map(|t| moved(from, t, t.net)).collect()),
         (from, [to]) if !from.is_empty() => {
             Some(from.iter().map(|f| moved(f, to, -f.net)).collect())
@@ -716,12 +720,16 @@ fn exact_transfers(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
 }
 
 /// Every party to a movement: pools and curves by credential, orders by
-/// address (each is its own order), wallets by stake. `None` when an address
-/// does not decode.
-fn group<'a>(unit: &'a UnitMove, roles: &Roles) -> Option<Vec<Side<'a>>> {
+/// address (each is its own order), wallets by stake.
+///
+/// An address that does not decode (a Byron one) is a wallet of its own, by
+/// its literal address: it cannot be a venue, and failing the whole movement
+/// over it left distributions from Byron wallets unread (MEASURED on
+/// $NikePig, about 40).
+fn group<'a>(unit: &'a UnitMove, roles: &Roles) -> Vec<Side<'a>> {
     let mut sides: HashMap<String, Side> = HashMap::new();
     for p in &unit.parties {
-        let (cred, stake) = address_parts(&p.address)?;
+        let (cred, stake) = address_parts(&p.address).unwrap_or_default();
         let role = roles.role_of(&cred);
         let id = match role {
             Some(Role::Order) => p.address.clone(),
@@ -744,7 +752,7 @@ fn group<'a>(unit: &'a UnitMove, roles: &Roles) -> Option<Vec<Side<'a>>> {
     // In a stable order, so nothing downstream depends on hashing.
     let mut sides: Vec<Side> = sides.into_values().collect();
     sides.sort_by(|a, b| a.address.cmp(b.address));
-    Some(sides)
+    sides
 }
 
 /// Fold a feed page: every event each `(transaction, unit)` holds, usually
@@ -1087,6 +1095,17 @@ mod tests {
         assert_eq!(
             classify_moves(&mv(&[(&a, -100), (&b, -400), (&c, 500)]), &roles()),
             vec![moved(&b, &c, 400), moved(&a, &c, 100)]
+        );
+        // A Byron sender distributes like any other wallet.
+        const BYRON: &str = "DdzFFzCqrhsrcTVhLygT24QwTnNqQqQ8mZrq5jykUzMveU26sxaH529kMpo7VhPrt5pwW3dXeB2k3EEvKcNBRmzCfcQ7dTkyGzTs658C";
+        assert_eq!(
+            classify_moves(&mv(&[(BYRON, -300), (&b, 200), (&c, 100)]), &roles()),
+            vec![moved(BYRON, &b, 200), moved(BYRON, &c, 100)]
+        );
+        // One wallet moving its own between its addresses: nothing to say.
+        assert_eq!(
+            classify_moves(&mv(&[(&c, -300), (&c2, 200), (&c, 100)]), &roles()),
+            vec![]
         );
         // A plain one-to-one keeps the feed's own reading.
         assert_eq!(

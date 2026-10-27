@@ -26,7 +26,7 @@
 //! is left as it was, for the reader's own pairing; those are recent, so
 //! their placements are almost always on the same page anyway.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use policy_archive::story::{Kind, StoryEvent, Trader};
 use policy_archive::trade::{Role, Roles, address_parts};
@@ -109,18 +109,24 @@ pub struct Named {
 
 /// Name every anonymous sell in `events` that the chain can: its `party`
 /// becomes the wallet that placed the order it filled. Events of other units
-/// of `policy_hex`, and of anything else, are left alone.
+/// of `policy_hex`, and of anything else, are left alone. At most `limit`
+/// fills are followed; the rest count as unnamed.
 pub fn name_shared_fills(
     events: &mut [StoryEvent],
     policy_hex: &str,
     roles: &Roles,
     chain: &mut impl Chain,
+    limit: usize,
 ) -> Named {
     let mut out = Named::default();
+    // Order outputs already credited to a fill: in a batch, each order is
+    // one fill's and no other's.
+    let mut used: HashSet<OutRef> = HashSet::new();
     for e in events.iter_mut() {
         let Kind::Fill {
             party,
             into_pool: true,
+            amount,
             ..
         } = &mut e.kind
         else {
@@ -129,7 +135,7 @@ pub fn name_shared_fills(
         if *party != Trader::NotEncodedByVenue {
             continue;
         }
-        if out.named + out.unnamed >= MAX_FILLS {
+        if out.named + out.unnamed >= limit {
             out.unnamed += 1;
             continue;
         }
@@ -138,7 +144,13 @@ pub fn name_shared_fills(
             continue;
         };
         let unit = hex::encode(&e.unit);
-        match seller(&tx, policy_hex, &unit, roles, chain) {
+        let fill = Fill {
+            tx: &tx,
+            policy_hex,
+            unit_hex: &unit,
+            amount: amount.unsigned_abs(),
+        };
+        match seller(&fill, roles, chain, &mut used) {
             Some(wallet) => {
                 *party = Trader::Wallet(wallet);
                 out.named += 1;
@@ -149,10 +161,26 @@ pub fn name_shared_fills(
     out
 }
 
-fn holds(o: &ResolvedOutput, policy_hex: &str, unit_hex: &str) -> bool {
+/// How much of the unit an output holds.
+fn held(o: &ResolvedOutput, policy_hex: &str, unit_hex: &str) -> u64 {
     o.assets
         .iter()
-        .any(|a| a.quantity > 0 && a.policy == policy_hex && a.name == unit_hex)
+        .filter(|a| a.policy == policy_hex && a.name == unit_hex)
+        .map(|a| a.quantity)
+        .sum()
+}
+
+fn holds(o: &ResolvedOutput, policy_hex: &str, unit_hex: &str) -> bool {
+    held(o, policy_hex, unit_hex) > 0
+}
+
+/// One anonymous fill to follow back.
+struct Fill<'a> {
+    tx: &'a [u8; 32],
+    policy_hex: &'a str,
+    unit_hex: &'a str,
+    /// What the fill moved, to tell several orders in one batch apart.
+    amount: u64,
 }
 
 fn role(address: &str, roles: &Roles) -> Option<Role> {
@@ -160,19 +188,46 @@ fn role(address: &str, roles: &Roles) -> Option<Role> {
 }
 
 /// The wallet that placed the order `fill` spent, if the chain says.
+///
+/// The order is the fill transaction's one unused order-contract input
+/// holding the unit. Where a batch spent several, the one holding exactly the
+/// fill's amount; two of the same size, or none, is not guessed between.
 fn seller(
-    fill: &[u8; 32],
-    policy_hex: &str,
-    unit_hex: &str,
+    fill: &Fill,
     roles: &Roles,
     chain: &mut impl Chain,
+    used: &mut HashSet<OutRef>,
 ) -> Option<String> {
-    // The order this fill spent: an order contract's output holding the unit.
-    let placement = chain.inputs(fill)?.into_iter().find_map(|(tx, ix)| {
-        let o = chain.output(&tx, ix)?;
-        (role(&o.address, roles) == Some(Role::Order) && holds(&o, policy_hex, unit_hex))
-            .then_some(tx)
-    })?;
+    let Fill {
+        tx,
+        policy_hex,
+        unit_hex,
+        amount,
+    } = *fill;
+    let mut orders: Vec<(OutRef, u64)> = Vec::new();
+    for input in chain.inputs(tx)? {
+        if used.contains(&input) {
+            continue;
+        }
+        let Some(o) = chain.output(&input.0, input.1) else {
+            continue;
+        };
+        if role(&o.address, roles) == Some(Role::Order) && holds(&o, policy_hex, unit_hex) {
+            orders.push((input, held(&o, policy_hex, unit_hex)));
+        }
+    }
+    let order = match orders.as_slice() {
+        [(only, _)] => *only,
+        _ => {
+            let mut exact = orders.iter().filter(|(_, q)| *q == amount);
+            match (exact.next(), exact.next()) {
+                (Some((one, _)), None) => *one,
+                _ => return None,
+            }
+        }
+    };
+    used.insert(order);
+    let placement = order.0;
     // Who funded it: the inputs that held the unit, outside any venue.
     let mut wallets: Vec<String> = Vec::new();
     for (tx, ix) in chain.inputs(&placement)? {
@@ -306,7 +361,7 @@ mod tests {
     fn a_fill_is_named_from_the_order_it_spent() {
         let mut events = vec![fill(Trader::NotEncodedByVenue)];
         let mut c = chain(vec![out(SELLER, 500), out(OTHER, 0)]);
-        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c);
+        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c, MAX_FILLS);
         assert_eq!(
             n,
             Named {
@@ -317,12 +372,56 @@ mod tests {
         assert_eq!(party(&events[0]), &Trader::Wallet(SELLER.to_string()));
     }
 
+    /// A batch spending two orders: each fill is named from the order holding
+    /// its own amount, and neither order is credited twice. Two orders of the
+    /// same size are not guessed between.
+    #[test]
+    fn a_batch_names_each_fill_from_its_own_order() {
+        const FUNDING_B: [u8; 32] = [5; 32];
+        const PLACEMENT_B: [u8; 32] = [6; 32];
+        let mut c = chain(vec![out(SELLER, 500)]);
+        c.0.insert(FUNDING_B, (vec![], vec![out(OTHER, 200)]));
+        c.0.insert(
+            PLACEMENT_B,
+            (vec![(FUNDING_B, 0)], vec![out(CSWAP_ORDER, 200)]),
+        );
+        c.0.insert(
+            FILL,
+            (
+                vec![(POOL_TX, 0), (PLACEMENT, 0), (PLACEMENT_B, 0)],
+                vec![out(CSWAP_POOL, 90_700)],
+            ),
+        );
+        let sized = |amount| {
+            let mut e = fill(Trader::NotEncodedByVenue);
+            if let Kind::Fill { amount: a, .. } = &mut e.kind {
+                *a = amount;
+            }
+            e
+        };
+        let mut events = vec![sized(200), sized(500)];
+        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c, MAX_FILLS);
+        assert_eq!(n.named, 2);
+        assert_eq!(party(&events[0]), &Trader::Wallet(OTHER.to_string()));
+        assert_eq!(party(&events[1]), &Trader::Wallet(SELLER.to_string()));
+
+        // The same two orders at the same size: neither is named.
+        c.0.insert(FUNDING_B, (vec![], vec![out(OTHER, 500)]));
+        c.0.insert(
+            PLACEMENT_B,
+            (vec![(FUNDING_B, 0)], vec![out(CSWAP_ORDER, 500)]),
+        );
+        let mut events = vec![sized(500), sized(500)];
+        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c, MAX_FILLS);
+        assert_eq!(n.named, 0);
+    }
+
     /// Two different wallets' tokens in one placement: not guessed between.
     #[test]
     fn two_funding_wallets_are_not_guessed_between() {
         let mut events = vec![fill(Trader::NotEncodedByVenue)];
         let mut c = chain(vec![out(SELLER, 300), out(OTHER, 200)]);
-        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c);
+        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c, MAX_FILLS);
         assert_eq!(
             n,
             Named {
@@ -338,7 +437,7 @@ mod tests {
     fn a_fill_the_index_cannot_see_is_left_alone() {
         let mut events = vec![fill(Trader::NotEncodedByVenue)];
         let mut c = Fake::default();
-        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c);
+        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c, MAX_FILLS);
         assert_eq!(
             n,
             Named {
@@ -356,7 +455,7 @@ mod tests {
         let named = Trader::Stake("stake1u…".to_string());
         let mut events = vec![fill(named.clone())];
         let mut c = Fake::default();
-        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c);
+        let n = name_shared_fills(&mut events, POLICY, &roles(), &mut c, MAX_FILLS);
         assert_eq!(n, Named::default());
         assert_eq!(party(&events[0]), &named);
     }
