@@ -138,7 +138,7 @@ pub struct Site {
 ///
 /// A venue added here reaches both halves. A venue added to only one of them
 /// is the bug above.
-pub const SITES: [Site; 16] = [
+pub const SITES: [Site; 17] = [
     Site {
         key: SiteKey::Cred(crate::splash::POOL_CRED_A),
         venue: SPLASH,
@@ -234,11 +234,19 @@ pub const SITES: [Site; 16] = [
         role: SiteRole::Pool,
         shared: false,
     },
+    // Customer-keyed, with a stake-less enterprise form beside it: the trade
+    // fold reads that form as shared per address (`Roles::keying_at`).
     Site {
         key: SiteKey::Cred(crate::wingriders::V1_REQUEST_CRED),
         venue: WINGRIDERS_V1,
         role: SiteRole::Order,
-        shared: true,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::wingriders::V2_REQUEST_CRED),
+        venue: WINGRIDERS_V2,
+        role: SiteRole::Order,
+        shared: false,
     },
 ];
 

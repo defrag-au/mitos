@@ -105,6 +105,23 @@ impl Roles {
             .unwrap_or(OrderKeying::CustomerStake)
     }
 
+    /// How ONE order address keys its customer: the credential's keying,
+    /// except that an address with no stake part names nobody by stake
+    /// whatever the contract usually does, so it reads as
+    /// [`OrderKeying::Shared`].
+    ///
+    /// MEASURED on $NikePig: WingRiders V1 and V2 orders sit both at an
+    /// enterprise address shared by every trader and at addresses carrying the
+    /// customer's stake. Keying by credential alone either drops the customer
+    /// from the staked form (declared shared) or the placing wallet from the
+    /// enterprise form (declared customer-keyed). Per address, neither is lost.
+    pub fn keying_at(&self, cred_hex: &str, stake: Option<&str>) -> OrderKeying {
+        match stake {
+            None => OrderKeying::Shared,
+            Some(_) => self.keying_of(cred_hex),
+        }
+    }
+
     /// The venue's name, or `None` when nothing has registered this
     /// credential.
     ///
@@ -278,17 +295,10 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
     let (from, to) = (losers[0], gainers[0]);
     let (from_role, to_role) = (role_at(&from.address), role_at(&to.address));
 
-    // The trader, from the order address's stake — unless the venue shares one
-    // address for every order, in which case nobody can say from this tx.
-    let party_from_order = |cred: &str, stake: &Option<String>| match roles.keying_of(cred) {
-        OrderKeying::Shared => Party::NotEncodedByVenue,
-        OrderKeying::CustomerStake => stake.clone().map_or(Party::Ambiguous, Party::Stake),
-    };
-
     match (from_role, to_role) {
         // order → pool: the swap.
         (Some((Role::Order, cred, stake)), Some((Role::Pool | Role::Curve, _, _))) => Event::Fill {
-            party: party_from_order(&cred, &stake),
+            party: order_party(roles, &cred, &stake),
             venue_cred: cred,
             amount: -from.amount,
             into_pool: true,
@@ -306,9 +316,9 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
         // sells reached the arena as "someone" while this said nobody could
         // tell). A customer-keyed address still names them by its stake.
         (None, Some((Role::Order, cred, stake))) => Event::Placement {
-            party: match roles.keying_of(&cred) {
+            party: match roles.keying_at(&cred, stake.as_deref()) {
                 OrderKeying::Shared => Party::Wallet(from.address.clone()),
-                OrderKeying::CustomerStake => party_from_order(&cred, &stake),
+                OrderKeying::CustomerStake => order_party(roles, &cred, &stake),
             },
             venue_cred: cred,
             amount: to.amount,
@@ -523,9 +533,9 @@ struct Side<'a> {
 /// The order's trader, as the order address names them: its stake, unless the
 /// venue shares one address for every order.
 fn order_party(roles: &Roles, cred: &str, stake: &Option<String>) -> Party {
-    match roles.keying_of(cred) {
-        OrderKeying::Shared => Party::NotEncodedByVenue,
-        OrderKeying::CustomerStake => stake.clone().map_or(Party::Ambiguous, Party::Stake),
+    match (roles.keying_at(cred, stake.as_deref()), stake) {
+        (OrderKeying::CustomerStake, Some(stake)) => Party::Stake(stake.clone()),
+        _ => Party::NotEncodedByVenue,
     }
 }
 
@@ -622,7 +632,7 @@ fn one_source(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
             // `classify_move` names it; into a pool, a sell.
             (None, Some(Role::Order)) => Event::Placement {
                 venue_cred: (*cred).clone(),
-                party: match roles.keying_of(cred) {
+                party: match roles.keying_at(cred, stake.as_deref()) {
                     OrderKeying::Shared => Party::Wallet(source.to_string()),
                     OrderKeying::CustomerStake => order_party(roles, cred, stake),
                 },
@@ -1012,6 +1022,43 @@ mod tests {
                     amount: 14_141,
                 },
             ]
+        );
+    }
+
+    /// A customer-keyed order contract with a stake-less enterprise form too
+    /// (WingRiders, both versions): the staked form names its customer, and
+    /// the enterprise form reads as shared, naming the placing wallet and
+    /// leaving the fill to the placement. Real addresses from $NikePig.
+    #[test]
+    fn a_stake_less_order_address_reads_as_shared() {
+        const ENTERPRISE: &str = "addr1wxr2a8htmzuhj39y2gq7ftkpxv98y2g67tg8zezthgq4jkg0a4ul4";
+        const STAKED: &str = "addr1zxr2a8htmzuhj39y2gq7ftkpxv98y2g67tg8zezthgq4jkw7snnjm8fjxg2nt3lhnqj8veegcyqq5tc9pdtuvw4n7r2qxnt66c";
+        const POOL: &str = "addr1z8nvjzjeydcn4atcd93aac8allvrpjn7pjr2qsweukpnaydrn6a23ngn97d9j7cwmx0rq5mxggqvsggsnastu77f5y2sn8zx04";
+        let mut r = Roles::default();
+        r.roles
+            .insert(address_parts(ENTERPRISE).unwrap().0, Role::Order);
+        r.roles.insert(address_parts(POOL).unwrap().0, Role::Pool);
+        let w = wallet(50, 50);
+        let party = |e: Event| match e {
+            Event::Fill { party, .. } | Event::Placement { party, .. } => party,
+            other => panic!("expected a fill or a placement, got {other:?}"),
+        };
+        assert_eq!(
+            party(classify_move(&mv(&[(&w, -10), (ENTERPRISE, 10)]), &r)),
+            Party::Wallet(w.clone())
+        );
+        assert_eq!(
+            party(classify_move(&mv(&[(ENTERPRISE, -10), (POOL, 10)]), &r)),
+            Party::NotEncodedByVenue
+        );
+        let customer = address_parts(STAKED).unwrap().1.unwrap();
+        assert_eq!(
+            party(classify_move(&mv(&[(STAKED, -10), (POOL, 10)]), &r)),
+            Party::Stake(customer.clone())
+        );
+        assert_eq!(
+            party(classify_move(&mv(&[(&w, -10), (STAKED, 10)]), &r)),
+            Party::Stake(customer)
         );
     }
 

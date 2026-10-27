@@ -74,13 +74,27 @@ pub fn is_wingriders_v1(payment_cred: &[u8; 28]) -> bool {
 /// WingRiders **V1**'s request (order) contract: the hash every V1 pool datum
 /// names in its first field.
 ///
-/// MEASURED on $NikePig: one enterprise address with no stake part,
-/// `addr1wxr2a8htmzuhj39y2gq7ftkpxv98y2g67tg8zezthgq4jkg0a4ul4`, holding
-/// 1,256 outputs read as an unclaimed script. One address for every trader, so
-/// a request spent from it cannot name who placed it.
+/// ⚠️ **Two address forms, keyed differently.** MEASURED on $NikePig: the
+/// enterprise `addr1wxr2a8htmzuhj39y2gq7ftkpxv98y2g67tg8zezthgq4jkg0a4ul4`,
+/// shared by every trader (1,256 outputs read as an unclaimed script), AND
+/// `addr1zxr2a8ht…` addresses carrying the customer's stake. Registered as
+/// customer-keyed; the trade fold reads the stake-less form as shared per
+/// address.
 pub const V1_REQUEST_CRED: [u8; 28] = [
     0x86, 0xae, 0x9e, 0xeb, 0xd8, 0xb9, 0x79, 0x44, 0xa4, 0x52, 0x01, 0xe4, 0xae, 0xc1, 0x33, 0x0a,
     0x72, 0x29, 0x1a, 0xf2, 0xd0, 0x71, 0x64, 0x4b, 0xba, 0x01, 0x59, 0x59,
+];
+
+/// WingRiders **V2**'s request (order) contract: the hash every V2 pool datum
+/// names in its first field.
+///
+/// The same two forms as [`V1_REQUEST_CRED`]. MEASURED on $NikePig: 358
+/// transactions, through the enterprise
+/// `addr1w8qnfkpe5e99m7umz4vxnmelxs5qw5dxytmfjk964rla98q605wte` and through
+/// `addr1z8qnfkpe…` addresses carrying the customer's stake.
+pub const V2_REQUEST_CRED: [u8; 28] = [
+    0xc1, 0x34, 0xd8, 0x39, 0xa6, 0x4a, 0x5d, 0xfb, 0x9b, 0x15, 0x58, 0x69, 0xef, 0x3f, 0x34, 0x28,
+    0x07, 0x51, 0xa6, 0x22, 0xf6, 0x99, 0x58, 0xba, 0xa8, 0xff, 0xd2, 0x9c,
 ];
 
 /// WingRiders **V1**'s LP policy. Like V2 it mints both the pool NFT and the LP
@@ -312,6 +326,16 @@ mod tests {
     /// 2026-08-30. The UTxO held 42,924,008,929 lovelace and
     /// 1,982,469,155,671 WRT, plus its `L` pool NFT and the unissued LP.
     const V1_ADA_WRT: &str = "d8799f581c86ae9eebd8b97944a45201e4aec1330a72291af2d071644bba015959d8799fd8799fd8799f4040ffd8799f581cc0ee29a85b13209423b10447d3c2e6a50641a15c57770e27cb9d50734a57696e67526964657273ffff1b000001a0465ecc881a00316e071a0a1cce9effff";
+
+    /// Each request credential is the one its version's pool datums name in
+    /// their first field: the structural evidence it is WingRiders' order
+    /// contract, rather than an address seen beside a pool.
+    #[test]
+    fn the_request_credentials_are_the_ones_pool_datums_name() {
+        let first = |datum: &str| hex::decode(&datum[10..66]).unwrap();
+        assert_eq!(first(V1_ADA_WRT), V1_REQUEST_CRED);
+        assert_eq!(first(NIGHT_IAG), V2_REQUEST_CRED);
+    }
 
     fn v1_ada_wrt() -> PoolV1 {
         decode_v1_pool_datum(&hex::decode(V1_ADA_WRT).unwrap()).expect("decode")
