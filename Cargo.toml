@@ -40,6 +40,10 @@ members = [
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
     "crates/policy-archive",
+    # A token's history as compact binary chunks with stable party numbers:
+    # written on cardano-infra, read by the flow explorer's macroquad arena.
+    # No dependencies, so it links anywhere.
+    "crates/token-tape",
     # The published catalogue of what collections EXIST — pure types + postcard,
     # written on cardano-infra and read by a Worker and an egui WASM palette.
     "crates/collection-catalogue",

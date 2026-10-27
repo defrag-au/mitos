@@ -574,6 +574,12 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 orders: *orders,
                 amount: *amount,
             },
+            // One leg of a movement that also held a trade: exact.
+            Event::Moved { from, to, amount } => Kind::Transfer {
+                from: from.clone(),
+                to: to.clone(),
+                amount: *amount,
+            },
             // A plain movement: the direction the rows themselves support.
             Event::Transfer => match direction_of(&by_tx, &f.tx_hash, &f.unit) {
                 Some(k) => k,

@@ -71,6 +71,18 @@ pub fn is_wingriders_v1(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &V1_PAYMENT_CRED
 }
 
+/// WingRiders **V1**'s request (order) contract: the hash every V1 pool datum
+/// names in its first field.
+///
+/// MEASURED on $NikePig: one enterprise address with no stake part,
+/// `addr1wxr2a8htmzuhj39y2gq7ftkpxv98y2g67tg8zezthgq4jkg0a4ul4`, holding
+/// 1,256 outputs read as an unclaimed script. One address for every trader, so
+/// a request spent from it cannot name who placed it.
+pub const V1_REQUEST_CRED: [u8; 28] = [
+    0x86, 0xae, 0x9e, 0xeb, 0xd8, 0xb9, 0x79, 0x44, 0xa4, 0x52, 0x01, 0xe4, 0xae, 0xc1, 0x33, 0x0a,
+    0x72, 0x29, 0x1a, 0xf2, 0xd0, 0x71, 0x64, 0x4b, 0xba, 0x01, 0x59, 0x59,
+];
+
 /// WingRiders **V1**'s LP policy. Like V2 it mints both the pool NFT and the LP
 /// token, but here the two are trivially separable by name: the pool NFT is
 /// [`V1_POOL_NFT_NAME`] on every pool, and the LP token carries a 32-byte

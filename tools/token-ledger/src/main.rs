@@ -15,10 +15,13 @@
 //! - `stats` — derived balances at tip, for reconciliation against a known total
 //! - `export`/`serve` — later; see the design doc's three-tier artifact
 
+mod ambiguous;
 mod archive;
 mod buffer;
 mod export;
+mod names;
 mod observer;
+mod pack;
 mod policy_api;
 mod publish;
 mod pull;
@@ -78,6 +81,15 @@ enum Command {
     /// the distribution and balance checkpoints — and say what is in it. A
     /// completed walk writes one; this forces it.
     Summary(archive::SummaryArgs),
+    /// Write a policy's history as `token-tape` files: stable party numbers,
+    /// and day chunks of market, transfer and order events.
+    Pack(pack::PackArgs),
+    /// Name a packed token's parties from the ADA Handle policy's archive:
+    /// who holds which handle, joined to the party table by stake key.
+    Names(names::NamesArgs),
+    /// Sort a policy's "ambiguous" movements (not one sender and one
+    /// receiver) into what they turn out to be. Read-only.
+    Ambiguous(ambiguous::AmbiguousArgs),
     /// Fold a policy's passes into ONE file at its root — fewer footers per
     /// read, one object per policy for R2. Runs on its own after every few
     /// passes; this forces it.
@@ -181,6 +193,9 @@ fn main() -> Result<()> {
         Command::Archive(args) => archive::inspect(args),
         Command::Graph(args) => archive::graph(args),
         Command::Summary(args) => archive::summary(args),
+        Command::Pack(args) => pack::pack(args),
+        Command::Names(args) => names::names(args),
+        Command::Ambiguous(args) => ambiguous::ambiguous(args),
         Command::Rollup(args) => segments::run_rollup(args),
         Command::RepairObservations(args) => segments::run_repair_observations(args),
         Command::Bundle(args) => archive::bundle(args),

@@ -6559,6 +6559,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "token-ledger-wire",
+ "token-tape",
  "tokio",
  "tokio-stream",
  "toml 0.8.20",
@@ -6575,6 +6576,10 @@ dependencies = [
  "postcard",
  "serde",
 ]
+
+[[package]]
+name = "token-tape"
+version = "0.0.1"
 
 [[package]]
 name = "tokio"

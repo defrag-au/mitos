@@ -1903,7 +1903,7 @@ pub async fn trades(
             Event::Placement { .. } => r.placements += 1,
             Event::Cancellation { .. } => r.cancellations += 1,
             Event::BatchedFill { .. } => r.batched_fills += 1,
-            Event::Transfer => r.transfers += 1,
+            Event::Transfer | Event::Moved { .. } => r.transfers += 1,
         }
     }
     r.venue_events = r.over_movements - r.transfers;

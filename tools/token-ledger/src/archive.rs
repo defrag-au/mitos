@@ -2337,7 +2337,7 @@ fn report_trades(a: &mut PolicyArchive, dir: &Path) -> Result<()> {
             Event::Placement { .. } => "placement",
             Event::Cancellation { .. } => "cancellation",
             Event::BatchedFill { .. } => "batched fill",
-            Event::Transfer => "transfer",
+            Event::Transfer | Event::Moved { .. } => "transfer",
         };
         *kinds.entry(k).or_default() += 1;
     }

@@ -138,7 +138,7 @@ pub struct Site {
 ///
 /// A venue added here reaches both halves. A venue added to only one of them
 /// is the bug above.
-pub const SITES: [Site; 13] = [
+pub const SITES: [Site; 16] = [
     Site {
         key: SiteKey::Cred(crate::splash::POOL_CRED_A),
         venue: SPLASH,
@@ -147,6 +147,12 @@ pub const SITES: [Site; 13] = [
     },
     Site {
         key: SiteKey::Cred(crate::splash::POOL_CRED_B),
+        venue: SPLASH,
+        role: SiteRole::Pool,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::splash::POOL_CRED_C),
         venue: SPLASH,
         role: SiteRole::Pool,
         shared: false,
@@ -174,6 +180,12 @@ pub const SITES: [Site; 13] = [
         venue: MINSWAP_V1,
         role: SiteRole::Pool,
         shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::minswap::V1_ORDER_CRED),
+        venue: MINSWAP_V1,
+        role: SiteRole::Order,
+        shared: true,
     },
     Site {
         key: SiteKey::Cred(crate::minswap::V2_PAYMENT_CRED),
@@ -221,6 +233,12 @@ pub const SITES: [Site; 13] = [
         venue: WINGRIDERS_V1,
         role: SiteRole::Pool,
         shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::wingriders::V1_REQUEST_CRED),
+        venue: WINGRIDERS_V1,
+        role: SiteRole::Order,
+        shared: true,
     },
 ];
 

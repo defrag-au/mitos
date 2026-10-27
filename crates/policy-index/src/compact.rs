@@ -413,7 +413,11 @@ mod tests {
 
         compact(dir.path()).unwrap();
         let floors = crate::runs::Floors::open(dir.path()).unwrap().unwrap();
-        assert_eq!(floors.first_chunk_of(7), Some(0), "the segment's answer wins");
+        assert_eq!(
+            floors.first_chunk_of(7),
+            Some(0),
+            "the segment's answer wins"
+        );
     }
 
     /// With no sidecar, `Floors` must fall back to the base and answer identically

@@ -48,8 +48,20 @@ pub const POOL_CRED_B: [u8; 28] = [
     0x12, 0x22, 0xaf, 0xfd, 0x71, 0x0b, 0x09, 0xbe, 0x69, 0x0f, 0x92, 0x4d,
 ];
 
+/// A third pool contract, found holding $NikePig 2026-10-27: 9,128 outputs
+/// and 30 billion units read as an unclaimed script.
+///
+/// Confirmed the way [`POOL_CRED_B`] was: an 11-field datum whose four leading
+/// fields are `TEWWE_ADA_NFT`, ADA, the token and `TEWWE_ADA_LQ`, closing with
+/// the same `75c4570e…` hash as [`POOL_CRED_A`]'s pools, and Splash's stake
+/// credential on the address.
+pub const POOL_CRED_C: [u8; 28] = [
+    0xf0, 0x02, 0xfa, 0xcf, 0xd6, 0x9d, 0x51, 0xb6, 0x3e, 0x70, 0x46, 0xc6, 0xd4, 0x03, 0x49, 0xb0,
+    0xb1, 0x7c, 0x8d, 0xd7, 0x75, 0xee, 0x41, 0x5c, 0x66, 0xaf, 0x3c, 0xcc,
+];
+
 /// Every known Splash pool payment credential.
-pub const POOL_CREDS: [[u8; 28]; 2] = [POOL_CRED_A, POOL_CRED_B];
+pub const POOL_CREDS: [[u8; 28]; 3] = [POOL_CRED_A, POOL_CRED_B, POOL_CRED_C];
 
 pub fn is_splash_pool(payment_cred: &[u8; 28]) -> bool {
     POOL_CREDS.contains(payment_cred)
@@ -191,7 +203,18 @@ mod tests {
         // holding 9.8% of a token's supply and read as an unnamed script.
         assert!(is_splash_pool(&POOL_CRED_A));
         assert!(is_splash_pool(&POOL_CRED_B));
+        assert!(is_splash_pool(&POOL_CRED_C));
         assert_ne!(POOL_CRED_A, POOL_CRED_B);
+    }
+
+    /// A real pool at [`POOL_CRED_C`]: TEWWE/ADA, 11 fields.
+    #[test]
+    fn the_third_contract_decodes_with_the_same_prefix() {
+        const CRED_C_TEWWE: &str = "d8798bd87982581c1bea99ceab7fb635603e059713ed7ba9b775cae9a2e66d358cb8e2b24d54455757455f4144415f4e4654d879824040d87982581c688572653ff19eda47aadfb2caa079e39e26b3e204e5ed4f46556b98455445575745d87982581cef011839e23750fe70032646654b1d6be31225a6a747c6b5a70a9bba4c54455757455f4144415f4c511a000180c41896000081d87981d87a81581c4634b66176a13bbbdb332d524cfefad9e37fb5c44440cf21776d968a00581c75c4570eb625ae881b32a34c52b159f6f3f3f2c7aaabf5bac4688133";
+        let p = decode_pool_datum(&hex::decode(CRED_C_TEWWE).unwrap()).expect("decode");
+        assert_eq!(p.pool_nft.name, b"TEWWE_ADA_NFT".to_vec());
+        assert_eq!(p.token_side().unwrap().name, b"TEWWE".to_vec());
+        assert_eq!(p.lp_token.name, b"TEWWE_ADA_LQ".to_vec());
     }
 
     #[test]
