@@ -233,6 +233,50 @@ pub fn default_observers() -> Vec<Box<dyn OutputObserver>> {
     vec![Box::new(DexObserver), Box::new(LaunchpadObserver)]
 }
 
+/// Decode again every observation nothing claimed when it was walked, with
+/// the observers THIS build has; returns how many it now claims.
+///
+/// What keeping the candidates was for (see the module's docs): a decoder
+/// added after a walk reads that walk's history without a re-walk. MEASURED on
+/// $NikePig: Splash's third pool contract and VyFi were registered after the
+/// box walked the token, and 9,128 Splash and 7,002 VyFi pool states sat
+/// undecoded, so every trade on them had no ADA figure.
+///
+/// The output is rebuilt from what the observation kept: its address, its
+/// lovelace, the watched unit's quantity and its datum. That is everything an
+/// ADA-paired pool's reserves are read from; a pool's other assets (its NFT,
+/// a token/token pair's far side) were not kept, so such a pool decodes with
+/// its identity or its pair unknown, as a datum-less one does.
+pub fn redecode(observations: &mut [policy_archive::Observation], policy: &[u8]) -> usize {
+    use mitos_chain_walk::decode::Asset;
+    let observers = default_observers();
+    let mut claimed = 0;
+    for o in observations.iter_mut().filter(|o| o.decoded.is_none()) {
+        let Ok(qty) = u64::try_from(o.unit_amount) else {
+            continue;
+        };
+        let out = DecodedOutput {
+            address: o.address.clone(),
+            lovelace: u64::try_from(o.lovelace).unwrap_or(0),
+            assets: vec![Asset::new(policy.to_vec(), o.unit_name.clone(), qty)],
+            index: 0,
+            datum_hash: None,
+            inline_datum: None,
+            min_utxo: 0,
+        };
+        o.decoded = observe_all(
+            &observers,
+            &out,
+            o.unit_amount,
+            policy,
+            &o.unit_name,
+            o.datum.as_deref(),
+        );
+        claimed += usize::from(o.decoded.is_some());
+    }
+    claimed
+}
+
 /// Run the chain of observers over one output.
 pub fn observe_all(
     observers: &[Box<dyn OutputObserver>],

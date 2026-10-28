@@ -1462,6 +1462,10 @@ pub enum UnrecognisedKind {
     Lock,
     /// A registered burn sink: provably unspendable. Expected; not a gap.
     Burn,
+    /// A registered airdropper (`address-registry`'s `Airdropper`): a
+    /// token-drop vault handing tokens out to claimants. Its payouts are
+    /// distributions the story already reads. Expected; not a gap.
+    Airdrop,
 }
 
 impl UnrecognisedKind {
@@ -1499,9 +1503,24 @@ impl UnrecognisedKind {
             (UnrecognisedKind::Lock, Some("crowdlock"))
         } else if mitos_vesting_decode::snek_fun::is_snek_fun(cred) {
             (UnrecognisedKind::Lock, Some(SNEK_FUN))
+        } else if let Some(label) = airdropper(cred) {
+            // "Unknown" is the registry saying nobody is named: no operator.
+            (
+                UnrecognisedKind::Airdrop,
+                (label != "Unknown").then_some(label),
+            )
         } else {
             (UnrecognisedKind::UnknownScript, None)
         }
+    }
+}
+
+/// The operator label of a script the address registry calls an airdropper.
+pub(crate) fn airdropper(cred: &[u8; 28]) -> Option<&'static str> {
+    use address_registry::{AddressCategory, ScriptCategory};
+    match address_registry::registry::lookup_payment_credential(&hex::encode(cred))?.category {
+        AddressCategory::Script(ScriptCategory::Airdropper { label }) => Some(label),
+        _ => None,
     }
 }
 
@@ -1526,6 +1545,7 @@ pub struct UnrecognisedKinds {
     pub order: usize,
     pub lock: usize,
     pub burn: usize,
+    pub airdrop: usize,
 }
 
 /// Unrecognised outputs at one script.
@@ -1624,6 +1644,7 @@ fn unrecognised_totals(scripts: &[UnrecognisedScriptDto]) -> (usize, Unrecognise
             UnrecognisedKind::Order => &mut by_kind.order,
             UnrecognisedKind::Lock => &mut by_kind.lock,
             UnrecognisedKind::Burn => &mut by_kind.burn,
+            UnrecognisedKind::Airdrop => &mut by_kind.airdrop,
         } += s.outputs;
     }
     (scripts.iter().map(|s| s.outputs).sum(), by_kind)
@@ -3509,6 +3530,13 @@ mod pools_tests {
                 None,
             ),
             (
+                // A token-drop vault on $NikePig, registered as an airdropper
+                // with no operator named.
+                "addr1wysrmj9a67x6gntfrw2f7ky4zh4wd6sd0d4jftws4gpp86gw3kf46",
+                UnrecognisedKind::Airdrop,
+                None,
+            ),
+            (
                 // Shaped like the sink, registered nowhere: still unknown.
                 "addr1w8n8kq3j96v03a3znqqy9f54prt8uf6s4lyj7nuf2cvg2ucnwhs68",
                 UnrecognisedKind::UnknownScript,
@@ -3545,6 +3573,7 @@ mod pools_tests {
                 order: 2,
                 lock: 0,
                 burn: 0,
+                airdrop: 0,
             }
         );
         assert_eq!(summary.top.len(), UNRECOGNISED_TOP);

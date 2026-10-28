@@ -2527,7 +2527,16 @@ pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive:
         })?;
         rows.extend(policy_archive::read_all(&bytes)?);
     }
+    redecode(&mut rows, m);
     Ok(rows)
+}
+
+/// What a decoder added since the walk claims of `rows`: every reader sees
+/// observations as THIS build decodes them (see `observer::redecode`).
+fn redecode(rows: &mut [policy_archive::Observation], m: &Manifest) {
+    if let Ok(policy) = hex::decode(&m.policy) {
+        crate::observer::redecode(rows, &policy);
+    }
 }
 
 /// Every observation ABOVE `slot` — the tail half of a carried fold.
@@ -2572,6 +2581,7 @@ pub fn read_observations_above(
                 .filter(|o| o.slot > slot),
         );
     }
+    redecode(&mut rows, m);
     Ok(rows)
 }
 
@@ -3430,21 +3440,27 @@ mod tests {
         let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         for site in venue::SITES {
-            let cred = match site.key {
-                SiteKey::Cred(c) => hex(&c),
-                SiteKey::Address(a) => {
-                    policy_archive::trade::address_parts(a)
-                        .expect("a site address must parse")
-                        .0
-                }
+            let want = match site.role {
+                SiteRole::Pool => policy_archive::trade::Role::Pool,
+                SiteRole::Order => policy_archive::trade::Role::Order,
+                SiteRole::Book => policy_archive::trade::Role::Book,
+                SiteRole::Escrow => policy_archive::trade::Role::Escrow,
             };
-            let got = roles.role_of(&cred);
+            let (cred, got) = match site.key {
+                SiteKey::Cred(c) => (hex(&c), roles.role_of(&hex(&c))),
+                SiteKey::Address(a) => {
+                    let c = policy_archive::trade::address_parts(a)
+                        .expect("a site address must parse")
+                        .0;
+                    let got = roles.role_of(&c);
+                    (c, got)
+                }
+                // Known by stake, and only where the credential is not.
+                SiteKey::Stake(s) => (hex(&s), roles.role_at("", Some(&hex(&s)))),
+            };
             assert_eq!(
                 got,
-                Some(match site.role {
-                    SiteRole::Pool => policy_archive::trade::Role::Pool,
-                    SiteRole::Order => policy_archive::trade::Role::Order,
-                }),
+                Some(want),
                 "{} ({:?}) did not reach the fold",
                 site.venue,
                 site.role,

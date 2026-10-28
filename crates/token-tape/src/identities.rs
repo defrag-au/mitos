@@ -47,6 +47,7 @@ const MAGIC_HOLDERS: &[u8; 4] = b"TTHT";
 const MAGIC_HOLDERS_OVERFLOW: &[u8; 4] = b"TTHO";
 const MAGIC_IDENTITIES: &[u8; 4] = b"TTID";
 const MAGIC_HOLDING: &[u8; 4] = b"TTHD";
+const MAGIC_ROLES: &[u8; 4] = b"TTRL";
 
 /// Who one party is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +236,107 @@ impl Identities {
     }
 }
 
+// ── roles ───────────────────────────────────────────────────────────────────
+
+/// What kind of holder a party is, where it is not a person.
+///
+/// "What", not "who": decided by the address registry when the files are
+/// built, so a reader needs no registry of its own. Names stay out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// A pool or curve the token trades against: its reserves, not a
+    /// holder's. A reader leaves it out of the holders.
+    Pool = 1,
+    /// Tokens that can never move again.
+    Burn = 2,
+    /// A vesting or time lock.
+    Lock = 3,
+    /// A staking contract or programme: stakers' tokens, pooled.
+    Staking = 4,
+    /// A venue's own address: an order book, an escrow, a marketplace, an
+    /// exchange's wallet, an airdrop vault. Tokens passing through.
+    Venue = 5,
+    /// A script nobody has named.
+    Contract = 6,
+}
+
+impl Role {
+    pub(crate) fn from_byte(b: u8) -> Result<Self, Error> {
+        Ok(match b {
+            1 => Role::Pool,
+            2 => Role::Burn,
+            3 => Role::Lock,
+            4 => Role::Staking,
+            5 => Role::Venue,
+            6 => Role::Contract,
+            _ => return Err(Error::Invalid("an unknown role")),
+        })
+    }
+}
+
+/// Every party that is not a person, by role. Sparse: a party absent from it
+/// is a person.
+pub const ROLES_PATH: &str = "roles.bin";
+
+/// The parties that are not people.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Roles {
+    /// Ascending by party number, one each.
+    pub entries: Vec<(u32, Role)>,
+}
+
+impl Roles {
+    /// `"TTRL" format:u16 count`, then each party as the gap from the one
+    /// before (a varint) and its role (a byte).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(MAGIC_ROLES);
+        w.uint(self.entries.len() as u64);
+        let mut last = 0u32;
+        for (party, role) in &self.entries {
+            w.uint(u64::from(party - last));
+            w.byte(*role as u8);
+            last = *party;
+        }
+        w.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::open(bytes, MAGIC_ROLES)?;
+        let n = r.len()?;
+        let mut entries = Vec::with_capacity(n);
+        let mut last = 0u32;
+        for _ in 0..n {
+            let party = last
+                .checked_add(r.u32()?)
+                .ok_or(Error::Invalid("a party number overflows"))?;
+            entries.push((party, Role::from_byte(r.byte()?)?));
+            last = party;
+        }
+        r.end()?;
+        Ok(Self { entries })
+    }
+
+    /// The role of `party`, or `None` for a person.
+    pub fn of(&self, party: u32) -> Option<Role> {
+        self.entries
+            .binary_search_by_key(&party, |(p, _)| *p)
+            .ok()
+            .map(|i| self.entries[i].1)
+    }
+}
+
+// ── balance checkpoints ─────────────────────────────────────────────────────
+
+/// Every party's balance at the END of UTC day `day` (days since the epoch),
+/// as a [`Holding`]: one for each day any stream has a chunk.
+///
+/// What makes a page of whole days settle on its own: its closing balances
+/// are the checkpoint of its last day, so a reader jumping far back fetches
+/// one small file rather than every day between there and now.
+pub fn checkpoint_path(day: u32) -> String {
+    format!("checkpoints/{day}.bin")
+}
+
 // ── current holders ─────────────────────────────────────────────────────────
 
 /// Every party holding the token now, and how much, largest first.
@@ -264,5 +366,36 @@ impl Holding {
         }
         r.end()?;
         Ok(Self { balances })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Roles round-trip, and a party absent from them is a person.
+    #[test]
+    fn roles_round_trip_and_absence_is_a_person() {
+        let roles = Roles {
+            entries: vec![(3, Role::Pool), (40, Role::Burn), (41, Role::Venue)],
+        };
+        let back = Roles::decode(&roles.encode()).unwrap();
+        assert_eq!(back, roles);
+        assert_eq!(back.of(40), Some(Role::Burn));
+        assert_eq!(back.of(39), None);
+        assert!(
+            Roles::decode(b"TTRL\x01\x00\x01\x00\x09").is_err(),
+            "role 9"
+        );
+    }
+
+    /// A checkpoint is a holding under its day's path.
+    #[test]
+    fn a_checkpoint_is_a_holding_by_day() {
+        assert_eq!(checkpoint_path(19893), "checkpoints/19893.bin");
+        let h = Holding {
+            balances: vec![(7, 1_000), (2, 5)],
+        };
+        assert_eq!(Holding::decode(&h.encode()).unwrap(), h);
     }
 }

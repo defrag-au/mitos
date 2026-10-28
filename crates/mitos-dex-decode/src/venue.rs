@@ -481,7 +481,8 @@ mod tests {
     #[test]
     fn every_recognised_pool_contract_has_a_site() {
         type Pred = fn(&[u8; 28]) -> bool;
-        let recognised: [(&str, Pred); 7] = [
+        let recognised: [(&str, Pred); 8] = [
+            ("vyfi", crate::vyfi::is_vyfi_pool),
             ("splash", crate::splash::is_splash_pool),
             ("minswap-v1", crate::minswap::is_minswap_v1),
             ("minswap-v2", crate::minswap::is_minswap_v2),

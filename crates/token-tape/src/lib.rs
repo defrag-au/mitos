@@ -34,17 +34,24 @@
 
 mod codec;
 mod identities;
+mod pages;
+
+pub use pages::{
+    PAGE_BUDGET, PAGE_TOP_HOLDERS, PAGES_INDEX_PATH, Page, PageInfo, Person, grid, page_digest,
+    page_path,
+};
 
 use codec::{Reader, Writer};
 
 pub use codec::Error;
 pub use identities::{
     ACTIVE_PATH, HOLDER_HEADER, HOLDER_RECORD, HOLDERS_OVERFLOW_PATH, HOLDERS_PATH, HOLDING_PATH,
-    HolderTable, Holding, Identities, Identity, NAME_BYTES, OPENING_PATH,
+    HolderTable, Holding, Identities, Identity, NAME_BYTES, OPENING_PATH, ROLES_PATH, Role, Roles,
+    checkpoint_path,
 };
 
 /// The format of every file here. Bumped when any layout changes.
-pub const FORMAT: u16 = 1;
+pub const FORMAT: u16 = 6;
 
 const MAGIC_PARTIES: &[u8; 4] = b"TTPT";
 const MAGIC_OVERFLOW: &[u8; 4] = b"TTPO";
@@ -288,6 +295,13 @@ pub enum What {
         venue: u16,
         sell: bool,
         units: u64,
+        /// A sell spent from an order contract: the units left the trader
+        /// when the order was PLACED, so the fill moves nothing of theirs.
+        escrowed: bool,
+        /// The ADA the party paid or got, where the chain says it directly:
+        /// an order book's fill, which no pool reading prices. `None` for a
+        /// pool's fill, which the pool's own readings price.
+        lovelace: Option<u64>,
     },
     /// Several orders into one pool at once. Never decomposed.
     Batch {
@@ -425,8 +439,10 @@ fn read_opt(r: &mut Reader) -> Result<Option<u32>, Error> {
 impl Chunk {
     /// `"TTCH" format:u16 stream:u8 day first_slot first_unix count`, then
     /// each event: a head byte (low 4 bits the kind, bit 4 "same slot as the
-    /// last", bit 5 "a new transaction"), the slot and time as deltas from
-    /// the last event's unless the same slot, then the kind's fields.
+    /// last", bit 5 "a new transaction", bit 6 a fill's `escrowed`, bit 7 a
+    /// fill's `lovelace` follows its units), the slot
+    /// and time as deltas from the last event's unless the same slot, then
+    /// the kind's fields.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new(MAGIC_CHUNK);
         w.byte(self.stream.code());
@@ -438,7 +454,19 @@ impl Chunk {
         let (mut slot, mut unix) = (first_slot, first_unix);
         for e in &self.events {
             let same = e.slot == slot;
-            let head = e.what.tag() | u8::from(same) << 4 | u8::from(e.new_tx) << 5;
+            let escrowed = matches!(e.what, What::Fill { escrowed: true, .. });
+            let priced = matches!(
+                e.what,
+                What::Fill {
+                    lovelace: Some(_),
+                    ..
+                }
+            );
+            let head = e.what.tag()
+                | u8::from(same) << 4
+                | u8::from(e.new_tx) << 5
+                | u8::from(escrowed) << 6
+                | u8::from(priced) << 7;
             w.byte(head);
             if !same {
                 w.uint(e.slot - slot);
@@ -450,11 +478,15 @@ impl Chunk {
                     party,
                     venue,
                     units,
+                    lovelace,
                     ..
                 } => {
                     opt(&mut w, *party);
                     w.uint(u64::from(*venue));
                     w.uint(*units);
+                    if let Some(l) = lovelace {
+                        w.uint(*l);
+                    }
                 }
                 What::Batch {
                     venue,
@@ -538,6 +570,12 @@ impl Chunk {
                     venue: u16_(&mut r)?,
                     units: r.uint()?,
                     sell: t == 1,
+                    escrowed: head & 0x40 != 0,
+                    lovelace: if head & 0x80 != 0 {
+                        Some(r.uint()?)
+                    } else {
+                        None
+                    },
                 },
                 2 => What::Batch {
                     venue: u16_(&mut r)?,
@@ -636,6 +674,17 @@ pub struct Meta {
     pub unit: Vec<u8>,
     pub venues: Vec<String>,
     pub pools: Vec<Pool>,
+    /// What the token is called, where a registry says; empty where none
+    /// does, and a reader falls back to the asset name.
+    pub ticker: String,
+    /// Display decimals, where a registry says. `None` is "render raw", not
+    /// zero: decimals are not on chain.
+    pub decimals: Option<u8>,
+    /// Units minted less units burned over the history the files hold.
+    pub supply: Option<u64>,
+    /// The token's launch on a bonding curve, as `(slot, unix)`: where a
+    /// replay marks it. `None` for a token that never had one.
+    pub launch: Option<(u64, u64)>,
 }
 
 impl Meta {
@@ -656,6 +705,18 @@ impl Meta {
             w.bytes(&p.quote_policy);
             w.bytes(&p.quote_name);
             w.byte(u8::from(p.curve));
+        }
+        w.bytes(self.ticker.as_bytes());
+        // Absent as 0, else the value plus one.
+        w.uint(self.decimals.map_or(0, |d| u64::from(d) + 1));
+        w.uint(self.supply.map_or(0, |s| s.saturating_add(1)));
+        // Absent as a slot of 0, else the slot plus one, then the time.
+        match self.launch {
+            Some((slot, unix)) => {
+                w.uint(slot.saturating_add(1));
+                w.uint(unix);
+            }
+            None => w.uint(0),
         }
         w.finish()
     }
@@ -680,12 +741,26 @@ impl Meta {
                 curve: r.byte()? != 0,
             });
         }
+        let ticker = r.string()?;
+        let decimals = match r.uint()? {
+            0 => None,
+            d => Some(u8::try_from(d - 1).map_err(|_| Error::Invalid("decimals past 8 bits"))?),
+        };
+        let supply = r.uint()?.checked_sub(1);
+        let launch = match r.uint()? {
+            0 => None,
+            slot => Some((slot - 1, r.uint()?)),
+        };
         r.end()?;
         Ok(Self {
             policy,
             unit,
             venues,
             pools,
+            ticker,
+            decimals,
+            supply,
+            launch,
         })
     }
 }
@@ -708,6 +783,8 @@ pub struct Index {
     pub parties: u32,
     /// By stream, then by day.
     pub chunks: Vec<ChunkInfo>,
+    /// The grid's pages, oldest first: what a replay fetches (see `pages`).
+    pub pages: Vec<PageInfo>,
 }
 
 impl Index {
@@ -722,6 +799,14 @@ impl Index {
             w.uint(c.last_slot - c.first_slot);
             w.uint(u64::from(c.events));
             w.uint(u64::from(c.bytes));
+        }
+        w.uint(self.pages.len() as u64);
+        for p in &self.pages {
+            w.uint(u64::from(p.first_day));
+            w.uint(u64::from(p.last_day - p.first_day));
+            w.uint(u64::from(p.events));
+            w.uint(u64::from(p.bytes));
+            w.uint(p.digest);
         }
         w.finish()
     }
@@ -744,8 +829,25 @@ impl Index {
                 bytes: r.u32()?,
             });
         }
+        let mut pages = Vec::new();
+        for _ in 0..r.len()? {
+            let first_day = r.u32()?;
+            pages.push(PageInfo {
+                first_day,
+                last_day: first_day
+                    .checked_add(r.u32()?)
+                    .ok_or(Error::Invalid("a day overflows"))?,
+                events: r.u32()?,
+                bytes: r.u32()?,
+                digest: r.uint()?,
+            });
+        }
         r.end()?;
-        Ok(Self { parties, chunks })
+        Ok(Self {
+            parties,
+            chunks,
+            pages,
+        })
     }
 }
 

@@ -396,6 +396,9 @@ pub fn recognise(
         if mitos_dex_decode::wingriders::is_wingriders_v1(&cred) {
             return wingriders_v1(out, qty, datum, watched_policy, watched_name);
         }
+        if mitos_dex_decode::vyfi::is_vyfi_pool(&cred) {
+            return vyfi(out, qty, datum, watched_policy, watched_name);
+        }
     }
 
     let dex = if out.address == cswap::POOL_SCRIPT_ADDR {
@@ -760,6 +763,44 @@ fn minswap_v1(
         fee_bps: None,
         total_lp: Some(i64::try_from(d.total_liquidity).unwrap_or(i64::MAX)),
         reserve_source: ReserveSource::Value,
+    })
+}
+
+/// VyFi: the value less the two treasuries its datum declares (see
+/// `mitos_dex_decode::vyfi`). Asset A is ADA on an ADA pool, the side whose
+/// treasury grows by a tenth of a percent of the ADA paid in.
+///
+/// The pool's NFT is per pool under a policy of its own, so nothing here can
+/// tell it from any other token in the value: the identity is left unknown,
+/// and the pool is told apart by its address.
+fn vyfi(
+    out: &DecodedOutput,
+    qty: i64,
+    datum: Option<&[u8]>,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+) -> Option<PoolObservation> {
+    let ada = out.lovelace as i64 > MIN_UTXO_CARRIER_CEILING;
+    // Without its datum the treasuries are unknown, and the value alone
+    // carries them: dropped rather than priced, as the other treasury venues.
+    let d = datum.and_then(mitos_dex_decode::vyfi::decode_pool_datum)?;
+    let (base, quote, source, total_lp) = (
+        qty.saturating_sub(i64::try_from(d.treasury_b).unwrap_or(i64::MAX)),
+        (out.lovelace as i64).saturating_sub(i64::try_from(d.treasury_a).unwrap_or(i64::MAX)),
+        ReserveSource::ValueMinusTreasury,
+        i64::try_from(d.issued_shares).ok(),
+    );
+    Some(PoolObservation {
+        dex: venue::VYFI,
+        address: out.address.clone(),
+        key_policy: Vec::new(),
+        key_name: Vec::new(),
+        key_basis: KeyBasis::Unknown,
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base),
+        quote: ada.then(|| Side::ada(quote)),
+        fee_bps: None,
+        total_lp,
+        reserve_source: source,
     })
 }
 
@@ -1274,6 +1315,31 @@ mod tests {
         assert_eq!(constant_product_out(0, 1_000, 100, 0), 0);
         assert_eq!(constant_product_out(1_000, 0, 100, 0), 0);
         assert_eq!(constant_product_out(1_000, 1_000, 0, 0), 0);
+    }
+
+    /// $NikePig's VyFi pool after a buy (`857a9936…`): the reserves are the
+    /// value less the treasuries its datum declares, and with no datum the
+    /// pool is dropped rather than priced from a value that carries them.
+    #[test]
+    fn a_vyfi_pool_is_its_value_less_its_treasuries() {
+        let nike = hex::decode("c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c").unwrap();
+        let out = DecodedOutput {
+            address: "addr1z8xj659zlqm2kfa8tufadwv22nqq3py0j84rhsp9cfl8dk4ksyd8pn7amnr48geat0yft0uezfunealzy4ghl0cayp4sen5fsv".into(),
+            lovelace: 384_121_807,
+            assets: vec![Asset::new(nike.clone(), b"Nike".to_vec(), 207_184)],
+            index: 0,
+            datum_hash: None,
+            inline_datum: None,
+            min_utxo: 0,
+        };
+        let datum = hex::decode("d8799f1a00b7c705190efc1a0069573aff").unwrap();
+        let obs = recognise(&out, 207_184, &nike, b"Nike", Some(&datum)).expect("a VyFi pool");
+        assert_eq!(obs.dex, venue::VYFI);
+        assert_eq!(obs.base.reserve, Some(207_184 - 3_836));
+        assert_eq!(obs.quote_reserve(), Some(384_121_807 - 12_044_037));
+        assert_eq!(obs.reserve_source, ReserveSource::ValueMinusTreasury);
+        assert_eq!(obs.total_lp, Some(6_903_610));
+        assert!(recognise(&out, 207_184, &nike, b"Nike", None).is_none());
     }
 
     /// The far side of a token/token pool is MEASURED from the value, not

@@ -57,6 +57,9 @@ pub mod multi;
 /// What a script output HELD, decoded or not — the tier that lets a decoder
 /// added later re-derive its history from the archive instead of from chunks.
 pub mod observation;
+/// Who controls an address its stake credential does not say: rules over
+/// movements, joined transitively. Byron change chains are the first.
+pub mod owners;
 /// Price, as far as ONE policy's archive can honestly take it — and a name for
 /// everything it cannot.
 pub mod price;

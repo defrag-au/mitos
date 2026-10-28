@@ -17,6 +17,7 @@
 
 mod ambiguous;
 mod archive;
+mod book_prices;
 mod buffer;
 mod export;
 mod names;
@@ -24,6 +25,7 @@ mod observer;
 mod pack;
 mod policy_api;
 mod publish;
+mod publish_tape;
 mod pull;
 mod registry;
 mod reverse;
@@ -33,6 +35,7 @@ mod serve;
 mod shared_fills;
 mod store;
 mod sync;
+mod tapes;
 mod tip;
 mod walk;
 
@@ -104,6 +107,9 @@ enum Command {
     /// Publish one policy's archive — R2 and the KV bundle — by hand, from
     /// the same environment `sync` uses, and print the per-step record.
     Publish(publish::PublishArgs),
+    /// Publish one policy's pack — the pages and meta a replay reads — to R2
+    /// under a build named by its bytes, then flip the policy's pointer.
+    PublishTape(publish_tape::PublishTapeArgs),
     /// Pull one policy's published archive from R2 into a local archive
     /// directory — the mirror of `publish`, for working on folds without the
     /// box. A read-only R2 token is enough, and the safer one to hold.
@@ -115,6 +121,10 @@ enum Command {
     /// pass publishes every archive whose `published.json` does not name its
     /// manifest's current version, so it is safe to interrupt and re-run.
     Sync(sync::SyncArgs),
+    /// Keep every registered token's published tape level with its archive:
+    /// pack and publish each one whose archive moved since its last publish.
+    /// Runs as its own service beside `sync`.
+    Tapes(tapes::TapesArgs),
     /// Derived balances at tip — the reconciliation surface.
     Stats {
         #[arg(long)]
@@ -200,8 +210,10 @@ fn main() -> Result<()> {
         Command::RepairObservations(args) => segments::run_repair_observations(args),
         Command::Bundle(args) => archive::bundle(args),
         Command::Publish(args) => publish::run(args),
+        Command::PublishTape(args) => publish_tape::run(args),
         Command::Pull(args) => pull::run(args),
         Command::Sync(args) => sync::run(args),
+        Command::Tapes(args) => tapes::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),

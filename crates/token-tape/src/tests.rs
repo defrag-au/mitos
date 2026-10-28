@@ -22,6 +22,8 @@ fn a_chunk_of_every_kind_round_trips() {
                 venue: 1,
                 sell: true,
                 units: 5,
+                escrowed: true,
+                lovelace: Some(8_338_886),
             },
         ),
         ev(
@@ -41,6 +43,8 @@ fn a_chunk_of_every_kind_round_trips() {
                 venue: 0,
                 sell: false,
                 units: u64::MAX,
+                escrowed: false,
+                lovelace: None,
             },
         ),
         ev(
@@ -190,8 +194,20 @@ fn meta_and_index_round_trip() {
             quote_name: vec![],
             curve: false,
         }],
+        ticker: "NIKEPIG".into(),
+        decimals: Some(0),
+        supply: Some(10_000_000_000),
+        launch: Some((127_000_000, 1_718_582_400)),
     };
-    assert_eq!(Meta::decode(&meta.encode()), Ok(meta));
+    assert_eq!(Meta::decode(&meta.encode()), Ok(meta.clone()));
+    // Unknown decimals and supply are not zero.
+    let unknown = Meta {
+        decimals: None,
+        supply: None,
+        launch: None,
+        ..meta
+    };
+    assert_eq!(Meta::decode(&unknown.encode()), Ok(unknown));
     let index = Index {
         parties: 70_000,
         chunks: vec![ChunkInfo {
@@ -202,8 +218,92 @@ fn meta_and_index_round_trip() {
             events: 4_000,
             bytes: 30_000,
         }],
+        pages: vec![crate::PageInfo {
+            first_day: 19_890,
+            last_day: 19_900,
+            events: 3_100,
+            bytes: 41_000,
+            digest: u64::MAX - 1,
+        }],
     };
     assert_eq!(Index::decode(&index.encode()), Ok(index));
+}
+
+/// A page's file is named by its bytes: the same bytes the same name, a
+/// changed byte another.
+#[test]
+fn a_page_file_is_named_by_its_bytes() {
+    let a = crate::page_digest(b"a page");
+    assert_eq!(a, crate::page_digest(b"a page"));
+    assert_ne!(a, crate::page_digest(b"a pagf"));
+    assert_eq!(
+        crate::page_path(20_693, 0xab),
+        "pages/20693-00000000000000ab.bin"
+    );
+}
+
+/// The grid is cut from the first day forward, so a page closed once stays
+/// closed as days are added; only the last is open.
+#[test]
+fn the_grid_grows_forward_and_closed_pages_never_move() {
+    let days = [(10, 2), (11, 2), (12, 5), (14, 1)];
+    assert_eq!(crate::grid(days, 4), vec![(10, 11), (12, 12), (14, 14)]);
+    let more = [(10, 2), (11, 2), (12, 5), (14, 1), (15, 3), (16, 9)];
+    assert_eq!(
+        crate::grid(more, 4),
+        vec![(10, 11), (12, 12), (14, 15), (16, 16)],
+        "the pages before the open one are unchanged"
+    );
+    assert!(crate::grid([], 4).is_empty());
+}
+
+/// A page round-trips: its people, every kind of key, and its chunks.
+#[test]
+fn a_page_round_trips() {
+    use crate::{Page, Person, Role};
+    let page = Page {
+        first_day: 19_890,
+        last_day: 19_892,
+        holders_total: 5_600,
+        people: vec![
+            Person {
+                party: 3,
+                key: PartyKey::StakeKey([4; 28]),
+                name: Some("pig".into()),
+                role: None,
+                closing: 1_000,
+            },
+            Person {
+                party: 9,
+                key: PartyKey::Address(vec![0x71; 29]),
+                name: None,
+                role: Some(Role::Pool),
+                closing: 50_000,
+            },
+            Person {
+                party: 12,
+                key: PartyKey::Byron("DdzFFzCqrh".into()),
+                name: None,
+                role: Some(Role::Contract),
+                closing: 0,
+            },
+        ],
+        chunks: vec![Chunk {
+            stream: Stream::Transfers,
+            day: 19_891,
+            events: vec![Event {
+                slot: 1,
+                unix: 19_891 * 86_400,
+                new_tx: true,
+                what: What::Transfer {
+                    from: 3,
+                    to: 12,
+                    units: 7,
+                },
+            }],
+        }],
+    };
+    assert_eq!(Page::decode(&page.encode()), Ok(page));
 }
 
 /// What a reader must refuse rather than misread.

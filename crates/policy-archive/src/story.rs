@@ -910,9 +910,10 @@ mod tests {
         ));
     }
 
-    /// Several parties a side: stated, never resolved to a guess.
+    /// Several parties a side, no venue: transfers whose totals per party are
+    /// the chain's (`trade::exact_transfers` pairs them largest to largest).
     #[test]
-    fn a_batched_move_stays_ambiguous() {
+    fn a_batched_move_is_transfers_with_exact_totals() {
         let rows = vec![row(
             1,
             10,
@@ -921,10 +922,18 @@ mod tests {
             &[("a", -10), ("b", -10), ("c", 12), ("d", 8)],
         )];
         let s = build(&rows, &[], &Roles::default());
-        match &s.events[0].kind {
-            Kind::Ambiguous { parties, .. } => assert_eq!(*parties, 4),
-            k => panic!("expected Ambiguous, got {k:?}"),
+        let mut net: std::collections::BTreeMap<&str, i64> = Default::default();
+        for e in &s.events {
+            let Kind::Transfer { from, to, amount } = &e.kind else {
+                panic!("expected transfers, got {:?}", e.kind);
+            };
+            *net.entry(from.as_str()).or_default() -= amount;
+            *net.entry(to.as_str()).or_default() += amount;
         }
+        assert_eq!(
+            net.into_iter().collect::<Vec<_>>(),
+            vec![("a", -10), ("b", -10), ("c", 12), ("d", 8)]
+        );
     }
 
     /// Curve sightings sharing a slot come back by position up the curve, so a

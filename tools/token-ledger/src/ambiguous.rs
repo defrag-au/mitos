@@ -147,12 +147,15 @@ pub fn ambiguous(args: AmbiguousArgs) -> Result<()> {
         }
         let mut by: Vec<_> = by.into_iter().collect();
         by.sort_by_key(|(_, s)| std::cmp::Reverse(s.0));
-        for (cred, (txs, units_in, units_out, stakes, address, tx)) in
-            by.iter().take(args.examples)
+        for (cred, (txs, units_in, units_out, stakes, address, tx)) in by.iter().take(args.examples)
         {
             let mut top: Vec<_> = stakes.iter().collect();
             top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-            let top: Vec<String> = top.iter().take(4).map(|(s, n)| format!("{s}×{n}")).collect();
+            let top: Vec<String> = top
+                .iter()
+                .take(4)
+                .map(|(s, n)| format!("{s}×{n}"))
+                .collect();
             println!(
                 "{cred} {txs} txs, in {units_in} out {units_out}, {} stake parts [{}]\n    \
                  {address}\n    tx {tx}",

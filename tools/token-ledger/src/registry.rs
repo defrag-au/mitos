@@ -220,6 +220,15 @@ fn read(path: &Path) -> Result<RegistryFile> {
     toml::from_str(&text).with_context(|| format!("parsing token registry {}", path.display()))
 }
 
+/// Every registered token, validated.
+pub fn tokens(path: &Path) -> Result<Vec<TokenEntry>> {
+    let tokens = read(path)?.token;
+    for t in &tokens {
+        t.policy_bytes()?;
+    }
+    Ok(tokens)
+}
+
 /// Load the registry and return the one requested token.
 pub fn load(path: &Path, name: &str) -> Result<TokenEntry> {
     let entry = read(path)?

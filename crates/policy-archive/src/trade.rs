@@ -337,13 +337,18 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
     let (from_role, to_role) = (role_at(&from.address), role_at(&to.address));
 
     match (from_role, to_role) {
-        // order → pool: the swap.
-        (Some((Role::Order, cred, stake)), Some((Role::Pool | Role::Curve, _, _))) => Event::Fill {
-            party: order_party(roles, &cred, &stake),
-            venue_cred: cred,
-            amount: -from.amount,
-            into_pool: true,
-        },
+        // order → pool: the swap, credited to the POOL's venue. The same
+        // venue as the order's for a DEX's own orders; for an aggregator's
+        // (DexHunter's limit orders into Splash, MEASURED on $NikePig) the
+        // pool is where the trade happened, and the order only the route.
+        (Some((Role::Order, cred, stake)), Some((Role::Pool | Role::Curve, pool, _))) => {
+            Event::Fill {
+                party: order_party(roles, &cred, &stake),
+                venue_cred: pool,
+                amount: -from.amount,
+                into_pool: true,
+            }
+        }
         // pool → wallet: the proceeds coming back.
         (Some((Role::Pool | Role::Curve, cred, _)), None) => Event::Fill {
             venue_cred: cred,
@@ -351,16 +356,16 @@ pub fn classify_move(unit: &UnitMove, roles: &Roles) -> Event {
             amount: to.amount,
             into_pool: false,
         },
-        // wallet → order: the placement. On a SHARED order address the
-        // order's stake is the venue's, so the trader is the wallet the asset
-        // left: the one leg that names them (MEASURED: 34 of $PERP's 35 CSwap
-        // sells reached the arena as "someone" while this said nobody could
-        // tell). A customer-keyed address still names them by its stake.
-        (None, Some((Role::Order, cred, stake))) => Event::Placement {
-            party: match roles.keying_at(&cred, stake.as_deref()) {
-                OrderKeying::Shared => Party::Wallet(from.address.clone()),
-                OrderKeying::CustomerStake => order_party(roles, &cred, &stake),
-            },
+        // wallet → order: the placement, by the wallet the asset left. On a
+        // SHARED order address it is the one leg that names the trader at all
+        // (MEASURED: 34 of $PERP's 35 CSwap sells reached the arena as
+        // "someone" while this said nobody could tell). On a customer-keyed
+        // one the order's stake is usually the same wallet's, but not always:
+        // MEASURED on $NikePig, `$steelswap`'s Sundae orders funded from a
+        // second wallet. The units left the FUNDER, so the funder placed it;
+        // the fill still names the order's owner, who is paid.
+        (None, Some((Role::Order, cred, _))) => Event::Placement {
+            party: Party::Wallet(from.address.clone()),
             venue_cred: cred,
             amount: to.amount,
         },
@@ -627,7 +632,7 @@ fn batch_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
     orders.sort_by(by_size);
     wallets.sort_by(by_size);
     let sells = orders.into_iter().map(|o| Event::Fill {
-        venue_cred: o.cred.clone(),
+        venue_cred: pool.cred.clone(),
         party: order_party(roles, &o.cred, &o.stake),
         amount: -o.net,
         into_pool: true,
@@ -669,7 +674,6 @@ fn one_source(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
         net: amount,
         role,
         cred,
-        stake,
         address,
         ..
     } in gainers
@@ -677,12 +681,10 @@ fn one_source(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
         let event = match (source_role, role) {
             // A wallet: into an order is a placement, named as
             // `classify_move` names it; into a pool, a sell.
+            // By the wallet the units left, as `classify_move` names it.
             (None, Some(Role::Order)) => Event::Placement {
                 venue_cred: (*cred).clone(),
-                party: match roles.keying_at(cred, stake.as_deref()) {
-                    OrderKeying::Shared => Party::Wallet(source.to_string()),
-                    OrderKeying::CustomerStake => order_party(roles, cred, stake),
-                },
+                party: Party::Wallet(source.to_string()),
                 amount: *amount,
             },
             (None, Some(Role::Pool | Role::Curve)) => Event::Fill {
@@ -691,10 +693,11 @@ fn one_source(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
                 amount: *amount,
                 into_pool: true,
             },
-            // An order into a pool: the fill, named as the order names it.
+            // An order into a pool: the fill, named as the order names it,
+            // at the pool's venue (see `classify_move`).
             (Some(Role::Order), Some(Role::Pool | Role::Curve)) => Event::Fill {
                 party: order_party(roles, source_cred, source_stake),
-                venue_cred: source_cred.clone(),
+                venue_cred: (*cred).clone(),
                 amount: *amount,
                 into_pool: true,
             },
@@ -829,8 +832,19 @@ fn book_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
         let sells = losers.iter().map(|b| fill(b, party_of(b), true));
         return Some(buys.chain(sells).collect());
     }
-    // Wallets funding orders.
+    // Wallets funding orders. An order with an owner on its address IS the
+    // owner's (its trades are credited to them), so funding it moves tokens
+    // to the owner, nothing leaves: a movement, which is no movement at all
+    // when the funder is the owner. An order naming no owner (a DCA) holds
+    // the tokens apart from the wallet that funded it: a placement by that
+    // wallet.
     if all(&losers, &wallet) && all(&gainers, &book) {
+        if gainers.iter().all(|b| owner(b).is_some()) {
+            return moves();
+        }
+        if gainers.iter().any(|b| owner(b).is_some()) {
+            return None;
+        }
         let funder = match losers.as_slice() {
             [one] => Party::Wallet(one.address.to_string()),
             _ => Party::NotEncodedByVenue,
@@ -838,10 +852,7 @@ fn book_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
         return Some(
             gainers
                 .iter()
-                .map(|b| {
-                    let party = owner(b).map_or_else(|| funder.clone(), Party::Stake);
-                    placement(b, party)
-                })
+                .map(|b| placement(b, funder.clone()))
                 .collect(),
         );
     }
@@ -860,24 +871,25 @@ fn book_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
                 .collect(),
         );
     }
-    // Escrows relisting proceeds into orders.
+    // Escrows relisting proceeds into orders: proceeds reaching their owner,
+    // whose order the book is. A movement.
     if all(&losers, &escrow) && all(&gainers, &book) {
-        return Some(gainers.iter().map(|b| placement(b, party_of(b))).collect());
+        return moves();
     }
-    // An order routing into other venues' orders and pools.
+    // An order routing into other venues' orders and pools (a DCA paying
+    // Sundae and Minswap orders): tokens moving from one contract to another,
+    // the owner's already gone at the placement; what went straight into a
+    // pool, a sell.
     if all(&losers, &book) && all(&gainers, &elsewhere) {
-        let source = match losers.as_slice() {
-            [one] => party_of(one),
-            _ => Party::NotEncodedByVenue,
+        let [source] = losers.as_slice() else {
+            return None;
         };
         return Some(
             gainers
                 .iter()
                 .map(|g| match g.role {
-                    Some(Role::Order) => {
-                        placement(g, order_party(roles, &g.cred, &g.stake))
-                    }
-                    _ => fill(g, source.clone(), true),
+                    Some(Role::Order) => moved(source, g, g.net),
+                    _ => fill(g, party_of(source), true),
                 })
                 .collect(),
         );
@@ -891,8 +903,15 @@ fn book_trades(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
 ///
 /// Only where the feed itself could not name a direction
 /// ([`crate::feed::Direction::Ambiguous`]): a plain one-to-one movement keeps
-/// its own path, `SourceBelowFloor` included. Several senders AND several
-/// receivers stay a `Transfer`, because pairing them would be a guess.
+/// its own path, `SourceBelowFloor` included.
+///
+/// Several senders AND several receivers are paired in order, largest to
+/// largest, an amount split where it has to be: every party's total is the
+/// chain's, which is what a balance needs, and WHICH sender paid WHICH
+/// receiver is arithmetic, not a claim. Left out, the receivers' balances
+/// could not be reconciled: MEASURED on $NikePig, a token-drop service's two
+/// vaults paying two claimants per transaction, 71 units each, left 992
+/// holders' openings off on one page.
 ///
 /// MEASURED on $NikePig: 2,927 distributions (one sender, up to 40
 /// receivers; a reward script's 1,368 among them), 1,441 collections and
@@ -934,6 +953,26 @@ fn exact_transfers(unit: &UnitMove, roles: &Roles) -> Option<Vec<Event>> {
         ([from], to) if !to.is_empty() => Some(to.iter().map(|t| moved(from, t, t.net)).collect()),
         (from, [to]) if !from.is_empty() => {
             Some(from.iter().map(|f| moved(f, to, -f.net)).collect())
+        }
+        (from, to) if !from.is_empty() && !to.is_empty() => {
+            let mut left: Vec<i64> = from.iter().map(|f| -f.net).collect();
+            let mut owed: Vec<i64> = to.iter().map(|t| t.net).collect();
+            let (mut i, mut j, mut legs) = (0, 0, Vec::new());
+            while i < from.len() && j < to.len() {
+                let amount = left[i].min(owed[j]);
+                if amount > 0 {
+                    legs.push(moved(from[i], to[j], amount));
+                }
+                left[i] -= amount;
+                owed[j] -= amount;
+                if left[i] == 0 {
+                    i += 1;
+                }
+                if owed[j] == 0 {
+                    j += 1;
+                }
+            }
+            Some(legs)
         }
         _ => None,
     }
@@ -1199,8 +1238,9 @@ mod tests {
         assert_eq!(
             e,
             vec![
+                // At the pool's venue, as every order's fill is.
                 Event::Fill {
-                    venue_cred: cred(SPLASH_ORDER_A),
+                    venue_cred: cred(SPLASH_POOL),
                     party: order_stake.map_or(Party::Ambiguous, Party::Stake),
                     amount: 1_605_216,
                     into_pool: true,
@@ -1289,11 +1329,173 @@ mod tests {
         let customer = address_parts(STAKED).unwrap().1.unwrap();
         assert_eq!(
             party(classify_move(&mv(&[(STAKED, -10), (POOL, 10)]), &r)),
-            Party::Stake(customer.clone())
+            Party::Stake(customer)
         );
+        // Placed by the wallet the units left, whatever stake the order
+        // carries: the funder's balance is what falls.
         assert_eq!(
             party(classify_move(&mv(&[(&w, -10), (STAKED, 10)]), &r)),
-            Party::Stake(customer)
+            Party::Wallet(w.clone())
+        );
+    }
+
+    /// [`roles`], plus order books: an Axo-like book at credential `60…`, a
+    /// SaturnSwap-like exchange at `61…`, a DCA-like book at `63…`, and
+    /// escrows known only by the venue's stake `62…`.
+    fn book_roles() -> Roles {
+        let h = |n: u8| format!("{n:02x}").repeat(28);
+        let mut r = roles();
+        r.register(h(60), Role::Book, "axo");
+        r.register(h(61), Role::Book, "saturnswap");
+        r.register(h(63), Role::Book, "dexhunter");
+        r.register_stake(h(62), Role::Escrow, "saturnswap");
+        r
+    }
+
+    fn stake(n: u8) -> String {
+        format!("{n:02x}").repeat(28)
+    }
+
+    /// Two Axo strategies trading in place ("Axo: Trade", MEASURED amounts):
+    /// a fill for each owner, the one that gave units selling.
+    #[test]
+    fn two_orders_trading_in_place_are_a_fill_for_each_owner() {
+        let (seller, buyer) = (wallet(60, 1), wallet(60, 2));
+        let e = classify_moves(&mv(&[(&seller, -17_653), (&buyer, 17_653)]), &book_roles());
+        let at = stake(60);
+        assert_eq!(
+            e,
+            vec![
+                Event::Fill {
+                    venue_cred: at.clone(),
+                    party: Party::Stake(stake(1)),
+                    amount: 17_653,
+                    into_pool: true,
+                },
+                Event::Fill {
+                    venue_cred: at,
+                    party: Party::Stake(stake(2)),
+                    amount: 17_653,
+                    into_pool: false,
+                },
+            ]
+        );
+    }
+
+    /// An order paying its OWNER (an Axo order closing, a SaturnSwap cancel)
+    /// and an order with no owner on its address paying anyone (a DCA
+    /// delivering, an order under the venue's own stake): movements.
+    #[test]
+    fn an_order_paying_its_owner_or_with_no_owner_is_a_movement() {
+        let r = book_roles();
+        let moved = |from: &str, to: &str, amount| Event::Moved {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount,
+        };
+        let (order, owner) = (wallet(60, 1), wallet(9, 1));
+        assert_eq!(
+            classify_moves(&mv(&[(&order, -500), (&owner, 500)]), &r),
+            vec![moved(&order, &owner, 500)]
+        );
+        let (venue_owned, taker) = (wallet(61, 62), wallet(12, 6));
+        assert_eq!(
+            classify_moves(&mv(&[(&venue_owned, -10), (&taker, 10)]), &r),
+            vec![moved(&venue_owned, &taker, 10)]
+        );
+    }
+
+    /// A SaturnSwap taker spending a sell order: a buy by the taker and a
+    /// sell by the order's owner, both at the exchange.
+    #[test]
+    fn a_taker_spending_an_order_buys_from_its_owner() {
+        let (order, taker) = (wallet(61, 3), wallet(10, 4));
+        let e = classify_moves(&mv(&[(&order, -53_908), (&taker, 53_908)]), &book_roles());
+        assert_eq!(
+            e,
+            vec![
+                Event::Fill {
+                    venue_cred: stake(61),
+                    party: Party::Wallet(taker),
+                    amount: 53_908,
+                    into_pool: false,
+                },
+                Event::Fill {
+                    venue_cred: stake(61),
+                    party: Party::Stake(stake(3)),
+                    amount: 53_908,
+                    into_pool: true,
+                },
+            ]
+        );
+    }
+
+    /// A taker selling into two escrows (scripts known only by the venue's
+    /// stake): one sell, named for the venue by its stake. An escrow paying
+    /// its owner out is a movement.
+    #[test]
+    fn a_taker_paying_escrows_sells_and_a_payout_is_a_movement() {
+        let r = book_roles();
+        let (taker, a, b) = (wallet(10, 4), wallet(70, 62), wallet(71, 62));
+        let e = classify_moves(&mv(&[(&taker, -100), (&a, 60), (&b, 40)]), &r);
+        assert_eq!(
+            e,
+            vec![Event::Fill {
+                venue_cred: stake(62),
+                party: Party::Wallet(taker),
+                amount: 100,
+                into_pool: true,
+            }]
+        );
+        assert_eq!(r.name_of(&stake(62)), Some("saturnswap"));
+        let owner = wallet(11, 5);
+        assert!(matches!(
+            classify_moves(&mv(&[(&a, -60), (&owner, 60)]), &r).as_slice(),
+            [Event::Moved { amount: 60, .. }]
+        ));
+    }
+
+    /// A DCA book routing into another venue's order: the tokens move from
+    /// one contract to the other. The owner's left at the DCA's placement;
+    /// a second placement would take them twice.
+    #[test]
+    fn an_order_routing_into_another_venue_moves_between_contracts() {
+        let dca = wallet(63, 7);
+        let e = classify_moves(&mv(&[(&dca, -100), (SPLASH_ORDER_A, 100)]), &book_roles());
+        assert_eq!(
+            e,
+            vec![Event::Moved {
+                from: dca,
+                to: SPLASH_ORDER_A.to_string(),
+                amount: 100,
+            }]
+        );
+    }
+
+    /// Funding an order book: a movement to the book's owner, which is none
+    /// when the funder is the owner; funding a DCA (no owner on its address):
+    /// a placement by the funder.
+    #[test]
+    fn funding_a_book_moves_to_its_owner_and_a_dca_is_a_placement() {
+        let r = book_roles();
+        let (owner_wallet, book) = (wallet(9, 1), wallet(60, 1));
+        assert!(matches!(
+            classify_moves(&mv(&[(&owner_wallet, -50), (&book, 50)]), &r).as_slice(),
+            [Event::Moved { amount: 50, .. }]
+        ));
+        // DexHunter's DCA: an enterprise address, so no owner on it.
+        let dca = "addr1wxtlzuefvjg9k0r36ysk895gzjk97wl8027ffqc2snfje7gkzkf3h";
+        let dca_cred = address_parts(dca).unwrap().0;
+        let mut with_dca = r;
+        with_dca.register(dca_cred.clone(), Role::Book, "dexhunter");
+        let funder = wallet(9, 2);
+        assert_eq!(
+            classify_moves(&mv(&[(&funder, -20), (dca, 20)]), &with_dca),
+            vec![Event::Placement {
+                venue_cred: dca_cred,
+                party: Party::Wallet(funder),
+                amount: 20,
+            }]
         );
     }
 
@@ -1341,13 +1543,37 @@ mod tests {
         );
     }
 
+    /// Several senders paying several receivers, no venue among them: paired
+    /// largest to largest, a split where needed, and every party's total is
+    /// the chain's. (MEASURED: two vaults paying two claimants.)
+    #[test]
+    fn several_to_several_pairs_with_every_total_exact() {
+        let (a, b, c, d) = (
+            wallet(10, 10),
+            wallet(11, 11),
+            wallet(12, 12),
+            wallet(13, 13),
+        );
+        let e = classify_moves(
+            &mv(&[(&a, -500), (&d, -100), (&b, 400), (&c, 200)]),
+            &roles(),
+        );
+        let leg = |from: &str, to: &str, amount| Event::Moved {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount,
+        };
+        assert_eq!(
+            e,
+            vec![leg(&a, &b, 400), leg(&a, &c, 100), leg(&d, &c, 100)]
+        );
+    }
+
     /// Still not guessed: wallets on both sides of a pool, an order among
-    /// several WALLETS, two orders feeding each other, and several wallets on
-    /// both sides.
+    /// several WALLETS, and two orders feeding each other.
     #[test]
     fn other_multi_party_shapes_stay_transfers() {
-        let (a, b, c) = (wallet(10, 10), wallet(11, 11), wallet(12, 12));
-        let d = wallet(13, 13);
+        let (a, b) = (wallet(10, 10), wallet(11, 11));
         for parties in [
             vec![(SPLASH_POOL, -500), (a.as_str(), -100), (b.as_str(), 600)],
             vec![
@@ -1359,12 +1585,6 @@ mod tests {
                 (a.as_str(), -300),
                 (b.as_str(), -200),
                 (SPLASH_ORDER_A, 500),
-            ],
-            vec![
-                (a.as_str(), -500),
-                (d.as_str(), -100),
-                (b.as_str(), 400),
-                (c.as_str(), 200),
             ],
         ] {
             assert_eq!(
