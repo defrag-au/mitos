@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 
 use mithril_snapshot::aggregator::{Aggregator, MAINNET_AGGREGATOR, MAINNET_GENESIS_VKEY};
 use mithril_snapshot::ingest;
-use mithril_snapshot::{Inventory, PART_EXTS, Reconciliation, Report, lift, verify_parts};
+use mithril_snapshot::{Inventory, PART_EXTS, Reconciliation, Report, verify_parts};
 
 #[derive(Parser)]
 #[command(
@@ -506,14 +506,19 @@ fn sync(
         // A fresh staging directory per run: `download_unpack` leaves `allow_override`
         // false, so it refuses a directory that already holds an `immutable/`.
         clear_staging(&staging, &db_dir)?;
-        fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
 
-        let ingested = runtime.block_on(ingest::fetch(
-            &endpoint,
-            genesis_key,
-            &staging,
+        let ingested = runtime.block_on(ingest::ingest_range(
+            &ingest::IngestTarget {
+                endpoint: &endpoint,
+                genesis_key,
+                staging: &staging,
+                db_immutable: &immutable,
+                digests: &digests,
+                jobs,
+            },
             gap.from,
             gap.to,
+            ingest::stdout_progress(),
         ))?;
         println!(
             "ingested    {:05}–{:05} — snapshot {}, certificate {}, beacon {:05}",
@@ -523,33 +528,11 @@ fn sync(
             short(&ingested.certificate_hash),
             ingested.beacon
         );
-
-        // Independent of the certificate, and the check that governs what gets served:
-        // the bytes against the digest map the aggregator publishes.
-        let staged = Inventory::scan(&staging.join("immutable"))?;
-        let mismatches = verify_parts(&staged, &digests, jobs)?;
-        if !mismatches.is_empty() {
-            for mismatch in &mismatches {
-                println!("              {}", mismatch.name);
-                println!("                published {}", mismatch.published);
-                println!("                local     {}", mismatch.local);
-            }
-            bail!(
-                "{} of {} ingested part(s) do not match the published digest — nothing was \
-                 moved into {}, which is untouched",
-                mismatches.len(),
-                staged.part_count(),
-                immutable.display()
-            );
-        }
-
-        let moved = lift(&staging.join("immutable"), &immutable)?;
         println!(
             "moved       {} part(s) into {}",
-            moved.len(),
+            ingested.moved.len(),
             immutable.display()
         );
-        clear_staging(&staging, &db_dir)?;
     }
 
     let after = Inventory::scan(&immutable)?;

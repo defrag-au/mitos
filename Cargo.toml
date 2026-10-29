@@ -109,6 +109,10 @@ members = [
     "tools/mitos-run",
     "tools/mitos-chain-walk",
     "tools/market-ledger",
+    # Resolves a policy's first mint through Koios and fetches the Mithril
+    # immutable-file window its history needs. A TUI over the same core a
+    # script drives, because the answer is a range of chunks, not a token.
+    "tools/mithril-fetch",
     "tools/project-ledger",
     # Artifacts derived from the policy index — the collection catalogue.
     # A READER of the index, never a walker: the daily `tx-index build

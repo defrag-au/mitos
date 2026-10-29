@@ -206,6 +206,7 @@ mitos/
 | `project-ledger` | one project's mint window: capital in, holders forming, capital out | [→](tools/project-ledger/README.md) |
 | `wallet-sieve` | on-demand single-wallet flow excavation | [→](tools/wallet-sieve/README.md) |
 | `wallet-trace` | wallet clustering from vkey witness sets | [→](tools/wallet-trace/README.md) |
+| `mithril-fetch` | a policy's first mint (Koios) → the Mithril chunk range its history needs, into a shared store. TUI and `--run` | [→](tools/mithril-fetch/README.md) |
 | `tx-index` | build + serve the tx-hash index | [→](tools/tx-index/README.md) |
 | `mitos-chain-walk` | *library*, not a binary: the shared walker plumbing (bootstrap, chunk iteration, bare-pallas decode, checkpoint mirror) | [→](tools/mitos-chain-walk/README.md) |
 

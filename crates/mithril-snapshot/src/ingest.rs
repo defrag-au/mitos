@@ -27,11 +27,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use mithril_client::cardano_database_client::{DownloadUnpackOptions, ImmutableFileRange};
-use mithril_client::feedback::{FeedbackReceiver, MithrilEvent, MithrilEventCardanoDatabase};
 use mithril_client::{ClientBuilder, MessageBuilder};
+
+use crate::{Digests, Inventory, PART_EXTS, lift, verify_parts};
+
+pub use mithril_client::feedback::{FeedbackReceiver, MithrilEvent, MithrilEventCardanoDatabase};
 
 /// What was fetched, and which signed snapshot and certificate it was checked against.
 #[derive(Debug, Clone)]
@@ -58,8 +61,32 @@ pub async fn fetch(
     from: u64,
     to: u64,
 ) -> Result<Ingested> {
+    fetch_with(endpoint, genesis_key, target, from, to, stdout_progress()).await
+}
+
+/// The receiver [`fetch`] uses: the same live line `mithril-client-cli` draws.
+///
+/// Exposed so a caller that wants the CLI's rendering for one range in a loop
+/// does not have to reach into this module's private `Progress`.
+pub fn stdout_progress() -> Arc<dyn FeedbackReceiver> {
+    Arc::new(Progress::new())
+}
+
+/// [`fetch`], reporting through a receiver the caller owns.
+///
+/// This is the entry point a TUI uses: the progress events are the same ones the
+/// library exposes, so a screen does not have to parse a rendered line, and the
+/// download can be cancelled by dropping the future.
+pub async fn fetch_with(
+    endpoint: &str,
+    genesis_key: &str,
+    target: &Path,
+    from: u64,
+    to: u64,
+    receiver: Arc<dyn FeedbackReceiver>,
+) -> Result<Ingested> {
     let client = ClientBuilder::aggregator(endpoint, genesis_key)
-        .add_feedback_receiver(Arc::new(Progress::new()))
+        .add_feedback_receiver(receiver)
         .build()
         .map_err(|error| anyhow!("building the Mithril client: {error}"))?;
     let api = client.cardano_database_v2();
@@ -131,6 +158,147 @@ pub async fn fetch(
         snapshot_hash: snapshot.hash.clone(),
         beacon,
         certificate_hash: snapshot.certificate_hash.clone(),
+    })
+}
+
+/// A range that was fetched, proved against the certificate, checked against the
+/// published digests, and moved into the database.
+#[derive(Debug, Clone)]
+pub struct IngestedRange {
+    pub from: u64,
+    pub to: u64,
+    pub snapshot_hash: String,
+    pub certificate_hash: String,
+    pub beacon: u64,
+    /// Bytes of the parts that were moved in.
+    pub bytes: u64,
+    /// Part names that were moved in, sorted.
+    pub moved: Vec<String>,
+}
+
+/// Everything a verified ingest needs besides the range and the progress sink.
+#[derive(Debug, Clone, Copy)]
+pub struct IngestTarget<'a> {
+    pub endpoint: &'a str,
+    pub genesis_key: &'a str,
+    /// A fresh directory this creates and removes. A sibling of `db_immutable`
+    /// on the same filesystem, because [`lift`] renames rather than copies.
+    pub staging: &'a Path,
+    pub db_immutable: &'a Path,
+    /// The aggregator's published SHA-256 per part name.
+    pub digests: &'a Digests,
+    /// Files to hash at once.
+    pub jobs: usize,
+}
+
+/// Fetch `from..=to`, verify the staged parts against the published digest map,
+/// then move them into the database.
+///
+/// The certificate proof `fetch_with` computes covers the transfer. The digest
+/// check here covers the bytes that landed on this disk — the two are different
+/// claims, and `sync` made both before this was extracted. Nothing is moved in
+/// until both hold, so an interrupted or lied-to transfer costs the staging
+/// directory and never the database.
+pub async fn ingest_range(
+    target: &IngestTarget<'_>,
+    from: u64,
+    to: u64,
+    receiver: Arc<dyn FeedbackReceiver>,
+) -> Result<IngestedRange> {
+    if target.staging.exists() {
+        bail!(
+            "staging directory {} already exists — it must be fresh, because a partial \
+             transfer is not something to reason about",
+            target.staging.display()
+        );
+    }
+    std::fs::create_dir_all(target.staging).with_context(|| {
+        format!(
+            "creating the staging directory {}",
+            target.staging.display()
+        )
+    })?;
+
+    let ingested = fetch_with(
+        target.endpoint,
+        target.genesis_key,
+        target.staging,
+        from,
+        to,
+        receiver,
+    )
+    .await?;
+
+    let staged = Inventory::scan(&target.staging.join("immutable"))?;
+
+    // `download_unpack` should write all three parts for every requested
+    // number. If it did not, moving the rest in would leave the database with a
+    // triple `lift` will refuse to repair on the next run.
+    let incomplete: Vec<u64> = staged
+        .parts
+        .iter()
+        .filter(|(_, parts)| parts.len() != PART_EXTS.len())
+        .map(|(number, _)| *number)
+        .collect();
+    if !incomplete.is_empty() {
+        bail!(
+            "the staged transfer for {from:05}–{to:05} is missing parts for: {}. Nothing was \
+             moved into {}",
+            incomplete
+                .iter()
+                .map(|number| format!("{number:05}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            target.db_immutable.display()
+        );
+    }
+
+    let mut bytes = 0u64;
+    for path in staged.parts.values().flat_map(|parts| parts.values()) {
+        bytes += std::fs::metadata(path)
+            .with_context(|| format!("reading the size of {}", path.display()))?
+            .len();
+    }
+
+    let digests = target.digests.clone();
+    let jobs = target.jobs;
+    let mismatches = tokio::task::spawn_blocking(move || verify_parts(&staged, &digests, jobs))
+        .await
+        .context("joining the digest check")??;
+    if !mismatches.is_empty() {
+        let listed = mismatches
+            .iter()
+            .map(|mismatch| {
+                format!(
+                    "{} (published {}, local {})",
+                    mismatch.name, mismatch.published, mismatch.local
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "{from:05}–{to:05} did not match the published digests: {listed}. Nothing was \
+             moved into {}",
+            target.db_immutable.display()
+        );
+    }
+
+    let moved = lift(&target.staging.join("immutable"), target.db_immutable)?;
+    std::fs::remove_dir_all(target.staging).with_context(|| {
+        format!(
+            "cleaning up the staging directory {}",
+            target.staging.display()
+        )
+    })?;
+
+    Ok(IngestedRange {
+        from,
+        to,
+        snapshot_hash: ingested.snapshot_hash,
+        certificate_hash: ingested.certificate_hash,
+        beacon: ingested.beacon,
+        bytes,
+        moved,
     })
 }
 
@@ -239,7 +407,7 @@ fn summary(state: &State) -> String {
 }
 
 /// Bytes in binary units, because this is a download, not a disk.
-fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
