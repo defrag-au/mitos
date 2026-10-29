@@ -2452,42 +2452,28 @@ fn live_folds(
 
     let (held, series) = match crate::archive::History::open(&dir)? {
         Some(mut h) => {
-            // ⚠️ The SERIES first: its carry is the one that knows the boundary,
-            // and the balance table resumes above the SAME slot, so a reader
-            // that has to build both folds one tail for the pair.
-            // The carried series, continued through whatever has happened
-            // since its boundary. This is the whole point of the artifacts:
-            // the fold is proportional to the TAIL, not to the history.
-            let continued = written.filter(|carry| match &manifest {
-                // ⚠️ A GAP would be silent — see `tail_series`. If the
-                // archive's coverage does not reach from the boundary to the
-                // tail, folding above the boundary drops every row in
-                // between and the series loses a stretch of trades without
-                // saying so.
-                Some(m) => tail_is_continuous(m, carry.settled_to),
-                None => false,
-            });
-            let (series, settled_to) = match continued {
-                Some(carry) => match &manifest {
-                    Some(m) => {
-                        let settled_to = carry.settled_to;
-                        (
-                            crate::archive::tail_series(&mut h, &dir, m, &carry)?,
-                            settled_to,
-                        )
-                    }
-                    None => {
-                        let settled_to = carry.settled_to;
-                        (carry.series, settled_to)
-                    }
-                },
-                None => {
-                    let observations = match &manifest {
-                        Some(m) => crate::archive::read_observations(&dir, m)?,
-                        None => Vec::new(),
-                    };
-                    let carry = crate::archive::carry_from(&mut h, &observations)?;
-                    let settled_to = carry.settled_to;
+            // ⚠️ The WRITTEN artifacts carry the IMMUTABLE archive only, and
+            // `read_series`/`read_holders` refuse one whose boundary is anywhere
+            // else. The volatile tail is folded HERE, from the live files,
+            // because it is replaced whole on every refresh: a carry that
+            // included it is a snapshot of rows the next refresh may not have.
+            // See `archive::write_derived`.
+            //
+            // A GAP would be silent — see `tail_series`. If the archive's
+            // coverage does not reach from the boundary to the tail, folding
+            // above the boundary drops every row in between, so the whole
+            // archive is folded and nothing is written: there is no boundary a
+            // later tail fold could resume from.
+            let continuous = manifest
+                .as_ref()
+                .is_some_and(|m| tail_is_continuous(m, immutable));
+
+            let series = match (&manifest, written.filter(|_| continuous)) {
+                (Some(m), Some(carry)) => crate::archive::tail_series(&mut h, &dir, m, &carry)?,
+                (Some(m), None) if continuous => {
+                    let observations = crate::archive::read_observations_upto(&dir, m, immutable)?;
+                    let carry =
+                        crate::archive::immutable_carry_from(&mut h, &observations, immutable)?;
                     // ⚠️ Record the fold that just happened. The publisher
                     // rewrites this when a walk lands; writing it here is what
                     // covers a box that has just restarted and a reader on a
@@ -2500,17 +2486,27 @@ fn live_folds(
                             "policy: series artifact not written"
                         );
                     }
-                    (carry.series, settled_to)
+                    // ⚠️ The carry is the IMMUTABLE half; the answer is the
+                    // whole archive. Continue it through the tail — the same
+                    // fold the artifact path takes above.
+                    crate::archive::tail_series(&mut h, &dir, m, &carry)?
                 }
+                (Some(m), _) => {
+                    let observations = crate::archive::read_observations(&dir, m)?;
+                    crate::archive::carry_from(&mut h, &observations)?.series
+                }
+                (None, _) => policy_archive::series::Series::default(),
             };
 
-            let held = match &written_holders {
+            let held = match (&manifest, written_holders.filter(|_| continuous)) {
                 // The published table, continued through the same tail.
-                Some(file) => crate::archive::holders_tail(&mut h, &file.carry, file.settled_to)?,
-                None => {
-                    let carry = crate::archive::holders_carry_from(&mut h)?;
+                (Some(_), Some(file)) => {
+                    crate::archive::holders_tail(&mut h, &file.carry, file.settled_to)?
+                }
+                (Some(_), None) if continuous => {
+                    let carry = crate::archive::immutable_holders_carry_from(&mut h)?;
                     if let Err(e) =
-                        crate::archive::store_holders(&dir, immutable, settled_to, &carry)
+                        crate::archive::store_holders(&dir, immutable, immutable, &carry)
                     {
                         tracing::warn!(
                             policy,
@@ -2518,8 +2514,14 @@ fn live_folds(
                             "policy: holders artifact not written"
                         );
                     }
-                    policy_archive::holders::publish(&carry)
+                    // ⚠️ The carry is the IMMUTABLE half; the answer is the
+                    // whole archive. Continue it through the tail — the same
+                    // fold the artifact path takes above.
+                    crate::archive::holders_tail(&mut h, &carry, immutable)?
                 }
+                // No boundary can be trusted: fold the whole archive and write
+                // nothing. `holders_of` reaches the same answer the same way.
+                _ => crate::archive::holders_from(&mut h)?,
             };
             (held, Arc::new(series))
         }

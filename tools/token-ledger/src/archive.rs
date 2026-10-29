@@ -606,6 +606,16 @@ impl PolicyArchive {
     /// movements below `before_slot`, plus every correction to them. A
     /// caller with more rows of its own — the live view of a running pass —
     /// appends them and folds once.
+    ///
+    /// ⚠️ ONE row set, whichever mix of files holds it. A top-up walk into a
+    /// stretch the volatile tail also covers must write its own rows there, so
+    /// for a window the same transaction legitimately exists in BOTH an
+    /// immutable and a volatile file. Counting both double-counts its amounts,
+    /// which is the same fault [`PolicyArchive::reconcile`] documents for
+    /// supply — seen by every reader of this page rather than only by the
+    /// reconciler. Rows at or below the immutable ceiling therefore come from
+    /// the STABLE copy alone; the volatile file contributes only what is above
+    /// it.
     pub fn movements_page(
         &mut self,
         limit: u32,
@@ -613,6 +623,7 @@ impl PolicyArchive {
     ) -> Result<Vec<Movement>> {
         let limit = limit.clamp(1, 5_000) as usize;
         let before = before_slot.unwrap_or(u64::MAX);
+        let stable = immutable_to(&self.manifest);
 
         // Every movement group that could hold a row below `before`, newest
         // first by its top slot.
@@ -624,6 +635,9 @@ impl PolicyArchive {
             for g in 0..f.archive.num_groups() {
                 if let Some((lo, hi)) = f.archive.slot_range(g)
                     && lo < before
+                    // A volatile group wholly at or below the immutable ceiling
+                    // is a top-up duplicate of rows already in a stable file.
+                    && !(f.range == RangeKind::Volatile && hi <= stable)
                 {
                     candidates.push((i, g, hi));
                 }
@@ -637,16 +651,18 @@ impl PolicyArchive {
             if txs.len() >= limit {
                 break;
             }
+            let volatile = self.files[i].range == RangeKind::Volatile;
             let f = &mut self.files[i];
             f.fetch_group(g)?;
             for m in f.archive.read_group(&f.bytes, g)? {
-                if m.slot < before {
+                let duplicate = volatile && m.slot <= stable;
+                if m.slot < before && !duplicate {
                     txs.insert(m.tx_hash.clone());
                     rows.push(m);
                 }
             }
         }
-        self.attach_corrections(&mut rows, &txs)?;
+        self.attach_corrections(&mut rows, &txs, false)?;
         Ok(rows)
     }
 
@@ -832,10 +848,16 @@ impl PolicyArchive {
     }
 
     /// Pull in corrections for the transactions in hand.
+    ///
+    /// `immutable_only` keeps the carried fold inside the stable half: the
+    /// volatile tail's corrections are written when the tail resolves a source,
+    /// and the tail is replaced whole — so a correction read into a carry is a
+    /// row the next refresh may not have.
     fn attach_corrections(
         &mut self,
         rows: &mut Vec<Movement>,
         txs: &HashSet<Vec<u8>>,
+        immutable_only: bool,
     ) -> Result<()> {
         let (Some(lo), Some(hi)) = (
             rows.iter().map(|m| m.slot).min(),
@@ -844,7 +866,9 @@ impl PolicyArchive {
             return Ok(());
         };
         for f in &mut self.files {
-            if f.kind != FileKind::Corrections {
+            if f.kind != FileKind::Corrections
+                || (immutable_only && f.range != RangeKind::Immutable)
+            {
                 continue;
             }
             for g in f.archive.groups_overlapping(lo, hi) {
@@ -1421,12 +1445,17 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
 pub struct History {
     archive: PolicyArchive,
     all: Option<Vec<Movement>>,
+    immutable: Option<Vec<Movement>>,
 }
 
 impl History {
     /// `None` when no pass has ever run for this policy.
     pub fn open(dir: &Path) -> Result<Option<Self>> {
-        Ok(PolicyArchive::open(dir)?.map(|archive| Self { archive, all: None }))
+        Ok(PolicyArchive::open(dir)?.map(|archive| Self {
+            archive,
+            all: None,
+            immutable: None,
+        }))
     }
 
     /// Every movement in the archive, decoded ONCE.
@@ -1457,6 +1486,53 @@ impl History {
             self.all = Some(all);
         }
         Ok(self.all.as_deref().unwrap_or(&[]))
+    }
+
+    /// Every movement in the archive's IMMUTABLE files, decoded ONCE.
+    ///
+    /// ⚠️ Immutable only, deliberately. A carried artifact is keyed on
+    /// [`immutable_to`], and the volatile tail is a projection that is
+    /// REPLACED WHOLE on every refresh: a carry built from it is a snapshot of
+    /// rows that may not exist on the next read, and continuing it above its
+    /// own boundary folds whatever is left a second time. MEASURED 2026-10-29
+    /// on $PERP: the cold fold was 6,000 units across 428 parties and the
+    /// carried one 6,156 across 429, from the same archive.
+    pub fn immutable_movements(&mut self) -> Result<&[Movement]> {
+        if self.immutable.is_none() {
+            let mut rows: Vec<Movement> = Vec::new();
+            let mut txs: HashSet<Vec<u8>> = HashSet::new();
+            for i in 0..self.archive.files.len() {
+                if self.archive.files[i].kind != FileKind::Movements
+                    || self.archive.files[i].range != RangeKind::Immutable
+                {
+                    continue;
+                }
+                let groups = self.archive.files[i].archive.num_groups();
+                for g in 0..groups {
+                    self.archive.files[i].fetch_group(g)?;
+                }
+                let f = &self.archive.files[i];
+                let reader = f.archive.reader(&f.bytes)?;
+                for g in 0..groups {
+                    for m in Archive::read_group_with(&reader, g)? {
+                        txs.insert(m.tx_hash.clone());
+                        rows.push(m);
+                    }
+                }
+            }
+            self.archive.attach_corrections(&mut rows, &txs, true)?;
+            self.immutable = Some(rows);
+        }
+        Ok(self.immutable.as_deref().unwrap_or(&[]))
+    }
+
+    /// Release the memoised IMMUTABLE decode.
+    ///
+    /// The publisher folds the immutable half for the carried artifacts and then
+    /// the whole archive for the summary; keeping both decodes resident doubles
+    /// the largest allocation here for no answer.
+    pub fn forget_immutable(&mut self) {
+        self.immutable = None;
     }
 
     /// Every movement ABOVE `slot`, decoded — the tail half of a carried fold.
@@ -1497,7 +1573,7 @@ impl History {
                 }
             }
         }
-        self.archive.attach_corrections(&mut rows, &txs)?;
+        self.archive.attach_corrections(&mut rows, &txs, false)?;
         Ok(rows)
     }
 }
@@ -1546,6 +1622,39 @@ pub fn carry_from(
     observations: &[policy_archive::Observation],
 ) -> Result<policy_archive::series::Carry> {
     let movements = h.all_movements()?.to_vec();
+    Ok(carry_of(movements, observations))
+}
+
+/// [`carry_from`] over the IMMUTABLE archive only, against the boundary a
+/// reader resumes from.
+///
+/// ⚠️ The artifacts exist to make the carried half STABLE. The volatile tail is
+/// replaced whole, so a carry that includes it is only true until the next
+/// refresh — see [`History::immutable_movements`]. `settled_to` is set to
+/// `immutable_to`, not to the last row, so the read side folds every row above
+/// the immutable coverage exactly once.
+pub fn immutable_carry_from(
+    h: &mut History,
+    observations: &[policy_archive::Observation],
+    immutable_to: u64,
+) -> Result<policy_archive::series::Carry> {
+    let movements = h.immutable_movements()?.to_vec();
+    let observations: Vec<policy_archive::Observation> = observations
+        .iter()
+        .filter(|o| o.slot <= immutable_to)
+        .cloned()
+        .collect();
+    let mut carry = carry_of(movements, &observations);
+    carry.settled_to = immutable_to;
+    Ok(carry)
+}
+
+/// The fold itself: one story from the movements and observations, and the
+/// state a later tail continues from.
+fn carry_of(
+    movements: Vec<Movement>,
+    observations: &[policy_archive::Observation],
+) -> policy_archive::series::Carry {
     let settled_to = movements
         .iter()
         .map(|m| m.slot)
@@ -1559,12 +1668,12 @@ pub fn carry_from(
         &policy_archive::view::Projection::default(),
         &policy_archive::series::Carry::default(),
     );
-    Ok(policy_archive::series::Carry {
+    policy_archive::series::Carry {
         series,
         view,
         roles,
         settled_to,
-    })
+    }
 }
 
 /// Continue a carried series through everything ABOVE its boundary.
@@ -1613,33 +1722,47 @@ pub fn tail_series(
 ///
 /// Written through a RENAME: `/live` reads this while the scheduler writes it,
 /// and half a postcard stream decodes as corruption rather than as "not yet".
-/// Write BOTH derived artefacts — `series.bin` and `holders.bin` — from ONE
-/// read of the archive.
 ///
-/// ⚠️ One decode, not two. Each fold walks every movement row and the walk is
-/// the expensive half; [`History`] memoises it, so the second fold is nearly
-/// free. They also share a boundary, so a reader folds one tail for the pair.
+/// ⚠️ **`series.bin` and `holders.bin` carry the IMMUTABLE archive only**, and
+/// say so with `settled_to == immutable_to`. The volatile tail is replaced
+/// whole on every refresh, so a carry that includes it is a snapshot of rows
+/// the next refresh may not have; continuing it above its own boundary folds
+/// the replacement on top of the original. Readers fold the tail themselves,
+/// from the live files. This costs one more decode here (the immutable half,
+/// then the whole archive for the summary) and saves every reader the history.
 pub fn write_derived(dir: &Path) -> Result<()> {
     let Some(manifest) = load_manifest(dir)? else {
         return Ok(());
     };
-    let observations = read_observations(dir, &manifest)?;
     let Some(mut history) = History::open(dir)? else {
         return Ok(());
     };
-    let series = carry_from(&mut history, &observations)?;
-    let held = holders_carry_from(&mut history)?;
-    let settled_to = series.settled_to;
+    // ⚠️ The carried artifacts describe the IMMUTABLE archive, and say so with
+    // `settled_to == immutable_to`. The volatile tail below is a projection
+    // replaced WHOLE on every refresh, so folding it into a carry would make
+    // the artifact a snapshot of rows that may not exist when it is read — and
+    // a reader continuing it above its own boundary would fold the replacement
+    // on top of the original. Reads fold the tail themselves, from the live
+    // files. MEASURED 2026-10-29: $PERP's stale carry served 6,156 units held
+    // where the archive holds 6,000.
     let key = immutable_to(&manifest);
+    let observations = read_observations_upto(dir, &manifest, key)?;
+    let series = immutable_carry_from(&mut history, &observations, key)?;
+    let held = immutable_holders_carry_from(&mut history)?;
     store_series(dir, key, &series)?;
-    store_holders(dir, key, settled_to, &held)?;
-    // THE SUMMARY, from the same decode and the same series: the third reader
-    // of these rows, so it costs a sort and a fold, never another read.
+    store_holders(dir, key, key, &held)?;
+    // The whole archive is folded next for the summary; the immutable decode
+    // is dead weight from here.
+    history.forget_immutable();
+    // THE SUMMARY is of the whole archive, tail included: it is a published
+    // document rather than a fold a reader resumes, so it takes the full
+    // series and every movement.
+    let full = carry_from(&mut history, &read_observations(dir, &manifest)?)?;
     let complete = manifest.completeness() == Completeness::Complete;
     let policy = policy_of(dir);
     let (summary, checkpoints) = policy_archive::summary::build(&policy_archive::summary::Inputs {
         policy: &policy,
-        series: &series.series,
+        series: &full.series,
         movements: history.all_movements()?,
         immutable_to: key,
         complete,
@@ -1839,10 +1962,13 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
     Ok(())
 }
 
-/// The balance state at the archive's tip, for writing as an artefact.
-pub fn holders_carry_from(h: &mut History) -> Result<policy_archive::holders::Carry> {
+/// The balance state over the IMMUTABLE archive, for [`policy_archive::HOLDERS`].
+///
+/// ⚠️ See [`History::immutable_movements`]: the tail is replaced whole, so a
+/// carry that includes it cannot be resumed from a boundary.
+pub fn immutable_holders_carry_from(h: &mut History) -> Result<policy_archive::holders::Carry> {
     Ok(policy_archive::holders::carry(
-        h.all_movements()?.iter().cloned(),
+        h.immutable_movements()?.iter().cloned(),
     ))
 }
 
@@ -1893,7 +2019,12 @@ pub fn read_holders(dir: &Path, immutable_to: u64) -> Result<Option<policy_archi
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let file = policy_archive::HoldersFile::decode(&bytes)?;
-    Ok((file.immutable_to == immutable_to).then_some(file))
+    // ⚠️ The boundary must BE the immutable ceiling. A file folded through the
+    // volatile tail names a boundary inside a stretch that is replaced whole,
+    // so continuing it above that boundary counts the replacements on top of
+    // the originals. Format 2 stopped writing those; this also refuses any
+    // that survive a format-compatible rewrite.
+    Ok((file.immutable_to == immutable_to && file.settled_to == immutable_to).then_some(file))
 }
 
 /// The archive's IMMUTABLE coverage ceiling — what invalidates a written
@@ -1955,7 +2086,12 @@ pub fn read_series(dir: &Path, immutable_to: u64) -> Result<Option<policy_archiv
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let file = policy_archive::SeriesFile::decode(&bytes)?;
-    Ok((file.immutable_to == immutable_to).then_some(file.carry))
+    // See `read_holders`: a carry whose boundary is above the immutable
+    // ceiling was folded through a tail that is replaced whole.
+    Ok(
+        (file.immutable_to == immutable_to && file.carry.settled_to == immutable_to)
+            .then_some(file.carry),
+    )
 }
 
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
@@ -2526,6 +2662,44 @@ pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive:
             )
         })?;
         rows.extend(policy_archive::read_all(&bytes)?);
+    }
+    redecode(&mut rows, m);
+    Ok(rows)
+}
+
+/// Every observation in the IMMUTABLE passes at or below `slot` — the carried
+/// half of a fold whose boundary is the immutable ceiling.
+///
+/// ⚠️ Immutable passes only. A volatile pass may overlap the immutable range,
+/// and its rows are replaced whole; including them here would put replaceable
+/// data behind a stable boundary, which is the defect this split exists to
+/// remove — see [`History::immutable_movements`].
+pub fn read_observations_upto(
+    dir: &Path,
+    m: &Manifest,
+    slot: u64,
+) -> Result<Vec<policy_archive::Observation>> {
+    let mut rows: Vec<policy_archive::Observation> = Vec::new();
+    for p in &m.passes {
+        if p.kind != RangeKind::Immutable || p.ceiling > slot {
+            continue;
+        }
+        let Some(rel) = p.observations_path() else {
+            continue;
+        };
+        let path = dir.join(&rel);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "pass {} names {rel} and it is not there — the archive is \
+                 incomplete and needs re-walking, not reading",
+                p.seq,
+            )
+        })?;
+        rows.extend(
+            policy_archive::read_all(&bytes)?
+                .into_iter()
+                .filter(|o| o.slot <= slot),
+        );
     }
     redecode(&mut rows, m);
     Ok(rows)
@@ -3611,5 +3785,252 @@ mod tests {
 
         // And the static table alone cannot know it — the discovery is what did.
         assert!(venue_roles().role_of(&curve).is_none());
+    }
+
+    /// A pass entry for the carried-artifact tests, with the fields those
+    /// tests exercise and honest zeros everywhere else.
+    fn archive_pass(
+        seq: u32,
+        kind: RangeKind,
+        floor: u64,
+        ceiling: u64,
+        movements: FileEntry,
+    ) -> PassEntry {
+        PassEntry {
+            seq,
+            dir: match kind {
+                RangeKind::Immutable => PassEntry::dir_name(seq),
+                RangeKind::Volatile => PassEntry::tip_dir_name(seq),
+            },
+            ceiling,
+            floor,
+            windows: Vec::new(),
+            kind,
+            rolled_up: false,
+            movements: Some(movements),
+            corrections: None,
+            observations: None,
+            segments: Vec::new(),
+            pending: 0,
+            found: 0,
+            written: 0,
+            backfilled: 0,
+            units: 0,
+            secs: 0.0,
+            written_unix: 0,
+        }
+    }
+
+    /// A complete archive with an immutable pass and a volatile tail, for the
+    /// carried-artifact tests. Returns the manifest and the tail's file path, so
+    /// a test can REPLACE the tail the way the tip does.
+    fn archive_with_a_tail(dir: &Path, tail: Vec<Movement>) -> (Manifest, PathBuf) {
+        let stamp = stamp_for("aa");
+        let mut manifest = Manifest::new("aa");
+        manifest.completeness = Completeness::Complete.as_wire().to_string();
+        manifest.walk_from = Some(0);
+        manifest.walk_to = Some(2_000);
+        manifest.updated_unix = 1;
+
+        let imm_dir = dir.join(PassEntry::dir_name(0));
+        std::fs::create_dir_all(&imm_dir).unwrap();
+        let movements = crate::segments::write_file(
+            &imm_dir.join(MOVEMENTS),
+            &stamp,
+            vec![
+                // A mint of 10 to alice, and 4 of it moved to bob.
+                row(10, 1, "addr_alice", 10, 10),
+                row(20, 2, "addr_alice", -4, 0),
+                row(20, 2, "addr_bob", 4, 0),
+            ],
+        )
+        .unwrap();
+        manifest
+            .passes
+            .push(archive_pass(0, RangeKind::Immutable, 0, 1_000, movements));
+
+        let tail_dir = dir.join(PassEntry::tip_dir_name(1));
+        std::fs::create_dir_all(&tail_dir).unwrap();
+        let tail_path = tail_dir.join(MOVEMENTS);
+        let written = crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+        manifest
+            .passes
+            .push(archive_pass(1, RangeKind::Volatile, 1_001, 2_000, written));
+        store_manifest(dir, &manifest).unwrap();
+        (manifest, tail_path)
+    }
+
+    fn row(slot: u64, tx: u8, addr: &str, amount: i64, net_mint: i64) -> Movement {
+        Movement {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![tx; 32],
+            unit_name: b"Perp1".to_vec(),
+            address: addr.to_string(),
+            amount,
+            net_mint,
+            tx_index: 0,
+        }
+    }
+
+    /// ⚠️ THE FLAP THIS PINS. A derived balance table used to be trusted
+    /// whenever the archive's IMMUTABLE ceiling matched, while its carry named
+    /// a boundary inside the VOLATILE tail. The tail is REPLACED WHOLE on
+    /// every refresh, so the next read continued a carry that already held the
+    /// replaced rows through whatever the replacement contained.
+    ///
+    /// MEASURED 2026-10-29 on $PERP (`e6ba9c0f…`): a cold `/holders` folded the
+    /// archive to 6,000 units across 428 parties; after `/live` had warmed the
+    /// shared cache from `holders.bin`, the same route reported 6,156 across
+    /// 429, from the same files.
+    #[test]
+    fn a_holder_artifact_never_carries_the_volatile_tail() {
+        use policy_archive::supply::Diagnose;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (mut manifest, tail_path) = archive_with_a_tail(
+            dir,
+            vec![
+                // A mint of 2 to carol, and 3 of bob's holding moved on.
+                row(1_500, 3, "addr_carol", 2, 2),
+                row(1_600, 4, "addr_bob", -3, 0),
+                row(1_600, 4, "addr_carol", 3, 0),
+            ],
+        );
+
+        // The publisher writes the carried artifacts.
+        write_derived(dir).unwrap();
+        let key = immutable_to(&manifest);
+        let artifact = read_holders(dir, key).unwrap().expect("a fresh artifact");
+        assert_eq!(
+            artifact.settled_to, key,
+            "a carry must end at the immutable ceiling, never inside the tail"
+        );
+
+        // The tail is REPLACED WHOLE: the same coverage, different rows.
+        crate::segments::write_file(
+            &tail_path,
+            &stamp_for("aa"),
+            vec![
+                row(1_500, 5, "addr_bob", -1, 0),
+                row(1_500, 5, "addr_dave", 1, 0),
+            ],
+        )
+        .unwrap();
+        manifest.updated_unix += 1;
+        store_manifest(dir, &manifest).unwrap();
+
+        let whole = build_holders(dir).unwrap().unwrap();
+        let mut h = History::open(dir).unwrap().unwrap();
+        let served = holders_tail(&mut h, &artifact.carry, artifact.settled_to).unwrap();
+
+        // ⚠️ THE INVARIANT: the carried table continued through the LIVE tail
+        // is the table a whole fold gives, so no party keeps units the chain
+        // has since moved, and none gains them without a departure.
+        assert_eq!(served, whole);
+
+        // And on a COMPLETE archive the table's total IS the net mint.
+        let mut a = PolicyArchive::open(dir).unwrap().unwrap();
+        let minted: i64 = a
+            .reconcile_current(Diagnose::Totals)
+            .unwrap()
+            .reconciler
+            .balances()
+            .iter()
+            .map(|b| b.minted)
+            .sum();
+        assert_eq!(whole.held, minted);
+    }
+
+    /// ⚠️ The artifact VERSION 1 wrote — its carry folded the whole archive and
+    /// named the tail's top slot as the boundary — is refused, not continued.
+    /// Without this the stale file already on a box outlives the fix, because
+    /// its `immutable_to` still matches until the next snapshot.
+    #[test]
+    fn a_holder_artifact_ending_inside_the_tail_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (manifest, _) = archive_with_a_tail(
+            dir,
+            vec![
+                row(1_500, 3, "addr_carol", 2, 2),
+                row(1_600, 4, "addr_bob", -3, 0),
+                row(1_600, 4, "addr_carol", 3, 0),
+            ],
+        );
+        let key = immutable_to(&manifest);
+
+        // Exactly what version 1 stored: the whole fold, and the tail's top
+        // slot as the boundary.
+        let mut h = History::open(dir).unwrap().unwrap();
+        let carry = policy_archive::holders::carry(h.all_movements().unwrap().iter().cloned());
+        store_holders(dir, key, 1_600, &carry).unwrap();
+
+        assert!(
+            read_holders(dir, key).unwrap().is_none(),
+            "a carry whose boundary is inside the replaced tail is not a \
+             resume point, and must be rebuilt rather than continued"
+        );
+    }
+
+    /// ⚠️ The same fault one layer down. A top-up walk into a stretch the
+    /// volatile tail also covers writes its own rows there, so for a window a
+    /// transaction exists in an immutable AND a volatile file. Folding both
+    /// counts an arrival twice with no departure — the shape that reads as a
+    /// holder conjuring units — so the stable copy is the only one counted at or
+    /// below the immutable ceiling.
+    #[test]
+    fn a_volatile_copy_of_immutable_rows_is_not_folded_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let stamp = stamp_for("aa");
+        let imm_path = dir.join("movements.parquet");
+        let tail_path = dir.join("tail.parquet");
+        let imm =
+            crate::segments::write_file(&imm_path, &stamp, vec![row(10, 1, "addr_alice", 10, 10)])
+                .unwrap();
+        let tail = crate::segments::write_file(
+            &tail_path,
+            &stamp,
+            vec![
+                // The SAME mint, as the tail's copy, plus a transfer only the
+                // tail holds.
+                row(10, 1, "addr_alice", 10, 10),
+                row(1_500, 2, "addr_alice", -4, 0),
+                row(1_500, 2, "addr_bob", 4, 0),
+            ],
+        )
+        .unwrap();
+        let mut manifest = Manifest::new("aa");
+        manifest
+            .passes
+            .push(archive_pass(0, RangeKind::Immutable, 0, 1_000, imm));
+        // ⚠️ The tail's floor is BELOW the immutable ceiling — the overlap.
+        manifest
+            .passes
+            .push(archive_pass(1, RangeKind::Volatile, 900, 2_000, tail));
+
+        let mut h = History {
+            archive: PolicyArchive {
+                manifest,
+                files: vec![
+                    OpenFile::open(&imm_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                    OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+                ],
+            },
+            all: None,
+            immutable: None,
+        };
+        let fold = holders_from(&mut h).unwrap();
+        assert_eq!(fold.held, 10, "the duplicated mint is counted once");
+        assert_eq!(
+            fold.holders
+                .iter()
+                .find(|x| x.key == "addr_alice")
+                .map(|x| x.amount),
+            Some(6),
+            "10 minted, 4 sent on"
+        );
     }
 }

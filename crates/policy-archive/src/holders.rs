@@ -223,7 +223,13 @@ pub const HOLDERS: &str = "holders.bin";
 /// Bumped when [`Carry`], [`Party`] or [`Fold`] changes shape. Same rule as
 /// [`crate::SERIES_FORMAT`]: a stale file and a broken one are different
 /// answers, so the byte is checked before anything is deserialized.
-pub const HOLDERS_FORMAT: u8 = 1;
+///
+/// ⚠️ **2 makes [`HoldersFile::settled_to`] the IMMUTABLE boundary.** Version 1
+/// was written from a fold that could include the volatile tail while naming a
+/// boundary above it, so its carry held rows a later tail fold folded AGAIN.
+/// The tail is replaced whole, so those rows cannot be trusted to still exist;
+/// every version-1 file is refused and rebuilt rather than read.
+pub const HOLDERS_FORMAT: u8 = 2;
 
 /// What `holders.bin` holds: the balance state, and the archive it describes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

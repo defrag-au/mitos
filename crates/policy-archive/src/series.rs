@@ -292,7 +292,13 @@ pub const SERIES: &str = "series.bin";
 ///
 /// 2 carries the fold's [`Carry`], so a reader continues the series from the
 /// boundary instead of re-folding the archive.
-pub const SERIES_FORMAT: u8 = 2;
+///
+/// ⚠️ **3 requires [`Carry::settled_to`] to be the IMMUTABLE boundary.** A
+/// version-2 carry could hold rows from the volatile tail while naming a
+/// boundary above them; because the tail is REPLACED WHOLE, the next read
+/// folded those rows a second time. A version-2 file is refused and rebuilt
+/// rather than continued.
+pub const SERIES_FORMAT: u8 = 3;
 
 /// What `series.bin` holds: the series, the state it stopped at, and the
 /// archive it describes.
