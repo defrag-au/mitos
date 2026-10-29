@@ -1598,9 +1598,20 @@ pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>
 ///
 /// Split out so a caller that also wants the series shares ONE decode of the
 /// history: `/live` asks for both, and each used to walk the archive alone.
+///
+/// ⚠️ USER units only. A CIP-68 reference twin, a CIP-27 royalty declaration
+/// and a CIP-68 fungible tranche share the policy and are held by scripts, but
+/// they are not members of the collection — the supply route already excludes
+/// them (`reconcile_current`), and a holder table that counted them would never
+/// reconcile against it. MEASURED 2026-10-29 on the Ada Handle policy: 46,167
+/// reference twins added 46,168 to `held` on top of the 266,985 the supply
+/// route reports.
 pub fn holders_from(h: &mut History) -> Result<policy_archive::holders::Fold> {
     Ok(policy_archive::holders::fold(
-        h.all_movements()?.iter().cloned(),
+        h.all_movements()?
+            .iter()
+            .filter(|m| is_user_unit(&m.unit_name))
+            .cloned(),
     ))
 }
 
@@ -1965,10 +1976,14 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
 /// The balance state over the IMMUTABLE archive, for [`policy_archive::HOLDERS`].
 ///
 /// ⚠️ See [`History::immutable_movements`]: the tail is replaced whole, so a
-/// carry that includes it cannot be resumed from a boundary.
+/// carry that includes it cannot be resumed from a boundary. ⚠️ And see
+/// [`holders_from`]: plumbing units are not holdings.
 pub fn immutable_holders_carry_from(h: &mut History) -> Result<policy_archive::holders::Carry> {
     Ok(policy_archive::holders::carry(
-        h.immutable_movements()?.iter().cloned(),
+        h.immutable_movements()?
+            .iter()
+            .filter(|m| is_user_unit(&m.unit_name))
+            .cloned(),
     ))
 }
 
@@ -1982,7 +1997,10 @@ pub fn holders_tail(
     settled_to: u64,
 ) -> Result<policy_archive::holders::Fold> {
     Ok(policy_archive::holders::fold_onto(
-        h.movements_above(settled_to)?.into_iter(),
+        h.movements_above(settled_to)?
+            .into_iter()
+            // The same unit rule as the carried half — see [`holders_from`].
+            .filter(|m| is_user_unit(&m.unit_name)),
         carry,
     ))
 }
@@ -2022,7 +2040,7 @@ pub fn read_holders(dir: &Path, immutable_to: u64) -> Result<Option<policy_archi
     // ⚠️ The boundary must BE the immutable ceiling. A file folded through the
     // volatile tail names a boundary inside a stretch that is replaced whole,
     // so continuing it above that boundary counts the replacements on top of
-    // the originals. Format 2 stopped writing those; this also refuses any
+    // originals. Format 3 stopped writing those; this also refuses any
     // that survive a format-compatible rewrite.
     Ok((file.immutable_to == immutable_to && file.settled_to == immutable_to).then_some(file))
 }
@@ -3842,6 +3860,9 @@ mod tests {
                 row(10, 1, "addr_alice", 10, 10),
                 row(20, 2, "addr_alice", -4, 0),
                 row(20, 2, "addr_bob", 4, 0),
+                // A CIP-68 reference twin (label 100): real, held at a script,
+                // and NOT a holding — see `holders_from`.
+                row_unit(30, 6, b"\x00\x06\x43\xb0ref", "addr_script", 1, 1),
             ],
         )
         .unwrap();
@@ -3861,11 +3882,22 @@ mod tests {
     }
 
     fn row(slot: u64, tx: u8, addr: &str, amount: i64, net_mint: i64) -> Movement {
+        row_unit(slot, tx, b"Perp1", addr, amount, net_mint)
+    }
+
+    fn row_unit(
+        slot: u64,
+        tx: u8,
+        unit: impl AsRef<[u8]>,
+        addr: &str,
+        amount: i64,
+        net_mint: i64,
+    ) -> Movement {
         Movement {
             slot,
             block_time: 1_700_000_000 + slot,
             tx_hash: vec![tx; 32],
-            unit_name: b"Perp1".to_vec(),
+            unit_name: unit.as_ref().to_vec(),
             address: addr.to_string(),
             amount,
             net_mint,
@@ -3929,6 +3961,10 @@ mod tests {
         // is the table a whole fold gives, so no party keeps units the chain
         // has since moved, and none gains them without a departure.
         assert_eq!(served, whole);
+        assert!(
+            whole.holders.iter().all(|h| h.key != "addr_script"),
+            "a CIP-68 reference twin is not a holding"
+        );
 
         // And on a COMPLETE archive the table's total IS the net mint.
         let mut a = PolicyArchive::open(dir).unwrap().unwrap();

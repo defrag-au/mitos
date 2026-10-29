@@ -229,7 +229,14 @@ pub const HOLDERS: &str = "holders.bin";
 /// boundary above it, so its carry held rows a later tail fold folded AGAIN.
 /// The tail is replaced whole, so those rows cannot be trusted to still exist;
 /// every version-1 file is refused and rebuilt rather than read.
-pub const HOLDERS_FORMAT: u8 = 2;
+///
+/// ⚠️ **3 excludes PLUMBING units.** A version-2 carry was folded over every
+/// unit in the archive, so a CIP-68 reference twin or a CIP-27 royalty token
+/// sat in the table as a holding. MEASURED 2026-10-29 on the Ada Handle policy:
+/// 46,167 reference twins added 46,168 to `held` on top of the 266,985 the
+/// supply route reports. The supply route has always excluded them; the holder
+/// table now does too, so the two can be compared.
+pub const HOLDERS_FORMAT: u8 = 3;
 
 /// What `holders.bin` holds: the balance state, and the archive it describes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
