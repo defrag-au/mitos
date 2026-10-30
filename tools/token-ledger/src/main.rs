@@ -19,11 +19,13 @@ mod ambiguous;
 mod archive;
 mod book_prices;
 mod buffer;
+mod events;
 mod export;
 mod names;
 mod observer;
 mod pack;
 mod policy_api;
+mod profile;
 mod publish;
 mod publish_tape;
 mod pull;
@@ -195,6 +197,9 @@ fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // Logs go to stderr, always. stdout is data: `walk --events` writes NDJSON there
+        // and nothing else, so a tracing line on stdout would corrupt a pipe.
+        .with_writer(std::io::stderr)
         .init();
 
     match Cli::parse().command {

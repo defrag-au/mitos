@@ -178,6 +178,14 @@ pub struct PoolTip {
 /// One transaction that touched the watched asset.
 pub struct TxRow {
     pub tx_hash: Hash<32>,
+    /// The transaction's position within its block.
+    ///
+    /// Chain order is `(slot, tx_index, event_index)`, and without this a merged
+    /// stream cannot put two facts from one block back in the order they happened
+    /// — a mint and a transfer, or a buy and a sell. It is a COORDINATE and not
+    /// identity: `EventId` does not hash it, so a row that learns its position
+    /// keeps the id it already had.
+    pub tx_index: u32,
     pub slot: u64,
     pub block_time: u64,
     /// Net mint per unit in this tx (0 / +mint / −burn), keyed by asset-name

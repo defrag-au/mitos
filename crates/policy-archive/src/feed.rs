@@ -12,6 +12,12 @@ use crate::schema::Movement;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedRow {
     pub tx_hash: Vec<u8>,
+    /// The transaction's position in its block.
+    ///
+    /// Carried because it was already computed to order the fold, and because an
+    /// `(occurred_at, tx_index)` pair is what orders two transactions in the same block;
+    /// `block_time` alone cannot.
+    pub tx_index: u32,
     pub slot: u64,
     pub block_time: u64,
     /// One entry per unit of the policy that this transaction touched.
@@ -134,6 +140,7 @@ pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
                 acc.tx_index,
                 FeedRow {
                     tx_hash,
+                    tx_index: acc.tx_index,
                     slot: acc.slot,
                     block_time: acc.block_time,
                     units,

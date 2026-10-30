@@ -285,6 +285,26 @@ pub fn load_or_unit(path: &Path, name_or_unit: &str) -> Result<TokenEntry> {
     Ok(entry)
 }
 
+/// A synthetic entry for a bare policy id — no registry, no floor.
+///
+/// This is what `walk --policy` uses: a collection that is not in `tokens.toml` still
+/// walks, and every filename is keyed by the on-chain identity rather than a nickname.
+pub fn policy_entry(policy: &str) -> Result<TokenEntry> {
+    let policy = policy.to_lowercase();
+    if policy.len() != 56 || !policy.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("`{policy}` is not a 56-hex policy id");
+    }
+    let entry = TokenEntry {
+        name: policy.clone(),
+        policy,
+        asset_name: None,
+        decimals: None,
+        floor_slot: None,
+    };
+    entry.policy_bytes()?;
+    Ok(entry)
+}
+
 /// The registered token holding this on-chain unit, if any — so a request
 /// arriving by unit reuses the curated entry (floor, decimals, nickname-keyed
 /// ledger db) instead of a synthetic one.
@@ -300,4 +320,33 @@ pub fn load_lock_platforms(path: &Path) -> Result<Vec<LockPlatform>> {
         p.cred_bytes()?;
     }
     Ok(platforms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POLICY: &str = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0";
+
+    #[test]
+    fn a_bare_policy_becomes_a_whole_policy_entry() {
+        let entry = policy_entry(POLICY).unwrap();
+
+        assert_eq!(entry.name, POLICY);
+        assert_eq!(entry.unit(), POLICY);
+        assert!(entry.asset_name.is_none());
+        assert!(entry.floor_slot.is_none());
+    }
+
+    #[test]
+    fn an_upper_case_policy_is_normalised() {
+        assert_eq!(policy_entry(&POLICY.to_uppercase()).unwrap().policy, POLICY);
+    }
+
+    #[test]
+    fn something_that_is_not_a_policy_is_refused() {
+        assert!(policy_entry("perps").is_err());
+        assert!(policy_entry(&POLICY[..54]).is_err());
+        assert!(policy_entry(&"z".repeat(56)).is_err());
+    }
 }

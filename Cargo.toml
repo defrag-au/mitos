@@ -40,6 +40,10 @@ members = [
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
     "crates/policy-archive",
+    # policy-archive's rows → the chain-neutral event vocabulary the holder-behaviour
+    # store speaks. A separate crate because the vocabulary is shared with the EVM
+    # feed: this is the half that knows Cardano, and only this half does.
+    "crates/chain-events-cardano",
     # A token's history as compact binary chunks with stable party numbers:
     # written on cardano-infra, read by the flow explorer's macroquad arena.
     # No dependencies, so it links anywhere.
@@ -118,6 +122,16 @@ members = [
     # A READER of the index, never a walker: the daily `tx-index build
     # --policy-index-dir` already pays the extraction pass.
     "tools/policy-ledger",
+    # The Cardano half of the chain-events ingest, proven against a sealed
+    # archive: every movement row becomes one event, and the events fold back
+    # to the same holders the archive reconciles to.
+    "tools/policy-events",
+    # The stream, on a terminal: reads `--events` NDJSON from a pipe or a file
+    # and draws what arrived, per block, with the rows worth a second look.
+    "tools/event-firehose",
+    # N producers, one timeline: reads `chain-events` NDJSON from any number of sources,
+    # filters by collection, and emits the union in chain order.
+    "tools/event-merge",
     "tools/token-ledger",
     "tools/wallet-sieve",
     "tools/wallet-trace",
@@ -199,6 +213,10 @@ cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "be
 address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
 pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
 chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
+# The chain-neutral event vocabulary. `be4544a2` predates the crate, so this resolves
+# through the `[patch]` block at the bottom while the branch that carries it is local —
+# bump this `rev` and re-comment that block together, never one without the other.
+chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
 asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
 
 # Async runtime + HTTP server.
@@ -271,9 +289,10 @@ strip = "symbols"
 
 # --- Patch overrides ---
 #
-# **COMMENTED (2026-09-30)** — the workspace builds from the pinned git revs above,
-# which is what CI and the arm box see. Un-comment to develop against the sibling
-# tree at `../shared-crates` instead; **re-comment the WHOLE BLOCK BEFORE COMMIT**.
+# **ACTIVE (2026-10-29)** — developing against the sibling tree at `../shared-crates`,
+# because `chain-events` is not on the pinned rev yet. The commented state is what CI and
+# the arm box see: **re-comment the WHOLE BLOCK BEFORE COMMIT**, and bump the
+# `chain-events` rev in the same commit so the two cannot drift.
 #
 # Toggle the block as a UNIT, never line by line: a selective edit either
 # duplicates a key (if a line ends up both active and commented) or breaks an
@@ -294,10 +313,11 @@ strip = "symbols"
 # Both states are verified to build: ACTIVE (local paths) and COMMENTED (the
 # pinned git revs). Keep it that way — the commented state is what CI sees.
 [patch."https://github.com/defrag-au/shared-crates"]
-# cardano-assets = { path = "../shared-crates/cardano-assets" }
-# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
-# chain-ledger = { path = "../shared-crates/chain-ledger" }
-# address-registry = { path = "../shared-crates/address-registry" }
+cardano-assets = { path = "../shared-crates/cardano-assets" }
+pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+chain-ledger = { path = "../shared-crates/chain-ledger" }
+address-registry = { path = "../shared-crates/address-registry" }
+chain-events = { path = "../shared-crates/chain/chain-events" }
 
 # `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which
 # returns None for an output stored in an earlier era — and a resolved UTxO

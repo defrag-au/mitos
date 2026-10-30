@@ -287,15 +287,20 @@ fn build(hub: &Hub, unit: &str) -> Result<JobState> {
 
     set(hub, unit, JobState::Walking);
     walk::run(walk::WalkArgs {
-        data_dir: a.data_dir.clone(),
+        data_dir: Some(a.data_dir.clone()),
+        profile: None,
         tokens: a.tokens.clone(),
-        token: token.name.clone(),
+        token: Some(token.name.clone()),
+        policy: Vec::new(),
         db: Some(db.clone()),
         from_slot: None,
         fresh: false,
         buffer_every: 20_000,
         max_blocks: None,
         sieve: true,
+        // The hosted path walks for its own artifacts; an event stream is something a
+        // person opens a pipe for.
+        events: false,
     })
     .context("sieve walk")?;
 

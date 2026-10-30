@@ -727,6 +727,7 @@ mod tests {
     fn row(tx: u8, slot: u64, unit: &str, net_mint: i64, parties: &[(&str, i64)]) -> FeedRow {
         FeedRow {
             tx_hash: vec![tx; 32],
+            tx_index: 0,
             slot,
             block_time: 1_700_000_000 + slot,
             units: vec![UnitMove {

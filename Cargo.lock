@@ -23,7 +23,6 @@ dependencies = [
 [[package]]
 name = "address-registry"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=be4544a2c205f714717b005bf95f3382758cd557#be4544a2c205f714717b005bf95f3382758cd557"
 dependencies = [
  "phf",
  "serde",
@@ -690,7 +689,6 @@ dependencies = [
 [[package]]
 name = "cardano-assets"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=be4544a2c205f714717b005bf95f3382758cd557#be4544a2c205f714717b005bf95f3382758cd557"
 dependencies = [
  "bech32 0.11.1",
  "blake2 0.10.6",
@@ -776,9 +774,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "chain-events"
+version = "0.1.0"
+dependencies = [
+ "chains",
+ "serde",
+ "wasm_safe_serde",
+]
+
+[[package]]
+name = "chain-events-cardano"
+version = "0.0.1"
+dependencies = [
+ "chain-events",
+ "hex",
+ "market-ledger-wire",
+ "policy-archive",
+]
+
+[[package]]
 name = "chain-ledger"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=be4544a2c205f714717b005bf95f3382758cd557#be4544a2c205f714717b005bf95f3382758cd557"
 dependencies = [
  "serde",
 ]
@@ -792,6 +808,13 @@ dependencies = [
  "memchr",
  "mitos-chain-walk",
  "pallas-traverse 1.4.0",
+]
+
+[[package]]
+name = "chains"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -2119,6 +2142,29 @@ checksum = "976dd42dc7e85965fe702eb8164f21f450704bdde31faefd6471dba214cb594e"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "event-firehose"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chain-events",
+ "clap",
+ "crossterm 0.28.1",
+ "hex",
+ "ratatui",
+ "serde_json",
+]
+
+[[package]]
+name = "event-merge"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chain-events",
+ "clap",
+ "serde_json",
 ]
 
 [[package]]
@@ -4969,7 +5015,6 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pipeline-types"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=be4544a2c205f714717b005bf95f3382758cd557#be4544a2c205f714717b005bf95f3382758cd557"
 dependencies = [
  "cardano-assets",
  "hex",
@@ -5007,6 +5052,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "policy-events"
+version = "0.0.1"
+dependencies = [
+ "chain-events",
+ "chain-events-cardano",
+ "hex",
+ "policy-archive",
+ "serde_json",
 ]
 
 [[package]]
@@ -6706,6 +6762,8 @@ dependencies = [
  "axum 0.8.4",
  "cardano-assets",
  "cf-publish",
+ "chain-events",
+ "chain-events-cardano",
  "chain-ledger",
  "chain-sieve",
  "clap",
@@ -7310,7 +7368,6 @@ dependencies = [
 [[package]]
 name = "tx_insights"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=be4544a2c205f714717b005bf95f3382758cd557#be4544a2c205f714717b005bf95f3382758cd557"
 dependencies = [
  "cardano-assets",
  "serde",
@@ -7799,7 +7856,6 @@ dependencies = [
 [[package]]
 name = "wasm_safe_serde"
 version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=be4544a2c205f714717b005bf95f3382758cd557#be4544a2c205f714717b005bf95f3382758cd557"
 dependencies = [
  "serde",
  "serde_json",

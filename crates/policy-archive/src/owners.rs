@@ -180,6 +180,7 @@ mod tests {
     fn row(slot: u64, parties: &[(&str, i64)]) -> FeedRow {
         FeedRow {
             tx_hash: vec![slot as u8],
+            tx_index: 0,
             slot,
             block_time: slot,
             units: vec![UnitMove {

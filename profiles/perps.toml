@@ -1,0 +1,44 @@
+# The Perps event streams, and where their chain comes from.
+#
+# One file, two consumers: `token-ledger walk --profile` reads the walk settings and the
+# collection list; `event-firehose --profile profiles/perps.toml` runs that walk and draws
+# its events. Nothing here scores anything.
+#
+# The `[[collection]]` keys mirror the frozen achievement catalogue
+# (cnft.dev-workers/config/achievements/perps.toml) on purpose: the viewer and the
+# evaluator must not disagree about which policies Perps is.
+
+schema = 1
+
+[walk]
+# The local Mithril snapshot. `<data-dir>/immutable` is opened directly — no archive, no
+# network, no Koios. Chunks 7889–9334 are on disk and the policy index beside them already
+# knows Perps' first mint, so this profile walks end to end offline.
+data-dir = "~/data/mithril"
+
+# Each collection gets `<db-dir>/<id>.db`. The walk resumes from its own ledger, so a second
+# run continues where the first stopped; delete the db (or pass `--fresh`) to start over.
+db-dir = ".tmp/ledgers"
+
+# Perps' first mint, from `~/data/mithril/policies/<policy>.json`. A floor is what makes the
+# outref buffer complete — walking earlier decodes blocks that cannot hold the collection.
+from-slot = 170445182
+
+# Memmem each raw block for the policy id and decode only on a hit. The walk's CPU is almost
+# entirely decode, so this is the difference between tens of minutes and about one.
+sieve = true
+
+[[collection]]
+id = "perps"
+kind = "nft"
+policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+
+[[collection]]
+# $PERP launched before the NFT mint, and the profile's `from-slot` is the NFT's. A walk of
+# this collection therefore starts late: fine for a viewer that is watching activity, not
+# fine for a supply reconciliation. Give this collection its own floor once the token
+# archive's manifest names one — the frozen catalogue has the same open item.
+id = "perp-coin"
+kind = "token"
+policy = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64"
+asset-name-hex = "5045525020434f494e"

@@ -37,6 +37,26 @@ token-ledger reverse --archive-dir <dir> --token <policy> --data-dir <db> \
     [--days N | --to-slot S] [--first-mint S] [--probe-first-mint] \
     [--policy-index-dir <dir>] [--tx-index-dir <dir>] [--no-observe]
 
+# The independent forward derivation. With --events it also writes the same rows as
+# chain-events NDJSON on stdout (logs stay on stderr), which `event-firehose` draws.
+# `--policy` takes a bare 56-hex id and is repeatable; it needs no registry, and each
+# policy gets its own <policy>.db. Ids are derived from the fact, so ingesting the
+# finished archive later upserts over the stream instead of duplicating it.
+token-ledger walk --data-dir <db> (--token <name-or-unit> | --policy <hex>...) \
+    [--from-slot S] [--max-blocks N] [--events]
+
+# A whole project from one file: the snapshot, where each ledger lives, and every
+# collection. The NFT and the token are separate policies, so each gets its own db, and
+# `event-firehose --profile <file>` runs exactly this as its child.
+token-ledger walk --profile profiles/perps.toml [--events] [--max-blocks N] [--fresh]
+
+# A collection that is not in tokens.toml. Keep the stream for the viewer: write it to a
+# file and let `event-firehose --follow` read it, so the viewer keeps the terminal for keys
+# and the run stays replayable (the pipe works too, but only in a real terminal):
+token-ledger walk --data-dir <db> --policy <hex> --from-slot S --events \
+    > .tmp/perps.ndjson 2> .tmp/walk.log
+event-firehose .tmp/perps.ndjson --follow
+
 # Read an archive back the way a Worker would — footers first, then only the
 # row groups a page needs — and report what it cost in requests and bytes.
 # Also prints the supply reconciliation, observations, trades and density.

@@ -3767,6 +3767,7 @@ mod tests {
         // A buy: the tokens leave the curve into the buyer's wallet.
         let rows = vec![FeedRow {
             tx_hash: vec![0x1f; 32],
+            tx_index: 0,
             slot: 201_233_716,
             block_time: 1_792_800_007,
             units: vec![UnitMove {

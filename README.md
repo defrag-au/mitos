@@ -202,6 +202,8 @@ mitos/
 | tool | what | README |
 |---|---|---|
 | `token-ledger` | one policy's movements → Parquet archive, on demand; serves a live correcting feed | [→](tools/token-ledger/README.md) |
+| `event-firehose` | a terminal view over the `chain-events` stream — `--profile` runs the walk itself, or read a recorded NDJSON file | [→](tools/event-firehose/README.md) |
+| `event-merge` | N producer streams → one timeline, in chain order: filter by collection, dedupe by `EventId`, and report what it could not place | [→](tools/event-merge/README.md) |
 | `market-ledger` | listings / offers / sales across marketplaces into one slot-keyed ledger | [→](tools/market-ledger/README.md) |
 | `project-ledger` | one project's mint window: capital in, holders forming, capital out | [→](tools/project-ledger/README.md) |
 | `wallet-sieve` | on-demand single-wallet flow excavation | [→](tools/wallet-sieve/README.md) |
@@ -233,6 +235,22 @@ at host startup.
 > analytical walkers' designs live in the sibling `cnft.dev-workers/docs/design/`
 > repo (`TX_INDEX.md`, `POLICY_INDEX.md`, `POLICY_ARCHIVE_*.md`,
 > `MARKET_LEDGER.md`, …).
+
+## Profiles
+
+`profiles/` holds one TOML per project: the snapshot to read, where each ledger lives, and
+the collections the project is made of. Perps is two policies — the NFT collection and
+$PERP — so `profiles/perps.toml` carries both.
+
+```sh
+token-ledger walk --profile profiles/perps.toml --events   # the walk on its own
+event-firehose --profile profiles/perps.toml              # the same walk, drawn
+```
+
+One file, read by both: the walk owns the settings, and the viewer runs it as a child rather
+than duplicating them. The `[[collection]]` keys mirror the achievement catalogue in
+`cnft.dev-workers/config/achievements/` — the viewer and the scorer must agree about what a
+collection IS, and nothing in a profile scores anything.
 
 ## Building
 

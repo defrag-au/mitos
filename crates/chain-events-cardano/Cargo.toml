@@ -1,0 +1,20 @@
+[package]
+name = "chain-events-cardano"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "policy-archive's movement rows and market-ledger's marketplace rows, translated into the chain-neutral event vocabulary — the Cardano half of the holder-behaviour store's input"
+
+[dependencies]
+# The vocabulary. Cardano's identity types come through its re-exports, so this crate
+# does not name `chains` itself and cannot drift from what the events carry.
+chain-events = { workspace = true }
+# The rows. A reader, never a walker: this crate sees what the archive already
+# reconciled, which is what keeps the translation honest.
+policy-archive = { path = "../policy-archive" }
+# The marketplace rows, in the shape `tools/market-ledger` already serves. One wire
+# type for both halves, so the adapter's input does not change when the source moves
+# from the serving ledger to the policy archive.
+market-ledger-wire = { path = "../market-ledger-wire" }
+hex = { workspace = true }
