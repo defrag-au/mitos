@@ -1,0 +1,88 @@
+# Local acceptance stack: a mitos preprod host + the minting-engine worker.
+#
+# This is the first version of the local stack named in
+# docs/design/PLANE_LANDING.md §8. The book-backed plane run adds a read-only
+# book mount and MITOS_DATA_PLANE=book to the `mitos` service rather than a
+# second stack; shadow diffing adds a second host service over the same inputs.
+#
+# The worker is the module owner: it serves `cip-25-mint` at the well-known
+# paths mitos derives from the announcement. `up.sh` starts a Cloudflare quick
+# tunnel on the workstation and renders the worker's client id + the host's
+# namespace from its hostname, because the host's artifact fetch is HTTPS-only
+# by design.
+#
+# `up` is foreground because both services have a restart policy: the supervisor
+# can only honour one while it is attached.
+version = 1
+name = "mitos-lab"
+
+[env]
+file = ".env"
+
+[volumes.mitos-data]
+size = "40G"
+
+# ── mitos ──────────────────────────────────────────────────────────────────
+# The binary is cross-built by up.sh (`cargo zigbuild`, musl) and copied into
+# mitos-image/ before `container-compose build`. It runs as root, which is
+# fine for a dev volume.
+[services.mitos]
+entrypoint = "/usr/local/bin/mitos"
+command = ["--config", "/etc/mitos/mitos.toml"]
+env = { MITOS_AUTH_TOKEN = "${MITOS_AUTH_TOKEN}", MITOS_TOKEN_DEV = "${MITOS_TOKEN_DEV}", MITOS_NAMESPACES_FILE = "/etc/mitos/namespaces.toml", BUNDLE_COMMUNITY_MODULES_DIR = "/community-modules", RUST_LOG = "info,mitos_platform=debug" }
+volumes = [
+  "mitos-data:/var/lib/mitos",
+  "./generated/mitos.toml:/etc/mitos/mitos.toml:ro",
+  "./generated/namespaces.toml:/etc/mitos/namespaces.toml:ro",
+  "./generated/community-modules:/community-modules:ro",
+]
+ports = ["127.0.0.1:8080:8080"]
+cpus = 6
+memory = "8G"
+init = true
+restart = "on-stop"
+max_retries = 3
+
+[services.mitos.healthcheck]
+exec = ["curl", "-fsS", "http://127.0.0.1:8080/health"]
+interval = "5s"
+timeout = "3s"
+start_period = "30s"
+retries = 12
+
+[services.mitos.build]
+context = "./mitos-image"
+containerfile = "Containerfile"
+
+# ── minting-engine ────────────────────────────────────────────────────────
+# `wrangler dev` runs the shim's `[build]` command (a no-op in the image) and
+# bundles the staged build/ output. Do NOT pass --no-bundle: that hands workerd
+# the shim's `export * from '../index.js'`, which it refuses outside the bundle.
+[services.worker]
+entrypoint = "wrangler"
+command = [
+  "dev", "--local",
+  "--ip", "0.0.0.0", "--port", "8787", "--env", "dev",
+]
+volumes = ["./.tmp/worker:/app"]
+ports = ["127.0.0.1:18787:8787"]
+cpus = 4
+memory = "4G"
+init = true
+restart = "on-stop"
+max_retries = 5
+
+[[services.worker.depends_on]]
+service = "mitos"
+condition = "service_healthy"
+
+[services.worker.healthcheck]
+exec = ["node", "-e", "fetch('http://127.0.0.1:8787/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+interval = "5s"
+timeout = "3s"
+start_period = "20s"
+retries = 12
+
+[services.worker.build]
+context = "./worker-image"
+containerfile = "Containerfile"

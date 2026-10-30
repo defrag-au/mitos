@@ -46,7 +46,7 @@ pub struct Counts {
 /// Writes one collection's movement events to stdout as they are walked.
 pub struct Tap {
     collection: Collection,
-    out: std::io::BufWriter<std::io::Stdout>,
+    out: std::io::BufWriter<Box<dyn Write>>,
     /// One clock for the whole stream: a stream is one recording session.
     recorded_at: u64,
     /// Set when the consumer closed the pipe. Every later call is a no-op, so the walk
@@ -60,7 +60,12 @@ impl Tap {
     ///
     /// The header goes to stderr, never stdout: stdout is NDJSON and nothing else, so
     /// `| jaq` and `| grep` see only events.
-    pub fn open(chain: ChainRef, policy: &str, coverage: Coverage) -> Result<Self> {
+    pub fn open(
+        chain: ChainRef,
+        policy: &str,
+        coverage: Coverage,
+        out: Box<dyn Write>,
+    ) -> Result<Self> {
         let collection = Collection::new(chain, policy, coverage)?;
         eprintln!(
             "# chain-events · {chain} · {policy}\n\
@@ -75,7 +80,7 @@ impl Tap {
 
         Ok(Self {
             collection,
-            out: std::io::BufWriter::new(std::io::stdout()),
+            out: std::io::BufWriter::new(out),
             recorded_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())

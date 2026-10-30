@@ -12,16 +12,16 @@ schema = 1
 
 [walk]
 # The local Mithril snapshot. `<data-dir>/immutable` is opened directly — no archive, no
-# network, no Koios. Chunks 7889–9334 are on disk and the policy index beside them already
-# knows Perps' first mint, so this profile walks end to end offline.
+# network, no Koios. Chunks 6723–9337 are on disk and the policy index beside them knows
+# both collections' first mints, so this profile walks end to end offline.
 data-dir = "~/data/mithril"
 
 # Each collection gets `<db-dir>/<id>.db`. The walk resumes from its own ledger, so a second
 # run continues where the first stopped; delete the db (or pass `--fresh`) to start over.
 db-dir = ".tmp/ledgers"
 
-# Perps' first mint, from `~/data/mithril/policies/<policy>.json`. A floor is what makes the
-# outref buffer complete — walking earlier decodes blocks that cannot hold the collection.
+# Where a collection with no `first-mint-slot` of its own would start. Both collections here
+# state their own, so this is only the fallback.
 from-slot = 170445182
 
 # Memmem each raw block for the policy id and decode only on a hit. The walk's CPU is almost
@@ -32,13 +32,19 @@ sieve = true
 id = "perps"
 kind = "nft"
 policy = "e6ba9c0ff27be029442c32533c6efd956a60d15ecb976acbb64c4de0"
+# From `~/data/mithril/policies/<policy>.json`. That figure is the policy's ROOT TOKEN
+# (`earliest_asset` is the empty name), which CAIP-19 cannot express — the two movements it
+# produces are reported as unrepresentable. The first NFT event is 513,113 slots later at
+# 170958295. Stating it here is what lets the walk call this collection's coverage COMPLETE,
+# which is what every "never sold" achievement depends on.
+first-mint-slot = 170445182
 
 [[collection]]
-# $PERP launched before the NFT mint, and the profile's `from-slot` is the NFT's. A walk of
-# this collection therefore starts late: fine for a viewer that is watching activity, not
-# fine for a supply reconciliation. Give this collection its own floor once the token
-# archive's manifest names one — the frozen catalogue has the same open item.
 id = "perp-coin"
 kind = "token"
 policy = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64"
 asset-name-hex = "5045525020434f494e"
+# Ten months earlier than the NFTs: 2025-01-13 against 2025-11-01. Without its own floor
+# this collection would start at the NFT mint and silently lose almost all of its history —
+# which is why `eligible_since_slot` was still unset in the frozen catalogue.
+first-mint-slot = 145246220

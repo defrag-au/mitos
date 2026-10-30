@@ -301,6 +301,7 @@ fn build(hub: &Hub, unit: &str) -> Result<JobState> {
         // The hosted path walks for its own artifacts; an event stream is something a
         // person opens a pipe for.
         events: false,
+        events_out: None,
     })
     .context("sieve walk")?;
 

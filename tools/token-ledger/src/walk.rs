@@ -99,6 +99,16 @@ pub struct WalkArgs {
     #[arg(long)]
     pub sieve: bool,
 
+    /// Write each walked collection's event stream to `<dir>/<name>.ndjson` instead of
+    /// stdout.
+    ///
+    /// A profile walks several collections, and their runs are NOT one ascending stream:
+    /// Perps begins where $PERP has been trading for ten months. A consumer that needs
+    /// chain order — `event-merge` — wants one file per collection, and it refuses a
+    /// concatenation because the second run starts before the first one ended.
+    #[arg(long, value_name = "DIR", requires = "events")]
+    pub events_out: Option<PathBuf>,
+
     /// Write the policy's event stream to stdout as NDJSON while walking.
     ///
     /// The same rows the archive stores, translated by `chain-events-cardano`, so
@@ -418,8 +428,15 @@ pub fn run(args: WalkArgs) -> Result<()> {
         .data_dir
         .clone()
         .context("--data-dir is required without --profile")?;
+    if let Some(dir) = &args.events_out {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     for token in &tokens {
-        run_one(&args, &data_dir, token, &lock_creds)?;
+        let out = args
+            .events_out
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.ndjson", token.name)));
+        run_one(&args, &data_dir, token, &lock_creds, out.as_deref())?;
     }
     Ok(())
 }
@@ -439,25 +456,38 @@ fn run_profile(args: &WalkArgs, path: &Path) -> Result<()> {
     let db_dir = profile.db_dir();
     std::fs::create_dir_all(&db_dir)
         .with_context(|| format!("creating the ledger directory {}", db_dir.display()))?;
+    if let Some(dir) = &args.events_out {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
 
     for collection in profile.collections() {
-        let token = registry::policy_entry(&collection.policy)?;
+        let mut token = registry::policy_entry(&collection.policy)?;
+        // The profile states the policy's first mint, which is exactly what the registry's
+        // `floor_slot` means to `coverage_is_complete`. A synthetic entry has none, so
+        // without this every profile walk stamps its events PARTIAL however early it
+        // started — the guard against blessing a shallow walk, firing on a complete one.
+        token.floor_slot = collection.first_mint_slot;
         let one = WalkArgs {
             data_dir: Some(data_dir.clone()),
             tokens: args.tokens.clone(),
             token: None,
             policy: vec![collection.policy.clone()],
             db: Some(profile.db_path(collection)),
-            from_slot: args.from_slot.or(profile.start_slot()),
+            from_slot: args.from_slot.or(profile.floor_of(collection)),
             fresh: args.fresh,
             buffer_every: args.buffer_every,
             max_blocks: args.max_blocks.or(profile.max_blocks()),
             sieve: args.sieve || profile.sieve(),
             events: args.events,
+            events_out: None,
             profile: None,
         };
         // A raw policy names no lock platform — the same as the `--policy` path above.
-        run_one(&one, &data_dir, &token, &[])?;
+        let out = args
+            .events_out
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.ndjson", collection.id)));
+        run_one(&one, &data_dir, &token, &[], out.as_deref())?;
     }
     Ok(())
 }
@@ -467,6 +497,7 @@ fn run_one(
     data_dir: &Path,
     token: &registry::TokenEntry,
     lock_creds: &[[u8; 28]],
+    events_out: Option<&Path>,
 ) -> Result<()> {
     let policy = token.policy_bytes()?;
     let asset_name = token.asset_name_bytes()?;
@@ -561,6 +592,13 @@ fn run_one(
     let mut tap = args
         .events
         .then(|| {
+            let out: Box<dyn std::io::Write> = match events_out {
+                Some(path) => Box::new(
+                    std::fs::File::create(path)
+                        .with_context(|| format!("creating {}", path.display()))?,
+                ),
+                None => Box::new(std::io::stdout()),
+            };
             crate::events::Tap::open(
                 ChainRef::from_str("cardano:mainnet").expect("the chain this walker reads"),
                 &hex::encode(&policy),
@@ -568,6 +606,7 @@ fn run_one(
                     true => Coverage::Complete,
                     false => Coverage::Partial,
                 },
+                out,
             )
         })
         .transpose()?;

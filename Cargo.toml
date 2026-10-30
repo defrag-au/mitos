@@ -209,15 +209,15 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
 # The chain-neutral event vocabulary. `be4544a2` predates the crate, so this resolves
 # through the `[patch]` block at the bottom while the branch that carries it is local —
 # bump this `rev` and re-comment that block together, never one without the other.
-chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
-asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "be4544a2c205f714717b005bf95f3382758cd557" }
+chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
+asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -313,11 +313,11 @@ strip = "symbols"
 # Both states are verified to build: ACTIVE (local paths) and COMMENTED (the
 # pinned git revs). Keep it that way — the commented state is what CI sees.
 [patch."https://github.com/defrag-au/shared-crates"]
-cardano-assets = { path = "../shared-crates/cardano-assets" }
-pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
-chain-ledger = { path = "../shared-crates/chain-ledger" }
-address-registry = { path = "../shared-crates/address-registry" }
-chain-events = { path = "../shared-crates/chain/chain-events" }
+# cardano-assets = { path = "../shared-crates/cardano-assets" }
+# pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
+# chain-ledger = { path = "../shared-crates/chain-ledger" }
+# address-registry = { path = "../shared-crates/address-registry" }
+# chain-events = { path = "../shared-crates/chain/chain-events" }
 
 # `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which
 # returns None for an output stored in an earlier era — and a resolved UTxO

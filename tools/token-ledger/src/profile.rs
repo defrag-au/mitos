@@ -67,6 +67,18 @@ pub struct Collection {
     pub id: String,
     pub kind: String,
     pub policy: String,
+    /// The policy's first mint, from `~/data/mithril/policies/<policy>.json`.
+    ///
+    /// It is BOTH where the walk starts and what makes its coverage complete, because
+    /// the walk's `floor_slot` is exactly this fact. A collection that states it and starts
+    /// there produces `coverage: complete`; one that does not is indistinguishable from a
+    /// shallow walk of an unregistered policy, and every event it emits says `partial` no
+    /// matter where it started.
+    ///
+    /// The two collections of one project rarely share it — $PERP minted ten months before
+    /// the Perps NFTs — so it belongs here and not on `[walk]`.
+    #[serde(rename = "first-mint-slot", default)]
+    pub first_mint_slot: Option<u64>,
     /// Which asset under the policy a token collection means. Unused by the walk, which
     /// follows the whole policy; it is the catalogue's identity and the viewer's label.
     #[serde(rename = "asset-name-hex", default)]
@@ -149,8 +161,9 @@ impl Profile {
         self.db_dir().join(format!("{}.db", collection.id))
     }
 
-    pub fn start_slot(&self) -> Option<u64> {
-        self.walk.from_slot
+    /// The floor one collection starts at: its own first mint, else the file's floor.
+    pub fn floor_of(&self, collection: &Collection) -> Option<u64> {
+        collection.first_mint_slot.or(self.walk.from_slot)
     }
 
     pub fn max_blocks(&self) -> Option<u64> {
@@ -202,7 +215,10 @@ mod tests {
 
         assert_eq!(profile.collections().len(), 1);
         assert_eq!(profile.data_dir().unwrap(), PathBuf::from("/snapshot"));
-        assert_eq!(profile.start_slot(), Some(170_445_182));
+        assert_eq!(
+            profile.floor_of(&profile.collections()[0]),
+            Some(170_445_182)
+        );
         assert!(profile.sieve());
         assert_eq!(
             profile.db_path(&profile.collections()[0]),
@@ -284,6 +300,32 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot name a ledger file")
+        );
+    }
+
+    #[test]
+    fn a_collection_may_set_its_own_first_mint() {
+        // The real case: $PERP minted ten months before the Perps NFTs, so the file's
+        // floor cannot serve both.
+        let text = format!(
+            "schema = 1\n[walk]\nfrom-slot = 170445182\n{}\n[[collection]]\nid = \"perp-coin\"\n\
+             kind = \"token\"\npolicy = \"{PERP}\"\nfirst-mint-slot = 145246220\n",
+            collection("perps", PERPS)
+        );
+        let profile = parse(&text).unwrap();
+
+        let nft = &profile.collections()[0];
+        let token = &profile.collections()[1];
+        assert_eq!(
+            profile.floor_of(nft),
+            Some(170_445_182),
+            "inherits the file's"
+        );
+        assert_eq!(profile.floor_of(token), Some(145_246_220), "its own wins");
+        assert_eq!(
+            token.first_mint_slot,
+            Some(145_246_220),
+            "the walk is given it as its floor_slot"
         );
     }
 

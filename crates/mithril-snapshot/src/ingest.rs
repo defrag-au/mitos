@@ -61,8 +61,21 @@ pub async fn fetch(
     from: u64,
     to: u64,
 ) -> Result<Ingested> {
-    fetch_with(endpoint, genesis_key, target, from, to, stdout_progress()).await
+    fetch_with(
+        endpoint,
+        genesis_key,
+        target,
+        from,
+        to,
+        stdout_progress(),
+        DEFAULT_PARALLEL_DOWNLOADS,
+    )
+    .await
 }
+
+/// The library's own default, stated so `sync` and a policy fetch do not drift
+/// from it. A backfill lowers it deliberately.
+pub const DEFAULT_PARALLEL_DOWNLOADS: usize = 100;
 
 /// The receiver [`fetch`] uses: the same live line `mithril-client-cli` draws.
 ///
@@ -84,6 +97,7 @@ pub async fn fetch_with(
     from: u64,
     to: u64,
     receiver: Arc<dyn FeedbackReceiver>,
+    parallel: usize,
 ) -> Result<Ingested> {
     let client = ClientBuilder::aggregator(endpoint, genesis_key)
         .add_feedback_receiver(receiver)
@@ -133,7 +147,11 @@ pub async fn fetch_with(
         })?;
 
     let range = ImmutableFileRange::Range(from, to);
-    api.download_unpack(&snapshot, &range, target, DownloadUnpackOptions::default())
+    let options = DownloadUnpackOptions {
+        max_parallel_downloads: parallel.max(1),
+        ..DownloadUnpackOptions::default()
+    };
+    api.download_unpack(&snapshot, &range, target, options)
         .await
         .map_err(|error| anyhow!("downloading immutable files {from}–{to}: {error}"))?;
 
@@ -189,6 +207,10 @@ pub struct IngestTarget<'a> {
     pub digests: &'a Digests,
     /// Files to hash at once.
     pub jobs: usize,
+    /// Concurrent archive downloads. Lower it to make a transfer gentler on a
+    /// shared link; the library's default is
+    /// [`DEFAULT_PARALLEL_DOWNLOADS`].
+    pub parallel: usize,
 }
 
 /// Fetch `from..=to`, verify the staged parts against the published digest map,
@@ -226,6 +248,7 @@ pub async fn ingest_range(
         from,
         to,
         receiver,
+        target.parallel,
     )
     .await?;
 

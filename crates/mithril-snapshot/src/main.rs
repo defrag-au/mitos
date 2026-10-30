@@ -515,6 +515,7 @@ fn sync(
                 db_immutable: &immutable,
                 digests: &digests,
                 jobs,
+                parallel: ingest::DEFAULT_PARALLEL_DOWNLOADS,
             },
             gap.from,
             gap.to,

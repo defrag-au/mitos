@@ -50,6 +50,12 @@ token-ledger walk --data-dir <db> (--token <name-or-unit> | --policy <hex>...) \
 # `event-firehose --profile <file>` runs exactly this as its child.
 token-ledger walk --profile profiles/perps.toml [--events] [--max-blocks N] [--fresh]
 
+# One file per collection instead of one stdout run after another. A profile walks its
+# collections in turn and their runs do NOT overlap in time — Perps starts where $PERP
+# has been trading for ten months — so anything that needs chain order wants the split:
+# `event-merge --policy <a> --policy <b> streams/*.ndjson > perps.ndjson`.
+token-ledger walk --profile profiles/perps.toml --events --events-out .tmp/streams
+
 # A collection that is not in tokens.toml. Keep the stream for the viewer: write it to a
 # file and let `event-firehose --follow` read it, so the viewer keeps the terminal for keys
 # and the run stays replayable (the pipe works too, but only in a real terminal):

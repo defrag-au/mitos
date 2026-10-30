@@ -247,6 +247,16 @@ token-ledger walk --profile profiles/perps.toml --events   # the walk on its own
 event-firehose --profile profiles/perps.toml              # the same walk, drawn
 ```
 
+For one ordered timeline across the collections, split the streams and merge them — each
+collection's run is ascending, but the runs are concatenated, so only the merge can
+interleave them:
+
+```sh
+token-ledger walk --profile profiles/perps.toml --events --events-out .tmp/streams
+event-merge --policy <nft-policy> --policy <token-policy> .tmp/streams/*.ndjson \
+    > .tmp/perps.ndjson
+```
+
 One file, read by both: the walk owns the settings, and the viewer runs it as a child rather
 than duplicating them. The `[[collection]]` keys mirror the achievement catalogue in
 `cnft.dev-workers/config/achievements/` — the viewer and the scorer must agree about what a
@@ -322,6 +332,9 @@ recapture — are in [`docs/TESTING.md`](docs/TESTING.md).
 Local module-level testing without the production host or a Dolos
 snapshot uses `mitos-run` against fixture-driven inputs — see
 [`docs/HOWTO_TESTING_COMMUNITY_MODULES.md`](docs/HOWTO_TESTING_COMMUNITY_MODULES.md).
+
+The announce → fetch → verify → move loop runs locally as a two-service
+`container-compose` stack: [`deploy/local/README.md`](deploy/local/README.md).
 
 ## License
 
