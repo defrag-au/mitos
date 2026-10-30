@@ -22,8 +22,8 @@
 //! | `resolve_stake_for_payment_pkh` | ✅ | overridden: the row's bytes carry the delegation part, so no bech32 round trip |
 //! | `holder_count` | ✅ | distinct addresses over `by_policy` — see the note on cost |
 //! | `read_output_datums` / `output_datum_hashes` | ✅ | inline datums are in the row; hash-referenced ones yield the hash and no payload |
-//! | `tip` | ❌ | **the artifact records no chain position.** See below |
-//! | `search_utxos` | ❌ | it returns a `Page`, and a `Page` carries a tip |
+//! | `tip` | ✅ when `book.meta.base_slot` is recorded; refuses when it is not |
+//! | `search_utxos` | ✅ for `Match` of `Policy`, an exact address or a payment credential; other shapes refused |
 //! | `read_datum` | ❌ | the table exists now (`datum.tbl`, captured by the walk — see `LIVE_BOOK.md` phase 3); this adapter does not open it yet |
 //! | `read_script` | ❌ | the row has no `script_ref` column at all |
 //! | `tx_metadata` / `read_tx` / `slot_by_tx_hash` | ❌ | history, not live state: `tx-index` + the chunks |
@@ -31,16 +31,13 @@
 //! | `protocol_params` | ❌ | not a UTxO fold |
 //! | `read_block` | ❌ | needs a retained block body |
 //!
-//! **The `tip` refusal is the structural one.** A book is a snapshot of the live
-//! set at *some* chunk boundary, and `book.meta` does not record which — so the
-//! plane cannot say what slot it is at, and anything a consumer does with a chain
-//! position (staleness, `TickEvery`, drift across a paginated query) is
-//! unanswerable. That is not a gap in this adapter; it is a gap in the artifact,
-//! and it is the first thing `LIVE_BOOK.md` phase 4 has to close. Do not paper
-//! over it with `ChainTip::origin()`: `Origin` means genesis, and a module that
-//! believed it would conclude the chain had not started. It answers
-//! `ChainPoint::Slot(base_slot)` when the artifact records where it sits, and
-//! refuses when it does not.
+//! **`tip` is conditional on the artifact.** A book records the slot its fold
+//! stopped at in `book.meta`'s `base_slot`; when the field is present, `tip`
+//! answers `ChainPoint::Slot(base_slot)`, and when it is absent the plane refuses.
+//! Do not paper over the absence with `ChainTip::origin()`: `Origin` means
+//! genesis, and a module that believed it would conclude the chain had not
+//! started. `search_utxos` returns a `Page`, which carries that tip, so it
+//! inherits the same condition: it answers only from a stamped artifact.
 //!
 //! # What the trait's shape costs
 //!
@@ -66,9 +63,9 @@ use pallas_primitives::Hash;
 use crate::impls::UTXOS_BY_ADDRESS_HARD_CAP;
 use crate::types::ProtocolParameters;
 use crate::{
-    AssetEntry, ChainDataPlane, ChainPoint, ChainTip, DataPlaneError, DataPlaneResult, DatumKind,
-    DecodeLevel, OutputRef, Page, PageRequest, Resolution, StakeCred, TypedDatum, TypedOutput,
-    TypedScript, UtxoPredicate,
+    AddressPattern, AssetEntry, AssetPattern, ChainDataPlane, ChainPoint, ChainTip, DataPlaneError,
+    DataPlaneResult, DatumKind, DecodeLevel, OutputRef, Page, PageRequest, Resolution, StakeCred,
+    TypedDatum, TypedOutput, TypedScript, UtxoPattern, UtxoPredicate,
 };
 
 /// A `ChainDataPlane` over a published live book.
@@ -78,6 +75,13 @@ use crate::{
 /// construction, rather than answering narrowly wrongly later.
 pub struct BookDataPlane {
     base: Base,
+}
+
+/// The ordering a supported `search_utxos` predicate selects.
+enum Query {
+    Policy([u8; 28]),
+    Address(Vec<u8>),
+    PaymentCred([u8; 28]),
 }
 
 impl BookDataPlane {
@@ -222,6 +226,60 @@ impl BookDataPlane {
             .map_err(|e| DataPlaneError::Storage(e.to_string()))?;
         Ok(self.refs(&page))
     }
+
+    /// The ordering a predicate selects, and the prefix a cursor for it must
+    /// carry. The three book orderings are the three shapes the callers use;
+    /// anything else refuses by name rather than scanning.
+    fn query(&self, predicate: &UtxoPredicate) -> DataPlaneResult<(Query, u64)> {
+        match predicate {
+            UtxoPredicate::Match(UtxoPattern {
+                asset: Some(AssetPattern::Policy(policy)),
+                address: None,
+                output_ref: None,
+            }) => {
+                let policy = policy.as_bytes().map_err(|e| {
+                    DataPlaneError::InvalidRequest(format!("policy id not valid hex: {e:?}"))
+                })?;
+                let prefix = u64::from_le_bytes(policy[0..8].try_into().expect("8 bytes"));
+                Ok((Query::Policy(policy), prefix))
+            }
+            UtxoPredicate::Match(UtxoPattern {
+                address: Some(AddressPattern::Exact(address)),
+                asset: None,
+                output_ref: None,
+            }) => {
+                let bytes = Address::from_bech32(address).map_err(|e| {
+                    DataPlaneError::InvalidRequest(format!("address not bech32: {e:?}"))
+                })?;
+                let bytes = bytes.to_vec();
+                // A Byron address has no payment credential; `by_address` returns
+                // an empty page for it, so there is no token to check. Zero is a
+                // placeholder, never compared with a token that exists.
+                let prefix = live_book::address::credential(&bytes)
+                    .map(|cred| cred.prefix())
+                    .unwrap_or(0);
+                Ok((Query::Address(bytes), prefix))
+            }
+            UtxoPredicate::Match(UtxoPattern {
+                address: Some(AddressPattern::PaymentCredential(cred)),
+                asset: None,
+                output_ref: None,
+            }) => {
+                let len = cred.len();
+                let cred: [u8; 28] = cred.as_slice().try_into().map_err(|_| {
+                    DataPlaneError::InvalidRequest(format!(
+                        "credential must be 28 bytes, got {len}"
+                    ))
+                })?;
+                let prefix = u64::from_le_bytes(cred[0..8].try_into().expect("8 bytes"));
+                Ok((Query::PaymentCred(cred), prefix))
+            }
+            _ => Err(DataPlaneError::NotYetImplemented(
+                "search_utxos: the book answers `Match` of `Policy`, an exact address or a payment \
+                 credential",
+            )),
+        }
+    }
 }
 
 /// `AssetEntry`, named through the crate's re-export so this module's imports stay
@@ -268,20 +326,61 @@ impl ChainDataPlane for BookDataPlane {
 
     async fn search_utxos(
         &self,
-        _predicate: &UtxoPredicate,
-        _decode: DecodeLevel,
-        _page: PageRequest,
+        predicate: &UtxoPredicate,
+        decode: DecodeLevel,
+        page: PageRequest,
     ) -> DataPlaneResult<Page<(OutputRef, TypedOutput)>> {
-        // The three shapes the book can answer — `at_address`, `under_policy` and a
-        // payment credential — all go through the enumerations above, and a `Page`
-        // can now carry a tip (`tip()` answers from `base_slot`). What is still
-        // missing is the predicate algebra and the cursor discipline between
-        // requests; `PHONEBOOK_COVERAGE.md` §3 and §4a name the shapes callers use,
-        // which is where a first implementation should start.
-        Err(DataPlaneError::NotYetImplemented(
-            "search_utxos: the book can answer `tip` now, but not a predicate algebra over \
-             utxos, nor the cursor a Page must carry between requests",
-        ))
+        let (query, prefix) = self.query(predicate)?;
+        // `max_items == 0` is not "no items": an empty page with no token would
+        // look like the end of the run. Treat it as one.
+        let limit = (page.max_items as usize).clamp(1, live_book::MAX_PAGE);
+        let after = match page.start_token.as_deref() {
+            Some(token) => {
+                let cursor = live_book::Cursor::decode(token).ok_or_else(|| {
+                    DataPlaneError::InvalidRequest(
+                        "page token is not a cursor this plane issued".into(),
+                    )
+                })?;
+                if cursor.prefix() != prefix {
+                    return Err(DataPlaneError::InvalidRequest(
+                        "page token belongs to a different query".into(),
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        let page = match query {
+            Query::Policy(policy) => self.base.by_policy(&policy, after, limit),
+            Query::Address(address) => self.base.by_address(&address, after, limit),
+            Query::PaymentCred(cred) => self.base.by_payment_cred(&cred, after, limit),
+        }
+        .map_err(|e| DataPlaneError::Storage(e.to_string()))?;
+
+        let mut items = Vec::with_capacity(page.refs.len());
+        for (hash, index) in page.refs {
+            if let Some(row) = self
+                .base
+                .utxo(&hash, index)
+                .map_err(|e| DataPlaneError::Storage(e.to_string()))?
+            {
+                items.push((
+                    OutputRef::from_bytes(hash, index),
+                    self.output(&row, decode)?,
+                ));
+            }
+        }
+
+        // A `Page` carries the tip. The book knows it only when `book.meta`
+        // records `base_slot`; an unstamped artifact refuses rather than claiming
+        // genesis.
+        let tip = self.tip().await?;
+        Ok(Page {
+            items,
+            next_token: page.next.map(live_book::Cursor::encode),
+            tip,
+        })
     }
 
     async fn utxos_by_address(&self, address: &str) -> DataPlaneResult<Vec<OutputRef>> {
@@ -661,6 +760,162 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(base_dir(&plane));
+    }
+
+    /// A fixture with a recorded boundary, so `search_utxos` can answer the tip
+    /// a `Page` has to carry.
+    fn slot_fixture(name: &str, slot: u64) -> BookDataPlane {
+        let base = fixture(name);
+        live_book::Meta::stamp_base_slot(base.dir(), slot).expect("stamp");
+        BookDataPlane::open(base.dir()).expect("reopen")
+    }
+
+    fn payment_cred_predicate() -> UtxoPredicate {
+        UtxoPredicate::matching(UtxoPattern {
+            address: Some(AddressPattern::PaymentCredential(vec![0x11; 28])),
+            ..Default::default()
+        })
+    }
+
+    fn policy_predicate() -> UtxoPredicate {
+        let mut policy = [0u8; 28];
+        policy[0] = 0xC1;
+        UtxoPredicate::matching(UtxoPattern::under_policy(
+            PolicyId::new(hex::encode(policy)).expect("policy id"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn search_utxos_answers_the_three_shapes() {
+        let plane = slot_fixture("search-shapes", 198_590_382);
+        let page = plane
+            .search_utxos(
+                &policy_predicate(),
+                DecodeLevel::Lean,
+                PageRequest::first(10),
+            )
+            .await
+            .expect("policy");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].0, OutputRef::from_bytes([0xA0; 32], 0));
+        assert!(page.next_token.is_none());
+        assert_eq!(page.tip.slot(), 198_590_382);
+
+        let exact = UtxoPredicate::matching(UtxoPattern::at_address(base_address_bech32()));
+        let page = plane
+            .search_utxos(&exact, DecodeLevel::Lean, PageRequest::first(10))
+            .await
+            .expect("address");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].0, OutputRef::from_bytes([0xA0; 32], 0));
+
+        let page = plane
+            .search_utxos(
+                &payment_cred_predicate(),
+                DecodeLevel::Lean,
+                PageRequest::first(10),
+            )
+            .await
+            .expect("credential");
+        assert_eq!(page.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_utxos_pages_until_next_token_is_none() {
+        let plane = slot_fixture("search-pages", 42);
+        let mut token = None;
+        let mut refs = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = plane
+                .search_utxos(
+                    &payment_cred_predicate(),
+                    DecodeLevel::Lean,
+                    PageRequest {
+                        max_items: 1,
+                        start_token: token,
+                    },
+                )
+                .await
+                .expect("page");
+            pages += 1;
+            assert_eq!(page.tip.slot(), 42);
+            refs.extend(page.items.into_iter().map(|(r, _)| r));
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        refs.sort_by_key(|r| r.index);
+        assert_eq!(refs.len(), 2, "{refs:?}");
+        assert_eq!(pages, 2);
+    }
+
+    #[tokio::test]
+    async fn search_utxos_refuses_a_token_from_another_query() {
+        let plane = slot_fixture("search-replay", 42);
+        let first = plane
+            .search_utxos(
+                &payment_cred_predicate(),
+                DecodeLevel::Lean,
+                PageRequest::first(1),
+            )
+            .await
+            .expect("first page");
+        let token = first.next_token.expect("a next token");
+        let err = plane
+            .search_utxos(
+                &policy_predicate(),
+                DecodeLevel::Lean,
+                PageRequest::next(token, 10),
+            )
+            .await;
+        assert!(
+            matches!(err, Err(DataPlaneError::InvalidRequest(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_utxos_refuses_an_unsupported_predicate() {
+        let plane = slot_fixture("search-refuse", 42);
+        let stake = UtxoPredicate::matching(UtxoPattern {
+            address: Some(AddressPattern::StakeCredential(vec![0x22; 28])),
+            ..Default::default()
+        });
+        assert!(matches!(
+            plane
+                .search_utxos(&stake, DecodeLevel::Lean, PageRequest::first(10))
+                .await,
+            Err(DataPlaneError::NotYetImplemented(_))
+        ));
+        assert!(matches!(
+            plane
+                .search_utxos(
+                    &UtxoPredicate::any(),
+                    DecodeLevel::Lean,
+                    PageRequest::first(10)
+                )
+                .await,
+            Err(DataPlaneError::NotYetImplemented(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_utxos_refuses_an_unstamped_book() {
+        let plane = BookDataPlane {
+            base: fixture("search-unstamped"),
+        };
+        assert!(matches!(
+            plane
+                .search_utxos(
+                    &policy_predicate(),
+                    DecodeLevel::Lean,
+                    PageRequest::first(10)
+                )
+                .await,
+            Err(DataPlaneError::NotYetImplemented(_))
+        ));
     }
 
     /// The bech32 of row 0's address — computed once here so the assertion is

@@ -6,7 +6,9 @@
 //!   the tree against both. `--hash` also proves the bytes.
 //! - `sync <dir>` fetches the immutable files Mithril publishes that are missing
 //!   locally through `mithril-client` as a library, proving them against the snapshot's
-//!   certificate in a staging directory and renaming only the verified parts in.
+//!   certificate in a staging directory and renaming only the verified parts in. It
+//!   keeps the validated chain links in `.mithril-certificate-chain` beside `immutable/`,
+//!   so a second run does not walk the chain to genesis again.
 //! - `publish <dir> --dest r2:… [--sync] [--run]` drives rclone, so what reaches R2
 //!   behind an immutable cache header is what the aggregator publishes.
 //!
@@ -25,7 +27,7 @@ use clap::{Parser, Subcommand};
 
 use mithril_snapshot::aggregator::{Aggregator, MAINNET_AGGREGATOR, MAINNET_GENESIS_VKEY};
 use mithril_snapshot::ingest;
-use mithril_snapshot::{Inventory, PART_EXTS, Reconciliation, Report, verify_parts};
+use mithril_snapshot::{Inventory, PART_EXTS, Reconciliation, Report, chain_cache, verify_parts};
 
 #[derive(Parser)]
 #[command(
@@ -488,6 +490,9 @@ fn sync(
             .unwrap_or(&db_dir)
             .join(".mithril-sync-staging")
     });
+    // One cache for the whole sync: without it each gap re-verifies the chain
+    // to genesis, which is a few hundred requests per gap.
+    let chain_cache = db_dir.join(chain_cache::FILE_NAME);
 
     if !run {
         println!("staging     {}", staging.display());
@@ -516,6 +521,7 @@ fn sync(
                 digests: &digests,
                 jobs,
                 parallel: ingest::DEFAULT_PARALLEL_DOWNLOADS,
+                chain_cache: Some(&chain_cache),
             },
             gap.from,
             gap.to,

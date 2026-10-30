@@ -87,6 +87,40 @@ pub struct Cursor {
     at: u64,
 }
 
+impl Cursor {
+    /// The wire form of a cursor, for a caller that has to carry it between
+    /// requests. Opaque: pass it back unchanged.
+    ///
+    /// The prefix travels with the position, so a token minted for one key is
+    /// refused against another before the first read — the reader checks it
+    /// again in `enumerate`, which is where a hand-built cursor would be caught.
+    pub fn encode(self) -> String {
+        let (prefix, at) = (self.prefix, self.at);
+        format!("v1-{prefix:016x}-{at:016x}")
+    }
+
+    /// Parse a token from [`Cursor::encode`]. `None` for anything this version
+    /// did not write, including a truncated or non-hex token.
+    pub fn decode(token: &str) -> Option<Cursor> {
+        let rest = token.strip_prefix("v1-")?;
+        let (prefix, at) = rest.split_once('-')?;
+        if prefix.len() != 16 || at.len() != 16 {
+            return None;
+        }
+        Some(Cursor {
+            prefix: u64::from_str_radix(prefix, 16).ok()?,
+            at: u64::from_str_radix(at, 16).ok()?,
+        })
+    }
+
+    /// The ordering key this cursor belongs to. A layer that owns the ordering
+    /// can refuse a token from another query before it reads; the reader checks
+    /// the same prefix in `enumerate`.
+    pub fn prefix(self) -> u64 {
+        self.prefix
+    }
+}
+
 /// One page of refs, and how to get the next.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Page {
@@ -1156,6 +1190,25 @@ mod tests {
                 .is_none()
         );
         assert_eq!(truncated.reads.get(), 3);
+    }
+
+    #[test]
+    fn a_cursor_round_trips_and_rejects_a_token_it_did_not_write() {
+        let cursor = Cursor {
+            prefix: 0x0123_4567_89ab_cdef,
+            at: 42,
+        };
+        assert_eq!(Cursor::decode(&cursor.encode()), Some(cursor));
+        assert_eq!(cursor.prefix(), 0x0123_4567_89ab_cdef);
+        for bad in [
+            "",
+            "v1-",
+            "v2-0000000000000000-0000000000000000",
+            "v1-000000000000000-0000000000000000",
+            "v1-zzzzzzzzzzzzzzzz-0000000000000000",
+        ] {
+            assert_eq!(Cursor::decode(bad), None, "token: {bad}");
+        }
     }
 
     #[test]

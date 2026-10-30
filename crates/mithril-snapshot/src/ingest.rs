@@ -30,8 +30,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use mithril_client::cardano_database_client::{DownloadUnpackOptions, ImmutableFileRange};
+use mithril_client::certificate_client::CertificateVerifierCache;
 use mithril_client::{ClientBuilder, MessageBuilder};
 
+use crate::chain_cache::ChainCache;
 use crate::{Digests, Inventory, PART_EXTS, lift, verify_parts};
 
 pub use mithril_client::feedback::{FeedbackReceiver, MithrilEvent, MithrilEventCardanoDatabase};
@@ -68,7 +70,7 @@ pub async fn fetch(
         from,
         to,
         stdout_progress(),
-        DEFAULT_PARALLEL_DOWNLOADS,
+        FetchOptions::default(),
     )
     .await
 }
@@ -85,6 +87,26 @@ pub fn stdout_progress() -> Arc<dyn FeedbackReceiver> {
     Arc::new(Progress::new())
 }
 
+/// The knobs a single transfer takes besides its range.
+pub struct FetchOptions {
+    /// Concurrent archive downloads. Lower it to make a transfer gentler on a
+    /// shared link.
+    pub parallel: usize,
+    /// The verifier's certificate-chain cache. Pass the store's
+    /// [`ChainCache`] when a caller fetches more than one range, or the chain
+    /// is re-verified from genesis for every one of them.
+    pub cache: Option<Arc<dyn CertificateVerifierCache>>,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            parallel: DEFAULT_PARALLEL_DOWNLOADS,
+            cache: None,
+        }
+    }
+}
+
 /// [`fetch`], reporting through a receiver the caller owns.
 ///
 /// This is the entry point a TUI uses: the progress events are the same ones the
@@ -97,10 +119,11 @@ pub async fn fetch_with(
     from: u64,
     to: u64,
     receiver: Arc<dyn FeedbackReceiver>,
-    parallel: usize,
+    options: FetchOptions,
 ) -> Result<Ingested> {
     let client = ClientBuilder::aggregator(endpoint, genesis_key)
         .add_feedback_receiver(receiver)
+        .with_certificate_verifier_cache(options.cache)
         .build()
         .map_err(|error| anyhow!("building the Mithril client: {error}"))?;
     let api = client.cardano_database_v2();
@@ -148,7 +171,7 @@ pub async fn fetch_with(
 
     let range = ImmutableFileRange::Range(from, to);
     let options = DownloadUnpackOptions {
-        max_parallel_downloads: parallel.max(1),
+        max_parallel_downloads: options.parallel.max(1),
         ..DownloadUnpackOptions::default()
     };
     api.download_unpack(&snapshot, &range, target, options)
@@ -211,6 +234,9 @@ pub struct IngestTarget<'a> {
     /// shared link; the library's default is
     /// [`DEFAULT_PARALLEL_DOWNLOADS`].
     pub parallel: usize,
+    /// The store's certificate-chain cache. Without one every [`ingest_range`]
+    /// re-verifies the chain to genesis, which is a few hundred HTTP requests.
+    pub chain_cache: Option<&'a Path>,
 }
 
 /// Fetch `from..=to`, verify the staged parts against the published digest map,
@@ -241,6 +267,11 @@ pub async fn ingest_range(
         )
     })?;
 
+    let cache = match target.chain_cache {
+        Some(path) => Some(Arc::new(ChainCache::open(path)?) as Arc<dyn CertificateVerifierCache>),
+        None => None,
+    };
+
     let ingested = fetch_with(
         target.endpoint,
         target.genesis_key,
@@ -248,7 +279,10 @@ pub async fn ingest_range(
         from,
         to,
         receiver,
-        target.parallel,
+        FetchOptions {
+            parallel: target.parallel,
+            cache,
+        },
     )
     .await?;
 

@@ -45,6 +45,7 @@
 //! remove a chunk that a later run would have published.
 
 pub mod aggregator;
+pub mod chain_cache;
 pub mod ingest;
 
 use std::collections::{BTreeMap, BTreeSet};

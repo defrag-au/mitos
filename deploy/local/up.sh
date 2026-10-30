@@ -22,8 +22,25 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 MITOS_SRC="$(cd "${DIR}/../.." && pwd)"
 WORKER_SRC="${WORKER_SRC:-$(cd "${MITOS_SRC}/../cnft.dev-workers" 2>/dev/null && pwd || true)}"
 WORKER_DIR="${WORKER_SRC}/workers/minting-engine"
+# Resolve the runtime CLI absolutely, and fall back to Homebrew's install. An
+# interactive shell may reach `container` through an alias or a PATH the script
+# does not inherit; the runtime is the same binary either way.
+CONTAINER_BIN="${CONTAINER_BIN:-$(command -v container 2>/dev/null || true)}"
+if [ -z "${CONTAINER_BIN}" ] && [ -x /opt/homebrew/bin/container ]; then
+    CONTAINER_BIN=/opt/homebrew/bin/container
+fi
+# The devshell's container-compose is the pinned Nix build; override it to run a
+# local build while a fix is in flight.
+CONTAINER_COMPOSE="${CONTAINER_COMPOSE:-container-compose}"
 STATE="${DIR}/.tmp"
 GENERATED="${DIR}/generated"
+
+CHECK=0
+case "${1:-}" in
+    --check) CHECK=1 ;;
+    "") ;;
+    *) die "usage: deploy/local/up.sh [--check]" ;;
+esac
 
 log() { printf '▸ %s\n' "$*" >&2; }
 die() {
@@ -46,16 +63,46 @@ trap cleanup EXIT INT TERM
 if [ -z "${WORKER_SRC}" ] || [ ! -f "${WORKER_DIR}/wrangler.toml" ]; then
     die "no minting-engine under a cnft.dev-workers checkout; set WORKER_SRC=/path/to/cnft.dev-workers"
 fi
-command -v container-compose >/dev/null || die "container-compose is not on PATH — run this inside the devshell"
+command -v "${CONTAINER_COMPOSE}" >/dev/null || die "container-compose is not on PATH — run this inside the devshell"
 command -v cloudflared >/dev/null || die "cloudflared is not on PATH"
-STATUS_TEXT="$(container system status 2>/dev/null || true)"
-if ! printf '%s\n' "${STATUS_TEXT}" | grep -qE '^status[[:space:]]+running'; then
-    die "the container runtime is not running; run: container system start"
+# Probe the API server directly instead of parsing `container system status`'s
+# table: the table's shape is a presentation detail, and a `--format` set in the
+# caller's environment changes it. `container ls` only succeeds when the server
+# answers, and `container system start` returns before that is true.
+RUNTIME_OK=""
+for _ in $(seq 1 20); do
+    if "${CONTAINER_BIN}" ls >/dev/null 2>&1; then
+        RUNTIME_OK=1
+        break
+    fi
+    sleep 0.5
+done
+if [ -z "${RUNTIME_OK}" ]; then
+    printf '✗ the container runtime is not responding (container=%s)\n' "${CONTAINER_BIN}" >&2
+    printf 'container system status:\n' >&2
+    "${CONTAINER_BIN}" system status >&2 || true
+    exit 1
 fi
-DNS_TEXT="$(container system dns list 2>/dev/null || true)"
+DNS_TEXT="$("${CONTAINER_BIN}" system dns list 2>/dev/null || true)"
 if ! printf '%s\n' "${DNS_TEXT}" | grep -qx 'test'; then
     log "⚠️  DNS domain 'test' is not registered; the worker will not resolve mitos-lab-mitos.test"
     log "    run once: sudo container system dns create test   (then restart the runtime)"
+fi
+
+if [ "${CHECK}" = "1" ]; then
+    for name in cip-25-mint cip-68-mint credit-address; do
+        stem="${name//-/_}"
+        [ -d "${MITOS_SRC}/community-modules/${name}/target/mitos/${name}" ] \
+            || die "${name} has no built artifact; run: mitos-build --module community-modules/${name}/${stem}.rs"
+    done
+    if [ -n "$(command -v llvm-strip || true)" ]; then
+        STRIP="llvm-strip"
+    else
+        STRIP="none"
+    fi
+    printf '✓ check ok\n  mitos     %s\n  worker    %s\n  modules   cip-25-mint cip-68-mint credit-address\n  container %s\n  compose   %s\n  fds       soft %s, hard %s\n  strip     %s\n' \
+        "${MITOS_SRC}" "${WORKER_DIR}" "${CONTAINER_BIN}" "$(command -v "${CONTAINER_COMPOSE}")" "$(ulimit -Sn)" "$(ulimit -Hn)" "${STRIP}"
+    exit 0
 fi
 
 mkdir -p "${STATE}" "${GENERATED}" "${DIR}/mitos-image" "${STATE}/worker"
@@ -94,6 +141,11 @@ log "building minting-engine (module + worker bundle)"
 
 # 2. Host: a Linux binary for the container. The musl cross-build is the same
 #    route scripts/pack-release.sh uses; incremental after the first run.
+#
+#    The link opens every object at once, so a desktop shell's default FD limit
+#    is not enough (zig reports `ProcessFdQuotaExceeded`). The linker wrapper
+#    raises its own limit too; this covers cargo and rustc.
+ulimit -S -n 65536 2>/dev/null || true
 log "cross-building mitos for aarch64-unknown-linux-musl (first run is slow)"
 (
     cd "${MITOS_SRC}"
@@ -236,4 +288,4 @@ EOF
     "INSERT OR IGNORE INTO collections (policy_id, deposit_address) VALUES ('${POLICY}', NULL)" >/dev/null )
 
 log "starting stack — Ctrl-C stops both services and the tunnel"
-container-compose -f "${DIR}/stack.toml" up
+"${CONTAINER_COMPOSE}" --runtime "${CONTAINER_BIN}" -f "${DIR}/stack.toml" up

@@ -10,6 +10,7 @@
 //! `tui-shot` reviews a frame that would otherwise need the network.
 
 mod app;
+mod coverage;
 mod fetch;
 mod fmt;
 mod harness;
@@ -29,13 +30,17 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use mithril_snapshot::aggregator::Aggregator;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, oneshot};
 
-use app::{Action, App, Event, FetchState, PlanBound, Screen};
+use app::{
+    Action, App, BackfillRun, BackfillSettings, BackfillSpec, CoverageView, Event, FetchState,
+    PlanBound, Screen,
+};
 use fetch::Observer;
-use manifest::PolicyManifest;
+use manifest::{FetchedRange, PolicyManifest};
 use plan::{PolicyId, RangePlan};
 
 #[derive(Parser)]
@@ -69,6 +74,34 @@ struct Cli {
     /// Resolve and fetch without the TUI, printing to stderr and stdout.
     #[arg(long)]
     run: bool,
+
+    /// Fill every missing published immutable file into the store.
+    ///
+    /// From 00001 to the newest signed chunk unless --backfill-from/--backfill-to
+    /// bound it. This is the slow, resumable whole-store backfill; the TUI's
+    /// coverage screen starts the same fill.
+    #[arg(long, conflicts_with_all = ["run", "fixture", "policy", "chunks", "to_slot"])]
+    backfill: bool,
+
+    /// First immutable file for a backfill [default: 1].
+    #[arg(long)]
+    backfill_from: Option<u64>,
+
+    /// Last immutable file for a backfill [default: the newest signed chunk].
+    #[arg(long)]
+    backfill_to: Option<u64>,
+
+    /// Concurrent archive downloads for a backfill.
+    #[arg(long, default_value_t = 4)]
+    backfill_parallel: usize,
+
+    /// Files per verified batch for a backfill.
+    #[arg(long, default_value_t = 20)]
+    backfill_batch: u64,
+
+    /// Seconds to pause between backfill batches.
+    #[arg(long, default_value_t = 10)]
+    backfill_pause: u64,
 
     /// A screen fixture for `tui-shot` and the `TestBackend` harness.
     #[arg(long)]
@@ -113,11 +146,31 @@ fn main() -> Result<()> {
     if cli.chunks == Some(0) {
         bail!("--chunks 0 asks for nothing");
     }
+    if cli.backfill_parallel == 0 {
+        bail!("--backfill-parallel 0 has no workers");
+    }
+    if cli.backfill_batch == 0 {
+        bail!("--backfill-batch 0 asks for nothing");
+    }
+
+    let settings = BackfillSettings {
+        parallel: cli.backfill_parallel,
+        batch_files: cli.backfill_batch,
+        pause_secs: cli.backfill_pause,
+    };
 
     let destination = cli
         .dest
         .clone()
         .or_else(|| std::env::var_os("MITHRIL_DATA_DIR").map(PathBuf::from));
+
+    if cli.backfill {
+        let destination = destination.context(
+            "no chunk store — pass --dest or set MITHRIL_DATA_DIR (mitos/.env is read \
+             automatically)",
+        )?;
+        return run_backfill(destination, cli.backfill_from, cli.backfill_to, settings);
+    }
 
     if cli.run {
         let text = cli
@@ -175,6 +228,9 @@ fn main() -> Result<()> {
         to_slot: cli.to_slot,
         chunks: cli.chunks,
     };
+    app.backfill = settings;
+    app.backfill_from = cli.backfill_from;
+    app.backfill_to = cli.backfill_to;
     run_tui(app, initial)
 }
 
@@ -308,27 +364,46 @@ fn execute(action: Action, app: &mut App, observer: &Observer) {
         Action::Resolve(policy) => start_resolve(app, observer, policy),
         Action::Start(plan) => start_fetch(app, observer, plan),
         Action::Cancel => {
-            let (policy, done) = match &app.screen {
-                Screen::Fetching { plan, fetch, .. } => (plan.policy, fetch.files_done),
-                _ => return,
+            let fetching = match &app.screen {
+                Screen::Fetching { plan, fetch, .. } => Some((plan.policy, fetch.files_done)),
+                _ => None,
             };
-            cancel(app);
-            app.generation += 1;
-            app.screen = Screen::Failed {
-                policy,
-                message: format!(
-                    "cancelled after {} verified file(s). Press r to resume; the store keeps \
-                     everything that reached it.",
-                    fmt::count(done)
-                ),
-                retry: true,
-            };
+            if let Some((policy, done)) = fetching {
+                cancel(app);
+                app.generation += 1;
+                app.screen = Screen::Failed {
+                    policy,
+                    message: format!(
+                        "cancelled after {} verified file(s). Press r to resume; the store keeps \
+                         everything that reached it.",
+                        fmt::count(done)
+                    ),
+                    retry: true,
+                };
+                return;
+            }
+
+            let backfilling = matches!(
+                &app.screen,
+                Screen::Coverage { view } if view.fill.is_some()
+            );
+            if backfilling {
+                cancel(app);
+                app.generation += 1;
+                if let Screen::Coverage { view } = &mut app.screen {
+                    view.fill = None;
+                    view.error = None;
+                    view.status = "backfill stopped — press b to resume".to_string();
+                }
+            }
         }
         Action::Back => {
             cancel(app);
             app.back();
         }
         Action::Retry(policy) => start_resolve(app, observer, policy),
+        Action::Coverage => start_coverage(app, observer),
+        Action::Backfill(spec) => start_backfill(app, observer, spec),
     }
 }
 
@@ -339,6 +414,202 @@ fn cancel(app: &mut App) {
         // The worker finished before the cancellation arrived. Its event is
         // stale because the generation has moved on.
     }
+}
+
+fn start_coverage(app: &mut App, observer: &Observer) {
+    let Some(destination) = app.destination.clone() else {
+        app.screen = Screen::Coverage {
+            view: CoverageView {
+                error: Some(
+                    "no chunk store — set MITHRIL_DATA_DIR in mitos/.env or pass --dest"
+                        .to_string(),
+                ),
+                ..CoverageView::default()
+            },
+        };
+        return;
+    };
+
+    let settings = app.backfill;
+    let generation = app.next_generation();
+    if let Screen::Coverage { view } = &mut app.screen {
+        view.status = "rescanning…".to_string();
+        view.error = None;
+    } else {
+        app.screen = Screen::Coverage {
+            view: CoverageView {
+                settings,
+                status: "scanning…".to_string(),
+                ..CoverageView::default()
+            },
+        };
+    }
+
+    let observer = observer.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = fetch::coverage_blocking(&destination, generation, &observer) {
+            (observer)(Event::CoverageFailed {
+                generation,
+                message: format!("{error:#}"),
+            });
+        }
+    });
+}
+
+fn start_backfill(app: &mut App, observer: &Observer, spec: BackfillSpec) {
+    if spec.from == 0 || spec.from > spec.to {
+        if let Screen::Coverage { view } = &mut app.screen {
+            view.error = Some(format!(
+                "backfill range {:05}–{:05} is empty",
+                spec.from, spec.to
+            ));
+        }
+        return;
+    }
+
+    let generation = app.next_generation();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    app.cancel = Some(cancel_tx);
+
+    if let Screen::Coverage { view } = &mut app.screen {
+        let (files, bytes) = match &view.published {
+            Some(published) if spec.from <= 1 && spec.to >= published.beacon => {
+                (published.missing_files, published.missing_bytes)
+            }
+            Some(published) => {
+                let files = view
+                    .local
+                    .as_ref()
+                    .map(|local| {
+                        (spec.from..=spec.to)
+                            .filter(|number| !local.complete.contains(number))
+                            .count() as u64
+                    })
+                    .unwrap_or_else(|| spec.to.saturating_sub(spec.from) + 1);
+                (files, files.saturating_mul(published.per_file_bytes))
+            }
+            None => (spec.to.saturating_sub(spec.from) + 1, 0),
+        };
+        view.fill = Some(BackfillRun::new(spec.settings, files, bytes));
+        view.error = None;
+        view.status = "starting…".to_string();
+    }
+
+    let observer = observer.clone();
+    std::thread::spawn(move || {
+        let store = fetch::StoreRange {
+            destination: spec.destination.clone(),
+            from: spec.from,
+            to: spec.to,
+            parallel: spec.settings.parallel,
+            batch_files: spec.settings.batch_files,
+            pause_secs: spec.settings.pause_secs,
+        };
+
+        match fetch::fill_store(&store, generation, observer.clone(), cancel_rx, |_| Ok(())) {
+            Ok(outcome) => {
+                (observer)(Event::Done {
+                    generation,
+                    outcome,
+                });
+                // A completed pass is the one moment the coverage numbers are
+                // known to be stale, so the same worker reads them again.
+                if let Err(error) =
+                    fetch::coverage_blocking(&spec.destination, generation, &observer)
+                {
+                    (observer)(Event::CoverageFailed {
+                        generation,
+                        message: format!("{error:#}"),
+                    });
+                }
+            }
+            Err(error) => (observer)(Event::FetchFailed {
+                generation,
+                message: format!("{error:#}"),
+            }),
+        }
+    });
+}
+
+fn run_backfill(
+    destination: PathBuf,
+    from: Option<u64>,
+    to: Option<u64>,
+    settings: BackfillSettings,
+) -> Result<()> {
+    let observer: Observer = Arc::new(|event| match event {
+        Event::Status { message, .. } => eprintln!("{message}"),
+        Event::RangeDone { range, .. } => eprintln!(
+            "verified    {:05}–{:05} · {} files · {} · snapshot {}",
+            range.from,
+            range.to,
+            fmt::count(range.files),
+            fmt::bytes(range.bytes),
+            short(&range.snapshot_hash)
+        ),
+        _ => {}
+    });
+
+    // The horizon comes from the newest signed snapshot, so a backfill never
+    // asks for a file the aggregator cannot yet serve.
+    let aggregator = Aggregator::mainnet().context("building the aggregator client")?;
+    let snapshots = aggregator
+        .snapshots()
+        .context("listing the aggregator's Cardano database snapshots")?;
+    let latest = snapshots
+        .into_iter()
+        .max_by_key(|snapshot| snapshot.beacon.immutable_file_number)
+        .context("the aggregator listed no Cardano database snapshots")?;
+    let beacon = latest.beacon.immutable_file_number;
+
+    let from = from.unwrap_or(1);
+    let to = to.unwrap_or(beacon);
+    if from == 0 {
+        bail!("immutable files start at 00001");
+    }
+    if to > beacon {
+        bail!("--backfill-to {to:05} is above the newest signed chunk {beacon:05}");
+    }
+    if from > to {
+        bail!("--backfill-from {from:05} is after --backfill-to {to:05}");
+    }
+
+    let store = fetch::StoreRange {
+        destination: destination.clone(),
+        from,
+        to,
+        parallel: settings.parallel,
+        batch_files: settings.batch_files,
+        pause_secs: settings.pause_secs,
+    };
+    println!(
+        "backfill    {:05}–{:05} · {} files · {} parallel · {}-file batches · {}s pause",
+        from,
+        to,
+        fmt::count(store.files()),
+        settings.parallel,
+        settings.batch_files,
+        settings.pause_secs
+    );
+
+    let (_cancel, cancel_rx) = oneshot::channel();
+    let outcome = fetch::fill_store(&store, 0, observer, cancel_rx, |_: &FetchedRange| Ok(()))?;
+
+    println!();
+    println!(
+        "fetched     {} files · {}",
+        fmt::count(outcome.files),
+        fmt::bytes(outcome.bytes)
+    );
+    if outcome.already_present > 0 {
+        println!(
+            "present     {} files were already in the store",
+            fmt::count(outcome.already_present)
+        );
+    }
+    println!("store       {}", destination.display());
+
+    Ok(())
 }
 
 fn run_once(

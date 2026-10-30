@@ -36,6 +36,10 @@ pub struct PolicyManifest {
     /// The chunk the slot falls in, and the one fetched from (one earlier).
     pub exact_chunk: u64,
     pub floor_chunk: u64,
+    /// The end the fetch was asked for. Older manifests predate this and fall
+    /// back to their highest fetched range when coverage is computed.
+    #[serde(default)]
+    pub requested_to: Option<u64>,
     pub assets: usize,
     pub earliest_asset: String,
     pub minting_tx: Option<String>,
@@ -51,6 +55,7 @@ impl PolicyManifest {
             first_mint_slot: plan.floor.slot,
             exact_chunk: plan.floor.exact_chunk,
             floor_chunk: plan.floor.floor_chunk,
+            requested_to: Some(plan.to),
             assets: plan.floor.assets,
             earliest_asset: plan.floor.earliest_asset.clone(),
             minting_tx: plan.floor.minting_tx.clone(),

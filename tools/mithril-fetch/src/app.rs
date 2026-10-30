@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::coverage::{LocalCoverage, PublishedCoverage};
 use crate::fmt;
 use crate::manifest::FetchedRange;
 use crate::plan::{PolicyFloor, PolicyId, RangePlan, Tip};
@@ -46,13 +47,17 @@ pub struct FetchState {
 }
 
 impl FetchState {
-    pub fn started(plan: &RangePlan) -> Self {
+    pub fn expected(files_total: u64, bytes_expected: u64) -> Self {
         Self {
             started_unix: fmt::now_unix(),
-            files_total: plan.files(),
-            bytes_expected: plan.estimated_bytes(),
+            files_total,
+            bytes_expected,
             ..Self::default()
         }
+    }
+
+    pub fn started(plan: &RangePlan) -> Self {
+        Self::expected(plan.files(), plan.estimated_bytes())
     }
 
     pub fn apply(&mut self, progress: FetchProgress) {
@@ -131,12 +136,31 @@ impl FetchState {
         }
     }
 
+    /// The bytes estimate, corrected by the sizes of the batch in flight.
+    ///
+    /// A plan estimates `files × the snapshot's average`, and a small range can
+    /// beat that: 06203 is 53 MiB where the average is 24 MiB, so an uncorrected
+    /// screen read "53.4 MiB of ≈ 48.4 MiB" and reported an ETA of zero. The
+    /// library names each file's real size when its download starts, so once a
+    /// batch is in flight the total can be rebuilt from what is known plus the
+    /// average for what is not.
+    pub fn projected_bytes(&self) -> u64 {
+        if self.files_total == 0 {
+            return self.bytes_expected;
+        }
+        let average = self.bytes_expected / self.files_total;
+        let known: u64 = self.batch_sizes.values().sum();
+        let counted = self.files_done + self.batch_sizes.len() as u64;
+        let unknown = self.files_total.saturating_sub(counted);
+        (self.bytes_done + known + unknown.saturating_mul(average)).max(self.bytes_expected)
+    }
+
     pub fn eta_secs(&self) -> Option<u64> {
         let rate = self.rate();
         if rate <= 0.0 {
             return None;
         }
-        let remaining = self.bytes_expected.saturating_sub(self.received());
+        let remaining = self.projected_bytes().saturating_sub(self.received());
         Some((remaining as f64 / rate) as u64)
     }
 }
@@ -148,6 +172,63 @@ pub struct Outcome {
     pub bytes: u64,
     pub already_present: u64,
     pub elapsed_secs: u64,
+}
+
+/// How gently a backfill runs. Defaults are the slow profile: leave the link
+/// and the disk idle between small bursts rather than take the whole machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillSettings {
+    pub parallel: usize,
+    pub batch_files: u64,
+    pub pause_secs: u64,
+}
+
+impl Default for BackfillSettings {
+    fn default() -> Self {
+        Self {
+            parallel: 4,
+            batch_files: 20,
+            pause_secs: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillRun {
+    pub fetch: FetchState,
+    pub phase: String,
+    pub settings: BackfillSettings,
+}
+
+impl BackfillRun {
+    pub fn new(settings: BackfillSettings, files: u64, bytes: u64) -> Self {
+        Self {
+            fetch: FetchState::expected(files, bytes),
+            phase: "starting…".to_string(),
+            settings,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CoverageView {
+    /// The directory scan, available before (and without) the aggregator.
+    pub local: Option<LocalCoverage>,
+    /// The local scan joined to Mithril's published set.
+    pub published: Option<PublishedCoverage>,
+    pub status: String,
+    pub error: Option<String>,
+    pub fill: Option<BackfillRun>,
+    pub settings: BackfillSettings,
+}
+
+/// A backfill the UI asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackfillSpec {
+    pub destination: PathBuf,
+    pub from: u64,
+    pub to: u64,
+    pub settings: BackfillSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +261,9 @@ pub enum Screen {
         message: String,
         retry: bool,
     },
+    Coverage {
+        view: CoverageView,
+    },
 }
 
 impl Screen {
@@ -191,6 +275,7 @@ impl Screen {
             Screen::Fetching { .. } => "fetching",
             Screen::Done { .. } => "done",
             Screen::Failed { .. } => "failed",
+            Screen::Coverage { .. } => "coverage",
         }
     }
 }
@@ -267,6 +352,18 @@ pub enum Event {
         generation: u64,
         outcome: Outcome,
     },
+    CoverageLocal {
+        generation: u64,
+        local: LocalCoverage,
+    },
+    CoveragePublished {
+        generation: u64,
+        published: PublishedCoverage,
+    },
+    CoverageFailed {
+        generation: u64,
+        message: String,
+    },
 }
 
 impl Event {
@@ -278,7 +375,10 @@ impl Event {
             | Event::Progress { generation, .. }
             | Event::RangeDone { generation, .. }
             | Event::FetchFailed { generation, .. }
-            | Event::Done { generation, .. } => *generation,
+            | Event::Done { generation, .. }
+            | Event::CoverageLocal { generation, .. }
+            | Event::CoveragePublished { generation, .. }
+            | Event::CoverageFailed { generation, .. } => *generation,
         }
     }
 }
@@ -293,6 +393,8 @@ pub enum Action {
     Cancel,
     Back,
     Retry(PolicyId),
+    Coverage,
+    Backfill(BackfillSpec),
 }
 
 /// The CLI's bounds, applied once a resolved plan exists.
@@ -306,6 +408,10 @@ pub struct App {
     pub screen: Screen,
     pub destination: Option<PathBuf>,
     pub bound: PlanBound,
+    pub backfill: BackfillSettings,
+    /// The CLI's bounds on the TUI's backfill, for a probe or a staged fill.
+    pub backfill_from: Option<u64>,
+    pub backfill_to: Option<u64>,
     /// Bumped whenever the screen stops caring about a worker's result. An
     /// event from an older generation is ignored, so a cancelled download
     /// cannot repaint a new plan.
@@ -323,6 +429,9 @@ impl App {
             screen,
             destination,
             bound: PlanBound::default(),
+            backfill: BackfillSettings::default(),
+            backfill_from: None,
+            backfill_to: None,
             generation: 0,
             tick: 0,
             quit: false,
@@ -355,6 +464,7 @@ impl App {
             Screen::Fetching { plan, .. } => Some(plan.policy),
             Screen::Done { plan, .. } => Some(plan.policy),
             Screen::Failed { policy, .. } => Some(*policy),
+            Screen::Coverage { .. } => None,
         };
         self.generation += 1;
         self.cancel = None;
@@ -375,6 +485,11 @@ impl App {
                 _ => Action::None,
             };
         }
+
+        // Read before the screen is borrowed: the coverage arm needs them.
+        let destination = self.destination.clone();
+        let backfill_from = self.backfill_from;
+        let backfill_to = self.backfill_to;
 
         match &mut self.screen {
             Screen::Policy { input, error } => match code {
@@ -402,6 +517,7 @@ impl App {
                         Action::None
                     }
                 },
+                KeyCode::Char('v') => Action::Coverage,
                 _ => Action::None,
             },
             Screen::Resolving { .. } => match code {
@@ -444,6 +560,7 @@ impl App {
                 },
                 KeyCode::Esc => Action::Back,
                 KeyCode::Char('q') => Action::Quit,
+                KeyCode::Char('v') => Action::Coverage,
                 _ => Action::None,
             },
             Screen::Fetching { .. } => match code {
@@ -454,11 +571,36 @@ impl App {
             Screen::Done { .. } => match code {
                 KeyCode::Char('q') => Action::Quit,
                 KeyCode::Esc => Action::Back,
+                KeyCode::Char('v') => Action::Coverage,
                 _ => Action::None,
             },
             Screen::Failed { policy, retry, .. } => match code {
                 KeyCode::Char('r') if *retry => Action::Retry(*policy),
                 KeyCode::Esc => Action::Back,
+                KeyCode::Char('q') => Action::Quit,
+                KeyCode::Char('v') => Action::Coverage,
+                _ => Action::None,
+            },
+            Screen::Coverage { view } => match code {
+                KeyCode::Char('b') if view.fill.is_none() && view.published.is_some() => {
+                    let Some(published) = &view.published else {
+                        return Action::None;
+                    };
+                    let Some(destination) = destination else {
+                        return Action::None;
+                    };
+                    Action::Backfill(BackfillSpec {
+                        destination,
+                        from: backfill_from.unwrap_or(1),
+                        to: backfill_to
+                            .unwrap_or(published.beacon)
+                            .min(published.beacon),
+                        settings: view.settings,
+                    })
+                }
+                KeyCode::Esc if view.fill.is_some() => Action::Cancel,
+                KeyCode::Esc => Action::Back,
+                KeyCode::Char('r') => Action::Coverage,
                 KeyCode::Char('q') => Action::Quit,
                 _ => Action::None,
             },
@@ -474,6 +616,12 @@ impl App {
             Event::Status { message, .. } => match &mut self.screen {
                 Screen::Resolving { status, .. } => *status = message,
                 Screen::Fetching { phase, .. } => *phase = message,
+                Screen::Coverage { view } => {
+                    if let Some(fill) = &mut view.fill {
+                        fill.phase = message.clone();
+                    }
+                    view.status = message;
+                }
                 _ => {}
             },
             Event::Resolved { floor, tip, .. } => {
@@ -520,49 +668,95 @@ impl App {
                     retry: true,
                 };
             }
-            Event::Progress { progress, .. } => {
-                if let Screen::Fetching { fetch, .. } = &mut self.screen {
-                    fetch.apply(progress);
+            Event::Progress { progress, .. } => match &mut self.screen {
+                Screen::Fetching { fetch, .. } => fetch.apply(progress),
+                Screen::Coverage { view } => {
+                    if let Some(fill) = &mut view.fill {
+                        fill.fetch.apply(progress);
+                    }
                 }
-            }
+                _ => {}
+            },
             Event::RangeDone {
                 range,
                 files,
                 bytes,
                 ..
-            } => {
-                if let Screen::Fetching { fetch, .. } = &mut self.screen {
+            } => match &mut self.screen {
+                Screen::Fetching { fetch, .. } => {
                     fetch.finish_batch(files, bytes);
                     fetch.ranges.push(range);
                 }
-            }
+                Screen::Coverage { view } => {
+                    if let Some(fill) = &mut view.fill {
+                        fill.fetch.finish_batch(files, bytes);
+                        fill.fetch.ranges.push(range);
+                    }
+                }
+                _ => {}
+            },
             Event::FetchFailed { message, .. } => {
-                let policy = match &self.screen {
-                    Screen::Fetching { plan, .. } => plan.policy,
-                    _ => return,
-                };
                 self.cancel = None;
-                self.screen = Screen::Failed {
-                    policy,
-                    message,
-                    retry: true,
+                let policy = match &self.screen {
+                    Screen::Fetching { plan, .. } => Some(plan.policy),
+                    _ => None,
                 };
+                if let Some(policy) = policy {
+                    self.screen = Screen::Failed {
+                        policy,
+                        message,
+                        retry: true,
+                    };
+                } else if let Screen::Coverage { view } = &mut self.screen {
+                    view.fill = None;
+                    view.error = Some(message);
+                    view.status = "backfill stopped — r rescans, b resumes".to_string();
+                }
             }
             Event::Done { outcome, .. } => {
-                let plan = match &self.screen {
-                    Screen::Fetching { plan, .. } => plan.clone(),
-                    _ => return,
-                };
                 self.cancel = None;
-                self.screen = Screen::Done { plan, outcome };
+                let plan = match &self.screen {
+                    Screen::Fetching { plan, .. } => Some(plan.clone()),
+                    _ => None,
+                };
+                if let Some(plan) = plan {
+                    self.screen = Screen::Done { plan, outcome };
+                } else if let Screen::Coverage { view } = &mut self.screen {
+                    view.fill = None;
+                    view.status = "backfill complete — reading the store again…".to_string();
+                }
+            }
+            Event::CoverageLocal { local, .. } => {
+                if let Screen::Coverage { view } = &mut self.screen {
+                    view.local = Some(local);
+                    // Every scan ends with a `CoveragePublished` that joins this
+                    // local set. Keeping the previous join up in the meantime
+                    // shows a Covered count that disagrees with the Local line
+                    // beside it — a fresh scan with a stale verdict on top.
+                    view.published = None;
+                }
+            }
+            Event::CoveragePublished { published, .. } => {
+                if let Screen::Coverage { view } = &mut self.screen {
+                    view.published = Some(published);
+                    view.status.clear();
+                }
+            }
+            Event::CoverageFailed { message, .. } => {
+                if let Screen::Coverage { view } = &mut self.screen {
+                    view.error = Some(message);
+                    view.status =
+                        "the local scan is shown; the published set could not be read".to_string();
+                }
             }
         }
     }
 
     /// How long until the heartbeat should repaint, if anything is moving.
     pub fn repaint_interval(&self) -> Option<Duration> {
-        match self.screen {
+        match &self.screen {
             Screen::Resolving { .. } | Screen::Fetching { .. } => Some(Duration::from_millis(100)),
+            Screen::Coverage { view } if view.fill.is_some() => Some(Duration::from_millis(100)),
             _ => None,
         }
     }
@@ -571,8 +765,41 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coverage::ChunkRange;
 
     const POLICY: &str = "16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7";
+
+    fn local_coverage() -> LocalCoverage {
+        LocalCoverage {
+            files: 2,
+            bytes: 100,
+            first: Some(6201),
+            last: Some(6202),
+            incomplete: Vec::new(),
+            policies: Vec::new(),
+            policy_errors: Vec::new(),
+            complete: [6201, 6202].into_iter().collect(),
+        }
+    }
+
+    fn published_coverage() -> PublishedCoverage {
+        PublishedCoverage {
+            beacon: 6204,
+            epoch: 500,
+            created_at: "now".to_string(),
+            per_file_bytes: 50,
+            published_files: 4,
+            covered_files: 2,
+            missing_files: 2,
+            missing_bytes: 100,
+            unpublished_files: 0,
+            gaps: vec![ChunkRange {
+                from: 6203,
+                to: 6204,
+            }],
+            gap_count: 1,
+        }
+    }
 
     fn plan() -> RangePlan {
         let policy = PolicyId::parse(POLICY).unwrap();
@@ -734,5 +961,194 @@ mod tests {
         assert_eq!(state.files_done, 2);
         assert_eq!(state.bytes_done, 2_000);
         assert_eq!(state.percent(), 0);
+    }
+
+    #[test]
+    fn a_batch_that_beats_the_average_corrects_the_estimate() {
+        let mut state = FetchState::expected(2, 48);
+        state.apply(FetchProgress::Started { total: 1 });
+        state.apply(FetchProgress::FileStarted {
+            number: 6203,
+            size: 53,
+        });
+        // 53 for the file in flight, 24 (the snapshot average) for the next.
+        assert_eq!(state.projected_bytes(), 77);
+
+        state.apply(FetchProgress::FileCompleted { number: 6203 });
+        state.finish_batch(1, 53);
+        state.apply(FetchProgress::Started { total: 1 });
+        state.apply(FetchProgress::FileStarted {
+            number: 6204,
+            size: 37,
+        });
+        assert_eq!(state.projected_bytes(), 90);
+        // 6204 has been announced but has not reported a byte yet, which is
+        // exactly when the projection matters: the estimate already includes it.
+        assert_eq!(state.received(), 53);
+    }
+
+    #[test]
+    fn v_opens_coverage_from_the_policy_screen() {
+        let mut app = App::new(
+            Some(PathBuf::from("/store")),
+            Screen::Policy {
+                input: String::new(),
+                error: None,
+            },
+        );
+        assert_eq!(
+            app.on_key(KeyCode::Char('v'), KeyModifiers::NONE),
+            Action::Coverage
+        );
+    }
+
+    #[test]
+    fn coverage_starts_a_backfill_over_the_published_horizon() {
+        let view = CoverageView {
+            local: Some(local_coverage()),
+            published: Some(published_coverage()),
+            settings: BackfillSettings {
+                parallel: 2,
+                batch_files: 5,
+                pause_secs: 1,
+            },
+            ..CoverageView::default()
+        };
+        let mut app = App::new(Some(PathBuf::from("/store")), Screen::Coverage { view });
+
+        match app.on_key(KeyCode::Char('b'), KeyModifiers::NONE) {
+            Action::Backfill(spec) => {
+                assert_eq!(spec.from, 1);
+                assert_eq!(spec.to, 6204);
+                assert_eq!(spec.settings.batch_files, 5);
+                assert_eq!(spec.destination, PathBuf::from("/store"));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coverage_esc_stops_a_running_backfill_before_leaving() {
+        let mut view = CoverageView {
+            published: Some(published_coverage()),
+            ..CoverageView::default()
+        };
+        view.fill = Some(BackfillRun::new(BackfillSettings::default(), 2, 100));
+        let mut app = App::new(Some(PathBuf::from("/store")), Screen::Coverage { view });
+        assert_eq!(app.on_key(KeyCode::Esc, KeyModifiers::NONE), Action::Cancel);
+
+        let mut app = App::new(
+            Some(PathBuf::from("/store")),
+            Screen::Coverage {
+                view: CoverageView {
+                    published: Some(published_coverage()),
+                    ..CoverageView::default()
+                },
+            },
+        );
+        assert_eq!(app.on_key(KeyCode::Esc, KeyModifiers::NONE), Action::Back);
+    }
+
+    #[test]
+    fn a_coverage_scan_updates_both_halves() {
+        let mut app = App::new(
+            Some(PathBuf::from("/store")),
+            Screen::Coverage {
+                view: CoverageView::default(),
+            },
+        );
+        app.apply(Event::CoverageLocal {
+            generation: 0,
+            local: local_coverage(),
+        });
+        app.apply(Event::CoveragePublished {
+            generation: 0,
+            published: published_coverage(),
+        });
+
+        match &app.screen {
+            Screen::Coverage { view } => {
+                assert_eq!(view.local.as_ref().unwrap().files, 2);
+                assert_eq!(view.published.as_ref().unwrap().beacon, 6204);
+                assert!(view.status.is_empty());
+            }
+            other => panic!("stayed on {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_coverage_rescan_drops_the_stale_published_join() {
+        let mut app = App::new(
+            Some(PathBuf::from("/store")),
+            Screen::Coverage {
+                view: CoverageView {
+                    local: Some(local_coverage()),
+                    published: Some(published_coverage()),
+                    ..CoverageView::default()
+                },
+            },
+        );
+
+        app.apply(Event::CoverageLocal {
+            generation: 0,
+            local: local_coverage(),
+        });
+
+        match &app.screen {
+            Screen::Coverage { view } => {
+                assert_eq!(view.local.as_ref().unwrap().files, 2);
+                assert!(
+                    view.published.is_none(),
+                    "a new local scan must not sit beside the previous join"
+                );
+            }
+            other => panic!("left coverage for {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_backfill_keeps_the_coverage_screen() {
+        let mut view = CoverageView {
+            published: Some(published_coverage()),
+            ..CoverageView::default()
+        };
+        view.fill = Some(BackfillRun::new(BackfillSettings::default(), 2, 100));
+        let mut app = App::new(Some(PathBuf::from("/store")), Screen::Coverage { view });
+
+        app.apply(Event::Done {
+            generation: 0,
+            outcome: Outcome::default(),
+        });
+
+        match &app.screen {
+            Screen::Coverage { view } => {
+                assert!(view.fill.is_none());
+                assert!(view.status.contains("backfill complete"));
+            }
+            other => panic!("left coverage for {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_backfill_stays_on_coverage_with_the_error() {
+        let mut view = CoverageView {
+            published: Some(published_coverage()),
+            ..CoverageView::default()
+        };
+        view.fill = Some(BackfillRun::new(BackfillSettings::default(), 2, 100));
+        let mut app = App::new(Some(PathBuf::from("/store")), Screen::Coverage { view });
+
+        app.apply(Event::FetchFailed {
+            generation: 0,
+            message: "offline".to_string(),
+        });
+
+        match &app.screen {
+            Screen::Coverage { view } => {
+                assert!(view.fill.is_none());
+                assert_eq!(view.error.as_deref(), Some("offline"));
+            }
+            other => panic!("left coverage for {other:?}"),
+        }
     }
 }

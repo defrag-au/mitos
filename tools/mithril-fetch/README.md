@@ -48,18 +48,26 @@ mithril-fetch --run --policy <policy> --dest <store> --chunks 2
 
 # Stop at a slot instead of the tip (its immutable file is included).
 mithril-fetch --run --policy <policy> --dest <store> --to-slot 134006400
+
+# The whole published store, gently, with no policy in mind.
+mithril-fetch --backfill --dest <store>
+
+# A bounded or more/less gentle backfill.
+mithril-fetch --backfill --dest <store> --backfill-from 6201 --backfill-to 7000 \
+    --backfill-parallel 4 --backfill-batch 20 --backfill-pause 10
 ```
 
 The TUI:
 
 | screen | keys |
 |---|---|
-| policy | type hex · `Enter` resolve · `Esc` clear · `Ctrl-C` quit |
+| policy | type hex · `Enter` resolve · `Esc` clear · `v` coverage · `Ctrl-C` quit |
 | resolving | `Esc` back · `q` quit |
-| plan | `Enter` start · digits edit the end chunk · `t` tip · `Esc` back |
+| plan | `Enter` start · digits edit the end chunk · `t` tip · `v` coverage · `Esc` back |
 | fetching | `Esc` cancel · `q` quit |
-| done | `Esc` new policy · `q` quit |
-| failed | `r` retry · `Esc` back |
+| done | `Esc` new policy · `v` coverage · `q` quit |
+| failed | `r` retry · `Esc` back · `v` coverage |
+| coverage | `b` backfill · `r` rescan · `Esc` stop a running backfill (then back) · `q` quit |
 
 ## Store layout
 
@@ -71,6 +79,7 @@ so a per-policy copy would duplicate tens of gigabytes.
   immutable/06201.chunk 06201.primary 06201.secondary  ...
   policies/<policy>.json      # floor, ranges, certificate and snapshot hashes
   .mithril-fetch-staging/     # only while a batch is in flight
+  .mithril-certificate-chain  # validated chain links, so a rerun does not re-walk it
   archives/                   # `token-ledger reverse --archive-dir` writes here
 ```
 
@@ -78,6 +87,34 @@ so a per-policy copy would duplicate tens of gigabytes.
 gitignored; `.env.example` is the committed template). `--dest` wins over both.
 There is no default, deliberately: a silent multi-gigabyte download into `./data`
 is not a useful surprise.
+
+## Coverage and backfill
+
+`v` opens the coverage screen. It scans the store locally first, so the local
+numbers are there even when the aggregator is not, and then joins them to
+Mithril's published digest map:
+
+```
+Local       4 files · 148.8 MiB · 06201–06204
+Published   00001–09338 · 9,338 files · beacon 09338 (epoch 664)
+Covered     4 of 9,338 · <1%
+Missing     9,334 files · ≈ 220.7 GiB
+Gaps        2 run(s) · 00001–06200, 06205–09338
+```
+
+`00001` is the first number, not `00000`: Mithril's `ImmutableFileRange` starts
+at 1 and a fetch of 0 is refused. Coverage is therefore counted against the
+published set from 1 to the newest signed beacon.
+
+`b` starts a backfill of the whole published window (`--backfill-from` and
+`--backfill-to` narrow it). The defaults are the slow profile — 4 concurrent
+downloads, 20 files per verified batch, 10 seconds idle between batches — so the
+transfer leaves the link and the disk alone between bursts rather than saturating
+them. `Esc` stops after the batch in flight; `b` resumes from the first file that
+is still missing.
+
+A full mainnet backfill is ~9,300 files and ~220 GiB. At the defaults it is a
+background job measured in days, which is the point.
 
 ## Verification and resume
 
@@ -93,6 +130,18 @@ the staging directory; the store keeps everything that reached it. Re-running
 scans the store and fetches only the missing runs, so resume is free. A batch is
 at most 200 files (~5 GB), which is the most a cancel can cost.
 
+The certificate chain is the slow part of a cold start: verifying it walks back
+to the genesis certificate, one HTTPS request and one multi-signature check per
+Mithril epoch. Measured 2026-10-30 on a fresh store in a **debug** build: the
+first one-file batch took 3m56s end to end, nearly all of it the 127-certificate
+chain walk, while a second batch against the same store verified 3 certificates
+and finished in under 20 seconds. Every verified link is therefore written to
+`.mithril-certificate-chain`, and the client's own verifier cache reads it: the
+first batch of a store pays the walk, later batches (and later runs against the
+same store) verify only the newest epoch and follow cached links for the rest.
+The screen shows how many certificates have been checked, so a long walk is
+visibly working rather than hung.
+
 The store is refused, not repaired, if it holds an incomplete triple inside the
 requested range: `lift` never overwrites, and guessing which half is canonical
 is not something this tool will do.
@@ -100,14 +149,16 @@ is not something this tool will do.
 ## Testing
 
 ```bash
-nix develop -c cargo test -p mithril-fetch
-nix develop -c cargo clippy -p mithril-fetch --all-targets -- -D warnings
+nix develop -c cargo test -p mithril-fetch -p mithril-snapshot
+nix develop -c cargo clippy -p mithril-fetch -p mithril-snapshot --all-targets -- -D warnings
 ```
 
-The pure half (`plan.rs`) is tested without a network: the earliest-asset rule,
-the one-chunk margin, the chunk arithmetic, the end-chunk bounds, and the
-estimate. `app.rs` tests key handling and that a worker event from an older
-generation cannot repaint a new screen.
+The pure half (`plan.rs`, `coverage.rs`) is tested without a network: the
+earliest-asset rule, the one-chunk margin, chunk arithmetic, end-chunk bounds,
+the estimate, and coverage runs. `app.rs` tests key handling, the coverage and
+backfill state, and that a worker event from an older generation cannot repaint
+a new screen. `crates/mithril-snapshot` tests the chain cache's round trip and
+its refusal to accept a malformed line.
 
 `--fixture` draws a captured screen through a `TestBackend`; `--fixture …
 --capture <stem>` writes `<stem>.txt` and `<stem>.json`. `tui-shot` can drive
@@ -148,4 +199,11 @@ command fetched nothing and reported the two files already present.
   chunks are the expensive part; the walk is a separate decision.
 - **One writer per store.** Two runs share `.mithril-fetch-staging`, and the
   second would clear the first's transfer. The store is a cache of sealed files,
-  not a queue; run one fetch against it at a time.
+  not a queue; run one fetch against it at a time. The chain cache is
+  append-only and safe for readers, but a backfill and a policy fetch are still
+  two writers to the staging directory.
+- **The first chain walk of a store is minutes, not seconds.** It is one
+  request per Mithril epoch since genesis, and the screen says how many
+  certificates it has checked. Later batches use the cache and are quick. A
+  fresh *store* pays it once; deleting `.mithril-certificate-chain` pays it
+  again.
