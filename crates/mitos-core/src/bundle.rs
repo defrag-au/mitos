@@ -387,15 +387,69 @@ impl Bundle {
             }
             let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine()
                 .map_err(|e| anyhow::anyhow!("module engine: {e}"))?;
-            // Single DomainDataPlane instance: v2 wires it as the
-            // concrete `Arc<DomainDataPlane<_>>` so the dispatch
-            // composer's generic bound resolves without a vtable
-            // hop. The `dp` view (`Arc<dyn DataPlaneFacade>`) is
-            // what the per-instance host fns see.
-            let chain_plane = Arc::new(mitos_platform::host_fns::DomainDataPlane::new(
-                domain.clone(),
-            ));
+            // Plane selection. `MITOS_DATA_PLANE` is `dolos` (the default) or
+            // `book`; `book` requires `MITOS_BOOK_DIR` and a stamped artifact,
+            // because every follower and paginated query anchors on `tip()`.
+            // The Dolos domain is still constructed either way: it is the tail,
+            // not the selection.
+            let plane_mode = std::env::var("MITOS_DATA_PLANE").unwrap_or_else(|_| "dolos".into());
+            let selected = match plane_mode.as_str() {
+                "dolos" => mitos_platform::selected_plane::SelectedPlane::Dolos(
+                    mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
+                ),
+                "book" => {
+                    // A compose file can only pass a variable it can name, so an
+                    // unset optional setting arrives as an empty string rather
+                    // than an absent one. Treat empty as absent here, or the
+                    // datum dir would be opened as the empty path.
+                    let book_dir = std::env::var("MITOS_BOOK_DIR")
+                        .ok()
+                        .filter(|dir| !dir.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "MITOS_DATA_PLANE=book requires MITOS_BOOK_DIR to name the \
+                                 live-book directory"
+                            )
+                        })?;
+                    let book_dir = std::path::Path::new(&book_dir);
+                    let datum_dir = std::env::var("MITOS_DATUM_DIR")
+                        .ok()
+                        .filter(|dir| !dir.is_empty());
+                    let plane = match datum_dir {
+                        Some(datum_dir) => mitos_platform::BookDataPlane::open_with_datums(
+                            book_dir,
+                            std::path::Path::new(&datum_dir),
+                        ),
+                        None => mitos_platform::BookDataPlane::open(book_dir),
+                    }
+                    .map_err(|e| {
+                        anyhow::anyhow!("open live book at {}: {e}", book_dir.display())
+                    })?;
+                    if plane.base().meta().base_slot.is_none() {
+                        anyhow::bail!(
+                            "live book at {} has no base_slot; stamp it with `fold-probe \
+                             stamp-boundary` before serving it",
+                            book_dir.display()
+                        );
+                    }
+                    mitos_platform::selected_plane::SelectedPlane::Book(Box::new(plane))
+                }
+                other => anyhow::bail!(
+                    "unknown MITOS_DATA_PLANE={other}; expected `dolos` or `book`"
+                ),
+            };
+            info!(plane = selected.label(), "data plane selected");
+            let chain_plane = Arc::new(selected);
             let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = chain_plane.clone();
+            // The admin routes answer from the plane the host serves. `/_admin/status`
+            // and `/_admin/metrics` report its tip, which is the one place an operator
+            // can see which plane the cohort is actually reading — reporting dolos's
+            // tip while a book serves would hide exactly the thing a book run is
+            // checking. `/_admin/utxos/{address}` reads the same rows the modules do.
+            // The block routes have no book equivalent: under `book` they hit the
+            // trait's default and answer "no block at this slot", which is true of an
+            // artifact that carries no blocks.
+            let admin_chain_data: Arc<dyn mitos_platform::ChainDataPlane> = chain_plane.clone();
 
             // Subscription factory: each follower gets its own
             // tip-watch. Two layers of fix applied:
@@ -690,9 +744,7 @@ impl Bundle {
             // pull real-chain block CBOR straight out of the live
             // archive for `mitos-run` fixtures.
             let reserved_names = core_bridge.reserved_names_owned();
-            let chain_data: Arc<dyn mitos_platform::ChainDataPlane> = Arc::new(
-                mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
-            );
+            let chain_data = admin_chain_data;
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage.clone(),
                 host_for_admin,

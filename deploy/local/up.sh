@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Bring up the local mitos + minting-engine acceptance stack.
 #
-#   direnv exec . deploy/local/up.sh          # from the mitos root
+#   direnv exec . deploy/local/up.sh                 # host on dolos, as before
+#   direnv exec . deploy/local/up.sh --plane book --book .tmp/book-window-1848
+#
+# `--book` / `--datum` are host paths under the repository's .tmp/ (or
+# MITOS_BOOK_DIR / MITOS_DATUM_DIR for the same); the stack mounts that
+# directory at /books and the container sees /books/<name>.
 #
 # Builds the worker (and its module artifact), cross-builds the mitos host for
 # the container's architecture, starts a Cloudflare quick tunnel for the worker,
@@ -35,13 +40,6 @@ CONTAINER_COMPOSE="${CONTAINER_COMPOSE:-container-compose}"
 STATE="${DIR}/.tmp"
 GENERATED="${DIR}/generated"
 
-CHECK=0
-case "${1:-}" in
-    --check) CHECK=1 ;;
-    "") ;;
-    *) die "usage: deploy/local/up.sh [--check]" ;;
-esac
-
 log() { printf '▸ %s\n' "$*" >&2; }
 die() {
     printf '✗ %s\n' "$*" >&2
@@ -57,6 +55,69 @@ cleanup() {
     fi
 }
 trap cleanup EXIT INT TERM
+
+CHECK=0
+PLANE="${MITOS_DATA_PLANE:-dolos}"
+BOOK_HOST="${MITOS_BOOK_DIR:-}"
+DATUM_HOST="${MITOS_DATUM_DIR:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) CHECK=1; shift ;;
+        --plane)
+            [ $# -ge 2 ] || die "--plane needs dolos or book"
+            PLANE="$2"
+            shift 2
+            ;;
+        --book)
+            [ $# -ge 2 ] || die "--book needs a directory"
+            BOOK_HOST="$2"
+            shift 2
+            ;;
+        --datum)
+            [ $# -ge 2 ] || die "--datum needs a directory"
+            DATUM_HOST="$2"
+            shift 2
+            ;;
+        *)
+            die "usage: deploy/local/up.sh [--check] [--plane dolos|book] [--book <dir>] [--datum <dir>]"
+            ;;
+    esac
+done
+case "${PLANE}" in
+    dolos | book) ;;
+    *) die "unknown --plane ${PLANE}; expected dolos or book" ;;
+esac
+
+# The stack mounts the repository's scratch directory read-only at /books (see
+# stack.toml), so an artifact is reachable only from inside it. Refusing a path
+# outside is deliberate: the alternative is a bind the host never reads.
+container_path() {
+    local host
+    host="$(cd "$1" && pwd)" || die "no such directory: $1"
+    case "${host}" in
+        "${MITOS_SRC}/.tmp"/*) printf '/books/%s\n' "${host#"${MITOS_SRC}/.tmp/"}" ;;
+        *) die "$1 is outside ${MITOS_SRC}/.tmp; the stack mounts only that directory (at /books)" ;;
+    esac
+}
+
+BOOK_DIR=""
+DATUM_DIR=""
+if [ -n "${BOOK_HOST}" ]; then
+    BOOK_DIR="$(container_path "${BOOK_HOST}")"
+    [ -f "${BOOK_HOST}/book.meta" ] \
+        || die "${BOOK_HOST} has no book.meta; point --book at a finished live book (fold-probe fold … --primitives --book <dir>)"
+fi
+if [ -n "${DATUM_HOST}" ]; then
+    DATUM_DIR="$(container_path "${DATUM_HOST}")"
+    [ -f "${DATUM_HOST}/datum.tbl" ] \
+        || die "${DATUM_HOST} has no datum.tbl; point --datum at a datum capture"
+fi
+if [ "${PLANE}" = "book" ] && [ -z "${BOOK_DIR}" ]; then
+    die "--plane book needs --book <dir> (or MITOS_BOOK_DIR)"
+fi
+if [ "${PLANE}" = "dolos" ] && [ -n "${BOOK_DIR}" ]; then
+    log "⚠️  a book was given but the plane is dolos; the artifact will not be read"
+fi
 
 [ -f "${MITOS_SRC}/bundles/default/Cargo.toml" ] \
     || die "${MITOS_SRC} is not the mitos checkout; run this from the repo (deploy/local/up.sh)"
@@ -100,12 +161,13 @@ if [ "${CHECK}" = "1" ]; then
     else
         STRIP="none"
     fi
-    printf '✓ check ok\n  mitos     %s\n  worker    %s\n  modules   cip-25-mint cip-68-mint credit-address\n  container %s\n  compose   %s\n  fds       soft %s, hard %s\n  strip     %s\n' \
-        "${MITOS_SRC}" "${WORKER_DIR}" "${CONTAINER_BIN}" "$(command -v "${CONTAINER_COMPOSE}")" "$(ulimit -Sn)" "$(ulimit -Hn)" "${STRIP}"
+    printf '✓ check ok\n  mitos     %s\n  worker    %s\n  modules   cip-25-mint cip-68-mint credit-address\n  plane     %s\n  book      %s\n  datum     %s\n  container %s\n  compose   %s\n  fds       soft %s, hard %s\n  strip     %s\n' \
+        "${MITOS_SRC}" "${WORKER_DIR}" "${PLANE}" "${BOOK_DIR:-(none)}" "${DATUM_DIR:-(none)}" \
+        "${CONTAINER_BIN}" "$(command -v "${CONTAINER_COMPOSE}")" "$(ulimit -Sn)" "$(ulimit -Hn)" "${STRIP}"
     exit 0
 fi
 
-mkdir -p "${STATE}" "${GENERATED}" "${DIR}/mitos-image" "${STATE}/worker"
+mkdir -p "${STATE}" "${GENERATED}" "${DIR}/mitos-image" "${STATE}/worker" "${MITOS_SRC}/.tmp"
 
 # Two tokens, and they must differ: the host refuses a file where the operator
 # token and a namespace token are the same value, because a bearer token has to
@@ -288,4 +350,11 @@ EOF
     "INSERT OR IGNORE INTO collections (policy_id, deposit_address) VALUES ('${POLICY}', NULL)" >/dev/null )
 
 log "starting stack — Ctrl-C stops both services and the tunnel"
+log "data plane: ${PLANE}${BOOK_DIR:+ (${BOOK_DIR})}"
+# The stack resolves these from the environment, which wins over `.env`; a
+# compose file can only name variables that resolve, so all three are always
+# exported (empty means unset to the host).
+export MITOS_DATA_PLANE="${PLANE}"
+export MITOS_BOOK_DIR="${BOOK_DIR}"
+export MITOS_DATUM_DIR="${DATUM_DIR}"
 "${CONTAINER_COMPOSE}" --runtime "${CONTAINER_BIN}" -f "${DIR}/stack.toml" up

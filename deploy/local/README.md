@@ -34,14 +34,16 @@ This is the first version of the local stack named in
 closes the loop that hurts most: the host runs as it does in a deployment, and
 the companion runs in workerd with local DO and D1 state.
 
-The plane work is additive, not a second stack. M2 adds a read-only book mount
-and `MITOS_DATA_PLANE=book` to the `mitos` service; a shadow diff adds a second
-host service over the same inputs. Nothing here should fork into a parallel
-compose file.
+The plane work is additive, not a second stack: `MITOS_DATA_PLANE=book` selects a
+published live book for every host query, and `up.sh --plane book` mounts one. A shadow
+diff adds a second host service over the same inputs. Nothing here should fork into a
+parallel compose file.
 
 ## Prerequisites
 
-- macOS with Apple's `container` 1.6+ running (`container system status`).
+- macOS with Apple's `container` 1.6+ running (`container ls` succeeds; `container
+  system status` answers `unregistered` from a shell other than the one that started the
+  runtime, so it is not a liveness probe).
 - The container DNS domain registered once per machine:
   ```toml
   # ~/.config/container/config.toml
@@ -105,6 +107,37 @@ POLICY=<preprod-policy-hex> direnv exec . deploy/local/up.sh
 The policy must be supplied on both sides: see “the dial-back pins one policy”
 under Known gaps. A policy with no `collections` row onboards with just the
 policy interest; the credit-address watch is skipped.
+
+### Run it book-backed
+
+The host can answer from a published live book instead of Dolos's stores. The artifact is
+mmapped read-only from the repository's scratch directory, so it has to live there:
+
+```sh
+# build a window if there isn't one (chunks 1848–1851 is 92,165 rows at slot 40,003,168)
+direnv exec . cargo run -q -p fold-probe -- fold \
+    --immutable ~/data/mithril/immutable --start 1848 --chunks 4 --primitives \
+    --book .tmp/book-window-1848
+
+# 220 refs for 0a85dd15…, 0 for the default cip-25-mint fixture policy
+POLICY=0a85dd1543465407852c90e66c074a3b52ea2d7c77a2346ddc20550a \
+    direnv exec . deploy/local/up.sh --plane book --book .tmp/book-window-1848
+./deploy/local/onboard.sh 0a85dd1543465407852c90e66c074a3b52ea2d7c77a2346ddc20550a
+```
+
+`--datum <dir>` adds a `datum.tbl` capture beside the book (`MITOS_DATUM_DIR`). Both flags
+name host paths under `.tmp/`; the stack mounts that directory at `/books` and refuses a
+path outside it rather than creating a bind the host never reads.
+
+What to read back: `up.sh` prints `data plane: book`, the host logs
+`data plane selected plane="book"`, and `/_admin/status` reports the book's `base_slot`
+as the tip (`40003168` for the window above) with `archive_horizon_slot: null`. Dolos is
+still running as the tail, so its own tip is not what that field shows — that is the
+point of routing the admin routes through the selected plane.
+
+A windowed book is a snapshot: it holds the UTxOs created inside its window, not the whole
+live set. A policy whose outputs predate the window returns nothing, which looks like a
+broken plane and is not. Use a whole-store book when the module needs the full live set.
 
 ## Watch the move
 

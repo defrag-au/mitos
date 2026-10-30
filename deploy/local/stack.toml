@@ -1,9 +1,15 @@
 # Local acceptance stack: a mitos preprod host + the minting-engine worker.
 #
 # This is the first version of the local stack named in
-# docs/design/PLANE_LANDING.md §8. The book-backed plane run adds a read-only
-# book mount and MITOS_DATA_PLANE=book to the `mitos` service rather than a
-# second stack; shadow diffing adds a second host service over the same inputs.
+# docs/design/PLANE_LANDING.md §8. The book-backed plane run is the same stack
+# with `MITOS_DATA_PLANE=book` and the book mounted: `up.sh --plane book`
+# chooses it, and the artifact is read out of the mounted scratch directory
+# rather than copied into an image. Shadow diffing adds a second host service
+# over the same inputs.
+#
+# `MITOS_BOOK_DIR` / `MITOS_DATUM_DIR` are container paths and are always
+# exported by `up.sh` (empty when the run is dolos-backed), because a compose
+# file can only name a variable that resolves.
 #
 # The worker is the module owner: it serves `cip-25-mint` at the well-known
 # paths mitos derives from the announcement. `up.sh` starts a Cloudflare quick
@@ -26,15 +32,24 @@ size = "40G"
 # The binary is cross-built by up.sh (`cargo zigbuild`, musl) and copied into
 # mitos-image/ before `container-compose build`. It runs as root, which is
 # fine for a dev volume.
+# `--config-file` names the mitos.toml explicitly. `--config` is the legacy
+# dolos.toml flag; this stack only worked with it because the file also lands on
+# the default path `/etc/mitos/mitos.toml`, which flips the mode anyway.
 [services.mitos]
 entrypoint = "/usr/local/bin/mitos"
-command = ["--config", "/etc/mitos/mitos.toml"]
-env = { MITOS_AUTH_TOKEN = "${MITOS_AUTH_TOKEN}", MITOS_TOKEN_DEV = "${MITOS_TOKEN_DEV}", MITOS_NAMESPACES_FILE = "/etc/mitos/namespaces.toml", BUNDLE_COMMUNITY_MODULES_DIR = "/community-modules", RUST_LOG = "info,mitos_platform=debug" }
+command = ["--config-file", "/etc/mitos/mitos.toml"]
+env = { MITOS_AUTH_TOKEN = "${MITOS_AUTH_TOKEN}", MITOS_TOKEN_DEV = "${MITOS_TOKEN_DEV}", MITOS_NAMESPACES_FILE = "/etc/mitos/namespaces.toml", BUNDLE_COMMUNITY_MODULES_DIR = "/community-modules", MITOS_DATA_PLANE = "${MITOS_DATA_PLANE}", MITOS_BOOK_DIR = "${MITOS_BOOK_DIR}", MITOS_DATUM_DIR = "${MITOS_DATUM_DIR}", RUST_LOG = "info,mitos_platform=debug" }
 volumes = [
   "mitos-data:/var/lib/mitos",
   "./generated/mitos.toml:/etc/mitos/mitos.toml:ro",
   "./generated/namespaces.toml:/etc/mitos/namespaces.toml:ro",
   "./generated/community-modules:/community-modules:ro",
+  # A live book is a directory the host mmaps, not a service. The repository's
+  # scratch directory is mounted because it always exists (up.sh creates it) and
+  # is where `fold-probe` builds artifacts: the plan check must not depend on a
+  # book having been built, and an empty directory named as a book fails at open
+  # with the path in the message. `MITOS_BOOK_DIR` names the artifact inside it.
+  "../../.tmp:/books:ro",
 ]
 ports = ["127.0.0.1:8080:8080"]
 cpus = 6

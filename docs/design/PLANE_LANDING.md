@@ -44,23 +44,24 @@ Most of the risk lives in L2's tip and mint ledger, not in the base.
 |---|---|---|
 | **Base artifact** (`rows.bin`, `by_outref`, `by_policy`, `by_addr`, `policy.tbl`, `dir`, `book.meta`) | **Built and verified whole-store**: 10,911,674 rows, 2.23 GB, 32.7 M entry confirms with 0 failures | `LIVE_BOOK.md` Sizes; `PHONEBOOK_COVERAGE.md` §6 |
 | **Reader** (`Base::open`, point + three orderings, opaque cursors) | **Built**; long-row (>8 KiB) bug found and fixed 2026-09-26 | `crates/live-book`; `LARGE_POLICY_VIEWS.md` §0 |
-| **`BookDataPlane`** | **Built**; answers the UTxO/address/policy/holder methods, refuses the rest by name; `tip()` answers from `base_slot` | `crates/mitos-data-plane/src/impls/book.rs` |
-| **Host wiring** | **Not wired.** `bundle.rs` constructs `DomainDataPlane` (Dolos) unconditionally | `crates/mitos-core/src/bundle.rs:395` |
-| **First module execution** | **Passes**: shipped `collection-holders` runs against a published book, emits 839 holdings matching the book | `crates/mitos-platform/tests/collection_holders_over_book.rs`; `PHONEBOOK_COVERAGE.md` §12 |
-| **`datum.tbl`** | **Capture and reader built** (2026-09-24); the plane does not open it yet | `LIVE_BOOK.md` Phasing 3 |
+| **`BookDataPlane`** | **Built**; answers the UTxO/address/policy/holder methods, `search_utxos` for the three caller shapes, datum resolution from a `datum.tbl`, and `tip()` from `base_slot`; the rest refuse by name | `crates/mitos-data-plane/src/impls/book.rs` |
+| **Host wiring** | **Wired.** `MITOS_DATA_PLANE=book` opens the artifact in `bundle.rs` and every host query delegates through `SelectedPlane`; a missing `MITOS_BOOK_DIR`, an unstamped book, or an unknown mode fails at startup by name. The admin routes answer from the same plane, so `/_admin/status` reports the book's boundary rather than Dolos's tip | `crates/mitos-core/src/bundle.rs`; `crates/mitos-platform/src/selected_plane.rs` |
+| **First module execution** | **Passes**: shipped `collection-holders` runs against a published book, emits 736 holdings over 220 live refs | `crates/mitos-platform/tests/collection_holders_over_book.rs`; `PHONEBOOK_COVERAGE.md` §12 |
+| **`datum.tbl`** | **Capture, reader and plane wiring built**: `read_datum` and the hash arm of `read_output_datums` resolve from a table beside the book or via `open_with_datums`; without one the plane keeps the hash and `payload: None` | `LIVE_BOOK.md` Phasing 3; `DATUM_RESOLVER_FORMAT.md`; `book.rs` |
 | **Delta** | **Point resolution built and measured**: 100% of base-unanswerable inputs, ~240 ns/input, +31% walk, 3.3 MiB/chunk | `DELTA_CHAIN.md` §3–§5 |
 | **Delta orderings** | **Not built.** Enumeration at the tip is a full scan: 97.5 ms over 288 K rows | `DELTA_CHAIN.md` §6 |
 | **Delta publication / merge** | **Not built.** No `delta/NNNNN.dlt`, no rebase | `DELTA_CHAIN.md` §6, §11 |
 | **Live tail source** | **Open.** The bundle still uses Dolos's `LagTolerantSubscription`; no production tail over a book | `bundle.rs:421`; `DELTA_CHAIN.md` §11 |
 | **Mint ledger** (`asset_state`, `total_supply`, `cip25_metadata`) | **Not built for the book.** Dolos provides `asset_state`; `total_supply` is `NotYetImplemented` even there. `policy-index` has mint provenance, not net supply | `crates/mitos-data-plane/src/impls/book.rs`; `policy-index/README.md` |
 | **History** (`tx_metadata`, `read_tx`, `slot_by_tx_hash`) | **Not on the book.** `tx-index` holds locations; the chunk holds the bytes | `DELTA_CHAIN.md` §9; `TX_INDEX_DATASOURCE.md` |
-| **`search_utxos`** | **Refuses.** The host's watched-UTxO seeding calls it on every dynamic-interest Add; it logs and carries on | `book.rs:269`; `DELTA_CHAIN.md` §7 |
+| **`search_utxos`** | **Built** for `Match` of policy, exact address and payment credential, paged with an opaque cursor; other shapes refuse by name. The host's watched-UTxO seed now fills instead of logging and carrying on | `book.rs`; `PHONEBOOK_COVERAGE.md` §3/§4a |
 | **Publish path** | Components exist (`live-book::publish`, `cf-publish`, `mithril-snapshot`, `mithril-source`); the edge read path is deployed against a windowed book. No cadence or ownership decision | `LIVE_BOOK.md` Open; `MITOS_AT_THE_EDGE.md` §12 |
 | **Release / install** | **Not landed.** No release workflow; the 2026-09-29 review found production on an older source build; `INSTALLABLE_MITOS.md` still says "nothing built" | `MITOS_UPGRADE_REVIEW_AND_PLAN.md` §2; `.github/workflows/` |
 
-The honest summary: **the base is a finished artifact with a reader and one passing
-module. The plane is not a finished data plane, because nothing in the host selects it
-and nothing serves the tip.**
+The honest summary: **the base is a finished artifact with a reader, one passing module,
+and — since 2026-10-30 — a host that can select it. What the selection does not carry is the
+tip: the tail is still Dolos's, the delta is neither published nor merged, and the mint
+ledger and history are not on the book.**
 
 ---
 
@@ -252,17 +253,25 @@ the mint ledger rides the same walk as the book (`DELTA_CHAIN.md` §8).
 
 ## 7. Immediate next step
 
-The smallest useful package is M1 plus the M2 skeleton:
+The smallest useful package is M1 plus the M2 skeleton. The first three items landed
+on 2026-10-30; the shadow diff is what remains:
 
-1. `search_utxos` for `at_address`, `under_policy` and payment credential — the shapes
-   the host and the cohort actually call — with the opaque `Page` cursor.
-2. Open the existing `datum.tbl` in `BookDataPlane` (`read_datum`, and the hash arm of
-   `read_output_datums`), which closes most of the 16% of a policy scan that currently
-   returns `payload: None`. The remainder is the era-dependent unrevealed tail (the
-   table answers 99% of Babbage/Conway hash-attached outputs and 68% of Alonzo's), so
-   it needs a named fallback rather than a claim of completeness.
-3. A `MITOS_DATA_PLANE=book` selection in `bundle.rs`, with a hard failure if the book
-   or its boundary is missing.
+1. **Done.** `search_utxos` for `at_address`, `under_policy` and payment credential
+   with the opaque `Page` cursor. The watched-UTxO seed that previously logged and
+   carried on now seeds 220 of 220 refs on the 1848–1851 window.
+2. **Done.** `datum.tbl` is opened by `BookDataPlane`: `read_datum` and the hash arm
+   of `read_output_datums` resolve from a table beside the book or via
+   `open_with_datums`. Without one the hash is still returned with `payload: None`.
+   The era-dependent unrevealed tail remains a named fallback (99% Babbage/Conway,
+   68% Alonzo), not a completeness claim.
+3. **Done.** `MITOS_DATA_PLANE=book` opens `MITOS_BOOK_DIR` (optionally with
+   `MITOS_DATUM_DIR`) and delegates every `ChainDataPlane` call through `SelectedPlane`;
+   a missing directory, an unstamped `book.meta`, or an unknown mode fails at startup by
+   name, and the admin routes answer from the selected plane so `/_admin/status` shows the
+   book's `base_slot`. Verified natively on the 1848–1851 window: the host logs
+   `plane="book"`, status reports slot 40,003,168 with no archive horizon, and
+   `/_admin/blocks/1` answers "no block at this slot", which is true of an artifact that
+   carries no blocks.
 4. A shadow diff for `collection-holders`, `holder-distribution`, `vesting-tracker` and
    `burn-address` against the same block range.
 
@@ -288,9 +297,12 @@ artifact format.
 | Companion apply/recapture | Deploy a Worker or use the box | `wrangler dev` (workerd) with local DO storage |
 | Publish/attestation read | R2 + the edge | Local R2 or MinIO, or a bind-mounted artifact |
 
-The data is the part people forget is already local: `LARGE_POLICY_VIEWS.md` measures
-the full book at `/Volumes/cardano/fold-book/local` (10,896,105 rows, 2.19 GB,
-`base_slot` 198,590,382). That is a real artifact for the host to mmap, not a fixture.
+The data is the part people forget is already local. The chunk store is
+`~/data/mithril/immutable` (9,338 chunks, 219 GB, rsynced off the external volume), and
+`fold-probe fold --immutable … --primitives --book <dir>` builds a real artifact from it for
+the host to mmap. The inner loop uses a windowed book — chunks 1848–1851 is 92,165 rows at
+tip 40,003,168, enough for a module to cold-start — while a whole-store book (10.9 M rows,
+2.23 GB) is the artifact for a footprint or cutover run.
 
 ### What it does not buy
 
@@ -327,11 +339,17 @@ id is the tunnel hostname. The pieces that already pay for themselves:
   `cip-25-mint`, `cip-68-mint` and `credit-address` from the tree.
 - **The workerd gaps are named**, not discovered per session: no Secrets Store emulation,
   and the DO runtime reports no name so the dial-back pins one policy.
+- **The book mount.** `up.sh --plane book --book .tmp/<artifact>` exports
+  `MITOS_DATA_PLANE` and the container-side paths, and the stack mounts the repository's
+  scratch directory read-only at `/books`. The bind source is the scratch directory, which
+  `up.sh` always creates, so the plan check never depends on an artifact existing — and an
+  empty directory named as a book fails at open with the path, rather than being read as
+  "no rows".
 
-The plane run extends this stack rather than adding a second one. M2 adds a read-only
-book mount and `MITOS_DATA_PLANE=book` to `mitos`; a shadow diff adds a second host
-service over the same bind mounts. `dolos` and `r2` stay optional and arrive only when
-the tail and publish paths are on the critical path.
+The plane run extends this stack rather than adding a second one. The book mount and
+`MITOS_DATA_PLANE=book` are already on the `mitos` service; a shadow diff adds a second host
+service over the same bind mounts. `dolos` and `r2` stay optional and arrive only when the
+tail and publish paths are on the critical path.
 
 One trap worth knowing before editing the stack file: `container-compose plan` checks
 that every bind source exists, and `up.sh` creates `generated/` and `.tmp/worker` as its

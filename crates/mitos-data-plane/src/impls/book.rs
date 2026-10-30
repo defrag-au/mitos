@@ -21,10 +21,10 @@
 //! | `utxos_by_payment_cred` | ✅ | `by_addr`, payment-credential hits only |
 //! | `resolve_stake_for_payment_pkh` | ✅ | overridden: the row's bytes carry the delegation part, so no bech32 round trip |
 //! | `holder_count` | ✅ | distinct addresses over `by_policy` — see the note on cost |
-//! | `read_output_datums` / `output_datum_hashes` | ✅ | inline datums are in the row; hash-referenced ones yield the hash and no payload |
+//! | `read_output_datums` / `output_datum_hashes` | ✅ | inline datums are in the row; hash-referenced ones resolve from `datum.tbl` when the book was opened with one, otherwise the hash and `payload: None` |
 //! | `tip` | ✅ when `book.meta.base_slot` is recorded; refuses when it is not |
 //! | `search_utxos` | ✅ for `Match` of `Policy`, an exact address or a payment credential; other shapes refused |
-//! | `read_datum` | ❌ | the table exists now (`datum.tbl`, captured by the walk — see `LIVE_BOOK.md` phase 3); this adapter does not open it yet |
+//! | `read_datum` | ✅ when a `datum.tbl` is opened with the book; refuses without one |
 //! | `read_script` | ❌ | the row has no `script_ref` column at all |
 //! | `tx_metadata` / `read_tx` / `slot_by_tx_hash` | ❌ | history, not live state: `tx-index` + the chunks |
 //! | `total_supply` / `asset_state` | ❌ | the mint ledger, a second fold |
@@ -54,6 +54,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use cardano_assets::PolicyId;
+use live_book::format::DatumTable;
 use live_book::{Base, Datum, Row};
 use pallas::codec::minicbor;
 use pallas::ledger::primitives::PlutusData;
@@ -75,6 +76,10 @@ use crate::{
 /// construction, rather than answering narrowly wrongly later.
 pub struct BookDataPlane {
     base: Base,
+    /// The witness-datum capture, when the book was opened with one. A book
+    /// without it still answers inline datums; hash-referenced ones carry their
+    /// hash and `payload: None`.
+    datum: Option<DatumTable>,
 }
 
 /// The ordering a supported `search_utxos` predicate selects.
@@ -87,7 +92,29 @@ enum Query {
 impl BookDataPlane {
     pub fn open(dir: &Path) -> DataPlaneResult<BookDataPlane> {
         let base = Base::open(dir).map_err(|e| DataPlaneError::Storage(e.to_string()))?;
-        Ok(BookDataPlane { base })
+        // A datum capture is a separate artifact, but the common local layout
+        // puts it beside the book. A present-but-broken pair is an error, not a
+        // silent fallback: answering `payload: None` from a table that failed to
+        // map would make corruption look like an unwitnessed datum.
+        let datum = if dir.join(live_book::format::DATUM_FILE).exists() {
+            Some(DatumTable::open(dir).map_err(|e| DataPlaneError::Storage(e.to_string()))?)
+        } else {
+            None
+        };
+        Ok(BookDataPlane { base, datum })
+    }
+
+    /// Open the book and a datum capture held in a different directory — the
+    /// `fold-probe fold --datum-tbl <dir>` layout, where the table is its own
+    /// tree rather than a sibling of `book.meta`.
+    pub fn open_with_datums(book_dir: &Path, datum_dir: &Path) -> DataPlaneResult<BookDataPlane> {
+        let base = Base::open(book_dir).map_err(|e| DataPlaneError::Storage(e.to_string()))?;
+        let datum =
+            DatumTable::open(datum_dir).map_err(|e| DataPlaneError::Storage(e.to_string()))?;
+        Ok(BookDataPlane {
+            base,
+            datum: Some(datum),
+        })
     }
 
     /// The artifact underneath. For callers that want the book's own API — refs
@@ -166,10 +193,9 @@ impl BookDataPlane {
     ///
     /// An inline datum is in the row, so it resolves completely — payload, hash
     /// and CBOR — with no lookup. A hash-referenced one yields the hash and
-    /// `payload: None`, which is the documented meaning of `None` here: "the
-    /// plane could not resolve the bytes", not "there is no datum". Closing that
-    /// is `datum.tbl` (`LIVE_BOOK.md` phase 3), which is a *capture* rather than
-    /// a view — the witness bytes are not in any row.
+    /// `payload: None` unless the plane was opened with a `datum.tbl`, which is a
+    /// *capture* rather than a view: the witness bytes are not in any row, so
+    /// `read_output_datums` fills them from the table when one is open.
     fn datum(&self, row: &Row<'_>) -> Option<TypedDatum> {
         match row.datum() {
             Datum::None => None,
@@ -279,6 +305,17 @@ impl BookDataPlane {
                  credential",
             )),
         }
+    }
+}
+
+/// A hash-attached datum resolved from the capture. `kind` stays `Hash`: the
+/// output referenced it by hash, and the table supplied the preimage.
+fn resolved_datum(hash: [u8; 32], payload: &[u8]) -> TypedDatum {
+    TypedDatum {
+        hash: Hash::from(hash),
+        kind: DatumKind::Hash,
+        payload: minicbor::decode::<PlutusData>(payload).ok(),
+        original_cbor: Some(payload.to_vec()),
     }
 }
 
@@ -473,10 +510,56 @@ impl ChainDataPlane for BookDataPlane {
         Ok(addresses.len() as u64)
     }
 
-    async fn read_datum(&self, _hash: &Hash<32>) -> DataPlaneResult<Option<TypedDatum>> {
-        Err(DataPlaneError::NotYetImplemented(
-            "datum_by_hash needs the datum table (LIVE_BOOK.md phase 3): witness bytes are not in any row",
-        ))
+    async fn read_datum(&self, hash: &Hash<32>) -> DataPlaneResult<Option<TypedDatum>> {
+        let Some(table) = &self.datum else {
+            return Err(DataPlaneError::NotYetImplemented(
+                "read_datum: this book has no datum table. Capture one with `fold-probe fold \
+                 --datum-tbl <dir>` and open the plane with that directory",
+            ));
+        };
+        let bytes: [u8; 32] = hash
+            .as_ref()
+            .try_into()
+            .map_err(|_| DataPlaneError::InvalidRequest("datum hash is not 32 bytes".into()))?;
+        Ok(table
+            .get(&bytes)
+            .map(|payload| resolved_datum(bytes, payload)))
+    }
+
+    /// The bulk read, with the hash arm resolved from the capture when one is
+    /// open. The default walks `read_utxo` and leaves hash-attached payloads
+    /// empty; this keeps that behaviour without a table and fills them when one
+    /// is present.
+    async fn read_output_datums(
+        &self,
+        refs: &[OutputRef],
+    ) -> DataPlaneResult<Vec<Option<TypedDatum>>> {
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let Some(mut datum) = self
+                .read_utxo(r, DecodeLevel::WithDatum)
+                .await?
+                .and_then(|output| output.datum)
+            else {
+                out.push(None);
+                continue;
+            };
+            if matches!(datum.kind, DatumKind::Hash)
+                && datum.payload.is_none()
+                && let Some(table) = &self.datum
+            {
+                let bytes: [u8; 32] = datum
+                    .hash
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| DataPlaneError::Decode("datum hash is not 32 bytes".into()))?;
+                if let Some(payload) = table.get(&bytes) {
+                    datum = resolved_datum(bytes, payload);
+                }
+            }
+            out.push(Some(datum));
+        }
+        Ok(out)
     }
 
     async fn read_script(&self, _hash: &Hash<28>) -> DataPlaneResult<Option<TypedScript>> {
@@ -538,6 +621,10 @@ mod tests {
     /// against bytes the test laid out, so a bug shared with the builder could
     /// not hide in both.
     fn fixture(name: &str) -> Base {
+        fixture_with(name, None, false)
+    }
+
+    fn fixture_with(name: &str, hash_datum: Option<([u8; 32], Vec<u8>)>, with_table: bool) -> Base {
         let dir = std::env::temp_dir().join(format!("book-plane-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create dir");
@@ -566,6 +653,8 @@ mod tests {
             }
             let d = if i == 0 {
                 Datum::Inline(&datum)
+            } else if let Some((hash, _)) = &hash_datum {
+                Datum::Hash(hash.as_slice())
             } else {
                 Datum::None
             };
@@ -624,6 +713,11 @@ mod tests {
         write_ordering(&dir, "by_addr.idx", "addr.dir.idx", &addr).expect("addr");
         write_ordering(&dir, "by_policy.idx", "policy.dir.idx", &policy_perms).expect("policy");
         write_policy_tbl(&dir, &[policy]).expect("policy tbl");
+        if with_table {
+            let (hash, payload) = hash_datum.as_ref().expect("a table needs a datum");
+            live_book::format::write_datum_table(&dir, (0, 0), &[(*hash, payload.clone())])
+                .expect("datum table");
+        }
         Meta {
             layout_version: live_book::LAYOUT_VERSION,
             rows: rows.len() as u64,
@@ -643,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn the_module_path_answers_from_the_artifact() {
         let base = fixture("path");
-        let plane = BookDataPlane { base };
+        let plane = BookDataPlane { base, datum: None };
 
         // read_utxo: the row's own outref is the confirmation.
         let oref = OutputRef::from_bytes([0xA0; 32], 0);
@@ -730,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn what_the_artifact_cannot_answer_is_refused() {
         let base = fixture("refuse");
-        let plane = BookDataPlane { base };
+        let plane = BookDataPlane { base, datum: None };
 
         assert!(matches!(
             plane.tip().await,
@@ -905,6 +999,7 @@ mod tests {
     async fn search_utxos_refuses_an_unstamped_book() {
         let plane = BookDataPlane {
             base: fixture("search-unstamped"),
+            datum: None,
         };
         assert!(matches!(
             plane
@@ -916,6 +1011,92 @@ mod tests {
                 .await,
             Err(DataPlaneError::NotYetImplemented(_))
         ));
+    }
+
+    fn hash_of(payload: &[u8]) -> [u8; 32] {
+        let hash = pallas::crypto::hash::Hasher::<256>::hash(payload);
+        hash.as_ref().try_into().expect("32 bytes")
+    }
+
+    #[tokio::test]
+    async fn read_datum_resolves_a_hash_attached_payload() {
+        let payload = vec![0x82, 0x01, 0x02];
+        let hash = hash_of(&payload);
+        let base = fixture_with("datum-table", Some((hash, payload.clone())), true);
+        let plane = BookDataPlane::open(base.dir()).expect("open");
+        let datum = plane
+            .read_datum(&Hash::from(hash))
+            .await
+            .expect("read")
+            .expect("witnessed");
+        assert_eq!(datum.kind, DatumKind::Hash);
+        assert!(datum.payload.is_some());
+        assert_eq!(datum.original_cbor.as_deref(), Some(payload.as_slice()));
+        assert!(
+            plane
+                .read_datum(&Hash::from(hash_of(b"never witnessed")))
+                .await
+                .expect("read")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(base_dir(&plane));
+    }
+
+    #[tokio::test]
+    async fn read_output_datums_fills_the_hash_arm() {
+        let payload = vec![0x82, 0x01, 0x03];
+        let hash = hash_of(&payload);
+        let base = fixture_with("datum-bulk", Some((hash, payload.clone())), true);
+        let plane = BookDataPlane::open(base.dir()).expect("open");
+        let oref = OutputRef::from_bytes([0xA1; 32], 1);
+        let datums = plane.read_output_datums(&[oref]).await.expect("bulk");
+        let datum = datums[0].as_ref().expect("a datum");
+        assert!(datum.payload.is_some());
+        assert_eq!(datum.original_cbor.as_deref(), Some(payload.as_slice()));
+        let _ = std::fs::remove_dir_all(base_dir(&plane));
+    }
+
+    #[tokio::test]
+    async fn without_a_table_the_hash_arm_keeps_its_hash() {
+        let payload = vec![0x82, 0x01, 0x04];
+        let hash = hash_of(&payload);
+        let base = fixture_with("datum-bulk-none", Some((hash, payload)), false);
+        let plane = BookDataPlane { base, datum: None };
+        let oref = OutputRef::from_bytes([0xA1; 32], 1);
+        let datums = plane.read_output_datums(&[oref]).await.expect("bulk");
+        let datum = datums[0].as_ref().expect("a datum");
+        assert_eq!(datum.hash, Hash::from(hash));
+        assert!(datum.payload.is_none());
+        assert!(datum.original_cbor.is_none());
+        // `read_datum` is a capability refusal, not an empty answer.
+        assert!(matches!(
+            plane.read_datum(&Hash::from(hash)).await,
+            Err(DataPlaneError::NotYetImplemented(_))
+        ));
+        let _ = std::fs::remove_dir_all(base_dir(&plane));
+    }
+
+    #[tokio::test]
+    async fn open_with_datums_resolves_a_separate_capture() {
+        let payload = vec![0x82, 0x01, 0x05];
+        let hash = hash_of(&payload);
+        let base = fixture_with("datum-separate-book", Some((hash, payload.clone())), false);
+        let datum_dir =
+            std::env::temp_dir().join(format!("book-plane-datum-separate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&datum_dir);
+        std::fs::create_dir_all(&datum_dir).expect("create datum dir");
+        live_book::format::write_datum_table(&datum_dir, (0, 0), &[(hash, payload.clone())])
+            .expect("datum table");
+        let plane =
+            BookDataPlane::open_with_datums(base.dir(), &datum_dir).expect("open with datums");
+        let datum = plane
+            .read_datum(&Hash::from(hash))
+            .await
+            .expect("read")
+            .expect("witnessed");
+        assert_eq!(datum.original_cbor.as_deref(), Some(payload.as_slice()));
+        let _ = std::fs::remove_dir_all(base_dir(&plane));
+        let _ = std::fs::remove_dir_all(&datum_dir);
     }
 
     /// The bech32 of row 0's address — computed once here so the assertion is

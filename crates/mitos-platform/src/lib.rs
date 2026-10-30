@@ -76,6 +76,7 @@ pub mod manifest;
 pub mod moves;
 pub mod registry_v2;
 pub mod rows;
+pub mod selected_plane;
 pub mod storage;
 pub mod supervisor;
 pub mod trap_context;
@@ -89,6 +90,9 @@ pub use budget::{AdaptiveSizer, BudgetLimiter, TrapClass};
 /// `admin::admin_router_with_host` without a separate dep on
 /// `mitos-data-plane`.
 pub use mitos_data_plane::ChainDataPlane;
+/// Re-exported so `bundle.rs` can choose the live-book plane without a
+/// separate dependency on `mitos-data-plane`.
+pub use mitos_data_plane::BookDataPlane;
 /// Re-export the platform-internal `ChainPoint` from
 /// `mitos-data-plane` so consumers (like the bundle binary) can
 /// take/return it without a separate dep on `mitos-data-plane`.
