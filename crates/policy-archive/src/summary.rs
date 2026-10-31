@@ -194,6 +194,104 @@ pub struct TopHolder {
     pub role: Role,
     pub label: Option<String>,
     pub movements: u32,
+    /// LP-decomposition attribution from a pool. ⚠️ **ADDITIVE** to
+    /// [`TopHolder::amount`], unlike [`HolderEntry`]'s `lp_amount`: the archive's
+    /// holder fold has never moved the pool's reserve into its providers, so a
+    /// provider's raw balance does not include this. Never add the pool's full
+    /// `amount` and the providers' `lp_amount` together; use
+    /// [`Segmentation::lp`]'s `residual` for the pool's side.
+    #[serde(default)]
+    pub lp_amount: u64,
+    /// Locked units beneficially owned by this party. ⚠️ **A SUBSET** of
+    /// [`TopHolder::amount`]: a CrowdLock address delegates to its owner's
+    /// stake credential, so the holder fold already counts the locked units in
+    /// the row. `free = amount - vested`.
+    #[serde(default)]
+    pub vested: u64,
+}
+
+/// A lock platform, for the vesting detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VestStyle {
+    Shield,
+    CrowdLock,
+    SnekFun,
+    Other,
+}
+
+/// One lock position attributed to its owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VestLock {
+    pub amount: u64,
+    pub unlock_ts_ms: u64,
+    pub lock_address: String,
+    pub style: VestStyle,
+}
+
+/// Every lock a party beneficially owns at the tip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VestOwner {
+    /// The owner's holder key.
+    pub key: String,
+    pub amount: u64,
+    pub locks: Vec<VestLock>,
+}
+
+/// One LP provider's share of a pool's reserve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LpProvider {
+    /// The provider's holder key.
+    pub key: String,
+    /// LP tokens held (or staked) by the provider.
+    pub lp_tokens: u64,
+    /// The policy's units their LP share accounts for.
+    pub amount: u64,
+}
+
+/// How much of a pool's reserve the decomposition could account for.
+///
+/// Externally tagged rather than `#[serde(tag = "status")]`: this travels
+/// inside the postcard-encoded summary, and postcard cannot decode an
+/// internally tagged enum — it buffers the variant through `deserialize_any`,
+/// which postcard answers with `WontImplement`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LpStatus {
+    /// Every provider was resolved from the LP policy's archive.
+    Complete,
+    /// Some LP remained in the residual (for example, staked in a farm the
+    /// scan could not name).
+    Partial { because: String },
+    /// No claim is made: the LP policy's archive was absent or incomplete.
+    Unavailable { because: String },
+}
+
+/// A CSwap pool's reserve split between its LP providers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LpDecomposition {
+    pub pool_address: String,
+    pub pool_key: String,
+    /// The pool's raw balance of the policy, from the holder fold.
+    pub reserve: u64,
+    /// The LP supply the pool datum names.
+    pub total_lp: u64,
+    pub providers: Vec<LpProvider>,
+    /// `reserve - Σ providers.amount`: the pool's own side. Use this instead of
+    /// the pool holder's `amount` whenever the providers are displayed.
+    pub residual: u64,
+    pub status: LpStatus,
+}
+
+/// Tip-only decomposition of the raw holder table.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Segmentation {
+    /// The slot the tip facts were read at.
+    pub as_of: u64,
+    #[serde(default)]
+    pub vests: Vec<VestOwner>,
+    #[serde(default)]
+    pub lp: Option<LpDecomposition>,
 }
 
 /// Where one checkpoint file is, and what it holds.
@@ -245,8 +343,58 @@ pub struct Summary {
     pub distribution: Distribution,
     pub top: Vec<TopHolder>,
     pub checkpoints: Vec<CheckpointRef>,
+    /// Display decimals. `None` when nobody has stated them — decimals are not
+    /// on chain, so there is no rule to apply, only knowledge (the token
+    /// registry's, or the curated shared table's). A reader that gets `None`
+    /// renders RAW units and says so.
+    ///
+    /// `Some(0)` and `None` are different answers, which is why this is an
+    /// `Option` rather than a defaulted number.
+    #[serde(default)]
+    pub decimals: Option<u8>,
     /// Trades over the whole life that could not be valued.
     pub unvalued: u64,
+    /// LP and vesting attribution at the tip. Empty on a summary folded before
+    /// the decomposition existed; see [`Summary::apply_segmentation`].
+    #[serde(default)]
+    pub segmentation: Segmentation,
+}
+
+impl Summary {
+    /// Attach the tip decomposition and copy its per-holder totals onto the
+    /// matching [`TopHolder`]s, so a reader that only wants `free / lp /
+    /// vested` does not have to join two tables.
+    pub fn apply_segmentation(&mut self, seg: Segmentation) {
+        use std::collections::HashMap;
+
+        let lp: HashMap<&str, u64> = seg
+            .lp
+            .as_ref()
+            .map(|lp| {
+                lp.providers
+                    .iter()
+                    .map(|p| (p.key.as_str(), p.amount))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let vests: HashMap<&str, u64> = seg
+            .vests
+            .iter()
+            .map(|v| (v.key.as_str(), v.amount))
+            .collect();
+        for h in &mut self.top {
+            h.lp_amount = lp.get(h.key.as_str()).copied().unwrap_or(0);
+            // A lock address delegates to the owner's stake credential, so the
+            // holder row already includes the locked units. Keeping `vested`
+            // within `amount` is what makes `free = amount - vested` true.
+            h.vested = vests
+                .get(h.key.as_str())
+                .copied()
+                .unwrap_or(0)
+                .min(h.amount);
+        }
+        self.segmentation = seg;
+    }
 }
 
 /// What [`build`] folds.
@@ -258,6 +406,10 @@ pub struct Inputs<'a> {
     pub movements: &'a [Movement],
     pub immutable_to: u64,
     pub complete: bool,
+    /// The token's display decimals, where the caller knows them; `None` renders
+    /// raw. Passed in rather than looked up here: the archive crate owns no
+    /// registry.
+    pub decimals: Option<u8>,
     pub classify: Classify<'a>,
 }
 
@@ -423,6 +575,16 @@ pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
                 label,
             }
         });
+        // The representative address is the smallest this party used, not the
+        // first one this fold happened to see: the holder table folds the same
+        // history in file order, and the two must name (and therefore label)
+        // one party the same way.
+        if m.address < party.address {
+            party.address = m.address.clone();
+            let (role, label) = (inp.classify)(&party.address);
+            party.role = role;
+            party.label = label;
+        }
         let before = party.amount;
         party.amount += m.amount;
         party.movements += 1;
@@ -475,6 +637,7 @@ pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
             immutable_to: inp.immutable_to,
             settled_to,
             complete: inp.complete,
+            decimals: inp.decimals,
             first_unix,
             last_unix,
             daily,
@@ -484,6 +647,7 @@ pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
             top,
             checkpoints: refs,
             unvalued: inp.series.unvalued,
+            segmentation: Segmentation::default(),
         },
         checkpoints,
     )
@@ -636,6 +800,8 @@ fn distribution(parties: &HashMap<String, Party>) -> (Distribution, Vec<TopHolde
             role: p.role,
             label: p.label.clone(),
             movements: p.movements,
+            lp_amount: 0,
+            vested: 0,
         })
         .collect();
 
@@ -850,6 +1016,48 @@ mod tests {
         }
     }
 
+    /// Same stake key, two payment addresses — the live Aliens pool. The two
+    /// folds used to pick different representatives and label it differently.
+    const POOL_A: &str = "addr1x89ksjnfu7ys02tedvslc9g2wk90tu5qte0dt4dge60hdudj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrsg0g63z";
+    const POOL_B: &str = "addr1xxg94wrfjcdsjncmsxtj0r87zk69e0jfl28n934sznu95tdj764lvrxdayh2ux30fl0ktuh27csgmpevdu89jlxppvrs2993lw";
+
+    fn labelled(address: &str) -> (Role, Option<String>) {
+        match address {
+            POOL_A => (Role::Venue, Some("Splash exchange".into())),
+            POOL_B => (Role::Venue, Some("snek.fun bonding curve".into())),
+            _ => (Role::Person, None),
+        }
+    }
+
+    #[test]
+    fn a_partys_representative_is_the_smallest_address_and_its_label_follows() {
+        let movements = vec![mv(1, 10, 1, POOL_B, 100), mv(1, 10, 2, POOL_A, 300)];
+        let (s, _) = build(&Inputs {
+            policy: "p",
+            series: &Series::default(),
+            movements: &movements,
+            immutable_to: 0,
+            complete: true,
+            decimals: None,
+            classify: &labelled,
+        });
+        let canonical = POOL_A.min(POOL_B);
+        let holder = s
+            .top
+            .iter()
+            .find(|h| h.key == crate::holders::key_of(POOL_A))
+            .expect("one party");
+        assert_eq!(holder.address, canonical);
+        assert_eq!(
+            holder.label.as_deref(),
+            Some(if canonical == POOL_A {
+                "Splash exchange"
+            } else {
+                "snek.fun bonding curve"
+            })
+        );
+    }
+
     fn summary(
         movements: &[Movement],
         series: &Series,
@@ -861,8 +1069,69 @@ mod tests {
             movements,
             immutable_to: 0,
             complete,
+            decimals: None,
             classify: &classify,
         })
+    }
+
+    #[test]
+    fn segmentation_copies_lp_and_vested_totals_onto_the_holders() {
+        let movements = vec![mv(1, 10, 1, A, 100), mv(1, 10, 2, B, 50)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        let a = crate::holders::key_of(A);
+        let b = crate::holders::key_of(B);
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: vec![VestOwner {
+                key: a.clone(),
+                amount: 40,
+                locks: vec![VestLock {
+                    amount: 40,
+                    unlock_ts_ms: 1_800_000_000_000,
+                    lock_address: "addr_lock".into(),
+                    style: VestStyle::CrowdLock,
+                }],
+            }],
+            lp: Some(LpDecomposition {
+                pool_address: "addr_pool".into(),
+                pool_key: "pool".into(),
+                reserve: 100,
+                total_lp: 1_000,
+                providers: vec![LpProvider {
+                    key: a.clone(),
+                    lp_tokens: 100,
+                    amount: 30,
+                }],
+                residual: 70,
+                status: LpStatus::Complete,
+            }),
+        });
+        let ha = s.top.iter().find(|h| h.key == a).expect("A");
+        let hb = s.top.iter().find(|h| h.key == b).expect("B");
+        assert_eq!(ha.vested, 40, "vested is a subset of the amount");
+        assert_eq!(ha.lp_amount, 30, "lp is additive attribution");
+        assert_eq!(hb.vested, 0);
+        assert_eq!(hb.lp_amount, 0);
+        assert_eq!(s.segmentation.as_of, 10);
+        assert_eq!(s.segmentation.lp.as_ref().unwrap().residual, 70);
+    }
+
+    /// `vested` must never exceed the raw balance: a caller subtracting it to
+    /// get `free` would otherwise wrap.
+    #[test]
+    fn vested_is_clamped_to_the_holder_amount() {
+        let movements = vec![mv(1, 10, 1, A, 10)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: vec![VestOwner {
+                key: crate::holders::key_of(A),
+                amount: 999,
+                locks: Vec::new(),
+            }],
+            lp: None,
+        });
+        assert_eq!(s.top[0].vested, 10);
     }
 
     #[test]
@@ -1055,5 +1324,45 @@ mod tests {
             Err(SummaryError::Version { .. })
         ));
         assert!(matches!(Summary::decode(&[]), Err(SummaryError::Empty(_))));
+    }
+
+    /// The segmentation rides inside the summary's postcard payload, so every
+    /// shape in it must be postcard-representable. An internally tagged enum is
+    /// not, and the failure only appears on the archive a walk wrote.
+    #[test]
+    fn a_segmented_summary_round_trips() {
+        let (mut s, _) = summary(&[mv(1, 10, 1, A, 4)], &Series::default(), true);
+        // The scale rides in the same payload, and `Some(6)` is not `None`.
+        s.decimals = Some(6);
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: vec![VestOwner {
+                key: A.into(),
+                amount: 1,
+                locks: vec![VestLock {
+                    amount: 1,
+                    unlock_ts_ms: 1_700_000_000_000,
+                    lock_address: "addr_lock".into(),
+                    style: VestStyle::CrowdLock,
+                }],
+            }],
+            lp: Some(LpDecomposition {
+                pool_address: "addr_pool".into(),
+                pool_key: "pool".into(),
+                reserve: 1_000,
+                total_lp: 500,
+                providers: vec![LpProvider {
+                    key: A.into(),
+                    lp_tokens: 100,
+                    amount: 200,
+                }],
+                residual: 800,
+                status: LpStatus::Partial {
+                    because: "some LP was staked in an unnamed farm".into(),
+                },
+            }),
+        });
+        let bytes = s.encode().unwrap();
+        assert_eq!(Summary::decode(&bytes).unwrap(), s);
     }
 }

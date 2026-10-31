@@ -71,6 +71,10 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300u64);
+    let quiet = std::env::var("MITOS_SHADOW_QUIET_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10u64);
 
     let artifact = artifact_dir(&module_id);
     let wasm = std::fs::read(artifact.join(format!("{module_id}.wasm"))).unwrap_or_else(|e| {
@@ -127,6 +131,7 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
         &wasm,
         &policy_hex,
         timeout,
+        quiet,
     )
     .await;
     let dolos_run = run_module(
@@ -137,6 +142,7 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
         &wasm,
         &policy_hex,
         timeout,
+        quiet,
     )
     .await;
 
@@ -152,6 +158,22 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
         byte_len(&dolos_run.events),
         dolos_run.elapsed.as_secs_f64()
     );
+    if std::env::var("MITOS_SHADOW_TRACE").is_ok() {
+        trace_events("book", &book_run.events);
+        trace_events("dolos", &dolos_run.events);
+    }
+
+    // A begin on its own is not a snapshot: it proves the anchor agrees and
+    // nothing else. Every policy-interest module emits at least begin + end, so
+    // one event means the cold-start pump never ran — which must not read as a
+    // pass just because both planes produced the same nothing.
+    assert!(
+        book_run.events.len() > 1 && dolos_run.events.len() > 1,
+        "only one event per plane — the cold-start pump did not run, so this run compares an \
+         anchor and nothing else (book {}, dolos {})",
+        book_run.events.len(),
+        dolos_run.events.len()
+    );
 
     compare(&dolos_run.events, &book_run.events);
 }
@@ -165,6 +187,7 @@ async fn run_module<P>(
     wasm: &[u8],
     policy_hex: &str,
     timeout_secs: u64,
+    quiet_secs: u64,
 ) -> Run
 where
     P: ChainDataPlane + Send + Sync + 'static,
@@ -173,6 +196,10 @@ where
     let started = Instant::now();
 
     let dir = tempfile::tempdir().expect("tempdir");
+    let trace = std::env::var("MITOS_SHADOW_TRACE").is_ok();
+    if trace {
+        println!("{label}: keeping storage at {}", dir.path().display());
+    }
     let storage = ModuleStorage::new(dir.path());
     storage.activate(manifest, wasm).expect("activate");
     write_companion_subscription(&storage, &module_id);
@@ -233,7 +260,7 @@ where
                 events.push(row.payload.clone());
             }
             quiet_since = Instant::now();
-        } else if (!events.is_empty() && quiet_since.elapsed() > Duration::from_secs(10))
+        } else if (!events.is_empty() && quiet_since.elapsed() > Duration::from_secs(quiet_secs))
             || (events.is_empty() && started.elapsed() > Duration::from_secs(30))
         {
             break;
@@ -243,6 +270,12 @@ where
 
     host.stop(&module_id).await.expect("stop");
     drop(tx);
+
+    if trace {
+        // Leak the temp dir: a trace run keeps the emissions store and any
+        // trap fixture for inspection.
+        std::mem::forget(dir);
+    }
 
     Run {
         events,
@@ -303,6 +336,21 @@ fn artifact_dir(module_id: &str) -> PathBuf {
 
 fn byte_len(events: &[Vec<u8>]) -> usize {
     events.iter().map(Vec::len).sum()
+}
+
+/// Event sizes and their leading bytes. Enough to tell an enum's first variant
+/// from its second without knowing the module's schema; small events are shown
+/// whole, which is how a policy id or a cursor slot is read out of them.
+fn trace_events(label: &str, events: &[Vec<u8>]) {
+    for (i, event) in events.iter().enumerate() {
+        let hex: String = event.iter().map(|b| format!("{b:02x}")).collect();
+        let shown = if event.len() <= 256 {
+            hex
+        } else {
+            format!("{}…", &hex[..512])
+        };
+        println!("  {label} [{i}] {} B · {shown}", event.len());
+    }
 }
 
 // ── the two test-support pieces this harness needs ──────────────────────────

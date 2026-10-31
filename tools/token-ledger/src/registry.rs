@@ -84,10 +84,32 @@ impl LockPlatform {
 // It stopped being a per-token concern the moment two walked tokens were found
 // sending supply to the same script.
 
+/// What a registered policy is FOR.
+///
+/// The walk treats every kind the same — an LP token's movements are as real as
+/// any other — and the difference is in what gets PUBLISHED. An LP policy is
+/// registered so the tip decomposition can attribute a pool's reserve to the
+/// wallets that provided it (`token-ledger`'s `segmentation`); nobody trades it
+/// here, so it gets no tape and no catalogue card.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenKind {
+    /// A token somebody holds and trades: walked, summarised, packed and
+    /// catalogued.
+    #[default]
+    Project,
+    /// A pool's LP token: walked and summarised only.
+    Lp,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenEntry {
     /// Short label used for the ledger filename and log lines (`aliens`).
     pub name: String,
+    /// What this policy is FOR. The walk treats every kind the same; the
+    /// artefact publishers do not.
+    #[serde(default)]
+    pub kind: TokenKind,
     /// 56-char lowercase hex policy id.
     pub policy: String,
     /// Lowercase hex of the on-chain asset-name bytes, or `None` to watch the
@@ -229,6 +251,20 @@ pub fn tokens(path: &Path) -> Result<Vec<TokenEntry>> {
     Ok(tokens)
 }
 
+/// A policy's display decimals, from the registry that declares it.
+///
+/// `Ok(None)` when the policy is not registered or the entry states nothing and
+/// the curated table does not know it — which is the honest answer: decimals are
+/// not on chain, so there is no rule to apply, only knowledge. An unreadable
+/// registry is an ERROR rather than `None`, so a typo'd path fails loudly
+/// instead of quietly rendering raw.
+pub fn decimals(path: &Path, policy: &str) -> Result<Option<u8>> {
+    Ok(tokens(path)?
+        .into_iter()
+        .find(|t| t.policy.eq_ignore_ascii_case(policy))
+        .and_then(|t| t.resolved_decimals()))
+}
+
 /// Load the registry and return the one requested token.
 pub fn load(path: &Path, name: &str) -> Result<TokenEntry> {
     let entry = read(path)?
@@ -275,6 +311,7 @@ pub fn load_or_unit(path: &Path, name_or_unit: &str) -> Result<TokenEntry> {
     };
     let entry = TokenEntry {
         name: unit.clone(),
+        kind: TokenKind::Project,
         policy,
         asset_name,
         decimals: None,
@@ -296,6 +333,7 @@ pub fn policy_entry(policy: &str) -> Result<TokenEntry> {
     }
     let entry = TokenEntry {
         name: policy.clone(),
+        kind: TokenKind::Project,
         policy,
         asset_name: None,
         decimals: None,
@@ -348,5 +386,23 @@ mod tests {
         assert!(policy_entry("perps").is_err());
         assert!(policy_entry(&POLICY[..54]).is_err());
         assert!(policy_entry(&"z".repeat(56)).is_err());
+    }
+
+    /// A registered policy is a PROJECT unless it says otherwise, so every
+    /// entry written before `kind` existed keeps its tape and its card; an `lp`
+    /// entry is walked for the tip decomposition and published as nothing else.
+    #[test]
+    fn a_kind_defaults_to_project_and_an_lp_entry_says_so() {
+        let plain: TokenEntry = toml::from_str(&format!(
+            "name = \"x\"\npolicy = \"{POLICY}\"\nasset_name = \"\"\ndecimals = 0"
+        ))
+        .unwrap();
+        assert_eq!(plain.kind, TokenKind::Project);
+
+        let lp: TokenEntry = toml::from_str(&format!(
+            "name = \"lp\"\nkind = \"lp\"\npolicy = \"{POLICY}\"\nasset_name = \"\"\n"
+        ))
+        .unwrap();
+        assert_eq!(lp.kind, TokenKind::Lp);
     }
 }

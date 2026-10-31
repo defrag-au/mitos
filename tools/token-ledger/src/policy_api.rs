@@ -2285,6 +2285,20 @@ pub struct HolderDto {
     pub label: Option<String>,
     /// A registered burn sink: units that exist on chain and can never move.
     pub burn_sink: bool,
+    /// Units of an ADA pool's reserve this party's LP share accounts for.
+    ///
+    /// ⚠️ **ADDITIVE** to [`HolderDto::amount`], not a part of it: the pool's
+    /// reserve sits in the pool's own row, so a provider's balance has never
+    /// included this. Non-zero only where the pool's LP policy has its own
+    /// walked archive — see the summary's `segmentation.lp.status`.
+    pub lp_amount: String,
+    /// Units locked on this party's behalf by a vesting address.
+    ///
+    /// ⚠️ A **SUBSET** of [`HolderDto::amount`], not a separate pile: a
+    /// CrowdLock address delegates to its owner's stake credential, so the
+    /// holder fold already counts the locked units in the row. `free = amount −
+    /// vested`.
+    pub vested: String,
 }
 
 /// `GET /policy/{p}/holders` — who holds it.
@@ -2319,12 +2333,24 @@ pub struct PolicyHoldersResponse {
     /// Distinct parties with a positive balance — the honest holder count,
     /// before any `limit` is applied to the list.
     pub parties: usize,
+    /// True when more parties cleared `min` than the returned page carries.
+    ///
+    /// A caller that asked for a floor must not read a full page as complete:
+    /// a truncated threshold list under-counts the role it is driving, and the
+    /// difference is invisible in the rows themselves.
+    pub truncated: bool,
     /// Movement rows folded.
     pub rows: u64,
     /// Parties whose balance came out NEGATIVE — impossible on chain, so a
     /// count of inbound movements the archive is missing rather than a
     /// rounding curiosity.
     pub negative: usize,
+    /// The archive's IMMUTABLE coverage ceiling this table was folded at.
+    /// Compare like-for-like with `/summary`'s `immutable_to`: a difference is
+    /// a different archive, not a different arithmetic.
+    pub immutable_to: u64,
+    /// When the archive was last written. Display only; the slot is the key.
+    pub updated_unix: u64,
 }
 
 /// The holder table, memoised against the archive's own `updated_unix`.
@@ -2614,20 +2640,73 @@ pub async fn holders(
 ) -> Result<Json<PolicyHoldersResponse>, ApiError> {
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = crate::archive::load_manifest(&dir).map_err(internal)?;
+    let immutable_to = manifest
+        .as_ref()
+        .map(crate::archive::immutable_to)
+        .unwrap_or(0);
+    let updated_unix = manifest.as_ref().map(|m| m.updated_unix).unwrap_or(0);
     let fold = holders_of(&hub, &policy).map_err(internal)?;
     // ⚠️ `parties` is taken BEFORE the limit. A truncated list that also
     // reported a truncated count would make a policy look concentrated
     // precisely because the caller asked for a short list.
     let parties = fold.holders.len();
     let limit = q.limit.unwrap_or(50).clamp(1, 2_000);
+    // A floor, not a page size. Parsed rather than defaulted: a typo in `min`
+    // silently returning every holder would look like a token whose whole
+    // supply is above the threshold.
+    let min = match q.min.as_deref() {
+        Some(raw) => raw.trim().parse::<i128>().map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("min must be an integer amount in raw units, got {raw:?}"),
+            )
+        })?,
+        None => 0,
+    };
 
     // ⚠️ Totalled over EVERY holder, then the list is truncated — never the
     // other way round. A sink ranked below the limit would otherwise drop out
     // and `circulating` would depend on the page size, which is not a number.
     let (burned, circulating) = burn_split(&fold);
 
-    let out: Vec<HolderDto> = fold
+    // The tip decomposition is the summary's, not a second fold of the archive:
+    // `/summary` serves the same facts, and a provider or a lock read here must
+    // not disagree with the one read there. A summary folded before the
+    // decomposition existed simply has none, and every row reports zero.
+    let segmentation = crate::archive::read_summary(&dir)
+        .ok()
+        .flatten()
+        .map(|s| s.segmentation)
+        .unwrap_or_default();
+    let lp_by_key: HashMap<&str, u64> = segmentation
+        .lp
+        .as_ref()
+        .map(|lp| {
+            lp.providers
+                .iter()
+                .map(|p| (p.key.as_str(), p.amount))
+                .collect()
+        })
+        .unwrap_or_default();
+    let vested_by_key: HashMap<&str, u64> = segmentation
+        .vests
+        .iter()
+        .map(|v| (v.key.as_str(), v.amount))
+        .collect();
+
+    let matching: Vec<_> = fold
         .holders
+        .into_iter()
+        .filter(|h| i128::from(h.amount.max(0)) >= min)
+        .collect();
+    // Computed from the FLOOR's matches, not from `parties`: the question is
+    // "did this list carry every holder at or above the floor", and only the
+    // filtered rows can answer it.
+    let truncated = matching.len() > limit;
+
+    let out: Vec<HolderDto> = matching
         .into_iter()
         .take(limit)
         .map(|h| {
@@ -2644,8 +2723,21 @@ pub async fn holders(
                 )
                 .map(|(cat, _)| cat.to_string())
             });
+            // Clamped to the row, so `free = amount − vested` cannot wrap on a
+            // lock observation that outlived its units.
+            let vested = vested_by_key
+                .get(h.key.as_str())
+                .copied()
+                .unwrap_or(0)
+                .min(u64::try_from(h.amount).unwrap_or(0));
             HolderDto {
                 burn_sink: is_burn_sink(&h.address),
+                lp_amount: lp_by_key
+                    .get(h.key.as_str())
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                vested: vested.to_string(),
                 key: h.key,
                 address: h.address,
                 amount: h.amount.to_string(),
@@ -2663,14 +2755,23 @@ pub async fn holders(
         burned: burned.to_string(),
         circulating: circulating.to_string(),
         parties,
+        truncated,
         rows: fold.rows,
         negative: fold.negative,
+        immutable_to,
+        updated_unix,
     }))
 }
 
 #[derive(Deserialize)]
 pub struct HoldersQuery {
     pub limit: Option<usize>,
+    /// A FLOOR, in raw units: only parties at or above it are returned.
+    ///
+    /// Distinct from `limit`, which is a page. A caller asking "everyone at or
+    /// above 1M" needs to know whether the list it got is all of them, which is
+    /// what `truncated` answers.
+    pub min: Option<String>,
 }
 
 /// One sighting of the bonding curve — a point on the launch timeline.

@@ -16,10 +16,10 @@
 //! through a CF tunnel without a proxy hop.
 
 mod auth;
-mod db;
-mod encode;
+pub(crate) mod db;
+pub(crate) mod encode;
 mod handlers;
-mod query;
+pub(crate) mod query;
 
 use std::path::PathBuf;
 

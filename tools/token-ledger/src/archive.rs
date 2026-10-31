@@ -1742,6 +1742,15 @@ pub fn tail_series(
 /// from the live files. This costs one more decode here (the immutable half,
 /// then the whole archive for the summary) and saves every reader the history.
 pub fn write_derived(dir: &Path) -> Result<()> {
+    write_derived_at(dir, None)
+}
+
+/// [`write_derived`], stating what the token's display decimals are.
+///
+/// The scale is the registry's to know and this module's to carry: a summary
+/// that names it lets every reader draw a human number without owning a table
+/// of its own.
+pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
     let Some(manifest) = load_manifest(dir)? else {
         return Ok(());
     };
@@ -1768,17 +1777,38 @@ pub fn write_derived(dir: &Path) -> Result<()> {
     // THE SUMMARY is of the whole archive, tail included: it is a published
     // document rather than a fold a reader resumes, so it takes the full
     // series and every movement.
-    let full = carry_from(&mut history, &read_observations(dir, &manifest)?)?;
+    let observations = read_observations(dir, &manifest)?;
+    let full = carry_from(&mut history, &observations)?;
     let complete = manifest.completeness() == Completeness::Complete;
     let policy = policy_of(dir);
-    let (summary, checkpoints) = policy_archive::summary::build(&policy_archive::summary::Inputs {
-        policy: &policy,
-        series: &full.series,
-        movements: history.all_movements()?,
-        immutable_to: key,
-        complete,
-        classify: &classify_holder,
-    });
+    // ⚠️ USER units only, the same rule as `holders_from` and the supply
+    // route. A CIP-68 reference twin or a CIP-27 royalty declaration shares
+    // the policy but is not a member of the collection; folding it here put
+    // plumbing units into `distribution.held` that `/holders` and `/supply`
+    // correctly exclude. MEASURED on $Aliens (2026-10-31): 2,928,030 units,
+    // the whole difference between the two folds.
+    let movements: Vec<_> = history
+        .all_movements()?
+        .iter()
+        .filter(|m| is_user_unit(&m.unit_name))
+        .cloned()
+        .collect();
+    let (mut summary, checkpoints) =
+        policy_archive::summary::build(&policy_archive::summary::Inputs {
+            policy: &policy,
+            series: &full.series,
+            movements: &movements,
+            immutable_to: key,
+            complete,
+            decimals,
+            classify: &classify_holder,
+        });
+    // The tip decomposition is a re-read of the archive's own observations, so
+    // the summary and the holder table cannot disagree about what is locked or
+    // how much LP a provider owns.
+    let segmentation =
+        crate::segmentation::build(dir, summary.settled_to, &observations, &movements);
+    summary.apply_segmentation(segmentation);
     store_summary(dir, &summary, &checkpoints)?;
     Ok(())
 }
@@ -1918,24 +1948,38 @@ pub struct SummaryArgs {
     /// 56-hex policy id.
     #[arg(long)]
     pub policy: String,
+    /// Token registry, for the token's display decimals. A policy it does not
+    /// name is summarised RAW, which is the honest answer rather than `0`.
+    #[arg(long, default_value = "tokens.toml")]
+    pub tokens: PathBuf,
+    /// Also write the summary as JSON — the exact body `/summary` serves — to
+    /// this path, so a client can be reviewed against the real fold offline
+    /// instead of against a hand-built fixture.
+    #[arg(long)]
+    pub json: Option<PathBuf>,
 }
 
 pub fn summary(args: SummaryArgs) -> Result<()> {
     let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
     let started = std::time::Instant::now();
-    write_derived(&dir)?;
+    let decimals = crate::registry::decimals(&args.tokens, &args.policy)?;
+    write_derived_at(&dir, decimals)?;
     let Some(s) = read_summary(&dir)? else {
         bail!("no archive at {}", dir.display());
     };
     let d = &s.distribution;
     println!(
-        "{}: folded in {:.1}s, complete {}, {} days, {} hourly, {} unvalued trades",
+        "{}: folded in {:.1}s, complete {}, {} days, {} hourly, {} unvalued trades, {}",
         s.policy,
         started.elapsed().as_secs_f64(),
         s.complete,
         s.daily.len(),
         s.hourly.len(),
-        s.unvalued
+        s.unvalued,
+        match s.decimals {
+            Some(dp) => format!("{dp} dp"),
+            None => "raw units (no decimals known)".to_string(),
+        }
     );
     println!(
         "held {} burned {} circulating {}; {} parties, {} people, {} negative",
@@ -1958,6 +2002,7 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
     for r in &d.roles {
         println!("  {:?}: {} parties, {}", r.role, r.parties, r.amount);
     }
+    report_segmentation(&s.segmentation);
     let bytes: u64 = s
         .checkpoints
         .iter()
@@ -1970,7 +2015,62 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
         bytes,
         std::fs::metadata(dir.join(policy_archive::SUMMARY)).map_or(0, |m| m.len())
     );
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec(&s)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
     Ok(())
+}
+
+/// What the tip decomposition found, in the same report the fold prints.
+///
+/// It is printed last because it is a read of the archive's observations, not
+/// of the movement rows the lines above fold: a reader comparing the two is
+/// comparing a summary at `settled_to` with a decomposition at `as_of`.
+fn report_segmentation(seg: &policy_archive::summary::Segmentation) {
+    use policy_archive::summary::LpStatus;
+
+    if seg.as_of == 0 && seg.vests.is_empty() && seg.lp.is_none() {
+        return;
+    }
+    let vested: u64 = seg.vests.iter().map(|v| v.amount).sum();
+    let locks: usize = seg.vests.iter().map(|v| v.locks.len()).sum();
+    println!(
+        "  segmentation as of slot {}: {} vesting owners, {} locks, {} units",
+        seg.as_of,
+        seg.vests.len(),
+        locks,
+        vested
+    );
+    for v in seg.vests.iter().take(5) {
+        println!("    vest {}: {} units", v.key, v.amount);
+    }
+    let Some(lp) = &seg.lp else {
+        println!("    lp: no pool observed");
+        return;
+    };
+    let attributed: u64 = lp.providers.iter().map(|p| p.amount).sum();
+    println!(
+        "    lp {}: reserve {}, {} LP tokens, {} providers, {} attributed, {} residual",
+        lp.pool_address,
+        lp.reserve,
+        lp.total_lp,
+        lp.providers.len(),
+        attributed,
+        lp.residual
+    );
+    match &lp.status {
+        LpStatus::Complete => println!("    lp status: complete"),
+        LpStatus::Partial { because } => println!("    lp status: partial — {because}"),
+        LpStatus::Unavailable { because } => println!("    lp status: unavailable — {because}"),
+    }
+    for p in lp.providers.iter().take(5) {
+        println!(
+            "      provider {}: {} lp -> {} units",
+            p.key, p.lp_tokens, p.amount
+        );
+    }
 }
 
 /// The balance state over the IMMUTABLE archive, for [`policy_archive::HOLDERS`].

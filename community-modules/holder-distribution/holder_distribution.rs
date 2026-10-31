@@ -48,8 +48,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mitos_community_events::holder_distribution::{
-    AssetBalance, HolderDelta, HolderEntry, HolderEvent, HolderId, HolderRole, SnapshotBegin,
-    SnapshotChunk, SnapshotEnd,
+    AssetBalance, Basis, Cohort, HolderDelta, HolderEntry, HolderEvent, HolderId, HolderRole,
+    SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
 use mitos_community_events::vesting_tracker::{LockEntry, LockRef, VestStyle};
 use mitos_dex_decode::{cswap, lp_share, splash};
@@ -145,6 +145,11 @@ type AssetMap = BTreeMap<Vec<u8>, u64>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LedgerEntry {
     holder: LedgerKey,
+    /// The canonical (smallest) address this holder was seen at. Classification
+    /// happens on THIS address, so the wire carries what was actually seen
+    /// rather than a guess from the stake key alone.
+    #[serde(default)]
+    address: String,
     assets: AssetMap,
     #[serde(default)]
     lp_amount: u64,
@@ -157,6 +162,11 @@ struct LedgerEntry {
 struct MetaState {
     /// First-spotted DEX pool UTxO holding the policy, if any.
     pool_ref: Option<OutputRefCbor>,
+    /// The address that UTxO sat at, so the residual can be classified without
+    /// re-reading it. Separate from `pool_ref` because a pool's stake key can be
+    /// shared with another address.
+    #[serde(default)]
+    pool_address: Option<String>,
     /// CrowdLock vesting-lock UTxO refs (bypass the ledger).
     vesting_lock_refs: Vec<OutputRefCbor>,
     /// `true` once decomp materialised `decomp:` shards (so emit pages
@@ -258,13 +268,61 @@ fn assets_map_to_vec(map: &AssetMap) -> Vec<AssetBalance> {
     out
 }
 
+/// The addresses `mitos_cohort` must treat as pools. CSwap and Splash both
+/// share their stake credential across pool instances, so the classifier needs
+/// the address to tell a pool from the script it looks like.
+fn pool_addresses() -> &'static [String] {
+    use std::sync::LazyLock;
+    static POOLS: LazyLock<Vec<String>> = LazyLock::new(|| {
+        vec![
+            cswap::POOL_SCRIPT_ADDR.to_string(),
+            splash::POOL_SCRIPT_ADDR.to_string(),
+        ]
+    });
+    POOLS.as_slice()
+}
+
+fn cohort_wire(c: mitos_cohort::Cohort) -> Cohort {
+    match c {
+        mitos_cohort::Cohort::Burn => Cohort::Burn,
+        mitos_cohort::Cohort::Inventory => Cohort::Inventory,
+        mitos_cohort::Cohort::Pool => Cohort::Pool,
+        mitos_cohort::Cohort::Vesting => Cohort::Vesting,
+        mitos_cohort::Cohort::Script => Cohort::Script,
+        mitos_cohort::Cohort::Wallet => Cohort::Wallet,
+    }
+}
+
+fn basis_wire(b: &str) -> Basis {
+    match b {
+        "proven" => Basis::Proven,
+        "decoded" => Basis::Decoded,
+        "registered" => Basis::Registered,
+        _ => Basis::Chain,
+    }
+}
+
+/// Classify the address the module actually saw. The module's own role still
+/// wins for a DEX pool: a pool's stake key can be shared with another address,
+/// so the canonical payment address may not be the pool script itself.
+fn classify_entry(entry: &LedgerEntry) -> (Cohort, Basis) {
+    if holder_role_for(&entry.holder) == HolderRole::DexPool {
+        return (Cohort::Pool, Basis::Decoded);
+    }
+    let c = mitos_cohort::classify(&entry.address, pool_addresses(), &[]);
+    (cohort_wire(c.cohort), basis_wire(c.basis))
+}
+
 /// Render a sharded [`LedgerEntry`] as the wire `HolderEntry`.
 fn entry_to_wire(entry: &LedgerEntry) -> HolderEntry {
+    let (cohort, basis) = classify_entry(entry);
     HolderEntry {
         id: key_to_id(&entry.holder),
         assets: assets_map_to_vec(&entry.assets),
         lp_amount: entry.lp_amount,
         role: holder_role_for(&entry.holder),
+        cohort,
+        basis,
         vests: entry.vests.clone(),
     }
 }
@@ -516,10 +574,11 @@ enum DecompSub {
 /// holder-count-sized materialise pages the `ledger:` shards. Lost on
 /// a trap → re-derived from the durable `meta:` + `ledger:` shards.
 struct DecompState {
-    policy: [u8; HASH_BYTES],
     policy_hex: String,
     sub: DecompSub,
     pool_key: Option<LedgerKey>,
+    /// The pool's address, for the residual entry's classification.
+    pool_address: String,
     /// The pool's raw aggregate (its `ledger:` AssetMap), captured
     /// before redistribution.
     pool_reserve: AssetMap,
@@ -570,7 +629,12 @@ fn compute_lp_plan(st: &mut DecompState) {
 
 /// Write one decomposed holder shard, folding in LP shares + vests for
 /// `holder` on top of `base` assets. Marks the holder visited.
-fn write_decomp_holder(st: &mut DecompState, holder: &LedgerKey, base: AssetMap) {
+fn write_decomp_holder(
+    st: &mut DecompState,
+    holder: &LedgerKey,
+    address: String,
+    base: AssetMap,
+) {
     let mut assets = base;
     let mut lp_amount = 0u64;
     if let Some(share) = st.lp_shares.get(holder) {
@@ -583,6 +647,7 @@ fn write_decomp_holder(st: &mut DecompState, holder: &LedgerKey, base: AssetMap)
     st.visited.insert(holder.clone());
     let entry = LedgerEntry {
         holder: holder.clone(),
+        address,
         assets,
         lp_amount,
         vests,
@@ -916,8 +981,10 @@ fn flush_buffer(buf: TxBuffer) {
 
     for policy in policies {
         let policy_hex = hex::encode(policy);
-        // Per-(holder) net delta of this policy's assets across the TX.
-        let mut deltas: BTreeMap<LedgerKey, BTreeMap<Vec<u8>, i64>> = BTreeMap::new();
+        // Per-(holder) net delta of this policy's assets across the TX, with
+        // the canonical (smallest) address seen for the holder so the delta can
+        // be classified without a second lookup.
+        let mut deltas: BTreeMap<LedgerKey, (String, BTreeMap<Vec<u8>, i64>)> = BTreeMap::new();
 
         if let Some(events) = buf.consumed.get(&policy) {
             for c in events {
@@ -927,15 +994,18 @@ fn flush_buffer(buf: TxBuffer) {
                 let Some(key) = extract_holder_key(&c.prior_output.address) else {
                     continue;
                 };
+                let delta = deltas.entry(key.clone()).or_insert_with(|| {
+                    (c.prior_output.address.clone(), BTreeMap::new())
+                });
+                if c.prior_output.address < delta.0 {
+                    delta.0 = c.prior_output.address.clone();
+                }
                 for asset in &c.prior_output.assets {
                     if asset.asset.policy != policy {
                         continue;
                     }
-                    *deltas
-                        .entry(key.clone())
-                        .or_default()
-                        .entry(asset.asset.name.clone())
-                        .or_insert(0) -= asset.quantity as i64;
+                    *delta.1.entry(asset.asset.name.clone()).or_insert(0) -=
+                        asset.quantity as i64;
                 }
             }
         }
@@ -947,28 +1017,35 @@ fn flush_buffer(buf: TxBuffer) {
                 let Some(key) = extract_holder_key(&p.output.address) else {
                     continue;
                 };
+                let delta = deltas
+                    .entry(key.clone())
+                    .or_insert_with(|| (p.output.address.clone(), BTreeMap::new()));
+                if p.output.address < delta.0 {
+                    delta.0 = p.output.address.clone();
+                }
                 for asset in &p.output.assets {
                     if asset.asset.policy != policy {
                         continue;
                     }
-                    *deltas
-                        .entry(key.clone())
-                        .or_default()
-                        .entry(asset.asset.name.clone())
-                        .or_insert(0) += asset.quantity as i64;
+                    *delta.1.entry(asset.asset.name.clone()).or_insert(0) +=
+                        asset.quantity as i64;
                 }
             }
         }
 
         let mut changed: Vec<HolderEntry> = Vec::new();
-        for (key, per_asset) in deltas {
+        for (key, (address, per_asset)) in deltas {
             let entry_key = holder_entry_key(&key);
             let mut entry = read_ledger_entry(&policy_hex, &entry_key).unwrap_or(LedgerEntry {
                 holder: key.clone(),
+                address: address.clone(),
                 assets: AssetMap::new(),
                 lp_amount: 0,
                 vests: Vec::new(),
             });
+            if entry.address.is_empty() || address < entry.address {
+                entry.address = address;
+            }
             let mut touched = false;
             for (name, delta) in per_asset {
                 if delta == 0 {
@@ -992,11 +1069,14 @@ fn flush_buffer(buf: TxBuffer) {
                 write_ledger_entry(&policy_hex, &entry_key, &entry);
             }
             // Report the post-TX balance (empty assets if zeroed out).
+            let (cohort, basis) = classify_entry(&entry);
             changed.push(HolderEntry {
                 id: key_to_id(&key),
                 assets: assets_map_to_vec(&entry.assets),
                 lp_amount: 0,
                 role: holder_role_for(&key),
+                cohort,
+                basis,
                 vests: Vec::new(),
             });
         }
@@ -1145,6 +1225,10 @@ impl HolderDistIo {
         );
 
         // Pool plan, if a pool was discovered + its datum decodes.
+        let pool_address = meta
+            .pool_address
+            .clone()
+            .unwrap_or_else(|| cswap::POOL_SCRIPT_ADDR.to_string());
         let mut pool_key = None;
         let mut pool_reserve = AssetMap::new();
         let mut total_lp_tokens = 0u64;
@@ -1187,10 +1271,10 @@ impl HolderDistIo {
         };
 
         Some(DecompState {
-            policy,
             policy_hex,
             sub,
             pool_key,
+            pool_address,
             pool_reserve,
             total_lp_tokens,
             lp_policy,
@@ -1217,7 +1301,7 @@ impl BootstrapIo for HolderDistIo {
         // Fold the page into per-holder AssetMaps, collecting pool +
         // vesting side-state into the meta shard. CrowdLock locks
         // bypass the ledger (their tokens become owners' vests).
-        let mut per_holder: BTreeMap<LedgerKey, AssetMap> = BTreeMap::new();
+        let mut per_holder: BTreeMap<LedgerKey, (String, AssetMap)> = BTreeMap::new();
         let mut meta = read_meta(&policy_hex);
         let mut meta_dirty = false;
         for (oref, out) in chain_data::read_utxos(&page.refs) {
@@ -1228,12 +1312,18 @@ impl BootstrapIo for HolderDistIo {
             }
             if meta.pool_ref.is_none() && out.address == cswap::POOL_SCRIPT_ADDR {
                 meta.pool_ref = Some(OutputRefCbor::from_wit(&oref));
+                meta.pool_address = Some(out.address.clone());
                 meta_dirty = true;
             }
             let Some(key) = extract_holder_key(&out.address) else {
                 continue;
             };
-            let map = per_holder.entry(key).or_default();
+            let (address, map) = per_holder
+                .entry(key)
+                .or_insert_with(|| (out.address.clone(), AssetMap::new()));
+            if out.address.as_str() < address.as_str() {
+                *address = out.address.clone();
+            }
             for asset in &out.assets {
                 if asset.asset.policy != policy {
                     continue;
@@ -1247,11 +1337,12 @@ impl BootstrapIo for HolderDistIo {
 
         let entries: Vec<(Vec<u8>, LedgerEntry)> = per_holder
             .into_iter()
-            .map(|(holder, assets)| {
+            .map(|(holder, (address, assets))| {
                 (
                     holder_entry_key(&holder),
                     LedgerEntry {
                         holder,
+                        address,
                         assets,
                         lp_amount: 0,
                         vests: Vec::new(),
@@ -1332,6 +1423,11 @@ impl BootstrapIo for HolderDistIo {
     fn merge(&self, prior: Option<LedgerEntry>, incoming: LedgerEntry) -> LedgerEntry {
         match prior {
             Some(mut p) => {
+                if !incoming.address.is_empty()
+                    && (p.address.is_empty() || incoming.address < p.address)
+                {
+                    p.address = incoming.address.clone();
+                }
                 for (name, qty) in incoming.assets {
                     let total = p.assets.entry(name).or_insert(0);
                     *total = total.saturating_add(qty);
@@ -1437,7 +1533,7 @@ impl BootstrapIo for HolderDistIo {
                         if pool_key.as_ref() == Some(&entry.holder) {
                             continue;
                         }
-                        write_decomp_holder(st, &entry.holder, entry.assets);
+                        write_decomp_holder(st, &entry.holder, entry.address.clone(), entry.assets);
                     }
                     st.mat_after = last_entry_key;
                     DecompStep {
@@ -1456,7 +1552,7 @@ impl BootstrapIo for HolderDistIo {
                         .cloned()
                         .collect();
                     for holder in lp_only {
-                        write_decomp_holder(st, &holder, AssetMap::new());
+                        write_decomp_holder(st, &holder, String::new(), AssetMap::new());
                     }
                     // Vest-only owners (no liquid holdings, no LP).
                     let vest_only: Vec<LedgerKey> = st
@@ -1466,7 +1562,7 @@ impl BootstrapIo for HolderDistIo {
                         .cloned()
                         .collect();
                     for holder in vest_only {
-                        write_decomp_holder(st, &holder, AssetMap::new());
+                        write_decomp_holder(st, &holder, String::new(), AssetMap::new());
                     }
                     // Pool residual (rounding remainder + un-enumerated LP).
                     if let Some(pool_key) = st.pool_key.clone() {
@@ -1474,6 +1570,7 @@ impl BootstrapIo for HolderDistIo {
                             let residual = std::mem::take(&mut st.residual);
                             let entry = LedgerEntry {
                                 holder: pool_key.clone(),
+                                address: st.pool_address.clone(),
                                 assets: residual,
                                 lp_amount: 0,
                                 vests: st.vests.get(&pool_key).cloned().unwrap_or_default(),

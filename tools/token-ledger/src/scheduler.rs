@@ -725,7 +725,16 @@ fn worker(hub: Arc<PolicyHub>, kind: JobKind) {
                         // the request path. One decode covers both. A failure
                         // is logged and never blocks the archive; `/live`
                         // falls back to folding.
-                        if let Err(e) = crate::archive::write_derived(&hub.policy_dir(&policy)) {
+                        // A registry that cannot be read costs the scale, not
+                        // the summary: the fold is still worth writing.
+                        let decimals = crate::registry::decimals(&hub.tokens, &policy)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(policy, error = %format!("{e:#}"), "policy: decimals unknown");
+                                None
+                            });
+                        if let Err(e) =
+                            crate::archive::write_derived_at(&hub.policy_dir(&policy), decimals)
+                        {
                             tracing::warn!(policy, error = %format!("{e:#}"), "policy: derived artifacts not written");
                         }
                     }

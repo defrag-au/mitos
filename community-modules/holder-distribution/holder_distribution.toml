@@ -15,6 +15,10 @@ policies = []
 [deps]
 mitos-community-events = { path = "../../crates/mitos-community-events" }
 mitos-module-kit = { path = "../../crates/mitos-module-kit" }
+# The ONE classifier for burn / inventory / pool / vesting / script / wallet,
+# so a consumer does not grow a second opinion. `wasm-cheap`: pallas only, no
+# chain-walk stack.
+mitos-cohort = { path = "../../crates/mitos-cohort" }
 # Shared DEX decode — CSWAP pool/staking datum + script
 # addresses, for the LP-pool decomposition step.
 mitos-dex-decode = { path = "../../crates/mitos-dex-decode" }

@@ -59,6 +59,18 @@ pub struct WalkArgs {
     #[arg(long)]
     from_point: Option<String>,
 
+    /// Seek the immutable DB to `--from-slot` with a slot-only fuzzy seek, instead of
+    /// decoding every block below it. pallas-hardano binary-searches the chunk list and
+    /// yields the first block at `slot >=` the floor, so it skips whole chunk files rather
+    /// than decoding them — on mainnet, decoding down to a ~180M-slot floor is over an hour
+    /// of CPU.
+    ///
+    /// It is a probe, not a production build: the outref buffer starts cold, so a sale,
+    /// accept or delist of a listing created before the floor will not resolve. Use it to
+    /// measure a window; use a full walk for a corpus you intend to serve.
+    #[arg(long, requires = "from_slot")]
+    seek: bool,
+
     /// Ignore any saved cursor/buffer and walk from the floor.
     #[arg(long)]
     fresh: bool,
@@ -130,17 +142,21 @@ pub fn run(args: WalkArgs) -> Result<()> {
         ledger.min_cursor_slot(&enabled_refs)?
     };
 
-    // `--from-point <slot>:<hash>` seeks the reader; its slot is also the floor.
+    // `--from-point <slot>:<hash>` seeks the reader exactly; `--seek` seeks it fuzzily to
+    // `--from-slot`. Either way the point's slot is also the floor.
     let from_point = args.from_point.as_deref().map(parse_point).transpose()?;
     let point_slot = from_point.as_ref().map(|(slot, _)| *slot);
     let floor = point_slot
         .or(args.from_slot)
         .or(resume)
         .unwrap_or_else(|| registry.min_earliest_slot());
+    // An EMPTY block hash is pallas-hardano's slot-only fuzzy seek. `parse_point` will not
+    // produce one (an exact point is 32 bytes), so it is built here and only here.
+    let seek = from_point.or_else(|| args.seek.then(|| (floor, Vec::new())));
 
-    if from_point.is_some() && buffer.is_empty() {
+    if seek.is_some() && buffer.is_empty() {
         tracing::warn!(
-            "walk: --from-point with a cold buffer — sales/accepts/delists of \
+            "walk: seeking with a cold buffer — sales/accepts/delists of \
              listings created before the point won't resolve"
         );
     }
@@ -148,7 +164,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     tracing::info!(
         venues = ?enabled,
         floor,
-        seek = from_point.is_some(),
+        seek = seek.is_some(),
         resumed = resume.is_some(),
         open_book = buffer.len(),
         dir = %immutable_dir.display(),
@@ -157,7 +173,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
     );
 
     // Seek to the point (efficient) or stream from genesis.
-    let blocks = mitos_chain_walk::open_blocks(&immutable_dir, from_point)?;
+    let blocks = mitos_chain_walk::open_blocks(&immutable_dir, seek)?;
 
     let mut scanned: u64 = 0;
     let mut in_range: u64 = 0;

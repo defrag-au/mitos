@@ -3469,6 +3469,8 @@ dependencies = [
  "anyhow",
  "axum 0.8.4",
  "cardano-assets",
+ "chain-events",
+ "chain-events-cardano",
  "clap",
  "hex",
  "market-ledger-wire",

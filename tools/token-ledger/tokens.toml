@@ -29,6 +29,14 @@
 # and decodes its datum, so its positions carry a schedule. Anything listed
 # here is known to be a lock but its datum shape is not one we read, so its
 # supply counts as locked with no maturity date — the conservative reading.
+#
+# `kind = "lp"` registers a POOL'S LP TOKEN — $NIKEPIG's CSwap LP, say. Such a
+# policy is walked for one reason only: the tip decomposition attributes a
+# pool's reserve to the wallets that provided it, and that needs the LP
+# policy's holder fold. It is never packed into a tape and never catalogued,
+# because nobody trades an LP token here. Everything else is a project by
+# default, so an entry without `kind` behaves exactly as it did before the
+# field existed.
 
 # (snek.fun now needs no entry here — its credential and datum live in
 # `mitos-vesting-decode::snek_fun`, so its locks decode with a real schedule
@@ -94,6 +102,24 @@ name = "nikepig"
 policy = "c881c20e49dbaca3ff6cef365969354150983230c39520b917f5cf7c"
 asset_name = "4e696b65"                # "Nike" — mints under a different name than it displays
 decimals = 0                           # registry: 0 dp, ticker NIKEPIG
+
+# $Aliens' CSwap pool LP token — walked ONLY so the tip decomposition can
+# attribute that pool's reserve to the wallets that provided it. Policy mode
+# (no `asset_name`) because an LP policy is one asset and its name is an
+# implementation detail nobody displays. `floor_slot` is the mint the first
+# walk found with `--policy-index-dir`: measured 29 s for the whole history.
+#
+# No `decimals`: nobody renders an LP token's own units here, and an unstated
+# scale is a different claim from `0`.
+#
+# ⚠️ $NIKEPIG's pool names LP policy `1372dcec56364a1890704d25010fa46a9fde65d47e027176c359c147`,
+# which is NOT yet walked and so reports `Unavailable`. It needs an entry of
+# this shape with a floor from `reverse --probe-first-mint`.
+[[token]]
+name = "aliens-lp"
+kind = "lp"
+policy = "090da86f84b83c4612a73012fb186ea26d8b607e610a3bb29cd8cc3a"
+floor_slot = 182_239_200
 
 # The first LumpFun v5 launch (2026-10-23 22:50:03 UTC), and the launchpad test
 # case: an ADA-quoted curve over VIRTUAL reserves, identified by its state NFT

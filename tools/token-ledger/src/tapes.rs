@@ -106,8 +106,12 @@ pub fn run(args: TapesArgs) -> Result<()> {
 /// One pass: every token whose archive moved, packed and published.
 fn pass(args: &TapesArgs, client: &Client, runtime: &tokio::runtime::Runtime) -> Result<usize> {
     let policies: Vec<String> = match args.policies.is_empty() {
+        // An LP policy is walked for the tip decomposition, not for a tape:
+        // nobody trades it here, and a page for one would be a catalogue entry
+        // nobody can act on.
         true => crate::registry::tokens(&args.tokens)?
             .into_iter()
+            .filter(|t| t.kind != crate::registry::TokenKind::Lp)
             .map(|t| t.policy.to_lowercase())
             .collect(),
         false => args.policies.iter().map(|p| p.to_lowercase()).collect(),

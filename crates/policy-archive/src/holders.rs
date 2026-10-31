@@ -38,8 +38,12 @@ pub struct Holder {
     /// which genuinely has no stake part. Those cannot be merged with anything
     /// and must not be merged with each other.
     pub key: String,
-    /// One address this party used — enough to resolve a handle or open an
-    /// explorer, and NOT a claim that it is the only one.
+    /// The lexicographically smallest address this party used — enough to
+    /// resolve a handle or open an explorer, and NOT a claim that it is the
+    /// only one. Chosen rather than "the first seen" so a party's
+    /// representative is the same in every fold, however the rows are ordered;
+    /// [`crate::summary`] folds the same history and must name the same
+    /// address, or the two tables label one party two ways.
     pub address: String,
     /// Units held. For a fungible policy this is the balance; for an NFT
     /// collection it is **how many items**, which is the useful reading of the
@@ -154,12 +158,20 @@ fn finalise(carry: Carry) -> Fold {
             }
             p.amount > 0
         })
-        .map(|(key, p)| Holder {
-            key,
-            address: p.address,
-            amount: p.amount,
-            movements: p.movements,
-            addresses: p.addresses.len() as u32,
+        .map(|(key, p)| {
+            let address = p
+                .addresses
+                .iter()
+                .min()
+                .cloned()
+                .unwrap_or_else(|| p.address.clone());
+            Holder {
+                key,
+                address,
+                amount: p.amount,
+                movements: p.movements,
+                addresses: p.addresses.len() as u32,
+            }
         })
         .collect();
     // Deterministic: by amount, then by key, so equal balances do not shuffle
@@ -318,6 +330,12 @@ mod tests {
             assert_eq!(f.holders.len(), 1, "one wallet, one row");
             assert_eq!(f.holders[0].amount, 400);
             assert_eq!(f.holders[0].addresses, 2);
+            // The representative is chosen, not "the first seen": the summary
+            // folds the same history in a different order and must name the
+            // same address.
+            assert_eq!(f.holders[0].address, a.min(b));
+            let reversed = fold([mv(b, 300), mv(a, 100)].into_iter());
+            assert_eq!(reversed.holders[0].address, f.holders[0].address);
         }
     }
 

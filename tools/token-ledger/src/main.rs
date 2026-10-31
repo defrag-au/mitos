@@ -32,6 +32,7 @@ mod pull;
 mod registry;
 mod reverse;
 mod scheduler;
+mod segmentation;
 mod segments;
 mod serve;
 mod shared_fills;
