@@ -139,6 +139,12 @@ A windowed book is a snapshot: it holds the UTxOs created inside its window, not
 live set. A policy whose outputs predate the window returns nothing, which looks like a
 broken plane and is not. Use a whole-store book when the module needs the full live set.
 
+**Match the network.** The chunk store on this workstation (`~/data/mithril`) is **mainnet**,
+so every book folded from it is a mainnet artifact. The stack itself follows **preprod**. A
+mainnet book on this host exercises the read path — it is what the native and container
+smokes did — but the rows and the followed chain are different networks, so no policy will
+line up. A coherent book-backed acceptance needs a preprod chunk store (or a mainnet host).
+
 ## Watch the move
 
 `up.sh` prints the tunnel hostname. The token is in `.env`:

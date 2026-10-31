@@ -140,9 +140,7 @@ fn accumulate(mut carry: Carry, movements: impl Iterator<Item = Movement>) -> Ca
 /// address has no stake part and keys by itself. Shared with
 /// [`crate::summary`], whose checkpoints must name the same parties.
 pub fn key_of(address: &str) -> String {
-    crate::trade::address_parts(address)
-        .and_then(|(_, stake)| stake)
-        .unwrap_or_else(|| address.to_string())
+    crate::trade::account_key(address)
 }
 
 fn finalise(carry: Carry) -> Fold {

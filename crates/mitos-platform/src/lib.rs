@@ -85,14 +85,14 @@ pub mod watchdog;
 pub mod watched_ref_index;
 
 pub use budget::{AdaptiveSizer, BudgetLimiter, TrapClass};
+/// Re-exported so `bundle.rs` can choose the live-book plane without a
+/// separate dependency on `mitos-data-plane`.
+pub use mitos_data_plane::BookDataPlane;
 /// Re-exported so bundle consumers can construct
 /// `Arc<dyn ChainDataPlane>` to pass into
 /// `admin::admin_router_with_host` without a separate dep on
 /// `mitos-data-plane`.
 pub use mitos_data_plane::ChainDataPlane;
-/// Re-exported so `bundle.rs` can choose the live-book plane without a
-/// separate dependency on `mitos-data-plane`.
-pub use mitos_data_plane::BookDataPlane;
 /// Re-export the platform-internal `ChainPoint` from
 /// `mitos-data-plane` so consumers (like the bundle binary) can
 /// take/return it without a separate dep on `mitos-data-plane`.

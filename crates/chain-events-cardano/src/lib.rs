@@ -18,6 +18,11 @@
 //!   an empty asset name — the policy's root token — and CAIP-19 has no token id for it.
 //!   [`Translated::unrepresentable`] carries those names so a supply that does not
 //!   reconcile has a stated reason.
+//! - **A party is the account, not the address that happened to hold it.** Every party is
+//!   keyed by [`policy_archive::trade::account_key`] — the stake credential, lower-case
+//!   hex — so a wallet that rotates payment addresses is one party, and so a movement and a
+//!   marketplace sale naming the same wallet are the same party. Both halves of a
+//!   collection go through that one function; see the identity note in [`market`].
 //!
 //! The marketplace half of the Cardano input is [`market`], and it decodes nothing: a
 //! listing is a UTxO observation that `tools/market-ledger` has already read with
@@ -28,6 +33,8 @@ use chain_events::{
     EventSource, HolderEvent, PartyDelta, TokenRef, TxRef,
 };
 use policy_archive::feed::FeedRow;
+use policy_archive::trade::account_key;
+use std::collections::BTreeMap;
 
 mod market;
 
@@ -91,16 +98,32 @@ impl Collection {
                 continue;
             };
 
-            let body = HolderEvent::from_net_mint(
-                unit.net_mint,
-                unit.parties
-                    .iter()
-                    .map(|party| PartyDelta {
-                        account: AccountRef::new(self.chain, party.address.clone()),
-                        delta: party.amount,
-                    })
-                    .collect(),
-            );
+            // Key by account, then net. Two payment addresses of one wallet are one
+            // party, and a movement between them changed nothing: 22.6% of Perps transfers
+            // are that rotation, and left un-netted they read as a sale and an instant
+            // re-buy — which revokes "never sold" and ends a "held since mint" span for a
+            // holder who did neither. A `BTreeMap` also makes the party order depend on the
+            // accounts rather than on how the archive enumerated the row.
+            let mut net: BTreeMap<String, i64> = BTreeMap::new();
+            for party in &unit.parties {
+                *net.entry(account_key(&party.address)).or_insert(0) += party.amount;
+            }
+            let parties: Vec<PartyDelta> = net
+                .into_iter()
+                .filter(|(_, delta)| *delta != 0)
+                .map(|(address, delta)| PartyDelta {
+                    account: AccountRef::new(self.chain, address),
+                    delta,
+                })
+                .collect();
+
+            // Every party netted to zero and no supply was created: ownership did not
+            // change, so there is no holder fact to state.
+            if parties.is_empty() && unit.net_mint == 0 {
+                continue;
+            }
+
+            let body = HolderEvent::from_net_mint(unit.net_mint, parties);
             let discriminator = body.discriminator();
 
             events.push(
@@ -188,6 +211,80 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A base address over `pay` and `stake`, network 1 — the shape a wallet uses.
+    fn wallet(pay: u8, stake: u8) -> String {
+        const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        let mut bytes = vec![0x01];
+        bytes.extend([pay; 28]);
+        bytes.extend([stake; 28]);
+        let (mut acc, mut bits, mut out) = (0u32, 0u32, String::from("addr1"));
+        for b in bytes {
+            acc = (acc << 8) | u32::from(b);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(CHARSET[((acc >> bits) & 31) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(CHARSET[((acc << (5 - bits)) & 31) as usize] as char);
+        }
+        out + "qqqqqq"
+    }
+
+    #[test]
+    fn a_wallet_rotating_payment_addresses_states_no_holder_fact() {
+        // The common case, not an edge: 22.6% of Perps transfers are one wallet moving an
+        // asset to another of its own addresses. Nothing changed hands, and a holder fact
+        // here would revoke "never sold" for a holder who never sold.
+        let from = wallet(1, 9);
+        let to = wallet(2, 9);
+        let translated =
+            collection().from_row(&row(3, vec![unit(b"Perp", 0, &[(&from, -1), (&to, 1)])]), 1);
+        assert!(translated.events.is_empty());
+        assert!(translated.unrepresentable.is_empty());
+    }
+
+    #[test]
+    fn a_real_transfer_names_the_account_on_both_sides() {
+        // Different stake credentials: one event, two parties, each keyed by its credential.
+        let from = wallet(1, 9);
+        let to = wallet(2, 10);
+        let event = &collection()
+            .from_row(&row(3, vec![unit(b"Perp", 0, &[(&from, -1), (&to, 1)])]), 1)
+            .events[0];
+        let EventBody::Holder(holder) = &event.body else {
+            panic!("a holder row is a holder event")
+        };
+        assert_eq!(holder.parties.len(), 2);
+        // Sorted by account key, so the row's own enumeration order cannot reach the id.
+        assert_eq!(holder.parties[0].account.address, "09".repeat(28));
+        assert_eq!(holder.parties[1].account.address, "0a".repeat(28));
+        assert_eq!(holder.parties[0].delta, -1);
+        assert_eq!(holder.parties[1].delta, 1);
+    }
+
+    #[test]
+    fn a_mint_that_reached_nobody_is_still_a_fact() {
+        // Netting must not swallow a supply change: a mint with no watched output is the
+        // reason a supply can be reconciled at all.
+        let translated = collection().from_row(&row(3, vec![unit(b"Perp", 1, &[])]), 1);
+        assert_eq!(translated.events.len(), 1);
+    }
+
+    #[test]
+    fn an_address_with_no_stake_credential_is_its_own_party() {
+        // An enterprise address has no credential to fold under. Emptying its identity
+        // would collapse every stake-less address into one party.
+        let event = &collection()
+            .from_row(&row(3, vec![unit(b"Perp", 1, &[("addr1vminter", 1)])]), 1)
+            .events[0];
+        let EventBody::Holder(holder) = &event.body else {
+            panic!("a holder row is a holder event")
+        };
+        assert_eq!(holder.parties[0].account.address, "addr1vminter");
     }
 
     #[test]

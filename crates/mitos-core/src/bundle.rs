@@ -434,9 +434,9 @@ impl Bundle {
                     }
                     mitos_platform::selected_plane::SelectedPlane::Book(Box::new(plane))
                 }
-                other => anyhow::bail!(
-                    "unknown MITOS_DATA_PLANE={other}; expected `dolos` or `book`"
-                ),
+                other => {
+                    anyhow::bail!("unknown MITOS_DATA_PLANE={other}; expected `dolos` or `book`")
+                }
             };
             info!(plane = selected.label(), "data plane selected");
             let chain_plane = Arc::new(selected);

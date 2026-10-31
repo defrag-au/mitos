@@ -268,9 +268,56 @@ pub enum Event {
 /// is linked by wasm consumers and the whole job is splitting a known-shape
 /// address into two byte ranges.
 pub fn address_parts(addr: &str) -> Option<(String, Option<String>)> {
+    let out = bech32_payload(addr)?;
+    if out.len() < 29 {
+        return None;
+    }
+    Some((
+        hex(&out[1..29]),
+        (out.len() >= 57).then(|| hex(&out[29..57])),
+    ))
+}
+
+/// The account a Shelley address belongs to.
+///
+/// A base address belongs to its **stake credential**, because that is what survives a
+/// wallet rotating payment addresses — one wallet is one party however many addresses it
+/// uses, and 22.6% of Perps transfers are exactly that rotation. A reward address *is* its
+/// stake credential. An enterprise or pointer address has no credential to key on and
+/// belongs to itself, as does anything this decoder cannot read: an identity that silently
+/// became empty would fold every such address into one party, which is worse than not
+/// folding at all.
+///
+/// The key is **lower-case hex** for a credential and the address unchanged otherwise.
+/// That is the form [`crate::holders`] already folds parties under and the form the market
+/// half can produce from a `stake1…` address, so the two halves of one collection agree —
+/// which is what lets a holder fact and a sale be attributed to the same party.
+pub fn account_key(address: &str) -> String {
+    let Some(payload) = bech32_payload(address) else {
+        return address.to_string();
+    };
+    let Some(header) = payload.first() else {
+        return address.to_string();
+    };
+    match header >> 4 {
+        // Base addresses: 28 bytes of payment credential, then 28 of stake.
+        0..=3 if payload.len() >= 57 => hex(&payload[29..57]),
+        // Reward addresses: the payload is the stake credential and nothing else.
+        14 | 15 if payload.len() >= 29 => hex(&payload[1..29]),
+        // Enterprise, pointer, Byron, or something this decoder does not model.
+        _ => address.to_string(),
+    }
+}
+
+/// The bytes a bech32 string carries, separator and six-character checksum removed.
+///
+/// No checksum verification: every address here comes from a decoded transaction, and the
+/// checksum guards transmission rather than storage. A character outside the alphabet
+/// fails, which is what makes a hex string fall through rather than half-decode.
+fn bech32_payload(encoded: &str) -> Option<Vec<u8>> {
     const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-    let sep = addr.rfind('1')?;
-    let data = addr.get(sep + 1..)?;
+    let sep = encoded.rfind('1')?;
+    let data = encoded.get(sep + 1..)?;
     if data.len() < 6 {
         return None;
     }
@@ -286,14 +333,11 @@ pub fn address_parts(addr: &str) -> Option<(String, Option<String>)> {
             out.push(((acc >> bits) & 0xff) as u8);
         }
     }
-    if out.len() < 29 {
-        return None;
-    }
-    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    Some((
-        hex(&out[1..29]),
-        (out.len() >= 57).then(|| hex(&out[29..57])),
-    ))
+    Some(out)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|x| format!("{x:02x}")).collect::<String>()
 }
 
 /// Fold one transaction's unit movement into an event.
@@ -1746,5 +1790,64 @@ mod tests {
             "b2f6abf60ccde92eae1a2f4fdf65f2eaf6208d872c6f0e597cc10b07"
         );
         assert!(address_parts("not-an-address").is_none());
+    }
+
+    /// A reward (stake) address carrying `stake` as its credential, network 1.
+    fn reward(stake: u8) -> String {
+        let mut bytes = vec![0xe1];
+        bytes.extend([stake; 28]);
+        bech32("stake1", &bytes)
+    }
+
+    /// An enterprise (payment-only) address — no stake credential to key on.
+    fn enterprise(pay: u8) -> String {
+        let mut bytes = vec![0x61];
+        bytes.extend([pay; 28]);
+        bech32("addr1", &bytes)
+    }
+
+    /// A bech32 string over `bytes`, with a placeholder checksum.
+    fn bech32(hrp: &str, bytes: &[u8]) -> String {
+        const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        let (mut acc, mut bits, mut out) = (0u32, 0u32, String::from(hrp));
+        for &b in bytes {
+            acc = (acc << 8) | u32::from(b);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(CHARSET[((acc >> bits) & 31) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(CHARSET[((acc << (5 - bits)) & 31) as usize] as char);
+        }
+        out + "qqqqqq"
+    }
+
+    #[test]
+    fn two_payment_addresses_of_one_wallet_are_one_account() {
+        // The rotation case: same stake credential, different payment credential.
+        assert_eq!(account_key(&wallet(1, 9)), account_key(&wallet(2, 9)));
+        assert_ne!(account_key(&wallet(1, 9)), account_key(&wallet(1, 10)));
+        assert_eq!(account_key(&wallet(1, 9)), hex(&[9; 28]));
+    }
+
+    #[test]
+    fn a_reward_address_is_its_own_credential() {
+        // A `stake1…` address names the account directly; it must land on the same key a
+        // base address with that stake credential produces, or the market half and the
+        // holder half of one collection would never join.
+        assert_eq!(account_key(&reward(9)), hex(&[9; 28]));
+        assert_eq!(account_key(&reward(9)), account_key(&wallet(4, 9)));
+    }
+
+    #[test]
+    fn an_address_with_no_stake_credential_is_its_own_account() {
+        // Enterprise: payment credential only. Falling back to an empty key here would
+        // fold every stake-less address into one party.
+        let only_payment = enterprise(7);
+        assert_eq!(account_key(&only_payment), only_payment);
+        assert_eq!(account_key("not-an-address"), "not-an-address");
+        assert_eq!(account_key(""), "");
     }
 }

@@ -129,6 +129,15 @@ book plane is a test-only concern. Landing means:
    a book that fails to open must not silently fall back to Dolos.
 2. **A hybrid plane** — base + delta for UTxO; `tx-index` for history; the mint ledger
    where built; a named fallback for the rest. Each refusal is a metric, not a surprise.
+
+   The first half of this is landed: a plane that declines (`NotYetImplemented`) is now a
+   **miss** in `CachingDataPlane`, so the tiers behind it run under `book` — the local
+   `tx-index` over the chunk store for aux-data, the remote provider for datums. That is
+   what lets `vesting-tracker`'s key-674 lookup (and any CIP-25 module's `tx_metadata`)
+   degrade instead of trapping. It is not yet a metric: the wrapper logs the refusal at
+   `debug` with the plane's own reason, and a counter belongs with the M2 operations
+   surface. `asset_state` (and therefore `cip25_metadata`) and `read_tx` still have no
+   tier behind them — the mint ledger and the history read are M5.
 3. **A tail independent of the plane** — or Dolos retained only for follow. Do not
    couple the book's selection to the subscription factory.
 4. **Shadow mode** — run both planes for the cohort and diff answers. The test harness
@@ -275,6 +284,18 @@ on 2026-10-30; the shadow diff is what remains:
 4. A shadow diff for `collection-holders`, `holder-distribution`, `vesting-tracker` and
    `burn-address` against the same block range.
 
+   The harness exists: `crates/mitos-core/tests/shadow_planes.rs` runs one module artifact
+   against a Dolos domain and a book, over the same chunks, and compares the emission
+   payloads byte for byte (an ordering difference is reported separately from a content
+   difference). The domain is opened with `setup_domain` and no sync pipeline, so neither
+   plane moves during the run. It needs two artifacts built from the **same** chunk store:
+   `mitos bootstrap --chunk-store ~/data/mithril --fetch never` into a Dolos data dir, and
+   `fold-probe fold --chunks 0 --primitives --book <dir>`. Measured on the workstation
+   (18 cores, mainnet store): the fold is ~2.5 h, the Dolos import ~10 h — the import is the
+   long pole, and it is why the diff is not yet an inner-loop check. The harness itself is
+   policy-scoped, so it covers `collection-holders` and `holder-distribution`; the address-
+   and credential-scoped modules need the interest selector extended first.
+
 That is enough to know whether the L1 cutover is real, without betting on the delta,
 the merge, the tail, or the mint ledger.
 
@@ -300,9 +321,13 @@ artifact format.
 The data is the part people forget is already local. The chunk store is
 `~/data/mithril/immutable` (9,338 chunks, 219 GB, rsynced off the external volume), and
 `fold-probe fold --immutable … --primitives --book <dir>` builds a real artifact from it for
-the host to mmap. The inner loop uses a windowed book — chunks 1848–1851 is 92,165 rows at
-tip 40,003,168, enough for a module to cold-start — while a whole-store book (10.9 M rows,
-2.23 GB) is the artifact for a footprint or cutover run.
+the host to mmap. **It is mainnet.** A book built from it is a mainnet artifact: pairing it
+with a preprod host exercises the read path but the rows and the followed chain are different
+networks, and `mitos bootstrap` against it fails at ~block 2500 with `input not found` when
+the config says preprod — that failure is the network telling you which genesis it is not.
+The inner loop uses a windowed book — chunks 1848–1851 is 92,165 rows at tip 40,003,168,
+enough for a module to cold-start — while a whole-store book (10.9 M rows, 2.23 GB) is the
+artifact for a footprint or cutover run.
 
 ### What it does not buy
 

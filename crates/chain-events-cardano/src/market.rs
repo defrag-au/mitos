@@ -27,15 +27,17 @@
 //!   [`EventId`](chain_events::EventId), so a row that does carry one can fill it in
 //!   without rewriting an id.
 //!
-//! # Parties are stake addresses
+//! # Parties are accounts, in one form
 //!
-//! A market row's seller and buyer are **stake** addresses (`stake1…`), because that is
-//! what the marketplace decode can read off a datum. The holder adapter's parties are
-//! **payment** addresses (`addr1…`), because a movement names the address that held the
-//! asset. The common key is the stake credential — `policy_archive::holders::key_of`
-//! maps one to the other — so anything joining the two families must normalise first.
-//! This is the one place the two halves of the same collection disagree about identity,
-//! and it is a property of the chain rather than of either adapter.
+//! Every party is keyed by [`policy_archive::trade::account_key`], the same function the
+//! holder adapter uses. A market row's seller and buyer arrive as **stake** addresses
+//! (`stake1…`), because that is what the marketplace decode can read off a datum; a holder
+//! movement arrives as a **payment** address (`addr1…`), because that is what held the
+//! asset. They are the same account, and the key is the stake credential in lower-case hex.
+//!
+//! This was the one place the two halves of a collection disagreed about identity, and it
+//! is now decided in one function rather than documented as a trap for each consumer to
+//! solve. An address with no stake credential keys by itself; nothing folds to an empty key.
 
 use chain_events::{
     AccountRef, ChainCoord, ChainEvent, ChainRef, EventBody, EventSource, MarketEvent, MarketParty,
@@ -255,14 +257,22 @@ fn order_ref(row: &EventRow) -> Option<OrderRef> {
     )))
 }
 
-/// A stake address the page interns, or an error when the index does not resolve.
+/// A stake address the page interns, keyed the way the holder half keys a movement.
+///
+/// An index that does not resolve is corruption rather than an ordinary miss, so it is an
+/// error; an address that does not decode keys by itself.
 fn party(page: &EventsPage, chain: ChainRef, index: Option<u32>) -> Result<Option<AccountRef>, ()> {
     match index {
         None => Ok(None),
         Some(index) => page
             .stakes
             .get(index as usize)
-            .map(|address| Some(AccountRef::new(chain, address.clone())))
+            .map(|address| {
+                Some(AccountRef::new(
+                    chain,
+                    policy_archive::trade::account_key(address),
+                ))
+            })
             .ok_or(()),
     }
 }
