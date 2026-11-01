@@ -197,6 +197,7 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
 }
 
 /// Run the module once against one plane and collect the payload bytes.
+#[allow(clippy::too_many_arguments)]
 async fn run_module<P>(
     label: &str,
     plane: Arc<P>,

@@ -580,7 +580,7 @@ mod tests {
     /// the byte span has to come out identical to the shard-local route.
     #[test]
     fn a_global_pair_addresses_the_same_run_as_a_local_one() {
-        let h = published_header();
+        let _h = published_header();
         // Bucket 64 is in shard 0, and shard 0 starts at entry 0 on this base.
         let base = shard_base(&0u32.to_le_bytes()).unwrap();
         assert_eq!(base, 0);

@@ -29,6 +29,9 @@ use mitos_protocol::{AnnouncedModule, SubscribeTarget};
 /// CF DO, which is single-threaded but uses async APIs. All sync
 /// methods on the trait stay as plain `fn`; the macro only
 /// rewrites methods declared `async fn`.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait MitosCompanion: Send + Sync + 'static {
     /// Stable name (matches the indexer's `name()` on the mitos
@@ -190,6 +193,9 @@ pub trait MitosCompanion: Send + Sync + 'static {
 /// `?Send` is used on the trait method because worker-rs's DO
 /// futures are single-threaded (wasm); requiring `Send` on user
 /// code would be a footgun.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait MitosChannel: 'static {
     /// Stable channel name. Matches the host-side indexer channel
@@ -230,6 +236,9 @@ pub trait MitosChannel: 'static {
 ///
 /// Blanket-impl'd for any `MitosChannel`; dApps never write this
 /// themselves.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait MitosChannelDyn: 'static {
     /// Stable channel name (matches `MitosChannel::NAME`).

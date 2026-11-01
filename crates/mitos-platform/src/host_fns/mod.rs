@@ -35,6 +35,9 @@ fn cip25_source_tx(state: &mitos_data_plane::AssetMintState) -> Option<[u8; 32]>
 /// `(OutputRef, TypedOutput)` — so the conversion at the WIT
 /// boundary stays trivial. Missing entries are silently omitted
 /// (per the underlying contract).
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait DataPlaneFacade: Send + Sync + 'static {
     async fn read_utxos(

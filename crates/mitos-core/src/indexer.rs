@@ -44,6 +44,9 @@ pub enum SubscribeReply {
 /// Indexers are typed against it rather than `dyn Domain` so they can use
 /// the associated types (`D::State`, `D::Indexes`, etc.) without
 /// dynamic dispatch.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Indexer<D: dolos_core::Domain>: Send + Sync {
     /// Indexer-defined scope payload for CF subscriptions. Each indexer

@@ -12,6 +12,9 @@ use async_trait::async_trait;
 /// (CBOR-encoded envelopes) — text/ping/pong are handled inside each
 /// transport impl as appropriate (e.g. tungstenite auto-replies to
 /// pings).
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait WsTransport: Send {
     /// Receive the next binary frame. Returns `Ok(None)` when the peer

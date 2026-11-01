@@ -49,6 +49,9 @@ pub enum FetchError {
 
 /// Brings bytes back from a URL. A trait so every test in this order runs
 /// against a fake — no test here touches the network.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ArtifactFetcher: Send + Sync {
     /// Fetch `url`, refusing at `max + 1` bytes read.

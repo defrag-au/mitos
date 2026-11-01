@@ -69,6 +69,9 @@ use cardano_assets::PolicyId;
 /// in-process impls return immediately; IPC / wasm / gRPC impls
 /// genuinely await. Consumers don't need to special-case the
 /// transport.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChainDataPlane: Send + Sync {
     /// Fetch a single output by reference. Returns `None` if the

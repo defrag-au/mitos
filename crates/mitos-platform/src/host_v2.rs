@@ -48,6 +48,9 @@ use crate::{PlatformError, PlatformResult};
 /// `ChainDataPlane` types; the admin router doesn't care about that
 /// — it just needs "start a module" / "stop a module" / "what's
 /// running." The trait keeps the generics out of route signatures.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ModuleHostHandle: Send + Sync {
     async fn replace(&self, id: &str) -> PlatformResult<()>;
@@ -220,6 +223,9 @@ fn v1_interest_to_predicate(
 /// instance's exports (the wasmtime Store isn't safely shareable
 /// across tasks), so the dialer can't invoke `update-interest`
 /// directly — it pushes through this trait and the follower drains.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait InterestRouter: Send + Sync {
     async fn route_interest(
