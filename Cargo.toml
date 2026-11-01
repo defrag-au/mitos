@@ -77,6 +77,18 @@ members = [
     # the probe WRITES the book and the data plane reads it, and a binary crate
     # cannot be depended on. `docs/design/LIVE_BOOK.md` is the spec.
     "crates/live-book",
+    # The fold plane's contract: an `Aggregate` over one deterministic walk, a registry
+    # that runs them, and the artifact envelope every aggregate describes itself with.
+    # `docs/design/FOLD_PLANE.md` is the spec. Pure: no I/O, no chain types, no wasm.
+    "crates/mitos-fold",
+    # The native walker for the fold plane: a chunk window, decoded once into an owned
+    # `DecodedBlock`, handed to a `mitos-fold` registry. A sibling crate rather than a
+    # feature of the contract, so the contract stays dependency-free and linkable by a
+    # worker, a test and a game.
+    "crates/mitos-fold-walk",
+    # The first production aggregate on the fold plane: one policy's holders from a
+    # DecodedBlock, grouped by stake credential and classified by mitos-cohort.
+    "crates/mitos-holder-table",
     # Readiness-driven dispatch for ranged reads: the wants a reader discovers as
     # bytes arrive, planned into the fewest in-flight requests instead of awaited
     # one phase at a time. Pure — no I/O, no async, no clock — so the browser, a

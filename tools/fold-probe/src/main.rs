@@ -51,6 +51,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::hash::BuildHasherDefault;
 use std::path::Path;
@@ -77,6 +78,13 @@ use clap::{Args, Parser, Subcommand};
 use live_book::row::Datum;
 use mitos_chain_walk::decode::decode_tx;
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
+use mitos_fold::Fingerprint;
+use mitos_fold::View;
+use mitos_fold_walk::{
+    BlockSink, WalkSpec, Walked, WindowStrategy, chunk_path, read_chunk_into, split_blocks,
+    walk_with_sink,
+};
+use mitos_holder_table::{HolderKey, HolderTable, HolderTableAggregate, HolderTableView};
 use mitos_meter::{Meter, Op, Run, human};
 use pallas_addresses::byron::AddressPayload;
 use pallas_codec::minicbor::Decoder;
@@ -110,6 +118,8 @@ struct Cli {
 enum Cmd {
     /// Fold a contiguous window with a real live set (serial), reporting all four numbers.
     Fold(FoldArgs),
+    /// One walk, two artifacts: the published book and a holder table for one policy.
+    Pilot(PilotArgs),
     /// Count created/spent over every complete chunk with no set (parallel) — the exact live-set size.
     Count(CountArgs),
     /// Measure CIP-25: how big the mint metadata corpus is, and what it carries.
@@ -136,6 +146,10 @@ enum Cmd {
     /// assets and holders, over every policy in the book. The measurement that
     /// decides whether the exact columns are affordable, and what they hold.
     Catalogue(CatalogueArgs),
+    /// Sum a published book's live rows for one policy into a holder table. This is
+    /// the substrate answer — the table as a projection over the book — and the
+    /// cross-check the stream aggregate is held against.
+    Holders(HoldersArgs),
     /// Record where a published book sits on chain, from the chunk it was built at.
     /// A build writes `base_slot` itself; this is for an artifact built before the
     /// field existed, so `tip()` can answer instead of refusing.
@@ -358,6 +372,20 @@ struct CatalogueArgs {
 }
 
 #[derive(Args)]
+struct HoldersArgs {
+    /// The book directory to read.
+    #[arg(long)]
+    book: PathBuf,
+    /// The 28-byte policy to project, hex.
+    #[arg(long)]
+    policy: String,
+    /// Where to write the table, in the pilot's `holders.tsv` shape. The parity
+    /// test reads that file, so this is directly comparable to a walk's table.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct PublishArgs {
     /// The book directory to publish from.
     #[arg(long)]
@@ -438,7 +466,8 @@ struct FoldArgs {
     /// The Mithril immutable directory (holds `NNNNN.chunk`).
     #[arg(long)]
     immutable: PathBuf,
-    /// First chunk of the window. Default: the newest `--chunks` complete chunks.
+    /// First chunk of the window, which must be a complete chunk under `--immutable`.
+    /// Default: the newest `--chunks` complete chunks.
     #[arg(long)]
     start: Option<u16>,
     /// Chunks to walk; 0 = every complete chunk (the full serial fold — hours).
@@ -515,10 +544,37 @@ struct CountArgs {
     max_chunks: usize,
 }
 
+#[derive(Args)]
+struct PilotArgs {
+    /// The Mithril immutable directory (holds `NNNNN.chunk`).
+    #[arg(long)]
+    immutable: PathBuf,
+    /// First chunk of the window, which must be a complete chunk under `--immutable`.
+    /// Default: the first complete chunk.
+    #[arg(long)]
+    start: Option<u32>,
+    /// Chunks to walk; 0 = every complete chunk.
+    #[arg(long, default_value_t = 0)]
+    chunks: usize,
+    /// The 56-hex policy whose holder table is built alongside the book.
+    #[arg(long)]
+    policy: String,
+    /// The book directory to write.
+    #[arg(long)]
+    book: PathBuf,
+    /// Where the table dump and summary go.
+    #[arg(long, default_value = ".tmp/pilot")]
+    out: PathBuf,
+    /// Compact the book once it holds this many MiB of dead rows.
+    #[arg(long, default_value_t = 1024)]
+    book_compact_mb: u64,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Fold(a) => fold(a),
+        Cmd::Pilot(a) => pilot(a),
         Cmd::Count(a) => count(a),
         Cmd::Cip25(a) => cip25(a),
         Cmd::Labels(a) => labels(a),
@@ -526,6 +582,7 @@ fn main() -> Result<()> {
         Cmd::Reindex(a) => reindex(a),
         Cmd::Lookup(a) => lookup(a),
         Cmd::Catalogue(a) => catalogue(a),
+        Cmd::Holders(a) => holders(a),
         Cmd::StampBoundary(a) => stamp_boundary(a),
         Cmd::Publish(a) => publish(a),
         Cmd::DatumPush(a) => datum_push(a),
@@ -872,29 +929,6 @@ struct ApplyStats {
 }
 
 // ------------------------------------------------------------- the decode
-
-/// Split a chunk file into its top-level CBOR items — the block bytes.
-///
-/// Deliberately not the `.secondary` sidecar: `tx-index`'s extractor splits
-/// CBOR itself so every offset it records is a fact about bytes it saw, and a
-/// probe that measured a different decode path than the index would not be
-/// measuring the thing it claims to.
-fn split_blocks(bytes: &[u8]) -> Result<Vec<&[u8]>> {
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let mut d = Decoder::new(&bytes[pos..]);
-        d.skip()
-            .with_context(|| format!("splitting block at byte {pos}"))?;
-        let len = d.position();
-        if len == 0 {
-            bail!("zero-length CBOR item at byte {pos}");
-        }
-        out.push(&bytes[pos..pos + len]);
-        pos += len;
-    }
-    Ok(out)
-}
 
 /// Everything the applier needs from a block, extracted with no reference to
 /// the set — which is what makes this phase the parallelisable one.
@@ -1995,29 +2029,6 @@ fn apply_plan<S: BuildHasher>(
 
 // ------------------------------------------------------------- the driver
 
-fn chunk_path(immutable: &std::path::Path, chunk: u16) -> PathBuf {
-    immutable.join(format!("{chunk:05}.chunk"))
-}
-
-/// Read a chunk into a buffer that is reused across chunks.
-///
-/// `fs::read` allocates fresh each time, and a 5–40 MB allocation goes to
-/// `mmap`, so every chunk re-faults its whole extent on first touch. Reusing the
-/// buffer keeps the mapping and the pages, and the reads land in memory the
-/// process already has.
-fn read_chunk_into(buf: &mut Vec<u8>, path: &std::path::Path) -> Result<()> {
-    use std::io::Read;
-
-    let mut f = std::fs::File::open(path)?;
-    let hint = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    buf.clear();
-    if buf.capacity() < hint {
-        buf.reserve(hint - buf.len());
-    }
-    f.read_to_end(buf)?;
-    Ok(())
-}
-
 /// Apparent bytes of every `NNNNN.chunk` under `immutable`, excluding the
 /// sidecars — they are 1.5 GB against 230 GB of chunk on mainnet, and including
 /// them would inflate a byte-weighted projection. A `metadata()` per chunk, so
@@ -2036,7 +2047,7 @@ fn chunk_bytes_total(immutable: &std::path::Path) -> u64 {
 
 fn fold(a: FoldArgs) -> Result<()> {
     let all = list_chunks(&a.immutable)?;
-    let window = pick_window(&all, a.start, a.chunks)?;
+    let window = mitos_fold_walk::chunk_window(&all, a.start, a.chunks, WindowStrategy::FromTail)?;
 
     println!("fold-probe fold");
     println!("  immutable   {}", a.immutable.display());
@@ -2763,6 +2774,254 @@ fn fold(a: FoldArgs) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// The fold plane's first pilot: one walk writes the published book and a holder table.
+///
+/// The sink is the book's lean path — `plan_block_primitives` over the decoded
+/// `MultiEraBlock` — and the registry is the holder table over the owned `DecodedBlock`.
+/// They share the block decode, not a second walk.
+fn pilot(a: PilotArgs) -> Result<()> {
+    let all = mitos_fold_walk::chunk_numbers(&a.immutable)?;
+    let window = mitos_fold_walk::chunk_window(&all, a.start, a.chunks, WindowStrategy::FromHead)?;
+    let policy_bytes = hex::decode(&a.policy).with_context(|| format!("policy {}", a.policy))?;
+    let policy: [u8; 28] = policy_bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "policy must be 28 bytes (56 hex); got {}",
+            policy_bytes.len()
+        )
+    })?;
+    // The window's identity, not a content hash: the stamp says which walk produced
+    // the artifact, and two artifacts over the same window must pair.
+    let source = Fingerprint::from_u128(
+        (u128::from(window[0]) << 64) | u128::from(*window.last().expect("window is non-empty")),
+    );
+
+    println!("fold pilot");
+    println!("  immutable   {}", a.immutable.display());
+    println!(
+        "  window      chunks {}..={} ({})",
+        window[0],
+        window[window.len() - 1],
+        window.len()
+    );
+    println!("  policy      {}", a.policy.to_lowercase());
+    println!("  book        {}", a.book.display());
+    println!("  table       {}", a.out.display());
+
+    let mut sink = PilotSink {
+        book: Book::create(&a.book, a.book_compact_mb * 1024 * 1024)?,
+        offers: OfferPass::new(),
+        plan: BlockPlan::default(),
+        dec: DecodeStats::default(),
+        hashes: Vec::new(),
+    };
+    let mut registry = mitos_fold::Registry::new();
+    registry.register(
+        "holder-table-stream",
+        HolderTableAggregate::new(policy, Vec::new(), Vec::new()),
+    )?;
+
+    let walked = walk_with_sink(
+        WalkSpec {
+            immutable: &a.immutable,
+            chunks: &window,
+            source,
+        },
+        &mut sink,
+        &mut registry,
+    )?;
+    let cost = sink.book.finish()?;
+    let streamed = &walked.artifacts[0].artifact;
+
+    // Phase two. The book is written, so the views can read it — and a view cannot run
+    // before this line, which is the whole reason it is a view rather than an aggregate.
+    let book = live_book::Base::open(&a.book)?;
+    let mut views = mitos_fold::ViewRegistry::new();
+    views.register(
+        "holder-table",
+        HolderTableView::new(policy, Vec::new(), Vec::new()),
+    )?;
+    views.view(&book)?;
+    let viewed = views.finish(walked.stamp)?;
+    let table = &viewed[0].artifact;
+
+    // The two shapes are one definition or they are not a fold plane. This is the local
+    // gate's cheapest assertion: the walk's live set and the book's are the same set.
+    if table != streamed {
+        bail!(
+            "the two shapes disagree — stream: {} holders / {} units, book: {} holders / {} units{}",
+            streamed.distinct_holders(),
+            streamed.total_quantity(),
+            table.distinct_holders(),
+            table.total_quantity(),
+            first_disagreement(streamed, table)
+                .map(|detail| format!("\n  first: {detail}"))
+                .unwrap_or_default(),
+        );
+    }
+
+    std::fs::create_dir_all(&a.out)?;
+    write_holder_table(&a.out, table)?;
+    write_pilot_summary(&a.out, &walked, table, streamed, &cost)?;
+
+    println!();
+    println!("walk");
+    println!("  blocks      {}", walked.blocks);
+    println!("  txs         {}", walked.txs);
+    println!("  base slot   {}", walked.stamp.base_slot);
+    println!(
+        "  base hash   {}",
+        walked.stamp.base_hash.map(hex::encode).unwrap_or_default()
+    );
+    println!();
+    println!("book");
+    println!("  rows live   {}", cost.rows_live);
+    println!("  created     {}", cost.created);
+    println!(
+        "  spent       {} hit / {} miss",
+        cost.spent_hits, cost.spent_misses
+    );
+    println!();
+    println!("holder table");
+    println!("  holders     {}", table.distinct_holders());
+    println!("  quantity    {}", table.total_quantity());
+    println!(
+        "  shapes      agree (stream {} holders / {} units)",
+        streamed.distinct_holders(),
+        streamed.total_quantity(),
+    );
+    Ok(())
+}
+
+/// The first holder the two tables disagree about, for a failure a reader can act on.
+///
+/// Scanned in the artifact's own order so two runs describe the same disagreement.
+fn first_disagreement(streamed: &HolderTable, viewed: &HolderTable) -> Option<String> {
+    for row in &streamed.holders {
+        match viewed.holder(&row.holder) {
+            None => return Some(format!("stream has {:?}, the book does not", row.holder)),
+            Some(other) if other.assets != row.assets => {
+                return Some(format!(
+                    "{:?}: stream {:?} vs book {:?}",
+                    row.holder, row.assets, other.assets
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    viewed
+        .holders
+        .iter()
+        .find(|row| streamed.holder(&row.holder).is_none())
+        .map(|row| format!("the book has {:?}, the stream does not", row.holder))
+}
+
+struct PilotSink {
+    book: Book,
+    offers: OfferPass,
+    plan: BlockPlan,
+    dec: DecodeStats,
+    hashes: Vec<Hash<32>>,
+}
+
+impl BlockSink for PilotSink {
+    fn observe(&mut self, block: &MultiEraBlock<'_>, chunk: u32) -> Result<()> {
+        let chunk = u16::try_from(chunk)
+            .with_context(|| format!("chunk {chunk} exceeds the book's u16 coordinate"))?;
+        let Self {
+            book,
+            offers,
+            plan,
+            dec,
+            hashes,
+        } = self;
+        let mut sink = Sink::Book(book, offers);
+        match shelley_block_of(block) {
+            Some(shelley) => {
+                plan_block_primitives(shelley, chunk, plan, dec, hashes, Some(&mut sink))
+            }
+            None => plan_block(block, chunk, plan, dec, None, Some(&mut sink)),
+        }
+    }
+}
+
+fn write_holder_table(dir: &std::path::Path, table: &HolderTable) -> Result<()> {
+    let mut text = String::new();
+    writeln!(
+        &mut text,
+        "holder\taddress\tcohort\tasset_name_hex\tquantity"
+    )
+    .expect("writing to a String cannot fail");
+    for row in &table.holders {
+        let holder = match &row.holder {
+            HolderKey::Stake(credential) => hex::encode(credential),
+            HolderKey::Enterprise(address) => address.clone(),
+        };
+        for asset in &row.assets {
+            writeln!(
+                &mut text,
+                "{holder}\t{}\t{}\t{}\t{}",
+                row.address,
+                row.cohort.as_str(),
+                hex::encode(&asset.name),
+                asset.quantity,
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    let path = dir.join("holders.tsv");
+    std::fs::write(&path, text)?;
+    println!("  table       {}", path.display());
+    Ok(())
+}
+
+fn write_pilot_summary(
+    dir: &std::path::Path,
+    walked: &Walked<HolderTable>,
+    table: &HolderTable,
+    streamed: &HolderTable,
+    cost: &book::Cost,
+) -> Result<()> {
+    let mut text = String::new();
+    writeln!(&mut text, "policy\t{}", hex::encode(table.policy))
+        .expect("writing to a String cannot fail");
+    writeln!(&mut text, "schema\t{}", walked.artifacts[0].schema)
+        .expect("writing to a String cannot fail");
+    writeln!(&mut text, "blocks\t{}", walked.blocks).expect("writing to a String cannot fail");
+    writeln!(&mut text, "txs\t{}", walked.txs).expect("writing to a String cannot fail");
+    writeln!(&mut text, "base_slot\t{}", walked.stamp.base_slot)
+        .expect("writing to a String cannot fail");
+    writeln!(
+        &mut text,
+        "base_hash\t{}",
+        walked.stamp.base_hash.map(hex::encode).unwrap_or_default()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(&mut text, "source\t{}", walked.stamp.source)
+        .expect("writing to a String cannot fail");
+    writeln!(&mut text, "holders\t{}", table.distinct_holders())
+        .expect("writing to a String cannot fail");
+    writeln!(&mut text, "total_quantity\t{}", table.total_quantity())
+        .expect("writing to a String cannot fail");
+    writeln!(&mut text, "stream_holders\t{}", streamed.distinct_holders())
+        .expect("writing to a String cannot fail");
+    writeln!(
+        &mut text,
+        "stream_total_quantity\t{}",
+        streamed.total_quantity()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(&mut text, "book_rows\t{}", cost.rows_live).expect("writing to a String cannot fail");
+    writeln!(&mut text, "book_created\t{}", cost.created).expect("writing to a String cannot fail");
+    writeln!(&mut text, "book_spent_hits\t{}", cost.spent_hits)
+        .expect("writing to a String cannot fail");
+    writeln!(&mut text, "book_spent_misses\t{}", cost.spent_misses)
+        .expect("writing to a String cannot fail");
+    let path = dir.join("summary.tsv");
+    std::fs::write(&path, text)?;
+    println!("  summary     {}", path.display());
     Ok(())
 }
 
@@ -5066,6 +5325,77 @@ fn catalogue(a: CatalogueArgs) -> Result<()> {
     Ok(())
 }
 
+/// The holder table as a projection over a published book.
+///
+/// This is the production shape: the same [`HolderTableView`] the pilot registers in its
+/// second phase, so what this prints is what a build would publish. `by_policy` names only
+/// live rows — a spent output is a tombstone, and the ordering never points at one — so the
+/// result is a net position rather than a history.
+fn holders(a: HoldersArgs) -> Result<()> {
+    let policy_bytes = hex::decode(&a.policy).with_context(|| format!("policy {}", a.policy))?;
+    let policy: [u8; 28] = policy_bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "policy must be 28 bytes (56 hex); got {}",
+            policy_bytes.len()
+        )
+    })?;
+
+    let started = Instant::now();
+    let book = live_book::Base::open(&a.book)?;
+    let opened = started.elapsed();
+
+    println!("book holders — the table as a projection over the book");
+    println!(
+        "  book       {} · {} live rows",
+        a.book.display(),
+        book.rows()
+    );
+    println!("  policy     {}", a.policy.to_lowercase());
+    println!("  opened     {:.3} s", opened.as_secs_f64());
+    println!();
+
+    let mut view = HolderTableView::new(policy, Vec::new(), Vec::new());
+    let walked = Instant::now();
+    view.view(&book)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let secs = walked.elapsed().as_secs_f64();
+    let (refs, dropped) = (view.refs(), view.dropped());
+    let table = view.table().map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    println!("  refs       {refs}");
+    println!("  dropped    {dropped} (pointer or Byron address — no holder identity)");
+    println!("  holders    {}", table.distinct_holders());
+    println!("  quantity   {}", table.total_quantity());
+    println!("  wall       {secs:.3} s");
+    println!();
+
+    if let Some(path) = &a.out {
+        let mut text = String::new();
+        writeln!(&mut text, "holder\taddress\tasset_name_hex\tquantity")
+            .expect("writing to a String cannot fail");
+        for row in &table.holders {
+            let label = match &row.holder {
+                HolderKey::Stake(credential) => hex::encode(credential),
+                HolderKey::Enterprise(address) => address.clone(),
+            };
+            for asset in &row.assets {
+                writeln!(
+                    &mut text,
+                    "{label}\t{}\t{}\t{}",
+                    row.address,
+                    hex::encode(&asset.name),
+                    asset.quantity,
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        println!("  table      {}", path.display());
+    }
+
+    Ok(())
+}
+
 /// A policy id as hex, or an error: an id that was just walked and is not in the
 /// table means the artifact disagrees with itself, which is not a blank to print.
 fn policy_hex(book: &live_book::Base, id: u32) -> Result<String> {
@@ -6068,46 +6398,6 @@ fn count(a: CountArgs) -> Result<()> {
 }
 
 // ------------------------------------------------------------- utilities
-
-fn pick_window(all: &[u16], start: Option<u16>, chunks: usize) -> Result<Vec<u16>> {
-    let Some(&first) = all.first() else {
-        bail!("no complete chunks");
-    };
-    // `chunks == 0` is "to the end", NOT "from the beginning": with a `--start` the two
-    // readings differ by hours, and a resume that silently re-walked the store would
-    // look like it was working.
-    if chunks == 0 {
-        return match start {
-            None => Ok(all.to_vec()),
-            Some(s) => {
-                if s < first {
-                    bail!("--start {s} is below the first complete chunk {first}");
-                }
-                Ok(all.iter().copied().skip_while(|c| *c < s).collect())
-            }
-        };
-    }
-    let window = match start {
-        None => {
-            let take = chunks.min(all.len());
-            all[all.len() - take..].to_vec()
-        }
-        Some(s) => {
-            if s < first {
-                bail!("--start {s} is below the first complete chunk {first}");
-            }
-            all.iter()
-                .copied()
-                .skip_while(|c| *c < s)
-                .take(chunks)
-                .collect()
-        }
-    };
-    if window.is_empty() {
-        bail!("window is empty — --start {start:?} past the last complete chunk?");
-    }
-    Ok(window)
-}
 
 fn share(part: u64, whole: u64) -> f64 {
     if whole == 0 {
@@ -7227,23 +7517,6 @@ mod tests {
     }
 
     #[test]
-    fn splits_concatenated_cbor_items() {
-        // Two one-byte items: 0x01 (1), 0x02 (2).
-        let items = split_blocks(&[0x01, 0x02]).expect("splits");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], &[0x01]);
-        assert_eq!(items[1], &[0x02]);
-    }
-
-    #[test]
-    fn splits_a_multi_byte_item_as_one_block() {
-        // 0x42 0xAA 0xBB is a 2-byte byte-string: one item, not three.
-        let items = split_blocks(&[0x42, 0xAA, 0xBB]).expect("splits");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].len(), 3);
-    }
-
-    #[test]
     fn reads_a_smaps_rollup_field() {
         let smaps = "Rss:                   12345 kB\n\
                      Pss:                    9999 kB\n\
@@ -7251,40 +7524,6 @@ mod tests {
         assert_eq!(kb_field(smaps, "Rss:"), Some(12345));
         assert_eq!(kb_field(smaps, "Anonymous:"), Some(6789));
         assert_eq!(kb_field(smaps, "Swap:"), None);
-    }
-
-    #[test]
-    fn window_defaults_to_the_newest_chunks() {
-        let all: Vec<u16> = (0..20).collect();
-        let w = pick_window(&all, None, 5).expect("window");
-        assert_eq!(w, vec![15, 16, 17, 18, 19]);
-    }
-
-    #[test]
-    fn window_from_a_start_chunk_is_contiguous() {
-        let all: Vec<u16> = vec![10, 11, 12, 13, 14];
-        let w = pick_window(&all, Some(12), 2).expect("window");
-        assert_eq!(w, vec![12, 13]);
-    }
-
-    #[test]
-    fn window_refuses_a_start_below_the_store() {
-        let all: Vec<u16> = vec![100, 101];
-        assert!(pick_window(&all, Some(9), 1).is_err());
-    }
-
-    /// `--chunks 0` with a `--start` is "from there to the end" — the resume path. Read
-    /// the other way it would re-walk the store, which is hours of work that looks like
-    /// progress.
-    #[test]
-    fn an_open_ended_window_starts_where_it_is_told() {
-        let all: Vec<u16> = vec![10, 11, 12, 13, 14, 15];
-        assert_eq!(
-            pick_window(&all, Some(13), 0).expect("to the end"),
-            vec![13, 14, 15]
-        );
-        assert_eq!(pick_window(&all, None, 0).expect("the store"), all);
-        assert!(pick_window(&all, Some(9), 0).is_err(), "below the store");
     }
 
     /// The rollover's arithmetic: distinct chunks counted once each, however many blocks

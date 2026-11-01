@@ -1,0 +1,12 @@
+[package]
+name = "mitos-fold"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The fold plane's contract: aggregates, a registry over one deterministic walk, and the artifact envelope. No I/O, no chain types, no wasm."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]

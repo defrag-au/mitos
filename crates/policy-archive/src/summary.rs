@@ -368,6 +368,10 @@ pub struct Summary {
     pub hourly: Vec<Candle>,
     pub holders: Vec<HolderDay>,
     pub distribution: Distribution,
+    /// The largest parties by BALANCE, plus any LP provider that holds no units
+    /// of the token itself — appended by [`Summary::apply_segmentation`], with
+    /// `amount == 0` and the pool side in `lp_amount`. A reader that wants rows
+    /// with a position selects on `amount > 0 || lp_amount > 0`.
     pub top: Vec<TopHolder>,
     pub checkpoints: Vec<CheckpointRef>,
     /// Display decimals. `None` when nobody has stated them — decimals are not
@@ -392,7 +396,7 @@ impl Summary {
     /// matching [`TopHolder`]s, so a reader that only wants `free / lp /
     /// vested` does not have to join two tables.
     pub fn apply_segmentation(&mut self, seg: Segmentation) {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         let lp: HashMap<&str, u64> = seg
             .lp
@@ -435,6 +439,39 @@ impl Summary {
             // its units from wrapping.
             h.vested = vested.min(h.amount);
         }
+
+        // A provider can hold LP and no units of the token itself, and then the
+        // holder fold has no row for it: `distribution` ranks parties by
+        // BALANCE and skips a non-positive one. Appended here rather than kept
+        // there, because such a party is not a holder of this token and must
+        // not move `parties`, the share bands or the role totals — but it does
+        // have a position, and a table that omits it says the pool's reserve
+        // came from nowhere.
+        //
+        // ⚠️ These rows are why a reader selects on `amount > 0 || lp_amount > 0`
+        // and never on `amount > 0` alone.
+        let known: HashSet<&str> = self.top.iter().map(|h| h.key.as_str()).collect();
+        let mut missing: Vec<(&str, u64)> = lp
+            .iter()
+            .filter(|(key, amount)| **amount > 0 && !known.contains(*key))
+            .map(|(key, amount)| (*key, *amount))
+            .collect();
+        // Biggest pool position first, then the key. `lp` is a HashMap, so
+        // emitting these in arrival order would not be byte-stable.
+        missing.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        self.top.extend(missing.into_iter().map(|(key, lp_amount)| TopHolder {
+            key: key.to_string(),
+            // No address: this party never moved the token, so the archive has
+            // none to give. A name is asked for by the key instead.
+            address: String::new(),
+            amount: 0,
+            role: Role::Person,
+            label: None,
+            movements: 0,
+            lp_amount,
+            vested: 0,
+        }));
+
         self.segmentation = seg;
     }
 }
@@ -1163,6 +1200,57 @@ mod tests {
         assert_eq!(hb.lp_amount, 0);
         assert_eq!(s.segmentation.as_of, 10);
         assert_eq!(s.segmentation.lp.as_ref().unwrap().residual, 70);
+    }
+
+    /// A provider can hold LP and no units of the token, and then the holder
+    /// fold has no row to copy onto — the reserve would be attributed to nobody
+    /// and the pool would read as having come from nowhere. It gets its own row
+    /// instead, which must not move the holder counts.
+    #[test]
+    fn a_provider_with_no_balance_gets_a_row_without_becoming_a_holder() {
+        let movements = vec![mv(1, 10, 1, A, 100)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        let parties = s.distribution.parties;
+        let held = s.distribution.held;
+        let provider = |key: &str, lp_tokens: u64, amount: u64| LpProvider {
+            key: key.into(),
+            lp_tokens,
+            amount,
+        };
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: Vec::new(),
+            lp: Some(LpDecomposition {
+                pool_address: "addr_pool".into(),
+                pool_key: "pool".into(),
+                reserve: 100,
+                total_lp: 1_000,
+                providers: vec![provider("bb", 10, 5), provider("cc", 20, 20)],
+                residual: 75,
+                status: LpStatus::Complete,
+            }),
+        });
+        let extra: Vec<&TopHolder> = s.top.iter().filter(|h| h.amount == 0).collect();
+        assert_eq!(extra.len(), 2, "both providers get a row");
+        assert_eq!(
+            extra
+                .iter()
+                .map(|h| (h.key.as_str(), h.lp_amount))
+                .collect::<Vec<_>>(),
+            vec![("cc", 20), ("bb", 5)],
+            "the bigger pool position sorts first, so a re-fold is stable"
+        );
+        assert!(
+            extra
+                .iter()
+                .all(|h| h.address.is_empty() && h.role == Role::Person),
+            "no address to give, and no role to claim"
+        );
+        assert_eq!(
+            s.distribution.parties, parties,
+            "a provider is not a holder of this token"
+        );
+        assert_eq!(s.distribution.held, held, "and moves no supply");
     }
 
     /// `vested` must never exceed the raw balance: a caller subtracting it to

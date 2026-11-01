@@ -1,0 +1,27 @@
+[package]
+name = "mitos-holder-table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The holder table: one policy's current holders, grouped by stake credential, classified by mitos-cohort. Exists as both a fold aggregate and a projection over the published book, so the two shapes check each other."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+mitos-fold = { path = "../mitos-fold" }
+chain-decode = { path = "../chain-decode" }
+mitos-cohort = { path = "../mitos-cohort" }
+# The substrate the view reads. A view of the book has to name the book; the aggregate
+# above does not, which is why the crate carries both shapes rather than one.
+live-book = { path = "../live-book" }
+pallas-addresses.workspace = true
+
+[dev-dependencies]
+mitos-fold-walk = { path = "../mitos-fold-walk" }
+mitos-community-events = { path = "../mitos-community-events" }
+pallas-traverse.workspace = true
+anyhow = { workspace = true }
+ciborium = "0.2"
+hex = { workspace = true }

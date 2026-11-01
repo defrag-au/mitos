@@ -3301,7 +3301,10 @@ mod tests {
             mv(2, "(222)token", "addr1", 1, 0),
             mv(3, "(222)token", "addr2", 1, 0),
         ];
-        assert_eq!(dominant_unit(&rows).as_deref(), Some("2832323229746f6b656e".into()));
+        assert_eq!(
+            dominant_unit(&rows).as_deref(),
+            Some("2832323229746f6b656e")
+        );
         // Equal counts: the lower hex wins, whichever order the rows arrive in.
         let tie = [mv(1, "b", "addr1", 1, 0), mv(2, "a", "addr1", 1, 0)];
         assert_eq!(dominant_unit(&tie).as_deref(), Some("61"));

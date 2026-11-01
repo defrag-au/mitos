@@ -2315,6 +2315,9 @@ dependencies = [
  "hex",
  "live-book",
  "mitos-chain-walk",
+ "mitos-fold",
+ "mitos-fold-walk",
+ "mitos-holder-table",
  "mitos-marketplace-decode",
  "mitos-meter",
  "pallas-addresses 1.4.0",
@@ -4033,6 +4036,38 @@ dependencies = [
  "hex",
  "pallas-codec 1.4.0",
  "pallas-primitives 1.4.0",
+]
+
+[[package]]
+name = "mitos-fold"
+version = "0.0.1"
+
+[[package]]
+name = "mitos-fold-walk"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chain-decode",
+ "mitos-fold",
+ "pallas-codec 1.4.0",
+ "pallas-traverse 1.4.0",
+]
+
+[[package]]
+name = "mitos-holder-table"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chain-decode",
+ "ciborium",
+ "hex",
+ "live-book",
+ "mitos-cohort",
+ "mitos-community-events",
+ "mitos-fold",
+ "mitos-fold-walk",
+ "pallas-addresses 1.4.0",
+ "pallas-traverse 1.4.0",
 ]
 
 [[package]]

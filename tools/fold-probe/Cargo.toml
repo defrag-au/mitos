@@ -33,6 +33,11 @@ mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
 # Structured timing, so a number this tool prints can be compared with one another
 # tool prints — one vocabulary of operation names, one report shape.
 mitos-meter = { path = "../../crates/mitos-meter" }
+# The fold plane's contract, walker and first aggregate. The pilot command uses all
+# three so the same walk can write the book and the holder table.
+mitos-fold = { path = "../../crates/mitos-fold" }
+mitos-fold-walk = { path = "../../crates/mitos-fold-walk" }
+mitos-holder-table = { path = "../../crates/mitos-holder-table" }
 
 tx-index = { path = "../../crates/tx-index" }
 mitos-chain-walk = { path = "../mitos-chain-walk" }

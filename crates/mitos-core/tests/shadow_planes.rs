@@ -170,6 +170,16 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
         trace_events("book", &book_run.events);
         trace_events("dolos", &dolos_run.events);
     }
+    if let Ok(dir) = std::env::var("MITOS_SHADOW_DUMP") {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).expect("create the shadow dump directory");
+        for (label, run) in [("book", &book_run), ("dolos", &dolos_run)] {
+            for (index, payload) in run.events.iter().enumerate() {
+                std::fs::write(dir.join(format!("{label}-{index:03}.bin")), payload)
+                    .expect("write a shadow event");
+            }
+        }
+    }
 
     // A begin on its own is not a snapshot: it proves the anchor agrees and
     // nothing else. Every policy-interest module emits at least begin + end, so
