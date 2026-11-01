@@ -548,6 +548,8 @@ struct Counts {
 
 /// Fold the summary, and the checkpoint files it names.
 pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
+    use std::collections::HashMap;
+
     let mut rows: Vec<&Movement> = inp.movements.iter().collect();
     // The chain's order: a block at a time, and its transactions in place.
     rows.sort_by(|a, b| {
@@ -575,6 +577,8 @@ pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
     let mut next_checkpoint = every;
 
     let mut parties: HashMap<String, Party> = HashMap::new();
+    // Address → key, filled as the fold meets each address. See the entry below.
+    let mut keys: HashMap<&str, String> = HashMap::new();
     let mut counts = Counts::default();
     let mut days: Vec<HolderDay> = Vec::new();
     let mut day: Option<u64> = None;
@@ -647,8 +651,13 @@ pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
         if m.is_placeholder() || m.address.is_empty() {
             continue;
         }
-        let key = crate::holders::key_of(&m.address);
-        let party = parties.entry(key).or_insert_with(|| {
+        // Address → key, once per address rather than once per movement: the
+        // key is a bech32 decode, and these rows repeat a few thousand
+        // addresses millions of times.
+        let key = keys
+            .entry(m.address.as_str())
+            .or_insert_with(|| crate::holders::key_of(&m.address));
+        let party = parties.entry(key.clone()).or_insert_with(|| {
             let (role, label) = (inp.classify)(&m.address);
             Party {
                 address: m.address.clone(),

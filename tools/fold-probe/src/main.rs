@@ -80,9 +80,9 @@ use mitos_chain_walk::decode::decode_tx;
 use mitos_chain_walk::mithril::CHUNK_SLOTS;
 use mitos_fold::Fingerprint;
 use mitos_fold::View;
+use mitos_fold::{Artifact, ArtifactFile, ArtifactKind, Counts};
 use mitos_fold_walk::{
-    BlockSink, WalkSpec, Walked, WindowStrategy, chunk_path, read_chunk_into, split_blocks,
-    walk_with_sink,
+    BlockSink, WalkSpec, WindowStrategy, chunk_path, read_chunk_into, split_blocks, walk_with_sink,
 };
 use mitos_holder_table::{HolderKey, HolderTable, HolderTableAggregate, HolderTableView};
 use mitos_meter::{Meter, Op, Run, human};
@@ -2863,8 +2863,30 @@ fn pilot(a: PilotArgs) -> Result<()> {
     }
 
     std::fs::create_dir_all(&a.out)?;
-    write_holder_table(&a.out, table)?;
-    write_pilot_summary(&a.out, &walked, table, streamed, &cost)?;
+    let rows = table.to_rows();
+    let artifact = Artifact::new(
+        ArtifactKind::Ordered,
+        viewed[0].schema,
+        walked.stamp,
+        vec![ArtifactFile::new(
+            HolderTable::ROWS_FILE,
+            rows.len() as u64,
+        )?],
+        // `rows` is the primary table's row type — a holder — and `entries` is what the
+        // file holds, one line per (holder, asset) balance. The two are different numbers
+        // on purpose: a reader sizing a page wants holders, a reader checking the file
+        // wants lines.
+        Counts::new(
+            table.distinct_holders() as u64,
+            table.balances() as u64,
+            rows.len() as u64,
+        ),
+        vec![mitos_fold::Extension::new(
+            HolderTable::POLICY_EXTENSION,
+            table.policy.to_vec(),
+        )?],
+    )?;
+    write_artifact(&a.out, &artifact, &rows)?;
 
     println!();
     println!("walk");
@@ -2892,6 +2914,31 @@ fn pilot(a: PilotArgs) -> Result<()> {
         streamed.distinct_holders(),
         streamed.total_quantity(),
     );
+    Ok(())
+}
+
+/// Write one artifact: the rows, then the manifest last.
+///
+/// The manifest is **removed first and written last**, so a run that dies mid-write leaves
+/// an artifact a reader refuses as absent rather than one claiming rows it does not have.
+/// A reader that wants the remaining case — a file changed under a manifest that survived —
+/// checks each file's length against the manifest, which `tests/book_view.rs` does.
+fn write_artifact(dir: &Path, artifact: &Artifact, rows: &str) -> Result<()> {
+    let manifest = dir.join(Artifact::FILE);
+    match std::fs::remove_file(&manifest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("removing {}", manifest.display()));
+        }
+    }
+
+    let rows_path = dir.join(HolderTable::ROWS_FILE);
+    std::fs::write(&rows_path, rows).with_context(|| format!("writing {}", rows_path.display()))?;
+    std::fs::write(&manifest, artifact.encode())
+        .with_context(|| format!("writing {}", manifest.display()))?;
+
+    println!("  artifact    {}", manifest.display());
     Ok(())
 }
 
@@ -2945,84 +2992,6 @@ impl BlockSink for PilotSink {
             None => plan_block(block, chunk, plan, dec, None, Some(&mut sink)),
         }
     }
-}
-
-fn write_holder_table(dir: &std::path::Path, table: &HolderTable) -> Result<()> {
-    let mut text = String::new();
-    writeln!(
-        &mut text,
-        "holder\taddress\tcohort\tasset_name_hex\tquantity"
-    )
-    .expect("writing to a String cannot fail");
-    for row in &table.holders {
-        let holder = match &row.holder {
-            HolderKey::Stake(credential) => hex::encode(credential),
-            HolderKey::Enterprise(address) => address.clone(),
-        };
-        for asset in &row.assets {
-            writeln!(
-                &mut text,
-                "{holder}\t{}\t{}\t{}\t{}",
-                row.address,
-                row.cohort.as_str(),
-                hex::encode(&asset.name),
-                asset.quantity,
-            )
-            .expect("writing to a String cannot fail");
-        }
-    }
-    let path = dir.join("holders.tsv");
-    std::fs::write(&path, text)?;
-    println!("  table       {}", path.display());
-    Ok(())
-}
-
-fn write_pilot_summary(
-    dir: &std::path::Path,
-    walked: &Walked<HolderTable>,
-    table: &HolderTable,
-    streamed: &HolderTable,
-    cost: &book::Cost,
-) -> Result<()> {
-    let mut text = String::new();
-    writeln!(&mut text, "policy\t{}", hex::encode(table.policy))
-        .expect("writing to a String cannot fail");
-    writeln!(&mut text, "schema\t{}", walked.artifacts[0].schema)
-        .expect("writing to a String cannot fail");
-    writeln!(&mut text, "blocks\t{}", walked.blocks).expect("writing to a String cannot fail");
-    writeln!(&mut text, "txs\t{}", walked.txs).expect("writing to a String cannot fail");
-    writeln!(&mut text, "base_slot\t{}", walked.stamp.base_slot)
-        .expect("writing to a String cannot fail");
-    writeln!(
-        &mut text,
-        "base_hash\t{}",
-        walked.stamp.base_hash.map(hex::encode).unwrap_or_default()
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(&mut text, "source\t{}", walked.stamp.source)
-        .expect("writing to a String cannot fail");
-    writeln!(&mut text, "holders\t{}", table.distinct_holders())
-        .expect("writing to a String cannot fail");
-    writeln!(&mut text, "total_quantity\t{}", table.total_quantity())
-        .expect("writing to a String cannot fail");
-    writeln!(&mut text, "stream_holders\t{}", streamed.distinct_holders())
-        .expect("writing to a String cannot fail");
-    writeln!(
-        &mut text,
-        "stream_total_quantity\t{}",
-        streamed.total_quantity()
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(&mut text, "book_rows\t{}", cost.rows_live).expect("writing to a String cannot fail");
-    writeln!(&mut text, "book_created\t{}", cost.created).expect("writing to a String cannot fail");
-    writeln!(&mut text, "book_spent_hits\t{}", cost.spent_hits)
-        .expect("writing to a String cannot fail");
-    writeln!(&mut text, "book_spent_misses\t{}", cost.spent_misses)
-        .expect("writing to a String cannot fail");
-    let path = dir.join("summary.tsv");
-    std::fs::write(&path, text)?;
-    println!("  summary     {}", path.display());
-    Ok(())
 }
 
 /// Every complete chunk, no set, counters only. `created − spent` is the live

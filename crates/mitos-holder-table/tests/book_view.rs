@@ -1,10 +1,13 @@
-//! The book view against the walk's own answer.
+//! The published artifact against the book it was built from.
 //!
-//! `pilot` asserts the two shapes agree while it runs; this is the same assertion made
-//! afterwards, from the artifacts alone, so a later change to either shape is caught without
-//! re-walking two thousand chunks.
+//! `pilot` asserts the two shapes agree while it runs — the walk's live set and the book's
+//! are the same set. This is the other half, from the artifacts alone: the manifest is
+//! readable, every file is the length it claims, and projecting the book again reproduces
+//! the rows byte for byte. A changed row encoder, a book that drifted from its artifact, or
+//! a manifest that outlived the file it describes all fail here without re-walking two
+//! thousand chunks.
 //!
-//! It runs only when the pilot has produced a summary and a book. Generate them with:
+//! It runs only when the pilot has produced an artifact. Generate one with:
 //!
 //! ```text
 //! fold-probe pilot --immutable ~/data/mithril/immutable --start 0 --chunks 2000 \
@@ -15,11 +18,10 @@
 //!
 //! `MITOS_PILOT_DIR` and `MITOS_PILOT_BOOK` override the two paths.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use mitos_fold::View;
-use mitos_holder_table::HolderTableView;
+use mitos_fold::{Artifact, SchemaId, View};
+use mitos_holder_table::{HolderTable, HolderTableView};
 
 fn path_from_env(name: &str, fallback: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(name) {
@@ -31,51 +33,49 @@ fn path_from_env(name: &str, fallback: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// `summary.tsv` as key → value. Written whole by the pilot, so a missing key is a summary
-/// this test does not understand rather than a blank to invent.
-fn read_summary(path: &std::path::Path) -> BTreeMap<String, String> {
-    std::fs::read_to_string(path)
-        .expect("read the pilot summary")
-        .lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once('\t')?;
-            Some((key.to_owned(), value.to_owned()))
-        })
-        .collect()
-}
-
-fn number(summary: &BTreeMap<String, String>, key: &str) -> Option<u128> {
-    summary.get(key)?.parse().ok()
-}
-
 #[test]
-fn the_book_projects_to_the_walk_s_answer() {
+fn the_book_reproduces_the_published_artifact() {
     let Some(dir) = path_from_env("MITOS_PILOT_DIR", ".tmp/pilot/full") else {
-        eprintln!("skipping: no pilot summary (run the pilot)");
+        eprintln!("skipping: no pilot artifact (run the pilot)");
         return;
     };
     let Some(book_dir) = path_from_env("MITOS_PILOT_BOOK", ".tmp/pilot/book-2000") else {
         eprintln!("skipping: no pilot book (run the pilot)");
         return;
     };
-    let summary = read_summary(&dir.join("summary.tsv"));
 
-    let Some(policy_hex) = summary.get("policy") else {
-        eprintln!("skipping: the summary names no policy");
+    let manifest = dir.join(Artifact::FILE);
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        eprintln!("skipping: no manifest at {}", manifest.display());
         return;
     };
-    let policy_bytes = hex::decode(policy_hex).expect("the summary's policy is hex");
-    let policy: [u8; 28] = policy_bytes.try_into().expect("a 28-byte policy");
+    let artifact = Artifact::decode(&text, SchemaId::new("holder-table", 1))
+        .expect("the manifest is one this build writes");
 
-    let (Some(walked_holders), Some(walked_quantity)) = (
-        number(&summary, "stream_holders"),
-        number(&summary, "stream_total_quantity"),
-    ) else {
-        // A summary written before the view existed has no stream line. That is a stale
-        // artifact, not a disagreement, and saying so is more useful than failing.
-        eprintln!("skipping: the summary predates the two-shape cross-check — re-run the pilot");
-        return;
+    // Every file the manifest names must be the length it names. This is what catches a
+    // rows file that changed under a manifest that survived — the case the writer's
+    // remove-then-write ordering cannot cover on its own.
+    for file in &artifact.files {
+        let path = dir.join(&file.name);
+        let length = std::fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .len();
+        assert_eq!(
+            length, file.bytes,
+            "{} is {length} bytes; the manifest says {}",
+            file.name, file.bytes
+        );
+    }
+
+    let Some(policy) = HolderTable::policy_of(&artifact.extensions) else {
+        panic!(
+            "the artifact names no policy — tag {} is missing",
+            HolderTable::POLICY_EXTENSION
+        );
     };
+
+    let published = std::fs::read_to_string(dir.join(HolderTable::ROWS_FILE))
+        .expect("the manifest names a rows file");
 
     let book = live_book::Base::open(&book_dir).expect("open the pilot book");
     let mut view = HolderTableView::new(policy, Vec::new(), Vec::new());
@@ -83,23 +83,46 @@ fn the_book_projects_to_the_walk_s_answer() {
     let refs = view.refs();
     let dropped = view.dropped();
     let table = view.table().expect("the view produces a table");
+    let rebuilt = table.to_rows();
 
     println!(
-        "book:   {} holders, {} quantity ({refs} refs, {dropped} without a holder identity)",
+        "book:   {} holders, {} balances ({refs} refs, {dropped} without a holder identity)",
         table.distinct_holders(),
-        table.total_quantity()
+        table.balances()
     );
-    println!("walk:   {walked_holders} holders, {walked_quantity} quantity");
+    println!(
+        "artifact: {} rows, {} entries, {} bytes at slot {}",
+        artifact.counts.rows,
+        artifact.counts.entries,
+        artifact.counts.bytes,
+        artifact.stamp.base_slot
+    );
 
     assert_eq!(
-        u128::from(table.distinct_holders() as u64),
-        walked_holders,
-        "the book and the walk disagree about how many holders the policy has"
+        artifact.counts.rows,
+        table.distinct_holders() as u64,
+        "the manifest's row count is not the table's holder count"
     );
     assert_eq!(
-        table.total_quantity(),
-        walked_quantity,
-        "the book and the walk disagree about how much of the policy is held"
+        artifact.counts.entries,
+        table.balances() as u64,
+        "the manifest's entry count is not the table's balance count"
     );
-    println!("OK          the two shapes agree");
+    assert_eq!(
+        rebuilt.len() as u64,
+        artifact.counts.bytes,
+        "the rebuilt rows are not the length the manifest claims"
+    );
+    assert_eq!(
+        rebuilt, published,
+        "the book does not reproduce the published rows"
+    );
+
+    // The stamp is the coordinate a reader pairs a delta against, so it must survive the
+    // manifest's text form exactly.
+    artifact
+        .require_stamp(artifact.stamp)
+        .expect("the artifact's own stamp is the stamp it requires");
+
+    println!("OK          the artifact is reproducible from its book");
 }

@@ -9,10 +9,11 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Component, Path};
 
 use crate::schema::SchemaId;
-use crate::stamp::Stamp;
+use crate::stamp::{Fingerprint, Stamp};
 use crate::{Error, Result};
 
 /// The physical shape of an artifact.
@@ -133,6 +134,19 @@ pub struct Artifact {
 }
 
 impl Artifact {
+    /// The manifest's file name inside an artifact directory.
+    ///
+    /// One name, in the contract rather than in a writer, because a reader has to find it
+    /// without being told which tool wrote the artifact.
+    pub const FILE: &'static str = "artifact.meta";
+
+    /// The envelope's own format version.
+    ///
+    /// Separate from a schema's version on purpose: this numbers *the manifest*, while a
+    /// schema numbers the rows. A new field in the manifest bumps this; a new column in a
+    /// row bumps the schema.
+    pub const VERSION: u32 = 1;
+
     /// Construct an artifact and validate it immediately.
     pub fn new(
         kind: ArtifactKind,
@@ -194,6 +208,253 @@ impl Artifact {
 
         Ok(())
     }
+
+    /// Render the envelope as its manifest.
+    ///
+    /// The `key value` text form, the same one `live-book`'s `book.meta` uses, rather than a
+    /// fourth convention: it is inspectable, diffable, and needs no codec. Scalars come
+    /// first in a fixed order, then one `file` line per file and one `extension` line per
+    /// extension — both repeatable, and both read in the order they are written.
+    pub fn encode(&self) -> String {
+        let mut out = String::with_capacity(256);
+        let mut line = |key: &str, value: &dyn fmt::Display| {
+            writeln!(out, "{key} {value}").expect("writing to a String cannot fail");
+        };
+
+        line("version", &Self::VERSION);
+        line("kind", &self.kind);
+        line("schema", &self.schema);
+        line("base_slot", &self.stamp.base_slot);
+        if let Some(hash) = self.stamp.base_hash {
+            line("base_hash", &hex(&hash));
+        }
+        line("source", &self.stamp.source);
+        line("rows", &self.counts.rows);
+        line("entries", &self.counts.entries);
+        line("bytes", &self.counts.bytes);
+        for file in &self.files {
+            writeln!(out, "file {} {}", file.bytes, file.name)
+                .expect("writing to a String cannot fail");
+        }
+        for extension in &self.extensions {
+            writeln!(out, "extension {} {}", extension.tag, hex(&extension.body))
+                .expect("writing to a String cannot fail");
+        }
+        out
+    }
+
+    /// Parse a manifest, refusing anything this build does not write.
+    ///
+    /// `expected` is the schema the caller requires, not a hint. A schema is named by a
+    /// `&'static str` in this crate because it is a property of the reader's code, so a
+    /// manifest cannot introduce a schema the reader has never heard of — a version it does
+    /// not know is refused by name rather than parsed and returned.
+    pub fn decode(text: &str, expected: SchemaId) -> Result<Artifact> {
+        let mut version = None;
+        let mut kind = None;
+        let mut schema = None;
+        let mut base_slot = None;
+        let mut base_hash = None;
+        let mut source = None;
+        let mut rows = None;
+        let mut entries = None;
+        let mut byte_count = None;
+        let mut files = Vec::new();
+        let mut extensions = Vec::new();
+
+        for (index, raw) in text.lines().enumerate() {
+            let line = index + 1;
+            let (key, value) = raw.split_once(' ').ok_or_else(|| Error::InvalidEnvelope {
+                reason: format!("line {line}: a field is `key value`, found {raw:?}"),
+            })?;
+
+            match key {
+                "version" => once(&mut version, line, key, number(line, key, value)?)?,
+                "kind" => once(&mut kind, line, key, kind_of(line, value)?)?,
+                "schema" => {
+                    if value != expected.to_string() {
+                        return Err(Error::SchemaMismatch {
+                            found: value.to_owned(),
+                            expected,
+                        });
+                    }
+                    once(&mut schema, line, key, expected)?;
+                }
+                "base_slot" => once(&mut base_slot, line, key, number(line, key, value)?)?,
+                "base_hash" => {
+                    let parsed = bytes(line, key, value)?;
+                    let hash: [u8; 32] = parsed.try_into().map_err(|_| Error::InvalidEnvelope {
+                        reason: format!("line {line}: `base_hash` must be 32 bytes"),
+                    })?;
+                    once(&mut base_hash, line, key, hash)?;
+                }
+                "source" => {
+                    let parsed: Fingerprint =
+                        value
+                            .parse()
+                            .map_err(|error: Error| Error::InvalidEnvelope {
+                                reason: format!("line {line}: `source`: {error}"),
+                            })?;
+                    once(&mut source, line, key, parsed)?;
+                }
+                "rows" => once(&mut rows, line, key, number(line, key, value)?)?,
+                "entries" => once(&mut entries, line, key, number(line, key, value)?)?,
+                "bytes" => once(&mut byte_count, line, key, number(line, key, value)?)?,
+                "file" => {
+                    let (size, name) =
+                        value
+                            .split_once(' ')
+                            .ok_or_else(|| Error::InvalidEnvelope {
+                                reason: format!("line {line}: a file is `file <bytes> <name>`"),
+                            })?;
+                    let size = size.parse().map_err(|_| Error::InvalidEnvelope {
+                        reason: format!("line {line}: `file` size is not a number: {size:?}"),
+                    })?;
+                    files.push(ArtifactFile::new(name, size)?);
+                }
+                "extension" => {
+                    let (tag, body) =
+                        value
+                            .split_once(' ')
+                            .ok_or_else(|| Error::InvalidEnvelope {
+                                reason: format!(
+                                    "line {line}: an extension is `extension <tag> <hex>`"
+                                ),
+                            })?;
+                    let tag: u32 = tag.parse().map_err(|_| Error::InvalidEnvelope {
+                        reason: format!("line {line}: `extension` tag is not a number: {tag:?}"),
+                    })?;
+                    extensions.push(Extension::new(tag, bytes(line, key, body)?)?);
+                }
+                other => {
+                    return Err(Error::InvalidEnvelope {
+                        reason: format!("line {line}: unknown field `{other}`"),
+                    });
+                }
+            }
+        }
+
+        let version = required(version, "version")?;
+        if version != Self::VERSION {
+            return Err(Error::UnsupportedEnvelope { version });
+        }
+        // `schema` is written only when it matched `expected`, so its absence is the same
+        // refusal as a mismatch — reported as the missing field it is.
+        required(schema, "schema")?;
+
+        Artifact::new(
+            required(kind, "kind")?,
+            expected,
+            Stamp::new(
+                required(base_slot, "base_slot")?,
+                base_hash,
+                required(source, "source")?,
+            ),
+            files,
+            Counts::new(
+                required(rows, "rows")?,
+                required(entries, "entries")?,
+                required(byte_count, "bytes")?,
+            ),
+            extensions,
+        )
+    }
+
+    /// Refuse an artifact whose base is not the one the caller requires.
+    ///
+    /// Exact, all three fields. A caller that cares about fewer compares them itself; a
+    /// check that silently ignored the source is the pairing hole this exists to close.
+    /// The refusal names the slot and the source, which is what a reader pins a delta to.
+    pub fn require_stamp(&self, expected: Stamp) -> Result<()> {
+        if self.stamp != expected {
+            return Err(Error::StampMismatch {
+                found: describe(self.stamp),
+                expected: describe(expected),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A stamp as a reader names it: the slot it is, and the source it came from.
+fn describe(stamp: Stamp) -> String {
+    format!("slot {} from {}", stamp.base_slot, stamp.source)
+}
+
+/// Store a scalar field, refusing a second one: a manifest with two `rows` lines has no
+/// single answer, and picking either would be a guess.
+fn once<T>(slot: &mut Option<T>, line: usize, key: &str, value: T) -> Result<()> {
+    if slot.is_some() {
+        return Err(Error::InvalidEnvelope {
+            reason: format!("line {line}: `{key}` appears twice"),
+        });
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn required<T>(slot: Option<T>, key: &str) -> Result<T> {
+    slot.ok_or_else(|| Error::InvalidEnvelope {
+        reason: format!("the manifest has no `{key}`"),
+    })
+}
+
+fn number<T>(line: usize, key: &str, value: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    value.parse().map_err(|_| Error::InvalidEnvelope {
+        reason: format!("line {line}: `{key}` is not a number: {value:?}"),
+    })
+}
+
+fn kind_of(line: usize, value: &str) -> Result<ArtifactKind> {
+    match value {
+        "point" => Ok(ArtifactKind::Point),
+        "ordered" => Ok(ArtifactKind::Ordered),
+        "summary" => Ok(ArtifactKind::Summary),
+        "log" => Ok(ArtifactKind::Log),
+        other => Err(Error::InvalidEnvelope {
+            reason: format!("line {line}: unknown kind `{other}`"),
+        }),
+    }
+}
+
+const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+fn bytes(line: usize, key: &str, value: &str) -> Result<Vec<u8>> {
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+
+    let digits = value.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return Err(Error::InvalidEnvelope {
+            reason: format!("line {line}: `{key}` has an odd number of hex digits"),
+        });
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.as_chunks::<2>().0 {
+        let (Some(high), Some(low)) = (nibble(pair[0]), nibble(pair[1])) else {
+            return Err(Error::InvalidEnvelope {
+                reason: format!("line {line}: `{key}` is not hex: {value:?}"),
+            });
+        };
+        out.push(high << 4 | low);
+    }
+    Ok(out)
 }
 
 /// A file name is a relative path of normal components, `/`-separated.
@@ -416,5 +677,136 @@ mod tests {
         assert_eq!(ArtifactKind::Summary.as_str(), "summary");
         assert_eq!(ArtifactKind::Log.as_str(), "log");
         assert_eq!(ArtifactKind::Summary.to_string(), "summary");
+    }
+
+    // ---- the manifest ----
+
+    /// Everything the envelope can carry: two files, a base hash and an extension.
+    fn rich() -> Artifact {
+        Artifact::new(
+            ArtifactKind::Ordered,
+            SchemaId::new("holder-table", 1),
+            Stamp::new(
+                43_199_989,
+                Some([0x51, 0x95, 0xdf, 0xa0].repeat(8).try_into().expect("32")),
+                Fingerprint::from_u128(0x7cf),
+            ),
+            vec![file("holders.tsv", 64_929), file("parts/0001.bin", 10)],
+            Counts::new(294, 1, 64_939),
+            vec![Extension::new(9, vec![0x00, 0xff, 0x10]).expect("tag 9")],
+        )
+        .expect("a valid artifact")
+    }
+
+    #[test]
+    fn an_artifact_round_trips_through_its_manifest() {
+        let artifact = rich();
+        let text = artifact.encode();
+        let parsed = Artifact::decode(&text, artifact.schema).expect("decode");
+        assert_eq!(parsed, artifact);
+    }
+
+    #[test]
+    fn an_artifact_without_a_base_hash_round_trips() {
+        let artifact = sample();
+        assert_eq!(artifact.stamp.base_hash, None);
+        let parsed = Artifact::decode(&artifact.encode(), artifact.schema).expect("decode");
+        assert_eq!(parsed, artifact);
+        assert_eq!(parsed.stamp.base_hash, None);
+    }
+
+    #[test]
+    fn the_manifest_is_stable_across_encodes() {
+        // Two runs over the same artifact produce the same bytes, which is what the
+        // rebuild check compares.
+        assert_eq!(rich().encode(), rich().encode());
+    }
+
+    #[test]
+    fn a_schema_the_reader_does_not_know_is_refused_by_name() {
+        let text = rich().encode();
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 2)).unwrap_err();
+        assert!(matches!(error, Error::SchemaMismatch { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("holder-table/v1") && message.contains("holder-table/v2"),
+            "the refusal names both versions: {message}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_a_schema_is_refused() {
+        let text = rich()
+            .encode()
+            .lines()
+            .filter(|line| !line.starts_with("schema "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 1)).unwrap_err();
+        assert!(matches!(error, Error::InvalidEnvelope { .. }));
+        assert!(error.to_string().contains("schema"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused() {
+        let mut text = rich().encode();
+        text.push_str("nonsense 1\n");
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 1)).unwrap_err();
+        assert!(matches!(error, Error::InvalidEnvelope { .. }));
+        assert!(error.to_string().contains("nonsense"), "{error}");
+    }
+
+    #[test]
+    fn a_field_that_appears_twice_is_refused() {
+        let mut text = rich().encode();
+        text.push_str("rows 7\n");
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 1)).unwrap_err();
+        assert!(matches!(error, Error::InvalidEnvelope { .. }));
+        assert!(error.to_string().contains("rows"), "{error}");
+    }
+
+    #[test]
+    fn an_unsupported_envelope_version_is_refused() {
+        let text = rich().encode().replace("version 1\n", "version 2\n");
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 1)).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedEnvelope { version: 2 }));
+    }
+
+    #[test]
+    fn a_manifest_whose_byte_count_does_not_match_its_files_is_refused() {
+        let text = rich().encode().replace("bytes 64939", "bytes 64938");
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 1)).unwrap_err();
+        assert!(matches!(error, Error::ByteCountMismatch { .. }));
+    }
+
+    #[test]
+    fn an_odd_number_of_hex_digits_is_refused() {
+        let text = rich()
+            .encode()
+            .replace("extension 9 00ff10", "extension 9 00ff1");
+        let error = Artifact::decode(&text, SchemaId::new("holder-table", 1)).unwrap_err();
+        assert!(matches!(error, Error::InvalidEnvelope { .. }));
+        assert!(error.to_string().contains("hex"), "{error}");
+    }
+
+    #[test]
+    fn the_required_stamp_is_accepted_and_any_other_is_refused() {
+        let artifact = rich();
+        artifact
+            .require_stamp(artifact.stamp)
+            .expect("its own stamp");
+
+        let other = Stamp::new(
+            artifact.stamp.base_slot,
+            None,
+            Fingerprint::from_u128(0xabc),
+        );
+        let error = artifact.require_stamp(other).unwrap_err();
+        assert!(matches!(error, Error::StampMismatch { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("43199989") && message.contains("00000000000000000000000000000abc"),
+            "the refusal names both bases: {message}"
+        );
     }
 }

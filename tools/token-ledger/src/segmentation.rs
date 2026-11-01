@@ -57,20 +57,31 @@ struct PendingVest {
 
 fn payment_map(movements: &[policy_archive::Movement]) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    // Address → its payment part, worked out once. `address_parts` is a bech32
+    // decode plus two allocations, and these rows repeat a few thousand
+    // addresses millions of times.
+    let mut parts: HashMap<&str, Option<String>> = HashMap::new();
     for m in movements {
-        let Some((payment, _)) = policy_archive::trade::address_parts(&m.address) else {
+        let payment = parts.entry(m.address.as_str()).or_insert_with(|| {
+            policy_archive::trade::address_parts(&m.address).map(|(payment, _)| payment)
+        });
+        let Some(payment) = payment.as_ref() else {
             continue;
         };
-        out.entry(payment)
-            .or_insert_with(|| holders::key_of(&m.address));
+        if out.contains_key(payment) {
+            continue;
+        }
+        out.insert(payment.clone(), holders::key_of(&m.address));
     }
     out
 }
 
-fn address_balances(movements: &[policy_archive::Movement]) -> HashMap<String, i64> {
-    let mut out: HashMap<String, i64> = HashMap::new();
+fn address_balances(movements: &[policy_archive::Movement]) -> HashMap<&str, i64> {
+    let mut out: HashMap<&str, i64> = HashMap::new();
     for m in movements {
-        *out.entry(m.address.clone()).or_default() += m.amount;
+        // Borrowed rather than cloned: this is one allocation per ROW today, and
+        // the map only ever holds one entry per distinct address.
+        *out.entry(m.address.as_str()).or_default() += m.amount;
     }
     out
 }
@@ -79,7 +90,7 @@ fn address_balances(movements: &[policy_archive::Movement]) -> HashMap<String, i
 fn vesting(
     observations: &[Observation],
     by_payment: &HashMap<String, String>,
-    by_address: &HashMap<String, i64>,
+    by_address: &HashMap<&str, i64>,
 ) -> Vec<VestOwner> {
     let mut pending: BTreeMap<String, Vec<PendingVest>> = BTreeMap::new();
     for o in observations {
@@ -109,7 +120,7 @@ fn vesting(
 
     let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
     for (address, items) in pending {
-        let current = by_address.get(&address).copied().unwrap_or(0).max(0) as u64;
+        let current = by_address.get(address.as_str()).copied().unwrap_or(0).max(0) as u64;
         if current == 0 {
             // Every lock at this address has been claimed.
             continue;
@@ -225,10 +236,14 @@ fn latest_cswap_pool(observations: &[Observation]) -> Option<(String, cswap::Csw
 fn lp_decomposition(
     dir: &Path,
     observations: &[Observation],
-    by_address: &HashMap<String, i64>,
+    by_address: &HashMap<&str, i64>,
 ) -> Option<LpDecomposition> {
     let (pool_address, datum) = latest_cswap_pool(observations)?;
-    let reserve = by_address.get(&pool_address).copied().unwrap_or(0).max(0) as u64;
+    let reserve = by_address
+        .get(pool_address.as_str())
+        .copied()
+        .unwrap_or(0)
+        .max(0) as u64;
     let unavailable = |because: String| LpDecomposition {
         pool_key: holders::key_of(&pool_address),
         pool_address: pool_address.clone(),

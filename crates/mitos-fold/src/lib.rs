@@ -116,8 +116,20 @@ pub enum Error {
     Finish { aggregate: String, source: BoxError },
     /// An artifact lists no files.
     EmptyArtifact,
-    /// An artifact file name is empty, absolute, or escapes the artifact root.
+    /// A file name is empty, absolute, or escapes the artifact root.
     UnsafeFileName { name: String, reason: &'static str },
+    /// The manifest could not be read: a missing field, an unknown one, a bad number.
+    InvalidEnvelope { reason: String },
+    /// The manifest's format version is not one this build writes.
+    UnsupportedEnvelope { version: u32 },
+    /// The artifact's schema is not the one the reader requires.
+    SchemaMismatch { found: String, expected: SchemaId },
+    /// The artifact's stamp is not the one the reader requires.
+    ///
+    /// The slot and the source, as text. Holding the two whole `Stamp`s here would make the
+    /// variant 128 bytes and every `Result` in this crate would pay for it; the base hash
+    /// follows from the slot, and the message is what a reader acts on.
+    StampMismatch { found: String, expected: String },
     /// Two artifact files share a name.
     DuplicateFileName { name: String },
     /// The declared byte count does not equal the sum of the files.
@@ -169,6 +181,23 @@ impl fmt::Display for Error {
             Error::EmptyArtifact => write!(f, "an artifact must list at least one file"),
             Error::UnsafeFileName { name, reason } => {
                 write!(f, "artifact file name {name:?} is invalid: {reason}")
+            }
+            Error::InvalidEnvelope { reason } => {
+                write!(f, "the artifact manifest is invalid: {reason}")
+            }
+            Error::UnsupportedEnvelope { version } => write!(
+                f,
+                "the artifact manifest is version {version}; this build writes {}",
+                Artifact::VERSION
+            ),
+            Error::SchemaMismatch { found, expected } => {
+                write!(
+                    f,
+                    "the artifact's schema is `{found}`, not the required `{expected}`"
+                )
+            }
+            Error::StampMismatch { found, expected } => {
+                write!(f, "the artifact is {found}, not the required {expected}")
             }
             Error::DuplicateFileName { name } => {
                 write!(f, "artifact file `{name}` is listed twice")

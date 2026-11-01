@@ -75,8 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // proof: a party or a delta lost on the way cannot appear on both sides.
     let expected = holders::fold(
         rows.iter()
-            .filter(|movement| !movement.unit_name.is_empty())
-            .cloned(),
+            .filter(|movement| !movement.unit_name.is_empty()),
     );
 
     let feed = fold_rows(rows);

@@ -461,6 +461,18 @@ pub struct PolicyArchive {
     files: Vec<OpenFile>,
 }
 
+/// Which correction files a fold may read.
+///
+/// The stable and volatile halves answer different questions: a carry must see
+/// only what the next refresh cannot take away, while a document folded from
+/// the whole archive must see every resolution there is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CorrectionScope {
+    ImmutableOnly,
+    VolatileOnly,
+    All,
+}
+
 impl PolicyArchive {
     /// `None` when no pass has ever run for this policy.
     pub fn open(dir: &Path) -> Result<Option<Self>> {
@@ -681,7 +693,7 @@ impl PolicyArchive {
                 }
             }
         }
-        self.attach_corrections(&mut rows, &txs, false)?;
+        self.attach_corrections(&mut rows, &txs, CorrectionScope::All)?;
         Ok(rows)
     }
 
@@ -868,15 +880,15 @@ impl PolicyArchive {
 
     /// Pull in corrections for the transactions in hand.
     ///
-    /// `immutable_only` keeps the carried fold inside the stable half: the
-    /// volatile tail's corrections are written when the tail resolves a source,
-    /// and the tail is replaced whole — so a correction read into a carry is a
-    /// row the next refresh may not have.
+    /// [`CorrectionScope::ImmutableOnly`] keeps the carried fold inside the
+    /// stable half: the volatile tail's corrections are written when the tail
+    /// resolves a source, and the tail is replaced whole — so a correction read
+    /// into a carry is a row the next refresh may not have.
     fn attach_corrections(
         &mut self,
         rows: &mut Vec<Movement>,
         txs: &HashSet<Vec<u8>>,
-        immutable_only: bool,
+        scope: CorrectionScope,
     ) -> Result<()> {
         let (Some(lo), Some(hi)) = (
             rows.iter().map(|m| m.slot).min(),
@@ -885,9 +897,15 @@ impl PolicyArchive {
             return Ok(());
         };
         for f in &mut self.files {
-            if f.kind != FileKind::Corrections
-                || (immutable_only && f.range != RangeKind::Immutable)
-            {
+            if f.kind != FileKind::Corrections {
+                continue;
+            }
+            let wanted = match scope {
+                CorrectionScope::All => true,
+                CorrectionScope::ImmutableOnly => f.range == RangeKind::Immutable,
+                CorrectionScope::VolatileOnly => f.range != RangeKind::Immutable,
+            };
+            if !wanted {
                 continue;
             }
             for g in f.archive.groups_overlapping(lo, hi) {
@@ -1539,19 +1557,37 @@ impl History {
                     }
                 }
             }
-            self.archive.attach_corrections(&mut rows, &txs, true)?;
+            self.archive
+                .attach_corrections(&mut rows, &txs, CorrectionScope::ImmutableOnly)?;
             self.immutable = Some(rows);
         }
         Ok(self.immutable.as_deref().unwrap_or(&[]))
     }
 
-    /// Release the memoised IMMUTABLE decode.
+    /// Every movement, built from the IMMUTABLE decode already held plus
+    /// everything ABOVE it — the same rows [`Self::all_movements`] returns,
+    /// without re-reading the files the immutable fold just read.
     ///
-    /// The publisher folds the immutable half for the carried artifacts and then
-    /// the whole archive for the summary; keeping both decodes resident doubles
-    /// the largest allocation here for no answer.
-    pub fn forget_immutable(&mut self) {
-        self.immutable = None;
+    /// ⚠️ The immutable half carries only IMMUTABLE corrections, because a
+    /// carry may see no other. A document folded from the whole archive must
+    /// see every resolution there is, so the volatile ones are attached here
+    /// rather than left behind: a row set that differed by one correction would
+    /// be a different summary, and nothing would say so.
+    ///
+    /// Falls back to a full decode when no immutable fold ran first, so a caller
+    /// cannot get a short answer by calling this out of order.
+    pub fn take_all(&mut self, immutable_to: u64) -> Result<Vec<Movement>> {
+        let Some(mut rows) = self.immutable.take() else {
+            return Ok(self.all_movements()?.to_vec());
+        };
+        // The whole-archive memo, if a caller made one, is a second copy of
+        // these rows. Drop it now rather than hold both.
+        self.all = None;
+        let txs: HashSet<Vec<u8>> = rows.iter().map(|m| m.tx_hash.clone()).collect();
+        self.archive
+            .attach_corrections(&mut rows, &txs, CorrectionScope::VolatileOnly)?;
+        rows.extend(self.movements_above(immutable_to)?);
+        Ok(rows)
     }
 
     /// Every movement ABOVE `slot`, decoded — the tail half of a carried fold.
@@ -1592,7 +1628,8 @@ impl History {
                 }
             }
         }
-        self.archive.attach_corrections(&mut rows, &txs, false)?;
+        self.archive
+            .attach_corrections(&mut rows, &txs, CorrectionScope::All)?;
         Ok(rows)
     }
 }
@@ -1629,8 +1666,7 @@ pub fn holders_from(h: &mut History) -> Result<policy_archive::holders::Fold> {
     Ok(policy_archive::holders::fold(
         h.all_movements()?
             .iter()
-            .filter(|m| is_user_unit(&m.unit_name))
-            .cloned(),
+            .filter(|m| is_user_unit(&m.unit_name)),
     ))
 }
 
@@ -1651,8 +1687,7 @@ pub fn carry_from(
     h: &mut History,
     observations: &[policy_archive::Observation],
 ) -> Result<policy_archive::series::Carry> {
-    let movements = h.all_movements()?.to_vec();
-    Ok(carry_of(movements, observations))
+    Ok(carry_of(h.all_movements()?, observations))
 }
 
 /// [`carry_from`] over the IMMUTABLE archive only, against the boundary a
@@ -1668,7 +1703,7 @@ pub fn immutable_carry_from(
     observations: &[policy_archive::Observation],
     immutable_to: u64,
 ) -> Result<policy_archive::series::Carry> {
-    let movements = h.immutable_movements()?.to_vec();
+    let movements = h.immutable_movements()?;
     let observations: Vec<policy_archive::Observation> = observations
         .iter()
         .filter(|o| o.slot <= immutable_to)
@@ -1682,7 +1717,7 @@ pub fn immutable_carry_from(
 /// The fold itself: one story from the movements and observations, and the
 /// state a later tail continues from.
 fn carry_of(
-    movements: Vec<Movement>,
+    movements: &[Movement],
     observations: &[policy_archive::Observation],
 ) -> policy_archive::series::Carry {
     let settled_to = movements
@@ -1692,7 +1727,11 @@ fn carry_of(
         .max()
         .unwrap_or(0);
     let roles = venue_roles_for(observations);
-    let story = policy_archive::story::build(&fold_rows(movements), observations, &roles);
+    let story = policy_archive::story::build(
+        &policy_archive::feed::fold_rows_ref(movements),
+        observations,
+        &roles,
+    );
     let (series, view) = policy_archive::series::fold_onto(
         &story,
         &policy_archive::view::Projection::default(),
@@ -1758,8 +1797,9 @@ pub fn tail_series(
 /// whole on every refresh, so a carry that includes it is a snapshot of rows
 /// the next refresh may not have; continuing it above its own boundary folds
 /// the replacement on top of the original. Readers fold the tail themselves,
-/// from the live files. This costs one more decode here (the immutable half,
-/// then the whole archive for the summary) and saves every reader the history.
+/// from the live files. A fold reads the archive ONCE: the carried half comes
+/// from the immutable decode, and the summary continues from that same decode
+/// through everything above it. It used to read the whole archive twice.
 /// [`write_derived_at`] with no scale. The archive tests fold through here;
 /// the scheduler and the `summary` command state the registry's decimals
 /// instead, so this wrapper is not in the shipped binary.
@@ -1794,14 +1834,14 @@ pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
     let held = immutable_holders_carry_from(&mut history)?;
     store_series(dir, key, &series)?;
     store_holders(dir, key, key, &held)?;
-    // The whole archive is folded next for the summary; the immutable decode
-    // is dead weight from here.
-    history.forget_immutable();
     // THE SUMMARY is of the whole archive, tail included: it is a published
     // document rather than a fold a reader resumes, so it takes the full
-    // series and every movement.
+    // series and every movement. ONE row set serves both — the immutable
+    // decode the carried artifacts just used, plus everything above it — so
+    // the archive is read once here rather than twice.
     let observations = read_observations(dir, &manifest)?;
-    let full = carry_from(&mut history, &observations)?;
+    let mut all = history.take_all(key)?;
+    let full = carry_of(&all, &observations);
     let complete = manifest.completeness() == Completeness::Complete;
     let policy = policy_of(dir);
     // ⚠️ USER units only, the same rule as `holders_from` and the supply
@@ -1809,19 +1849,17 @@ pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
     // the policy but is not a member of the collection; folding it here put
     // plumbing units into `distribution.held` that `/holders` and `/supply`
     // correctly exclude. MEASURED on $Aliens (2026-10-31): 2,928,030 units,
-    // the whole difference between the two folds.
-    let movements: Vec<_> = history
-        .all_movements()?
-        .iter()
-        .filter(|m| is_user_unit(&m.unit_name))
-        .cloned()
-        .collect();
+    // the whole difference between the two folds. Filtered IN PLACE: this vec
+    // is the only copy of the archive's rows, and a second one is a second
+    // copy of the whole archive.
+    all.retain(|m| is_user_unit(&m.unit_name));
+    let movements = &all;
     let (mut summary, checkpoints) =
         policy_archive::summary::build(&policy_archive::summary::Inputs {
             policy: &policy,
-            unit: dominant_unit(&movements).as_deref(),
+            unit: dominant_unit(movements).as_deref(),
             series: &full.series,
-            movements: &movements,
+            movements,
             immutable_to: key,
             complete,
             decimals,
@@ -1831,7 +1869,7 @@ pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
     // the summary and the holder table cannot disagree about what is locked or
     // how much LP a provider owns.
     let segmentation =
-        crate::segmentation::build(dir, summary.settled_to, &observations, &movements);
+        crate::segmentation::build(dir, summary.settled_to, &observations, movements);
     summary.apply_segmentation(segmentation);
     store_summary(dir, &summary, &checkpoints)?;
     Ok(())
@@ -2106,8 +2144,7 @@ pub fn immutable_holders_carry_from(h: &mut History) -> Result<policy_archive::h
     Ok(policy_archive::holders::carry(
         h.immutable_movements()?
             .iter()
-            .filter(|m| is_user_unit(&m.unit_name))
-            .cloned(),
+            .filter(|m| is_user_unit(&m.unit_name)),
     ))
 }
 
@@ -2120,11 +2157,10 @@ pub fn holders_tail(
     carry: &policy_archive::holders::Carry,
     settled_to: u64,
 ) -> Result<policy_archive::holders::Fold> {
+    let rows = h.movements_above(settled_to)?;
     Ok(policy_archive::holders::fold_onto(
-        h.movements_above(settled_to)?
-            .into_iter()
-            // The same unit rule as the carried half — see [`holders_from`].
-            .filter(|m| is_user_unit(&m.unit_name)),
+        // The same unit rule as the carried half — see [`holders_from`].
+        rows.iter().filter(|m| is_user_unit(&m.unit_name)),
         carry,
     ))
 }
@@ -4145,7 +4181,7 @@ mod tests {
         // Exactly what version 1 stored: the whole fold, and the tail's top
         // slot as the boundary.
         let mut h = History::open(dir).unwrap().unwrap();
-        let carry = policy_archive::holders::carry(h.all_movements().unwrap().iter().cloned());
+        let carry = policy_archive::holders::carry(h.all_movements().unwrap().iter());
         store_holders(dir, key, 1_600, &carry).unwrap();
 
         assert!(

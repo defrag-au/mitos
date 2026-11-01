@@ -39,6 +39,7 @@
 //! about *which* outputs are live, never about what to do with them.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use chain_decode::{DecodedBlock, DecodedOutput};
 use mitos_cohort::Cohort;
@@ -97,6 +98,72 @@ pub struct HolderTable {
 }
 
 impl HolderTable {
+    /// The rows file's name inside an artifact directory.
+    pub const ROWS_FILE: &'static str = "holders.tsv";
+
+    /// The envelope extension tag that names the policy this table covers.
+    ///
+    /// The envelope generalises over artifacts, so it has no field for "which policy" — the
+    /// table's subject is exactly the kind of additive field `Extension` exists for. The body
+    /// is the 28 policy bytes. Tag 1 is assigned here and never reused, per the contract.
+    pub const POLICY_EXTENSION: u32 = 1;
+
+    /// The policy an artifact's extensions name, if they name one.
+    ///
+    /// `None` for an artifact that carries no policy field or one of the wrong length — a
+    /// reader cannot key a table on a policy that is not 28 bytes, and inventing a default
+    /// would attach the rows to somebody else's token.
+    pub fn policy_of(extensions: &[mitos_fold::Extension]) -> Option<[u8; 28]> {
+        extensions
+            .iter()
+            .find(|extension| extension.tag == Self::POLICY_EXTENSION)?
+            .body
+            .as_slice()
+            .try_into()
+            .ok()
+    }
+
+    /// How many `(holder, asset)` balances the file holds.
+    ///
+    /// One line each, so this is the file's data-row count rather than its holder count.
+    pub fn balances(&self) -> usize {
+        self.holders.iter().map(|row| row.assets.len()).sum()
+    }
+
+    /// Render the table as its rows file.
+    ///
+    /// **TSV, deliberately and temporarily.** The row encoding is the one part of this
+    /// artifact that will change — a binary sorted array is smaller and pages without
+    /// parsing — and everything around it is encoding-agnostic: the envelope names the file
+    /// and its length, `counts` says what is in it, and a reader checks the length before
+    /// trusting it. Replacing this function is the whole of that change.
+    pub fn to_rows(&self) -> String {
+        let mut text = String::new();
+        writeln!(
+            &mut text,
+            "holder\taddress\tcohort\tasset_name_hex\tquantity"
+        )
+        .expect("writing to a String cannot fail");
+        for row in &self.holders {
+            let holder = match &row.holder {
+                HolderKey::Stake(credential) => hex(credential),
+                HolderKey::Enterprise(address) => address.clone(),
+            };
+            for asset in &row.assets {
+                writeln!(
+                    &mut text,
+                    "{holder}\t{}\t{}\t{}\t{}",
+                    row.address,
+                    row.cohort.as_str(),
+                    hex(&asset.name),
+                    asset.quantity,
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        text
+    }
+
     /// How many distinct holders the table holds.
     pub fn distinct_holders(&self) -> usize {
         self.holders.len()
@@ -238,6 +305,17 @@ impl HolderTableAggregate {
         }
         Ok(held)
     }
+}
+
+/// Lowercase hex, for the rows file's credential and asset-name columns.
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 /// A hash and an index as a hashable key.

@@ -158,6 +158,45 @@ summary() -> Summary
 
 No query language. If a question needs a join, it is a different aggregate.
 
+### The manifest, as built
+
+`Artifact::encode` / `Artifact::decode` in `crates/mitos-fold`, `key value` text in the same
+convention as `live_book`'s `book.meta` — inspectable, diffable, and no codec dependency, so
+the contract crate stays dependency-free. Scalars first in a fixed order, then one `file` line
+per file and one `extension` line per extension:
+
+```text
+version 1                                  # the manifest's format, not the schema's
+kind ordered
+schema holder-table/v1
+base_slot 43199989
+base_hash 5195dfa0…                        # omitted when the source has none
+source 000000000000000000000000000007cf
+rows 294                                   # the primary table's row type
+entries 294                                # what the file holds, line by line
+bytes 52603
+file 52603 holders.tsv
+extension 1 407ca40a…                      # tag 1 = the holder table's policy
+```
+
+**A reader names the schema it requires; the manifest cannot introduce one.**
+`decode(text, expected)` refuses a schema that is not `expected`, by name, because a schema
+id is a `&'static str` in the reader's own code — a version it has never heard of is a
+refusal, not a guess. `require_stamp` is the other half and is exact on all three fields.
+
+Interpretation notes, both load-bearing:
+
+- **`version` numbers the manifest; the schema's version numbers the rows.** A new field in
+the manifest bumps the first; a new column in a row bumps the second.
+- **`rows` and `entries` are different numbers on purpose.** In the holder table `rows` is
+the row type (a holder) and `entries` is what the file physically holds (one line per
+`(holder, asset)` balance). A reader sizing a page asks the first; a reader checking the
+file asks the second.
+
+An artifact whose *subject* is not a general field — the holder table's policy — carries it
+as an extension with a tag assigned once (`HolderTable::POLICY_EXTENSION`). That is what the
+slot is for, and a reader that does not know the tag ignores it.
+
 One publisher, one index, atomic swap, meta last. `cf-publish` and `live-book` already have
 the mechanics; the fold plane should not grow a second path.
 
@@ -245,10 +284,16 @@ not yet the table's. `fold-probe pilot` is the full-window version: phase one wa
 writes the book, phase two projects the table from it, and the run fails if the stream
 aggregate and the view disagree.
 
-- One walk writes `live-book` + `holders.tbl` + `summary.tbl` from the same row stream.
-  Build from the builder's stream, never through the reader's `with_row` — the warning in
-  `LARGE_POLICY_VIEWS.md` §4 exists because that is how 630 long rows would silently
-  disappear.
+- One walk writes the book and one artifact directory: `holders.tsv` plus `artifact.meta`,
+  the manifest written last. `summary.tsv` is gone — the manifest carries the schema, the
+  stamp and the counts, so it *is* the summary. Build from the builder's stream, never
+  through the reader's `with_row` — the warning in `LARGE_POLICY_VIEWS.md` §4 exists because
+  that is how 630 long rows would silently disappear.
+- **The rows are TSV, temporarily.** The row encoding is the one part of this artifact that
+  changes: a binary sorted array is smaller and pages without parsing. Everything around it
+  is encoding-agnostic — the manifest names the file and its length, `counts` says what is
+  in it, and a reader checks the length before trusting it — so replacing
+  `HolderTable::to_rows` is the whole of that change.
 - The module's snapshot becomes a read of the summary/page; its delta path stays in wasm.
   The module keeps its interest handling and its live events. It stops doing the
   aggregation.
@@ -281,18 +326,22 @@ The gate:
 
 1. **Contract tests** — envelope round-trip; schema/version mismatch fails by name; stamp
    refusal; registry ordering; determinism (same input → byte-identical artifact across two
-   runs).
-2. **Pilot parity** on the local shadow pair (`.tmp/shadow/book-2000` against
-   `.tmp/shadow/dolos-mainnet`): the artifact summary matches the module's 396-ref snapshot
-   byte for byte. The 995/9,625 policies run the no-cap enumeration and the delta path.
-3. **The local stack** — `deploy/local` serves the artifact and the flow plane together;
+   runs). **Done**: 32 unit tests in `mitos-fold`, 13 in `tests/registry.rs`, 13 in
+   `tests/views.rs`.
+2. **Pilot parity** on the local shadow pair: the walk, the book and the module agree on
+   294 holders / 68,994,134 units for `407ca4…`. **Done** — `pilot` fails the run if the two
+   shapes disagree, `tests/module_parity.rs` checks the module against either table, and
+   `tests/book_view.rs` re-projects the book and compares the rows byte for byte.
+3. **A rebuild** — wipe the artifact and rebuild from the same range; compare bytes with
+   the first build. A difference is a failure. **Done**, 2026-11-01: two independent runs over
+   chunks 0..=1999 produced a byte-identical `artifact.meta` and `holders.tsv`, and a
+   byte-identical book (`diff -r`, no output, 568 MB each).
+4. **The local stack** — `deploy/local` serves the artifact and the flow plane together;
    `container-compose` is pinned (the `observe()` fix must be committed and re-pinned, or
    the lab is one machine's working tree); the module reads the artifact and emits the same
-   events.
-4. **A rebuild** — wipe the artifact and rebuild from the same range; compare bytes with
-   the first build. A difference is a failure.
+   events. **Not started** — this is the remaining item.
 5. **No production path** — the first publish target is a local directory or a test prefix.
-   `mitos-watch`, the box, and the edge are untouched.
+   `mitos-watch`, the box, and the edge are untouched. **Holds.**
 
 Once the gate passes, the contract is frozen at version 1. Additive changes (extension
 slots) are allowed afterwards; a field change is a version bump.

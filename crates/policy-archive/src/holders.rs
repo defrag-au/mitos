@@ -68,7 +68,7 @@ pub struct Holder {
 /// counted by [`Fold::negative`] rather than silently discarded, because a
 /// table that quietly drops the evidence of its own incompleteness is how an
 /// incomplete table gets trusted.
-pub fn fold(movements: impl Iterator<Item = Movement>) -> Fold {
+pub fn fold<'a>(movements: impl Iterator<Item = &'a Movement>) -> Fold {
     fold_onto(movements, &Carry::default())
 }
 
@@ -103,17 +103,23 @@ pub struct Party {
 }
 
 /// The carried state after folding these movements, without publishing.
-pub fn carry(movements: impl Iterator<Item = Movement>) -> Carry {
+pub fn carry<'a>(movements: impl Iterator<Item = &'a Movement>) -> Carry {
     accumulate(Carry::default(), movements)
 }
 
 /// Fold movements ONTO a carried balance table, and publish the result.
-pub fn fold_onto(movements: impl Iterator<Item = Movement>, carry: &Carry) -> Fold {
+pub fn fold_onto<'a>(movements: impl Iterator<Item = &'a Movement>, carry: &Carry) -> Fold {
     finalise(accumulate(carry.clone(), movements))
 }
 
-fn accumulate(mut carry: Carry, movements: impl Iterator<Item = Movement>) -> Carry {
+fn accumulate<'a>(mut carry: Carry, movements: impl Iterator<Item = &'a Movement>) -> Carry {
+    use std::collections::HashMap;
+
     let Carry { parties, rows } = &mut carry;
+    // Address → key, worked out once per address rather than once per row. The
+    // key is a bech32 decode, and a wallet's history is thousands of rows of
+    // the same few addresses; repeating that decode was most of the fold.
+    let mut keys: HashMap<&'a str, String> = HashMap::new();
 
     for m in movements {
         // A placeholder stands in for a `(tx, unit)` attributed to nobody. It
@@ -122,8 +128,10 @@ fn accumulate(mut carry: Carry, movements: impl Iterator<Item = Movement>) -> Ca
             continue;
         }
         *rows += 1;
-        let key = key_of(&m.address);
-        let e = parties.entry(key).or_insert_with(|| Party {
+        let key = keys
+            .entry(m.address.as_str())
+            .or_insert_with(|| key_of(&m.address));
+        let e = parties.entry(key.clone()).or_insert_with(|| Party {
             address: m.address.clone(),
             amount: 0,
             movements: 0,
@@ -321,7 +329,7 @@ mod tests {
         // Same 28-byte stake part, different payment parts.
         let a = "addr1q9xy2xk7s8wvkq0w7qr4t6u9e3xj5m8n2p4r6t8v0w2y4a6c8e0g2j4l6n8q0s2u4w6y8a0c2e4g6j8l0n2q4s6u8w0yjqamn8h";
         let b = "addr1q8ab2xk7s8wvkq0w7qr4t6u9e3xj5m8n2p4r6t8v0w2y4a6c8e0g2j4l6n8q0s2u4w6y8a0c2e4g6j8l0n2q4s6u8w0yjqamn8h";
-        let f = fold([mv(a, 100), mv(b, 300)].into_iter());
+        let f = fold([mv(a, 100), mv(b, 300)].iter());
         // They may or may not share a stake part depending on the synthetic
         // bytes; what must hold is that the fold is driven by the stake part
         // and never by the raw string.
@@ -334,14 +342,14 @@ mod tests {
             // folds the same history in a different order and must name the
             // same address.
             assert_eq!(f.holders[0].address, a.min(b));
-            let reversed = fold([mv(b, 300), mv(a, 100)].into_iter());
+            let reversed = fold([mv(b, 300), mv(a, 100)].iter());
             assert_eq!(reversed.holders[0].address, f.holders[0].address);
         }
     }
 
     #[test]
     fn a_party_that_sent_everything_back_is_not_a_holder() {
-        let f = fold([mv("addr_a", 100), mv("addr_a", -100), mv("addr_b", 50)].into_iter());
+        let f = fold([mv("addr_a", 100), mv("addr_a", -100), mv("addr_b", 50)].iter());
         assert_eq!(f.holders.len(), 1);
         assert_eq!(f.holders[0].address, "addr_b");
         assert_eq!(f.held, 50);
@@ -351,7 +359,7 @@ mod tests {
     /// rather than being an arithmetic curiosity to round away.
     #[test]
     fn a_negative_balance_is_counted_as_missing_coverage() {
-        let f = fold([mv("addr_a", -100), mv("addr_b", 50)].into_iter());
+        let f = fold([mv("addr_a", -100), mv("addr_b", 50)].iter());
         assert_eq!(f.negative, 1, "the impossible row is REPORTED");
         assert_eq!(f.holders.len(), 1, "and not listed as a holder");
         assert_eq!(f.held, 50);
@@ -361,14 +369,14 @@ mod tests {
     fn placeholders_are_not_parties() {
         let mut p = mv("", 0);
         p.net_mint = 1_000;
-        let f = fold([p, mv("addr_a", 1_000)].into_iter());
+        let f = fold([p, mv("addr_a", 1_000)].iter());
         assert_eq!(f.holders.len(), 1);
         assert_eq!(f.rows, 1, "the placeholder is not a folded row either");
     }
 
     #[test]
     fn holders_are_ordered_largest_first_and_deterministically() {
-        let f = fold([mv("addr_b", 100), mv("addr_a", 100), mv("addr_c", 900)].into_iter());
+        let f = fold([mv("addr_b", 100), mv("addr_a", 100), mv("addr_c", 900)].iter());
         let keys: Vec<&str> = f.holders.iter().map(|h| h.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -380,7 +388,7 @@ mod tests {
     /// ⚠️ `None`, not 0, when there is no supply to take a share of.
     #[test]
     fn concentration_is_undefined_without_a_supply() {
-        let f = fold([mv("addr_a", 100)].into_iter());
+        let f = fold([mv("addr_a", 100)].iter());
         assert_eq!(f.concentration(1, 0), None);
         assert_eq!(f.concentration(1, 200), Some(50.0));
     }
@@ -392,7 +400,7 @@ mod tests {
     /// not.
     #[test]
     fn a_fold_split_at_a_boundary_equals_a_fold_in_one() {
-        let rows = vec![
+        let rows = [
             mv("addr_a", 100),
             mv("addr_b", 50),
             // addr_a sends everything: zero at the seam, so it is not a holder
@@ -402,10 +410,10 @@ mod tests {
             mv("addr_c", -10),
             mv("addr_b", 25),
         ];
-        let whole = fold(rows.clone().into_iter());
+        let whole = fold(rows.iter());
 
-        let seam = carry(rows[..3].iter().cloned());
-        let split = fold_onto(rows[3..].iter().cloned(), &seam);
+        let seam = carry(rows[..3].iter());
+        let split = fold_onto(rows[3..].iter(), &seam);
 
         assert_eq!(split, whole);
         assert!(
@@ -425,7 +433,7 @@ mod tests {
             format: HOLDERS_FORMAT,
             immutable_to: 201_160_800,
             settled_to: 201_160_800,
-            carry: carry([mv("addr_a", 100)].into_iter()),
+            carry: carry([mv("addr_a", 100)].iter()),
         };
         let bytes = file.encode().unwrap();
         assert_eq!(bytes[0], HOLDERS_FORMAT);

@@ -97,6 +97,15 @@ pub fn direction(unit: &UnitMove) -> Direction {
 /// it, and the explorer read as "order placed" AFTER the sale. `tx_index` is
 /// the position in the block; it sorts a placement before the fill it enables.
 pub fn fold_rows(rows: Vec<Movement>) -> Vec<FeedRow> {
+    fold_rows_ref(&rows)
+}
+
+/// [`fold_rows`] over rows the caller already holds.
+///
+/// The fold copies the fields each [`FeedRow`] keeps either way, so passing the
+/// slice in is the same work minus the intermediate `Vec<Movement>` copy — which
+/// on the widest archive here is a whole second copy of every row.
+pub fn fold_rows_ref(rows: &[Movement]) -> Vec<FeedRow> {
     struct Acc {
         slot: u64,
         block_time: u64,
