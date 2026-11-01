@@ -48,7 +48,10 @@
 //! nothing here is worth a durable cursor:
 //!
 //! 1. **Read** — one `fold-data::read` page per call. The host caps a page
-//!    at 256 KiB and refuses more rather than clamping.
+//!    at 256 KiB and refuses more rather than clamping, so `READ_PAGE` is
+//!    that cap. The pilot's rows file fits one page; the multi-page loop is
+//!    exercised by any artifact above it, and a boundary mistake there fails
+//!    loudly — `SnapshotBegin` with no `SnapshotEnd` — rather than silently.
 //! 2. **Parse** — one call: `HolderTable::from_rows` over the assembled
 //!    file, then flatten and sort to the wire order
 //!    `(asset_name_hex, holder)`.
@@ -211,7 +214,7 @@ fn load() -> Option<Served> {
         base_hash_hex: artifact
             .stamp
             .base_hash
-            .map(|hash| hex::encode(hash))
+            .map(hex::encode)
             .unwrap_or_default(),
         rows_file: rows.name.clone(),
         rows_bytes: rows.bytes,

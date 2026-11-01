@@ -336,8 +336,21 @@ fn bech32_payload(encoded: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Lower-case hex, two characters a byte.
+///
+/// Written out rather than `format!("{x:02x}")` per byte. MEASURED with
+/// `sample` on a real fold: that `format!` was the single largest self-time
+/// frame in the whole run — `fmt::write`, `write_prefix`, `pad_integral` and a
+/// `String` allocation for every byte of every credential, called once per
+/// address per classification.
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Fold one transaction's unit movement into an event.
